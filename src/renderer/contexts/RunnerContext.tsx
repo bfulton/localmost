@@ -301,6 +301,8 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
 
     if (result.success) {
       setIsConfigured(true);
+      // Save the full runnerConfig so re-registration has runnerName, level, etc.
+      await window.localmost.settings.set({ runnerConfig });
       await window.localmost.runner.start();
       const displayName = await window.localmost.runner.getDisplayName();
       setRunnerDisplayName(displayName);
