@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode } from 'react';
-import { LogEntry, SleepProtection, LogLevel, ToolCacheLocation } from '../../shared/types';
+import { LogEntry, SleepProtection, LogLevel, ToolCacheLocation, UserFilterConfig } from '../../shared/types';
 
 export type ThemeSetting = 'light' | 'dark' | 'auto';
 
@@ -33,6 +33,10 @@ interface AppConfigContextValue {
   setPreserveWorkDir: (setting: 'never' | 'session' | 'always') => Promise<void>;
   toolCacheLocation: ToolCacheLocation;
   setToolCacheLocation: (setting: ToolCacheLocation) => Promise<void>;
+
+  // User filter
+  userFilter: UserFilterConfig;
+  setUserFilter: (filter: UserFilterConfig) => Promise<void>;
 
   // App state
   isOnline: boolean;
@@ -81,6 +85,9 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
   // Runner settings
   const [preserveWorkDir, setPreserveWorkDirState] = useState<'never' | 'session' | 'always'>('never');
   const [toolCacheLocation, setToolCacheLocationState] = useState<ToolCacheLocation>('persistent');
+
+  // User filter
+  const [userFilter, setUserFilterState] = useState<UserFilterConfig>({ mode: 'everyone', allowlist: [] });
 
   // Apply theme whenever it changes
   useEffect(() => {
@@ -148,6 +155,17 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
         }
         if (settings.runnerLogLevel && ['debug', 'info', 'warn', 'error'].includes(settings.runnerLogLevel as string)) {
           setRunnerLogLevelState(settings.runnerLogLevel as LogLevel);
+        }
+
+        // User filter
+        if (settings.userFilter) {
+          const filter = settings.userFilter as UserFilterConfig;
+          if (filter.mode && ['everyone', 'just-me', 'allowlist'].includes(filter.mode)) {
+            setUserFilterState({
+              mode: filter.mode,
+              allowlist: Array.isArray(filter.allowlist) ? filter.allowlist : [],
+            });
+          }
         }
 
         setIsLoading(false);
@@ -233,6 +251,11 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     await window.localmost.settings.set({ toolCacheLocation: setting });
   }, []);
 
+  const setUserFilter = useCallback(async (filter: UserFilterConfig) => {
+    setUserFilterState(filter);
+    await window.localmost.settings.set({ userFilter: filter });
+  }, []);
+
   const clearLogs = useCallback(() => {
     logsRef.current = [];
     setLogs([]);
@@ -259,6 +282,8 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     setPreserveWorkDir,
     toolCacheLocation,
     setToolCacheLocation,
+    userFilter,
+    setUserFilter,
     isOnline,
     isLoading,
     error,

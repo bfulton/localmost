@@ -4,6 +4,7 @@ import { faXmark, faLightbulb, faMoon, faDesktop } from '@fortawesome/free-solid
 import { SleepProtection } from '../../shared/types';
 import { GITHUB_APP_SETTINGS_URL, PRIVACY_POLICY_URL, REPOSITORY_URL } from '../../shared/constants';
 import { useAppConfig, useRunner } from '../contexts';
+import UserFilterSettings from './UserFilterSettings';
 import styles from './SettingsPage.module.css';
 import shared from '../styles/shared.module.css';
 
@@ -33,6 +34,8 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection }) 
     setPreserveWorkDir,
     toolCacheLocation,
     setToolCacheLocation,
+    userFilter,
+    setUserFilter,
   } = useAppConfig();
 
   // Runner state from context
@@ -438,6 +441,18 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection }) 
             >
               {isLoading ? 'Configuring...' : isConfigured ? 'Reconfigure' : 'Configure Runner'}
             </button>
+          </section>
+        )}
+
+        {/* User Filter Section */}
+        {user && isConfigured && (
+          <section className={styles.settingsSection}>
+            <h3>Job Filtering</h3>
+            <UserFilterSettings
+              userFilter={userFilter}
+              currentUserLogin={user.login}
+              onFilterChange={setUserFilter}
+            />
           </section>
         )}
 

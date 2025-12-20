@@ -353,9 +353,9 @@ export class GitHubAuth {
     accessToken: string,
     owner: string,
     repo: string
-  ): Promise<Array<{ id: number; name: string; status: string; created_at: string }>> {
+  ): Promise<Array<{ id: number; name: string; status: string; created_at: string; actor: { login: string } }>> {
     const client = new GitHubClient(accessToken);
-    const data = await client.get<{ workflow_runs: Array<{ id: number; name: string; status: string; created_at: string }> }>(
+    const data = await client.get<{ workflow_runs: Array<{ id: number; name: string; status: string; created_at: string; actor: { login: string } }> }>(
       `/repos/${owner}/${repo}/actions/runs`,
       { params: { per_page: '10', status: 'in_progress' } }
     );
@@ -364,6 +364,7 @@ export class GitHubAuth {
       name: run.name,
       status: run.status,
       created_at: run.created_at,
+      actor: { login: run.actor?.login || 'unknown' },
     }));
   }
 
@@ -502,5 +503,51 @@ export class GitHubAuth {
         throw error;
       }
     }
+  }
+
+  /**
+   * Search for GitHub users by username.
+   * Returns up to 10 users matching the query.
+   */
+  async searchUsers(
+    accessToken: string,
+    query: string
+  ): Promise<Array<{ login: string; avatar_url: string; name: string | null }>> {
+    if (!query || query.trim().length === 0) {
+      return [];
+    }
+
+    const client = new GitHubClient(accessToken);
+    const data = await client.get<{
+      items: Array<{ login: string; avatar_url: string }>;
+    }>('/search/users', {
+      params: {
+        q: query,
+        per_page: '10',
+      },
+    });
+
+    // GitHub search API doesn't return the name field, so we need to fetch each user
+    // To avoid rate limiting, we only fetch details for the first 5 results
+    const usersWithNames = await Promise.all(
+      (data.items || []).slice(0, 5).map(async (user) => {
+        try {
+          const userDetails = await client.get<{ name: string | null }>(`/users/${user.login}`);
+          return {
+            login: user.login,
+            avatar_url: user.avatar_url,
+            name: userDetails.name,
+          };
+        } catch {
+          return {
+            login: user.login,
+            avatar_url: user.avatar_url,
+            name: null,
+          };
+        }
+      })
+    );
+
+    return usersWithNames;
   }
 }

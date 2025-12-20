@@ -155,6 +155,7 @@ export const IPC_CHANNELS = {
   GITHUB_GET_REPOS: 'github:get-repos',
   GITHUB_GET_ORGS: 'github:get-orgs',
   GITHUB_GET_REGISTRATION_TOKEN: 'github:get-registration-token',
+  GITHUB_SEARCH_USERS: 'github:search-users',
 
   // Runner setup
   RUNNER_DOWNLOAD: 'runner:download',
@@ -258,4 +259,32 @@ export interface DeviceCodeInfo {
 export interface HeartbeatStatus {
   /** Whether the heartbeat is currently running */
   isRunning: boolean;
+}
+
+// =============================================================================
+// User Filter Types
+// =============================================================================
+
+/** Mode for filtering jobs by triggering user */
+export type UserFilterMode = 'everyone' | 'just-me' | 'allowlist';
+
+/** A GitHub user for the filter allowlist */
+export interface AllowlistUser {
+  login: string;
+  avatar_url: string;
+  name: string | null;
+}
+
+/** User filter configuration */
+export interface UserFilterConfig {
+  mode: UserFilterMode;
+  /** List of allowed users (only used when mode is 'allowlist') */
+  allowlist: AllowlistUser[];
+}
+
+/** Search result for GitHub users */
+export interface GitHubUserSearchResult {
+  login: string;
+  avatar_url: string;
+  name: string | null;
 }

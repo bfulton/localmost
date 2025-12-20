@@ -13,6 +13,7 @@ import {
   RunnerRelease,
   JobHistoryEntry,
   HeartbeatStatus,
+  GitHubUserSearchResult,
 } from '../shared/types';
 
 // Expose protected methods to the renderer process
@@ -40,6 +41,7 @@ contextBridge.exposeInMainWorld('localmost', {
     logout: () => ipcRenderer.invoke(IPC_CHANNELS.GITHUB_AUTH_LOGOUT),
     getRepos: () => ipcRenderer.invoke(IPC_CHANNELS.GITHUB_GET_REPOS),
     getOrgs: () => ipcRenderer.invoke(IPC_CHANNELS.GITHUB_GET_ORGS),
+    searchUsers: (query: string) => ipcRenderer.invoke(IPC_CHANNELS.GITHUB_SEARCH_USERS, query),
     onDeviceCode: (callback: (info: DeviceCodeInfo) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, info: DeviceCodeInfo) => callback(info);
       ipcRenderer.on(IPC_CHANNELS.GITHUB_DEVICE_CODE, handler);
@@ -135,6 +137,7 @@ export interface LocalmostAPI {
     logout: () => Promise<{ success: boolean }>;
     getRepos: () => Promise<{ success: boolean; repos?: GitHubRepo[]; error?: string }>;
     getOrgs: () => Promise<{ success: boolean; orgs?: GitHubOrg[]; error?: string }>;
+    searchUsers: (query: string) => Promise<{ success: boolean; users?: GitHubUserSearchResult[]; error?: string }>;
     onDeviceCode: (callback: (info: DeviceCodeInfo) => void) => () => void;
   };
   runner: {
