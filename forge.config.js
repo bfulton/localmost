@@ -39,14 +39,14 @@ function isReleaseBuild() {
 }
 
 // Find the appropriate signing identity
-// For release builds (on main, clean tree), use "Apple Distribution"
+// For release builds (on main, clean tree), use "Developer ID Application" (for direct distribution)
 // For dev builds (branch or uncommitted changes), use "Apple Development"
 function getSigningIdentity() {
   if (process.env.APPLE_IDENTITY === '-') return null;
   if (process.env.APPLE_IDENTITY) return process.env.APPLE_IDENTITY;
 
   const identities = getSigningIdentities();
-  const preferredPrefix = isReleaseBuild() ? 'Apple Distribution' : 'Apple Development';
+  const preferredPrefix = isReleaseBuild() ? 'Developer ID Application' : 'Apple Development';
 
   // First try preferred identity type
   const preferred = identities.find(id => id.startsWith(preferredPrefix));
