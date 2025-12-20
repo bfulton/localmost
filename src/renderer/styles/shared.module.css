@@ -1,0 +1,265 @@
+/**
+ * Shared component styles - Buttons, forms, and utilities
+ */
+
+/* Buttons */
+.btn {
+  -webkit-app-region: no-drag;
+  padding: 10px 20px;
+  border-radius: 8px;
+  border: none;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btnPrimary {
+  composes: btn;
+  background: var(--accent);
+  color: white;
+}
+
+.btnPrimary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.btnSecondary {
+  composes: btn;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.btnSecondary:hover:not(:disabled) {
+  background: var(--border);
+}
+
+.btnIcon {
+  composes: btn;
+  padding: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.btnIcon:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+/* Page Header */
+.pageHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.pageHeader h2 {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+/* Form Controls */
+.formGroup {
+  margin-bottom: 20px;
+}
+
+.formGroup label {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+  margin-bottom: 8px;
+  color: var(--text-secondary);
+}
+
+.toggleRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0;
+  cursor: pointer;
+}
+
+.toggleRow span {
+  color: var(--text-primary);
+}
+
+.toggleRow input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.formGroup input:not([type="checkbox"]):not([type="range"]),
+.formGroup select {
+  width: 100%;
+  padding: 12px 16px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-primary);
+  font-size: 14px;
+  transition: border-color 0.2s;
+}
+
+.formGroup select {
+  padding-right: 36px;
+  -webkit-appearance: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23888' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+}
+
+.formGroup input:not([type="checkbox"]):not([type="range"]):focus,
+.formGroup select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.formGroup input:not([type="checkbox"]):not([type="range"])::placeholder {
+  color: var(--text-secondary);
+  opacity: 0.6;
+}
+
+.formGroup select {
+  cursor: pointer;
+}
+
+.formHint {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 8px;
+  line-height: 1.4;
+}
+
+/* Error Message */
+.errorMessage {
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid var(--error);
+  color: var(--error);
+  padding: 12px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  margin-top: 16px;
+}
+
+/* Spinner */
+.spinner {
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+/* Waiting Indicator */
+.waitingIndicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: var(--text-secondary);
+  font-size: 14px;
+  padding: 16px 0;
+}
+
+/* Utility Classes */
+.flexBetween {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.flexGap4 {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+/* Chevron Icon States */
+.chevronIcon {
+  transition: transform 0.2s;
+}
+
+.chevronExpanded {
+  transform: rotate(180deg);
+}
+
+.chevronCollapsed {
+  transform: rotate(0deg);
+}
+
+/* Icon States */
+.iconSuccess {
+  color: var(--success);
+}
+
+/* Modal Dialog */
+.modalOverlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modalDialog {
+  background: var(--bg-secondary);
+  border-radius: 12px;
+  padding: 24px;
+  max-width: 420px;
+  width: 90%;
+  border: 1px solid var(--border);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+}
+
+.modalDialog h3 {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  color: var(--text-primary);
+}
+
+.modalDialog p {
+  font-size: 14px;
+  color: var(--text-secondary);
+  margin-bottom: 12px;
+  line-height: 1.5;
+}
+
+.modalDialog ul {
+  margin: 0 0 16px 20px;
+  padding: 0;
+}
+
+.modalDialog li {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+  line-height: 1.4;
+}
+
+.modalActions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+  margin-top: 20px;
+}

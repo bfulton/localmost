@@ -1,0 +1,71 @@
+/* Page Error Fallback Styles */
+
+.pageErrorFallback {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: calc(100vh - 52px);
+  padding: 24px;
+  text-align: center;
+}
+
+.content {
+  max-width: 400px;
+}
+
+.icon {
+  font-size: 48px;
+  margin-bottom: 16px;
+  opacity: 0.6;
+}
+
+.content h2 {
+  font-size: 20px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  color: var(--text-primary);
+}
+
+.content p {
+  font-size: 14px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  margin-bottom: 20px;
+}
+
+.details {
+  text-align: left;
+  margin-bottom: 20px;
+  background-color: var(--bg-secondary);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.details summary {
+  padding: 0.75rem 1rem;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.details summary:hover {
+  background-color: var(--bg-tertiary);
+}
+
+.details pre {
+  padding: 1rem;
+  font-size: 0.75rem;
+  overflow-x: auto;
+  margin: 0;
+  color: var(--error);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.actions {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+}

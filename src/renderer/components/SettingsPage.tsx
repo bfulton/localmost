@@ -1,0 +1,621 @@
+import React, { useState, useEffect } from 'react';
+import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
+import { faXmark, faLightbulb, faMoon, faDesktop } from '@fortawesome/free-solid-svg-icons';
+import { SleepProtection } from '../../shared/types';
+import { GITHUB_APP_SETTINGS_URL, PRIVACY_POLICY_URL, REPOSITORY_URL } from '../../shared/constants';
+import { useAppConfig, useRunner } from '../contexts';
+import styles from './SettingsPage.module.css';
+import shared from '../styles/shared.module.css';
+
+interface SettingsPageProps {
+  onBack: () => void;
+  scrollToSection?: string;
+}
+
+const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection }) => {
+  // App config from context
+  const {
+    theme,
+    setTheme,
+    maxLogScrollback,
+    setMaxLogScrollback,
+    maxJobHistory,
+    setMaxJobHistory,
+    sleepProtection,
+    setSleepProtection,
+    sleepProtectionConsented,
+    consentToSleepProtection,
+    logLevel,
+    setLogLevel,
+    runnerLogLevel,
+    setRunnerLogLevel,
+    preserveWorkDir,
+    setPreserveWorkDir,
+    toolCacheLocation,
+    setToolCacheLocation,
+  } = useAppConfig();
+
+  // Runner state from context
+  const {
+    user,
+    isAuthenticating,
+    deviceCode,
+    login,
+    logout,
+    repos,
+    orgs,
+    isDownloaded,
+    runnerVersion,
+    availableVersions,
+    selectedVersion,
+    setSelectedVersion,
+    downloadProgress,
+    isLoadingVersions,
+    downloadRunner,
+    isConfigured,
+    runnerConfig,
+    updateRunnerConfig,
+    configureRunner,
+    isLoading,
+    isInitialLoading,
+    error,
+    setError,
+  } = useRunner();
+
+  // Local UI state
+  const [showSleepConsentDialog, setShowSleepConsentDialog] = useState(false);
+  const [pendingSleepSetting, setPendingSleepSetting] = useState<SleepProtection | null>(null);
+  const [avatarError, setAvatarError] = useState(false);
+  const [launchAtLogin, setLaunchAtLogin] = useState(false);
+  const [hideOnStart, setHideOnStart] = useState(false);
+
+  // Load startup settings
+  useEffect(() => {
+    const loadStartupSettings = async () => {
+      const settings = await window.localmost.settings.get();
+      setLaunchAtLogin((settings.launchAtLogin as boolean | undefined) ?? false);
+      setHideOnStart((settings.hideOnStart as boolean | undefined) ?? false);
+    };
+    loadStartupSettings();
+  }, []);
+
+  // Scroll to section when specified
+  useEffect(() => {
+    if (scrollToSection) {
+      const attemptScroll = () => {
+        const element = document.getElementById(scrollToSection);
+        if (element) {
+          setTimeout(() => {
+            element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            element.classList.add('highlight');
+            setTimeout(() => {
+              element.classList.remove('highlight');
+            }, 1500);
+          }, 100);
+          return true;
+        }
+        return false;
+      };
+
+      if (!attemptScroll()) {
+        let attempts = 0;
+        const maxAttempts = 10;
+        const interval = setInterval(() => {
+          attempts++;
+          if (attemptScroll() || attempts >= maxAttempts) {
+            clearInterval(interval);
+          }
+        }, 100);
+      }
+    }
+  }, [scrollToSection, user, isDownloaded]);
+
+  const handleLogin = async () => {
+    setAvatarError(false);
+    await login();
+  };
+
+  const handleConfigure = async () => {
+    const result = await configureRunner();
+    if (result.success) {
+      onBack();
+    }
+  };
+
+  const handleSleepProtectionChange = (newValue: SleepProtection) => {
+    if (newValue !== 'never' && !sleepProtectionConsented) {
+      setPendingSleepSetting(newValue);
+      setShowSleepConsentDialog(true);
+    } else {
+      setSleepProtection(newValue);
+    }
+  };
+
+  return (
+    <div className={styles.settingsPage}>
+      <div className={shared.pageHeader}>
+        <h2>Settings</h2>
+        <button className={shared.btnIcon} onClick={onBack} title="Close settings">
+          <FontAwesomeIcon icon={faXmark} />
+        </button>
+      </div>
+
+      <div className={styles.settingsContent}>
+        {/* Startup Section */}
+        <section className={styles.settingsSection}>
+          <h3>Startup</h3>
+          <div className={shared.formGroup}>
+            <label className={shared.toggleRow}>
+              <span>Start localmost when you sign in</span>
+              <input
+                type="checkbox"
+                checked={launchAtLogin}
+                onChange={(e) => {
+                  const value = e.target.checked;
+                  setLaunchAtLogin(value);
+                  window.localmost.settings.set({ launchAtLogin: value });
+                }}
+              />
+            </label>
+          </div>
+          <div className={shared.formGroup}>
+            <label className={shared.toggleRow}>
+              <span>Hide localmost when it starts</span>
+              <input
+                type="checkbox"
+                checked={hideOnStart}
+                onChange={(e) => {
+                  const value = e.target.checked;
+                  setHideOnStart(value);
+                  window.localmost.settings.set({ hideOnStart: value });
+                }}
+              />
+            </label>
+          </div>
+        </section>
+
+        {/* GitHub Account Section */}
+        <section className={styles.settingsSection}>
+          <h3>GitHub Account</h3>
+          {user ? (
+            <div className={styles.accountInfo}>
+              {user.avatar_url && !avatarError ? (
+                <img
+                  src={user.avatar_url}
+                  alt={user.login}
+                  className={styles.avatar}
+                  onError={() => setAvatarError(true)}
+                />
+              ) : (
+                <div className={styles.avatarFallback}>
+                  {(user.name || user.login).charAt(0).toUpperCase()}
+                </div>
+              )}
+              <div className={styles.accountDetails}>
+                <span className={styles.accountName}>{user.name || user.login}</span>
+                <a
+                  href={GITHUB_APP_SETTINGS_URL}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className={styles.accountLoginLink}
+                >
+                  @{user.login}
+                </a>
+              </div>
+              <button className={shared.btnSecondary} onClick={logout}>
+                Sign Out
+              </button>
+            </div>
+          ) : (
+            <div className={styles.authSection}>
+              {!isAuthenticating && !deviceCode && (
+                <button className={shared.btnPrimary} onClick={handleLogin}>
+                  Sign in with GitHub
+                </button>
+              )}
+
+              {deviceCode && (
+                <div className={styles.deviceCodeCompact}>
+                  <p>Enter code on GitHub:</p>
+                  <code className={styles.userCodeSmall}>{deviceCode.userCode}</code>
+                  <div className={shared.waitingIndicator}>
+                    <div className={shared.spinner} />
+                    <span>Waiting...</span>
+                  </div>
+                </div>
+              )}
+
+              {isAuthenticating && !deviceCode && (
+                <div className={shared.waitingIndicator}>
+                  <div className={shared.spinner} />
+                  <span>Connecting...</span>
+                </div>
+              )}
+            </div>
+          )}
+        </section>
+
+        {/* Runner Download Section */}
+        <section className={styles.settingsSection}>
+          <div className={styles.sectionHeaderRow}>
+            <h3>Runner Binary</h3>
+            {isDownloaded && runnerVersion.version && (
+              <a
+                href={runnerVersion.url || '#'}
+                target="_blank"
+                rel="noopener noreferrer"
+                className={styles.versionLink}
+              >
+                v{runnerVersion.version}
+              </a>
+            )}
+          </div>
+          <div className={styles.downloadSection}>
+            {downloadProgress ? (
+              <div className={styles.downloadProgress}>
+                <div className={styles.progressBar}>
+                  <div
+                    className={styles.progressFill}
+                    style={{ width: `${downloadProgress.percent}%` }}
+                  />
+                </div>
+                <p className={styles.progressMessage}>{downloadProgress.message}</p>
+              </div>
+            ) : (
+              <>
+                <div className={shared.formGroup}>
+                  <label>Version</label>
+                  {isLoadingVersions ? (
+                    <div className={shared.waitingIndicator}>
+                      <div className={shared.spinner} />
+                      <span>Loading versions...</span>
+                    </div>
+                  ) : (
+                    <select
+                      value={selectedVersion}
+                      onChange={(e) => setSelectedVersion(e.target.value)}
+                      disabled={isLoading}
+                    >
+                      {availableVersions.map((release) => {
+                        const isInstalled = isDownloaded && runnerVersion.version === release.version;
+                        const isLatest = availableVersions[0]?.version === release.version;
+                        const labels = [];
+                        if (isLatest) labels.push('latest');
+                        if (isInstalled) labels.push('installed');
+                        const labelStr = labels.length > 0 ? ` (${labels.join(', ')})` : '';
+
+                        return (
+                          <option key={release.version} value={release.version}>
+                            v{release.version}{labelStr}
+                          </option>
+                        );
+                      })}
+                    </select>
+                  )}
+                </div>
+                {!isInitialLoading && (!isDownloaded || selectedVersion !== runnerVersion.version) && (
+                  <button
+                    className={shared.btnPrimary}
+                    onClick={downloadRunner}
+                    disabled={isLoading || isLoadingVersions || !selectedVersion}
+                  >
+                    {isDownloaded ? 'Change Version' : 'Download Runner'}
+                  </button>
+                )}
+              </>
+            )}
+          </div>
+        </section>
+
+        {/* Runner Configuration Section */}
+        {user && isDownloaded && (
+          <section id="runner-config-section" className={styles.settingsSection}>
+            <h3>Runner Configuration</h3>
+
+            <div className={shared.formGroup}>
+              <label>Runner Level</label>
+              <div className={styles.levelSelector}>
+                <button
+                  className={runnerConfig.level === 'repo' ? styles.levelOptionActive : styles.levelOption}
+                  onClick={() => updateRunnerConfig({ level: 'repo' })}
+                >
+                  Repository
+                </button>
+                <button
+                  className={runnerConfig.level === 'org' ? styles.levelOptionActive : styles.levelOption}
+                  onClick={() => updateRunnerConfig({ level: 'org' })}
+                  disabled={orgs.length === 0}
+                  title={orgs.length === 0 ? 'No organizations available' : undefined}
+                >
+                  Organization
+                </button>
+              </div>
+            </div>
+
+            {runnerConfig.level === 'repo' ? (
+              <div className={shared.formGroup}>
+                <label>Repository</label>
+                <select
+                  value={runnerConfig.repoUrl || ''}
+                  onChange={(e) => updateRunnerConfig({ repoUrl: e.target.value })}
+                >
+                  <option value="">Select a repository...</option>
+                  {repos.map((repo) => (
+                    <option key={repo.id} value={repo.html_url}>
+                      {repo.full_name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : (
+              <div className={shared.formGroup}>
+                <label>Organization</label>
+                <select
+                  value={runnerConfig.orgName || ''}
+                  onChange={(e) => updateRunnerConfig({ orgName: e.target.value })}
+                >
+                  <option value="">Select an organization...</option>
+                  {orgs.map((org) => (
+                    <option key={org.id} value={org.login}>
+                      {org.login}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            <div className={shared.formGroup}>
+              <label>Runner Name</label>
+              <input
+                type="text"
+                value={runnerConfig.runnerName}
+                onChange={(e) => updateRunnerConfig({ runnerName: e.target.value })}
+                placeholder="my-local-runner"
+              />
+            </div>
+
+            <div className={shared.formGroup}>
+              <label>Labels (comma-separated)</label>
+              <input
+                type="text"
+                value={runnerConfig.labels}
+                onChange={(e) => updateRunnerConfig({ labels: e.target.value })}
+                placeholder="self-hosted,macOS"
+              />
+            </div>
+
+            <div className={shared.formGroup}>
+              <label>Parallelism</label>
+              <div className={styles.parallelismControl}>
+                <input
+                  type="range"
+                  min="1"
+                  max="16"
+                  value={runnerConfig.runnerCount}
+                  onChange={(e) => updateRunnerConfig({ runnerCount: parseInt(e.target.value, 10) })}
+                />
+                <span className={styles.parallelismValue}>{runnerConfig.runnerCount} runner{runnerConfig.runnerCount > 1 ? 's' : ''}</span>
+              </div>
+              <p className={shared.formHint}>
+                Run multiple runner instances for parallel job execution.
+                Each runner will be named {runnerConfig.runnerName}.1 through {runnerConfig.runnerName}.{runnerConfig.runnerCount}
+              </p>
+            </div>
+
+            <div className={shared.formGroup}>
+              <label>Cache work directory</label>
+              <select
+                value={preserveWorkDir}
+                onChange={(e) => setPreserveWorkDir(e.target.value as 'never' | 'session' | 'always')}
+              >
+                <option value="never">Never</option>
+                <option value="session">During session</option>
+                <option value="always">Always</option>
+              </select>
+              <p className={shared.formHint}>
+                Preserve workflow _work directory to cache dependencies like node_modules. "During session" clears on app start/quit.
+              </p>
+            </div>
+
+            <div className={shared.formGroup}>
+              <label>Tool cache location</label>
+              <select
+                value={toolCacheLocation}
+                onChange={(e) => setToolCacheLocation(e.target.value as 'persistent' | 'per-sandbox')}
+              >
+                <option value="persistent">Persistent (recommended)</option>
+                <option value="per-sandbox">Per-sandbox</option>
+              </select>
+              <p className={shared.formHint}>
+                Persistent caches tools like Node.js across restarts. Per-sandbox rebuilds each time (slower but cleaner).
+              </p>
+            </div>
+
+            <button
+              className={shared.btnPrimary}
+              onClick={handleConfigure}
+              disabled={isLoading || (runnerConfig.level === 'repo' ? !runnerConfig.repoUrl : !runnerConfig.orgName)}
+            >
+              {isLoading ? 'Configuring...' : isConfigured ? 'Reconfigure' : 'Configure Runner'}
+            </button>
+          </section>
+        )}
+
+        {/* Power Section */}
+        <section id="power-section" className={styles.settingsSection}>
+          <h3>Power</h3>
+          <div className={shared.formGroup}>
+            <label>Prevent sleep</label>
+            <select
+              value={sleepProtection}
+              onChange={(e) => handleSleepProtectionChange(e.target.value as SleepProtection)}
+            >
+              <option value="never">Never</option>
+              <option value="when-busy">When running a job</option>
+              <option value="always">Always</option>
+            </select>
+            <p className={shared.formHint}>
+              Prevents your Mac from sleeping while GitHub Actions jobs are running, ensuring jobs complete successfully.
+            </p>
+          </div>
+        </section>
+
+        {/* Sleep Protection Consent Dialog */}
+        {showSleepConsentDialog && (
+          <div className={shared.modalOverlay}>
+            <div className={shared.modalDialog}>
+              <h3>Enable Sleep Prevention?</h3>
+              <p>
+                This feature prevents your Mac from sleeping while jobs are running.
+                Without it, system sleep may interrupt active jobs.
+              </p>
+              <p>
+                <strong>What this does:</strong>
+              </p>
+              <ul>
+                <li>Keeps your Mac awake during job execution</li>
+                <li>Automatically releases when jobs complete</li>
+                <li>Can be changed anytime in Settings</li>
+              </ul>
+              <div className={shared.modalActions}>
+                <button
+                  className={shared.btnSecondary}
+                  onClick={() => {
+                    setShowSleepConsentDialog(false);
+                    setPendingSleepSetting(null);
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  className={shared.btnPrimary}
+                  onClick={() => {
+                    if (pendingSleepSetting) {
+                      consentToSleepProtection();
+                      setSleepProtection(pendingSleepSetting);
+                    }
+                    setShowSleepConsentDialog(false);
+                    setPendingSleepSetting(null);
+                  }}
+                >
+                  Enable
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* History Section */}
+        <section className={styles.settingsSection}>
+          <h3>History</h3>
+          <div className={shared.formGroup}>
+            <label>Max recent jobs</label>
+            <select
+              value={maxJobHistory}
+              onChange={(e) => setMaxJobHistory(parseInt(e.target.value, 10))}
+            >
+              <option value={5}>5 jobs</option>
+              <option value={10}>10 jobs</option>
+              <option value={20}>20 jobs</option>
+              <option value={30}>30 jobs</option>
+              <option value={50}>50 jobs</option>
+            </select>
+          </div>
+          <div className={shared.formGroup}>
+            <label>Max log scrollback</label>
+            <select
+              value={maxLogScrollback}
+              onChange={(e) => setMaxLogScrollback(parseInt(e.target.value, 10))}
+            >
+              <option value={100}>100 lines</option>
+              <option value={250}>250 lines</option>
+              <option value={500}>500 lines</option>
+              <option value={1000}>1,000 lines</option>
+              <option value={2500}>2,500 lines</option>
+              <option value={5000}>5,000 lines</option>
+            </select>
+          </div>
+          <div className={shared.formGroup}>
+            <label>localmost log level</label>
+            <select
+              value={logLevel}
+              onChange={(e) => setLogLevel(e.target.value as 'debug' | 'info' | 'warn' | 'error')}
+            >
+              <option value="debug">Debug</option>
+              <option value="info">Info</option>
+              <option value="warn">Warning</option>
+              <option value="error">Error</option>
+            </select>
+          </div>
+          <div className={shared.formGroup}>
+            <label>Runner log level</label>
+            <select
+              value={runnerLogLevel}
+              onChange={(e) => setRunnerLogLevel(e.target.value as 'debug' | 'info' | 'warn' | 'error')}
+            >
+              <option value="debug">Debug</option>
+              <option value="info">Info</option>
+              <option value="warn">Warning</option>
+              <option value="error">Error</option>
+            </select>
+          </div>
+        </section>
+
+        {/* Appearance Section */}
+        <section className={styles.settingsSection}>
+          <h3>Appearance</h3>
+          <div className={styles.themeSelector}>
+            <button
+              className={theme === 'light' ? styles.themeOptionActive : styles.themeOption}
+              onClick={() => setTheme('light')}
+            >
+              <FontAwesomeIcon icon={faLightbulb} />
+              <span>Light</span>
+            </button>
+            <button
+              className={theme === 'dark' ? styles.themeOptionActive : styles.themeOption}
+              onClick={() => setTheme('dark')}
+            >
+              <FontAwesomeIcon icon={faMoon} />
+              <span>Dark</span>
+            </button>
+            <button
+              className={theme === 'auto' ? styles.themeOptionActive : styles.themeOption}
+              onClick={() => setTheme('auto')}
+            >
+              <FontAwesomeIcon icon={faDesktop} />
+              <span>Auto</span>
+            </button>
+          </div>
+        </section>
+
+        {/* About Section */}
+        <section className={styles.settingsSection}>
+          <h3>About</h3>
+          <div className={styles.aboutLinks}>
+            <a
+              href={PRIVACY_POLICY_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={styles.aboutLink}
+            >
+              Privacy Policy
+            </a>
+            <a
+              href={REPOSITORY_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={styles.aboutLink}
+            >
+              View on GitHub
+            </a>
+          </div>
+        </section>
+
+        {error && <div className={shared.errorMessage}>{error}</div>}
+      </div>
+    </div>
+  );
+};
+
+export default SettingsPage;

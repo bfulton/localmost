@@ -1,0 +1,480 @@
+/* Status Page Styles */
+
+.statusPage {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 52px);
+}
+
+.statusContent {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Status Items */
+.statusItems {
+  display: flex;
+  flex-direction: column;
+  padding: 16px 24px;
+  gap: 12px;
+}
+
+.statusItem {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.statusItemExpandable {
+  composes: statusItem;
+}
+
+.statusItemHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.statusItemLabel {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.statusItemIndicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.statusItemDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.statusItemDotSpinning {
+  composes: statusItemDot;
+  width: 12px;
+  height: 12px;
+  border: 2px solid transparent;
+  border-top-color: var(--spinner-color, var(--accent));
+  border-right-color: var(--spinner-color, var(--accent));
+  background: transparent !important;
+  animation: spin 0.8s linear infinite;
+}
+
+.statusItemStatus {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.statusItemDetail {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+  font-family: 'SF Mono', 'Menlo', monospace;
+}
+
+.statusItemLink {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.statusItemLink:hover {
+  text-decoration: underline;
+}
+
+/* Expandable Status Item */
+.statusItemRight {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.statusItemExpand {
+  padding: 4px;
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.statusItemExpand:hover {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+/* Status Item Usage */
+.statusItemUsage {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.usageIntro {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 12px;
+}
+
+.usageMethod {
+  margin-bottom: 12px;
+}
+
+.usageMethod:last-child {
+  margin-bottom: 0;
+}
+
+.usageMethod h4 {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 6px;
+}
+
+.usageCode {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+  font-size: 10px;
+  line-height: 1.4;
+  overflow-x: auto;
+  white-space: pre;
+  color: var(--text-primary);
+}
+
+.codeAdd {
+  color: #3fb950;
+  background: rgba(63, 185, 80, 0.1);
+  display: inline;
+}
+
+.codeDim {
+  opacity: 0.5;
+}
+
+/* Job History */
+.jobHistory {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.jobHistoryScrollable {
+  composes: jobHistory;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.jobCount {
+  font-weight: 400;
+  opacity: 0.7;
+}
+
+.jobHistoryEmpty {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.jobHistoryEntry {
+  display: grid;
+  grid-template-columns: 20px 1fr auto auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 0;
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.jobHistoryEntry:last-child {
+  border-bottom: none;
+}
+
+.jobHistoryStatus {
+  font-size: 14px;
+  text-align: center;
+}
+
+.jobHistoryName {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.jobHistoryName a {
+  color: var(--text-primary);
+  text-decoration: none;
+  transition: color 0.2s;
+}
+
+.jobHistoryName a:hover {
+  color: var(--accent);
+}
+
+.jobHistoryRunner {
+  color: var(--text-secondary);
+  font-size: 10px;
+  background: var(--background-tertiary);
+  padding: 1px 4px;
+  border-radius: 3px;
+  margin-left: 4px;
+  flex-shrink: 0;
+}
+
+.jobHistoryTime {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.jobHistoryDuration {
+  color: var(--text-secondary);
+  font-size: 11px;
+  min-width: 50px;
+  text-align: right;
+}
+
+/* Logs Panel */
+.logsPanel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-top: 1px solid var(--border);
+}
+
+.logsPanelExpanded {
+  composes: logsPanel;
+  flex: 1;
+  min-height: 200px;
+}
+
+.logsPanelCollapsed {
+  composes: logsPanel;
+  flex: none;
+}
+
+.logsPanelCollapsed .logsHeader {
+  cursor: pointer;
+  border-bottom: none;
+}
+
+.logsPanelCollapsed .logsHeader:hover {
+  background: var(--bg-tertiary);
+}
+
+.logsHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 24px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+}
+
+.logsHeader h3 {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.logCount {
+  font-weight: 400;
+  opacity: 0.7;
+}
+
+.logsFilter {
+  display: flex;
+  align-items: center;
+  padding: 8px 24px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.logsFilterInput {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+}
+
+.logsFilterInput:focus {
+  outline: none;
+  border-color: var(--accent-color);
+}
+
+.logsFilterInput::placeholder {
+  color: var(--text-secondary);
+}
+
+.logsFilterClear {
+  margin-left: 8px;
+  padding: 4px 8px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 16px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.logsFilterClear:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.logsContent {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 24px;
+  font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  background: var(--bg-primary);
+}
+
+.logsEmpty {
+  color: var(--text-secondary);
+  text-align: center;
+  padding: 24px;
+  font-size: 12px;
+}
+
+/* Log Entry */
+.logEntry {
+  display: flex;
+  gap: 12px;
+  padding: 4px 0;
+}
+
+.logTimestamp {
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.logLevel {
+  flex-shrink: 0;
+  min-width: 50px;
+}
+
+.logMessage {
+  word-break: break-all;
+}
+
+.logEntryInfo .logLevel,
+.logEntryInfo .logMessage { color: var(--text-primary); }
+.logEntryWarn .logLevel,
+.logEntryWarn .logMessage { color: var(--warning); }
+.logEntryError .logLevel,
+.logEntryError .logMessage { color: var(--error); }
+.logEntryDebug .logLevel,
+.logEntryDebug .logMessage { color: var(--text-secondary); }
+
+/* Links */
+.detailLink {
+  color: var(--text-secondary);
+  text-decoration: none;
+  transition: color 0.2s;
+}
+
+.detailLink:hover {
+  color: var(--accent);
+}
+
+.sleepInfoLink {
+  color: var(--text-secondary);
+  text-decoration: none;
+  transition: color 0.2s;
+  cursor: pointer;
+}
+
+.sleepInfoLink:hover {
+  color: var(--accent);
+}
+
+.versionLinkInline {
+  color: var(--text-secondary);
+  text-decoration: none;
+  transition: color 0.2s;
+}
+
+.versionLinkInline:hover {
+  color: var(--accent);
+}
+
+.runnerNameLink {
+  color: var(--text-secondary);
+  text-decoration: none;
+  transition: color 0.2s;
+}
+
+.runnerNameLink:hover {
+  color: var(--accent);
+}
+
+.runnerTargetLink {
+  color: var(--text-secondary);
+  text-decoration: none;
+  transition: color 0.2s;
+  font-size: 12px;
+}
+
+.runnerTargetLink:hover {
+  color: var(--accent);
+}
+
+/* Status colors via data attributes */
+.statusItemDot[data-status="starting"] {
+  background-color: var(--warning);
+}
+
+.statusItemDot[data-status="running"] {
+  background-color: var(--success);
+}
+
+.statusItemDot[data-status="busy"] {
+  background-color: var(--warning);
+}
+
+.statusItemDot[data-status="error"] {
+  background-color: var(--error);
+}
+
+.statusItemDot[data-status="idle"],
+.statusItemDot[data-status="offline"] {
+  background-color: var(--text-secondary);
+}
+
+/* Job history status colors */
+.jobHistoryStatus[data-status="running"] {
+  color: var(--warning);
+}
+
+.jobHistoryStatus[data-status="completed"] {
+  color: var(--success);
+}
+
+.jobHistoryStatus[data-status="failed"] {
+  color: var(--error);
+}
+
+.jobHistoryStatus[data-status="cancelled"] {
+  color: var(--text-secondary);
+}

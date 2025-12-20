@@ -1,0 +1,296 @@
+import { Tray, Menu, nativeImage, app } from 'electron';
+import * as fs from 'fs';
+import * as path from 'path';
+import { TRAY_ANIMATION_FRAMES, TRAY_ANIMATION_INTERVAL_MS } from '../shared/constants';
+import { RunnerState } from '../shared/types';
+
+/**
+ * Callback types for tray actions.
+ */
+export interface TrayCallbacks {
+  onShowStatus: () => void;
+  onShowSettings: () => void;
+  onHide: () => void;
+  onQuit: () => Promise<void>;
+}
+
+/**
+ * Status information for tray display.
+ */
+export interface TrayStatusInfo {
+  isAuthenticated: boolean;
+  isConfigured: boolean;
+  runnerStatus?: RunnerState['status'];
+  isBusy: boolean;
+  isSleepBlocked?: boolean;
+}
+
+/**
+ * TrayManager handles the system tray icon, animations, and context menu.
+ * Encapsulates all tray-related state and behavior.
+ */
+export class TrayManager {
+  private tray: Tray | null = null;
+  private callbacks: TrayCallbacks;
+
+  // Animation state
+  private busyAnimationTimer: NodeJS.Timeout | null = null;
+  private busyAnimationFrame = 0;
+  private busyIconFrames: Electron.NativeImage[] = [];
+  private notReadyAnimationTimer: NodeJS.Timeout | null = null;
+  private notReadyAnimationFrame = 0;
+  private notReadyIconFrames: Electron.NativeImage[] = [];
+
+  // Asset finder function (passed in to avoid circular dependencies)
+  private findAsset: (filename: string) => string | undefined;
+
+  constructor(
+    callbacks: TrayCallbacks,
+    findAsset: (filename: string) => string | undefined
+  ) {
+    this.callbacks = callbacks;
+    this.findAsset = findAsset;
+  }
+
+  /**
+   * Create and initialize the system tray icon.
+   */
+  create(): void {
+    let icon: Electron.NativeImage;
+    const trayIconPath = this.findAsset('tray-iconTemplate.png');
+
+    if (trayIconPath) {
+      icon = nativeImage.createFromPath(trayIconPath);
+    } else {
+      // Fallback: minimal PNG icon
+      const minimalPng = 'iVBORw0KGgoAAAANSUhEUgAAABYAAAAWCAYAAADEtGw7AAAAQklEQVR42mNgGAWjYBSMglEwCkYBDQATAwMDw38iNDMwMDA0EKuZiYGB4T8xmhkYGBgaSDGYoGYSDSaoeTQKRgEFAABX2wgPnpmT0AAAAABJRU5ErkJggg==';
+      try {
+        icon = nativeImage.createFromDataURL(`data:image/png;base64,${minimalPng}`);
+      } catch {
+        icon = nativeImage.createEmpty();
+      }
+    }
+
+    icon.setTemplateImage(true);
+    this.tray = new Tray(icon);
+
+    this.tray.on('click', () => {
+      this.callbacks.onShowStatus();
+    });
+
+    // Pre-load animation frames
+    this.loadBusyIconFrames();
+    this.loadNotReadyIconFrames();
+  }
+
+  /**
+   * Update the tray menu and icon based on current status.
+   */
+  updateMenu(status: TrayStatusInfo): void {
+    if (!this.tray) return;
+
+    // Update icon animation based on status
+    this.updateIconAnimation(status);
+
+    // Build status label
+    const statusLabel = this.getStatusLabel(status);
+
+    // Build context menu
+    const menuItems: Electron.MenuItemConstructorOptions[] = [
+      {
+        label: statusLabel,
+        enabled: false,
+      },
+    ];
+
+    // Add sleep blocked indicator if active
+    if (status.isSleepBlocked) {
+      menuItems.push({
+        label: '☕ Sleep blocked',
+        enabled: false,
+      });
+    }
+
+    menuItems.push(
+      { type: 'separator' },
+      {
+        label: 'Status',
+        click: () => this.callbacks.onShowStatus(),
+      },
+      {
+        label: 'Settings...',
+        click: () => this.callbacks.onShowSettings(),
+      },
+      { type: 'separator' },
+      {
+        label: 'Hide localmost',
+        click: () => this.callbacks.onHide(),
+      },
+      {
+        label: '⏻  Quit',
+        click: () => this.callbacks.onQuit(),
+      }
+    );
+
+    const contextMenu = Menu.buildFromTemplate(menuItems);
+
+    this.tray.setToolTip(`localmost - ${statusLabel}`);
+    this.tray.setContextMenu(contextMenu);
+  }
+
+  /**
+   * Clean up resources when shutting down.
+   */
+  destroy(): void {
+    this.stopBusyAnimation();
+    this.stopNotReadyAnimation();
+    if (this.tray) {
+      this.tray.destroy();
+      this.tray = null;
+    }
+  }
+
+  /**
+   * Load busy animation frames from assets.
+   */
+  private loadBusyIconFrames(): void {
+    this.busyIconFrames = [];
+    for (let i = 0; i < TRAY_ANIMATION_FRAMES; i++) {
+      const iconPath = this.findAsset(`tray-icon-busy-${i}.png`);
+      if (iconPath) {
+        const icon = nativeImage.createFromPath(iconPath);
+        icon.setTemplateImage(false);
+        this.busyIconFrames.push(icon);
+      }
+    }
+  }
+
+  /**
+   * Load not-ready animation frames from assets.
+   */
+  private loadNotReadyIconFrames(): void {
+    this.notReadyIconFrames = [];
+    for (let i = 0; i < TRAY_ANIMATION_FRAMES; i++) {
+      const iconPath = this.findAsset(`tray-icon-notready-${i}.png`);
+      if (iconPath) {
+        const icon = nativeImage.createFromPath(iconPath);
+        icon.setTemplateImage(false);
+        this.notReadyIconFrames.push(icon);
+      }
+    }
+  }
+
+  /**
+   * Update icon animation based on runner status.
+   */
+  private updateIconAnimation(status: TrayStatusInfo): void {
+    const isListening = status.runnerStatus === 'running';
+
+    if (status.isBusy) {
+      this.stopNotReadyAnimation();
+      this.startBusyAnimation();
+    } else if (isListening) {
+      this.stopBusyAnimation();
+      this.stopNotReadyAnimation();
+      this.setNormalIcon();
+    } else {
+      this.stopBusyAnimation();
+      this.startNotReadyAnimation();
+    }
+  }
+
+  /**
+   * Set the normal (non-animated) tray icon.
+   */
+  private setNormalIcon(): void {
+    const iconPath = this.findAsset('tray-iconTemplate.png');
+    if (iconPath && this.tray) {
+      const icon = nativeImage.createFromPath(iconPath);
+      icon.setTemplateImage(true);
+      this.tray.setImage(icon);
+    }
+  }
+
+  /**
+   * Start the busy (running job) animation.
+   */
+  private startBusyAnimation(): void {
+    if (this.busyAnimationTimer || !this.tray || this.busyIconFrames.length === 0) return;
+
+    this.busyAnimationFrame = 0;
+    this.busyAnimationTimer = setInterval(() => {
+      if (!this.tray || this.busyIconFrames.length === 0) {
+        this.stopBusyAnimation();
+        return;
+      }
+      this.tray.setImage(this.busyIconFrames[this.busyAnimationFrame]);
+      this.busyAnimationFrame = (this.busyAnimationFrame + 1) % this.busyIconFrames.length;
+    }, TRAY_ANIMATION_INTERVAL_MS);
+  }
+
+  /**
+   * Stop the busy animation.
+   */
+  private stopBusyAnimation(): void {
+    if (this.busyAnimationTimer) {
+      clearInterval(this.busyAnimationTimer);
+      this.busyAnimationTimer = null;
+    }
+    this.busyAnimationFrame = 0;
+  }
+
+  /**
+   * Start the not-ready (offline) animation.
+   */
+  private startNotReadyAnimation(): void {
+    if (this.notReadyAnimationTimer || !this.tray || this.notReadyIconFrames.length === 0) return;
+
+    this.notReadyAnimationFrame = 0;
+    this.notReadyAnimationTimer = setInterval(() => {
+      if (!this.tray || this.notReadyIconFrames.length === 0) {
+        this.stopNotReadyAnimation();
+        return;
+      }
+      this.tray.setImage(this.notReadyIconFrames[this.notReadyAnimationFrame]);
+      this.notReadyAnimationFrame = (this.notReadyAnimationFrame + 1) % this.notReadyIconFrames.length;
+    }, TRAY_ANIMATION_INTERVAL_MS);
+  }
+
+  /**
+   * Stop the not-ready animation.
+   */
+  private stopNotReadyAnimation(): void {
+    if (this.notReadyAnimationTimer) {
+      clearInterval(this.notReadyAnimationTimer);
+      this.notReadyAnimationTimer = null;
+    }
+    this.notReadyAnimationFrame = 0;
+  }
+
+  /**
+   * Get a human-readable status label for the tray menu.
+   */
+  private getStatusLabel(status: TrayStatusInfo): string {
+    if (!status.isAuthenticated) {
+      return 'GitHub: Not connected';
+    }
+    if (!status.isConfigured) {
+      return 'Runner: Not configured';
+    }
+
+    switch (status.runnerStatus) {
+      case 'busy':
+        return 'Job: Running';
+      case 'starting':
+        return 'Runner: Starting';
+      case 'running':
+        return 'Runner: Listening';
+      case 'error':
+        return 'Runner: Error';
+      case 'idle':
+        return 'Runner: Idle';
+      default:
+        return 'Runner: Offline';
+    }
+  }
+}

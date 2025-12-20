@@ -1,0 +1,63 @@
+name: Test
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  check:
+    # Use the check workflow from the same ref (branch/SHA) as this workflow
+    uses: ./.github/workflows/check.yaml
+    with:
+      fallback: ubuntu-latest  # This repo builds on Linux; typical users would use macos-latest
+
+  build:
+    needs: check
+    runs-on: ${{ needs.check.outputs.runner }}
+    steps:
+      - name: Show runner info
+        run: |
+          echo "Runner: $RUNNER_NAME"
+          echo "Hostname: $(hostname)"
+
+      - uses: actions/checkout@v4
+
+      - name: Validate runner selection
+        run: |
+          echo "Selected runner: ${{ needs.check.outputs.runner }}"
+          if [ -z "${{ needs.check.outputs.runner }}" ]; then
+            echo "::error::Runner selection failed - output is empty"
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          # Only cache npm on GitHub-hosted runners (self-hosted has persistent storage)
+          cache: ${{ needs.check.outputs.runner != 'self-hosted' && 'npm' || '' }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Report runner info
+        run: |
+          echo "## Runner Report" >> $GITHUB_STEP_SUMMARY
+          echo "- **Runner Name**: $RUNNER_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "- **Selected**: ${{ needs.check.outputs.runner }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Hostname**: $(hostname)" >> $GITHUB_STEP_SUMMARY
+          echo "- **OS**: $(uname -a)" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ needs.check.outputs.runner }}" = "self-hosted" ]; then
+            echo "- **Type**: localmost self-hosted runner" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Type**: GitHub-hosted runner (fallback)" >> $GITHUB_STEP_SUMMARY
+          fi

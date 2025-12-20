@@ -1,0 +1,67 @@
+/* App Component Styles */
+
+/* Draggable title bar area */
+.titlebar {
+  -webkit-app-region: drag;
+  height: 52px;
+  display: flex;
+  align-items: center;
+  padding-left: 80px; /* Space for traffic lights */
+  padding-right: 16px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+}
+
+.titlebar h1 {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* Offline banner */
+.offlineBanner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: var(--warning);
+  color: #1a1a1a;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.offlineIcon {
+  font-size: 10px;
+  opacity: 0.8;
+}
+
+/* Loading screen */
+.loadingScreen {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  gap: 16px;
+}
+
+.loadingSpinner {
+  width: 32px;
+  height: 32px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+/* Error screen styles */
+.errorHeading {
+  color: var(--error);
+}
+
+.errorDescription {
+  color: var(--text-secondary);
+  max-width: 400px;
+  text-align: center;
+}

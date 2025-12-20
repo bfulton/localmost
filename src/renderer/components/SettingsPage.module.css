@@ -1,0 +1,312 @@
+/* Settings Page Styles */
+
+.settingsPage {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 52px);
+}
+
+.settingsContent {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 24px;
+}
+
+.settingsSection {
+  background: var(--bg-secondary);
+  border-radius: 12px;
+  padding: 24px;
+  margin-bottom: 24px;
+  border: 1px solid var(--border);
+}
+
+.settingsSection h3 {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 16px;
+  color: var(--text-primary);
+}
+
+/* Section highlight animation */
+.settingsSection.highlight {
+  animation: section-glow 1.5s ease-out;
+  border-radius: 8px;
+}
+
+.sectionHeaderRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.sectionHeaderRow h3 {
+  margin-bottom: 0;
+}
+
+.versionLink {
+  font-size: 12px;
+  color: var(--text-secondary);
+  text-decoration: none;
+  padding: 4px 8px;
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+  transition: all 0.2s;
+}
+
+.versionLink:hover {
+  color: var(--accent);
+  background: var(--bg-primary);
+}
+
+/* Account Info */
+.accountInfo {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.avatar {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.avatarFallback {
+  composes: avatar;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent);
+  color: white;
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.accountDetails {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.accountName {
+  font-weight: 600;
+}
+
+.accountLogin {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.accountLoginLink {
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-decoration: none;
+  transition: color 0.2s;
+}
+
+.accountLoginLink:hover {
+  color: var(--accent);
+}
+
+/* Auth Section */
+.authSection {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.deviceCodeCompact {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.deviceCodeCompact p {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.userCodeSmall {
+  font-family: 'SF Mono', 'Menlo', monospace;
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--accent);
+  letter-spacing: 2px;
+}
+
+/* Download Section */
+.downloadSection {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Download Progress */
+.downloadProgress {
+  padding: 24px 0;
+}
+
+.progressBar {
+  height: 8px;
+  background: var(--bg-primary);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 12px;
+}
+
+.progressFill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+
+.progressMessage {
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+/* Level Selector */
+.levelSelector {
+  display: flex;
+  gap: 8px;
+}
+
+.levelOption {
+  flex: 1;
+  padding: 12px 16px;
+  background: var(--bg-primary);
+  border: 2px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.levelOption:hover:not(:disabled) {
+  border-color: var(--text-secondary);
+  color: var(--text-primary);
+}
+
+.levelOptionActive {
+  composes: levelOption;
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--bg-tertiary);
+}
+
+.levelOption:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Parallelism Control */
+.parallelismControl {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.parallelismControl input[type="range"] {
+  flex: 1;
+  height: 6px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: var(--bg-primary);
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  padding: 0;
+}
+
+.parallelismControl input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  background: var(--accent);
+  border-radius: 50%;
+  cursor: pointer;
+  border: 2px solid var(--bg-secondary);
+}
+
+.parallelismControl input[type="range"]::-webkit-slider-thumb:hover {
+  background: var(--accent-hover);
+}
+
+.parallelismValue {
+  min-width: 80px;
+  text-align: right;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+/* Theme Selector */
+.themeSelector {
+  display: flex;
+  gap: 8px;
+}
+
+.themeOption {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 16px 12px;
+  background: var(--bg-primary);
+  border: 2px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.themeOption:hover {
+  border-color: var(--text-secondary);
+  color: var(--text-primary);
+}
+
+.themeOptionActive {
+  composes: themeOption;
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--bg-tertiary);
+}
+
+.themeOption span {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+/* About Links */
+.aboutLinks {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.aboutLink {
+  color: var(--text-secondary);
+  text-decoration: none;
+  font-size: 14px;
+  padding: 8px 0;
+  transition: color 0.2s;
+  display: flex;
+  align-items: center;
+}
+
+.aboutLink:hover {
+  color: var(--accent);
+}
+
+.aboutLink::after {
+  content: '\2197';
+  margin-left: 6px;
+  font-size: 12px;
+}

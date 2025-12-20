@@ -1,0 +1,182 @@
+/* Setup Wizard Styles */
+
+.setupWizard {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 52px);
+  padding: 32px;
+  overflow-y: auto;
+}
+
+.setupHeader {
+  text-align: center;
+  margin-bottom: 32px;
+}
+
+.setupHeader h1 {
+  font-size: 28px;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.setupHeader p {
+  color: var(--text-secondary);
+  font-size: 16px;
+}
+
+.setupSteps {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  margin-bottom: 40px;
+}
+
+.stepIndicator {
+  padding: 8px 16px;
+  background: var(--bg-secondary);
+  border-radius: 20px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+}
+
+.stepIndicatorActive {
+  composes: stepIndicator;
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}
+
+.stepIndicatorDone {
+  composes: stepIndicator;
+  background: var(--bg-tertiary);
+  color: var(--success);
+  border-color: var(--success);
+}
+
+.setupContent {
+  max-width: 480px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+.setupStep {
+  background: var(--bg-secondary);
+  border-radius: 12px;
+  padding: 32px;
+  border: 1px solid var(--border);
+}
+
+.setupStep h2 {
+  font-size: 20px;
+  margin-bottom: 8px;
+}
+
+.stepDescription {
+  color: var(--text-secondary);
+  font-size: 14px;
+  margin-bottom: 24px;
+  line-height: 1.5;
+}
+
+.stepDescription a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.stepDescription a:hover {
+  text-decoration: underline;
+}
+
+.authPrompt {
+  text-align: center;
+  padding: 32px 0;
+}
+
+.githubIcon {
+  margin-bottom: 16px;
+  color: var(--text-primary);
+}
+
+/* Device Flow Code Display */
+.deviceCodeDisplay {
+  text-align: center;
+  padding: 16px 0;
+}
+
+.userCode {
+  font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+  font-size: 32px;
+  font-weight: 700;
+  letter-spacing: 4px;
+  color: var(--accent);
+  background: var(--bg-primary);
+  padding: 20px 32px;
+  border-radius: 12px;
+  margin: 24px 0;
+  border: 2px dashed var(--border);
+  user-select: text;
+}
+
+.codeHint {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 24px;
+}
+
+.codeHint a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.codeHint a:hover {
+  text-decoration: underline;
+}
+
+/* Download Progress */
+.downloadProgress {
+  padding: 24px 0;
+}
+
+.progressBar {
+  height: 8px;
+  background: var(--bg-primary);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 12px;
+}
+
+.progressFill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+
+.progressMessage {
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.hint {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 16px;
+}
+
+.hint code {
+  background: var(--bg-primary);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: 'SF Mono', 'Menlo', monospace;
+}
+
+.setupActions {
+  margin-top: 24px;
+  display: flex;
+  justify-content: center;
+}
+
+.setupActions button {
+  min-width: 200px;
+}

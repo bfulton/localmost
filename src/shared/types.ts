@@ -1,0 +1,261 @@
+// =============================================================================
+// Result Type - Consistent error handling for IPC operations
+// =============================================================================
+
+/**
+ * Represents a successful result with optional data.
+ */
+export interface SuccessResult<T = void> {
+  success: true;
+  data?: T;
+}
+
+/**
+ * Represents a failed result with an error message.
+ */
+export interface ErrorResult {
+  success: false;
+  error: string;
+}
+
+/**
+ * A discriminated union type for IPC operation results.
+ * Use this for consistent error handling across all IPC calls.
+ *
+ * @example
+ * // In main process:
+ * ipcMain.handle('my-operation', async (): Promise<Result<MyData>> => {
+ *   try {
+ *     const data = await doSomething();
+ *     return { success: true, data };
+ *   } catch (error) {
+ *     return { success: false, error: (error as Error).message };
+ *   }
+ * });
+ *
+ * // In renderer:
+ * const result = await window.localmost.myOperation();
+ * if (result.success) {
+ *   console.log(result.data);
+ * } else {
+ *   console.error(result.error);
+ * }
+ */
+export type Result<T = void> = SuccessResult<T> | ErrorResult;
+
+/**
+ * Helper to create a success result.
+ */
+export const success = <T>(data?: T): SuccessResult<T> => ({ success: true, data });
+
+/**
+ * Helper to create an error result.
+ */
+export const failure = (error: string | Error): ErrorResult => ({
+  success: false,
+  error: typeof error === 'string' ? error : error.message,
+});
+
+// =============================================================================
+// Runner Types
+// =============================================================================
+
+// Runner status types
+export type RunnerStatus = 'idle' | 'starting' | 'running' | 'busy' | 'offline' | 'error';
+
+export interface RunnerState {
+  status: RunnerStatus;
+  jobName?: string;
+  repository?: string;
+  startedAt?: string;
+  error?: string;
+}
+
+export type JobStatus = 'running' | 'completed' | 'failed' | 'cancelled';
+
+export interface JobHistoryEntry {
+  id: string;
+  jobName: string;
+  repository: string;
+  status: JobStatus;
+  startedAt: string;
+  completedAt?: string;
+  runTimeSeconds?: number;
+  actionsUrl?: string;
+  githubJobId?: number;
+  runnerName?: string;
+}
+
+export interface RunnerConfig {
+  url: string;
+  token: string;
+  name: string;
+  labels: string[];
+  workFolder: string;
+}
+
+export interface LogEntry {
+  timestamp: string;
+  level: 'info' | 'warn' | 'error' | 'debug';
+  message: string;
+}
+
+// Setup state
+export type SetupStep = 'welcome' | 'auth' | 'download' | 'configure' | 'complete';
+
+export interface SetupState {
+  step: SetupStep;
+  isRunnerDownloaded: boolean;
+  isRunnerConfigured: boolean;
+  user?: GitHubUser;
+  error?: string;
+}
+
+export interface DownloadProgress {
+  phase: 'downloading' | 'extracting' | 'complete' | 'error';
+  percent: number;
+  message: string;
+}
+
+export interface RunnerRelease {
+  version: string;
+  url: string;
+  publishedAt: string;
+}
+
+// IPC channel names
+export const IPC_CHANNELS = {
+  // Runner control
+  RUNNER_START: 'runner:start',
+  RUNNER_STOP: 'runner:stop',
+  RUNNER_STATUS: 'runner:status',
+  RUNNER_STATUS_UPDATE: 'runner:status-update',
+  RUNNER_IS_CONFIGURED: 'runner:is-configured',
+  RUNNER_GET_DISPLAY_NAME: 'runner:get-display-name',
+
+  // Logs
+  LOG_ENTRY: 'log:entry',
+  LOG_WRITE: 'log:write',
+  LOG_CLEAR: 'log:clear',
+  LOG_GET_PATH: 'log:get-path',
+
+  // Job history
+  JOB_HISTORY_GET: 'job:history-get',
+  JOB_HISTORY_SET_MAX: 'job:history-set-max',
+  JOB_HISTORY_UPDATE: 'job:history-update',
+
+  // GitHub auth (Device Flow)
+  GITHUB_AUTH_START: 'github:auth-start',
+  GITHUB_AUTH_DEVICE_FLOW: 'github:auth-device-flow',
+  GITHUB_AUTH_POLL: 'github:auth-poll',
+  GITHUB_AUTH_CANCEL: 'github:auth-cancel',
+  GITHUB_DEVICE_CODE: 'github:device-code',
+  GITHUB_AUTH_STATUS: 'github:auth-status',
+  GITHUB_AUTH_LOGOUT: 'github:auth-logout',
+  GITHUB_GET_REPOS: 'github:get-repos',
+  GITHUB_GET_ORGS: 'github:get-orgs',
+  GITHUB_GET_REGISTRATION_TOKEN: 'github:get-registration-token',
+
+  // Runner setup
+  RUNNER_DOWNLOAD: 'runner:download',
+  RUNNER_DOWNLOAD_PROGRESS: 'runner:download-progress',
+  RUNNER_IS_DOWNLOADED: 'runner:is-downloaded',
+  RUNNER_CONFIGURE: 'runner:configure',
+  RUNNER_GET_VERSION: 'runner:get-version',
+  RUNNER_GET_AVAILABLE_VERSIONS: 'runner:get-available-versions',
+  RUNNER_SET_DOWNLOAD_VERSION: 'runner:set-download-version',
+
+  // Settings
+  SETTINGS_GET: 'settings:get',
+  SETTINGS_SET: 'settings:set',
+
+  // App
+  APP_QUIT: 'app:quit',
+  APP_MINIMIZE_TO_TRAY: 'app:minimize-to-tray',
+  APP_GET_SETUP_STATE: 'app:get-setup-state',
+  APP_GET_HOSTNAME: 'app:get-hostname',
+  APP_GET_CPU_COUNT: 'app:get-cpu-count',
+
+  // Heartbeat
+  HEARTBEAT_GET_STATUS: 'heartbeat:get-status',
+
+  // Network status
+  NETWORK_GET_STATUS: 'network:get-status',
+  NETWORK_STATUS_CHANGED: 'network:status-changed',
+} as const;
+
+export interface GitHubUser {
+  login: string;
+  avatar_url: string;
+  name: string | null;
+}
+
+export interface GitHubRepo {
+  id: number;
+  full_name: string;
+  private: boolean;
+  html_url: string;
+  owner: {
+    login: string;
+    type: string;
+  };
+}
+
+export interface GitHubOrg {
+  id: number;
+  login: string;
+  avatar_url: string;
+}
+
+export interface ConfigureOptions {
+  level: 'repo' | 'org';
+  repoUrl?: string;  // Required for repo level
+  orgName?: string;  // Required for org level
+  runnerName: string;
+  labels: string[];
+  runnerCount?: number;  // Number of parallel runners (1-16), defaults to 1
+}
+
+export type SleepProtection = 'never' | 'when-busy' | 'always';
+
+/** Log level - controls what gets displayed/saved. Lower = more verbose */
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+export type PreserveWorkDir = 'never' | 'session' | 'always';
+
+/** Tool cache location - controls where actions like setup-node cache downloaded tools */
+export type ToolCacheLocation = 'persistent' | 'per-sandbox';
+
+/** Log level priority for filtering (lower number = more verbose) */
+export const LOG_LEVEL_PRIORITY: Record<LogLevel, number> = {
+  debug: 0,
+  info: 1,
+  warn: 2,
+  error: 3,
+};
+
+export interface AppSettings {
+  githubClientId?: string;
+  maxLogScrollback?: number;
+  sleepProtection?: SleepProtection;
+  /** Whether user has consented to sleep protection feature. Defaults to false */
+  sleepProtectionConsented?: boolean;
+  /** Minimum log level for localmost app logs. Defaults to 'info' */
+  logLevel?: LogLevel;
+  /** Minimum log level for runner output logs. Defaults to 'warn' */
+  runnerLogLevel?: LogLevel;
+  /** Preserve workflow _work directory. Defaults to 'never' */
+  preserveWorkDir?: PreserveWorkDir;
+  /** Tool cache location. Defaults to 'persistent' (shared across restarts) */
+  toolCacheLocation?: ToolCacheLocation;
+}
+
+export interface DeviceCodeInfo {
+  userCode: string;
+  verificationUri: string;
+}
+
+export interface HeartbeatStatus {
+  /** Whether the heartbeat is currently running */
+  isRunning: boolean;
+}

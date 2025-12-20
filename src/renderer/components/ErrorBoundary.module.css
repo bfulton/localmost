@@ -1,0 +1,67 @@
+/* Error Boundary Styles */
+
+.errorBoundary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  padding: 2rem;
+  background-color: var(--bg-primary);
+}
+
+.content {
+  max-width: 500px;
+  text-align: center;
+}
+
+.content h2 {
+  color: var(--error);
+  margin-bottom: 1rem;
+  font-size: 1.5rem;
+}
+
+.content p {
+  color: var(--text-secondary);
+  margin-bottom: 1.5rem;
+}
+
+.details {
+  text-align: left;
+  margin-bottom: 1.5rem;
+  background-color: var(--bg-secondary);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.details summary {
+  padding: 0.75rem 1rem;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.details summary:hover {
+  background-color: var(--bg-tertiary);
+}
+
+.details pre {
+  padding: 1rem;
+  font-size: 0.75rem;
+  overflow-x: auto;
+  margin: 0;
+  color: var(--error);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.errorStack {
+  color: var(--text-secondary) !important;
+  border-top: 1px solid var(--border);
+}
+
+.actions {
+  display: flex;
+  gap: 0.75rem;
+  justify-content: center;
+}

@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["jest", "@testing-library/jest-dom", "node"],
+    "rootDir": "."
+  },
+  "include": ["src/renderer/**/*", "src/shared/**/*", "test/**/*"],
+  "exclude": ["node_modules", "dist", ".webpack", "src/main/**/*"]
+}

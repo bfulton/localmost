@@ -1,0 +1,74 @@
+name: Test Inline Check
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      runner: ${{ steps.check.outputs.runner }}
+    steps:
+      - id: check
+        run: |
+          # Check for LOCALMOST_HEARTBEAT variable (automatically set by localmost app)
+          HEARTBEAT="${{ vars.LOCALMOST_HEARTBEAT }}"
+
+          if [ -n "$HEARTBEAT" ]; then
+            echo "Checking localmost heartbeat..."
+
+            # Convert ISO timestamp to Unix seconds
+            HEARTBEAT_TIME=$(date -d "$HEARTBEAT" +%s 2>/dev/null || echo "0")
+            CURRENT_TIME=$(date +%s)
+            AGE=$((CURRENT_TIME - HEARTBEAT_TIME))
+
+            echo "Heartbeat age: ${AGE}s"
+
+            # If heartbeat is less than 90 seconds old, use self-hosted
+            if [ "$AGE" -lt 90 ]; then
+              echo "localmost runner is online (heartbeat ${AGE}s ago)"
+              echo "runner=self-hosted" >> $GITHUB_OUTPUT
+              exit 0
+            else
+              echo "Heartbeat is stale (${AGE}s old), falling back to macos-latest"
+            fi
+          else
+            echo "No LOCALMOST_HEARTBEAT variable found"
+          fi
+
+          # Default: use macos-latest
+          echo "No localmost runner available, using macos-latest"
+          echo "runner=macos-latest" >> $GITHUB_OUTPUT
+
+  validate:
+    needs: check
+    runs-on: ${{ needs.check.outputs.runner }}
+    steps:
+      - name: Show runner info
+        run: |
+          echo "Runner: $RUNNER_NAME"
+          echo "Hostname: $(hostname)"
+
+      - name: Validate runner selection
+        run: |
+          echo "Selected runner: ${{ needs.check.outputs.runner }}"
+          if [ -z "${{ needs.check.outputs.runner }}" ]; then
+            echo "::error::Runner selection failed - output is empty"
+            exit 1
+          fi
+          echo "## Runner Report" >> $GITHUB_STEP_SUMMARY
+          echo "- **Runner Name**: $RUNNER_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "- **Selected**: ${{ needs.check.outputs.runner }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Hostname**: $(hostname)" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ needs.check.outputs.runner }}" = "self-hosted" ]; then
+            echo "- **Type**: localmost self-hosted runner" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Type**: GitHub-hosted runner (fallback)" >> $GITHUB_STEP_SUMMARY
+          fi

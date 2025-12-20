@@ -1,0 +1,58 @@
+name: localmost-check-runner
+on:
+  workflow_call:
+    inputs:
+      local:
+        description: 'Runner label when localmost is available'
+        required: false
+        type: string
+        default: 'self-hosted'
+      fallback:
+        description: 'Runner to use when localmost is unavailable'
+        required: false
+        type: string
+        default: 'macos-latest'
+    outputs:
+      runner:
+        description: 'The runner to use (local or fallback)'
+        value: ${{ jobs.check.outputs.runner }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      runner: ${{ steps.check.outputs.runner }}
+    steps:
+      - id: check
+        env:
+          LOCAL: ${{ inputs.local }}
+          FALLBACK: ${{ inputs.fallback }}
+        run: |
+          # Check for LOCALMOST_HEARTBEAT variable (automatically set by localmost app)
+          HEARTBEAT="${{ vars.LOCALMOST_HEARTBEAT }}"
+
+          if [ -n "$HEARTBEAT" ]; then
+            echo "Checking localmost heartbeat..."
+
+            # Convert ISO timestamp to Unix seconds
+            HEARTBEAT_TIME=$(date -d "$HEARTBEAT" +%s 2>/dev/null || echo "0")
+            CURRENT_TIME=$(date +%s)
+            AGE=$((CURRENT_TIME - HEARTBEAT_TIME))
+
+            echo "Heartbeat age: ${AGE}s"
+
+            # If heartbeat is less than 90 seconds old, use local runner
+            if [ "$AGE" -lt 90 ]; then
+              echo "localmost runner is online (heartbeat ${AGE}s ago)"
+              echo "runner=$LOCAL" >> $GITHUB_OUTPUT
+              exit 0
+            else
+              echo "Heartbeat is stale (${AGE}s old), falling back to $FALLBACK"
+            fi
+          else
+            echo "No LOCALMOST_HEARTBEAT variable found"
+          fi
+
+          # Default: use fallback runner
+          echo "No localmost runner available, using $FALLBACK"
+          echo "runner=$FALLBACK" >> $GITHUB_OUTPUT

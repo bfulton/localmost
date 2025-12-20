@@ -1,0 +1,51 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+.webpack/
+out/
+stats.json
+
+# Electron Forge
+*.dmg
+*.zip
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+
+# Runner data (local development)
+.localmost/
+
+# Generated icons (SVGs and PNGs built at compile time)
+assets/generated/
+
+# Auto-generated build info
+src/shared/build-info.ts
+
+# Playwright test output
+playwright-report/
+test-results/
+
+.claude/
+release/
+
+.envrc
+
+# Downloaded runner binaries (not bundled, downloaded at runtime)
+bundled-runner/
