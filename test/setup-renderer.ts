@@ -56,6 +56,14 @@ export interface MockLocalmost {
     getStatus: jest.Mock;
     onStatusChange: jest.Mock;
   };
+  targets: {
+    list: jest.Mock;
+    add: jest.Mock;
+    remove: jest.Mock;
+    update: jest.Mock;
+    getStatus: jest.Mock;
+    onStatusUpdate: jest.Mock;
+  };
 }
 
 // Extend Window interface for tests
@@ -120,6 +128,14 @@ const mockLocalmost: MockLocalmost = {
     install: jest.fn().mockResolvedValue({ success: true }),
     getStatus: jest.fn().mockResolvedValue({ status: 'idle', currentVersion: '0.1.1-alpha' }),
     onStatusChange: jest.fn().mockReturnValue(() => {}),
+  },
+  targets: {
+    list: jest.fn().mockResolvedValue([]),
+    add: jest.fn().mockResolvedValue({ success: true }),
+    remove: jest.fn().mockResolvedValue({ success: true }),
+    update: jest.fn().mockResolvedValue({ success: true }),
+    getStatus: jest.fn().mockResolvedValue([]),
+    onStatusUpdate: jest.fn().mockReturnValue(() => {}),
   },
 };
 

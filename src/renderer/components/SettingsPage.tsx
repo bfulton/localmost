@@ -373,22 +373,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
             </div>
 
             <div className={shared.formGroup}>
-              <label>Cache work directory</label>
-              <select
-                value={preserveWorkDir}
-                onChange={(e) => setPreserveWorkDir(e.target.value as 'never' | 'session' | 'always')}
-              >
-                <option value="never">Never</option>
-                <option value="session">During session</option>
-                <option value="always">Always</option>
-              </select>
-              <p className={shared.formHint}>
-                Preserve workflow _work directory to cache dependencies like node_modules. "During session" clears on app start/quit.
-              </p>
-            </div>
-
-            <div className={shared.formGroup}>
-              <label>Tool cache location</label>
+              <label>Tool cache</label>
               <select
                 value={toolCacheLocation}
                 onChange={(e) => setToolCacheLocation(e.target.value as 'persistent' | 'per-sandbox')}
@@ -398,6 +383,21 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
               </select>
               <p className={shared.formHint}>
                 Persistent caches tools like Node.js across restarts. Per-sandbox rebuilds each time (slower but cleaner).
+              </p>
+            </div>
+
+            <div className={shared.formGroup}>
+              <label>Cache work directory</label>
+              <select
+                value={preserveWorkDir}
+                onChange={(e) => setPreserveWorkDir(e.target.value as 'never' | 'session' | 'always')}
+              >
+                <option value="never">Never (recommended)</option>
+                <option value="session">During session</option>
+                <option value="always">Always</option>
+              </select>
+              <p className={shared.formHint}>
+                Preserve workflow _work directory to cache dependencies like node_modules. "During session" clears on app start/quit.
               </p>
             </div>
           </section>
