@@ -13,7 +13,14 @@ import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
 interface RunnerInstance {
   process: ChildProcess | null;
   status: RunnerStatus;
-  currentJob: { name: string; repository: string; startedAt: string; id: string } | null;
+  currentJob: {
+    name: string;
+    repository: string;
+    startedAt: string;
+    id: string;
+    targetId?: string;        // For multi-target: which target this job came from
+    targetDisplayName?: string;
+  } | null;
   name: string;
   jobsCompleted: number;
   fatalError: boolean; // Set when runner has an unrecoverable error (e.g., registration deleted)
@@ -100,6 +107,10 @@ export class RunnerManager {
 
   // Path to job history file
   private readonly jobHistoryPath: string;
+
+  // Pending target context for jobs received from broker
+  // Maps runner name (or 'next') to target context
+  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string }> = new Map();
 
   /**
    * Validate that a child path stays within the expected base directory.
@@ -230,6 +241,37 @@ export class RunnerManager {
       this.jobHistory = this.jobHistory.slice(-this.maxJobHistory);
       this.onJobHistoryUpdate(this.jobHistory);
     }
+  }
+
+  /**
+   * Set pending target context for the next job received by a runner.
+   * Called by broker-proxy-service when a job is received from a target.
+   * @param runnerName The runner name or 'next' to apply to next job on any runner
+   * @param targetId The target ID from which the job was received
+   * @param targetDisplayName Human-readable target name
+   */
+  setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string): void {
+    this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName });
+    this.log('debug', `Set pending target context for ${runnerName}: ${targetDisplayName}`);
+  }
+
+  /**
+   * Consume pending target context for a runner.
+   * Returns and removes the context if found.
+   */
+  private consumePendingTargetContext(runnerName: string): { targetId: string; targetDisplayName: string } | undefined {
+    // Try exact match first, then fall back to 'next'
+    let context = this.pendingTargetContext.get(runnerName);
+    if (context) {
+      this.pendingTargetContext.delete(runnerName);
+      return context;
+    }
+    context = this.pendingTargetContext.get('next');
+    if (context) {
+      this.pendingTargetContext.delete('next');
+      return context;
+    }
+    return undefined;
   }
 
   private loadRunnerConfig(): void {
@@ -915,14 +957,20 @@ export class RunnerManager {
       }
 
       instance.status = 'busy';
+
+      // Get target context if available (from broker-proxy-service)
+      const targetContext = this.consumePendingTargetContext(instance.name);
+
       instance.currentJob = {
         name: jobName,
         repository: this.config?.url || 'unknown',
         startedAt: new Date().toISOString(),
         id: `job-${++this.jobIdCounter}`,
+        targetId: targetContext?.targetId,
+        targetDisplayName: targetContext?.targetDisplayName,
       };
 
-      this.log('debug', `[instance ${instanceNum}] Job started: ${jobName} (id: ${instance.currentJob.id})`);
+      this.log('debug', `[instance ${instanceNum}] Job started: ${jobName} (id: ${instance.currentJob.id})${targetContext ? ` from ${targetContext.targetDisplayName}` : ''}`);
 
       this.addJobToHistory({
         id: instance.currentJob.id,
@@ -931,6 +979,8 @@ export class RunnerManager {
         status: 'running',
         startedAt: instance.currentJob.startedAt,
         runnerName: instance.name,
+        targetId: instance.currentJob.targetId,
+        targetDisplayName: instance.currentJob.targetDisplayName,
       });
 
       this.updateAggregateStatus();

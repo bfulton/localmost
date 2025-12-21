@@ -8,6 +8,8 @@ import { RunnerManager } from './runner-manager';
 import { GitHubAuth } from './github-auth';
 import { RunnerDownloader } from './runner-downloader';
 import { HeartbeatManager } from './heartbeat-manager';
+import { BrokerProxyService } from './broker-proxy-service';
+import { TargetManager } from './target-manager';
 
 // State management
 import {
@@ -17,10 +19,14 @@ import {
   setGitHubAuth,
   setHeartbeatManager,
   setCliServer,
+  setBrokerProxyService,
+  setTargetManager,
   getRunnerManager,
   getRunnerDownloader,
   getHeartbeatManager,
   getCliServer,
+  getBrokerProxyService,
+  getTargetManager,
   getAuthState,
   setAuthState,
   getGitHubAuth,
@@ -177,7 +183,7 @@ app.whenReady().then(async () => {
   });
   setHeartbeatManager(heartbeatManager);
 
-  // Initialize CLI server for `localmost` CLI companion
+// Initialize CLI server for `localmost` CLI companion
   const cliServer = new CliServer({
     onLog: (level, message) => {
       if (level === 'info') logger?.info(message);
@@ -191,6 +197,23 @@ app.whenReady().then(async () => {
   } catch (err) {
     logger?.warn(`Failed to start CLI server: ${(err as Error).message}`);
   }
+
+  // Initialize target manager
+  const targetManager = new TargetManager();
+  setTargetManager(targetManager);
+
+  // Initialize broker proxy service
+  const brokerProxyService = new BrokerProxyService();
+  setBrokerProxyService(brokerProxyService);
+
+  // Wire up broker proxy to runner manager: when a job is received from a target,
+  // set the pending target context so it gets applied when the job starts
+  brokerProxyService.on('job-received', (targetId: string, _jobId: string) => {
+    const target = targetManager.getTargets().find(t => t.id === targetId);
+    if (target) {
+      runnerManager.setPendingTargetContext('next', targetId, target.displayName);
+    }
+  });
 
   // Load saved auth state and settings
   const config = loadConfig();
@@ -379,6 +402,7 @@ app.on('before-quit', async (event) => {
     const heartbeatManager = getHeartbeatManager();
     const runnerManager = getRunnerManager();
     const runnerDownloader = getRunnerDownloader();
+    const brokerProxyService = getBrokerProxyService();
     const trayManager = getTrayManager();
     const mainWindow = getMainWindow();
     const cliServer = getCliServer();
@@ -387,8 +411,11 @@ app.on('before-quit', async (event) => {
     await heartbeatManager?.clear();
     heartbeatManager?.stop();
 
-    // Stop CLI server
+// Stop CLI server
     await cliServer?.stop();
+
+    // Stop broker proxy service
+    await brokerProxyService?.stop();
 
     // Cancel any jobs running on our runners before stopping
     // This prevents orphaned jobs that would block runner deletion on next startup
@@ -421,6 +448,7 @@ process.on('SIGINT', async () => {
   const heartbeatManager = getHeartbeatManager();
   const runnerManager = getRunnerManager();
   const runnerDownloader = getRunnerDownloader();
+  const brokerProxyService = getBrokerProxyService();
   const trayManager = getTrayManager();
   const mainWindow = getMainWindow();
   const cliServer = getCliServer();
@@ -429,8 +457,11 @@ process.on('SIGINT', async () => {
   await heartbeatManager?.clear();
   heartbeatManager?.stop();
 
-  // Stop CLI server
+// Stop CLI server
   await cliServer?.stop();
+
+  // Stop broker proxy service
+  await brokerProxyService?.stop();
 
   // Cancel any jobs running on our runners before stopping
   await cancelJobsOnOurRunners();

@@ -84,6 +84,9 @@ export interface JobHistoryEntry {
   actionsUrl?: string;
   githubJobId?: number;
   runnerName?: string;
+  /** For multi-target: which target this job came from */
+  targetId?: string;
+  targetDisplayName?: string;
 }
 
 export interface RunnerConfig {

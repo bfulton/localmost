@@ -11,9 +11,10 @@ import shared from '../styles/shared.module.css';
 interface SettingsPageProps {
   onBack: () => void;
   scrollToSection?: string;
+  onOpenTargets?: () => void;
 }
 
-const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection }) => {
+const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, onOpenTargets }) => {
   // App config from context
   const {
     theme,
@@ -444,6 +445,20 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection }) 
             >
               {isLoading ? 'Configuring...' : isConfigured ? 'Reconfigure' : 'Configure Runner'}
             </button>
+
+            {isConfigured && onOpenTargets && (
+              <div className={styles.targetsLink}>
+                <button
+                  className={shared.btnSecondary}
+                  onClick={onOpenTargets}
+                >
+                  Manage Targets
+                </button>
+                <p className={shared.formHint}>
+                  Configure multiple repositories or organizations to receive jobs from.
+                </p>
+              </div>
+            )}
           </section>
         )}
 

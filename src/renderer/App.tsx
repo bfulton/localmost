@@ -2,11 +2,12 @@ import React, { useState, useEffect } from 'react';
 import StatusPage from './components/StatusPage';
 import SettingsPage from './components/SettingsPage';
 import UpdateNotification from './components/UpdateNotification';
+import TargetsPage from './components/TargetsPage';
 import PageErrorBoundary from './components/PageErrorBoundary';
 import { AppConfigProvider, RunnerProvider, UpdateProvider, useAppConfig, useRunner } from './contexts';
 import styles from './components/App.module.css';
 
-type View = 'status' | 'settings';
+type View = 'status' | 'settings' | 'targets';
 
 // Re-export ThemeSetting for backward compatibility
 export type { ThemeSetting } from './contexts';
@@ -105,7 +106,19 @@ const AppContent: React.FC = () => {
               setView('status');
             }}
             scrollToSection={scrollToSection}
+            onOpenTargets={() => setView('targets')}
           />
+        </PageErrorBoundary>
+      )}
+
+      {view === 'targets' && (
+        <PageErrorBoundary
+          key="targets-page"
+          pageName="Targets"
+          onNavigateAway={() => setView('settings')}
+          alternatePageName="Settings"
+        >
+          <TargetsPage onBack={() => setView('settings')} />
         </PageErrorBoundary>
       )}
     </>
