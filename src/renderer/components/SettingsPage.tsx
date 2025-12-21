@@ -59,8 +59,6 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     isConfigured,
     runnerConfig,
     updateRunnerConfig,
-    configureRunner,
-    isLoading,
     isInitialLoading,
     error,
     setError,
@@ -120,13 +118,6 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
   const handleLogin = async () => {
     setAvatarError(false);
     await login();
-  };
-
-  const handleConfigure = async () => {
-    const result = await configureRunner();
-    if (result.success) {
-      onBack();
-    }
   };
 
   const handleSleepProtectionChange = (newValue: SleepProtection) => {
@@ -281,7 +272,6 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
                     <select
                       value={selectedVersion}
                       onChange={(e) => setSelectedVersion(e.target.value)}
-                      disabled={isLoading}
                     >
                       {availableVersions.map((release) => {
                         const isInstalled = isDownloaded && runnerVersion.version === release.version;
@@ -304,7 +294,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
                   <button
                     className={shared.btnPrimary}
                     onClick={downloadRunner}
-                    disabled={isLoading || isLoadingVersions || !selectedVersion}
+                    disabled={isLoadingVersions || !selectedVersion}
                   >
                     {isDownloaded ? 'Change Version' : 'Download Runner'}
                   </button>
@@ -319,55 +309,17 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
           <section id="runner-config-section" className={styles.settingsSection}>
             <h3>Runner Configuration</h3>
 
-            <div className={shared.formGroup}>
-              <label>Runner Level</label>
-              <div className={styles.levelSelector}>
-                <button
-                  className={runnerConfig.level === 'repo' ? styles.levelOptionActive : styles.levelOption}
-                  onClick={() => updateRunnerConfig({ level: 'repo' })}
-                >
-                  Repository
-                </button>
-                <button
-                  className={runnerConfig.level === 'org' ? styles.levelOptionActive : styles.levelOption}
-                  onClick={() => updateRunnerConfig({ level: 'org' })}
-                  disabled={orgs.length === 0}
-                  title={orgs.length === 0 ? 'No organizations available' : undefined}
-                >
-                  Organization
-                </button>
-              </div>
-            </div>
-
-            {runnerConfig.level === 'repo' ? (
+            {onOpenTargets && (
               <div className={shared.formGroup}>
-                <label>Repository</label>
-                <select
-                  value={runnerConfig.repoUrl || ''}
-                  onChange={(e) => updateRunnerConfig({ repoUrl: e.target.value })}
+                <button
+                  className={shared.btnPrimary}
+                  onClick={onOpenTargets}
                 >
-                  <option value="">Select a repository...</option>
-                  {repos.map((repo) => (
-                    <option key={repo.id} value={repo.html_url}>
-                      {repo.full_name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            ) : (
-              <div className={shared.formGroup}>
-                <label>Organization</label>
-                <select
-                  value={runnerConfig.orgName || ''}
-                  onChange={(e) => updateRunnerConfig({ orgName: e.target.value })}
-                >
-                  <option value="">Select an organization...</option>
-                  {orgs.map((org) => (
-                    <option key={org.id} value={org.login}>
-                      {org.login}
-                    </option>
-                  ))}
-                </select>
+                  Manage Targets
+                </button>
+                <p className={shared.formHint}>
+                  Add repositories or organizations to receive jobs from.
+                </p>
               </div>
             )}
 
@@ -379,6 +331,9 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
                 onChange={(e) => updateRunnerConfig({ runnerName: e.target.value })}
                 placeholder="my-local-runner"
               />
+              <p className={shared.formHint}>
+                Base name for runner registrations with GitHub.
+              </p>
             </div>
 
             <div className={shared.formGroup}>
@@ -404,8 +359,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
                 <span className={styles.parallelismValue}>{runnerConfig.runnerCount} runner{runnerConfig.runnerCount > 1 ? 's' : ''}</span>
               </div>
               <p className={shared.formHint}>
-                Run multiple runner instances for parallel job execution.
-                Each runner will be named {runnerConfig.runnerName}.1 through {runnerConfig.runnerName}.{runnerConfig.runnerCount}
+                Maximum concurrent jobs across all targets.
               </p>
             </div>
 
@@ -437,28 +391,6 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
                 Persistent caches tools like Node.js across restarts. Per-sandbox rebuilds each time (slower but cleaner).
               </p>
             </div>
-
-            <button
-              className={shared.btnPrimary}
-              onClick={handleConfigure}
-              disabled={isLoading || (runnerConfig.level === 'repo' ? !runnerConfig.repoUrl : !runnerConfig.orgName)}
-            >
-              {isLoading ? 'Configuring...' : isConfigured ? 'Reconfigure' : 'Configure Runner'}
-            </button>
-
-            {isConfigured && onOpenTargets && (
-              <div className={styles.targetsLink}>
-                <button
-                  className={shared.btnSecondary}
-                  onClick={onOpenTargets}
-                >
-                  Manage Targets
-                </button>
-                <p className={shared.formHint}>
-                  Configure multiple repositories or organizations to receive jobs from.
-                </p>
-              </div>
-            )}
           </section>
         )}
 
