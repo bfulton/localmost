@@ -19,6 +19,8 @@ const TestConsumer: React.FC = () => {
       <span data-testid="sleep-consented">{String(config.sleepProtectionConsented)}</span>
       <span data-testid="preserve-work-dir">{config.preserveWorkDir}</span>
       <span data-testid="tool-cache-location">{config.toolCacheLocation}</span>
+      <span data-testid="user-filter-mode">{config.userFilter.mode}</span>
+      <span data-testid="user-filter-allowlist-count">{config.userFilter.allowlist.length}</span>
       <span data-testid="is-online">{String(config.isOnline)}</span>
       <span data-testid="is-loading">{String(config.isLoading)}</span>
       <span data-testid="error">{config.error || 'no-error'}</span>
@@ -34,6 +36,8 @@ const TestConsumer: React.FC = () => {
       <button data-testid="consent-sleep" onClick={config.consentToSleepProtection}>Consent</button>
       <button data-testid="set-preserve-work-dir" onClick={() => config.setPreserveWorkDir('session')}>Set Preserve</button>
       <button data-testid="set-tool-cache" onClick={() => config.setToolCacheLocation('per-sandbox')}>Set Tool Cache</button>
+      <button data-testid="set-user-filter-just-me" onClick={() => config.setUserFilter({ mode: 'just-me', allowlist: [] })}>Set Just Me</button>
+      <button data-testid="set-user-filter-allowlist" onClick={() => config.setUserFilter({ mode: 'allowlist', allowlist: [{ login: 'testuser', avatar_url: '', name: null }] })}>Set Allowlist</button>
     </div>
   );
 };
@@ -540,6 +544,114 @@ describe('AppConfigContext', () => {
       unmount();
 
       expect(unsubLogs).toHaveBeenCalled();
+    });
+  });
+
+  describe('User Filter', () => {
+    it('should have default user filter mode as everyone', async () => {
+      render(
+        <AppConfigProvider>
+          <TestConsumer />
+        </AppConfigProvider>
+      );
+
+      await waitFor(() => {
+        expect(screen.getByTestId('is-loading').textContent).toBe('false');
+      });
+
+      expect(screen.getByTestId('user-filter-mode').textContent).toBe('everyone');
+      expect(screen.getByTestId('user-filter-allowlist-count').textContent).toBe('0');
+    });
+
+    it('should load user filter from settings', async () => {
+      mockLocalmost.settings.get.mockResolvedValue({
+        userFilter: {
+          mode: 'allowlist',
+          allowlist: [
+            { login: 'user1', avatar_url: '', name: null },
+            { login: 'user2', avatar_url: '', name: null },
+          ],
+        },
+      });
+
+      render(
+        <AppConfigProvider>
+          <TestConsumer />
+        </AppConfigProvider>
+      );
+
+      await waitFor(() => {
+        expect(screen.getByTestId('user-filter-mode').textContent).toBe('allowlist');
+        expect(screen.getByTestId('user-filter-allowlist-count').textContent).toBe('2');
+      });
+    });
+
+    it('should set user filter to just-me', async () => {
+      render(
+        <AppConfigProvider>
+          <TestConsumer />
+        </AppConfigProvider>
+      );
+
+      await waitFor(() => {
+        expect(screen.getByTestId('is-loading').textContent).toBe('false');
+      });
+
+      await act(async () => {
+        screen.getByTestId('set-user-filter-just-me').click();
+      });
+
+      expect(screen.getByTestId('user-filter-mode').textContent).toBe('just-me');
+      expect(mockLocalmost.settings.set).toHaveBeenCalledWith({
+        userFilter: { mode: 'just-me', allowlist: [] },
+      });
+    });
+
+    it('should set user filter with allowlist', async () => {
+      render(
+        <AppConfigProvider>
+          <TestConsumer />
+        </AppConfigProvider>
+      );
+
+      await waitFor(() => {
+        expect(screen.getByTestId('is-loading').textContent).toBe('false');
+      });
+
+      await act(async () => {
+        screen.getByTestId('set-user-filter-allowlist').click();
+      });
+
+      expect(screen.getByTestId('user-filter-mode').textContent).toBe('allowlist');
+      expect(screen.getByTestId('user-filter-allowlist-count').textContent).toBe('1');
+      expect(mockLocalmost.settings.set).toHaveBeenCalledWith({
+        userFilter: {
+          mode: 'allowlist',
+          allowlist: [{ login: 'testuser', avatar_url: '', name: null }],
+        },
+      });
+    });
+
+    it('should handle invalid user filter mode in settings', async () => {
+      mockLocalmost.settings.get.mockResolvedValue({
+        userFilter: {
+          mode: 'invalid-mode',
+          allowlist: [],
+        },
+      });
+
+      render(
+        <AppConfigProvider>
+          <TestConsumer />
+        </AppConfigProvider>
+      );
+
+      await waitFor(() => {
+        expect(screen.getByTestId('is-loading').textContent).toBe('false');
+      });
+
+      // Should fall back to default
+      expect(screen.getByTestId('user-filter-mode').textContent).toBe('everyone');
     });
   });
 });

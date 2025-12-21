@@ -48,7 +48,7 @@ const UserFilterSettings: React.FC<UserFilterSettingsProps> = ({
       if (result.success && result.users) {
         // Filter out users already in the allowlist
         const filtered = result.users.filter(
-          (user) => !userFilter.allowlist.some((u) => u.login === user.login)
+          (user: AllowlistUser) => !userFilter.allowlist.some((u) => u.login === user.login)
         );
         setSearchResults(filtered);
       }
