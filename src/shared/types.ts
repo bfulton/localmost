@@ -190,6 +190,14 @@ export const IPC_CHANNELS = {
   UPDATE_INSTALL: 'update:install',
   UPDATE_GET_STATUS: 'update:get-status',
   UPDATE_STATUS: 'update:status',
+
+  // Targets (multi-target runner support)
+  TARGETS_LIST: 'targets:list',
+  TARGETS_ADD: 'targets:add',
+  TARGETS_REMOVE: 'targets:remove',
+  TARGETS_UPDATE: 'targets:update',
+  TARGETS_GET_STATUS: 'targets:get-status',
+  TARGETS_STATUS_UPDATE: 'targets:status-update',
 } as const;
 
 export interface GitHubUser {
@@ -329,4 +337,88 @@ export interface UpdateSettings {
   autoCheck: boolean;
   /** Hours between automatic update checks (default: 24) */
   checkIntervalHours: number;
+}
+
+// =============================================================================
+// Multi-Target Types
+// =============================================================================
+
+/**
+ * A target represents a GitHub repo or org where runners can be registered.
+ * Each target gets its own runner proxy registration with GitHub.
+ */
+export interface Target {
+  /** Unique identifier for this target */
+  id: string;
+  /** Whether this is a repo or org level target */
+  type: 'repo' | 'org';
+  /** GitHub owner (user or org name) */
+  owner: string;
+  /** Repository name (only for type='repo') */
+  repo?: string;
+  /** Display name (e.g., "owner/repo" or "org-name") */
+  displayName: string;
+  /** Full GitHub URL */
+  url: string;
+  /** Runner proxy name registered with GitHub (e.g., "localmost.hostname.repo-name") */
+  proxyRunnerName: string;
+  /** Whether this target is enabled for job polling */
+  enabled: boolean;
+  /** ISO timestamp when target was added */
+  addedAt: string;
+}
+
+/**
+ * Status for a runner proxy (phantom registration with GitHub).
+ */
+export interface RunnerProxyStatus {
+  /** Target this proxy is for */
+  targetId: string;
+  /** Whether runner is registered with GitHub */
+  registered: boolean;
+  /** Whether broker session is active */
+  sessionActive: boolean;
+  /** Last successful poll timestamp */
+  lastPoll: string | null;
+  /** Total jobs assigned from this target */
+  jobsAssigned: number;
+  /** Error message if something went wrong */
+  error?: string;
+}
+
+/**
+ * Status for a worker (execution environment).
+ */
+export interface WorkerStatus {
+  /** Worker instance number */
+  id: number;
+  /** Current state */
+  status: 'idle' | 'starting' | 'running' | 'busy' | 'error';
+  /** Current job info if busy */
+  currentJob?: {
+    targetId: string;
+    targetDisplayName: string;
+    jobName: string;
+    startedAt: string;
+  };
+  /** Total jobs completed by this worker */
+  jobsCompleted: number;
+}
+
+/**
+ * Aggregate state for multi-target runner system.
+ */
+export interface MultiTargetRunnerState {
+  /** Overall system status */
+  status: 'idle' | 'starting' | 'running' | 'error';
+  /** When the system was started */
+  startedAt?: string;
+  /** Status of each runner proxy */
+  targets: RunnerProxyStatus[];
+  /** Status of each worker */
+  workers: WorkerStatus[];
+  /** Number of currently active jobs */
+  activeJobs: number;
+  /** Maximum concurrent jobs allowed */
+  maxConcurrentJobs: number;
 }

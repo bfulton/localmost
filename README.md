@@ -207,7 +207,6 @@ Future feature ideas:
 - **Deep links** - Jump directly to job logs in GitHub.
 - **Audit logging** - Detailed logs of what each job accessed.
 - **Network policy customization** - User-defined network allowlists per repo.
-- **Auto-update** - In-app update mechanism.
 - **Workflow testing mode** - Run and validate workflows locally before pushing.
 - **Spotlight integration** - Check status or pause builds from Spotlight.
 - **Artifact inspector** - Browse uploaded artifacts without leaving the app.

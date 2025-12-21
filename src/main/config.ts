@@ -8,7 +8,7 @@ import * as yaml from 'js-yaml';
 import { getAppDataDir, getConfigPath } from './paths';
 import { encryptValue, decryptValue } from './encryption';
 import { bootLog } from './log-file';
-import { GitHubUser, SleepProtection, LogLevel, UserFilterConfig } from '../shared/types';
+import { GitHubUser, SleepProtection, LogLevel, UserFilterConfig, Target } from '../shared/types';
 
 // Config paths - uses centralized path management
 const configDir = getAppDataDir();
@@ -28,6 +28,8 @@ export const SETTABLE_CONFIG_KEYS = [
   'logLevel',
   'runnerLogLevel',
   'userFilter',
+  'targets',
+  'maxConcurrentJobs',
 ] as const;
 
 export type SettableConfigKey = typeof SETTABLE_CONFIG_KEYS[number];
@@ -56,6 +58,10 @@ export interface AppConfig {
   runnerLogLevel?: LogLevel;
   preserveWorkDir?: 'always' | 'never';
   userFilter?: UserFilterConfig;
+  /** Multi-target configuration - list of repos/orgs to register runners for */
+  targets?: Target[];
+  /** Maximum concurrent jobs across all targets (1-16, defaults to 4) */
+  maxConcurrentJobs?: number;
 }
 
 /**
