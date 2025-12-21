@@ -138,6 +138,22 @@ app.whenReady().then(async () => {
       return auth.getWorkflowRunJobs(accessToken, owner, repo, runId);
     },
     getRunnerLogLevel: () => getRunnerLogLevelSetting(),
+    getUserFilter: () => {
+      const config = loadConfig();
+      return config.userFilter;
+    },
+    getCurrentUserLogin: () => {
+      const authState = getAuthState();
+      return authState?.user?.login;
+    },
+    cancelWorkflowRun: async (owner: string, repo: string, runId: number) => {
+      const accessToken = await getValidAccessToken();
+      const auth = getGitHubAuth();
+      if (!accessToken || !auth) {
+        throw new Error('Not authenticated');
+      }
+      return auth.cancelWorkflowRun(accessToken, owner, repo, runId);
+    },
   });
   setRunnerManager(runnerManager);
 

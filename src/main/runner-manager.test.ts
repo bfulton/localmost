@@ -267,4 +267,91 @@ describe('RunnerManager', () => {
       );
     });
   });
+
+  describe('user filtering', () => {
+    it('should allow all users when filter mode is everyone', () => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getUserFilter: () => ({ mode: 'everyone', allowlist: [] }),
+        getCurrentUserLogin: () => 'testuser',
+      });
+
+      // Access private method via any cast for testing
+      const isAllowed = (manager as any).isUserAllowed('anyuser');
+      expect(isAllowed).toBe(true);
+    });
+
+    it('should allow all users when no filter is set', () => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getUserFilter: () => undefined,
+      });
+
+      const isAllowed = (manager as any).isUserAllowed('anyuser');
+      expect(isAllowed).toBe(true);
+    });
+
+    it('should only allow current user when filter mode is just-me', () => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getUserFilter: () => ({ mode: 'just-me', allowlist: [] }),
+        getCurrentUserLogin: () => 'testuser',
+      });
+
+      expect((manager as any).isUserAllowed('testuser')).toBe(true);
+      expect((manager as any).isUserAllowed('TestUser')).toBe(true); // case insensitive
+      expect((manager as any).isUserAllowed('otheruser')).toBe(false);
+    });
+
+    it('should only allow users in allowlist when filter mode is allowlist', () => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getUserFilter: () => ({
+          mode: 'allowlist',
+          allowlist: [
+            { login: 'user1', avatar_url: '', name: null },
+            { login: 'user2', avatar_url: '', name: null },
+          ],
+        }),
+      });
+
+      expect((manager as any).isUserAllowed('user1')).toBe(true);
+      expect((manager as any).isUserAllowed('User1')).toBe(true); // case insensitive
+      expect((manager as any).isUserAllowed('user2')).toBe(true);
+      expect((manager as any).isUserAllowed('user3')).toBe(false);
+    });
+
+    it('should allow user when just-me mode but no current user is set', () => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getUserFilter: () => ({ mode: 'just-me', allowlist: [] }),
+        getCurrentUserLogin: () => undefined,
+      });
+
+      // Should return true (allow) when current user is unknown
+      expect((manager as any).isUserAllowed('anyuser')).toBe(true);
+    });
+
+    it('should handle empty allowlist', () => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getUserFilter: () => ({ mode: 'allowlist', allowlist: [] }),
+      });
+
+      // Empty allowlist should not allow anyone
+      expect((manager as any).isUserAllowed('anyuser')).toBe(false);
+    });
+  });
 });

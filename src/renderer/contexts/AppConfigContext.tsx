@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode } from 'react';
-import { LogEntry, SleepProtection, LogLevel, ToolCacheLocation } from '../../shared/types';
+import { LogEntry, SleepProtection, LogLevel, ToolCacheLocation, UserFilterConfig } from '../../shared/types';
 
 export type ThemeSetting = 'light' | 'dark' | 'auto';
 
@@ -33,6 +33,10 @@ interface AppConfigContextValue {
   setPreserveWorkDir: (setting: 'never' | 'session' | 'always') => Promise<void>;
   toolCacheLocation: ToolCacheLocation;
   setToolCacheLocation: (setting: ToolCacheLocation) => Promise<void>;
+
+  // User filter
+  userFilter: UserFilterConfig;
+  setUserFilter: (filter: UserFilterConfig) => Promise<void>;
 
   // App state
   isOnline: boolean;
@@ -81,6 +85,9 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
   // Runner settings
   const [preserveWorkDir, setPreserveWorkDirState] = useState<'never' | 'session' | 'always'>('never');
   const [toolCacheLocation, setToolCacheLocationState] = useState<ToolCacheLocation>('persistent');
+
+  // User filter
+  const [userFilter, setUserFilterState] = useState<UserFilterConfig>({ mode: 'everyone', allowlist: [] });
 
   // Apply theme whenever it changes
   useEffect(() => {
@@ -150,6 +157,17 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
           setRunnerLogLevelState(settings.runnerLogLevel as LogLevel);
         }
 
+        // User filter
+        if (settings.userFilter) {
+          const filter = settings.userFilter as UserFilterConfig;
+          if (filter.mode && ['everyone', 'just-me', 'allowlist'].includes(filter.mode)) {
+            setUserFilterState({
+              mode: filter.mode,
+              allowlist: Array.isArray(filter.allowlist) ? filter.allowlist : [],
+            });
+          }
+        }
+
         setIsLoading(false);
       } catch (err) {
         setError(`Failed to load settings: ${(err as Error).message}`);
@@ -167,7 +185,10 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     });
 
     // Network status
-    window.localmost.network.isOnline().then(setIsOnline);
+    window.localmost.network.isOnline().then(setIsOnline).catch(() => {
+      // Default to online if check fails
+      setIsOnline(true);
+    });
     const handleOnline = () => setIsOnline(true);
     const handleOffline = () => setIsOnline(false);
     window.addEventListener('online', handleOnline);
@@ -183,23 +204,39 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
   // Setting updaters with persistence
   const setTheme = useCallback(async (newTheme: ThemeSetting) => {
     setThemeState(newTheme);
-    await window.localmost.settings.set({ theme: newTheme });
+    try {
+      await window.localmost.settings.set({ theme: newTheme });
+    } catch {
+      // Optimistic update - UI already changed, log error but don't revert
+    }
   }, []);
 
   const setLogLevel = useCallback(async (newLevel: LogLevel) => {
     setLogLevelState(newLevel);
-    await window.localmost.settings.set({ logLevel: newLevel });
+    try {
+      await window.localmost.settings.set({ logLevel: newLevel });
+    } catch {
+      // Optimistic update - UI already changed
+    }
   }, []);
 
   const setRunnerLogLevel = useCallback(async (newLevel: LogLevel) => {
     setRunnerLogLevelState(newLevel);
-    await window.localmost.settings.set({ runnerLogLevel: newLevel });
+    try {
+      await window.localmost.settings.set({ runnerLogLevel: newLevel });
+    } catch {
+      // Optimistic update - UI already changed
+    }
   }, []);
 
   const setMaxLogScrollback = useCallback(async (newMax: number) => {
     setMaxLogScrollbackState(newMax);
     maxLogScrollbackRef.current = newMax;
-    await window.localmost.settings.set({ maxLogScrollback: newMax });
+    try {
+      await window.localmost.settings.set({ maxLogScrollback: newMax });
+    } catch {
+      // Optimistic update - UI already changed
+    }
     // Trim existing logs if needed
     if (logsRef.current.length > newMax) {
       logsRef.current = logsRef.current.slice(-newMax);
@@ -209,28 +246,57 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
 
   const setMaxJobHistory = useCallback(async (newMax: number) => {
     setMaxJobHistoryState(newMax);
-    await window.localmost.settings.set({ maxJobHistory: newMax });
-    await window.localmost.jobs.setMaxHistory(newMax);
+    try {
+      await window.localmost.settings.set({ maxJobHistory: newMax });
+      await window.localmost.jobs.setMaxHistory(newMax);
+    } catch {
+      // Optimistic update - UI already changed
+    }
   }, []);
 
   const setSleepProtection = useCallback(async (newSetting: SleepProtection) => {
     setSleepProtectionState(newSetting);
-    await window.localmost.settings.set({ sleepProtection: newSetting });
+    try {
+      await window.localmost.settings.set({ sleepProtection: newSetting });
+    } catch {
+      // Optimistic update - UI already changed
+    }
   }, []);
 
   const consentToSleepProtection = useCallback(async () => {
     setSleepProtectionConsentedState(true);
-    await window.localmost.settings.set({ sleepProtectionConsented: true });
+    try {
+      await window.localmost.settings.set({ sleepProtectionConsented: true });
+    } catch {
+      // Optimistic update - UI already changed
+    }
   }, []);
 
   const setPreserveWorkDir = useCallback(async (setting: 'never' | 'session' | 'always') => {
     setPreserveWorkDirState(setting);
-    await window.localmost.settings.set({ preserveWorkDir: setting });
+    try {
+      await window.localmost.settings.set({ preserveWorkDir: setting });
+    } catch {
+      // Optimistic update - UI already changed
+    }
   }, []);
 
   const setToolCacheLocation = useCallback(async (setting: ToolCacheLocation) => {
     setToolCacheLocationState(setting);
-    await window.localmost.settings.set({ toolCacheLocation: setting });
+    try {
+      await window.localmost.settings.set({ toolCacheLocation: setting });
+    } catch {
+      // Optimistic update - UI already changed
+    }
+  }, []);
+
+  const setUserFilter = useCallback(async (filter: UserFilterConfig) => {
+    setUserFilterState(filter);
+    try {
+      await window.localmost.settings.set({ userFilter: filter });
+    } catch {
+      // Optimistic update - UI already changed
+    }
   }, []);
 
   const clearLogs = useCallback(() => {
@@ -259,6 +325,8 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     setPreserveWorkDir,
     toolCacheLocation,
     setToolCacheLocation,
+    userFilter,
+    setUserFilter,
     isOnline,
     isLoading,
     error,

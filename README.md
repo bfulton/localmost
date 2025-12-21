@@ -162,8 +162,4 @@ npm run make
 
 Future feature ideas:
 
-- **User-based job filtering** - Only allow runners to pick up jobs triggered by specific GitHub users
-  - Default: "Everyone" (current behavior)
-  - "Just me" option for personal use
-  - Custom user list with autocomplete and profile image previews
 - **Multiple repo/org runner registration** - Support registering runners with more than one repo / org, or a mix of repos and orgs.

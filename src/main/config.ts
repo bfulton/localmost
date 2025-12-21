@@ -8,7 +8,7 @@ import * as yaml from 'js-yaml';
 import { getAppDataDir, getConfigPath } from './paths';
 import { encryptValue, decryptValue } from './encryption';
 import { bootLog } from './log-file';
-import { GitHubUser, SleepProtection, LogLevel } from '../shared/types';
+import { GitHubUser, SleepProtection, LogLevel, UserFilterConfig } from '../shared/types';
 
 // Config paths - uses centralized path management
 const configDir = getAppDataDir();
@@ -27,6 +27,7 @@ export const SETTABLE_CONFIG_KEYS = [
   'sleepProtection',
   'logLevel',
   'runnerLogLevel',
+  'userFilter',
 ] as const;
 
 export type SettableConfigKey = typeof SETTABLE_CONFIG_KEYS[number];
@@ -54,6 +55,7 @@ export interface AppConfig {
   logLevel?: LogLevel;
   runnerLogLevel?: LogLevel;
   preserveWorkDir?: 'always' | 'never';
+  userFilter?: UserFilterConfig;
 }
 
 /**

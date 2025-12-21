@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as yaml from 'js-yaml';
-import { RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel } from '../shared/types';
+import { RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig } from '../shared/types';
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
 import { spawnSandboxed } from './process-sandbox';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
@@ -24,6 +24,7 @@ interface WorkflowRun {
   name: string;
   status: string;
   created_at: string;
+  actor: { login: string };
 }
 
 interface WorkflowJob {
@@ -44,6 +45,12 @@ interface RunnerManagerOptions {
   getWorkflowRuns?: (owner: string, repo: string) => Promise<WorkflowRun[]>;
   getWorkflowJobs?: (owner: string, repo: string, runId: number) => Promise<WorkflowJob[]>;
   getRunnerLogLevel?: () => LogEntry['level'];
+  /** Get user filter configuration */
+  getUserFilter?: () => UserFilterConfig | undefined;
+  /** Get the current authenticated user login */
+  getCurrentUserLogin?: () => string | undefined;
+  /** Cancel a workflow run */
+  cancelWorkflowRun?: (owner: string, repo: string, runId: number) => Promise<void>;
 }
 
 export class RunnerManager {
@@ -60,6 +67,9 @@ export class RunnerManager {
   private getWorkflowRuns?: (owner: string, repo: string) => Promise<WorkflowRun[]>;
   private getWorkflowJobs?: (owner: string, repo: string, runId: number) => Promise<WorkflowJob[]>;
   private getRunnerLogLevel: () => LogEntry['level'];
+  private getUserFilter?: () => UserFilterConfig | undefined;
+  private getCurrentUserLogin?: () => string | undefined;
+  private cancelWorkflowRun?: (owner: string, repo: string, runId: number) => Promise<void>;
   private jobHistory: JobHistoryEntry[] = [];
   private jobIdCounter = 0;
   private maxJobHistory = DEFAULT_MAX_JOB_HISTORY;
@@ -120,6 +130,9 @@ export class RunnerManager {
     this.getWorkflowRuns = options.getWorkflowRuns;
     this.getWorkflowJobs = options.getWorkflowJobs;
     this.getRunnerLogLevel = options.getRunnerLogLevel ?? (() => 'warn');
+    this.getUserFilter = options.getUserFilter;
+    this.getCurrentUserLogin = options.getCurrentUserLogin;
+    this.cancelWorkflowRun = options.cancelWorkflowRun;
 
     this.downloader = new RunnerDownloader();
     this.configPath = getConfigPath();
@@ -922,6 +935,11 @@ export class RunnerManager {
 
       this.updateAggregateStatus();
 
+      // Check user filter asynchronously (don't block runner output processing)
+      this.checkJobUserFilter(instanceNum, instance.name).catch((err) => {
+        this.log('debug', `User filter check failed: ${(err as Error).message}`);
+      });
+
       // Scale up if all runners are busy
       const idleCount = this.countIdleRunners();
       if (idleCount === 0 && this.instances.size < this.runnerCount) {
@@ -963,6 +981,83 @@ export class RunnerManager {
       instance.currentJob = null;
       instance.status = 'running';
       this.updateAggregateStatus();
+    }
+  }
+
+  /**
+   * Check if a user is allowed to trigger jobs based on the user filter configuration.
+   */
+  private isUserAllowed(actorLogin: string): boolean {
+    const userFilter = this.getUserFilter?.();
+
+    // Default to everyone if no filter is set
+    if (!userFilter || userFilter.mode === 'everyone') {
+      return true;
+    }
+
+    if (userFilter.mode === 'just-me') {
+      const currentUser = this.getCurrentUserLogin?.();
+      return currentUser ? actorLogin.toLowerCase() === currentUser.toLowerCase() : true;
+    }
+
+    if (userFilter.mode === 'allowlist') {
+      return userFilter.allowlist.some(
+        (user) => user.login.toLowerCase() === actorLogin.toLowerCase()
+      );
+    }
+
+    return true;
+  }
+
+  /**
+   * Check if a job should be allowed based on user filter.
+   * If not allowed, attempts to cancel the workflow run.
+   */
+  private async checkJobUserFilter(instanceNum: number, runnerName: string): Promise<void> {
+    if (!this.config?.url || !this.getWorkflowRuns || !this.getWorkflowJobs || !this.cancelWorkflowRun) {
+      return;
+    }
+
+    const userFilter = this.getUserFilter?.();
+    if (!userFilter || userFilter.mode === 'everyone') {
+      return; // No filtering needed
+    }
+
+    // Parse owner/repo from config URL
+    const match = this.config.url.match(/github\.com[\/:]([^\/]+)\/([^\/\.]+)/);
+    if (!match) return;
+    const [, owner, repo] = match;
+
+    try {
+      // Get recent workflow runs
+      const runs = await this.getWorkflowRuns(owner, repo);
+      if (!runs || runs.length === 0) return;
+
+      // Find the run that this runner is working on
+      for (const run of runs.slice(0, 10)) {
+        const jobs = await this.getWorkflowJobs(owner, repo, run.id);
+        const matchingJob = jobs.find(j => j.runner_name === runnerName && j.status === 'in_progress');
+
+        if (matchingJob) {
+          // Check if the actor is allowed
+          const isAllowed = this.isUserAllowed(run.actor.login);
+
+          if (!isAllowed) {
+            this.log('info', `Job triggered by '${run.actor.login}' is not in allowed users list. Cancelling workflow run.`);
+            try {
+              await this.cancelWorkflowRun(owner, repo, run.id);
+              this.log('info', `Cancelled workflow run ${run.id} triggered by '${run.actor.login}'`);
+            } catch (cancelErr) {
+              this.log('warn', `Failed to cancel workflow run ${run.id}: ${(cancelErr as Error).message}`);
+            }
+          } else {
+            this.log('debug', `Job triggered by '${run.actor.login}' is allowed`);
+          }
+          return;
+        }
+      }
+    } catch (apiErr) {
+      this.log('debug', `Failed to check job user filter: ${(apiErr as Error).message}`);
     }
   }
 

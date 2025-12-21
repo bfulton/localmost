@@ -16,7 +16,7 @@ import {
   getLogger,
 } from '../app-state';
 import { updateTrayMenu } from '../tray-init';
-import { IPC_CHANNELS, GitHubRepo } from '../../shared/types';
+import { IPC_CHANNELS, GitHubRepo, GitHubUserSearchResult } from '../../shared/types';
 
 /**
  * Register authentication-related IPC handlers.
@@ -179,6 +179,24 @@ export const registerAuthHandlers = (): void => {
       return { success: true, orgs };
     } catch (error) {
       const { userMessage, technicalDetails } = toUserError(error, 'Fetching organizations');
+      logger?.error(technicalDetails);
+      return { success: false, error: userMessage };
+    }
+  });
+
+  // Search for GitHub users
+  ipcMain.handle(IPC_CHANNELS.GITHUB_SEARCH_USERS, async (_event, query: string): Promise<{ success: boolean; users?: GitHubUserSearchResult[]; error?: string }> => {
+    const accessToken = await getValidAccessToken();
+    const githubAuth = getGitHubAuth();
+    if (!accessToken || !githubAuth) {
+      return { success: false, error: 'Not authenticated' };
+    }
+
+    try {
+      const users = await githubAuth.searchUsers(accessToken, query);
+      return { success: true, users };
+    } catch (error) {
+      const { userMessage, technicalDetails } = toUserError(error, 'Searching users');
       logger?.error(technicalDetails);
       return { success: false, error: userMessage };
     }

@@ -10,6 +10,7 @@ export interface MockLocalmost {
     getRepos: jest.Mock;
     getOrgs: jest.Mock;
     onDeviceCode: jest.Mock;
+    searchUsers: jest.Mock;
   };
   runner: {
     isDownloaded: jest.Mock;
@@ -67,6 +68,7 @@ const mockLocalmost: MockLocalmost = {
     getRepos: jest.fn().mockResolvedValue({ success: true, repos: [] }),
     getOrgs: jest.fn().mockResolvedValue({ success: true, orgs: [] }),
     onDeviceCode: jest.fn().mockReturnValue(() => {}),
+    searchUsers: jest.fn().mockResolvedValue({ success: true, users: [] }),
   },
   runner: {
     isDownloaded: jest.fn().mockResolvedValue(false),

@@ -200,9 +200,8 @@ describe('ErrorBoundary', () => {
       // Click to expand details
       fireEvent.click(screen.getByText('Technical details (for developers)'));
 
-      // Component stack should be visible in the error-stack element
-      const errorStack = document.querySelector('.error-stack');
-      expect(errorStack).toBeInTheDocument();
+      // Component stack should be visible - look for ThrowError in the stack
+      expect(screen.getByText(/ThrowError/)).toBeInTheDocument();
     });
 
     it('should be collapsible details section', () => {

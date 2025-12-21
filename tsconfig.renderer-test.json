@@ -4,6 +4,6 @@
     "types": ["jest", "@testing-library/jest-dom", "node"],
     "rootDir": "."
   },
-  "include": ["src/renderer/**/*", "src/shared/**/*", "test/**/*"],
+  "include": ["src/renderer/**/*", "src/shared/**/*", "src/css-modules.d.ts", "test/**/*"],
   "exclude": ["node_modules", "dist", ".webpack", "src/main/**/*"]
 }
