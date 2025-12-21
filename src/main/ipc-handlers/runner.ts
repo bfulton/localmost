@@ -290,24 +290,16 @@ export const registerRunnerHandlers = (): void => {
       // Start heartbeat when runner starts
       if (heartbeatManager && authState?.accessToken && githubAuth) {
         const config = loadConfig();
-        // Use first target for heartbeat
+        // Set up heartbeat for all configured targets
         const targets = config.targets || [];
-        const firstTarget = targets[0];
+        const heartbeatTargets = targets.map(t =>
+          t.type === 'org'
+            ? { level: 'org' as const, org: t.owner }
+            : { level: 'repo' as const, owner: t.owner, repo: t.repo! }
+        );
 
-        if (firstTarget) {
-          // Set up heartbeat target from first configured target
-          if (firstTarget.type === 'org') {
-            heartbeatManager.setTarget({
-              level: 'org',
-              org: firstTarget.owner,
-            });
-          } else {
-            heartbeatManager.setTarget({
-              level: 'repo',
-              owner: firstTarget.owner,
-              repo: firstTarget.repo!,
-            });
-          }
+        if (heartbeatTargets.length > 0) {
+          heartbeatManager.setTargets(heartbeatTargets);
 
           // Set up API callbacks with automatic token refresh on auth errors
           heartbeatManager.setApiCallbacks({

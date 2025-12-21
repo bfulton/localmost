@@ -1,15 +1,17 @@
 /**
- * HeartbeatManager - Manages a GitHub Actions variable that serves as a heartbeat
+ * HeartbeatManager - Manages GitHub Actions variables that serve as heartbeats
  * to indicate that the localmost runner is online and available.
  *
  * Instead of requiring a token and API permissions to check runner status,
  * workflows can simply read the LOCALMOST_HEARTBEAT variable and check if
  * the timestamp is recent (less than ~90 seconds old).
+ *
+ * Supports multiple targets - updates heartbeat for all configured repos/orgs.
  */
 
 import { HEARTBEAT_INTERVAL_MS, HEARTBEAT_VARIABLE_NAME } from '../shared/constants';
 
-/** Configuration for the target repo or org */
+/** Configuration for a target repo or org */
 export interface HeartbeatTarget {
   level: 'repo' | 'org';
   owner?: string;  // For repo level
@@ -19,7 +21,7 @@ export interface HeartbeatTarget {
 
 export class HeartbeatManager {
   private intervalId: NodeJS.Timeout | null = null;
-  private target: HeartbeatTarget | null = null;
+  private targets: HeartbeatTarget[] = [];
   private runnerName: string | null = null;
   private onLog?: (level: 'info' | 'error' | 'warn', message: string) => void;
 
@@ -52,18 +54,18 @@ export class HeartbeatManager {
   }
 
   /**
-   * Set the target repo or org for the heartbeat.
+   * Set all targets for the heartbeat.
    */
-  setTarget(target: HeartbeatTarget): void {
-    this.target = target;
+  setTargets(targets: HeartbeatTarget[]): void {
+    this.targets = targets;
   }
 
   /**
-   * Start the heartbeat - updates the variable every HEARTBEAT_INTERVAL_MS.
+   * Start the heartbeat - updates the variable every HEARTBEAT_INTERVAL_MS for all targets.
    */
   async start(): Promise<boolean> {
-    if (!this.target) {
-      this.log('error', 'Cannot start heartbeat: no target configured');
+    if (this.targets.length === 0) {
+      this.log('info', 'No targets configured, heartbeat not started');
       return false;
     }
 
@@ -75,12 +77,8 @@ export class HeartbeatManager {
     // Stop any existing heartbeat
     this.stop();
 
-    // Try initial update (but don't fail if it doesn't work)
-    try {
-      await this.updateHeartbeat();
-    } catch (error) {
-      this.log('warn', `Initial heartbeat failed: ${(error as Error).message}`);
-    }
+    // Try initial update for all targets (but don't fail if some don't work)
+    await this.updateAllHeartbeats();
 
     // Set up periodic updates - keep trying even if initial failed.
     // Note: We intentionally don't add retry logic here. If an update fails,
@@ -89,14 +87,10 @@ export class HeartbeatManager {
     // during outages. The 60s/90s heartbeat window already provides tolerance
     // for occasional failures.
     this.intervalId = setInterval(async () => {
-      try {
-        await this.updateHeartbeat();
-      } catch (error) {
-        this.log('warn', `Heartbeat update failed: ${(error as Error).message}`);
-      }
+      await this.updateAllHeartbeats();
     }, HEARTBEAT_INTERVAL_MS);
 
-    this.log('info', 'Heartbeat started');
+    this.log('info', `Heartbeat started for ${this.targets.length} target(s)`);
     return true;
   }
 
@@ -112,11 +106,11 @@ export class HeartbeatManager {
   }
 
   /**
-   * Clear the heartbeat by setting it to a stale timestamp.
+   * Clear all heartbeats by setting them to a stale timestamp.
    * This prevents workflows from dispatching jobs to orphaned runners.
    */
   async clear(): Promise<void> {
-    if (!this.target) {
+    if (this.targets.length === 0) {
       return;
     }
 
@@ -127,16 +121,18 @@ export class HeartbeatManager {
     // Use epoch timestamp to indicate runner is offline
     const staleTimestamp = '1970-01-01T00:00:00Z';
 
-    try {
-      if (this.target.level === 'org' && this.target.org) {
-        await this.setOrgVariable(this.target.org, HEARTBEAT_VARIABLE_NAME, staleTimestamp);
-        this.log('info', `Cleared heartbeat for org ${this.target.org}`);
-      } else if (this.target.level === 'repo' && this.target.owner && this.target.repo) {
-        await this.setRepoVariable(this.target.owner, this.target.repo, HEARTBEAT_VARIABLE_NAME, staleTimestamp);
-        this.log('info', `Cleared heartbeat for ${this.target.owner}/${this.target.repo}`);
+    for (const target of this.targets) {
+      try {
+        if (target.level === 'org' && target.org) {
+          await this.setOrgVariable(target.org, HEARTBEAT_VARIABLE_NAME, staleTimestamp);
+          this.log('info', `Cleared heartbeat for org ${target.org}`);
+        } else if (target.level === 'repo' && target.owner && target.repo) {
+          await this.setRepoVariable(target.owner, target.repo, HEARTBEAT_VARIABLE_NAME, staleTimestamp);
+          this.log('info', `Cleared heartbeat for ${target.owner}/${target.repo}`);
+        }
+      } catch (error) {
+        this.log('warn', `Failed to clear heartbeat for ${this.targetName(target)}: ${(error as Error).message}`);
       }
-    } catch (error) {
-      this.log('warn', `Failed to clear heartbeat: ${(error as Error).message}`);
     }
   }
 
@@ -148,24 +144,45 @@ export class HeartbeatManager {
   }
 
   /**
-   * Update the heartbeat variable with the current timestamp.
+   * Update heartbeat for all targets.
    */
-  private async updateHeartbeat(): Promise<void> {
-    if (!this.target) {
-      throw new Error('No target configured');
-    }
-
+  private async updateAllHeartbeats(): Promise<void> {
     const timestamp = new Date().toISOString();
 
-    if (this.target.level === 'org' && this.target.org) {
-      await this.setOrgVariable!(this.target.org, HEARTBEAT_VARIABLE_NAME, timestamp);
-      this.log('info', `Updated heartbeat for org ${this.target.org}`);
-    } else if (this.target.level === 'repo' && this.target.owner && this.target.repo) {
-      await this.setRepoVariable!(this.target.owner, this.target.repo, HEARTBEAT_VARIABLE_NAME, timestamp);
-      this.log('info', `Updated heartbeat for ${this.target.owner}/${this.target.repo}`);
+    for (const target of this.targets) {
+      try {
+        await this.updateHeartbeat(target, timestamp);
+      } catch (error) {
+        this.log('warn', `Heartbeat failed for ${this.targetName(target)}: ${(error as Error).message}`);
+      }
+    }
+  }
+
+  /**
+   * Update the heartbeat variable for a single target.
+   */
+  private async updateHeartbeat(target: HeartbeatTarget, timestamp: string): Promise<void> {
+    if (target.level === 'org' && target.org) {
+      await this.setOrgVariable!(target.org, HEARTBEAT_VARIABLE_NAME, timestamp);
+      this.log('info', `Heartbeat updated for org:${target.org}`);
+    } else if (target.level === 'repo' && target.owner && target.repo) {
+      await this.setRepoVariable!(target.owner, target.repo, HEARTBEAT_VARIABLE_NAME, timestamp);
+      this.log('info', `Heartbeat updated for ${target.owner}/${target.repo}`);
     } else {
       throw new Error('Invalid target configuration');
     }
+  }
+
+  /**
+   * Get a display name for a target.
+   */
+  private targetName(target: HeartbeatTarget): string {
+    if (target.level === 'org' && target.org) {
+      return `org:${target.org}`;
+    } else if (target.level === 'repo' && target.owner && target.repo) {
+      return `${target.owner}/${target.repo}`;
+    }
+    return 'unknown';
   }
 
   private log(level: 'info' | 'error' | 'warn', message: string): void {
