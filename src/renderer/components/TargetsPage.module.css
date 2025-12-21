@@ -12,6 +12,7 @@
   flex: 1;
   overflow-y: auto;
   padding-right: 0.5rem;
+  padding-bottom: 220px; /* Room for search dropdown */
 }
 
 .section {
