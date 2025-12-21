@@ -20,6 +20,14 @@ const TargetsPage: React.FC<TargetsPageProps> = ({ onBack }) => {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Pending targets (being registered)
+  interface PendingTarget {
+    id: string;
+    type: 'repo' | 'org';
+    displayName: string;
+  }
+  const [pendingTargets, setPendingTargets] = useState<PendingTarget[]>([]);
+
   // Add form state
   const [addType, setAddType] = useState<'repo' | 'org'>('repo');
   const [searchQuery, setSearchQuery] = useState('');
@@ -58,8 +66,16 @@ const TargetsPage: React.FC<TargetsPageProps> = ({ onBack }) => {
 
   // Add a target
   const handleAddTarget = async (type: 'repo' | 'org', owner: string, repo?: string) => {
-    setIsLoading(true);
     setError(null);
+
+    // Create pending target to show immediately
+    const displayName = type === 'org' ? owner : `${owner}/${repo}`;
+    const pendingId = `pending-${Date.now()}`;
+    const pending: PendingTarget = { id: pendingId, type, displayName };
+
+    setPendingTargets(prev => [...prev, pending]);
+    setSearchQuery('');
+    setShowResults(false);
 
     try {
       const result = await window.localmost.targets.add(type, owner, repo);
@@ -67,15 +83,14 @@ const TargetsPage: React.FC<TargetsPageProps> = ({ onBack }) => {
         if (result.data) {
           setTargets(prev => [...prev, result.data!]);
         }
-        setSearchQuery('');
-        setShowResults(false);
       } else {
         setError(result.error);
       }
     } catch (err) {
       setError((err as Error).message);
     } finally {
-      setIsLoading(false);
+      // Remove from pending
+      setPendingTargets(prev => prev.filter(p => p.id !== pendingId));
     }
   };
 
@@ -145,13 +160,35 @@ const TargetsPage: React.FC<TargetsPageProps> = ({ onBack }) => {
         {/* Current targets */}
         <section className={styles.section}>
           <h3>Registered Targets</h3>
-          {targets.length === 0 ? (
+          {targets.length === 0 && pendingTargets.length === 0 ? (
             <div className={styles.emptyState}>
               <p>No targets configured yet.</p>
               <p>Add a repository or organization below to start receiving jobs.</p>
             </div>
           ) : (
             <div className={styles.targetList}>
+              {/* Pending targets (registering) */}
+              {pendingTargets.map(pending => (
+                <div key={pending.id} className={`${styles.targetItem} ${styles.targetItemPending}`}>
+                  <div className={styles.targetInfo}>
+                    <div className={styles.targetIcon}>
+                      <FontAwesomeIcon icon={pending.type === 'org' ? faBuilding : faBook} />
+                    </div>
+                    <div className={styles.targetDetails}>
+                      <div className={styles.targetName}>{pending.displayName}</div>
+                      <div className={styles.targetMeta}>
+                        <span>{pending.type === 'org' ? 'Organization' : 'Repository'}</span>
+                        <span className={styles.targetStatus}>
+                          <span className={styles.statusDot} data-status="pending" />
+                          Registering...
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+
+              {/* Registered targets */}
               {targets.map(target => {
                 const status = getTargetStatus(target.id);
                 const statusType = status?.error ? 'error' : status?.sessionActive ? 'active' : 'inactive';
