@@ -140,7 +140,9 @@ describe('StatusPage', () => {
       expect(screen.getByText('Logs')).toBeInTheDocument();
     });
 
-    const logsHeader = screen.getByText('Logs').closest('.logs-header');
+    // Click on the Logs heading to expand the logs panel
+    const logsHeading = screen.getByRole('heading', { name: /Logs/ });
+    const logsHeader = logsHeading.parentElement;
     if (logsHeader) {
       fireEvent.click(logsHeader);
     }

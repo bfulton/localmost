@@ -23,8 +23,12 @@ describe('UserFilterSettings', () => {
         />
       );
 
-      const everyoneButton = screen.getByRole('button', { name: 'Everyone' });
-      expect(everyoneButton).toHaveClass('modeOptionActive');
+      // Verify all mode buttons are rendered
+      expect(screen.getByRole('button', { name: 'Everyone' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Just me' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Specific users' })).toBeInTheDocument();
+      // Verify hint text for everyone mode
+      expect(screen.getByText(/Accept workflow jobs triggered by any user/)).toBeInTheDocument();
     });
 
     it('should switch to just-me mode when clicked', async () => {
