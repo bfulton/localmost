@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
-import { GitHubUser, GitHubRepo, GitHubOrg, RunnerState, JobHistoryEntry, DownloadProgress, DeviceCodeInfo, RunnerRelease } from '../../shared/types';
+import { GitHubUser, GitHubRepo, GitHubOrg, RunnerState, JobHistoryEntry, DownloadProgress, DeviceCodeInfo, RunnerRelease, Target } from '../../shared/types';
 
 interface RunnerConfig {
   level: 'repo' | 'org';
@@ -39,6 +39,10 @@ interface RunnerContextValue {
   updateRunnerConfig: (updates: Partial<RunnerConfig>) => Promise<void>;
   configureRunner: () => Promise<{ success: boolean; error?: string }>;
   runnerDisplayName: string | null;
+
+  // Targets
+  targets: Target[];
+  refreshTargets: () => Promise<void>;
 
   // Runner status
   runnerState: RunnerState;
@@ -86,6 +90,9 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
     runnerCount: 4,
   });
   const [runnerDisplayName, setRunnerDisplayName] = useState<string | null>(null);
+
+  // Targets
+  const [targets, setTargets] = useState<Target[]>([]);
 
   // Runner status
   const [runnerState, setRunnerState] = useState<RunnerState>({ status: 'offline' });
@@ -155,6 +162,10 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
         // Get initial job history
         const history = await window.localmost.jobs.getHistory();
         setJobHistory(history);
+
+        // Load targets
+        const loadedTargets = await window.localmost.targets.list();
+        setTargets(loadedTargets);
       } catch (err) {
         setError(`Failed to load runner state: ${(err as Error).message}`);
       } finally {
@@ -224,6 +235,11 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
 
   const refreshReposAndOrgs = useCallback(async () => {
     await loadReposAndOrgs();
+  }, []);
+
+  const refreshTargets = useCallback(async () => {
+    const loadedTargets = await window.localmost.targets.list();
+    setTargets(loadedTargets);
   }, []);
 
   const login = useCallback(async () => {
@@ -336,6 +352,8 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
     updateRunnerConfig,
     configureRunner,
     runnerDisplayName,
+    targets,
+    refreshTargets,
     runnerState,
     jobHistory,
     isLoading,

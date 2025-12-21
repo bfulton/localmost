@@ -59,6 +59,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     isConfigured,
     runnerConfig,
     updateRunnerConfig,
+    targets,
     isInitialLoading,
     error,
     setError,
@@ -317,9 +318,17 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
                 >
                   Manage Targets
                 </button>
-                <p className={shared.formHint}>
-                  Add repositories or organizations to receive jobs from.
-                </p>
+                {targets.length > 0 ? (
+                  <p className={shared.formHint}>
+                    {targets.length === 1
+                      ? `${targets[0].type}: ${targets[0].displayName}`
+                      : `${targets.length} targets: ${targets.map(t => t.displayName).join(', ')}`}
+                  </p>
+                ) : (
+                  <p className={shared.formHint}>
+                    Add repositories or organizations to receive jobs from.
+                  </p>
+                )}
               </div>
             )}
 
