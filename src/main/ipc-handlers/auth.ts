@@ -138,26 +138,16 @@ export const registerAuthHandlers = (): void => {
     return { success: true };
   });
 
-  // Get user repos
+  // Get repos where the GitHub App is installed
   ipcMain.handle(IPC_CHANNELS.GITHUB_GET_REPOS, async (): Promise<{ success: boolean; repos?: GitHubRepo[]; error?: string }> => {
     const accessToken = await getValidAccessToken();
-    if (!accessToken) {
+    const githubAuth = getGitHubAuth();
+    if (!accessToken || !githubAuth) {
       return { success: false, error: 'Not authenticated' };
     }
 
     try {
-      const response = await fetch('https://api.github.com/user/repos?per_page=100&sort=updated', {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: 'application/vnd.github.v3+json',
-        },
-      });
-
-      if (!response.ok) {
-        throw new Error(`Failed to fetch repos: ${response.status}`);
-      }
-
-      const repos = await response.json();
+      const repos = await githubAuth.getInstalledRepos(accessToken);
       return { success: true, repos };
     } catch (error) {
       const { userMessage, technicalDetails } = toUserError(error, 'Fetching repositories');

@@ -442,6 +442,55 @@ export class GitHubAuth {
   }
 
   /**
+   * Get repositories where the GitHub App is installed.
+   * This returns only repos the App has access to, not all user repos.
+   */
+  async getInstalledRepos(accessToken: string): Promise<Array<{
+    id: number;
+    name: string;
+    full_name: string;
+    owner: { login: string; avatar_url: string };
+    private: boolean;
+    html_url: string;
+  }>> {
+    const installations = await this.getInstallations(accessToken);
+    const client = new GitHubClient(accessToken);
+    const allRepos: Array<{
+      id: number;
+      name: string;
+      full_name: string;
+      owner: { login: string; avatar_url: string };
+      private: boolean;
+      html_url: string;
+    }> = [];
+
+    // Fetch repos from each installation
+    for (const installation of installations) {
+      try {
+        const data = await client.get<{
+          repositories: Array<{
+            id: number;
+            name: string;
+            full_name: string;
+            owner: { login: string; avatar_url: string };
+            private: boolean;
+            html_url: string;
+          }>;
+        }>(`/user/installations/${installation.id}/repositories?per_page=100`);
+
+        if (data.repositories) {
+          allRepos.push(...data.repositories);
+        }
+      } catch (error) {
+        // Log but continue - one installation failing shouldn't break all
+        console.error(`Failed to fetch repos for installation ${installation.id}: ${(error as Error).message}`);
+      }
+    }
+
+    return allRepos;
+  }
+
+  /**
    * Create or update a repository variable.
    * Variables are plaintext and readable in workflows without special permissions.
    */
