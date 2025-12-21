@@ -149,7 +149,6 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection }) 
           <h3>Startup</h3>
           <div className={shared.formGroup}>
             <label className={shared.toggleRow}>
-              <span>Start localmost when you sign in</span>
               <input
                 type="checkbox"
                 checked={launchAtLogin}
@@ -159,11 +158,11 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection }) 
                   window.localmost.settings.set({ launchAtLogin: value });
                 }}
               />
+              <span>Start localmost when you sign in</span>
             </label>
           </div>
           <div className={shared.formGroup}>
             <label className={shared.toggleRow}>
-              <span>Hide localmost when it starts</span>
               <input
                 type="checkbox"
                 checked={hideOnStart}
@@ -173,6 +172,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection }) 
                   window.localmost.settings.set({ hideOnStart: value });
                 }}
               />
+              <span>Hide localmost when it starts</span>
             </label>
           </div>
         </section>
