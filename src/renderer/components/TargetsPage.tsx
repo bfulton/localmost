@@ -11,12 +11,10 @@ interface TargetsPageProps {
 }
 
 const TargetsPage: React.FC<TargetsPageProps> = ({ onBack }) => {
-  const { repos, orgs } = useRunner();
+  const { repos, orgs, targets, refreshTargets } = useRunner();
 
   // State
-  const [targets, setTargets] = useState<Target[]>([]);
   const [targetStatus, setTargetStatus] = useState<RunnerProxyStatus[]>([]);
-  const [maxConcurrentJobs, setMaxConcurrentJobs] = useState(4);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -33,23 +31,17 @@ const TargetsPage: React.FC<TargetsPageProps> = ({ onBack }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [showResults, setShowResults] = useState(false);
 
-  // Load targets on mount
+  // Load status on mount
   useEffect(() => {
-    const loadTargets = async () => {
+    const loadStatus = async () => {
       try {
-        const loadedTargets = await window.localmost.targets.list();
-        setTargets(loadedTargets);
-
         const status = await window.localmost.targets.getStatus();
         setTargetStatus(status);
-
-        const settings = await window.localmost.settings.get();
-        setMaxConcurrentJobs((settings.maxConcurrentJobs as number) ?? 4);
       } catch (err) {
         setError((err as Error).message);
       }
     };
-    loadTargets();
+    loadStatus();
 
     // Subscribe to status updates
     const unsubscribe = window.localmost.targets.onStatusUpdate((status) => {
@@ -80,9 +72,7 @@ const TargetsPage: React.FC<TargetsPageProps> = ({ onBack }) => {
     try {
       const result = await window.localmost.targets.add(type, owner, repo);
       if (result.success) {
-        if (result.data) {
-          setTargets(prev => [...prev, result.data!]);
-        }
+        await refreshTargets();
       } else {
         setError(result.error);
       }
@@ -109,7 +99,7 @@ const TargetsPage: React.FC<TargetsPageProps> = ({ onBack }) => {
     try {
       const result = await window.localmost.targets.remove(targetId);
       if (result.success) {
-        setTargets(prev => prev.filter(t => t.id !== targetId));
+        await refreshTargets();
       } else {
         setError(result.error);
       }
@@ -118,12 +108,6 @@ const TargetsPage: React.FC<TargetsPageProps> = ({ onBack }) => {
     } finally {
       setIsLoading(false);
     }
-  };
-
-  // Update max concurrent jobs
-  const handleMaxJobsChange = async (value: number) => {
-    setMaxConcurrentJobs(value);
-    await window.localmost.settings.set({ maxConcurrentJobs: value });
   };
 
   // Filter repos/orgs based on search
@@ -329,28 +313,6 @@ const TargetsPage: React.FC<TargetsPageProps> = ({ onBack }) => {
           </div>
         </section>
 
-        {/* Concurrency setting */}
-        <section className={styles.section}>
-          <h3>Concurrency</h3>
-          <div className={shared.formGroup}>
-            <label>Maximum concurrent jobs</label>
-            <div className={styles.concurrencyControl}>
-              <input
-                type="range"
-                min="1"
-                max="16"
-                value={maxConcurrentJobs}
-                onChange={(e) => handleMaxJobsChange(parseInt(e.target.value, 10))}
-              />
-              <span className={styles.concurrencyValue}>
-                {maxConcurrentJobs} job{maxConcurrentJobs !== 1 ? 's' : ''}
-              </span>
-            </div>
-            <p className={shared.formHint}>
-              Jobs from all targets share this pool. More concurrent jobs uses more CPU and memory.
-            </p>
-          </div>
-        </section>
       </div>
     </div>
   );

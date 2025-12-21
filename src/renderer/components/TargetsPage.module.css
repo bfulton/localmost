@@ -246,19 +246,3 @@
   margin-left: auto;
 }
 
-/* Concurrency slider */
-.concurrencyControl {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-}
-
-.concurrencyControl input[type="range"] {
-  flex: 1;
-}
-
-.concurrencyValue {
-  min-width: 80px;
-  text-align: right;
-  font-variant-numeric: tabular-nums;
-}
