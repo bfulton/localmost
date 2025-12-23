@@ -84,3 +84,11 @@ export function getJobHistoryPath(): string {
 export function getLogsDir(): string {
   return path.join(getAppDataDir(), 'logs');
 }
+
+/**
+ * Get the CLI socket path.
+ * Used for communication between CLI and running app.
+ */
+export function getCliSocketPath(): string {
+  return path.join(getAppDataDir(), 'localmost.sock');
+}

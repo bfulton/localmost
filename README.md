@@ -138,6 +138,32 @@ localmost uses OAuth device flow authentication. Your access token is:
 - Scoped only to the repositories you explicitly grant access to
 - Revocable at any time from your GitHub settings
 
+## CLI Companion
+
+localmost includes a command-line interface for controlling the app from your terminal:
+
+```bash
+# Check runner status
+localmost status
+
+# Pause the runner (stops accepting new jobs)
+localmost pause
+
+# Resume the runner
+localmost resume
+
+# View recent job history
+localmost jobs
+```
+
+To install the CLI globally after building:
+
+```bash
+npm link
+```
+
+The CLI communicates with the running localmost app via a Unix socket. The app must be running for CLI commands to work.
+
 ## Development
 
 Built with Electron + React/TypeScript. Requires Node.js 18+.
@@ -166,7 +192,6 @@ Future feature ideas:
 - **Resource-aware scheduling** - Pause runners when on battery or during video calls.
 - **Quick actions** - Re-run failed job, cancel all jobs.
 - **Notifications** - Native macOS notifications for job completion/failure.
-- **CLI companion** - `localmost status`, `localmost pause` from terminal.
 - **Deep links** - Jump directly to job logs in GitHub.
 - **Audit logging** - Detailed logs of what each job accessed.
 - **Network policy customization** - User-defined network allowlists per repo.

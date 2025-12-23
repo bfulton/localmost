@@ -1,0 +1,272 @@
+#!/usr/bin/env node
+/**
+ * localmost CLI companion
+ *
+ * Commands:
+ *   localmost status  - Show runner status
+ *   localmost pause   - Pause the runner
+ *   localmost resume  - Resume the runner
+ *   localmost jobs    - Show recent job history
+ */
+
+import * as net from 'net';
+import * as fs from 'fs';
+import { getCliSocketPath } from '../shared/paths';
+
+interface CliRequest {
+  command: 'status' | 'pause' | 'resume' | 'jobs';
+}
+
+interface RunnerState {
+  status: 'idle' | 'starting' | 'running' | 'busy' | 'offline' | 'error';
+  jobName?: string;
+  repository?: string;
+  startedAt?: string;
+}
+
+interface JobHistoryEntry {
+  id: string;
+  jobName: string;
+  repository: string;
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  startedAt: string;
+  completedAt?: string;
+  runTimeSeconds?: number;
+  actionsUrl?: string;
+}
+
+interface StatusResponse {
+  success: true;
+  command: 'status';
+  data: {
+    runner: RunnerState;
+    runnerName: string;
+    heartbeat: { isRunning: boolean };
+    authenticated: boolean;
+    userName?: string;
+  };
+}
+
+interface JobsResponse {
+  success: true;
+  command: 'jobs';
+  data: { jobs: JobHistoryEntry[] };
+}
+
+interface ActionResponse {
+  success: true;
+  command: 'pause' | 'resume';
+  message: string;
+}
+
+interface ErrorResponse {
+  success: false;
+  error: string;
+}
+
+type CliResponse = StatusResponse | JobsResponse | ActionResponse | ErrorResponse;
+
+const HELP_TEXT = `
+localmost - CLI companion for localmost app
+
+USAGE:
+  localmost <command>
+
+COMMANDS:
+  status    Show current runner status
+  pause     Pause the runner (stops accepting jobs)
+  resume    Resume the runner (start accepting jobs)
+  jobs      Show recent job history
+  help      Show this help message
+
+EXAMPLES:
+  localmost status
+  localmost pause
+  localmost resume
+  localmost jobs
+
+NOTE:
+  The localmost app must be running for CLI commands to work.
+`;
+
+function printHelp(): void {
+  console.log(HELP_TEXT.trim());
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  if (minutes < 60) return `${minutes}m ${secs}s`;
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  return `${hours}h ${mins}m`;
+}
+
+function formatTimestamp(isoString: string): string {
+  const date = new Date(isoString);
+  return date.toLocaleString();
+}
+
+function getStatusIcon(status: string): string {
+  switch (status) {
+    case 'running': return '\u2713'; // checkmark
+    case 'busy': return '\u25CF';    // filled circle
+    case 'starting': return '\u25CB'; // empty circle
+    case 'idle': return '\u25CB';    // empty circle
+    case 'offline': return '\u25CB'; // empty circle
+    case 'error': return '\u2717';   // x mark
+    case 'completed': return '\u2713';
+    case 'failed': return '\u2717';
+    case 'cancelled': return '-';
+    default: return '?';
+  }
+}
+
+function printStatus(response: StatusResponse): void {
+  const { runner, runnerName, heartbeat, authenticated, userName } = response.data;
+
+  console.log(`\nRunner: ${runnerName}`);
+  console.log(`Status: ${getStatusIcon(runner.status)} ${runner.status}`);
+
+  if (runner.status === 'busy' && runner.jobName) {
+    console.log(`Job:    ${runner.jobName}`);
+  }
+
+  if (runner.startedAt) {
+    console.log(`Uptime: started ${formatTimestamp(runner.startedAt)}`);
+  }
+
+  console.log(`\nHeartbeat: ${heartbeat.isRunning ? 'active' : 'inactive'}`);
+
+  if (authenticated) {
+    console.log(`GitHub:    authenticated as ${userName || 'unknown'}`);
+  } else {
+    console.log(`GitHub:    not authenticated`);
+  }
+
+  console.log();
+}
+
+function printJobs(response: JobsResponse): void {
+  const { jobs } = response.data;
+
+  if (jobs.length === 0) {
+    console.log('\nNo recent jobs.\n');
+    return;
+  }
+
+  console.log(`\nRecent jobs (${jobs.length}):\n`);
+
+  // Print in reverse order (most recent first)
+  const sortedJobs = [...jobs].reverse();
+
+  for (const job of sortedJobs) {
+    const icon = getStatusIcon(job.status);
+    const duration = job.runTimeSeconds ? formatDuration(job.runTimeSeconds) : '-';
+    const time = formatTimestamp(job.startedAt);
+
+    console.log(`  ${icon} ${job.jobName}`);
+    console.log(`    Status:   ${job.status}`);
+    console.log(`    Duration: ${duration}`);
+    console.log(`    Started:  ${time}`);
+    if (job.actionsUrl) {
+      console.log(`    URL:      ${job.actionsUrl}`);
+    }
+    console.log();
+  }
+}
+
+async function sendCommand(command: CliRequest['command']): Promise<CliResponse> {
+  const socketPath = getCliSocketPath();
+
+  if (!fs.existsSync(socketPath)) {
+    throw new Error('localmost app is not running (socket not found)');
+  }
+
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(socketPath, () => {
+      const request: CliRequest = { command };
+      socket.write(JSON.stringify(request) + '\n');
+    });
+
+    let buffer = '';
+
+    socket.on('data', (data) => {
+      buffer += data.toString();
+
+      const lines = buffer.split('\n');
+      for (const line of lines) {
+        if (line.trim()) {
+          try {
+            const response = JSON.parse(line) as CliResponse;
+            socket.end();
+            resolve(response);
+            return;
+          } catch {
+            // Not complete JSON yet
+          }
+        }
+      }
+    });
+
+    socket.on('error', (err) => {
+      if ((err as NodeJS.ErrnoException).code === 'ECONNREFUSED') {
+        reject(new Error('localmost app is not running (connection refused)'));
+      } else if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        reject(new Error('localmost app is not running (socket not found)'));
+      } else {
+        reject(err);
+      }
+    });
+
+    socket.setTimeout(5000, () => {
+      socket.destroy();
+      reject(new Error('Connection timed out'));
+    });
+  });
+}
+
+async function main(): Promise<void> {
+  const args = process.argv.slice(2);
+
+  if (args.length === 0 || args[0] === 'help' || args[0] === '--help' || args[0] === '-h') {
+    printHelp();
+    process.exit(0);
+  }
+
+  const command = args[0];
+
+  if (!['status', 'pause', 'resume', 'jobs'].includes(command)) {
+    console.error(`Unknown command: ${command}`);
+    console.error('Run "localmost help" for usage information.');
+    process.exit(1);
+  }
+
+  try {
+    const response = await sendCommand(command as CliRequest['command']);
+
+    if (!response.success) {
+      console.error(`Error: ${response.error}`);
+      process.exit(1);
+    }
+
+    switch (response.command) {
+      case 'status':
+        printStatus(response as StatusResponse);
+        break;
+      case 'jobs':
+        printJobs(response as JobsResponse);
+        break;
+      case 'pause':
+      case 'resume':
+        console.log((response as ActionResponse).message);
+        break;
+    }
+  } catch (err) {
+    console.error(`Error: ${(err as Error).message}`);
+    process.exit(1);
+  }
+}
+
+main();
