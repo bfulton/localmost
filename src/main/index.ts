@@ -55,12 +55,17 @@ import { initTray } from './tray-init';
 // IPC handlers
 import { setupIpcHandlers } from './ipc-handlers';
 
+// Auto-updater
+import { initAutoUpdater, checkForUpdates } from './auto-updater';
+
 // Constants
 import {
   TOKEN_REFRESH_INTERVAL_MS,
   TOKEN_REFRESH_WINDOW_MS,
   AUTO_START_DELAY_MS,
+  UPDATE_CHECK_DELAY_MS,
 } from '../shared/constants';
+import { UpdateSettings } from '../shared/types';
 import { IPC_CHANNELS, SleepProtection, LogLevel } from '../shared/types';
 
 // ============================================================================
@@ -202,6 +207,23 @@ app.whenReady().then(async () => {
   initTray();
   setDockIcon();
   setupIpcHandlers();
+
+  // Initialize auto-updater
+  const mainWindow = getMainWindow();
+  if (mainWindow) {
+    initAutoUpdater(mainWindow);
+
+    // Check for updates on startup (if enabled in settings)
+    const updateSettings = config.updateSettings as UpdateSettings | undefined;
+    if (updateSettings?.autoCheck !== false) {
+      setTimeout(() => {
+        logger?.info('Checking for updates...');
+        checkForUpdates().catch((err) => {
+          logger?.warn(`Update check failed: ${(err as Error).message}`);
+        });
+      }, UPDATE_CHECK_DELAY_MS);
+    }
+  }
 
   // Always launch with visible UI so users see the app is running
 

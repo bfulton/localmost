@@ -14,6 +14,7 @@ import {
   JobHistoryEntry,
   HeartbeatStatus,
   GitHubUserSearchResult,
+  UpdateStatus,
 } from '../shared/types';
 
 // Expose protected methods to the renderer process
@@ -117,6 +118,19 @@ contextBridge.exposeInMainWorld('localmost', {
       return () => ipcRenderer.removeListener(IPC_CHANNELS.NETWORK_STATUS_CHANGED, handler);
     },
   },
+
+  // Auto-update
+  update: {
+    check: () => ipcRenderer.invoke(IPC_CHANNELS.UPDATE_CHECK),
+    download: () => ipcRenderer.invoke(IPC_CHANNELS.UPDATE_DOWNLOAD),
+    install: () => ipcRenderer.invoke(IPC_CHANNELS.UPDATE_INSTALL),
+    getStatus: () => ipcRenderer.invoke(IPC_CHANNELS.UPDATE_GET_STATUS),
+    onStatusChange: (callback: (status: UpdateStatus) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, status: UpdateStatus) => callback(status);
+      ipcRenderer.on(IPC_CHANNELS.UPDATE_STATUS, handler);
+      return () => ipcRenderer.removeListener(IPC_CHANNELS.UPDATE_STATUS, handler);
+    },
+  },
 });
 
 // Type declarations for the exposed API
@@ -176,6 +190,13 @@ export interface LocalmostAPI {
   network: {
     isOnline: () => Promise<boolean>;
     onStatusChange: (callback: (isOnline: boolean) => void) => () => void;
+  };
+  update: {
+    check: () => Promise<{ success: boolean; error?: string }>;
+    download: () => Promise<{ success: boolean; error?: string }>;
+    install: () => Promise<{ success: boolean; error?: string }>;
+    getStatus: () => Promise<UpdateStatus>;
+    onStatusChange: (callback: (status: UpdateStatus) => void) => () => void;
   };
 }
 

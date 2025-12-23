@@ -183,6 +183,13 @@ export const IPC_CHANNELS = {
   // Network status
   NETWORK_GET_STATUS: 'network:get-status',
   NETWORK_STATUS_CHANGED: 'network:status-changed',
+
+  // Auto-update
+  UPDATE_CHECK: 'update:check',
+  UPDATE_DOWNLOAD: 'update:download',
+  UPDATE_INSTALL: 'update:install',
+  UPDATE_GET_STATUS: 'update:get-status',
+  UPDATE_STATUS: 'update:status',
 } as const;
 
 export interface GitHubUser {
@@ -287,4 +294,39 @@ export interface GitHubUserSearchResult {
   login: string;
   avatar_url: string;
   name: string | null;
+}
+
+// =============================================================================
+// Auto-Update Types
+// =============================================================================
+
+/** Status of the auto-updater */
+export type UpdateStatusType =
+  | 'idle'
+  | 'checking'
+  | 'available'
+  | 'downloading'
+  | 'downloaded'
+  | 'error';
+
+/** Current state of the auto-updater */
+export interface UpdateStatus {
+  status: UpdateStatusType;
+  currentVersion: string;
+  availableVersion?: string;
+  releaseNotes?: string;
+  releaseDate?: string;
+  downloadProgress?: number;
+  bytesPerSecond?: number;
+  totalBytes?: number;
+  transferredBytes?: number;
+  error?: string;
+}
+
+/** User preferences for auto-updates */
+export interface UpdateSettings {
+  /** Whether to automatically check for updates on startup (default: true) */
+  autoCheck: boolean;
+  /** Hours between automatic update checks (default: 24) */
+  checkIntervalHours: number;
 }

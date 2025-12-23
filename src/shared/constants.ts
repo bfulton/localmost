@@ -116,3 +116,13 @@ export const MIN_JOB_HISTORY = 5;
 
 /** Maximum job history entries */
 export const MAX_JOB_HISTORY = 50;
+
+// =============================================================================
+// Auto-Update
+// =============================================================================
+
+/** Delay before checking for updates on app launch (ms) - 10 seconds */
+export const UPDATE_CHECK_DELAY_MS = 10 * 1000;
+
+/** Default update check interval (hours) */
+export const DEFAULT_UPDATE_CHECK_INTERVAL_HOURS = 24;

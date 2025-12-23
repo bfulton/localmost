@@ -49,6 +49,13 @@ export interface MockLocalmost {
   network: {
     isOnline: jest.Mock;
   };
+  update: {
+    check: jest.Mock;
+    download: jest.Mock;
+    install: jest.Mock;
+    getStatus: jest.Mock;
+    onStatusChange: jest.Mock;
+  };
 }
 
 // Extend Window interface for tests
@@ -106,6 +113,13 @@ const mockLocalmost: MockLocalmost = {
   },
   network: {
     isOnline: jest.fn().mockResolvedValue(true),
+  },
+  update: {
+    check: jest.fn().mockResolvedValue({ success: true }),
+    download: jest.fn().mockResolvedValue({ success: true }),
+    install: jest.fn().mockResolvedValue({ success: true }),
+    getStatus: jest.fn().mockResolvedValue({ status: 'idle', currentVersion: '0.1.1-alpha' }),
+    onStatusChange: jest.fn().mockReturnValue(() => {}),
   },
 };
 

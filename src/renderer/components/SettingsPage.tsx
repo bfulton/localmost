@@ -3,7 +3,7 @@ import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faXmark, faLightbulb, faMoon, faDesktop } from '@fortawesome/free-solid-svg-icons';
 import { SleepProtection } from '../../shared/types';
 import { GITHUB_APP_SETTINGS_URL, PRIVACY_POLICY_URL, REPOSITORY_URL } from '../../shared/constants';
-import { useAppConfig, useRunner } from '../contexts';
+import { useAppConfig, useRunner, useUpdate } from '../contexts';
 import UserFilterSettings from './UserFilterSettings';
 import styles from './SettingsPage.module.css';
 import shared from '../styles/shared.module.css';
@@ -64,6 +64,9 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection }) 
     error,
     setError,
   } = useRunner();
+
+  // Update state from context
+  const { status: updateStatus, settings: updateSettings, setSettings: setUpdateSettings, checkForUpdates, isChecking } = useUpdate();
 
   // Local UI state
   const [showSleepConsentDialog, setShowSleepConsentDialog] = useState(false);
@@ -601,6 +604,43 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection }) 
               <FontAwesomeIcon icon={faDesktop} />
               <span>Auto</span>
             </button>
+          </div>
+        </section>
+
+        {/* Updates Section */}
+        <section className={styles.settingsSection}>
+          <div className={styles.sectionHeaderRow}>
+            <h3>Updates</h3>
+            <span className={styles.versionLink}>v{updateStatus.currentVersion}</span>
+          </div>
+          <div className={shared.formGroup}>
+            <label className={shared.toggleRow}>
+              <input
+                type="checkbox"
+                checked={updateSettings.autoCheck}
+                onChange={(e) => setUpdateSettings({ ...updateSettings, autoCheck: e.target.checked })}
+              />
+              <span>Check for updates automatically</span>
+            </label>
+          </div>
+          <div className={styles.updateCheckRow}>
+            <button
+              className={shared.btnSecondary}
+              onClick={checkForUpdates}
+              disabled={isChecking}
+            >
+              {isChecking ? 'Checking...' : 'Check for Updates'}
+            </button>
+            {updateStatus.status === 'available' && (
+              <span className={styles.updateAvailable}>
+                Version {updateStatus.availableVersion} available
+              </span>
+            )}
+            {updateStatus.status === 'downloaded' && (
+              <span className={styles.updateReady}>
+                Update ready to install
+              </span>
+            )}
           </div>
         </section>
 
