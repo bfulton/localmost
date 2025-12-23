@@ -143,6 +143,10 @@ localmost uses OAuth device flow authentication. Your access token is:
 localmost includes a command-line interface for controlling the app from your terminal:
 
 ```bash
+# Start/stop the app
+localmost start
+localmost stop
+
 # Check runner status
 localmost status
 
@@ -156,13 +160,21 @@ localmost resume
 localmost jobs
 ```
 
-To install the CLI globally after building:
+### Installing the CLI
+
+After installing localmost.app, create a symlink to add the CLI to your PATH:
+
+```bash
+sudo ln -sf "/Applications/localmost.app/Contents/Resources/localmost-cli" /usr/local/bin/localmost
+```
+
+Or for development builds:
 
 ```bash
 npm link
 ```
 
-The CLI communicates with the running localmost app via a Unix socket. The app must be running for CLI commands to work.
+The CLI communicates with the running app via a Unix socket. Most commands require the app to be running - use `localmost start` to launch it first.
 
 ## Development
 

@@ -3,6 +3,8 @@
  * localmost CLI companion
  *
  * Commands:
+ *   localmost start   - Start the localmost app
+ *   localmost stop    - Stop the localmost app
  *   localmost status  - Show runner status
  *   localmost pause   - Pause the runner
  *   localmost resume  - Resume the runner
@@ -11,10 +13,12 @@
 
 import * as net from 'net';
 import * as fs from 'fs';
-import { getCliSocketPath } from '../shared/paths';
+import * as path from 'path';
+import { spawn } from 'child_process';
+import { getCliSocketPath, getAppDataDirWithoutElectron } from '../shared/paths';
 
 interface CliRequest {
-  command: 'status' | 'pause' | 'resume' | 'jobs';
+  command: 'status' | 'pause' | 'resume' | 'jobs' | 'quit';
 }
 
 interface RunnerState {
@@ -55,7 +59,7 @@ interface JobsResponse {
 
 interface ActionResponse {
   success: true;
-  command: 'pause' | 'resume';
+  command: 'pause' | 'resume' | 'quit';
   message: string;
 }
 
@@ -73,6 +77,8 @@ USAGE:
   localmost <command>
 
 COMMANDS:
+  start     Start the localmost app
+  stop      Stop the localmost app
   status    Show current runner status
   pause     Pause the runner (stops accepting jobs)
   resume    Resume the runner (start accepting jobs)
@@ -80,13 +86,14 @@ COMMANDS:
   help      Show this help message
 
 EXAMPLES:
+  localmost start
   localmost status
   localmost pause
-  localmost resume
-  localmost jobs
+  localmost stop
 
 NOTE:
-  The localmost app must be running for CLI commands to work.
+  Most commands require the localmost app to be running.
+  Use 'localmost start' to launch the app first.
 `;
 
 function printHelp(): void {
@@ -227,6 +234,105 @@ async function sendCommand(command: CliRequest['command']): Promise<CliResponse>
   });
 }
 
+/**
+ * Check if the app is running by testing socket connection.
+ */
+function isAppRunning(): boolean {
+  const socketPath = getCliSocketPath();
+  return fs.existsSync(socketPath);
+}
+
+/**
+ * Find the localmost app bundle path.
+ * Checks standard macOS installation locations.
+ */
+function findAppPath(): string | null {
+  const possiblePaths = [
+    '/Applications/localmost.app',
+    path.join(process.env.HOME || '', 'Applications', 'localmost.app'),
+    // Development build location
+    path.join(__dirname, '..', '..', 'out', 'localmost-darwin-arm64', 'localmost.app'),
+    path.join(__dirname, '..', '..', 'out', 'localmost-darwin-x64', 'localmost.app'),
+  ];
+
+  for (const appPath of possiblePaths) {
+    if (fs.existsSync(appPath)) {
+      return appPath;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Start the localmost app.
+ */
+async function startApp(): Promise<void> {
+  if (isAppRunning()) {
+    console.log('localmost is already running');
+    return;
+  }
+
+  const appPath = findAppPath();
+
+  if (!appPath) {
+    console.error('Error: Could not find localmost.app');
+    console.error('Please install localmost to /Applications or ~/Applications');
+    process.exit(1);
+  }
+
+  console.log('Starting localmost...');
+
+  // Use 'open' command on macOS to launch the app
+  const child = spawn('open', ['-a', appPath], {
+    detached: true,
+    stdio: 'ignore',
+  });
+
+  child.unref();
+
+  // Wait for the app to start (up to 10 seconds)
+  const maxWait = 10000;
+  const checkInterval = 500;
+  let waited = 0;
+
+  while (waited < maxWait) {
+    await new Promise((resolve) => setTimeout(resolve, checkInterval));
+    waited += checkInterval;
+
+    if (isAppRunning()) {
+      console.log('localmost started successfully');
+      return;
+    }
+  }
+
+  console.log('localmost is starting... (check the menu bar for the icon)');
+}
+
+/**
+ * Stop the localmost app.
+ */
+async function stopApp(): Promise<void> {
+  if (!isAppRunning()) {
+    console.log('localmost is not running');
+    return;
+  }
+
+  try {
+    const response = await sendCommand('quit');
+
+    if (!response.success) {
+      console.error(`Error: ${response.error}`);
+      process.exit(1);
+    }
+
+    console.log((response as ActionResponse).message);
+  } catch (err) {
+    console.error(`Error: ${(err as Error).message}`);
+    process.exit(1);
+  }
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
 
@@ -236,6 +342,18 @@ async function main(): Promise<void> {
   }
 
   const command = args[0];
+
+  // Handle start command separately (doesn't need socket)
+  if (command === 'start') {
+    await startApp();
+    process.exit(0);
+  }
+
+  // Handle stop command
+  if (command === 'stop') {
+    await stopApp();
+    process.exit(0);
+  }
 
   if (!['status', 'pause', 'resume', 'jobs'].includes(command)) {
     console.error(`Unknown command: ${command}`);

@@ -2,18 +2,19 @@
  * CLI Server - Unix domain socket server for CLI communication.
  *
  * Enables the CLI to communicate with the running Electron app.
- * Supports commands: status, pause, resume, jobs
+ * Supports commands: status, pause, resume, jobs, quit
  */
 
 import * as net from 'net';
 import * as fs from 'fs';
+import { app } from 'electron';
 import { getCliSocketPath } from './paths';
 import { getRunnerManager, getHeartbeatManager, getAuthState } from './app-state';
 import { RunnerState, JobHistoryEntry } from '../shared/types';
 
 /** CLI command request */
 export interface CliRequest {
-  command: 'status' | 'pause' | 'resume' | 'jobs';
+  command: 'status' | 'pause' | 'resume' | 'jobs' | 'quit';
 }
 
 /** CLI response for status command */
@@ -40,10 +41,10 @@ export interface JobsResponse {
   };
 }
 
-/** CLI response for pause/resume commands */
+/** CLI response for pause/resume/quit commands */
 export interface ActionResponse {
   success: true;
-  command: 'pause' | 'resume';
+  command: 'pause' | 'resume' | 'quit';
   message: string;
 }
 
@@ -263,6 +264,22 @@ export class CliServer {
         } catch (err) {
           return { success: false, error: `Failed to resume: ${(err as Error).message}` };
         }
+      }
+
+      case 'quit': {
+        // Send response before quitting
+        const response: ActionResponse = {
+          success: true,
+          command: 'quit',
+          message: 'localmost is shutting down...',
+        };
+
+        // Schedule quit after response is sent
+        setImmediate(() => {
+          app.quit();
+        });
+
+        return response;
       }
 
       default:
