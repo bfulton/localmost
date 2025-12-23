@@ -172,3 +172,7 @@ Future feature ideas:
 - **Network policy customization** - User-defined network allowlists per repo.
 - **Auto-update** - In-app update mechanism.
 - **Workflow testing mode** - Run and validate workflows locally before pushing.
+- **Spotlight integration** - Check status or pause builds from Spotlight.
+- **Artifact inspector** - Browse uploaded artifacts without leaving the app.
+- **Disk space monitoring** - Warn or pause when disk is low, auto-clean old work dirs.
+- **Runner handoff** - Transfer a running job to GitHub-hosted if you need to leave.
