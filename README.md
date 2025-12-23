@@ -163,3 +163,12 @@ npm run make
 Future feature ideas:
 
 - **Multiple repo/org runner registration** - Support registering runners with more than one repo / org, or a mix of repos and orgs.
+- **Resource-aware scheduling** - Pause runners when on battery or during video calls.
+- **Quick actions** - Re-run failed job, cancel all jobs.
+- **Notifications** - Native macOS notifications for job completion/failure.
+- **CLI companion** - `localmost status`, `localmost pause` from terminal.
+- **Deep links** - Jump directly to job logs in GitHub.
+- **Audit logging** - Detailed logs of what each job accessed.
+- **Network policy customization** - User-defined network allowlists per repo.
+- **Auto-update** - In-app update mechanism.
+- **Workflow testing mode** - Run and validate workflows locally before pushing.
