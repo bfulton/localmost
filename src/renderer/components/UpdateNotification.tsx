@@ -58,6 +58,7 @@ const UpdateNotification: React.FC = () => {
           <div
             className={styles.progressFill}
             style={{ width: `${progress}%` }}
+            data-testid="progress-fill"
           />
         </div>
       </div>

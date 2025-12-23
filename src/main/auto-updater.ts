@@ -127,7 +127,10 @@ function formatReleaseNotes(
 
   // Array of release notes (for staged rollouts)
   if (Array.isArray(notes)) {
-    return notes.map((n) => n.note).join('\n\n');
+    return notes
+      .map((n) => n.note)
+      .filter((note): note is string => note !== null)
+      .join('\n\n');
   }
 
   return undefined;
@@ -135,5 +138,5 @@ function formatReleaseNotes(
 
 interface ReleaseNoteInfo {
   version: string;
-  note: string;
+  note: string | null;
 }

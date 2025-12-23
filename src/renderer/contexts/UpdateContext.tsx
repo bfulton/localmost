@@ -93,6 +93,8 @@ export const UpdateProvider: React.FC<UpdateProviderProps> = ({ children }) => {
     setIsDismissed(false);
     try {
       await window.localmost.update.check();
+    } catch {
+      // Error handling is done via status updates
     } finally {
       setIsChecking(false);
     }
