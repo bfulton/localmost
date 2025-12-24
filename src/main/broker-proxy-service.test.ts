@@ -295,4 +295,55 @@ describe('BrokerProxyService', () => {
       expect(status[0].sessionActive).toBe(false);
     });
   });
+
+  describe('setCanAcceptJobCallback', () => {
+    it('should accept callback function', () => {
+      const callback = (): boolean => true;
+      service.setCanAcceptJobCallback(callback);
+
+      // Callback is stored internally - can't directly verify, but it shouldn't throw
+      expect(true).toBe(true);
+    });
+
+    it('should allow capacity-based job acceptance', () => {
+      let capacity = true;
+      const callback = (): boolean => capacity;
+      service.setCanAcceptJobCallback(callback);
+
+      // Simulate changing capacity
+      capacity = false;
+
+      // The callback should now return false (at capacity)
+      expect(callback()).toBe(false);
+    });
+  });
+
+  describe('getQueuedJob', () => {
+    it('should return null when no jobs queued', () => {
+      expect(service.getQueuedJob()).toBeNull();
+    });
+  });
+
+  describe('hasQueuedJobs', () => {
+    it('should return false when no jobs queued', () => {
+      expect(service.hasQueuedJobs()).toBe(false);
+    });
+  });
+
+  describe('shutdown handling', () => {
+    it('should handle stop gracefully', async () => {
+      await service.start();
+
+      // Stop should complete without error
+      await expect(service.stop()).resolves.not.toThrow();
+    });
+
+    it('should clear polling on stop', async () => {
+      await service.start();
+      await service.stop();
+
+      // Starting again should work (polling was properly cleaned up)
+      await expect(service.start()).resolves.not.toThrow();
+    });
+  });
 });

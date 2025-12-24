@@ -179,4 +179,117 @@ describe('RunnerDownloader', () => {
       expect(downloader).toBeDefined();
     });
   });
+
+  describe('hasAnyProxyCredentials', () => {
+    it('should return false when proxies directory does not exist', () => {
+      (fs.existsSync as jest.Mock).mockReturnValue(false);
+      expect(downloader.hasAnyProxyCredentials()).toBe(false);
+    });
+
+    it('should return false when proxies directory is empty', () => {
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (fs.readdirSync as jest.Mock).mockReturnValue([]);
+      expect(downloader.hasAnyProxyCredentials()).toBe(false);
+    });
+
+    it('should return true when a proxy directory has .runner file', () => {
+      const proxiesDir = path.join(mockRunnerDir, 'proxies');
+      const proxyDir = path.join(proxiesDir, 'target-1');
+      const runnerFile = path.join(proxyDir, '.runner');
+
+      (fs.existsSync as jest.Mock).mockImplementation((p: string) => {
+        return p === proxiesDir || p === runnerFile;
+      });
+      (fs.readdirSync as jest.Mock).mockReturnValue([
+        { name: 'target-1', isDirectory: () => true },
+      ]);
+
+      expect(downloader.hasAnyProxyCredentials()).toBe(true);
+    });
+
+    it('should return false when proxy directories have no .runner file', () => {
+      const proxiesDir = path.join(mockRunnerDir, 'proxies');
+
+      (fs.existsSync as jest.Mock).mockImplementation((p: string) => {
+        return p === proxiesDir; // proxies dir exists but no .runner files
+      });
+      (fs.readdirSync as jest.Mock).mockReturnValue([
+        { name: 'target-1', isDirectory: () => true },
+      ]);
+
+      expect(downloader.hasAnyProxyCredentials()).toBe(false);
+    });
+
+    it('should return false on error reading directory', () => {
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (fs.readdirSync as jest.Mock).mockImplementation(() => {
+        throw new Error('Permission denied');
+      });
+
+      expect(downloader.hasAnyProxyCredentials()).toBe(false);
+    });
+  });
+
+  describe('copyProxyCredentials', () => {
+    it('should copy credential files and modify .runner serverUrlV2', async () => {
+      const proxyDir = '/path/to/proxy';
+      const configDir = path.join(mockRunnerDir, 'config', '1');
+
+      // Mock file existence
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+
+      // Mock reading .runner file
+      const mockRunnerConfig = { serverUrlV2: 'https://github.com/broker' };
+      (fs.readFileSync as jest.Mock).mockReturnValue(JSON.stringify(mockRunnerConfig));
+
+      // Mock fs.promises
+      const mockCopyFile = jest.fn().mockResolvedValue(undefined);
+      const mockWriteFile = jest.fn().mockResolvedValue(undefined);
+      (fs.promises.mkdir as jest.Mock).mockResolvedValue(undefined);
+      (fs.promises as any).copyFile = mockCopyFile;
+      (fs.promises as any).writeFile = mockWriteFile;
+
+      const mockLog = jest.fn();
+      await downloader.copyProxyCredentials(1, proxyDir, mockLog);
+
+      // Should create config directory
+      expect(fs.promises.mkdir).toHaveBeenCalledWith(configDir, { recursive: true });
+
+      // Should copy all three credential files
+      expect(mockCopyFile).toHaveBeenCalledTimes(3);
+      expect(mockCopyFile).toHaveBeenCalledWith(
+        path.join(proxyDir, '.runner'),
+        path.join(configDir, '.runner')
+      );
+      expect(mockCopyFile).toHaveBeenCalledWith(
+        path.join(proxyDir, '.credentials'),
+        path.join(configDir, '.credentials')
+      );
+      expect(mockCopyFile).toHaveBeenCalledWith(
+        path.join(proxyDir, '.credentials_rsaparams'),
+        path.join(configDir, '.credentials_rsaparams')
+      );
+
+      // Should modify .runner to point to localhost:8787
+      expect(mockWriteFile).toHaveBeenCalledWith(
+        path.join(configDir, '.runner'),
+        expect.stringContaining('localhost:8787')
+      );
+
+      // Should log success
+      expect(mockLog).toHaveBeenCalledWith('info', expect.stringContaining('Copied proxy credentials'));
+    });
+
+    it('should throw error if credential file is missing', async () => {
+      const proxyDir = '/path/to/proxy';
+
+      // Mock file not existing
+      (fs.existsSync as jest.Mock).mockReturnValue(false);
+      (fs.promises.mkdir as jest.Mock).mockResolvedValue(undefined);
+
+      await expect(downloader.copyProxyCredentials(1, proxyDir)).rejects.toThrow(
+        'Missing proxy credential file'
+      );
+    });
+  });
 });
