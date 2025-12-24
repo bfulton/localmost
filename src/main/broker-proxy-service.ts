@@ -783,6 +783,15 @@ export class BrokerProxyService extends EventEmitter {
     const session = this.localSessions.get(sessionId)!;
     const targetId = session.targetId;
 
+    // If this worker already has a job, don't give them another one.
+    // Workers run with --once so they should only get one job.
+    if (session.currentJobId) {
+      log()?.debug(`[BrokerProxy] Worker already has job ${session.currentJobId}, returning empty`);
+      res.writeHead(202, { 'Content-Type': 'application/json' });
+      res.end('');
+      return;
+    }
+
     // Helper to get a message for this session's target
     const getMessageForTarget = (): string | undefined => {
       if (!targetId) {
@@ -795,9 +804,28 @@ export class BrokerProxyService extends EventEmitter {
       return queue?.shift();
     };
 
+    // Helper to extract job ID from message and mark session
+    const markSessionWithJob = (message: string): void => {
+      try {
+        const parsed = JSON.parse(message);
+        let innerBody = parsed.body;
+        if (typeof innerBody === 'string') {
+          innerBody = JSON.parse(innerBody);
+        }
+        const jobId = innerBody?.jobId || innerBody?.runner_request_id;
+        if (jobId) {
+          session.currentJobId = jobId;
+          log()?.debug(`[BrokerProxy] Marked session ${sessionId} with job ${jobId}`);
+        }
+      } catch {
+        // Could not parse, still deliver the message
+      }
+    };
+
     // Check queue first (messages are queued by active polling)
     const message = getMessageForTarget();
     if (message) {
+      markSessionWithJob(message);
       log()?.info(`[BrokerProxy] Returning message to worker (target: ${targetId})`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(message);
@@ -835,6 +863,7 @@ export class BrokerProxyService extends EventEmitter {
           // Check for a message for this target
           const msg = getMessageForTarget();
           if (msg) {
+            markSessionWithJob(msg);
             log()?.info(`[BrokerProxy] Returning message to worker (long-poll, target: ${targetId})`);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(msg);
