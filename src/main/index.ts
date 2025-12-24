@@ -65,6 +65,7 @@ import { initTray } from './tray-init';
 
 // IPC handlers
 import { setupIpcHandlers } from './ipc-handlers';
+import { sendTargetStatusUpdate } from './ipc-handlers/targets';
 
 // Auto-updater
 import { initAutoUpdater, checkForUpdates } from './auto-updater';
@@ -206,13 +207,31 @@ app.whenReady().then(async () => {
   const brokerProxyService = new BrokerProxyService();
   setBrokerProxyService(brokerProxyService);
 
-  // Wire up broker proxy to runner manager: when a job is received from a target,
-  // set the pending target context so it gets applied when the job starts
-  brokerProxyService.on('job-received', (targetId: string, _jobId: string) => {
+  // Set capacity check callback - broker proxy will only acquire jobs when we have capacity
+  brokerProxyService.setCanAcceptJobCallback(() => runnerManager.hasAvailableSlot());
+
+  // Wire up broker proxy to runner manager: when a job is received, spawn a worker
+  brokerProxyService.on('job-received', async (targetId: string, jobId: string) => {
+    getLogger()?.info(`[job-received event] targetId=${targetId}, jobId=${jobId}`);
     const target = targetManager.getTargets().find(t => t.id === targetId);
     if (target) {
+      getLogger()?.info(`Spawning worker for job ${jobId} from ${target.displayName}...`);
       runnerManager.setPendingTargetContext('next', targetId, target.displayName);
+
+      // Spawn a worker to handle this job
+      try {
+        await runnerManager.spawnWorkerForJob();
+      } catch (err) {
+        getLogger()?.error(`Failed to spawn worker for job ${jobId}: ${(err as Error).message}`);
+      }
+    } else {
+      getLogger()?.warn(`[job-received] Target not found for id: ${targetId}`);
     }
+  });
+
+  // Wire up broker proxy status updates to renderer
+  brokerProxyService.on('status-update', (status) => {
+    sendTargetStatusUpdate(status);
   });
 
   // Load saved auth state and settings
@@ -286,7 +305,37 @@ app.whenReady().then(async () => {
 
         // Clear any stale runner registrations before starting
         await clearStaleRunnerRegistrations();
-        await runnerManager.start();
+
+        // Initialize broker proxy with all target credentials
+        const targets = config.targets || [];
+        if (targets.length > 0 && brokerProxyService) {
+          const { getRunnerProxyManager } = await import('./runner-proxy-manager');
+          const proxyManager = getRunnerProxyManager();
+
+          for (const target of targets) {
+            if (!target.enabled) continue;
+
+            const credentials = proxyManager.loadCredentials(target.id);
+            if (credentials) {
+              brokerProxyService.addTarget(target, credentials.runner, credentials.credentials, credentials.rsaParams);
+            } else {
+              logger?.warn(`[BrokerProxy] No credentials for ${target.displayName}, skipping`);
+            }
+          }
+
+          // Start broker proxy server - workers will connect to this
+          try {
+            await brokerProxyService.start();
+            logger?.info('Broker proxy started, waiting for jobs from targets...');
+          } catch (err) {
+            logger?.error(`[BrokerProxy] Failed to start: ${(err as Error).message}`);
+          }
+        }
+
+        // Initialize runner manager (but don't start workers yet)
+        // Workers are spawned on-demand when jobs arrive via broker proxy
+        await runnerManager.initialize();
+        logger?.info('Broker proxy running, workers will spawn when jobs arrive');
 
         // Start heartbeat when runner auto-starts
         const authState = getAuthState();

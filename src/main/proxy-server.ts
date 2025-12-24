@@ -30,6 +30,10 @@ export interface ProxyServerOptions {
 
 // Default allowed hosts for GitHub Actions runners
 const DEFAULT_ALLOWED_HOSTS = [
+  // Local broker proxy (for multi-target support)
+  'localhost',
+  '127.0.0.1',
+
   // GitHub API and services
   'github.com',
   'api.github.com',

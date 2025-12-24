@@ -79,6 +79,8 @@ interface LocalSession {
   id: string;
   createdAt: Date;
   workerId?: number;
+  targetId?: string;  // Which target this session is handling
+  currentJobId?: string;  // Job currently being executed
 }
 
 /** Job assignment tracking */
@@ -177,11 +179,29 @@ export class BrokerProxyService extends EventEmitter {
   private localSessions: Map<string, LocalSession> = new Map();
   private jobAssignments: Map<string, JobAssignment> = new Map();
   private isRunning = false;
+  private isShuttingDown = false;
   private runnerVersion = '2.330.0';
+  private pollInterval: NodeJS.Timeout | null = null;
+  private messageQueues: Map<string, Array<string>> = new Map();  // Per-target message queues
+  private seenMessageIds: Set<string> = new Set();
+  private pendingTargetAssignments: string[] = [];  // Queue of target IDs for upcoming sessions
+  private jobRunServiceUrls: Map<string, string> = new Map();  // jobId -> run_service_url for job operations
+  private canAcceptJobCallback?: () => boolean;
+
+  /** How often to poll targets for jobs (ms) */
+  private static readonly POLL_INTERVAL_MS = 5000;
 
   constructor(port = 8787) {
     super();
     this.port = port;
+  }
+
+  /**
+   * Set a callback to check if we can accept more jobs.
+   * If this returns false, we won't acquire new jobs from GitHub.
+   */
+  setCanAcceptJobCallback(callback: () => boolean): void {
+    this.canAcceptJobCallback = callback;
   }
 
   // --------------------------------------------------------------------------
@@ -222,12 +242,16 @@ export class BrokerProxyService extends EventEmitter {
   }
 
   /**
-   * Start the proxy server.
+   * Start the proxy server and begin polling for jobs.
    */
   async start(): Promise<void> {
     if (this.isRunning) return;
 
-    return new Promise((resolve, reject) => {
+    // Reset shutdown flag in case we're restarting
+    this.isShuttingDown = false;
+
+    // Start HTTP server for workers to connect to
+    await new Promise<void>((resolve, reject) => {
       this.server = http.createServer((req, res) => this.handleRequest(req, res));
 
       this.server.on('error', (err) => {
@@ -241,6 +265,159 @@ export class BrokerProxyService extends EventEmitter {
         resolve();
       });
     });
+
+    // Create upstream sessions for all targets
+    const enabledTargets = Array.from(this.targets.values())
+      .filter(s => s.target.enabled);
+
+    for (const state of enabledTargets) {
+      try {
+        await this.createUpstreamSession(state);
+      } catch (error) {
+        log()?.error(`[BrokerProxy] Failed to create session for ${state.target.displayName}: ${(error as Error).message}`);
+        state.error = (error as Error).message;
+      }
+    }
+
+    this.emitStatusUpdate();
+
+    // Start active polling for jobs
+    this.startPolling();
+  }
+
+  /**
+   * Start the active polling loop to check all targets for jobs.
+   */
+  private startPolling(): void {
+    if (this.pollInterval) return;
+
+    log()?.info('[BrokerProxy] Starting active job polling...');
+
+    const poll = async () => {
+      if (!this.isRunning) return;
+
+      // Poll all enabled targets with active sessions
+      // Since we acquire jobs immediately, GitHub won't return the same job twice
+      const allTargets = Array.from(this.targets.values());
+      const enabledTargets = allTargets.filter(s => s.target.enabled && s.sessionId);
+
+      log()?.debug(`[BrokerProxy] Polling ${enabledTargets.length}/${allTargets.length} targets`);
+
+      if (enabledTargets.length === 0) return;
+
+      // Poll all targets concurrently
+      const pollPromises = enabledTargets.map(async (state) => {
+        try {
+          const result = await this.pollUpstreamTarget(state);
+          return { state, ...result };
+        } catch (error) {
+          state.error = (error as Error).message;
+          return { state, hasMessage: false, body: '' };
+        }
+      });
+
+      const results = await Promise.all(pollPromises);
+
+      for (const result of results) {
+        if (result.hasMessage) {
+          log()?.info(`[BrokerProxy] Processing message from ${result.state.target.displayName}, body length=${result.body.length}`);
+          // Parse message to determine type
+          let message;
+          try {
+            message = JSON.parse(result.body);
+            log()?.info(`[BrokerProxy] Parsed: messageType=${message.messageType}, bodyType=${typeof message.body}`);
+          } catch (e) {
+            log()?.info(`[BrokerProxy] Could not parse message from ${result.state.target.displayName}: ${(e as Error).message}`);
+            continue;
+          }
+
+          const messageType = message.messageType || '';
+          const messageId = message.messageId || crypto.createHash('sha256').update(result.body).digest('hex').slice(0, 16);
+
+          // Parse the inner body if it's a string (GitHub wraps the actual message)
+          let innerBody = message.body;
+          if (typeof innerBody === 'string') {
+            try {
+              innerBody = JSON.parse(innerBody);
+            } catch {
+              // Keep as string if not valid JSON
+            }
+          }
+
+          // Check if this is a job assignment
+          // GitHub sends RunnerJobRequest with runner_request_id (not jobId)
+          const isJobMessage = messageType.toLowerCase().includes('job');
+          const jobId = innerBody?.jobId || innerBody?.runner_request_id;
+          const targetId = result.state.target.id;
+
+          log()?.info(`[BrokerProxy] Message: type=${messageType}, isJob=${isJobMessage}, jobId=${jobId}`);
+
+          if (isJobMessage && jobId) {
+            // Deduplicate by job ID - don't spawn multiple workers for the same job
+            if (this.jobAssignments.has(jobId)) {
+              log()?.debug(`[BrokerProxy] Skipping duplicate job ${jobId}`);
+              continue;
+            }
+
+            // Check if we have capacity to accept more jobs
+            if (this.canAcceptJobCallback && !this.canAcceptJobCallback()) {
+              log()?.info(`[BrokerProxy] At capacity, skipping job ${jobId}`);
+              continue;
+            }
+
+            // Store run_service_url for forwarding job operations
+            const runServiceUrl = innerBody?.run_service_url;
+            if (runServiceUrl) {
+              this.jobRunServiceUrls.set(jobId, runServiceUrl);
+              log()?.info(`[BrokerProxy] Job ${jobId} received from ${result.state.target.displayName}, run_service_url=${runServiceUrl}`);
+            } else {
+              log()?.info(`[BrokerProxy] Job ${jobId} received from ${result.state.target.displayName} (no run_service_url)`);
+            }
+
+            // Queue message for the worker
+            if (!this.messageQueues.has(targetId)) {
+              this.messageQueues.set(targetId, []);
+            }
+            this.messageQueues.get(targetId)!.push(result.body);
+
+            result.state.jobsAssigned++;
+
+            // Track job assignment
+            this.jobAssignments.set(jobId, {
+              jobId,
+              targetId: result.state.target.id,
+              sessionId: result.state.sessionId!,
+              assignedAt: new Date(),
+            });
+
+            // Queue target assignment for the worker that will be spawned
+            this.pendingTargetAssignments.push(targetId);
+
+            // Emit event to spawn worker for job messages only
+            this.emit('job-received', result.state.target.id, jobId);
+            this.emitStatusUpdate();
+          } else if (isJobMessage) {
+            log()?.debug(`[BrokerProxy] Job-like message without jobId (${messageType}) from ${result.state.target.displayName}`);
+          } else {
+            log()?.info(`[BrokerProxy] Message (${messageType}) received from ${result.state.target.displayName}`);
+          }
+        }
+      }
+    };
+
+    // Poll immediately, then on interval
+    poll();
+    this.pollInterval = setInterval(poll, BrokerProxyService.POLL_INTERVAL_MS);
+  }
+
+  /**
+   * Stop the polling loop.
+   */
+  private stopPolling(): void {
+    if (this.pollInterval) {
+      clearInterval(this.pollInterval);
+      this.pollInterval = null;
+    }
   }
 
   /**
@@ -248,6 +425,12 @@ export class BrokerProxyService extends EventEmitter {
    */
   async stop(): Promise<void> {
     if (!this.isRunning || !this.server) return;
+
+    // Signal shutdown to break out of long-polls immediately
+    this.isShuttingDown = true;
+
+    // Stop polling first
+    this.stopPolling();
 
     // Delete all upstream sessions
     const deletePromises = Array.from(this.targets.values()).map(
@@ -263,6 +446,29 @@ export class BrokerProxyService extends EventEmitter {
         resolve();
       });
     });
+  }
+
+  /**
+   * Get the next queued job, if any.
+   * Workers call this to get a job to execute.
+   */
+  getQueuedJob(): { targetId: string; message: string } | null {
+    for (const [targetId, queue] of this.messageQueues) {
+      if (queue.length > 0) {
+        return { targetId, message: queue.shift()! };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Check if there are queued jobs.
+   */
+  hasQueuedJobs(): boolean {
+    for (const queue of this.messageQueues.values()) {
+      if (queue.length > 0) return true;
+    }
+    return false;
   }
 
   /**
@@ -333,11 +539,11 @@ export class BrokerProxyService extends EventEmitter {
   // Upstream Session Management
   // --------------------------------------------------------------------------
 
-  private async createUpstreamSession(state: TargetState): Promise<string> {
+  private async createUpstreamSession(state: TargetState, retryOnConflict = true): Promise<string> {
     const token = await this.getOAuthToken(state);
     const brokerUrl = state.runner.serverUrlV2;
 
-    log()?.debug( `[BrokerProxy] Creating session for ${state.target.displayName}`);
+    log()?.debug(`[BrokerProxy] Creating session for ${state.target.displayName}`);
 
     const response = await httpsRequest(`${brokerUrl}session`, {
       method: 'POST',
@@ -348,6 +554,28 @@ export class BrokerProxyService extends EventEmitter {
       },
     }, '{}');
 
+    // Handle 409 Conflict - session already exists
+    if (response.statusCode === 409 && retryOnConflict) {
+      log()?.info(`[BrokerProxy] Session conflict for ${state.target.displayName}, clearing stale session...`);
+
+      // Try to extract existing session ID from response
+      try {
+        const conflictData = JSON.parse(response.body);
+        if (conflictData.sessionId) {
+          state.sessionId = conflictData.sessionId;
+          await this.deleteUpstreamSession(state);
+        }
+      } catch {
+        // Response might not have session ID, try deleting anyway
+      }
+
+      // Wait a moment for session to clear
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // Retry once without recursion
+      return this.createUpstreamSession(state, false);
+    }
+
     if (response.statusCode !== 200 && response.statusCode !== 201) {
       throw new Error(`Session creation failed: ${response.statusCode} ${response.body}`);
     }
@@ -356,7 +584,7 @@ export class BrokerProxyService extends EventEmitter {
     state.sessionId = sessionData.sessionId;
     state.error = undefined;
 
-    log()?.info( `[BrokerProxy] Session created for ${state.target.displayName}`);
+    log()?.info(`[BrokerProxy] Session created for ${state.target.displayName}`);
     this.emitStatusUpdate();
 
     return state.sessionId!;
@@ -406,14 +634,55 @@ export class BrokerProxyService extends EventEmitter {
       state.lastPoll = new Date();
       state.error = undefined;
 
+      // Log poll results for debugging
       if (response.statusCode === 200 && response.body) {
+        log()?.info(`[BrokerProxy] Poll ${state.target.displayName}: got message (${response.body.length} bytes)`);
         return { hasMessage: true, body: response.body };
       }
+      log()?.info(`[BrokerProxy] Poll ${state.target.displayName}: no message (status=${response.statusCode})`);
       return { hasMessage: false, body: '' };
     } catch (error) {
       state.error = (error as Error).message;
       this.emit('error', state.target.id, error);
       return { hasMessage: false, body: '' };
+    }
+  }
+
+  /**
+   * Acquire a job upstream on behalf of the worker.
+   * This claims the job so GitHub won't return it on subsequent polls.
+   */
+  private async acquireJobUpstream(state: TargetState, requestId: string): Promise<string | null> {
+    const token = await this.getOAuthToken(state);
+    const brokerUrl = state.runner.serverUrlV2;
+    const acquireUrl = `${brokerUrl}acquirejob?sessionId=${state.sessionId}`;
+
+    // GitHub expects jobRequestId for acquiring jobs
+    const body = JSON.stringify({ jobRequestId: requestId });
+
+    log()?.info(`[BrokerProxy] Acquiring job: POST ${acquireUrl} with requestId=${requestId}`);
+
+    try {
+      const response = await httpsRequest(acquireUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+      }, body);
+
+      log()?.info(`[BrokerProxy] Acquire response: status=${response.statusCode}, body=${response.body.slice(0, 200)}`);
+
+      if (response.statusCode === 200) {
+        return response.body;
+      }
+
+      log()?.warn(`[BrokerProxy] acquirejob returned ${response.statusCode}: ${response.body}`);
+      return null;
+    } catch (error) {
+      log()?.error(`[BrokerProxy] acquirejob error: ${(error as Error).message}`);
+      return null;
     }
   }
 
@@ -447,17 +716,21 @@ export class BrokerProxyService extends EventEmitter {
 
   private async handleSessionCreate(res: http.ServerResponse): Promise<void> {
     const sessionId = crypto.randomUUID();
-    log()?.debug( `[BrokerProxy] Creating local session ${sessionId}`);
 
-    // Create upstream sessions for all enabled targets
+    // Assign this session to a target (from pending assignments queue)
+    const targetId = this.pendingTargetAssignments.shift();
+    log()?.debug(`[BrokerProxy] Creating local session ${sessionId} for target ${targetId || 'unknown'}`);
+
+    // Only create upstream sessions if they don't already exist
+    // (sessions are created on broker start, workers just reuse them)
     const enabledTargets = Array.from(this.targets.values())
-      .filter(s => s.target.enabled);
+      .filter(s => s.target.enabled && !s.sessionId);
 
     for (const state of enabledTargets) {
       try {
         await this.createUpstreamSession(state);
       } catch (error) {
-        log()?.error( `[BrokerProxy] Failed to create upstream session for ${state.target.displayName}: ${(error as Error).message}`);
+        log()?.error(`[BrokerProxy] Failed to create upstream session for ${state.target.displayName}: ${(error as Error).message}`);
         state.error = (error as Error).message;
       }
     }
@@ -465,6 +738,7 @@ export class BrokerProxyService extends EventEmitter {
     this.localSessions.set(sessionId, {
       id: sessionId,
       createdAt: new Date(),
+      targetId,  // Associate session with target
     });
 
     res.writeHead(201, { 'Content-Type': 'application/json' });
@@ -485,54 +759,87 @@ export class BrokerProxyService extends EventEmitter {
       return;
     }
 
-    const enabledTargets = Array.from(this.targets.values())
-      .filter(s => s.target.enabled && s.sessionId);
+    const session = this.localSessions.get(sessionId)!;
+    const targetId = session.targetId;
 
-    if (enabledTargets.length === 0) {
-      res.writeHead(202, { 'Content-Type': 'application/json' });
-      res.end('');
+    // Helper to get a message for this session's target
+    const getMessageForTarget = (): string | undefined => {
+      if (!targetId) {
+        // No target assigned - shouldn't happen, but try first available
+        for (const [, queue] of this.messageQueues) {
+          if (queue.length > 0) return queue.shift();
+        }
+        return undefined;
+      }
+      const queue = this.messageQueues.get(targetId);
+      return queue?.shift();
+    };
+
+    // Check queue first (messages are queued by active polling)
+    const message = getMessageForTarget();
+    if (message) {
+      log()?.info(`[BrokerProxy] Returning message to worker (target: ${targetId})`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(message);
       return;
     }
 
-    // Poll all targets concurrently
-    const pollPromises = enabledTargets.map(async (state) => {
-      const result = await this.pollUpstreamTarget(state);
-      return { state, ...result };
-    });
+    // Long-polling with exponential backoff: wait for a message to arrive
+    const LONG_POLL_TIMEOUT_MS = 50000;  // 50 seconds (just under typical HTTP timeout)
+    const INITIAL_CHECK_INTERVAL_MS = 100;
+    const MAX_CHECK_INTERVAL_MS = 5000;
+    const BACKOFF_MULTIPLIER = 1.5;
 
-    const results = await Promise.all(pollPromises);
+    const startTime = Date.now();
+    let checkInterval = INITIAL_CHECK_INTERVAL_MS;
 
-    for (const result of results) {
-      if (result.hasMessage) {
-        log()?.info( `[BrokerProxy] Job received from ${result.state.target.displayName}`);
-        result.state.jobsAssigned++;
-
-        // Parse job info if possible
-        try {
-          const message = JSON.parse(result.body);
-          if (message.body?.jobId) {
-            this.jobAssignments.set(message.body.jobId, {
-              jobId: message.body.jobId,
-              targetId: result.state.target.id,
-              sessionId: result.state.sessionId!,
-              assignedAt: new Date(),
-            });
-            this.emit('job-received', result.state.target.id, message.body.jobId);
+    const checkForMessage = (): Promise<void> => {
+      return new Promise((resolve) => {
+        const check = () => {
+          // Check if shutting down - return empty response immediately
+          if (this.isShuttingDown) {
+            if (!res.writableEnded) {
+              res.writeHead(202, { 'Content-Type': 'application/json' });
+              res.end('');
+            }
+            resolve();
+            return;
           }
-        } catch {
-          // Not JSON or no jobId, that's fine
-        }
 
-        this.emitStatusUpdate();
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(result.body);
-        return;
-      }
-    }
+          // Check if response is already closed
+          if (res.writableEnded) {
+            resolve();
+            return;
+          }
 
-    // No messages from any target
-    res.writeHead(202, { 'Content-Type': 'application/json' });
-    res.end('');
+          // Check for a message for this target
+          const msg = getMessageForTarget();
+          if (msg) {
+            log()?.info(`[BrokerProxy] Returning message to worker (long-poll, target: ${targetId})`);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(msg);
+            resolve();
+            return;
+          }
+
+          // Check if timeout reached
+          if (Date.now() - startTime >= LONG_POLL_TIMEOUT_MS) {
+            res.writeHead(202, { 'Content-Type': 'application/json' });
+            res.end('');
+            resolve();
+            return;
+          }
+
+          // Exponential backoff: increase interval up to max
+          checkInterval = Math.min(checkInterval * BACKOFF_MULTIPLIER, MAX_CHECK_INTERVAL_MS);
+          setTimeout(check, checkInterval);
+        };
+
+        check();
+      });
+    };
+
+    await checkForMessage();
   }
 
   private async handleSessionDelete(res: http.ServerResponse, url: URL): Promise<void> {
@@ -549,39 +856,74 @@ export class BrokerProxyService extends EventEmitter {
     res: http.ServerResponse,
     url: URL
   ): Promise<void> {
-    // Determine which target to forward to based on session ID in query params
-    const sessionId = url.searchParams.get('sessionId');
+    // Determine which target to forward to based on local session ID
+    const localSessionId = url.searchParams.get('sessionId');
     let targetState: TargetState | undefined;
 
-    // Find target by session ID
-    if (sessionId) {
-      targetState = Array.from(this.targets.values())
-        .find(s => s.sessionId === sessionId);
+    // Look up local session to find associated target
+    if (localSessionId) {
+      const localSession = this.localSessions.get(localSessionId);
+      if (localSession?.targetId) {
+        targetState = this.targets.get(localSession.targetId);
+      }
     }
 
-    // Fallback to first enabled target
+    // Fallback to first enabled target with an active upstream session
     if (!targetState) {
       targetState = Array.from(this.targets.values())
         .find(s => s.target.enabled && s.sessionId);
     }
 
-    if (!targetState) {
+    if (!targetState || !targetState.sessionId) {
       res.writeHead(503, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'No active target sessions' }));
       return;
     }
 
-    const token = await this.getOAuthToken(targetState);
-    const upstreamUrl = `${targetState.runner.serverUrlV2}${url.pathname.slice(1)}${url.search}`;
-
-    // Read request body
+    // Read request body first (needed for routing decisions)
     const chunks: Buffer[] = [];
     for await (const chunk of req) {
       chunks.push(chunk as Buffer);
     }
     const body = Buffer.concat(chunks).toString();
 
-    log()?.debug( `[BrokerProxy] Forward ${req.method} -> ${targetState.target.displayName}`);
+    // Replace local session ID with upstream session ID in query params
+    const upstreamParams = new URLSearchParams(url.search);
+    if (localSessionId) {
+      upstreamParams.set('sessionId', targetState.sessionId);
+    }
+
+    const token = await this.getOAuthToken(targetState);
+
+    // Determine upstream URL - job operations go to run_service_url, others to broker
+    let upstreamUrl: string;
+
+    // For job operations, try to use the run_service_url from the job message
+    const jobOperations = ['/acquirejob', '/renewjob', '/finishjob', '/jobrequest'];
+    if (jobOperations.some(op => url.pathname.startsWith(op))) {
+      // Try to find run_service_url from request body or stored job info
+      let runServiceUrl: string | undefined;
+      try {
+        const bodyJson = JSON.parse(body);
+        const jobId = bodyJson.jobRequestId || bodyJson.requestId;
+        if (jobId) {
+          runServiceUrl = this.jobRunServiceUrls.get(jobId);
+        }
+      } catch {
+        // Body not JSON or no jobId
+      }
+
+      if (runServiceUrl) {
+        upstreamUrl = `${runServiceUrl}${url.pathname}?${upstreamParams.toString()}`;
+        log()?.info(`[BrokerProxy] Forward ${req.method} ${url.pathname} -> run_service_url`);
+      } else {
+        upstreamUrl = `${targetState.runner.serverUrlV2}${url.pathname.slice(1)}?${upstreamParams.toString()}`;
+        log()?.info(`[BrokerProxy] Forward ${req.method} ${url.pathname} -> broker (no run_service_url found)`);
+      }
+    } else {
+      upstreamUrl = `${targetState.runner.serverUrlV2}${url.pathname.slice(1)}?${upstreamParams.toString()}`;
+      log()?.debug(`[BrokerProxy] Forward ${req.method} ${url.pathname} -> broker`);
+    }
 
     const response = await httpsRequest(upstreamUrl, {
       method: req.method,

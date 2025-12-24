@@ -160,6 +160,14 @@ function generateSandboxProfile(instanceDir: string): string {
   (literal "/dev/random")
   (literal "/dev/urandom"))
 
+;; Device files that need read/write access (git, many tools redirect to /dev/null)
+(allow file-write*
+  (literal "/dev/null")
+  (literal "/dev/random")
+  (literal "/dev/urandom")
+  (literal "/dev/tty")
+  (literal "/dev/dtracehelper"))
+
 ;; Allow file metadata operations everywhere (ls, stat, etc.)
 (allow file-read-metadata)
 

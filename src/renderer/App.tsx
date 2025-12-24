@@ -13,18 +13,20 @@ type View = 'status' | 'settings' | 'targets';
 export type { ThemeSetting } from './contexts';
 
 const AppContent: React.FC = () => {
-  const { isLoading, error, isOnline } = useAppConfig();
-  const { user, isDownloaded, isConfigured } = useRunner();
+  const { isLoading: isConfigLoading, error, isOnline } = useAppConfig();
+  const { user, isDownloaded, isConfigured, isInitialLoading: isRunnerLoading } = useRunner();
 
   const [view, setView] = useState<View>('status');
   const [scrollToSection, setScrollToSection] = useState<string | undefined>();
 
   // Check if setup is needed and redirect to settings
+  // Must wait for BOTH contexts to finish loading before checking setup state
   useEffect(() => {
+    const isLoading = isConfigLoading || isRunnerLoading;
     if (!isLoading && (!user || !isDownloaded || !isConfigured)) {
       setView('settings');
     }
-  }, [isLoading, user, isDownloaded, isConfigured]);
+  }, [isConfigLoading, isRunnerLoading, user, isDownloaded, isConfigured]);
 
   // Listen for navigation from menu
   useEffect(() => {
@@ -41,7 +43,7 @@ const AppContent: React.FC = () => {
     };
   }, []);
 
-  if (isLoading) {
+  if (isConfigLoading || isRunnerLoading) {
     return (
       <div className={styles.loadingScreen}>
         <div className={styles.loadingSpinner} />

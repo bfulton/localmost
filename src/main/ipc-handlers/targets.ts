@@ -5,7 +5,7 @@
 import { ipcMain } from 'electron';
 import { IPC_CHANNELS, Target, Result, RunnerProxyStatus } from '../../shared/types';
 import { getTargetManager } from '../target-manager';
-import { getLogger } from '../app-state';
+import { getLogger, getBrokerProxyService } from '../app-state';
 
 /**
  * Register all target-related IPC handlers.
@@ -58,8 +58,11 @@ export const registerTargetHandlers = (): void => {
   ipcMain.handle(
     IPC_CHANNELS.TARGETS_GET_STATUS,
     (): RunnerProxyStatus[] => {
-      // TODO: Get from broker proxy service when implemented
-      // For now, return placeholder status based on targets
+      const brokerProxy = getBrokerProxyService();
+      if (brokerProxy) {
+        return brokerProxy.getStatus();
+      }
+      // Fallback: return placeholder status based on targets
       const targets = getTargetManager().getTargets();
       return targets.map(t => ({
         targetId: t.id,

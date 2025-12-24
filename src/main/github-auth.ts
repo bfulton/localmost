@@ -255,7 +255,13 @@ export class GitHubAuth {
       throw new Error(`Failed to refresh token: ${response.status}`);
     }
 
-    const data: GitHubTokenResponse = await response.json();
+    // GitHub OAuth returns errors as 200 OK with error field in JSON body
+    const data = await response.json() as GitHubTokenResponse & { error?: string; error_description?: string };
+
+    // Check for OAuth error response
+    if (data.error) {
+      throw new Error(`Failed to refresh token: ${data.error_description || data.error}`);
+    }
 
     if (!data.access_token) {
       throw new Error('Failed to refresh token: no access token returned');

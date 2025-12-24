@@ -365,7 +365,7 @@ const JobStatusItem: React.FC<JobStatusItemProps> = ({
 const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
   // Get state from contexts
   const { logs, maxLogScrollback, maxJobHistory, sleepProtection, clearLogs } = useAppConfig();
-  const { user, isDownloaded, isConfigured, runnerVersion, runnerState, jobHistory, runnerConfig, runnerDisplayName, targets } = useRunner();
+  const { user, isDownloaded, isConfigured, runnerVersion, runnerState, jobHistory, runnerConfig, runnerDisplayName, targets, targetStatus } = useRunner();
 
   // Local UI state
   const [runnerSettingsUrl, setRunnerSettingsUrl] = useState<string | null>(null);
@@ -479,7 +479,7 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
     };
   };
 
-  // Runner status
+  // Runner status - combines worker status with connection status
   const getRunnerStatusInfo = (): { status: string; statusType: string } => {
     if (!user) {
       return { status: 'Waiting for GitHub', statusType: 'offline' };
@@ -491,6 +491,53 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
       return { status: 'Not configured', statusType: 'offline' };
     }
 
+    // Check connection status for all targets
+    const getConnectionStatus = (): { status: string; statusType: string } | null => {
+      if (targets.length === 0) {
+        return null; // No targets, skip connection status
+      }
+
+      // Map each target to its connection state
+      const connectionStates = targets.map(target => {
+        const status = targetStatus.find(s => s.targetId === target.id);
+        if (!status) return 'unknown';
+        if (status.error) return 'error';
+        if (status.sessionActive) return 'connected';
+        return 'disconnected';
+      });
+
+      // Check if all targets have the same status
+      const uniqueStates = [...new Set(connectionStates)];
+
+      if (uniqueStates.length === 1) {
+        // All same status
+        const state = uniqueStates[0];
+        if (state === 'error') {
+          return { status: 'Connection error', statusType: 'error' };
+        }
+        if (state === 'disconnected') {
+          return { status: 'Disconnected', statusType: 'offline' };
+        }
+        // If all connected or unknown, continue to worker status
+        return null;
+      }
+
+      // Mixed status
+      const errorCount = connectionStates.filter(s => s === 'error').length;
+      const connectedCount = connectionStates.filter(s => s === 'connected').length;
+      if (errorCount > 0) {
+        return { status: `Mixed (${connectedCount}/${targets.length} connected)`, statusType: 'error' };
+      }
+      return { status: `Mixed (${connectedCount}/${targets.length} connected)`, statusType: 'starting' };
+    };
+
+    // Check connection status first
+    const connectionStatus = getConnectionStatus();
+    if (connectionStatus) {
+      return connectionStatus;
+    }
+
+    // Worker status
     switch (runnerState.status) {
       case 'starting':
         return { status: 'Starting', statusType: 'starting' };
