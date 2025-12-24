@@ -777,10 +777,9 @@ export class BrokerProxyService extends EventEmitter {
     // Helper to get a message for this session's target
     const getMessageForTarget = (): string | undefined => {
       if (!targetId) {
-        // No target assigned - shouldn't happen, but try first available
-        for (const [, queue] of this.messageQueues) {
-          if (queue.length > 0) return queue.shift();
-        }
+        // No target assigned - this worker was scaled up preemptively or recycled
+        // without a job. It should NOT steal messages from target-specific queues.
+        // Only workers spawned for specific jobs should receive messages.
         return undefined;
       }
       const queue = this.messageQueues.get(targetId);
@@ -911,13 +910,13 @@ export class BrokerProxyService extends EventEmitter {
     let upstreamUrl: string;
 
     // For job operations, try to use the run_service_url from the job message
-    const jobOperations = ['/acquirejob', '/renewjob', '/finishjob', '/jobrequest'];
+    const jobOperations = ['/acquirejob', '/renewjob', '/finishjob', '/jobrequest', '/acknowledge'];
     if (jobOperations.some(op => url.pathname.startsWith(op))) {
       // Try to find run_service_url from request body or stored job info
       let runServiceUrl: string | undefined;
       try {
         const bodyJson = JSON.parse(body);
-        const jobId = bodyJson.jobRequestId || bodyJson.requestId;
+        const jobId = bodyJson.jobRequestId || bodyJson.requestId || bodyJson.runnerRequestId;
         if (jobId) {
           runServiceUrl = this.jobRunServiceUrls.get(jobId);
         }
