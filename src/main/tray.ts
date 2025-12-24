@@ -232,13 +232,16 @@ export class TrayManager {
     if (this.busyAnimationTimer || !this.tray || this.busyIconFrames.length === 0) return;
 
     this.busyAnimationFrame = 0;
+    // Show first frame immediately
+    this.tray.setImage(this.busyIconFrames[0]);
+
     this.busyAnimationTimer = setInterval(() => {
       if (!this.tray || this.busyIconFrames.length === 0) {
         this.stopBusyAnimation();
         return;
       }
-      this.tray.setImage(this.busyIconFrames[this.busyAnimationFrame]);
       this.busyAnimationFrame = (this.busyAnimationFrame + 1) % this.busyIconFrames.length;
+      this.tray.setImage(this.busyIconFrames[this.busyAnimationFrame]);
     }, TRAY_ANIMATION_INTERVAL_MS);
   }
 
@@ -260,13 +263,16 @@ export class TrayManager {
     if (this.notReadyAnimationTimer || !this.tray || this.notReadyIconFrames.length === 0) return;
 
     this.notReadyAnimationFrame = 0;
+    // Show first frame immediately
+    this.tray.setImage(this.notReadyIconFrames[0]);
+
     this.notReadyAnimationTimer = setInterval(() => {
       if (!this.tray || this.notReadyIconFrames.length === 0) {
         this.stopNotReadyAnimation();
         return;
       }
-      this.tray.setImage(this.notReadyIconFrames[this.notReadyAnimationFrame]);
       this.notReadyAnimationFrame = (this.notReadyAnimationFrame + 1) % this.notReadyIconFrames.length;
+      this.tray.setImage(this.notReadyIconFrames[this.notReadyAnimationFrame]);
     }, TRAY_ANIMATION_INTERVAL_MS);
   }
 
