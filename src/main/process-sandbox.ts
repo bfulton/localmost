@@ -123,8 +123,16 @@ function generateSandboxProfile(instanceDir: string): string {
 (allow file-write*
   (subpath "${escapedDir}"))
 
+;; File ioctl for git file locking in sandbox directory
+(allow file-ioctl
+  (subpath "${escapedDir}"))
+
 ;; App data directory (tool cache, other instances)
 (allow file-write*
+  (subpath "${appDataDir}"))
+
+;; File ioctl for git file locking in app data directory
+(allow file-ioctl
   (subpath "${appDataDir}"))
 
 ;; System temp directories (many tools require this)
