@@ -719,8 +719,13 @@ export class BrokerProxyService extends EventEmitter {
         await this.handleMessagePoll(res, url);
       } else if (method === 'DELETE' && url.pathname === '/session') {
         await this.handleSessionDelete(res, url);
+      } else if (method === 'POST' && url.pathname === '/acknowledge') {
+        // Handle acknowledge locally - the broker proxy already received the message
+        // when it polled GitHub, so workers don't need to acknowledge upstream
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{}');
       } else {
-        // Forward all other requests (acquirejob, renewjob, acknowledge, etc.)
+        // Forward all other requests (acquirejob, renewjob, etc.)
         await this.handleForward(req, res, url);
       }
     } catch (error) {
