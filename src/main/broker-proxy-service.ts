@@ -187,6 +187,8 @@ export class BrokerProxyService extends EventEmitter {
   private seenMessageIds: Set<string> = new Set();
   private pendingTargetAssignments: string[] = [];  // Queue of target IDs for upcoming sessions
   private jobRunServiceUrls: Map<string, string> = new Map();  // jobId -> run_service_url for job operations
+  private acquiredJobDetails: Map<string, string> = new Map();  // jobId -> job details from acquireJobUpstream
+  private jobInfo: Map<string, { billingOwnerId?: string; runServiceUrl: string }> = new Map();  // messageId -> job info
   private canAcceptJobCallback?: () => boolean;
 
   /** How often to poll targets for jobs (ms) */
@@ -341,7 +343,9 @@ export class BrokerProxyService extends EventEmitter {
           }
 
           const messageType = message.messageType || '';
-          const messageId = message.messageId || crypto.createHash('sha256').update(result.body).digest('hex').slice(0, 16);
+          // Extract messageId as string from raw JSON to avoid precision loss with large integers
+          const messageIdMatch = result.body.match(/"messageId"\s*:\s*(\d+)/);
+          const messageId = messageIdMatch ? messageIdMatch[1] : (message.messageId ? String(message.messageId) : crypto.createHash('sha256').update(result.body).digest('hex').slice(0, 16));
 
           // Parse the inner body if it's a string (GitHub wraps the actual message)
           let innerBody = message.body;
@@ -360,6 +364,10 @@ export class BrokerProxyService extends EventEmitter {
           const targetId = result.state.target.id;
 
           log()?.info(`[BrokerProxy] Message: type=${messageType}, isJob=${isJobMessage}, jobId=${jobId}`);
+          // Debug: log all fields in innerBody
+          if (innerBody && typeof innerBody === 'object') {
+            log()?.info(`[BrokerProxy] innerBody fields: ${Object.keys(innerBody).join(', ')}`);
+          }
 
           if (isJobMessage && jobId) {
             // Deduplicate by job ID - don't spawn multiple workers for the same job
@@ -374,32 +382,51 @@ export class BrokerProxyService extends EventEmitter {
               continue;
             }
 
-            // Store run_service_url for forwarding job operations
+            // Store real run_service_url for forwarding job operations
+            // Store by multiple keys since runner may use different IDs
             const runServiceUrl = innerBody?.run_service_url;
+            const billingOwnerId = innerBody?.billing_owner_id;
             if (runServiceUrl) {
               this.jobRunServiceUrls.set(jobId, runServiceUrl);
-              log()?.info(`[BrokerProxy] Job ${jobId} received from ${result.state.target.displayName}, run_service_url=${runServiceUrl}`);
+              // Also store by messageId (used as jobMessageId in acquirejob)
+              // messageId was extracted as string to avoid precision loss
+              this.jobRunServiceUrls.set(messageId, runServiceUrl);
+              // Store job info for acquireJobUpstream
+              this.jobInfo.set(messageId, { billingOwnerId, runServiceUrl });
+              log()?.info(`[BrokerProxy] Job ${jobId} (messageId=${messageId}) received from ${result.state.target.displayName}, run_service_url=${runServiceUrl}, billingOwnerId=${billingOwnerId}`);
             } else {
               log()?.info(`[BrokerProxy] Job ${jobId} received from ${result.state.target.displayName} (no run_service_url)`);
             }
 
-            // Acknowledge to GitHub so they don't resend this message
-            await this.acknowledgeMessageUpstream(result.state, messageId);
-
-            // Acquire the job upstream using our session
-            // This is critical - the job is tied to our upstream session, so workers
-            // can't acquire it themselves (they'd get Conflict)
-            const acquiredJob = await this.acquireJobUpstream(result.state, jobId);
-            if (!acquiredJob) {
-              log()?.warn(`[BrokerProxy] Failed to acquire job ${jobId}, not queuing`);
-              continue;
+            // Acquire job from GitHub immediately using target's credentials
+            // This claims the job so GitHub won't keep sending it on subsequent polls
+            // Note: GitHub uses runner_request_id (UUID) as jobMessageId, not the broker's numeric messageId
+            if (runServiceUrl) {
+              const jobDetails = await this.acquireJobUpstream(result.state, jobId, runServiceUrl, billingOwnerId);
+              if (jobDetails) {
+                this.acquiredJobDetails.set(jobId, jobDetails);
+                this.acquiredJobDetails.set(messageId, jobDetails);
+                log()?.info(`[BrokerProxy] Acquired job ${jobId} (messageId=${messageId}) upstream, stored details`);
+              } else {
+                log()?.warn(`[BrokerProxy] Failed to acquire job ${jobId} upstream, continuing anyway`);
+              }
             }
 
-            // Queue the acquired job data for the worker (not the original message)
+            // Rewrite run_service_url to point to our proxy
+            // This ensures the runner talks to us, not directly to GitHub
+            const proxyUrl = `http://localhost:${this.port}/`;
+            innerBody.run_service_url = proxyUrl;
+
+            // Rebuild the message with rewritten URL
+            message.body = JSON.stringify(innerBody);
+            const rewrittenMessage = JSON.stringify(message);
+            log()?.info(`[BrokerProxy] Rewrote run_service_url to ${proxyUrl}`);
+
+            // Queue the rewritten message for the worker
             if (!this.messageQueues.has(targetId)) {
               this.messageQueues.set(targetId, []);
             }
-            this.messageQueues.get(targetId)!.push(acquiredJob);
+            this.messageQueues.get(targetId)!.push(rewrittenMessage);
 
             result.state.jobsAssigned++;
 
@@ -711,16 +738,25 @@ export class BrokerProxyService extends EventEmitter {
   /**
    * Acquire a job upstream on behalf of the worker.
    * This claims the job so GitHub won't return it on subsequent polls.
+   * Must use run_service_url, not broker URL.
    */
-  private async acquireJobUpstream(state: TargetState, requestId: string): Promise<string | null> {
+  private async acquireJobUpstream(state: TargetState, jobId: string, runServiceUrl: string, billingOwnerId?: string): Promise<string | null> {
     const token = await this.getOAuthToken(state);
-    const brokerUrl = state.runner.serverUrlV2;
-    const acquireUrl = `${brokerUrl}acquirejob?sessionId=${state.sessionId}`;
+    const acquireUrl = `${runServiceUrl}acquirejob?sessionId=${state.sessionId}`;
 
-    // GitHub expects jobRequestId for acquiring jobs
-    const body = JSON.stringify({ jobRequestId: requestId });
+    // GitHub expects jobMessageId (the runner_request_id UUID) as a string for acquiring jobs
+    // Also include billingOwnerId and runnerOS as required by the API
+    const runnerOS = 'macOS';  // Must match what runner sends
+    const bodyObj: Record<string, string> = {
+      jobMessageId: jobId,
+      runnerOS,
+    };
+    if (billingOwnerId) {
+      bodyObj.billingOwnerId = billingOwnerId;
+    }
+    const body = JSON.stringify(bodyObj);
 
-    log()?.info(`[BrokerProxy] Acquiring job: POST ${acquireUrl} with requestId=${requestId}`);
+    log()?.info(`[BrokerProxy] Acquiring job: POST ${acquireUrl} body=${body}`);
 
     try {
       const response = await httpsRequest(acquireUrl, {
@@ -768,8 +804,11 @@ export class BrokerProxyService extends EventEmitter {
         // when it polled GitHub, so workers don't need to acknowledge upstream
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end('{}');
+      } else if (method === 'POST' && url.pathname === '/acquirejob') {
+        // Return stored job details - we already acquired the job from GitHub
+        await this.handleAcquireJob(req, res);
       } else {
-        // Forward all other requests (acquirejob, renewjob, etc.)
+        // Forward all other requests (renewjob, finishjob, etc.)
         await this.handleForward(req, res, url);
       }
     } catch (error) {
@@ -944,6 +983,70 @@ export class BrokerProxyService extends EventEmitter {
     res.end();
   }
 
+  /**
+   * Handle acquirejob requests from workers.
+   * We already acquired the job from GitHub when we received the job message,
+   * so we just return the stored job details.
+   */
+  private async handleAcquireJob(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    // Read request body to get job ID
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(chunk as Buffer);
+    }
+    const body = Buffer.concat(chunks).toString();
+
+    // Parse body to find job ID
+    let jobId: string | undefined;
+    try {
+      const bodyJson = JSON.parse(body);
+      log()?.info(`[BrokerProxy] acquirejob request body: ${JSON.stringify(bodyJson)}`);
+      // Runner uses jobMessageId (which is the message.messageId from the broker)
+      jobId = bodyJson.jobMessageId || bodyJson.jobRequestId || bodyJson.requestId;
+    } catch (e) {
+      log()?.warn(`[BrokerProxy] Could not parse acquirejob body: ${body}`);
+    }
+
+    if (!jobId) {
+      log()?.warn(`[BrokerProxy] acquirejob: no job ID found in request`);
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'No job ID in request' }));
+      return;
+    }
+
+    // Look up stored job details
+    let jobDetails = this.acquiredJobDetails.get(jobId);
+    if (jobDetails) {
+      // Rewrite run_service_url in the response to point to our proxy
+      // This ensures all subsequent job operations go through us
+      try {
+        const parsed = JSON.parse(jobDetails);
+        log()?.info(`[BrokerProxy] acquirejob response keys: ${Object.keys(parsed).join(', ')}`);
+        // Check various possible field names
+        const urlField = parsed.runServiceUrl || parsed.run_service_url || parsed.runnerServiceUrl;
+        if (urlField) {
+          const proxyUrl = `http://localhost:${this.port}/`;
+          log()?.info(`[BrokerProxy] Rewriting runServiceUrl in acquirejob response: ${urlField} -> ${proxyUrl}`);
+          if (parsed.runServiceUrl) parsed.runServiceUrl = proxyUrl;
+          if (parsed.run_service_url) parsed.run_service_url = proxyUrl;
+          if (parsed.runnerServiceUrl) parsed.runnerServiceUrl = proxyUrl;
+          jobDetails = JSON.stringify(parsed);
+        } else {
+          log()?.info(`[BrokerProxy] No runServiceUrl field found in acquirejob response`);
+        }
+      } catch (e) {
+        log()?.warn(`[BrokerProxy] Could not rewrite runServiceUrl in acquirejob response: ${(e as Error).message}`);
+      }
+      log()?.info(`[BrokerProxy] acquirejob: returning stored details for ${jobId}`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(jobDetails);
+    } else {
+      log()?.warn(`[BrokerProxy] acquirejob: no stored details for ${jobId}`);
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Job not found' }));
+    }
+  }
+
   private async handleForward(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -973,6 +1076,8 @@ export class BrokerProxyService extends EventEmitter {
       return;
     }
 
+    log()?.info(`[BrokerProxy] Forward using target ${targetState.target.displayName}, upstream sessionId=${targetState.sessionId}`);
+
     // Read request body first (needed for routing decisions)
     const chunks: Buffer[] = [];
     for await (const chunk of req) {
@@ -999,12 +1104,17 @@ export class BrokerProxyService extends EventEmitter {
       let runServiceUrl: string | undefined;
       try {
         const bodyJson = JSON.parse(body);
-        const jobId = bodyJson.jobRequestId || bodyJson.requestId || bodyJson.runnerRequestId;
+        log()?.info(`[BrokerProxy] Job operation ${url.pathname} body: ${JSON.stringify(bodyJson)}`);
+        // Try multiple ID fields - runner uses different ones for different operations
+        const jobId = bodyJson.jobRequestId || bodyJson.requestId || bodyJson.runnerRequestId
+          || bodyJson.runner_request_id || bodyJson.jobMessageId;
+        log()?.debug(`[BrokerProxy] Looking for run_service_url with jobId: ${jobId}`);
         if (jobId) {
           runServiceUrl = this.jobRunServiceUrls.get(jobId);
+          log()?.info(`[BrokerProxy] Found run_service_url for ${jobId}: ${runServiceUrl || 'not found'}`);
         }
-      } catch {
-        // Body not JSON or no jobId
+      } catch (e) {
+        log()?.info(`[BrokerProxy] Could not parse job operation body: ${(e as Error).message}, body: ${body?.slice(0, 100)}`);
       }
 
       if (runServiceUrl) {
