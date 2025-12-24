@@ -121,7 +121,8 @@ export class HeartbeatManager {
     // Use epoch timestamp to indicate runner is offline
     const staleTimestamp = '1970-01-01T00:00:00Z';
 
-    for (const target of this.targets) {
+    // Clear all heartbeats in parallel with a short timeout for fast shutdown
+    const clearPromises = this.targets.map(async (target) => {
       try {
         if (target.level === 'org' && target.org) {
           await this.setOrgVariable(target.org, HEARTBEAT_VARIABLE_NAME, staleTimestamp);
@@ -133,7 +134,11 @@ export class HeartbeatManager {
       } catch (error) {
         this.log('warn', `Failed to clear heartbeat for ${this.targetName(target)}: ${(error as Error).message}`);
       }
-    }
+    });
+
+    // Wait up to 3 seconds for heartbeat clearing, then continue shutdown
+    const timeout = new Promise<void>((resolve) => setTimeout(resolve, 3000));
+    await Promise.race([Promise.all(clearPromises), timeout]);
   }
 
   /**

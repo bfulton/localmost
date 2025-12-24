@@ -444,17 +444,17 @@ export class BrokerProxyService extends EventEmitter {
     // Stop polling first
     this.stopPolling();
 
-    // Delete all upstream sessions
-    const deletePromises = Array.from(this.targets.values()).map(
-      state => this.deleteUpstreamSession(state).catch(() => {})
-    );
-    await Promise.all(deletePromises);
+    // Delete upstream sessions in background - don't wait during shutdown
+    // Sessions will expire on their own if deletion fails
+    for (const state of this.targets.values()) {
+      this.deleteUpstreamSession(state).catch(() => {});
+    }
 
     return new Promise((resolve) => {
       this.server!.close(() => {
         this.isRunning = false;
         this.server = null;
-        log()?.info( '[BrokerProxy] Stopped');
+        log()?.info('[BrokerProxy] Stopped');
         resolve();
       });
     });
