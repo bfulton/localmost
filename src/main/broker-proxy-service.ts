@@ -182,6 +182,7 @@ export class BrokerProxyService extends EventEmitter {
   private isShuttingDown = false;
   private runnerVersion = '2.330.0';
   private pollInterval: NodeJS.Timeout | null = null;
+  private isPolling = false;  // Prevent concurrent poll execution
   private messageQueues: Map<string, Array<string>> = new Map();  // Per-target message queues
   private seenMessageIds: Set<string> = new Set();
   private pendingTargetAssignments: string[] = [];  // Queue of target IDs for upcoming sessions
@@ -296,6 +297,14 @@ export class BrokerProxyService extends EventEmitter {
     const poll = async () => {
       if (!this.isRunning) return;
 
+      // Prevent concurrent poll execution
+      if (this.isPolling) {
+        log()?.debug('[BrokerProxy] Skipping poll - previous poll still in progress');
+        return;
+      }
+      this.isPolling = true;
+
+      try {
       // Poll all enabled targets with active sessions
       // Since we acquire jobs immediately, GitHub won't return the same job twice
       const allTargets = Array.from(this.targets.values());
@@ -402,6 +411,9 @@ export class BrokerProxyService extends EventEmitter {
             log()?.info(`[BrokerProxy] Message (${messageType}) received from ${result.state.target.displayName}`);
           }
         }
+      }
+      } finally {
+        this.isPolling = false;
       }
     };
 
