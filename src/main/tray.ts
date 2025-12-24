@@ -23,6 +23,8 @@ export interface TrayStatusInfo {
   runnerStatus?: RunnerState['status'];
   isBusy: boolean;
   isSleepBlocked?: boolean;
+  isPaused?: boolean;
+  pauseReason?: string | null;
 }
 
 /**
@@ -296,6 +298,11 @@ export class TrayManager {
     }
     if (!status.isConfigured) {
       return 'Runner: Not configured';
+    }
+
+    // Show pause reason if paused
+    if (status.isPaused && status.pauseReason) {
+      return `⏸ ${status.pauseReason}`;
     }
 
     switch (status.runnerStatus) {

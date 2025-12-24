@@ -12,6 +12,7 @@ import {
   getAuthState,
   getPowerSaveBlockerId,
   getBrokerProxyService,
+  getEffectivePauseState,
 } from './app-state';
 import { findAsset } from './log-file';
 import { confirmQuitIfBusy } from './window';
@@ -65,6 +66,7 @@ export const updateTrayMenu = (): void => {
   const authState = getAuthState();
   const powerSaveBlockerId = getPowerSaveBlockerId();
   const brokerProxyService = getBrokerProxyService();
+  const pauseState = getEffectivePauseState();
 
   const runnerStatus = runnerManager?.getStatus();
 
@@ -87,6 +89,8 @@ export const updateTrayMenu = (): void => {
     runnerStatus: effectiveStatus,
     isBusy: runnerStatus?.status === 'busy',
     isSleepBlocked: powerSaveBlockerId !== null,
+    isPaused: pauseState.isPaused,
+    pauseReason: pauseState.reason,
   };
   trayManager?.updateMenu(status);
 };
