@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import StatusPage from './components/StatusPage';
 import SettingsPage from './components/SettingsPage';
+import UpdateNotification from './components/UpdateNotification';
 import PageErrorBoundary from './components/PageErrorBoundary';
-import { AppConfigProvider, RunnerProvider, useAppConfig, useRunner } from './contexts';
+import { AppConfigProvider, RunnerProvider, UpdateProvider, useAppConfig, useRunner } from './contexts';
 import styles from './components/App.module.css';
 
 type View = 'status' | 'settings';
@@ -70,6 +71,8 @@ const AppContent: React.FC = () => {
         </div>
       )}
 
+      <UpdateNotification />
+
       {view === 'status' && (
         <PageErrorBoundary
           key="status-page"
@@ -113,7 +116,9 @@ const App: React.FC = () => {
   return (
     <AppConfigProvider>
       <RunnerProvider>
-        <AppContent />
+        <UpdateProvider>
+          <AppContent />
+        </UpdateProvider>
       </RunnerProvider>
     </AppConfigProvider>
   );

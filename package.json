@@ -5,6 +5,10 @@
   "description": "Run GitHub actions locally when possible.",
   "author": "Bright Fulton",
   "license": "GPL-3.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bfulton/localmost.git"
+  },
   "main": "dist/main.js",
   "bin": {
     "localmost": "./dist/cli.js"
@@ -78,6 +82,7 @@
     "@fortawesome/fontawesome-svg-core": "^7.1.0",
     "@fortawesome/free-solid-svg-icons": "^7.1.0",
     "@fortawesome/react-fontawesome": "^3.1.1",
+    "electron-updater": "^6.6.2",
     "js-yaml": "^4.1.1",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",

@@ -310,3 +310,23 @@
   margin-left: 6px;
   font-size: 12px;
 }
+
+/* Update Check Row */
+.updateCheckRow {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.updateAvailable {
+  font-size: 13px;
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.updateReady {
+  font-size: 13px;
+  color: var(--success);
+  font-weight: 500;
+}

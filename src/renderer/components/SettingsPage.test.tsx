@@ -3,13 +3,16 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import SettingsPage from './SettingsPage';
 import { AppConfigProvider } from '../contexts/AppConfigContext';
 import { RunnerProvider } from '../contexts/RunnerContext';
+import { UpdateProvider } from '../contexts/UpdateContext';
 import { mockLocalmost } from '../../../test/setup-renderer';
 
-// Wrapper component that provides both contexts
+// Wrapper component that provides all required contexts
 const TestWrapper: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   <AppConfigProvider>
     <RunnerProvider>
-      {children}
+      <UpdateProvider>
+        {children}
+      </UpdateProvider>
     </RunnerProvider>
   </AppConfigProvider>
 );
