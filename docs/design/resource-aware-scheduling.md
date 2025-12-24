@@ -30,8 +30,11 @@ powerMonitor.on('on-ac', () => { /* resume */ });
 ```
 
 **Configuration Options**:
-- `pauseOnBattery`: `'always' | 'when-below-threshold' | 'never'` (default: `'never'`)
-- `batteryThreshold`: `number` (0-100, default: `20`) — only pause when below this percentage
+- `pauseOnBattery`: `'no' | '<25%' | '<50%' | '<75%'` (default: `'no'`)
+  - `'no'` — Never pause for battery
+  - `'<25%'` — Pause when battery drops below 25%
+  - `'<50%'` — Pause when battery drops below 50%
+  - `'<75%'` — Pause when battery drops below 75%
 
 **Edge Cases**:
 - Desktop Macs (iMac, Mac Mini, Mac Pro) never run on battery — feature auto-disables
@@ -71,28 +74,11 @@ const VIDEO_APPS = [
 ioreg -c AppleHDAEngineInput | grep IOAudioEngineState
 ```
 
-**Recommended Approach**: Combine camera usage detection (primary) with app detection (fallback). Camera is the strongest signal since it's rarely on outside of video calls.
-
 **Configuration Options**:
 - `pauseOnVideoCall`: `boolean` (default: `false`)
-- `videoCallDetection`: `'camera' | 'camera-and-app' | 'app-only'` (default: `'camera'`)
-- `videoCallGracePeriod`: `number` (seconds, default: `60`) — wait before resuming after call ends
+- `videoCallGracePeriod`: `number` (seconds, default: `60`) — wait before resuming after last call ends
 
-### 3. Low Battery (Medium Priority)
-
-**Condition**: Battery level drops below threshold (even when plugged in, for UPS scenarios)
-
-**Detection**:
-```typescript
-powerMonitor.on('low-power-mode', () => { /* pause */ });
-// Or check battery level directly via native module
-```
-
-**Configuration Options**:
-- `pauseOnLowBattery`: `boolean` (default: `false`)
-- `lowBatteryThreshold`: `number` (0-100, default: `10`)
-
-### 4. System Under Load (Low Priority - Future)
+### 3. System Under Load (Future)
 
 **Condition**: CPU/Memory usage exceeds threshold
 
@@ -109,7 +95,7 @@ const loadPercent = (loadAvg / cpuCount) * 100;
 - `loadThreshold`: `number` (0-100, default: `80`)
 - `loadSampleDuration`: `number` (seconds, default: `60`) — average over this period
 
-### 5. User-Defined Time Windows (Low Priority - Future)
+### 4. User-Defined Time Windows (Future)
 
 **Condition**: Current time falls within "do not disturb" windows
 
@@ -216,48 +202,25 @@ Add to `AppSettings` in `src/shared/types.ts`:
 
 ```typescript
 interface ResourceAwareConfig {
-  /** Master switch for resource-aware scheduling */
-  enabled: boolean;
+  /** Pause when on battery power below threshold */
+  pauseOnBattery: 'no' | '<25%' | '<50%' | '<75%';
 
-  /** Pause when running on battery power */
-  battery: {
-    enabled: boolean;
-    /** Only pause when battery below this % (0 = always pause on battery) */
-    threshold: number;
-  };
+  /** Pause during video calls (camera detection) */
+  pauseOnVideoCall: boolean;
 
-  /** Pause during video calls */
-  videoCall: {
-    enabled: boolean;
-    /** Detection method */
-    detection: 'camera' | 'camera-and-app' | 'app-only';
-    /** Seconds to wait after call ends before resuming */
-    gracePeriod: number;
-  };
+  /** Seconds to wait after call ends before resuming */
+  videoCallGracePeriod: number;
 
-  /** Pause when battery critically low (even if plugged in) */
-  lowBattery: {
-    enabled: boolean;
-    threshold: number;
-  };
+  /** Show notifications when auto-pausing/resuming */
+  notifyOnPause: boolean;
 }
 
 // Defaults
 const DEFAULT_RESOURCE_CONFIG: ResourceAwareConfig = {
-  enabled: false,
-  battery: {
-    enabled: true,
-    threshold: 0, // Pause on any battery
-  },
-  videoCall: {
-    enabled: true,
-    detection: 'camera',
-    gracePeriod: 60,
-  },
-  lowBattery: {
-    enabled: false,
-    threshold: 10,
-  },
+  pauseOnBattery: 'no',
+  pauseOnVideoCall: false,
+  videoCallGracePeriod: 60,
+  notifyOnPause: false,
 };
 ```
 
@@ -272,21 +235,12 @@ Add a "Resource Awareness" section to Settings:
 │ Resource Awareness                                          │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
-│ [Toggle] Pause runners automatically                        │
-│          Pause when your Mac needs its resources            │
+│ Pause when using battery                                    │
+│ [Dropdown: No / < 25% / < 50% / < 75%]                      │
 │                                                             │
-│ ─────────────────────────────────────────────────────────── │
+│ [Toggle] Pause during video calls                           │
 │                                                             │
-│ When to pause:                                              │
-│                                                             │
-│ [✓] On battery power                                        │
-│     [Dropdown: Always / Below 50% / Below 20%]              │
-│                                                             │
-│ [✓] During video calls                                      │
-│     Detection: [Dropdown: Camera / Camera + Apps / Apps]    │
-│     Resume delay: [Slider: 30s - 5min] after call ends      │
-│                                                             │
-│ [ ] When battery critically low (< 10%)                     │
+│ [Toggle] Notify when pausing/resuming                       │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -297,10 +251,8 @@ When resource-paused, show in the status area:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ 🔋 Runner paused — on battery power                         │
-│    Will resume automatically when plugged in                │
-├─────────────────────────────────────────────────────────────┤
-│ [Override: Run Anyway]                                      │
+│ 🔋 Runner paused — battery below 50%                        │
+│    Will resume when plugged in                              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -310,8 +262,6 @@ Or for video calls:
 ┌─────────────────────────────────────────────────────────────┐
 │ 📹 Runner paused — video call detected                      │
 │    Will resume 60s after call ends                          │
-├─────────────────────────────────────────────────────────────┤
-│ [Override: Run Anyway]                                      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -360,19 +310,17 @@ $ localmost status --json
 ### Phase 2: Video Call Detection
 
 1. Create `VideoCallMonitor` with camera detection
-2. Add grace period logic
+2. Add grace period logic (resets on new calls)
 3. Extend settings UI
-4. Add video call apps fallback detection
 
 **Deliverables**:
 - Camera-based video call detection
-- Configurable grace period
-- App-based fallback option
+- Grace period with reset on new calls
 
 ### Phase 3: Polish & Edge Cases
 
 1. Handle edge cases (desktop Macs, multiple conditions)
-2. Add "Override: Run Anyway" button
+2. Add notification support (optional, default off)
 3. Improve detection reliability
 4. Add analytics/logging for debugging
 
@@ -403,20 +351,17 @@ $ localmost status --json
 - Test with actual video calls (Zoom, FaceTime, etc.)
 - Test edge cases (plug in during job, video call ends during job)
 
-## Open Questions
+## Design Decisions
 
-1. **Video call detection accuracy**: Camera detection is reliable but may have false positives (Photo Booth, camera test sites). Should we require multiple signals (camera + known app)?
+1. **No "Run Anyway" override** — User can simply turn off auto-pause in settings; no need for a separate override button.
 
-2. **Grace period behavior**: Should grace period reset if a new call starts during the grace period?
+2. **Video call detection**: Camera-only. Simple and reliable.
 
-3. **Override persistence**: If user clicks "Run Anyway", should this:
-   - Override just once (next pause will still happen)?
-   - Override until condition clears?
-   - Override for a fixed duration (e.g., 1 hour)?
+3. **Grace period resets**: If a new call starts during the grace period, the timer resets. Always 60s after the *last* call ends.
 
-4. **Multiple conditions**: If both battery and video call are active, which reason do we show? (Current design: show all, but this is the first recommendation)
+4. **Multiple conditions**: Show the highest-priority active condition only.
 
-5. **Notification**: Should we show a macOS notification when auto-pausing? Could be useful but might be annoying.
+5. **Notifications**: Notify on pause and resume, but controlled by a separate setting (default: off).
 
 ## Security Considerations
 
