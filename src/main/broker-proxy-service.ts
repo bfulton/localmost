@@ -190,9 +190,12 @@ export class BrokerProxyService extends EventEmitter {
   private acquiredJobDetails: Map<string, string> = new Map();  // jobId -> job details from acquireJobUpstream
   private jobInfo: Map<string, { billingOwnerId?: string; runServiceUrl: string }> = new Map();  // messageId -> job info
   private canAcceptJobCallback?: () => boolean;
+  private sessionRetryTimeouts: Map<string, NodeJS.Timeout> = new Map();  // targetId -> retry timeout
 
   /** How often to poll targets for jobs (ms) */
   private static readonly POLL_INTERVAL_MS = 5000;
+  /** How long to wait before retrying failed session creation (ms) */
+  private static readonly SESSION_RETRY_INTERVAL_MS = 30000;
 
   constructor(port = 8787) {
     super();
@@ -279,6 +282,8 @@ export class BrokerProxyService extends EventEmitter {
       } catch (error) {
         log()?.error(`[BrokerProxy] Failed to create session for ${state.target.displayName}: ${(error as Error).message}`);
         state.error = (error as Error).message;
+        // Schedule background retry for failed session
+        this.scheduleSessionRetry(state);
       }
     }
 
@@ -480,6 +485,9 @@ export class BrokerProxyService extends EventEmitter {
     // Signal shutdown to break out of long-polls immediately
     this.isShuttingDown = true;
 
+    // Cancel any pending session retries
+    this.cancelSessionRetries();
+
     // Stop polling first
     this.stopPolling();
 
@@ -666,6 +674,62 @@ export class BrokerProxyService extends EventEmitter {
       state.sessionId = undefined;
       this.emitStatusUpdate();
     }
+  }
+
+  /**
+   * Schedule a background retry for session creation.
+   * This handles the case where GitHub has a stale session that takes ~90s to expire.
+   */
+  private scheduleSessionRetry(state: TargetState): void {
+    const targetId = state.target.id;
+
+    // Don't schedule if already scheduled or if we're shutting down
+    if (this.sessionRetryTimeouts.has(targetId) || this.isShuttingDown) {
+      return;
+    }
+
+    log()?.info(`[BrokerProxy] Scheduling session retry for ${state.target.displayName} in ${BrokerProxyService.SESSION_RETRY_INTERVAL_MS / 1000}s`);
+
+    const timeout = setTimeout(async () => {
+      this.sessionRetryTimeouts.delete(targetId);
+
+      if (this.isShuttingDown || !this.isRunning) {
+        return;
+      }
+
+      // Skip if session was already created (e.g., by another code path)
+      if (state.sessionId) {
+        log()?.debug(`[BrokerProxy] Session already exists for ${state.target.displayName}, skipping retry`);
+        return;
+      }
+
+      log()?.info(`[BrokerProxy] Retrying session creation for ${state.target.displayName}...`);
+
+      try {
+        await this.createUpstreamSession(state);
+        state.error = undefined;
+        log()?.info(`[BrokerProxy] Session retry succeeded for ${state.target.displayName}`);
+        this.emitStatusUpdate();
+      } catch (error) {
+        log()?.warn(`[BrokerProxy] Session retry failed for ${state.target.displayName}: ${(error as Error).message}`);
+        state.error = (error as Error).message;
+        this.emitStatusUpdate();
+        // Schedule another retry
+        this.scheduleSessionRetry(state);
+      }
+    }, BrokerProxyService.SESSION_RETRY_INTERVAL_MS);
+
+    this.sessionRetryTimeouts.set(targetId, timeout);
+  }
+
+  /**
+   * Cancel all pending session retries (called during shutdown).
+   */
+  private cancelSessionRetries(): void {
+    for (const timeout of this.sessionRetryTimeouts.values()) {
+      clearTimeout(timeout);
+    }
+    this.sessionRetryTimeouts.clear();
   }
 
   private async pollUpstreamTarget(state: TargetState): Promise<{ hasMessage: boolean; body: string }> {
