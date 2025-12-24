@@ -99,6 +99,16 @@ export function getUpdateStatus(): UpdateStatus {
 }
 
 /**
+ * Reset the update status. For testing only.
+ */
+export function resetForTesting(): void {
+  currentStatus = {
+    status: 'idle',
+    currentVersion: '',
+  };
+}
+
+/**
  * Update the status and notify renderer.
  */
 function updateStatus(mainWindow: BrowserWindow, update: Partial<UpdateStatus>): void {

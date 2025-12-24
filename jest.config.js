@@ -14,6 +14,7 @@ module.exports = {
   setupFilesAfterEnv: ['<rootDir>/test/setup.ts'],
   moduleNameMapper: {
     '^electron$': '<rootDir>/test/mocks/electron.ts',
+    '^electron-updater$': '<rootDir>/test/mocks/electron-updater.ts',
   },
   transform: {
     '^.+\\.tsx?$': ['ts-jest', {

@@ -1,27 +1,8 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { jest } from '@jest/globals';
-import { EventEmitter } from 'events';
+import type { EventEmitter } from 'events';
 
-// Create a mock autoUpdater as an EventEmitter
-const mockAutoUpdater = new EventEmitter() as EventEmitter & {
-  autoDownload: boolean;
-  autoInstallOnAppQuit: boolean;
-  checkForUpdates: jest.Mock;
-  downloadUpdate: jest.Mock;
-  quitAndInstall: jest.Mock;
-};
-mockAutoUpdater.autoDownload = true;
-mockAutoUpdater.autoInstallOnAppQuit = false;
-mockAutoUpdater.checkForUpdates = jest.fn();
-mockAutoUpdater.downloadUpdate = jest.fn();
-mockAutoUpdater.quitAndInstall = jest.fn();
-
-// Mock electron-updater
-jest.mock('electron-updater', () => ({
-  autoUpdater: mockAutoUpdater,
-}));
-
-// Mock electron
+// Mock electron (electron-updater is mocked via jest.config.js moduleNameMapper)
 jest.mock('electron', () => ({
   app: {
     getVersion: jest.fn().mockReturnValue('1.0.0'),
@@ -33,6 +14,14 @@ jest.mock('electron', () => ({
 jest.mock('./app-state', () => ({
   getIsQuitting: jest.fn().mockReturnValue(false),
 }));
+
+type MockAutoUpdater = EventEmitter & {
+  autoDownload: boolean;
+  autoInstallOnAppQuit: boolean;
+  checkForUpdates: jest.Mock;
+  downloadUpdate: jest.Mock;
+  quitAndInstall: jest.Mock;
+};
 
 import { app, BrowserWindow } from 'electron';
 import { IPC_CHANNELS } from '../shared/types';
@@ -51,29 +40,42 @@ describe('auto-updater', () => {
   let downloadUpdate: typeof import('./auto-updater').downloadUpdate;
   let installUpdate: typeof import('./auto-updater').installUpdate;
   let getUpdateStatus: typeof import('./auto-updater').getUpdateStatus;
+  let resetForTesting: typeof import('./auto-updater').resetForTesting;
   let mockGetIsQuitting: jest.Mock;
+  let mockAutoUpdater: MockAutoUpdater;
 
-  beforeEach(async () => {
+  beforeEach(() => {
     jest.clearAllMocks();
 
-    // Reset autoUpdater state
+    // Get fresh reference to the mock autoUpdater (persisted via global singleton)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const electronUpdaterModule = require('electron-updater');
+    mockAutoUpdater = electronUpdaterModule.autoUpdater as MockAutoUpdater;
+
+    // Reset autoUpdater state - remove all listeners so initAutoUpdater can re-register
     mockAutoUpdater.removeAllListeners();
     mockAutoUpdater.autoDownload = true;
     mockAutoUpdater.autoInstallOnAppQuit = false;
+    (mockAutoUpdater.checkForUpdates as jest.Mock).mockClear();
+    (mockAutoUpdater.downloadUpdate as jest.Mock).mockClear();
+    (mockAutoUpdater.quitAndInstall as jest.Mock).mockClear();
 
-    // Reset module to clear internal state
-    jest.resetModules();
-
-    // Re-import modules with fresh state
-    const autoUpdaterModule = await import('./auto-updater');
+    // Get module functions (cached, but listeners are reset above)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const autoUpdaterModule = require('./auto-updater');
     initAutoUpdater = autoUpdaterModule.initAutoUpdater;
     checkForUpdates = autoUpdaterModule.checkForUpdates;
     downloadUpdate = autoUpdaterModule.downloadUpdate;
     installUpdate = autoUpdaterModule.installUpdate;
     getUpdateStatus = autoUpdaterModule.getUpdateStatus;
+    resetForTesting = autoUpdaterModule.resetForTesting;
 
-    // Get fresh reference to the mocked getIsQuitting
-    const appStateModule = await import('./app-state');
+    // Reset module state for test isolation
+    resetForTesting();
+
+    // Get reference to the mocked getIsQuitting
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const appStateModule = require('./app-state');
     mockGetIsQuitting = appStateModule.getIsQuitting as jest.Mock;
 
     // Create mock window
