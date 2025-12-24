@@ -910,7 +910,8 @@ export class BrokerProxyService extends EventEmitter {
     let upstreamUrl: string;
 
     // For job operations, try to use the run_service_url from the job message
-    const jobOperations = ['/acquirejob', '/renewjob', '/finishjob', '/jobrequest', '/acknowledge'];
+    // Note: /acknowledge goes to broker, NOT run_service_url (it's BrokerHttpClient.AcknowledgeRunnerRequestAsync)
+    const jobOperations = ['/acquirejob', '/renewjob', '/finishjob', '/jobrequest'];
     if (jobOperations.some(op => url.pathname.startsWith(op))) {
       // Try to find run_service_url from request body or stored job info
       let runServiceUrl: string | undefined;
