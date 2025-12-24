@@ -152,13 +152,20 @@ export class TrayManager {
 
   /**
    * Load busy animation frames from assets.
+   * Loads both 1x and 2x versions for smooth Retina display animation.
    */
   private loadBusyIconFrames(): void {
     this.busyIconFrames = [];
     for (let i = 0; i < TRAY_ANIMATION_FRAMES; i++) {
       const iconPath = this.findAsset(`tray-icon-busy-${i}.png`);
+      const icon2xPath = this.findAsset(`tray-icon-busy-${i}@2x.png`);
       if (iconPath) {
         const icon = nativeImage.createFromPath(iconPath);
+        // Add 2x representation for Retina displays
+        if (icon2xPath) {
+          const icon2x = nativeImage.createFromPath(icon2xPath);
+          icon.addRepresentation({ scaleFactor: 2, buffer: icon2x.toPNG() });
+        }
         icon.setTemplateImage(false);
         this.busyIconFrames.push(icon);
       }
@@ -167,13 +174,20 @@ export class TrayManager {
 
   /**
    * Load not-ready animation frames from assets.
+   * Loads both 1x and 2x versions for smooth Retina display animation.
    */
   private loadNotReadyIconFrames(): void {
     this.notReadyIconFrames = [];
     for (let i = 0; i < TRAY_ANIMATION_FRAMES; i++) {
       const iconPath = this.findAsset(`tray-icon-notready-${i}.png`);
+      const icon2xPath = this.findAsset(`tray-icon-notready-${i}@2x.png`);
       if (iconPath) {
         const icon = nativeImage.createFromPath(iconPath);
+        // Add 2x representation for Retina displays
+        if (icon2xPath) {
+          const icon2x = nativeImage.createFromPath(icon2xPath);
+          icon.addRepresentation({ scaleFactor: 2, buffer: icon2x.toPNG() });
+        }
         icon.setTemplateImage(false);
         this.notReadyIconFrames.push(icon);
       }
