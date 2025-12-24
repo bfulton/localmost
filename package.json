@@ -6,10 +6,14 @@
   "author": "Bright Fulton",
   "license": "GPL-3.0",
   "main": "dist/main.js",
+  "bin": {
+    "localmost": "./dist/cli.js"
+  },
   "scripts": {
     "start": "npm run prebuild && npm run build:dev && electron .",
     "start:dev": "npm run prebuild && concurrently \"npm run watch\" \"wait-on dist/main.js && electron .\"",
-    "build": "npm run prebuild && cross-env NODE_ENV=production webpack --config webpack.config.js",
+    "build": "npm run prebuild && cross-env NODE_ENV=production webpack --config webpack.config.js && npm run build:cli",
+    "build:cli": "cross-env NODE_ENV=production webpack --config webpack.config.cli.js",
     "build:dev": "cross-env NODE_ENV=development webpack --config webpack.config.js",
     "watch": "cross-env NODE_ENV=development webpack --config webpack.config.js --watch",
     "package": "npm run build && electron-forge package",

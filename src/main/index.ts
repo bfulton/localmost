@@ -16,9 +16,11 @@ import {
   setRunnerDownloader,
   setGitHubAuth,
   setHeartbeatManager,
+  setCliServer,
   getRunnerManager,
   getRunnerDownloader,
   getHeartbeatManager,
+  getCliServer,
   getAuthState,
   setAuthState,
   getGitHubAuth,
@@ -32,6 +34,9 @@ import {
   getTrayManager,
   getLogger,
 } from './app-state';
+
+// CLI server
+import { CliServer } from './cli-server';
 
 // Config and security
 import { loadConfig } from './config';
@@ -166,6 +171,21 @@ app.whenReady().then(async () => {
     },
   });
   setHeartbeatManager(heartbeatManager);
+
+  // Initialize CLI server for `localmost` CLI companion
+  const cliServer = new CliServer({
+    onLog: (level, message) => {
+      if (level === 'info') logger?.info(message);
+      else if (level === 'warn') logger?.warn(message);
+      else logger?.error(message);
+    },
+  });
+  setCliServer(cliServer);
+  try {
+    await cliServer.start();
+  } catch (err) {
+    logger?.warn(`Failed to start CLI server: ${(err as Error).message}`);
+  }
 
   // Load saved auth state and settings
   const config = loadConfig();
@@ -339,10 +359,14 @@ app.on('before-quit', async (event) => {
     const runnerDownloader = getRunnerDownloader();
     const trayManager = getTrayManager();
     const mainWindow = getMainWindow();
+    const cliServer = getCliServer();
 
     // Now safe to do cleanup that logs (logs go to file only, not renderer)
     await heartbeatManager?.clear();
     heartbeatManager?.stop();
+
+    // Stop CLI server
+    await cliServer?.stop();
 
     // Cancel any jobs running on our runners before stopping
     // This prevents orphaned jobs that would block runner deletion on next startup
@@ -377,10 +401,14 @@ process.on('SIGINT', async () => {
   const runnerDownloader = getRunnerDownloader();
   const trayManager = getTrayManager();
   const mainWindow = getMainWindow();
+  const cliServer = getCliServer();
 
   // Clear heartbeat before stopping to prevent orphaned runners from picking up jobs
   await heartbeatManager?.clear();
   heartbeatManager?.stop();
+
+  // Stop CLI server
+  await cliServer?.stop();
 
   // Cancel any jobs running on our runners before stopping
   await cancelJobsOnOurRunners();

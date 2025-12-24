@@ -10,6 +10,7 @@ import { GitHubAuth } from './github-auth';
 import { HeartbeatManager } from './heartbeat-manager';
 import { TrayManager } from './tray';
 import { Logger } from './logger';
+import { CliServer } from './cli-server';
 import {
   RunnerState,
   GitHubUser,
@@ -33,6 +34,7 @@ let runnerDownloader: RunnerDownloader | null = null;
 let githubAuth: GitHubAuth | null = null;
 let heartbeatManager: HeartbeatManager | null = null;
 let logger: Logger | null = null;
+let cliServer: CliServer | null = null;
 
 let powerSaveBlockerId: number | null = null;
 let sleepProtectionSetting: SleepProtection = 'never';
@@ -89,6 +91,11 @@ export const setHeartbeatManager = (manager: HeartbeatManager | null): void => {
 export const getLogger = (): Logger | null => logger;
 export const setLogger = (l: Logger | null): void => {
   logger = l;
+};
+
+export const getCliServer = (): CliServer | null => cliServer;
+export const setCliServer = (server: CliServer | null): void => {
+  cliServer = server;
 };
 
 // ============================================================================

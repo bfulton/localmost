@@ -114,8 +114,9 @@ module.exports = {
   rebuildConfig: {},
   hooks: {
     postPackage: async (config, packageResult) => {
-      // Strip unused locales to reduce app size
       const fs = require('fs');
+
+      // Strip unused locales to reduce app size
       const localesDir = path.join(packageResult.outputPaths[0], 'locales');
 
       if (fs.existsSync(localesDir)) {
@@ -129,6 +130,28 @@ module.exports = {
           }
         }
         console.log(`Stripped ${removed} unused locale files (kept: ${keepLanguages.join(', ')})`);
+      }
+
+      // Copy CLI to Resources for easy access outside the asar
+      const appPath = packageResult.outputPaths[0];
+      const resourcesPath = path.join(appPath, 'localmost.app', 'Contents', 'Resources');
+      const cliSrc = path.join(__dirname, 'dist', 'cli.js');
+      const cliDest = path.join(resourcesPath, 'cli.js');
+
+      if (fs.existsSync(cliSrc)) {
+        fs.copyFileSync(cliSrc, cliDest);
+        fs.chmodSync(cliDest, 0o755);
+        console.log('Copied CLI to Resources/cli.js');
+
+        // Create a shell wrapper script for easier invocation
+        const wrapperPath = path.join(resourcesPath, 'localmost-cli');
+        const wrapperContent = `#!/bin/bash
+# localmost CLI wrapper
+exec /usr/bin/env node "\${0%/*}/cli.js" "$@"
+`;
+        fs.writeFileSync(wrapperPath, wrapperContent);
+        fs.chmodSync(wrapperPath, 0o755);
+        console.log('Created CLI wrapper at Resources/localmost-cli');
       }
     },
     postMake: async (config, makeResults) => {
