@@ -383,6 +383,9 @@ export class BrokerProxyService extends EventEmitter {
               log()?.info(`[BrokerProxy] Job ${jobId} received from ${result.state.target.displayName} (no run_service_url)`);
             }
 
+            // Acknowledge to GitHub so they don't resend this message
+            await this.acknowledgeMessageUpstream(result.state, messageId);
+
             // Queue message for the worker
             if (!this.messageQueues.has(targetId)) {
               this.messageQueues.set(targetId, []);
@@ -661,6 +664,38 @@ export class BrokerProxyService extends EventEmitter {
       state.error = (error as Error).message;
       this.emit('error', state.target.id, error);
       return { hasMessage: false, body: '' };
+    }
+  }
+
+  /**
+   * Acknowledge a message to GitHub so it won't be sent again.
+   */
+  private async acknowledgeMessageUpstream(state: TargetState, messageId: string): Promise<void> {
+    try {
+      const token = await this.getOAuthToken(state);
+      const brokerUrl = state.runner.serverUrlV2;
+      const ackUrl = `${brokerUrl}acknowledge?sessionId=${state.sessionId}`;
+
+      const body = JSON.stringify({ messageId });
+
+      log()?.debug(`[BrokerProxy] Acknowledging message ${messageId} to GitHub`);
+
+      const response = await httpsRequest(ackUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+      }, body);
+
+      if (response.statusCode === 200) {
+        log()?.debug(`[BrokerProxy] Acknowledged message ${messageId}`);
+      } else {
+        log()?.warn(`[BrokerProxy] Acknowledge returned ${response.statusCode}: ${response.body}`);
+      }
+    } catch (error) {
+      log()?.warn(`[BrokerProxy] Failed to acknowledge message: ${(error as Error).message}`);
     }
   }
 
