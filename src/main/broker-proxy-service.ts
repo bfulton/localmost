@@ -551,7 +551,7 @@ export class BrokerProxyService extends EventEmitter {
   // Upstream Session Management
   // --------------------------------------------------------------------------
 
-  private async createUpstreamSession(state: TargetState, retryOnConflict = true): Promise<string> {
+  private async createUpstreamSession(state: TargetState, retriesLeft = 3): Promise<string> {
     const token = await this.getOAuthToken(state);
     const brokerUrl = state.runner.serverUrlV2;
 
@@ -567,25 +567,29 @@ export class BrokerProxyService extends EventEmitter {
     }, '{}');
 
     // Handle 409 Conflict - session already exists
-    if (response.statusCode === 409 && retryOnConflict) {
-      log()?.info(`[BrokerProxy] Session conflict for ${state.target.displayName}, clearing stale session...`);
+    if (response.statusCode === 409 && retriesLeft > 0) {
+      log()?.info(`[BrokerProxy] Session conflict for ${state.target.displayName}, retries left: ${retriesLeft}`);
+      log()?.debug(`[BrokerProxy] Conflict response: ${response.body}`);
 
       // Try to extract existing session ID from response
+      let deletedSession = false;
       try {
         const conflictData = JSON.parse(response.body);
         if (conflictData.sessionId) {
           state.sessionId = conflictData.sessionId;
           await this.deleteUpstreamSession(state);
+          deletedSession = true;
         }
       } catch {
-        // Response might not have session ID, try deleting anyway
+        // Response might not have session ID
       }
 
-      // Wait a moment for session to clear
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      // Wait with exponential backoff: 2s, 4s, 8s
+      const waitMs = deletedSession ? 1000 : 2000 * Math.pow(2, 3 - retriesLeft);
+      log()?.info(`[BrokerProxy] Waiting ${waitMs}ms before retry...`);
+      await new Promise(resolve => setTimeout(resolve, waitMs));
 
-      // Retry once without recursion
-      return this.createUpstreamSession(state, false);
+      return this.createUpstreamSession(state, retriesLeft - 1);
     }
 
     if (response.statusCode !== 200 && response.statusCode !== 201) {
