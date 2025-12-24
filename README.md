@@ -37,6 +37,7 @@ Features:
 - **Multi-runner parallelism** — run 1-16 concurrent jobs
 - **Network isolation** — runner traffic is proxied through an allowlist (GitHub, npm, PyPI, etc.)
 - **Filesystem sandboxing** — runner processes can only write to their working directory
+- **Resource-aware scheduling** — automatically pause runners when on battery or during video calls
 
 ## What It Is
 
@@ -210,7 +211,6 @@ npm run make
 Future feature ideas:
 
 - **Multiple repo/org runner registration** - Support registering runners with more than one repo / org, or a mix of repos and orgs.
-- **Resource-aware scheduling** - Pause runners when on battery or during video calls.
 - **Quick actions** - Re-run failed job, cancel all jobs.
 - **Notifications** - Native macOS notifications for job completion/failure.
 - **Deep links** - Jump directly to job logs in GitHub.

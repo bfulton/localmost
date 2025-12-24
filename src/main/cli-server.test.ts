@@ -28,6 +28,7 @@ const mockStart = jest.fn<() => Promise<void>>();
 const mockStop = jest.fn<() => Promise<void>>();
 const mockHeartbeatIsRunning = jest.fn<() => boolean>();
 const mockHeartbeatStop = jest.fn<() => void>();
+const mockResourcePauseState = { isPaused: false, reason: null, conditions: [] };
 
 jest.mock('./app-state', () => ({
   getRunnerManager: () => ({
@@ -45,6 +46,9 @@ jest.mock('./app-state', () => ({
   }),
   getAuthState: () => ({
     user: { login: 'testuser' },
+  }),
+  getResourceMonitor: () => ({
+    getPauseState: () => mockResourcePauseState,
   }),
 }));
 
@@ -146,6 +150,7 @@ describe('CliServer', () => {
         heartbeat: { isRunning: true },
         authenticated: true,
         userName: 'testuser',
+        resourcePause: { isPaused: false, reason: null, conditions: [] },
       },
     });
   });
