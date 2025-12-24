@@ -386,11 +386,20 @@ export class BrokerProxyService extends EventEmitter {
             // Acknowledge to GitHub so they don't resend this message
             await this.acknowledgeMessageUpstream(result.state, messageId);
 
-            // Queue message for the worker
+            // Acquire the job upstream using our session
+            // This is critical - the job is tied to our upstream session, so workers
+            // can't acquire it themselves (they'd get Conflict)
+            const acquiredJob = await this.acquireJobUpstream(result.state, jobId);
+            if (!acquiredJob) {
+              log()?.warn(`[BrokerProxy] Failed to acquire job ${jobId}, not queuing`);
+              continue;
+            }
+
+            // Queue the acquired job data for the worker (not the original message)
             if (!this.messageQueues.has(targetId)) {
               this.messageQueues.set(targetId, []);
             }
-            this.messageQueues.get(targetId)!.push(result.body);
+            this.messageQueues.get(targetId)!.push(acquiredJob);
 
             result.state.jobsAssigned++;
 
