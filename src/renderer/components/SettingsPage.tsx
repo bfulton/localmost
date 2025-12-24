@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faXmark, faLightbulb, faMoon, faDesktop } from '@fortawesome/free-solid-svg-icons';
-import { SleepProtection } from '../../shared/types';
+import { SleepProtection, BatteryPauseThreshold } from '../../shared/types';
 import { GITHUB_APP_SETTINGS_URL, PRIVACY_POLICY_URL, REPOSITORY_URL } from '../../shared/constants';
 import { useAppConfig, useRunner, useUpdate } from '../contexts';
 import UserFilterSettings from './UserFilterSettings';
@@ -37,6 +37,10 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     setToolCacheLocation,
     userFilter,
     setUserFilter,
+    resourceAware,
+    setPauseOnBattery,
+    setPauseOnVideoCall,
+    setNotifyOnPause,
   } = useAppConfig();
 
   // Runner state from context
@@ -431,6 +435,49 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
             <p className={shared.formHint}>
               Prevents your Mac from sleeping while GitHub Actions jobs are running, ensuring jobs complete successfully.
             </p>
+          </div>
+        </section>
+
+        {/* Resource Awareness Section */}
+        <section id="resource-section" className={styles.settingsSection}>
+          <h3>Resource Awareness</h3>
+          <div className={shared.formGroup}>
+            <label>Pause when using battery</label>
+            <select
+              value={resourceAware.pauseOnBattery}
+              onChange={(e) => setPauseOnBattery(e.target.value as BatteryPauseThreshold)}
+            >
+              <option value="no">No</option>
+              <option value="<25%">Below 25%</option>
+              <option value="<50%">Below 50%</option>
+              <option value="<75%">Below 75%</option>
+            </select>
+            <p className={shared.formHint}>
+              Automatically pause runners when your Mac is on battery power. Jobs will fall back to GitHub-hosted runners.
+            </p>
+          </div>
+          <div className={shared.formGroup}>
+            <label className={shared.toggleRow}>
+              <input
+                type="checkbox"
+                checked={resourceAware.pauseOnVideoCall}
+                onChange={(e) => setPauseOnVideoCall(e.target.checked)}
+              />
+              <span>Pause during video calls</span>
+            </label>
+            <p className={shared.formHint}>
+              Detects camera usage and pauses runners during video calls. Resumes 60 seconds after the call ends.
+            </p>
+          </div>
+          <div className={shared.formGroup}>
+            <label className={shared.toggleRow}>
+              <input
+                type="checkbox"
+                checked={resourceAware.notifyOnPause}
+                onChange={(e) => setNotifyOnPause(e.target.checked)}
+              />
+              <span>Notify when pausing/resuming</span>
+            </label>
           </div>
         </section>
 

@@ -39,6 +39,11 @@ interface JobHistoryEntry {
   actionsUrl?: string;
 }
 
+interface ResourcePauseState {
+  isPaused: boolean;
+  reason: string | null;
+}
+
 interface StatusResponse {
   success: true;
   command: 'status';
@@ -48,6 +53,7 @@ interface StatusResponse {
     heartbeat: { isRunning: boolean };
     authenticated: boolean;
     userName?: string;
+    resourcePause?: ResourcePauseState;
   };
 }
 
@@ -131,13 +137,20 @@ function getStatusIcon(status: string): string {
 }
 
 function printStatus(response: StatusResponse): void {
-  const { runner, runnerName, heartbeat, authenticated, userName } = response.data;
+  const { runner, runnerName, heartbeat, authenticated, userName, resourcePause } = response.data;
 
   console.log(`\nRunner: ${runnerName}`);
-  console.log(`Status: ${getStatusIcon(runner.status)} ${runner.status}`);
 
-  if (runner.status === 'busy' && runner.jobName) {
-    console.log(`Job:    ${runner.jobName}`);
+  // Check for resource pause first
+  if (resourcePause?.isPaused && runner.status === 'offline') {
+    console.log(`Status: \u23F8 Paused (${resourcePause.reason || 'resource constraint'})`);
+    console.log(`        Will resume when condition clears`);
+  } else {
+    console.log(`Status: ${getStatusIcon(runner.status)} ${runner.status}`);
+
+    if (runner.status === 'busy' && runner.jobName) {
+      console.log(`Job:    ${runner.jobName}`);
+    }
   }
 
   if (runner.startedAt) {

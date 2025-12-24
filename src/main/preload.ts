@@ -18,6 +18,7 @@ import {
   Target,
   RunnerProxyStatus,
   Result,
+  ResourcePauseState,
 } from '../shared/types';
 
 // Expose protected methods to the renderer process
@@ -150,6 +151,16 @@ contextBridge.exposeInMainWorld('localmost', {
       return () => ipcRenderer.removeListener(IPC_CHANNELS.TARGETS_STATUS_UPDATE, handler);
     },
   },
+
+  // Resource-aware scheduling
+  resource: {
+    getState: () => ipcRenderer.invoke(IPC_CHANNELS.RESOURCE_GET_STATE),
+    onStateChange: (callback: (state: ResourcePauseState) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, state: ResourcePauseState) => callback(state);
+      ipcRenderer.on(IPC_CHANNELS.RESOURCE_STATE_CHANGED, handler);
+      return () => ipcRenderer.removeListener(IPC_CHANNELS.RESOURCE_STATE_CHANGED, handler);
+    },
+  },
 });
 
 // Type declarations for the exposed API
@@ -224,6 +235,10 @@ export interface LocalmostAPI {
     update: (targetId: string, updates: Partial<Pick<Target, 'enabled'>>) => Promise<Result<Target>>;
     getStatus: () => Promise<RunnerProxyStatus[]>;
     onStatusUpdate: (callback: (status: RunnerProxyStatus[]) => void) => () => void;
+  };
+  resource: {
+    getState: () => Promise<ResourcePauseState>;
+    onStateChange: (callback: (state: ResourcePauseState) => void) => () => void;
   };
 }
 

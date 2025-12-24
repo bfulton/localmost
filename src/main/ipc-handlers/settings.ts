@@ -9,8 +9,9 @@ import {
   setLogLevelSetting,
   setRunnerLogLevelSetting,
   updateSleepProtection,
+  getResourceMonitor,
 } from '../app-state';
-import { IPC_CHANNELS, SleepProtection, LogLevel } from '../../shared/types';
+import { IPC_CHANNELS, SleepProtection, LogLevel, ResourceAwareConfig } from '../../shared/types';
 
 /**
  * Register settings-related IPC handlers.
@@ -56,6 +57,14 @@ export const registerSettingsHandlers = (): void => {
         openAtLogin: settings.launchAtLogin,
         openAsHidden: false,
       });
+    }
+
+    // Update resource-aware config if setting changed
+    if (settings.resourceAware !== undefined) {
+      const resourceMonitor = getResourceMonitor();
+      if (resourceMonitor) {
+        resourceMonitor.updateConfig(settings.resourceAware as ResourceAwareConfig);
+      }
     }
 
     return { success: true };

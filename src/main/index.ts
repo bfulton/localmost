@@ -21,12 +21,14 @@ import {
   setCliServer,
   setBrokerProxyService,
   setTargetManager,
+  setResourceMonitor,
   getRunnerManager,
   getRunnerDownloader,
   getHeartbeatManager,
   getCliServer,
   getBrokerProxyService,
   getTargetManager,
+  getResourceMonitor,
   getAuthState,
   setAuthState,
   getGitHubAuth,
@@ -39,6 +41,8 @@ import {
   disableSleepProtection,
   getTrayManager,
   getLogger,
+  setResourcePaused,
+  isUserPaused,
 } from './app-state';
 
 // CLI server
@@ -78,7 +82,10 @@ import {
   UPDATE_CHECK_DELAY_MS,
 } from '../shared/constants';
 import { UpdateSettings } from '../shared/types';
-import { IPC_CHANNELS, SleepProtection, LogLevel } from '../shared/types';
+import { IPC_CHANNELS, SleepProtection, LogLevel, DEFAULT_RESOURCE_CONFIG } from '../shared/types';
+
+// Resource monitoring
+import { ResourceMonitor } from './resource-monitor';
 
 // ============================================================================
 // App Initialization
@@ -262,6 +269,68 @@ app.whenReady().then(async () => {
   if (config.runnerLogLevel) {
     setRunnerLogLevelSetting(config.runnerLogLevel as LogLevel);
   }
+
+  // Initialize resource monitor for resource-aware scheduling
+  const resourceConfig = config.resourceAware || DEFAULT_RESOURCE_CONFIG;
+  const resourceMonitor = new ResourceMonitor(resourceConfig);
+  setResourceMonitor(resourceMonitor);
+
+  // Handle resource-based pause/resume
+  resourceMonitor.on('should-pause', async (reason: string) => {
+    // Don't pause if user explicitly paused (they control when to resume)
+    if (isUserPaused()) return;
+
+    const runnerManager = getRunnerManager();
+    const heartbeatManager = getHeartbeatManager();
+
+    if (runnerManager?.isRunning()) {
+      logger?.info(`Resource pause triggered: ${reason}`);
+      setResourcePaused(true);
+
+      // Stop heartbeat first to signal unavailability
+      await heartbeatManager?.clear();
+      heartbeatManager?.stop();
+
+      // Stop the runner (gracefully - in-progress jobs will complete)
+      await runnerManager.stop();
+    }
+  });
+
+  resourceMonitor.on('should-resume', async () => {
+    // Don't resume if user explicitly paused
+    if (isUserPaused()) return;
+
+    const runnerManager = getRunnerManager();
+
+    if (runnerManager?.isConfigured() && !runnerManager.isRunning()) {
+      logger?.info('Resource pause cleared - resuming runner');
+      setResourcePaused(false);
+
+      try {
+        await runnerManager.start();
+
+        // Restart heartbeat
+        const heartbeatManager = getHeartbeatManager();
+        const authState = getAuthState();
+        if (heartbeatManager && authState?.accessToken) {
+          await heartbeatManager.start();
+        }
+      } catch (err) {
+        logger?.error(`Failed to resume runner: ${(err as Error).message}`);
+      }
+    }
+  });
+
+  // Send resource state changes to renderer
+  resourceMonitor.on('state-changed', (state) => {
+    const mainWindow = getMainWindow();
+    if (mainWindow && !mainWindow.isDestroyed() && !getIsQuitting()) {
+      mainWindow.webContents.send(IPC_CHANNELS.RESOURCE_STATE_CHANGED, state);
+    }
+  });
+
+  // Start monitoring (will evaluate conditions and emit events as needed)
+  resourceMonitor.start();
 
   // Create UI
   createMenu();
@@ -455,6 +524,9 @@ app.on('before-quit', async (event) => {
 
     // Stop broker proxy service
     await brokerProxyService?.stop();
+
+    // Stop resource monitor
+    getResourceMonitor()?.stop();
 
     // Cancel any jobs running on our runners before stopping
     // This prevents orphaned jobs that would block runner deletion on next startup

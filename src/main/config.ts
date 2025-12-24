@@ -8,7 +8,7 @@ import * as yaml from 'js-yaml';
 import { getAppDataDir, getConfigPath } from './paths';
 import { encryptValue, decryptValue } from './encryption';
 import { bootLog } from './log-file';
-import { GitHubUser, SleepProtection, LogLevel, UserFilterConfig, Target } from '../shared/types';
+import { GitHubUser, SleepProtection, LogLevel, UserFilterConfig, Target, ResourceAwareConfig } from '../shared/types';
 
 // Config paths - uses centralized path management
 const configDir = getAppDataDir();
@@ -30,6 +30,7 @@ export const SETTABLE_CONFIG_KEYS = [
   'userFilter',
   'targets',
   'maxConcurrentJobs',
+  'resourceAware',
 ] as const;
 
 export type SettableConfigKey = typeof SETTABLE_CONFIG_KEYS[number];
@@ -62,6 +63,7 @@ export interface AppConfig {
   targets?: Target[];
   /** Maximum concurrent jobs across all targets (1-16, defaults to 4) */
   maxConcurrentJobs?: number;
+  resourceAware?: ResourceAwareConfig;
 }
 
 /**

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faGear, faChevronDown, faFile, faCheck, faBackwardStep, faForwardStep, faBan } from '@fortawesome/free-solid-svg-icons';
-import { JobHistoryEntry, Target } from '../../shared/types';
+import { JobHistoryEntry, Target, ResourcePauseState } from '../../shared/types';
 import { GITHUB_APP_SETTINGS_URL } from '../../shared/constants';
 import { useAppConfig, useRunner } from '../contexts';
 import styles from './StatusPage.module.css';
@@ -83,6 +83,7 @@ const StatusItem: React.FC<StatusItemProps> = ({ label, status, statusType, deta
 interface RunnerStatusItemProps {
   status: string;
   statusType: string;
+  pauseReason?: string;
   runnerName: string | null;
   runnerSettingsUrl: string | null;
   runnerVersion: { version: string | null; url: string | null };
@@ -91,11 +92,13 @@ interface RunnerStatusItemProps {
   showUsage: boolean;
   onToggleUsage: () => void;
   onOpenRunnerConfig: () => void;
+  onPauseReasonClick?: () => void;
 }
 
 const RunnerStatusItem: React.FC<RunnerStatusItemProps> = ({
   status,
   statusType,
+  pauseReason,
   runnerName,
   runnerSettingsUrl,
   runnerVersion,
@@ -104,6 +107,7 @@ const RunnerStatusItem: React.FC<RunnerStatusItemProps> = ({
   showUsage,
   onToggleUsage,
   onOpenRunnerConfig,
+  onPauseReasonClick,
 }) => {
   // Build targets display
   const getTargetsDisplay = (): { text: string; tooltip?: string } | null => {
@@ -178,6 +182,20 @@ const RunnerStatusItem: React.FC<RunnerStatusItemProps> = ({
             {targetsDisplay.text}
           </a>
         )}
+      </div>
+    )}
+    {pauseReason && (
+      <div className={styles.statusItemDetail}>
+        <a
+          href="#"
+          className={styles.pauseReasonLink}
+          onClick={(e) => {
+            e.preventDefault();
+            onPauseReasonClick?.();
+          }}
+        >
+          {pauseReason}
+        </a>
       </div>
     )}
     {showUsage && (
@@ -377,6 +395,7 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
   const [logPathCopied, setLogPathCopied] = useState(false);
   const [logFilter, setLogFilter] = useState('');
   const [, setTick] = useState(0); // Force re-render for elapsed time updates
+  const [resourcePause, setResourcePause] = useState<ResourcePauseState>({ isPaused: false, reason: null, conditions: [] });
   const logsEndRef = useRef<HTMLDivElement>(null);
   const logsContentRef = useRef<HTMLDivElement>(null);
   const isAtBottomRef = useRef(true); // Track if user is scrolled to bottom
@@ -398,6 +417,15 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
 
     // Get log file path
     window.localmost.logs.getPath().then(setLogPath);
+
+
+    // Load initial resource pause state and subscribe to changes
+    window.localmost.resource.getState().then(setResourcePause);
+    const unsubResource = window.localmost.resource.onStateChange(setResourcePause);
+
+    return () => {
+      unsubResource();
+    };
   }, [isConfigured, targets]);
 
   // Helper to check if scroll is at bottom
@@ -479,8 +507,8 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
     };
   };
 
-  // Runner status - combines worker status with connection status
-  const getRunnerStatusInfo = (): { status: string; statusType: string } => {
+  // Runner status - combines worker status with connection status and pause reason
+  const getRunnerStatusInfo = (): { status: string; statusType: string; pauseReason?: string } => {
     if (!user) {
       return { status: 'Waiting for GitHub', statusType: 'offline' };
     }
@@ -489,6 +517,11 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
     }
     if (!isConfigured) {
       return { status: 'Not configured', statusType: 'offline' };
+    }
+
+    // Check if paused due to resource constraints
+    if (resourcePause.isPaused && runnerState.status === 'offline') {
+      return { status: 'Paused', statusType: 'idle', pauseReason: resourcePause.reason || 'Resource constraint' };
     }
 
     // Check connection status for all targets
@@ -641,6 +674,7 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
         <RunnerStatusItem
           status={runnerStatus.status}
           statusType={runnerStatus.statusType}
+          pauseReason={runnerStatus.pauseReason}
           runnerName={isConfigured ? runnerDisplayName : null}
           runnerSettingsUrl={runnerSettingsUrl}
           runnerVersion={runnerVersion}
@@ -649,6 +683,7 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
           showUsage={showUsage}
           onToggleUsage={() => setShowUsage(!showUsage)}
           onOpenRunnerConfig={() => onOpenSettings('runner-config-section')}
+          onPauseReasonClick={() => onOpenSettings('resource-section')}
         />
         <JobStatusItem
           status={jobStatus.status}

@@ -201,6 +201,10 @@ export const IPC_CHANNELS = {
   TARGETS_UPDATE: 'targets:update',
   TARGETS_GET_STATUS: 'targets:get-status',
   TARGETS_STATUS_UPDATE: 'targets:status-update',
+
+  // Resource-aware scheduling
+  RESOURCE_GET_STATE: 'resource:get-state',
+  RESOURCE_STATE_CHANGED: 'resource:state-changed',
 } as const;
 
 export interface GitHubUser {
@@ -424,4 +428,49 @@ export interface MultiTargetRunnerState {
   activeJobs: number;
   /** Maximum concurrent jobs allowed */
   maxConcurrentJobs: number;
+}
+
+// =============================================================================
+// Resource-Aware Scheduling Types
+// =============================================================================
+
+/** Battery threshold for auto-pause. 'no' means never pause for battery. */
+export type BatteryPauseThreshold = 'no' | '<25%' | '<50%' | '<75%';
+
+/** Resource condition that can trigger auto-pause */
+export interface ResourceCondition {
+  type: 'battery' | 'video-call';
+  active: boolean;
+  reason: string;
+  since?: string; // ISO timestamp
+}
+
+/** Resource-aware scheduling configuration */
+export interface ResourceAwareConfig {
+  /** Pause when on battery power below threshold */
+  pauseOnBattery: BatteryPauseThreshold;
+  /** Pause during video calls (camera detection) */
+  pauseOnVideoCall: boolean;
+  /** Seconds to wait after call ends before resuming */
+  videoCallGracePeriod: number;
+  /** Show notifications when auto-pausing/resuming */
+  notifyOnPause: boolean;
+}
+
+/** Default resource-aware configuration */
+export const DEFAULT_RESOURCE_CONFIG: ResourceAwareConfig = {
+  pauseOnBattery: 'no',
+  pauseOnVideoCall: false,
+  videoCallGracePeriod: 60,
+  notifyOnPause: false,
+};
+
+/** Resource pause state for UI display */
+export interface ResourcePauseState {
+  /** Whether the runner is currently paused due to resource conditions */
+  isPaused: boolean;
+  /** The reason for the pause (highest priority condition) */
+  reason: string | null;
+  /** All active conditions */
+  conditions: ResourceCondition[];
 }

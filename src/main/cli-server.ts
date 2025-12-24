@@ -9,8 +9,8 @@ import * as net from 'net';
 import * as fs from 'fs';
 import { app } from 'electron';
 import { getCliSocketPath } from './paths';
-import { getRunnerManager, getHeartbeatManager, getAuthState } from './app-state';
-import { RunnerState, JobHistoryEntry } from '../shared/types';
+import { getRunnerManager, getHeartbeatManager, getAuthState, getResourceMonitor } from './app-state';
+import { RunnerState, JobHistoryEntry, ResourcePauseState } from '../shared/types';
 
 /** CLI command request */
 export interface CliRequest {
@@ -29,6 +29,7 @@ export interface StatusResponse {
     };
     authenticated: boolean;
     userName?: string;
+    resourcePause?: ResourcePauseState;
   };
 }
 
@@ -184,6 +185,8 @@ export class CliServer {
       case 'status': {
         const runnerState = runnerManager?.getStatus() || { status: 'offline' as const };
         const runnerName = runnerManager?.getStatusDisplayName() || 'unknown';
+        const resourceMonitor = getResourceMonitor();
+        const resourcePause = resourceMonitor?.getPauseState();
 
         return {
           success: true,
@@ -196,6 +199,7 @@ export class CliServer {
             },
             authenticated: !!authState,
             userName: authState?.user?.login,
+            resourcePause: resourcePause,
           },
         };
       }

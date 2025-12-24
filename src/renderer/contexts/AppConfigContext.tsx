@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode } from 'react';
-import { LogEntry, SleepProtection, LogLevel, ToolCacheLocation, UserFilterConfig } from '../../shared/types';
+import { LogEntry, SleepProtection, LogLevel, ToolCacheLocation, UserFilterConfig, ResourceAwareConfig, BatteryPauseThreshold, DEFAULT_RESOURCE_CONFIG } from '../../shared/types';
 
 export type ThemeSetting = 'light' | 'dark' | 'auto';
 
@@ -37,6 +37,13 @@ interface AppConfigContextValue {
   // User filter
   userFilter: UserFilterConfig;
   setUserFilter: (filter: UserFilterConfig) => Promise<void>;
+
+  // Resource-aware scheduling
+  resourceAware: ResourceAwareConfig;
+  setResourceAware: (config: ResourceAwareConfig) => Promise<void>;
+  setPauseOnBattery: (threshold: BatteryPauseThreshold) => Promise<void>;
+  setPauseOnVideoCall: (enabled: boolean) => Promise<void>;
+  setNotifyOnPause: (enabled: boolean) => Promise<void>;
 
   // App state
   isOnline: boolean;
@@ -88,6 +95,9 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
 
   // User filter
   const [userFilter, setUserFilterState] = useState<UserFilterConfig>({ mode: 'just-me', allowlist: [] });
+
+  // Resource-aware scheduling
+  const [resourceAware, setResourceAwareState] = useState<ResourceAwareConfig>(DEFAULT_RESOURCE_CONFIG);
 
   // Apply theme whenever it changes
   useEffect(() => {
@@ -166,6 +176,15 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
               allowlist: Array.isArray(filter.allowlist) ? filter.allowlist : [],
             });
           }
+        }
+
+        // Resource-aware scheduling
+        if (settings.resourceAware) {
+          const config = settings.resourceAware as ResourceAwareConfig;
+          setResourceAwareState({
+            ...DEFAULT_RESOURCE_CONFIG,
+            ...config,
+          });
         }
 
         setIsLoading(false);
@@ -299,6 +318,45 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     }
   }, []);
 
+  const setResourceAware = useCallback(async (config: ResourceAwareConfig) => {
+    setResourceAwareState(config);
+    try {
+      await window.localmost.settings.set({ resourceAware: config });
+    } catch {
+      // Optimistic update - UI already changed
+    }
+  }, []);
+
+  const setPauseOnBattery = useCallback(async (threshold: BatteryPauseThreshold) => {
+    const newConfig = { ...resourceAware, pauseOnBattery: threshold };
+    setResourceAwareState(newConfig);
+    try {
+      await window.localmost.settings.set({ resourceAware: newConfig });
+    } catch {
+      // Optimistic update - UI already changed
+    }
+  }, [resourceAware]);
+
+  const setPauseOnVideoCall = useCallback(async (enabled: boolean) => {
+    const newConfig = { ...resourceAware, pauseOnVideoCall: enabled };
+    setResourceAwareState(newConfig);
+    try {
+      await window.localmost.settings.set({ resourceAware: newConfig });
+    } catch {
+      // Optimistic update - UI already changed
+    }
+  }, [resourceAware]);
+
+  const setNotifyOnPause = useCallback(async (enabled: boolean) => {
+    const newConfig = { ...resourceAware, notifyOnPause: enabled };
+    setResourceAwareState(newConfig);
+    try {
+      await window.localmost.settings.set({ resourceAware: newConfig });
+    } catch {
+      // Optimistic update - UI already changed
+    }
+  }, [resourceAware]);
+
   const clearLogs = useCallback(() => {
     logsRef.current = [];
     setLogs([]);
@@ -327,6 +385,11 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     setToolCacheLocation,
     userFilter,
     setUserFilter,
+    resourceAware,
+    setResourceAware,
+    setPauseOnBattery,
+    setPauseOnVideoCall,
+    setNotifyOnPause,
     isOnline,
     isLoading,
     error,

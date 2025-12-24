@@ -13,11 +13,14 @@ import { Logger } from './logger';
 import { CliServer } from './cli-server';
 import { BrokerProxyService } from './broker-proxy-service';
 import { TargetManager } from './target-manager';
+import { ResourceMonitor } from './resource-monitor';
 import {
   RunnerState,
   GitHubUser,
   SleepProtection,
   LogLevel,
+  ResourceAwareConfig,
+  ResourcePauseState,
 } from '../shared/types';
 
 // Auth state structure
@@ -39,6 +42,7 @@ let logger: Logger | null = null;
 let cliServer: CliServer | null = null;
 let brokerProxyService: BrokerProxyService | null = null;
 let targetManager: TargetManager | null = null;
+let resourceMonitor: ResourceMonitor | null = null;
 
 let powerSaveBlockerId: number | null = null;
 let sleepProtectionSetting: SleepProtection = 'never';
@@ -47,6 +51,10 @@ let runnerLogLevelSetting: LogLevel = 'warn';
 let currentRunnerStatus: RunnerState['status'] = 'offline';
 let authState: AuthState | null = null;
 let isQuitting = false;
+
+// Resource-aware scheduling state
+let resourcePaused = false;
+let userPaused = false;
 
 // Track instances that are blocked because they're running jobs on GitHub
 const busyInstances = new Set<number>();
@@ -110,6 +118,39 @@ export const setBrokerProxyService = (service: BrokerProxyService | null): void 
 export const getTargetManager = (): TargetManager | null => targetManager;
 export const setTargetManager = (manager: TargetManager | null): void => {
   targetManager = manager;
+};
+
+export const getResourceMonitor = (): ResourceMonitor | null => resourceMonitor;
+export const setResourceMonitor = (monitor: ResourceMonitor | null): void => {
+  resourceMonitor = monitor;
+};
+
+// ============================================================================
+// Resource-Aware Pause State
+// ============================================================================
+
+export const isResourcePaused = (): boolean => resourcePaused;
+export const setResourcePaused = (paused: boolean): void => {
+  resourcePaused = paused;
+};
+
+export const isUserPaused = (): boolean => userPaused;
+export const setUserPaused = (paused: boolean): void => {
+  userPaused = paused;
+};
+
+/**
+ * Get the overall pause state combining user and resource pauses.
+ */
+export const getEffectivePauseState = (): { isPaused: boolean; reason: string | null } => {
+  if (userPaused) {
+    return { isPaused: true, reason: 'Paused by user' };
+  }
+  if (resourcePaused && resourceMonitor) {
+    const state = resourceMonitor.getPauseState();
+    return { isPaused: true, reason: state.reason };
+  }
+  return { isPaused: false, reason: null };
 };
 
 // ============================================================================
