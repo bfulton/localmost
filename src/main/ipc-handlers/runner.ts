@@ -19,6 +19,7 @@ import {
   getLogger,
   getIsQuitting,
 } from '../app-state';
+import { getSnapshot, selectRunnerStatus } from '../runner-state-service';
 import {
   IPC_CHANNELS,
   ConfigureOptions,
@@ -375,8 +376,9 @@ export const registerRunnerHandlers = (): void => {
   });
 
   ipcMain.handle(IPC_CHANNELS.RUNNER_STATUS, () => {
-    const runnerManager = getRunnerManager();
-    return runnerManager?.getStatus() ?? { status: 'offline' };
+    // Use state machine for consistent status (same as CLI)
+    const snapshot = getSnapshot();
+    return snapshot ? selectRunnerStatus(snapshot) : { status: 'offline' };
   });
 
   // Job history

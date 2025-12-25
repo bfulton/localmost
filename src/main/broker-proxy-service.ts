@@ -1205,7 +1205,6 @@ export class BrokerProxyService extends EventEmitter {
 
       // Prevent concurrent poll execution
       if (this.isPolling) {
-        log()?.debug('[BrokerProxy] Skipping poll - previous poll still in progress');
         return;
       }
       this.isPolling = true;
