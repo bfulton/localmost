@@ -375,9 +375,8 @@ export class RunnerManager {
   }
 
   private getInstanceName(instance: number): string {
-    if (this.runnerCount === 1) {
-      return this.baseRunnerName || `localmost.${os.hostname()}`;
-    }
+    // Always use .N suffix to match how runners are registered with GitHub
+    // (registration always uses baseRunnerName.N format)
     return `${this.baseRunnerName || `localmost.${os.hostname()}`}.${instance}`;
   }
 
