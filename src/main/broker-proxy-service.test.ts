@@ -5,10 +5,12 @@ import { EventEmitter } from 'events';
 // Mock http module
 const mockServerListen = jest.fn<(port: number, callback: () => void) => void>();
 const mockServerClose = jest.fn<(callback: () => void) => void>();
+const mockServerCloseAllConnections = jest.fn();
 const mockServer = {
   on: jest.fn(),
   listen: mockServerListen,
   close: mockServerClose,
+  closeAllConnections: mockServerCloseAllConnections,
 };
 const mockCreateServer = jest.fn(() => mockServer);
 

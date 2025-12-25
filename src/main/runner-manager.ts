@@ -42,6 +42,17 @@ interface WorkflowJob {
   runner_name: string | null;
 }
 
+/** Job event types for notifications */
+export type JobEventType = 'started' | 'completed';
+
+/** Job event data for notifications */
+export interface JobEvent {
+  type: JobEventType;
+  jobName: string;
+  repository: string;
+  status?: 'succeeded' | 'failed' | 'cancelled';
+}
+
 interface RunnerManagerOptions {
   onLog: (entry: LogEntry) => void;
   onStatusChange: (state: RunnerState) => void;
@@ -58,6 +69,8 @@ interface RunnerManagerOptions {
   getCurrentUserLogin?: () => string | undefined;
   /** Cancel a workflow run */
   cancelWorkflowRun?: (owner: string, repo: string, runId: number) => Promise<void>;
+  /** Called when a job starts or completes (for notifications) */
+  onJobEvent?: (event: JobEvent) => void;
 }
 
 export class RunnerManager {
@@ -77,6 +90,7 @@ export class RunnerManager {
   private getUserFilter?: () => UserFilterConfig | undefined;
   private getCurrentUserLogin?: () => string | undefined;
   private cancelWorkflowRun?: (owner: string, repo: string, runId: number) => Promise<void>;
+  private onJobEvent?: (event: JobEvent) => void;
   private jobHistory: JobHistoryEntry[] = [];
   private jobIdCounter = 0;
   private maxJobHistory = DEFAULT_MAX_JOB_HISTORY;
@@ -144,6 +158,7 @@ export class RunnerManager {
     this.getUserFilter = options.getUserFilter;
     this.getCurrentUserLogin = options.getCurrentUserLogin;
     this.cancelWorkflowRun = options.cancelWorkflowRun;
+    this.onJobEvent = options.onJobEvent;
 
     this.downloader = new RunnerDownloader();
     this.configPath = getConfigPath();
@@ -1302,6 +1317,13 @@ export class RunnerManager {
     }
     this.saveJobHistory();
     this.onJobHistoryUpdate([...this.jobHistory]); // Send a copy to trigger React update
+
+    // Notify about job start
+    this.onJobEvent?.({
+      type: 'started',
+      jobName: job.jobName,
+      repository: job.repository,
+    });
   }
 
   private updateJobInHistory(jobId: string, updates: Partial<JobHistoryEntry>): void {
@@ -1311,6 +1333,16 @@ export class RunnerManager {
       Object.assign(job, updates);
       this.saveJobHistory();
       this.onJobHistoryUpdate([...this.jobHistory]); // Send a copy to trigger React update
+
+      // Notify about job completion if status changed to a terminal state
+      if (updates.status && updates.status !== 'running') {
+        this.onJobEvent?.({
+          type: 'completed',
+          jobName: job.jobName,
+          repository: job.repository,
+          status: updates.status as 'succeeded' | 'failed' | 'cancelled',
+        });
+      }
     } else {
       this.log('warn', `Could not find job ${jobId} to update. History has ${this.jobHistory.length} jobs: ${this.jobHistory.map(j => j.id).join(', ')}`);
     }

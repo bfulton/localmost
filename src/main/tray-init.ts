@@ -14,6 +14,7 @@ import {
   getBrokerProxyService,
   getEffectivePauseState,
   setUserPaused,
+  setResourcePaused,
   getLogger,
   getHeartbeatManager,
   getIsQuitting,
@@ -80,7 +81,9 @@ export const initTray = (): void => {
       },
       onResume: async () => {
         getLogger()?.info('User resumed runner');
+        // Clear both user and resource pause - user override takes precedence
         setUserPaused(false);
+        setResourcePaused(false);
 
         // Restart heartbeat to signal availability
         const heartbeatManager = getHeartbeatManager();

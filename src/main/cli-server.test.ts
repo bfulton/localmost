@@ -19,7 +19,6 @@ jest.mock('./paths', () => ({
 }));
 
 // Mock app-state
-const mockGetStatus = jest.fn<() => { status: string }>();
 const mockGetStatusDisplayName = jest.fn<() => string>();
 const mockGetJobHistory = jest.fn<() => unknown[]>();
 const mockIsRunning = jest.fn<() => boolean>();
@@ -28,11 +27,9 @@ const mockStart = jest.fn<() => Promise<void>>();
 const mockStop = jest.fn<() => Promise<void>>();
 const mockHeartbeatIsRunning = jest.fn<() => boolean>();
 const mockHeartbeatStop = jest.fn<() => void>();
-const mockResourcePauseState = { isPaused: false, reason: null, conditions: [] };
 
 jest.mock('./app-state', () => ({
   getRunnerManager: () => ({
-    getStatus: mockGetStatus,
     getStatusDisplayName: mockGetStatusDisplayName,
     getJobHistory: mockGetJobHistory,
     isRunning: mockIsRunning,
@@ -47,9 +44,17 @@ jest.mock('./app-state', () => ({
   getAuthState: () => ({
     user: { login: 'testuser' },
   }),
-  getResourceMonitor: () => ({
-    getPauseState: () => mockResourcePauseState,
-  }),
+}));
+
+// Mock runner-state-service
+const mockSnapshot = { value: { running: 'listening' }, context: {} };
+const mockSelectRunnerStatus = jest.fn<() => { status: string }>();
+const mockSelectEffectivePauseState = jest.fn<() => { isPaused: boolean; reason: string | null }>();
+
+jest.mock('./runner-state-service', () => ({
+  getSnapshot: () => mockSnapshot,
+  selectRunnerStatus: () => mockSelectRunnerStatus(),
+  selectEffectivePauseState: () => mockSelectEffectivePauseState(),
 }));
 
 import { CliServer, CliRequest } from './cli-server';
@@ -73,7 +78,6 @@ describe('CliServer', () => {
 
     // Reset all mocks
     mockQuit.mockClear();
-    mockGetStatus.mockReset();
     mockGetStatusDisplayName.mockReset();
     mockGetJobHistory.mockReset();
     mockIsRunning.mockReset();
@@ -82,14 +86,17 @@ describe('CliServer', () => {
     mockStop.mockReset();
     mockHeartbeatIsRunning.mockReset();
     mockHeartbeatStop.mockReset();
+    mockSelectRunnerStatus.mockReset();
+    mockSelectEffectivePauseState.mockReset();
 
     // Default mock implementations
-    mockGetStatus.mockReturnValue({ status: 'listening' });
     mockGetStatusDisplayName.mockReturnValue('localmost.test');
     mockGetJobHistory.mockReturnValue([]);
     mockIsRunning.mockReturnValue(true);
     mockIsConfigured.mockReturnValue(true);
     mockHeartbeatIsRunning.mockReturnValue(true);
+    mockSelectRunnerStatus.mockReturnValue({ status: 'listening' });
+    mockSelectEffectivePauseState.mockReturnValue({ isPaused: false, reason: null });
   });
 
   afterEach(async () => {

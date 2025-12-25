@@ -87,7 +87,6 @@ export const initLogFile = (): void => {
 
     // Open write stream
     logFileStream = fs.createWriteStream(logFilePath, { flags: 'a' });
-    logFileStream.write(`=== localmost started at ${now.toISOString()} ===\n`);
 
     // Clean up old log files
     const logFiles = fs.readdirSync(logsDir)

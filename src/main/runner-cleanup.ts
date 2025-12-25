@@ -5,6 +5,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { shell } from 'electron';
 
 export type CleanupLogger = (message: string) => void;
 export type LeveledLogger = (level: 'info' | 'error', message: string) => void;
@@ -113,11 +114,20 @@ export async function cleanupSandboxDirectories(
       }
 
       if (entry.name.includes('.trash.')) {
-        // Trash directories: clean in background (may have locked files)
-        log(`Removing leftover trash: ${entry.name}`);
-        fs.promises.rm(dirPath, { recursive: true, force: true }).catch(() => {
-          // Background cleanup failure is non-fatal - will retry next startup
-        });
+        // Trash directories: try to remove (may have extended attributes blocking deletion)
+        try {
+          await fs.promises.rm(dirPath, { recursive: true, force: true });
+          log(`Removed leftover trash: ${entry.name}`);
+        } catch {
+          // fs.rm failed (likely due to macOS extended attributes on .app bundles)
+          // Fall back to moving to system Trash
+          try {
+            await shell.trashItem(dirPath);
+            log(`Moved to Trash: ${entry.name}`);
+          } catch (trashErr) {
+            log(`Warning: Failed to remove trash ${entry.name}: ${(trashErr as Error).message}`);
+          }
+        }
       } else {
         // Regular sandbox directories: clean synchronously with timeout
         log(`Removing sandbox: ${entry.name}`);

@@ -1,5 +1,12 @@
 import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 
+// Mock is-camera-on (ESM-only package)
+jest.mock('is-camera-on', () => ({
+  isCameraOnChanges: jest.fn(async function* () {
+    // Yield nothing - just end the generator
+  }),
+}));
+
 // Mock electron
 jest.mock('electron', () => ({
   powerMonitor: {
@@ -60,8 +67,8 @@ describe('BatteryMonitor', () => {
     expect(state).toHaveProperty('batteryLevel');
   });
 
-  it('should not recommend pause when threshold is "no"', () => {
-    expect(monitor.shouldPause('no')).toBe(false);
+  it('should not recommend pause when threshold is "never"', () => {
+    expect(monitor.shouldPause('never')).toBe(false);
   });
 
   it('should recommend pause only when on battery and below threshold', () => {
@@ -124,7 +131,7 @@ describe('ResourceMonitor', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     monitor = new ResourceMonitor({
-      pauseOnBattery: 'no',
+      pauseOnBattery: 'never',
       pauseOnVideoCall: false,
       videoCallGracePeriod: 60,
       notifyOnPause: false,

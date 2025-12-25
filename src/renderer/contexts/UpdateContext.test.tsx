@@ -374,9 +374,8 @@ describe('UpdateContext', () => {
       // Use real timers but with a shorter wait
       jest.useFakeTimers();
 
-      let result: ReturnType<typeof render>;
       await act(async () => {
-        result = render(
+        render(
           <UpdateProvider>
             <TestConsumer />
           </UpdateProvider>

@@ -440,8 +440,8 @@ export interface MultiTargetRunnerState {
 // Resource-Aware Scheduling Types
 // =============================================================================
 
-/** Battery threshold for auto-pause. 'no' means never pause for battery. */
-export type BatteryPauseThreshold = 'no' | '<25%' | '<50%' | '<75%';
+/** Battery threshold for auto-pause. 'never' means never pause, 'always' means pause whenever on battery. */
+export type BatteryPauseThreshold = 'never' | '<25%' | '<50%' | '<75%' | 'always';
 
 /** Resource condition that can trigger auto-pause */
 export interface ResourceCondition {
@@ -451,24 +451,35 @@ export interface ResourceCondition {
   since?: string; // ISO timestamp
 }
 
-/** Resource-aware scheduling configuration */
-export interface ResourceAwareConfig {
+/** Power settings configuration (Power section in UI) */
+export interface PowerConfig {
   /** Pause when on battery power below threshold */
   pauseOnBattery: BatteryPauseThreshold;
   /** Pause during video calls (camera detection) */
   pauseOnVideoCall: boolean;
   /** Seconds to wait after call ends before resuming */
   videoCallGracePeriod: number;
-  /** Show notifications when auto-pausing/resuming */
-  notifyOnPause: boolean;
 }
 
-/** Default resource-aware configuration */
-export const DEFAULT_RESOURCE_CONFIG: ResourceAwareConfig = {
-  pauseOnBattery: 'no',
+/** Default power configuration */
+export const DEFAULT_POWER_CONFIG: PowerConfig = {
+  pauseOnBattery: 'never',
   pauseOnVideoCall: false,
   videoCallGracePeriod: 60,
+};
+
+/** Notifications configuration (Notifications section in UI) */
+export interface NotificationsConfig {
+  /** Show notifications when auto-pausing/resuming */
+  notifyOnPause: boolean;
+  /** Show notifications when jobs start/complete */
+  notifyOnJobEvents: boolean;
+}
+
+/** Default notifications configuration */
+export const DEFAULT_NOTIFICATIONS_CONFIG: NotificationsConfig = {
   notifyOnPause: false,
+  notifyOnJobEvents: false,
 };
 
 /** Resource pause state for UI display */

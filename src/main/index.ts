@@ -3,8 +3,8 @@
  * Orchestrates app lifecycle and initializes all modules.
  */
 
-import { app, BrowserWindow } from 'electron';
-import { RunnerManager } from './runner-manager';
+import { app, BrowserWindow, Notification } from 'electron';
+import { RunnerManager, JobEvent } from './runner-manager';
 import { GitHubAuth } from './github-auth';
 import { RunnerDownloader } from './runner-downloader';
 import { HeartbeatManager } from './heartbeat-manager';
@@ -40,7 +40,6 @@ import {
   disableSleepProtection,
   getTrayManager,
   getLogger,
-  setResourcePaused,
   isUserPaused,
 } from './app-state';
 
@@ -81,10 +80,20 @@ import {
   UPDATE_CHECK_DELAY_MS,
 } from '../shared/constants';
 import { UpdateSettings } from '../shared/types';
-import { IPC_CHANNELS, SleepProtection, LogLevel, DEFAULT_RESOURCE_CONFIG } from '../shared/types';
+import { IPC_CHANNELS, SleepProtection, LogLevel, DEFAULT_POWER_CONFIG, DEFAULT_NOTIFICATIONS_CONFIG } from '../shared/types';
 
 // Resource monitoring
 import { ResourceMonitor } from './resource-monitor';
+
+// State machine
+import {
+  initRunnerStateMachine,
+  stopRunnerStateMachine,
+  sendRunnerEvent,
+  onStateChange,
+  selectRunnerStatus,
+  selectEffectivePauseState,
+} from './runner-state-service';
 
 // ============================================================================
 // App Initialization
@@ -131,6 +140,46 @@ app.whenReady().then(async () => {
 
   const logger = getLogger();
 
+  // Log startup banner (figlet "localmost" with font Big)
+  const banner = [
+    ' _                 _                     _   ',
+    '| |               | |                   | |  ',
+    '| | ___   ___ __ _| |_ __ ___   ___  ___| |_ ',
+    '| |/ _ \\ / __/ _` | | \'_ ` _ \\ / _ \\/ __| __|',
+    '| | (_) | (_| (_| | | | | | | | (_) \\__ \\ |_ ',
+    '|_|\\___/ \\___\\__,_|_|_| |_| |_|\\___/|___/\\__|',
+    '',
+    `v${app.getVersion()}`,
+  ];
+  for (const line of banner) {
+    logger?.info(line);
+  }
+
+  // Initialize state machine (must be early - before anything uses state)
+  initRunnerStateMachine();
+
+  // Subscribe to state changes for UI updates
+  onStateChange((snapshot) => {
+    const mainWindow = getMainWindow();
+
+    // Send runner status to renderer
+    if (mainWindow && !mainWindow.isDestroyed() && !getIsQuitting()) {
+      const runnerStatus = selectRunnerStatus(snapshot);
+      mainWindow.webContents.send(IPC_CHANNELS.RUNNER_STATUS_UPDATE, runnerStatus);
+
+      // Also send pause state
+      const pauseState = selectEffectivePauseState(snapshot);
+      mainWindow.webContents.send(IPC_CHANNELS.RESOURCE_STATE_CHANGED, {
+        isPaused: pauseState.isPaused,
+        reason: pauseState.reason,
+        conditions: [],
+      });
+    }
+
+    // Update tray icon
+    updateTrayMenu();
+  });
+
   // Initialize modules
   const runnerDownloader = new RunnerDownloader();
   setRunnerDownloader(runnerDownloader);
@@ -176,6 +225,37 @@ app.whenReady().then(async () => {
         throw new Error('Not authenticated');
       }
       return auth.cancelWorkflowRun(accessToken, owner, repo, runId);
+    },
+    onJobEvent: (event: JobEvent) => {
+      logger?.info(`Job event: ${event.type} ${event.jobName}`);
+
+      // Check if job notifications are enabled
+      const config = loadConfig();
+      if (!config.notifications?.notifyOnJobEvents) {
+        logger?.debug('Job notifications disabled');
+        return;
+      }
+
+      try {
+        const repoShort = event.repository.split('/').pop() || event.repository;
+        let title: string;
+        let body: string;
+
+        if (event.type === 'started') {
+          title = 'Job Started';
+          body = `${event.jobName} on ${repoShort}`;
+        } else {
+          const statusEmoji = event.status === 'succeeded' ? '✓' : event.status === 'failed' ? '✗' : '○';
+          title = `Job ${event.status === 'succeeded' ? 'Succeeded' : event.status === 'failed' ? 'Failed' : 'Cancelled'}`;
+          body = `${statusEmoji} ${event.jobName} on ${repoShort}`;
+        }
+
+        logger?.info(`Showing notification: ${title} - ${body}`);
+        const notification = new Notification({ title, body, silent: true });
+        notification.show();
+      } catch (err) {
+        logger?.warn(`Failed to show job notification: ${(err as Error).message}`);
+      }
     },
   });
   setRunnerManager(runnerManager);
@@ -275,19 +355,24 @@ app.whenReady().then(async () => {
     setRunnerLogLevelSetting(config.runnerLogLevel as LogLevel);
   }
 
-  // Initialize resource monitor for resource-aware scheduling
-  const resourceConfig = config.resourceAware || DEFAULT_RESOURCE_CONFIG;
-  const resourceMonitor = new ResourceMonitor(resourceConfig);
+  // Initialize resource monitor for power settings
+  const powerConfig = config.power || DEFAULT_POWER_CONFIG;
+  const notificationsConfig = config.notifications || DEFAULT_NOTIFICATIONS_CONFIG;
+  const resourceMonitor = new ResourceMonitor({
+    ...powerConfig,
+    notifyOnPause: notificationsConfig.notifyOnPause,
+  });
   setResourceMonitor(resourceMonitor);
 
-  // Handle resource-based pause/resume
+  // Handle resource-based pause/resume via state machine
   resourceMonitor.on('should-pause', async (reason: string) => {
     // Don't pause if user explicitly paused (they control when to resume)
     if (isUserPaused()) return;
 
     logger?.info(`Resource pause triggered: ${reason}`);
-    setResourcePaused(true);
-    updateTrayMenu(); // Update immediately after setting pause state
+
+    // Send event to state machine - it will update tray and renderer via subscription
+    sendRunnerEvent({ type: 'RESOURCE_PAUSE', reason });
 
     const runnerManager = getRunnerManager();
     const heartbeatManager = getHeartbeatManager();
@@ -308,8 +393,9 @@ app.whenReady().then(async () => {
     if (isUserPaused()) return;
 
     logger?.info('Resource pause cleared - resuming runner');
-    setResourcePaused(false);
-    updateTrayMenu(); // Update immediately after clearing pause state
+
+    // Send event to state machine - it will update tray and renderer via subscription
+    sendRunnerEvent({ type: 'RESOURCE_RESUME' });
 
     // Restart heartbeat to signal availability
     // The broker proxy will start accepting jobs via the canAcceptJob callback
@@ -324,15 +410,8 @@ app.whenReady().then(async () => {
     }
   });
 
-  // Send resource state changes to renderer and update tray
-  resourceMonitor.on('state-changed', (state) => {
-    const mainWindow = getMainWindow();
-    if (mainWindow && !mainWindow.isDestroyed() && !getIsQuitting()) {
-      mainWindow.webContents.send(IPC_CHANNELS.RESOURCE_STATE_CHANGED, state);
-    }
-    // Update tray icon to reflect pause state
-    updateTrayMenu();
-  });
+  // Note: state-changed event is now handled by the XState subscription above
+  // which sends status updates to renderer and updates tray
 
   // Start monitoring (will evaluate conditions and emit events as needed)
   resourceMonitor.start();
@@ -368,14 +447,8 @@ app.whenReady().then(async () => {
     setTimeout(async () => {
       logger?.info('Auto-starting runner...');
       try {
-        // Show 'starting' status immediately - clearStaleRunnerRegistrations can take a while
-        const mainWindow = getMainWindow();
-        if (mainWindow && !mainWindow.isDestroyed() && !getIsQuitting()) {
-          mainWindow.webContents.send(IPC_CHANNELS.RUNNER_STATUS_UPDATE, {
-            status: 'starting',
-            startedAt: new Date().toISOString(),
-          });
-        }
+        // Signal state machine that we're starting
+        sendRunnerEvent({ type: 'START' });
 
         // Clear any stale runner registrations before starting
         await clearStaleRunnerRegistrations();
@@ -410,6 +483,9 @@ app.whenReady().then(async () => {
         // Workers are spawned on-demand when jobs arrive via broker proxy
         await runnerManager.initialize();
         logger?.info('Broker proxy running, workers will spawn when jobs arrive');
+
+        // Signal state machine that initialization is complete
+        sendRunnerEvent({ type: 'INITIALIZED' });
 
         // Start heartbeat when runner auto-starts
         const authState = getAuthState();
@@ -511,6 +587,9 @@ app.on('before-quit', async (event) => {
     // Set isQuitting FIRST to stop all IPC sends to renderer
     setIsQuitting(true);
 
+    // Signal state machine that we're shutting down
+    sendRunnerEvent({ type: 'STOP' });
+
     const logger = getLogger();
     const heartbeatManager = getHeartbeatManager();
     const runnerManager = getRunnerManager();
@@ -551,6 +630,11 @@ app.on('before-quit', async (event) => {
     trayManager?.destroy();
     mainWindow?.destroy();
 
+    // Signal state machine shutdown is complete and stop it
+    sendRunnerEvent({ type: 'SHUTDOWN_COMPLETE' });
+    stopRunnerStateMachine();
+
+    logger?.info('Exiting');
     app.quit();
   }
 });
@@ -558,6 +642,9 @@ app.on('before-quit', async (event) => {
 // Handle Ctrl+C
 process.on('SIGINT', async () => {
   setIsQuitting(true);
+
+  // Signal state machine that we're shutting down
+  sendRunnerEvent({ type: 'STOP' });
 
   const logger = getLogger();
   const heartbeatManager = getHeartbeatManager();
@@ -595,5 +682,10 @@ process.on('SIGINT', async () => {
   trayManager?.destroy();
   mainWindow?.destroy();
 
+  // Signal state machine shutdown is complete and stop it
+  sendRunnerEvent({ type: 'SHUTDOWN_COMPLETE' });
+  stopRunnerStateMachine();
+
+  getLogger()?.info('Exiting');
   app.quit();
 });

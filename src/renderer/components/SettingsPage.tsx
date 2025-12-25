@@ -37,10 +37,12 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     setToolCacheLocation,
     userFilter,
     setUserFilter,
-    resourceAware,
+    power,
     setPauseOnBattery,
     setPauseOnVideoCall,
+    notifications,
     setNotifyOnPause,
+    setNotifyOnJobEvents,
   } = useAppConfig();
 
   // Runner state from context
@@ -436,13 +438,14 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
           <div className={shared.formGroup}>
             <label>Pause when using battery</label>
             <select
-              value={resourceAware.pauseOnBattery}
+              value={power.pauseOnBattery}
               onChange={(e) => setPauseOnBattery(e.target.value as BatteryPauseThreshold)}
             >
-              <option value="no">No</option>
+              <option value="never">Never</option>
               <option value="<25%">Below 25%</option>
               <option value="<50%">Below 50%</option>
               <option value="<75%">Below 75%</option>
+              <option value="always">Always</option>
             </select>
             <p className={shared.formHint}>
               Automatically pause runners when your Mac is on battery power. Jobs will fall back to GitHub-hosted runners.
@@ -452,7 +455,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
             <label className={shared.toggleRow}>
               <input
                 type="checkbox"
-                checked={resourceAware.pauseOnVideoCall}
+                checked={power.pauseOnVideoCall}
                 onChange={(e) => setPauseOnVideoCall(e.target.checked)}
               />
               <span>Pause during video calls</span>
@@ -461,15 +464,36 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
               Detects camera usage and pauses runners during video calls. Resumes 60 seconds after the call ends.
             </p>
           </div>
+        </section>
+
+        {/* Notifications Section */}
+        <section className={styles.settingsSection}>
+          <h3>Notifications</h3>
           <div className={shared.formGroup}>
             <label className={shared.toggleRow}>
               <input
                 type="checkbox"
-                checked={resourceAware.notifyOnPause}
+                checked={notifications.notifyOnPause}
                 onChange={(e) => setNotifyOnPause(e.target.checked)}
               />
               <span>Notify when pausing/resuming</span>
             </label>
+            <p className={shared.formHint}>
+              Show a notification when runners are paused or resumed due to resource constraints.
+            </p>
+          </div>
+          <div className={shared.formGroup}>
+            <label className={shared.toggleRow}>
+              <input
+                type="checkbox"
+                checked={notifications.notifyOnJobEvents}
+                onChange={(e) => setNotifyOnJobEvents(e.target.checked)}
+              />
+              <span>Notify on job start/end</span>
+            </label>
+            <p className={shared.formHint}>
+              Show a notification when a GitHub Actions job starts or completes on your runner.
+            </p>
           </div>
         </section>
 

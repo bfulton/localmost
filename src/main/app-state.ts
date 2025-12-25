@@ -1,6 +1,8 @@
 /**
  * Centralized application state management.
  * All mutable global state lives here with typed getters/setters.
+ *
+ * Runner state is now managed by XState - see runner-state-service.ts
  */
 
 import { BrowserWindow, powerSaveBlocker } from 'electron';
@@ -15,11 +17,21 @@ import { BrokerProxyService } from './broker-proxy-service';
 import { TargetManager } from './target-manager';
 import { ResourceMonitor } from './resource-monitor';
 import {
-  RunnerState,
   GitHubUser,
   SleepProtection,
   LogLevel,
 } from '../shared/types';
+
+// Import state machine service for runner state
+import {
+  sendRunnerEvent,
+  getEffectivePauseState as getEffectivePauseStateFromMachine,
+  isUserPaused as isUserPausedFromMachine,
+  isResourcePaused as isResourcePausedFromMachine,
+  getBusyInstances as getBusyInstancesFromMachine,
+  selectRunnerStatus,
+  getSnapshot,
+} from './runner-state-service';
 
 // Auth state structure
 export interface AuthState {
@@ -46,16 +58,8 @@ let powerSaveBlockerId: number | null = null;
 let sleepProtectionSetting: SleepProtection = 'never';
 let logLevelSetting: LogLevel = 'info';
 let runnerLogLevelSetting: LogLevel = 'warn';
-let currentRunnerStatus: RunnerState['status'] = 'offline';
 let authState: AuthState | null = null;
 let isQuitting = false;
-
-// Resource-aware scheduling state
-let resourcePaused = false;
-let userPaused = false;
-
-// Track instances that are blocked because they're running jobs on GitHub
-const busyInstances = new Set<number>();
 
 // Track instances currently being re-registered to prevent concurrent attempts
 const reregisteringInstances = new Set<number>();
@@ -124,31 +128,34 @@ export const setResourceMonitor = (monitor: ResourceMonitor | null): void => {
 };
 
 // ============================================================================
-// Resource-Aware Pause State
+// Resource-Aware Pause State (delegated to XState machine)
 // ============================================================================
 
-export const isResourcePaused = (): boolean => resourcePaused;
-export const setResourcePaused = (paused: boolean): void => {
-  resourcePaused = paused;
+export const isResourcePaused = (): boolean => isResourcePausedFromMachine();
+
+export const setResourcePaused = (paused: boolean, reason?: string): void => {
+  if (paused) {
+    sendRunnerEvent({ type: 'RESOURCE_PAUSE', reason: reason || 'Resource constraint' });
+  } else {
+    sendRunnerEvent({ type: 'RESOURCE_RESUME' });
+  }
 };
 
-export const isUserPaused = (): boolean => userPaused;
+export const isUserPaused = (): boolean => isUserPausedFromMachine();
+
 export const setUserPaused = (paused: boolean): void => {
-  userPaused = paused;
+  if (paused) {
+    sendRunnerEvent({ type: 'USER_PAUSE' });
+  } else {
+    sendRunnerEvent({ type: 'USER_RESUME' });
+  }
 };
 
 /**
  * Get the overall pause state combining user and resource pauses.
  */
 export const getEffectivePauseState = (): { isPaused: boolean; reason: string | null } => {
-  if (userPaused) {
-    return { isPaused: true, reason: 'Paused by user' };
-  }
-  if (resourcePaused && resourceMonitor) {
-    const state = resourceMonitor.getPauseState();
-    return { isPaused: true, reason: state.reason };
-  }
-  return { isPaused: false, reason: null };
+  return getEffectivePauseStateFromMachine();
 };
 
 // ============================================================================
@@ -180,12 +187,20 @@ export const setRunnerLogLevelSetting = (level: LogLevel): void => {
 };
 
 // ============================================================================
-// Runner Status
+// Runner Status (delegated to XState machine)
 // ============================================================================
 
-export const getCurrentRunnerStatus = (): RunnerState['status'] => currentRunnerStatus;
-export const setCurrentRunnerStatus = (status: RunnerState['status']): void => {
-  currentRunnerStatus = status;
+export const getCurrentRunnerStatus = (): string => {
+  const snapshot = getSnapshot();
+  if (!snapshot) return 'offline';
+  return selectRunnerStatus(snapshot).status;
+};
+
+// Note: setCurrentRunnerStatus is no longer used - state changes via events
+// Keeping for backwards compatibility but it's a no-op
+export const setCurrentRunnerStatus = (_status: string): void => {
+  // Status is now managed by XState machine via events
+  // This function is deprecated - use sendRunnerEvent() instead
 };
 
 // ============================================================================
@@ -210,7 +225,7 @@ export const setIsQuitting = (quitting: boolean): void => {
 // Instance Tracking Sets
 // ============================================================================
 
-export const getBusyInstances = (): Set<number> => busyInstances;
+export const getBusyInstances = (): Set<number> => getBusyInstancesFromMachine();
 
 export const getReregisteringInstances = (): Set<number> => reregisteringInstances;
 
@@ -244,9 +259,10 @@ export const disableSleepProtection = (): void => {
 };
 
 export const updateSleepProtection = (): void => {
+  const currentStatus = getCurrentRunnerStatus();
   const shouldProtect =
     sleepProtectionSetting === 'always' ||
-    (sleepProtectionSetting === 'when-busy' && currentRunnerStatus === 'busy');
+    (sleepProtectionSetting === 'when-busy' && currentStatus === 'busy');
 
   if (shouldProtect) {
     enableSleepProtection();

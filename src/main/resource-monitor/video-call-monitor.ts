@@ -68,7 +68,6 @@ export class VideoCallMonitor extends EventEmitter {
       }
     } catch (error) {
       // If is-camera-on fails (non-macOS, etc.), log and continue without video detection
-      // eslint-disable-next-line no-console
       console.warn('Video call detection unavailable:', (error as Error).message);
     }
   }

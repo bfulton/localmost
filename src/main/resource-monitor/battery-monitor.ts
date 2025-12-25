@@ -80,8 +80,11 @@ export class BatteryMonitor extends EventEmitter {
    * Check if we should pause based on battery threshold setting.
    */
   shouldPause(threshold: BatteryPauseThreshold): boolean {
-    if (threshold === 'no') return false;
+    if (threshold === 'never') return false;
     if (!this.state.isOnBattery) return false;
+
+    // 'always' means pause whenever on battery, regardless of level
+    if (threshold === 'always') return true;
 
     // If we're on battery, check level threshold
     const level = this.state.batteryLevel;

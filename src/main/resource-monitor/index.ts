@@ -10,11 +10,22 @@ import { Notification } from 'electron';
 import { BatteryMonitor } from './battery-monitor';
 import { VideoCallMonitor } from './video-call-monitor';
 import {
-  ResourceAwareConfig,
+  PowerConfig,
+  DEFAULT_POWER_CONFIG,
   ResourceCondition,
   ResourcePauseState,
-  DEFAULT_RESOURCE_CONFIG,
 } from '../../shared/types';
+
+/** Configuration for the ResourceMonitor */
+export interface ResourceMonitorConfig extends PowerConfig {
+  /** Show notifications when pausing/resuming (from NotificationsConfig) */
+  notifyOnPause?: boolean;
+}
+
+const DEFAULT_RESOURCE_MONITOR_CONFIG: ResourceMonitorConfig = {
+  ...DEFAULT_POWER_CONFIG,
+  notifyOnPause: false,
+};
 
 interface ResourceMonitorEvents {
   'should-pause': (reason: string) => void;
@@ -25,15 +36,15 @@ interface ResourceMonitorEvents {
 export class ResourceMonitor extends EventEmitter {
   private batteryMonitor: BatteryMonitor;
   private videoCallMonitor: VideoCallMonitor;
-  private config: ResourceAwareConfig;
+  private config: ResourceMonitorConfig;
   private isPaused = false;
   private pauseReason: string | null = null;
   private conditions: ResourceCondition[] = [];
   private started = false;
 
-  constructor(config: Partial<ResourceAwareConfig> = {}) {
+  constructor(config: Partial<ResourceMonitorConfig> = {}) {
     super();
-    this.config = { ...DEFAULT_RESOURCE_CONFIG, ...config };
+    this.config = { ...DEFAULT_RESOURCE_MONITOR_CONFIG, ...config };
     this.batteryMonitor = new BatteryMonitor();
     this.videoCallMonitor = new VideoCallMonitor(this.config.videoCallGracePeriod);
   }
@@ -41,7 +52,7 @@ export class ResourceMonitor extends EventEmitter {
   /**
    * Update configuration. Can be called while running.
    */
-  updateConfig(config: Partial<ResourceAwareConfig>): void {
+  updateConfig(config: Partial<ResourceMonitorConfig>): void {
     this.config = { ...this.config, ...config };
 
     // Update video call grace period if changed
@@ -58,7 +69,7 @@ export class ResourceMonitor extends EventEmitter {
   /**
    * Get current configuration.
    */
-  getConfig(): ResourceAwareConfig {
+  getConfig(): ResourceMonitorConfig {
     return { ...this.config };
   }
 
@@ -124,7 +135,7 @@ export class ResourceMonitor extends EventEmitter {
     const now = new Date().toISOString();
 
     // Check battery condition
-    if (this.config.pauseOnBattery !== 'no') {
+    if (this.config.pauseOnBattery !== 'never') {
       const shouldPauseBattery = this.batteryMonitor.shouldPause(this.config.pauseOnBattery);
       const batteryReason = this.batteryMonitor.getPauseReason(this.config.pauseOnBattery);
 
