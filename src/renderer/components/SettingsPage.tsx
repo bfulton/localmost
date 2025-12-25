@@ -433,11 +433,6 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
               Prevents your Mac from sleeping while GitHub Actions jobs are running, ensuring jobs complete successfully.
             </p>
           </div>
-        </section>
-
-        {/* Resource Awareness Section */}
-        <section id="resource-section" className={styles.settingsSection}>
-          <h3>Resource Awareness</h3>
           <div className={shared.formGroup}>
             <label>Pause when using battery</label>
             <select
