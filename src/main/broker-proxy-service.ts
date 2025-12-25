@@ -751,7 +751,11 @@ export class BrokerProxyService extends EventEmitter {
       });
 
       state.lastPoll = new Date();
+      const hadError = !!state.error;
       state.error = undefined;
+      if (hadError) {
+        this.emitStatusUpdate(); // Notify UI that error was cleared
+      }
 
       // Log poll results for debugging
       if (response.statusCode === 200 && response.body) {
@@ -761,7 +765,11 @@ export class BrokerProxyService extends EventEmitter {
       log()?.info(`[BrokerProxy] Poll ${state.target.displayName}: no message (status=${response.statusCode})`);
       return { hasMessage: false, body: '' };
     } catch (error) {
+      const hadError = !!state.error;
       state.error = (error as Error).message;
+      if (!hadError) {
+        this.emitStatusUpdate(); // Notify UI of new error
+      }
       this.emit('error', state.target.id, error);
       return { hasMessage: false, body: '' };
     }
