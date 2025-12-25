@@ -13,6 +13,12 @@ jest.mock('electron', () => ({
 // Mock app-state
 jest.mock('./app-state', () => ({
   getIsQuitting: jest.fn().mockReturnValue(false),
+  getLogger: jest.fn().mockReturnValue({
+    info: jest.fn(),
+    warn: jest.fn(),
+    error: jest.fn(),
+    debug: jest.fn(),
+  }),
 }));
 
 type MockAutoUpdater = EventEmitter & {
