@@ -304,12 +304,18 @@ app.whenReady().then(async () => {
   });
 
   // Wire up broker proxy to runner manager: when a job is received, spawn a worker
-  brokerProxyService.on('job-received', async (targetId: string, jobId: string, registeredRunnerName: string) => {
-    getLogger()?.info(`[job-received event] targetId=${targetId}, jobId=${jobId}, runner=${registeredRunnerName}`);
+  brokerProxyService.on('job-received', async (targetId: string, jobId: string, registeredRunnerName: string, githubInfo) => {
+    getLogger()?.info(`[job-received event] targetId=${targetId}, jobId=${jobId}, runner=${registeredRunnerName}, runId=${githubInfo.githubRunId}, ghJobId=${githubInfo.githubJobId}`);
     const target = targetManager.getTargets().find(t => t.id === targetId);
     if (target) {
       getLogger()?.info(`Spawning worker for job ${jobId} from ${target.displayName}...`);
-      runnerManager.setPendingTargetContext('next', targetId, target.displayName, registeredRunnerName);
+      // Construct actions URL directly from GitHub IDs
+      let actionsUrl: string | undefined;
+      if (githubInfo.githubRunId && githubInfo.githubJobId && githubInfo.githubRepo) {
+        actionsUrl = `https://github.com/${githubInfo.githubRepo}/actions/runs/${githubInfo.githubRunId}/job/${githubInfo.githubJobId}`;
+        getLogger()?.info(`Constructed actions URL: ${actionsUrl}`);
+      }
+      runnerManager.setPendingTargetContext('next', targetId, target.displayName, registeredRunnerName, actionsUrl);
 
       // Spawn a worker to handle this job
       try {

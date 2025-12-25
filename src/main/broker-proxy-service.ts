@@ -166,9 +166,16 @@ function createJWT(clientId: string, authorizationUrl: string, privateKey: crypt
 // Broker Proxy Service
 // ============================================================================
 
+/** GitHub job info extracted from job details */
+export interface GitHubJobInfo {
+  githubRunId?: number;
+  githubJobId?: number;
+  githubRepo?: string;
+}
+
 export interface BrokerProxyEvents {
   'status-update': (status: RunnerProxyStatus[]) => void;
-  'job-received': (targetId: string, jobId: string) => void;
+  'job-received': (targetId: string, jobId: string, registeredRunnerName: string, githubInfo: GitHubJobInfo) => void;
   'error': (targetId: string, error: Error) => void;
 }
 
@@ -369,12 +376,31 @@ export class BrokerProxyService extends EventEmitter {
       // Acquire job from GitHub immediately using target's credentials
       // This claims the job so GitHub won't keep sending it on subsequent polls
       // Note: GitHub uses runner_request_id (UUID) as jobMessageId, not the broker's numeric messageId
+      let githubRunId: number | undefined;
+      let githubJobId: number | undefined;
+      let githubRepo: string | undefined;
       if (runServiceUrl) {
         const jobDetails = await this.acquireJobUpstream(state, jobId, runServiceUrl, billingOwnerId);
         if (jobDetails) {
           this.acquiredJobDetails.set(jobId, jobDetails);
           this.acquiredJobDetails.set(messageId, jobDetails);
           log()?.info(`[BrokerProxy] Acquired job ${jobId} (messageId=${messageId}) upstream, stored details`);
+
+          // Extract run_id and job ID from job details for URL construction
+          try {
+            const parsed = JSON.parse(jobDetails);
+            if (parsed.contextData?.github) {
+              githubRunId = parsed.contextData.github.run_id;
+              githubRepo = parsed.contextData.github.repository;
+            }
+            // requestId is the GitHub job ID (numeric)
+            if (parsed.requestId) {
+              githubJobId = parseInt(parsed.requestId, 10);
+            }
+            log()?.info(`[BrokerProxy] Extracted: run_id=${githubRunId}, job_id=${githubJobId}, repo=${githubRepo}`);
+          } catch (e) {
+            log()?.warn(`[BrokerProxy] Failed to parse job details for IDs: ${(e as Error).message}`);
+          }
         } else {
           log()?.warn(`[BrokerProxy] Failed to acquire job ${jobId} upstream, continuing anyway`);
         }
@@ -410,8 +436,12 @@ export class BrokerProxyService extends EventEmitter {
       this.pendingTargetAssignments.push(targetId);
 
       // Emit event to spawn worker for job messages only
-      // Include the agentName so we can look up the job URL in GitHub's API
-      this.emit('job-received', state.target.id, jobId, state.runner.agentName);
+      // Include IDs so we can construct the job URL directly
+      this.emit('job-received', state.target.id, jobId, state.runner.agentName, {
+        githubRunId,
+        githubJobId,
+        githubRepo,
+      });
       this.emitStatusUpdate();
     } else if (isJobMessage) {
       log()?.debug(`[BrokerProxy] Job-like message without jobId (${messageType}) from ${state.target.displayName}`);
@@ -1065,6 +1095,16 @@ export class BrokerProxyService extends EventEmitter {
       try {
         const parsed = JSON.parse(jobDetails);
         log()?.info(`[BrokerProxy] acquirejob response keys: ${Object.keys(parsed).join(', ')}`);
+        // Log IDs for debugging
+        log()?.info(`[BrokerProxy] jobId=${parsed.jobId}, requestId=${parsed.requestId}, jobName=${parsed.jobName}`);
+        // Log contextData for debugging - should contain run_id
+        if (parsed.contextData) {
+          log()?.info(`[BrokerProxy] contextData keys: ${Object.keys(parsed.contextData).join(', ')}`);
+          if (parsed.contextData.github) {
+            const gh = parsed.contextData.github;
+            log()?.info(`[BrokerProxy] github context: run_id=${gh.run_id}, run_number=${gh.run_number}, job=${gh.job}, repository=${gh.repository}`);
+          }
+        }
         // Check various possible field names
         const urlField = parsed.runServiceUrl || parsed.run_service_url || parsed.runnerServiceUrl;
         if (urlField) {

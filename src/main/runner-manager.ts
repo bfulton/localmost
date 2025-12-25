@@ -21,6 +21,7 @@ interface RunnerInstance {
     targetId?: string;        // For multi-target: which target this job came from
     targetDisplayName?: string;
     registeredRunnerName?: string; // The runner name as registered with GitHub
+    actionsUrl?: string;      // GitHub Actions URL for this job
   } | null;
   name: string;
   jobsCompleted: number;
@@ -125,7 +126,7 @@ export class RunnerManager {
 
   // Pending target context for jobs received from broker
   // Maps runner name (or 'next') to target context
-  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string; registeredRunnerName?: string }> = new Map();
+  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string; registeredRunnerName?: string; actionsUrl?: string }> = new Map();
 
   /**
    * Validate that a child path stays within the expected base directory.
@@ -281,16 +282,16 @@ export class RunnerManager {
    * @param targetId The target ID from which the job was received
    * @param targetDisplayName Human-readable target name
    */
-  setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string, registeredRunnerName?: string): void {
-    this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName, registeredRunnerName });
-    this.log('debug', `Set pending target context for ${runnerName}: ${targetDisplayName} (registered as ${registeredRunnerName})`);
+  setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string, registeredRunnerName?: string, actionsUrl?: string): void {
+    this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName, registeredRunnerName, actionsUrl });
+    this.log('debug', `Set pending target context for ${runnerName}: ${targetDisplayName} (registered as ${registeredRunnerName}, url=${actionsUrl})`);
   }
 
   /**
    * Consume pending target context for a runner.
    * Returns and removes the context if found.
    */
-  private consumePendingTargetContext(runnerName: string): { targetId: string; targetDisplayName: string; registeredRunnerName?: string } | undefined {
+  private consumePendingTargetContext(runnerName: string): { targetId: string; targetDisplayName: string; registeredRunnerName?: string; actionsUrl?: string } | undefined {
     // Try exact match first, then fall back to 'next'
     let context = this.pendingTargetContext.get(runnerName);
     if (context) {
@@ -1118,9 +1119,10 @@ export class RunnerManager {
         targetId: targetContext?.targetId,
         targetDisplayName: targetContext?.targetDisplayName,
         registeredRunnerName: targetContext?.registeredRunnerName,
+        actionsUrl: targetContext?.actionsUrl,
       };
 
-      this.log('debug', `[instance ${instanceNum}] Job started: ${jobName} (id: ${instance.currentJob.id})${targetContext ? ` from ${targetContext.targetDisplayName}` : ''}`);
+      this.log('debug', `[instance ${instanceNum}] Job started: ${jobName} (id: ${instance.currentJob.id})${targetContext ? ` from ${targetContext.targetDisplayName}` : ''}${instance.currentJob.actionsUrl ? ` url=${instance.currentJob.actionsUrl}` : ''}`);
 
       this.addJobToHistory({
         id: instance.currentJob.id,
@@ -1130,6 +1132,7 @@ export class RunnerManager {
         startedAt: instance.currentJob.startedAt,
         runnerName: instance.name,
         registeredRunnerName: instance.currentJob.registeredRunnerName,
+        actionsUrl: instance.currentJob.actionsUrl,
         targetId: instance.currentJob.targetId,
         targetDisplayName: instance.currentJob.targetDisplayName,
       });
@@ -1165,8 +1168,7 @@ export class RunnerManager {
       this.log('debug', `[instance ${instanceNum}] Job completed: ${instance.currentJob.name} (id: ${instance.currentJob.id}) result: ${result}`);
 
       const jobId = instance.currentJob.id;
-      // Use the registered runner name (as seen by GitHub) for API lookups
-      const registeredRunnerName = instance.currentJob.registeredRunnerName;
+      const hasActionsUrl = !!instance.currentJob.actionsUrl;
 
       this.updateJobInHistory(jobId, {
         status,
@@ -1174,15 +1176,8 @@ export class RunnerManager {
         runTimeSeconds,
       });
 
-      // Try to fetch the GitHub Actions URL asynchronously (don't block)
-      if (registeredRunnerName) {
-        this.fetchActionsUrl(jobId, registeredRunnerName).catch((fetchErr) => {
-          // Actions URL is optional enhancement - failures don't affect job tracking
-          this.log('debug', `Failed to fetch actions URL for ${jobId}: ${(fetchErr as Error).message}`);
-        });
-      } else {
-        this.log('warn', `No registeredRunnerName for job ${jobId}, skipping actions URL lookup`);
-      }
+      // URL is now extracted directly from job details at job start
+      // No need for post-completion API lookup
 
       instance.currentJob = null;
       instance.status = 'listening';
@@ -1264,74 +1259,6 @@ export class RunnerManager {
       }
     } catch (apiErr) {
       this.log('debug', `Failed to check job user filter: ${(apiErr as Error).message}`);
-    }
-  }
-
-  /**
-   * Fetch the GitHub Actions URL for a completed job by querying the API.
-   */
-  private async fetchActionsUrl(jobId: string, runnerName: string): Promise<void> {
-    if (!this.getWorkflowRuns || !this.getWorkflowJobs) {
-      this.log('debug', `fetchActionsUrl: No workflow API methods available`);
-      return;
-    }
-
-    // Find the job in history to get its repository
-    const job = this.jobHistory.find(j => j.id === jobId);
-    if (!job?.repository || job.repository === 'unknown') {
-      this.log('debug', `fetchActionsUrl: No repository for job ${jobId}`);
-      return;
-    }
-
-    // Parse owner/repo from repository field
-    // Handles both "owner/repo" format and "https://github.com/owner/repo" URL format
-    let owner: string;
-    let repo: string;
-
-    const urlMatch = job.repository.match(/github\.com[\/:]([^\/]+)\/([^\/\.]+)/);
-    if (urlMatch) {
-      [, owner, repo] = urlMatch;
-    } else {
-      // Try simple "owner/repo" format
-      const parts = job.repository.split('/');
-      if (parts.length !== 2) {
-        this.log('debug', `fetchActionsUrl: Could not parse owner/repo from ${job.repository}`);
-        return;
-      }
-      [owner, repo] = parts;
-    }
-
-    this.log('debug', `fetchActionsUrl: Looking for job on runner "${runnerName}" in ${owner}/${repo}`);
-
-    try {
-      // Get recent workflow runs
-      const runs = await this.getWorkflowRuns(owner, repo);
-      if (!runs || runs.length === 0) {
-        this.log('debug', `fetchActionsUrl: No recent runs found for ${owner}/${repo}`);
-        return;
-      }
-
-      this.log('debug', `fetchActionsUrl: Found ${runs.length} recent runs, checking first 5`);
-
-      // Check the most recent runs for a job matching our runner
-      for (const run of runs.slice(0, 5)) {
-        const jobs = await this.getWorkflowJobs(owner, repo, run.id);
-        const runnerNames = jobs.map(j => j.runner_name).filter(Boolean);
-        this.log('debug', `fetchActionsUrl: Run ${run.id} has jobs with runners: [${runnerNames.join(', ')}]`);
-
-        const matchingJob = jobs.find(j => j.runner_name === runnerName);
-        if (matchingJob?.html_url) {
-          this.log('debug', `fetchActionsUrl: Found matching job, URL: ${matchingJob.html_url}`);
-          this.updateJobInHistory(jobId, { actionsUrl: matchingJob.html_url });
-          return;
-        }
-      }
-
-      this.log('debug', `fetchActionsUrl: No job found matching runner "${runnerName}"`);
-    } catch (err) {
-      // API errors are non-fatal - actionsUrl is an optional enhancement
-      // Common causes: rate limits, network issues, race conditions
-      this.log('debug', `fetchActionsUrl: API error: ${(err as Error).message}`);
     }
   }
 
