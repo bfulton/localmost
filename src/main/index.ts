@@ -514,36 +514,35 @@ app.on('before-quit', async (event) => {
     const mainWindow = getMainWindow();
     const cliServer = getCliServer();
 
-    // Now safe to do cleanup that logs (logs go to file only, not renderer)
-    await heartbeatManager?.clear();
-    heartbeatManager?.stop();
+    // Hide window immediately for visual feedback that quit is happening
+    mainWindow?.hide();
 
-// Stop CLI server
-    await cliServer?.stop();
-
-    // Stop broker proxy service
-    await brokerProxyService?.stop();
-
-    // Stop resource monitor
+    // Stop resource monitor (sync, fast)
     getResourceMonitor()?.stop();
+    heartbeatManager?.stop();
+    disableSleepProtection();
 
-    // Cancel any jobs running on our runners before stopping
-    // This prevents orphaned jobs that would block runner deletion on next startup
-    await cancelJobsOnOurRunners();
+    // Run independent cleanup tasks in parallel for faster shutdown
+    await Promise.all([
+      // Clear heartbeats (has 3s timeout)
+      heartbeatManager?.clear(),
+      // Stop CLI server
+      cliServer?.stop(),
+      // Stop broker proxy service
+      brokerProxyService?.stop(),
+      // Cancel jobs and stop runners (has 10s timeout)
+      (async () => {
+        await cancelJobsOnOurRunners();
+        await runnerManager?.stop();
+      })(),
+    ]);
 
-    // Must await stop() to ensure runner processes are killed before app exits
-    // (runners are detached process groups that survive parent exit)
-    await runnerManager?.stop();
-
-    // Clean up work directories unless set to 'always' preserve
+    // Clean up work directories (can be slow for large dirs)
     if (runnerManager?.getPreserveWorkDir() !== 'always') {
       await runnerDownloader?.cleanupWorkDirectories((msg) => logger?.info(msg));
     }
 
-    disableSleepProtection();
     trayManager?.destroy();
-
-    // Close window after all cleanup is done
     mainWindow?.destroy();
 
     app.quit();
@@ -563,28 +562,30 @@ process.on('SIGINT', async () => {
   const mainWindow = getMainWindow();
   const cliServer = getCliServer();
 
-  // Clear heartbeat before stopping to prevent orphaned runners from picking up jobs
-  await heartbeatManager?.clear();
+  // Hide window immediately for visual feedback
+  mainWindow?.hide();
+
+  // Stop sync operations first
+  getResourceMonitor()?.stop();
   heartbeatManager?.stop();
+  disableSleepProtection();
 
-// Stop CLI server
-  await cliServer?.stop();
-
-  // Stop broker proxy service
-  await brokerProxyService?.stop();
-
-  // Cancel any jobs running on our runners before stopping
-  await cancelJobsOnOurRunners();
-
-  // Must await stop() to ensure runner processes are killed before app exits
-  await runnerManager?.stop();
+  // Run independent cleanup tasks in parallel for faster shutdown
+  await Promise.all([
+    heartbeatManager?.clear(),
+    cliServer?.stop(),
+    brokerProxyService?.stop(),
+    (async () => {
+      await cancelJobsOnOurRunners();
+      await runnerManager?.stop();
+    })(),
+  ]);
 
   // Clean up work directories unless set to 'always' preserve
   if (runnerManager?.getPreserveWorkDir() !== 'always') {
     await runnerDownloader?.cleanupWorkDirectories((msg) => logger?.info(msg));
   }
 
-  disableSleepProtection();
   trayManager?.destroy();
   mainWindow?.destroy();
 
