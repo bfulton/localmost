@@ -50,8 +50,6 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     deviceCode,
     login,
     logout,
-    repos,
-    orgs,
     isDownloaded,
     runnerVersion,
     availableVersions,
@@ -66,7 +64,6 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     targets,
     isInitialLoading,
     error,
-    setError,
   } = useRunner();
 
   // Update state from context

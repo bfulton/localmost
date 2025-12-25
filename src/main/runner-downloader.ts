@@ -12,7 +12,6 @@ import {
   cleanupSandboxDirectories,
   cleanupIncompleteConfigs,
   cleanupWorkDirectories as cleanupWorkDirs,
-  moveToTrash,
 } from './runner-cleanup';
 
 export interface DownloadProgress {
@@ -201,7 +200,7 @@ export class RunnerDownloader {
         fs.renameSync(sandboxDir, trashDir);
         log('info', `Moved sandbox to trash for background cleanup`);
         // Delete in background (fire and forget)
-        fs.promises.rm(trashDir, { recursive: true, force: true }).catch((rmErr) => {
+        fs.promises.rm(trashDir, { recursive: true, force: true }).catch(() => {
           // Background cleanup - failures are non-fatal, will retry on next startup
           // Common causes: file in use, permissions, concurrent access
         });
@@ -374,7 +373,7 @@ export class RunnerDownloader {
     workFolder?: string;
     onLog?: (level: 'info' | 'error', message: string) => void;
   }): Promise<void> {
-    const log = options.onLog || ((level: string, msg: string) => {
+    const log = options.onLog || ((_level: string, _msg: string) => {
       // Fallback logging when no callback provided - should rarely happen in practice
     });
 
@@ -511,7 +510,7 @@ export class RunnerDownloader {
         .map(d => d.substring(1))
         .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
       return versions[0] || null;
-    } catch (readErr) {
+    } catch {
       // Failed to read versions - could be permissions or corrupt directory
       return null;
     }
@@ -544,7 +543,7 @@ export class RunnerDownloader {
           url: r.html_url,
           publishedAt: r.published_at,
         }));
-    } catch (fetchErr) {
+    } catch {
       // Network error or GitHub API issue - fall back to hardcoded version
       // This is intentional degradation, not an error worth surfacing
       return [{
@@ -821,7 +820,7 @@ export class RunnerDownloader {
 
       // Attestations may not be available for older releases - this is fine
       return false;
-    } catch (attestErr) {
+    } catch {
       // Attestation check is best-effort - don't fail the download
       // Common causes: network issues, API rate limits, older releases
       return false;

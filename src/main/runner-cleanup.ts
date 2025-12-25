@@ -60,7 +60,7 @@ export async function killOrphanedProcesses(
           killedAny = true;
           try {
             process.kill(-pid, 'SIGTERM'); // Kill process group
-          } catch (pgidErr) {
+          } catch {
             // Process group kill failed (not a group leader?) - fall back to single process
             process.kill(pid, 'SIGTERM');
           }
@@ -72,21 +72,21 @@ export async function killOrphanedProcesses(
             log(`Force killing orphaned process ${pid}`);
             try {
               process.kill(-pid, 'SIGKILL');
-            } catch (pgidErr) {
+            } catch {
               // Process group kill failed - fall back to single process
               process.kill(pid, 'SIGKILL');
             }
-          } catch (aliveCheckErr) {
+          } catch {
             // Process exited after SIGTERM - this is the expected success case
           }
-        } catch (notRunningErr) {
+        } catch {
           // Process not running (ESRCH) - already dead, nothing to do
         }
-      } catch (pidReadErr) {
+      } catch {
         // Couldn't read PID file - corrupted or permissions issue, skip
       }
     }
-  } catch (scanErr) {
+  } catch {
     // Failed to scan sandbox directories - non-fatal, continue with cleanup
   }
 
@@ -115,7 +115,7 @@ export async function cleanupSandboxDirectories(
       if (entry.name.includes('.trash.')) {
         // Trash directories: clean in background (may have locked files)
         log(`Removing leftover trash: ${entry.name}`);
-        fs.promises.rm(dirPath, { recursive: true, force: true }).catch((bgRmErr) => {
+        fs.promises.rm(dirPath, { recursive: true, force: true }).catch(() => {
           // Background cleanup failure is non-fatal - will retry next startup
         });
       } else {
@@ -128,22 +128,22 @@ export async function cleanupSandboxDirectories(
             setTimeout(() => reject(new Error('timeout')), timeoutMs)
           );
           await Promise.race([rmPromise, timeoutPromise]);
-        } catch (rmErr) {
+        } catch {
           // Deletion failed or timed out - rename to trash for background cleanup
           const trashDir = `${dirPath}.trash.${Date.now()}`;
           try {
             await fs.promises.rename(dirPath, trashDir);
             log(`Moved ${entry.name} to trash for background cleanup`);
-            fs.promises.rm(trashDir, { recursive: true, force: true }).catch((bgRmErr) => {
+            fs.promises.rm(trashDir, { recursive: true, force: true }).catch(() => {
               // Background cleanup failure is non-fatal
             });
-          } catch (renameErr) {
+          } catch {
             log(`Warning: Could not clean ${entry.name}, will retry when runner starts`);
           }
         }
       }
     }
-  } catch (readDirErr) {
+  } catch {
     // Failed to read sandbox directory - non-fatal, skip cleanup
   }
 }
@@ -174,7 +174,7 @@ export async function cleanupIncompleteConfigs(
       log(`Removing incomplete config directory: ${entry.name}`);
       try {
         await fs.promises.rm(configDir, { recursive: true, force: true });
-      } catch (rmErr) {
+      } catch {
         // Config cleanup failed - non-fatal, may succeed on next startup
         log(`Warning: Failed to remove config directory ${entry.name}`);
       }
@@ -210,17 +210,17 @@ export async function cleanupWorkDirectories(
       const trashDir = `${workDir}.trash.${Date.now()}`;
       try {
         fs.renameSync(workDir, trashDir);
-        fs.promises.rm(trashDir, { recursive: true, force: true }).catch((bgRmErr) => {
+        fs.promises.rm(trashDir, { recursive: true, force: true }).catch(() => {
           // Background cleanup failure is non-fatal
         });
-      } catch (renameErr) {
+      } catch {
         // Rename failed (cross-device?) - try direct delete as fallback
-        fs.promises.rm(workDir, { recursive: true, force: true }).catch((rmErr) => {
+        fs.promises.rm(workDir, { recursive: true, force: true }).catch(() => {
           // Work dir cleanup failed - non-fatal, will try again next time
         });
       }
     }
-  } catch (scanErr) {
+  } catch {
     // Failed to scan work directories - non-fatal
   }
 }
@@ -235,11 +235,11 @@ export function moveToTrash(dirPath: string, log: CleanupLogger): boolean {
     fs.renameSync(dirPath, trashDir);
     log(`Moved to trash for background cleanup`);
     // Delete in background (fire and forget)
-    fs.promises.rm(trashDir, { recursive: true, force: true }).catch((rmErr) => {
+    fs.promises.rm(trashDir, { recursive: true, force: true }).catch(() => {
       // Background cleanup - failures are non-fatal, will retry on next startup
     });
     return true;
-  } catch (renameErr) {
+  } catch {
     return false;
   }
 }

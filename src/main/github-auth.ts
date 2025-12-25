@@ -1,6 +1,6 @@
 import { shell } from 'electron';
 import { DEFAULT_GITHUB_CLIENT_ID } from '../shared/constants';
-import { GitHubClient, githubOAuthRequest } from './github-client';
+import { GitHubClient } from './github-client';
 
 // Re-export for backward compatibility
 export const DEFAULT_CLIENT_ID = DEFAULT_GITHUB_CLIENT_ID;
@@ -516,7 +516,7 @@ export class GitHubAuth {
       });
     } catch (error) {
       // If variable doesn't exist (404), create it
-      if ((error as any).status === 404) {
+      if ((error as { status?: number }).status === 404) {
         await client.post(`/repos/${owner}/${repo}/actions/variables`, {
           name,
           value,
@@ -548,7 +548,7 @@ export class GitHubAuth {
       });
     } catch (error) {
       // If variable doesn't exist (404), create it
-      if ((error as any).status === 404) {
+      if ((error as { status?: number }).status === 404) {
         await client.post(`/orgs/${org}/actions/variables`, {
           name,
           value,

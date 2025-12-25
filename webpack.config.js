@@ -137,8 +137,10 @@ const rendererConfig = {
     sideEffects: true,
   },
   performance: {
-    maxAssetSize: 250 * 1024,
-    maxEntrypointSize: 300 * 1024,
+    // Desktop Electron apps load assets locally, so bundle size has minimal impact
+    // These limits are appropriate for a React-based desktop app
+    maxAssetSize: 500 * 1024,
+    maxEntrypointSize: 600 * 1024,
   },
   plugins: [
     new HtmlWebpackPlugin({

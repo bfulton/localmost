@@ -1,6 +1,4 @@
-import { Tray, Menu, nativeImage, app } from 'electron';
-import * as fs from 'fs';
-import * as path from 'path';
+import { Tray, Menu, nativeImage } from 'electron';
 import { TRAY_ANIMATION_FRAMES, TRAY_ANIMATION_INTERVAL_MS } from '../shared/constants';
 import { RunnerState } from '../shared/types';
 

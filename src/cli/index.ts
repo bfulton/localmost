@@ -15,7 +15,7 @@ import * as net from 'net';
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
-import { getCliSocketPath, getAppDataDirWithoutElectron } from '../shared/paths';
+import { getCliSocketPath } from '../shared/paths';
 
 interface CliRequest {
   command: 'status' | 'pause' | 'resume' | 'jobs' | 'quit';

@@ -133,7 +133,7 @@ export class ProxyServer {
       clientSocket.pipe(serverSocket);
     });
 
-    serverSocket.on('error', (err) => {
+    serverSocket.on('error', (_err) => {
       clientSocket.write(`HTTP/1.1 502 Bad Gateway\r\n\r\n`);
       clientSocket.destroy();
     });

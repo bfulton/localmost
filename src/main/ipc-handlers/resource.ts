@@ -3,7 +3,7 @@
  */
 
 import { ipcMain } from 'electron';
-import { getResourceMonitor, getEffectivePauseState } from '../app-state';
+import { getResourceMonitor } from '../app-state';
 import { IPC_CHANNELS, ResourcePauseState } from '../../shared/types';
 
 /**

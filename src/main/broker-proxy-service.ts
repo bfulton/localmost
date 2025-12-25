@@ -1075,7 +1075,7 @@ export class BrokerProxyService extends EventEmitter {
       log()?.info(`[BrokerProxy] acquirejob request body: ${JSON.stringify(bodyJson)}`);
       // Runner uses jobMessageId (which is the message.messageId from the broker)
       jobId = bodyJson.jobMessageId || bodyJson.jobRequestId || bodyJson.requestId;
-    } catch (e) {
+    } catch {
       log()?.warn(`[BrokerProxy] Could not parse acquirejob body: ${body}`);
     }
 

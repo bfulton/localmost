@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+ 
 import { jest } from '@jest/globals';
 import type { EventEmitter } from 'events';
 
@@ -54,7 +54,7 @@ describe('auto-updater', () => {
     jest.clearAllMocks();
 
     // Get fresh reference to the mock autoUpdater (persisted via global singleton)
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
+     
     const electronUpdaterModule = require('electron-updater');
     mockAutoUpdater = electronUpdaterModule.autoUpdater as MockAutoUpdater;
 
@@ -67,7 +67,7 @@ describe('auto-updater', () => {
     (mockAutoUpdater.quitAndInstall as jest.Mock).mockClear();
 
     // Get module functions (cached, but listeners are reset above)
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
+     
     const autoUpdaterModule = require('./auto-updater');
     initAutoUpdater = autoUpdaterModule.initAutoUpdater;
     checkForUpdates = autoUpdaterModule.checkForUpdates;
@@ -80,7 +80,7 @@ describe('auto-updater', () => {
     resetForTesting();
 
     // Get reference to the mocked getIsQuitting
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
+     
     const appStateModule = require('./app-state');
     mockGetIsQuitting = appStateModule.getIsQuitting as jest.Mock;
 

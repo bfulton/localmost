@@ -13,7 +13,7 @@ jest.mock('./runner-downloader', () => ({
     getToolCacheDir: jest.fn().mockReturnValue('/Users/test/.localmost/runner/tool-cache'),
     buildSandbox: jest.fn().mockImplementation((instance: number) => Promise.resolve(`/Users/test/.localmost/runner/sandbox/${instance}`)),
     isDownloaded: jest.fn().mockReturnValue(true),
-    isConfigured: jest.fn().mockImplementation((instance: number) => true),
+    isConfigured: jest.fn().mockImplementation((_instance: number) => true),
     hasAnyProxyCredentials: jest.fn().mockReturnValue(true),
     copyProxyCredentials: jest.fn().mockResolvedValue(undefined),
     getInstalledVersion: jest.fn().mockReturnValue('2.330.0'),
@@ -72,7 +72,6 @@ describe('RunnerManager', () => {
   let mockOnStatusChange: jest.Mock<void, [RunnerState]>;
   let mockOnJobHistoryUpdate: jest.Mock<void, [JobHistoryEntry[]]>;
 
-  const mockRunnerDir = path.join(os.homedir(), '.localmost', 'runner');
   const mockConfigPath = path.join(os.homedir(), '.localmost', 'config.yaml');
 
   beforeEach(() => {
@@ -103,7 +102,8 @@ describe('RunnerManager', () => {
       (fs.readFileSync as jest.Mock).mockReturnValue(`runnerConfig:
   runnerName: test-runner`);
 
-      const manager = new RunnerManager({
+      // Create new manager to test config loading
+      new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,

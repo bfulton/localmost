@@ -383,7 +383,7 @@ const JobStatusItem: React.FC<JobStatusItemProps> = ({
 const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
   // Get state from contexts
   const { logs, maxLogScrollback, maxJobHistory, sleepProtection, clearLogs } = useAppConfig();
-  const { user, isDownloaded, isConfigured, runnerVersion, runnerState, jobHistory, runnerConfig, runnerDisplayName, targets, targetStatus } = useRunner();
+  const { user, isDownloaded, isConfigured, runnerVersion, runnerState, jobHistory, runnerDisplayName, targets, targetStatus } = useRunner();
 
   // Local UI state
   const [runnerSettingsUrl, setRunnerSettingsUrl] = useState<string | null>(null);

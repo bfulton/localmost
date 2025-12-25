@@ -14,8 +14,6 @@ import {
 } from './app-state';
 import { AppConfig } from './config';
 import { DEFAULT_RUNNER_COUNT } from '../shared/constants';
-import type { Target } from '../shared/types';
-
 /** Delay before retry in milliseconds. */
 const RETRY_DELAY_MS = 2000;
 

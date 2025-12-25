@@ -235,7 +235,7 @@ export class RunnerManager {
     try {
       proc.kill(signal);
       return true;
-    } catch (killErr) {
+    } catch {
       // Process already dead or permission denied - either way, nothing more to do
       return false;
     }
@@ -620,7 +620,7 @@ export class RunnerManager {
     if (proxy) {
       try {
         await proxy.stop();
-      } catch (proxyErr) {
+      } catch {
         // Proxy stop failed - non-fatal, may already be stopped
       }
       this.proxyServers.delete(instanceNum);
@@ -1261,7 +1261,7 @@ export class RunnerManager {
           return;
         }
       }
-    } catch (apiErr) {
+    } catch {
       // API errors are non-fatal - actionsUrl is an optional enhancement
       // Common causes: rate limits, network issues, race conditions
     }
@@ -1311,7 +1311,7 @@ export class RunnerManager {
     });
   }
 
-  private updateStatus(status: RunnerStatus, errorMessage?: string): void {
+  private updateStatus(status: RunnerStatus, _errorMessage?: string): void {
     this.onStatusChange({
       status,
       jobName: undefined,
@@ -1365,15 +1365,15 @@ export class RunnerManager {
           try {
             process.kill(pid, 0);
             process.kill(pid, 'SIGKILL');
-          } catch (aliveCheckErr) {
+          } catch {
             // Process exited after SIGTERM - expected success case
           }
-        } catch (notRunningErr) {
+        } catch {
           // Process doesn't exist (ESRCH) - already dead
         }
 
         await fs.promises.unlink(pidFile);
-      } catch (pidErr) {
+      } catch {
         // Failed to read/process PID file - non-fatal, continue with other entries
       }
     }
@@ -1422,13 +1422,13 @@ export class RunnerManager {
             process.kill(pid, 0);
             // Process exists but we're not tracking it - it's orphaned
             orphanedPids.push(pid);
-          } catch (notRunningErr) {
+          } catch {
             // Process doesn't exist - clean up stale PID file
-            await fs.promises.unlink(pidFile).catch((unlinkErr) => {
+            await fs.promises.unlink(pidFile).catch(() => {
               // PID file cleanup failed - non-fatal
             });
           }
-        } catch (pidReadErr) {
+        } catch {
           // Couldn't read PID file - corrupted or permissions, skip
         }
       }
@@ -1445,15 +1445,15 @@ export class RunnerManager {
             try {
               process.kill(pid, 0);
               process.kill(pid, 'SIGKILL');
-            } catch (aliveCheckErr) {
+            } catch {
               // Process exited after SIGTERM - expected success case
             }
-          } catch (killErr) {
+          } catch {
             // Process doesn't exist or permission denied - continue with next
           }
         }
       }
-    } catch (scanErr) {
+    } catch {
       // Error scanning sandbox directories - non-fatal
     }
   }

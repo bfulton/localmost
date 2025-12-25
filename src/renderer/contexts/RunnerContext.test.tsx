@@ -554,9 +554,8 @@ describe('RunnerContext', () => {
     });
 
     it('should subscribe to job history updates', async () => {
-      let historyCallback: (history: any[]) => void;
-      mockLocalmost.jobs.onHistoryUpdate.mockImplementation((cb) => {
-        historyCallback = cb;
+      mockLocalmost.jobs.onHistoryUpdate.mockImplementation(() => {
+        // Callback captured for subscription, not invoked in this test
         return () => {};
       });
 

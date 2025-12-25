@@ -79,7 +79,7 @@ export const initLogFile = (): void => {
       // Clean up temp symlink on failure
       try {
         fs.unlinkSync(tempSymlinkPath);
-      } catch (cleanupErr) {
+      } catch {
         // Cleanup failed but original error is more important
       }
       bootLog('warn', `Failed to create log symlink: ${(symlinkErr as Error).message}`);

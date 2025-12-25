@@ -16,8 +16,8 @@ jest.mock('child_process', () => ({
   spawn: mockSpawn,
 }));
 
-// Import after mocking
-import { spawnSandboxed } from './process-sandbox';
+// Note: spawnSandboxed is imported via require() in each test's jest.isolateModules block
+// This allows fresh imports with different mocks for each test scenario
 
 // Create a mock process factory
 function createMockProcess(pid: number): any {

@@ -27,7 +27,6 @@ import {
   getHeartbeatManager,
   getCliServer,
   getBrokerProxyService,
-  getTargetManager,
   getResourceMonitor,
   getAuthState,
   setAuthState,

@@ -19,8 +19,6 @@ import {
   GitHubUser,
   SleepProtection,
   LogLevel,
-  ResourceAwareConfig,
-  ResourcePauseState,
 } from '../shared/types';
 
 // Auth state structure

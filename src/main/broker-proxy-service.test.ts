@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+ 
 import { jest } from '@jest/globals';
 import { EventEmitter } from 'events';
 
@@ -43,7 +43,7 @@ jest.mock('./app-state', () => ({
 }));
 
 import { BrokerProxyService } from './broker-proxy-service';
-import type { Target, RunnerProxyStatus } from '../shared/types';
+import type { Target } from '../shared/types';
 
 // Helper to create mock credentials
 const createMockCredentials = () => ({

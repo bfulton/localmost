@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen, waitFor, act, fireEvent } from '@testing-library/react';
+import { render, screen, act, fireEvent } from '@testing-library/react';
 import { UpdateProvider, useUpdate } from './UpdateContext';
 import { mockLocalmost } from '../../../test/setup-renderer';
 import { UpdateStatus } from '../../shared/types';

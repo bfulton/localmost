@@ -125,7 +125,7 @@ export class CliServer {
           if (fs.existsSync(this.socketPath)) {
             try {
               fs.unlinkSync(this.socketPath);
-            } catch (err) {
+            } catch {
               // Socket cleanup failed - non-fatal
             }
           }
