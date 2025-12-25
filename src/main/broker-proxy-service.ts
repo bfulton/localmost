@@ -410,7 +410,8 @@ export class BrokerProxyService extends EventEmitter {
       this.pendingTargetAssignments.push(targetId);
 
       // Emit event to spawn worker for job messages only
-      this.emit('job-received', state.target.id, jobId);
+      // Include the agentName so we can look up the job URL in GitHub's API
+      this.emit('job-received', state.target.id, jobId, state.runner.agentName);
       this.emitStatusUpdate();
     } else if (isJobMessage) {
       log()?.debug(`[BrokerProxy] Job-like message without jobId (${messageType}) from ${state.target.displayName}`);

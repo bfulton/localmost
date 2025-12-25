@@ -20,6 +20,7 @@ interface RunnerInstance {
     id: string;
     targetId?: string;        // For multi-target: which target this job came from
     targetDisplayName?: string;
+    registeredRunnerName?: string; // The runner name as registered with GitHub
   } | null;
   name: string;
   jobsCompleted: number;
@@ -124,7 +125,7 @@ export class RunnerManager {
 
   // Pending target context for jobs received from broker
   // Maps runner name (or 'next') to target context
-  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string }> = new Map();
+  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string; registeredRunnerName?: string }> = new Map();
 
   /**
    * Validate that a child path stays within the expected base directory.
@@ -280,16 +281,16 @@ export class RunnerManager {
    * @param targetId The target ID from which the job was received
    * @param targetDisplayName Human-readable target name
    */
-  setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string): void {
-    this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName });
-    this.log('debug', `Set pending target context for ${runnerName}: ${targetDisplayName}`);
+  setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string, registeredRunnerName?: string): void {
+    this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName, registeredRunnerName });
+    this.log('debug', `Set pending target context for ${runnerName}: ${targetDisplayName} (registered as ${registeredRunnerName})`);
   }
 
   /**
    * Consume pending target context for a runner.
    * Returns and removes the context if found.
    */
-  private consumePendingTargetContext(runnerName: string): { targetId: string; targetDisplayName: string } | undefined {
+  private consumePendingTargetContext(runnerName: string): { targetId: string; targetDisplayName: string; registeredRunnerName?: string } | undefined {
     // Try exact match first, then fall back to 'next'
     let context = this.pendingTargetContext.get(runnerName);
     if (context) {
@@ -1116,6 +1117,7 @@ export class RunnerManager {
         id: `job-${++this.jobIdCounter}`,
         targetId: targetContext?.targetId,
         targetDisplayName: targetContext?.targetDisplayName,
+        registeredRunnerName: targetContext?.registeredRunnerName,
       };
 
       this.log('debug', `[instance ${instanceNum}] Job started: ${jobName} (id: ${instance.currentJob.id})${targetContext ? ` from ${targetContext.targetDisplayName}` : ''}`);
@@ -1127,6 +1129,7 @@ export class RunnerManager {
         status: 'running',
         startedAt: instance.currentJob.startedAt,
         runnerName: instance.name,
+        registeredRunnerName: instance.currentJob.registeredRunnerName,
         targetId: instance.currentJob.targetId,
         targetDisplayName: instance.currentJob.targetDisplayName,
       });
@@ -1162,7 +1165,8 @@ export class RunnerManager {
       this.log('debug', `[instance ${instanceNum}] Job completed: ${instance.currentJob.name} (id: ${instance.currentJob.id}) result: ${result}`);
 
       const jobId = instance.currentJob.id;
-      const runnerName = instance.name;
+      // Use the registered runner name (as seen by GitHub) for API lookups
+      const registeredRunnerName = instance.currentJob.registeredRunnerName;
 
       this.updateJobInHistory(jobId, {
         status,
@@ -1171,10 +1175,14 @@ export class RunnerManager {
       });
 
       // Try to fetch the GitHub Actions URL asynchronously (don't block)
-      this.fetchActionsUrl(jobId, runnerName).catch((fetchErr) => {
-        // Actions URL is optional enhancement - failures don't affect job tracking
-        this.log('debug', `Failed to fetch actions URL for ${jobId}: ${(fetchErr as Error).message}`);
-      });
+      if (registeredRunnerName) {
+        this.fetchActionsUrl(jobId, registeredRunnerName).catch((fetchErr) => {
+          // Actions URL is optional enhancement - failures don't affect job tracking
+          this.log('debug', `Failed to fetch actions URL for ${jobId}: ${(fetchErr as Error).message}`);
+        });
+      } else {
+        this.log('warn', `No registeredRunnerName for job ${jobId}, skipping actions URL lookup`);
+      }
 
       instance.currentJob = null;
       instance.status = 'listening';

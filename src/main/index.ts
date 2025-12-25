@@ -304,12 +304,12 @@ app.whenReady().then(async () => {
   });
 
   // Wire up broker proxy to runner manager: when a job is received, spawn a worker
-  brokerProxyService.on('job-received', async (targetId: string, jobId: string) => {
-    getLogger()?.info(`[job-received event] targetId=${targetId}, jobId=${jobId}`);
+  brokerProxyService.on('job-received', async (targetId: string, jobId: string, registeredRunnerName: string) => {
+    getLogger()?.info(`[job-received event] targetId=${targetId}, jobId=${jobId}, runner=${registeredRunnerName}`);
     const target = targetManager.getTargets().find(t => t.id === targetId);
     if (target) {
       getLogger()?.info(`Spawning worker for job ${jobId} from ${target.displayName}...`);
-      runnerManager.setPendingTargetContext('next', targetId, target.displayName);
+      runnerManager.setPendingTargetContext('next', targetId, target.displayName, registeredRunnerName);
 
       // Spawn a worker to handle this job
       try {

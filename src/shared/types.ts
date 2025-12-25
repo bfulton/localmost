@@ -90,6 +90,8 @@ export interface JobHistoryEntry {
   actionsUrl?: string;
   githubJobId?: number;
   runnerName?: string;
+  /** The runner name as registered with GitHub (for API lookups) */
+  registeredRunnerName?: string;
   /** For multi-target: which target this job came from */
   targetId?: string;
   targetDisplayName?: string;

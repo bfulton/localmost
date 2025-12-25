@@ -353,7 +353,7 @@ export class GitHubAuth {
   }
 
   /**
-   * Get recent workflow runs for a repository (in_progress runs first)
+   * Get recent workflow runs for a repository
    */
   async getRecentWorkflowRuns(
     accessToken: string,
@@ -361,9 +361,10 @@ export class GitHubAuth {
     repo: string
   ): Promise<Array<{ id: number; name: string; status: string; created_at: string; actor: { login: string } }>> {
     const client = new GitHubClient(accessToken);
+    // Don't filter by status - we need to find completed runs when looking up job URLs
     const data = await client.get<{ workflow_runs: Array<{ id: number; name: string; status: string; created_at: string; actor: { login: string } }> }>(
       `/repos/${owner}/${repo}/actions/runs`,
-      { params: { per_page: '10', status: 'in_progress' } }
+      { params: { per_page: '10' } }
     );
     return (data.workflow_runs || []).map((run) => ({
       id: run.id,
