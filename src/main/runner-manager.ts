@@ -1084,9 +1084,12 @@ export class RunnerManager {
       // Get target context if available (from broker-proxy-service)
       const targetContext = this.consumePendingTargetContext(instance.name);
 
+      // Use target display name (owner/repo format) for repository if available
+      const repository = targetContext?.targetDisplayName || this.config?.url || 'unknown';
+
       instance.currentJob = {
         name: jobName,
-        repository: this.config?.url || 'unknown',
+        repository,
         startedAt: new Date().toISOString(),
         id: `job-${++this.jobIdCounter}`,
         targetId: targetContext?.targetId,
@@ -1238,14 +1241,30 @@ export class RunnerManager {
    * Fetch the GitHub Actions URL for a completed job by querying the API.
    */
   private async fetchActionsUrl(jobId: string, runnerName: string): Promise<void> {
-    if (!this.config?.url || !this.getWorkflowRuns || !this.getWorkflowJobs) {
+    if (!this.getWorkflowRuns || !this.getWorkflowJobs) {
       return;
     }
 
-    // Parse owner/repo from config URL (e.g., https://github.com/owner/repo)
-    const match = this.config.url.match(/github\.com[\/:]([^\/]+)\/([^\/\.]+)/);
-    if (!match) return;
-    const [, owner, repo] = match;
+    // Find the job in history to get its repository
+    const job = this.jobHistory.find(j => j.id === jobId);
+    if (!job?.repository || job.repository === 'unknown') {
+      return;
+    }
+
+    // Parse owner/repo from repository field
+    // Handles both "owner/repo" format and "https://github.com/owner/repo" URL format
+    let owner: string;
+    let repo: string;
+
+    const urlMatch = job.repository.match(/github\.com[\/:]([^\/]+)\/([^\/\.]+)/);
+    if (urlMatch) {
+      [, owner, repo] = urlMatch;
+    } else {
+      // Try simple "owner/repo" format
+      const parts = job.repository.split('/');
+      if (parts.length !== 2) return;
+      [owner, repo] = parts;
+    }
 
     try {
       // Get recent workflow runs
