@@ -64,6 +64,10 @@ export interface MockLocalmost {
     getStatus: jest.Mock;
     onStatusUpdate: jest.Mock;
   };
+  resource: {
+    getState: jest.Mock;
+    onStateChange: jest.Mock;
+  };
 }
 
 // Extend Window interface for tests
@@ -136,6 +140,10 @@ const mockLocalmost: MockLocalmost = {
     update: jest.fn().mockResolvedValue({ success: true }),
     getStatus: jest.fn().mockResolvedValue([]),
     onStatusUpdate: jest.fn().mockReturnValue(() => {}),
+  },
+  resource: {
+    getState: jest.fn().mockResolvedValue({ isPaused: false, reason: null, conditions: [] }),
+    onStateChange: jest.fn().mockReturnValue(() => {}),
   },
 };
 
