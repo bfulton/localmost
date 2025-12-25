@@ -64,7 +64,11 @@
   border-top-color: var(--spinner-color, var(--accent));
   border-right-color: var(--spinner-color, var(--accent));
   background: transparent !important;
-  animation: spin 0.8s linear infinite;
+  animation: statusSpin 0.8s linear infinite;
+}
+
+@keyframes statusSpin {
+  to { transform: rotate(360deg); }
 }
 
 .statusItemStatus {
