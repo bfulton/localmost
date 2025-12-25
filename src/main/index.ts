@@ -231,7 +231,8 @@ app.whenReady().then(async () => {
 
       // Check if job notifications are enabled
       const config = loadConfig();
-      if (!config.notifications?.notifyOnJobEvents) {
+      const notificationsConfig = { ...DEFAULT_NOTIFICATIONS_CONFIG, ...config.notifications };
+      if (!notificationsConfig.notifyOnJobEvents) {
         logger?.debug('Job notifications disabled');
         return;
       }
@@ -245,8 +246,8 @@ app.whenReady().then(async () => {
           title = 'Job Started';
           body = `${event.jobName} on ${repoShort}`;
         } else {
-          const statusEmoji = event.status === 'succeeded' ? '✓' : event.status === 'failed' ? '✗' : '○';
-          title = `Job ${event.status === 'succeeded' ? 'Succeeded' : event.status === 'failed' ? 'Failed' : 'Cancelled'}`;
+          const statusEmoji = event.status === 'completed' ? '✓' : event.status === 'failed' ? '✗' : '○';
+          title = `Job ${event.status === 'completed' ? 'Completed' : event.status === 'failed' ? 'Failed' : 'Cancelled'}`;
           body = `${statusEmoji} ${event.jobName} on ${repoShort}`;
         }
 

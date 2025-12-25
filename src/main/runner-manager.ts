@@ -50,7 +50,7 @@ export interface JobEvent {
   type: JobEventType;
   jobName: string;
   repository: string;
-  status?: 'succeeded' | 'failed' | 'cancelled';
+  status?: 'completed' | 'failed' | 'cancelled';
 }
 
 interface RunnerManagerOptions {
@@ -1265,12 +1265,14 @@ export class RunnerManager {
    */
   private async fetchActionsUrl(jobId: string, runnerName: string): Promise<void> {
     if (!this.getWorkflowRuns || !this.getWorkflowJobs) {
+      this.log('debug', `fetchActionsUrl: No workflow API methods available`);
       return;
     }
 
     // Find the job in history to get its repository
     const job = this.jobHistory.find(j => j.id === jobId);
     if (!job?.repository || job.repository === 'unknown') {
+      this.log('debug', `fetchActionsUrl: No repository for job ${jobId}`);
       return;
     }
 
@@ -1285,27 +1287,44 @@ export class RunnerManager {
     } else {
       // Try simple "owner/repo" format
       const parts = job.repository.split('/');
-      if (parts.length !== 2) return;
+      if (parts.length !== 2) {
+        this.log('debug', `fetchActionsUrl: Could not parse owner/repo from ${job.repository}`);
+        return;
+      }
       [owner, repo] = parts;
     }
+
+    this.log('debug', `fetchActionsUrl: Looking for job on runner "${runnerName}" in ${owner}/${repo}`);
 
     try {
       // Get recent workflow runs
       const runs = await this.getWorkflowRuns(owner, repo);
-      if (!runs || runs.length === 0) return;
+      if (!runs || runs.length === 0) {
+        this.log('debug', `fetchActionsUrl: No recent runs found for ${owner}/${repo}`);
+        return;
+      }
+
+      this.log('debug', `fetchActionsUrl: Found ${runs.length} recent runs, checking first 5`);
 
       // Check the most recent runs for a job matching our runner
       for (const run of runs.slice(0, 5)) {
         const jobs = await this.getWorkflowJobs(owner, repo, run.id);
+        const runnerNames = jobs.map(j => j.runner_name).filter(Boolean);
+        this.log('debug', `fetchActionsUrl: Run ${run.id} has jobs with runners: [${runnerNames.join(', ')}]`);
+
         const matchingJob = jobs.find(j => j.runner_name === runnerName);
         if (matchingJob?.html_url) {
+          this.log('debug', `fetchActionsUrl: Found matching job, URL: ${matchingJob.html_url}`);
           this.updateJobInHistory(jobId, { actionsUrl: matchingJob.html_url });
           return;
         }
       }
-    } catch {
+
+      this.log('debug', `fetchActionsUrl: No job found matching runner "${runnerName}"`);
+    } catch (err) {
       // API errors are non-fatal - actionsUrl is an optional enhancement
       // Common causes: rate limits, network issues, race conditions
+      this.log('debug', `fetchActionsUrl: API error: ${(err as Error).message}`);
     }
   }
 
@@ -1340,7 +1359,7 @@ export class RunnerManager {
           type: 'completed',
           jobName: job.jobName,
           repository: job.repository,
-          status: updates.status as 'succeeded' | 'failed' | 'cancelled',
+          status: updates.status as 'completed' | 'failed' | 'cancelled',
         });
       }
     } else {

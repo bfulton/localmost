@@ -294,176 +294,129 @@ export class BrokerProxyService extends EventEmitter {
   }
 
   /**
-   * Start the active polling loop to check all targets for jobs.
+   * Process a message received from a target.
+   * Extracted to allow immediate processing without waiting for other polls.
    */
-  private startPolling(): void {
-    if (this.pollInterval) return;
+  private async processMessage(state: TargetState, body: string): Promise<void> {
+    log()?.info(`[BrokerProxy] Processing message from ${state.target.displayName}, body length=${body.length}`);
 
-    log()?.info('[BrokerProxy] Starting active job polling...');
+    // Parse message to determine type
+    let message;
+    try {
+      message = JSON.parse(body);
+      log()?.info(`[BrokerProxy] Parsed: messageType=${message.messageType}, bodyType=${typeof message.body}`);
+    } catch (e) {
+      log()?.info(`[BrokerProxy] Could not parse message from ${state.target.displayName}: ${(e as Error).message}`);
+      return;
+    }
 
-    const poll = async () => {
-      if (!this.isRunning) return;
+    const messageType = message.messageType || '';
+    // Extract messageId as string from raw JSON to avoid precision loss with large integers
+    const messageIdMatch = body.match(/"messageId"\s*:\s*(\d+)/);
+    const messageId = messageIdMatch ? messageIdMatch[1] : (message.messageId ? String(message.messageId) : crypto.createHash('sha256').update(body).digest('hex').slice(0, 16));
 
-      // Prevent concurrent poll execution
-      if (this.isPolling) {
-        log()?.debug('[BrokerProxy] Skipping poll - previous poll still in progress');
+    // Parse the inner body if it's a string (GitHub wraps the actual message)
+    let innerBody = message.body;
+    if (typeof innerBody === 'string') {
+      try {
+        innerBody = JSON.parse(innerBody);
+      } catch {
+        // Keep as string if not valid JSON
+      }
+    }
+
+    // Check if this is a job assignment
+    // GitHub sends RunnerJobRequest with runner_request_id (not jobId)
+    const isJobMessage = messageType.toLowerCase().includes('job');
+    const jobId = innerBody?.jobId || innerBody?.runner_request_id;
+    const targetId = state.target.id;
+
+    log()?.info(`[BrokerProxy] Message: type=${messageType}, isJob=${isJobMessage}, jobId=${jobId}`);
+    // Debug: log all fields in innerBody
+    if (innerBody && typeof innerBody === 'object') {
+      log()?.info(`[BrokerProxy] innerBody fields: ${Object.keys(innerBody).join(', ')}`);
+    }
+
+    if (isJobMessage && jobId) {
+      // Deduplicate by job ID - don't spawn multiple workers for the same job
+      if (this.jobAssignments.has(jobId)) {
+        log()?.debug(`[BrokerProxy] Skipping duplicate job ${jobId}`);
         return;
       }
-      this.isPolling = true;
 
-      try {
-      // Poll all enabled targets with active sessions
-      // Since we acquire jobs immediately, GitHub won't return the same job twice
-      const allTargets = Array.from(this.targets.values());
-      const enabledTargets = allTargets.filter(s => s.target.enabled && s.sessionId);
+      // Check if we have capacity to accept more jobs
+      if (this.canAcceptJobCallback && !this.canAcceptJobCallback()) {
+        log()?.info(`[BrokerProxy] At capacity, skipping job ${jobId}`);
+        return;
+      }
 
-      log()?.debug(`[BrokerProxy] Polling ${enabledTargets.length}/${allTargets.length} targets`);
+      // Store real run_service_url for forwarding job operations
+      // Store by multiple keys since runner may use different IDs
+      const runServiceUrl = innerBody?.run_service_url;
+      const billingOwnerId = innerBody?.billing_owner_id;
+      if (runServiceUrl) {
+        this.jobRunServiceUrls.set(jobId, runServiceUrl);
+        // Also store by messageId (used as jobMessageId in acquirejob)
+        // messageId was extracted as string to avoid precision loss
+        this.jobRunServiceUrls.set(messageId, runServiceUrl);
+        // Store job info for acquireJobUpstream
+        this.jobInfo.set(messageId, { billingOwnerId, runServiceUrl });
+        log()?.info(`[BrokerProxy] Job ${jobId} (messageId=${messageId}) received from ${state.target.displayName}, run_service_url=${runServiceUrl}, billingOwnerId=${billingOwnerId}`);
+      } else {
+        log()?.info(`[BrokerProxy] Job ${jobId} received from ${state.target.displayName} (no run_service_url)`);
+      }
 
-      if (enabledTargets.length === 0) return;
-
-      // Poll all targets concurrently
-      const pollPromises = enabledTargets.map(async (state) => {
-        try {
-          const result = await this.pollUpstreamTarget(state);
-          return { state, ...result };
-        } catch (error) {
-          state.error = (error as Error).message;
-          return { state, hasMessage: false, body: '' };
+      // Acquire job from GitHub immediately using target's credentials
+      // This claims the job so GitHub won't keep sending it on subsequent polls
+      // Note: GitHub uses runner_request_id (UUID) as jobMessageId, not the broker's numeric messageId
+      if (runServiceUrl) {
+        const jobDetails = await this.acquireJobUpstream(state, jobId, runServiceUrl, billingOwnerId);
+        if (jobDetails) {
+          this.acquiredJobDetails.set(jobId, jobDetails);
+          this.acquiredJobDetails.set(messageId, jobDetails);
+          log()?.info(`[BrokerProxy] Acquired job ${jobId} (messageId=${messageId}) upstream, stored details`);
+        } else {
+          log()?.warn(`[BrokerProxy] Failed to acquire job ${jobId} upstream, continuing anyway`);
         }
+      }
+
+      // Rewrite run_service_url to point to our proxy
+      // This ensures the runner talks to us, not directly to GitHub
+      const proxyUrl = `http://localhost:${this.port}/`;
+      innerBody.run_service_url = proxyUrl;
+
+      // Rebuild the message with rewritten URL
+      message.body = JSON.stringify(innerBody);
+      const rewrittenMessage = JSON.stringify(message);
+      log()?.info(`[BrokerProxy] Rewrote run_service_url to ${proxyUrl}`);
+
+      // Queue the rewritten message for the worker
+      if (!this.messageQueues.has(targetId)) {
+        this.messageQueues.set(targetId, []);
+      }
+      this.messageQueues.get(targetId)!.push(rewrittenMessage);
+
+      state.jobsAssigned++;
+
+      // Track job assignment
+      this.jobAssignments.set(jobId, {
+        jobId,
+        targetId: state.target.id,
+        sessionId: state.sessionId!,
+        assignedAt: new Date(),
       });
 
-      const results = await Promise.all(pollPromises);
+      // Queue target assignment for the worker that will be spawned
+      this.pendingTargetAssignments.push(targetId);
 
-      for (const result of results) {
-        if (result.hasMessage) {
-          log()?.info(`[BrokerProxy] Processing message from ${result.state.target.displayName}, body length=${result.body.length}`);
-          // Parse message to determine type
-          let message;
-          try {
-            message = JSON.parse(result.body);
-            log()?.info(`[BrokerProxy] Parsed: messageType=${message.messageType}, bodyType=${typeof message.body}`);
-          } catch (e) {
-            log()?.info(`[BrokerProxy] Could not parse message from ${result.state.target.displayName}: ${(e as Error).message}`);
-            continue;
-          }
-
-          const messageType = message.messageType || '';
-          // Extract messageId as string from raw JSON to avoid precision loss with large integers
-          const messageIdMatch = result.body.match(/"messageId"\s*:\s*(\d+)/);
-          const messageId = messageIdMatch ? messageIdMatch[1] : (message.messageId ? String(message.messageId) : crypto.createHash('sha256').update(result.body).digest('hex').slice(0, 16));
-
-          // Parse the inner body if it's a string (GitHub wraps the actual message)
-          let innerBody = message.body;
-          if (typeof innerBody === 'string') {
-            try {
-              innerBody = JSON.parse(innerBody);
-            } catch {
-              // Keep as string if not valid JSON
-            }
-          }
-
-          // Check if this is a job assignment
-          // GitHub sends RunnerJobRequest with runner_request_id (not jobId)
-          const isJobMessage = messageType.toLowerCase().includes('job');
-          const jobId = innerBody?.jobId || innerBody?.runner_request_id;
-          const targetId = result.state.target.id;
-
-          log()?.info(`[BrokerProxy] Message: type=${messageType}, isJob=${isJobMessage}, jobId=${jobId}`);
-          // Debug: log all fields in innerBody
-          if (innerBody && typeof innerBody === 'object') {
-            log()?.info(`[BrokerProxy] innerBody fields: ${Object.keys(innerBody).join(', ')}`);
-          }
-
-          if (isJobMessage && jobId) {
-            // Deduplicate by job ID - don't spawn multiple workers for the same job
-            if (this.jobAssignments.has(jobId)) {
-              log()?.debug(`[BrokerProxy] Skipping duplicate job ${jobId}`);
-              continue;
-            }
-
-            // Check if we have capacity to accept more jobs
-            if (this.canAcceptJobCallback && !this.canAcceptJobCallback()) {
-              log()?.info(`[BrokerProxy] At capacity, skipping job ${jobId}`);
-              continue;
-            }
-
-            // Store real run_service_url for forwarding job operations
-            // Store by multiple keys since runner may use different IDs
-            const runServiceUrl = innerBody?.run_service_url;
-            const billingOwnerId = innerBody?.billing_owner_id;
-            if (runServiceUrl) {
-              this.jobRunServiceUrls.set(jobId, runServiceUrl);
-              // Also store by messageId (used as jobMessageId in acquirejob)
-              // messageId was extracted as string to avoid precision loss
-              this.jobRunServiceUrls.set(messageId, runServiceUrl);
-              // Store job info for acquireJobUpstream
-              this.jobInfo.set(messageId, { billingOwnerId, runServiceUrl });
-              log()?.info(`[BrokerProxy] Job ${jobId} (messageId=${messageId}) received from ${result.state.target.displayName}, run_service_url=${runServiceUrl}, billingOwnerId=${billingOwnerId}`);
-            } else {
-              log()?.info(`[BrokerProxy] Job ${jobId} received from ${result.state.target.displayName} (no run_service_url)`);
-            }
-
-            // Acquire job from GitHub immediately using target's credentials
-            // This claims the job so GitHub won't keep sending it on subsequent polls
-            // Note: GitHub uses runner_request_id (UUID) as jobMessageId, not the broker's numeric messageId
-            if (runServiceUrl) {
-              const jobDetails = await this.acquireJobUpstream(result.state, jobId, runServiceUrl, billingOwnerId);
-              if (jobDetails) {
-                this.acquiredJobDetails.set(jobId, jobDetails);
-                this.acquiredJobDetails.set(messageId, jobDetails);
-                log()?.info(`[BrokerProxy] Acquired job ${jobId} (messageId=${messageId}) upstream, stored details`);
-              } else {
-                log()?.warn(`[BrokerProxy] Failed to acquire job ${jobId} upstream, continuing anyway`);
-              }
-            }
-
-            // Rewrite run_service_url to point to our proxy
-            // This ensures the runner talks to us, not directly to GitHub
-            const proxyUrl = `http://localhost:${this.port}/`;
-            innerBody.run_service_url = proxyUrl;
-
-            // Rebuild the message with rewritten URL
-            message.body = JSON.stringify(innerBody);
-            const rewrittenMessage = JSON.stringify(message);
-            log()?.info(`[BrokerProxy] Rewrote run_service_url to ${proxyUrl}`);
-
-            // Queue the rewritten message for the worker
-            if (!this.messageQueues.has(targetId)) {
-              this.messageQueues.set(targetId, []);
-            }
-            this.messageQueues.get(targetId)!.push(rewrittenMessage);
-
-            result.state.jobsAssigned++;
-
-            // Track job assignment
-            this.jobAssignments.set(jobId, {
-              jobId,
-              targetId: result.state.target.id,
-              sessionId: result.state.sessionId!,
-              assignedAt: new Date(),
-            });
-
-            // Queue target assignment for the worker that will be spawned
-            this.pendingTargetAssignments.push(targetId);
-
-            // Emit event to spawn worker for job messages only
-            this.emit('job-received', result.state.target.id, jobId);
-            this.emitStatusUpdate();
-          } else if (isJobMessage) {
-            log()?.debug(`[BrokerProxy] Job-like message without jobId (${messageType}) from ${result.state.target.displayName}`);
-          } else {
-            log()?.info(`[BrokerProxy] Message (${messageType}) received from ${result.state.target.displayName}`);
-          }
-        }
-      }
-      } finally {
-        this.isPolling = false;
-      }
-    };
-
-    // Poll immediately, then on interval
-    poll();
-    this.pollInterval = setInterval(poll, BrokerProxyService.POLL_INTERVAL_MS);
+      // Emit event to spawn worker for job messages only
+      this.emit('job-received', state.target.id, jobId);
+      this.emitStatusUpdate();
+    } else if (isJobMessage) {
+      log()?.debug(`[BrokerProxy] Job-like message without jobId (${messageType}) from ${state.target.displayName}`);
+    } else {
+      log()?.info(`[BrokerProxy] Message (${messageType}) received from ${state.target.displayName}`);
+    }
   }
 
   /**
@@ -828,9 +781,9 @@ export class BrokerProxyService extends EventEmitter {
     if (billingOwnerId) {
       bodyObj.billingOwnerId = billingOwnerId;
     }
-    const body = JSON.stringify(bodyObj);
+    const reqBody = JSON.stringify(bodyObj);
 
-    log()?.info(`[BrokerProxy] Acquiring job: POST ${acquireUrl} body=${body}`);
+    log()?.info(`[BrokerProxy] Acquiring job: POST ${acquireUrl} body=${reqBody}`);
 
     try {
       const response = await httpsRequest(acquireUrl, {
@@ -840,7 +793,7 @@ export class BrokerProxyService extends EventEmitter {
           'Content-Type': 'application/json',
           'Accept': 'application/json',
         },
-      }, body);
+      }, reqBody);
 
       log()?.info(`[BrokerProxy] Acquire response: status=${response.statusCode}, body=${response.body.slice(0, 200)}`);
 
@@ -942,10 +895,25 @@ export class BrokerProxyService extends EventEmitter {
 
     // If this worker already has a job, don't give them another one.
     // Workers run with --once so they should only get one job.
+    // Use long-poll to prevent rapid re-polling.
     if (session.currentJobId) {
-      log()?.debug(`[BrokerProxy] Worker already has job ${session.currentJobId}, returning empty`);
-      res.writeHead(202, { 'Content-Type': 'application/json' });
-      res.end('');
+      log()?.debug(`[BrokerProxy] Worker already has job ${session.currentJobId}, holding connection`);
+      // Hold for 30 seconds before returning empty (GitHub broker does similar)
+      await new Promise<void>((resolve) => {
+        const timeout = setTimeout(() => {
+          if (!res.writableEnded) {
+            res.writeHead(202, { 'Content-Type': 'application/json' });
+            res.end('');
+          }
+          resolve();
+        }, 30000);
+
+        // Clean up if connection closes early
+        res.on('close', () => {
+          clearTimeout(timeout);
+          resolve();
+        });
+      });
       return;
     }
 
@@ -1068,17 +1036,17 @@ export class BrokerProxyService extends EventEmitter {
     for await (const chunk of req) {
       chunks.push(chunk as Buffer);
     }
-    const body = Buffer.concat(chunks).toString();
+    const reqBody = Buffer.concat(chunks).toString();
 
     // Parse body to find job ID
     let jobId: string | undefined;
     try {
-      const bodyJson = JSON.parse(body);
+      const bodyJson = JSON.parse(reqBody);
       log()?.info(`[BrokerProxy] acquirejob request body: ${JSON.stringify(bodyJson)}`);
       // Runner uses jobMessageId (which is the message.messageId from the broker)
       jobId = bodyJson.jobMessageId || bodyJson.jobRequestId || bodyJson.requestId;
     } catch {
-      log()?.warn(`[BrokerProxy] Could not parse acquirejob body: ${body}`);
+      log()?.warn(`[BrokerProxy] Could not parse acquirejob body: ${reqBody}`);
     }
 
     if (!jobId) {
@@ -1157,7 +1125,7 @@ export class BrokerProxyService extends EventEmitter {
     for await (const chunk of req) {
       chunks.push(chunk as Buffer);
     }
-    const body = Buffer.concat(chunks).toString();
+    const reqBody = Buffer.concat(chunks).toString();
 
     // Replace local session ID with upstream session ID in query params
     const upstreamParams = new URLSearchParams(url.search);
@@ -1177,18 +1145,18 @@ export class BrokerProxyService extends EventEmitter {
       // Try to find run_service_url from request body or stored job info
       let runServiceUrl: string | undefined;
       try {
-        const bodyJson = JSON.parse(body);
+        const bodyJson = JSON.parse(reqBody);
         log()?.info(`[BrokerProxy] Job operation ${url.pathname} body: ${JSON.stringify(bodyJson)}`);
         // Try multiple ID fields - runner uses different ones for different operations
-        const jobId = bodyJson.jobRequestId || bodyJson.requestId || bodyJson.runnerRequestId
+        const opJobId = bodyJson.jobRequestId || bodyJson.requestId || bodyJson.runnerRequestId
           || bodyJson.runner_request_id || bodyJson.jobMessageId;
-        log()?.debug(`[BrokerProxy] Looking for run_service_url with jobId: ${jobId}`);
-        if (jobId) {
-          runServiceUrl = this.jobRunServiceUrls.get(jobId);
-          log()?.info(`[BrokerProxy] Found run_service_url for ${jobId}: ${runServiceUrl || 'not found'}`);
+        log()?.debug(`[BrokerProxy] Looking for run_service_url with jobId: ${opJobId}`);
+        if (opJobId) {
+          runServiceUrl = this.jobRunServiceUrls.get(opJobId);
+          log()?.info(`[BrokerProxy] Found run_service_url for ${opJobId}: ${runServiceUrl || 'not found'}`);
         }
       } catch (e) {
-        log()?.info(`[BrokerProxy] Could not parse job operation body: ${(e as Error).message}, body: ${body?.slice(0, 100)}`);
+        log()?.info(`[BrokerProxy] Could not parse job operation body: ${(e as Error).message}, body: ${reqBody?.slice(0, 100)}`);
       }
 
       if (runServiceUrl) {
@@ -1210,7 +1178,7 @@ export class BrokerProxyService extends EventEmitter {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
       },
-    }, body || undefined);
+    }, reqBody || undefined);
 
     res.writeHead(response.statusCode, { 'Content-Type': 'application/json' });
     res.end(response.body);
@@ -1222,5 +1190,58 @@ export class BrokerProxyService extends EventEmitter {
 
   private emitStatusUpdate(): void {
     this.emit('status-update', this.getStatus());
+  }
+
+  /**
+   * Start the active polling loop to check all targets for jobs.
+   */
+  private startPolling(): void {
+    if (this.pollInterval) return;
+
+    log()?.info('[BrokerProxy] Starting active job polling...');
+
+    const poll = async () => {
+      if (!this.isRunning) return;
+
+      // Prevent concurrent poll execution
+      if (this.isPolling) {
+        log()?.debug('[BrokerProxy] Skipping poll - previous poll still in progress');
+        return;
+      }
+      this.isPolling = true;
+
+      try {
+        // Poll all enabled targets with active sessions
+        // Since we acquire jobs immediately, GitHub won't return the same job twice
+        const allTargets = Array.from(this.targets.values());
+        const enabledTargets = allTargets.filter(s => s.target.enabled && s.sessionId);
+
+        log()?.debug(`[BrokerProxy] Polling ${enabledTargets.length}/${allTargets.length} targets`);
+
+        if (enabledTargets.length === 0) return;
+
+        // Poll all targets concurrently and process messages immediately as they arrive
+        const pollPromises = enabledTargets.map(async (state) => {
+          try {
+            const result = await this.pollUpstreamTarget(state);
+            // Process message immediately when poll completes - don't wait for other polls
+            if (result.hasMessage) {
+              await this.processMessage(state, result.body);
+            }
+          } catch (error) {
+            state.error = (error as Error).message;
+          }
+        });
+
+        // Wait for all polls to complete (but messages are already processed)
+        await Promise.all(pollPromises);
+      } finally {
+        this.isPolling = false;
+      }
+    };
+
+    // Poll immediately, then on interval
+    poll();
+    this.pollInterval = setInterval(poll, BrokerProxyService.POLL_INTERVAL_MS);
   }
 }
