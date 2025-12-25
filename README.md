@@ -42,6 +42,15 @@ Features:
 
 localmost is a macOS app that manages GitHub's official [actions-runner](https://github.com/actions/runner) binary. It handles authentication, registration, runner process lifecycle, and automatic fallback — the tedious parts of self-hosted runners.
 
+## Architecture
+
+<img src="docs/localmost-arch.png" alt="localmost architecture diagram" width="600">
+
+- **Runner proxy** — maintains long-poll sessions with GitHub's broker to receive job assignments
+- **Runner pool** — 1-16 worker instances that execute jobs in sandboxed environments
+- **HTTP proxy** — allowlist-based network isolation for runner traffic (GitHub, npm, PyPI, etc.)
+- **Build cache** — persistent tool cache shared across job runs (Node.js, Python, etc.)
+
 ## Workflow Integration
 
 Add to your GitHub Actions workflow to automatically use localmost when available:
@@ -207,7 +216,6 @@ Future feature ideas:
 - **Deep links** - Jump directly to job logs in GitHub.
 - **Audit logging** - Detailed logs of what each job accessed.
 - **Network policy customization** - User-defined network allowlists per repo.
-- **Auto-update** - In-app update mechanism.
 - **Workflow testing mode** - Run and validate workflows locally before pushing.
 - **Spotlight integration** - Check status or pause builds from Spotlight.
 - **Artifact inspector** - Browse uploaded artifacts without leaving the app.

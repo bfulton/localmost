@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faGear, faChevronDown, faFile, faCheck, faBackwardStep, faForwardStep, faBan } from '@fortawesome/free-solid-svg-icons';
-import { JobHistoryEntry } from '../../shared/types';
+import { JobHistoryEntry, Target } from '../../shared/types';
 import { GITHUB_APP_SETTINGS_URL } from '../../shared/constants';
 import { useAppConfig, useRunner } from '../contexts';
 import styles from './StatusPage.module.css';
@@ -86,7 +86,7 @@ interface RunnerStatusItemProps {
   runnerName: string | null;
   runnerSettingsUrl: string | null;
   runnerVersion: { version: string | null; url: string | null };
-  runnerTarget: { type: 'repo' | 'org'; name: string } | null;
+  targets: Target[];
   isConfigured: boolean;
   showUsage: boolean;
   onToggleUsage: () => void;
@@ -99,12 +99,27 @@ const RunnerStatusItem: React.FC<RunnerStatusItemProps> = ({
   runnerName,
   runnerSettingsUrl,
   runnerVersion,
-  runnerTarget,
+  targets,
   isConfigured,
   showUsage,
   onToggleUsage,
   onOpenRunnerConfig,
-}) => (
+}) => {
+  // Build targets display
+  const getTargetsDisplay = (): { text: string; tooltip?: string } | null => {
+    if (targets.length === 0) return null;
+    if (targets.length === 1) {
+      const t = targets[0];
+      return { text: `${t.type}: ${t.displayName}` };
+    }
+    // Multiple targets: show count with hover tooltip
+    const tooltip = targets.map(t => `${t.type}: ${t.displayName}`).join('\n');
+    return { text: `${targets.length} targets`, tooltip };
+  };
+
+  const targetsDisplay = getTargetsDisplay();
+
+  return (
   <div className={styles.statusItemExpandable}>
     <div className={styles.statusItemHeader}>
       <span className={styles.statusItemLabel}>Runner</span>
@@ -123,7 +138,7 @@ const RunnerStatusItem: React.FC<RunnerStatusItemProps> = ({
         )}
       </div>
     </div>
-    {(runnerName || runnerVersion.version || runnerTarget) && (
+    {(runnerName || runnerVersion.version || targetsDisplay) && (
       <div className={`${styles.statusItemDetail} ${shared.flexBetween}`}>
         <span>
           {runnerName && runnerSettingsUrl ? (
@@ -150,7 +165,7 @@ const RunnerStatusItem: React.FC<RunnerStatusItemProps> = ({
             </a>
           )}
         </span>
-        {runnerTarget && (
+        {targetsDisplay && (
           <a
             href="#"
             className={styles.runnerTargetLink}
@@ -158,8 +173,9 @@ const RunnerStatusItem: React.FC<RunnerStatusItemProps> = ({
               e.preventDefault();
               onOpenRunnerConfig();
             }}
+            title={targetsDisplay.tooltip}
           >
-            {runnerTarget.type}: {runnerTarget.name}
+            {targetsDisplay.text}
           </a>
         )}
       </div>
@@ -215,7 +231,8 @@ const RunnerStatusItem: React.FC<RunnerStatusItemProps> = ({
       </div>
     )}
   </div>
-);
+  );
+};
 
 interface JobStatusItemProps {
   status: string;
@@ -348,11 +365,10 @@ const JobStatusItem: React.FC<JobStatusItemProps> = ({
 const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
   // Get state from contexts
   const { logs, maxLogScrollback, maxJobHistory, sleepProtection, clearLogs } = useAppConfig();
-  const { user, isDownloaded, isConfigured, runnerVersion, runnerState, jobHistory, runnerConfig, runnerDisplayName } = useRunner();
+  const { user, isDownloaded, isConfigured, runnerVersion, runnerState, jobHistory, runnerConfig, runnerDisplayName, targets, targetStatus } = useRunner();
 
   // Local UI state
   const [runnerSettingsUrl, setRunnerSettingsUrl] = useState<string | null>(null);
-  const [runnerTarget, setRunnerTarget] = useState<{ type: 'repo' | 'org'; name: string } | null>(null);
   const [actionsUrl, setActionsUrl] = useState<string | null>(null);
   const [showUsage, setShowUsage] = useState(false);
   const [showJobHistory, setShowJobHistory] = useState(false);
@@ -367,27 +383,22 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
   const isProgrammaticScrollRef = useRef(false); // Ignore scroll events during programmatic scroll
 
   useEffect(() => {
-    // Construct runner settings URL, actions URL, and target info
-    if (isConfigured && runnerConfig) {
+    // Construct runner settings URL and actions URL from first target
+    if (isConfigured && targets.length > 0) {
+      const firstTarget = targets[0];
       const actionsQuery = '?query=is%3Ain_progress';
-      if (runnerConfig.level === 'org' && runnerConfig.orgName) {
-        setRunnerSettingsUrl(`https://github.com/organizations/${runnerConfig.orgName}/settings/actions/runners`);
-        setActionsUrl(`https://github.com/orgs/${runnerConfig.orgName}/actions${actionsQuery}`);
-        setRunnerTarget({ type: 'org', name: runnerConfig.orgName });
-      } else if (runnerConfig.repoUrl) {
-        // Extract owner/repo from URL like https://github.com/owner/repo
-        const match = runnerConfig.repoUrl.match(/github\.com\/([^/]+)\/([^/]+)/);
-        if (match) {
-          setRunnerSettingsUrl(`https://github.com/${match[1]}/${match[2]}/settings/actions/runners`);
-          setActionsUrl(`https://github.com/${match[1]}/${match[2]}/actions${actionsQuery}`);
-          setRunnerTarget({ type: 'repo', name: `${match[1]}/${match[2]}` });
-        }
+      if (firstTarget.type === 'org') {
+        setRunnerSettingsUrl(`https://github.com/organizations/${firstTarget.owner}/settings/actions/runners`);
+        setActionsUrl(`https://github.com/orgs/${firstTarget.owner}/actions${actionsQuery}`);
+      } else {
+        setRunnerSettingsUrl(`https://github.com/${firstTarget.owner}/${firstTarget.repo}/settings/actions/runners`);
+        setActionsUrl(`https://github.com/${firstTarget.owner}/${firstTarget.repo}/actions${actionsQuery}`);
       }
     }
 
     // Get log file path
     window.localmost.logs.getPath().then(setLogPath);
-  }, [isConfigured, runnerConfig]);
+  }, [isConfigured, targets]);
 
   // Helper to check if scroll is at bottom
   const isScrolledToBottom = (): boolean => {
@@ -468,7 +479,7 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
     };
   };
 
-  // Runner status
+  // Runner status - combines worker status with connection status
   const getRunnerStatusInfo = (): { status: string; statusType: string } => {
     if (!user) {
       return { status: 'Waiting for GitHub', statusType: 'offline' };
@@ -480,6 +491,53 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
       return { status: 'Not configured', statusType: 'offline' };
     }
 
+    // Check connection status for all targets
+    const getConnectionStatus = (): { status: string; statusType: string } | null => {
+      if (targets.length === 0) {
+        return null; // No targets, skip connection status
+      }
+
+      // Map each target to its connection state
+      const connectionStates = targets.map(target => {
+        const status = targetStatus.find(s => s.targetId === target.id);
+        if (!status) return 'unknown';
+        if (status.error) return 'error';
+        if (status.sessionActive) return 'connected';
+        return 'disconnected';
+      });
+
+      // Check if all targets have the same status
+      const uniqueStates = [...new Set(connectionStates)];
+
+      if (uniqueStates.length === 1) {
+        // All same status
+        const state = uniqueStates[0];
+        if (state === 'error') {
+          return { status: 'Connection error', statusType: 'error' };
+        }
+        if (state === 'disconnected') {
+          return { status: 'Disconnected', statusType: 'offline' };
+        }
+        // If all connected or unknown, continue to worker status
+        return null;
+      }
+
+      // Mixed status
+      const errorCount = connectionStates.filter(s => s === 'error').length;
+      const connectedCount = connectionStates.filter(s => s === 'connected').length;
+      if (errorCount > 0) {
+        return { status: `Mixed (${connectedCount}/${targets.length} connected)`, statusType: 'error' };
+      }
+      return { status: `Mixed (${connectedCount}/${targets.length} connected)`, statusType: 'starting' };
+    };
+
+    // Check connection status first
+    const connectionStatus = getConnectionStatus();
+    if (connectionStatus) {
+      return connectionStatus;
+    }
+
+    // Worker status
     switch (runnerState.status) {
       case 'starting':
         return { status: 'Starting', statusType: 'starting' };
@@ -586,7 +644,7 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
           runnerName={isConfigured ? runnerDisplayName : null}
           runnerSettingsUrl={runnerSettingsUrl}
           runnerVersion={runnerVersion}
-          runnerTarget={isConfigured ? runnerTarget : null}
+          targets={targets}
           isConfigured={isConfigured}
           showUsage={showUsage}
           onToggleUsage={() => setShowUsage(!showUsage)}

@@ -15,6 +15,9 @@ import {
   HeartbeatStatus,
   GitHubUserSearchResult,
   UpdateStatus,
+  Target,
+  RunnerProxyStatus,
+  Result,
 } from '../shared/types';
 
 // Expose protected methods to the renderer process
@@ -131,6 +134,22 @@ contextBridge.exposeInMainWorld('localmost', {
       return () => ipcRenderer.removeListener(IPC_CHANNELS.UPDATE_STATUS, handler);
     },
   },
+
+  // Targets (multi-target runner support)
+  targets: {
+    list: () => ipcRenderer.invoke(IPC_CHANNELS.TARGETS_LIST),
+    add: (type: 'repo' | 'org', owner: string, repo?: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.TARGETS_ADD, type, owner, repo),
+    remove: (targetId: string) => ipcRenderer.invoke(IPC_CHANNELS.TARGETS_REMOVE, targetId),
+    update: (targetId: string, updates: Partial<Pick<Target, 'enabled'>>) =>
+      ipcRenderer.invoke(IPC_CHANNELS.TARGETS_UPDATE, targetId, updates),
+    getStatus: () => ipcRenderer.invoke(IPC_CHANNELS.TARGETS_GET_STATUS),
+    onStatusUpdate: (callback: (status: RunnerProxyStatus[]) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, status: RunnerProxyStatus[]) => callback(status);
+      ipcRenderer.on(IPC_CHANNELS.TARGETS_STATUS_UPDATE, handler);
+      return () => ipcRenderer.removeListener(IPC_CHANNELS.TARGETS_STATUS_UPDATE, handler);
+    },
+  },
 });
 
 // Type declarations for the exposed API
@@ -197,6 +216,14 @@ export interface LocalmostAPI {
     install: () => Promise<{ success: boolean; error?: string }>;
     getStatus: () => Promise<UpdateStatus>;
     onStatusChange: (callback: (status: UpdateStatus) => void) => () => void;
+  };
+  targets: {
+    list: () => Promise<Target[]>;
+    add: (type: 'repo' | 'org', owner: string, repo?: string) => Promise<Result<Target>>;
+    remove: (targetId: string) => Promise<Result>;
+    update: (targetId: string, updates: Partial<Pick<Target, 'enabled'>>) => Promise<Result<Target>>;
+    getStatus: () => Promise<RunnerProxyStatus[]>;
+    onStatusUpdate: (callback: (status: RunnerProxyStatus[]) => void) => () => void;
   };
 }
 

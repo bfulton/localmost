@@ -97,6 +97,7 @@
 .toggleRow input[type="checkbox"] {
   width: 18px;
   height: 18px;
+  margin-right: 4px;
   accent-color: var(--accent);
   cursor: pointer;
 }

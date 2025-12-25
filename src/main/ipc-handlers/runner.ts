@@ -290,26 +290,16 @@ export const registerRunnerHandlers = (): void => {
       // Start heartbeat when runner starts
       if (heartbeatManager && authState?.accessToken && githubAuth) {
         const config = loadConfig();
-        const runnerConfig = config.runnerConfig;
+        // Set up heartbeat for all configured targets
+        const targets = config.targets || [];
+        const heartbeatTargets = targets.map(t =>
+          t.type === 'org'
+            ? { level: 'org' as const, org: t.owner }
+            : { level: 'repo' as const, owner: t.owner, repo: t.repo! }
+        );
 
-        if (runnerConfig) {
-          // Set up heartbeat target
-          if (runnerConfig.level === 'org' && runnerConfig.orgName) {
-            heartbeatManager.setTarget({
-              level: 'org',
-              org: runnerConfig.orgName,
-            });
-          } else if (runnerConfig.level === 'repo' && runnerConfig.repoUrl) {
-            const match = runnerConfig.repoUrl.match(/github\.com[\/:]([^\/]+)\/([^\/\.]+)/);
-            if (match) {
-              const [, owner, repo] = match;
-              heartbeatManager.setTarget({
-                level: 'repo',
-                owner,
-                repo,
-              });
-            }
-          }
+        if (heartbeatTargets.length > 0) {
+          heartbeatManager.setTargets(heartbeatTargets);
 
           // Set up API callbacks with automatic token refresh on auth errors
           heartbeatManager.setApiCallbacks({
@@ -348,7 +338,8 @@ export const registerRunnerHandlers = (): void => {
           });
 
           // Set runner name for logging
-          if (runnerConfig.runnerName) {
+          const runnerConfig = config.runnerConfig;
+          if (runnerConfig?.runnerName) {
             heartbeatManager.setRunnerName(runnerConfig.runnerName);
           }
 

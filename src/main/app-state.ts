@@ -11,6 +11,8 @@ import { HeartbeatManager } from './heartbeat-manager';
 import { TrayManager } from './tray';
 import { Logger } from './logger';
 import { CliServer } from './cli-server';
+import { BrokerProxyService } from './broker-proxy-service';
+import { TargetManager } from './target-manager';
 import {
   RunnerState,
   GitHubUser,
@@ -35,6 +37,8 @@ let githubAuth: GitHubAuth | null = null;
 let heartbeatManager: HeartbeatManager | null = null;
 let logger: Logger | null = null;
 let cliServer: CliServer | null = null;
+let brokerProxyService: BrokerProxyService | null = null;
+let targetManager: TargetManager | null = null;
 
 let powerSaveBlockerId: number | null = null;
 let sleepProtectionSetting: SleepProtection = 'never';
@@ -96,6 +100,16 @@ export const setLogger = (l: Logger | null): void => {
 export const getCliServer = (): CliServer | null => cliServer;
 export const setCliServer = (server: CliServer | null): void => {
   cliServer = server;
+};
+
+export const getBrokerProxyService = (): BrokerProxyService | null => brokerProxyService;
+export const setBrokerProxyService = (service: BrokerProxyService | null): void => {
+  brokerProxyService = service;
+};
+
+export const getTargetManager = (): TargetManager | null => targetManager;
+export const setTargetManager = (manager: TargetManager | null): void => {
+  targetManager = manager;
 };
 
 // ============================================================================

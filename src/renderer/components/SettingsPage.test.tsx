@@ -206,7 +206,7 @@ describe('SettingsPage', () => {
     });
   });
 
-  it('should show runner level options when configuring', async () => {
+  it('should show runner configuration options when authenticated', async () => {
     mockLocalmost.github.getAuthStatus.mockResolvedValue({
       isAuthenticated: true,
       user: { login: 'testuser', name: 'Test User', avatar_url: '' },
@@ -216,9 +216,9 @@ describe('SettingsPage', () => {
     renderWithProviders(<SettingsPage {...defaultProps} />);
 
     await waitFor(() => {
-      // Use getAllByText since Repository/Organization appear as both level options and labels
-      expect(screen.getAllByText('Repository').length).toBeGreaterThan(0);
-      expect(screen.getAllByText('Organization').length).toBeGreaterThan(0);
+      expect(screen.getByText('Runner Name')).toBeInTheDocument();
+      expect(screen.getByText('Labels (comma-separated)')).toBeInTheDocument();
+      expect(screen.getByText('Parallelism')).toBeInTheDocument();
     });
   });
 });

@@ -14,6 +14,8 @@ jest.mock('./runner-downloader', () => ({
     buildSandbox: jest.fn().mockImplementation((instance: number) => Promise.resolve(`/Users/test/.localmost/runner/sandbox/${instance}`)),
     isDownloaded: jest.fn().mockReturnValue(true),
     isConfigured: jest.fn().mockImplementation((instance: number) => true),
+    hasAnyProxyCredentials: jest.fn().mockReturnValue(true),
+    copyProxyCredentials: jest.fn().mockResolvedValue(undefined),
     getInstalledVersion: jest.fn().mockReturnValue('2.330.0'),
   })),
 }));
@@ -128,7 +130,7 @@ describe('RunnerManager', () => {
   });
 
   describe('isConfigured', () => {
-    it('should delegate to downloader.isConfigured', () => {
+    it('should delegate to downloader.hasAnyProxyCredentials', () => {
       // The mock returns true by default
       expect(runnerManager.isConfigured()).toBe(true);
     });
@@ -150,6 +152,7 @@ describe('RunnerManager', () => {
           getConfigDir: jest.fn().mockImplementation((instance: number) => `/Users/test/.localmost/runner/config/${instance}`),
           isDownloaded: jest.fn().mockReturnValue(false),
           isConfigured: jest.fn().mockReturnValue(true),
+          hasAnyProxyCredentials: jest.fn().mockReturnValue(true),
           getInstalledVersion: jest.fn().mockReturnValue(null),
         })),
       }));
@@ -265,6 +268,48 @@ describe('RunnerManager', () => {
           message: expect.stringContaining('not running'),
         })
       );
+    });
+  });
+
+  describe('hasAvailableSlot', () => {
+    it('should return true when no instances are running', () => {
+      expect(runnerManager.hasAvailableSlot()).toBe(true);
+    });
+
+    it('should return true when some instances are idle', () => {
+      // Access private instances map to set up state
+      const instances = (runnerManager as any).instances;
+      instances.set(1, { status: 'running' });
+      instances.set(2, { status: 'idle' });
+
+      expect(runnerManager.hasAvailableSlot()).toBe(true);
+    });
+
+    it('should return true when some instances are offline', () => {
+      const instances = (runnerManager as any).instances;
+      instances.set(1, { status: 'running' });
+      instances.set(2, { status: 'offline' });
+
+      expect(runnerManager.hasAvailableSlot()).toBe(true);
+    });
+
+    it('should return true when some instances have error status', () => {
+      const instances = (runnerManager as any).instances;
+      instances.set(1, { status: 'running' });
+      instances.set(2, { status: 'error' });
+
+      expect(runnerManager.hasAvailableSlot()).toBe(true);
+    });
+
+    it('should return false when all instances are running', () => {
+      const instances = (runnerManager as any).instances;
+      // Default runnerCount is 4
+      instances.set(1, { status: 'running' });
+      instances.set(2, { status: 'running' });
+      instances.set(3, { status: 'running' });
+      instances.set(4, { status: 'running' });
+
+      expect(runnerManager.hasAvailableSlot()).toBe(false);
     });
   });
 

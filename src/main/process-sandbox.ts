@@ -123,8 +123,16 @@ function generateSandboxProfile(instanceDir: string): string {
 (allow file-write*
   (subpath "${escapedDir}"))
 
+;; File ioctl for git file locking in sandbox directory
+(allow file-ioctl
+  (subpath "${escapedDir}"))
+
 ;; App data directory (tool cache, other instances)
 (allow file-write*
+  (subpath "${appDataDir}"))
+
+;; File ioctl for git file locking in app data directory
+(allow file-ioctl
   (subpath "${appDataDir}"))
 
 ;; System temp directories (many tools require this)
@@ -159,6 +167,14 @@ function generateSandboxProfile(instanceDir: string): string {
   (literal "/dev/null")
   (literal "/dev/random")
   (literal "/dev/urandom"))
+
+;; Device files that need read/write access (git, many tools redirect to /dev/null)
+(allow file-write*
+  (literal "/dev/null")
+  (literal "/dev/random")
+  (literal "/dev/urandom")
+  (literal "/dev/tty")
+  (literal "/dev/dtracehelper"))
 
 ;; Allow file metadata operations everywhere (ls, stat, etc.)
 (allow file-read-metadata)

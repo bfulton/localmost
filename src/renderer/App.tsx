@@ -2,28 +2,31 @@ import React, { useState, useEffect } from 'react';
 import StatusPage from './components/StatusPage';
 import SettingsPage from './components/SettingsPage';
 import UpdateNotification from './components/UpdateNotification';
+import TargetsPage from './components/TargetsPage';
 import PageErrorBoundary from './components/PageErrorBoundary';
 import { AppConfigProvider, RunnerProvider, UpdateProvider, useAppConfig, useRunner } from './contexts';
 import styles from './components/App.module.css';
 
-type View = 'status' | 'settings';
+type View = 'status' | 'settings' | 'targets';
 
 // Re-export ThemeSetting for backward compatibility
 export type { ThemeSetting } from './contexts';
 
 const AppContent: React.FC = () => {
-  const { isLoading, error, isOnline } = useAppConfig();
-  const { user, isDownloaded, isConfigured } = useRunner();
+  const { isLoading: isConfigLoading, error, isOnline } = useAppConfig();
+  const { user, isDownloaded, isConfigured, isInitialLoading: isRunnerLoading } = useRunner();
 
   const [view, setView] = useState<View>('status');
   const [scrollToSection, setScrollToSection] = useState<string | undefined>();
 
   // Check if setup is needed and redirect to settings
+  // Must wait for BOTH contexts to finish loading before checking setup state
   useEffect(() => {
+    const isLoading = isConfigLoading || isRunnerLoading;
     if (!isLoading && (!user || !isDownloaded || !isConfigured)) {
       setView('settings');
     }
-  }, [isLoading, user, isDownloaded, isConfigured]);
+  }, [isConfigLoading, isRunnerLoading, user, isDownloaded, isConfigured]);
 
   // Listen for navigation from menu
   useEffect(() => {
@@ -40,7 +43,7 @@ const AppContent: React.FC = () => {
     };
   }, []);
 
-  if (isLoading) {
+  if (isConfigLoading || isRunnerLoading) {
     return (
       <div className={styles.loadingScreen}>
         <div className={styles.loadingSpinner} />
@@ -105,7 +108,19 @@ const AppContent: React.FC = () => {
               setView('status');
             }}
             scrollToSection={scrollToSection}
+            onOpenTargets={() => setView('targets')}
           />
+        </PageErrorBoundary>
+      )}
+
+      {view === 'targets' && (
+        <PageErrorBoundary
+          key="targets-page"
+          pageName="Targets"
+          onNavigateAway={() => setView('settings')}
+          alternatePageName="Settings"
+        >
+          <TargetsPage onBack={() => setView('settings')} />
         </PageErrorBoundary>
       )}
     </>

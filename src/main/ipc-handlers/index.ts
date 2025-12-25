@@ -8,6 +8,7 @@ import { registerRunnerHandlers } from './runner';
 import { registerSettingsHandlers } from './settings';
 import { registerAppHandlers } from './app';
 import { registerUpdateHandlers } from './updater';
+import { registerTargetHandlers } from './targets';
 
 /**
  * Set up all IPC handlers.
@@ -18,4 +19,5 @@ export const setupIpcHandlers = (): void => {
   registerSettingsHandlers();
   registerAppHandlers();
   registerUpdateHandlers();
+  registerTargetHandlers();
 };

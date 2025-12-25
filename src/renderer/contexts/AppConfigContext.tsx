@@ -87,7 +87,7 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
   const [toolCacheLocation, setToolCacheLocationState] = useState<ToolCacheLocation>('persistent');
 
   // User filter
-  const [userFilter, setUserFilterState] = useState<UserFilterConfig>({ mode: 'everyone', allowlist: [] });
+  const [userFilter, setUserFilterState] = useState<UserFilterConfig>({ mode: 'just-me', allowlist: [] });
 
   // Apply theme whenever it changes
   useEffect(() => {

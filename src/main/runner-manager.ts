@@ -13,7 +13,14 @@ import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
 interface RunnerInstance {
   process: ChildProcess | null;
   status: RunnerStatus;
-  currentJob: { name: string; repository: string; startedAt: string; id: string } | null;
+  currentJob: {
+    name: string;
+    repository: string;
+    startedAt: string;
+    id: string;
+    targetId?: string;        // For multi-target: which target this job came from
+    targetDisplayName?: string;
+  } | null;
   name: string;
   jobsCompleted: number;
   fatalError: boolean; // Set when runner has an unrecoverable error (e.g., registration deleted)
@@ -101,6 +108,10 @@ export class RunnerManager {
   // Path to job history file
   private readonly jobHistoryPath: string;
 
+  // Pending target context for jobs received from broker
+  // Maps runner name (or 'next') to target context
+  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string }> = new Map();
+
   /**
    * Validate that a child path stays within the expected base directory.
    * Prevents path traversal attacks via malicious directory names.
@@ -155,6 +166,21 @@ export class RunnerManager {
         const data = JSON.parse(content);
         if (Array.isArray(data.jobs)) {
           this.jobHistory = data.jobs.slice(-this.maxJobHistory);
+
+          // Clean up stale "running" jobs from previous sessions
+          let staleCount = 0;
+          for (const job of this.jobHistory) {
+            if (job.status === 'running') {
+              job.status = 'cancelled';
+              job.completedAt = new Date().toISOString();
+              staleCount++;
+            }
+          }
+          if (staleCount > 0) {
+            this.log('info', `Marked ${staleCount} stale running job(s) as cancelled`);
+            this.saveJobHistory();
+          }
+
           // Get the highest job ID to continue the counter
           for (const job of this.jobHistory) {
             const match = job.id.match(/job-(\d+)/);
@@ -230,6 +256,37 @@ export class RunnerManager {
       this.jobHistory = this.jobHistory.slice(-this.maxJobHistory);
       this.onJobHistoryUpdate(this.jobHistory);
     }
+  }
+
+  /**
+   * Set pending target context for the next job received by a runner.
+   * Called by broker-proxy-service when a job is received from a target.
+   * @param runnerName The runner name or 'next' to apply to next job on any runner
+   * @param targetId The target ID from which the job was received
+   * @param targetDisplayName Human-readable target name
+   */
+  setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string): void {
+    this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName });
+    this.log('debug', `Set pending target context for ${runnerName}: ${targetDisplayName}`);
+  }
+
+  /**
+   * Consume pending target context for a runner.
+   * Returns and removes the context if found.
+   */
+  private consumePendingTargetContext(runnerName: string): { targetId: string; targetDisplayName: string } | undefined {
+    // Try exact match first, then fall back to 'next'
+    let context = this.pendingTargetContext.get(runnerName);
+    if (context) {
+      this.pendingTargetContext.delete(runnerName);
+      return context;
+    }
+    context = this.pendingTargetContext.get('next');
+    if (context) {
+      this.pendingTargetContext.delete('next');
+      return context;
+    }
+    return undefined;
   }
 
   private loadRunnerConfig(): void {
@@ -373,7 +430,8 @@ export class RunnerManager {
   }
 
   isConfigured(): boolean {
-    return this.downloader.isConfigured(1);
+    // In proxy-only mode, check for proxy credentials instead of individual worker configs
+    return this.downloader.hasAnyProxyCredentials();
   }
 
   getPreserveWorkDir(): 'never' | 'session' | 'always' {
@@ -433,9 +491,119 @@ export class RunnerManager {
     this.updateStatus('running');
   }
 
+  /**
+   * Initialize the runner manager without starting any workers.
+   * Used for on-demand worker spawning where broker proxy triggers worker starts.
+   */
+  async initialize(): Promise<void> {
+    this.startedAt = new Date().toISOString();
+    this.updateStatus('starting');
+
+    if (!this.isConfigured()) {
+      this.startedAt = null;
+      this.updateStatus('offline');
+      throw new Error('Runner is not configured. Please complete setup first.');
+    }
+
+    this.loadRunnerConfig();
+
+    // Get the installed version
+    this.runnerVersion = this.downloader.getInstalledVersion();
+    if (!this.runnerVersion) {
+      this.startedAt = null;
+      this.updateStatus('offline');
+      throw new Error('Could not determine runner version.');
+    }
+
+    // Kill any stale runner processes
+    await this.killStaleProcesses();
+    await this.detectStaleRunnerProcesses();
+
+    const displayName = this.getStatusDisplayName();
+    this.log('info', `Runner manager initialized (max ${this.runnerCount}, ${displayName})`);
+
+    this.instances.clear();
+    this.startingInstances.clear();
+    this.stopping = false;
+
+    // Don't start any instances - workers will be spawned on demand
+    this.updateStatus('running');
+  }
+
+  /**
+   * Check if there's an available slot for a new worker.
+   * Used by broker proxy to decide whether to acquire a job.
+   */
+  hasAvailableSlot(): boolean {
+    for (let i = 1; i <= this.runnerCount; i++) {
+      const instance = this.instances.get(i);
+      if (!instance || instance.status === 'idle' || instance.status === 'offline' || instance.status === 'error') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Spawn a worker to handle a job received by the broker proxy.
+   * Finds an available instance slot and starts a worker there.
+   */
+  async spawnWorkerForJob(): Promise<void> {
+    // Find an available instance slot
+    let instanceNum: number | null = null;
+
+    for (let i = 1; i <= this.runnerCount; i++) {
+      const instance = this.instances.get(i);
+      if (!instance || instance.status === 'idle' || instance.status === 'offline' || instance.status === 'error') {
+        instanceNum = i;
+        break;
+      }
+    }
+
+    if (instanceNum === null) {
+      this.log('warn', 'No available worker slots, job may need to wait');
+      return;
+    }
+
+    // Get the target context for this job (set by broker proxy before calling this)
+    const targetContext = this.pendingTargetContext.get('next');
+    if (!targetContext) {
+      this.log('error', 'No target context for spawned worker');
+      return;
+    }
+
+    this.log('info', `Spawning worker ${instanceNum} for incoming job from ${targetContext.targetDisplayName}...`);
+
+    // Copy proxy credentials to this instance's config before building sandbox
+    const proxyDir = path.join(getRunnerDir(), 'proxies', targetContext.targetId);
+    if (fs.existsSync(proxyDir)) {
+      try {
+        await this.downloader.copyProxyCredentials(
+          instanceNum,
+          proxyDir,
+          (level, msg) => this.log(level, msg)
+        );
+      } catch (err) {
+        this.log('error', `Failed to copy proxy credentials: ${(err as Error).message}`);
+        return;
+      }
+    } else {
+      this.log('error', `Proxy credentials not found for target ${targetContext.targetId}`);
+      return;
+    }
+
+    // Configure and start the instance
+    // The instance will connect to broker proxy and pick up the queued job
+    await this.startInstance(instanceNum);
+  }
+
   private async startInstanceProxy(instanceNum: number): Promise<ProxyServer> {
     const proxy = new ProxyServer({
       onLog: (entry: ProxyLogEntry) => {
+        // Skip logging routine localhost message polling (very noisy)
+        if (!entry.blocked && (entry.host === 'localhost' || entry.host === '127.0.0.1')) {
+          return;
+        }
         const status = entry.blocked ? 'BLOCKED' : 'ALLOWED';
         this.log('info', `[proxy ${instanceNum}] ${status} ${entry.method} ${entry.host}:${entry.port}${entry.path || ''}`);
       },
@@ -865,32 +1033,29 @@ export class RunnerManager {
       if (!instance.fatalError) {
         instance.status = 'error';
         instance.fatalError = true;
-        this.log('error', `Runner ${instanceNum} has a fatal error - registration deleted, triggering re-registration`);
-        this.updateAggregateStatus();
-        // Trigger re-registration
-        if (this.onReregistrationNeeded) {
-          this.onReregistrationNeeded(instanceNum, 'registration_deleted').catch((err) => {
-            this.log('error', `Re-registration failed for instance ${instanceNum}: ${err.message}`);
-          });
+        // In proxy-only mode, workers use proxy credentials - the proxy registration was deleted
+        // Need to re-register the proxy for the target, not the individual worker
+        const targetContext = this.pendingTargetContext.get(String(instanceNum));
+        if (targetContext) {
+          this.log('error', `Runner ${instanceNum} fatal error - proxy registration for ${targetContext.targetDisplayName} may be deleted`);
+          // TODO: Implement proxy re-registration when needed
+        } else {
+          this.log('error', `Runner ${instanceNum} has a fatal error - registration deleted`);
         }
+        this.updateAggregateStatus();
       }
       return;
     }
 
-    // Detect session conflicts - need to delete and re-register
+    // Detect session conflicts - broker proxy should handle this now
     if (line.includes('session for this runner already exists')) {
       // Only trigger once per instance (fatalError flag prevents re-trigger)
       if (!instance.fatalError) {
         instance.status = 'error';
         instance.fatalError = true;
-        this.log('warn', `Runner ${instanceNum} has stale session - re-registering`);
+        // In proxy-only mode, session conflicts should be handled by the broker proxy
+        this.log('warn', `Runner ${instanceNum} has session conflict - broker proxy should handle this`);
         this.updateAggregateStatus();
-        // Trigger re-registration (will delete the GitHub registration and re-register)
-        if (this.onReregistrationNeeded) {
-          this.onReregistrationNeeded(instanceNum, 'session_conflict').catch((err) => {
-            this.log('error', `Re-registration failed for instance ${instanceNum}: ${err.message}`);
-          });
-        }
       }
       return;
     }
@@ -915,14 +1080,20 @@ export class RunnerManager {
       }
 
       instance.status = 'busy';
+
+      // Get target context if available (from broker-proxy-service)
+      const targetContext = this.consumePendingTargetContext(instance.name);
+
       instance.currentJob = {
         name: jobName,
         repository: this.config?.url || 'unknown',
         startedAt: new Date().toISOString(),
         id: `job-${++this.jobIdCounter}`,
+        targetId: targetContext?.targetId,
+        targetDisplayName: targetContext?.targetDisplayName,
       };
 
-      this.log('debug', `[instance ${instanceNum}] Job started: ${jobName} (id: ${instance.currentJob.id})`);
+      this.log('debug', `[instance ${instanceNum}] Job started: ${jobName} (id: ${instance.currentJob.id})${targetContext ? ` from ${targetContext.targetDisplayName}` : ''}`);
 
       this.addJobToHistory({
         id: instance.currentJob.id,
@@ -931,6 +1102,8 @@ export class RunnerManager {
         status: 'running',
         startedAt: instance.currentJob.startedAt,
         runnerName: instance.name,
+        targetId: instance.currentJob.targetId,
+        targetDisplayName: instance.currentJob.targetDisplayName,
       });
 
       this.updateAggregateStatus();

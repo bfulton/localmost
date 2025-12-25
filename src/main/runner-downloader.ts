@@ -322,6 +322,47 @@ export class RunnerDownloader {
   }
 
   /**
+   * Copy proxy credentials to an instance's config directory.
+   * Used for multi-target support where workers use proxy credentials.
+   * The .runner file is modified to point to the local broker proxy.
+   */
+  async copyProxyCredentials(
+    instance: number,
+    proxyDir: string,
+    onLog?: (level: 'info' | 'error', message: string) => void
+  ): Promise<void> {
+    const log = onLog || (() => {});
+    const configDir = this.getConfigDir(instance);
+    const configFiles = ['.runner', '.credentials', '.credentials_rsaparams'];
+
+    // Ensure config directory exists
+    await fs.promises.mkdir(configDir, { recursive: true });
+
+    // Copy credentials from proxy directory
+    for (const file of configFiles) {
+      const srcPath = path.join(proxyDir, file);
+      const destPath = path.join(configDir, file);
+
+      if (!fs.existsSync(srcPath)) {
+        throw new Error(`Missing proxy credential file: ${file} in ${proxyDir}`);
+      }
+
+      await fs.promises.copyFile(srcPath, destPath);
+    }
+
+    // Modify .runner to point to local broker proxy
+    const runnerConfigPath = path.join(configDir, '.runner');
+    const runnerConfig = JSON.parse(
+      fs.readFileSync(runnerConfigPath, 'utf-8').replace(/^\uFEFF/, '')
+    );
+
+    runnerConfig.serverUrlV2 = 'http://localhost:8787/';
+    await fs.promises.writeFile(runnerConfigPath, JSON.stringify(runnerConfig, null, 2));
+
+    log('info', `Copied proxy credentials to instance ${instance} config`);
+  }
+
+  /**
    * Configure a runner instance.
    * Builds sandbox, runs config.sh, then saves config.
    */
@@ -391,6 +432,54 @@ export class RunnerDownloader {
 
     // Save config files to persistent location
     await this.saveConfig(instance);
+
+    // Modify .runner to route through local broker proxy if enabled
+    await this.configureForBrokerProxy(instance, options.onLog);
+  }
+
+  /**
+   * Modify a runner instance's config to route through the local broker proxy.
+   * All workers connect through the broker proxy which routes to any target.
+   */
+  async configureForBrokerProxy(
+    instance: number,
+    onLog?: (level: 'info' | 'error', message: string) => void
+  ): Promise<void> {
+    const log = onLog || (() => {});
+    const configDir = this.getConfigDir(instance);
+    const runnerConfigPath = path.join(configDir, '.runner');
+
+    if (!fs.existsSync(runnerConfigPath)) {
+      return; // No config to update
+    }
+
+    try {
+      const runnerConfig = JSON.parse(
+        fs.readFileSync(runnerConfigPath, 'utf-8').replace(/^\uFEFF/, '')
+      );
+
+      // Already configured for broker proxy?
+      if (runnerConfig.serverUrlV2 === 'http://localhost:8787/') {
+        return;
+      }
+
+      // Store original broker URL and point to local proxy
+      const originalBrokerUrl = runnerConfig.serverUrlV2;
+      runnerConfig.serverUrlV2 = 'http://localhost:8787/';
+      runnerConfig.originalServerUrlV2 = originalBrokerUrl; // Keep for reference
+
+      await fs.promises.writeFile(runnerConfigPath, JSON.stringify(runnerConfig, null, 2));
+      log('info', `Configured instance ${instance} to use broker proxy`);
+
+      // Also update sandbox copy
+      const sandboxDir = this.getSandboxDir(instance);
+      const sandboxRunnerPath = path.join(sandboxDir, '.runner');
+      if (fs.existsSync(sandboxRunnerPath)) {
+        await fs.promises.writeFile(sandboxRunnerPath, JSON.stringify(runnerConfig, null, 2));
+      }
+    } catch (err) {
+      log('error', `Failed to configure broker proxy for instance ${instance}: ${(err as Error).message}`);
+    }
   }
 
   /**
@@ -507,10 +596,38 @@ export class RunnerDownloader {
 
   /**
    * Check if an instance is configured.
+   * @deprecated For proxy-only mode, use hasAnyProxyCredentials() instead
    */
   isConfigured(instance: number): boolean {
     const configDir = this.getConfigDir(instance);
     return fs.existsSync(path.join(configDir, '.runner'));
+  }
+
+  /**
+   * Check if any proxy credentials exist (multi-target mode).
+   * Returns true if at least one target has proxy credentials.
+   */
+  hasAnyProxyCredentials(): boolean {
+    const proxiesDir = path.join(this.baseDir, 'proxies');
+    if (!fs.existsSync(proxiesDir)) {
+      return false;
+    }
+
+    try {
+      const entries = fs.readdirSync(proxiesDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          const proxyDir = path.join(proxiesDir, entry.name);
+          const runnerFile = path.join(proxyDir, '.runner');
+          if (fs.existsSync(runnerFile)) {
+            return true;
+          }
+        }
+      }
+    } catch {
+      // Error reading directory - treat as no credentials
+    }
+    return false;
   }
 
   /**

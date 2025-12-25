@@ -8,6 +8,8 @@ import { RunnerManager } from './runner-manager';
 import { GitHubAuth } from './github-auth';
 import { RunnerDownloader } from './runner-downloader';
 import { HeartbeatManager } from './heartbeat-manager';
+import { BrokerProxyService } from './broker-proxy-service';
+import { TargetManager } from './target-manager';
 
 // State management
 import {
@@ -17,10 +19,14 @@ import {
   setGitHubAuth,
   setHeartbeatManager,
   setCliServer,
+  setBrokerProxyService,
+  setTargetManager,
   getRunnerManager,
   getRunnerDownloader,
   getHeartbeatManager,
   getCliServer,
+  getBrokerProxyService,
+  getTargetManager,
   getAuthState,
   setAuthState,
   getGitHubAuth,
@@ -59,6 +65,7 @@ import { initTray } from './tray-init';
 
 // IPC handlers
 import { setupIpcHandlers } from './ipc-handlers';
+import { sendTargetStatusUpdate } from './ipc-handlers/targets';
 
 // Auto-updater
 import { initAutoUpdater, checkForUpdates } from './auto-updater';
@@ -177,7 +184,7 @@ app.whenReady().then(async () => {
   });
   setHeartbeatManager(heartbeatManager);
 
-  // Initialize CLI server for `localmost` CLI companion
+// Initialize CLI server for `localmost` CLI companion
   const cliServer = new CliServer({
     onLog: (level, message) => {
       if (level === 'info') logger?.info(message);
@@ -191,6 +198,41 @@ app.whenReady().then(async () => {
   } catch (err) {
     logger?.warn(`Failed to start CLI server: ${(err as Error).message}`);
   }
+
+  // Initialize target manager
+  const targetManager = new TargetManager();
+  setTargetManager(targetManager);
+
+  // Initialize broker proxy service
+  const brokerProxyService = new BrokerProxyService();
+  setBrokerProxyService(brokerProxyService);
+
+  // Set capacity check callback - broker proxy will only acquire jobs when we have capacity
+  brokerProxyService.setCanAcceptJobCallback(() => runnerManager.hasAvailableSlot());
+
+  // Wire up broker proxy to runner manager: when a job is received, spawn a worker
+  brokerProxyService.on('job-received', async (targetId: string, jobId: string) => {
+    getLogger()?.info(`[job-received event] targetId=${targetId}, jobId=${jobId}`);
+    const target = targetManager.getTargets().find(t => t.id === targetId);
+    if (target) {
+      getLogger()?.info(`Spawning worker for job ${jobId} from ${target.displayName}...`);
+      runnerManager.setPendingTargetContext('next', targetId, target.displayName);
+
+      // Spawn a worker to handle this job
+      try {
+        await runnerManager.spawnWorkerForJob();
+      } catch (err) {
+        getLogger()?.error(`Failed to spawn worker for job ${jobId}: ${(err as Error).message}`);
+      }
+    } else {
+      getLogger()?.warn(`[job-received] Target not found for id: ${targetId}`);
+    }
+  });
+
+  // Wire up broker proxy status updates to renderer
+  brokerProxyService.on('status-update', (status) => {
+    sendTargetStatusUpdate(status);
+  });
 
   // Load saved auth state and settings
   const config = loadConfig();
@@ -263,32 +305,52 @@ app.whenReady().then(async () => {
 
         // Clear any stale runner registrations before starting
         await clearStaleRunnerRegistrations();
-        await runnerManager.start();
+
+        // Initialize broker proxy with all target credentials
+        const targets = config.targets || [];
+        if (targets.length > 0 && brokerProxyService) {
+          const { getRunnerProxyManager } = await import('./runner-proxy-manager');
+          const proxyManager = getRunnerProxyManager();
+
+          for (const target of targets) {
+            if (!target.enabled) continue;
+
+            const credentials = proxyManager.loadCredentials(target.id);
+            if (credentials) {
+              brokerProxyService.addTarget(target, credentials.runner, credentials.credentials, credentials.rsaParams);
+            } else {
+              logger?.warn(`[BrokerProxy] No credentials for ${target.displayName}, skipping`);
+            }
+          }
+
+          // Start broker proxy server - workers will connect to this
+          try {
+            await brokerProxyService.start();
+            logger?.info('Broker proxy started, waiting for jobs from targets...');
+          } catch (err) {
+            logger?.error(`[BrokerProxy] Failed to start: ${(err as Error).message}`);
+          }
+        }
+
+        // Initialize runner manager (but don't start workers yet)
+        // Workers are spawned on-demand when jobs arrive via broker proxy
+        await runnerManager.initialize();
+        logger?.info('Broker proxy running, workers will spawn when jobs arrive');
 
         // Start heartbeat when runner auto-starts
         const authState = getAuthState();
         const githubAuth = getGitHubAuth();
         if (heartbeatManager && authState?.accessToken && githubAuth) {
-          const runnerConfig = config.runnerConfig;
+          // Set up heartbeat for all configured targets
+          const targets = config.targets || [];
+          const heartbeatTargets = targets.map(t =>
+            t.type === 'org'
+              ? { level: 'org' as const, org: t.owner }
+              : { level: 'repo' as const, owner: t.owner, repo: t.repo! }
+          );
 
-          if (runnerConfig) {
-            // Set up heartbeat target
-            if (runnerConfig.level === 'org' && runnerConfig.orgName) {
-              heartbeatManager.setTarget({
-                level: 'org',
-                org: runnerConfig.orgName,
-              });
-            } else if (runnerConfig.level === 'repo' && runnerConfig.repoUrl) {
-              const match = runnerConfig.repoUrl.match(/github\.com[\/:]([^\/]+)\/([^\/\.]+)/);
-              if (match) {
-                const [, owner, repo] = match;
-                heartbeatManager.setTarget({
-                  level: 'repo',
-                  owner,
-                  repo,
-                });
-              }
-            }
+          if (heartbeatTargets.length > 0) {
+            heartbeatManager.setTargets(heartbeatTargets);
 
             // Set up API callbacks with automatic token refresh on auth errors
             heartbeatManager.setApiCallbacks({
@@ -379,6 +441,7 @@ app.on('before-quit', async (event) => {
     const heartbeatManager = getHeartbeatManager();
     const runnerManager = getRunnerManager();
     const runnerDownloader = getRunnerDownloader();
+    const brokerProxyService = getBrokerProxyService();
     const trayManager = getTrayManager();
     const mainWindow = getMainWindow();
     const cliServer = getCliServer();
@@ -387,8 +450,11 @@ app.on('before-quit', async (event) => {
     await heartbeatManager?.clear();
     heartbeatManager?.stop();
 
-    // Stop CLI server
+// Stop CLI server
     await cliServer?.stop();
+
+    // Stop broker proxy service
+    await brokerProxyService?.stop();
 
     // Cancel any jobs running on our runners before stopping
     // This prevents orphaned jobs that would block runner deletion on next startup
@@ -421,6 +487,7 @@ process.on('SIGINT', async () => {
   const heartbeatManager = getHeartbeatManager();
   const runnerManager = getRunnerManager();
   const runnerDownloader = getRunnerDownloader();
+  const brokerProxyService = getBrokerProxyService();
   const trayManager = getTrayManager();
   const mainWindow = getMainWindow();
   const cliServer = getCliServer();
@@ -429,8 +496,11 @@ process.on('SIGINT', async () => {
   await heartbeatManager?.clear();
   heartbeatManager?.stop();
 
-  // Stop CLI server
+// Stop CLI server
   await cliServer?.stop();
+
+  // Stop broker proxy service
+  await brokerProxyService?.stop();
 
   // Cancel any jobs running on our runners before stopping
   await cancelJobsOnOurRunners();

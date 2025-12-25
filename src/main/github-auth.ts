@@ -255,7 +255,13 @@ export class GitHubAuth {
       throw new Error(`Failed to refresh token: ${response.status}`);
     }
 
-    const data: GitHubTokenResponse = await response.json();
+    // GitHub OAuth returns errors as 200 OK with error field in JSON body
+    const data = await response.json() as GitHubTokenResponse & { error?: string; error_description?: string };
+
+    // Check for OAuth error response
+    if (data.error) {
+      throw new Error(`Failed to refresh token: ${data.error_description || data.error}`);
+    }
 
     if (!data.access_token) {
       throw new Error('Failed to refresh token: no access token returned');
@@ -439,6 +445,55 @@ export class GitHubAuth {
         login: inst.account.login,
         avatar_url: inst.account.avatar_url,
       }));
+  }
+
+  /**
+   * Get repositories where the GitHub App is installed.
+   * This returns only repos the App has access to, not all user repos.
+   */
+  async getInstalledRepos(accessToken: string): Promise<Array<{
+    id: number;
+    name: string;
+    full_name: string;
+    owner: { login: string; avatar_url: string };
+    private: boolean;
+    html_url: string;
+  }>> {
+    const installations = await this.getInstallations(accessToken);
+    const client = new GitHubClient(accessToken);
+    const allRepos: Array<{
+      id: number;
+      name: string;
+      full_name: string;
+      owner: { login: string; avatar_url: string };
+      private: boolean;
+      html_url: string;
+    }> = [];
+
+    // Fetch repos from each installation
+    for (const installation of installations) {
+      try {
+        const data = await client.get<{
+          repositories: Array<{
+            id: number;
+            name: string;
+            full_name: string;
+            owner: { login: string; avatar_url: string };
+            private: boolean;
+            html_url: string;
+          }>;
+        }>(`/user/installations/${installation.id}/repositories?per_page=100`);
+
+        if (data.repositories) {
+          allRepos.push(...data.repositories);
+        }
+      } catch (error) {
+        // Log but continue - one installation failing shouldn't break all
+        console.error(`Failed to fetch repos for installation ${installation.id}: ${(error as Error).message}`);
+      }
+    }
+
+    return allRepos;
   }
 
   /**

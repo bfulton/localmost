@@ -548,7 +548,7 @@ describe('AppConfigContext', () => {
   });
 
   describe('User Filter', () => {
-    it('should have default user filter mode as everyone', async () => {
+    it('should have default user filter mode as just-me', async () => {
       render(
         <AppConfigProvider>
           <TestConsumer />
@@ -559,7 +559,7 @@ describe('AppConfigContext', () => {
         expect(screen.getByTestId('is-loading').textContent).toBe('false');
       });
 
-      expect(screen.getByTestId('user-filter-mode').textContent).toBe('everyone');
+      expect(screen.getByTestId('user-filter-mode').textContent).toBe('just-me');
       expect(screen.getByTestId('user-filter-allowlist-count').textContent).toBe('0');
     });
 
@@ -651,7 +651,7 @@ describe('AppConfigContext', () => {
       });
 
       // Should fall back to default
-      expect(screen.getByTestId('user-filter-mode').textContent).toBe('everyone');
+      expect(screen.getByTestId('user-filter-mode').textContent).toBe('just-me');
     });
   });
 });

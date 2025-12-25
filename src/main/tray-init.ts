@@ -11,6 +11,7 @@ import {
   getRunnerManager,
   getAuthState,
   getPowerSaveBlockerId,
+  getBrokerProxyService,
 } from './app-state';
 import { findAsset } from './log-file';
 import { confirmQuitIfBusy } from './window';
@@ -63,12 +64,27 @@ export const updateTrayMenu = (): void => {
   const runnerManager = getRunnerManager();
   const authState = getAuthState();
   const powerSaveBlockerId = getPowerSaveBlockerId();
+  const brokerProxyService = getBrokerProxyService();
 
   const runnerStatus = runnerManager?.getStatus();
+
+  // If all targets have active sessions, show as 'running' even if
+  // no workers are spawned yet (they spawn on-demand when jobs arrive)
+  let effectiveStatus = runnerStatus?.status;
+  if (brokerProxyService) {
+    const proxyStatuses = brokerProxyService.getStatus();
+    if (proxyStatuses.length > 0) {
+      const allSessionsActive = proxyStatuses.every(s => s.sessionActive);
+      if (allSessionsActive && effectiveStatus === 'idle') {
+        effectiveStatus = 'running';
+      }
+    }
+  }
+
   const status: TrayStatusInfo = {
     isAuthenticated: !!authState,
     isConfigured: runnerManager?.isConfigured() ?? false,
-    runnerStatus: runnerStatus?.status,
+    runnerStatus: effectiveStatus,
     isBusy: runnerStatus?.status === 'busy',
     isSleepBlocked: powerSaveBlockerId !== null,
   };
