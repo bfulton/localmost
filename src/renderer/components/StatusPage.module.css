@@ -461,7 +461,7 @@
   background-color: var(--warning);
 }
 
-.statusItemDot[data-status="running"] {
+.statusItemDot[data-status="listening"] {
   background-color: var(--success);
 }
 
@@ -469,12 +469,16 @@
   background-color: var(--warning);
 }
 
+.statusItemDot[data-status="paused"] {
+  background-color: var(--warning);
+}
+
 .statusItemDot[data-status="error"] {
   background-color: var(--error);
 }
 
-.statusItemDot[data-status="idle"],
-.statusItemDot[data-status="offline"] {
+.statusItemDot[data-status="offline"],
+.statusItemDot[data-status="shutting_down"] {
   background-color: var(--text-secondary);
 }
 

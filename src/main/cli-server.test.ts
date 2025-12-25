@@ -84,7 +84,7 @@ describe('CliServer', () => {
     mockHeartbeatStop.mockReset();
 
     // Default mock implementations
-    mockGetStatus.mockReturnValue({ status: 'running' });
+    mockGetStatus.mockReturnValue({ status: 'listening' });
     mockGetStatusDisplayName.mockReturnValue('localmost.test');
     mockGetJobHistory.mockReturnValue([]);
     mockIsRunning.mockReturnValue(true);
@@ -145,7 +145,7 @@ describe('CliServer', () => {
       success: true,
       command: 'status',
       data: {
-        runner: { status: 'running' },
+        runner: { status: 'listening' },
         runnerName: 'localmost.test',
         heartbeat: { isRunning: true },
         authenticated: true,

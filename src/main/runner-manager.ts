@@ -371,15 +371,23 @@ export class RunnerManager {
   }
 
   getStatus(): RunnerState {
-    // If no instances exist or we're not started, return idle
+    // If shutting down, return that status
+    if (this.stopping) {
+      return {
+        status: 'shutting_down',
+        startedAt: this.startedAt ?? undefined,
+      };
+    }
+
+    // If no instances exist or we're not started, return offline
     if (this.instances.size === 0 || !this.startedAt) {
       return {
-        status: 'idle',
+        status: 'offline',
         startedAt: undefined,
       };
     }
 
-    // Priority: busy > running > starting > error > offline
+    // Priority: busy > listening > starting > error > offline
     let aggregateStatus: RunnerStatus = 'offline';
     let currentJob: { name: string; repository: string; runnerName: string } | null = null;
 
@@ -394,11 +402,11 @@ export class RunnerManager {
           };
         }
         break;
-      } else if (instance.status === 'running') {
-        aggregateStatus = 'running';
-      } else if (instance.status === 'starting' && aggregateStatus !== 'running') {
+      } else if (instance.status === 'listening') {
+        aggregateStatus = 'listening';
+      } else if (instance.status === 'starting' && aggregateStatus !== 'listening') {
         aggregateStatus = 'starting';
-      } else if (instance.status === 'error' && aggregateStatus !== 'running' && aggregateStatus !== 'starting') {
+      } else if (instance.status === 'error' && aggregateStatus !== 'listening' && aggregateStatus !== 'starting') {
         aggregateStatus = 'error';
       }
     }
@@ -422,7 +430,7 @@ export class RunnerManager {
   isRunning(): boolean {
     for (const [, instance] of this.instances) {
       // Consider running if process is active OR status indicates active state
-      if (instance.process || instance.status === 'starting' || instance.status === 'running' || instance.status === 'busy') {
+      if (instance.process || instance.status === 'starting' || instance.status === 'listening' || instance.status === 'busy') {
         return true;
       }
     }
@@ -488,7 +496,7 @@ export class RunnerManager {
     // Start with just 1 runner - will scale up dynamically
     await this.startInstance(1);
 
-    this.updateStatus('running');
+    this.updateStatus('listening');
   }
 
   /**
@@ -527,7 +535,7 @@ export class RunnerManager {
     this.stopping = false;
 
     // Don't start any instances - workers will be spawned on demand
-    this.updateStatus('running');
+    this.updateStatus('listening');
   }
 
   /**
@@ -537,7 +545,7 @@ export class RunnerManager {
   hasAvailableSlot(): boolean {
     for (let i = 1; i <= this.runnerCount; i++) {
       const instance = this.instances.get(i);
-      if (!instance || instance.status === 'idle' || instance.status === 'offline' || instance.status === 'error') {
+      if (!instance || instance.status === 'offline' || instance.status === 'error') {
         return true;
       }
     }
@@ -554,7 +562,7 @@ export class RunnerManager {
 
     for (let i = 1; i <= this.runnerCount; i++) {
       const instance = this.instances.get(i);
-      if (!instance || instance.status === 'idle' || instance.status === 'offline' || instance.status === 'error') {
+      if (!instance || instance.status === 'offline' || instance.status === 'error') {
         instanceNum = i;
         break;
       }
@@ -776,7 +784,7 @@ export class RunnerManager {
 
           if (!this.isRunning()) {
             this.startedAt = null;
-            this.updateStatus('idle');
+            this.updateStatus('offline');
           }
           return;
         }
@@ -948,13 +956,13 @@ export class RunnerManager {
     this.startingInstances.clear();
     this.startedAt = null;
     this.stopping = false;
-    this.updateStatus('idle');
+    this.updateStatus('offline');
   }
 
   private countIdleRunners(): number {
     let count = 0;
     for (const [, instance] of this.instances) {
-      if (instance.status === 'running' && !instance.currentJob) {
+      if (instance.status === 'listening' && !instance.currentJob) {
         count++;
       }
     }
@@ -1021,7 +1029,7 @@ export class RunnerManager {
 
     // Detect runner ready (listening for jobs)
     if (line.includes('Listening for Jobs')) {
-      instance.status = 'running';
+      instance.status = 'listening';
       this.updateAggregateStatus();
       return;
     }
@@ -1155,7 +1163,7 @@ export class RunnerManager {
       });
 
       instance.currentJob = null;
-      instance.status = 'running';
+      instance.status = 'listening';
       this.updateAggregateStatus();
     }
   }

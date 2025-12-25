@@ -1,6 +1,11 @@
 # localmost
 
-<img src="assets/icon/icon_128x128.png" alt="localmost icon" width="64" height="64" align="left">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/icon/icon_128x128.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/icon/icon_128x128_light.png">
+  <img src="assets/icon/icon_128x128.png" alt="localmost icon" width="64" height="64" align="left">
+</picture>
+
 Run most of your builds locally
 <br>
 Self-hosted GitHub Actions runners for your Mac

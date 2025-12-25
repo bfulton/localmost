@@ -61,7 +61,13 @@ export const failure = (error: string | Error): ErrorResult => ({
 // =============================================================================
 
 // Runner status types
-export type RunnerStatus = 'idle' | 'starting' | 'running' | 'busy' | 'offline' | 'error';
+// - 'offline': Runner not started or fully stopped
+// - 'starting': Runner process is starting up
+// - 'listening': Runner is connected and waiting for jobs
+// - 'busy': Runner is actively processing a job
+// - 'error': Runner encountered an error
+// - 'shutting_down': Runner is in the process of stopping
+export type RunnerStatus = 'offline' | 'starting' | 'listening' | 'busy' | 'error' | 'shutting_down';
 
 export interface RunnerState {
   status: RunnerStatus;

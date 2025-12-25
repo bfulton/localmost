@@ -1,6 +1,7 @@
 import { Tray, Menu, nativeImage } from 'electron';
 import { TRAY_ANIMATION_FRAMES, TRAY_ANIMATION_INTERVAL_MS } from '../shared/constants';
 import { RunnerState } from '../shared/types';
+import { getLogger } from './app-state';
 
 /**
  * Callback types for tray actions.
@@ -8,7 +9,10 @@ import { RunnerState } from '../shared/types';
 export interface TrayCallbacks {
   onShowStatus: () => void;
   onShowSettings: () => void;
-  onHide: () => void;
+  onShowWindow: () => void;
+  onHideWindow: () => void;
+  onPause: () => void | Promise<void>;
+  onResume: () => void | Promise<void>;
   onQuit: () => Promise<void>;
 }
 
@@ -23,6 +27,7 @@ export interface TrayStatusInfo {
   isSleepBlocked?: boolean;
   isPaused?: boolean;
   pauseReason?: string | null;
+  isWindowVisible?: boolean;
 }
 
 /**
@@ -40,6 +45,9 @@ export class TrayManager {
   private notReadyAnimationTimer: NodeJS.Timeout | null = null;
   private notReadyAnimationFrame = 0;
   private notReadyIconFrames: Electron.NativeImage[] = [];
+  private pausedAnimationTimer: NodeJS.Timeout | null = null;
+  private pausedAnimationFrame = 0;
+  private pausedIconFrames: Electron.NativeImage[] = [];
 
   // Asset finder function (passed in to avoid circular dependencies)
   private findAsset: (filename: string) => string | undefined;
@@ -74,13 +82,13 @@ export class TrayManager {
     icon.setTemplateImage(true);
     this.tray = new Tray(icon);
 
-    this.tray.on('click', () => {
-      this.callbacks.onShowStatus();
-    });
+    // On macOS, clicking the tray icon shows the context menu by default
+    // No click handler needed - let the menu handle all interactions
 
     // Pre-load animation frames
     this.loadBusyIconFrames();
     this.loadNotReadyIconFrames();
+    this.loadPausedIconFrames();
   }
 
   /**
@@ -88,6 +96,13 @@ export class TrayManager {
    */
   updateMenu(status: TrayStatusInfo): void {
     if (!this.tray) return;
+
+    getLogger()?.debug('[Tray] updateMenu: ' + JSON.stringify({
+      isAuthenticated: status.isAuthenticated,
+      isConfigured: status.isConfigured,
+      isPaused: status.isPaused,
+      isWindowVisible: status.isWindowVisible,
+    }));
 
     // Update icon animation based on status
     this.updateIconAnimation(status);
@@ -111,8 +126,30 @@ export class TrayManager {
       });
     }
 
+    menuItems.push({ type: 'separator' });
+
+    // Add pause/resume option when configured
+    if (status.isAuthenticated && status.isConfigured) {
+      if (status.isPaused) {
+        menuItems.push({
+          label: '▶  Resume',
+          click: () => {
+            getLogger()?.info('[Tray] Resume clicked');
+            this.callbacks.onResume();
+          },
+        });
+      } else {
+        menuItems.push({
+          label: '⏸  Pause',
+          click: () => {
+            getLogger()?.info('[Tray] Pause clicked');
+            this.callbacks.onPause();
+          },
+        });
+      }
+    }
+
     menuItems.push(
-      { type: 'separator' },
       {
         label: 'Status',
         click: () => this.callbacks.onShowStatus(),
@@ -121,17 +158,34 @@ export class TrayManager {
         label: 'Settings...',
         click: () => this.callbacks.onShowSettings(),
       },
-      { type: 'separator' },
-      {
-        label: 'Hide localmost',
-        click: () => this.callbacks.onHide(),
-      },
-      {
-        label: '⏻  Quit',
-        click: () => this.callbacks.onQuit(),
-      }
+      { type: 'separator' }
     );
 
+    // Show/Hide window option
+    if (status.isWindowVisible) {
+      menuItems.push({
+        label: 'Hide localmost',
+        click: () => {
+          getLogger()?.info('[Tray] Hide clicked');
+          this.callbacks.onHideWindow();
+        },
+      });
+    } else {
+      menuItems.push({
+        label: 'Show localmost',
+        click: () => {
+          getLogger()?.info('[Tray] Show clicked');
+          this.callbacks.onShowWindow();
+        },
+      });
+    }
+
+    menuItems.push({
+      label: '⏻  Quit',
+      click: () => this.callbacks.onQuit(),
+    });
+
+    getLogger()?.debug('[Tray] Menu items: ' + menuItems.map(m => m.label || m.type).join(', '));
     const contextMenu = Menu.buildFromTemplate(menuItems);
 
     this.tray.setToolTip(`localmost - ${statusLabel}`);
@@ -144,6 +198,7 @@ export class TrayManager {
   destroy(): void {
     this.stopBusyAnimation();
     this.stopNotReadyAnimation();
+    this.stopPausedAnimation();
     if (this.tray) {
       this.tray.destroy();
       this.tray = null;
@@ -195,20 +250,50 @@ export class TrayManager {
   }
 
   /**
+   * Load paused animation frames from assets.
+   * Loads both 1x and 2x versions for smooth Retina display animation.
+   */
+  private loadPausedIconFrames(): void {
+    this.pausedIconFrames = [];
+    for (let i = 0; i < TRAY_ANIMATION_FRAMES; i++) {
+      const iconPath = this.findAsset(`tray-icon-paused-${i}.png`);
+      const icon2xPath = this.findAsset(`tray-icon-paused-${i}@2x.png`);
+      if (iconPath) {
+        const icon = nativeImage.createFromPath(iconPath);
+        // Add 2x representation for Retina displays
+        if (icon2xPath) {
+          const icon2x = nativeImage.createFromPath(icon2xPath);
+          icon.addRepresentation({ scaleFactor: 2, buffer: icon2x.toPNG() });
+        }
+        icon.setTemplateImage(false);
+        this.pausedIconFrames.push(icon);
+      }
+    }
+  }
+
+  /**
    * Update icon animation based on runner status.
    */
   private updateIconAnimation(status: TrayStatusInfo): void {
-    const isListening = status.runnerStatus === 'running';
+    const isListening = status.runnerStatus === 'listening';
 
-    if (status.isBusy) {
+    // Paused state takes priority over other animations
+    if (status.isPaused) {
+      this.stopBusyAnimation();
       this.stopNotReadyAnimation();
+      this.startPausedAnimation();
+    } else if (status.isBusy) {
+      this.stopNotReadyAnimation();
+      this.stopPausedAnimation();
       this.startBusyAnimation();
     } else if (isListening) {
       this.stopBusyAnimation();
       this.stopNotReadyAnimation();
+      this.stopPausedAnimation();
       this.setNormalIcon();
     } else {
       this.stopBusyAnimation();
+      this.stopPausedAnimation();
       this.startNotReadyAnimation();
     }
   }
@@ -288,6 +373,37 @@ export class TrayManager {
   }
 
   /**
+   * Start the paused animation.
+   */
+  private startPausedAnimation(): void {
+    if (this.pausedAnimationTimer || !this.tray || this.pausedIconFrames.length === 0) return;
+
+    this.pausedAnimationFrame = 0;
+    // Show first frame immediately
+    this.tray.setImage(this.pausedIconFrames[0]);
+
+    this.pausedAnimationTimer = setInterval(() => {
+      if (!this.tray || this.pausedIconFrames.length === 0) {
+        this.stopPausedAnimation();
+        return;
+      }
+      this.pausedAnimationFrame = (this.pausedAnimationFrame + 1) % this.pausedIconFrames.length;
+      this.tray.setImage(this.pausedIconFrames[this.pausedAnimationFrame]);
+    }, TRAY_ANIMATION_INTERVAL_MS);
+  }
+
+  /**
+   * Stop the paused animation.
+   */
+  private stopPausedAnimation(): void {
+    if (this.pausedAnimationTimer) {
+      clearInterval(this.pausedAnimationTimer);
+      this.pausedAnimationTimer = null;
+    }
+    this.pausedAnimationFrame = 0;
+  }
+
+  /**
    * Get a human-readable status label for the tray menu.
    */
   private getStatusLabel(status: TrayStatusInfo): string {
@@ -308,12 +424,13 @@ export class TrayManager {
         return 'Job: Running';
       case 'starting':
         return 'Runner: Starting';
-      case 'running':
+      case 'listening':
         return 'Runner: Listening';
       case 'error':
         return 'Runner: Error';
-      case 'idle':
-        return 'Runner: Idle';
+      case 'shutting_down':
+        return 'Runner: Shutting down';
+      case 'offline':
       default:
         return 'Runner: Offline';
     }

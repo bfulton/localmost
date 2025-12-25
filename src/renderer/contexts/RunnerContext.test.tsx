@@ -110,7 +110,7 @@ describe('RunnerContext', () => {
     it('should load runner status on mount', async () => {
       mockLocalmost.runner.isDownloaded.mockResolvedValue(true);
       mockLocalmost.runner.isConfigured.mockResolvedValue(true);
-      mockLocalmost.runner.getStatus.mockResolvedValue({ status: 'running' });
+      mockLocalmost.runner.getStatus.mockResolvedValue({ status: 'listening' });
 
       render(
         <RunnerProvider>
@@ -121,7 +121,7 @@ describe('RunnerContext', () => {
       await waitFor(() => {
         expect(screen.getByTestId('is-downloaded').textContent).toBe('true');
         expect(screen.getByTestId('is-configured').textContent).toBe('true');
-        expect(screen.getByTestId('runner-status').textContent).toBe('running');
+        expect(screen.getByTestId('runner-status').textContent).toBe('listening');
       });
     });
 

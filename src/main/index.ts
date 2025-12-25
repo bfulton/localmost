@@ -64,7 +64,7 @@ import { reRegisterSingleInstance, configureSingleInstance, clearStaleRunnerRegi
 // UI
 import { createWindow, setDockIcon } from './window';
 import { createMenu } from './menu';
-import { initTray } from './tray-init';
+import { initTray, updateTrayMenu } from './tray-init';
 
 // IPC handlers
 import { setupIpcHandlers } from './ipc-handlers';
@@ -213,8 +213,14 @@ app.whenReady().then(async () => {
   const brokerProxyService = new BrokerProxyService();
   setBrokerProxyService(brokerProxyService);
 
-  // Set capacity check callback - broker proxy will only acquire jobs when we have capacity
-  brokerProxyService.setCanAcceptJobCallback(() => runnerManager.hasAvailableSlot());
+  // Set capacity check callback - broker proxy will only acquire jobs when we have capacity AND not paused
+  brokerProxyService.setCanAcceptJobCallback(() => {
+    // Don't accept jobs if resource monitor says we should be paused
+    if (resourceMonitor.shouldPause()) {
+      return false;
+    }
+    return runnerManager.hasAvailableSlot();
+  });
 
   // Wire up broker proxy to runner manager: when a job is received, spawn a worker
   brokerProxyService.on('job-received', async (targetId: string, jobId: string) => {
@@ -279,18 +285,20 @@ app.whenReady().then(async () => {
     // Don't pause if user explicitly paused (they control when to resume)
     if (isUserPaused()) return;
 
+    logger?.info(`Resource pause triggered: ${reason}`);
+    setResourcePaused(true);
+    updateTrayMenu(); // Update immediately after setting pause state
+
     const runnerManager = getRunnerManager();
     const heartbeatManager = getHeartbeatManager();
 
+    // Stop heartbeat to signal unavailability
+    heartbeatManager?.stop();
+    await heartbeatManager?.clear();
+
+    // Stop any running workers (gracefully - in-progress jobs will complete)
+    // The broker proxy will reject new jobs via the canAcceptJob callback
     if (runnerManager?.isRunning()) {
-      logger?.info(`Resource pause triggered: ${reason}`);
-      setResourcePaused(true);
-
-      // Stop heartbeat first to signal unavailability
-      await heartbeatManager?.clear();
-      heartbeatManager?.stop();
-
-      // Stop the runner (gracefully - in-progress jobs will complete)
       await runnerManager.stop();
     }
   });
@@ -299,33 +307,31 @@ app.whenReady().then(async () => {
     // Don't resume if user explicitly paused
     if (isUserPaused()) return;
 
-    const runnerManager = getRunnerManager();
+    logger?.info('Resource pause cleared - resuming runner');
+    setResourcePaused(false);
+    updateTrayMenu(); // Update immediately after clearing pause state
 
-    if (runnerManager?.isConfigured() && !runnerManager.isRunning()) {
-      logger?.info('Resource pause cleared - resuming runner');
-      setResourcePaused(false);
-
+    // Restart heartbeat to signal availability
+    // The broker proxy will start accepting jobs via the canAcceptJob callback
+    const heartbeatManager = getHeartbeatManager();
+    const authState = getAuthState();
+    if (heartbeatManager && authState?.accessToken) {
       try {
-        await runnerManager.start();
-
-        // Restart heartbeat
-        const heartbeatManager = getHeartbeatManager();
-        const authState = getAuthState();
-        if (heartbeatManager && authState?.accessToken) {
-          await heartbeatManager.start();
-        }
+        await heartbeatManager.start();
       } catch (err) {
-        logger?.error(`Failed to resume runner: ${(err as Error).message}`);
+        logger?.error(`Failed to restart heartbeat: ${(err as Error).message}`);
       }
     }
   });
 
-  // Send resource state changes to renderer
+  // Send resource state changes to renderer and update tray
   resourceMonitor.on('state-changed', (state) => {
     const mainWindow = getMainWindow();
     if (mainWindow && !mainWindow.isDestroyed() && !getIsQuitting()) {
       mainWindow.webContents.send(IPC_CHANNELS.RESOURCE_STATE_CHANGED, state);
     }
+    // Update tray icon to reflect pause state
+    updateTrayMenu();
   });
 
   // Start monitoring (will evaluate conditions and emit events as needed)

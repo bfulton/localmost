@@ -22,7 +22,7 @@ interface CliRequest {
 }
 
 interface RunnerState {
-  status: 'idle' | 'starting' | 'running' | 'busy' | 'offline' | 'error';
+  status: 'offline' | 'starting' | 'listening' | 'busy' | 'error' | 'shutting_down';
   jobName?: string;
   repository?: string;
   startedAt?: string;
@@ -123,11 +123,11 @@ function formatTimestamp(isoString: string): string {
 
 function getStatusIcon(status: string): string {
   switch (status) {
-    case 'running': return '\u2713'; // checkmark
+    case 'listening': return '\u2713'; // checkmark
     case 'busy': return '\u25CF';    // filled circle
     case 'starting': return '\u25CB'; // empty circle
-    case 'idle': return '\u25CB';    // empty circle
     case 'offline': return '\u25CB'; // empty circle
+    case 'shutting_down': return '\u25CB'; // empty circle
     case 'error': return '\u2717';   // x mark
     case 'completed': return '\u2713';
     case 'failed': return '\u2717';

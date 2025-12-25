@@ -342,7 +342,7 @@ const JobStatusItem: React.FC<JobStatusItemProps> = ({
           {jobHistory.length === 0 ? (
             <div className={styles.jobHistoryEmpty}>No recent jobs</div>
           ) : (
-            jobHistory.map((job) => {
+            [...jobHistory].reverse().map((job) => {
               // Extract instance number from runner name (e.g., "localmost.blue-243.1" -> "1")
               const instanceNum = job.runnerName?.match(/\.(\d+)$/)?.[1];
               return (
@@ -519,9 +519,9 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
       return { status: 'Not configured', statusType: 'offline' };
     }
 
-    // Check if paused due to resource constraints
-    if (resourcePause.isPaused && runnerState.status === 'offline') {
-      return { status: 'Paused', statusType: 'idle', pauseReason: resourcePause.reason || 'Resource constraint' };
+    // Check if paused due to resource constraints (takes priority over connection status)
+    if (resourcePause.isPaused) {
+      return { status: 'Paused', statusType: 'paused', pauseReason: resourcePause.reason || 'Resource constraint' };
     }
 
     // Check connection status for all targets
@@ -574,14 +574,15 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
     switch (runnerState.status) {
       case 'starting':
         return { status: 'Starting', statusType: 'starting' };
-      case 'running':
-        return { status: 'Listening', statusType: 'running' };
+      case 'listening':
+        return { status: 'Listening', statusType: 'listening' };
       case 'busy':
         return { status: 'Running job', statusType: 'busy' };
       case 'error':
         return { status: 'Error', statusType: 'error' };
-      case 'idle':
-        return { status: 'Idle', statusType: 'idle' };
+      case 'shutting_down':
+        return { status: 'Shutting down', statusType: 'shutting_down' };
+      case 'offline':
       default:
         return { status: 'Offline', statusType: 'offline' };
     }
@@ -592,8 +593,8 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
     const runningJobs = jobHistory.filter(j => j.status === 'running');
 
     if (runningJobs.length > 0) {
-      // Find the oldest running job (latest startedAt since array is sorted newest first)
-      const oldestJob = runningJobs[runningJobs.length - 1];
+      // Find the oldest running job (first in array since it's chronologically sorted)
+      const oldestJob = runningJobs[0];
       const elapsedSeconds = Math.round((Date.now() - new Date(oldestJob.startedAt).getTime()) / 1000);
       const durationStr = formatRunTime(elapsedSeconds);
 

@@ -498,6 +498,8 @@ export class BrokerProxyService extends EventEmitter {
     }
 
     return new Promise((resolve) => {
+      // Force close all connections immediately - don't wait for long-polls to timeout
+      this.server!.closeAllConnections();
       this.server!.close(() => {
         this.isRunning = false;
         this.server = null;

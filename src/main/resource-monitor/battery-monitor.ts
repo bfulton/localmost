@@ -86,8 +86,9 @@ export class BatteryMonitor extends EventEmitter {
     // If we're on battery, check level threshold
     const level = this.state.batteryLevel;
     if (level === null) {
-      // Unknown level but on battery - be conservative and pause
-      return true;
+      // Unknown level - don't pause (could be desktop Mac or pmset not ready yet)
+      // User can still see they're on battery from the UI
+      return false;
     }
 
     switch (threshold) {

@@ -125,8 +125,10 @@ export const getValidAccessToken = async (): Promise<string | null> => {
  * Called on app quit to ensure clean shutdown - prevents orphaned jobs
  * that would block runner deletion on next startup.
  *
+ * Supports both repo-level and org-level targets.
+ *
  * @param runnerNames - Optional list of specific runner names to cancel jobs for.
- *                      If not provided, cancels for all runners matching our base name.
+ *                      If not provided, cancels for all runners matching configured targets.
  */
 export const cancelJobsOnOurRunners = async (runnerNames?: string[]): Promise<void> => {
   const logger = getLogger();
@@ -141,88 +143,121 @@ export const cancelJobsOnOurRunners = async (runnerNames?: string[]): Promise<vo
   }
 
   const config = loadConfig();
-  const runnerConfig = config.runnerConfig;
-  if (!runnerConfig?.runnerName) {
-    logger?.info('cancelJobsOnOurRunners: No runner name configured, skipping');
+  const targets = config.targets || [];
+
+  if (targets.length === 0) {
+    logger?.info('cancelJobsOnOurRunners: No targets configured, skipping');
     return;
   }
 
-  const baseRunnerName = runnerConfig.runnerName;
+  // Collect all unique owner/repo pairs to check
+  // For repo targets: use the target's owner/repo
+  // For org targets: we need to check repos that might have jobs
+  const reposToCheck = new Set<string>();
+
+  for (const target of targets) {
+    if (target.type === 'repo' && target.owner && target.repo) {
+      reposToCheck.add(`${target.owner}/${target.repo}`);
+    }
+    // For org targets, we'll check repos based on proxyRunnerName matching later
+    // For now, org-level cancellation requires knowing which repos have active jobs
+    // We'll handle this by checking all repos mentioned in the target proxy names
+  }
+
+  // Also check legacy runnerConfig if present
+  const runnerConfig = config.runnerConfig;
+  if (runnerConfig?.level === 'repo' && runnerConfig.repoUrl) {
+    const match = runnerConfig.repoUrl.match(/github\.com[\/:]([^\/]+)\/([^\/\.]+)/);
+    if (match) {
+      reposToCheck.add(`${match[1]}/${match[2]}`);
+    }
+  }
+
+  if (reposToCheck.size === 0) {
+    logger?.info('cancelJobsOnOurRunners: No repo targets found, skipping');
+    return;
+  }
+
+  // Collect all runner names we should match
+  const allRunnerNames = new Set<string>();
+  if (runnerNames && runnerNames.length > 0) {
+    runnerNames.forEach(name => allRunnerNames.add(name));
+  } else {
+    // Use proxy runner names from all targets
+    for (const target of targets) {
+      if (target.proxyRunnerName) {
+        allRunnerNames.add(target.proxyRunnerName);
+      }
+    }
+    // Also add legacy runner name
+    if (runnerConfig?.runnerName) {
+      allRunnerNames.add(runnerConfig.runnerName);
+    }
+  }
+
+  if (allRunnerNames.size === 0) {
+    logger?.info('cancelJobsOnOurRunners: No runner names to match, skipping');
+    return;
+  }
+
+  let totalCancelledCount = 0;
 
   try {
-    let owner: string | undefined;
-    let repo: string | undefined;
+    for (const repoKey of reposToCheck) {
+      const [owner, repo] = repoKey.split('/');
 
-    if (runnerConfig.level === 'repo' && runnerConfig.repoUrl) {
-      const match = runnerConfig.repoUrl.match(/github\.com[\/:]([^\/]+)\/([^\/\.]+)/);
-      if (match) {
-        [, owner, repo] = match;
-      }
-    }
-
-    // For now, only support repo-level runners (org-level would need different API)
-    if (!owner || !repo) {
-      logger?.info('cancelJobsOnOurRunners: Only repo-level runners supported, skipping');
-      return;
-    }
-
-    // Get in-progress workflow runs
-    logger?.info(`Checking for jobs on our runners to cancel (repo: ${owner}/${repo})...`);
-    const runs = await githubAuth.getRecentWorkflowRuns(accessToken, owner, repo);
-    const inProgressRuns = runs.filter(r => r.status === 'in_progress' || r.status === 'queued');
-
-    if (inProgressRuns.length === 0) {
-      logger?.info('No in-progress workflow runs found');
-      return;
-    }
-
-    logger?.info(`Found ${inProgressRuns.length} in-progress/queued workflow run(s)`);
-
-    let cancelledCount = 0;
-
-    // Check each run's jobs to see if any are using our runners
-    for (const run of inProgressRuns) {
       try {
-        const jobs = await githubAuth.getWorkflowRunJobs(accessToken, owner, repo, run.id);
-        const activeJobs = jobs.filter(job => job.status === 'in_progress' || job.status === 'queued');
-        const ourJobs = activeJobs.filter(job => {
-          if (!job.runner_name) return false;
-          // If specific runner names provided, only match those
-          if (runnerNames && runnerNames.length > 0) {
-            return runnerNames.includes(job.runner_name);
-          }
-          // Otherwise match all runners with our base name
-          return job.runner_name.startsWith(baseRunnerName);
-        });
+        logger?.info(`Checking for jobs to cancel in ${owner}/${repo}...`);
+        const runs = await githubAuth.getRecentWorkflowRuns(accessToken, owner, repo);
+        const inProgressRuns = runs.filter(r => r.status === 'in_progress' || r.status === 'queued');
 
-        // Log at info level to see what's happening
-        logger?.info(`Run ${run.id} (${run.name}): ${activeJobs.length} active jobs, ${ourJobs.length} on our runners`);
-        if (activeJobs.length > 0) {
-          logger?.info(`  Jobs: ${activeJobs.map(j => `${j.name} (runner: ${j.runner_name || 'not assigned'})`).join(', ')}`);
+        if (inProgressRuns.length === 0) {
+          logger?.debug(`No in-progress workflow runs in ${owner}/${repo}`);
+          continue;
         }
 
-        if (ourJobs.length > 0) {
-          logger?.info(`Cancelling workflow run ${run.id} (${run.name}) - has jobs on our runners: ${ourJobs.map(j => j.runner_name).join(', ')}`);
+        logger?.info(`Found ${inProgressRuns.length} in-progress/queued run(s) in ${owner}/${repo}`);
+
+        for (const run of inProgressRuns) {
           try {
-            await githubAuth.cancelWorkflowRun(accessToken, owner, repo, run.id);
-            logger?.info(`Successfully requested cancellation of run ${run.id}`);
-            cancelledCount++;
-          } catch (cancelErr) {
-            logger?.warn(`Failed to cancel run ${run.id}: ${(cancelErr as Error).message}`);
+            const jobs = await githubAuth.getWorkflowRunJobs(accessToken, owner, repo, run.id);
+            const activeJobs = jobs.filter(job => job.status === 'in_progress' || job.status === 'queued');
+            const ourJobs = activeJobs.filter(job => {
+              if (!job.runner_name) return false;
+              // Check if this runner matches any of our runner names (exact or prefix match)
+              for (const name of allRunnerNames) {
+                if (job.runner_name === name || job.runner_name.startsWith(name + '.')) {
+                  return true;
+                }
+              }
+              return false;
+            });
+
+            if (ourJobs.length > 0) {
+              logger?.info(`Cancelling run ${run.id} (${run.name}) - has jobs on our runners: ${ourJobs.map(j => j.runner_name).join(', ')}`);
+              try {
+                await githubAuth.cancelWorkflowRun(accessToken, owner, repo, run.id);
+                logger?.info(`Successfully requested cancellation of run ${run.id}`);
+                totalCancelledCount++;
+              } catch (cancelErr) {
+                logger?.warn(`Failed to cancel run ${run.id}: ${(cancelErr as Error).message}`);
+              }
+            }
+          } catch (jobErr) {
+            logger?.warn(`Failed to check jobs for run ${run.id}: ${(jobErr as Error).message}`);
           }
         }
-      } catch (jobErr) {
-        logger?.warn(`Failed to check jobs for run ${run.id}: ${(jobErr as Error).message}`);
+      } catch (repoErr) {
+        logger?.warn(`Failed to check repo ${owner}/${repo}: ${(repoErr as Error).message}`);
       }
     }
 
-    // If we cancelled any runs, wait for GitHub to process the cancellation
-    // This helps prevent "runner is busy" errors on next startup
-    if (cancelledCount > 0) {
-      logger?.info(`Waiting for ${cancelledCount} cancellation(s) to be processed...`);
-      // Give GitHub up to 5 seconds to process - cancellation is async on their end
+    if (totalCancelledCount > 0) {
+      logger?.info(`Waiting for ${totalCancelledCount} cancellation(s) to be processed...`);
       await new Promise(resolve => setTimeout(resolve, 5000));
       logger?.info('Done waiting for cancellations');
+    } else {
+      logger?.info('No jobs needed cancellation');
     }
   } catch (err) {
     logger?.warn(`Failed to cancel jobs on quit: ${(err as Error).message}`);

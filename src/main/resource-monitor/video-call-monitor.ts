@@ -1,12 +1,11 @@
 /**
  * VideoCallMonitor - Detects active video calls via camera usage.
  *
- * Uses macOS system commands to check if the camera is in use.
+ * Uses the is-camera-on package for reliable native camera detection.
  * Implements a grace period before resuming after a call ends.
  */
 
 import { EventEmitter } from 'events';
-import { exec } from 'child_process';
 
 export interface VideoCallState {
   isCameraInUse: boolean;
@@ -24,10 +23,10 @@ export class VideoCallMonitor extends EventEmitter {
     inGracePeriod: false,
     gracePeriodEndsAt: null,
   };
-  private checkInterval: NodeJS.Timeout | null = null;
   private gracePeriodTimer: NodeJS.Timeout | null = null;
   private gracePeriodSeconds: number;
   private started = false;
+  private abortController: AbortController | null = null;
 
   constructor(gracePeriodSeconds: number = 60) {
     super();
@@ -42,19 +41,36 @@ export class VideoCallMonitor extends EventEmitter {
   }
 
   /**
-   * Start monitoring for video calls.
+   * Start monitoring for video calls using native camera detection.
    */
   start(): void {
     if (this.started) return;
     this.started = true;
 
-    // Check immediately
-    this.checkCameraUsage();
+    this.abortController = new AbortController();
+    this.startCameraMonitoring();
+  }
 
-    // Check every 5 seconds
-    this.checkInterval = setInterval(() => {
-      this.checkCameraUsage();
-    }, 5000);
+  /**
+   * Start async camera monitoring loop.
+   */
+  private async startCameraMonitoring(): Promise<void> {
+    try {
+      // Dynamic import for ESM package
+      const { isCameraOnChanges } = await import('is-camera-on');
+
+      for await (const isOn of isCameraOnChanges()) {
+        // Check if we've been stopped
+        if (!this.started || this.abortController?.signal.aborted) {
+          break;
+        }
+        this.handleCameraState(isOn);
+      }
+    } catch (error) {
+      // If is-camera-on fails (non-macOS, etc.), log and continue without video detection
+      // eslint-disable-next-line no-console
+      console.warn('Video call detection unavailable:', (error as Error).message);
+    }
   }
 
   /**
@@ -64,10 +80,9 @@ export class VideoCallMonitor extends EventEmitter {
     if (!this.started) return;
     this.started = false;
 
-    if (this.checkInterval) {
-      clearInterval(this.checkInterval);
-      this.checkInterval = null;
-    }
+    // Signal the async iterator to stop
+    this.abortController?.abort();
+    this.abortController = null;
 
     if (this.gracePeriodTimer) {
       clearTimeout(this.gracePeriodTimer);
@@ -103,24 +118,6 @@ export class VideoCallMonitor extends EventEmitter {
   }
 
   /**
-   * Check if camera is in use using macOS commands.
-   */
-  private checkCameraUsage(): void {
-    // Check for camera usage via lsof - looks for processes accessing camera devices
-    // VDCAssistant is the macOS camera daemon
-    exec("lsof 2>/dev/null | grep -E 'VDCAssistant|AppleCamera' | wc -l", (error, stdout) => {
-      if (error) {
-        // Can't determine camera state - assume not in use
-        this.handleCameraState(false);
-        return;
-      }
-
-      const count = parseInt(stdout.trim(), 10);
-      this.handleCameraState(count > 0);
-    });
-  }
-
-  /**
    * Handle camera state change.
    */
   private handleCameraState(inUse: boolean): void {
@@ -144,17 +141,8 @@ export class VideoCallMonitor extends EventEmitter {
       this.state.isCameraInUse = false;
       this.startGracePeriod();
       this.emit('state-changed', this.getState());
-    } else if (inUse && wasInUse) {
-      // Still in a call - reset grace period timer if one was started
-      if (this.gracePeriodTimer) {
-        clearTimeout(this.gracePeriodTimer);
-        this.gracePeriodTimer = null;
-        this.state.inGracePeriod = false;
-        this.state.gracePeriodEndsAt = null;
-        this.emit('state-changed', this.getState());
-      }
     }
-    // If !inUse && !wasInUse, no change needed
+    // If state hasn't changed, no event needed
   }
 
   /**
