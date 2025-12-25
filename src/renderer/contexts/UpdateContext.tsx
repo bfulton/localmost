@@ -96,6 +96,8 @@ export const UpdateProvider: React.FC<UpdateProviderProps> = ({ children }) => {
     try {
       await window.localmost.update.check();
       setLastChecked(new Date());
+      // Clear "Up to date" message after 5 seconds
+      setTimeout(() => setLastChecked(null), 5000);
     } catch {
       // Error handling is done via status updates
     } finally {
