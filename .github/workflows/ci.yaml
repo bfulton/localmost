@@ -1,4 +1,4 @@
-name: Test
+name: CI
 on:
   push:
     branches: [main]
@@ -46,8 +46,14 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Run linter
+        run: npm run lint
+
       - name: Run tests
         run: npm test
+
+      - name: Build
+        run: npm run build
 
       - name: Report runner info
         run: |
