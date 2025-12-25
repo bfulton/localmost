@@ -67,7 +67,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
   } = useRunner();
 
   // Update state from context
-  const { status: updateStatus, settings: updateSettings, setSettings: setUpdateSettings, checkForUpdates, isChecking } = useUpdate();
+  const { status: updateStatus, settings: updateSettings, setSettings: setUpdateSettings, checkForUpdates, isChecking, lastChecked } = useUpdate();
 
   // Local UI state
   const [showSleepConsentDialog, setShowSleepConsentDialog] = useState(false);
@@ -639,6 +639,11 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
             {updateStatus.status === 'downloaded' && (
               <span className={styles.updateReady}>
                 Update ready to install
+              </span>
+            )}
+            {updateStatus.status === 'idle' && lastChecked && (
+              <span className={styles.upToDate}>
+                ✓ Up to date
               </span>
             )}
           </div>

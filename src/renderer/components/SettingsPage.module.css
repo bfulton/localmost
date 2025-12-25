@@ -337,3 +337,8 @@
   color: var(--success);
   font-weight: 500;
 }
+
+.upToDate {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
