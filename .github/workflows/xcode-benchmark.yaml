@@ -5,7 +5,10 @@ on:
 
 jobs:
   benchmark:
-    runs-on: macos-latest
+    strategy:
+      matrix:
+        runner: [macos-latest, macos-15-large]
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Show runner info
         run: |
