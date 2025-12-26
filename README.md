@@ -224,3 +224,8 @@ Future feature ideas:
 - **Disk space monitoring** - Warn or pause when disk is low, auto-clean old work dirs.
 - **Runner handoff** - Transfer a running job to GitHub-hosted if you need to leave.
 - **Reactive state management** - Unify disk state, React state, and state machine into a single reactive store to prevent synchronization bugs.
+
+Bugs and quick improvements:
+
+- Fix the CLI install process to be polished
+
