@@ -220,6 +220,7 @@ npm run make
 Future feature ideas:
 
 - **Trusted contributors for public repos** - Control which repos can run on your machine based on their contributor list. Options: never build public repos, only build repos where all contributors are trusted (default: you + known bots, customizable), or always build (with high-friction confirmation). Repos with untrusted contributors fail with a clear error.
+- **Graceful heartbeat shutdown** - On clean exit, immediately mark heartbeat stale so workflows fall back to cloud without waiting for the 90s timeout.
 - **Quick actions** - Re-run failed job, cancel all jobs.
 - **Audit logging** - Detailed logs of what each job accessed.
 - **Network policy customization** - User-defined network allowlists per repo.
