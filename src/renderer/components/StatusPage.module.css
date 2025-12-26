@@ -471,18 +471,6 @@
   color: var(--accent);
 }
 
-.pauseReasonLink {
-  color: var(--text-secondary);
-  text-decoration: none;
-  transition: color 0.2s;
-  font-size: 12px;
-  font-style: italic;
-}
-
-.pauseReasonLink:hover {
-  color: var(--accent);
-}
-
 /* Status colors via data attributes */
 .statusItemDot[data-status="starting"] {
   background-color: var(--warning);

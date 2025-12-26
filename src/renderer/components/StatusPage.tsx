@@ -83,7 +83,6 @@ const StatusItem: React.FC<StatusItemProps> = ({ label, status, statusType, deta
 interface RunnerStatusItemProps {
   status: string;
   statusType: string;
-  pauseReason?: string;
   runnerName: string | null;
   runnerSettingsUrl: string | null;
   runnerVersion: { version: string | null; url: string | null };
@@ -92,13 +91,11 @@ interface RunnerStatusItemProps {
   showUsage: boolean;
   onToggleUsage: () => void;
   onOpenRunnerConfig: () => void;
-  onPauseReasonClick?: () => void;
 }
 
 const RunnerStatusItem: React.FC<RunnerStatusItemProps> = ({
   status,
   statusType,
-  pauseReason,
   runnerName,
   runnerSettingsUrl,
   runnerVersion,
@@ -107,7 +104,6 @@ const RunnerStatusItem: React.FC<RunnerStatusItemProps> = ({
   showUsage,
   onToggleUsage,
   onOpenRunnerConfig,
-  onPauseReasonClick,
 }) => {
   // Build targets display
   const getTargetsDisplay = (): { text: string; tooltip?: string } | null => {
@@ -182,20 +178,6 @@ const RunnerStatusItem: React.FC<RunnerStatusItemProps> = ({
             {targetsDisplay.text}
           </a>
         )}
-      </div>
-    )}
-    {pauseReason && (
-      <div className={styles.statusItemDetail}>
-        <a
-          href="#"
-          className={styles.pauseReasonLink}
-          onClick={(e) => {
-            e.preventDefault();
-            onPauseReasonClick?.();
-          }}
-        >
-          {pauseReason}
-        </a>
       </div>
     )}
     {showUsage && (
@@ -568,7 +550,7 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
   };
 
   // Runner status - combines worker status with connection status and pause reason
-  const getRunnerStatusInfo = (): { status: string; statusType: string; pauseReason?: string } => {
+  const getRunnerStatusInfo = (): { status: string; statusType: string } => {
     if (!user) {
       return { status: 'Waiting for GitHub', statusType: 'offline' };
     }
@@ -581,7 +563,17 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
 
     // Check if paused due to resource constraints (takes priority over connection status)
     if (resourcePause.isPaused) {
-      return { status: 'Paused', statusType: 'paused', pauseReason: resourcePause.reason || 'Resource constraint' };
+      // Convert long reason to short form for inline display
+      const reason = resourcePause.reason || '';
+      let shortReason = 'resource';
+      if (reason.toLowerCase().includes('user')) {
+        shortReason = 'user';
+      } else if (reason.toLowerCase().includes('battery')) {
+        shortReason = 'battery';
+      } else if (reason.toLowerCase().includes('video')) {
+        shortReason = 'video';
+      }
+      return { status: `Paused (${shortReason})`, statusType: 'paused' };
     }
 
     // Check connection status for all targets
@@ -735,7 +727,6 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
         <RunnerStatusItem
           status={runnerStatus.status}
           statusType={runnerStatus.statusType}
-          pauseReason={runnerStatus.pauseReason}
           runnerName={isConfigured ? runnerDisplayName : null}
           runnerSettingsUrl={runnerSettingsUrl}
           runnerVersion={runnerVersion}
@@ -744,7 +735,6 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
           showUsage={showUsage}
           onToggleUsage={() => setShowUsage(!showUsage)}
           onOpenRunnerConfig={() => onOpenSettings('runner-config-section')}
-          onPauseReasonClick={() => onOpenSettings('resource-section')}
         />
         <JobStatusItem
           status={jobStatus.status}
