@@ -231,7 +231,7 @@ Future feature ideas:
 - **Runner handoff** - Transfer a running job to GitHub-hosted if you need to leave.
 - **Reactive state management** - Unify disk state, React state, and state machine into a single reactive store to prevent synchronization bugs.
 - **Linux and Windows host support** - Run self-hosted runners on non-Mac machines for projects that need them.
-- **Higher parallelism cap** - Improve proxy registration to support 16+ concurrent runners (currently capped at 8 due to broker connection limits).
+- **Higher parallelism cap** - Parallelize proxy registration to support 16+ concurrent runners (currently capped at 8 due to serial registration time).
 
 Bugs and quick improvements:
 
