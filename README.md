@@ -27,11 +27,13 @@ Here's what some open source projects would save:
 
 Local builds are also faster. Based on [XcodeBenchmark](https://github.com/devMEremenko/XcodeBenchmark):
 
-| Runner | Time | vs GitHub |
-|--------|------|-----------|
-| GitHub macos-latest | [967s](https://github.com/bfulton/localmost/actions/runs/20388833445/job/58594848226) | — |
-| MacBook Air M2 (2022) | 202s | **4.8x faster** |
-| MacBook Pro M4 Max (2024) | 77s | **12.6x faster** |
+| Runner | Time |
+|--------|------|
+| GitHub macos-latest M1 x3 ($0.06/m) | [838s](https://github.com/bfulton/localmost/actions/runs/20525324038/job/58967518701) |
+| GitHub macos-15-large Intel x12 ($0.08/m) | [955s](https://github.com/bfulton/localmost/actions/runs/20525324038/job/58967518696) |
+| GitHub macos-15-xlarge M2 Pro x5 ($0.10/m) | [339s](https://github.com/bfulton/localmost/actions/runs/20525919481/job/58969135831) |
+| MacBook Air M2 x8 (2022) | 202s |
+| MacBook Pro M4 Max x16 (2024) | 77s |
 
 ## Why else use localmost?
 
