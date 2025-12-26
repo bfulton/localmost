@@ -1183,7 +1183,7 @@ export class RunnerManager {
             if (conclusion !== null) {
               this.log('info', `[instance ${instanceNum}] Job completed: ${jobName} conclusion=${conclusion} → status=${status}`);
             }
-          } catch (err) {
+          } catch {
             // Fall back to runner-reported result
             const result = jobCompleteMatch[1].toLowerCase();
             status = result === 'succeeded' ? 'completed' : result === 'failed' ? 'failed' : 'cancelled';
