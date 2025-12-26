@@ -47,11 +47,12 @@ jest.mock('./app-state', () => ({
 import { BrokerProxyService } from './broker-proxy-service';
 import type { Target } from '../shared/types';
 
-// Helper to create mock credentials
-const createMockCredentials = () => ({
+// Helper to create mock credentials for a single instance
+const createMockInstanceCredentials = (instanceNum = 1) => ({
+  instanceNum,
   runner: {
-    agentId: 1,
-    agentName: 'test-runner',
+    agentId: instanceNum,
+    agentName: `test-runner.${instanceNum}`,
     poolId: 1,
     poolName: 'Default',
     serverUrl: 'https://pipelines.actions.githubusercontent.com',
@@ -79,6 +80,10 @@ const createMockCredentials = () => ({
     q: 'mock-q',
   },
 });
+
+// Helper to create array of mock credentials for multiple instances
+const createMockCredentials = (count = 1) =>
+  Array.from({ length: count }, (_, i) => createMockInstanceCredentials(i + 1));
 
 const createMockTarget = (overrides?: Partial<Target>): Target => ({
   id: 'test-target-id',
@@ -135,7 +140,7 @@ describe('BrokerProxyService', () => {
       const target = createMockTarget();
       const creds = createMockCredentials();
 
-      service.addTarget(target, creds.runner, creds.credentials, creds.rsaParams);
+      service.addTarget(target, creds);
 
       const status = service.getStatus();
       expect(status).toHaveLength(1);
@@ -147,8 +152,8 @@ describe('BrokerProxyService', () => {
       const target2 = createMockTarget({ id: 'target-2' });
       const creds = createMockCredentials();
 
-      service.addTarget(target1, creds.runner, creds.credentials, creds.rsaParams);
-      service.addTarget(target2, creds.runner, creds.credentials, creds.rsaParams);
+      service.addTarget(target1, creds);
+      service.addTarget(target2, creds);
 
       const status = service.getStatus();
       expect(status).toHaveLength(2);
@@ -160,7 +165,7 @@ describe('BrokerProxyService', () => {
       const target = createMockTarget();
       const creds = createMockCredentials();
 
-      service.addTarget(target, creds.runner, creds.credentials, creds.rsaParams);
+      service.addTarget(target, creds);
       expect(service.getStatus()).toHaveLength(1);
 
       service.removeTarget('test-target-id');
@@ -182,7 +187,7 @@ describe('BrokerProxyService', () => {
       const target = createMockTarget();
       const creds = createMockCredentials();
 
-      service.addTarget(target, creds.runner, creds.credentials, creds.rsaParams);
+      service.addTarget(target, creds);
 
       const status = service.getStatus();
       expect(status).toHaveLength(1);
@@ -281,7 +286,7 @@ describe('BrokerProxyService', () => {
       const target = createMockTarget();
       const creds = createMockCredentials();
 
-      service.addTarget(target, creds.runner, creds.credentials, creds.rsaParams);
+      service.addTarget(target, creds);
 
       const status = service.getStatus();
       expect(status[0].jobsAssigned).toBe(0);
@@ -291,7 +296,7 @@ describe('BrokerProxyService', () => {
       const target = createMockTarget();
       const creds = createMockCredentials();
 
-      service.addTarget(target, creds.runner, creds.credentials, creds.rsaParams);
+      service.addTarget(target, creds);
 
       const status = service.getStatus();
       expect(status[0].sessionActive).toBe(false);

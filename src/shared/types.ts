@@ -393,14 +393,18 @@ export interface RunnerProxyStatus {
   targetId: string;
   /** Whether runner is registered with GitHub */
   registered: boolean;
-  /** Whether broker session is active */
+  /** Whether broker session is active (at least one instance) */
   sessionActive: boolean;
-  /** Last successful poll timestamp */
+  /** Last successful poll timestamp (most recent across instances) */
   lastPoll: string | null;
   /** Total jobs assigned from this target */
   jobsAssigned: number;
   /** Error message if something went wrong */
   error?: string;
+  /** Total number of registered instances for this target */
+  instanceCount?: number;
+  /** Number of instances with active sessions */
+  activeInstances?: number;
 }
 
 /**

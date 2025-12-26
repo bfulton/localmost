@@ -4,6 +4,8 @@ import { jest } from '@jest/globals';
 // Mock fs
 const mockExistsSync = jest.fn<(path: string) => boolean>();
 const mockReadFileSync = jest.fn<(path: string, encoding: string) => string>();
+const mockReaddirSync = jest.fn<(path: string) => string[]>();
+const mockStatSync = jest.fn<(path: string) => { isDirectory: () => boolean }>();
 const mockMkdir = jest.fn<() => Promise<void>>();
 const mockRm = jest.fn<() => Promise<void>>();
 const mockCopyFile = jest.fn<() => Promise<void>>();
@@ -17,6 +19,8 @@ const mockChmod = jest.fn<() => Promise<void>>();
 jest.mock('fs', () => ({
   existsSync: mockExistsSync,
   readFileSync: mockReadFileSync,
+  readdirSync: mockReaddirSync,
+  statSync: mockStatSync,
   promises: {
     mkdir: mockMkdir,
     rm: mockRm,
@@ -87,30 +91,41 @@ describe('RunnerProxyManager', () => {
   });
 
   describe('hasCredentials', () => {
-    it('should return false when credential files do not exist', () => {
+    it('should return false when base directory does not exist', () => {
       mockExistsSync.mockReturnValue(false);
       expect(manager.hasCredentials('test-id')).toBe(false);
     });
 
-    it('should return true when all credential files exist', () => {
+    it('should return true when all credential files exist in instance directory', () => {
+      // Base directory exists
       mockExistsSync.mockImplementation((p: unknown) => {
         const pathStr = p as string;
-        return pathStr.includes('.runner') ||
-               pathStr.includes('.credentials') ||
-               pathStr.includes('.credentials_rsaparams');
+        // Base dir exists, instance dirs exist, credential files exist
+        return pathStr.includes('test-id') ||
+               pathStr.includes('.runner') ||
+               pathStr.includes('.credentials');
       });
+      // readdirSync returns numbered directories
+      mockReaddirSync.mockReturnValue(['1']);
+      // statSync returns isDirectory for instance dirs
+      mockStatSync.mockReturnValue({ isDirectory: () => true });
+
       expect(manager.hasCredentials('test-id')).toBe(true);
     });
 
     it('should return false when some credential files are missing', () => {
+      // Base directory exists
       mockExistsSync.mockImplementation((p: unknown) => {
         const pathStr = p as string;
-        // Only .runner and .credentials exist, but NOT .credentials_rsaparams
+        // Base dir and instance dir exist, but credentials_rsaparams missing
         if (pathStr.endsWith('.credentials_rsaparams')) return false;
-        if (pathStr.endsWith('.runner')) return true;
-        if (pathStr.endsWith('.credentials')) return true;
-        return false;
+        return pathStr.includes('test-id') ||
+               pathStr.includes('.runner') ||
+               pathStr.endsWith('.credentials');
       });
+      mockReaddirSync.mockReturnValue(['1']);
+      mockStatSync.mockReturnValue({ isDirectory: () => true });
+
       expect(manager.hasCredentials('test-id')).toBe(false);
     });
   });
@@ -153,7 +168,7 @@ describe('RunnerProxyManager', () => {
         throw new Error('File not found');
       });
 
-      expect(manager.loadCredentials('test-id')).toBeNull();
+      expect(manager.loadCredentials('test-id', 1)).toBeNull();
     });
 
     it('should load and parse credential files successfully', () => {
@@ -169,7 +184,7 @@ describe('RunnerProxyManager', () => {
         throw new Error('Unknown file');
       });
 
-      const result = manager.loadCredentials('test-id');
+      const result = manager.loadCredentials('test-id', 1);
 
       expect(result).not.toBeNull();
       expect(result?.runner).toEqual(mockRunnerConfig);
@@ -191,20 +206,20 @@ describe('RunnerProxyManager', () => {
         throw new Error('Unknown file');
       });
 
-      const result = manager.loadCredentials('test-id');
+      const result = manager.loadCredentials('test-id', 1);
 
       expect(result).not.toBeNull();
       expect(result?.runner).toEqual(mockRunnerConfig);
     });
   });
 
-  describe('register', () => {
+  describe('registerAll', () => {
     it('should throw when GitHub auth not initialized', async () => {
       mockGetGitHubAuth.mockReturnValue(null);
       mockGetRunnerDownloader.mockReturnValue({});
 
       const target = createMockTarget();
-      await expect(manager.register(target)).rejects.toThrow('Runner not initialized');
+      await expect(manager.registerAll(target, 4)).rejects.toThrow('Runner not initialized');
     });
 
     it('should throw when runner downloader not initialized', async () => {
@@ -212,7 +227,7 @@ describe('RunnerProxyManager', () => {
       mockGetRunnerDownloader.mockReturnValue(null);
 
       const target = createMockTarget();
-      await expect(manager.register(target)).rejects.toThrow('Runner not initialized');
+      await expect(manager.registerAll(target, 4)).rejects.toThrow('Runner not initialized');
     });
 
     it('should throw when not authenticated', async () => {
@@ -221,7 +236,7 @@ describe('RunnerProxyManager', () => {
       mockGetValidAccessToken.mockResolvedValue(null);
 
       const target = createMockTarget();
-      await expect(manager.register(target)).rejects.toThrow('Not authenticated');
+      await expect(manager.registerAll(target, 4)).rejects.toThrow('Not authenticated');
     });
 
     it('should throw when no runner version installed', async () => {
@@ -234,11 +249,11 @@ describe('RunnerProxyManager', () => {
       mockGetValidAccessToken.mockResolvedValue('test-token');
 
       const target = createMockTarget();
-      await expect(manager.register(target)).rejects.toThrow('No runner version installed');
+      await expect(manager.registerAll(target, 4)).rejects.toThrow('No runner version installed');
     });
   });
 
-  describe('unregister', () => {
+  describe('unregisterAll', () => {
     it('should remove local credentials even if GitHub deletion fails', async () => {
       mockGetGitHubAuth.mockReturnValue({
         listRunners: jest.fn<() => Promise<any[]>>().mockRejectedValue(new Error('API error')),
@@ -247,7 +262,7 @@ describe('RunnerProxyManager', () => {
       mockRm.mockResolvedValue(undefined);
 
       const target = createMockTarget();
-      await manager.unregister(target);
+      await manager.unregisterAll(target);
 
       expect(mockRm).toHaveBeenCalledWith(
         expect.stringContaining('test-target-id'),
@@ -267,7 +282,7 @@ describe('RunnerProxyManager', () => {
       mockRm.mockResolvedValue(undefined);
 
       const target = createMockTarget();
-      await manager.unregister(target);
+      await manager.unregisterAll(target);
 
       expect(mockDeleteRunner).toHaveBeenCalledWith('test-token', 'testowner', 'testrepo', 123);
     });
@@ -291,26 +306,26 @@ describe('RunnerProxyManager', () => {
         url: 'https://github.com/testorg',
         proxyRunnerName: 'localmost.test-host.testorg',
       });
-      await manager.unregister(target);
+      await manager.unregisterAll(target);
 
       expect(mockDeleteOrgRunner).toHaveBeenCalledWith('test-token', 'testorg', 456);
     });
   });
 
   describe('clearCredentials', () => {
-    it('should remove credential files', async () => {
-      mockUnlink.mockResolvedValue(undefined);
+    it('should remove credential directory', async () => {
+      mockRm.mockResolvedValue(undefined);
 
       await manager.clearCredentials('test-id');
 
-      expect(mockUnlink).toHaveBeenCalledTimes(3);
-      expect(mockUnlink).toHaveBeenCalledWith(expect.stringContaining('.runner'));
-      expect(mockUnlink).toHaveBeenCalledWith(expect.stringContaining('.credentials'));
-      expect(mockUnlink).toHaveBeenCalledWith(expect.stringContaining('.credentials_rsaparams'));
+      expect(mockRm).toHaveBeenCalledWith(
+        expect.stringContaining('test-id'),
+        { recursive: true, force: true }
+      );
     });
 
-    it('should ignore errors when deleting files', async () => {
-      mockUnlink.mockRejectedValue(new Error('File not found'));
+    it('should ignore errors when deleting directory', async () => {
+      mockRm.mockRejectedValue(new Error('Directory not found'));
 
       // Should not throw
       await manager.clearCredentials('test-id');

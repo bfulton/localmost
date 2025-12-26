@@ -10,8 +10,11 @@ import {
   setRunnerLogLevelSetting,
   updateSleepProtection,
   getResourceMonitor,
+  getLogger,
 } from '../app-state';
 import { IPC_CHANNELS, SleepProtection, LogLevel } from '../../shared/types';
+
+const log = () => getLogger();
 
 /**
  * Register settings-related IPC handlers.
@@ -33,6 +36,26 @@ export const registerSettingsHandlers = (): void => {
     }
 
     const current = loadConfig();
+
+    // Log settings changes
+    for (const key of Object.keys(sanitizedSettings) as Array<keyof typeof sanitizedSettings>) {
+      const oldValue = current[key];
+      const newValue = sanitizedSettings[key];
+      // Only log if value actually changed (deep comparison for objects would be complex, so stringify)
+      if (JSON.stringify(oldValue) !== JSON.stringify(newValue)) {
+        // Don't log sensitive data, just the key and a summary
+        if (key === 'userFilter' || key === 'power' || key === 'notifications') {
+          log()?.info(`[Settings] ${key} updated`);
+        } else if (key === 'targets') {
+          const oldCount = Array.isArray(oldValue) ? oldValue.length : 0;
+          const newCount = Array.isArray(newValue) ? newValue.length : 0;
+          log()?.info(`[Settings] targets updated: ${oldCount} -> ${newCount} targets`);
+        } else {
+          log()?.info(`[Settings] ${key}: ${JSON.stringify(oldValue)} -> ${JSON.stringify(newValue)}`);
+        }
+      }
+    }
+
     saveConfig({ ...current, ...sanitizedSettings });
 
     // Update sleep protection if setting changed

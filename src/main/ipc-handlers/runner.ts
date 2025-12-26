@@ -304,9 +304,10 @@ export const registerRunnerHandlers = (): void => {
         for (const target of targets) {
           if (!target.enabled) continue;
 
-          const credentials = proxyManager.loadCredentials(target.id);
-          if (credentials) {
-            brokerProxyService.addTarget(target, credentials.runner, credentials.credentials, credentials.rsaParams);
+          const allCredentials = proxyManager.loadAllCredentials(target.id);
+          if (allCredentials.length > 0) {
+            brokerProxyService.addTarget(target, allCredentials);
+            logger()?.info(`[BrokerProxy] Added ${target.displayName} with ${allCredentials.length} instances`);
           } else {
             logger()?.warn(`[BrokerProxy] No credentials for ${target.displayName}, skipping`);
           }

@@ -14,8 +14,11 @@
 import * as http from 'http';
 import * as https from 'https';
 import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 import { EventEmitter } from 'events';
 import { getLogger } from './app-state';
+import { getRunnerDir } from './paths';
 import type { Target, RunnerProxyStatus } from '../shared/types';
 
 // Helper to get logger (may be null before initialization)
@@ -60,9 +63,9 @@ interface RSAParamsFile {
   q: string;
 }
 
-/** Internal target state with credentials and session info */
-interface TargetState {
-  target: Target;
+/** State for a single runner instance within a target */
+interface RunnerInstanceState {
+  instanceNum: number;
   runner: RunnerFileConfig;
   credentials: CredentialsFile;
   rsaParams: RSAParamsFile;
@@ -70,8 +73,14 @@ interface TargetState {
   tokenExpiry?: number;
   sessionId?: string;
   lastPoll?: Date;
-  jobsAssigned: number;
   error?: string;
+}
+
+/** Internal target state - contains multiple runner instances */
+interface TargetState {
+  target: Target;
+  instances: Map<number, RunnerInstanceState>;
+  jobsAssigned: number;  // Aggregate across all instances
 }
 
 /** Local session for a connected worker */
@@ -229,28 +238,42 @@ export class BrokerProxyService extends EventEmitter {
    */
   addTarget(
     target: Target,
-    runner: RunnerFileConfig,
-    credentials: CredentialsFile,
-    rsaParams: RSAParamsFile
+    instanceCredentials: Array<{
+      instanceNum: number;
+      runner: RunnerFileConfig;
+      credentials: CredentialsFile;
+      rsaParams: RSAParamsFile;
+    }>
   ): void {
+    const instances = new Map<number, RunnerInstanceState>();
+
+    for (const cred of instanceCredentials) {
+      instances.set(cred.instanceNum, {
+        instanceNum: cred.instanceNum,
+        runner: cred.runner,
+        credentials: cred.credentials,
+        rsaParams: cred.rsaParams,
+      });
+    }
+
     const state: TargetState = {
       target,
-      runner,
-      credentials,
-      rsaParams,
+      instances,
       jobsAssigned: 0,
     };
     this.targets.set(target.id, state);
-    log()?.info(`[BrokerProxy] Added target: ${target.displayName}`);
+    log()?.info(`[BrokerProxy] Added target: ${target.displayName} (${instances.size} instances)`);
 
-    // If proxy is already running, create session immediately
+    // If proxy is already running, create sessions immediately
     if (this.isRunning && target.enabled) {
-      this.createUpstreamSession(state).catch((error) => {
-        log()?.error(`[BrokerProxy] Failed to create session for ${target.displayName}: ${(error as Error).message}`);
-        state.error = (error as Error).message;
-        this.scheduleSessionRetry(state);
-        this.emitStatusUpdate();
-      });
+      for (const [instanceNum, instance] of instances) {
+        this.createUpstreamSession(state, instance).catch((error) => {
+          log()?.error(`[BrokerProxy] Failed to create session for ${target.displayName}/${instanceNum}: ${(error as Error).message}`);
+          instance.error = (error as Error).message;
+          this.scheduleSessionRetry(state, instance);
+          this.emitStatusUpdate();
+        });
+      }
     }
   }
 
@@ -292,18 +315,23 @@ export class BrokerProxyService extends EventEmitter {
       });
     });
 
-    // Create upstream sessions for all targets
+    // Clean up any stale sessions from previous run before creating new ones
+    await this.cleanupStaleSessions();
+
+    // Create upstream sessions for all instances of all enabled targets
     const enabledTargets = Array.from(this.targets.values())
       .filter(s => s.target.enabled);
 
     for (const state of enabledTargets) {
-      try {
-        await this.createUpstreamSession(state);
-      } catch (error) {
-        log()?.error(`[BrokerProxy] Failed to create session for ${state.target.displayName}: ${(error as Error).message}`);
-        state.error = (error as Error).message;
-        // Schedule background retry for failed session
-        this.scheduleSessionRetry(state);
+      for (const instance of state.instances.values()) {
+        try {
+          await this.createUpstreamSession(state, instance);
+        } catch (error) {
+          log()?.error(`[BrokerProxy] Failed to create session for ${state.target.displayName}/${instance.instanceNum}: ${(error as Error).message}`);
+          instance.error = (error as Error).message;
+          // Schedule background retry for failed session
+          this.scheduleSessionRetry(state, instance);
+        }
       }
     }
 
@@ -314,11 +342,11 @@ export class BrokerProxyService extends EventEmitter {
   }
 
   /**
-   * Process a message received from a target.
+   * Process a message received from an instance.
    * Extracted to allow immediate processing without waiting for other polls.
    */
-  private async processMessage(state: TargetState, body: string): Promise<void> {
-    log()?.info(`[BrokerProxy] Processing message from ${state.target.displayName}, body length=${body.length}`);
+  private async processMessage(state: TargetState, instance: RunnerInstanceState, body: string): Promise<void> {
+    log()?.info(`[BrokerProxy] Processing message from ${state.target.displayName}/${instance.instanceNum}, body length=${body.length}`);
 
     // Parse message to determine type
     let message;
@@ -396,7 +424,7 @@ export class BrokerProxyService extends EventEmitter {
       let githubRepo: string | undefined;
       let githubActor: string | undefined;
       if (runServiceUrl) {
-        const jobDetails = await this.acquireJobUpstream(state, jobId, runServiceUrl, billingOwnerId);
+        const jobDetails = await this.acquireJobUpstream(state, instance, jobId, runServiceUrl, billingOwnerId);
         if (jobDetails) {
           this.acquiredJobDetails.set(jobId, jobDetails);
           this.acquiredJobDetails.set(messageId, jobDetails);
@@ -455,7 +483,7 @@ export class BrokerProxyService extends EventEmitter {
       this.jobAssignments.set(jobId, {
         jobId,
         targetId: state.target.id,
-        sessionId: state.sessionId!,
+        sessionId: instance.sessionId!,
         assignedAt: new Date(),
       });
 
@@ -464,7 +492,7 @@ export class BrokerProxyService extends EventEmitter {
 
       // Emit event to spawn worker for job messages only
       // Include IDs so we can construct the job URL and check user filter directly
-      this.emit('job-received', state.target.id, jobId, state.runner.agentName, {
+      this.emit('job-received', state.target.id, jobId, instance.runner.agentName, {
         githubRunId,
         githubJobId,
         githubRepo,
@@ -477,10 +505,13 @@ export class BrokerProxyService extends EventEmitter {
       const isCancelLike = messageType.toLowerCase().includes('cancel') ||
         (innerBody && typeof innerBody === 'object' && JSON.stringify(innerBody).toLowerCase().includes('cancel'));
       if (isCancelLike) {
-        log()?.info(`[BrokerProxy] CANCEL signal detected! messageType=${messageType}, target=${state.target.displayName}`);
+        log()?.info(`[BrokerProxy] CANCEL signal detected! messageType=${messageType}, target=${state.target.displayName}/${instance.instanceNum}`);
         log()?.info(`[BrokerProxy] Cancel message body: ${body.slice(0, 500)}`);
+        // Acknowledge cancel messages immediately so they don't block job requests
+        // Cancel signals are only relevant if there's an active job to cancel
+        await this.acknowledgeMessageUpstream(state, instance, messageId);
       } else {
-        log()?.info(`[BrokerProxy] Non-job message (${messageType}) received from ${state.target.displayName}, forwarding to runner`);
+        log()?.info(`[BrokerProxy] Non-job message (${messageType}) received from ${state.target.displayName}/${instance.instanceNum}, forwarding to runner`);
       }
       if (!this.messageQueues.has(targetId)) {
         this.messageQueues.set(targetId, []);
@@ -514,11 +545,18 @@ export class BrokerProxyService extends EventEmitter {
     // Stop polling first
     this.stopPolling();
 
-    // Delete upstream sessions in background - don't wait during shutdown
-    // Sessions will expire on their own if deletion fails
-    for (const state of this.targets.values()) {
-      this.deleteUpstreamSession(state).catch(() => {});
-    }
+    // Delete upstream sessions - wait for completion
+    // Sessions are removed from disk file as they're successfully deleted
+    // Any that fail will remain in the file for cleanup on next startup
+    const deletionPromises = Array.from(this.targets.values()).map(state =>
+      this.deleteUpstreamSession(state)
+    );
+
+    // Wait for all deletions with a timeout to not block shutdown forever
+    await Promise.race([
+      Promise.allSettled(deletionPromises),
+      new Promise(resolve => setTimeout(resolve, 5000)), // 5 second timeout
+    ]);
 
     return new Promise((resolve) => {
       // Force close all connections immediately - don't wait for long-polls to timeout
@@ -564,32 +602,47 @@ export class BrokerProxyService extends EventEmitter {
 
   /**
    * Get status for all targets.
+   * Aggregates status across all instances for each target.
    */
   getStatus(): RunnerProxyStatus[] {
-    return Array.from(this.targets.values()).map(state => ({
-      targetId: state.target.id,
-      registered: true, // We have credentials, so registered
-      sessionActive: !!state.sessionId,
-      lastPoll: state.lastPoll?.toISOString() || null,
-      jobsAssigned: state.jobsAssigned,
-      error: state.error,
-    }));
+    return Array.from(this.targets.values()).map(state => {
+      const instances = Array.from(state.instances.values());
+      const activeSessionCount = instances.filter(i => !!i.sessionId).length;
+      const latestPoll = instances.reduce((latest, i) => {
+        if (!i.lastPoll) return latest;
+        if (!latest) return i.lastPoll;
+        return i.lastPoll > latest ? i.lastPoll : latest;
+      }, null as Date | null);
+      const errors = instances.map(i => i.error).filter(Boolean);
+
+      return {
+        targetId: state.target.id,
+        registered: instances.length > 0, // We have credentials, so registered
+        sessionActive: activeSessionCount > 0,
+        lastPoll: latestPoll?.toISOString() || null,
+        jobsAssigned: state.jobsAssigned,
+        error: errors.length > 0 ? errors.join('; ') : undefined,
+        // Additional info for debugging
+        instanceCount: instances.length,
+        activeInstances: activeSessionCount,
+      };
+    });
   }
 
   // --------------------------------------------------------------------------
   // OAuth Token Management
   // --------------------------------------------------------------------------
 
-  private async getOAuthToken(state: TargetState): Promise<string> {
+  private async getOAuthToken(state: TargetState, instance: RunnerInstanceState): Promise<string> {
     // Check if we have a valid cached token (with 1 minute buffer)
-    if (state.accessToken && state.tokenExpiry && Date.now() < state.tokenExpiry - 60000) {
-      return state.accessToken;
+    if (instance.accessToken && instance.tokenExpiry && Date.now() < instance.tokenExpiry - 60000) {
+      return instance.accessToken;
     }
 
-    const privateKey = buildPrivateKey(state.rsaParams);
+    const privateKey = buildPrivateKey(instance.rsaParams);
     const jwt = createJWT(
-      state.credentials.data.clientId,
-      state.credentials.data.authorizationUrl,
+      instance.credentials.data.clientId,
+      instance.credentials.data.authorizationUrl,
       privateKey
     );
 
@@ -599,7 +652,7 @@ export class BrokerProxyService extends EventEmitter {
       client_assertion: jwt,
     }).toString();
 
-    const response = await httpsRequest(state.credentials.data.authorizationUrl, {
+    const response = await httpsRequest(instance.credentials.data.authorizationUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -612,22 +665,142 @@ export class BrokerProxyService extends EventEmitter {
     }
 
     const tokenData = JSON.parse(response.body);
-    state.accessToken = tokenData.access_token;
-    state.tokenExpiry = Date.now() + (tokenData.expires_in * 1000);
+    instance.accessToken = tokenData.access_token;
+    instance.tokenExpiry = Date.now() + (tokenData.expires_in * 1000);
 
-    log()?.debug( `[BrokerProxy] Got OAuth token for ${state.target.displayName}`);
-    return state.accessToken!;
+    log()?.debug( `[BrokerProxy] Got OAuth token for ${state.target.displayName}/${instance.instanceNum}`);
+    return instance.accessToken!;
+  }
+
+  // --------------------------------------------------------------------------
+  // Session Persistence (for cleanup on restart)
+  // --------------------------------------------------------------------------
+
+  private getSessionFilePath(): string {
+    return path.join(getRunnerDir(), 'broker-sessions.json');
+  }
+
+  /**
+   * Load saved session IDs from disk.
+   */
+  private loadSavedSessionIds(): Record<string, Record<number, string>> {
+    try {
+      const data = fs.readFileSync(this.getSessionFilePath(), 'utf-8');
+      return JSON.parse(data);
+    } catch {
+      return {};
+    }
+  }
+
+  /**
+   * Save a session ID to disk (for crash recovery).
+   */
+  private saveSessionId(targetId: string, instanceNum: number, sessionId: string): void {
+    const sessions = this.loadSavedSessionIds();
+    if (!sessions[targetId]) sessions[targetId] = {};
+    sessions[targetId][instanceNum] = sessionId;
+    try {
+      fs.writeFileSync(this.getSessionFilePath(), JSON.stringify(sessions, null, 2));
+    } catch {
+      // Ignore write errors
+    }
+  }
+
+  /**
+   * Remove a session ID from disk (after successful deletion).
+   */
+  private removeSessionId(targetId: string, instanceNum: number): void {
+    const sessions = this.loadSavedSessionIds();
+    if (sessions[targetId]) {
+      delete sessions[targetId][instanceNum];
+      if (Object.keys(sessions[targetId]).length === 0) {
+        delete sessions[targetId];
+      }
+    }
+    try {
+      if (Object.keys(sessions).length === 0) {
+        fs.unlinkSync(this.getSessionFilePath());
+      } else {
+        fs.writeFileSync(this.getSessionFilePath(), JSON.stringify(sessions, null, 2));
+      }
+    } catch {
+      // Ignore errors
+    }
+  }
+
+  /**
+   * Clear all saved session IDs from disk.
+   */
+  private clearSavedSessionIds(): void {
+    try {
+      fs.unlinkSync(this.getSessionFilePath());
+    } catch {
+      // Ignore if file doesn't exist
+    }
+  }
+
+  /**
+   * Clean up any stale sessions from a previous run.
+   * Called on startup before creating new sessions.
+   */
+  private async cleanupStaleSessions(): Promise<void> {
+    const savedSessions = this.loadSavedSessionIds();
+    const sessionCount = Object.values(savedSessions).reduce(
+      (sum, targetSessions) => sum + Object.keys(targetSessions).length, 0
+    );
+
+    if (sessionCount === 0) {
+      return;
+    }
+
+    log()?.info(`[BrokerProxy] Cleaning up ${sessionCount} stale sessions from previous run...`);
+
+    const deletions: Promise<void>[] = [];
+
+    for (const [targetId, targetSessions] of Object.entries(savedSessions)) {
+      const state = this.targets.get(targetId);
+      if (!state) continue;
+
+      for (const [instanceNumStr, sessionId] of Object.entries(targetSessions)) {
+        const instanceNum = parseInt(instanceNumStr, 10);
+        const instance = state.instances.get(instanceNum);
+        if (!instance) continue;
+
+        // Temporarily set sessionId so we can delete it
+        instance.sessionId = sessionId;
+        deletions.push(
+          this.deleteUpstreamInstanceSession(state, instance).then(() => {
+            log()?.debug(`[BrokerProxy] Deleted stale session for ${state.target.displayName}/${instanceNum}`);
+          }).catch(err => {
+            log()?.debug(`[BrokerProxy] Could not delete stale session for ${state.target.displayName}/${instanceNum}: ${(err as Error).message}`);
+          }).finally(() => {
+            // Clear the sessionId so we create a new one
+            instance.sessionId = undefined;
+          })
+        );
+      }
+    }
+
+    // Wait for all deletions with timeout
+    await Promise.race([
+      Promise.allSettled(deletions),
+      new Promise(resolve => setTimeout(resolve, 5000)),
+    ]);
+
+    // Clear the saved sessions file
+    this.clearSavedSessionIds();
+    log()?.info(`[BrokerProxy] Stale session cleanup complete`);
   }
 
   // --------------------------------------------------------------------------
   // Upstream Session Management
   // --------------------------------------------------------------------------
 
-  private async createUpstreamSession(state: TargetState, retriesLeft = 3): Promise<string> {
-    const token = await this.getOAuthToken(state);
-    const brokerUrl = state.runner.serverUrlV2;
+  private async createUpstreamSession(state: TargetState, instance: RunnerInstanceState, retriesLeft = 3): Promise<string> {
+    const token = await this.getOAuthToken(state, instance);
+    const brokerUrl = instance.runner.serverUrlV2;
 
-    log()?.debug(`[BrokerProxy] Creating session for ${state.target.displayName}`);
+    log()?.debug(`[BrokerProxy] Creating session for ${state.target.displayName}/${instance.instanceNum}`);
 
     const response = await httpsRequest(`${brokerUrl}session`, {
       method: 'POST',
@@ -640,7 +813,7 @@ export class BrokerProxyService extends EventEmitter {
 
     // Handle 409 Conflict - session already exists
     if (response.statusCode === 409 && retriesLeft > 0) {
-      log()?.info(`[BrokerProxy] Session conflict for ${state.target.displayName}, retries left: ${retriesLeft}`);
+      log()?.info(`[BrokerProxy] Session conflict for ${state.target.displayName}/${instance.instanceNum}, retries left: ${retriesLeft}`);
       log()?.debug(`[BrokerProxy] Conflict response: ${response.body}`);
 
       // Try to extract existing session ID from response
@@ -648,20 +821,22 @@ export class BrokerProxyService extends EventEmitter {
       try {
         const conflictData = JSON.parse(response.body);
         if (conflictData.sessionId) {
-          state.sessionId = conflictData.sessionId;
-          await this.deleteUpstreamSession(state);
+          instance.sessionId = conflictData.sessionId;
+          await this.deleteUpstreamInstanceSession(state, instance);
           deletedSession = true;
         }
       } catch {
         // Response might not have session ID
       }
 
-      // Wait with exponential backoff: 2s, 4s, 8s
-      const waitMs = deletedSession ? 1000 : 2000 * Math.pow(2, 3 - retriesLeft);
-      log()?.info(`[BrokerProxy] Waiting ${waitMs}ms before retry...`);
+      // Wait with backoff: 2s, 4s, 8s
+      // With proper session cleanup on startup/shutdown, conflicts should be rare
+      const attemptNum = 3 - retriesLeft + 1;
+      const waitMs = deletedSession ? 1000 : 2000 * Math.pow(2, attemptNum - 1);
+      log()?.info(`[BrokerProxy] Waiting ${waitMs / 1000}s before retry (attempt ${attemptNum}/3)...`);
       await new Promise(resolve => setTimeout(resolve, waitMs));
 
-      return this.createUpstreamSession(state, retriesLeft - 1);
+      return this.createUpstreamSession(state, instance, retriesLeft - 1);
     }
 
     if (response.statusCode !== 200 && response.statusCode !== 201) {
@@ -669,34 +844,54 @@ export class BrokerProxyService extends EventEmitter {
     }
 
     const sessionData = JSON.parse(response.body);
-    state.sessionId = sessionData.sessionId;
-    state.error = undefined;
+    const sessionId = sessionData.sessionId as string;
+    instance.sessionId = sessionId;
+    instance.error = undefined;
 
-    log()?.info(`[BrokerProxy] Session created for ${state.target.displayName}`);
+    // Save to disk for crash recovery
+    this.saveSessionId(state.target.id, instance.instanceNum, sessionId);
+
+    log()?.info(`[BrokerProxy] Session created for ${state.target.displayName}/${instance.instanceNum}`);
     this.emitStatusUpdate();
 
-    return state.sessionId!;
+    return instance.sessionId!;
   }
 
+  /**
+   * Delete all upstream sessions for a target (in parallel).
+   */
   private async deleteUpstreamSession(state: TargetState): Promise<void> {
-    if (!state.sessionId) return;
+    const deletions = Array.from(state.instances.values()).map(instance =>
+      this.deleteUpstreamInstanceSession(state, instance)
+    );
+    await Promise.allSettled(deletions);
+  }
+
+  /**
+   * Delete upstream session for a single instance.
+   */
+  private async deleteUpstreamInstanceSession(state: TargetState, instance: RunnerInstanceState): Promise<void> {
+    if (!instance.sessionId) return;
 
     try {
-      const token = await this.getOAuthToken(state);
-      const brokerUrl = state.runner.serverUrlV2;
+      const token = await this.getOAuthToken(state, instance);
+      const brokerUrl = instance.runner.serverUrlV2;
 
-      await httpsRequest(`${brokerUrl}session?sessionId=${state.sessionId}`, {
+      await httpsRequest(`${brokerUrl}session?sessionId=${instance.sessionId}`, {
         method: 'DELETE',
         headers: {
           'Authorization': `Bearer ${token}`,
         },
       });
 
-      log()?.debug( `[BrokerProxy] Session deleted for ${state.target.displayName}`);
+      // Remove from disk after successful deletion
+      this.removeSessionId(state.target.id, instance.instanceNum);
+      log()?.debug(`[BrokerProxy] Session deleted for ${state.target.displayName}/${instance.instanceNum}`);
     } catch (error) {
-      log()?.warn( `[BrokerProxy] Failed to delete session: ${(error as Error).message}`);
+      log()?.warn(`[BrokerProxy] Failed to delete session: ${(error as Error).message}`);
+      throw error; // Re-throw so caller knows deletion failed
     } finally {
-      state.sessionId = undefined;
+      instance.sessionId = undefined;
       this.emitStatusUpdate();
     }
   }
@@ -705,46 +900,46 @@ export class BrokerProxyService extends EventEmitter {
    * Schedule a background retry for session creation.
    * This handles the case where GitHub has a stale session that takes ~90s to expire.
    */
-  private scheduleSessionRetry(state: TargetState): void {
-    const targetId = state.target.id;
+  private scheduleSessionRetry(state: TargetState, instance: RunnerInstanceState): void {
+    const retryKey = `${state.target.id}/${instance.instanceNum}`;
 
     // Don't schedule if already scheduled or if we're shutting down
-    if (this.sessionRetryTimeouts.has(targetId) || this.isShuttingDown) {
+    if (this.sessionRetryTimeouts.has(retryKey) || this.isShuttingDown) {
       return;
     }
 
-    log()?.info(`[BrokerProxy] Scheduling session retry for ${state.target.displayName} in ${BrokerProxyService.SESSION_RETRY_INTERVAL_MS / 1000}s`);
+    log()?.info(`[BrokerProxy] Scheduling session retry for ${state.target.displayName}/${instance.instanceNum} in ${BrokerProxyService.SESSION_RETRY_INTERVAL_MS / 1000}s`);
 
     const timeout = setTimeout(async () => {
-      this.sessionRetryTimeouts.delete(targetId);
+      this.sessionRetryTimeouts.delete(retryKey);
 
       if (this.isShuttingDown || !this.isRunning) {
         return;
       }
 
       // Skip if session was already created (e.g., by another code path)
-      if (state.sessionId) {
-        log()?.debug(`[BrokerProxy] Session already exists for ${state.target.displayName}, skipping retry`);
+      if (instance.sessionId) {
+        log()?.debug(`[BrokerProxy] Session already exists for ${state.target.displayName}/${instance.instanceNum}, skipping retry`);
         return;
       }
 
-      log()?.info(`[BrokerProxy] Retrying session creation for ${state.target.displayName}...`);
+      log()?.info(`[BrokerProxy] Retrying session creation for ${state.target.displayName}/${instance.instanceNum}...`);
 
       try {
-        await this.createUpstreamSession(state);
-        state.error = undefined;
-        log()?.info(`[BrokerProxy] Session retry succeeded for ${state.target.displayName}`);
+        await this.createUpstreamSession(state, instance);
+        instance.error = undefined;
+        log()?.info(`[BrokerProxy] Session retry succeeded for ${state.target.displayName}/${instance.instanceNum}`);
         this.emitStatusUpdate();
       } catch (error) {
-        log()?.warn(`[BrokerProxy] Session retry failed for ${state.target.displayName}: ${(error as Error).message}`);
-        state.error = (error as Error).message;
+        log()?.warn(`[BrokerProxy] Session retry failed for ${state.target.displayName}/${instance.instanceNum}: ${(error as Error).message}`);
+        instance.error = (error as Error).message;
         this.emitStatusUpdate();
         // Schedule another retry
-        this.scheduleSessionRetry(state);
+        this.scheduleSessionRetry(state, instance);
       }
     }, BrokerProxyService.SESSION_RETRY_INTERVAL_MS);
 
-    this.sessionRetryTimeouts.set(targetId, timeout);
+    this.sessionRetryTimeouts.set(retryKey, timeout);
   }
 
   /**
@@ -757,14 +952,14 @@ export class BrokerProxyService extends EventEmitter {
     this.sessionRetryTimeouts.clear();
   }
 
-  private async pollUpstreamTarget(state: TargetState): Promise<{ hasMessage: boolean; body: string }> {
-    if (!state.sessionId) {
-      await this.createUpstreamSession(state);
+  private async pollUpstreamInstance(state: TargetState, instance: RunnerInstanceState): Promise<{ hasMessage: boolean; body: string }> {
+    if (!instance.sessionId) {
+      await this.createUpstreamSession(state, instance);
     }
 
-    const token = await this.getOAuthToken(state);
-    const brokerUrl = state.runner.serverUrlV2;
-    const pollUrl = `${brokerUrl}message?sessionId=${state.sessionId}&status=Online&runnerVersion=${this.runnerVersion}&os=darwin&architecture=arm64&disableUpdate=true`;
+    const token = await this.getOAuthToken(state, instance);
+    const brokerUrl = instance.runner.serverUrlV2;
+    const pollUrl = `${brokerUrl}message?sessionId=${instance.sessionId}&status=Online&runnerVersion=${this.runnerVersion}&os=darwin&architecture=arm64&disableUpdate=true`;
 
     try {
       const response = await httpsRequest(pollUrl, {
@@ -775,23 +970,23 @@ export class BrokerProxyService extends EventEmitter {
         },
       });
 
-      state.lastPoll = new Date();
-      const hadError = !!state.error;
-      state.error = undefined;
+      instance.lastPoll = new Date();
+      const hadError = !!instance.error;
+      instance.error = undefined;
       if (hadError) {
         this.emitStatusUpdate(); // Notify UI that error was cleared
       }
 
       // Log poll results for debugging
       if (response.statusCode === 200 && response.body) {
-        log()?.info(`[BrokerProxy] Poll ${state.target.displayName}: got message (${response.body.length} bytes)`);
+        log()?.info(`[BrokerProxy] Poll ${state.target.displayName}/${instance.instanceNum}: got message (${response.body.length} bytes)`);
         return { hasMessage: true, body: response.body };
       }
-      log()?.info(`[BrokerProxy] Poll ${state.target.displayName}: no message (status=${response.statusCode})`);
+      log()?.debug(`[BrokerProxy] Poll ${state.target.displayName}/${instance.instanceNum}: no message (status=${response.statusCode})`);
       return { hasMessage: false, body: '' };
     } catch (error) {
-      const hadError = !!state.error;
-      state.error = (error as Error).message;
+      const hadError = !!instance.error;
+      instance.error = (error as Error).message;
       if (!hadError) {
         this.emitStatusUpdate(); // Notify UI of new error
       }
@@ -803,11 +998,11 @@ export class BrokerProxyService extends EventEmitter {
   /**
    * Acknowledge a message to GitHub so it won't be sent again.
    */
-  private async acknowledgeMessageUpstream(state: TargetState, messageId: string): Promise<void> {
+  private async acknowledgeMessageUpstream(state: TargetState, instance: RunnerInstanceState, messageId: string): Promise<void> {
     try {
-      const token = await this.getOAuthToken(state);
-      const brokerUrl = state.runner.serverUrlV2;
-      const ackUrl = `${brokerUrl}acknowledge?sessionId=${state.sessionId}`;
+      const token = await this.getOAuthToken(state, instance);
+      const brokerUrl = instance.runner.serverUrlV2;
+      const ackUrl = `${brokerUrl}acknowledge?sessionId=${instance.sessionId}`;
 
       const body = JSON.stringify({ messageId });
 
@@ -837,9 +1032,9 @@ export class BrokerProxyService extends EventEmitter {
    * This claims the job so GitHub won't return it on subsequent polls.
    * Must use run_service_url, not broker URL.
    */
-  private async acquireJobUpstream(state: TargetState, jobId: string, runServiceUrl: string, billingOwnerId?: string): Promise<string | null> {
-    const token = await this.getOAuthToken(state);
-    const acquireUrl = `${runServiceUrl}acquirejob?sessionId=${state.sessionId}`;
+  private async acquireJobUpstream(state: TargetState, instance: RunnerInstanceState, jobId: string, runServiceUrl: string, billingOwnerId?: string): Promise<string | null> {
+    const token = await this.getOAuthToken(state, instance);
+    const acquireUrl = `${runServiceUrl}acquirejob?sessionId=${instance.sessionId}`;
 
     // GitHub expects jobMessageId (the runner_request_id UUID) as a string for acquiring jobs
     // Also include billingOwnerId and runnerOS as required by the API
@@ -922,17 +1117,18 @@ export class BrokerProxyService extends EventEmitter {
     const targetId = this.pendingTargetAssignments.shift();
     log()?.debug(`[BrokerProxy] Creating local session ${sessionId} for target ${targetId || 'unknown'}`);
 
-    // Only create upstream sessions if they don't already exist
+    // Only create upstream sessions for instances that don't already have them
     // (sessions are created on broker start, workers just reuse them)
-    const enabledTargets = Array.from(this.targets.values())
-      .filter(s => s.target.enabled && !s.sessionId);
-
-    for (const state of enabledTargets) {
-      try {
-        await this.createUpstreamSession(state);
-      } catch (error) {
-        log()?.error(`[BrokerProxy] Failed to create upstream session for ${state.target.displayName}: ${(error as Error).message}`);
-        state.error = (error as Error).message;
+    for (const state of this.targets.values()) {
+      if (!state.target.enabled) continue;
+      for (const instance of state.instances.values()) {
+        if (instance.sessionId) continue; // Already has session
+        try {
+          await this.createUpstreamSession(state, instance);
+        } catch (error) {
+          log()?.error(`[BrokerProxy] Failed to create upstream session for ${state.target.displayName}/${instance.instanceNum}: ${(error as Error).message}`);
+          instance.error = (error as Error).message;
+        }
       }
     }
 
@@ -1219,31 +1415,50 @@ export class BrokerProxyService extends EventEmitter {
     res: http.ServerResponse,
     url: URL
   ): Promise<void> {
-    // Determine which target to forward to based on local session ID
+    // Determine which target/instance to forward to based on local session ID
     const localSessionId = url.searchParams.get('sessionId');
     let targetState: TargetState | undefined;
+    let instance: RunnerInstanceState | undefined;
 
     // Look up local session to find associated target
     if (localSessionId) {
       const localSession = this.localSessions.get(localSessionId);
       if (localSession?.targetId) {
         targetState = this.targets.get(localSession.targetId);
+        // Find first active instance for this target
+        if (targetState) {
+          for (const inst of targetState.instances.values()) {
+            if (inst.sessionId) {
+              instance = inst;
+              break;
+            }
+          }
+        }
       }
     }
 
-    // Fallback to first enabled target with an active upstream session
-    if (!targetState) {
-      targetState = Array.from(this.targets.values())
-        .find(s => s.target.enabled && s.sessionId);
+    // Fallback to first enabled target with an active instance session
+    if (!targetState || !instance) {
+      for (const state of this.targets.values()) {
+        if (!state.target.enabled) continue;
+        for (const inst of state.instances.values()) {
+          if (inst.sessionId) {
+            targetState = state;
+            instance = inst;
+            break;
+          }
+        }
+        if (instance) break;
+      }
     }
 
-    if (!targetState || !targetState.sessionId) {
+    if (!targetState || !instance || !instance.sessionId) {
       res.writeHead(503, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'No active target sessions' }));
       return;
     }
 
-    log()?.info(`[BrokerProxy] Forward using target ${targetState.target.displayName}, upstream sessionId=${targetState.sessionId}`);
+    log()?.info(`[BrokerProxy] Forward using ${targetState.target.displayName}/${instance.instanceNum}, upstream sessionId=${instance.sessionId}`);
 
     // Read request body first (needed for routing decisions)
     const chunks: Buffer[] = [];
@@ -1255,10 +1470,10 @@ export class BrokerProxyService extends EventEmitter {
     // Replace local session ID with upstream session ID in query params
     const upstreamParams = new URLSearchParams(url.search);
     if (localSessionId) {
-      upstreamParams.set('sessionId', targetState.sessionId);
+      upstreamParams.set('sessionId', instance.sessionId);
     }
 
-    const token = await this.getOAuthToken(targetState);
+    const token = await this.getOAuthToken(targetState, instance);
 
     // Determine upstream URL - job operations go to run_service_url, others to broker
     let upstreamUrl: string;
@@ -1288,11 +1503,11 @@ export class BrokerProxyService extends EventEmitter {
         upstreamUrl = `${runServiceUrl}${url.pathname}?${upstreamParams.toString()}`;
         log()?.info(`[BrokerProxy] Forward ${req.method} ${url.pathname} -> run_service_url`);
       } else {
-        upstreamUrl = `${targetState.runner.serverUrlV2}${url.pathname.slice(1)}?${upstreamParams.toString()}`;
+        upstreamUrl = `${instance.runner.serverUrlV2}${url.pathname.slice(1)}?${upstreamParams.toString()}`;
         log()?.info(`[BrokerProxy] Forward ${req.method} ${url.pathname} -> broker (no run_service_url found)`);
       }
     } else {
-      upstreamUrl = `${targetState.runner.serverUrlV2}${url.pathname.slice(1)}?${upstreamParams.toString()}`;
+      upstreamUrl = `${instance.runner.serverUrlV2}${url.pathname.slice(1)}?${upstreamParams.toString()}`;
       log()?.debug(`[BrokerProxy] Forward ${req.method} ${url.pathname} -> broker`);
     }
 
@@ -1318,7 +1533,7 @@ export class BrokerProxyService extends EventEmitter {
   }
 
   /**
-   * Start the active polling loop to check all targets for jobs.
+   * Start the active polling loop to check all instances for jobs.
    */
   private startPolling(): void {
     if (this.pollInterval) return;
@@ -1335,25 +1550,31 @@ export class BrokerProxyService extends EventEmitter {
       this.isPolling = true;
 
       try {
-        // Poll all enabled targets with active sessions
-        // Since we acquire jobs immediately, GitHub won't return the same job twice
-        const allTargets = Array.from(this.targets.values());
-        const enabledTargets = allTargets.filter(s => s.target.enabled && s.sessionId);
+        // Collect all instances that have active sessions
+        const pollTasks: Array<{ state: TargetState; instance: RunnerInstanceState }> = [];
+        for (const state of this.targets.values()) {
+          if (!state.target.enabled) continue;
+          for (const instance of state.instances.values()) {
+            if (instance.sessionId) {
+              pollTasks.push({ state, instance });
+            }
+          }
+        }
 
-        log()?.debug(`[BrokerProxy] Polling ${enabledTargets.length}/${allTargets.length} targets`);
+        log()?.debug(`[BrokerProxy] Polling ${pollTasks.length} instances across ${this.targets.size} targets`);
 
-        if (enabledTargets.length === 0) return;
+        if (pollTasks.length === 0) return;
 
-        // Poll all targets concurrently and process messages immediately as they arrive
-        const pollPromises = enabledTargets.map(async (state) => {
+        // Poll all instances concurrently and process messages immediately as they arrive
+        const pollPromises = pollTasks.map(async ({ state, instance }) => {
           try {
-            const result = await this.pollUpstreamTarget(state);
+            const result = await this.pollUpstreamInstance(state, instance);
             // Process message immediately when poll completes - don't wait for other polls
             if (result.hasMessage) {
-              await this.processMessage(state, result.body);
+              await this.processMessage(state, instance, result.body);
             }
           } catch (error) {
-            state.error = (error as Error).message;
+            instance.error = (error as Error).message;
           }
         });
 

@@ -29,12 +29,12 @@ jest.mock('./app-state', () => ({
 }));
 
 // Mock runner-proxy-manager
-const mockRegister = jest.fn<() => Promise<void>>();
-const mockUnregister = jest.fn<() => Promise<void>>();
+const mockRegisterAll = jest.fn<() => Promise<Array<{ instanceNum: number }>>>();
+const mockUnregisterAll = jest.fn<() => Promise<void>>();
 jest.mock('./runner-proxy-manager', () => ({
   getRunnerProxyManager: jest.fn(() => ({
-    register: mockRegister,
-    unregister: mockUnregister,
+    registerAll: mockRegisterAll,
+    unregisterAll: mockUnregisterAll,
   })),
 }));
 
@@ -46,9 +46,9 @@ describe('TargetManager', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    mockLoadConfig.mockReturnValue({ targets: [] });
-    mockRegister.mockResolvedValue(undefined);
-    mockUnregister.mockResolvedValue(undefined);
+    mockLoadConfig.mockReturnValue({ targets: [], maxConcurrentJobs: 4 });
+    mockRegisterAll.mockResolvedValue([{ instanceNum: 1 }, { instanceNum: 2 }, { instanceNum: 3 }, { instanceNum: 4 }]);
+    mockUnregisterAll.mockResolvedValue(undefined);
     manager = new TargetManager();
   });
 
@@ -160,12 +160,12 @@ describe('TargetManager', () => {
         proxyRunnerName: 'localmost.test-host.testowner-testrepo',
         enabled: true,
       });
-      expect(mockRegister).toHaveBeenCalled();
+      expect(mockRegisterAll).toHaveBeenCalled();
       expect(mockSaveConfig).toHaveBeenCalled();
     });
 
     it('should add an org target successfully', async () => {
-      mockLoadConfig.mockReturnValue({ targets: [] });
+      mockLoadConfig.mockReturnValue({ targets: [], maxConcurrentJobs: 4 });
 
       const result = await manager.addTarget('org', 'testorg');
 
@@ -179,13 +179,13 @@ describe('TargetManager', () => {
         proxyRunnerName: 'localmost.test-host.testorg',
         enabled: true,
       });
-      expect(mockRegister).toHaveBeenCalled();
+      expect(mockRegisterAll).toHaveBeenCalled();
       expect(mockSaveConfig).toHaveBeenCalled();
     });
 
     it('should return error when proxy registration fails', async () => {
-      mockLoadConfig.mockReturnValue({ targets: [] });
-      mockRegister.mockRejectedValue(new Error('Registration failed'));
+      mockLoadConfig.mockReturnValue({ targets: [], maxConcurrentJobs: 4 });
+      mockRegisterAll.mockRejectedValue(new Error('Registration failed'));
 
       const result = await manager.addTarget('repo', 'testowner', 'testrepo');
 
@@ -222,7 +222,7 @@ describe('TargetManager', () => {
       const result = await manager.removeTarget('test-1');
 
       expect(result.success).toBe(true);
-      expect(mockUnregister).toHaveBeenCalledWith(target);
+      expect(mockUnregisterAll).toHaveBeenCalledWith(target);
       expect(mockSaveConfig).toHaveBeenCalledWith({ targets: [] });
     });
 
@@ -239,7 +239,7 @@ describe('TargetManager', () => {
         addedAt: '2024-01-01T00:00:00.000Z',
       };
       mockLoadConfig.mockReturnValue({ targets: [target] });
-      mockUnregister.mockRejectedValue(new Error('Unregister failed'));
+      mockUnregisterAll.mockRejectedValue(new Error('Unregister failed'));
 
       const result = await manager.removeTarget('test-1');
 

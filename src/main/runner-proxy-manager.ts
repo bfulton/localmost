@@ -2,13 +2,14 @@
  * Runner Proxy Manager
  *
  * Manages "phantom" runner registrations with GitHub for multi-target support.
- * Each target gets its own runner registration that maintains broker sessions.
+ * Each target gets N runner registrations (one per parallel job slot) that
+ * maintain broker sessions.
  *
  * Directory structure:
  * ~/.localmost/runner/proxies/<target-id>/
- *   .runner              - Runner config (agent ID, URLs, etc.)
- *   .credentials         - OAuth credentials
- *   .credentials_rsaparams - RSA private key for JWT signing
+ *   1/.runner, 1/.credentials, 1/.credentials_rsaparams  - Runner instance 1
+ *   2/.runner, 2/.credentials, 2/.credentials_rsaparams  - Runner instance 2
+ *   ...
  */
 
 import * as fs from 'fs';
@@ -72,9 +73,14 @@ export interface ProxyCredentials {
 /** Remove BOM from JSON files (Windows encoding) */
 const removeBOM = (str: string): string => str.replace(/^\uFEFF/, '');
 
-/** Get proxy credentials directory for a target */
-const getProxyDir = (targetId: string): string => {
+/** Get base proxy directory for a target */
+const getProxyBaseDir = (targetId: string): string => {
   return path.join(getRunnerDir(), 'proxies', targetId);
+};
+
+/** Get proxy credentials directory for a specific instance of a target */
+const getProxyInstanceDir = (targetId: string, instanceNum: number): string => {
+  return path.join(getProxyBaseDir(targetId), String(instanceNum));
 };
 
 // ============================================================================
@@ -85,47 +91,131 @@ export class RunnerProxyManager {
   private registeredTargets: Set<string> = new Set();
 
   /**
-   * Check if a target has credentials (was previously registered).
+   * Check if a target has any registered instances.
    */
   hasCredentials(targetId: string): boolean {
-    const proxyDir = getProxyDir(targetId);
-    const credFiles = ['.runner', '.credentials', '.credentials_rsaparams'];
-    return credFiles.every(file => fs.existsSync(path.join(proxyDir, file)));
+    const baseDir = getProxyBaseDir(targetId);
+    if (!fs.existsSync(baseDir)) return false;
+
+    // Check if any numbered subdirectory has credentials
+    try {
+      const entries = fs.readdirSync(baseDir);
+      return entries.some(entry => {
+        const num = parseInt(entry, 10);
+        if (isNaN(num)) return false;
+        const instanceDir = path.join(baseDir, entry);
+        if (!fs.statSync(instanceDir).isDirectory()) return false;
+        const credFiles = ['.runner', '.credentials', '.credentials_rsaparams'];
+        return credFiles.every(file => fs.existsSync(path.join(instanceDir, file)));
+      });
+    } catch {
+      return false;
+    }
   }
 
   /**
-   * Load credentials for a target.
+   * Get the count of registered instances for a target.
+   */
+  getInstanceCount(targetId: string): number {
+    const baseDir = getProxyBaseDir(targetId);
+    if (!fs.existsSync(baseDir)) return 0;
+
+    try {
+      const entries = fs.readdirSync(baseDir);
+      return entries.filter(entry => {
+        const num = parseInt(entry, 10);
+        if (isNaN(num)) return false;
+        const instanceDir = path.join(baseDir, entry);
+        if (!fs.statSync(instanceDir).isDirectory()) return false;
+        return fs.existsSync(path.join(instanceDir, '.runner'));
+      }).length;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Load credentials for a specific instance of a target.
    * Returns null if credentials don't exist or are invalid.
    */
-  loadCredentials(targetId: string): ProxyCredentials | null {
-    const proxyDir = getProxyDir(targetId);
+  loadCredentials(targetId: string, instanceNum: number): ProxyCredentials | null {
+    const instanceDir = getProxyInstanceDir(targetId, instanceNum);
     const log = () => getLogger();
 
     try {
       const runner = JSON.parse(removeBOM(
-        fs.readFileSync(path.join(proxyDir, '.runner'), 'utf-8')
+        fs.readFileSync(path.join(instanceDir, '.runner'), 'utf-8')
       )) as RunnerFileConfig;
 
       const credentials = JSON.parse(removeBOM(
-        fs.readFileSync(path.join(proxyDir, '.credentials'), 'utf-8')
+        fs.readFileSync(path.join(instanceDir, '.credentials'), 'utf-8')
       )) as CredentialsFile;
 
       const rsaParams = JSON.parse(removeBOM(
-        fs.readFileSync(path.join(proxyDir, '.credentials_rsaparams'), 'utf-8')
+        fs.readFileSync(path.join(instanceDir, '.credentials_rsaparams'), 'utf-8')
       )) as RSAParamsFile;
 
       return { runner, credentials, rsaParams };
     } catch (error) {
-      log()?.debug(`[RunnerProxyManager] Failed to load credentials for ${targetId}: ${(error as Error).message}`);
+      log()?.debug(`[RunnerProxyManager] Failed to load credentials for ${targetId}/${instanceNum}: ${(error as Error).message}`);
       return null;
     }
   }
 
   /**
-   * Register a runner proxy for a target.
-   * This creates a GitHub runner registration and stores the credentials locally.
+   * Load all credentials for a target.
+   * Returns array of credentials with instance numbers.
    */
-  async register(target: Target): Promise<ProxyCredentials> {
+  loadAllCredentials(targetId: string): Array<{ instanceNum: number } & ProxyCredentials> {
+    const baseDir = getProxyBaseDir(targetId);
+    if (!fs.existsSync(baseDir)) return [];
+
+    const results: Array<{ instanceNum: number } & ProxyCredentials> = [];
+
+    try {
+      const entries = fs.readdirSync(baseDir);
+      for (const entry of entries) {
+        const num = parseInt(entry, 10);
+        if (isNaN(num)) continue;
+
+        const creds = this.loadCredentials(targetId, num);
+        if (creds) {
+          results.push({ instanceNum: num, ...creds });
+        }
+      }
+    } catch {
+      // Ignore errors
+    }
+
+    return results.sort((a, b) => a.instanceNum - b.instanceNum);
+  }
+
+  /**
+   * Register all runner instances for a target.
+   * Creates N GitHub runner registrations and stores credentials locally.
+   */
+  async registerAll(target: Target, count: number): Promise<Array<{ instanceNum: number } & ProxyCredentials>> {
+    const log = () => getLogger();
+    log()?.info(`[RunnerProxyManager] Registering ${count} proxies for ${target.displayName}...`);
+
+    const results: Array<{ instanceNum: number } & ProxyCredentials> = [];
+
+    for (let i = 1; i <= count; i++) {
+      const creds = await this.registerInstance(target, i);
+      results.push({ instanceNum: i, ...creds });
+    }
+
+    this.registeredTargets.add(target.id);
+    log()?.info(`[RunnerProxyManager] Successfully registered ${count} proxies for ${target.displayName}`);
+
+    return results;
+  }
+
+  /**
+   * Register a single runner instance for a target.
+   * The runner name will have a .N suffix (e.g., localmost.blue-243.myrepo.1)
+   */
+  async registerInstance(target: Target, instanceNum: number): Promise<ProxyCredentials> {
     const githubAuth = getGitHubAuth();
     const runnerDownloader = getRunnerDownloader();
     const log = () => getLogger();
@@ -139,7 +229,8 @@ export class RunnerProxyManager {
       throw new Error('Not authenticated');
     }
 
-    log()?.info(`[RunnerProxyManager] Registering proxy for ${target.displayName}...`);
+    const runnerName = `${target.proxyRunnerName}.${instanceNum}`;
+    log()?.info(`[RunnerProxyManager] Registering instance ${instanceNum} as ${runnerName}...`);
 
     // Get registration token
     let registrationToken: string;
@@ -159,9 +250,9 @@ export class RunnerProxyManager {
       throw new Error('No runner version installed');
     }
 
-    // Create proxy directory
-    const proxyDir = getProxyDir(target.id);
-    await fs.promises.mkdir(proxyDir, { recursive: true });
+    // Create instance directory
+    const instanceDir = getProxyInstanceDir(target.id, instanceNum);
+    await fs.promises.mkdir(instanceDir, { recursive: true });
 
     // Build a temporary sandbox for configuration
     const sandboxDir = await this.buildTempSandbox(version);
@@ -171,15 +262,15 @@ export class RunnerProxyManager {
       await this.runConfigScript(sandboxDir, {
         url: configUrl,
         token: registrationToken,
-        name: target.proxyRunnerName,
+        name: runnerName,
         labels: ['localmost-proxy'],
       });
 
-      // Copy credential files to proxy directory
+      // Copy credential files to instance directory
       const credFiles = ['.runner', '.credentials', '.credentials_rsaparams'];
       for (const file of credFiles) {
         const srcPath = path.join(sandboxDir, file);
-        const destPath = path.join(proxyDir, file);
+        const destPath = path.join(instanceDir, file);
         if (fs.existsSync(srcPath)) {
           await fs.promises.copyFile(srcPath, destPath);
         } else {
@@ -189,19 +280,18 @@ export class RunnerProxyManager {
 
       // Modify .runner to point to broker.actions.githubusercontent.com
       const runnerConfig = JSON.parse(removeBOM(
-        await fs.promises.readFile(path.join(proxyDir, '.runner'), 'utf-8')
+        await fs.promises.readFile(path.join(instanceDir, '.runner'), 'utf-8')
       ));
       runnerConfig.serverUrlV2 = 'https://broker.actions.githubusercontent.com/';
       await fs.promises.writeFile(
-        path.join(proxyDir, '.runner'),
+        path.join(instanceDir, '.runner'),
         JSON.stringify(runnerConfig, null, 2)
       );
 
-      this.registeredTargets.add(target.id);
-      log()?.info(`[RunnerProxyManager] Successfully registered proxy for ${target.displayName}`);
+      log()?.info(`[RunnerProxyManager] Registered instance ${instanceNum} for ${target.displayName}`);
 
       // Load and return the credentials
-      const credentials = this.loadCredentials(target.id);
+      const credentials = this.loadCredentials(target.id, instanceNum);
       if (!credentials) {
         throw new Error('Failed to load credentials after registration');
       }
@@ -213,16 +303,19 @@ export class RunnerProxyManager {
   }
 
   /**
-   * Unregister a runner proxy for a target.
-   * This removes the GitHub registration and local credentials.
+   * Unregister all runner instances for a target.
+   * Removes all GitHub registrations and local credentials.
    */
-  async unregister(target: Target): Promise<void> {
+  async unregisterAll(target: Target): Promise<void> {
     const githubAuth = getGitHubAuth();
     const log = () => getLogger();
 
-    log()?.info(`[RunnerProxyManager] Unregistering proxy for ${target.displayName}...`);
+    log()?.info(`[RunnerProxyManager] Unregistering all proxies for ${target.displayName}...`);
 
-    // Try to delete from GitHub first
+    // Get all registered instances
+    const instanceCount = this.getInstanceCount(target.id);
+
+    // Try to delete from GitHub
     if (githubAuth) {
       const accessToken = await getValidAccessToken();
       if (accessToken) {
@@ -235,47 +328,53 @@ export class RunnerProxyManager {
             runners = await githubAuth.listRunners(accessToken, target.owner, target.repo!);
           }
 
-          const runner = runners.find(r => r.name === target.proxyRunnerName);
-          if (runner) {
-            if (target.type === 'org') {
-              await githubAuth.deleteOrgRunner(accessToken, target.owner, runner.id);
-            } else {
-              await githubAuth.deleteRunner(accessToken, target.owner, target.repo!, runner.id);
+          // Find and delete all runners matching this target's pattern
+          const runnerPrefix = `${target.proxyRunnerName}.`;
+          const matchingRunners = runners.filter(r =>
+            r.name === target.proxyRunnerName || r.name.startsWith(runnerPrefix)
+          );
+
+          for (const runner of matchingRunners) {
+            try {
+              if (target.type === 'org') {
+                await githubAuth.deleteOrgRunner(accessToken, target.owner, runner.id);
+              } else {
+                await githubAuth.deleteRunner(accessToken, target.owner, target.repo!, runner.id);
+              }
+              log()?.info(`[RunnerProxyManager] Deleted GitHub registration for ${runner.name}`);
+            } catch (error) {
+              log()?.warn(`[RunnerProxyManager] Could not delete ${runner.name}: ${(error as Error).message}`);
             }
-            log()?.info(`[RunnerProxyManager] Deleted GitHub registration for ${target.proxyRunnerName}`);
           }
         } catch (error) {
-          log()?.warn(`[RunnerProxyManager] Could not delete GitHub registration: ${(error as Error).message}`);
+          log()?.warn(`[RunnerProxyManager] Could not list/delete GitHub registrations: ${(error as Error).message}`);
         }
       }
     }
 
-    // Remove local credentials
-    const proxyDir = getProxyDir(target.id);
+    // Remove local credentials directory
+    const baseDir = getProxyBaseDir(target.id);
     try {
-      await fs.promises.rm(proxyDir, { recursive: true, force: true });
+      await fs.promises.rm(baseDir, { recursive: true, force: true });
     } catch {
       // Ignore errors
     }
 
     this.registeredTargets.delete(target.id);
-    log()?.info(`[RunnerProxyManager] Unregistered proxy for ${target.displayName}`);
+    log()?.info(`[RunnerProxyManager] Unregistered ${instanceCount} proxies for ${target.displayName}`);
   }
 
   /**
    * Clear credentials for a target without deleting GitHub registration.
-   * Used when re-registration is needed.
+   * Used when re-registration is needed. Removes all instance directories.
    */
   async clearCredentials(targetId: string): Promise<void> {
-    const proxyDir = getProxyDir(targetId);
-    const credFiles = ['.runner', '.credentials', '.credentials_rsaparams'];
+    const baseDir = getProxyBaseDir(targetId);
 
-    for (const file of credFiles) {
-      try {
-        await fs.promises.unlink(path.join(proxyDir, file));
-      } catch {
-        // Ignore errors
-      }
+    try {
+      await fs.promises.rm(baseDir, { recursive: true, force: true });
+    } catch {
+      // Ignore errors
     }
 
     this.registeredTargets.delete(targetId);

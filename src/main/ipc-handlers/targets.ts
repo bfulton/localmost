@@ -36,14 +36,9 @@ export const registerTargetHandlers = (): void => {
         const brokerProxy = getBrokerProxyService();
         if (brokerProxy) {
           const proxyManager = getRunnerProxyManager();
-          const credentials = proxyManager.loadCredentials(result.data.id);
-          if (credentials) {
-            brokerProxy.addTarget(
-              result.data,
-              credentials.runner,
-              credentials.credentials,
-              credentials.rsaParams
-            );
+          const allCredentials = proxyManager.loadAllCredentials(result.data.id);
+          if (allCredentials.length > 0) {
+            brokerProxy.addTarget(result.data, allCredentials);
           }
         }
       }

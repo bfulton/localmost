@@ -324,26 +324,32 @@ export class RunnerDownloader {
    * Copy proxy credentials to an instance's config directory.
    * Used for multi-target support where workers use proxy credentials.
    * The .runner file is modified to point to the local broker proxy.
+   *
+   * Directory structure:
+   * proxyBaseDir/<instance>/.runner, .credentials, .credentials_rsaparams
    */
   async copyProxyCredentials(
     instance: number,
-    proxyDir: string,
+    proxyBaseDir: string,
     onLog?: (level: 'info' | 'error', message: string) => void
   ): Promise<void> {
     const log = onLog || (() => {});
     const configDir = this.getConfigDir(instance);
     const configFiles = ['.runner', '.credentials', '.credentials_rsaparams'];
 
+    // Credentials are in instance subdirectory (e.g., proxyBaseDir/1/, proxyBaseDir/2/)
+    const proxyInstanceDir = path.join(proxyBaseDir, String(instance));
+
     // Ensure config directory exists
     await fs.promises.mkdir(configDir, { recursive: true });
 
-    // Copy credentials from proxy directory
+    // Copy credentials from proxy instance directory
     for (const file of configFiles) {
-      const srcPath = path.join(proxyDir, file);
+      const srcPath = path.join(proxyInstanceDir, file);
       const destPath = path.join(configDir, file);
 
       if (!fs.existsSync(srcPath)) {
-        throw new Error(`Missing proxy credential file: ${file} in ${proxyDir}`);
+        throw new Error(`Missing proxy credential file: ${file} in ${proxyInstanceDir}`);
       }
 
       await fs.promises.copyFile(srcPath, destPath);
@@ -605,6 +611,11 @@ export class RunnerDownloader {
   /**
    * Check if any proxy credentials exist (multi-target mode).
    * Returns true if at least one target has proxy credentials.
+   *
+   * Directory structure:
+   * proxies/<target-id>/1/.runner  (instance 1)
+   * proxies/<target-id>/2/.runner  (instance 2)
+   * ...
    */
   hasAnyProxyCredentials(): boolean {
     const proxiesDir = path.join(this.baseDir, 'proxies');
@@ -613,13 +624,22 @@ export class RunnerDownloader {
     }
 
     try {
-      const entries = fs.readdirSync(proxiesDir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isDirectory()) {
-          const proxyDir = path.join(proxiesDir, entry.name);
-          const runnerFile = path.join(proxyDir, '.runner');
-          if (fs.existsSync(runnerFile)) {
-            return true;
+      // Iterate target directories
+      const targetEntries = fs.readdirSync(proxiesDir, { withFileTypes: true });
+      for (const targetEntry of targetEntries) {
+        if (targetEntry.isDirectory()) {
+          const targetDir = path.join(proxiesDir, targetEntry.name);
+          // Check for numbered instance subdirectories
+          const instanceEntries = fs.readdirSync(targetDir, { withFileTypes: true });
+          for (const instanceEntry of instanceEntries) {
+            // Instance directories are numbered (1, 2, 3, etc.)
+            if (instanceEntry.isDirectory() && /^\d+$/.test(instanceEntry.name)) {
+              const instanceDir = path.join(targetDir, instanceEntry.name);
+              const runnerFile = path.join(instanceDir, '.runner');
+              if (fs.existsSync(runnerFile)) {
+                return true;
+              }
+            }
           }
         }
       }

@@ -115,13 +115,14 @@ export class TargetManager {
 
     log()?.info(`[TargetManager] Adding target: ${target.displayName}`);
 
-    // Register runner proxy with GitHub
+    // Register runner proxies with GitHub (N instances for parallel jobs)
     const proxyManager = getRunnerProxyManager();
+    const instanceCount = this.getMaxConcurrentJobs();
     try {
-      await proxyManager.register(target);
+      await proxyManager.registerAll(target, instanceCount);
     } catch (error) {
       const message = (error as Error).message;
-      log()?.error(`[TargetManager] Failed to register proxy: ${message}`);
+      log()?.error(`[TargetManager] Failed to register proxies: ${message}`);
       return { success: false, error: `Failed to register runner: ${message}` };
     }
 
@@ -148,12 +149,12 @@ export class TargetManager {
 
     log()?.info(`[TargetManager] Removing target: ${target.displayName}`);
 
-    // Unregister runner proxy from GitHub
+    // Unregister all runner proxies from GitHub
     const proxyManager = getRunnerProxyManager();
     try {
-      await proxyManager.unregister(target);
+      await proxyManager.unregisterAll(target);
     } catch (error) {
-      log()?.warn(`[TargetManager] Failed to unregister proxy: ${(error as Error).message}`);
+      log()?.warn(`[TargetManager] Failed to unregister proxies: ${(error as Error).message}`);
       // Continue with removal even if GitHub unregistration fails
     }
 
@@ -209,8 +210,14 @@ export class TargetManager {
    * Set maximum concurrent jobs.
    */
   setMaxConcurrentJobs(count: number): void {
+    const log = () => getLogger();
     const config = loadConfig();
-    config.maxConcurrentJobs = Math.max(1, Math.min(16, count));
+    const oldValue = config.maxConcurrentJobs ?? 4;
+    const newValue = Math.max(1, Math.min(16, count));
+    if (oldValue !== newValue) {
+      log()?.info(`[Settings] maxConcurrentJobs: ${oldValue} -> ${newValue}`);
+    }
+    config.maxConcurrentJobs = newValue;
     saveConfig(config);
   }
 }
