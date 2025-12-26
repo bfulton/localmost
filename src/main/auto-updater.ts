@@ -6,7 +6,7 @@
 import { autoUpdater, UpdateInfo, ProgressInfo } from 'electron-updater';
 import { BrowserWindow, app } from 'electron';
 import { IPC_CHANNELS, UpdateStatus } from '../shared/types';
-import { getIsQuitting } from './app-state';
+import { getIsQuitting, getLogger } from './app-state';
 
 // Update state that gets sent to renderer
 let currentStatus: UpdateStatus = {
@@ -26,6 +26,15 @@ export function initAutoUpdater(mainWindow: BrowserWindow): void {
   // Repository is auto-detected from package.json "repository" field
   autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = true;
+
+  // Redirect electron-updater logs to our logger instead of stdout
+  const logger = getLogger();
+  autoUpdater.logger = {
+    info: (message: string) => logger?.info(`[updater] ${message}`),
+    warn: (message: string) => logger?.warn(`[updater] ${message}`),
+    error: (message: string) => logger?.error(`[updater] ${message}`),
+    debug: (message: string) => logger?.debug(`[updater] ${message}`),
+  };
 
   // Set up event handlers
   autoUpdater.on('checking-for-update', () => {
@@ -96,6 +105,16 @@ export function installUpdate(): void {
  */
 export function getUpdateStatus(): UpdateStatus {
   return { ...currentStatus };
+}
+
+/**
+ * Reset the update status. For testing only.
+ */
+export function resetForTesting(): void {
+  currentStatus = {
+    status: 'idle',
+    currentVersion: '',
+  };
 }
 
 /**

@@ -20,26 +20,25 @@ interface RunnerInstance {
     id: string;
     targetId?: string;        // For multi-target: which target this job came from
     targetDisplayName?: string;
+    actionsUrl?: string;      // GitHub Actions URL for this job
+    githubRunId?: number;     // GitHub workflow run ID (for cancellation)
+    githubJobId?: number;     // GitHub job ID (for querying conclusion)
+    githubActor?: string;     // Username who triggered the workflow
   } | null;
   name: string;
   jobsCompleted: number;
   fatalError: boolean; // Set when runner has an unrecoverable error (e.g., registration deleted)
 }
 
-interface WorkflowRun {
-  id: number;
-  name: string;
-  status: string;
-  created_at: string;
-  actor: { login: string };
-}
+/** Job event types for notifications */
+export type JobEventType = 'started' | 'completed';
 
-interface WorkflowJob {
-  id: number;
-  name: string;
-  status: string;
-  html_url: string;
-  runner_name: string | null;
+/** Job event data for notifications */
+export interface JobEvent {
+  type: JobEventType;
+  jobName: string;
+  repository: string;
+  status?: 'completed' | 'failed' | 'cancelled';
 }
 
 interface RunnerManagerOptions {
@@ -49,8 +48,6 @@ interface RunnerManagerOptions {
   onReregistrationNeeded?: (instanceNum: number, reason: 'session_conflict' | 'registration_deleted') => Promise<void>;
   /** Called when an instance needs to be configured on-demand (lazy configuration) */
   onConfigurationNeeded?: (instanceNum: number) => Promise<void>;
-  getWorkflowRuns?: (owner: string, repo: string) => Promise<WorkflowRun[]>;
-  getWorkflowJobs?: (owner: string, repo: string, runId: number) => Promise<WorkflowJob[]>;
   getRunnerLogLevel?: () => LogEntry['level'];
   /** Get user filter configuration */
   getUserFilter?: () => UserFilterConfig | undefined;
@@ -58,6 +55,10 @@ interface RunnerManagerOptions {
   getCurrentUserLogin?: () => string | undefined;
   /** Cancel a workflow run */
   cancelWorkflowRun?: (owner: string, repo: string, runId: number) => Promise<void>;
+  /** Get job conclusion from GitHub API */
+  getJobConclusion?: (owner: string, repo: string, jobId: number) => Promise<string | null>;
+  /** Called when a job starts or completes (for notifications) */
+  onJobEvent?: (event: JobEvent) => void;
 }
 
 export class RunnerManager {
@@ -71,12 +72,12 @@ export class RunnerManager {
   private onJobHistoryUpdate: (jobs: JobHistoryEntry[]) => void;
   private onReregistrationNeeded?: (instanceNum: number, reason: 'session_conflict' | 'registration_deleted') => Promise<void>;
   private onConfigurationNeeded?: (instanceNum: number) => Promise<void>;
-  private getWorkflowRuns?: (owner: string, repo: string) => Promise<WorkflowRun[]>;
-  private getWorkflowJobs?: (owner: string, repo: string, runId: number) => Promise<WorkflowJob[]>;
   private getRunnerLogLevel: () => LogEntry['level'];
   private getUserFilter?: () => UserFilterConfig | undefined;
   private getCurrentUserLogin?: () => string | undefined;
   private cancelWorkflowRun?: (owner: string, repo: string, runId: number) => Promise<void>;
+  private getJobConclusion?: (owner: string, repo: string, jobId: number) => Promise<string | null>;
+  private onJobEvent?: (event: JobEvent) => void;
   private jobHistory: JobHistoryEntry[] = [];
   private jobIdCounter = 0;
   private maxJobHistory = DEFAULT_MAX_JOB_HISTORY;
@@ -110,7 +111,7 @@ export class RunnerManager {
 
   // Pending target context for jobs received from broker
   // Maps runner name (or 'next') to target context
-  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string }> = new Map();
+  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string }> = new Map();
 
   /**
    * Validate that a child path stays within the expected base directory.
@@ -138,12 +139,12 @@ export class RunnerManager {
     this.onJobHistoryUpdate = options.onJobHistoryUpdate;
     this.onReregistrationNeeded = options.onReregistrationNeeded;
     this.onConfigurationNeeded = options.onConfigurationNeeded;
-    this.getWorkflowRuns = options.getWorkflowRuns;
-    this.getWorkflowJobs = options.getWorkflowJobs;
     this.getRunnerLogLevel = options.getRunnerLogLevel ?? (() => 'warn');
     this.getUserFilter = options.getUserFilter;
     this.getCurrentUserLogin = options.getCurrentUserLogin;
     this.cancelWorkflowRun = options.cancelWorkflowRun;
+    this.getJobConclusion = options.getJobConclusion;
+    this.onJobEvent = options.onJobEvent;
 
     this.downloader = new RunnerDownloader();
     this.configPath = getConfigPath();
@@ -235,7 +236,7 @@ export class RunnerManager {
     try {
       proc.kill(signal);
       return true;
-    } catch (killErr) {
+    } catch {
       // Process already dead or permission denied - either way, nothing more to do
       return false;
     }
@@ -264,17 +265,21 @@ export class RunnerManager {
    * @param runnerName The runner name or 'next' to apply to next job on any runner
    * @param targetId The target ID from which the job was received
    * @param targetDisplayName Human-readable target name
+   * @param actionsUrl The GitHub Actions URL for this job
+   * @param githubRunId The GitHub workflow run ID (for cancellation)
+   * @param githubJobId The GitHub job ID (for querying conclusion)
+   * @param githubActor The username who triggered the workflow (for user filtering)
    */
-  setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string): void {
-    this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName });
-    this.log('debug', `Set pending target context for ${runnerName}: ${targetDisplayName}`);
+  setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string, actionsUrl?: string, githubRunId?: number, githubJobId?: number, githubActor?: string): void {
+    this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName, actionsUrl, githubRunId, githubJobId, githubActor });
+    this.log('debug', `Set pending target context for ${runnerName}: ${targetDisplayName} (runId=${githubRunId}, jobId=${githubJobId}, actor=${githubActor})`);
   }
 
   /**
    * Consume pending target context for a runner.
    * Returns and removes the context if found.
    */
-  private consumePendingTargetContext(runnerName: string): { targetId: string; targetDisplayName: string } | undefined {
+  private consumePendingTargetContext(runnerName: string): { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string } | undefined {
     // Try exact match first, then fall back to 'next'
     let context = this.pendingTargetContext.get(runnerName);
     if (context) {
@@ -360,9 +365,8 @@ export class RunnerManager {
   }
 
   private getInstanceName(instance: number): string {
-    if (this.runnerCount === 1) {
-      return this.baseRunnerName || `localmost.${os.hostname()}`;
-    }
+    // Always use .N suffix to match how runners are registered with GitHub
+    // (registration always uses baseRunnerName.N format)
     return `${this.baseRunnerName || `localmost.${os.hostname()}`}.${instance}`;
   }
 
@@ -371,15 +375,23 @@ export class RunnerManager {
   }
 
   getStatus(): RunnerState {
-    // If no instances exist or we're not started, return idle
+    // If shutting down, return that status
+    if (this.stopping) {
+      return {
+        status: 'shutting_down',
+        startedAt: this.startedAt ?? undefined,
+      };
+    }
+
+    // If no instances exist or we're not started, return offline
     if (this.instances.size === 0 || !this.startedAt) {
       return {
-        status: 'idle',
+        status: 'offline',
         startedAt: undefined,
       };
     }
 
-    // Priority: busy > running > starting > error > offline
+    // Priority: busy > listening > starting > error > offline
     let aggregateStatus: RunnerStatus = 'offline';
     let currentJob: { name: string; repository: string; runnerName: string } | null = null;
 
@@ -394,11 +406,11 @@ export class RunnerManager {
           };
         }
         break;
-      } else if (instance.status === 'running') {
-        aggregateStatus = 'running';
-      } else if (instance.status === 'starting' && aggregateStatus !== 'running') {
+      } else if (instance.status === 'listening') {
+        aggregateStatus = 'listening';
+      } else if (instance.status === 'starting' && aggregateStatus !== 'listening') {
         aggregateStatus = 'starting';
-      } else if (instance.status === 'error' && aggregateStatus !== 'running' && aggregateStatus !== 'starting') {
+      } else if (instance.status === 'error' && aggregateStatus !== 'listening' && aggregateStatus !== 'starting') {
         aggregateStatus = 'error';
       }
     }
@@ -422,7 +434,7 @@ export class RunnerManager {
   isRunning(): boolean {
     for (const [, instance] of this.instances) {
       // Consider running if process is active OR status indicates active state
-      if (instance.process || instance.status === 'starting' || instance.status === 'running' || instance.status === 'busy') {
+      if (instance.process || instance.status === 'starting' || instance.status === 'listening' || instance.status === 'busy') {
         return true;
       }
     }
@@ -488,7 +500,7 @@ export class RunnerManager {
     // Start with just 1 runner - will scale up dynamically
     await this.startInstance(1);
 
-    this.updateStatus('running');
+    this.updateStatus('listening');
   }
 
   /**
@@ -527,7 +539,7 @@ export class RunnerManager {
     this.stopping = false;
 
     // Don't start any instances - workers will be spawned on demand
-    this.updateStatus('running');
+    this.updateStatus('listening');
   }
 
   /**
@@ -537,7 +549,7 @@ export class RunnerManager {
   hasAvailableSlot(): boolean {
     for (let i = 1; i <= this.runnerCount; i++) {
       const instance = this.instances.get(i);
-      if (!instance || instance.status === 'idle' || instance.status === 'offline' || instance.status === 'error') {
+      if (!instance || instance.status === 'offline' || instance.status === 'error') {
         return true;
       }
     }
@@ -554,7 +566,7 @@ export class RunnerManager {
 
     for (let i = 1; i <= this.runnerCount; i++) {
       const instance = this.instances.get(i);
-      if (!instance || instance.status === 'idle' || instance.status === 'offline' || instance.status === 'error') {
+      if (!instance || instance.status === 'offline' || instance.status === 'error') {
         instanceNum = i;
         break;
       }
@@ -620,7 +632,7 @@ export class RunnerManager {
     if (proxy) {
       try {
         await proxy.stop();
-      } catch (proxyErr) {
+      } catch {
         // Proxy stop failed - non-fatal, may already be stopped
       }
       this.proxyServers.delete(instanceNum);
@@ -776,7 +788,7 @@ export class RunnerManager {
 
           if (!this.isRunning()) {
             this.startedAt = null;
-            this.updateStatus('idle');
+            this.updateStatus('offline');
           }
           return;
         }
@@ -948,13 +960,13 @@ export class RunnerManager {
     this.startingInstances.clear();
     this.startedAt = null;
     this.stopping = false;
-    this.updateStatus('idle');
+    this.updateStatus('offline');
   }
 
   private countIdleRunners(): number {
     let count = 0;
     for (const [, instance] of this.instances) {
-      if (instance.status === 'running' && !instance.currentJob) {
+      if (instance.status === 'listening' && !instance.currentJob) {
         count++;
       }
     }
@@ -1015,13 +1027,13 @@ export class RunnerManager {
     await this.startInstance(nextInstance);
   }
 
-  private parseRunnerOutput(instanceNum: number, line: string): void {
+  private async parseRunnerOutput(instanceNum: number, line: string): Promise<void> {
     const instance = this.instances.get(instanceNum);
     if (!instance) return;
 
     // Detect runner ready (listening for jobs)
     if (line.includes('Listening for Jobs')) {
-      instance.status = 'running';
+      instance.status = 'listening';
       this.updateAggregateStatus();
       return;
     }
@@ -1084,16 +1096,23 @@ export class RunnerManager {
       // Get target context if available (from broker-proxy-service)
       const targetContext = this.consumePendingTargetContext(instance.name);
 
+      // Use target display name (owner/repo format) for repository if available
+      const repository = targetContext?.targetDisplayName || this.config?.url || 'unknown';
+
       instance.currentJob = {
         name: jobName,
-        repository: this.config?.url || 'unknown',
+        repository,
         startedAt: new Date().toISOString(),
         id: `job-${++this.jobIdCounter}`,
         targetId: targetContext?.targetId,
         targetDisplayName: targetContext?.targetDisplayName,
+        actionsUrl: targetContext?.actionsUrl,
+        githubRunId: targetContext?.githubRunId,
+        githubJobId: targetContext?.githubJobId,
+        githubActor: targetContext?.githubActor,
       };
 
-      this.log('debug', `[instance ${instanceNum}] Job started: ${jobName} (id: ${instance.currentJob.id})${targetContext ? ` from ${targetContext.targetDisplayName}` : ''}`);
+      this.log('debug', `[instance ${instanceNum}] Job started: ${jobName} (id: ${instance.currentJob.id})${targetContext ? ` from ${targetContext.targetDisplayName}` : ''}${instance.currentJob.actionsUrl ? ` url=${instance.currentJob.actionsUrl}` : ''}`);
 
       this.addJobToHistory({
         id: instance.currentJob.id,
@@ -1102,6 +1121,8 @@ export class RunnerManager {
         status: 'running',
         startedAt: instance.currentJob.startedAt,
         runnerName: instance.name,
+        actionsUrl: instance.currentJob.actionsUrl,
+        githubRunId: instance.currentJob.githubRunId,
         targetId: instance.currentJob.targetId,
         targetDisplayName: instance.currentJob.targetDisplayName,
       });
@@ -1125,8 +1146,6 @@ export class RunnerManager {
     // Detect job completion
     const jobCompleteMatch = line.match(/Job .+ completed with result:\s*(\w+)/i);
     if (jobCompleteMatch && instance.currentJob) {
-      const result = jobCompleteMatch[1].toLowerCase();
-      const status: JobStatus = result === 'succeeded' ? 'completed' : result === 'failed' ? 'failed' : 'cancelled';
       const completedAt = new Date().toISOString();
 
       // Compute runtime in seconds
@@ -1134,10 +1153,49 @@ export class RunnerManager {
       const endTime = new Date(completedAt).getTime();
       const runTimeSeconds = Math.round((endTime - startTime) / 1000);
 
-      this.log('debug', `[instance ${instanceNum}] Job completed: ${instance.currentJob.name} (id: ${instance.currentJob.id}) result: ${result}`);
-
       const jobId = instance.currentJob.id;
-      const runnerName = instance.name;
+      const githubJobId = instance.currentJob.githubJobId;
+      const repository = instance.currentJob.repository;
+      const jobName = instance.currentJob.name;
+
+      // Query GitHub API for the actual conclusion (authoritative source)
+      let status: JobStatus = 'completed'; // Default fallback
+      if (this.getJobConclusion && githubJobId && repository) {
+        const [owner, repo] = repository.split('/');
+        if (owner && repo) {
+          try {
+            const conclusion = await this.getJobConclusion(owner, repo, githubJobId);
+            if (conclusion === 'success') {
+              status = 'completed';
+            } else if (conclusion === 'failure') {
+              status = 'failed';
+            } else if (conclusion === 'cancelled') {
+              status = 'cancelled';
+            } else if (conclusion === null) {
+              // Conclusion not yet set - use runner-reported result
+              const result = jobCompleteMatch[1].toLowerCase();
+              status = result === 'succeeded' ? 'completed' : result === 'failed' ? 'failed' : 'cancelled';
+              this.log('info', `[instance ${instanceNum}] Job completed: ${jobName} conclusion=null, using runner result=${result} → status=${status}`);
+            } else {
+              // Other conclusions (skipped, etc.) - treat as cancelled
+              status = 'cancelled';
+            }
+            if (conclusion !== null) {
+              this.log('info', `[instance ${instanceNum}] Job completed: ${jobName} conclusion=${conclusion} → status=${status}`);
+            }
+          } catch (err) {
+            // Fall back to runner-reported result
+            const result = jobCompleteMatch[1].toLowerCase();
+            status = result === 'succeeded' ? 'completed' : result === 'failed' ? 'failed' : 'cancelled';
+            this.log('warn', `[instance ${instanceNum}] Could not get job conclusion from GitHub, using runner result: ${result}`);
+          }
+        }
+      } else {
+        // No API available, use runner-reported result
+        const result = jobCompleteMatch[1].toLowerCase();
+        status = result === 'succeeded' ? 'completed' : result === 'failed' ? 'failed' : 'cancelled';
+        this.log('info', `[instance ${instanceNum}] Job completed: ${jobName} result=${result} → status=${status}`);
+      }
 
       this.updateJobInHistory(jobId, {
         status,
@@ -1145,14 +1203,8 @@ export class RunnerManager {
         runTimeSeconds,
       });
 
-      // Try to fetch the GitHub Actions URL asynchronously (don't block)
-      this.fetchActionsUrl(jobId, runnerName).catch((fetchErr) => {
-        // Actions URL is optional enhancement - failures don't affect job tracking
-        this.log('debug', `Failed to fetch actions URL for ${jobId}: ${(fetchErr as Error).message}`);
-      });
-
       instance.currentJob = null;
-      instance.status = 'running';
+      instance.status = 'listening';
       this.updateAggregateStatus();
     }
   }
@@ -1185,9 +1237,15 @@ export class RunnerManager {
   /**
    * Check if a job should be allowed based on user filter.
    * If not allowed, attempts to cancel the workflow run.
+   * Uses stored job info (actor, runId) instead of API lookups.
    */
-  private async checkJobUserFilter(instanceNum: number, runnerName: string): Promise<void> {
-    if (!this.config?.url || !this.getWorkflowRuns || !this.getWorkflowJobs || !this.cancelWorkflowRun) {
+  private async checkJobUserFilter(instanceNum: number, _runnerName: string): Promise<void> {
+    const instance = this.instances.get(instanceNum);
+    if (!instance?.currentJob) return;
+
+    const { githubActor, githubRunId, targetDisplayName } = instance.currentJob;
+    if (!githubActor || !githubRunId || !targetDisplayName) {
+      this.log('debug', `checkJobUserFilter: missing info (actor=${githubActor}, runId=${githubRunId}, target=${targetDisplayName})`);
       return;
     }
 
@@ -1196,74 +1254,33 @@ export class RunnerManager {
       return; // No filtering needed
     }
 
-    // Parse owner/repo from config URL
-    const match = this.config.url.match(/github\.com[\/:]([^\/]+)\/([^\/\.]+)/);
-    if (!match) return;
-    const [, owner, repo] = match;
+    // Check if the actor is allowed
+    const isAllowed = this.isUserAllowed(githubActor);
 
-    try {
-      // Get recent workflow runs
-      const runs = await this.getWorkflowRuns(owner, repo);
-      if (!runs || runs.length === 0) return;
+    if (!isAllowed) {
+      this.log('info', `Job triggered by '${githubActor}' is not in allowed users list. Cancelling workflow run.`);
 
-      // Find the run that this runner is working on
-      for (const run of runs.slice(0, 10)) {
-        const jobs = await this.getWorkflowJobs(owner, repo, run.id);
-        const matchingJob = jobs.find(j => j.runner_name === runnerName && j.status === 'in_progress');
-
-        if (matchingJob) {
-          // Check if the actor is allowed
-          const isAllowed = this.isUserAllowed(run.actor.login);
-
-          if (!isAllowed) {
-            this.log('info', `Job triggered by '${run.actor.login}' is not in allowed users list. Cancelling workflow run.`);
-            try {
-              await this.cancelWorkflowRun(owner, repo, run.id);
-              this.log('info', `Cancelled workflow run ${run.id} triggered by '${run.actor.login}'`);
-            } catch (cancelErr) {
-              this.log('warn', `Failed to cancel workflow run ${run.id}: ${(cancelErr as Error).message}`);
-            }
-          } else {
-            this.log('debug', `Job triggered by '${run.actor.login}' is allowed`);
-          }
-          return;
-        }
+      // Parse owner/repo from target display name (e.g., "owner/repo")
+      const parts = targetDisplayName.split('/');
+      if (parts.length !== 2) {
+        this.log('warn', `Cannot parse owner/repo from target: ${targetDisplayName}`);
+        return;
       }
-    } catch (apiErr) {
-      this.log('debug', `Failed to check job user filter: ${(apiErr as Error).message}`);
-    }
-  }
+      const [owner, repo] = parts;
 
-  /**
-   * Fetch the GitHub Actions URL for a completed job by querying the API.
-   */
-  private async fetchActionsUrl(jobId: string, runnerName: string): Promise<void> {
-    if (!this.config?.url || !this.getWorkflowRuns || !this.getWorkflowJobs) {
-      return;
-    }
-
-    // Parse owner/repo from config URL (e.g., https://github.com/owner/repo)
-    const match = this.config.url.match(/github\.com[\/:]([^\/]+)\/([^\/\.]+)/);
-    if (!match) return;
-    const [, owner, repo] = match;
-
-    try {
-      // Get recent workflow runs
-      const runs = await this.getWorkflowRuns(owner, repo);
-      if (!runs || runs.length === 0) return;
-
-      // Check the most recent runs for a job matching our runner
-      for (const run of runs.slice(0, 5)) {
-        const jobs = await this.getWorkflowJobs(owner, repo, run.id);
-        const matchingJob = jobs.find(j => j.runner_name === runnerName);
-        if (matchingJob?.html_url) {
-          this.updateJobInHistory(jobId, { actionsUrl: matchingJob.html_url });
-          return;
-        }
+      if (!this.cancelWorkflowRun) {
+        this.log('warn', 'Cannot cancel: cancelWorkflowRun not available');
+        return;
       }
-    } catch (apiErr) {
-      // API errors are non-fatal - actionsUrl is an optional enhancement
-      // Common causes: rate limits, network issues, race conditions
+
+      try {
+        await this.cancelWorkflowRun(owner, repo, githubRunId);
+        this.log('info', `Cancelled workflow run ${githubRunId} triggered by '${githubActor}'`);
+      } catch (cancelErr) {
+        this.log('warn', `Failed to cancel workflow run ${githubRunId}: ${(cancelErr as Error).message}`);
+      }
+    } else {
+      this.log('debug', `Job triggered by '${githubActor}' is allowed`);
     }
   }
 
@@ -1275,6 +1292,13 @@ export class RunnerManager {
     }
     this.saveJobHistory();
     this.onJobHistoryUpdate([...this.jobHistory]); // Send a copy to trigger React update
+
+    // Notify about job start
+    this.onJobEvent?.({
+      type: 'started',
+      jobName: job.jobName,
+      repository: job.repository,
+    });
   }
 
   private updateJobInHistory(jobId: string, updates: Partial<JobHistoryEntry>): void {
@@ -1284,6 +1308,16 @@ export class RunnerManager {
       Object.assign(job, updates);
       this.saveJobHistory();
       this.onJobHistoryUpdate([...this.jobHistory]); // Send a copy to trigger React update
+
+      // Notify about job completion if status changed to a terminal state
+      if (updates.status && updates.status !== 'running') {
+        this.onJobEvent?.({
+          type: 'completed',
+          jobName: job.jobName,
+          repository: job.repository,
+          status: updates.status as 'completed' | 'failed' | 'cancelled',
+        });
+      }
     } else {
       this.log('warn', `Could not find job ${jobId} to update. History has ${this.jobHistory.length} jobs: ${this.jobHistory.map(j => j.id).join(', ')}`);
     }
@@ -1311,7 +1345,7 @@ export class RunnerManager {
     });
   }
 
-  private updateStatus(status: RunnerStatus, errorMessage?: string): void {
+  private updateStatus(status: RunnerStatus, _errorMessage?: string): void {
     this.onStatusChange({
       status,
       jobName: undefined,
@@ -1365,15 +1399,15 @@ export class RunnerManager {
           try {
             process.kill(pid, 0);
             process.kill(pid, 'SIGKILL');
-          } catch (aliveCheckErr) {
+          } catch {
             // Process exited after SIGTERM - expected success case
           }
-        } catch (notRunningErr) {
+        } catch {
           // Process doesn't exist (ESRCH) - already dead
         }
 
         await fs.promises.unlink(pidFile);
-      } catch (pidErr) {
+      } catch {
         // Failed to read/process PID file - non-fatal, continue with other entries
       }
     }
@@ -1422,13 +1456,13 @@ export class RunnerManager {
             process.kill(pid, 0);
             // Process exists but we're not tracking it - it's orphaned
             orphanedPids.push(pid);
-          } catch (notRunningErr) {
+          } catch {
             // Process doesn't exist - clean up stale PID file
-            await fs.promises.unlink(pidFile).catch((unlinkErr) => {
+            await fs.promises.unlink(pidFile).catch(() => {
               // PID file cleanup failed - non-fatal
             });
           }
-        } catch (pidReadErr) {
+        } catch {
           // Couldn't read PID file - corrupted or permissions, skip
         }
       }
@@ -1445,15 +1479,15 @@ export class RunnerManager {
             try {
               process.kill(pid, 0);
               process.kill(pid, 'SIGKILL');
-            } catch (aliveCheckErr) {
+            } catch {
               // Process exited after SIGTERM - expected success case
             }
-          } catch (killErr) {
+          } catch {
             // Process doesn't exist or permission denied - continue with next
           }
         }
       }
-    } catch (scanErr) {
+    } catch {
       // Error scanning sandbox directories - non-fatal
     }
   }

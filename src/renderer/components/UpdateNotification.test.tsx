@@ -1,17 +1,23 @@
 import React from 'react';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, act } from '@testing-library/react';
 import UpdateNotification from './UpdateNotification';
 import { UpdateProvider } from '../contexts/UpdateContext';
 import { mockLocalmost } from '../../../test/setup-renderer';
 import { UpdateStatus } from '../../shared/types';
 
-// Helper to render with provider
-const renderWithProvider = () => {
-  return render(
-    <UpdateProvider>
-      <UpdateNotification />
-    </UpdateProvider>
-  );
+// Helper to render with provider and wait for initial state
+const renderWithProvider = async () => {
+  let result;
+  await act(async () => {
+    result = render(
+      <UpdateProvider>
+        <UpdateNotification />
+      </UpdateProvider>
+    );
+    // Allow initial async state to settle
+    await new Promise(resolve => setTimeout(resolve, 0));
+  });
+  return result!;
 };
 
 describe('UpdateNotification', () => {
@@ -39,7 +45,7 @@ describe('UpdateNotification', () => {
 
   describe('Idle State', () => {
     it('should not render when status is idle', async () => {
-      const { container } = renderWithProvider();
+      const { container } = await renderWithProvider();
 
       // Wait for initial load
       await new Promise(resolve => setTimeout(resolve, 50));
@@ -53,7 +59,7 @@ describe('UpdateNotification', () => {
         currentVersion: '1.0.0',
       });
 
-      const { container } = renderWithProvider();
+      const { container } = await renderWithProvider();
 
       await new Promise(resolve => setTimeout(resolve, 50));
 
@@ -71,19 +77,19 @@ describe('UpdateNotification', () => {
     });
 
     it('should show update available banner', async () => {
-      renderWithProvider();
+      await renderWithProvider();
 
       await screen.findByText('Version 2.0.0 is available');
     });
 
     it('should show Download button', async () => {
-      renderWithProvider();
+      await renderWithProvider();
 
       await screen.findByRole('button', { name: 'Download' });
     });
 
     it('should call downloadUpdate when Download clicked', async () => {
-      renderWithProvider();
+      await renderWithProvider();
 
       const downloadBtn = await screen.findByRole('button', { name: 'Download' });
       fireEvent.click(downloadBtn);
@@ -92,14 +98,14 @@ describe('UpdateNotification', () => {
     });
 
     it('should have dismiss button with correct title', async () => {
-      renderWithProvider();
+      await renderWithProvider();
 
       const dismissBtn = await screen.findByTitle('Remind me later');
       expect(dismissBtn).toBeInTheDocument();
     });
 
     it('should hide banner when dismissed', async () => {
-      const { container } = renderWithProvider();
+      const { container } = await renderWithProvider();
 
       const dismissBtn = await screen.findByTitle('Remind me later');
       fireEvent.click(dismissBtn);
@@ -120,13 +126,13 @@ describe('UpdateNotification', () => {
     });
 
     it('should show downloading banner with progress', async () => {
-      renderWithProvider();
+      await renderWithProvider();
 
       await screen.findByText('Downloading update... 45%');
     });
 
     it('should show progress bar', async () => {
-      renderWithProvider();
+      await renderWithProvider();
 
       await screen.findByText(/Downloading update/);
 
@@ -136,15 +142,17 @@ describe('UpdateNotification', () => {
     });
 
     it('should update progress when status changes', async () => {
-      renderWithProvider();
+      await renderWithProvider();
 
       await screen.findByText(/Downloading update/);
 
       // Simulate progress update
-      statusChangeCallback!({
-        status: 'downloading',
-        currentVersion: '1.0.0',
-        downloadProgress: 75,
+      await act(async () => {
+        statusChangeCallback!({
+          status: 'downloading',
+          currentVersion: '1.0.0',
+          downloadProgress: 75,
+        });
       });
 
       await screen.findByText('Downloading update... 75%');
@@ -158,7 +166,7 @@ describe('UpdateNotification', () => {
         currentVersion: '1.0.0',
       });
 
-      renderWithProvider();
+      await renderWithProvider();
 
       await screen.findByText('Downloading update... 0%');
     });
@@ -174,19 +182,19 @@ describe('UpdateNotification', () => {
     });
 
     it('should show update ready banner', async () => {
-      renderWithProvider();
+      await renderWithProvider();
 
       await screen.findByText('Update ready to install');
     });
 
     it('should show Restart & Install button', async () => {
-      renderWithProvider();
+      await renderWithProvider();
 
       await screen.findByRole('button', { name: /Restart.*Install/i });
     });
 
     it('should call installUpdate when Restart & Install clicked', async () => {
-      renderWithProvider();
+      await renderWithProvider();
 
       const installBtn = await screen.findByRole('button', { name: /Restart.*Install/i });
       fireEvent.click(installBtn);
@@ -195,14 +203,14 @@ describe('UpdateNotification', () => {
     });
 
     it('should have dismiss button with correct title', async () => {
-      renderWithProvider();
+      await renderWithProvider();
 
       const dismissBtn = await screen.findByTitle('Install later');
       expect(dismissBtn).toBeInTheDocument();
     });
 
     it('should hide banner when dismissed', async () => {
-      const { container } = renderWithProvider();
+      const { container } = await renderWithProvider();
 
       const dismissBtn = await screen.findByTitle('Install later');
       fireEvent.click(dismissBtn);
@@ -222,20 +230,20 @@ describe('UpdateNotification', () => {
     });
 
     it('should show error banner with message', async () => {
-      renderWithProvider();
+      await renderWithProvider();
 
       await screen.findByText('Update failed: Network connection failed');
     });
 
     it('should have dismiss button', async () => {
-      renderWithProvider();
+      await renderWithProvider();
 
       const dismissBtn = await screen.findByTitle('Dismiss');
       expect(dismissBtn).toBeInTheDocument();
     });
 
     it('should hide banner when dismissed', async () => {
-      const { container } = renderWithProvider();
+      const { container } = await renderWithProvider();
 
       const dismissBtn = await screen.findByTitle('Dismiss');
       fireEvent.click(dismissBtn);
@@ -253,7 +261,7 @@ describe('UpdateNotification', () => {
         availableVersion: '2.0.0',
       });
 
-      const { container } = renderWithProvider();
+      const { container } = await renderWithProvider();
 
       // Dismiss the update
       const dismissBtn = await screen.findByTitle('Remind me later');
@@ -270,7 +278,7 @@ describe('UpdateNotification', () => {
         availableVersion: '2.0.0',
       });
 
-      const { container } = renderWithProvider();
+      const { container } = await renderWithProvider();
 
       // Dismiss the update
       const dismissBtn = await screen.findByTitle('Remind me later');
@@ -280,10 +288,12 @@ describe('UpdateNotification', () => {
       expect(container.querySelector('[class*="banner"]')).toBeNull();
 
       // New update available (simulates reopening app)
-      statusChangeCallback!({
-        status: 'available',
-        currentVersion: '1.0.0',
-        availableVersion: '3.0.0',
+      await act(async () => {
+        statusChangeCallback!({
+          status: 'available',
+          currentVersion: '1.0.0',
+          availableVersion: '3.0.0',
+        });
       });
 
       await screen.findByText('Version 3.0.0 is available');
@@ -298,14 +308,16 @@ describe('UpdateNotification', () => {
         availableVersion: '2.0.0',
       });
 
-      renderWithProvider();
+      await renderWithProvider();
 
       await screen.findByText('Version 2.0.0 is available');
 
-      statusChangeCallback!({
-        status: 'downloading',
-        currentVersion: '1.0.0',
-        downloadProgress: 10,
+      await act(async () => {
+        statusChangeCallback!({
+          status: 'downloading',
+          currentVersion: '1.0.0',
+          downloadProgress: 10,
+        });
       });
 
       await screen.findByText('Downloading update... 10%');
@@ -318,14 +330,16 @@ describe('UpdateNotification', () => {
         downloadProgress: 50,
       });
 
-      renderWithProvider();
+      await renderWithProvider();
 
       await screen.findByText(/Downloading update/);
 
-      statusChangeCallback!({
-        status: 'downloaded',
-        currentVersion: '1.0.0',
-        availableVersion: '2.0.0',
+      await act(async () => {
+        statusChangeCallback!({
+          status: 'downloaded',
+          currentVersion: '1.0.0',
+          availableVersion: '2.0.0',
+        });
       });
 
       await screen.findByText('Update ready to install');
@@ -338,14 +352,16 @@ describe('UpdateNotification', () => {
         downloadProgress: 50,
       });
 
-      renderWithProvider();
+      await renderWithProvider();
 
       await screen.findByText(/Downloading update/);
 
-      statusChangeCallback!({
-        status: 'error',
-        currentVersion: '1.0.0',
-        error: 'Download interrupted',
+      await act(async () => {
+        statusChangeCallback!({
+          status: 'error',
+          currentVersion: '1.0.0',
+          error: 'Download interrupted',
+        });
       });
 
       await screen.findByText('Update failed: Download interrupted');

@@ -1,6 +1,11 @@
 # localmost
 
-<img src="assets/icon/icon_128x128.png" alt="localmost icon" width="64" height="64" align="left">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/icon/icon_128x128.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/icon/icon_128x128_light.png">
+  <img src="assets/icon/icon_128x128.png" alt="localmost icon" width="64" height="64" align="left">
+</picture>
+
 Run most of your builds locally
 <br>
 Self-hosted GitHub Actions runners for your Mac
@@ -37,6 +42,7 @@ Features:
 - **Multi-runner parallelism** — run 1-16 concurrent jobs
 - **Network isolation** — runner traffic is proxied through an allowlist (GitHub, npm, PyPI, etc.)
 - **Filesystem sandboxing** — runner processes can only write to their working directory
+- **Resource-aware scheduling** — automatically pause runners when on battery or during video calls
 
 ## What It Is
 
@@ -44,7 +50,7 @@ localmost is a macOS app that manages GitHub's official [actions-runner](https:/
 
 ## Architecture
 
-<img src="docs/localmost-arch.png" alt="localmost architecture diagram" width="600">
+<img src="docs/localmost-arch.png" alt="localmost architecture diagram" width="600" style="background-color: white; padding: 10px; border-radius: 8px;">
 
 - **Runner proxy** — maintains long-poll sessions with GitHub's broker to receive job assignments
 - **Runner pool** — 1-16 worker instances that execute jobs in sandboxed environments
@@ -116,7 +122,7 @@ localmost uses a GitHub App for authentication. During installation, you'll be a
 | Permission | Level | Purpose |
 |------------|-------|---------|
 | **Administration** | Read & Write | Register and remove self-hosted runners on repositories |
-| **Actions** | Read | Check workflow run status to determine if runners are needed |
+| **Actions** | Read & Write | Check workflow status and cancel running jobs |
 | **Metadata** | Read | Access basic repository information (required by GitHub for all apps) |
 | **Self-hosted runners** (org) | Read & Write | Register and remove self-hosted runners at the organization level |
 
@@ -210,7 +216,6 @@ npm run make
 Future feature ideas:
 
 - **Multiple repo/org runner registration** - Support registering runners with more than one repo / org, or a mix of repos and orgs.
-- **Resource-aware scheduling** - Pause runners when on battery or during video calls.
 - **Quick actions** - Re-run failed job, cancel all jobs.
 - **Notifications** - Native macOS notifications for job completion/failure.
 - **Deep links** - Jump directly to job logs in GitHub.

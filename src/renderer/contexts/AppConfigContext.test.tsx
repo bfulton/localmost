@@ -304,9 +304,8 @@ describe('AppConfigContext', () => {
     });
 
     it('should respect max log scrollback', async () => {
-      let logCallback: (entry: any) => void;
-      mockLocalmost.logs.onEntry.mockImplementation((cb) => {
-        logCallback = cb;
+      mockLocalmost.logs.onEntry.mockImplementation(() => {
+        // Callback captured for subscription, not invoked in this test
         return () => {};
       });
 

@@ -56,9 +56,11 @@ export const createWindow = (): void => {
     });
   });
 
-  // Open DevTools in development
+  // Open DevTools in development (slight delay to avoid sandbox_bundle.js errors)
   if (process.env.NODE_ENV === 'development') {
-    mainWindow.webContents.openDevTools();
+    mainWindow.webContents.once('did-finish-load', () => {
+      mainWindow.webContents.openDevTools();
+    });
   }
 
   // Open external links in default browser

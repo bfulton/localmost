@@ -13,7 +13,7 @@ jest.mock('./runner-downloader', () => ({
     getToolCacheDir: jest.fn().mockReturnValue('/Users/test/.localmost/runner/tool-cache'),
     buildSandbox: jest.fn().mockImplementation((instance: number) => Promise.resolve(`/Users/test/.localmost/runner/sandbox/${instance}`)),
     isDownloaded: jest.fn().mockReturnValue(true),
-    isConfigured: jest.fn().mockImplementation((instance: number) => true),
+    isConfigured: jest.fn().mockImplementation((_instance: number) => true),
     hasAnyProxyCredentials: jest.fn().mockReturnValue(true),
     copyProxyCredentials: jest.fn().mockResolvedValue(undefined),
     getInstalledVersion: jest.fn().mockReturnValue('2.330.0'),
@@ -72,7 +72,6 @@ describe('RunnerManager', () => {
   let mockOnStatusChange: jest.Mock<void, [RunnerState]>;
   let mockOnJobHistoryUpdate: jest.Mock<void, [JobHistoryEntry[]]>;
 
-  const mockRunnerDir = path.join(os.homedir(), '.localmost', 'runner');
   const mockConfigPath = path.join(os.homedir(), '.localmost', 'config.yaml');
 
   beforeEach(() => {
@@ -103,7 +102,8 @@ describe('RunnerManager', () => {
       (fs.readFileSync as jest.Mock).mockReturnValue(`runnerConfig:
   runnerName: test-runner`);
 
-      const manager = new RunnerManager({
+      // Create new manager to test config loading
+      new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -114,10 +114,10 @@ describe('RunnerManager', () => {
   });
 
   describe('getStatus', () => {
-    it('should return idle status initially', () => {
+    it('should return offline status initially', () => {
       const status = runnerManager.getStatus();
       expect(status).toEqual({
-        status: 'idle',
+        status: 'offline',
         startedAt: undefined,
       });
     });
@@ -276,18 +276,9 @@ describe('RunnerManager', () => {
       expect(runnerManager.hasAvailableSlot()).toBe(true);
     });
 
-    it('should return true when some instances are idle', () => {
-      // Access private instances map to set up state
-      const instances = (runnerManager as any).instances;
-      instances.set(1, { status: 'running' });
-      instances.set(2, { status: 'idle' });
-
-      expect(runnerManager.hasAvailableSlot()).toBe(true);
-    });
-
     it('should return true when some instances are offline', () => {
       const instances = (runnerManager as any).instances;
-      instances.set(1, { status: 'running' });
+      instances.set(1, { status: 'listening' });
       instances.set(2, { status: 'offline' });
 
       expect(runnerManager.hasAvailableSlot()).toBe(true);
@@ -295,19 +286,19 @@ describe('RunnerManager', () => {
 
     it('should return true when some instances have error status', () => {
       const instances = (runnerManager as any).instances;
-      instances.set(1, { status: 'running' });
+      instances.set(1, { status: 'listening' });
       instances.set(2, { status: 'error' });
 
       expect(runnerManager.hasAvailableSlot()).toBe(true);
     });
 
-    it('should return false when all instances are running', () => {
+    it('should return false when all instances are listening', () => {
       const instances = (runnerManager as any).instances;
       // Default runnerCount is 4
-      instances.set(1, { status: 'running' });
-      instances.set(2, { status: 'running' });
-      instances.set(3, { status: 'running' });
-      instances.set(4, { status: 'running' });
+      instances.set(1, { status: 'listening' });
+      instances.set(2, { status: 'listening' });
+      instances.set(3, { status: 'listening' });
+      instances.set(4, { status: 'listening' });
 
       expect(runnerManager.hasAvailableSlot()).toBe(false);
     });
@@ -397,6 +388,46 @@ describe('RunnerManager', () => {
 
       // Empty allowlist should not allow anyone
       expect((manager as any).isUserAllowed('anyuser')).toBe(false);
+    });
+  });
+
+  // fetchActionsUrl was removed - job URLs are now extracted directly from job details
+
+  describe('getStatus with shutting_down', () => {
+    it('should return shutting_down status when stopping is true', () => {
+      (runnerManager as any).stopping = true;
+      (runnerManager as any).startedAt = new Date().toISOString();
+
+      const status = runnerManager.getStatus();
+
+      expect(status.status).toBe('shutting_down');
+    });
+  });
+
+  describe('status aggregation with listening', () => {
+    it('should return listening when instance is listening', () => {
+      const instances = (runnerManager as any).instances;
+      (runnerManager as any).startedAt = new Date().toISOString();
+      instances.set(1, { status: 'listening', currentJob: null });
+
+      const status = runnerManager.getStatus();
+
+      expect(status.status).toBe('listening');
+    });
+
+    it('should return busy over listening when any instance is busy', () => {
+      const instances = (runnerManager as any).instances;
+      (runnerManager as any).startedAt = new Date().toISOString();
+      instances.set(1, { status: 'listening', currentJob: null });
+      instances.set(2, {
+        status: 'busy',
+        currentJob: { name: 'test-job', repository: 'owner/repo' }
+      });
+
+      const status = runnerManager.getStatus();
+
+      expect(status.status).toBe('busy');
+      expect(status.jobName).toBe('test-job');
     });
   });
 });

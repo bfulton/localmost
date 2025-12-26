@@ -14,8 +14,6 @@ import {
 } from './app-state';
 import { AppConfig } from './config';
 import { DEFAULT_RUNNER_COUNT } from '../shared/constants';
-import type { Target } from '../shared/types';
-
 /** Delay before retry in milliseconds. */
 const RETRY_DELAY_MS = 2000;
 
@@ -229,11 +227,17 @@ export const clearStaleRunnerRegistrations = async (): Promise<void> => {
       }
     }
 
-    // If any instances are busy, try to cancel their jobs
+    // If any instances are busy, try to cancel their jobs using persisted job history
     if (busyInstances.size > 0) {
-      const busyRunnerNames = Array.from(busyInstances).map(n => `${baseRunnerName}.${n}`);
-      logger?.info(`Attempting to cancel jobs for busy runners: ${busyRunnerNames.join(', ')}`);
-      await cancelJobsOnOurRunners(busyRunnerNames);
+      const runnerManager = getRunnerManager();
+      const runningJobs = runnerManager?.getJobHistory().filter(j => j.status === 'running') || [];
+
+      if (runningJobs.length > 0) {
+        logger?.info(`Cancelling ${runningJobs.length} running job(s) from previous session...`);
+        await cancelJobsOnOurRunners(runningJobs);
+      } else {
+        logger?.info(`Found ${busyInstances.size} busy instance(s) but no job history - jobs may need manual cancellation`);
+      }
 
       // After cancellation, retry deleting the busy runners
       for (const instanceNum of busyInstances) {

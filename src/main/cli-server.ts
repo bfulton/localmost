@@ -10,7 +10,8 @@ import * as fs from 'fs';
 import { app } from 'electron';
 import { getCliSocketPath } from './paths';
 import { getRunnerManager, getHeartbeatManager, getAuthState } from './app-state';
-import { RunnerState, JobHistoryEntry } from '../shared/types';
+import { getSnapshot, selectRunnerStatus, selectEffectivePauseState } from './runner-state-service';
+import { RunnerState, JobHistoryEntry, ResourcePauseState } from '../shared/types';
 
 /** CLI command request */
 export interface CliRequest {
@@ -29,6 +30,7 @@ export interface StatusResponse {
     };
     authenticated: boolean;
     userName?: string;
+    resourcePause?: ResourcePauseState;
   };
 }
 
@@ -124,7 +126,7 @@ export class CliServer {
           if (fs.existsSync(this.socketPath)) {
             try {
               fs.unlinkSync(this.socketPath);
-            } catch (err) {
+            } catch {
               // Socket cleanup failed - non-fatal
             }
           }
@@ -176,13 +178,18 @@ export class CliServer {
    * Handle a CLI command.
    */
   private async handleCommand(request: CliRequest): Promise<CliResponse> {
+    this.onLog('info', `CLI request: ${request.command}`);
+
     const runnerManager = getRunnerManager();
     const heartbeatManager = getHeartbeatManager();
     const authState = getAuthState();
 
     switch (request.command) {
       case 'status': {
-        const runnerState = runnerManager?.getStatus() || { status: 'offline' as const };
+        // Use state machine for consistent status with UI
+        const snapshot = getSnapshot();
+        const runnerState = snapshot ? selectRunnerStatus(snapshot) : { status: 'offline' as const };
+        const pauseState = snapshot ? selectEffectivePauseState(snapshot) : { isPaused: false, reason: null };
         const runnerName = runnerManager?.getStatusDisplayName() || 'unknown';
 
         return {
@@ -196,6 +203,11 @@ export class CliServer {
             },
             authenticated: !!authState,
             userName: authState?.user?.login,
+            resourcePause: {
+              isPaused: pauseState.isPaused,
+              reason: pauseState.reason,
+              conditions: [],
+            },
           },
         };
       }

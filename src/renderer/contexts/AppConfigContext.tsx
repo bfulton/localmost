@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode } from 'react';
-import { LogEntry, SleepProtection, LogLevel, ToolCacheLocation, UserFilterConfig } from '../../shared/types';
+import { LogEntry, SleepProtection, LogLevel, ToolCacheLocation, UserFilterConfig, PowerConfig, BatteryPauseThreshold, DEFAULT_POWER_CONFIG, NotificationsConfig, DEFAULT_NOTIFICATIONS_CONFIG } from '../../shared/types';
 
 export type ThemeSetting = 'light' | 'dark' | 'auto';
 
@@ -37,6 +37,18 @@ interface AppConfigContextValue {
   // User filter
   userFilter: UserFilterConfig;
   setUserFilter: (filter: UserFilterConfig) => Promise<void>;
+
+  // Power settings
+  power: PowerConfig;
+  setPower: (config: PowerConfig) => Promise<void>;
+  setPauseOnBattery: (threshold: BatteryPauseThreshold) => Promise<void>;
+  setPauseOnVideoCall: (enabled: boolean) => Promise<void>;
+
+  // Notifications
+  notifications: NotificationsConfig;
+  setNotifications: (config: NotificationsConfig) => Promise<void>;
+  setNotifyOnPause: (enabled: boolean) => Promise<void>;
+  setNotifyOnJobEvents: (enabled: boolean) => Promise<void>;
 
   // App state
   isOnline: boolean;
@@ -88,6 +100,12 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
 
   // User filter
   const [userFilter, setUserFilterState] = useState<UserFilterConfig>({ mode: 'just-me', allowlist: [] });
+
+  // Power settings
+  const [power, setPowerState] = useState<PowerConfig>(DEFAULT_POWER_CONFIG);
+
+  // Notifications
+  const [notifications, setNotificationsState] = useState<NotificationsConfig>(DEFAULT_NOTIFICATIONS_CONFIG);
 
   // Apply theme whenever it changes
   useEffect(() => {
@@ -166,6 +184,26 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
               allowlist: Array.isArray(filter.allowlist) ? filter.allowlist : [],
             });
           }
+        }
+
+        // Power settings
+        if (settings.power) {
+          const config = settings.power as PowerConfig;
+          setPowerState({
+            ...DEFAULT_POWER_CONFIG,
+            pauseOnBattery: config.pauseOnBattery ?? DEFAULT_POWER_CONFIG.pauseOnBattery,
+            pauseOnVideoCall: config.pauseOnVideoCall ?? DEFAULT_POWER_CONFIG.pauseOnVideoCall,
+            videoCallGracePeriod: config.videoCallGracePeriod ?? DEFAULT_POWER_CONFIG.videoCallGracePeriod,
+          });
+        }
+
+        // Notifications settings
+        if (settings.notifications) {
+          const config = settings.notifications as NotificationsConfig;
+          setNotificationsState({
+            ...DEFAULT_NOTIFICATIONS_CONFIG,
+            ...config,
+          });
         }
 
         setIsLoading(false);
@@ -299,6 +337,64 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     }
   }, []);
 
+  const setPower = useCallback(async (config: PowerConfig) => {
+    setPowerState(config);
+    try {
+      await window.localmost.settings.set({ power: config });
+    } catch {
+      // Optimistic update - UI already changed
+    }
+  }, []);
+
+  const setPauseOnBattery = useCallback(async (threshold: BatteryPauseThreshold) => {
+    const newConfig = { ...power, pauseOnBattery: threshold };
+    setPowerState(newConfig);
+    try {
+      await window.localmost.settings.set({ power: newConfig });
+    } catch {
+      // Optimistic update - UI already changed
+    }
+  }, [power]);
+
+  const setPauseOnVideoCall = useCallback(async (enabled: boolean) => {
+    const newConfig = { ...power, pauseOnVideoCall: enabled };
+    setPowerState(newConfig);
+    try {
+      await window.localmost.settings.set({ power: newConfig });
+    } catch {
+      // Optimistic update - UI already changed
+    }
+  }, [power]);
+
+  const setNotifications = useCallback(async (config: NotificationsConfig) => {
+    setNotificationsState(config);
+    try {
+      await window.localmost.settings.set({ notifications: config });
+    } catch {
+      // Optimistic update - UI already changed
+    }
+  }, []);
+
+  const setNotifyOnPause = useCallback(async (enabled: boolean) => {
+    const newConfig = { ...notifications, notifyOnPause: enabled };
+    setNotificationsState(newConfig);
+    try {
+      await window.localmost.settings.set({ notifications: newConfig });
+    } catch {
+      // Optimistic update - UI already changed
+    }
+  }, [notifications]);
+
+  const setNotifyOnJobEvents = useCallback(async (enabled: boolean) => {
+    const newConfig = { ...notifications, notifyOnJobEvents: enabled };
+    setNotificationsState(newConfig);
+    try {
+      await window.localmost.settings.set({ notifications: newConfig });
+    } catch {
+      // Optimistic update - UI already changed
+    }
+  }, [notifications]);
+
   const clearLogs = useCallback(() => {
     logsRef.current = [];
     setLogs([]);
@@ -327,6 +423,14 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     setToolCacheLocation,
     userFilter,
     setUserFilter,
+    power,
+    setPower,
+    setPauseOnBattery,
+    setPauseOnVideoCall,
+    notifications,
+    setNotifications,
+    setNotifyOnPause,
+    setNotifyOnJobEvents,
     isOnline,
     isLoading,
     error,

@@ -258,6 +258,8 @@ export function spawnSandboxed(
 
   // Extract custom options (don't pass to spawn)
   const { proxyPort, logPrefix, onLog, ...spawnOptions } = options;
+  // proxyPort is extracted but currently unused - reserved for future proxy routing
+  void proxyPort;
 
   // Create a prefixed logger - only logs if onLog callback is provided
   const prefix = logPrefix ? `[${logPrefix}] ` : '';

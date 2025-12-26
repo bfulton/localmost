@@ -1,11 +1,20 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, Suspense, lazy } from 'react';
 import StatusPage from './components/StatusPage';
-import SettingsPage from './components/SettingsPage';
 import UpdateNotification from './components/UpdateNotification';
-import TargetsPage from './components/TargetsPage';
 import PageErrorBoundary from './components/PageErrorBoundary';
 import { AppConfigProvider, RunnerProvider, UpdateProvider, useAppConfig, useRunner } from './contexts';
 import styles from './components/App.module.css';
+
+// Lazy load pages that aren't shown on initial render
+const SettingsPage = lazy(() => import('./components/SettingsPage'));
+const TargetsPage = lazy(() => import('./components/TargetsPage'));
+
+// Loading fallback for lazy-loaded components
+const PageLoading: React.FC = () => (
+  <div className={styles.loadingScreen}>
+    <div className={styles.loadingSpinner} />
+  </div>
+);
 
 type View = 'status' | 'settings' | 'targets';
 
@@ -102,14 +111,16 @@ const AppContent: React.FC = () => {
           }}
           alternatePageName="Status"
         >
-          <SettingsPage
-            onBack={() => {
-              setScrollToSection(undefined);
-              setView('status');
-            }}
-            scrollToSection={scrollToSection}
-            onOpenTargets={() => setView('targets')}
-          />
+          <Suspense fallback={<PageLoading />}>
+            <SettingsPage
+              onBack={() => {
+                setScrollToSection(undefined);
+                setView('status');
+              }}
+              scrollToSection={scrollToSection}
+              onOpenTargets={() => setView('targets')}
+            />
+          </Suspense>
         </PageErrorBoundary>
       )}
 
@@ -120,7 +131,9 @@ const AppContent: React.FC = () => {
           onNavigateAway={() => setView('settings')}
           alternatePageName="Settings"
         >
-          <TargetsPage onBack={() => setView('settings')} />
+          <Suspense fallback={<PageLoading />}>
+            <TargetsPage onBack={() => setView('settings')} />
+          </Suspense>
         </PageErrorBoundary>
       )}
     </>

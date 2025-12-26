@@ -9,6 +9,7 @@ import {
   setLogLevelSetting,
   setRunnerLogLevelSetting,
   updateSleepProtection,
+  getResourceMonitor,
 } from '../app-state';
 import { IPC_CHANNELS, SleepProtection, LogLevel } from '../../shared/types';
 
@@ -56,6 +57,14 @@ export const registerSettingsHandlers = (): void => {
         openAtLogin: settings.launchAtLogin,
         openAsHidden: false,
       });
+    }
+
+    // Update power config if setting changed
+    if (settings.power !== undefined) {
+      const resourceMonitor = getResourceMonitor();
+      if (resourceMonitor) {
+        resourceMonitor.updateConfig(settings.power);
+      }
     }
 
     return { success: true };

@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faXmark, faLightbulb, faMoon, faDesktop } from '@fortawesome/free-solid-svg-icons';
-import { SleepProtection } from '../../shared/types';
+import { SleepProtection, BatteryPauseThreshold } from '../../shared/types';
 import { GITHUB_APP_SETTINGS_URL, PRIVACY_POLICY_URL, REPOSITORY_URL } from '../../shared/constants';
 import { useAppConfig, useRunner, useUpdate } from '../contexts';
 import UserFilterSettings from './UserFilterSettings';
@@ -37,6 +37,12 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     setToolCacheLocation,
     userFilter,
     setUserFilter,
+    power,
+    setPauseOnBattery,
+    setPauseOnVideoCall,
+    notifications,
+    setNotifyOnPause,
+    setNotifyOnJobEvents,
   } = useAppConfig();
 
   // Runner state from context
@@ -46,8 +52,6 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     deviceCode,
     login,
     logout,
-    repos,
-    orgs,
     isDownloaded,
     runnerVersion,
     availableVersions,
@@ -62,11 +66,10 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     targets,
     isInitialLoading,
     error,
-    setError,
   } = useRunner();
 
   // Update state from context
-  const { status: updateStatus, settings: updateSettings, setSettings: setUpdateSettings, checkForUpdates, isChecking } = useUpdate();
+  const { status: updateStatus, settings: updateSettings, setSettings: setUpdateSettings, checkForUpdates, isChecking, lastChecked } = useUpdate();
 
   // Local UI state
   const [showSleepConsentDialog, setShowSleepConsentDialog] = useState(false);
@@ -432,6 +435,66 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
               Prevents your Mac from sleeping while GitHub Actions jobs are running, ensuring jobs complete successfully.
             </p>
           </div>
+          <div className={shared.formGroup}>
+            <label>Pause when using battery</label>
+            <select
+              value={power.pauseOnBattery}
+              onChange={(e) => setPauseOnBattery(e.target.value as BatteryPauseThreshold)}
+            >
+              <option value="never">Never</option>
+              <option value="<25%">Below 25%</option>
+              <option value="<50%">Below 50%</option>
+              <option value="<75%">Below 75%</option>
+              <option value="always">Always</option>
+            </select>
+            <p className={shared.formHint}>
+              Automatically pause runners when your Mac is on battery power. Jobs will fall back to GitHub-hosted runners.
+            </p>
+          </div>
+          <div className={shared.formGroup}>
+            <label className={shared.toggleRow}>
+              <input
+                type="checkbox"
+                checked={power.pauseOnVideoCall}
+                onChange={(e) => setPauseOnVideoCall(e.target.checked)}
+              />
+              <span>Pause during video calls</span>
+            </label>
+            <p className={shared.formHint}>
+              Detects camera usage and pauses runners during video calls. Resumes 60 seconds after the call ends.
+            </p>
+          </div>
+        </section>
+
+        {/* Notifications Section */}
+        <section className={styles.settingsSection}>
+          <h3>Notifications</h3>
+          <div className={shared.formGroup}>
+            <label className={shared.toggleRow}>
+              <input
+                type="checkbox"
+                checked={notifications.notifyOnPause}
+                onChange={(e) => setNotifyOnPause(e.target.checked)}
+              />
+              <span>Notify when pausing/resuming</span>
+            </label>
+            <p className={shared.formHint}>
+              Show a notification when runners are paused or resumed due to resource constraints.
+            </p>
+          </div>
+          <div className={shared.formGroup}>
+            <label className={shared.toggleRow}>
+              <input
+                type="checkbox"
+                checked={notifications.notifyOnJobEvents}
+                onChange={(e) => setNotifyOnJobEvents(e.target.checked)}
+              />
+              <span>Notify on job start/end</span>
+            </label>
+            <p className={shared.formHint}>
+              Show a notification when a GitHub Actions job starts or completes on your runner.
+            </p>
+          </div>
         </section>
 
         {/* Sleep Protection Consent Dialog */}
@@ -595,6 +658,11 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
             {updateStatus.status === 'downloaded' && (
               <span className={styles.updateReady}>
                 Update ready to install
+              </span>
+            )}
+            {updateStatus.status === 'idle' && lastChecked && (
+              <span className={styles.upToDate}>
+                ✓ Up to date
               </span>
             )}
           </div>

@@ -79,7 +79,7 @@ export const initLogFile = (): void => {
       // Clean up temp symlink on failure
       try {
         fs.unlinkSync(tempSymlinkPath);
-      } catch (cleanupErr) {
+      } catch {
         // Cleanup failed but original error is more important
       }
       bootLog('warn', `Failed to create log symlink: ${(symlinkErr as Error).message}`);
@@ -87,7 +87,6 @@ export const initLogFile = (): void => {
 
     // Open write stream
     logFileStream = fs.createWriteStream(logFilePath, { flags: 'a' });
-    logFileStream.write(`=== localmost started at ${now.toISOString()} ===\n`);
 
     // Clean up old log files
     const logFiles = fs.readdirSync(logsDir)

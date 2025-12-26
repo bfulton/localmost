@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import { faGear, faChevronDown, faFile, faCheck, faBackwardStep, faForwardStep, faBan } from '@fortawesome/free-solid-svg-icons';
-import { JobHistoryEntry, Target } from '../../shared/types';
+import { faGear, faChevronDown, faFile, faCheck, faBackwardStep, faForwardStep, faBan, faXmark } from '@fortawesome/free-solid-svg-icons';
+import { JobHistoryEntry, Target, ResourcePauseState } from '../../shared/types';
 import { GITHUB_APP_SETTINGS_URL } from '../../shared/constants';
 import { useAppConfig, useRunner } from '../contexts';
 import styles from './StatusPage.module.css';
@@ -239,13 +239,16 @@ interface JobStatusItemProps {
   statusType: string;
   spinning?: boolean;
   activeJobSummary?: string;
-  activeJobUrl?: string;
+  runningJobs: JobHistoryEntry[];
   jobHistory: JobHistoryEntry[];
   maxJobHistory: number;
   showHistory: boolean;
   onToggleHistory: () => void;
   sleepInfo?: React.ReactNode;
   onSleepInfoClick?: () => void;
+  cancellingJobs: Set<string>;
+  cancelledJobs: Set<string>;
+  onCancelJob: (job: JobHistoryEntry) => void;
 }
 
 const JobStatusItem: React.FC<JobStatusItemProps> = ({
@@ -253,20 +256,32 @@ const JobStatusItem: React.FC<JobStatusItemProps> = ({
   statusType,
   spinning,
   activeJobSummary,
-  activeJobUrl,
+  runningJobs,
   jobHistory,
   maxJobHistory,
   showHistory,
   onToggleHistory,
   sleepInfo,
   onSleepInfoClick,
+  cancellingJobs,
+  cancelledJobs,
+  onCancelJob,
 }) => {
+  // Handle clicking on running jobs summary - opens each job's URL
+  const handleRunningJobsClick = (e: React.MouseEvent) => {
+    e.preventDefault();
+    for (const job of runningJobs) {
+      if (job.actionsUrl) {
+        window.open(job.actionsUrl, '_blank');
+      }
+    }
+  };
   const getStatusSymbol = (jobStatus: JobHistoryEntry['status']) => {
     switch (jobStatus) {
       case 'running': return '●';
       case 'completed': return '✓';
       case 'failed': return '✗';
-      case 'cancelled': return '○';
+      case 'cancelled': return '!';
     }
   };
 
@@ -295,8 +310,8 @@ const JobStatusItem: React.FC<JobStatusItemProps> = ({
       {(activeJobSummary || sleepInfo) && (
         <div className={`${styles.statusItemDetail} ${shared.flexBetween}`}>
           {activeJobSummary ? (
-            activeJobUrl ? (
-              <a href={activeJobUrl} target="_blank" rel="noopener noreferrer" className={styles.detailLink}>
+            runningJobs.some(j => j.actionsUrl) ? (
+              <a href="#" onClick={handleRunningJobsClick} className={styles.detailLink}>
                 {activeJobSummary}
               </a>
             ) : (
@@ -324,7 +339,7 @@ const JobStatusItem: React.FC<JobStatusItemProps> = ({
           {jobHistory.length === 0 ? (
             <div className={styles.jobHistoryEmpty}>No recent jobs</div>
           ) : (
-            jobHistory.map((job) => {
+            [...jobHistory].reverse().map((job) => {
               // Extract instance number from runner name (e.g., "localmost.blue-243.1" -> "1")
               const instanceNum = job.runnerName?.match(/\.(\d+)$/)?.[1];
               return (
@@ -350,7 +365,18 @@ const JobStatusItem: React.FC<JobStatusItemProps> = ({
                     {formatTimestamp(job.startedAt)}
                   </span>
                   <span className={styles.jobHistoryDuration}>
-                    {job.runTimeSeconds !== undefined ? formatRunTime(job.runTimeSeconds) : '...'}
+                    {job.status === 'running' && job.githubRunId && job.repository && !cancelledJobs.has(job.id) ? (
+                      <button
+                        className={styles.jobHistoryCancelBtn}
+                        onClick={() => onCancelJob(job)}
+                        disabled={cancellingJobs.has(job.id)}
+                        title="Cancel job"
+                      >
+                        <FontAwesomeIcon icon={faXmark} spin={cancellingJobs.has(job.id)} />
+                      </button>
+                    ) : (
+                      job.runTimeSeconds !== undefined ? formatRunTime(job.runTimeSeconds) : '...'
+                    )}
                   </span>
                 </div>
               );
@@ -365,11 +391,10 @@ const JobStatusItem: React.FC<JobStatusItemProps> = ({
 const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
   // Get state from contexts
   const { logs, maxLogScrollback, maxJobHistory, sleepProtection, clearLogs } = useAppConfig();
-  const { user, isDownloaded, isConfigured, runnerVersion, runnerState, jobHistory, runnerConfig, runnerDisplayName, targets, targetStatus } = useRunner();
+  const { user, isDownloaded, isConfigured, runnerVersion, runnerState, jobHistory, runnerDisplayName, targets, targetStatus } = useRunner();
 
   // Local UI state
   const [runnerSettingsUrl, setRunnerSettingsUrl] = useState<string | null>(null);
-  const [actionsUrl, setActionsUrl] = useState<string | null>(null);
   const [showUsage, setShowUsage] = useState(false);
   const [showJobHistory, setShowJobHistory] = useState(false);
   const [logsExpanded, setLogsExpanded] = useState(false);
@@ -377,27 +402,36 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
   const [logPathCopied, setLogPathCopied] = useState(false);
   const [logFilter, setLogFilter] = useState('');
   const [, setTick] = useState(0); // Force re-render for elapsed time updates
+  const [resourcePause, setResourcePause] = useState<ResourcePauseState>({ isPaused: false, reason: null, conditions: [] });
+  const [cancellingJobs, setCancellingJobs] = useState<Set<string>>(new Set());
+  const [cancelledJobs, setCancelledJobs] = useState<Set<string>>(new Set());
   const logsEndRef = useRef<HTMLDivElement>(null);
   const logsContentRef = useRef<HTMLDivElement>(null);
   const isAtBottomRef = useRef(true); // Track if user is scrolled to bottom
   const isProgrammaticScrollRef = useRef(false); // Ignore scroll events during programmatic scroll
 
   useEffect(() => {
-    // Construct runner settings URL and actions URL from first target
+    // Construct runner settings URL from first target
     if (isConfigured && targets.length > 0) {
       const firstTarget = targets[0];
-      const actionsQuery = '?query=is%3Ain_progress';
       if (firstTarget.type === 'org') {
         setRunnerSettingsUrl(`https://github.com/organizations/${firstTarget.owner}/settings/actions/runners`);
-        setActionsUrl(`https://github.com/orgs/${firstTarget.owner}/actions${actionsQuery}`);
       } else {
         setRunnerSettingsUrl(`https://github.com/${firstTarget.owner}/${firstTarget.repo}/settings/actions/runners`);
-        setActionsUrl(`https://github.com/${firstTarget.owner}/${firstTarget.repo}/actions${actionsQuery}`);
       }
     }
 
     // Get log file path
     window.localmost.logs.getPath().then(setLogPath);
+
+
+    // Load initial resource pause state and subscribe to changes
+    window.localmost.resource.getState().then(setResourcePause);
+    const unsubResource = window.localmost.resource.onStateChange(setResourcePause);
+
+    return () => {
+      unsubResource();
+    };
   }, [isConfigured, targets]);
 
   // Helper to check if scroll is at bottom
@@ -466,6 +500,42 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
     return () => clearInterval(interval);
   }, [jobHistory]);
 
+  // Handle job cancellation
+  const handleCancelJob = async (job: JobHistoryEntry) => {
+    if (!job.githubRunId || !job.repository) return;
+
+    // Parse owner/repo from repository string
+    const [owner, repo] = job.repository.split('/');
+    if (!owner || !repo) return;
+
+    // Mark as cancelling
+    setCancellingJobs(prev => new Set(prev).add(job.id));
+
+    try {
+      const result = await window.localmost.jobs.cancel(owner, repo, job.githubRunId);
+      if (result.success) {
+        // Mark as cancelled so button hides immediately
+        setCancelledJobs(prev => new Set(prev).add(job.id));
+      } else {
+        // Check for permission error
+        if (result.error?.includes('Resource not accessible')) {
+          console.error('Failed to cancel job: GitHub App needs "Actions: Read and write" permission. Go to GitHub App settings to add it.');
+        } else {
+          console.error('Failed to cancel job:', result.error);
+        }
+      }
+    } catch (error) {
+      console.error('Error cancelling job:', error);
+    } finally {
+      // Remove from cancelling set
+      setCancellingJobs(prev => {
+        const next = new Set(prev);
+        next.delete(job.id);
+        return next;
+      });
+    }
+  };
+
   // GitHub status
   const getGitHubStatus = (): { status: string; statusType: string; detail?: string; link?: string } => {
     if (!user) {
@@ -473,13 +543,13 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
     }
     return {
       status: 'Connected',
-      statusType: 'running',
+      statusType: 'listening',
       detail: `@${user.login}`,
       link: GITHUB_APP_SETTINGS_URL
     };
   };
 
-  // Runner status - combines worker status with connection status
+  // Runner status - combines worker status with connection status and pause reason
   const getRunnerStatusInfo = (): { status: string; statusType: string } => {
     if (!user) {
       return { status: 'Waiting for GitHub', statusType: 'offline' };
@@ -489,6 +559,21 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
     }
     if (!isConfigured) {
       return { status: 'Not configured', statusType: 'offline' };
+    }
+
+    // Check if paused due to resource constraints (takes priority over connection status)
+    if (resourcePause.isPaused) {
+      // Convert long reason to short form for inline display
+      const reason = resourcePause.reason || '';
+      let shortReason = 'resource';
+      if (reason.toLowerCase().includes('user')) {
+        shortReason = 'user';
+      } else if (reason.toLowerCase().includes('battery')) {
+        shortReason = 'battery';
+      } else if (reason.toLowerCase().includes('video')) {
+        shortReason = 'video';
+      }
+      return { status: `Paused (${shortReason})`, statusType: 'paused' };
     }
 
     // Check connection status for all targets
@@ -541,26 +626,27 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
     switch (runnerState.status) {
       case 'starting':
         return { status: 'Starting', statusType: 'starting' };
-      case 'running':
-        return { status: 'Listening', statusType: 'running' };
+      case 'listening':
+        return { status: 'Listening', statusType: 'listening' };
       case 'busy':
         return { status: 'Running job', statusType: 'busy' };
       case 'error':
         return { status: 'Error', statusType: 'error' };
-      case 'idle':
-        return { status: 'Idle', statusType: 'idle' };
+      case 'shutting_down':
+        return { status: 'Shutting down', statusType: 'shutting_down' };
+      case 'offline':
       default:
         return { status: 'Offline', statusType: 'offline' };
     }
   };
 
   // Job status - summarize all running jobs
-  const getJobStatus = (): { status: string; statusType: string; spinning?: boolean; activeJobSummary?: string; activeJobUrl?: string } => {
-    const runningJobs = jobHistory.filter(j => j.status === 'running');
+  const getJobStatus = (): { status: string; statusType: string; spinning?: boolean; activeJobSummary?: string; runningJobs: JobHistoryEntry[] } => {
+    const runningJobs = jobHistory.filter(j => j.status === 'running' && !cancelledJobs.has(j.id));
 
     if (runningJobs.length > 0) {
-      // Find the oldest running job (latest startedAt since array is sorted newest first)
-      const oldestJob = runningJobs[runningJobs.length - 1];
+      // Find the oldest running job (first in array since it's chronologically sorted)
+      const oldestJob = runningJobs[0];
       const elapsedSeconds = Math.round((Date.now() - new Date(oldestJob.startedAt).getTime()) / 1000);
       const durationStr = formatRunTime(elapsedSeconds);
 
@@ -576,10 +662,10 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
         statusType: 'busy',
         spinning: true,
         activeJobSummary: summary,
-        activeJobUrl: actionsUrl || undefined
+        runningJobs
       };
     }
-    return { status: 'Inactive', statusType: 'idle' };
+    return { status: 'Inactive', statusType: 'idle', runningJobs: [] };
   };
 
   // Sleep behavior info
@@ -655,13 +741,16 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
           statusType={jobStatus.statusType}
           spinning={jobStatus.spinning}
           activeJobSummary={jobStatus.activeJobSummary}
-          activeJobUrl={jobStatus.activeJobUrl}
+          runningJobs={jobStatus.runningJobs}
           jobHistory={jobHistory}
           maxJobHistory={maxJobHistory}
           showHistory={showJobHistory}
           onToggleHistory={() => setShowJobHistory(!showJobHistory)}
           sleepInfo={sleepInfo}
           onSleepInfoClick={() => onOpenSettings('power-section')}
+          cancellingJobs={cancellingJobs}
+          cancelledJobs={cancelledJobs}
+          onCancelJob={handleCancelJob}
         />
       </div>
 

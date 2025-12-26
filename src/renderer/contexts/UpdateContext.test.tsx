@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen, waitFor, act, fireEvent } from '@testing-library/react';
+import { render, screen, act, fireEvent } from '@testing-library/react';
 import { UpdateProvider, useUpdate } from './UpdateContext';
 import { mockLocalmost } from '../../../test/setup-renderer';
 import { UpdateStatus } from '../../shared/types';
@@ -19,6 +19,7 @@ const TestConsumer: React.FC = () => {
       <span data-testid="check-interval">{update.settings.checkIntervalHours}</span>
       <span data-testid="is-checking">{String(update.isChecking)}</span>
       <span data-testid="is-dismissed">{String(update.isDismissed)}</span>
+      <span data-testid="last-checked">{update.lastChecked ? 'set' : 'null'}</span>
       <button data-testid="check-updates" onClick={update.checkForUpdates}>Check</button>
       <button data-testid="download-update" onClick={update.downloadUpdate}>Download</button>
       <button data-testid="install-update" onClick={update.installUpdate}>Install</button>
@@ -353,6 +354,55 @@ describe('UpdateContext', () => {
       unmount();
 
       expect(unsubscribe).toHaveBeenCalled();
+    });
+  });
+
+  describe('lastChecked auto-clear', () => {
+    it('should set lastChecked after successful check', async () => {
+      await renderWithProvider();
+
+      expect(screen.getByTestId('last-checked').textContent).toBe('null');
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('check-updates'));
+      });
+
+      expect(screen.getByTestId('last-checked').textContent).toBe('set');
+    });
+
+    it('should clear lastChecked after timeout', async () => {
+      // Use real timers but with a shorter wait
+      jest.useFakeTimers();
+
+      await act(async () => {
+        render(
+          <UpdateProvider>
+            <TestConsumer />
+          </UpdateProvider>
+        );
+      });
+
+      // Run pending timers to complete initial load
+      await act(async () => {
+        jest.runAllTimers();
+      });
+
+      // Trigger check
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('check-updates'));
+        jest.runAllTimers(); // Run the check promise
+      });
+
+      expect(screen.getByTestId('last-checked').textContent).toBe('set');
+
+      // Fast-forward past the 5 second timeout
+      await act(async () => {
+        jest.advanceTimersByTime(5000);
+      });
+
+      expect(screen.getByTestId('last-checked').textContent).toBe('null');
+
+      jest.useRealTimers();
     });
   });
 });

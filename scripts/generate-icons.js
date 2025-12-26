@@ -15,11 +15,15 @@ if (!fs.existsSync(generatedDir)) {
 }
 
 // Create the main app icon - laptop with play button on dark background
-const createAppIcon = () => {
+const createAppIcon = (withBorder = false) => {
+  const border = withBorder
+    ? `<rect x="2" y="2" width="96" height="96" rx="22" fill="none" stroke="#808080" stroke-width="1.5"/>`
+    : '';
   return `<?xml version="1.0" encoding="UTF-8"?>
 <svg width="1024" height="1024" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
   <!-- Dark rounded square background (macOS app icon style) -->
   <rect x="2" y="2" width="96" height="96" rx="22" fill="#1a1a1a"/>
+  ${border}
   <!-- Laptop outline -->
   <rect x="15" y="20" width="70" height="50" rx="9" stroke="#ffffff" stroke-width="6"/>
   <path d="M15.5 87H84.5" stroke="#808080" stroke-width="6" stroke-linecap="round"/>
@@ -117,6 +121,34 @@ const createTrayNotReadyTemplate = (size, intensity = 1.0) => {
 </svg>`;
 };
 
+// Create a "paused" tray icon with amber/yellow pause symbol at a given intensity (0-1)
+// Shows "||" (pause bars) instead of ">" (play button)
+const createTrayPausedTemplate = (size, intensity = 1.0) => {
+  const scale = size / 100;
+  const strokeWidth = Math.max(4, 6 / scale);
+
+  // Amber/yellow color that pulses
+  // At intensity 1.0: bright amber (#f59e0b - amber-500)
+  // At intensity 0.4: dimmed color
+  const baseR = 245, baseG = 158, baseB = 11;
+  const grayR = 120, grayG = 100, grayB = 60;
+
+  const r = Math.round(grayR + (baseR - grayR) * intensity);
+  const g = Math.round(grayG + (baseG - grayG) * intensity);
+  const b = Math.round(grayB + (baseB - grayB) * intensity);
+  const color = `rgb(${r},${g},${b})`;
+
+  // Pause bars (||) - two vertical lines
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg width="${size}" height="${size}" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect x="15" y="20" width="70" height="50" rx="9" stroke="black" stroke-width="${strokeWidth}"/>
+  <path d="M15.5 87H84.5" stroke="black" stroke-width="${strokeWidth}" stroke-linecap="round"/>
+  <!-- Pause bars -->
+  <path d="M42 35V55" stroke="${color}" stroke-width="${strokeWidth}" stroke-linecap="round"/>
+  <path d="M56 35V55" stroke="${color}" stroke-width="${strokeWidth}" stroke-linecap="round"/>
+</svg>`;
+};
+
 // Animation frame intensities for smooth pulsing (ease in/out)
 const PULSE_FRAMES = 8;
 const getPulseIntensities = () => {
@@ -132,7 +164,8 @@ const getPulseIntensities = () => {
 
 // Write SVG files
 console.log('Creating SVG icons...');
-fs.writeFileSync(path.join(generatedDir, 'icon.svg'), createAppIcon());
+fs.writeFileSync(path.join(generatedDir, 'icon.svg'), createAppIcon(false));
+fs.writeFileSync(path.join(generatedDir, 'icon-light.svg'), createAppIcon(true)); // For light mode backgrounds
 fs.writeFileSync(path.join(generatedDir, 'icon-backup.svg'), createAppIconBackup());
 fs.writeFileSync(path.join(generatedDir, 'tray-iconTemplate.svg'), createTrayTemplate(22));
 fs.writeFileSync(path.join(generatedDir, 'tray-iconTemplate@2x.svg'), createTrayTemplate(44));
@@ -161,4 +194,16 @@ for (let i = 0; i < PULSE_FRAMES; i++) {
     createTrayNotReadyTemplate(44, intensities[i])
   );
 }
-console.log(`SVG icons created in assets/generated/ (including ${PULSE_FRAMES} busy + ${PULSE_FRAMES} not-ready pulse frames)`);
+
+// Generate pulse animation frames for paused icon (amber "||")
+for (let i = 0; i < PULSE_FRAMES; i++) {
+  fs.writeFileSync(
+    path.join(generatedDir, `tray-icon-paused-${i}.svg`),
+    createTrayPausedTemplate(22, intensities[i])
+  );
+  fs.writeFileSync(
+    path.join(generatedDir, `tray-icon-paused-${i}@2x.svg`),
+    createTrayPausedTemplate(44, intensities[i])
+  );
+}
+console.log(`SVG icons created in assets/generated/ (including ${PULSE_FRAMES} busy + ${PULSE_FRAMES} not-ready + ${PULSE_FRAMES} paused pulse frames)`);

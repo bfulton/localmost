@@ -29,9 +29,9 @@
     "icons": "npm run icons:svg && npm run icons:convert",
     "icons:convert": "node scripts/convert-icons.js",
     "pretest": "npm run build-info",
-    "test": "jest --config jest.config.js",
+    "test": "jest --config jest.config.js && jest --config jest.config.renderer.js",
+    "test:main": "jest --config jest.config.js",
     "test:renderer": "jest --config jest.config.renderer.js",
-    "test:all": "npm run test && npm run test:renderer",
     "test:watch": "jest --config jest.config.js --watch",
     "test:coverage": "jest --config jest.config.js --coverage",
     "build:e2e": "npm run build && electron-forge package",
@@ -60,6 +60,7 @@
     "cross-env": "^7.0.3",
     "css-loader": "^6.10.0",
     "electron": "^39.2.6",
+    "electron-updater": "^6.6.2",
     "eslint-plugin-react": "^7.37.5",
     "eslint-plugin-react-hooks": "^7.0.1",
     "globals": "^16.5.0",
@@ -82,10 +83,11 @@
     "@fortawesome/fontawesome-svg-core": "^7.1.0",
     "@fortawesome/free-solid-svg-icons": "^7.1.0",
     "@fortawesome/react-fontawesome": "^3.1.1",
-    "electron-updater": "^6.6.2",
+    "is-camera-on": "^4.0.0",
     "js-yaml": "^4.1.1",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "tar": "^7.5.2"
+    "tar": "^7.5.2",
+    "xstate": "^5.25.0"
   }
 }

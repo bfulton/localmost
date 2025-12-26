@@ -115,7 +115,7 @@ describe('StatusPage', () => {
     });
     mockLocalmost.runner.isDownloaded.mockResolvedValue(true);
     mockLocalmost.runner.isConfigured.mockResolvedValue(true);
-    mockLocalmost.runner.getStatus.mockResolvedValue({ status: 'running' });
+    mockLocalmost.runner.getStatus.mockResolvedValue({ status: 'listening' });
 
     renderWithProviders(<StatusPage {...defaultProps} />);
 
@@ -159,7 +159,7 @@ describe('StatusPage', () => {
     });
     mockLocalmost.runner.isDownloaded.mockResolvedValue(true);
     mockLocalmost.runner.isConfigured.mockResolvedValue(true);
-    mockLocalmost.runner.getStatus.mockResolvedValue({ status: 'running' });
+    mockLocalmost.runner.getStatus.mockResolvedValue({ status: 'listening' });
 
     renderWithProviders(<StatusPage {...defaultProps} />);
 

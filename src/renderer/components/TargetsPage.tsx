@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faXmark, faTrash, faBuilding, faBook, faPlus } from '@fortawesome/free-solid-svg-icons';
-import { Target, RunnerProxyStatus, GitHubRepo, GitHubOrg } from '../../shared/types';
+import { RunnerProxyStatus } from '../../shared/types';
 import { useRunner } from '../contexts';
 import styles from './TargetsPage.module.css';
 import shared from '../styles/shared.module.css';

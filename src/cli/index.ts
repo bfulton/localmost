@@ -15,14 +15,14 @@ import * as net from 'net';
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
-import { getCliSocketPath, getAppDataDirWithoutElectron } from '../shared/paths';
+import { getCliSocketPath } from '../shared/paths';
 
 interface CliRequest {
   command: 'status' | 'pause' | 'resume' | 'jobs' | 'quit';
 }
 
 interface RunnerState {
-  status: 'idle' | 'starting' | 'running' | 'busy' | 'offline' | 'error';
+  status: 'offline' | 'starting' | 'listening' | 'busy' | 'error' | 'shutting_down';
   jobName?: string;
   repository?: string;
   startedAt?: string;
@@ -39,6 +39,11 @@ interface JobHistoryEntry {
   actionsUrl?: string;
 }
 
+interface ResourcePauseState {
+  isPaused: boolean;
+  reason: string | null;
+}
+
 interface StatusResponse {
   success: true;
   command: 'status';
@@ -48,6 +53,7 @@ interface StatusResponse {
     heartbeat: { isRunning: boolean };
     authenticated: boolean;
     userName?: string;
+    resourcePause?: ResourcePauseState;
   };
 }
 
@@ -117,11 +123,11 @@ function formatTimestamp(isoString: string): string {
 
 function getStatusIcon(status: string): string {
   switch (status) {
-    case 'running': return '\u2713'; // checkmark
+    case 'listening': return '\u2713'; // checkmark
     case 'busy': return '\u25CF';    // filled circle
     case 'starting': return '\u25CB'; // empty circle
-    case 'idle': return '\u25CB';    // empty circle
     case 'offline': return '\u25CB'; // empty circle
+    case 'shutting_down': return '\u25CB'; // empty circle
     case 'error': return '\u2717';   // x mark
     case 'completed': return '\u2713';
     case 'failed': return '\u2717';
@@ -131,26 +137,51 @@ function getStatusIcon(status: string): string {
 }
 
 function printStatus(response: StatusResponse): void {
-  const { runner, runnerName, heartbeat, authenticated, userName } = response.data;
+  const { runner, runnerName, heartbeat, authenticated, userName, resourcePause } = response.data;
 
-  console.log(`\nRunner: ${runnerName}`);
-  console.log(`Status: ${getStatusIcon(runner.status)} ${runner.status}`);
+  console.log();
 
-  if (runner.status === 'busy' && runner.jobName) {
-    console.log(`Job:    ${runner.jobName}`);
-  }
-
-  if (runner.startedAt) {
-    console.log(`Uptime: started ${formatTimestamp(runner.startedAt)}`);
-  }
-
-  console.log(`\nHeartbeat: ${heartbeat.isRunning ? 'active' : 'inactive'}`);
-
+  // GitHub status (matches Status Page order)
   if (authenticated) {
-    console.log(`GitHub:    authenticated as ${userName || 'unknown'}`);
+    console.log(`GitHub:    Connected as @${userName || 'unknown'}`);
   } else {
-    console.log(`GitHub:    not authenticated`);
+    console.log(`GitHub:    Not connected`);
   }
+
+  // Runner status
+  let runnerStatusText: string;
+  let runnerIcon: string;
+
+  if (resourcePause?.isPaused) {
+    runnerIcon = '\u23F8'; // pause symbol
+    runnerStatusText = `Paused (${resourcePause.reason || 'resource constraint'})`;
+  } else {
+    runnerIcon = getStatusIcon(runner.status);
+    // Capitalize status to match UI
+    const statusMap: Record<string, string> = {
+      'offline': 'Offline',
+      'starting': 'Starting',
+      'listening': 'Listening',
+      'busy': 'Running job',
+      'error': 'Error',
+      'shutting_down': 'Shutting down',
+    };
+    runnerStatusText = statusMap[runner.status] || runner.status;
+  }
+
+  console.log(`Runner:    ${runnerIcon} ${runnerStatusText}`);
+  console.log(`           ${runnerName}`);
+
+  // Job status
+  if (runner.status === 'busy' && runner.jobName) {
+    console.log(`Job:       Running`);
+    console.log(`           ${runner.jobName}`);
+  } else {
+    console.log(`Job:       Inactive`);
+  }
+
+  // Heartbeat status
+  console.log(`Heartbeat: ${heartbeat.isRunning ? 'Active' : 'Inactive'}`);
 
   console.log();
 }
@@ -218,9 +249,10 @@ async function sendCommand(command: CliRequest['command']): Promise<CliResponse>
     });
 
     socket.on('error', (err) => {
-      if ((err as NodeJS.ErrnoException).code === 'ECONNREFUSED') {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ECONNREFUSED') {
         reject(new Error('localmost app is not running (connection refused)'));
-      } else if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      } else if (code === 'ENOENT') {
         reject(new Error('localmost app is not running (socket not found)'));
       } else {
         reject(err);
@@ -243,24 +275,65 @@ function isAppRunning(): boolean {
 }
 
 /**
- * Find the localmost app bundle path.
- * Checks standard macOS installation locations.
+ * Get the real path of the CLI script, resolving symlinks.
+ * This is needed because npm link creates symlinks, and we need
+ * to know where the actual source lives to find dev builds.
+ */
+function getCliRealPath(): string {
+  try {
+    // process.argv[1] is the script being executed
+    // fs.realpathSync resolves all symlinks
+    return fs.realpathSync(process.argv[1]);
+  } catch {
+    // Fallback to __dirname if realpath fails
+    return path.join(__dirname, 'cli.js');
+  }
+}
+
+/**
+ * Find an installed localmost app bundle.
+ * Used when not in a dev checkout.
  */
 function findAppPath(): string | null {
-  const possiblePaths = [
-    '/Applications/localmost.app',
-    path.join(process.env.HOME || '', 'Applications', 'localmost.app'),
-    // Development build location
-    path.join(__dirname, '..', '..', 'out', 'localmost-darwin-arm64', 'localmost.app'),
-    path.join(__dirname, '..', '..', 'out', 'localmost-darwin-x64', 'localmost.app'),
-  ];
+  const cliPath = getCliRealPath();
 
-  for (const appPath of possiblePaths) {
-    if (fs.existsSync(appPath)) {
-      return appPath;
+  // Check if we're running from inside an .app bundle
+  // e.g., /Applications/localmost.app/Contents/Resources/app/dist/cli.js
+  const appBundleMatch = cliPath.match(/^(.+\.app)\/Contents\//);
+  if (appBundleMatch) {
+    const bundlePath = appBundleMatch[1];
+    if (fs.existsSync(bundlePath)) {
+      return bundlePath;
     }
   }
 
+  // Check system install locations
+  const systemPaths = [
+    '/Applications/localmost.app',
+    path.join(process.env.HOME || '', 'Applications', 'localmost.app'),
+  ];
+
+  for (const sysPath of systemPaths) {
+    if (fs.existsSync(sysPath)) {
+      return sysPath;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Check if we're in a development checkout.
+ * Returns the project root if so, null otherwise.
+ */
+function getDevCheckoutRoot(): string | null {
+  const cliPath = getCliRealPath();
+  const cliDir = path.dirname(cliPath);
+  const projectRoot = path.dirname(cliDir); // Go up from dist/ to project root
+
+  if (fs.existsSync(path.join(projectRoot, 'package.json'))) {
+    return projectRoot;
+  }
   return null;
 }
 
@@ -273,6 +346,24 @@ async function startApp(): Promise<void> {
     return;
   }
 
+  // If in a dev checkout, run npm run start
+  const devRoot = getDevCheckoutRoot();
+  if (devRoot) {
+    console.log(`Starting dev server in ${devRoot}...`);
+    const child = spawn('npm', ['run', 'start'], {
+      cwd: devRoot,
+      stdio: 'inherit',
+    });
+
+    child.on('error', (err) => {
+      console.error(`Failed to start: ${err.message}`);
+      process.exit(1);
+    });
+
+    return;
+  }
+
+  // Otherwise, find and launch an installed app
   const appPath = findAppPath();
 
   if (!appPath) {
@@ -281,10 +372,11 @@ async function startApp(): Promise<void> {
     process.exit(1);
   }
 
-  console.log('Starting localmost...');
+  console.log(`Starting ${appPath}...`);
 
   // Use 'open' command on macOS to launch the app
-  const child = spawn('open', ['-a', appPath], {
+  // Note: use path directly, not -a (which matches by name, not path)
+  const child = spawn('open', [appPath], {
     detached: true,
     stdio: 'ignore',
   });
@@ -359,6 +451,11 @@ async function main(): Promise<void> {
     console.error(`Unknown command: ${command}`);
     console.error('Run "localmost help" for usage information.');
     process.exit(1);
+  }
+
+  if (!isAppRunning()) {
+    console.log('localmost app is not running');
+    process.exit(0);
   }
 
   try {

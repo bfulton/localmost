@@ -24,14 +24,10 @@ jest.mock('./process-sandbox', () => ({
   spawnSandboxed: jest.fn(),
 }));
 
-import { RunnerDownloader, DownloadProgress, RunnerRelease } from './runner-downloader';
+import { RunnerDownloader } from './runner-downloader';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { spawnSandboxed } from './process-sandbox';
-
-// Get the mocked function
-const mockSpawnSandboxed = spawnSandboxed as jest.MockedFunction<typeof spawnSandboxed>;
 
 // Mock fetch
 const mockFetch = jest.fn();

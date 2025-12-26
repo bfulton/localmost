@@ -61,7 +61,13 @@ export const failure = (error: string | Error): ErrorResult => ({
 // =============================================================================
 
 // Runner status types
-export type RunnerStatus = 'idle' | 'starting' | 'running' | 'busy' | 'offline' | 'error';
+// - 'offline': Runner not started or fully stopped
+// - 'starting': Runner process is starting up
+// - 'listening': Runner is connected and waiting for jobs
+// - 'busy': Runner is actively processing a job
+// - 'error': Runner encountered an error
+// - 'shutting_down': Runner is in the process of stopping
+export type RunnerStatus = 'offline' | 'starting' | 'listening' | 'busy' | 'error' | 'shutting_down';
 
 export interface RunnerState {
   status: RunnerStatus;
@@ -82,6 +88,9 @@ export interface JobHistoryEntry {
   completedAt?: string;
   runTimeSeconds?: number;
   actionsUrl?: string;
+  /** GitHub workflow run ID - for direct cancellation */
+  githubRunId?: number;
+  /** GitHub job ID */
   githubJobId?: number;
   runnerName?: string;
   /** For multi-target: which target this job came from */
@@ -146,6 +155,7 @@ export const IPC_CHANNELS = {
   JOB_HISTORY_GET: 'job:history-get',
   JOB_HISTORY_SET_MAX: 'job:history-set-max',
   JOB_HISTORY_UPDATE: 'job:history-update',
+  JOB_CANCEL: 'job:cancel',
 
   // GitHub auth (Device Flow)
   GITHUB_AUTH_START: 'github:auth-start',
@@ -201,6 +211,10 @@ export const IPC_CHANNELS = {
   TARGETS_UPDATE: 'targets:update',
   TARGETS_GET_STATUS: 'targets:get-status',
   TARGETS_STATUS_UPDATE: 'targets:status-update',
+
+  // Resource-aware scheduling
+  RESOURCE_GET_STATE: 'resource:get-state',
+  RESOURCE_STATE_CHANGED: 'resource:state-changed',
 } as const;
 
 export interface GitHubUser {
@@ -424,4 +438,60 @@ export interface MultiTargetRunnerState {
   activeJobs: number;
   /** Maximum concurrent jobs allowed */
   maxConcurrentJobs: number;
+}
+
+// =============================================================================
+// Resource-Aware Scheduling Types
+// =============================================================================
+
+/** Battery threshold for auto-pause. 'never' means never pause, 'always' means pause whenever on battery. */
+export type BatteryPauseThreshold = 'never' | '<25%' | '<50%' | '<75%' | 'always';
+
+/** Resource condition that can trigger auto-pause */
+export interface ResourceCondition {
+  type: 'battery' | 'video-call';
+  active: boolean;
+  reason: string;
+  since?: string; // ISO timestamp
+}
+
+/** Power settings configuration (Power section in UI) */
+export interface PowerConfig {
+  /** Pause when on battery power below threshold */
+  pauseOnBattery: BatteryPauseThreshold;
+  /** Pause during video calls (camera detection) */
+  pauseOnVideoCall: boolean;
+  /** Seconds to wait after call ends before resuming */
+  videoCallGracePeriod: number;
+}
+
+/** Default power configuration */
+export const DEFAULT_POWER_CONFIG: PowerConfig = {
+  pauseOnBattery: 'never',
+  pauseOnVideoCall: false,
+  videoCallGracePeriod: 60,
+};
+
+/** Notifications configuration (Notifications section in UI) */
+export interface NotificationsConfig {
+  /** Show notifications when auto-pausing/resuming */
+  notifyOnPause: boolean;
+  /** Show notifications when jobs start/complete */
+  notifyOnJobEvents: boolean;
+}
+
+/** Default notifications configuration */
+export const DEFAULT_NOTIFICATIONS_CONFIG: NotificationsConfig = {
+  notifyOnPause: false,
+  notifyOnJobEvents: false,
+};
+
+/** Resource pause state for UI display */
+export interface ResourcePauseState {
+  /** Whether the runner is currently paused due to resource conditions */
+  isPaused: boolean;
+  /** The reason for the pause (highest priority condition) */
+  reason: string | null;
+  /** All active conditions */
+  conditions: ResourceCondition[];
 }

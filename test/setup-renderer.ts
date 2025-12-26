@@ -40,6 +40,7 @@ export interface MockLocalmost {
     getHistory: jest.Mock;
     onHistoryUpdate: jest.Mock;
     setMaxHistory: jest.Mock;
+    cancel: jest.Mock;
   };
   app: {
     getHostname: jest.Mock;
@@ -63,6 +64,10 @@ export interface MockLocalmost {
     update: jest.Mock;
     getStatus: jest.Mock;
     onStatusUpdate: jest.Mock;
+  };
+  resource: {
+    getState: jest.Mock;
+    onStateChange: jest.Mock;
   };
 }
 
@@ -113,6 +118,7 @@ const mockLocalmost: MockLocalmost = {
     getHistory: jest.fn().mockResolvedValue([]),
     onHistoryUpdate: jest.fn().mockReturnValue(() => {}),
     setMaxHistory: jest.fn().mockResolvedValue(undefined),
+    cancel: jest.fn().mockResolvedValue({ success: true }),
   },
   app: {
     getHostname: jest.fn().mockResolvedValue('test-host'),
@@ -136,6 +142,10 @@ const mockLocalmost: MockLocalmost = {
     update: jest.fn().mockResolvedValue({ success: true }),
     getStatus: jest.fn().mockResolvedValue([]),
     onStatusUpdate: jest.fn().mockReturnValue(() => {}),
+  },
+  resource: {
+    getState: jest.fn().mockResolvedValue({ isPaused: false, reason: null, conditions: [] }),
+    onStateChange: jest.fn().mockReturnValue(() => {}),
   },
 };
 

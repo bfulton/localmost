@@ -65,6 +65,20 @@ module.exports = [
       'react-hooks/exhaustive-deps': 'warn',
     },
   },
+  // CLI files (allow console.log since it's a command-line tool)
+  {
+    files: ['src/cli/**/*.ts'],
+    rules: {
+      'no-console': 'off',
+    },
+  },
+  // Security module (wraps console methods for output sanitization)
+  {
+    files: ['src/main/security.ts'],
+    rules: {
+      'no-console': 'off',
+    },
+  },
   // Test files (without type-aware linting)
   {
     files: ['src/**/*.test.{ts,tsx}'],

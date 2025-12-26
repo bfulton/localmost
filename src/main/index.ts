@@ -3,8 +3,8 @@
  * Orchestrates app lifecycle and initializes all modules.
  */
 
-import { app, BrowserWindow } from 'electron';
-import { RunnerManager } from './runner-manager';
+import { app, BrowserWindow, Notification } from 'electron';
+import { RunnerManager, JobEvent } from './runner-manager';
 import { GitHubAuth } from './github-auth';
 import { RunnerDownloader } from './runner-downloader';
 import { HeartbeatManager } from './heartbeat-manager';
@@ -21,12 +21,13 @@ import {
   setCliServer,
   setBrokerProxyService,
   setTargetManager,
+  setResourceMonitor,
   getRunnerManager,
   getRunnerDownloader,
   getHeartbeatManager,
   getCliServer,
   getBrokerProxyService,
-  getTargetManager,
+  getResourceMonitor,
   getAuthState,
   setAuthState,
   getGitHubAuth,
@@ -39,6 +40,7 @@ import {
   disableSleepProtection,
   getTrayManager,
   getLogger,
+  isUserPaused,
 } from './app-state';
 
 // CLI server
@@ -61,7 +63,7 @@ import { reRegisterSingleInstance, configureSingleInstance, clearStaleRunnerRegi
 // UI
 import { createWindow, setDockIcon } from './window';
 import { createMenu } from './menu';
-import { initTray } from './tray-init';
+import { initTray, updateTrayMenu } from './tray-init';
 
 // IPC handlers
 import { setupIpcHandlers } from './ipc-handlers';
@@ -78,7 +80,20 @@ import {
   UPDATE_CHECK_DELAY_MS,
 } from '../shared/constants';
 import { UpdateSettings } from '../shared/types';
-import { IPC_CHANNELS, SleepProtection, LogLevel } from '../shared/types';
+import { IPC_CHANNELS, SleepProtection, LogLevel, DEFAULT_POWER_CONFIG, DEFAULT_NOTIFICATIONS_CONFIG } from '../shared/types';
+
+// Resource monitoring
+import { ResourceMonitor } from './resource-monitor';
+
+// State machine
+import {
+  initRunnerStateMachine,
+  stopRunnerStateMachine,
+  sendRunnerEvent,
+  onStateChange,
+  selectRunnerStatus,
+  selectEffectivePauseState,
+} from './runner-state-service';
 
 // ============================================================================
 // App Initialization
@@ -125,6 +140,46 @@ app.whenReady().then(async () => {
 
   const logger = getLogger();
 
+  // Log startup banner (figlet "localmost" with font Big)
+  const banner = [
+    ' _                 _                     _   ',
+    '| |               | |                   | |  ',
+    '| | ___   ___ __ _| |_ __ ___   ___  ___| |_ ',
+    '| |/ _ \\ / __/ _` | | \'_ ` _ \\ / _ \\/ __| __|',
+    '| | (_) | (_| (_| | | | | | | | (_) \\__ \\ |_ ',
+    '|_|\\___/ \\___\\__,_|_|_| |_| |_|\\___/|___/\\__|',
+    '',
+    `v${app.getVersion()}`,
+  ];
+  for (const line of banner) {
+    logger?.info(line);
+  }
+
+  // Initialize state machine (must be early - before anything uses state)
+  initRunnerStateMachine();
+
+  // Subscribe to state changes for UI updates
+  onStateChange((snapshot) => {
+    const mainWindow = getMainWindow();
+
+    // Send runner status to renderer
+    if (mainWindow && !mainWindow.isDestroyed() && !getIsQuitting()) {
+      const runnerStatus = selectRunnerStatus(snapshot);
+      mainWindow.webContents.send(IPC_CHANNELS.RUNNER_STATUS_UPDATE, runnerStatus);
+
+      // Also send pause state
+      const pauseState = selectEffectivePauseState(snapshot);
+      mainWindow.webContents.send(IPC_CHANNELS.RESOURCE_STATE_CHANGED, {
+        isPaused: pauseState.isPaused,
+        reason: pauseState.reason,
+        conditions: [],
+      });
+    }
+
+    // Update tray icon
+    updateTrayMenu();
+  });
+
   // Initialize modules
   const runnerDownloader = new RunnerDownloader();
   setRunnerDownloader(runnerDownloader);
@@ -138,22 +193,6 @@ app.whenReady().then(async () => {
     onJobHistoryUpdate: sendJobHistoryUpdate,
     onReregistrationNeeded: reRegisterSingleInstance,
     onConfigurationNeeded: configureSingleInstance,
-    getWorkflowRuns: async (owner: string, repo: string) => {
-      const accessToken = await getValidAccessToken();
-      const auth = getGitHubAuth();
-      if (!accessToken || !auth) {
-        throw new Error('Not authenticated');
-      }
-      return auth.getRecentWorkflowRuns(accessToken, owner, repo);
-    },
-    getWorkflowJobs: async (owner: string, repo: string, runId: number) => {
-      const accessToken = await getValidAccessToken();
-      const auth = getGitHubAuth();
-      if (!accessToken || !auth) {
-        throw new Error('Not authenticated');
-      }
-      return auth.getWorkflowRunJobs(accessToken, owner, repo, runId);
-    },
     getRunnerLogLevel: () => getRunnerLogLevelSetting(),
     getUserFilter: () => {
       const config = loadConfig();
@@ -170,6 +209,46 @@ app.whenReady().then(async () => {
         throw new Error('Not authenticated');
       }
       return auth.cancelWorkflowRun(accessToken, owner, repo, runId);
+    },
+    getJobConclusion: async (owner: string, repo: string, jobId: number) => {
+      const accessToken = await getValidAccessToken();
+      const auth = getGitHubAuth();
+      if (!accessToken || !auth) {
+        throw new Error('Not authenticated');
+      }
+      return auth.getJobConclusion(accessToken, owner, repo, jobId);
+    },
+    onJobEvent: (event: JobEvent) => {
+      logger?.info(`Job event: ${event.type} ${event.jobName}`);
+
+      // Check if job notifications are enabled
+      const config = loadConfig();
+      const notificationsConfig = { ...DEFAULT_NOTIFICATIONS_CONFIG, ...config.notifications };
+      if (!notificationsConfig.notifyOnJobEvents) {
+        logger?.debug('Job notifications disabled');
+        return;
+      }
+
+      try {
+        const repoShort = event.repository.split('/').pop() || event.repository;
+        let title: string;
+        let body: string;
+
+        if (event.type === 'started') {
+          title = 'Job Started';
+          body = `${event.jobName} on ${repoShort}`;
+        } else {
+          const statusEmoji = event.status === 'completed' ? '✓' : event.status === 'failed' ? '✗' : '○';
+          title = `Job ${event.status === 'completed' ? 'Completed' : event.status === 'failed' ? 'Failed' : 'Cancelled'}`;
+          body = `${statusEmoji} ${event.jobName} on ${repoShort}`;
+        }
+
+        logger?.info(`Showing notification: ${title} - ${body}`);
+        const notification = new Notification({ title, body, silent: true });
+        notification.show();
+      } catch (err) {
+        logger?.warn(`Failed to show job notification: ${(err as Error).message}`);
+      }
     },
   });
   setRunnerManager(runnerManager);
@@ -207,16 +286,28 @@ app.whenReady().then(async () => {
   const brokerProxyService = new BrokerProxyService();
   setBrokerProxyService(brokerProxyService);
 
-  // Set capacity check callback - broker proxy will only acquire jobs when we have capacity
-  brokerProxyService.setCanAcceptJobCallback(() => runnerManager.hasAvailableSlot());
+  // Set capacity check callback - broker proxy will only acquire jobs when we have capacity AND not paused
+  brokerProxyService.setCanAcceptJobCallback(() => {
+    // Don't accept jobs if resource monitor says we should be paused
+    if (resourceMonitor.shouldPause()) {
+      return false;
+    }
+    return runnerManager.hasAvailableSlot();
+  });
 
   // Wire up broker proxy to runner manager: when a job is received, spawn a worker
-  brokerProxyService.on('job-received', async (targetId: string, jobId: string) => {
-    getLogger()?.info(`[job-received event] targetId=${targetId}, jobId=${jobId}`);
+  brokerProxyService.on('job-received', async (targetId: string, jobId: string, _registeredRunnerName: string, githubInfo) => {
+    getLogger()?.info(`[job-received event] targetId=${targetId}, jobId=${jobId}, runId=${githubInfo.githubRunId}, actor=${githubInfo.githubActor}`);
     const target = targetManager.getTargets().find(t => t.id === targetId);
     if (target) {
       getLogger()?.info(`Spawning worker for job ${jobId} from ${target.displayName}...`);
-      runnerManager.setPendingTargetContext('next', targetId, target.displayName);
+      // Construct actions URL directly from GitHub IDs
+      let actionsUrl: string | undefined;
+      if (githubInfo.githubRunId && githubInfo.githubJobId && githubInfo.githubRepo) {
+        actionsUrl = `https://github.com/${githubInfo.githubRepo}/actions/runs/${githubInfo.githubRunId}/job/${githubInfo.githubJobId}`;
+        getLogger()?.info(`Constructed actions URL: ${actionsUrl}`);
+      }
+      runnerManager.setPendingTargetContext('next', targetId, target.displayName, actionsUrl, githubInfo.githubRunId, githubInfo.githubJobId, githubInfo.githubActor);
 
       // Spawn a worker to handle this job
       try {
@@ -263,6 +354,67 @@ app.whenReady().then(async () => {
     setRunnerLogLevelSetting(config.runnerLogLevel as LogLevel);
   }
 
+  // Initialize resource monitor for power settings
+  const powerConfig = config.power || DEFAULT_POWER_CONFIG;
+  const notificationsConfig = config.notifications || DEFAULT_NOTIFICATIONS_CONFIG;
+  const resourceMonitor = new ResourceMonitor({
+    ...powerConfig,
+    notifyOnPause: notificationsConfig.notifyOnPause,
+  });
+  setResourceMonitor(resourceMonitor);
+
+  // Handle resource-based pause/resume via state machine
+  resourceMonitor.on('should-pause', async (reason: string) => {
+    // Don't pause if user explicitly paused (they control when to resume)
+    if (isUserPaused()) return;
+
+    logger?.info(`Resource pause triggered: ${reason}`);
+
+    // Send event to state machine - it will update tray and renderer via subscription
+    sendRunnerEvent({ type: 'RESOURCE_PAUSE', reason });
+
+    const runnerManager = getRunnerManager();
+    const heartbeatManager = getHeartbeatManager();
+
+    // Stop heartbeat to signal unavailability
+    heartbeatManager?.stop();
+    await heartbeatManager?.clear();
+
+    // Stop any running workers (gracefully - in-progress jobs will complete)
+    // The broker proxy will reject new jobs via the canAcceptJob callback
+    if (runnerManager?.isRunning()) {
+      await runnerManager.stop();
+    }
+  });
+
+  resourceMonitor.on('should-resume', async () => {
+    // Don't resume if user explicitly paused
+    if (isUserPaused()) return;
+
+    logger?.info('Resource pause cleared - resuming runner');
+
+    // Send event to state machine - it will update tray and renderer via subscription
+    sendRunnerEvent({ type: 'RESOURCE_RESUME' });
+
+    // Restart heartbeat to signal availability
+    // The broker proxy will start accepting jobs via the canAcceptJob callback
+    const heartbeatManager = getHeartbeatManager();
+    const authState = getAuthState();
+    if (heartbeatManager && authState?.accessToken) {
+      try {
+        await heartbeatManager.start();
+      } catch (err) {
+        logger?.error(`Failed to restart heartbeat: ${(err as Error).message}`);
+      }
+    }
+  });
+
+  // Note: state-changed event is now handled by the XState subscription above
+  // which sends status updates to renderer and updates tray
+
+  // Start monitoring (will evaluate conditions and emit events as needed)
+  resourceMonitor.start();
+
   // Create UI
   createMenu();
   createWindow();
@@ -294,14 +446,8 @@ app.whenReady().then(async () => {
     setTimeout(async () => {
       logger?.info('Auto-starting runner...');
       try {
-        // Show 'starting' status immediately - clearStaleRunnerRegistrations can take a while
-        const mainWindow = getMainWindow();
-        if (mainWindow && !mainWindow.isDestroyed() && !getIsQuitting()) {
-          mainWindow.webContents.send(IPC_CHANNELS.RUNNER_STATUS_UPDATE, {
-            status: 'starting',
-            startedAt: new Date().toISOString(),
-          });
-        }
+        // Signal state machine that we're starting
+        sendRunnerEvent({ type: 'START' });
 
         // Clear any stale runner registrations before starting
         await clearStaleRunnerRegistrations();
@@ -336,6 +482,9 @@ app.whenReady().then(async () => {
         // Workers are spawned on-demand when jobs arrive via broker proxy
         await runnerManager.initialize();
         logger?.info('Broker proxy running, workers will spawn when jobs arrive');
+
+        // Signal state machine that initialization is complete
+        sendRunnerEvent({ type: 'INITIALIZED' });
 
         // Start heartbeat when runner auto-starts
         const authState = getAuthState();
@@ -437,6 +586,9 @@ app.on('before-quit', async (event) => {
     // Set isQuitting FIRST to stop all IPC sends to renderer
     setIsQuitting(true);
 
+    // Signal state machine that we're shutting down
+    sendRunnerEvent({ type: 'STOP' });
+
     const logger = getLogger();
     const heartbeatManager = getHeartbeatManager();
     const runnerManager = getRunnerManager();
@@ -446,35 +598,43 @@ app.on('before-quit', async (event) => {
     const mainWindow = getMainWindow();
     const cliServer = getCliServer();
 
-    // Now safe to do cleanup that logs (logs go to file only, not renderer)
-    await heartbeatManager?.clear();
+    // Hide window immediately for visual feedback that quit is happening
+    mainWindow?.hide();
+
+    // Stop resource monitor (sync, fast)
+    getResourceMonitor()?.stop();
     heartbeatManager?.stop();
+    disableSleepProtection();
 
-// Stop CLI server
-    await cliServer?.stop();
+    // Run independent cleanup tasks in parallel for faster shutdown
+    await Promise.all([
+      // Clear heartbeats (has 3s timeout)
+      heartbeatManager?.clear(),
+      // Stop CLI server
+      cliServer?.stop(),
+      // Stop broker proxy service
+      brokerProxyService?.stop(),
+      // Cancel jobs and stop runners (has 10s timeout)
+      (async () => {
+        const runningJobs = runnerManager?.getJobHistory().filter(j => j.status === 'running') || [];
+        await cancelJobsOnOurRunners(runningJobs);
+        await runnerManager?.stop();
+      })(),
+    ]);
 
-    // Stop broker proxy service
-    await brokerProxyService?.stop();
-
-    // Cancel any jobs running on our runners before stopping
-    // This prevents orphaned jobs that would block runner deletion on next startup
-    await cancelJobsOnOurRunners();
-
-    // Must await stop() to ensure runner processes are killed before app exits
-    // (runners are detached process groups that survive parent exit)
-    await runnerManager?.stop();
-
-    // Clean up work directories unless set to 'always' preserve
+    // Clean up work directories (can be slow for large dirs)
     if (runnerManager?.getPreserveWorkDir() !== 'always') {
       await runnerDownloader?.cleanupWorkDirectories((msg) => logger?.info(msg));
     }
 
-    disableSleepProtection();
     trayManager?.destroy();
-
-    // Close window after all cleanup is done
     mainWindow?.destroy();
 
+    // Signal state machine shutdown is complete and stop it
+    sendRunnerEvent({ type: 'SHUTDOWN_COMPLETE' });
+    stopRunnerStateMachine();
+
+    logger?.info('Exiting');
     app.quit();
   }
 });
@@ -482,6 +642,9 @@ app.on('before-quit', async (event) => {
 // Handle Ctrl+C
 process.on('SIGINT', async () => {
   setIsQuitting(true);
+
+  // Signal state machine that we're shutting down
+  sendRunnerEvent({ type: 'STOP' });
 
   const logger = getLogger();
   const heartbeatManager = getHeartbeatManager();
@@ -492,30 +655,38 @@ process.on('SIGINT', async () => {
   const mainWindow = getMainWindow();
   const cliServer = getCliServer();
 
-  // Clear heartbeat before stopping to prevent orphaned runners from picking up jobs
-  await heartbeatManager?.clear();
+  // Hide window immediately for visual feedback
+  mainWindow?.hide();
+
+  // Stop sync operations first
+  getResourceMonitor()?.stop();
   heartbeatManager?.stop();
+  disableSleepProtection();
 
-// Stop CLI server
-  await cliServer?.stop();
-
-  // Stop broker proxy service
-  await brokerProxyService?.stop();
-
-  // Cancel any jobs running on our runners before stopping
-  await cancelJobsOnOurRunners();
-
-  // Must await stop() to ensure runner processes are killed before app exits
-  await runnerManager?.stop();
+  // Run independent cleanup tasks in parallel for faster shutdown
+  await Promise.all([
+    heartbeatManager?.clear(),
+    cliServer?.stop(),
+    brokerProxyService?.stop(),
+    (async () => {
+      const runningJobs = runnerManager?.getJobHistory().filter(j => j.status === 'running') || [];
+      await cancelJobsOnOurRunners(runningJobs);
+      await runnerManager?.stop();
+    })(),
+  ]);
 
   // Clean up work directories unless set to 'always' preserve
   if (runnerManager?.getPreserveWorkDir() !== 'always') {
     await runnerDownloader?.cleanupWorkDirectories((msg) => logger?.info(msg));
   }
 
-  disableSleepProtection();
   trayManager?.destroy();
   mainWindow?.destroy();
 
+  // Signal state machine shutdown is complete and stop it
+  sendRunnerEvent({ type: 'SHUTDOWN_COMPLETE' });
+  stopRunnerStateMachine();
+
+  getLogger()?.info('Exiting');
   app.quit();
 });

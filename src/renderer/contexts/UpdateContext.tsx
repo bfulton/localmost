@@ -18,6 +18,7 @@ interface UpdateContextValue {
   // UI state
   isChecking: boolean;
   isDismissed: boolean;
+  lastChecked: Date | null;
 }
 
 const defaultStatus: UpdateStatus = {
@@ -41,6 +42,7 @@ export const UpdateProvider: React.FC<UpdateProviderProps> = ({ children }) => {
   const [settings, setSettingsState] = useState<UpdateSettings>(defaultSettings);
   const [isChecking, setIsChecking] = useState(false);
   const [isDismissed, setIsDismissed] = useState(false);
+  const [lastChecked, setLastChecked] = useState<Date | null>(null);
 
   // Load initial status and settings
   useEffect(() => {
@@ -93,6 +95,9 @@ export const UpdateProvider: React.FC<UpdateProviderProps> = ({ children }) => {
     setIsDismissed(false);
     try {
       await window.localmost.update.check();
+      setLastChecked(new Date());
+      // Clear "Up to date" message after 5 seconds
+      setTimeout(() => setLastChecked(null), 5000);
     } catch {
       // Error handling is done via status updates
     } finally {
@@ -133,6 +138,7 @@ export const UpdateProvider: React.FC<UpdateProviderProps> = ({ children }) => {
     dismissUpdate,
     isChecking,
     isDismissed,
+    lastChecked,
   };
 
   return (

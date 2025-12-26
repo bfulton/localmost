@@ -23,6 +23,13 @@ async function convertIcons() {
     .toFile(path.join(generatedDir, 'icon.png'));
   console.log('  Created generated/icon.png');
 
+  // Light mode icon variant with border (for README on light backgrounds)
+  await sharp(path.join(generatedDir, 'icon-light.svg'))
+    .resize(1024, 1024)
+    .png()
+    .toFile(path.join(generatedDir, 'icon-light.png'));
+  console.log('  Created generated/icon-light.png');
+
   // Tray icons
   await sharp(path.join(generatedDir, 'tray-iconTemplate.svg'))
     .resize(22, 22)
@@ -64,6 +71,20 @@ async function convertIcons() {
       .toFile(path.join(generatedDir, `tray-icon-notready-${i}@2x.png`));
   }
   console.log(`  Created ${PULSE_FRAMES} not-ready icon pulse frames`);
+
+  // Paused tray icons - pulse animation frames (amber "||")
+  for (let i = 0; i < PULSE_FRAMES; i++) {
+    await sharp(path.join(generatedDir, `tray-icon-paused-${i}.svg`))
+      .resize(22, 22)
+      .png()
+      .toFile(path.join(generatedDir, `tray-icon-paused-${i}.png`));
+
+    await sharp(path.join(generatedDir, `tray-icon-paused-${i}@2x.svg`))
+      .resize(44, 44)
+      .png()
+      .toFile(path.join(generatedDir, `tray-icon-paused-${i}@2x.png`));
+  }
+  console.log(`  Created ${PULSE_FRAMES} paused icon pulse frames`);
 
   // Create .icns file (cross-platform using icns-lib)
   console.log('Creating macOS .icns file...');
