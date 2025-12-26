@@ -7,17 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.0] - Unreleased
 
+Core improvements to architecture to enable multiple targets.
+
 ### Added
 - Multi-target runner proxy support
 - Resource-aware job scheduling
 - CLI companion for terminal control
-- Auto-update feature
-- Parallel job execution with multiple runner registrations per target
-- Session persistence for crash recovery
+- Auto-update
 
 ### Fixed
 - Runner state synchronization issues
 - Proxy concurrency fixes
+- Session persistence and cleanup
 
 ## [0.1.0] - 2025-12-20
 
