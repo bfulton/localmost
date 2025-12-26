@@ -213,7 +213,7 @@ export class TargetManager {
     const log = () => getLogger();
     const config = loadConfig();
     const oldValue = config.maxConcurrentJobs ?? 4;
-    const newValue = Math.max(1, Math.min(16, count));
+    const newValue = Math.max(1, Math.min(8, count));
     if (oldValue !== newValue) {
       log()?.info(`[Settings] maxConcurrentJobs: ${oldValue} -> ${newValue}`);
     }

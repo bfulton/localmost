@@ -41,7 +41,7 @@ Features:
 - **Automatic fallback** — workflows detect when your Mac is available; fall back to hosted runners when it's not
 - **One-click setup** — no terminal commands, no manually generating registration tokens
 - **Lid-close protection** — close your laptop without killing in-progress jobs
-- **Multi-runner parallelism** — run 1-16 concurrent jobs
+- **Multi-runner parallelism** — run 1-8 concurrent jobs
 - **Network isolation** — runner traffic is proxied through an allowlist (GitHub, npm, PyPI, etc.)
 - **Filesystem sandboxing** — runner processes can only write to their working directory
 - **Resource-aware scheduling** — automatically pause runners when on battery or during video calls
@@ -57,7 +57,7 @@ localmost is a macOS app that manages GitHub's official [actions-runner](https:/
 <img src="docs/localmost-arch.png" alt="localmost architecture diagram" width="600" style="background-color: white; padding: 10px; border-radius: 8px;">
 
 - **Runner proxy** — maintains long-poll sessions with GitHub's broker to receive job assignments
-- **Runner pool** — 1-16 worker instances that execute jobs in sandboxed environments
+- **Runner pool** — 1-8 worker instances that execute jobs in sandboxed environments
 - **HTTP proxy** — allowlist-based network isolation for runner traffic (GitHub, npm, PyPI, etc.)
 - **Build cache** — persistent tool cache shared across job runs (Node.js, Python, etc.)
 
@@ -231,6 +231,7 @@ Future feature ideas:
 - **Runner handoff** - Transfer a running job to GitHub-hosted if you need to leave.
 - **Reactive state management** - Unify disk state, React state, and state machine into a single reactive store to prevent synchronization bugs.
 - **Linux and Windows host support** - Run self-hosted runners on non-Mac machines for projects that need them.
+- **Higher parallelism cap** - Improve proxy registration to support 16+ concurrent runners (currently capped at 8 due to broker connection limits).
 
 Bugs and quick improvements:
 

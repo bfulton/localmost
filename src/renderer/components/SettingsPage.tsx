@@ -364,7 +364,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
                 <input
                   type="range"
                   min="1"
-                  max="16"
+                  max="8"
                   value={runnerConfig.runnerCount}
                   onChange={(e) => updateRunnerConfig({ runnerCount: parseInt(e.target.value, 10) })}
                 />
