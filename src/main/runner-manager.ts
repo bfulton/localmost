@@ -10,6 +10,13 @@ import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { RunnerDownloader } from './runner-downloader';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
 
+/**
+ * Get the hostname without .local suffix (common on macOS).
+ */
+function getCleanHostname(): string {
+  return os.hostname().replace(/\.local$/, '');
+}
+
 interface RunnerInstance {
   process: ChildProcess | null;
   status: RunnerStatus;
@@ -356,18 +363,18 @@ export class RunnerManager {
 
       // Fall back to hostname-based name
       if (!this.baseRunnerName) {
-        this.baseRunnerName = `localmost.${os.hostname()}`;
+        this.baseRunnerName = `localmost.${getCleanHostname()}`;
       }
     } catch (error) {
       this.log('error', `Error loading runner config: ${error}`);
-      this.baseRunnerName = `localmost.${os.hostname()}`;
+      this.baseRunnerName = `localmost.${getCleanHostname()}`;
     }
   }
 
   private getInstanceName(instance: number): string {
     // Always use .N suffix to match how runners are registered with GitHub
     // (registration always uses baseRunnerName.N format)
-    return `${this.baseRunnerName || `localmost.${os.hostname()}`}.${instance}`;
+    return `${this.baseRunnerName || `localmost.${getCleanHostname()}`}.${instance}`;
   }
 
   getJobHistory(): JobHistoryEntry[] {
@@ -424,7 +431,7 @@ export class RunnerManager {
   }
 
   getStatusDisplayName(): string {
-    const baseName = this.baseRunnerName || `localmost.${os.hostname()}`;
+    const baseName = this.baseRunnerName || `localmost.${getCleanHostname()}`;
     if (this.runnerCount === 1) {
       return `${baseName}.1`;
     }
