@@ -49,6 +49,7 @@ import { CliServer } from './cli-server';
 // Config and security
 import { loadConfig } from './config';
 import { installSecurityHandlers } from './security';
+import { ensureAppDataDir } from './paths';
 
 // Logging
 import { initLogFile } from './log-file';
@@ -134,6 +135,12 @@ if (!gotTheLock) {
 // ============================================================================
 
 app.whenReady().then(async () => {
+  // Set restrictive umask so all files/directories are user-only (no group/world access)
+  process.umask(0o077);
+
+  // Ensure app data directory exists with secure permissions (user-only)
+  ensureAppDataDir();
+
   // Initialize log file and logger
   initLogFile();
   initLogger();

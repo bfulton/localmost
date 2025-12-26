@@ -727,11 +727,6 @@ export class RunnerDownloader {
       onProgress({ phase: 'extracting', percent: 0, message: 'Verifying checksum...' });
       await this.verifyChecksum(tarballPath, expectedChecksum);
 
-      // Check for GitHub attestations (best-effort, non-blocking)
-      // Attestations provide additional supply chain verification when available
-      onProgress({ phase: 'extracting', percent: 0, message: 'Checking attestations...' });
-      await this.checkAttestations(version, filename, expectedChecksum);
-
       // Extract the tarball
       onProgress({ phase: 'extracting', percent: 0, message: 'Extracting runner...' });
 
@@ -786,54 +781,13 @@ export class RunnerDownloader {
   }
 
   /**
-   * Check if GitHub attestations exist for this release.
-   * GitHub uses Sigstore/SLSA attestations for supply chain security.
-   *
-   * Note: This checks for attestation existence but does not perform full
-   * cryptographic verification (which would require Sigstore client libraries).
-   * The attestation check provides an additional signal that the release
-   * went through GitHub's official build/release pipeline.
-   *
-   * @returns true if attestations were found, false otherwise
-   */
-  private async checkAttestations(version: string, filename: string, sha256: string): Promise<boolean> {
-    try {
-      // GitHub's attestation API uses the artifact digest as the subject
-      const digest = `sha256:${sha256}`;
-      const attestationUrl = `https://api.github.com/orgs/actions/attestations/${encodeURIComponent(digest)}`;
-
-      const response = await fetch(attestationUrl, {
-        headers: {
-          Accept: 'application/vnd.github+json',
-          'User-Agent': 'localmost',
-          'X-GitHub-Api-Version': '2022-11-28',
-        },
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        const attestations = data.attestations || [];
-        if (attestations.length > 0) {
-          return true;
-        }
-      }
-
-      // Attestations may not be available for older releases - this is fine
-      return false;
-    } catch {
-      // Attestation check is best-effort - don't fail the download
-      // Common causes: network issues, API rate limits, older releases
-      return false;
-    }
-  }
-
-  /**
    * Fetch the expected SHA256 checksum from GitHub releases.
    *
    * SECURITY MODEL:
    * - Checksum verification detects download corruption and tampering in transit
    * - Both binary and checksum come from GitHub, so this trusts GitHub's infrastructure
-   * - Additional attestation checks verify the release went through official build pipeline
+   * - The runner binaries use adhoc code signatures (no verified identity), so we don't
+   *   verify signatures—the checksum provides equivalent integrity assurance
    * - For maximum security, users can verify the runner against GitHub's published hashes
    *   at: https://github.com/actions/runner/releases
    *

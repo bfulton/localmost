@@ -6,6 +6,19 @@ import { GitHubClient } from './github-client';
 export const DEFAULT_CLIENT_ID = DEFAULT_GITHUB_CLIENT_ID;
 
 /**
+ * Validate that a URL is a legitimate GitHub URL before opening externally.
+ * This prevents phishing attacks if the GitHub API were compromised.
+ */
+function isValidGitHubUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'https:' && parsed.hostname === 'github.com';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Rate limiting configuration for OAuth device flow polling.
  * These limits prevent abuse and ensure compliance with GitHub's API guidelines.
  */
@@ -104,10 +117,15 @@ export class GitHubAuth {
   }
 
   /**
-   * Open the verification URL in the user's browser
+   * Open the verification URL in the user's browser.
+   * Validates the URL is actually GitHub before opening.
    */
   openVerificationUrl(url: string): void {
-    shell.openExternal(url);
+    if (isValidGitHubUrl(url)) {
+      shell.openExternal(url);
+    } else {
+      throw new Error(`Refusing to open suspicious verification URL: ${url}`);
+    }
   }
 
   /**
