@@ -225,6 +225,7 @@ export class BrokerProxyService extends EventEmitter {
   /**
    * Add a target to the proxy.
    * The target must have valid credentials loaded from runner proxy registration.
+   * If the proxy is already running, creates an upstream session immediately.
    */
   addTarget(
     target: Target,
@@ -232,14 +233,25 @@ export class BrokerProxyService extends EventEmitter {
     credentials: CredentialsFile,
     rsaParams: RSAParamsFile
   ): void {
-    this.targets.set(target.id, {
+    const state: TargetState = {
       target,
       runner,
       credentials,
       rsaParams,
       jobsAssigned: 0,
-    });
+    };
+    this.targets.set(target.id, state);
     log()?.info(`[BrokerProxy] Added target: ${target.displayName}`);
+
+    // If proxy is already running, create session immediately
+    if (this.isRunning && target.enabled) {
+      this.createUpstreamSession(state).catch((error) => {
+        log()?.error(`[BrokerProxy] Failed to create session for ${target.displayName}: ${(error as Error).message}`);
+        state.error = (error as Error).message;
+        this.scheduleSessionRetry(state);
+        this.emitStatusUpdate();
+      });
+    }
   }
 
   /**
