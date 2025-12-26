@@ -1,0 +1,3 @@
+#!/bin/bash
+# localmost CLI wrapper
+exec /usr/bin/env node "${0%/*}/cli.js" "$@"
