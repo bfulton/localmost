@@ -392,4 +392,25 @@ export const registerRunnerHandlers = (): void => {
     runnerManager?.setMaxJobHistory(max);
     return { success: true };
   });
+
+  // Cancel a running job
+  ipcMain.handle(IPC_CHANNELS.JOB_CANCEL, async (_event, owner: string, repo: string, runId: number) => {
+    const logger = getLogger();
+    const auth = getGitHubAuth();
+    const accessToken = await getValidAccessToken();
+
+    if (!accessToken || !auth) {
+      return { success: false, error: 'Not authenticated' };
+    }
+
+    try {
+      logger?.info(`Cancelling workflow run ${runId} in ${owner}/${repo}`);
+      await auth.cancelWorkflowRun(accessToken, owner, repo, runId);
+      return { success: true };
+    } catch (err) {
+      const message = (err as Error).message;
+      logger?.warn(`Failed to cancel workflow run ${runId}: ${message}`);
+      return { success: false, error: message };
+    }
+  });
 };

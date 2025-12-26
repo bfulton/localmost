@@ -95,6 +95,8 @@ contextBridge.exposeInMainWorld('localmost', {
   jobs: {
     getHistory: () => ipcRenderer.invoke(IPC_CHANNELS.JOB_HISTORY_GET),
     setMaxHistory: (max: number) => ipcRenderer.invoke(IPC_CHANNELS.JOB_HISTORY_SET_MAX, max),
+    cancel: (owner: string, repo: string, runId: number) =>
+      ipcRenderer.invoke(IPC_CHANNELS.JOB_CANCEL, owner, repo, runId),
     onHistoryUpdate: (callback: (jobs: JobHistoryEntry[]) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, jobs: JobHistoryEntry[]) => callback(jobs);
       ipcRenderer.on(IPC_CHANNELS.JOB_HISTORY_UPDATE, handler);
@@ -208,6 +210,7 @@ export interface LocalmostAPI {
   jobs: {
     getHistory: () => Promise<JobHistoryEntry[]>;
     setMaxHistory: (max: number) => Promise<{ success: boolean }>;
+    cancel: (owner: string, repo: string, runId: number) => Promise<{ success: boolean; error?: string }>;
     onHistoryUpdate: (callback: (jobs: JobHistoryEntry[]) => void) => () => void;
   };
   settings: {

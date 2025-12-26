@@ -50,7 +50,7 @@ localmost is a macOS app that manages GitHub's official [actions-runner](https:/
 
 ## Architecture
 
-<img src="docs/localmost-arch.png" alt="localmost architecture diagram" width="600">
+<img src="docs/localmost-arch.png" alt="localmost architecture diagram" width="600" style="background-color: white; padding: 10px; border-radius: 8px;">
 
 - **Runner proxy** — maintains long-poll sessions with GitHub's broker to receive job assignments
 - **Runner pool** — 1-16 worker instances that execute jobs in sandboxed environments
@@ -122,7 +122,7 @@ localmost uses a GitHub App for authentication. During installation, you'll be a
 | Permission | Level | Purpose |
 |------------|-------|---------|
 | **Administration** | Read & Write | Register and remove self-hosted runners on repositories |
-| **Actions** | Read | Check workflow run status to determine if runners are needed |
+| **Actions** | Read & Write | Check workflow status and cancel running jobs |
 | **Metadata** | Read | Access basic repository information (required by GitHub for all apps) |
 | **Self-hosted runners** (org) | Read & Write | Register and remove self-hosted runners at the organization level |
 

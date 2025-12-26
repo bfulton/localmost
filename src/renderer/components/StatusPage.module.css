@@ -248,6 +248,33 @@
   font-size: 11px;
   min-width: 50px;
   text-align: right;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.jobHistoryCancelBtn {
+  padding: 2px 6px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+
+.jobHistoryCancelBtn:hover:not(:disabled) {
+  color: var(--error);
+  border-color: var(--error);
+  background: rgba(248, 81, 73, 0.1);
+}
+
+.jobHistoryCancelBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /* Logs Panel */

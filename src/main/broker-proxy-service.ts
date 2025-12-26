@@ -171,6 +171,7 @@ export interface GitHubJobInfo {
   githubRunId?: number;
   githubJobId?: number;
   githubRepo?: string;
+  githubActor?: string;  // Username who triggered the workflow
 }
 
 export interface BrokerProxyEvents {
@@ -332,19 +333,21 @@ export class BrokerProxyService extends EventEmitter {
       }
     }
 
-    // Check if this is a job assignment
+    // Check if this is a job assignment (not a cancellation or other signal)
     // GitHub sends RunnerJobRequest with runner_request_id (not jobId)
-    const isJobMessage = messageType.toLowerCase().includes('job');
+    // JobCancellation is NOT a job assignment - it's a signal to cancel a running job
+    const messageTypeLower = messageType.toLowerCase();
+    const isJobAssignment = messageTypeLower.includes('job') && !messageTypeLower.includes('cancel');
     const jobId = innerBody?.jobId || innerBody?.runner_request_id;
     const targetId = state.target.id;
 
-    log()?.info(`[BrokerProxy] Message: type=${messageType}, isJob=${isJobMessage}, jobId=${jobId}`);
+    log()?.info(`[BrokerProxy] Message: type=${messageType}, isJobAssignment=${isJobAssignment}, jobId=${jobId}`);
     // Debug: log all fields in innerBody
     if (innerBody && typeof innerBody === 'object') {
       log()?.info(`[BrokerProxy] innerBody fields: ${Object.keys(innerBody).join(', ')}`);
     }
 
-    if (isJobMessage && jobId) {
+    if (isJobAssignment && jobId) {
       // Deduplicate by job ID - don't spawn multiple workers for the same job
       if (this.jobAssignments.has(jobId)) {
         log()?.debug(`[BrokerProxy] Skipping duplicate job ${jobId}`);
@@ -379,6 +382,7 @@ export class BrokerProxyService extends EventEmitter {
       let githubRunId: number | undefined;
       let githubJobId: number | undefined;
       let githubRepo: string | undefined;
+      let githubActor: string | undefined;
       if (runServiceUrl) {
         const jobDetails = await this.acquireJobUpstream(state, jobId, runServiceUrl, billingOwnerId);
         if (jobDetails) {
@@ -386,18 +390,29 @@ export class BrokerProxyService extends EventEmitter {
           this.acquiredJobDetails.set(messageId, jobDetails);
           log()?.info(`[BrokerProxy] Acquired job ${jobId} (messageId=${messageId}) upstream, stored details`);
 
-          // Extract run_id and job ID from job details for URL construction
+          // Extract run_id, job ID, and actor from job details
           try {
             const parsed = JSON.parse(jobDetails);
-            if (parsed.contextData?.github) {
-              githubRunId = parsed.contextData.github.run_id;
-              githubRepo = parsed.contextData.github.repository;
+
+            // GitHub context uses a dict format: {"t":2,"d":[{"k":"run_id","v":"123"},...]}}
+            const github = parsed.contextData?.github;
+            if (github?.d && Array.isArray(github.d)) {
+              for (const item of github.d) {
+                if (item.k === 'run_id') githubRunId = parseInt(item.v, 10);
+                if (item.k === 'repository') githubRepo = item.v;
+                if (item.k === 'actor') githubActor = item.v;
+              }
             }
-            // requestId is the GitHub job ID (numeric)
-            if (parsed.requestId) {
-              githubJobId = parseInt(parsed.requestId, 10);
+
+            // Job ID (check_run_id) is in the job context
+            const job = parsed.contextData?.job;
+            if (job?.d && Array.isArray(job.d)) {
+              for (const item of job.d) {
+                if (item.k === 'check_run_id') githubJobId = parseInt(item.v, 10);
+              }
             }
-            log()?.info(`[BrokerProxy] Extracted: run_id=${githubRunId}, job_id=${githubJobId}, repo=${githubRepo}`);
+
+            log()?.info(`[BrokerProxy] Extracted: run_id=${githubRunId}, job_id=${githubJobId}, repo=${githubRepo}, actor=${githubActor}`);
           } catch (e) {
             log()?.warn(`[BrokerProxy] Failed to parse job details for IDs: ${(e as Error).message}`);
           }
@@ -436,17 +451,29 @@ export class BrokerProxyService extends EventEmitter {
       this.pendingTargetAssignments.push(targetId);
 
       // Emit event to spawn worker for job messages only
-      // Include IDs so we can construct the job URL directly
+      // Include IDs so we can construct the job URL and check user filter directly
       this.emit('job-received', state.target.id, jobId, state.runner.agentName, {
         githubRunId,
         githubJobId,
         githubRepo,
+        githubActor,
       });
       this.emitStatusUpdate();
-    } else if (isJobMessage) {
-      log()?.debug(`[BrokerProxy] Job-like message without jobId (${messageType}) from ${state.target.displayName}`);
     } else {
-      log()?.info(`[BrokerProxy] Message (${messageType}) received from ${state.target.displayName}`);
+      // Non-job messages (including cancel signals) must also be forwarded to the runner
+      // Log more details for debugging cancel signal delivery
+      const isCancelLike = messageType.toLowerCase().includes('cancel') ||
+        (innerBody && typeof innerBody === 'object' && JSON.stringify(innerBody).toLowerCase().includes('cancel'));
+      if (isCancelLike) {
+        log()?.info(`[BrokerProxy] CANCEL signal detected! messageType=${messageType}, target=${state.target.displayName}`);
+        log()?.info(`[BrokerProxy] Cancel message body: ${body.slice(0, 500)}`);
+      } else {
+        log()?.info(`[BrokerProxy] Non-job message (${messageType}) received from ${state.target.displayName}, forwarding to runner`);
+      }
+      if (!this.messageQueues.has(targetId)) {
+        this.messageQueues.set(targetId, []);
+      }
+      this.messageQueues.get(targetId)!.push(body);
     }
   }
 
@@ -924,14 +951,66 @@ export class BrokerProxyService extends EventEmitter {
     const session = this.localSessions.get(sessionId)!;
     const targetId = session.targetId;
 
-    // If this worker already has a job, don't give them another one.
-    // Workers run with --once so they should only get one job.
-    // Use long-poll to prevent rapid re-polling.
+    // Helper to check if a message is a job assignment (vs cancel or other signal)
+    const isJobAssignmentMessage = (message: string): boolean => {
+      try {
+        const parsed = JSON.parse(message);
+        const messageType = (parsed.messageType || '').toLowerCase();
+        // JobCancellation is NOT a job assignment - it's a signal to cancel
+        return messageType.includes('job') && !messageType.includes('cancel');
+      } catch {
+        return false;
+      }
+    };
+
+    // If this worker already has a job, only deliver non-job messages (like cancel signals).
+    // Don't give them another job message.
     if (session.currentJobId) {
-      log()?.debug(`[BrokerProxy] Worker already has job ${session.currentJobId}, holding connection`);
-      // Hold for 30 seconds before returning empty (GitHub broker does similar)
+      log()?.debug(`[BrokerProxy] Worker has job ${session.currentJobId}, checking for cancel signals`);
+
+      // Check for non-job messages (like cancel signals) that need to be delivered
+      const queue = targetId ? this.messageQueues.get(targetId) : undefined;
+      if (queue) {
+        // Find first non-job message to deliver
+        const nonJobIndex = queue.findIndex(msg => !isJobAssignmentMessage(msg));
+        if (nonJobIndex >= 0) {
+          const message = queue.splice(nonJobIndex, 1)[0];
+          log()?.info(`[BrokerProxy] Delivering non-job message to worker with job ${session.currentJobId}`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(message);
+          return;
+        }
+      }
+
+      // No cancel signals - hold connection with periodic checks for new signals
       await new Promise<void>((resolve) => {
+        const checkInterval = setInterval(() => {
+          if (this.isShuttingDown || res.writableEnded) {
+            clearInterval(checkInterval);
+            resolve();
+            return;
+          }
+
+          // Check again for non-job messages
+          const q = targetId ? this.messageQueues.get(targetId) : undefined;
+          if (q) {
+            const idx = q.findIndex(msg => !isJobAssignmentMessage(msg));
+            if (idx >= 0) {
+              const msg = q.splice(idx, 1)[0];
+              log()?.info(`[BrokerProxy] Delivering non-job message (poll) to worker with job ${session.currentJobId}`);
+              clearInterval(checkInterval);
+              if (!res.writableEnded) {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(msg);
+              }
+              resolve();
+              return;
+            }
+          }
+        }, 1000);  // Check every second for cancel signals
+
         const timeout = setTimeout(() => {
+          clearInterval(checkInterval);
           if (!res.writableEnded) {
             res.writeHead(202, { 'Content-Type': 'application/json' });
             res.end('');
@@ -941,6 +1020,7 @@ export class BrokerProxyService extends EventEmitter {
 
         // Clean up if connection closes early
         res.on('close', () => {
+          clearInterval(checkInterval);
           clearTimeout(timeout);
           resolve();
         });
@@ -1097,14 +1177,6 @@ export class BrokerProxyService extends EventEmitter {
         log()?.info(`[BrokerProxy] acquirejob response keys: ${Object.keys(parsed).join(', ')}`);
         // Log IDs for debugging
         log()?.info(`[BrokerProxy] jobId=${parsed.jobId}, requestId=${parsed.requestId}, jobName=${parsed.jobName}`);
-        // Log contextData for debugging - should contain run_id
-        if (parsed.contextData) {
-          log()?.info(`[BrokerProxy] contextData keys: ${Object.keys(parsed.contextData).join(', ')}`);
-          if (parsed.contextData.github) {
-            const gh = parsed.contextData.github;
-            log()?.info(`[BrokerProxy] github context: run_id=${gh.run_id}, run_number=${gh.run_number}, job=${gh.job}, repository=${gh.repository}`);
-          }
-        }
         // Check various possible field names
         const urlField = parsed.runServiceUrl || parsed.run_service_url || parsed.runnerServiceUrl;
         if (urlField) {

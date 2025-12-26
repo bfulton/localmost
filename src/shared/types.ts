@@ -88,10 +88,11 @@ export interface JobHistoryEntry {
   completedAt?: string;
   runTimeSeconds?: number;
   actionsUrl?: string;
+  /** GitHub workflow run ID - for direct cancellation */
+  githubRunId?: number;
+  /** GitHub job ID */
   githubJobId?: number;
   runnerName?: string;
-  /** The runner name as registered with GitHub (for API lookups) */
-  registeredRunnerName?: string;
   /** For multi-target: which target this job came from */
   targetId?: string;
   targetDisplayName?: string;
@@ -154,6 +155,7 @@ export const IPC_CHANNELS = {
   JOB_HISTORY_GET: 'job:history-get',
   JOB_HISTORY_SET_MAX: 'job:history-set-max',
   JOB_HISTORY_UPDATE: 'job:history-update',
+  JOB_CANCEL: 'job:cancel',
 
   // GitHub auth (Device Flow)
   GITHUB_AUTH_START: 'github:auth-start',

@@ -20,28 +20,14 @@ interface RunnerInstance {
     id: string;
     targetId?: string;        // For multi-target: which target this job came from
     targetDisplayName?: string;
-    registeredRunnerName?: string; // The runner name as registered with GitHub
     actionsUrl?: string;      // GitHub Actions URL for this job
+    githubRunId?: number;     // GitHub workflow run ID (for cancellation)
+    githubJobId?: number;     // GitHub job ID (for querying conclusion)
+    githubActor?: string;     // Username who triggered the workflow
   } | null;
   name: string;
   jobsCompleted: number;
   fatalError: boolean; // Set when runner has an unrecoverable error (e.g., registration deleted)
-}
-
-interface WorkflowRun {
-  id: number;
-  name: string;
-  status: string;
-  created_at: string;
-  actor: { login: string };
-}
-
-interface WorkflowJob {
-  id: number;
-  name: string;
-  status: string;
-  html_url: string;
-  runner_name: string | null;
 }
 
 /** Job event types for notifications */
@@ -62,8 +48,6 @@ interface RunnerManagerOptions {
   onReregistrationNeeded?: (instanceNum: number, reason: 'session_conflict' | 'registration_deleted') => Promise<void>;
   /** Called when an instance needs to be configured on-demand (lazy configuration) */
   onConfigurationNeeded?: (instanceNum: number) => Promise<void>;
-  getWorkflowRuns?: (owner: string, repo: string) => Promise<WorkflowRun[]>;
-  getWorkflowJobs?: (owner: string, repo: string, runId: number) => Promise<WorkflowJob[]>;
   getRunnerLogLevel?: () => LogEntry['level'];
   /** Get user filter configuration */
   getUserFilter?: () => UserFilterConfig | undefined;
@@ -71,6 +55,8 @@ interface RunnerManagerOptions {
   getCurrentUserLogin?: () => string | undefined;
   /** Cancel a workflow run */
   cancelWorkflowRun?: (owner: string, repo: string, runId: number) => Promise<void>;
+  /** Get job conclusion from GitHub API */
+  getJobConclusion?: (owner: string, repo: string, jobId: number) => Promise<string | null>;
   /** Called when a job starts or completes (for notifications) */
   onJobEvent?: (event: JobEvent) => void;
 }
@@ -86,12 +72,11 @@ export class RunnerManager {
   private onJobHistoryUpdate: (jobs: JobHistoryEntry[]) => void;
   private onReregistrationNeeded?: (instanceNum: number, reason: 'session_conflict' | 'registration_deleted') => Promise<void>;
   private onConfigurationNeeded?: (instanceNum: number) => Promise<void>;
-  private getWorkflowRuns?: (owner: string, repo: string) => Promise<WorkflowRun[]>;
-  private getWorkflowJobs?: (owner: string, repo: string, runId: number) => Promise<WorkflowJob[]>;
   private getRunnerLogLevel: () => LogEntry['level'];
   private getUserFilter?: () => UserFilterConfig | undefined;
   private getCurrentUserLogin?: () => string | undefined;
   private cancelWorkflowRun?: (owner: string, repo: string, runId: number) => Promise<void>;
+  private getJobConclusion?: (owner: string, repo: string, jobId: number) => Promise<string | null>;
   private onJobEvent?: (event: JobEvent) => void;
   private jobHistory: JobHistoryEntry[] = [];
   private jobIdCounter = 0;
@@ -126,7 +111,7 @@ export class RunnerManager {
 
   // Pending target context for jobs received from broker
   // Maps runner name (or 'next') to target context
-  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string; registeredRunnerName?: string; actionsUrl?: string }> = new Map();
+  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string }> = new Map();
 
   /**
    * Validate that a child path stays within the expected base directory.
@@ -154,12 +139,11 @@ export class RunnerManager {
     this.onJobHistoryUpdate = options.onJobHistoryUpdate;
     this.onReregistrationNeeded = options.onReregistrationNeeded;
     this.onConfigurationNeeded = options.onConfigurationNeeded;
-    this.getWorkflowRuns = options.getWorkflowRuns;
-    this.getWorkflowJobs = options.getWorkflowJobs;
     this.getRunnerLogLevel = options.getRunnerLogLevel ?? (() => 'warn');
     this.getUserFilter = options.getUserFilter;
     this.getCurrentUserLogin = options.getCurrentUserLogin;
     this.cancelWorkflowRun = options.cancelWorkflowRun;
+    this.getJobConclusion = options.getJobConclusion;
     this.onJobEvent = options.onJobEvent;
 
     this.downloader = new RunnerDownloader();
@@ -281,17 +265,21 @@ export class RunnerManager {
    * @param runnerName The runner name or 'next' to apply to next job on any runner
    * @param targetId The target ID from which the job was received
    * @param targetDisplayName Human-readable target name
+   * @param actionsUrl The GitHub Actions URL for this job
+   * @param githubRunId The GitHub workflow run ID (for cancellation)
+   * @param githubJobId The GitHub job ID (for querying conclusion)
+   * @param githubActor The username who triggered the workflow (for user filtering)
    */
-  setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string, registeredRunnerName?: string, actionsUrl?: string): void {
-    this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName, registeredRunnerName, actionsUrl });
-    this.log('debug', `Set pending target context for ${runnerName}: ${targetDisplayName} (registered as ${registeredRunnerName}, url=${actionsUrl})`);
+  setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string, actionsUrl?: string, githubRunId?: number, githubJobId?: number, githubActor?: string): void {
+    this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName, actionsUrl, githubRunId, githubJobId, githubActor });
+    this.log('debug', `Set pending target context for ${runnerName}: ${targetDisplayName} (runId=${githubRunId}, jobId=${githubJobId}, actor=${githubActor})`);
   }
 
   /**
    * Consume pending target context for a runner.
    * Returns and removes the context if found.
    */
-  private consumePendingTargetContext(runnerName: string): { targetId: string; targetDisplayName: string; registeredRunnerName?: string; actionsUrl?: string } | undefined {
+  private consumePendingTargetContext(runnerName: string): { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string } | undefined {
     // Try exact match first, then fall back to 'next'
     let context = this.pendingTargetContext.get(runnerName);
     if (context) {
@@ -1039,7 +1027,7 @@ export class RunnerManager {
     await this.startInstance(nextInstance);
   }
 
-  private parseRunnerOutput(instanceNum: number, line: string): void {
+  private async parseRunnerOutput(instanceNum: number, line: string): Promise<void> {
     const instance = this.instances.get(instanceNum);
     if (!instance) return;
 
@@ -1118,8 +1106,10 @@ export class RunnerManager {
         id: `job-${++this.jobIdCounter}`,
         targetId: targetContext?.targetId,
         targetDisplayName: targetContext?.targetDisplayName,
-        registeredRunnerName: targetContext?.registeredRunnerName,
         actionsUrl: targetContext?.actionsUrl,
+        githubRunId: targetContext?.githubRunId,
+        githubJobId: targetContext?.githubJobId,
+        githubActor: targetContext?.githubActor,
       };
 
       this.log('debug', `[instance ${instanceNum}] Job started: ${jobName} (id: ${instance.currentJob.id})${targetContext ? ` from ${targetContext.targetDisplayName}` : ''}${instance.currentJob.actionsUrl ? ` url=${instance.currentJob.actionsUrl}` : ''}`);
@@ -1131,8 +1121,8 @@ export class RunnerManager {
         status: 'running',
         startedAt: instance.currentJob.startedAt,
         runnerName: instance.name,
-        registeredRunnerName: instance.currentJob.registeredRunnerName,
         actionsUrl: instance.currentJob.actionsUrl,
+        githubRunId: instance.currentJob.githubRunId,
         targetId: instance.currentJob.targetId,
         targetDisplayName: instance.currentJob.targetDisplayName,
       });
@@ -1156,8 +1146,6 @@ export class RunnerManager {
     // Detect job completion
     const jobCompleteMatch = line.match(/Job .+ completed with result:\s*(\w+)/i);
     if (jobCompleteMatch && instance.currentJob) {
-      const result = jobCompleteMatch[1].toLowerCase();
-      const status: JobStatus = result === 'succeeded' ? 'completed' : result === 'failed' ? 'failed' : 'cancelled';
       const completedAt = new Date().toISOString();
 
       // Compute runtime in seconds
@@ -1165,19 +1153,55 @@ export class RunnerManager {
       const endTime = new Date(completedAt).getTime();
       const runTimeSeconds = Math.round((endTime - startTime) / 1000);
 
-      this.log('debug', `[instance ${instanceNum}] Job completed: ${instance.currentJob.name} (id: ${instance.currentJob.id}) result: ${result}`);
-
       const jobId = instance.currentJob.id;
-      const hasActionsUrl = !!instance.currentJob.actionsUrl;
+      const githubJobId = instance.currentJob.githubJobId;
+      const repository = instance.currentJob.repository;
+      const jobName = instance.currentJob.name;
+
+      // Query GitHub API for the actual conclusion (authoritative source)
+      let status: JobStatus = 'completed'; // Default fallback
+      if (this.getJobConclusion && githubJobId && repository) {
+        const [owner, repo] = repository.split('/');
+        if (owner && repo) {
+          try {
+            const conclusion = await this.getJobConclusion(owner, repo, githubJobId);
+            if (conclusion === 'success') {
+              status = 'completed';
+            } else if (conclusion === 'failure') {
+              status = 'failed';
+            } else if (conclusion === 'cancelled') {
+              status = 'cancelled';
+            } else if (conclusion === null) {
+              // Conclusion not yet set - use runner-reported result
+              const result = jobCompleteMatch[1].toLowerCase();
+              status = result === 'succeeded' ? 'completed' : result === 'failed' ? 'failed' : 'cancelled';
+              this.log('info', `[instance ${instanceNum}] Job completed: ${jobName} conclusion=null, using runner result=${result} → status=${status}`);
+            } else {
+              // Other conclusions (skipped, etc.) - treat as cancelled
+              status = 'cancelled';
+            }
+            if (conclusion !== null) {
+              this.log('info', `[instance ${instanceNum}] Job completed: ${jobName} conclusion=${conclusion} → status=${status}`);
+            }
+          } catch (err) {
+            // Fall back to runner-reported result
+            const result = jobCompleteMatch[1].toLowerCase();
+            status = result === 'succeeded' ? 'completed' : result === 'failed' ? 'failed' : 'cancelled';
+            this.log('warn', `[instance ${instanceNum}] Could not get job conclusion from GitHub, using runner result: ${result}`);
+          }
+        }
+      } else {
+        // No API available, use runner-reported result
+        const result = jobCompleteMatch[1].toLowerCase();
+        status = result === 'succeeded' ? 'completed' : result === 'failed' ? 'failed' : 'cancelled';
+        this.log('info', `[instance ${instanceNum}] Job completed: ${jobName} result=${result} → status=${status}`);
+      }
 
       this.updateJobInHistory(jobId, {
         status,
         completedAt,
         runTimeSeconds,
       });
-
-      // URL is now extracted directly from job details at job start
-      // No need for post-completion API lookup
 
       instance.currentJob = null;
       instance.status = 'listening';
@@ -1213,9 +1237,15 @@ export class RunnerManager {
   /**
    * Check if a job should be allowed based on user filter.
    * If not allowed, attempts to cancel the workflow run.
+   * Uses stored job info (actor, runId) instead of API lookups.
    */
-  private async checkJobUserFilter(instanceNum: number, runnerName: string): Promise<void> {
-    if (!this.config?.url || !this.getWorkflowRuns || !this.getWorkflowJobs || !this.cancelWorkflowRun) {
+  private async checkJobUserFilter(instanceNum: number, _runnerName: string): Promise<void> {
+    const instance = this.instances.get(instanceNum);
+    if (!instance?.currentJob) return;
+
+    const { githubActor, githubRunId, targetDisplayName } = instance.currentJob;
+    if (!githubActor || !githubRunId || !targetDisplayName) {
+      this.log('debug', `checkJobUserFilter: missing info (actor=${githubActor}, runId=${githubRunId}, target=${targetDisplayName})`);
       return;
     }
 
@@ -1224,41 +1254,33 @@ export class RunnerManager {
       return; // No filtering needed
     }
 
-    // Parse owner/repo from config URL
-    const match = this.config.url.match(/github\.com[\/:]([^\/]+)\/([^\/\.]+)/);
-    if (!match) return;
-    const [, owner, repo] = match;
+    // Check if the actor is allowed
+    const isAllowed = this.isUserAllowed(githubActor);
 
-    try {
-      // Get recent workflow runs
-      const runs = await this.getWorkflowRuns(owner, repo);
-      if (!runs || runs.length === 0) return;
+    if (!isAllowed) {
+      this.log('info', `Job triggered by '${githubActor}' is not in allowed users list. Cancelling workflow run.`);
 
-      // Find the run that this runner is working on
-      for (const run of runs.slice(0, 10)) {
-        const jobs = await this.getWorkflowJobs(owner, repo, run.id);
-        const matchingJob = jobs.find(j => j.runner_name === runnerName && j.status === 'in_progress');
-
-        if (matchingJob) {
-          // Check if the actor is allowed
-          const isAllowed = this.isUserAllowed(run.actor.login);
-
-          if (!isAllowed) {
-            this.log('info', `Job triggered by '${run.actor.login}' is not in allowed users list. Cancelling workflow run.`);
-            try {
-              await this.cancelWorkflowRun(owner, repo, run.id);
-              this.log('info', `Cancelled workflow run ${run.id} triggered by '${run.actor.login}'`);
-            } catch (cancelErr) {
-              this.log('warn', `Failed to cancel workflow run ${run.id}: ${(cancelErr as Error).message}`);
-            }
-          } else {
-            this.log('debug', `Job triggered by '${run.actor.login}' is allowed`);
-          }
-          return;
-        }
+      // Parse owner/repo from target display name (e.g., "owner/repo")
+      const parts = targetDisplayName.split('/');
+      if (parts.length !== 2) {
+        this.log('warn', `Cannot parse owner/repo from target: ${targetDisplayName}`);
+        return;
       }
-    } catch (apiErr) {
-      this.log('debug', `Failed to check job user filter: ${(apiErr as Error).message}`);
+      const [owner, repo] = parts;
+
+      if (!this.cancelWorkflowRun) {
+        this.log('warn', 'Cannot cancel: cancelWorkflowRun not available');
+        return;
+      }
+
+      try {
+        await this.cancelWorkflowRun(owner, repo, githubRunId);
+        this.log('info', `Cancelled workflow run ${githubRunId} triggered by '${githubActor}'`);
+      } catch (cancelErr) {
+        this.log('warn', `Failed to cancel workflow run ${githubRunId}: ${(cancelErr as Error).message}`);
+      }
+    } else {
+      this.log('debug', `Job triggered by '${githubActor}' is allowed`);
     }
   }
 

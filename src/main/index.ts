@@ -193,22 +193,6 @@ app.whenReady().then(async () => {
     onJobHistoryUpdate: sendJobHistoryUpdate,
     onReregistrationNeeded: reRegisterSingleInstance,
     onConfigurationNeeded: configureSingleInstance,
-    getWorkflowRuns: async (owner: string, repo: string) => {
-      const accessToken = await getValidAccessToken();
-      const auth = getGitHubAuth();
-      if (!accessToken || !auth) {
-        throw new Error('Not authenticated');
-      }
-      return auth.getRecentWorkflowRuns(accessToken, owner, repo);
-    },
-    getWorkflowJobs: async (owner: string, repo: string, runId: number) => {
-      const accessToken = await getValidAccessToken();
-      const auth = getGitHubAuth();
-      if (!accessToken || !auth) {
-        throw new Error('Not authenticated');
-      }
-      return auth.getWorkflowRunJobs(accessToken, owner, repo, runId);
-    },
     getRunnerLogLevel: () => getRunnerLogLevelSetting(),
     getUserFilter: () => {
       const config = loadConfig();
@@ -225,6 +209,14 @@ app.whenReady().then(async () => {
         throw new Error('Not authenticated');
       }
       return auth.cancelWorkflowRun(accessToken, owner, repo, runId);
+    },
+    getJobConclusion: async (owner: string, repo: string, jobId: number) => {
+      const accessToken = await getValidAccessToken();
+      const auth = getGitHubAuth();
+      if (!accessToken || !auth) {
+        throw new Error('Not authenticated');
+      }
+      return auth.getJobConclusion(accessToken, owner, repo, jobId);
     },
     onJobEvent: (event: JobEvent) => {
       logger?.info(`Job event: ${event.type} ${event.jobName}`);
@@ -304,8 +296,8 @@ app.whenReady().then(async () => {
   });
 
   // Wire up broker proxy to runner manager: when a job is received, spawn a worker
-  brokerProxyService.on('job-received', async (targetId: string, jobId: string, registeredRunnerName: string, githubInfo) => {
-    getLogger()?.info(`[job-received event] targetId=${targetId}, jobId=${jobId}, runner=${registeredRunnerName}, runId=${githubInfo.githubRunId}, ghJobId=${githubInfo.githubJobId}`);
+  brokerProxyService.on('job-received', async (targetId: string, jobId: string, _registeredRunnerName: string, githubInfo) => {
+    getLogger()?.info(`[job-received event] targetId=${targetId}, jobId=${jobId}, runId=${githubInfo.githubRunId}, actor=${githubInfo.githubActor}`);
     const target = targetManager.getTargets().find(t => t.id === targetId);
     if (target) {
       getLogger()?.info(`Spawning worker for job ${jobId} from ${target.displayName}...`);
@@ -315,7 +307,7 @@ app.whenReady().then(async () => {
         actionsUrl = `https://github.com/${githubInfo.githubRepo}/actions/runs/${githubInfo.githubRunId}/job/${githubInfo.githubJobId}`;
         getLogger()?.info(`Constructed actions URL: ${actionsUrl}`);
       }
-      runnerManager.setPendingTargetContext('next', targetId, target.displayName, registeredRunnerName, actionsUrl);
+      runnerManager.setPendingTargetContext('next', targetId, target.displayName, actionsUrl, githubInfo.githubRunId, githubInfo.githubJobId, githubInfo.githubActor);
 
       // Spawn a worker to handle this job
       try {
@@ -624,7 +616,8 @@ app.on('before-quit', async (event) => {
       brokerProxyService?.stop(),
       // Cancel jobs and stop runners (has 10s timeout)
       (async () => {
-        await cancelJobsOnOurRunners();
+        const runningJobs = runnerManager?.getJobHistory().filter(j => j.status === 'running') || [];
+        await cancelJobsOnOurRunners(runningJobs);
         await runnerManager?.stop();
       })(),
     ]);
@@ -676,7 +669,8 @@ process.on('SIGINT', async () => {
     cliServer?.stop(),
     brokerProxyService?.stop(),
     (async () => {
-      await cancelJobsOnOurRunners();
+      const runningJobs = runnerManager?.getJobHistory().filter(j => j.status === 'running') || [];
+      await cancelJobsOnOurRunners(runningJobs);
       await runnerManager?.stop();
     })(),
   ]);

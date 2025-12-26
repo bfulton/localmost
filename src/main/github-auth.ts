@@ -353,51 +353,6 @@ export class GitHubAuth {
   }
 
   /**
-   * Get recent workflow runs for a repository
-   */
-  async getRecentWorkflowRuns(
-    accessToken: string,
-    owner: string,
-    repo: string
-  ): Promise<Array<{ id: number; name: string; status: string; created_at: string; actor: { login: string } }>> {
-    const client = new GitHubClient(accessToken);
-    // Don't filter by status - we need to find completed runs when looking up job URLs
-    const data = await client.get<{ workflow_runs: Array<{ id: number; name: string; status: string; created_at: string; actor: { login: string } }> }>(
-      `/repos/${owner}/${repo}/actions/runs`,
-      { params: { per_page: '10' } }
-    );
-    return (data.workflow_runs || []).map((run) => ({
-      id: run.id,
-      name: run.name,
-      status: run.status,
-      created_at: run.created_at,
-      actor: { login: run.actor?.login || 'unknown' },
-    }));
-  }
-
-  /**
-   * Get jobs for a specific workflow run
-   */
-  async getWorkflowRunJobs(
-    accessToken: string,
-    owner: string,
-    repo: string,
-    runId: number
-  ): Promise<Array<{ id: number; name: string; status: string; html_url: string; runner_name: string | null }>> {
-    const client = new GitHubClient(accessToken);
-    const data = await client.get<{ jobs: Array<{ id: number; name: string; status: string; html_url: string; runner_name: string | null }> }>(
-      `/repos/${owner}/${repo}/actions/runs/${runId}/jobs`
-    );
-    return (data.jobs || []).map((job) => ({
-      id: job.id,
-      name: job.name,
-      status: job.status,
-      html_url: job.html_url,
-      runner_name: job.runner_name,
-    }));
-  }
-
-  /**
    * Cancel a workflow run
    */
   async cancelWorkflowRun(
@@ -408,6 +363,22 @@ export class GitHubAuth {
   ): Promise<void> {
     const client = new GitHubClient(accessToken);
     await client.post(`/repos/${owner}/${repo}/actions/runs/${runId}/cancel`, {});
+  }
+
+  /**
+   * Get job conclusion from GitHub API
+   */
+  async getJobConclusion(
+    accessToken: string,
+    owner: string,
+    repo: string,
+    jobId: number
+  ): Promise<string | null> {
+    const client = new GitHubClient(accessToken);
+    const data = await client.get<{ conclusion: string | null }>(
+      `/repos/${owner}/${repo}/actions/jobs/${jobId}`
+    );
+    return data.conclusion;
   }
 
   /**
