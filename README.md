@@ -228,4 +228,5 @@ Future feature ideas:
 Bugs and quick improvements:
 
 - Fix the CLI install process to be polished
+- Fix "build on unknown" race where jobs don't get links
 
