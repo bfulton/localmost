@@ -13,7 +13,7 @@ Self-hosted GitHub Actions runners for your Mac
 
 ## Save time and money on macOS builds
 
-GitHub charges [**$0.062/minute**](https://docs.github.com/en/billing/reference/actions-runner-pricing) for their cheapest `macos` runners. A 20-minute build costs **$1.24**. Push twice a day and you're spending **over $50/month** on CI. Run the same jobs on your MacBook and they finish in less than half the time for $0.
+GitHub charges [**$0.062/minute**](https://docs.github.com/en/billing/reference/actions-runner-pricing) for their cheapest `macos` runners—and iOS/macOS developers have no choice but to use them. A 20-minute build costs **$1.24**. Push twice a day and you're spending **over $50/month** on CI. Run the same jobs on your MacBook and they finish in less than half the time for $0.
 
 Here's what some open source projects would save:
 
