@@ -9,6 +9,14 @@ import { spawnSandboxed } from './process-sandbox';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { RunnerDownloader } from './runner-downloader';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
+import { loadConfig } from './config';
+
+/**
+ * Get the hostname without .local suffix (common on macOS).
+ */
+function getCleanHostname(): string {
+  return os.hostname().replace(/\.local$/, '');
+}
 
 interface RunnerInstance {
   process: ChildProcess | null;
@@ -356,18 +364,18 @@ export class RunnerManager {
 
       // Fall back to hostname-based name
       if (!this.baseRunnerName) {
-        this.baseRunnerName = `localmost.${os.hostname()}`;
+        this.baseRunnerName = `localmost.${getCleanHostname()}`;
       }
     } catch (error) {
       this.log('error', `Error loading runner config: ${error}`);
-      this.baseRunnerName = `localmost.${os.hostname()}`;
+      this.baseRunnerName = `localmost.${getCleanHostname()}`;
     }
   }
 
   private getInstanceName(instance: number): string {
     // Always use .N suffix to match how runners are registered with GitHub
     // (registration always uses baseRunnerName.N format)
-    return `${this.baseRunnerName || `localmost.${os.hostname()}`}.${instance}`;
+    return `${this.baseRunnerName || `localmost.${getCleanHostname()}`}.${instance}`;
   }
 
   getJobHistory(): JobHistoryEntry[] {
@@ -424,7 +432,20 @@ export class RunnerManager {
   }
 
   getStatusDisplayName(): string {
-    const baseName = this.baseRunnerName || `localmost.${os.hostname()}`;
+    // Use target-based naming for multi-target mode
+    const config = loadConfig();
+    const targets = config.targets || [];
+
+    if (targets.length === 1) {
+      // Single target: show the proxy runner name
+      return targets[0].proxyRunnerName;
+    } else if (targets.length > 1) {
+      // Multiple targets: show prefix with wildcard
+      return `localmost.${getCleanHostname()}.*`;
+    }
+
+    // Fallback for legacy single-runner mode (no targets)
+    const baseName = this.baseRunnerName || `localmost.${getCleanHostname()}`;
     if (this.runnerCount === 1) {
       return `${baseName}.1`;
     }
@@ -1183,7 +1204,7 @@ export class RunnerManager {
             if (conclusion !== null) {
               this.log('info', `[instance ${instanceNum}] Job completed: ${jobName} conclusion=${conclusion} → status=${status}`);
             }
-          } catch (err) {
+          } catch {
             // Fall back to runner-reported result
             const result = jobCompleteMatch[1].toLowerCase();
             status = result === 'succeeded' ? 'completed' : result === 'failed' ? 'failed' : 'cancelled';

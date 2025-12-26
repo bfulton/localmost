@@ -5,6 +5,7 @@
 import { ipcMain } from 'electron';
 import { IPC_CHANNELS, Target, Result, RunnerProxyStatus } from '../../shared/types';
 import { getTargetManager } from '../target-manager';
+import { getRunnerProxyManager } from '../runner-proxy-manager';
 import { getLogger, getBrokerProxyService } from '../app-state';
 
 /**
@@ -28,7 +29,21 @@ export const registerTargetHandlers = (): void => {
       repo?: string
     ): Promise<Result<Target>> => {
       log()?.info(`[IPC] targets:add ${type} ${owner}${repo ? '/' + repo : ''}`);
-      return getTargetManager().addTarget(type, owner, repo);
+      const result = await getTargetManager().addTarget(type, owner, repo);
+
+      // If successful and broker proxy is running, add target to it
+      if (result.success && result.data) {
+        const brokerProxy = getBrokerProxyService();
+        if (brokerProxy) {
+          const proxyManager = getRunnerProxyManager();
+          const allCredentials = proxyManager.loadAllCredentials(result.data.id);
+          if (allCredentials.length > 0) {
+            brokerProxy.addTarget(result.data, allCredentials);
+          }
+        }
+      }
+
+      return result;
     }
   );
 
@@ -37,6 +52,13 @@ export const registerTargetHandlers = (): void => {
     IPC_CHANNELS.TARGETS_REMOVE,
     async (_event, targetId: string): Promise<Result> => {
       log()?.info(`[IPC] targets:remove ${targetId}`);
+
+      // Remove from broker proxy first (if running)
+      const brokerProxy = getBrokerProxyService();
+      if (brokerProxy) {
+        brokerProxy.removeTarget(targetId);
+      }
+
       return getTargetManager().removeTarget(targetId);
     }
   );

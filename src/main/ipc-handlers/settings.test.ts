@@ -24,6 +24,13 @@ jest.mock('../app-state', () => ({
   setLogLevelSetting: jest.fn(),
   setRunnerLogLevelSetting: jest.fn(),
   updateSleepProtection: jest.fn(),
+  getResourceMonitor: jest.fn(),
+  getLogger: jest.fn(() => ({
+    info: jest.fn(),
+    warn: jest.fn(),
+    error: jest.fn(),
+    debug: jest.fn(),
+  })),
 }));
 
 import { app } from 'electron';

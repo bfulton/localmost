@@ -1,21 +1,89 @@
-# Security
+# Security Policy
 
-This document describes the security architecture of localmost and tracks known security issues.
+## Reporting a Vulnerability
 
-## Security Architecture
+If you discover a security vulnerability in localmost, please report it through [GitHub Security Advisories](https://github.com/bfulton/localmost/security/advisories/new).
 
-### Overview
+**Please do not open public issues for security vulnerabilities.**
+
+When reporting, please include:
+- Description of the vulnerability
+- Steps to reproduce
+- Potential impact
+- Any suggested fixes (optional)
+
+## Response Timeline
+
+- **Acknowledgment**: Within 1 week of report
+- **Initial assessment**: Within 2 weeks of report
+- **Fix timeline**: Depends on severity; critical issues prioritized
+
+We follow coordinated disclosure. If you report a vulnerability, we ask that you give us 90 days to address it before public disclosure.
+
+## Supported Versions
+
+Only the latest release receives security updates. Users should always run the latest version.
+
+## Scope
+
+### In Scope
+
+- The localmost application (Electron app, main/renderer processes)
+- Credential storage and handling
+- Sandbox and network isolation mechanisms
+- IPC between processes
+- Authentication flows
+
+### Out of Scope
+
+- **GitHub Actions Runner binary itself** - Report vulnerabilities in the runner binary to [GitHub](https://github.com/actions/runner/security). However, vulnerabilities in localmost's sandboxing or network isolation *of* the runner are in scope.
+- **Workflow code** - Security of workflows you write is your responsibility
+- **Third-party dependencies** - Report upstream, but please let us know so we can update
+
+## Security Updates
+
+Security fixes are communicated through:
+- [GitHub Security Advisories](https://github.com/bfulton/localmost/security/advisories)
+- Release notes on [GitHub Releases](https://github.com/bfulton/localmost/releases)
+
+---
+
+# Security Architecture
+
+This section describes the security design of localmost.
+
+## Overview
 
 localmost is an Electron desktop application that manages GitHub Actions self-hosted runners. It handles sensitive credentials and executes external binaries, requiring careful security considerations.
 
-### Authentication
+## Threat Model
 
-- **OAuth Device Flow**: Uses GitHub's Device Flow for user authentication, which is appropriate for desktop applications that cannot securely store client secrets
+### What localmost protects against
+
+- **Filesystem writes**: Workflows cannot write to files outside the runner directory and temp paths
+- **Home directory access**: Workflows cannot access `~/.ssh`, `~/.aws`, `~/.config`, or other sensitive dotfiles
+- **Network exfiltration**: Workflows can only connect to allowlisted hosts (GitHub, npm, PyPI, etc.)
+- **Credential exposure**: OAuth tokens are encrypted at rest using macOS Keychain
+
+### What localmost trusts (does NOT protect against)
+
+- **GitHub's infrastructure**: OAuth, API responses, and runner binary distribution are trusted. If GitHub is compromised, localmost provides no additional protection.
+- **Malware on your machine**: If your system is already compromised, localmost cannot protect you.
+- **A compromised GitHub account**: If an attacker has access to your GitHub account, they can modify workflows that run on your runner.
+- **Allowlisted hosts**: Data can be exfiltrated to any host on the network allowlist (GitHub, npm, etc.).
+
+## Authentication
+
+- **OAuth Device Flow**: Uses GitHub's Device Flow for user authentication, appropriate for desktop applications that cannot securely store client secrets
 - **Token Management**: Access tokens and refresh tokens are obtained via the GitHub App OAuth flow
 - **Token Refresh**: Expired tokens are automatically refreshed using refresh tokens
-- **Scopes**: Requires `Administration: Read & Write` for runner management (GitHub's requirement)
+- **Required Permissions**:
+  - `Administration: Read & Write` - Register and remove self-hosted runners on repositories
+  - `Actions: Read & Write` - Check workflow status and cancel running jobs
+  - `Metadata: Read` - Access basic repository information (required by GitHub for all apps)
+  - `Self-hosted runners: Read & Write` (org-level) - Register runners at the organization level
 
-### Credential Storage
+## Credential Storage
 
 - **Location**: Configuration stored in `~/.localmost/config.yaml`
 - **Encryption**: Sensitive tokens (access token, refresh token) are encrypted using Electron's `safeStorage` API
@@ -24,9 +92,9 @@ localmost is an Electron desktop application that manages GitHub Actions self-ho
   - Encrypted values are stored with an `encrypted:` prefix followed by base64-encoded ciphertext
 - **Fail-secure**: Plaintext credentials are rejected; users must re-authenticate if OS encryption is unavailable
 - **Non-sensitive data**: Settings like theme, runner count, and repository URLs remain in plaintext for easy user editing
-- **Access Control**: File permissions are default user permissions
+- **Access Control**: The `~/.localmost` directory and all contents are user-only (700 for directories, 600 for files). The app sets `umask(077)` at startup to ensure no group or world access.
 
-### Encryption Export Compliance
+## Encryption Export Compliance
 
 This app uses encryption **solely** for secure credential storage via OS-provided APIs:
 
@@ -41,9 +109,9 @@ This usage qualifies for:
 - **EAR Note 4**: Exemption for authentication and access control
 - **Apple App Store**: No additional export compliance documentation required (uses Apple-provided encryption only)
 
-### Electron Security
+## Electron Security
 
-The application implements several Electron security best practices:
+The application implements Electron security best practices:
 
 - **Context Isolation**: Enabled (`contextIsolation: true`) - renderer cannot access Node.js
 - **Node Integration**: Disabled (`nodeIntegration: false`) - renderer runs in browser sandbox
@@ -59,7 +127,7 @@ The application implements several Electron security best practices:
 - **Single Instance Lock**: Prevents multiple instances from running simultaneously
 - **External Link Handling**: External URLs open in system browser, not Electron
 
-### Content Security Policy
+## Content Security Policy
 
 The application enforces a strict CSP header for the renderer:
 ```
@@ -76,18 +144,19 @@ object-src 'none'
 Key security features:
 - **No `unsafe-inline`**: All styles are in external CSS files; dynamic styling uses CSS classes and data attributes
 - **No `unsafe-eval`**: No use of `eval()`, `new Function()`, or similar dynamic code execution
-- **Restricted sources**: Only same-origin resources allowed, with specific exceptions for GitHub avatars
-- **No WebSocket directives**: The app uses Electron IPC for all process communication, eliminating the need for WebSocket CSP permissions
+- **Restricted sources**: Only same-origin resources allowed; `img-src` includes `avatars.githubusercontent.com` for displaying user profile images in the UI
+- **No WebSocket directives**: The app uses Electron IPC for all process communication
 - **Frame/Object blocking**: Prevents embedding of iframes and plugins
 
-### Runner Binary
+## Runner Binary
 
 - **Source**: Downloads official GitHub Actions runner from `github.com/actions/runner` releases
-- **Integrity Verification**: Downloads are verified using SHA256 checksums and GitHub attestations (Sigstore/SLSA)
+- **Integrity Verification**: Downloads are verified using SHA256 checksums from GitHub's release API
   - Checksum is fetched from GitHub's official release notes
   - Downloaded tarball hash is computed and compared before extraction
   - Download is rejected if checksums don't match, preventing corrupted or tampered binaries
-  - GitHub attestations are checked to verify the release went through GitHub's official build pipeline
+  - Note: The runner binaries use adhoc code signatures (no verified identity), so we don't verify signatures—the checksum provides equivalent integrity assurance
+  - This verification model trusts GitHub's infrastructure, which localmost already relies on for OAuth and API access
 - **Execution**: Runner binary is spawned as a child process with controlled environment
 - **Process Management**: Child processes are managed via Node.js ChildProcess handles
   - Processes are spawned with `detached: false` so they terminate when parent exits
@@ -95,11 +164,11 @@ Key security features:
   - Stale process cleanup on startup uses path-specific matching (`~/.localmost/runner.*Runner.Listener`) to avoid affecting unrelated processes
 - **Directory Isolation**: Each runner instance has its own working directory
 
-### Runner Security Model (Important)
+## Runner Security Model
 
 localmost adds isolation layers that the stock GitHub Actions Runner lacks:
 
-#### Sandbox Restrictions
+### Sandbox Restrictions
 
 | Resource | Access Level |
 |----------|--------------|
@@ -109,7 +178,7 @@ localmost adds isolation layers that the stock GitHub Actions Runner lacks:
 | Home directory | **Denied** — no access to `~/.ssh`, `~/.aws`, etc. |
 | Other applications | **Denied** — no access to `/Applications` (except Xcode) |
 
-#### What Remains Accessible
+### What Remains Accessible
 
 | Resource | Access Level |
 |----------|--------------|
@@ -117,7 +186,18 @@ localmost adds isolation layers that the stock GitHub Actions Runner lacks:
 | Process spawning | Can spawn any executable in allowed paths |
 | Mach/IPC | System frameworks require this |
 
-#### Risk Levels by Repository Type
+### Sandbox Limitations
+
+The sandbox is **not** VM-level isolation. It primarily restricts filesystem writes:
+
+- **Network**: Proxied through an allowlist, but the allowlist is broad (GitHub, npm, PyPI, Docker Hub, etc.). A malicious workflow could exfiltrate data to any allowlisted host.
+- **Process spawning**: Allowed for any executable in permitted paths. CI runners genuinely require this capability.
+- **Mach/IPC**: Allowed because system frameworks require it. This is a fundamental macOS constraint.
+- **Read access**: Broader than write access—runners can read from `/usr/bin`, `/System/Library`, Xcode, etc.
+
+The sandbox reduces attack surface but does not provide full containment. For untrusted code, don't use a self-hosted runner.
+
+### Risk Levels by Repository Type
 
 | Repository Type | Risk Level | Recommendation |
 |-----------------|------------|----------------|
@@ -126,7 +206,7 @@ localmost adds isolation layers that the stock GitHub Actions Runner lacks:
 | **Public repos** | High | **Not recommended**—any PR can run arbitrary code |
 | **Forks** | High | Forked repo workflows can be modified maliciously |
 
-#### How localmost Compares to GitHub-Hosted Runners
+### Comparison to GitHub-Hosted Runners
 
 | Feature | GitHub-Hosted | localmost |
 |---------|---------------|-----------|
@@ -137,18 +217,31 @@ localmost adds isolation layers that the stock GitHub Actions Runner lacks:
 
 The sandbox is rebuilt fresh on each runner start and confines all writes to the runner directory and temp paths. Workflows cannot modify files elsewhere on your system or exfiltrate data to non-allowlisted hosts.
 
-#### Recommendations
+### User Filter
+
+localmost includes a user filter that restricts which GitHub users' jobs are accepted:
+
+| Mode | Description |
+|------|-------------|
+| **Everyone** | Accept jobs triggered by any user (default) |
+| **Just me** | Only accept jobs triggered by the authenticated user |
+| **Allowlist** | Only accept jobs from specific GitHub usernames |
+
+When a job is triggered by a user not matching the filter, localmost automatically cancels the workflow run.
+
+### Recommendations
 
 1. **Only use for private repositories you control**
 2. **Review all workflow changes** before they run
 3. **Disable "Run workflows from fork pull requests"** in repo settings
+4. **Use the user filter** to restrict which users' jobs run locally
 
 For more information on self-hosted runner security, see:
 - [GitHub: Security hardening for GitHub Actions](https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions)
 - [Praetorian: Self-Hosted GitHub Runners Are Backdoors](https://www.praetorian.com/blog/self-hosted-github-runners-are-backdoors/)
 - [Synacktiv: GitHub Actions exploitation](https://www.synacktiv.com/en/publications/github-actions-exploitation-self-hosted-runners)
 
-### Heartbeat Mechanism
+## Heartbeat Mechanism
 
 The runner availability check uses a GitHub Actions variable instead of requiring API tokens in workflows:
 
@@ -159,18 +252,17 @@ The runner availability check uses a GitHub Actions variable instead of requirin
 - **Update Frequency**: Heartbeat is updated every 60 seconds while runners are active
 - **Automatic Setup**: Variable is created/updated automatically when the runner starts
 
-This approach improves security by:
-- Eliminating the need for tokens in workflow secrets
-- Keeping sensitive OAuth tokens out of CI/CD pipelines
+This approach simplifies workflows by:
+- Allowing workflows to check runner availability without needing API tokens
 - Using the same permissions already required for runner registration
 
-### IPC Security
+## IPC Security
 
 - All IPC communication uses named channels defined in `shared/types.ts`
 - Renderer can only invoke explicitly exposed methods via the preload script
 - No direct access to Node.js APIs from renderer process
 
-### Log Sanitization
+## Log Sanitization
 
 Log messages are sanitized before being written to disk or displayed:
 - GitHub tokens (`ghp_*`, `gho_*`, etc.) are redacted
@@ -179,11 +271,11 @@ Log messages are sanitized before being written to disk or displayed:
 - Encrypted values and bearer tokens are redacted
 - Sanitization applies to both the log file and renderer display
 
-### Code Signing
+## Code Signing
 
 Code signing is required for distribution to prevent tampering warnings and establish trust.
 
-#### macOS Requirements
+### macOS Requirements
 
 **Certificates needed:**
 - Apple Developer Program membership ($99/year)
@@ -219,37 +311,29 @@ packagerConfig: {
 
 **Notarization** is required for macOS 10.15+ to avoid Gatekeeper warnings. Apple scans the signed app for malware before issuing a notarization ticket.
 
-## Reporting Security Issues
+## Verifying Integrity
 
-If you discover a security vulnerability, please report it by:
-1. Opening a private security advisory on GitHub
-2. Emailing the maintainers directly
+### Verifying the localmost app
 
-Please do not open public issues for security vulnerabilities.
+The app is code-signed and notarized by Apple. To verify:
 
-## Known Issues
+```bash
+codesign -dv --verbose=2 /Applications/localmost.app
+```
 
-### App Store Distribution (Guideline 2.5.2)
+Look for:
+- `Authority=Developer ID Application: Bright Fulton (8D3BFBJK55)`
+- `TeamIdentifier=8D3BFBJK55`
 
-**Status:** Not pursuing
+### Verifying the runner binary
 
-Mac App Store distribution is incompatible with localmost's architecture due to Apple's Guideline 2.5.2, which prohibits apps from downloading and executing code not reviewed by Apple.
+Runner binaries can be independently verified against GitHub's published checksums:
 
-localmost is distributed outside the App Store via:
-- Direct download (DMG) with Apple notarization
-- Homebrew cask (planned)
-- GitHub Releases
+1. Find the expected checksum at https://github.com/actions/runner/releases
+2. Compute the checksum of your downloaded runner:
+   ```bash
+   shasum -a 256 ~/.localmost/runner/arc/v*/actions-runner-*.tar.gz
+   ```
+3. Compare the hashes
 
-This is consistent with other developer tools (Docker Desktop, VS Code, iTerm2) which also distribute outside the App Store.
-
-### Runner Sandbox Limitations
-
-**Status:** Mitigated
-
-Runner processes are sandboxed via `sandbox-exec` with filesystem and network restrictions. However, the sandbox is not a complete security boundary:
-
-- Processes can still spawn other executables in allowed paths
-- Environment variables are accessible
-- Mach/IPC operations are allowed (required for system frameworks)
-
-See [Runner Security Model](#runner-security-model-important) for details.
+Note: localmost performs this verification automatically during download.

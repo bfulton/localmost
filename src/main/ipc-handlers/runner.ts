@@ -18,7 +18,11 @@ import {
   getAuthState,
   getLogger,
   getIsQuitting,
+  getBrokerProxyService,
 } from '../app-state';
+import { getRunnerProxyManager } from '../runner-proxy-manager';
+import { sendRunnerEvent } from '../runner-state-service';
+import { updateTrayMenu } from '../tray-init';
 import { getSnapshot, selectRunnerStatus } from '../runner-state-service';
 import {
   IPC_CHANNELS,
@@ -274,8 +278,12 @@ export const registerRunnerHandlers = (): void => {
     const authState = getAuthState();
     const githubAuth = getGitHubAuth();
     const mainWindow = getMainWindow();
+    const brokerProxyService = getBrokerProxyService();
 
     try {
+      // Signal state machine that we're starting
+      sendRunnerEvent({ type: 'START' });
+
       // Show 'starting' status immediately - clearStaleRunnerRegistrations can take a while
       if (mainWindow && !mainWindow.isDestroyed() && !getIsQuitting()) {
         mainWindow.webContents.send(IPC_CHANNELS.RUNNER_STATUS_UPDATE, {
@@ -286,13 +294,44 @@ export const registerRunnerHandlers = (): void => {
 
       // Clear any stale runner registrations before starting
       await clearStaleRunnerRegistrations();
-      await runnerManager?.start();
+
+      // Initialize broker proxy with all target credentials
+      const config = loadConfig();
+      const targets = config.targets || [];
+      if (targets.length > 0 && brokerProxyService) {
+        const proxyManager = getRunnerProxyManager();
+
+        for (const target of targets) {
+          if (!target.enabled) continue;
+
+          const allCredentials = proxyManager.loadAllCredentials(target.id);
+          if (allCredentials.length > 0) {
+            brokerProxyService.addTarget(target, allCredentials);
+            logger()?.info(`[BrokerProxy] Added ${target.displayName} with ${allCredentials.length} instances`);
+          } else {
+            logger()?.warn(`[BrokerProxy] No credentials for ${target.displayName}, skipping`);
+          }
+        }
+
+        // Start broker proxy server - workers will connect to this
+        try {
+          await brokerProxyService.start();
+          logger()?.info('Broker proxy started, waiting for jobs from targets...');
+        } catch (err) {
+          logger()?.error(`[BrokerProxy] Failed to start: ${(err as Error).message}`);
+        }
+      }
+
+      // Initialize runner manager (workers spawn on-demand when jobs arrive)
+      await runnerManager?.initialize();
+      logger()?.info('Broker proxy running, workers will spawn when jobs arrive');
+
+      // Signal state machine that initialization is complete
+      sendRunnerEvent({ type: 'INITIALIZED' });
 
       // Start heartbeat when runner starts
       if (heartbeatManager && authState?.accessToken && githubAuth) {
-        const config = loadConfig();
         // Set up heartbeat for all configured targets
-        const targets = config.targets || [];
         const heartbeatTargets = targets.map(t =>
           t.type === 'org'
             ? { level: 'org' as const, org: t.owner }
@@ -349,6 +388,9 @@ export const registerRunnerHandlers = (): void => {
         }
       }
 
+      // Update tray to reflect new state
+      updateTrayMenu();
+
       return { success: true };
     } catch (error) {
       const { userMessage, technicalDetails } = toUserError(error, 'Starting runner');
@@ -366,6 +408,9 @@ export const registerRunnerHandlers = (): void => {
 
       // Stop heartbeat when runner stops
       heartbeatManager?.stop();
+
+      // Update tray to reflect new state
+      updateTrayMenu();
 
       return { success: true };
     } catch (error) {

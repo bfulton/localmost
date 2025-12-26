@@ -188,30 +188,45 @@ describe('RunnerDownloader', () => {
       expect(downloader.hasAnyProxyCredentials()).toBe(false);
     });
 
-    it('should return true when a proxy directory has .runner file', () => {
+    it('should return true when a target has instance with .runner file', () => {
+      // New structure: proxies/<target-id>/1/.runner
       const proxiesDir = path.join(mockRunnerDir, 'proxies');
-      const proxyDir = path.join(proxiesDir, 'target-1');
-      const runnerFile = path.join(proxyDir, '.runner');
+      const targetDir = path.join(proxiesDir, 'target-1');
+      const instanceDir = path.join(targetDir, '1');
+      const runnerFile = path.join(instanceDir, '.runner');
 
       (fs.existsSync as jest.Mock).mockImplementation((p: string) => {
         return p === proxiesDir || p === runnerFile;
       });
-      (fs.readdirSync as jest.Mock).mockReturnValue([
-        { name: 'target-1', isDirectory: () => true },
-      ]);
+      (fs.readdirSync as jest.Mock).mockImplementation((p: string) => {
+        if (p === proxiesDir) {
+          return [{ name: 'target-1', isDirectory: () => true }];
+        }
+        if (p === targetDir) {
+          return [{ name: '1', isDirectory: () => true }];
+        }
+        return [];
+      });
 
       expect(downloader.hasAnyProxyCredentials()).toBe(true);
     });
 
-    it('should return false when proxy directories have no .runner file', () => {
+    it('should return false when target has no instance directories with .runner file', () => {
       const proxiesDir = path.join(mockRunnerDir, 'proxies');
+      const targetDir = path.join(proxiesDir, 'target-1');
 
       (fs.existsSync as jest.Mock).mockImplementation((p: string) => {
         return p === proxiesDir; // proxies dir exists but no .runner files
       });
-      (fs.readdirSync as jest.Mock).mockReturnValue([
-        { name: 'target-1', isDirectory: () => true },
-      ]);
+      (fs.readdirSync as jest.Mock).mockImplementation((p: string) => {
+        if (p === proxiesDir) {
+          return [{ name: 'target-1', isDirectory: () => true }];
+        }
+        if (p === targetDir) {
+          return [{ name: '1', isDirectory: () => true }];
+        }
+        return [];
+      });
 
       expect(downloader.hasAnyProxyCredentials()).toBe(false);
     });
@@ -227,8 +242,10 @@ describe('RunnerDownloader', () => {
   });
 
   describe('copyProxyCredentials', () => {
-    it('should copy credential files and modify .runner serverUrlV2', async () => {
-      const proxyDir = '/path/to/proxy';
+    it('should copy credential files from instance subdirectory and modify .runner serverUrlV2', async () => {
+      // proxyBaseDir is the target directory, credentials are in proxyBaseDir/<instance>/
+      const proxyBaseDir = '/path/to/proxy';
+      const proxyInstanceDir = path.join(proxyBaseDir, '1');
       const configDir = path.join(mockRunnerDir, 'config', '1');
 
       // Mock file existence
@@ -246,23 +263,23 @@ describe('RunnerDownloader', () => {
       (fs.promises as any).writeFile = mockWriteFile;
 
       const mockLog = jest.fn();
-      await downloader.copyProxyCredentials(1, proxyDir, mockLog);
+      await downloader.copyProxyCredentials(1, proxyBaseDir, mockLog);
 
       // Should create config directory
       expect(fs.promises.mkdir).toHaveBeenCalledWith(configDir, { recursive: true });
 
-      // Should copy all three credential files
+      // Should copy all three credential files from instance subdirectory
       expect(mockCopyFile).toHaveBeenCalledTimes(3);
       expect(mockCopyFile).toHaveBeenCalledWith(
-        path.join(proxyDir, '.runner'),
+        path.join(proxyInstanceDir, '.runner'),
         path.join(configDir, '.runner')
       );
       expect(mockCopyFile).toHaveBeenCalledWith(
-        path.join(proxyDir, '.credentials'),
+        path.join(proxyInstanceDir, '.credentials'),
         path.join(configDir, '.credentials')
       );
       expect(mockCopyFile).toHaveBeenCalledWith(
-        path.join(proxyDir, '.credentials_rsaparams'),
+        path.join(proxyInstanceDir, '.credentials_rsaparams'),
         path.join(configDir, '.credentials_rsaparams')
       );
 

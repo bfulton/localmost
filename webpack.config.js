@@ -84,7 +84,8 @@ const rendererConfig = {
   entry: './src/renderer/index.tsx',
   output: {
     path: path.resolve(__dirname, 'dist/renderer'),
-    filename: 'renderer.js',
+    filename: '[name].js',
+    chunkFilename: '[name].js',
     publicPath: './',
   },
   module: {
@@ -135,6 +136,32 @@ const rendererConfig = {
   optimization: {
     usedExports: true,
     sideEffects: true,
+    splitChunks: {
+      chunks: 'all',
+      cacheGroups: {
+        // Split React and related libraries into a separate vendor chunk
+        react: {
+          test: /[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/,
+          name: 'vendor-react',
+          chunks: 'all',
+          priority: 20,
+        },
+        // Split FontAwesome into a separate chunk (it's large)
+        fontawesome: {
+          test: /[\\/]node_modules[\\/]@fortawesome[\\/]/,
+          name: 'vendor-fontawesome',
+          chunks: 'all',
+          priority: 15,
+        },
+        // Other vendors
+        vendors: {
+          test: /[\\/]node_modules[\\/]/,
+          name: 'vendors',
+          chunks: 'all',
+          priority: 10,
+        },
+      },
+    },
   },
   performance: {
     maxAssetSize: 250 * 1024,
@@ -146,7 +173,8 @@ const rendererConfig = {
       filename: 'index.html',
     }),
     new MiniCssExtractPlugin({
-      filename: 'styles.css',
+      filename: '[name].css',
+      chunkFilename: '[name].css',
     }),
   ],
 };

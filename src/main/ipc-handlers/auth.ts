@@ -19,6 +19,31 @@ import { updateTrayMenu } from '../tray-init';
 import { IPC_CHANNELS, GitHubRepo, GitHubUserSearchResult } from '../../shared/types';
 
 /**
+ * Validate that a URL is a legitimate GitHub URL before opening externally.
+ * This prevents phishing attacks if the GitHub API were compromised.
+ */
+function isValidGitHubUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'https:' && parsed.hostname === 'github.com';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Safely open a GitHub verification URL in the user's browser.
+ * Validates the URL is actually GitHub before opening.
+ */
+function openGitHubVerificationUrl(url: string, logger?: { error: (msg: string) => void }): void {
+  if (isValidGitHubUrl(url)) {
+    shell.openExternal(url);
+  } else {
+    logger?.error(`Refusing to open suspicious verification URL: ${url}`);
+  }
+}
+
+/**
  * Register authentication-related IPC handlers.
  */
 export const registerAuthHandlers = (): void => {
@@ -60,8 +85,8 @@ export const registerAuthHandlers = (): void => {
     try {
       const { status, waitForAuth } = await githubAuth.startDeviceFlow();
 
-      // Open the verification URL
-      shell.openExternal(status.verificationUri);
+      // Open the verification URL (with validation)
+      openGitHubVerificationUrl(status.verificationUri, logger);
 
       // Wait for user to complete auth
       const result = await waitForAuth();
@@ -93,8 +118,8 @@ export const registerAuthHandlers = (): void => {
         verificationUri: status.verificationUri,
       });
 
-      // Open the verification URL in the browser
-      shell.openExternal(status.verificationUri);
+      // Open the verification URL in the browser (with validation)
+      openGitHubVerificationUrl(status.verificationUri, logger);
 
       // Wait for user to complete auth
       const result = await waitForAuth();

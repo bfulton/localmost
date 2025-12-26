@@ -14,6 +14,7 @@
 
 import * as path from 'path';
 import * as os from 'os';
+import * as fs from 'fs';
 import { app } from 'electron';
 
 /**
@@ -91,4 +92,25 @@ export function getLogsDir(): string {
  */
 export function getCliSocketPath(): string {
   return path.join(getAppDataDir(), 'localmost.sock');
+}
+
+/**
+ * Ensure the app data directory exists with secure permissions.
+ * Creates ~/.localmost (or sandbox equivalent) with 700 permissions (user-only).
+ * This should be called early in app startup.
+ */
+export function ensureAppDataDir(): void {
+  const dir = getAppDataDir();
+
+  if (!fs.existsSync(dir)) {
+    // Create with user-only permissions (rwx------)
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  } else {
+    // Ensure existing directory has correct permissions
+    try {
+      fs.chmodSync(dir, 0o700);
+    } catch {
+      // May fail if not owner - that's okay, we tried
+    }
+  }
 }
