@@ -219,7 +219,7 @@ npm run make
 
 Future feature ideas:
 
-- **Trusted authors for public repos** - Control who can trigger builds on your machine. Options: never build public repos, only build from trusted authors (default: you + known bots, customizable), or always build (with high-friction confirmation). Jobs from untrusted authors fail with a clear error.
+- **Trusted contributors for public repos** - Control which repos can run on your machine based on their contributor list. Options: never build public repos, only build repos where all contributors are trusted (default: you + known bots, customizable), or always build (with high-friction confirmation). Repos with untrusted contributors fail with a clear error.
 - **Quick actions** - Re-run failed job, cancel all jobs.
 - **Audit logging** - Detailed logs of what each job accessed.
 - **Network policy customization** - User-defined network allowlists per repo.
