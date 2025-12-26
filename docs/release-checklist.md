@@ -51,8 +51,6 @@
   - Attach `out/make/localmost-X.Y.Z-arm64.dmg`
   - Attach `out/make/localmost-X.Y.Z-x64.dmg`
   - Attach `out/make/latest-mac.yml`
-  - Attach `out/make/zip/darwin/arm64/localmost-darwin-arm64-X.Y.Z.zip`
-  - Attach `out/make/zip/darwin/x64/localmost-darwin-x64-X.Y.Z.zip`
 - [ ] Publish release
 - [ ] Bump the release version in [package.json](https://github.com/bfulton/localmost/edit/main/package.json)
 - [ ] Update [CHANGELOG.md](https://github.com/bfulton/localmost/edit/main/CHANGELOG.md) with proper release dates and links, and section for next unreleased version
