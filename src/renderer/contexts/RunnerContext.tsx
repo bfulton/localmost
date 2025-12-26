@@ -246,6 +246,19 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
   const refreshTargets = useCallback(async () => {
     const loadedTargets = await window.localmost.targets.list();
     setTargets(loadedTargets);
+    // Also refresh isConfigured since adding/removing targets changes it
+    const configured = await window.localmost.runner.isConfigured();
+    setIsConfigured(configured);
+    // Update display name if we became configured
+    if (configured) {
+      const displayName = await window.localmost.runner.getDisplayName();
+      setRunnerDisplayName(displayName);
+      // Auto-start runner if configured but offline (e.g., first target was just added)
+      const status = await window.localmost.runner.getStatus();
+      if (status.status === 'offline') {
+        await window.localmost.runner.start();
+      }
+    }
   }, []);
 
   const login = useCallback(async () => {

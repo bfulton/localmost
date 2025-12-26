@@ -215,10 +215,7 @@ npm run make
 
 Future feature ideas:
 
-- **Multiple repo/org runner registration** - Support registering runners with more than one repo / org, or a mix of repos and orgs.
 - **Quick actions** - Re-run failed job, cancel all jobs.
-- **Notifications** - Native macOS notifications for job completion/failure.
-- **Deep links** - Jump directly to job logs in GitHub.
 - **Audit logging** - Detailed logs of what each job accessed.
 - **Network policy customization** - User-defined network allowlists per repo.
 - **Workflow testing mode** - Run and validate workflows locally before pushing.
@@ -226,3 +223,4 @@ Future feature ideas:
 - **Artifact inspector** - Browse uploaded artifacts without leaving the app.
 - **Disk space monitoring** - Warn or pause when disk is low, auto-clean old work dirs.
 - **Runner handoff** - Transfer a running job to GitHub-hosted if you need to leave.
+- **Reactive state management** - Unify disk state, React state, and state machine into a single reactive store to prevent synchronization bugs.
