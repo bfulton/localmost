@@ -7,7 +7,7 @@ jobs:
   benchmark:
     strategy:
       matrix:
-        runner: [macos-latest, macos-15-large]
+        runner: [macos-15-xlarge]
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Show runner info
