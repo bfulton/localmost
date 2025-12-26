@@ -9,6 +9,7 @@ import { spawnSandboxed } from './process-sandbox';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { RunnerDownloader } from './runner-downloader';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
+import { loadConfig } from './config';
 
 /**
  * Get the hostname without .local suffix (common on macOS).
@@ -431,6 +432,19 @@ export class RunnerManager {
   }
 
   getStatusDisplayName(): string {
+    // Use target-based naming for multi-target mode
+    const config = loadConfig();
+    const targets = config.targets || [];
+
+    if (targets.length === 1) {
+      // Single target: show the proxy runner name
+      return targets[0].proxyRunnerName;
+    } else if (targets.length > 1) {
+      // Multiple targets: show prefix with wildcard
+      return `localmost.${getCleanHostname()}.*`;
+    }
+
+    // Fallback for legacy single-runner mode (no targets)
     const baseName = this.baseRunnerName || `localmost.${getCleanHostname()}`;
     if (this.runnerCount === 1) {
       return `${baseName}.1`;

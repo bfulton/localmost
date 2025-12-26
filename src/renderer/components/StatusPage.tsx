@@ -84,7 +84,7 @@ interface RunnerStatusItemProps {
   status: string;
   statusType: string;
   runnerName: string | null;
-  runnerSettingsUrl: string | null;
+  runnerSettingsUrls: string[];
   runnerVersion: { version: string | null; url: string | null };
   targets: Target[];
   isConfigured: boolean;
@@ -97,7 +97,7 @@ const RunnerStatusItem: React.FC<RunnerStatusItemProps> = ({
   status,
   statusType,
   runnerName,
-  runnerSettingsUrl,
+  runnerSettingsUrls,
   runnerVersion,
   targets,
   isConfigured,
@@ -141,12 +141,16 @@ const RunnerStatusItem: React.FC<RunnerStatusItemProps> = ({
     {(runnerName || runnerVersion.version || targetsDisplay) && (
       <div className={`${styles.statusItemDetail} ${shared.flexBetween}`}>
         <span>
-          {runnerName && runnerSettingsUrl ? (
+          {runnerName && runnerSettingsUrls.length > 0 ? (
             <a
-              href={runnerSettingsUrl}
-              target="_blank"
-              rel="noopener noreferrer"
+              href="#"
               className={styles.runnerNameLink}
+              onClick={(e) => {
+                e.preventDefault();
+                // Open all runner settings pages
+                runnerSettingsUrls.forEach(url => window.open(url, '_blank'));
+              }}
+              title={runnerSettingsUrls.length > 1 ? `Opens ${runnerSettingsUrls.length} settings pages` : undefined}
             >
               {runnerName}
             </a>
@@ -394,7 +398,7 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
   const { user, isDownloaded, isConfigured, runnerVersion, runnerState, jobHistory, runnerDisplayName, targets, targetStatus } = useRunner();
 
   // Local UI state
-  const [runnerSettingsUrl, setRunnerSettingsUrl] = useState<string | null>(null);
+  const [runnerSettingsUrls, setRunnerSettingsUrls] = useState<string[]>([]);
   const [showUsage, setShowUsage] = useState(false);
   const [showJobHistory, setShowJobHistory] = useState(false);
   const [logsExpanded, setLogsExpanded] = useState(false);
@@ -411,14 +415,19 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
   const isProgrammaticScrollRef = useRef(false); // Ignore scroll events during programmatic scroll
 
   useEffect(() => {
-    // Construct runner settings URL from first target
+    // Construct runner settings URLs from all targets
     if (isConfigured && targets.length > 0) {
-      const firstTarget = targets[0];
-      if (firstTarget.type === 'org') {
-        setRunnerSettingsUrl(`https://github.com/organizations/${firstTarget.owner}/settings/actions/runners`);
-      } else {
-        setRunnerSettingsUrl(`https://github.com/${firstTarget.owner}/${firstTarget.repo}/settings/actions/runners`);
-      }
+      const urls = targets.map(target => {
+        if (target.type === 'org') {
+          return `https://github.com/organizations/${target.owner}/settings/actions/runners`;
+        } else {
+          return `https://github.com/${target.owner}/${target.repo}/settings/actions/runners`;
+        }
+      });
+      // Deduplicate (in case multiple repos under same owner/org)
+      setRunnerSettingsUrls([...new Set(urls)]);
+    } else {
+      setRunnerSettingsUrls([]);
     }
 
     // Get log file path
@@ -728,7 +737,7 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
           status={runnerStatus.status}
           statusType={runnerStatus.statusType}
           runnerName={isConfigured ? runnerDisplayName : null}
-          runnerSettingsUrl={runnerSettingsUrl}
+          runnerSettingsUrls={runnerSettingsUrls}
           runnerVersion={runnerVersion}
           targets={targets}
           isConfigured={isConfigured}
