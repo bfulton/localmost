@@ -217,14 +217,15 @@ npm run make
 
 ## Roadmap
 
+Next release: [0.3.0 — Test Locally, Secure by Default](docs/roadmap/release-0.3.0.md)
+
 Future feature ideas:
 
+- **Workflow testing mode** - Run and validate workflows locally before pushing. ([design](docs/roadmap/workflow-test-mode.md))
+- **Declarative sandbox policy** - Per-repo `.localmostrc` files that specify allowed network and filesystem access, with audit logging. ([design](docs/roadmap/localmostrc.md))
 - **Trusted contributors for public repos** - Control which repos can run on your machine based on their contributor list. Options: never build public repos, only build repos where all contributors are trusted (default: you + known bots, customizable), or always build (with high-friction confirmation). Repos with untrusted contributors fail with a clear error.
 - **Graceful heartbeat shutdown** - On clean exit, immediately mark heartbeat stale so workflows fall back to cloud without waiting for the 90s timeout.
 - **Quick actions** - Re-run failed job, cancel all jobs.
-- **Audit logging** - Detailed logs of what each job accessed.
-- **Network policy customization** - User-defined network allowlists per repo.
-- **Workflow testing mode** - Run and validate workflows locally before pushing.
 - **Spotlight integration** - Check status or pause builds from Spotlight.
 - **Artifact inspector** - Browse uploaded artifacts without leaving the app.
 - **Disk space monitoring** - Warn or pause when disk is low, auto-clean old work dirs.
