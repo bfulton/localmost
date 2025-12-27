@@ -18,12 +18,15 @@ localmost test --updaterc         # Discover and record access policy
 Per-repo `.localmostrc` files that declare allowed access. Default-deny sandbox.
 
 ```yaml
-network:
-  allow:
-    - registry.npmjs.org
-filesystem:
-  write:
-    - ./build/
+shared:
+  network:
+    allow:
+      - registry.npmjs.org
+workflows:
+  deploy:
+    network:
+      allow:
+        - api.fastlane.tools   # Only deploy needs this
 ```
 
 ### 3. CLI Polish
@@ -99,8 +102,12 @@ Run workflow steps in the sandbox.
 ### Phase 5: .localmostrc Parser and Validator
 
 - [ ] Define YAML schema for `.localmostrc` v1
+  - [ ] `shared:` section for baseline policy
+  - [ ] `workflows:` section with per-workflow overrides
+  - [ ] Policy merge logic (workflow inherits from shared, can add or deny)
 - [ ] Parser with helpful error messages for invalid files
 - [ ] Wildcard expansion (`*.github.com`, `./build/**`)
+- [ ] Workflow name matching (e.g., `build` matches `build.yml`)
 - [ ] Schema validation on load
 
 ### Phase 6: Discovery Mode (`--updaterc`)
@@ -164,7 +171,7 @@ Run workflow steps in the sandbox.
 ## Out of Scope for 0.3.0
 
 - Visual workflow editor
-- Per-job policy overrides in `.localmostrc`
+- Per-job policy overrides within a workflow (per-workflow is sufficient)
 - Remote policy management (org-wide policies)
 - Windows/Linux support
 

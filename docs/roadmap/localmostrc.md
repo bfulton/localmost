@@ -18,26 +18,23 @@ Each repo declares its sandbox policy in `.localmostrc`:
 # .localmostrc
 version: 1
 
-network:
-  allow:
-    - registry.npmjs.org
-    - github.com
-    - api.fastlane.tools
+shared:                          # Applies to all workflows
+  network:
+    allow:
+      - registry.npmjs.org
+      - github.com
+  filesystem:
+    write:
+      - ./build/
 
-filesystem:
-  read:
-    - ~/.gitconfig
-    - ~/.ssh/known_hosts
-  write:
-    - ./build/
-    - ./DerivedData/
-
-env:
-  - DEVELOPER_DIR
-  - HOME
+workflows:                       # Per-workflow additions
+  deploy:
+    network:
+      allow:
+        - api.fastlane.tools     # Only deploy needs this
 ```
 
-**Default sandbox: deny everything.** Only punch holes for what's declared.
+**Default sandbox: deny everything.** Only punch holes for what's declared. Each workflow gets shared policy plus its own additions.
 
 ## The Workflow
 
@@ -105,33 +102,48 @@ A compromised dependency that tries to exfiltrate data would:
 # .localmostrc
 version: 1
 
-network:
-  allow:
-    - "*.github.com"           # Wildcard subdomain
-    - "registry.npmjs.org"     # Exact match
-    - "cdn.cocoapods.org"
-  deny:                        # Explicit denials (optional, for clarity)
-    - "*.analytics.com"
+# Shared policy — baseline for all workflows
+shared:
+  network:
+    allow:
+      - "*.github.com"           # Wildcard subdomain
+      - "registry.npmjs.org"     # Exact match
+    deny:                        # Explicit denials (optional, for clarity)
+      - "*.analytics.com"
 
-filesystem:
-  read:
-    - "~/.gitconfig"
-    - "~/.ssh/known_hosts"
-  write:
-    - "./build/**"
-    - "./DerivedData/**"
-  deny:
-    - "~/.aws/*"               # Explicit paranoia
-    - "~/.ssh/id_*"
+  filesystem:
+    read:
+      - "~/.gitconfig"
+      - "~/.ssh/known_hosts"
+    write:
+      - "./build/**"
+    deny:
+      - "~/.aws/*"               # Explicit paranoia
+      - "~/.ssh/id_*"
 
-env:
-  allow:
-    - DEVELOPER_DIR
-    - HOME
-    - PATH
-  deny:
-    - AWS_*
-    - GITHUB_TOKEN             # Don't leak to subprocesses
+  env:
+    allow:
+      - DEVELOPER_DIR
+      - HOME
+      - PATH
+    deny:
+      - AWS_*
+      - GITHUB_TOKEN             # Don't leak to subprocesses
+
+# Per-workflow policies — merged with shared
+workflows:
+  build:
+    filesystem:
+      write:
+        - "./DerivedData/**"
+
+  deploy:
+    network:
+      allow:
+        - "api.fastlane.tools"
+    secrets:
+      require:
+        - APPSTORE_CONNECT_KEY
 ```
 
 ### Wildcards
@@ -143,16 +155,93 @@ env:
 | `./build/**` | All files under `build/` recursively |
 | `~/.ssh/id_*` | `~/.ssh/id_rsa`, `~/.ssh/id_ed25519`, etc. |
 
-### Per-job overrides (future)
+### Per-workflow policies
+
+Policies have two levels: **shared** (applies to all workflows) and **per-workflow** (scoped to a specific workflow file).
 
 ```yaml
-jobs:
+# .localmostrc
+version: 1
+
+# Shared policy — applies to ALL workflows
+shared:
+  network:
+    allow:
+      - "*.github.com"
+      - "registry.npmjs.org"
+  filesystem:
+    read:
+      - "~/.gitconfig"
+    write:
+      - "./build/**"
+
+# Per-workflow policies — only apply to specific workflows
+workflows:
+  # Matches .github/workflows/build.yml
   build:
     network:
-      allow: [npm, github]
+      allow:
+        - "cdn.cocoapods.org"    # CocoaPods for iOS builds
+    filesystem:
+      write:
+        - "./Pods/**"
+        - "./DerivedData/**"
+
+  # Matches .github/workflows/deploy.yml
   deploy:
     network:
-      allow: [npm, github, fastlane]
+      allow:
+        - "api.fastlane.tools"   # App Store deployment
+        - "itunesconnect.apple.com"
+    filesystem:
+      read:
+        - "~/.fastlane/**"       # Fastlane credentials
+    env:
+      allow:
+        - FASTLANE_*
+        - MATCH_*
+    secrets:
+      require:                   # These secrets MUST be provided
+        - APPSTORE_CONNECT_KEY
+        - MATCH_PASSWORD
+
+  # Matches .github/workflows/test.yml
+  test:
+    # No additional permissions — inherits only shared policy
+```
+
+**Resolution order:**
+1. Start with `shared` policy
+2. Merge workflow-specific policy (additive)
+3. Explicit `deny` in workflow policy can revoke shared access
+
+**Why this matters:**
+- A compromised test dependency can't access deploy credentials
+- Build workflow can't phone home to analytics even if deploy can
+- Each workflow gets exactly what it needs, nothing more
+
+**Workflow matching:**
+- Keys under `workflows:` match the workflow filename (without `.yml`/`.yaml`)
+- `build` matches `.github/workflows/build.yml`
+- For matrix workflows, all jobs in the workflow share the workflow's policy
+
+**Discovery mode with per-workflow policies:**
+
+```bash
+localmost test --updaterc build.yml
+```
+
+```
+Discovered access for build.yml:
+  shared (already allowed):
+    ✓ registry.npmjs.org
+    ✓ github.com
+
+  workflow-specific (new):
+    + network: cdn.cocoapods.org
+    + filesystem write: ./Pods/**
+
+Add to .localmostrc under workflows.build? [y/n]
 ```
 
 ## Why Checked Into Git
