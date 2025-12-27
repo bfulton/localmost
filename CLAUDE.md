@@ -1,5 +1,11 @@
 # Claude Code Guidelines
 
+## Roadmap
+
+- Roadmap items in README.md should have a short name and one-sentence description
+- Larger features may link to a design doc in `docs/roadmap/`
+- Design docs should explain the problem, solution, key design decisions, and edge cases
+
 ## Decision Making
 
 - Don't disable warnings, linters, or other developer guardrails without discussing first
