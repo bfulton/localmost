@@ -466,3 +466,34 @@ export function getGitInfo(dir: string): {
 export function isGitRepo(dir: string): boolean {
   return fs.existsSync(path.join(dir, '.git'));
 }
+
+/**
+ * Parse a repository identifier from a directory path (via git remote origin).
+ * Returns "owner/repo" format or null if not a git repo.
+ */
+export function getRepositoryFromDir(dir: string): string | null {
+  try {
+    const result = execSync('git remote get-url origin', {
+      cwd: dir,
+      encoding: 'utf-8',
+    });
+
+    const url = result.trim();
+
+    // SSH format: git@github.com:owner/repo.git
+    const sshMatch = url.match(/git@github\.com:([^/]+\/[^.]+)(?:\.git)?$/);
+    if (sshMatch) {
+      return sshMatch[1];
+    }
+
+    // HTTPS format: https://github.com/owner/repo.git
+    const httpsMatch = url.match(/https:\/\/github\.com\/([^/]+\/[^.]+)(?:\.git)?$/);
+    if (httpsMatch) {
+      return httpsMatch[1];
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}

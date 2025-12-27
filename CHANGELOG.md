@@ -21,9 +21,6 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   - Per-workflow policy overrides
   - Discovery mode with `localmost test --updaterc`
   - Policy validation with `localmost policy validate`
-- **Secrets Management**: Secure storage of workflow secrets in macOS Keychain
-  - `localmost secrets set/get/delete/list` commands
-  - Per-repository secret scoping
 - **Environment Comparison**: Detect differences between local and GitHub runner environments
   - `localmost env` command shows local tooling versions
   - Compare against any GitHub runner label

@@ -40,8 +40,7 @@ import {
   LOCALMOSTRC_VERSION,
 } from '../shared/localmostrc';
 import { SandboxPolicy, DEFAULT_SANDBOX_POLICY } from '../shared/sandbox-profile';
-import { createWorkspace, cleanupWorkspaces, getGitInfo } from '../shared/workspace';
-import { getSecrets, hasSecret, storeSecret, getRepositoryFromDir } from '../shared/secrets';
+import { createWorkspace, cleanupWorkspaces, getGitInfo, getRepositoryFromDir } from '../shared/workspace';
 import {
   detectLocalEnvironment,
   compareEnvironments,
@@ -468,23 +467,24 @@ function resolveWorkflowPath(input: string | undefined, cwd: string): string {
 }
 
 /**
- * Resolve secrets from storage or stub them.
+ * Resolve secrets from environment variables or stub them.
  */
 async function resolveSecrets(
-  repository: string,
+  _repository: string,
   names: string[],
   mode: 'stub' | 'prompt' | 'abort'
 ): Promise<Record<string, string>> {
   const result: Record<string, string> = {};
 
   for (const name of names) {
-    if (hasSecret(repository, name)) {
-      result[name] = (await getSecrets(repository, [name]))[name] || '';
-      console.log(`  ${success(name)} (from keychain)`);
+    const envValue = process.env[name];
+    if (envValue !== undefined) {
+      result[name] = envValue;
+      console.log(`  ${success(name)} (from environment)`);
     } else {
       switch (mode) {
         case 'abort':
-          throw new Error(`Missing secret: ${name}. Set it with: localmost secrets set ${name}`);
+          throw new Error(`Missing secret: ${name}. Set it as an environment variable.`);
         case 'stub':
           result[name] = '';
           console.log(`  ${skipped(name)} (stubbed)`);

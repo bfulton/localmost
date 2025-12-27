@@ -119,7 +119,7 @@ export function parseLocalmostrcContent(content: string): ParseResult {
     };
   }
 
-  if (!parsed || typeof parsed !== 'object') {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return {
       success: false,
       errors: [{ message: 'Invalid .localmostrc: must be a YAML object' }],
@@ -161,9 +161,16 @@ export function parseLocalmostrcContent(content: string): ParseResult {
     return { success: false, errors, warnings };
   }
 
+  // Build a properly typed config object
+  const typedConfig: LocalmostrcConfig = {
+    version: typeof config.version === 'number' ? config.version : LOCALMOSTRC_VERSION,
+    shared: config.shared as SandboxPolicy | undefined,
+    workflows: config.workflows as Record<string, WorkflowPolicy> | undefined,
+  };
+
   return {
     success: true,
-    config: config as LocalmostrcConfig,
+    config: typedConfig,
     errors: [],
     warnings,
   };

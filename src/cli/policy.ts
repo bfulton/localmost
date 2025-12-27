@@ -22,7 +22,7 @@ import {
   LOCALMOSTRC_VERSION,
 } from '../shared/localmostrc';
 import { getAppDataDirWithoutElectron } from '../shared/paths';
-import { getRepositoryFromDir } from '../shared/secrets';
+import { getRepositoryFromDir } from '../shared/workspace';
 
 // ANSI colors
 const colors = {

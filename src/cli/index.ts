@@ -4,7 +4,6 @@
  *
  * Commands:
  *   localmost test    - Run workflows locally (standalone, no app required)
- *   localmost secrets - Manage workflow secrets
  *   localmost policy  - Manage sandbox policies
  *   localmost env     - Show environment information
  *   localmost start   - Start the localmost app
@@ -21,7 +20,6 @@ import * as path from 'path';
 import { spawn } from 'child_process';
 import { getCliSocketPath } from '../shared/paths';
 import { runTest, parseTestArgs, printTestHelp } from './test';
-import { runSecrets, parseSecretsArgs, printSecretsHelp } from './secrets';
 import { runPolicy, parsePolicyArgs, printPolicyHelp } from './policy';
 import { runEnv, parseEnvArgs, printEnvHelp } from './env';
 
@@ -92,7 +90,6 @@ USAGE:
 
 STANDALONE COMMANDS (no app required):
   test      Run workflows locally before pushing
-  secrets   Manage workflow secrets
   policy    Manage .localmostrc sandbox policies
   env       Show environment information
 
@@ -107,7 +104,6 @@ APP COMMANDS (requires running app):
 EXAMPLES:
   localmost test                  Run default workflow locally
   localmost test --updaterc       Generate .localmostrc from access
-  localmost secrets set NPM_TOKEN Store a secret
   localmost policy show           Display current policy
   localmost env                   Show environment info
   localmost start                 Launch background app
@@ -115,7 +111,6 @@ EXAMPLES:
 
 For command-specific help:
   localmost test --help
-  localmost secrets --help
   localmost policy --help
   localmost env --help
 
@@ -471,22 +466,6 @@ async function main(): Promise<void> {
       const options = parseTestArgs(subArgs);
       const result = await runTest(options);
       process.exit(result.success ? 0 : 1);
-    } catch (err) {
-      console.error(`Error: ${(err as Error).message}`);
-      process.exit(1);
-    }
-  }
-
-  // Secrets command - manage workflow secrets
-  if (command === 'secrets') {
-    if (subArgs.includes('--help') || subArgs.includes('-h')) {
-      printSecretsHelp();
-      process.exit(0);
-    }
-    try {
-      const { subcommand, args: secretArgs, options } = parseSecretsArgs(subArgs);
-      await runSecrets(subcommand, secretArgs, options);
-      process.exit(0);
     } catch (err) {
       console.error(`Error: ${(err as Error).message}`);
       process.exit(1);

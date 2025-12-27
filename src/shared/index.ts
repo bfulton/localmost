@@ -23,8 +23,5 @@ export * from './action-fetcher';
 // Workspace management
 export * from './workspace';
 
-// Secrets
-export * from './secrets';
-
 // Environment detection
 export * from './environment';
