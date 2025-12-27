@@ -307,10 +307,10 @@ describe('TargetManager', () => {
       expect(mockSaveConfig).toHaveBeenCalledWith({ maxConcurrentJobs: 1 });
     });
 
-    it('should clamp value to maximum of 16', () => {
+    it('should clamp value to maximum of 8', () => {
       mockLoadConfig.mockReturnValue({});
       manager.setMaxConcurrentJobs(100);
-      expect(mockSaveConfig).toHaveBeenCalledWith({ maxConcurrentJobs: 16 });
+      expect(mockSaveConfig).toHaveBeenCalledWith({ maxConcurrentJobs: 8 });
     });
   });
 

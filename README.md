@@ -27,11 +27,13 @@ Here's what some open source projects would save:
 
 Local builds are also faster. Based on [XcodeBenchmark](https://github.com/devMEremenko/XcodeBenchmark):
 
-| Runner | Time | vs GitHub |
-|--------|------|-----------|
-| GitHub macos-latest | [967s](https://github.com/bfulton/localmost/actions/runs/20388833445/job/58594848226) | — |
-| MacBook Air M2 (2022) | 202s | **4.8x faster** |
-| MacBook Pro M4 Max (2024) | 77s | **12.6x faster** |
+| Runner | Time |
+|--------|------|
+| GitHub macos-latest M1 x3 ($0.06/m) | [838s](https://github.com/bfulton/localmost/actions/runs/20525324038/job/58967518701) |
+| GitHub macos-15-large Intel x12 ($0.08/m) | [955s](https://github.com/bfulton/localmost/actions/runs/20525324038/job/58967518696) |
+| GitHub macos-15-xlarge M2 Pro x5 ($0.10/m) | [339s](https://github.com/bfulton/localmost/actions/runs/20525919481/job/58969135831) |
+| MacBook Air M2 x8 (2022) | 202s |
+| MacBook Pro M4 Max x16 (2024) | 77s |
 
 ## Why else use localmost?
 
@@ -39,7 +41,7 @@ Features:
 - **Automatic fallback** — workflows detect when your Mac is available; fall back to hosted runners when it's not
 - **One-click setup** — no terminal commands, no manually generating registration tokens
 - **Lid-close protection** — close your laptop without killing in-progress jobs
-- **Multi-runner parallelism** — run 1-16 concurrent jobs
+- **Multi-runner parallelism** — run 1-8 concurrent jobs
 - **Network isolation** — runner traffic is proxied through an allowlist (GitHub, npm, PyPI, etc.)
 - **Filesystem sandboxing** — runner processes can only write to their working directory
 - **Resource-aware scheduling** — automatically pause runners when on battery or during video calls
@@ -48,12 +50,14 @@ Features:
 
 localmost is a macOS app that manages GitHub's official [actions-runner](https://github.com/actions/runner) binary. It handles authentication, registration, runner process lifecycle, and automatic fallback — the tedious parts of self-hosted runners.
 
+**Security note:** Running CI jobs on your local machine has inherent risks—especially for public repos that accept external contributions. localmost sandboxes runner processes and restricts network access, but these are not VM-level isolation. See [SECURITY.md](SECURITY.md) for details on the threat model and recommendations.
+
 ## Architecture
 
 <img src="docs/localmost-arch.png" alt="localmost architecture diagram" width="600" style="background-color: white; padding: 10px; border-radius: 8px;">
 
 - **Runner proxy** — maintains long-poll sessions with GitHub's broker to receive job assignments
-- **Runner pool** — 1-16 worker instances that execute jobs in sandboxed environments
+- **Runner pool** — 1-8 worker instances that execute jobs in sandboxed environments
 - **HTTP proxy** — allowlist-based network isolation for runner traffic (GitHub, npm, PyPI, etc.)
 - **Build cache** — persistent tool cache shared across job runs (Node.js, Python, etc.)
 
@@ -215,6 +219,8 @@ npm run make
 
 Future feature ideas:
 
+- **Trusted contributors for public repos** - Control which repos can run on your machine based on their contributor list. Options: never build public repos, only build repos where all contributors are trusted (default: you + known bots, customizable), or always build (with high-friction confirmation). Repos with untrusted contributors fail with a clear error.
+- **Graceful heartbeat shutdown** - On clean exit, immediately mark heartbeat stale so workflows fall back to cloud without waiting for the 90s timeout.
 - **Quick actions** - Re-run failed job, cancel all jobs.
 - **Audit logging** - Detailed logs of what each job accessed.
 - **Network policy customization** - User-defined network allowlists per repo.
@@ -224,6 +230,9 @@ Future feature ideas:
 - **Disk space monitoring** - Warn or pause when disk is low, auto-clean old work dirs.
 - **Runner handoff** - Transfer a running job to GitHub-hosted if you need to leave.
 - **Reactive state management** - Unify disk state, React state, and state machine into a single reactive store to prevent synchronization bugs.
+- **Linux and Windows host support** - Run self-hosted runners on non-Mac machines for projects that need them.
+- **Higher parallelism cap** - Parallelize proxy registration to support 16+ concurrent runners (currently capped at 8 due to serial registration time).
+- **Ephemeral VM isolation** - Run each job in a fresh lightweight VM for stronger isolation between jobs.
 
 Bugs and quick improvements:
 

@@ -50,7 +50,7 @@ export interface AppConfig {
     orgName?: string;
     runnerName?: string;
     labels?: string;
-    runnerCount?: number;  // Number of parallel runners (1-16)
+    runnerCount?: number;  // Number of parallel runners (1-8)
   };
   theme?: string;
   launchAtLogin?: boolean;
@@ -62,7 +62,7 @@ export interface AppConfig {
   userFilter?: UserFilterConfig;
   /** Multi-target configuration - list of repos/orgs to register runners for */
   targets?: Target[];
-  /** Maximum concurrent jobs across all targets (1-16, defaults to 4) */
+  /** Maximum concurrent jobs across all targets (1-8, defaults to 4) */
   maxConcurrentJobs?: number;
   /** Power settings (battery/video call pausing) */
   power?: PowerConfig;

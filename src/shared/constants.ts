@@ -90,7 +90,7 @@ export const DEFAULT_RUNNER_COUNT = 4;
 export const MIN_RUNNER_COUNT = 1;
 
 /** Maximum number of runner instances */
-export const MAX_RUNNER_COUNT = 16;
+export const MAX_RUNNER_COUNT = 8;
 
 /** Default max job history entries to keep */
 export const DEFAULT_MAX_JOB_HISTORY = 10;

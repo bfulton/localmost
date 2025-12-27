@@ -246,7 +246,7 @@ export interface ConfigureOptions {
   orgName?: string;  // Required for org level
   runnerName: string;
   labels: string[];
-  runnerCount?: number;  // Number of parallel runners (1-16), defaults to 1
+  runnerCount?: number;  // Number of parallel runners (1-8), defaults to 1
 }
 
 export type SleepProtection = 'never' | 'when-busy' | 'always';
