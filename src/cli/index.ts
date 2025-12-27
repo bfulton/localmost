@@ -1,8 +1,12 @@
 #!/usr/bin/env node
 /**
- * localmost CLI companion
+ * localmost CLI
  *
  * Commands:
+ *   localmost test    - Run workflows locally (standalone, no app required)
+ *   localmost secrets - Manage workflow secrets
+ *   localmost policy  - Manage sandbox policies
+ *   localmost env     - Show environment information
  *   localmost start   - Start the localmost app
  *   localmost stop    - Stop the localmost app
  *   localmost status  - Show runner status
@@ -16,6 +20,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import { getCliSocketPath } from '../shared/paths';
+import { runTest, parseTestArgs, printTestHelp } from './test';
+import { runSecrets, parseSecretsArgs, printSecretsHelp } from './secrets';
+import { runPolicy, parsePolicyArgs, printPolicyHelp } from './policy';
+import { runEnv, parseEnvArgs, printEnvHelp } from './env';
 
 interface CliRequest {
   command: 'status' | 'pause' | 'resume' | 'jobs' | 'quit';
@@ -77,29 +85,42 @@ interface ErrorResponse {
 type CliResponse = StatusResponse | JobsResponse | ActionResponse | ErrorResponse;
 
 const HELP_TEXT = `
-localmost - CLI companion for localmost app
+localmost - Run GitHub Actions locally
 
 USAGE:
-  localmost <command>
+  localmost <command> [options]
 
-COMMANDS:
+STANDALONE COMMANDS (no app required):
+  test      Run workflows locally before pushing
+  secrets   Manage workflow secrets
+  policy    Manage .localmostrc sandbox policies
+  env       Show environment information
+
+APP COMMANDS (requires running app):
   start     Start the localmost app
   stop      Stop the localmost app
   status    Show current runner status
   pause     Pause the runner (stops accepting jobs)
   resume    Resume the runner (start accepting jobs)
   jobs      Show recent job history
-  help      Show this help message
 
 EXAMPLES:
-  localmost start
-  localmost status
-  localmost pause
-  localmost stop
+  localmost test                  Run default workflow locally
+  localmost test --updaterc       Generate .localmostrc from access
+  localmost secrets set NPM_TOKEN Store a secret
+  localmost policy show           Display current policy
+  localmost env                   Show environment info
+  localmost start                 Launch background app
+  localmost status                Check runner status
 
-NOTE:
-  Most commands require the localmost app to be running.
-  Use 'localmost start' to launch the app first.
+For command-specific help:
+  localmost test --help
+  localmost secrets --help
+  localmost policy --help
+  localmost env --help
+
+DOCUMENTATION:
+  https://github.com/bfulton/localmost
 `;
 
 function printHelp(): void {
@@ -434,6 +455,90 @@ async function main(): Promise<void> {
   }
 
   const command = args[0];
+  const subArgs = args.slice(1);
+
+  // =========================================================================
+  // STANDALONE COMMANDS (no app required)
+  // =========================================================================
+
+  // Test command - run workflows locally
+  if (command === 'test') {
+    if (subArgs.includes('--help') || subArgs.includes('-h')) {
+      printTestHelp();
+      process.exit(0);
+    }
+    try {
+      const options = parseTestArgs(subArgs);
+      const result = await runTest(options);
+      process.exit(result.success ? 0 : 1);
+    } catch (err) {
+      console.error(`Error: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  }
+
+  // Secrets command - manage workflow secrets
+  if (command === 'secrets') {
+    if (subArgs.includes('--help') || subArgs.includes('-h')) {
+      printSecretsHelp();
+      process.exit(0);
+    }
+    try {
+      const { subcommand, args: secretArgs, options } = parseSecretsArgs(subArgs);
+      await runSecrets(subcommand, secretArgs, options);
+      process.exit(0);
+    } catch (err) {
+      console.error(`Error: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  }
+
+  // Policy command - manage .localmostrc
+  if (command === 'policy') {
+    if (subArgs.includes('--help') || subArgs.includes('-h')) {
+      printPolicyHelp();
+      process.exit(0);
+    }
+    try {
+      const { subcommand, options } = parsePolicyArgs(subArgs);
+      runPolicy(subcommand, options);
+      process.exit(0);
+    } catch (err) {
+      console.error(`Error: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  }
+
+  // Env command - show environment info
+  if (command === 'env') {
+    if (subArgs.includes('--help') || subArgs.includes('-h')) {
+      printEnvHelp();
+      process.exit(0);
+    }
+    try {
+      const options = parseEnvArgs(subArgs);
+      runEnv(options);
+      process.exit(0);
+    } catch (err) {
+      console.error(`Error: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  }
+
+  // Version command
+  if (command === 'version' || command === '--version' || command === '-v') {
+    try {
+      const packageJson = require('../../package.json');
+      console.log(`localmost ${packageJson.version}`);
+    } catch {
+      console.log('localmost (version unknown)');
+    }
+    process.exit(0);
+  }
+
+  // =========================================================================
+  // APP COMMANDS (require running app)
+  // =========================================================================
 
   // Handle start command separately (doesn't need socket)
   if (command === 'start') {
