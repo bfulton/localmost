@@ -225,8 +225,6 @@ Future feature ideas:
 - **Spotlight integration** - Check status or pause builds from Spotlight.
 - **Artifact inspector** - Browse uploaded artifacts without leaving the app.
 - **Disk space monitoring** - Warn or pause when disk is low, auto-clean old work dirs.
-- **Runner handoff** - Transfer a running job to GitHub-hosted if you need to leave.
-- **Reactive state management** - Unify disk state, React state, and state machine into a single reactive store to prevent synchronization bugs.
 - **Linux and Windows host support** - Run self-hosted runners on non-Mac machines for projects that need them.
 - **Higher parallelism cap** - Parallelize proxy registration to support 16+ concurrent runners (currently capped at 8 due to serial registration time).
 - **Ephemeral VM isolation** - Run each job in a fresh lightweight VM for stronger isolation between jobs.
