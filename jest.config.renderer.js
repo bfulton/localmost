@@ -7,6 +7,7 @@ module.exports = {
   setupFilesAfterEnv: ['<rootDir>/test/setup-renderer.ts'],
   moduleNameMapper: {
     '\\.css$': '<rootDir>/test/mocks/styleMock.ts',
+    '^@zubridge/electron$': '<rootDir>/test/__mocks__/@zubridge/electron.ts',
   },
   transform: {
     '^.+\\.tsx?$': ['ts-jest', {

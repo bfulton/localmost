@@ -88,6 +88,25 @@ const rendererConfig = {
     chunkFilename: '[name].js',
     publicPath: './',
   },
+  resolve: {
+    ...commonConfig.resolve,
+    // Provide fallbacks for Node.js modules used by zubridge
+    fallback: {
+      path: false,
+      fs: false,
+      os: false,
+      crypto: false,
+      buffer: false,
+      stream: false,
+      util: false,
+      assert: false,
+      http: false,
+      https: false,
+      zlib: false,
+      url: false,
+      querystring: false,
+    },
+  },
   module: {
     rules: [
       {

@@ -35,6 +35,7 @@ export interface MockLocalmost {
     onEntry: jest.Mock;
     getPath: jest.Mock;
     write: jest.Mock;
+    clear: jest.Mock;
   };
   jobs: {
     getHistory: jest.Mock;
@@ -113,6 +114,7 @@ const mockLocalmost: MockLocalmost = {
     onEntry: jest.fn().mockReturnValue(() => {}),
     getPath: jest.fn().mockResolvedValue('/tmp/localmost.log'),
     write: jest.fn(),
+    clear: jest.fn(),
   },
   jobs: {
     getHistory: jest.fn().mockResolvedValue([]),
@@ -151,6 +153,16 @@ const mockLocalmost: MockLocalmost = {
 
 Object.defineProperty(window, 'localmost', {
   value: mockLocalmost,
+  writable: true,
+});
+
+// Mock zubridge for Zustand store sync
+Object.defineProperty(window, 'zubridge', {
+  value: {
+    getState: jest.fn().mockReturnValue(null),
+    subscribe: jest.fn().mockReturnValue(() => {}),
+    dispatch: jest.fn(),
+  },
   writable: true,
 });
 
