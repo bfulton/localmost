@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron';
+import { preloadBridge } from '@zubridge/electron/preload';
 import {
   IPC_CHANNELS,
   RunnerState,
@@ -20,6 +21,12 @@ import {
   Result,
   ResourcePauseState,
 } from '../shared/types';
+
+// Initialize zubridge preload handlers
+const { handlers: zubridgeHandlers } = preloadBridge();
+
+// Expose zubridge to renderer
+contextBridge.exposeInMainWorld('zubridge', zubridgeHandlers);
 
 // Expose protected methods to the renderer process
 contextBridge.exposeInMainWorld('localmost', {

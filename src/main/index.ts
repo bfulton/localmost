@@ -96,6 +96,9 @@ import {
   selectEffectivePauseState,
 } from './runner-state-service';
 
+// Zustand store
+import { initStore, connectWindow, cleanupStore } from './store/init';
+
 // ============================================================================
 // App Initialization
 // ============================================================================
@@ -164,6 +167,9 @@ app.whenReady().then(async () => {
 
   // Initialize state machine (must be early - before anything uses state)
   initRunnerStateMachine();
+
+  // Initialize Zustand store (after state machine, so XState sync works)
+  initStore();
 
   // Subscribe to state changes for UI updates
   onStateChange((snapshot) => {
@@ -429,6 +435,12 @@ app.whenReady().then(async () => {
   setDockIcon();
   setupIpcHandlers();
 
+  // Connect window to Zustand store via zubridge
+  const newMainWindow = getMainWindow();
+  if (newMainWindow) {
+    connectWindow(newMainWindow);
+  }
+
   // Initialize auto-updater
   const mainWindow = getMainWindow();
   if (mainWindow) {
@@ -642,6 +654,9 @@ app.on('before-quit', async (event) => {
     sendRunnerEvent({ type: 'SHUTDOWN_COMPLETE' });
     stopRunnerStateMachine();
 
+    // Clean up Zustand store (flushes persistence)
+    cleanupStore();
+
     logger?.info('Exiting');
     app.quit();
   }
@@ -694,6 +709,9 @@ process.on('SIGINT', async () => {
   // Signal state machine shutdown is complete and stop it
   sendRunnerEvent({ type: 'SHUTDOWN_COMPLETE' });
   stopRunnerStateMachine();
+
+  // Clean up Zustand store (flushes persistence)
+  cleanupStore();
 
   getLogger()?.info('Exiting');
   app.quit();
