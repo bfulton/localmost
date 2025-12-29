@@ -5,6 +5,7 @@
 import { app, Menu, MenuItemConstructorOptions, shell } from 'electron';
 import { getMainWindow, getRunnerManager } from './app-state';
 import { showAboutDialog, confirmQuitIfBusy } from './window';
+import { installCli, uninstallCli } from './cli-install';
 import { REPOSITORY_URL, PRIVACY_POLICY_URL } from '../shared/constants';
 
 /**
@@ -41,6 +42,15 @@ export const createMenu = (): void => {
                   mainWindow?.show();
                   mainWindow?.webContents.send('navigate', 'settings');
                 },
+              },
+              { type: 'separator' as const },
+              {
+                label: 'Install Command Line Tool...',
+                click: () => installCli(),
+              },
+              {
+                label: 'Uninstall Command Line Tool...',
+                click: () => uninstallCli(),
               },
               { type: 'separator' as const },
               { role: 'hide' as const, label: 'Hide localmost' },

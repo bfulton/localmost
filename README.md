@@ -182,17 +182,11 @@ localmost jobs
 
 ### Installing the CLI
 
-After installing localmost.app, create a symlink to add the CLI to your PATH:
+From the app menu: **localmost → Install Command Line Tool...**
 
-```bash
-sudo ln -sf "/Applications/localmost.app/Contents/Resources/localmost-cli" /usr/local/bin/localmost
-```
+This creates a symlink in `/usr/local/bin` so you can use `localmost` from any terminal. You'll be prompted for your administrator password.
 
-Or for development builds:
-
-```bash
-npm link
-```
+For development builds, use `npm link` instead.
 
 The CLI communicates with the running app via a Unix socket. Most commands require the app to be running - use `localmost start` to launch it first.
 
@@ -239,6 +233,5 @@ Future feature ideas:
 
 Bugs and quick improvements:
 
-- Fix the CLI install process to be polished
 - Fix "build on unknown" race where jobs don't get links
 
