@@ -1,5 +1,13 @@
+/**
+ * RunnerContext - provides runner state to React components.
+ *
+ * This context now reads state from the Zustand store (synced from main via zubridge)
+ * and updates via IPC calls (which update the main store).
+ */
+
 import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
 import { GitHubUser, GitHubRepo, GitHubOrg, RunnerState, JobHistoryEntry, DownloadProgress, DeviceCodeInfo, RunnerRelease, Target, RunnerProxyStatus } from '../../shared/types';
+import { useStore } from '../store';
 
 interface RunnerConfig {
   level: 'repo' | 'org';
@@ -62,96 +70,147 @@ interface RunnerProviderProps {
   children: ReactNode;
 }
 
+// Default runner config
+const defaultRunnerConfig: RunnerConfig = {
+  level: 'repo',
+  repoUrl: '',
+  orgName: '',
+  runnerName: '',
+  labels: 'self-hosted,macOS',
+  runnerCount: 4,
+};
+
 export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
-  // Auth state
-  const [user, setUser] = useState<GitHubUser | null>(null);
-  const [isAuthenticating, setIsAuthenticating] = useState(false);
-  const [deviceCode, setDeviceCode] = useState<DeviceCodeInfo | null>(null);
+  // Check if zubridge has synced state from main
+  const storeState = useStore();
+  const isZubridgeReady = storeState !== null && storeState !== undefined;
 
-  // Repos and orgs
-  const [repos, setRepos] = useState<GitHubRepo[]>([]);
-  const [orgs, setOrgs] = useState<GitHubOrg[]>([]);
+  // Read state from Zustand store when ready
+  const storeUser = useStore((state) => state?.auth?.user ?? null);
+  const storeIsAuthenticating = useStore((state) => state?.auth?.isAuthenticating ?? false);
+  const storeDeviceCode = useStore((state) => state?.auth?.deviceCode ?? null);
+  const storeRepos = useStore((state) => state?.github?.repos ?? []);
+  const storeOrgs = useStore((state) => state?.github?.orgs ?? []);
+  const storeIsDownloaded = useStore((state) => state?.runner?.isDownloaded ?? false);
+  const storeRunnerVersion = useStore((state) => state?.runner?.runnerVersion ?? { version: null, url: null });
+  const storeAvailableVersions = useStore((state) => state?.runner?.availableVersions ?? []);
+  const storeSelectedVersion = useStore((state) => state?.runner?.selectedVersion ?? '');
+  const storeDownloadProgress = useStore((state) => state?.runner?.downloadProgress ?? null);
+  const storeIsLoadingVersions = useStore((state) => state?.runner?.isLoadingVersions ?? false);
+  const storeIsConfigured = useStore((state) => state?.runner?.isConfigured ?? false);
+  const storeRunnerConfig = useStore((state) => state?.config?.runnerConfig ?? defaultRunnerConfig);
+  const storeRunnerDisplayName = useStore((state) => state?.runner?.runnerDisplayName ?? null);
+  const storeTargets = useStore((state) => state?.config?.targets ?? []);
+  const storeTargetStatus = useStore((state) => state?.runner?.targetStatus ?? []);
+  const storeRunnerState = useStore((state) => state?.runner?.runnerState ?? { status: 'offline' });
+  const storeJobHistory = useStore((state) => state?.jobs?.history ?? []);
+  const storeIsLoading = useStore((state) => state?.ui?.isLoading ?? false);
+  const storeIsInitialLoading = useStore((state) => state?.ui?.isInitialLoading ?? true);
+  const storeError = useStore((state) => state?.ui?.error ?? null);
 
-  // Runner binary
-  const [isDownloaded, setIsDownloaded] = useState(false);
-  const [runnerVersion, setRunnerVersion] = useState<{ version: string | null; url: string | null }>({ version: null, url: null });
-  const [availableVersions, setAvailableVersions] = useState<RunnerRelease[]>([]);
-  const [selectedVersion, setSelectedVersion] = useState<string>('');
-  const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
-  const [isLoadingVersions, setIsLoadingVersions] = useState(false);
-
-  // Runner configuration
-  const [isConfigured, setIsConfigured] = useState(false);
-  const [runnerConfig, setRunnerConfig] = useState<RunnerConfig>({
-    level: 'repo',
-    repoUrl: '',
-    orgName: '',
-    runnerName: '',
-    labels: 'self-hosted,macOS',
-    runnerCount: 4,
+  // Fallback state for when zubridge isn't ready
+  const [fallbackState, setFallbackState] = useState({
+    user: null as GitHubUser | null,
+    isAuthenticating: false,
+    deviceCode: null as DeviceCodeInfo | null,
+    repos: [] as GitHubRepo[],
+    orgs: [] as GitHubOrg[],
+    isDownloaded: false,
+    runnerVersion: { version: null, url: null } as { version: string | null; url: string | null },
+    availableVersions: [] as RunnerRelease[],
+    selectedVersion: '',
+    downloadProgress: null as DownloadProgress | null,
+    isLoadingVersions: false,
+    isConfigured: false,
+    runnerConfig: defaultRunnerConfig,
+    runnerDisplayName: null as string | null,
+    targets: [] as Target[],
+    targetStatus: [] as RunnerProxyStatus[],
+    runnerState: { status: 'offline' } as RunnerState,
+    jobHistory: [] as JobHistoryEntry[],
+    isLoading: false,
+    isInitialLoading: true,
+    error: null as string | null,
   });
-  const [runnerDisplayName, setRunnerDisplayName] = useState<string | null>(null);
 
-  // Targets
-  const [targets, setTargets] = useState<Target[]>([]);
-  const [targetStatus, setTargetStatus] = useState<RunnerProxyStatus[]>([]);
+  // Use store values if ready, otherwise fallback
+  const user = isZubridgeReady ? storeUser : fallbackState.user;
+  const isAuthenticating = isZubridgeReady ? storeIsAuthenticating : fallbackState.isAuthenticating;
+  const deviceCode = isZubridgeReady ? storeDeviceCode : fallbackState.deviceCode;
+  const repos = isZubridgeReady ? storeRepos : fallbackState.repos;
+  const orgs = isZubridgeReady ? storeOrgs : fallbackState.orgs;
+  const isDownloaded = isZubridgeReady ? storeIsDownloaded : fallbackState.isDownloaded;
+  const runnerVersion = isZubridgeReady ? storeRunnerVersion : fallbackState.runnerVersion;
+  const availableVersions = isZubridgeReady ? storeAvailableVersions : fallbackState.availableVersions;
+  const selectedVersion = isZubridgeReady ? storeSelectedVersion : fallbackState.selectedVersion;
+  const downloadProgress = isZubridgeReady ? storeDownloadProgress : fallbackState.downloadProgress;
+  const isLoadingVersions = isZubridgeReady ? storeIsLoadingVersions : fallbackState.isLoadingVersions;
+  const isConfigured = isZubridgeReady ? storeIsConfigured : fallbackState.isConfigured;
+  const runnerConfig = isZubridgeReady ? storeRunnerConfig : fallbackState.runnerConfig;
+  const runnerDisplayName = isZubridgeReady ? storeRunnerDisplayName : fallbackState.runnerDisplayName;
+  const targets = isZubridgeReady ? storeTargets : fallbackState.targets;
+  const targetStatus = isZubridgeReady ? storeTargetStatus : fallbackState.targetStatus;
+  const runnerState = isZubridgeReady ? storeRunnerState : fallbackState.runnerState;
+  const jobHistory = isZubridgeReady ? storeJobHistory : fallbackState.jobHistory;
+  const isLoading = isZubridgeReady ? storeIsLoading : fallbackState.isLoading;
+  const isInitialLoading = isZubridgeReady ? storeIsInitialLoading : fallbackState.isInitialLoading;
+  const error = isZubridgeReady ? storeError : fallbackState.error;
 
-  // Runner status
-  const [runnerState, setRunnerState] = useState<RunnerState>({ status: 'offline' });
-  const [jobHistory, setJobHistory] = useState<JobHistoryEntry[]>([]);
-
-  // Loading states
-  const [isLoading, setIsLoading] = useState(false);
-  const [isInitialLoading, setIsInitialLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  // Load initial state
+  // Load initial state via IPC (fallback until zubridge syncs)
   useEffect(() => {
     const loadState = async () => {
       try {
         // Check auth status
         const authStatus = await window.localmost.github.getAuthStatus();
         if (authStatus.isAuthenticated && authStatus.user) {
-          setUser(authStatus.user);
+          setFallbackState(prev => ({ ...prev, user: authStatus.user }));
           loadReposAndOrgs();
         }
 
         // Check runner status
-        setIsDownloaded(await window.localmost.runner.isDownloaded());
+        const downloaded = await window.localmost.runner.isDownloaded();
+        setFallbackState(prev => ({ ...prev, isDownloaded: downloaded }));
+
         const configured = await window.localmost.runner.isConfigured();
-        setIsConfigured(configured);
+        setFallbackState(prev => ({ ...prev, isConfigured: configured }));
 
         // Load version info
         const version = await window.localmost.runner.getVersion();
-        setRunnerVersion(version);
+        setFallbackState(prev => ({ ...prev, runnerVersion: version }));
 
         // Load runner config
         const settings = await window.localmost.settings.get();
         const savedConfig = settings.runnerConfig as Partial<RunnerConfig> | undefined;
 
         if (savedConfig) {
-          setRunnerConfig(prev => ({
+          setFallbackState(prev => ({
             ...prev,
-            level: savedConfig.level || prev.level,
-            repoUrl: savedConfig.repoUrl || prev.repoUrl,
-            orgName: savedConfig.orgName || prev.orgName,
-            runnerName: savedConfig.runnerName || prev.runnerName,
-            labels: savedConfig.labels || prev.labels,
-            runnerCount: savedConfig.runnerCount || prev.runnerCount,
+            runnerConfig: {
+              ...prev.runnerConfig,
+              level: savedConfig.level || prev.runnerConfig.level,
+              repoUrl: savedConfig.repoUrl || prev.runnerConfig.repoUrl,
+              orgName: savedConfig.orgName || prev.runnerConfig.orgName,
+              runnerName: savedConfig.runnerName || prev.runnerConfig.runnerName,
+              labels: savedConfig.labels || prev.runnerConfig.labels,
+              runnerCount: savedConfig.runnerCount || prev.runnerConfig.runnerCount,
+            },
           }));
         } else {
           // Default runner name based on hostname
           const hostname = await window.localmost.app.getHostname();
-          setRunnerConfig(prev => ({
+          setFallbackState(prev => ({
             ...prev,
-            runnerName: `localmost.${hostname}`,
+            runnerConfig: {
+              ...prev.runnerConfig,
+              runnerName: `localmost.${hostname}`,
+            },
           }));
         }
 
         // Get display name
         if (configured) {
           const displayName = await window.localmost.runner.getDisplayName();
-          setRunnerDisplayName(displayName);
+          setFallbackState(prev => ({ ...prev, runnerDisplayName: displayName }));
         }
 
         // Load available versions
@@ -159,47 +218,65 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
 
         // Get initial runner status
         const status = await window.localmost.runner.getStatus();
-        setRunnerState(status);
+        setFallbackState(prev => ({ ...prev, runnerState: status }));
 
         // Get initial job history
         const history = await window.localmost.jobs.getHistory();
-        setJobHistory(history);
+        setFallbackState(prev => ({ ...prev, jobHistory: history }));
 
         // Load targets and their status
         const loadedTargets = await window.localmost.targets.list();
-        setTargets(loadedTargets);
+        setFallbackState(prev => ({ ...prev, targets: loadedTargets }));
         const loadedStatus = await window.localmost.targets.getStatus();
-        setTargetStatus(loadedStatus);
+        setFallbackState(prev => ({ ...prev, targetStatus: loadedStatus }));
       } catch (err) {
-        setError(`Failed to load runner state: ${(err as Error).message}`);
+        setFallbackState(prev => ({
+          ...prev,
+          error: `Failed to load runner state: ${(err as Error).message}`,
+        }));
       } finally {
-        setIsInitialLoading(false);
+        setFallbackState(prev => ({ ...prev, isInitialLoading: false }));
       }
     };
 
     loadState();
 
     // Subscribe to status updates
-    const unsubStatus = window.localmost.runner.onStatusUpdate(setRunnerState);
-    const unsubJobHistory = window.localmost.jobs.onHistoryUpdate(setJobHistory);
-    const unsubDeviceCode = window.localmost.github.onDeviceCode(setDeviceCode);
-    const unsubTargetStatus = window.localmost.targets.onStatusUpdate(setTargetStatus);
+    const unsubStatus = window.localmost.runner.onStatusUpdate((status: RunnerState) => {
+      setFallbackState(prev => ({ ...prev, runnerState: status }));
+    });
+    const unsubJobHistory = window.localmost.jobs.onHistoryUpdate((history: JobHistoryEntry[]) => {
+      setFallbackState(prev => ({ ...prev, jobHistory: history }));
+    });
+    const unsubDeviceCode = window.localmost.github.onDeviceCode((code: DeviceCodeInfo) => {
+      setFallbackState(prev => ({ ...prev, deviceCode: code }));
+    });
+    const unsubTargetStatus = window.localmost.targets.onStatusUpdate((status: RunnerProxyStatus[]) => {
+      setFallbackState(prev => ({ ...prev, targetStatus: status }));
+    });
     const unsubDownload = window.localmost.runner.onDownloadProgress(async (progress: DownloadProgress) => {
       if (progress.phase === 'complete') {
-        setDownloadProgress(null);
-        setIsDownloaded(true);
-        setIsLoading(false);
+        setFallbackState(prev => ({
+          ...prev,
+          downloadProgress: null,
+          isDownloaded: true,
+          isLoading: false,
+        }));
         const version = await window.localmost.runner.getVersion();
-        setRunnerVersion(version);
-        if (version.version) {
-          setSelectedVersion(version.version);
-        }
+        setFallbackState(prev => ({
+          ...prev,
+          runnerVersion: version,
+          selectedVersion: version.version || prev.selectedVersion,
+        }));
       } else if (progress.phase === 'error') {
-        setDownloadProgress(null);
-        setError(progress.message);
-        setIsLoading(false);
+        setFallbackState(prev => ({
+          ...prev,
+          downloadProgress: null,
+          error: progress.message,
+          isLoading: false,
+        }));
       } else {
-        setDownloadProgress(progress);
+        setFallbackState(prev => ({ ...prev, downloadProgress: progress }));
       }
     });
 
@@ -213,17 +290,18 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
   }, []);
 
   const loadAvailableVersions = async (installedVersion?: string | null) => {
-    setIsLoadingVersions(true);
+    setFallbackState(prev => ({ ...prev, isLoadingVersions: true }));
     const result = await window.localmost.runner.getAvailableVersions();
     if (result.success && result.versions.length > 0) {
-      setAvailableVersions(result.versions);
-      if (installedVersion && result.versions.some((v: RunnerRelease) => v.version === installedVersion)) {
-        setSelectedVersion(installedVersion);
-      } else {
-        setSelectedVersion(result.versions[0].version);
-      }
+      setFallbackState(prev => ({
+        ...prev,
+        availableVersions: result.versions,
+        selectedVersion: installedVersion && result.versions.some((v: RunnerRelease) => v.version === installedVersion)
+          ? installedVersion
+          : result.versions[0].version,
+      }));
     }
-    setIsLoadingVersions(false);
+    setFallbackState(prev => ({ ...prev, isLoadingVersions: false }));
   };
 
   const loadReposAndOrgs = async () => {
@@ -232,10 +310,10 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
       window.localmost.github.getOrgs(),
     ]);
     if (reposResult.success && reposResult.repos) {
-      setRepos(reposResult.repos);
+      setFallbackState(prev => ({ ...prev, repos: reposResult.repos }));
     }
     if (orgsResult.success && orgsResult.orgs) {
-      setOrgs(orgsResult.orgs);
+      setFallbackState(prev => ({ ...prev, orgs: orgsResult.orgs }));
     }
   };
 
@@ -245,14 +323,14 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
 
   const refreshTargets = useCallback(async () => {
     const loadedTargets = await window.localmost.targets.list();
-    setTargets(loadedTargets);
+    setFallbackState(prev => ({ ...prev, targets: loadedTargets }));
     // Also refresh isConfigured since adding/removing targets changes it
     const configured = await window.localmost.runner.isConfigured();
-    setIsConfigured(configured);
+    setFallbackState(prev => ({ ...prev, isConfigured: configured }));
     // Update display name if we became configured
     if (configured) {
       const displayName = await window.localmost.runner.getDisplayName();
-      setRunnerDisplayName(displayName);
+      setFallbackState(prev => ({ ...prev, runnerDisplayName: displayName }));
       // Auto-start runner if configured but offline (e.g., first target was just added)
       const status = await window.localmost.runner.getStatus();
       if (status.status === 'offline') {
@@ -262,34 +340,46 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
   }, []);
 
   const login = useCallback(async () => {
-    setIsAuthenticating(true);
-    setError(null);
-    setDeviceCode(null);
+    setFallbackState(prev => ({
+      ...prev,
+      isAuthenticating: true,
+      error: null,
+      deviceCode: null,
+    }));
 
     const result = await window.localmost.github.startDeviceFlow();
 
     if (result.success && result.user) {
-      setUser(result.user);
+      setFallbackState(prev => ({ ...prev, user: result.user }));
       loadReposAndOrgs();
     } else {
-      setError(result.error || 'Authentication failed');
+      setFallbackState(prev => ({ ...prev, error: result.error || 'Authentication failed' }));
     }
 
-    setIsAuthenticating(false);
-    setDeviceCode(null);
+    setFallbackState(prev => ({
+      ...prev,
+      isAuthenticating: false,
+      deviceCode: null,
+    }));
   }, []);
 
   const logout = useCallback(async () => {
     await window.localmost.github.logout();
-    setUser(null);
-    setRepos([]);
-    setOrgs([]);
+    setFallbackState(prev => ({
+      ...prev,
+      user: null,
+      repos: [],
+      orgs: [],
+    }));
   }, []);
 
   const downloadRunner = useCallback(async () => {
-    setIsLoading(true);
-    setError(null);
-    setDownloadProgress({ phase: 'downloading', percent: 0, message: 'Starting...' });
+    setFallbackState(prev => ({
+      ...prev,
+      isLoading: true,
+      error: null,
+      downloadProgress: { phase: 'downloading', percent: 0, message: 'Starting...' },
+    }));
 
     if (selectedVersion) {
       await window.localmost.runner.setDownloadVersion(selectedVersion);
@@ -297,14 +387,24 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
 
     const result = await window.localmost.runner.download();
     if (!result.success) {
-      setError(result.error || 'Download failed');
-      setIsLoading(false);
-      setDownloadProgress(null);
+      setFallbackState(prev => ({
+        ...prev,
+        error: result.error || 'Download failed',
+        isLoading: false,
+        downloadProgress: null,
+      }));
     }
   }, [selectedVersion]);
 
+  const setSelectedVersionCallback = useCallback((version: string) => {
+    setFallbackState(prev => ({ ...prev, selectedVersion: version }));
+  }, []);
+
   const updateRunnerConfig = useCallback(async (updates: Partial<RunnerConfig>) => {
-    setRunnerConfig(prev => ({ ...prev, ...updates }));
+    setFallbackState(prev => ({
+      ...prev,
+      runnerConfig: { ...prev.runnerConfig, ...updates },
+    }));
 
     const settings = await window.localmost.settings.get();
     const currentConfig = (settings.runnerConfig || {}) as Record<string, unknown>;
@@ -322,32 +422,39 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
       return { success: false, error: 'Please select an organization' };
     }
 
-    setIsLoading(true);
-    setError(null);
+    setFallbackState(prev => ({
+      ...prev,
+      isLoading: true,
+      error: null,
+    }));
 
     const result = await window.localmost.runner.configure({
       level: runnerConfig.level,
       repoUrl: runnerConfig.level === 'repo' ? runnerConfig.repoUrl : undefined,
       orgName: runnerConfig.level === 'org' ? runnerConfig.orgName : undefined,
       runnerName: runnerConfig.runnerName.trim(),
-      labels: runnerConfig.labels.split(',').map(l => l.trim()).filter(Boolean),
+      labels: runnerConfig.labels.split(',').map((l: string) => l.trim()).filter(Boolean),
       runnerCount: runnerConfig.runnerCount,
     });
 
     if (result.success) {
-      setIsConfigured(true);
+      setFallbackState(prev => ({ ...prev, isConfigured: true }));
       // Save the full runnerConfig so re-registration has runnerName, level, etc.
       await window.localmost.settings.set({ runnerConfig });
       await window.localmost.runner.start();
       const displayName = await window.localmost.runner.getDisplayName();
-      setRunnerDisplayName(displayName);
+      setFallbackState(prev => ({ ...prev, runnerDisplayName: displayName }));
     } else {
-      setError(result.error || 'Configuration failed');
+      setFallbackState(prev => ({ ...prev, error: result.error || 'Configuration failed' }));
     }
 
-    setIsLoading(false);
+    setFallbackState(prev => ({ ...prev, isLoading: false }));
     return result;
   }, [runnerConfig]);
+
+  const setError = useCallback((err: string | null) => {
+    setFallbackState(prev => ({ ...prev, error: err }));
+  }, []);
 
   const value: RunnerContextValue = {
     user,
@@ -362,7 +469,7 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
     runnerVersion,
     availableVersions,
     selectedVersion,
-    setSelectedVersion,
+    setSelectedVersion: setSelectedVersionCallback,
     downloadProgress,
     isLoadingVersions,
     downloadRunner,

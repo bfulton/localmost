@@ -1,5 +1,13 @@
+/**
+ * UpdateContext - provides update state to React components.
+ *
+ * This context now reads state from the Zustand store (synced from main via zubridge)
+ * and updates via IPC calls (which update the main store).
+ */
+
 import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
 import { UpdateStatus, UpdateSettings } from '../../shared/types';
+import { useStore } from '../store';
 
 interface UpdateContextValue {
   // Current update state
@@ -38,13 +46,35 @@ interface UpdateProviderProps {
 }
 
 export const UpdateProvider: React.FC<UpdateProviderProps> = ({ children }) => {
-  const [status, setStatus] = useState<UpdateStatus>(defaultStatus);
-  const [settings, setSettingsState] = useState<UpdateSettings>(defaultSettings);
-  const [isChecking, setIsChecking] = useState(false);
-  const [isDismissed, setIsDismissed] = useState(false);
-  const [lastChecked, setLastChecked] = useState<Date | null>(null);
+  // Check if zubridge has synced state from main
+  const storeState = useStore();
+  const isZubridgeReady = storeState !== null && storeState !== undefined;
 
-  // Load initial status and settings
+  // Read state from Zustand store when ready
+  const storeStatus = useStore((state) => state?.update?.status ?? defaultStatus);
+  const storeSettings = useStore((state) => state?.update?.settings ?? defaultSettings);
+  const storeIsChecking = useStore((state) => state?.update?.isChecking ?? false);
+  const storeIsDismissed = useStore((state) => state?.update?.isDismissed ?? false);
+  const storeLastChecked = useStore((state) => state?.update?.lastChecked ?? null);
+
+  // Fallback state for when zubridge isn't ready
+  const [fallbackState, setFallbackState] = useState({
+    status: defaultStatus,
+    settings: defaultSettings,
+    isChecking: false,
+    isDismissed: false,
+    lastChecked: null as string | null,
+  });
+
+  // Use store values if ready, otherwise fallback
+  const status = isZubridgeReady ? storeStatus : fallbackState.status;
+  const settings = isZubridgeReady ? storeSettings : fallbackState.settings;
+  const isChecking = isZubridgeReady ? storeIsChecking : fallbackState.isChecking;
+  const isDismissed = isZubridgeReady ? storeIsDismissed : fallbackState.isDismissed;
+  const lastCheckedStr = isZubridgeReady ? storeLastChecked : fallbackState.lastChecked;
+  const lastChecked = lastCheckedStr ? new Date(lastCheckedStr) : null;
+
+  // Load initial status and settings via IPC (fallback until zubridge syncs)
   useEffect(() => {
     const init = async () => {
       if (!window.localmost?.update) return;
@@ -52,7 +82,7 @@ export const UpdateProvider: React.FC<UpdateProviderProps> = ({ children }) => {
       // Get current status
       try {
         const currentStatus = await window.localmost.update.getStatus();
-        setStatus(currentStatus);
+        setFallbackState(prev => ({ ...prev, status: currentStatus }));
       } catch {
         // Ignore errors on initial load
       }
@@ -62,10 +92,13 @@ export const UpdateProvider: React.FC<UpdateProviderProps> = ({ children }) => {
         const savedSettings = await window.localmost.settings.get();
         if (savedSettings.updateSettings) {
           const updateSettings = savedSettings.updateSettings as UpdateSettings;
-          setSettingsState({
-            autoCheck: updateSettings.autoCheck ?? true,
-            checkIntervalHours: updateSettings.checkIntervalHours ?? 24,
-          });
+          setFallbackState(prev => ({
+            ...prev,
+            settings: {
+              autoCheck: updateSettings.autoCheck ?? true,
+              checkIntervalHours: updateSettings.checkIntervalHours ?? 24,
+            },
+          }));
         }
       } catch {
         // Use defaults
@@ -76,12 +109,13 @@ export const UpdateProvider: React.FC<UpdateProviderProps> = ({ children }) => {
 
     // Subscribe to status updates
     const unsubscribe = window.localmost?.update?.onStatusChange((newStatus: UpdateStatus) => {
-      setStatus(newStatus);
-      setIsChecking(newStatus.status === 'checking');
-      // Reset dismissed state when new update is available
-      if (newStatus.status === 'available') {
-        setIsDismissed(false);
-      }
+      setFallbackState(prev => ({
+        ...prev,
+        status: newStatus,
+        isChecking: newStatus.status === 'checking',
+        // Reset dismissed state when new update is available
+        isDismissed: newStatus.status === 'available' ? false : prev.isDismissed,
+      }));
     });
 
     return () => {
@@ -91,17 +125,17 @@ export const UpdateProvider: React.FC<UpdateProviderProps> = ({ children }) => {
 
   const checkForUpdates = useCallback(async () => {
     if (!window.localmost?.update) return;
-    setIsChecking(true);
-    setIsDismissed(false);
+    setFallbackState(prev => ({ ...prev, isChecking: true, isDismissed: false }));
     try {
       await window.localmost.update.check();
-      setLastChecked(new Date());
+      const now = new Date().toISOString();
+      setFallbackState(prev => ({ ...prev, lastChecked: now }));
       // Clear "Up to date" message after 5 seconds
-      setTimeout(() => setLastChecked(null), 5000);
+      setTimeout(() => setFallbackState(prev => ({ ...prev, lastChecked: null })), 5000);
     } catch {
       // Error handling is done via status updates
     } finally {
-      setIsChecking(false);
+      setFallbackState(prev => ({ ...prev, isChecking: false }));
     }
   }, []);
 
@@ -116,11 +150,11 @@ export const UpdateProvider: React.FC<UpdateProviderProps> = ({ children }) => {
   }, []);
 
   const dismissUpdate = useCallback(() => {
-    setIsDismissed(true);
+    setFallbackState(prev => ({ ...prev, isDismissed: true }));
   }, []);
 
-  const setSettings = useCallback(async (newSettings: UpdateSettings) => {
-    setSettingsState(newSettings);
+  const setSettingsCallback = useCallback(async (newSettings: UpdateSettings) => {
+    setFallbackState(prev => ({ ...prev, settings: newSettings }));
     try {
       await window.localmost.settings.set({ updateSettings: newSettings });
     } catch {
@@ -131,7 +165,7 @@ export const UpdateProvider: React.FC<UpdateProviderProps> = ({ children }) => {
   const value: UpdateContextValue = {
     status,
     settings,
-    setSettings,
+    setSettings: setSettingsCallback,
     checkForUpdates,
     downloadUpdate,
     installUpdate,
