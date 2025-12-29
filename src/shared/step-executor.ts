@@ -489,22 +489,77 @@ async function executeActionFromPath(
 }
 
 /**
- * Execute a composite action.
+ * Execute a composite action by running its nested steps.
  */
 async function executeCompositeAction(
-  _metadata: { runs: { steps?: unknown[] } },
-  _step: WorkflowStep,
-  _ctx: ExecutionContext,
-  _job: WorkflowJob,
+  metadata: { runs: { steps?: unknown[] }; inputs?: Record<string, { default?: string }> },
+  step: WorkflowStep,
+  ctx: ExecutionContext,
+  job: WorkflowJob,
   stepName: string
 ): Promise<StepResult> {
-  // TODO: Implement composite action execution
+  const startTime = Date.now();
+  const compositeSteps = metadata.runs.steps as WorkflowStep[] | undefined;
+
+  if (!compositeSteps || compositeSteps.length === 0) {
+    return {
+      name: stepName,
+      status: 'success',
+      duration: 0,
+      outputs: {},
+    };
+  }
+
+  ctx.onOutput?.(`Running composite action with ${compositeSteps.length} steps`, 'stdout');
+
+  // Create a new context for the composite action with its own step outputs
+  const compositeCtx: ExecutionContext = {
+    ...ctx,
+    stepOutputs: { ...ctx.stepOutputs },
+  };
+
+  // Add inputs to the environment for the composite steps
+  if (step.with) {
+    for (const [key, value] of Object.entries(step.with)) {
+      const inputName = key.toUpperCase().replace(/-/g, '_');
+      compositeCtx.workflowEnv[`INPUT_${inputName}`] = String(value);
+    }
+  }
+
+  const allOutputs: Record<string, string> = {};
+  let overallStatus: StepStatus = 'success';
+
+  for (let i = 0; i < compositeSteps.length; i++) {
+    const compositeStep = compositeSteps[i];
+    const stepDisplayName = compositeStep.name || compositeStep.id || `Step ${i + 1}`;
+
+    ctx.onOutput?.(`  [${i + 1}/${compositeSteps.length}] ${stepDisplayName}`, 'stdout');
+
+    const result = await executeStep(compositeStep, compositeCtx, job);
+
+    // Merge outputs from this step
+    Object.assign(allOutputs, result.outputs);
+
+    if (result.status === 'failure') {
+      overallStatus = 'failure';
+      // Stop on first failure unless continue-on-error is set
+      if (!compositeStep['continue-on-error']) {
+        return {
+          name: stepName,
+          status: 'failure',
+          duration: Date.now() - startTime,
+          outputs: allOutputs,
+          error: result.error || `Step "${stepDisplayName}" failed`,
+        };
+      }
+    }
+  }
+
   return {
     name: stepName,
-    status: 'failure',
-    duration: 0,
-    outputs: {},
-    error: 'Composite actions are not yet supported',
+    status: overallStatus,
+    duration: Date.now() - startTime,
+    outputs: allOutputs,
   };
 }
 
@@ -524,8 +579,13 @@ async function executeInterceptedAction(
     return executeCheckoutIntercept(step, ctx, stepName);
   }
 
-  // actions/cache
+  // actions/cache (restore and save variants)
   if (uses.startsWith('actions/cache')) {
+    // actions/cache/save is for saving only
+    if (uses.includes('/save')) {
+      return executeCacheSaveIntercept(step, ctx, stepName);
+    }
+    // actions/cache/restore is for restore only, regular actions/cache does both
     return executeCacheIntercept(step, ctx, stepName);
   }
 
@@ -602,6 +662,21 @@ function executeCheckoutIntercept(
 }
 
 /**
+ * Get the local cache directory for workflow caches.
+ */
+function getLocalCacheDir(): string {
+  return path.join(os.homedir(), '.localmost', 'workflow-cache');
+}
+
+/**
+ * Create a safe directory name from a cache key.
+ */
+function sanitizeCacheKey(key: string): string {
+  // Replace unsafe characters with underscores
+  return key.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 200);
+}
+
+/**
  * Intercept actions/cache - use local cache directory.
  */
 function executeCacheIntercept(
@@ -611,21 +686,196 @@ function executeCacheIntercept(
 ): StepResult {
   const key = step.with?.key as string | undefined;
   const cachePath = step.with?.path as string | undefined;
+  const restoreKeys = step.with?.['restore-keys'] as string | undefined;
+
+  if (!key || !cachePath) {
+    ctx.onOutput?.('Cache: missing key or path', 'stdout');
+    return {
+      name: stepName,
+      status: 'success',
+      duration: 0,
+      outputs: { 'cache-hit': 'false' },
+    };
+  }
 
   ctx.onOutput?.(`Cache (local): key=${key}, path=${cachePath}`, 'stdout');
 
-  // TODO: Implement local cache lookup
-  // For now, just report cache miss
-  ctx.onOutput?.('Cache miss (local cache not implemented yet)', 'stdout');
+  const cacheDir = getLocalCacheDir();
+  const sanitizedKey = sanitizeCacheKey(key);
+  const cacheEntryDir = path.join(cacheDir, sanitizedKey);
 
+  // Check for exact match first
+  if (fs.existsSync(cacheEntryDir)) {
+    ctx.onOutput?.(`Cache hit: ${key}`, 'stdout');
+    return restoreCacheEntry(cacheEntryDir, cachePath, ctx, stepName, true);
+  }
+
+  // Check restore keys for prefix match
+  if (restoreKeys) {
+    const prefixes = restoreKeys.split('\n').map(k => k.trim()).filter(Boolean);
+    try {
+      if (!fs.existsSync(cacheDir)) {
+        fs.mkdirSync(cacheDir, { recursive: true });
+      }
+      const entries = fs.readdirSync(cacheDir);
+
+      for (const prefix of prefixes) {
+        const sanitizedPrefix = sanitizeCacheKey(prefix);
+        // Find entries that start with this prefix
+        const match = entries.find(entry => entry.startsWith(sanitizedPrefix));
+        if (match) {
+          ctx.onOutput?.(`Cache restored from key prefix: ${prefix}`, 'stdout');
+          return restoreCacheEntry(path.join(cacheDir, match), cachePath, ctx, stepName, false);
+        }
+      }
+    } catch (err) {
+      ctx.onOutput?.(`Cache lookup error: ${(err as Error).message}`, 'stderr');
+    }
+  }
+
+  ctx.onOutput?.('Cache miss', 'stdout');
   return {
     name: stepName,
     status: 'success',
     duration: 0,
-    outputs: {
-      'cache-hit': 'false',
-    },
+    outputs: { 'cache-hit': 'false' },
   };
+}
+
+/**
+ * Restore a cache entry to the workspace.
+ */
+function restoreCacheEntry(
+  cacheEntryDir: string,
+  targetPath: string,
+  ctx: ExecutionContext,
+  stepName: string,
+  exactMatch: boolean
+): StepResult {
+  try {
+    // Handle multiple paths separated by newlines
+    const paths = targetPath.split('\n').map(p => p.trim()).filter(Boolean);
+
+    for (const singlePath of paths) {
+      const absoluteTarget = path.isAbsolute(singlePath)
+        ? singlePath
+        : path.join(ctx.workDir, singlePath);
+
+      const cachedPath = path.join(cacheEntryDir, sanitizeCacheKey(singlePath));
+
+      if (fs.existsSync(cachedPath)) {
+        // Ensure parent directory exists
+        const parentDir = path.dirname(absoluteTarget);
+        if (!fs.existsSync(parentDir)) {
+          fs.mkdirSync(parentDir, { recursive: true });
+        }
+
+        // Copy cached files to target
+        copyDirRecursive(cachedPath, absoluteTarget);
+        ctx.onOutput?.(`  Restored: ${singlePath}`, 'stdout');
+      }
+    }
+
+    return {
+      name: stepName,
+      status: 'success',
+      duration: 0,
+      outputs: { 'cache-hit': exactMatch ? 'true' : 'false' },
+    };
+  } catch (err) {
+    ctx.onOutput?.(`Cache restore error: ${(err as Error).message}`, 'stderr');
+    return {
+      name: stepName,
+      status: 'success',
+      duration: 0,
+      outputs: { 'cache-hit': 'false' },
+    };
+  }
+}
+
+/**
+ * Copy a directory recursively.
+ */
+function copyDirRecursive(src: string, dest: string): void {
+  const stat = fs.statSync(src);
+
+  if (stat.isDirectory()) {
+    if (!fs.existsSync(dest)) {
+      fs.mkdirSync(dest, { recursive: true });
+    }
+    for (const entry of fs.readdirSync(src)) {
+      copyDirRecursive(path.join(src, entry), path.join(dest, entry));
+    }
+  } else {
+    fs.copyFileSync(src, dest);
+  }
+}
+
+/**
+ * Intercept actions/cache/save - save to local cache directory.
+ */
+function executeCacheSaveIntercept(
+  step: WorkflowStep,
+  ctx: ExecutionContext,
+  stepName: string
+): StepResult {
+  const key = step.with?.key as string | undefined;
+  const cachePath = step.with?.path as string | undefined;
+
+  if (!key || !cachePath) {
+    ctx.onOutput?.('Cache save: missing key or path', 'stdout');
+    return {
+      name: stepName,
+      status: 'success',
+      duration: 0,
+      outputs: {},
+    };
+  }
+
+  ctx.onOutput?.(`Cache save (local): key=${key}, path=${cachePath}`, 'stdout');
+
+  const cacheDir = getLocalCacheDir();
+  const sanitizedKey = sanitizeCacheKey(key);
+  const cacheEntryDir = path.join(cacheDir, sanitizedKey);
+
+  try {
+    // Handle multiple paths separated by newlines
+    const paths = cachePath.split('\n').map(p => p.trim()).filter(Boolean);
+
+    // Create cache entry directory
+    if (!fs.existsSync(cacheEntryDir)) {
+      fs.mkdirSync(cacheEntryDir, { recursive: true });
+    }
+
+    for (const singlePath of paths) {
+      const absoluteSource = path.isAbsolute(singlePath)
+        ? singlePath
+        : path.join(ctx.workDir, singlePath);
+
+      if (fs.existsSync(absoluteSource)) {
+        const cachedPath = path.join(cacheEntryDir, sanitizeCacheKey(singlePath));
+        copyDirRecursive(absoluteSource, cachedPath);
+        ctx.onOutput?.(`  Saved: ${singlePath}`, 'stdout');
+      } else {
+        ctx.onOutput?.(`  Skipped (not found): ${singlePath}`, 'stdout');
+      }
+    }
+
+    return {
+      name: stepName,
+      status: 'success',
+      duration: 0,
+      outputs: {},
+    };
+  } catch (err) {
+    ctx.onOutput?.(`Cache save error: ${(err as Error).message}`, 'stderr');
+    return {
+      name: stepName,
+      status: 'success', // Cache save failure shouldn't fail the workflow
+      duration: 0,
+      outputs: {},
+    };
+  }
 }
 
 /**

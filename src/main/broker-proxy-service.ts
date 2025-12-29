@@ -283,8 +283,10 @@ export class BrokerProxyService extends EventEmitter {
   removeTarget(targetId: string): void {
     const state = this.targets.get(targetId);
     if (state) {
-      // Clean up session if exists
-      this.deleteUpstreamSession(state).catch(() => {});
+      // Clean up session if exists (continue even if cleanup fails)
+      this.deleteUpstreamSession(state).catch((err) => {
+        log()?.warn(`[BrokerProxy] Failed to delete upstream session for ${state.target.displayName}: ${(err as Error).message}`);
+      });
       this.targets.delete(targetId);
       log()?.info( `[BrokerProxy] Removed target: ${state.target.displayName}`);
     }
