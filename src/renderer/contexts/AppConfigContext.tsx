@@ -1,5 +1,26 @@
-import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode } from 'react';
-import { LogEntry, SleepProtection, LogLevel, ToolCacheLocation, UserFilterConfig, PowerConfig, BatteryPauseThreshold, DEFAULT_POWER_CONFIG, NotificationsConfig, DEFAULT_NOTIFICATIONS_CONFIG } from '../../shared/types';
+/**
+ * AppConfigContext - provides app configuration state to React components.
+ *
+ * This context now reads state from the Zustand store (synced from main via zubridge)
+ * and updates via IPC calls (which update the main store and persist to disk).
+ */
+
+import React, { createContext, useContext, useEffect, useRef, useCallback, useState, ReactNode } from 'react';
+import {
+  LogEntry,
+  SleepProtection,
+  LogLevel,
+  ToolCacheLocation,
+  UserFilterConfig,
+  PowerConfig,
+  BatteryPauseThreshold,
+  NotificationsConfig,
+  DEFAULT_POWER_CONFIG,
+  DEFAULT_NOTIFICATIONS_CONFIG,
+} from '../../shared/types';
+import {
+  useStore,
+} from '../store';
 
 export type ThemeSetting = 'light' | 'dark' | 'auto';
 
@@ -72,40 +93,90 @@ interface AppConfigProviderProps {
 }
 
 export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }) => {
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [isOnline, setIsOnline] = useState(true);
+  // Read state from Zustand store (synced from main via zubridge)
+  // Use optional chaining since store may not be initialized yet
+  const storeTheme = useStore((state) => state?.config?.theme ?? 'auto');
+  const storeLogLevel = useStore((state) => state?.config?.logLevel ?? 'info');
+  const storeRunnerLogLevel = useStore((state) => state?.config?.runnerLogLevel ?? 'warn');
+  const storeMaxLogScrollback = useStore((state) => state?.config?.maxLogScrollback ?? 500);
+  const storeMaxJobHistory = useStore((state) => state?.config?.maxJobHistory ?? 10);
+  const storeSleepProtection = useStore((state) => state?.config?.sleepProtection ?? 'never');
+  const storeSleepProtectionConsented = useStore((state) => state?.config?.sleepProtectionConsented ?? false);
+  const storePreserveWorkDir = useStore((state) => state?.config?.preserveWorkDir ?? 'never');
+  const storeToolCacheLocation = useStore((state) => state?.config?.toolCacheLocation ?? 'persistent');
+  const storeUserFilter = useStore((state) => state?.config?.userFilter ?? { mode: 'just-me' as const, allowlist: [] });
+  const storePower = useStore((state) => state?.config?.power ?? DEFAULT_POWER_CONFIG);
+  const storeNotifications = useStore((state) => state?.config?.notifications ?? DEFAULT_NOTIFICATIONS_CONFIG);
+  const storeIsOnline = useStore((state) => state?.ui?.isOnline ?? true);
+  const storeIsLoading = useStore((state) => state?.ui?.isInitialLoading ?? true);
+  const storeError = useStore((state) => state?.ui?.error ?? null);
 
-  // Theme
-  const [theme, setThemeState] = useState<ThemeSetting>('auto');
-
-  // Logging
-  const [logLevel, setLogLevelState] = useState<LogLevel>('info');
-  const [runnerLogLevel, setRunnerLogLevelState] = useState<LogLevel>('warn');
+  // Local state for logs (handled via IPC subscription for real-time updates)
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const logsRef = useRef<LogEntry[]>([]);
-  const [maxLogScrollback, setMaxLogScrollbackState] = useState<number>(500);
-  const maxLogScrollbackRef = useRef<number>(500);
+  const maxLogScrollbackRef = useRef<number>(storeMaxLogScrollback);
 
-  // Job history
-  const [maxJobHistory, setMaxJobHistoryState] = useState<number>(10);
+  // Check if zubridge has synced state from main
+  // useStore() without selector returns the full state - null if not yet synced
+  const storeState = useStore();
+  const isZubridgeReady = storeState !== null && storeState !== undefined;
 
-  // Sleep protection
-  const [sleepProtection, setSleepProtectionState] = useState<SleepProtection>('never');
-  const [sleepProtectionConsented, setSleepProtectionConsentedState] = useState(false);
+  // Fallback state for when zubridge isn't ready yet
+  const [fallbackState, setFallbackState] = useState<{
+    theme: ThemeSetting;
+    logLevel: LogLevel;
+    runnerLogLevel: LogLevel;
+    maxLogScrollback: number;
+    maxJobHistory: number;
+    sleepProtection: SleepProtection;
+    sleepProtectionConsented: boolean;
+    preserveWorkDir: 'never' | 'session' | 'always';
+    toolCacheLocation: ToolCacheLocation;
+    userFilter: UserFilterConfig;
+    power: PowerConfig;
+    notifications: NotificationsConfig;
+    isOnline: boolean;
+    isLoading: boolean;
+    error: string | null;
+  }>({
+    theme: 'auto',
+    logLevel: 'info',
+    runnerLogLevel: 'warn',
+    maxLogScrollback: 500,
+    maxJobHistory: 10,
+    sleepProtection: 'never',
+    sleepProtectionConsented: false,
+    preserveWorkDir: 'never',
+    toolCacheLocation: 'persistent',
+    userFilter: { mode: 'just-me', allowlist: [] },
+    power: DEFAULT_POWER_CONFIG,
+    notifications: DEFAULT_NOTIFICATIONS_CONFIG,
+    isOnline: true,
+    isLoading: true,
+    error: null,
+  });
 
-  // Runner settings
-  const [preserveWorkDir, setPreserveWorkDirState] = useState<'never' | 'session' | 'always'>('never');
-  const [toolCacheLocation, setToolCacheLocationState] = useState<ToolCacheLocation>('persistent');
+  // Use store values if zubridge is ready, otherwise use fallback
+  const theme = isZubridgeReady ? storeTheme : fallbackState.theme;
+  const logLevel = isZubridgeReady ? storeLogLevel : fallbackState.logLevel;
+  const runnerLogLevel = isZubridgeReady ? storeRunnerLogLevel : fallbackState.runnerLogLevel;
+  const maxLogScrollback = isZubridgeReady ? storeMaxLogScrollback : fallbackState.maxLogScrollback;
+  const maxJobHistory = isZubridgeReady ? storeMaxJobHistory : fallbackState.maxJobHistory;
+  const sleepProtection = isZubridgeReady ? storeSleepProtection : fallbackState.sleepProtection;
+  const sleepProtectionConsented = isZubridgeReady ? storeSleepProtectionConsented : fallbackState.sleepProtectionConsented;
+  const preserveWorkDir = isZubridgeReady ? storePreserveWorkDir : fallbackState.preserveWorkDir;
+  const toolCacheLocation = isZubridgeReady ? storeToolCacheLocation : fallbackState.toolCacheLocation;
+  const userFilter = isZubridgeReady ? storeUserFilter : fallbackState.userFilter;
+  const power = isZubridgeReady ? storePower : fallbackState.power;
+  const notifications = isZubridgeReady ? storeNotifications : fallbackState.notifications;
+  const isOnline = isZubridgeReady ? storeIsOnline : fallbackState.isOnline;
+  const isLoading = isZubridgeReady ? storeIsLoading : fallbackState.isLoading;
+  const error = isZubridgeReady ? storeError : fallbackState.error;
 
-  // User filter
-  const [userFilter, setUserFilterState] = useState<UserFilterConfig>({ mode: 'just-me', allowlist: [] });
-
-  // Power settings
-  const [power, setPowerState] = useState<PowerConfig>(DEFAULT_POWER_CONFIG);
-
-  // Notifications
-  const [notifications, setNotificationsState] = useState<NotificationsConfig>(DEFAULT_NOTIFICATIONS_CONFIG);
+  // Keep ref in sync with store value
+  useEffect(() => {
+    maxLogScrollbackRef.current = maxLogScrollback;
+  }, [maxLogScrollback]);
 
   // Apply theme whenever it changes
   useEffect(() => {
@@ -119,161 +190,114 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     }
   }, [theme]);
 
-  // Initialize settings from storage
+  // Initialize: load settings and subscribe to logs
   useEffect(() => {
-    const loadSettings = async () => {
-      try {
-        if (!window.localmost) {
-          setError('Preload script not loaded. window.localmost is undefined.');
-          setIsLoading(false);
-          return;
-        }
+    const init = async () => {
+      if (!window.localmost) {
+        setFallbackState(prev => ({
+          ...prev,
+          error: 'Preload script not loaded. window.localmost is undefined.',
+          isLoading: false,
+        }));
+        return;
+      }
 
+      // Load settings via IPC (fallback until zubridge syncs)
+      try {
         const settings = await window.localmost.settings.get();
 
-        // Theme
-        if (settings.theme && typeof settings.theme === 'string' && ['light', 'dark', 'auto'].includes(settings.theme)) {
-          setThemeState(settings.theme as ThemeSetting);
-        }
+        setFallbackState(prev => ({
+          ...prev,
+          theme: (settings.theme as ThemeSetting) || prev.theme,
+          logLevel: (settings.logLevel as LogLevel) || prev.logLevel,
+          runnerLogLevel: (settings.runnerLogLevel as LogLevel) || prev.runnerLogLevel,
+          maxLogScrollback: settings.maxLogScrollback ? Number(settings.maxLogScrollback) : prev.maxLogScrollback,
+          maxJobHistory: settings.maxJobHistory ? Number(settings.maxJobHistory) : prev.maxJobHistory,
+          sleepProtection: (settings.sleepProtection as SleepProtection) || prev.sleepProtection,
+          sleepProtectionConsented: settings.sleepProtectionConsented || prev.sleepProtectionConsented,
+          preserveWorkDir: (settings.preserveWorkDir as 'never' | 'session' | 'always') || prev.preserveWorkDir,
+          toolCacheLocation: (settings.toolCacheLocation as ToolCacheLocation) || prev.toolCacheLocation,
+          userFilter: settings.userFilter && ['just-me', 'allowlist', 'anyone'].includes((settings.userFilter as UserFilterConfig).mode)
+            ? (settings.userFilter as UserFilterConfig)
+            : prev.userFilter,
+          power: settings.power ? { ...DEFAULT_POWER_CONFIG, ...(settings.power as PowerConfig) } : prev.power,
+          notifications: settings.notifications ? { ...DEFAULT_NOTIFICATIONS_CONFIG, ...(settings.notifications as NotificationsConfig) } : prev.notifications,
+          isLoading: false,
+        }));
 
-        // Log scrollback
-        const savedMaxScrollback = settings.maxLogScrollback ? Number(settings.maxLogScrollback) : 500;
-        if (savedMaxScrollback > 0) {
-          setMaxLogScrollbackState(savedMaxScrollback);
-          maxLogScrollbackRef.current = savedMaxScrollback;
-        }
-
-        // Job history
-        const savedMaxJobHistory = settings.maxJobHistory ? Number(settings.maxJobHistory) : 10;
-        if (savedMaxJobHistory >= 5 && savedMaxJobHistory <= 50) {
-          setMaxJobHistoryState(savedMaxJobHistory);
-        }
-
-        // Sleep protection
-        if (settings.sleepProtection && ['never', 'when-busy', 'always'].includes(settings.sleepProtection as string)) {
-          setSleepProtectionState(settings.sleepProtection as SleepProtection);
-        }
-        if (settings.sleepProtectionConsented) {
-          setSleepProtectionConsentedState(true);
-        }
-
-        // Preserve work dir
-        if (settings.preserveWorkDir && ['never', 'session', 'always'].includes(settings.preserveWorkDir as string)) {
-          setPreserveWorkDirState(settings.preserveWorkDir as 'never' | 'session' | 'always');
-        }
-
-        // Tool cache location
-        if (settings.toolCacheLocation && ['persistent', 'per-sandbox'].includes(settings.toolCacheLocation as string)) {
-          setToolCacheLocationState(settings.toolCacheLocation as ToolCacheLocation);
-        }
-
-        // Log levels
-        if (settings.logLevel && ['debug', 'info', 'warn', 'error'].includes(settings.logLevel as string)) {
-          setLogLevelState(settings.logLevel as LogLevel);
-        }
-        if (settings.runnerLogLevel && ['debug', 'info', 'warn', 'error'].includes(settings.runnerLogLevel as string)) {
-          setRunnerLogLevelState(settings.runnerLogLevel as LogLevel);
-        }
-
-        // User filter
-        if (settings.userFilter) {
-          const filter = settings.userFilter as UserFilterConfig;
-          if (filter.mode && ['everyone', 'just-me', 'allowlist'].includes(filter.mode)) {
-            setUserFilterState({
-              mode: filter.mode,
-              allowlist: Array.isArray(filter.allowlist) ? filter.allowlist : [],
-            });
-          }
-        }
-
-        // Power settings
-        if (settings.power) {
-          const config = settings.power as PowerConfig;
-          setPowerState({
-            ...DEFAULT_POWER_CONFIG,
-            pauseOnBattery: config.pauseOnBattery ?? DEFAULT_POWER_CONFIG.pauseOnBattery,
-            pauseOnVideoCall: config.pauseOnVideoCall ?? DEFAULT_POWER_CONFIG.pauseOnVideoCall,
-            videoCallGracePeriod: config.videoCallGracePeriod ?? DEFAULT_POWER_CONFIG.videoCallGracePeriod,
-          });
-        }
-
-        // Notifications settings
-        if (settings.notifications) {
-          const config = settings.notifications as NotificationsConfig;
-          setNotificationsState({
-            ...DEFAULT_NOTIFICATIONS_CONFIG,
-            ...config,
-          });
-        }
-
-        setIsLoading(false);
+        // zubridge readiness is now detected automatically via useStore() return value
       } catch (err) {
-        setError(`Failed to load settings: ${(err as Error).message}`);
-        setIsLoading(false);
+        setFallbackState(prev => ({
+          ...prev,
+          error: `Failed to load settings: ${(err as Error).message}`,
+          isLoading: false,
+        }));
       }
     };
 
-    loadSettings();
+    init();
 
     // Subscribe to logs
-    const unsubLogs = window.localmost.logs.onEntry((entry: LogEntry) => {
+    const unsubLogs = window.localmost?.logs?.onEntry((entry: LogEntry) => {
       const max = maxLogScrollbackRef.current;
       logsRef.current = [...logsRef.current.slice(-(max - 1)), entry];
       setLogs(logsRef.current);
     });
 
     // Network status
-    window.localmost.network.isOnline().then(setIsOnline).catch(() => {
+    window.localmost?.network?.isOnline().then((online: boolean) => {
+      setFallbackState(prev => ({ ...prev, isOnline: online }));
+    }).catch(() => {
       // Default to online if check fails
-      setIsOnline(true);
     });
-    const handleOnline = () => setIsOnline(true);
-    const handleOffline = () => setIsOnline(false);
+    const handleOnline = () => setFallbackState(prev => ({ ...prev, isOnline: true }));
+    const handleOffline = () => setFallbackState(prev => ({ ...prev, isOnline: false }));
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
 
     return () => {
-      unsubLogs();
+      unsubLogs?.();
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
   }, []);
 
-  // Setting updaters with persistence
+  // Setting updaters - call IPC which updates main store + persists
   const setTheme = useCallback(async (newTheme: ThemeSetting) => {
-    setThemeState(newTheme);
+    // Optimistic update for fallback state
+    setFallbackState(prev => ({ ...prev, theme: newTheme }));
     try {
       await window.localmost.settings.set({ theme: newTheme });
     } catch {
-      // Optimistic update - UI already changed, log error but don't revert
+      // Store update failed, but zubridge will sync if main store was updated
     }
   }, []);
 
   const setLogLevel = useCallback(async (newLevel: LogLevel) => {
-    setLogLevelState(newLevel);
+    setFallbackState(prev => ({ ...prev, logLevel: newLevel }));
     try {
       await window.localmost.settings.set({ logLevel: newLevel });
     } catch {
-      // Optimistic update - UI already changed
+      // Optimistic update handled by zubridge sync
     }
   }, []);
 
   const setRunnerLogLevel = useCallback(async (newLevel: LogLevel) => {
-    setRunnerLogLevelState(newLevel);
+    setFallbackState(prev => ({ ...prev, runnerLogLevel: newLevel }));
     try {
       await window.localmost.settings.set({ runnerLogLevel: newLevel });
     } catch {
-      // Optimistic update - UI already changed
+      // Optimistic update handled by zubridge sync
     }
   }, []);
 
   const setMaxLogScrollback = useCallback(async (newMax: number) => {
-    setMaxLogScrollbackState(newMax);
     maxLogScrollbackRef.current = newMax;
+    setFallbackState(prev => ({ ...prev, maxLogScrollback: newMax }));
     try {
       await window.localmost.settings.set({ maxLogScrollback: newMax });
     } catch {
-      // Optimistic update - UI already changed
+      // Optimistic update handled by zubridge sync
     }
     // Trim existing logs if needed
     if (logsRef.current.length > newMax) {
@@ -283,121 +307,122 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
   }, []);
 
   const setMaxJobHistory = useCallback(async (newMax: number) => {
-    setMaxJobHistoryState(newMax);
+    setFallbackState(prev => ({ ...prev, maxJobHistory: newMax }));
     try {
       await window.localmost.settings.set({ maxJobHistory: newMax });
       await window.localmost.jobs.setMaxHistory(newMax);
     } catch {
-      // Optimistic update - UI already changed
+      // Optimistic update handled by zubridge sync
     }
   }, []);
 
   const setSleepProtection = useCallback(async (newSetting: SleepProtection) => {
-    setSleepProtectionState(newSetting);
+    setFallbackState(prev => ({ ...prev, sleepProtection: newSetting }));
     try {
       await window.localmost.settings.set({ sleepProtection: newSetting });
     } catch {
-      // Optimistic update - UI already changed
+      // Optimistic update handled by zubridge sync
     }
   }, []);
 
   const consentToSleepProtection = useCallback(async () => {
-    setSleepProtectionConsentedState(true);
+    setFallbackState(prev => ({ ...prev, sleepProtectionConsented: true }));
     try {
       await window.localmost.settings.set({ sleepProtectionConsented: true });
     } catch {
-      // Optimistic update - UI already changed
+      // Optimistic update handled by zubridge sync
     }
   }, []);
 
   const setPreserveWorkDir = useCallback(async (setting: 'never' | 'session' | 'always') => {
-    setPreserveWorkDirState(setting);
+    setFallbackState(prev => ({ ...prev, preserveWorkDir: setting }));
     try {
       await window.localmost.settings.set({ preserveWorkDir: setting });
     } catch {
-      // Optimistic update - UI already changed
+      // Optimistic update handled by zubridge sync
     }
   }, []);
 
   const setToolCacheLocation = useCallback(async (setting: ToolCacheLocation) => {
-    setToolCacheLocationState(setting);
+    setFallbackState(prev => ({ ...prev, toolCacheLocation: setting }));
     try {
       await window.localmost.settings.set({ toolCacheLocation: setting });
     } catch {
-      // Optimistic update - UI already changed
+      // Optimistic update handled by zubridge sync
     }
   }, []);
 
   const setUserFilter = useCallback(async (filter: UserFilterConfig) => {
-    setUserFilterState(filter);
+    setFallbackState(prev => ({ ...prev, userFilter: filter }));
     try {
       await window.localmost.settings.set({ userFilter: filter });
     } catch {
-      // Optimistic update - UI already changed
+      // Optimistic update handled by zubridge sync
     }
   }, []);
 
   const setPower = useCallback(async (config: PowerConfig) => {
-    setPowerState(config);
+    setFallbackState(prev => ({ ...prev, power: config }));
     try {
       await window.localmost.settings.set({ power: config });
     } catch {
-      // Optimistic update - UI already changed
+      // Optimistic update handled by zubridge sync
     }
   }, []);
 
   const setPauseOnBattery = useCallback(async (threshold: BatteryPauseThreshold) => {
     const newConfig = { ...power, pauseOnBattery: threshold };
-    setPowerState(newConfig);
+    setFallbackState(prev => ({ ...prev, power: newConfig }));
     try {
       await window.localmost.settings.set({ power: newConfig });
     } catch {
-      // Optimistic update - UI already changed
+      // Optimistic update handled by zubridge sync
     }
   }, [power]);
 
   const setPauseOnVideoCall = useCallback(async (enabled: boolean) => {
     const newConfig = { ...power, pauseOnVideoCall: enabled };
-    setPowerState(newConfig);
+    setFallbackState(prev => ({ ...prev, power: newConfig }));
     try {
       await window.localmost.settings.set({ power: newConfig });
     } catch {
-      // Optimistic update - UI already changed
+      // Optimistic update handled by zubridge sync
     }
   }, [power]);
 
   const setNotifications = useCallback(async (config: NotificationsConfig) => {
-    setNotificationsState(config);
+    setFallbackState(prev => ({ ...prev, notifications: config }));
     try {
       await window.localmost.settings.set({ notifications: config });
     } catch {
-      // Optimistic update - UI already changed
+      // Optimistic update handled by zubridge sync
     }
   }, []);
 
   const setNotifyOnPause = useCallback(async (enabled: boolean) => {
     const newConfig = { ...notifications, notifyOnPause: enabled };
-    setNotificationsState(newConfig);
+    setFallbackState(prev => ({ ...prev, notifications: newConfig }));
     try {
       await window.localmost.settings.set({ notifications: newConfig });
     } catch {
-      // Optimistic update - UI already changed
+      // Optimistic update handled by zubridge sync
     }
   }, [notifications]);
 
   const setNotifyOnJobEvents = useCallback(async (enabled: boolean) => {
     const newConfig = { ...notifications, notifyOnJobEvents: enabled };
-    setNotificationsState(newConfig);
+    setFallbackState(prev => ({ ...prev, notifications: newConfig }));
     try {
       await window.localmost.settings.set({ notifications: newConfig });
     } catch {
-      // Optimistic update - UI already changed
+      // Optimistic update handled by zubridge sync
     }
   }, [notifications]);
 
   const clearLogs = useCallback(() => {
     logsRef.current = [];
     setLogs([]);
+    window.localmost?.logs?.clear();
   }, []);
 
   const value: AppConfigContextValue = {
@@ -410,9 +435,9 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     logs,
     clearLogs,
     maxLogScrollback,
-    setMaxLogScrollback,
-    maxJobHistory,
     setMaxJobHistory,
+    maxJobHistory,
+    setMaxLogScrollback,
     sleepProtection,
     setSleepProtection,
     sleepProtectionConsented,

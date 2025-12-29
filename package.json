@@ -83,12 +83,14 @@
     "@fortawesome/fontawesome-svg-core": "^7.1.0",
     "@fortawesome/free-solid-svg-icons": "^7.1.0",
     "@fortawesome/react-fontawesome": "^3.1.1",
+    "@zubridge/electron": "^2.1.1",
     "is-camera-on": "^4.0.0",
     "js-yaml": "^4.1.1",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "tar": "^7.5.2",
-    "xstate": "^5.25.0"
+    "xstate": "^5.25.0",
+    "zustand": "^5.0.9"
   },
   "overrides": {
     "tmp": "^0.2.5"

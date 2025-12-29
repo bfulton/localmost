@@ -13,6 +13,8 @@ import {
   getLogger,
 } from '../app-state';
 import { IPC_CHANNELS, SleepProtection, LogLevel } from '../../shared/types';
+import { store } from '../store';
+import { ThemeSetting } from '../store/types';
 
 const log = () => getLogger();
 
@@ -57,6 +59,42 @@ export const registerSettingsHandlers = (): void => {
     }
 
     saveConfig({ ...current, ...sanitizedSettings });
+
+    // Update Zustand store to sync with renderer via zubridge
+    const storeState = store.getState();
+    if (settings.theme !== undefined) {
+      storeState.setTheme(settings.theme as ThemeSetting);
+    }
+    if (settings.logLevel !== undefined) {
+      storeState.setLogLevel(settings.logLevel as LogLevel);
+    }
+    if (settings.runnerLogLevel !== undefined) {
+      storeState.setRunnerLogLevel(settings.runnerLogLevel as LogLevel);
+    }
+    if (settings.sleepProtection !== undefined) {
+      storeState.setSleepProtection(settings.sleepProtection as SleepProtection);
+    }
+    if (settings.userFilter !== undefined) {
+      storeState.setUserFilter(settings.userFilter);
+    }
+    if (settings.power !== undefined) {
+      storeState.setPower(settings.power);
+    }
+    if (settings.notifications !== undefined) {
+      storeState.setNotifications(settings.notifications);
+    }
+    if (settings.launchAtLogin !== undefined) {
+      storeState.setLaunchAtLogin(settings.launchAtLogin);
+    }
+    if (settings.targets !== undefined) {
+      storeState.setTargets(settings.targets);
+    }
+    if (settings.maxConcurrentJobs !== undefined) {
+      storeState.setMaxConcurrentJobs(settings.maxConcurrentJobs);
+    }
+    if (settings.runnerConfig !== undefined) {
+      storeState.updateRunnerConfig(settings.runnerConfig);
+    }
 
     // Update sleep protection if setting changed
     if (settings.sleepProtection !== undefined) {
