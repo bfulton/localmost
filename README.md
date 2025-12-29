@@ -114,6 +114,7 @@ The check workflow uses a simple heartbeat mechanism:
 - The workflow reads this variable and checks the timestamp
 - If the timestamp is less than 90 seconds old → use `self-hosted`
 - Otherwise → fall back to `macos-latest` (or your configured fallback)
+- On clean exit, localmost immediately marks the heartbeat stale so workflows fall back without waiting
 
 This fallback-to-cloud design is intentional: if your Mac is asleep, offline, or the heartbeat is stale for any reason, workflows continue running on GitHub-hosted runners rather than waiting or failing.
 
@@ -226,7 +227,6 @@ Current release: **0.3.0 — Test Locally, Secure by Default**
 Future feature ideas:
 
 - **Trusted contributors for public repos** - Control which repos can run on your machine based on their contributor list. Options: never build public repos, only build repos where all contributors are trusted (default: you + known bots, customizable), or always build (with high-friction confirmation). Repos with untrusted contributors fail with a clear error.
-- **Graceful heartbeat shutdown** - On clean exit, immediately mark heartbeat stale so workflows fall back to cloud without waiting for the 90s timeout.
 - **Quick actions** - Re-run failed job, cancel all jobs.
 - **Spotlight integration** - Check status or pause builds from Spotlight.
 - **Artifact inspector** - Browse uploaded artifacts without leaving the app.
