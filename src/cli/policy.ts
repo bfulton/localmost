@@ -100,67 +100,67 @@ shared:
   }
 }
 
+interface PrintablePolicy {
+  network?: { allow?: string[]; deny?: string[] };
+  filesystem?: { read?: string[]; write?: string[]; deny?: string[] };
+  env?: { allow?: string[]; deny?: string[] };
+}
+
 /**
  * Print a policy section.
  */
-function printPolicy(policy: Record<string, unknown>): void {
+function printPolicy(policy: PrintablePolicy): void {
   if (!policy || Object.keys(policy).length === 0) {
     console.log('  (empty - uses defaults only)');
     return;
   }
 
-  const p = policy as {
-    network?: { allow?: string[]; deny?: string[] };
-    filesystem?: { read?: string[]; write?: string[]; deny?: string[] };
-    env?: { allow?: string[]; deny?: string[] };
-  };
-
-  if (p.network) {
-    if (p.network.allow?.length) {
+  if (policy.network) {
+    if (policy.network.allow?.length) {
       console.log('  Network allow:');
-      for (const domain of p.network.allow) {
+      for (const domain of policy.network.allow) {
         console.log(`    ${colors.green}+${colors.reset} ${domain}`);
       }
     }
-    if (p.network.deny?.length) {
+    if (policy.network.deny?.length) {
       console.log('  Network deny:');
-      for (const domain of p.network.deny) {
+      for (const domain of policy.network.deny) {
         console.log(`    ${colors.red}-${colors.reset} ${domain}`);
       }
     }
   }
 
-  if (p.filesystem) {
-    if (p.filesystem.read?.length) {
+  if (policy.filesystem) {
+    if (policy.filesystem.read?.length) {
       console.log('  Filesystem read:');
-      for (const path of p.filesystem.read) {
-        console.log(`    ${colors.cyan}r${colors.reset} ${path}`);
+      for (const filePath of policy.filesystem.read) {
+        console.log(`    ${colors.cyan}r${colors.reset} ${filePath}`);
       }
     }
-    if (p.filesystem.write?.length) {
+    if (policy.filesystem.write?.length) {
       console.log('  Filesystem write:');
-      for (const path of p.filesystem.write) {
-        console.log(`    ${colors.green}w${colors.reset} ${path}`);
+      for (const filePath of policy.filesystem.write) {
+        console.log(`    ${colors.green}w${colors.reset} ${filePath}`);
       }
     }
-    if (p.filesystem.deny?.length) {
+    if (policy.filesystem.deny?.length) {
       console.log('  Filesystem deny:');
-      for (const path of p.filesystem.deny) {
-        console.log(`    ${colors.red}-${colors.reset} ${path}`);
+      for (const filePath of policy.filesystem.deny) {
+        console.log(`    ${colors.red}-${colors.reset} ${filePath}`);
       }
     }
   }
 
-  if (p.env) {
-    if (p.env.allow?.length) {
+  if (policy.env) {
+    if (policy.env.allow?.length) {
       console.log('  Environment allow:');
-      for (const name of p.env.allow) {
+      for (const name of policy.env.allow) {
         console.log(`    ${colors.green}+${colors.reset} ${name}`);
       }
     }
-    if (p.env.deny?.length) {
+    if (policy.env.deny?.length) {
       console.log('  Environment deny:');
-      for (const name of p.env.deny) {
+      for (const name of policy.env.deny) {
         console.log(`    ${colors.red}-${colors.reset} ${name}`);
       }
     }

@@ -1070,12 +1070,18 @@ export class RunnerManager {
         // Need to re-register the proxy for the target, not the individual worker
         const targetContext = this.pendingTargetContext.get(String(instanceNum));
         if (targetContext) {
-          this.log('error', `Runner ${instanceNum} fatal error - proxy registration for ${targetContext.targetDisplayName} may be deleted`);
-          // TODO: Implement proxy re-registration when needed
+          this.log('error', `Runner ${instanceNum} fatal error - proxy registration for ${targetContext.targetDisplayName} was deleted, attempting re-registration`);
         } else {
-          this.log('error', `Runner ${instanceNum} has a fatal error - registration deleted`);
+          this.log('error', `Runner ${instanceNum} has a fatal error - registration deleted, attempting re-registration`);
         }
         this.updateAggregateStatus();
+
+        // Trigger re-registration asynchronously
+        if (this.onReregistrationNeeded) {
+          this.onReregistrationNeeded(instanceNum, 'registration_deleted').catch(err => {
+            this.log('error', `Re-registration failed for instance ${instanceNum}: ${(err as Error).message}`);
+          });
+        }
       }
       return;
     }
