@@ -14,12 +14,13 @@
 import * as http from 'http';
 import * as https from 'https';
 import * as crypto from 'crypto';
-import * as fs from 'fs';
-import * as path from 'path';
 import { EventEmitter } from 'events';
 import { getLogger } from './app-state';
-import { getRunnerDir } from './paths';
 import type { Target, RunnerProxyStatus } from '../shared/types';
+import {
+  SessionPersistence,
+  OAuthTokenManager,
+} from './broker-proxy';
 
 // Helper to get logger (may be null before initialization)
 const log = () => getLogger();
@@ -203,11 +204,15 @@ export class BrokerProxyService extends EventEmitter {
   private messageQueues: Map<string, Array<string>> = new Map();  // Per-target message queues
   private seenMessageIds: Set<string> = new Set();
   private pendingTargetAssignments: string[] = [];  // Queue of target IDs for upcoming sessions
-  private jobRunServiceUrls: Map<string, string> = new Map();  // jobId -> run_service_url for job operations
-  private acquiredJobDetails: Map<string, string> = new Map();  // jobId -> job details from acquireJobUpstream
-  private jobInfo: Map<string, { billingOwnerId?: string; runServiceUrl: string }> = new Map();  // messageId -> job info
+  private jobRunServiceUrls: Map<string, string> = new Map();  // jobId -> run_service_url
+  private acquiredJobDetails: Map<string, string> = new Map();  // jobId -> job details
+  private jobInfo: Map<string, { billingOwnerId?: string; runServiceUrl: string }> = new Map();
   private canAcceptJobCallback?: () => boolean;
   private sessionRetryTimeouts: Map<string, NodeJS.Timeout> = new Map();  // targetId -> retry timeout
+
+  // Extracted modules (for gradual migration)
+  private readonly sessionPersistence = new SessionPersistence();
+  private readonly tokenManager = new OAuthTokenManager();
 
   /** How often to poll targets for jobs (ms) */
   private static readonly POLL_INTERVAL_MS = 5000;
@@ -675,70 +680,23 @@ export class BrokerProxyService extends EventEmitter {
   }
 
   // --------------------------------------------------------------------------
-  // Session Persistence (for cleanup on restart)
+  // Session Persistence (delegates to SessionPersistence module)
   // --------------------------------------------------------------------------
 
-  private getSessionFilePath(): string {
-    return path.join(getRunnerDir(), 'broker-sessions.json');
-  }
-
-  /**
-   * Load saved session IDs from disk.
-   */
   private loadSavedSessionIds(): Record<string, Record<number, string>> {
-    try {
-      const data = fs.readFileSync(this.getSessionFilePath(), 'utf-8');
-      return JSON.parse(data);
-    } catch {
-      return {};
-    }
+    return this.sessionPersistence.load();
   }
 
-  /**
-   * Save a session ID to disk (for crash recovery).
-   */
   private saveSessionId(targetId: string, instanceNum: number, sessionId: string): void {
-    const sessions = this.loadSavedSessionIds();
-    if (!sessions[targetId]) sessions[targetId] = {};
-    sessions[targetId][instanceNum] = sessionId;
-    try {
-      fs.writeFileSync(this.getSessionFilePath(), JSON.stringify(sessions, null, 2));
-    } catch {
-      // Ignore write errors
-    }
+    this.sessionPersistence.save(targetId, instanceNum, sessionId);
   }
 
-  /**
-   * Remove a session ID from disk (after successful deletion).
-   */
   private removeSessionId(targetId: string, instanceNum: number): void {
-    const sessions = this.loadSavedSessionIds();
-    if (sessions[targetId]) {
-      delete sessions[targetId][instanceNum];
-      if (Object.keys(sessions[targetId]).length === 0) {
-        delete sessions[targetId];
-      }
-    }
-    try {
-      if (Object.keys(sessions).length === 0) {
-        fs.unlinkSync(this.getSessionFilePath());
-      } else {
-        fs.writeFileSync(this.getSessionFilePath(), JSON.stringify(sessions, null, 2));
-      }
-    } catch {
-      // Ignore errors
-    }
+    this.sessionPersistence.remove(targetId, instanceNum);
   }
 
-  /**
-   * Clear all saved session IDs from disk.
-   */
   private clearSavedSessionIds(): void {
-    try {
-      fs.unlinkSync(this.getSessionFilePath());
-    } catch {
-      // Ignore if file doesn't exist
-    }
+    this.sessionPersistence.clear();
   }
 
   /**
@@ -746,15 +704,12 @@ export class BrokerProxyService extends EventEmitter {
    * Called on startup before creating new sessions.
    */
   private async cleanupStaleSessions(): Promise<void> {
-    const savedSessions = this.loadSavedSessionIds();
-    const sessionCount = Object.values(savedSessions).reduce(
-      (sum, targetSessions) => sum + Object.keys(targetSessions).length, 0
-    );
-
+    const sessionCount = this.sessionPersistence.getSessionCount();
     if (sessionCount === 0) {
       return;
     }
 
+    const savedSessions = this.loadSavedSessionIds();
     log()?.info(`[BrokerProxy] Cleaning up ${sessionCount} stale sessions from previous run...`);
 
     const deletions: Promise<void>[] = [];

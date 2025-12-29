@@ -34,22 +34,12 @@ import { RunnerManager } from './runner-manager';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { EventEmitter } from 'events';
 import { LogEntry, RunnerState, JobHistoryEntry } from '../shared/types';
 import { spawnSandboxed } from './process-sandbox';
+import { createMockProcess, RunnerManagerTestHelper } from './test-utils';
 
 // Get the mocked function
 const mockSpawnSandboxed = spawnSandboxed as jest.MockedFunction<typeof spawnSandboxed>;
-
-// Create a mock process factory to properly handle the readonly pid
-function createMockProcess(pid: number): any {
-  const proc = new EventEmitter();
-  Object.defineProperty(proc, 'pid', { value: pid, writable: false });
-  (proc as any).stdout = new EventEmitter();
-  (proc as any).stderr = new EventEmitter();
-  (proc as any).kill = jest.fn();
-  return proc;
-}
 
 // Mock fs
 jest.mock('fs', () => ({
@@ -277,28 +267,28 @@ describe('RunnerManager', () => {
     });
 
     it('should return true when some instances are offline', () => {
-      const instances = (runnerManager as any).instances;
-      instances.set(1, { status: 'listening' });
-      instances.set(2, { status: 'offline' });
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      helper.setInstance(1, { status: 'listening' });
+      helper.setInstance(2, { status: 'offline' });
 
       expect(runnerManager.hasAvailableSlot()).toBe(true);
     });
 
     it('should return true when some instances have error status', () => {
-      const instances = (runnerManager as any).instances;
-      instances.set(1, { status: 'listening' });
-      instances.set(2, { status: 'error' });
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      helper.setInstance(1, { status: 'listening' });
+      helper.setInstance(2, { status: 'error' });
 
       expect(runnerManager.hasAvailableSlot()).toBe(true);
     });
 
     it('should return false when all instances are listening', () => {
-      const instances = (runnerManager as any).instances;
+      const helper = new RunnerManagerTestHelper(runnerManager);
       // Default runnerCount is 4
-      instances.set(1, { status: 'listening' });
-      instances.set(2, { status: 'listening' });
-      instances.set(3, { status: 'listening' });
-      instances.set(4, { status: 'listening' });
+      helper.setInstance(1, { status: 'listening' });
+      helper.setInstance(2, { status: 'listening' });
+      helper.setInstance(3, { status: 'listening' });
+      helper.setInstance(4, { status: 'listening' });
 
       expect(runnerManager.hasAvailableSlot()).toBe(false);
     });
@@ -313,10 +303,9 @@ describe('RunnerManager', () => {
         getUserFilter: () => ({ mode: 'everyone', allowlist: [] }),
         getCurrentUserLogin: () => 'testuser',
       });
+      const helper = new RunnerManagerTestHelper(manager);
 
-      // Access private method via any cast for testing
-      const isAllowed = (manager as any).isUserAllowed('anyuser');
-      expect(isAllowed).toBe(true);
+      expect(helper.isUserAllowed('anyuser')).toBe(true);
     });
 
     it('should allow all users when no filter is set', () => {
@@ -326,9 +315,9 @@ describe('RunnerManager', () => {
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
         getUserFilter: () => undefined,
       });
+      const helper = new RunnerManagerTestHelper(manager);
 
-      const isAllowed = (manager as any).isUserAllowed('anyuser');
-      expect(isAllowed).toBe(true);
+      expect(helper.isUserAllowed('anyuser')).toBe(true);
     });
 
     it('should only allow current user when filter mode is just-me', () => {
@@ -339,10 +328,11 @@ describe('RunnerManager', () => {
         getUserFilter: () => ({ mode: 'just-me', allowlist: [] }),
         getCurrentUserLogin: () => 'testuser',
       });
+      const helper = new RunnerManagerTestHelper(manager);
 
-      expect((manager as any).isUserAllowed('testuser')).toBe(true);
-      expect((manager as any).isUserAllowed('TestUser')).toBe(true); // case insensitive
-      expect((manager as any).isUserAllowed('otheruser')).toBe(false);
+      expect(helper.isUserAllowed('testuser')).toBe(true);
+      expect(helper.isUserAllowed('TestUser')).toBe(true); // case insensitive
+      expect(helper.isUserAllowed('otheruser')).toBe(false);
     });
 
     it('should only allow users in allowlist when filter mode is allowlist', () => {
@@ -358,11 +348,12 @@ describe('RunnerManager', () => {
           ],
         }),
       });
+      const helper = new RunnerManagerTestHelper(manager);
 
-      expect((manager as any).isUserAllowed('user1')).toBe(true);
-      expect((manager as any).isUserAllowed('User1')).toBe(true); // case insensitive
-      expect((manager as any).isUserAllowed('user2')).toBe(true);
-      expect((manager as any).isUserAllowed('user3')).toBe(false);
+      expect(helper.isUserAllowed('user1')).toBe(true);
+      expect(helper.isUserAllowed('User1')).toBe(true); // case insensitive
+      expect(helper.isUserAllowed('user2')).toBe(true);
+      expect(helper.isUserAllowed('user3')).toBe(false);
     });
 
     it('should allow user when just-me mode but no current user is set', () => {
@@ -373,9 +364,10 @@ describe('RunnerManager', () => {
         getUserFilter: () => ({ mode: 'just-me', allowlist: [] }),
         getCurrentUserLogin: () => undefined,
       });
+      const helper = new RunnerManagerTestHelper(manager);
 
       // Should return true (allow) when current user is unknown
-      expect((manager as any).isUserAllowed('anyuser')).toBe(true);
+      expect(helper.isUserAllowed('anyuser')).toBe(true);
     });
 
     it('should handle empty allowlist', () => {
@@ -385,9 +377,10 @@ describe('RunnerManager', () => {
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
         getUserFilter: () => ({ mode: 'allowlist', allowlist: [] }),
       });
+      const helper = new RunnerManagerTestHelper(manager);
 
       // Empty allowlist should not allow anyone
-      expect((manager as any).isUserAllowed('anyuser')).toBe(false);
+      expect(helper.isUserAllowed('anyuser')).toBe(false);
     });
   });
 
@@ -395,8 +388,9 @@ describe('RunnerManager', () => {
 
   describe('getStatus with shutting_down', () => {
     it('should return shutting_down status when stopping is true', () => {
-      (runnerManager as any).stopping = true;
-      (runnerManager as any).startedAt = new Date().toISOString();
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      helper.stopping = true;
+      helper.startedAt = new Date().toISOString();
 
       const status = runnerManager.getStatus();
 
@@ -406,9 +400,9 @@ describe('RunnerManager', () => {
 
   describe('status aggregation with listening', () => {
     it('should return listening when instance is listening', () => {
-      const instances = (runnerManager as any).instances;
-      (runnerManager as any).startedAt = new Date().toISOString();
-      instances.set(1, { status: 'listening', currentJob: null });
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      helper.startedAt = new Date().toISOString();
+      helper.setInstance(1, { status: 'listening', currentJob: null });
 
       const status = runnerManager.getStatus();
 
@@ -416,12 +410,12 @@ describe('RunnerManager', () => {
     });
 
     it('should return busy over listening when any instance is busy', () => {
-      const instances = (runnerManager as any).instances;
-      (runnerManager as any).startedAt = new Date().toISOString();
-      instances.set(1, { status: 'listening', currentJob: null });
-      instances.set(2, {
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      helper.startedAt = new Date().toISOString();
+      helper.setInstance(1, { status: 'listening', currentJob: null });
+      helper.setInstance(2, {
         status: 'busy',
-        currentJob: { name: 'test-job', repository: 'owner/repo' }
+        currentJob: { name: 'test-job', repository: 'owner/repo', startedAt: new Date().toISOString(), id: 'job-1' }
       });
 
       const status = runnerManager.getStatus();
