@@ -67,6 +67,9 @@ const mainConfig = {
 };
 
 // Preload script configuration
+// Note: Electron 20+ sandboxes preload scripts by default, so Node.js modules
+// are not available. We provide empty fallbacks for modules used by dependencies
+// like the 'debug' library (bundled in @zubridge/electron).
 const preloadConfig = {
   ...commonConfig,
   target: 'electron-preload',
@@ -75,6 +78,37 @@ const preloadConfig = {
     path: path.resolve(__dirname, 'dist'),
     filename: 'preload.js',
   },
+  // Disable automatic Node.js externalization for sandboxed preload
+  // electron-preload target uses node externals preset under the hood
+  externalsPresets: { node: false, electronPreload: false },
+  // Only externalize electron (which is available in preload)
+  externals: {
+    electron: 'commonjs electron',
+  },
+  resolve: {
+    ...commonConfig.resolve,
+    // Provide empty fallbacks for Node.js modules used by zubridge's debug dependency
+    fallback: {
+      fs: false,
+      path: false,
+      os: false,
+      crypto: false,
+      util: false,
+      tty: false,
+      process: false,
+      // Handle node: prefix scheme (used by uuid package)
+      'node:crypto': false,
+    },
+  },
+  plugins: [
+    // Handle node: scheme imports by aliasing them to non-prefixed versions
+    new webpack.NormalModuleReplacementPlugin(
+      /^node:/,
+      (resource) => {
+        resource.request = resource.request.replace(/^node:/, '');
+      }
+    ),
+  ],
 };
 
 // Renderer process configuration
