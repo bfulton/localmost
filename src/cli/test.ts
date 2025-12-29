@@ -34,7 +34,6 @@ import {
   findLocalmostrc,
   parseLocalmostrc,
   getEffectivePolicy,
-  getRequiredSecrets,
   LocalmostrcConfig,
   serializeLocalmostrc,
   LOCALMOSTRC_VERSION,
@@ -507,7 +506,7 @@ async function resolveSecrets(
 async function handleUpdateRc(
   cwd: string,
   workflow: ParsedWorkflow,
-  context: ExecutionContext
+  _context: ExecutionContext
 ): Promise<void> {
   console.log();
   console.log(`${colors.bold}Discovery mode:${colors.reset}`);

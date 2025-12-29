@@ -49,7 +49,6 @@ export type PolicyApprovalCallback = (request: PolicyApprovalRequest) => Promise
 // =============================================================================
 
 const POLICY_CACHE_DIR = 'policies';
-const POLICY_INDEX_FILE = 'policy-index.json';
 
 /**
  * Get the policies cache directory.

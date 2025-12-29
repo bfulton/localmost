@@ -8,7 +8,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { spawn, ChildProcess, SpawnOptions } from 'child_process';
+import { spawn, SpawnOptions } from 'child_process';
 import { WorkflowStep, WorkflowJob, MatrixCombination } from './workflow-parser';
 import { SandboxPolicy, generateSandboxProfile } from './sandbox-profile';
 import { parseActionRef, fetchAction, isInterceptedAction, readActionMetadata } from './action-fetcher';
@@ -1058,7 +1058,7 @@ function parseGitHubOutputFile(filePath: string): Record<string, string> {
  * Evaluate a step condition.
  * This is a simplified implementation - full expression support would require more work.
  */
-function evaluateCondition(condition: string, ctx: ExecutionContext): boolean {
+function evaluateCondition(condition: string, _ctx: ExecutionContext): boolean {
   // Always run conditions
   if (condition === 'always()') {
     return true;

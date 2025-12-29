@@ -7,8 +7,6 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as https from 'https';
-import * as os from 'os';
 import { getAppDataDirWithoutElectron } from './paths';
 
 // =============================================================================
@@ -195,47 +193,6 @@ export function isInterceptedAction(uses: string): boolean {
 // =============================================================================
 
 /**
- * Fetch JSON from a URL.
- */
-function fetchJson<T>(url: string): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const options = {
-      headers: {
-        'User-Agent': 'localmost',
-        Accept: 'application/vnd.github.v3+json',
-      },
-    };
-
-    https
-      .get(url, options, (res) => {
-        if (res.statusCode === 302 || res.statusCode === 301) {
-          // Handle redirects
-          if (res.headers.location) {
-            fetchJson<T>(res.headers.location).then(resolve).catch(reject);
-            return;
-          }
-        }
-
-        if (res.statusCode !== 200) {
-          reject(new Error(`HTTP ${res.statusCode}: ${url}`));
-          return;
-        }
-
-        let data = '';
-        res.on('data', (chunk) => (data += chunk));
-        res.on('end', () => {
-          try {
-            resolve(JSON.parse(data) as T);
-          } catch (err) {
-            reject(new Error(`Invalid JSON from ${url}`));
-          }
-        });
-      })
-      .on('error', reject);
-  });
-}
-
-/**
  * Download a tarball and extract it.
  */
 function downloadAndExtract(url: string, destDir: string): Promise<void> {
@@ -303,7 +260,7 @@ export async function fetchAction(ref: ActionRef): Promise<CachedAction> {
 
   try {
     await downloadAndExtract(tarballUrl, actionDir);
-  } catch (err) {
+  } catch {
     // Try as a branch
     const branchUrl = `https://github.com/${ref.owner}/${ref.repo}/archive/refs/heads/${ref.version}.tar.gz`;
     await downloadAndExtract(branchUrl, actionDir);

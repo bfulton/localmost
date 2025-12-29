@@ -94,13 +94,13 @@ const preloadConfig = {
       os: false,
       crypto: false,
       util: false,
-      tty: false,
       // Handle node: prefix scheme (used by uuid package)
       'node:crypto': false,
     },
-    // Alias process to our minimal shim (supports-color needs process.argv)
+    // Alias process and tty to our minimal shims (supports-color needs them)
     alias: {
       process: path.resolve(__dirname, 'scripts/process-shim.js'),
+      tty: path.resolve(__dirname, 'scripts/tty-shim.js'),
     },
   },
   plugins: [

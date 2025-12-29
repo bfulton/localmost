@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'js-yaml';
 import { getAppDataDir, getConfigPath } from '../../paths';
-import { encryptValue, decryptValue } from '../../encryption';
+import { decryptValue } from '../../encryption';
 import { bootLog } from '../../log-file';
 import { store, getState } from '../index';
 import { ConfigSlice, defaultConfigState } from '../types';
@@ -175,10 +175,11 @@ export function loadPersistedConfig(): void {
     // Handle auth tokens separately (with decryption)
     if (diskConfig.auth) {
       try {
-        const accessToken = decryptValue(diskConfig.auth.accessToken);
-        const refreshToken = diskConfig.auth.refreshToken
-          ? decryptValue(diskConfig.auth.refreshToken)
-          : undefined;
+        // Validate tokens can be decrypted (actual token storage handled by auth-tokens module)
+        decryptValue(diskConfig.auth.accessToken);
+        if (diskConfig.auth.refreshToken) {
+          decryptValue(diskConfig.auth.refreshToken);
+        }
 
         store.setState((state) => ({
           auth: {
@@ -187,9 +188,6 @@ export function loadPersistedConfig(): void {
             isAuthenticated: true,
           },
         }));
-
-        // Store decrypted tokens in a separate location (not in Zustand for security)
-        // The auth-tokens module handles this
       } catch (e) {
         bootLog('warn', `Failed to decrypt auth tokens: ${(e as Error).message}`);
       }

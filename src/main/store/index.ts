@@ -37,7 +37,7 @@ import {
 
 // Create the store
 export const store = createStore<AppStore>()(
-  subscribeWithSelector((set, get) => ({
+  subscribeWithSelector((set, _get) => ({
     // Initial state
     ...defaultAppState,
 

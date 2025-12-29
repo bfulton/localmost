@@ -1,5 +1,5 @@
-import { jest, describe, it, expect, beforeEach } from '@jest/globals';
-import { parseTestArgs, TestOptions } from './test';
+import { describe, it, expect } from '@jest/globals';
+import { parseTestArgs } from './test';
 
 describe('CLI test command', () => {
   describe('parseTestArgs', () => {

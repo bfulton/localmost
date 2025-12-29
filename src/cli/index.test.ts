@@ -22,7 +22,6 @@ jest.mock('../shared/paths', () => ({
 }));
 
 // Import after mocks are set up
-import { spawn } from 'child_process';
 
 describe('CLI index', () => {
   beforeEach(() => {
