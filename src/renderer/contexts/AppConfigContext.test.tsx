@@ -19,7 +19,8 @@ const TestConsumer: React.FC = () => {
       <span data-testid="sleep-consented">{String(config.sleepProtectionConsented)}</span>
       <span data-testid="preserve-work-dir">{config.preserveWorkDir}</span>
       <span data-testid="tool-cache-location">{config.toolCacheLocation}</span>
-      <span data-testid="user-filter-mode">{config.userFilter.mode}</span>
+      <span data-testid="user-filter-scope">{config.userFilter.scope}</span>
+      <span data-testid="user-filter-allowed-users">{config.userFilter.allowedUsers}</span>
       <span data-testid="user-filter-allowlist-count">{config.userFilter.allowlist.length}</span>
       <span data-testid="is-online">{String(config.isOnline)}</span>
       <span data-testid="is-loading">{String(config.isLoading)}</span>
@@ -36,8 +37,8 @@ const TestConsumer: React.FC = () => {
       <button data-testid="consent-sleep" onClick={config.consentToSleepProtection}>Consent</button>
       <button data-testid="set-preserve-work-dir" onClick={() => config.setPreserveWorkDir('session')}>Set Preserve</button>
       <button data-testid="set-tool-cache" onClick={() => config.setToolCacheLocation('per-sandbox')}>Set Tool Cache</button>
-      <button data-testid="set-user-filter-just-me" onClick={() => config.setUserFilter({ mode: 'just-me', allowlist: [] })}>Set Just Me</button>
-      <button data-testid="set-user-filter-allowlist" onClick={() => config.setUserFilter({ mode: 'allowlist', allowlist: [{ login: 'testuser', avatar_url: '', name: null }] })}>Set Allowlist</button>
+      <button data-testid="set-user-filter-just-me" onClick={() => config.setUserFilter({ scope: 'trigger', allowedUsers: 'just-me', allowlist: [] })}>Set Just Me</button>
+      <button data-testid="set-user-filter-allowlist" onClick={() => config.setUserFilter({ scope: 'trigger', allowedUsers: 'allowlist', allowlist: [{ login: 'testuser', avatar_url: '', name: null }] })}>Set Allowlist</button>
     </div>
   );
 };
@@ -547,7 +548,7 @@ describe('AppConfigContext', () => {
   });
 
   describe('User Filter', () => {
-    it('should have default user filter mode as just-me', async () => {
+    it('should have default user filter scope as everyone', async () => {
       render(
         <AppConfigProvider>
           <TestConsumer />
@@ -558,14 +559,16 @@ describe('AppConfigContext', () => {
         expect(screen.getByTestId('is-loading').textContent).toBe('false');
       });
 
-      expect(screen.getByTestId('user-filter-mode').textContent).toBe('just-me');
+      expect(screen.getByTestId('user-filter-scope').textContent).toBe('everyone');
+      expect(screen.getByTestId('user-filter-allowed-users').textContent).toBe('just-me');
       expect(screen.getByTestId('user-filter-allowlist-count').textContent).toBe('0');
     });
 
     it('should load user filter from settings', async () => {
       mockLocalmost.settings.get.mockResolvedValue({
         userFilter: {
-          mode: 'allowlist',
+          scope: 'trigger',
+          allowedUsers: 'allowlist',
           allowlist: [
             { login: 'user1', avatar_url: '', name: null },
             { login: 'user2', avatar_url: '', name: null },
@@ -580,12 +583,13 @@ describe('AppConfigContext', () => {
       );
 
       await waitFor(() => {
-        expect(screen.getByTestId('user-filter-mode').textContent).toBe('allowlist');
+        expect(screen.getByTestId('user-filter-scope').textContent).toBe('trigger');
+        expect(screen.getByTestId('user-filter-allowed-users').textContent).toBe('allowlist');
         expect(screen.getByTestId('user-filter-allowlist-count').textContent).toBe('2');
       });
     });
 
-    it('should set user filter to just-me', async () => {
+    it('should set user filter to trigger scope with just-me', async () => {
       render(
         <AppConfigProvider>
           <TestConsumer />
@@ -600,9 +604,10 @@ describe('AppConfigContext', () => {
         screen.getByTestId('set-user-filter-just-me').click();
       });
 
-      expect(screen.getByTestId('user-filter-mode').textContent).toBe('just-me');
+      expect(screen.getByTestId('user-filter-scope').textContent).toBe('trigger');
+      expect(screen.getByTestId('user-filter-allowed-users').textContent).toBe('just-me');
       expect(mockLocalmost.settings.set).toHaveBeenCalledWith({
-        userFilter: { mode: 'just-me', allowlist: [] },
+        userFilter: { scope: 'trigger', allowedUsers: 'just-me', allowlist: [] },
       });
     });
 
@@ -621,20 +626,23 @@ describe('AppConfigContext', () => {
         screen.getByTestId('set-user-filter-allowlist').click();
       });
 
-      expect(screen.getByTestId('user-filter-mode').textContent).toBe('allowlist');
+      expect(screen.getByTestId('user-filter-scope').textContent).toBe('trigger');
+      expect(screen.getByTestId('user-filter-allowed-users').textContent).toBe('allowlist');
       expect(screen.getByTestId('user-filter-allowlist-count').textContent).toBe('1');
       expect(mockLocalmost.settings.set).toHaveBeenCalledWith({
         userFilter: {
-          mode: 'allowlist',
+          scope: 'trigger',
+          allowedUsers: 'allowlist',
           allowlist: [{ login: 'testuser', avatar_url: '', name: null }],
         },
       });
     });
 
-    it('should handle invalid user filter mode in settings', async () => {
+    it('should handle invalid user filter scope in settings', async () => {
       mockLocalmost.settings.get.mockResolvedValue({
         userFilter: {
-          mode: 'invalid-mode',
+          scope: 'invalid-scope',
+          allowedUsers: 'just-me',
           allowlist: [],
         },
       });
@@ -650,7 +658,7 @@ describe('AppConfigContext', () => {
       });
 
       // Should fall back to default
-      expect(screen.getByTestId('user-filter-mode').textContent).toBe('just-me');
+      expect(screen.getByTestId('user-filter-scope').textContent).toBe('everyone');
     });
   });
 });

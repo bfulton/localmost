@@ -7,6 +7,7 @@ import { IPC_CHANNELS, Target, Result, RunnerProxyStatus } from '../../shared/ty
 import { getTargetManager } from '../target-manager';
 import { getRunnerProxyManager } from '../runner-proxy-manager';
 import { getLogger, getBrokerProxyService } from '../app-state';
+import { store } from '../store/init';
 
 /**
  * Register all target-related IPC handlers.
@@ -16,7 +17,10 @@ export const registerTargetHandlers = (): void => {
 
   // List all targets
   ipcMain.handle(IPC_CHANNELS.TARGETS_LIST, (): Target[] => {
-    return getTargetManager().getTargets();
+    const targets = getTargetManager().getTargets();
+    // Update store so zubridge syncs to renderer
+    store.getState().setTargets(targets);
+    return targets;
   });
 
   // Add a new target
@@ -80,19 +84,24 @@ export const registerTargetHandlers = (): void => {
   ipcMain.handle(
     IPC_CHANNELS.TARGETS_GET_STATUS,
     (): RunnerProxyStatus[] => {
+      let status: RunnerProxyStatus[];
       const brokerProxy = getBrokerProxyService();
       if (brokerProxy) {
-        return brokerProxy.getStatus();
+        status = brokerProxy.getStatus();
+      } else {
+        // Fallback: return placeholder status based on targets
+        const targets = getTargetManager().getTargets();
+        status = targets.map(t => ({
+          targetId: t.id,
+          registered: true,
+          sessionActive: false,
+          lastPoll: null,
+          jobsAssigned: 0,
+        }));
       }
-      // Fallback: return placeholder status based on targets
-      const targets = getTargetManager().getTargets();
-      return targets.map(t => ({
-        targetId: t.id,
-        registered: true,
-        sessionActive: false,
-        lastPoll: null,
-        jobsAssigned: 0,
-      }));
+      // Update store so zubridge syncs to renderer
+      store.getState().setTargetStatus(status);
+      return status;
     }
   );
 };

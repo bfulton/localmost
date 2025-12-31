@@ -68,7 +68,7 @@ const mainConfig = {
 
 // Preload script configuration
 // Note: Electron 20+ sandboxes preload scripts by default, so Node.js modules
-// are not available. We provide empty fallbacks for modules used by dependencies
+// are not available. We provide shims for modules used by dependencies
 // like the 'debug' library (bundled in @zubridge/electron).
 const preloadConfig = {
   ...commonConfig,
@@ -111,6 +111,11 @@ const preloadConfig = {
         resource.request = resource.request.replace(/^node:/, '');
       }
     ),
+    // Replace global process and tty references with our shims
+    new webpack.ProvidePlugin({
+      process: path.resolve(__dirname, 'scripts/process-shim.js'),
+      tty: path.resolve(__dirname, 'scripts/tty-shim.js'),
+    }),
   ],
 };
 

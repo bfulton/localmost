@@ -39,7 +39,14 @@ export interface MatrixStrategy {
 
 export interface WorkflowJob {
   name?: string;
-  'runs-on': string | string[];
+  /** Runner label(s) - required for regular jobs, absent for reusable workflow calls */
+  'runs-on'?: string | string[];
+  /** Reference to a reusable workflow (e.g., "./.github/workflows/check.yaml") */
+  uses?: string;
+  /** Inputs to pass to a reusable workflow */
+  with?: Record<string, string | number | boolean>;
+  /** Secrets to pass to a reusable workflow ('inherit' or explicit mapping) */
+  secrets?: 'inherit' | Record<string, string>;
   needs?: string | string[];
   if?: string;
   strategy?: MatrixStrategy;
@@ -50,7 +57,8 @@ export interface WorkflowJob {
       'working-directory'?: string;
     };
   };
-  steps: WorkflowStep[];
+  /** Steps to execute - required for regular jobs, absent for reusable workflow calls */
+  steps?: WorkflowStep[];
   outputs?: Record<string, string>;
   'timeout-minutes'?: number;
   'continue-on-error'?: boolean;
@@ -66,9 +74,38 @@ export interface WorkflowTrigger {
   schedule?: { cron: string }[];
 }
 
+/** Input definition for workflow_call trigger */
+export interface WorkflowCallInput {
+  description?: string;
+  required?: boolean;
+  type?: 'string' | 'boolean' | 'number';
+  default?: string | boolean | number;
+}
+
+/** Output definition for workflow_call trigger */
+export interface WorkflowCallOutput {
+  description?: string;
+  value: string;
+}
+
+/** workflow_call trigger configuration */
+export interface WorkflowCallTrigger {
+  inputs?: Record<string, WorkflowCallInput>;
+  outputs?: Record<string, WorkflowCallOutput>;
+  secrets?: Record<string, { description?: string; required?: boolean }>;
+}
+
+/** Parsed reusable workflow with its inputs/outputs */
+export interface ReusableWorkflow extends ParsedWorkflow {
+  /** Input definitions from workflow_call trigger */
+  inputs: Record<string, WorkflowCallInput>;
+  /** Output definitions from workflow_call trigger */
+  outputs: Record<string, WorkflowCallOutput>;
+}
+
 export interface Workflow {
   name?: string;
-  on: string | string[] | Record<string, WorkflowTrigger | null>;
+  on: string | string[] | Record<string, WorkflowTrigger | WorkflowCallTrigger | null>;
   env?: Record<string, string>;
   defaults?: {
     run?: {
@@ -137,6 +174,14 @@ export function parseWorkflowContent(content: string, filePath: string): ParsedW
 
   // Validate each job has required fields
   for (const [jobId, job] of Object.entries(workflow.jobs)) {
+    // Check if this is a reusable workflow call
+    if (job.uses) {
+      // Reusable workflow jobs don't have runs-on or steps
+      // They reference another workflow file
+      continue;
+    }
+
+    // Regular job requires runs-on and steps
     if (!job['runs-on']) {
       throw new Error(`Job "${jobId}" is missing required 'runs-on' field`);
     }
@@ -369,6 +414,9 @@ export function extractSecretReferences(workflow: Workflow): string[] {
       extractFromValue(job.env);
     }
 
+    // Skip reusable workflow jobs (they have no steps)
+    if (!job.steps) continue;
+
     for (const step of job.steps) {
       if (step.env) {
         extractFromValue(step.env);
@@ -406,6 +454,9 @@ export function extractEnvReferences(workflow: Workflow): string[] {
   }
 
   for (const job of Object.values(workflow.jobs)) {
+    // Skip reusable workflow jobs (they have no steps)
+    if (!job.steps) continue;
+
     for (const step of job.steps) {
       if (step.run) {
         extractFromValue(step.run);
@@ -420,4 +471,102 @@ export function extractEnvReferences(workflow: Workflow): string[] {
   }
 
   return Array.from(envVars).sort();
+}
+
+// =============================================================================
+// Reusable Workflow Functions
+// =============================================================================
+
+/**
+ * Check if a job is a reusable workflow call.
+ */
+export function isReusableWorkflowJob(job: WorkflowJob): boolean {
+  return !!job.uses;
+}
+
+/**
+ * Check if a workflow is a reusable workflow (has workflow_call trigger).
+ */
+export function isReusableWorkflow(workflow: Workflow): boolean {
+  if (typeof workflow.on === 'string') {
+    return workflow.on === 'workflow_call';
+  }
+  if (Array.isArray(workflow.on)) {
+    return workflow.on.includes('workflow_call');
+  }
+  return 'workflow_call' in workflow.on;
+}
+
+/**
+ * Parse a reusable workflow file, extracting its inputs and outputs.
+ */
+export function parseReusableWorkflow(filePath: string): ReusableWorkflow {
+  const parsed = parseWorkflowFile(filePath);
+
+  if (!isReusableWorkflow(parsed.workflow)) {
+    throw new Error(`Workflow "${filePath}" is not a reusable workflow (missing workflow_call trigger)`);
+  }
+
+  // Extract inputs and outputs from workflow_call trigger
+  let inputs: Record<string, WorkflowCallInput> = {};
+  let outputs: Record<string, WorkflowCallOutput> = {};
+
+  const on = parsed.workflow.on;
+  if (typeof on === 'object' && !Array.isArray(on) && on.workflow_call) {
+    const callTrigger = on.workflow_call as WorkflowCallTrigger;
+    inputs = callTrigger.inputs || {};
+    outputs = callTrigger.outputs || {};
+  }
+
+  return {
+    ...parsed,
+    inputs,
+    outputs,
+  };
+}
+
+/**
+ * Resolve the file path for a reusable workflow reference.
+ * Handles local references like "./.github/workflows/check.yaml".
+ */
+export function resolveReusableWorkflowPath(
+  uses: string,
+  callerWorkflowPath: string
+): string | null {
+  // Local workflow reference: ./.github/workflows/workflow.yaml
+  if (uses.startsWith('./')) {
+    const repoRoot = path.dirname(path.dirname(path.dirname(callerWorkflowPath)));
+    return path.join(repoRoot, uses.slice(2));
+  }
+
+  // Remote workflow reference: owner/repo/.github/workflows/workflow.yaml@ref
+  // Not supported yet
+  if (uses.includes('/') && uses.includes('@')) {
+    return null;
+  }
+
+  return null;
+}
+
+/**
+ * Resolve inputs for a reusable workflow call.
+ * Combines caller's `with` values with workflow defaults.
+ */
+export function resolveReusableWorkflowInputs(
+  callerInputs: Record<string, string | number | boolean> | undefined,
+  workflowInputDefs: Record<string, WorkflowCallInput>
+): Record<string, string | number | boolean> {
+  const resolved: Record<string, string | number | boolean> = {};
+
+  for (const [name, def] of Object.entries(workflowInputDefs)) {
+    if (callerInputs && name in callerInputs) {
+      resolved[name] = callerInputs[name];
+    } else if (def.default !== undefined) {
+      resolved[name] = def.default;
+    } else if (def.required) {
+      throw new Error(`Required input "${name}" not provided for reusable workflow`);
+    }
+  }
+
+  return resolved;
 }

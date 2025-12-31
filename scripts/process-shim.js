@@ -6,10 +6,14 @@
  * - process.argv for hasFlag() checks
  * - process.stderr.fd for useColors check
  * - process.env for various environment checks
+ *
+ * DEBUG_COLORS=false disables color detection to avoid the process.stderr.fd check
  */
 module.exports = {
   argv: [],
-  env: {},
+  env: {
+    DEBUG_COLORS: 'false',
+  },
   platform: 'browser',
   version: '',
   versions: {},

@@ -10,6 +10,7 @@ import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { RunnerDownloader } from './runner-downloader';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
 import { loadConfig } from './config';
+import { normalizeFilterConfig, isUserAllowed, areAllUsersAllowed, parseRepository } from './runner/user-filter';
 
 /**
  * Get the hostname without .local suffix (common on macOS).
@@ -32,6 +33,8 @@ interface RunnerInstance {
     githubRunId?: number;     // GitHub workflow run ID (for cancellation)
     githubJobId?: number;     // GitHub job ID (for querying conclusion)
     githubActor?: string;     // Username who triggered the workflow
+    githubSha?: string;       // Commit SHA that triggered the workflow
+    githubRef?: string;       // Branch/tag ref (e.g., refs/heads/main)
   } | null;
   name: string;
   jobsCompleted: number;
@@ -65,6 +68,8 @@ interface RunnerManagerOptions {
   cancelWorkflowRun?: (owner: string, repo: string, runId: number) => Promise<void>;
   /** Get job conclusion from GitHub API */
   getJobConclusion?: (owner: string, repo: string, jobId: number) => Promise<string | null>;
+  /** Get all contributors/authors for a repo at a given commit SHA (for contributor filtering) */
+  getAllContributors?: (owner: string, repo: string, sha: string) => Promise<Set<string>>;
   /** Called when a job starts or completes (for notifications) */
   onJobEvent?: (event: JobEvent) => void;
 }
@@ -85,6 +90,7 @@ export class RunnerManager {
   private getCurrentUserLogin?: () => string | undefined;
   private cancelWorkflowRun?: (owner: string, repo: string, runId: number) => Promise<void>;
   private getJobConclusion?: (owner: string, repo: string, jobId: number) => Promise<string | null>;
+  private getAllContributors?: (owner: string, repo: string, sha: string) => Promise<Set<string>>;
   private onJobEvent?: (event: JobEvent) => void;
   private jobHistory: JobHistoryEntry[] = [];
   private jobIdCounter = 0;
@@ -119,7 +125,7 @@ export class RunnerManager {
 
   // Pending target context for jobs received from broker
   // Maps runner name (or 'next') to target context
-  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string }> = new Map();
+  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string; githubSha?: string; githubRef?: string }> = new Map();
 
   /**
    * Validate that a child path stays within the expected base directory.
@@ -152,6 +158,7 @@ export class RunnerManager {
     this.getCurrentUserLogin = options.getCurrentUserLogin;
     this.cancelWorkflowRun = options.cancelWorkflowRun;
     this.getJobConclusion = options.getJobConclusion;
+    this.getAllContributors = options.getAllContributors;
     this.onJobEvent = options.onJobEvent;
 
     this.downloader = new RunnerDownloader();
@@ -277,17 +284,19 @@ export class RunnerManager {
    * @param githubRunId The GitHub workflow run ID (for cancellation)
    * @param githubJobId The GitHub job ID (for querying conclusion)
    * @param githubActor The username who triggered the workflow (for user filtering)
+   * @param githubSha The commit SHA that triggered the workflow
+   * @param githubRef The branch/tag ref (e.g., refs/heads/main)
    */
-  setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string, actionsUrl?: string, githubRunId?: number, githubJobId?: number, githubActor?: string): void {
-    this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName, actionsUrl, githubRunId, githubJobId, githubActor });
-    this.log('debug', `Set pending target context for ${runnerName}: ${targetDisplayName} (runId=${githubRunId}, jobId=${githubJobId}, actor=${githubActor})`);
+  setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string, actionsUrl?: string, githubRunId?: number, githubJobId?: number, githubActor?: string, githubSha?: string, githubRef?: string): void {
+    this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName, actionsUrl, githubRunId, githubJobId, githubActor, githubSha, githubRef });
+    this.log('debug', `Set pending target context for ${runnerName}: ${targetDisplayName} (runId=${githubRunId}, jobId=${githubJobId}, actor=${githubActor}, sha=${githubSha?.slice(0, 7)})`);
   }
 
   /**
    * Consume pending target context for a runner.
    * Returns and removes the context if found.
    */
-  private consumePendingTargetContext(runnerName: string): { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string } | undefined {
+  private consumePendingTargetContext(runnerName: string): { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string; githubSha?: string; githubRef?: string } | undefined {
     // Try exact match first, then fall back to 'next'
     let context = this.pendingTargetContext.get(runnerName);
     if (context) {
@@ -1137,6 +1146,8 @@ export class RunnerManager {
         githubRunId: targetContext?.githubRunId,
         githubJobId: targetContext?.githubJobId,
         githubActor: targetContext?.githubActor,
+        githubSha: targetContext?.githubSha,
+        githubRef: targetContext?.githubRef,
       };
 
       this.log('debug', `[instance ${instanceNum}] Job started: ${jobName} (id: ${instance.currentJob.id})${targetContext ? ` from ${targetContext.targetDisplayName}` : ''}${instance.currentJob.actionsUrl ? ` url=${instance.currentJob.actionsUrl}` : ''}`);
@@ -1237,63 +1248,103 @@ export class RunnerManager {
   }
 
   /**
-   * Check if a user is allowed to trigger jobs based on the user filter configuration.
+   * Check if a single user is allowed by the trigger-based filter.
+   * Used for testing and as a fallback in checkJobUserFilter.
    */
   private isUserAllowed(actorLogin: string): boolean {
-    const userFilter = this.getUserFilter?.();
-
-    // Default to everyone if no filter is set
-    if (!userFilter || userFilter.mode === 'everyone') {
-      return true;
-    }
-
-    if (userFilter.mode === 'just-me') {
-      const currentUser = this.getCurrentUserLogin?.();
-      return currentUser ? actorLogin.toLowerCase() === currentUser.toLowerCase() : true;
-    }
-
-    if (userFilter.mode === 'allowlist') {
-      return userFilter.allowlist.some(
-        (user) => user.login.toLowerCase() === actorLogin.toLowerCase()
-      );
-    }
-
-    return true;
+    return isUserAllowed(actorLogin, this.getUserFilter?.(), this.getCurrentUserLogin?.());
   }
 
   /**
    * Check if a job should be allowed based on user filter.
    * If not allowed, attempts to cancel the workflow run.
-   * Uses stored job info (actor, runId) instead of API lookups.
+   *
+   * Supports three scopes:
+   * - 'everyone': No filtering, all jobs allowed
+   * - 'trigger': Check the workflow trigger author only
+   * - 'contributors': Check all repository contributors/commit authors
    */
   private async checkJobUserFilter(instanceNum: number, _runnerName: string): Promise<void> {
     const instance = this.instances.get(instanceNum);
     if (!instance?.currentJob) return;
 
-    const { githubActor, githubRunId, targetDisplayName } = instance.currentJob;
+    const { githubActor, githubRunId, targetDisplayName, githubSha } = instance.currentJob;
     if (!githubActor || !githubRunId || !targetDisplayName) {
       this.log('debug', `checkJobUserFilter: missing info (actor=${githubActor}, runId=${githubRunId}, target=${targetDisplayName})`);
       return;
     }
 
     const userFilter = this.getUserFilter?.();
-    if (!userFilter || userFilter.mode === 'everyone') {
-      return; // No filtering needed
+    const { scope } = normalizeFilterConfig(userFilter);
+
+    // No filtering in everyone scope
+    if (scope === 'everyone') {
+      return;
     }
 
-    // Check if the actor is allowed
-    const isAllowed = this.isUserAllowed(githubActor);
+    // Parse owner/repo from target display name (e.g., "owner/repo")
+    const repoInfo = parseRepository(targetDisplayName);
+    if (!repoInfo) {
+      this.log('warn', `Cannot parse owner/repo from target: ${targetDisplayName}`);
+      return;
+    }
+    const { owner, repo } = repoInfo;
+    const currentUser = this.getCurrentUserLogin?.();
 
-    if (!isAllowed) {
-      this.log('info', `Job triggered by '${githubActor}' is not in allowed users list. Cancelling workflow run.`);
+    let shouldCancel = false;
+    let reason = '';
 
-      // Parse owner/repo from target display name (e.g., "owner/repo")
-      const parts = targetDisplayName.split('/');
-      if (parts.length !== 2) {
-        this.log('warn', `Cannot parse owner/repo from target: ${targetDisplayName}`);
-        return;
+    if (scope === 'trigger') {
+      // Check if the trigger author is allowed
+      if (!isUserAllowed(githubActor, userFilter, currentUser)) {
+        shouldCancel = true;
+        reason = `trigger author '${githubActor}' not in allowed users`;
+      } else {
+        this.log('debug', `Job triggered by '${githubActor}' is allowed`);
       }
-      const [owner, repo] = parts;
+    } else if (scope === 'contributors') {
+      // Check all repository contributors
+      if (!githubSha) {
+        this.log('warn', `checkJobUserFilter: no SHA for contributors check, falling back to trigger check`);
+        // Fall back to trigger check if no SHA available
+        if (!isUserAllowed(githubActor, userFilter, currentUser)) {
+          shouldCancel = true;
+          reason = `trigger author '${githubActor}' not in allowed users (no SHA for contributors check)`;
+        }
+      } else if (!this.getAllContributors) {
+        this.log('warn', 'checkJobUserFilter: getAllContributors not available, falling back to trigger check');
+        if (!isUserAllowed(githubActor, userFilter, currentUser)) {
+          shouldCancel = true;
+          reason = `trigger author '${githubActor}' not in allowed users (contributors check unavailable)`;
+        }
+      } else {
+        try {
+          // Get all contributors/authors for the repo at this SHA
+          const contributors = await this.getAllContributors(owner, repo, githubSha);
+          this.log('debug', `checkJobUserFilter: found ${contributors.size} contributors for ${owner}/${repo} at ${githubSha.slice(0, 7)}`);
+
+          // Check if all contributors are allowed
+          const result = areAllUsersAllowed(contributors, userFilter, currentUser);
+
+          if (!result.allowed) {
+            shouldCancel = true;
+            const disallowedList = result.disallowedUsers.slice(0, 3).join(', ');
+            const suffix = result.disallowedUsers.length > 3 ? ` and ${result.disallowedUsers.length - 3} more` : '';
+            reason = `repo has disallowed contributors: ${disallowedList}${suffix}`;
+          } else {
+            this.log('debug', `All ${contributors.size} contributors for ${owner}/${repo} are allowed`);
+          }
+        } catch (err) {
+          // If contributor check fails, fail safe (cancel the job)
+          this.log('warn', `Failed to get contributors: ${(err as Error).message}, cancelling job for safety`);
+          shouldCancel = true;
+          reason = `contributor check failed: ${(err as Error).message}`;
+        }
+      }
+    }
+
+    if (shouldCancel) {
+      this.log('info', `Job not allowed: ${reason}. Cancelling workflow run.`);
 
       if (!this.cancelWorkflowRun) {
         this.log('warn', 'Cannot cancel: cancelWorkflowRun not available');
@@ -1302,12 +1353,10 @@ export class RunnerManager {
 
       try {
         await this.cancelWorkflowRun(owner, repo, githubRunId);
-        this.log('info', `Cancelled workflow run ${githubRunId} triggered by '${githubActor}'`);
+        this.log('info', `Cancelled workflow run ${githubRunId}: ${reason}`);
       } catch (cancelErr) {
         this.log('warn', `Failed to cancel workflow run ${githubRunId}: ${(cancelErr as Error).message}`);
       }
-    } else {
-      this.log('debug', `Job triggered by '${githubActor}' is allowed`);
     }
   }
 

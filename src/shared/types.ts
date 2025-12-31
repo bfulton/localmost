@@ -225,12 +225,13 @@ export interface GitHubUser {
 
 export interface GitHubRepo {
   id: number;
+  name?: string;
   full_name: string;
   private: boolean;
   html_url: string;
   owner: {
     login: string;
-    type: string;
+    avatar_url: string;
   };
 }
 
@@ -286,6 +287,7 @@ export interface AppSettings {
 export interface DeviceCodeInfo {
   userCode: string;
   verificationUri: string;
+  copiedToClipboard?: boolean;
 }
 
 export interface HeartbeatStatus {
@@ -297,8 +299,14 @@ export interface HeartbeatStatus {
 // User Filter Types
 // =============================================================================
 
-/** Mode for filtering jobs by triggering user */
+/** @deprecated Use FilterScope instead */
 export type UserFilterMode = 'everyone' | 'just-me' | 'allowlist';
+
+/** What to check when filtering jobs */
+export type FilterScope = 'everyone' | 'trigger' | 'contributors';
+
+/** Who is allowed when scope is not 'everyone' */
+export type AllowedUsers = 'just-me' | 'allowlist';
 
 /** A GitHub user for the filter allowlist */
 export interface AllowlistUser {
@@ -307,11 +315,25 @@ export interface AllowlistUser {
   name: string | null;
 }
 
-/** User filter configuration */
+/**
+ * User filter configuration.
+ *
+ * Two-dimensional model:
+ * - scope: What to check (everyone, trigger author, or all contributors)
+ * - allowedUsers: Who is allowed (just me, or explicit allowlist)
+ *
+ * For backwards compatibility, also supports legacy 'mode' field.
+ */
 export interface UserFilterConfig {
-  mode: UserFilterMode;
-  /** List of allowed users (only used when mode is 'allowlist') */
+  /** What to check when filtering */
+  scope: FilterScope;
+  /** Who is allowed (when scope is not 'everyone') */
+  allowedUsers: AllowedUsers;
+  /** List of allowed users (used when allowedUsers is 'allowlist') */
   allowlist: AllowlistUser[];
+
+  /** @deprecated Legacy field - use scope/allowedUsers instead */
+  mode?: UserFilterMode;
 }
 
 /** Search result for GitHub users */

@@ -182,6 +182,8 @@ export interface GitHubJobInfo {
   githubJobId?: number;
   githubRepo?: string;
   githubActor?: string;  // Username who triggered the workflow
+  githubSha?: string;    // Commit SHA that triggered the workflow
+  githubRef?: string;    // Branch/tag ref (e.g., refs/heads/main)
 }
 
 export interface BrokerProxyEvents {
@@ -430,6 +432,8 @@ export class BrokerProxyService extends EventEmitter {
       let githubJobId: number | undefined;
       let githubRepo: string | undefined;
       let githubActor: string | undefined;
+      let githubSha: string | undefined;
+      let githubRef: string | undefined;
       if (runServiceUrl) {
         const jobDetails = await this.acquireJobUpstream(state, instance, jobId, runServiceUrl, billingOwnerId);
         if (jobDetails) {
@@ -437,7 +441,7 @@ export class BrokerProxyService extends EventEmitter {
           this.acquiredJobDetails.set(messageId, jobDetails);
           log()?.info(`[BrokerProxy] Acquired job ${jobId} (messageId=${messageId}) upstream, stored details`);
 
-          // Extract run_id, job ID, and actor from job details
+          // Extract run_id, job ID, actor, sha, ref from job details
           try {
             const parsed = JSON.parse(jobDetails);
 
@@ -448,6 +452,8 @@ export class BrokerProxyService extends EventEmitter {
                 if (item.k === 'run_id') githubRunId = parseInt(item.v, 10);
                 if (item.k === 'repository') githubRepo = item.v;
                 if (item.k === 'actor') githubActor = item.v;
+                if (item.k === 'sha') githubSha = item.v;
+                if (item.k === 'ref') githubRef = item.v;
               }
             }
 
@@ -459,7 +465,7 @@ export class BrokerProxyService extends EventEmitter {
               }
             }
 
-            log()?.info(`[BrokerProxy] Extracted: run_id=${githubRunId}, job_id=${githubJobId}, repo=${githubRepo}, actor=${githubActor}`);
+            log()?.info(`[BrokerProxy] Extracted: run_id=${githubRunId}, job_id=${githubJobId}, repo=${githubRepo}, actor=${githubActor}, sha=${githubSha?.slice(0, 7)}`);
           } catch (e) {
             log()?.warn(`[BrokerProxy] Failed to parse job details for IDs: ${(e as Error).message}`);
           }
@@ -504,6 +510,8 @@ export class BrokerProxyService extends EventEmitter {
         githubJobId,
         githubRepo,
         githubActor,
+        githubSha,
+        githubRef,
       });
       this.emitStatusUpdate();
     } else {
@@ -560,10 +568,15 @@ export class BrokerProxyService extends EventEmitter {
     );
 
     // Wait for all deletions with a timeout to not block shutdown forever
+    let timeoutId: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<void>(resolve => {
+      timeoutId = setTimeout(resolve, 5000);
+    });
     await Promise.race([
       Promise.allSettled(deletionPromises),
-      new Promise(resolve => setTimeout(resolve, 5000)), // 5 second timeout
+      timeoutPromise,
     ]);
+    if (timeoutId) clearTimeout(timeoutId);
 
     return new Promise((resolve) => {
       // Force close all connections immediately - don't wait for long-polls to timeout

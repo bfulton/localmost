@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faXmark } from '@fortawesome/free-solid-svg-icons';
-import { UserFilterMode, AllowlistUser, UserFilterConfig } from '../../shared/types';
+import { FilterScope, AllowedUsers, AllowlistUser, UserFilterConfig } from '../../shared/types';
 import styles from './UserFilterSettings.module.css';
 import shared from '../styles/shared.module.css';
 
@@ -22,6 +22,7 @@ const UserFilterSettings: React.FC<UserFilterSettingsProps> = ({
   const [showDropdown, setShowDropdown] = useState(false);
   const searchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
+  const currentSearchRef = useRef<string>(''); // Track current search to prevent stale results
 
   // Close dropdown when clicking outside
   useEffect(() => {
@@ -42,20 +43,32 @@ const UserFilterSettings: React.FC<UserFilterSettingsProps> = ({
       return;
     }
 
+    // Track this search so we can ignore stale results
+    currentSearchRef.current = query;
     setIsSearching(true);
+
     try {
       const result = await window.localmost.github.searchUsers(query);
+
+      // Only update results if this is still the current search
+      if (currentSearchRef.current !== query) {
+        return; // Stale result, ignore
+      }
+
       if (result.success && result.users) {
-        // Filter out users already in the allowlist
-        const filtered = result.users.filter(
-          (user: AllowlistUser) => !userFilter.allowlist.some((u) => u.login === user.login)
-        );
+        // Filter out users already in the allowlist and limit to 10 results
+        const filtered = result.users
+          .filter((user: AllowlistUser) => !userFilter.allowlist.some((u) => u.login === user.login))
+          .slice(0, 10);
         setSearchResults(filtered);
       }
     } catch (error) {
       console.error('User search failed:', error);
     } finally {
-      setIsSearching(false);
+      // Only clear loading if this is still the current search
+      if (currentSearchRef.current === query) {
+        setIsSearching(false);
+      }
     }
   }, [userFilter.allowlist]);
 
@@ -70,16 +83,30 @@ const UserFilterSettings: React.FC<UserFilterSettingsProps> = ({
       clearTimeout(searchTimeoutRef.current);
     }
 
-    // Debounce search
+    // Clear results immediately when query changes to avoid showing stale results
+    if (!query.trim()) {
+      setSearchResults([]);
+      currentSearchRef.current = '';
+      return;
+    }
+
+    // Debounce search - wait 1 second for user to pause typing
     searchTimeoutRef.current = setTimeout(() => {
       searchUsers(query);
-    }, 300);
+    }, 1000);
   };
 
-  const handleModeChange = (mode: UserFilterMode) => {
+  const handleScopeChange = (scope: FilterScope) => {
     onFilterChange({
       ...userFilter,
-      mode,
+      scope,
+    });
+  };
+
+  const handleAllowedUsersChange = (allowedUsers: AllowedUsers) => {
+    onFilterChange({
+      ...userFilter,
+      allowedUsers,
     });
   };
 
@@ -100,43 +127,83 @@ const UserFilterSettings: React.FC<UserFilterSettingsProps> = ({
     });
   };
 
+  // Get hint text for scope
+  const getScopeHint = () => {
+    switch (userFilter.scope) {
+      case 'everyone':
+        return 'Accept workflow jobs triggered by any user.';
+      case 'trigger':
+        return 'Check who triggered the workflow and filter based on that user.';
+      case 'contributors':
+        return 'Check all contributors to the repository and ensure all are trusted.';
+      default:
+        return '';
+    }
+  };
+
+  // Get hint text for allowedUsers
+  const getAllowedUsersHint = () => {
+    if (userFilter.allowedUsers === 'just-me') {
+      return currentUserLogin
+        ? `Only @${currentUserLogin}. Jobs involving other users will be cancelled.`
+        : 'Only you. Jobs involving other users will be cancelled.';
+    }
+    return 'Only users in the list below. Jobs involving other users will be cancelled.';
+  };
+
   return (
     <div className={styles.userFilterSettings}>
+      {/* Scope selector: What to check */}
       <div className={shared.formGroup}>
-        <label>Accept jobs from</label>
+        <label>Filter scope</label>
         <div className={styles.modeSelector}>
           <button
-            className={userFilter.mode === 'everyone' ? styles.modeOptionActive : styles.modeOption}
-            onClick={() => handleModeChange('everyone')}
+            className={userFilter.scope === 'everyone' ? styles.modeOptionActive : styles.modeOption}
+            onClick={() => handleScopeChange('everyone')}
           >
             Everyone
           </button>
           <button
-            className={userFilter.mode === 'just-me' ? styles.modeOptionActive : styles.modeOption}
-            onClick={() => handleModeChange('just-me')}
-            title={currentUserLogin ? `Only jobs triggered by @${currentUserLogin}` : 'Only jobs triggered by you'}
+            className={userFilter.scope === 'trigger' ? styles.modeOptionActive : styles.modeOption}
+            onClick={() => handleScopeChange('trigger')}
           >
-            Just me
+            Trigger author
           </button>
           <button
-            className={userFilter.mode === 'allowlist' ? styles.modeOptionActive : styles.modeOption}
-            onClick={() => handleModeChange('allowlist')}
+            className={userFilter.scope === 'contributors' ? styles.modeOptionActive : styles.modeOption}
+            onClick={() => handleScopeChange('contributors')}
           >
-            Specific users
+            All contributors
           </button>
         </div>
-        <p className={shared.formHint}>
-          {userFilter.mode === 'everyone' && 'Accept workflow jobs triggered by any user.'}
-          {userFilter.mode === 'just-me' && (
-            currentUserLogin
-              ? `Only accept jobs triggered by @${currentUserLogin}. Jobs from other users will be cancelled.`
-              : 'Only accept jobs you trigger. Jobs from other users will be cancelled.'
-          )}
-          {userFilter.mode === 'allowlist' && 'Only accept jobs triggered by users in the list below.'}
-        </p>
+        <p className={shared.formHint}>{getScopeHint()}</p>
       </div>
 
-      {userFilter.mode === 'allowlist' && (
+      {/* AllowedUsers selector: Who is allowed (shown when scope is not 'everyone') */}
+      {userFilter.scope !== 'everyone' && (
+        <div className={shared.formGroup}>
+          <label>Who is allowed</label>
+          <div className={styles.modeSelector}>
+            <button
+              className={userFilter.allowedUsers === 'just-me' ? styles.modeOptionActive : styles.modeOption}
+              onClick={() => handleAllowedUsersChange('just-me')}
+              title={currentUserLogin ? `Only @${currentUserLogin}` : 'Only you'}
+            >
+              Just me
+            </button>
+            <button
+              className={userFilter.allowedUsers === 'allowlist' ? styles.modeOptionActive : styles.modeOption}
+              onClick={() => handleAllowedUsersChange('allowlist')}
+            >
+              Allowlist
+            </button>
+          </div>
+          <p className={shared.formHint}>{getAllowedUsersHint()}</p>
+        </div>
+      )}
+
+      {/* Allowlist user search and list (shown when allowedUsers is 'allowlist' and scope is not 'everyone') */}
+      {userFilter.scope !== 'everyone' && userFilter.allowedUsers === 'allowlist' && (
         <div className={styles.allowlistSection}>
           <div className={styles.searchContainer} ref={dropdownRef}>
             <input

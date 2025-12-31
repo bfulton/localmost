@@ -42,6 +42,10 @@ export interface ExecutionContext {
   secrets: Record<string, string>;
   /** Previous step outputs (step_id -> outputs) */
   stepOutputs: Record<string, Record<string, string>>;
+  /** Inputs from workflow_call (for reusable workflows) */
+  inputs?: Record<string, string | number | boolean>;
+  /** Outputs from jobs this job depends on (needs context) */
+  needs?: Record<string, Record<string, string>>;
   /** Sandbox policy to enforce */
   policy?: SandboxPolicy;
   /** Whether running in permissive/discovery mode */
@@ -194,6 +198,20 @@ export function expandExpression(
     if (stepsMatch) {
       const [, stepId, outputName] = stepsMatch;
       return ctx.stepOutputs[stepId]?.[outputName] || '';
+    }
+
+    // inputs.VAR (for reusable workflows)
+    if (trimmed.startsWith('inputs.')) {
+      const inputName = trimmed.slice(7);
+      const value = ctx.inputs?.[inputName];
+      return value !== undefined ? String(value) : '';
+    }
+
+    // needs.JOB_ID.outputs.VAR
+    const needsMatch = trimmed.match(/^needs\.([^.]+)\.outputs\.(.+)$/);
+    if (needsMatch) {
+      const [, jobId, outputName] = needsMatch;
+      return ctx.needs?.[jobId]?.[outputName] || '';
     }
 
     // github.* context

@@ -295,12 +295,12 @@ describe('RunnerManager', () => {
   });
 
   describe('user filtering', () => {
-    it('should allow all users when filter mode is everyone', () => {
+    it('should allow all users when filter scope is everyone', () => {
       const manager = new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getUserFilter: () => ({ mode: 'everyone', allowlist: [] }),
+        getUserFilter: () => ({ scope: 'everyone', allowedUsers: 'just-me', allowlist: [] }),
         getCurrentUserLogin: () => 'testuser',
       });
       const helper = new RunnerManagerTestHelper(manager);
@@ -320,12 +320,12 @@ describe('RunnerManager', () => {
       expect(helper.isUserAllowed('anyuser')).toBe(true);
     });
 
-    it('should only allow current user when filter mode is just-me', () => {
+    it('should only allow current user when trigger scope with just-me', () => {
       const manager = new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getUserFilter: () => ({ mode: 'just-me', allowlist: [] }),
+        getUserFilter: () => ({ scope: 'trigger', allowedUsers: 'just-me', allowlist: [] }),
         getCurrentUserLogin: () => 'testuser',
       });
       const helper = new RunnerManagerTestHelper(manager);
@@ -335,13 +335,14 @@ describe('RunnerManager', () => {
       expect(helper.isUserAllowed('otheruser')).toBe(false);
     });
 
-    it('should only allow users in allowlist when filter mode is allowlist', () => {
+    it('should only allow users in allowlist when trigger scope with allowlist', () => {
       const manager = new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
         getUserFilter: () => ({
-          mode: 'allowlist',
+          scope: 'trigger',
+          allowedUsers: 'allowlist',
           allowlist: [
             { login: 'user1', avatar_url: '', name: null },
             { login: 'user2', avatar_url: '', name: null },
@@ -356,12 +357,12 @@ describe('RunnerManager', () => {
       expect(helper.isUserAllowed('user3')).toBe(false);
     });
 
-    it('should allow user when just-me mode but no current user is set', () => {
+    it('should allow user when just-me but no current user is set', () => {
       const manager = new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getUserFilter: () => ({ mode: 'just-me', allowlist: [] }),
+        getUserFilter: () => ({ scope: 'trigger', allowedUsers: 'just-me', allowlist: [] }),
         getCurrentUserLogin: () => undefined,
       });
       const helper = new RunnerManagerTestHelper(manager);
@@ -375,7 +376,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getUserFilter: () => ({ mode: 'allowlist', allowlist: [] }),
+        getUserFilter: () => ({ scope: 'trigger', allowedUsers: 'allowlist', allowlist: [] }),
       });
       const helper = new RunnerManagerTestHelper(manager);
 
