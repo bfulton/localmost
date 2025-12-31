@@ -2,37 +2,129 @@
  * User Filter
  *
  * Handles user filtering for job acceptance.
- * Supports everyone, just-me, and allowlist modes.
+ *
+ * Two-dimensional model:
+ * - scope: What to check (everyone, trigger author, or all contributors)
+ * - allowedUsers: Who is allowed (just me, or explicit allowlist)
+ *
+ * Also supports legacy 'mode' field for backwards compatibility.
  */
 
-import type { UserFilterConfig } from '../../shared/types';
+import type { UserFilterConfig, FilterScope, AllowedUsers } from '../../shared/types';
 
 /**
- * Check if a user is allowed based on filter configuration.
+ * Normalize a filter config, handling legacy 'mode' field.
+ * Returns the effective scope and allowedUsers.
+ */
+export function normalizeFilterConfig(
+  userFilter: UserFilterConfig | undefined
+): { scope: FilterScope; allowedUsers: AllowedUsers; allowlist: string[] } {
+  if (!userFilter) {
+    return { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] };
+  }
+
+  // Handle new format
+  if (userFilter.scope) {
+    return {
+      scope: userFilter.scope,
+      allowedUsers: userFilter.allowedUsers || 'just-me',
+      allowlist: (userFilter.allowlist || []).map(u => u.login.toLowerCase()),
+    };
+  }
+
+  // Handle legacy 'mode' field
+  if (userFilter.mode) {
+    switch (userFilter.mode) {
+      case 'everyone':
+        return { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] };
+      case 'just-me':
+        return { scope: 'trigger', allowedUsers: 'just-me', allowlist: [] };
+      case 'allowlist':
+        return {
+          scope: 'trigger',
+          allowedUsers: 'allowlist',
+          allowlist: (userFilter.allowlist || []).map(u => u.login.toLowerCase()),
+        };
+    }
+  }
+
+  return { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] };
+}
+
+/**
+ * Check if a single user is allowed based on filter configuration.
+ * Used for 'trigger' scope to check the workflow trigger.
  */
 export function isUserAllowed(
-  actorLogin: string,
+  login: string,
   userFilter: UserFilterConfig | undefined,
   currentUserLogin: string | undefined
 ): boolean {
-  // No filter or everyone mode - allow all
-  if (!userFilter || userFilter.mode === 'everyone') {
+  const { scope, allowedUsers, allowlist } = normalizeFilterConfig(userFilter);
+
+  // Everyone scope - allow all
+  if (scope === 'everyone') {
     return true;
   }
 
-  // Just-me mode - only allow current user
-  if (userFilter.mode === 'just-me') {
-    // If we don't know who we are, allow (fail open)
-    if (!currentUserLogin) return true;
-    return actorLogin.toLowerCase() === currentUserLogin.toLowerCase();
+  // Check the user against allowedUsers setting
+  return isLoginAllowed(login, allowedUsers, allowlist, currentUserLogin);
+}
+
+/**
+ * Check if ALL users in a set are allowed.
+ * Used for 'contributors' scope to check all repo contributors.
+ */
+export function areAllUsersAllowed(
+  logins: Set<string>,
+  userFilter: UserFilterConfig | undefined,
+  currentUserLogin: string | undefined
+): { allowed: boolean; disallowedUsers: string[] } {
+  const { scope, allowedUsers, allowlist } = normalizeFilterConfig(userFilter);
+
+  // Everyone scope - allow all
+  if (scope === 'everyone') {
+    return { allowed: true, disallowedUsers: [] };
   }
 
-  // Allowlist mode - check if user is in list
-  if (userFilter.mode === 'allowlist') {
-    const allowlist = userFilter.allowlist ?? [];
-    return allowlist.some(allowed =>
-      allowed.toLowerCase() === actorLogin.toLowerCase()
-    );
+  const disallowedUsers: string[] = [];
+
+  for (const login of logins) {
+    if (!isLoginAllowed(login, allowedUsers, allowlist, currentUserLogin)) {
+      disallowedUsers.push(login);
+    }
+  }
+
+  return {
+    allowed: disallowedUsers.length === 0,
+    disallowedUsers,
+  };
+}
+
+/**
+ * Check if a login is allowed by the allowedUsers setting.
+ */
+function isLoginAllowed(
+  login: string,
+  allowedUsers: AllowedUsers,
+  allowlist: string[],
+  currentUserLogin: string | undefined
+): boolean {
+  const loginLower = login.toLowerCase();
+
+  if (allowedUsers === 'just-me') {
+    // If we don't know who we are, allow (fail open)
+    if (!currentUserLogin) return true;
+    return loginLower === currentUserLogin.toLowerCase();
+  }
+
+  if (allowedUsers === 'allowlist') {
+    // Check if user is in the allowlist
+    // Also include current user automatically
+    if (currentUserLogin && loginLower === currentUserLogin.toLowerCase()) {
+      return true;
+    }
+    return allowlist.includes(loginLower);
   }
 
   return true;
@@ -104,14 +196,15 @@ export class UserFilterManager {
     }
 
     const userFilter = this.getFilter();
+    const { scope } = normalizeFilterConfig(userFilter);
 
-    // No filtering in everyone mode
-    if (!userFilter || userFilter.mode === 'everyone') {
+    // No filtering in everyone scope
+    if (scope === 'everyone') {
       return true;
     }
 
     if (!this.isAllowed(actorLogin)) {
-      log(`Job from ${actorLogin} not allowed by filter (mode: ${userFilter.mode}), cancelling...`);
+      log(`Job from ${actorLogin} not allowed by filter (scope: ${scope}), cancelling...`);
 
       const repoInfo = parseRepository(repository);
       if (!repoInfo) {

@@ -5,7 +5,7 @@ import { mockLocalmost } from '../../../test/setup-renderer';
 import { UserFilterConfig } from '../../shared/types';
 
 describe('UserFilterSettings', () => {
-  const defaultFilter: UserFilterConfig = { mode: 'everyone', allowlist: [] };
+  const defaultFilter: UserFilterConfig = { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] };
   const mockOnFilterChange = jest.fn();
 
   beforeEach(() => {
@@ -13,8 +13,8 @@ describe('UserFilterSettings', () => {
     mockLocalmost.github.searchUsers.mockResolvedValue({ success: true, users: [] });
   });
 
-  describe('Mode Selection', () => {
-    it('should render with everyone mode selected by default', () => {
+  describe('Scope Selection', () => {
+    it('should render with everyone scope selected by default', () => {
       render(
         <UserFilterSettings
           userFilter={defaultFilter}
@@ -23,15 +23,15 @@ describe('UserFilterSettings', () => {
         />
       );
 
-      // Verify all mode buttons are rendered
+      // Verify all scope buttons are rendered
       expect(screen.getByRole('button', { name: 'Everyone' })).toBeInTheDocument();
-      expect(screen.getByRole('button', { name: 'Just me' })).toBeInTheDocument();
-      expect(screen.getByRole('button', { name: 'Specific users' })).toBeInTheDocument();
-      // Verify hint text for everyone mode
+      expect(screen.getByRole('button', { name: 'Trigger author' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'All contributors' })).toBeInTheDocument();
+      // Verify hint text for everyone scope
       expect(screen.getByText(/Accept workflow jobs triggered by any user/)).toBeInTheDocument();
     });
 
-    it('should switch to just-me mode when clicked', async () => {
+    it('should switch to trigger scope when clicked', async () => {
       render(
         <UserFilterSettings
           userFilter={defaultFilter}
@@ -41,16 +41,17 @@ describe('UserFilterSettings', () => {
       );
 
       await act(async () => {
-        fireEvent.click(screen.getByRole('button', { name: 'Just me' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Trigger author' }));
       });
 
       expect(mockOnFilterChange).toHaveBeenCalledWith({
-        mode: 'just-me',
+        scope: 'trigger',
+        allowedUsers: 'just-me',
         allowlist: [],
       });
     });
 
-    it('should switch to allowlist mode when clicked', async () => {
+    it('should switch to contributors scope when clicked', async () => {
       render(
         <UserFilterSettings
           userFilter={defaultFilter}
@@ -60,19 +61,20 @@ describe('UserFilterSettings', () => {
       );
 
       await act(async () => {
-        fireEvent.click(screen.getByRole('button', { name: 'Specific users' }));
+        fireEvent.click(screen.getByRole('button', { name: 'All contributors' }));
       });
 
       expect(mockOnFilterChange).toHaveBeenCalledWith({
-        mode: 'allowlist',
+        scope: 'contributors',
+        allowedUsers: 'just-me',
         allowlist: [],
       });
     });
 
-    it('should show correct hint for each mode', () => {
+    it('should show correct hint for each scope', () => {
       const { rerender } = render(
         <UserFilterSettings
-          userFilter={{ mode: 'everyone', allowlist: [] }}
+          userFilter={{ scope: 'everyone', allowedUsers: 'just-me', allowlist: [] }}
           currentUserLogin="testuser"
           onFilterChange={mockOnFilterChange}
         />
@@ -82,30 +84,78 @@ describe('UserFilterSettings', () => {
 
       rerender(
         <UserFilterSettings
-          userFilter={{ mode: 'just-me', allowlist: [] }}
+          userFilter={{ scope: 'trigger', allowedUsers: 'just-me', allowlist: [] }}
           currentUserLogin="testuser"
           onFilterChange={mockOnFilterChange}
         />
       );
 
-      expect(screen.getByText(/Only accept jobs triggered by @testuser/)).toBeInTheDocument();
+      expect(screen.getByText(/Check who triggered the workflow/)).toBeInTheDocument();
 
       rerender(
         <UserFilterSettings
-          userFilter={{ mode: 'allowlist', allowlist: [] }}
+          userFilter={{ scope: 'contributors', allowedUsers: 'just-me', allowlist: [] }}
           currentUserLogin="testuser"
           onFilterChange={mockOnFilterChange}
         />
       );
 
-      expect(screen.getByText(/Only accept jobs triggered by users in the list below/)).toBeInTheDocument();
+      expect(screen.getByText(/Check all contributors to the repository/)).toBeInTheDocument();
+    });
+  });
+
+  describe('AllowedUsers Selection', () => {
+    it('should show allowedUsers selector when scope is trigger', () => {
+      render(
+        <UserFilterSettings
+          userFilter={{ scope: 'trigger', allowedUsers: 'just-me', allowlist: [] }}
+          currentUserLogin="testuser"
+          onFilterChange={mockOnFilterChange}
+        />
+      );
+
+      expect(screen.getByRole('button', { name: 'Just me' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Allowlist' })).toBeInTheDocument();
+    });
+
+    it('should not show allowedUsers selector when scope is everyone', () => {
+      render(
+        <UserFilterSettings
+          userFilter={{ scope: 'everyone', allowedUsers: 'just-me', allowlist: [] }}
+          currentUserLogin="testuser"
+          onFilterChange={mockOnFilterChange}
+        />
+      );
+
+      // Only the scope buttons should be visible, not the allowedUsers buttons
+      expect(screen.queryAllByRole('button', { name: 'Just me' })).toHaveLength(0);
+    });
+
+    it('should switch to allowlist when clicked', async () => {
+      render(
+        <UserFilterSettings
+          userFilter={{ scope: 'trigger', allowedUsers: 'just-me', allowlist: [] }}
+          currentUserLogin="testuser"
+          onFilterChange={mockOnFilterChange}
+        />
+      );
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Allowlist' }));
+      });
+
+      expect(mockOnFilterChange).toHaveBeenCalledWith({
+        scope: 'trigger',
+        allowedUsers: 'allowlist',
+        allowlist: [],
+      });
     });
   });
 
   describe('Allowlist Mode', () => {
-    const allowlistFilter: UserFilterConfig = { mode: 'allowlist', allowlist: [] };
+    const allowlistFilter: UserFilterConfig = { scope: 'trigger', allowedUsers: 'allowlist', allowlist: [] };
 
-    it('should show search input in allowlist mode', () => {
+    it('should show search input when allowedUsers is allowlist and scope is not everyone', () => {
       render(
         <UserFilterSettings
           userFilter={allowlistFilter}
@@ -117,10 +167,10 @@ describe('UserFilterSettings', () => {
       expect(screen.getByPlaceholderText('Search GitHub users...')).toBeInTheDocument();
     });
 
-    it('should not show search input in other modes', () => {
+    it('should not show search input in everyone scope', () => {
       render(
         <UserFilterSettings
-          userFilter={{ mode: 'everyone', allowlist: [] }}
+          userFilter={{ scope: 'everyone', allowedUsers: 'just-me', allowlist: [] }}
           currentUserLogin="testuser"
           onFilterChange={mockOnFilterChange}
         />
@@ -155,9 +205,9 @@ describe('UserFilterSettings', () => {
         fireEvent.change(searchInput, { target: { value: 'user' } });
       });
 
-      // Advance timers for debounce
+      // Advance timers for debounce (1 second)
       await act(async () => {
-        jest.advanceTimersByTime(300);
+        jest.advanceTimersByTime(1000);
       });
 
       expect(mockLocalmost.github.searchUsers).toHaveBeenCalledWith('user');
@@ -191,7 +241,7 @@ describe('UserFilterSettings', () => {
       });
 
       await act(async () => {
-        jest.advanceTimersByTime(300);
+        jest.advanceTimersByTime(1000);
       });
 
       await waitFor(() => {
@@ -228,7 +278,7 @@ describe('UserFilterSettings', () => {
       });
 
       await act(async () => {
-        jest.advanceTimersByTime(300);
+        jest.advanceTimersByTime(1000);
       });
 
       await waitFor(() => {
@@ -240,7 +290,8 @@ describe('UserFilterSettings', () => {
       });
 
       expect(mockOnFilterChange).toHaveBeenCalledWith({
-        mode: 'allowlist',
+        scope: 'trigger',
+        allowedUsers: 'allowlist',
         allowlist: [{ login: 'newuser', avatar_url: 'https://example.com/avatar.png', name: 'New User' }],
       });
 
@@ -249,7 +300,8 @@ describe('UserFilterSettings', () => {
 
     it('should display existing allowlist users', () => {
       const filterWithUsers: UserFilterConfig = {
-        mode: 'allowlist',
+        scope: 'trigger',
+        allowedUsers: 'allowlist',
         allowlist: [
           { login: 'existinguser', avatar_url: '', name: 'Existing User' },
         ],
@@ -269,7 +321,8 @@ describe('UserFilterSettings', () => {
 
     it('should remove user from allowlist when remove button clicked', async () => {
       const filterWithUsers: UserFilterConfig = {
-        mode: 'allowlist',
+        scope: 'trigger',
+        allowedUsers: 'allowlist',
         allowlist: [
           { login: 'usertoremove', avatar_url: '', name: 'User To Remove' },
         ],
@@ -290,7 +343,8 @@ describe('UserFilterSettings', () => {
       });
 
       expect(mockOnFilterChange).toHaveBeenCalledWith({
-        mode: 'allowlist',
+        scope: 'trigger',
+        allowedUsers: 'allowlist',
         allowlist: [],
       });
     });
@@ -311,7 +365,8 @@ describe('UserFilterSettings', () => {
       jest.useFakeTimers();
 
       const filterWithUsers: UserFilterConfig = {
-        mode: 'allowlist',
+        scope: 'trigger',
+        allowedUsers: 'allowlist',
         allowlist: [
           { login: 'existinguser', avatar_url: '', name: 'Existing User' },
         ],
@@ -341,7 +396,7 @@ describe('UserFilterSettings', () => {
       });
 
       await act(async () => {
-        jest.advanceTimersByTime(300);
+        jest.advanceTimersByTime(1000);
       });
 
       // Should only show newuser in search results, not existinguser

@@ -148,7 +148,7 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     sleepProtectionConsented: false,
     preserveWorkDir: 'never',
     toolCacheLocation: 'persistent',
-    userFilter: { mode: 'just-me', allowlist: [] },
+    userFilter: { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] },
     power: DEFAULT_POWER_CONFIG,
     notifications: DEFAULT_NOTIFICATIONS_CONFIG,
     isOnline: true,
@@ -217,7 +217,7 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
           sleepProtectionConsented: settings.sleepProtectionConsented || prev.sleepProtectionConsented,
           preserveWorkDir: (settings.preserveWorkDir as 'never' | 'session' | 'always') || prev.preserveWorkDir,
           toolCacheLocation: (settings.toolCacheLocation as ToolCacheLocation) || prev.toolCacheLocation,
-          userFilter: settings.userFilter && ['just-me', 'allowlist', 'anyone'].includes((settings.userFilter as UserFilterConfig).mode)
+          userFilter: settings.userFilter && ['everyone', 'trigger', 'contributors'].includes((settings.userFilter as UserFilterConfig).scope)
             ? (settings.userFilter as UserFilterConfig)
             : prev.userFilter,
           power: settings.power ? { ...DEFAULT_POWER_CONFIG, ...(settings.power as PowerConfig) } : prev.power,

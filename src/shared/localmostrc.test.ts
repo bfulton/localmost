@@ -3,7 +3,6 @@
  */
 
 import * as fs from 'fs';
-import * as path from 'path';
 import {
   findLocalmostrc,
   parseLocalmostrc,
@@ -15,7 +14,6 @@ import {
   diffConfigs,
   formatPolicyDiff,
   LocalmostrcConfig,
-  LOCALMOSTRC_VERSION,
 } from './localmostrc';
 import { SandboxPolicy } from './sandbox-profile';
 

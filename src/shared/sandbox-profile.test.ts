@@ -6,7 +6,6 @@ import {
   generateSandboxProfile,
   generateDiscoveryProfile,
   DEFAULT_SANDBOX_POLICY,
-  SandboxPolicy,
 } from './sandbox-profile';
 
 // Mock os module

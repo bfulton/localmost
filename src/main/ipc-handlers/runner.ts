@@ -23,6 +23,7 @@ import {
 import { getRunnerProxyManager } from '../runner-proxy-manager';
 import { sendRunnerEvent } from '../runner-state-service';
 import { updateTrayMenu } from '../tray-init';
+import { store } from '../store';
 import { getSnapshot, selectRunnerStatus } from '../runner-state-service';
 import {
   IPC_CHANNELS,
@@ -71,22 +72,40 @@ export const registerRunnerHandlers = (): void => {
   // Runner download
   ipcMain.handle(IPC_CHANNELS.RUNNER_IS_DOWNLOADED, () => {
     const runnerDownloader = getRunnerDownloader();
-    return runnerDownloader?.isDownloaded() ?? false;
+    const downloaded = runnerDownloader?.isDownloaded() ?? false;
+    // Update store so zubridge syncs to renderer
+    store.getState().setIsDownloaded(downloaded);
+    return downloaded;
   });
 
   ipcMain.handle(IPC_CHANNELS.RUNNER_GET_VERSION, () => {
     const runnerDownloader = getRunnerDownloader();
-    return {
+    const versionInfo = {
       version: runnerDownloader?.getVersion() ?? null,
       url: runnerDownloader?.getVersionUrl() ?? null,
     };
+    // Update store so zubridge syncs to renderer
+    store.getState().setRunnerVersion(versionInfo);
+    return versionInfo;
   });
 
   ipcMain.handle(IPC_CHANNELS.RUNNER_GET_AVAILABLE_VERSIONS, async () => {
     const runnerDownloader = getRunnerDownloader();
     try {
       const versions = await runnerDownloader?.getAvailableVersions();
-      return { success: true, versions: versions || [] };
+      const versionList = versions || [];
+      // Update store so zubridge syncs to renderer
+      store.getState().setAvailableVersions(versionList);
+      // Set initial selected version if not already set
+      const currentSelected = store.getState().runner.selectedVersion;
+      if (!currentSelected && versionList.length > 0) {
+        const installedVersion = runnerDownloader?.getInstalledVersion();
+        const defaultVersion = installedVersion && versionList.some(v => v.version === installedVersion)
+          ? installedVersion
+          : versionList[0].version;
+        store.getState().setSelectedVersion(defaultVersion);
+      }
+      return { success: true, versions: versionList };
     } catch (error) {
       const { userMessage, technicalDetails } = toUserError(error, 'Fetching versions');
       logger()?.error(technicalDetails);
@@ -97,6 +116,10 @@ export const registerRunnerHandlers = (): void => {
   ipcMain.handle(IPC_CHANNELS.RUNNER_SET_DOWNLOAD_VERSION, (_event, version: string | null) => {
     const runnerDownloader = getRunnerDownloader();
     runnerDownloader?.setDownloadVersion(version);
+    // Update store so zubridge syncs to renderer
+    if (version) {
+      store.getState().setSelectedVersion(version);
+    }
     return { success: true };
   });
 
@@ -104,14 +127,26 @@ export const registerRunnerHandlers = (): void => {
     const runnerDownloader = getRunnerDownloader();
     const mainWindow = getMainWindow();
     try {
+      // Set initial progress in store
+      store.getState().setDownloadProgress({ phase: 'downloading', percent: 0, message: 'Starting...' });
+
       const progressCallback = (progress: DownloadProgress) => {
+        // Update zubridge store so renderer sees progress
+        store.getState().setDownloadProgress(progress);
+        // Also send via IPC for fallback
         mainWindow?.webContents.send(IPC_CHANNELS.RUNNER_DOWNLOAD_PROGRESS, progress);
       };
 
       await runnerDownloader?.download(progressCallback);
 
+      // Update store: download complete, clear progress
+      store.getState().setDownloadProgress(null);
+      store.getState().setIsDownloaded(true);
+
       return { success: true };
     } catch (error) {
+      // Clear progress on error
+      store.getState().setDownloadProgress(null);
       const { userMessage, technicalDetails } = toUserError(error, 'Download');
       logger()?.error(technicalDetails);
       return { success: false, error: userMessage };
@@ -121,7 +156,10 @@ export const registerRunnerHandlers = (): void => {
   // Runner configuration
   ipcMain.handle(IPC_CHANNELS.RUNNER_IS_CONFIGURED, () => {
     const runnerManager = getRunnerManager();
-    return runnerManager?.isConfigured() ?? false;
+    const configured = runnerManager?.isConfigured() ?? false;
+    // Update store so zubridge syncs to renderer
+    store.getState().setIsConfigured(configured);
+    return configured;
   });
 
   ipcMain.handle(IPC_CHANNELS.RUNNER_GET_DISPLAY_NAME, () => {
@@ -429,7 +467,10 @@ export const registerRunnerHandlers = (): void => {
   // Job history
   ipcMain.handle(IPC_CHANNELS.JOB_HISTORY_GET, () => {
     const runnerManager = getRunnerManager();
-    return runnerManager?.getJobHistory() ?? [];
+    const history = runnerManager?.getJobHistory() ?? [];
+    // Update store so zubridge syncs to renderer
+    store.getState().setJobHistory(history);
+    return history;
   });
 
   ipcMain.handle(IPC_CHANNELS.JOB_HISTORY_SET_MAX, (_event, max: number) => {

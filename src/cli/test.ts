@@ -23,6 +23,11 @@ import {
   ParsedWorkflow,
   WorkflowJob,
   MatrixCombination,
+  isReusableWorkflowJob,
+  parseReusableWorkflow,
+  resolveReusableWorkflowPath,
+  resolveReusableWorkflowInputs,
+  ReusableWorkflow,
 } from '../shared/workflow-parser';
 import {
   executeStep,
@@ -34,7 +39,6 @@ import {
   findLocalmostrc,
   parseLocalmostrc,
   getEffectivePolicy,
-  getRequiredSecrets,
   LocalmostrcConfig,
   serializeLocalmostrc,
   LOCALMOSTRC_VERSION,
@@ -92,6 +96,13 @@ export interface JobResult {
   steps: StepResult[];
   status: 'success' | 'failure' | 'skipped';
   duration: number;
+  /** Outputs from this job (for use by dependent jobs) */
+  outputs?: Record<string, string>;
+}
+
+/** Tracks outputs from completed jobs for dependency resolution */
+interface JobOutputs {
+  [jobId: string]: Record<string, string>;
 }
 
 // =============================================================================
@@ -269,12 +280,37 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
 
   // Run jobs
   const jobResults: JobResult[] = [];
+  const jobOutputs: JobOutputs = {};
 
   for (const jobId of jobsToRun) {
     const job = workflow.workflow.jobs[jobId];
     const jobName = job.name || jobId;
 
-    // Determine matrix combinations
+    // Check if this is a reusable workflow call
+    if (isReusableWorkflowJob(job)) {
+      console.log(`${colors.bold}\u25B6 ${jobName}${colors.reset} ${colors.dim}(reusable workflow)${colors.reset}`);
+
+      const reusableResult = await runReusableWorkflowJob(
+        jobId,
+        job,
+        workflowPath,
+        { ...context, jobEnv: { ...context.jobEnv, GITHUB_JOB: jobId } },
+        jobOutputs,
+        options
+      );
+
+      jobResults.push(reusableResult);
+
+      // Store outputs for dependent jobs
+      if (reusableResult.outputs) {
+        jobOutputs[jobId] = reusableResult.outputs;
+      }
+
+      console.log();
+      continue;
+    }
+
+    // Regular job - determine matrix combinations
     const combinations = generateMatrixCombinations(job.strategy);
     let combinationsToRun: MatrixCombination[];
 
@@ -305,10 +341,17 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
         job,
         matrix,
         { ...context, matrix, jobEnv: { ...context.jobEnv, GITHUB_JOB: jobId, ...(job.env || {}) } },
+        jobOutputs,
         options
       );
 
       jobResults.push(jobResult);
+
+      // Store outputs for dependent jobs
+      if (jobResult.outputs) {
+        jobOutputs[jobId] = jobResult.outputs;
+      }
+
       console.log();
     }
   }
@@ -328,12 +371,22 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     console.log(formatEnvironmentInfo(localEnv));
     console.log();
 
-    // Compare to first job's runs-on
-    const firstJob = workflow.workflow.jobs[jobsToRun[0]];
-    const runsOn = Array.isArray(firstJob['runs-on']) ? firstJob['runs-on'][0] : firstJob['runs-on'];
-    const diffs = compareEnvironments(localEnv, runsOn);
-    environmentDiffs = formatEnvironmentDiff(diffs);
-    console.log(environmentDiffs);
+    // Compare to first non-reusable job's runs-on
+    let runsOn: string | undefined;
+    for (const jobId of jobsToRun) {
+      const job = workflow.workflow.jobs[jobId];
+      if (job['runs-on']) {
+        runsOn = Array.isArray(job['runs-on']) ? job['runs-on'][0] : job['runs-on'];
+        break;
+      }
+    }
+    if (runsOn) {
+      const diffs = compareEnvironments(localEnv, runsOn);
+      environmentDiffs = formatEnvironmentDiff(diffs);
+      console.log(environmentDiffs);
+    } else {
+      console.log('  (No runs-on to compare - all jobs are reusable workflows)');
+    }
   }
 
   // Show summary
@@ -373,20 +426,27 @@ async function runJob(
   job: WorkflowJob,
   matrix: MatrixCombination,
   context: ExecutionContext,
+  jobOutputs: JobOutputs,
   options: TestOptions
 ): Promise<JobResult> {
   const startTime = Date.now();
   const stepResults: StepResult[] = [];
   let jobStatus: 'success' | 'failure' | 'skipped' = 'success';
 
-  for (const step of job.steps) {
+  // Create context with job outputs available for expression substitution
+  const jobContext = {
+    ...context,
+    needs: jobOutputs,
+  };
+
+  for (const step of job.steps!) {
     if (options.dryRun) {
       const stepName = step.name || step.id || (step.uses ? `Run ${step.uses}` : 'Run script');
       console.log(`  ${pending(stepName)} (dry run)`);
       continue;
     }
 
-    const result = await executeStep(step, context, job);
+    const result = await executeStep(step, jobContext, job);
     stepResults.push(result);
 
     // Print step result
@@ -407,6 +467,9 @@ async function runJob(
     }
   }
 
+  // Extract job outputs from step outputs
+  const outputs = extractJobOutputs(job, context.stepOutputs);
+
   return {
     jobId,
     jobName: job.name || jobId,
@@ -414,7 +477,198 @@ async function runJob(
     steps: stepResults,
     status: jobStatus,
     duration: Date.now() - startTime,
+    outputs,
   };
+}
+
+/**
+ * Run a reusable workflow job.
+ */
+async function runReusableWorkflowJob(
+  jobId: string,
+  job: WorkflowJob,
+  callerWorkflowPath: string,
+  context: ExecutionContext,
+  jobOutputs: JobOutputs,
+  options: TestOptions
+): Promise<JobResult> {
+  const startTime = Date.now();
+
+  // Resolve the workflow path
+  const workflowPath = resolveReusableWorkflowPath(job.uses!, callerWorkflowPath);
+  if (!workflowPath) {
+    console.log(`  ${colors.yellow}Skipping: Remote reusable workflows not supported${colors.reset}`);
+    console.log(`  ${colors.dim}uses: ${job.uses}${colors.reset}`);
+    return {
+      jobId,
+      jobName: job.name || jobId,
+      steps: [],
+      status: 'skipped',
+      duration: Date.now() - startTime,
+    };
+  }
+
+  // Load and parse the reusable workflow
+  let reusableWorkflow: ReusableWorkflow;
+  try {
+    reusableWorkflow = parseReusableWorkflow(workflowPath);
+    console.log(`  ${colors.dim}Loading: ${path.basename(workflowPath)}${colors.reset}`);
+  } catch (err) {
+    console.log(`  ${colors.red}Error loading workflow: ${(err as Error).message}${colors.reset}`);
+    return {
+      jobId,
+      jobName: job.name || jobId,
+      steps: [],
+      status: 'failure',
+      duration: Date.now() - startTime,
+    };
+  }
+
+  // Resolve inputs
+  const inputs = resolveReusableWorkflowInputs(job.with, reusableWorkflow.inputs);
+  if (Object.keys(inputs).length > 0) {
+    console.log(`  ${colors.dim}Inputs: ${Object.entries(inputs).map(([k, v]) => `${k}=${v}`).join(', ')}${colors.reset}`);
+  }
+
+  // Run all jobs in the called workflow
+  const allStepResults: StepResult[] = [];
+  let overallStatus: 'success' | 'failure' | 'skipped' = 'success';
+  const calledJobOutputs: JobOutputs = {};
+
+  for (const calledJobId of reusableWorkflow.jobOrder) {
+    const calledJob = reusableWorkflow.workflow.jobs[calledJobId];
+
+    // Skip reusable workflow jobs within reusable workflows (nested not supported yet)
+    if (isReusableWorkflowJob(calledJob)) {
+      console.log(`  ${colors.yellow}Skipping nested reusable workflow: ${calledJobId}${colors.reset}`);
+      continue;
+    }
+
+    const calledJobName = calledJob.name || calledJobId;
+    console.log(`  ${colors.cyan}▸ ${calledJobName}${colors.reset}`);
+
+    // Create context with inputs available
+    const calledContext: ExecutionContext = {
+      ...context,
+      workflowEnv: {
+        ...context.workflowEnv,
+        ...(reusableWorkflow.workflow.env || {}),
+      },
+      jobEnv: {
+        ...context.jobEnv,
+        GITHUB_JOB: calledJobId,
+        ...(calledJob.env || {}),
+      },
+      // Make inputs available as inputs.* context
+      inputs,
+      stepOutputs: {},
+      needs: { ...jobOutputs, ...calledJobOutputs },
+    };
+
+    // Run steps in the called job
+    for (const step of calledJob.steps!) {
+      if (options.dryRun) {
+        const stepName = step.name || step.id || (step.uses ? `Run ${step.uses}` : 'Run script');
+        console.log(`    ${pending(stepName)} (dry run)`);
+        continue;
+      }
+
+      const result = await executeStep(step, calledContext, calledJob);
+      allStepResults.push(result);
+
+      if (!options.verbose) {
+        console.log(`    ${formatStepStatus(result.status, result.name, result.duration)}`);
+      }
+
+      if (result.status === 'failure') {
+        overallStatus = 'failure';
+        if (result.error) {
+          console.log(`      ${colors.red}Error: ${result.error}${colors.reset}`);
+        }
+        if (!step['continue-on-error']) {
+          break;
+        }
+      }
+    }
+
+    // Extract outputs from this job
+    const calledOutputs = extractJobOutputs(calledJob, calledContext.stepOutputs);
+    if (calledOutputs) {
+      calledJobOutputs[calledJobId] = calledOutputs;
+    }
+
+    if (overallStatus === 'failure') {
+      break;
+    }
+  }
+
+  // Map workflow-level outputs from job outputs
+  const workflowOutputs = extractWorkflowOutputs(reusableWorkflow, calledJobOutputs);
+
+  return {
+    jobId,
+    jobName: job.name || jobId,
+    steps: allStepResults,
+    status: overallStatus,
+    duration: Date.now() - startTime,
+    outputs: workflowOutputs,
+  };
+}
+
+/**
+ * Extract job outputs from step outputs using the job's output definitions.
+ */
+function extractJobOutputs(
+  job: WorkflowJob,
+  stepOutputs: Record<string, Record<string, string>>
+): Record<string, string> | undefined {
+  if (!job.outputs) {
+    return undefined;
+  }
+
+  const result: Record<string, string> = {};
+
+  for (const [outputName, expression] of Object.entries(job.outputs)) {
+    // Parse expressions like ${{ steps.check.outputs.runner }}
+    const match = expression.match(/\$\{\{\s*steps\.(\w+)\.outputs\.(\w+)\s*\}\}/);
+    if (match) {
+      const [, stepId, outputKey] = match;
+      const value = stepOutputs[stepId]?.[outputKey];
+      if (value !== undefined) {
+        result[outputName] = value;
+      }
+    }
+  }
+
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+/**
+ * Extract workflow-level outputs from job outputs.
+ */
+function extractWorkflowOutputs(
+  workflow: ReusableWorkflow,
+  jobOutputs: JobOutputs
+): Record<string, string> | undefined {
+  if (Object.keys(workflow.outputs).length === 0) {
+    return undefined;
+  }
+
+  const result: Record<string, string> = {};
+
+  for (const [outputName, outputDef] of Object.entries(workflow.outputs)) {
+    // Parse expressions like ${{ jobs.check.outputs.runner }}
+    const match = outputDef.value.match(/\$\{\{\s*jobs\.(\w+)\.outputs\.(\w+)\s*\}\}/);
+    if (match) {
+      const [, jobId, outputKey] = match;
+      const value = jobOutputs[jobId]?.[outputKey];
+      if (value !== undefined) {
+        result[outputName] = value;
+      }
+    }
+  }
+
+  return Object.keys(result).length > 0 ? result : undefined;
 }
 
 // =============================================================================
@@ -507,7 +761,7 @@ async function resolveSecrets(
 async function handleUpdateRc(
   cwd: string,
   workflow: ParsedWorkflow,
-  context: ExecutionContext
+  _context: ExecutionContext
 ): Promise<void> {
   console.log();
   console.log(`${colors.bold}Discovery mode:${colors.reset}`);

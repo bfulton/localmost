@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'js-yaml';
 import { getAppDataDir, getConfigPath } from '../../paths';
-import { encryptValue, decryptValue } from '../../encryption';
+import { decryptValue } from '../../encryption';
 import { bootLog } from '../../log-file';
 import { store, getState } from '../index';
 import { ConfigSlice, defaultConfigState } from '../types';
@@ -107,14 +107,37 @@ export function loadPersistedConfig(): void {
       configUpdates.preserveWorkDir = diskConfig.preserveWorkDir;
     }
 
-    // User filter
+    // User filter - supports both old 'mode' format and new 'scope/allowedUsers' format
     if (diskConfig.userFilter) {
       const filter = diskConfig.userFilter;
-      if (filter.mode && ['everyone', 'just-me', 'allowlist'].includes(filter.mode)) {
+      const allowlist = Array.isArray(filter.allowlist) ? filter.allowlist : [];
+
+      // Check for new format first
+      if (filter.scope && ['everyone', 'trigger', 'contributors'].includes(filter.scope)) {
         configUpdates.userFilter = {
-          mode: filter.mode,
-          allowlist: Array.isArray(filter.allowlist) ? filter.allowlist : [],
+          scope: filter.scope,
+          allowedUsers: filter.allowedUsers || 'just-me',
+          allowlist,
         };
+      } else if (filter.mode && ['everyone', 'just-me', 'allowlist'].includes(filter.mode)) {
+        // Migrate from old format to new format
+        // Old format mapping:
+        //   'everyone' -> scope: 'everyone', allowedUsers: 'just-me' (doesn't matter, not used)
+        //   'just-me' -> scope: 'trigger', allowedUsers: 'just-me'
+        //   'allowlist' -> scope: 'trigger', allowedUsers: 'allowlist'
+        let scope: 'everyone' | 'trigger' | 'contributors' = 'everyone';
+        let allowedUsers: 'just-me' | 'allowlist' = 'just-me';
+
+        if (filter.mode === 'just-me') {
+          scope = 'trigger';
+          allowedUsers = 'just-me';
+        } else if (filter.mode === 'allowlist') {
+          scope = 'trigger';
+          allowedUsers = 'allowlist';
+        }
+
+        configUpdates.userFilter = { scope, allowedUsers, allowlist };
+        bootLog('info', `Migrated userFilter from mode='${filter.mode}' to scope='${scope}', allowedUsers='${allowedUsers}'`);
       }
     }
 
@@ -175,10 +198,11 @@ export function loadPersistedConfig(): void {
     // Handle auth tokens separately (with decryption)
     if (diskConfig.auth) {
       try {
-        const accessToken = decryptValue(diskConfig.auth.accessToken);
-        const refreshToken = diskConfig.auth.refreshToken
-          ? decryptValue(diskConfig.auth.refreshToken)
-          : undefined;
+        // Validate tokens can be decrypted (actual token storage handled by auth-tokens module)
+        decryptValue(diskConfig.auth.accessToken);
+        if (diskConfig.auth.refreshToken) {
+          decryptValue(diskConfig.auth.refreshToken);
+        }
 
         store.setState((state) => ({
           auth: {
@@ -187,9 +211,6 @@ export function loadPersistedConfig(): void {
             isAuthenticated: true,
           },
         }));
-
-        // Store decrypted tokens in a separate location (not in Zustand for security)
-        // The auth-tokens module handles this
       } catch (e) {
         bootLog('warn', `Failed to decrypt auth tokens: ${(e as Error).message}`);
       }
@@ -206,6 +227,7 @@ export function loadPersistedConfig(): void {
 /**
  * Save current config state to disk.
  * Uses atomic write (temp file + rename) to prevent corruption.
+ * Preserves auth section from existing config (auth is saved separately by auth module).
  */
 export function savePersistedConfig(): void {
   if (isLoading) {
@@ -228,8 +250,19 @@ export function savePersistedConfig(): void {
       }
     }
 
-    // Auth is handled separately by auth-tokens module
-    // We don't save it here to avoid conflicts
+    // Preserve auth from existing config file (auth is saved separately by auth module)
+    // We must read and preserve it to avoid overwriting encrypted tokens
+    if (fs.existsSync(configPath)) {
+      try {
+        const existingContent = fs.readFileSync(configPath, 'utf-8');
+        const existingConfig = (yaml.load(existingContent, { schema: yaml.JSON_SCHEMA }) as AppConfig) || {};
+        if (existingConfig.auth) {
+          configToSave.auth = existingConfig.auth;
+        }
+      } catch (readErr) {
+        bootLog('warn', `Failed to read existing config for auth preservation: ${(readErr as Error).message}`);
+      }
+    }
 
     // Ensure directory exists
     fs.mkdirSync(configDir, { recursive: true });

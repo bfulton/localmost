@@ -157,6 +157,10 @@
 }
 
 /* Spinner */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
 .spinner {
   width: 20px;
   height: 20px;

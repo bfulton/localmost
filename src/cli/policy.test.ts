@@ -1,5 +1,5 @@
-import { jest, describe, it, expect, beforeEach } from '@jest/globals';
-import { parsePolicyArgs, PolicyOptions } from './policy';
+import { describe, it, expect } from '@jest/globals';
+import { parsePolicyArgs } from './policy';
 
 describe('CLI policy command', () => {
   describe('parsePolicyArgs', () => {

@@ -54,7 +54,7 @@ export async function getCliInstallStatus(): Promise<{
     const pointsToThisApp = target === expectedTarget;
 
     return { installed: true, pointsToThisApp, currentTarget: target };
-  } catch (error) {
+  } catch {
     // File doesn't exist or can't be read
     return { installed: false, pointsToThisApp: false };
   }

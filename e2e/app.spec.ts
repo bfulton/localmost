@@ -20,6 +20,20 @@ test.describe('localmost App', () => {
     expect(page).toBeDefined();
   });
 
+  test('should load preload script successfully', async () => {
+    // Verify window.localmost API is exposed by preload script
+    const hasLocalmostAPI = await page.evaluate(() => {
+      return typeof (window as any).localmost !== 'undefined';
+    });
+    expect(hasLocalmostAPI).toBe(true);
+
+    // Verify window.zubridge API is exposed by preload script
+    const hasZubridgeAPI = await page.evaluate(() => {
+      return typeof (window as any).zubridge !== 'undefined';
+    });
+    expect(hasZubridgeAPI).toBe(true);
+  });
+
   test('should display the app title', async () => {
     const title = await page.locator('.titlebar h1').textContent();
     expect(title).toBe('localmost');
