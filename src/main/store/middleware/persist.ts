@@ -195,26 +195,8 @@ export function loadPersistedConfig(): void {
       }));
     }
 
-    // Handle auth tokens separately (with decryption)
-    if (diskConfig.auth) {
-      try {
-        // Validate tokens can be decrypted (actual token storage handled by auth-tokens module)
-        decryptValue(diskConfig.auth.accessToken);
-        if (diskConfig.auth.refreshToken) {
-          decryptValue(diskConfig.auth.refreshToken);
-        }
-
-        store.setState((state) => ({
-          auth: {
-            ...state.auth,
-            user: diskConfig.auth!.user,
-            isAuthenticated: true,
-          },
-        }));
-      } catch (e) {
-        bootLog('warn', `Failed to decrypt auth tokens: ${(e as Error).message}`);
-      }
-    }
+    // Auth is handled by index.ts during startup - not by persist middleware
+    // This avoids duplicate config reads and keeps auth logic centralized
 
     bootLog('info', 'Loaded config from disk');
   } catch (e) {

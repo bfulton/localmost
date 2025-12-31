@@ -39,7 +39,7 @@ export type SettableConfigKey = typeof SETTABLE_CONFIG_KEYS[number];
 export interface AppConfig {
   githubClientId?: string;
   auth?: {
-    accessToken: string;
+    accessToken?: string;  // Optional - obtained fresh on startup, not persisted
     refreshToken?: string;
     expiresAt?: number;  // Unix timestamp (ms) when access token expires
     user: GitHubUser;
@@ -104,12 +104,15 @@ export const loadConfig = (): AppConfig => {
   }
 
   // Decrypt sensitive auth data if present
+  // We only persist refreshToken and user - access tokens are obtained fresh on startup
   if (config.auth) {
     try {
-      config.auth.accessToken = decryptValue(config.auth.accessToken);
       if (config.auth.refreshToken) {
         config.auth.refreshToken = decryptValue(config.auth.refreshToken);
       }
+      // Clear any persisted access token - we'll get a fresh one on startup
+      delete config.auth.accessToken;
+      delete config.auth.expiresAt;
     } catch (e) {
       bootLog('warn', `Failed to decrypt auth tokens: ${(e as Error).message}`);
       delete config.auth;
@@ -129,14 +132,17 @@ export const saveConfig = (config: AppConfig): void => {
     // Create a copy to avoid mutating the original config
     const configToSave = { ...config };
 
-    // Encrypt sensitive auth data before saving
+    // Only persist refreshToken and user - access tokens are obtained fresh on startup
     if (configToSave.auth) {
-      configToSave.auth = {
-        ...configToSave.auth,
-        accessToken: encryptValue(configToSave.auth.accessToken),
-      };
-      if (configToSave.auth.refreshToken) {
-        configToSave.auth.refreshToken = encryptValue(configToSave.auth.refreshToken);
+      const { refreshToken, user } = configToSave.auth;
+      if (refreshToken) {
+        configToSave.auth = {
+          refreshToken: encryptValue(refreshToken),
+          user,
+        };
+      } else {
+        // No refresh token means we can't persist auth
+        delete configToSave.auth;
       }
     }
 

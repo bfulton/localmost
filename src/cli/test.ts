@@ -774,6 +774,7 @@ async function handleUpdateRc(
   const existingPath = findLocalmostrc(cwd);
   if (existingPath) {
     console.log(`Would update: ${existingPath}`);
+    // TODO: Actually update the existing config
   } else {
     const newConfig: LocalmostrcConfig = {
       version: LOCALMOSTRC_VERSION,
@@ -792,11 +793,10 @@ async function handleUpdateRc(
     };
 
     const content = serializeLocalmostrc(newConfig);
-    console.log('Would create .localmostrc:');
+    const rcPath = path.join(cwd, '.localmostrc');
+    fs.writeFileSync(rcPath, content);
+    console.log(`Created ${rcPath}:`);
     console.log(colors.dim + content + colors.reset);
-    console.log();
-    console.log('Run this command to create the file:');
-    console.log(`  echo '${content.replace(/'/g, "'\\''")}' > .localmostrc`);
   }
 }
 

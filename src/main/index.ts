@@ -365,11 +365,18 @@ app.whenReady().then(async () => {
     logger?.warn(`Startup cleanup failed: ${(err as Error).message}. Will retry when runner starts.`);
   }
 
-  if (config.auth) {
+  if (config.auth?.refreshToken) {
+    // Set initial auth state with refresh token (no access token yet)
     setAuthState(config.auth);
-    // Also update store so zubridge syncs user to renderer
+    // Update store so zubridge syncs user to renderer
     if (config.auth.user) {
       store.getState().setUser(config.auth.user);
+    }
+    // Get fresh access token on startup
+    logger?.info('Getting fresh access token on startup...');
+    const token = await forceRefreshToken();
+    if (!token) {
+      logger?.warn('Failed to refresh access token on startup - user may need to re-authenticate');
     }
   }
   if (config.sleepProtection) {
