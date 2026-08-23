@@ -148,7 +148,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
   };
 
   return (
-    <div className={styles.settingsPage}>
+    <div className={styles.settingsPage} data-testid="settings-page">
       <div className={shared.pageHeader}>
         <h2>Settings</h2>
         <button className={shared.btnIcon} onClick={onBack} title="Close settings">
@@ -156,9 +156,9 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
         </button>
       </div>
 
-      <div className={styles.settingsContent}>
+      <div className={styles.settingsContent} data-testid="page-content">
         {/* Startup Section */}
-        <section className={styles.settingsSection}>
+        <section className={styles.settingsSection} data-testid="settings-section">
           <h3>Startup</h3>
           <div className={shared.formGroup}>
             <label className={shared.toggleRow}>
@@ -191,7 +191,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
         </section>
 
         {/* GitHub Account Section */}
-        <section className={styles.settingsSection}>
+        <section className={styles.settingsSection} data-testid="settings-section">
           <h3>GitHub Account</h3>
           {user ? (
             <div className={styles.accountInfo}>
@@ -263,7 +263,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
         </section>
 
         {/* Runner Download Section */}
-        <section className={styles.settingsSection}>
+        <section className={styles.settingsSection} data-testid="settings-section">
           <div className={styles.sectionHeaderRow}>
             <h3>Runner Binary</h3>
             {isDownloaded && runnerVersion.version && (
@@ -335,7 +335,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
 
         {/* Runner Configuration Section */}
         {user && isDownloaded && (
-          <section id="runner-config-section" className={styles.settingsSection}>
+          <section id="runner-config-section" className={styles.settingsSection} data-testid="settings-section">
             <h3>Runner Configuration</h3>
 
             {onOpenTargets && (
@@ -433,7 +433,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
 
         {/* Job Security Section */}
         {user && isConfigured && (
-          <section className={styles.settingsSection}>
+          <section className={styles.settingsSection} data-testid="settings-section">
             <h3>Job Security</h3>
 
             {/* Sandbox Policy Subsection */}
@@ -471,7 +471,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
         )}
 
         {/* Power Section */}
-        <section id="power-section" className={styles.settingsSection}>
+        <section id="power-section" className={styles.settingsSection} data-testid="settings-section">
           <h3>Power</h3>
           <div className={shared.formGroup}>
             <label>Prevent sleep</label>
@@ -519,7 +519,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
         </section>
 
         {/* Notifications Section */}
-        <section className={styles.settingsSection}>
+        <section className={styles.settingsSection} data-testid="settings-section">
           <h3>Notifications</h3>
           <div className={shared.formGroup}>
             <label className={shared.toggleRow}>
@@ -595,7 +595,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
         )}
 
         {/* History Section */}
-        <section className={styles.settingsSection}>
+        <section className={styles.settingsSection} data-testid="settings-section">
           <h3>History</h3>
           <div className={shared.formGroup}>
             <label>Max recent jobs</label>
@@ -651,7 +651,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
         </section>
 
         {/* Appearance Section */}
-        <section className={styles.settingsSection}>
+        <section className={styles.settingsSection} data-testid="settings-section">
           <h3>Appearance</h3>
           <div className={styles.themeSelector}>
             <button
@@ -679,7 +679,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
         </section>
 
         {/* Updates Section */}
-        <section className={styles.settingsSection}>
+        <section className={styles.settingsSection} data-testid="settings-section">
           <div className={styles.sectionHeaderRow}>
             <h3>Updates</h3>
             <span className={styles.versionLink}>v{updateStatus.currentVersion}</span>
@@ -721,7 +721,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
         </section>
 
         {/* About Section */}
-        <section className={styles.settingsSection}>
+        <section className={styles.settingsSection} data-testid="settings-section">
           <h3>About</h3>
           <div className={styles.aboutLinks}>
             <a

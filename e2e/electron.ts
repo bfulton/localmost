@@ -4,6 +4,12 @@ import * as fs from 'fs';
 import * as os from 'os';
 
 let electronApp: ElectronApplication | null = null;
+let consoleErrors: string[] = [];
+
+/** Console errors seen since the current app was launched. */
+export function getConsoleErrors(): string[] {
+  return [...consoleErrors];
+}
 let testConfigDir: string | null = null;
 
 export async function launchElectron(): Promise<{ app: ElectronApplication; page: Page }> {
@@ -29,11 +35,20 @@ export async function launchElectron(): Promise<{ app: ElectronApplication; page
 
   const page = await electronApp.firstWindow();
 
+  // Collect console errors from the moment the window exists, so tests can
+  // assert on load-time errors rather than only what happens after they start.
+  consoleErrors = [];
+  page.on('console', (msg) => {
+    if (msg.type() === 'error') {
+      consoleErrors.push(msg.text());
+    }
+  });
+
   // Wait for the app to be ready
   await page.waitForLoadState('domcontentloaded');
 
   // Wait for React to render (titlebar is always present once app loads)
-  await page.waitForSelector('.titlebar', { timeout: 30000 });
+  await page.waitForSelector('[data-testid="titlebar"]', { timeout: 30000 });
 
   return { app: electronApp, page };
 }
