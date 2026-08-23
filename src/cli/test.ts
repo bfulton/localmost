@@ -12,6 +12,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { execSync } from 'child_process';
 import {
   parseWorkflowFile,
   findDefaultWorkflow,
@@ -43,7 +44,8 @@ import {
   serializeLocalmostrc,
   LOCALMOSTRC_VERSION,
 } from '../shared/localmostrc';
-import { SandboxPolicy, DEFAULT_SANDBOX_POLICY } from '../shared/sandbox-profile';
+import { SandboxPolicy, parseSandboxTrace, SandboxTraceResult } from '../shared/sandbox-profile';
+import { DiscoveryProxy } from '../shared/discovery-proxy';
 import { createWorkspace, cleanupWorkspaces, getGitInfo, getRepositoryFromDir } from '../shared/workspace';
 import {
   detectLocalEnvironment,
@@ -79,6 +81,8 @@ export interface TestOptions {
   showEnv?: boolean;
   /** Secret handling mode */
   secretMode?: 'stub' | 'prompt' | 'abort';
+  /** Save debug info (sandbox logs, collected PIDs) */
+  debug?: boolean;
 }
 
 export interface TestResult {
@@ -103,6 +107,46 @@ export interface JobResult {
 /** Tracks outputs from completed jobs for dependency resolution */
 interface JobOutputs {
   [jobId: string]: Record<string, string>;
+}
+
+// =============================================================================
+// System Log Query for Sandbox Reports
+// =============================================================================
+
+/**
+ * Query the macOS unified system log for sandbox reports.
+ * Used in discovery mode to find what filesystem paths were accessed.
+ *
+ * The sandbox (with report) modifier logs to the kernel subsystem:
+ *   kernel: (Sandbox) Sandbox: <process>(<pid>) allow <operation> <path>
+ */
+function querySandboxLogs(sinceSeconds: number): string {
+  if (process.platform !== 'darwin') {
+    return '';
+  }
+
+  try {
+    // Query the unified log for sandbox reports
+    // Use /bin/bash explicitly and write to temp file to avoid pipe issues
+    const tmpFile = `/tmp/localmost-sandbox-log-${Date.now()}.txt`;
+    const script = `#!/bin/bash
+log show --last ${sinceSeconds}s 2>/dev/null | grep "kernel: (Sandbox)" > "${tmpFile}" || true
+`;
+    const scriptFile = `/tmp/localmost-query-log-${Date.now()}.sh`;
+    fs.writeFileSync(scriptFile, script);
+    execSync(`/bin/bash "${scriptFile}"`, { encoding: 'utf-8' });
+
+    let output = '';
+    if (fs.existsSync(tmpFile)) {
+      output = fs.readFileSync(tmpFile, 'utf-8');
+      fs.unlinkSync(tmpFile);
+    }
+    fs.unlinkSync(scriptFile);
+    return output;
+  } catch {
+    // If log command fails, return empty string
+    return '';
+  }
 }
 
 // =============================================================================
@@ -209,8 +253,8 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     }
   } else if (!options.updaterc) {
     console.log(`${colors.yellow}No .localmostrc found.${colors.reset} Run with --updaterc to generate.`);
-    console.log('Running in permissive mode.');
-    policy = DEFAULT_SANDBOX_POLICY;
+    console.log('Running in strict mode (no network access allowed).');
+    // policy stays undefined = empty allowlist
   }
   console.log();
 
@@ -221,6 +265,30 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   if (secretNames.length > 0) {
     console.log(`Secrets required: ${secretNames.join(', ')}`);
     secrets = await resolveSecrets(repository, secretNames, options.secretMode || 'stub');
+    console.log();
+  }
+
+  // Build network allowlist for the proxy
+  // - Discovery mode (--updaterc): no allowlist = allow everything
+  // - Enforcement mode: use policy allowlist or empty array (strict mode)
+  const networkAllowlist = options.updaterc
+    ? undefined  // Discovery mode: allow all traffic through
+    : (policy?.network?.allow || []);  // Enforcement mode: use policy or empty
+
+  // Start proxy for network isolation (sandbox restricts traffic to proxy only)
+  const discoveryProxy = new DiscoveryProxy({
+    allowlist: networkAllowlist,
+    onAccess: (host, port, allowed) => {
+      if (options.verbose) {
+        const status = allowed ? colors.dim : colors.red;
+        const action = allowed ? '' : ' (BLOCKED)';
+        console.log(`  ${status}[network] ${host}:${port}${action}${colors.reset}`);
+      }
+    },
+  });
+  const proxyPort = await discoveryProxy.start();
+  if (options.updaterc) {
+    console.log(`Discovery proxy listening on port ${proxyPort}`);
     console.log();
   }
 
@@ -237,22 +305,51 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   // Get git info for GITHUB_SHA and GITHUB_REF
   const gitInfo = getGitInfo(cwd);
 
+  // Build proxy environment variables
+  const proxyUrl = discoveryProxy.getProxyUrl();
+
+  // Create a tmp directory inside workDir for Unix sockets
+  // This keeps sockets within the sandbox's allowed network paths
+  const tmpDir = path.join(workspace.path, '.tmp');
+  fs.mkdirSync(tmpDir, { recursive: true });
+
+  // Create sandbox trace log file
+  // In updaterc mode: captures denies for policy generation
+  // In enforcement mode: captures denies for error reporting
+  const sandboxLogFile = path.join(workspace.path, '.sandbox-trace.log');
+
+  const proxyEnv: Record<string, string> = {
+    HTTP_PROXY: proxyUrl,
+    HTTPS_PROXY: proxyUrl,
+    http_proxy: proxyUrl,
+    https_proxy: proxyUrl,
+    TMPDIR: tmpDir,
+  };
+
+  // Track PIDs for discovery mode (to filter sandbox logs)
+  // Uses kqueue-based pid_tree_watch for real-time process tree tracking
+  const collectedPids = new Set<number>();
+
   // Build execution context
   const context: ExecutionContext = {
     workDir: workspace.path,
+    proxyPort,
     workflowEnv: {
       GITHUB_WORKFLOW: workflow.name,
       GITHUB_REPOSITORY: repository,
       GITHUB_SHA: gitInfo?.sha || '',
       GITHUB_REF: gitInfo?.ref || '',
       ...(workflow.workflow.env || {}),
+      ...proxyEnv,
     },
     jobEnv: {},
     matrix: {},
     secrets,
     stepOutputs: {},
     policy,
-    permissive: options.updaterc || !localmostrcPath,
+    permissive: options.updaterc,
+    sandboxLogFile,
+    collectedPids: options.updaterc ? collectedPids : undefined,
     onOutput: (line, stream) => {
       if (options.verbose) {
         const prefix = stream === 'stderr' ? colors.red : '';
@@ -281,6 +378,9 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   // Run jobs
   const jobResults: JobResult[] = [];
   const jobOutputs: JobOutputs = {};
+
+  // Record start time for system log query (discovery mode)
+  const jobsStartTime = Date.now();
 
   for (const jobId of jobsToRun) {
     const job = workflow.workflow.jobs[jobId];
@@ -394,16 +494,80 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   console.log(`  Duration: ${formatDuration(duration)}`);
   console.log(`  Jobs: ${jobResults.filter((j) => j.status === 'success').length}/${jobResults.length} passed`);
 
+  // Show network access summary (only in enforcement mode, not updaterc)
+  if (!options.updaterc) {
+    const accessStats = discoveryProxy.getAccessStats();
+    if (accessStats.allowed.length > 0 || accessStats.blocked.length > 0) {
+      console.log();
+      console.log(colors.bold + 'Network Access:' + colors.reset);
+      if (accessStats.allowed.length > 0) {
+        console.log(`  ${colors.green}Allowed:${colors.reset} ${accessStats.allowed.join(', ')}`);
+      }
+      if (accessStats.blocked.length > 0) {
+        console.log(`  ${colors.red}Blocked:${colors.reset} ${accessStats.blocked.join(', ')}`);
+      }
+    }
+  }
+
   if (allSucceeded) {
     console.log(`\n${colors.green}${colors.bold}\u2713 Workflow passed${colors.reset}`);
   } else {
     console.log(`\n${colors.red}${colors.bold}\u2717 Workflow failed${colors.reset}`);
+
   }
 
-  // Handle --updaterc
+  // Handle --updaterc (only write if workflow succeeded)
   if (options.updaterc) {
-    await handleUpdateRc(cwd, workflow, context);
+    const discoveredHosts = discoveryProxy.getAccessedHosts();
+
+    // Query system log for sandbox reports (discovery mode uses 'with report')
+    // Add a few seconds buffer to account for log write delay
+    const elapsedSeconds = Math.ceil((Date.now() - jobsStartTime) / 1000) + 5;
+    const logContent = querySandboxLogs(elapsedSeconds);
+
+    // Save debug info if requested
+    if (options.debug) {
+      const debugDir = path.join(workspace.path, '.debug');
+      if (!fs.existsSync(debugDir)) {
+        fs.mkdirSync(debugDir, { recursive: true });
+      }
+      // Save raw sandbox log
+      fs.writeFileSync(path.join(debugDir, 'sandbox-log.txt'), logContent);
+      // Save collected PIDs
+      fs.writeFileSync(
+        path.join(debugDir, 'collected-pids.json'),
+        JSON.stringify([...collectedPids], null, 2)
+      );
+      console.log(`${colors.dim}Debug info saved to ${debugDir}${colors.reset}`);
+    }
+
+    // Filter log entries to only include PIDs from our process tree
+    // This eliminates noise from other sandboxed processes running concurrently
+    const sandboxTrace = parseSandboxTrace(logContent, workspace.path, collectedPids);
+
+    if (allSucceeded) {
+      await handleUpdateRc(cwd, workflow, discoveredHosts, sandboxTrace);
+    } else {
+      console.log();
+      console.log(`${colors.yellow}Skipping .localmostrc generation - workflow failed.${colors.reset}`);
+      console.log('Fix the workflow issues first, then run --updaterc again.');
+      if (discoveredHosts.length > 0) {
+        console.log();
+        console.log(`${colors.dim}Hosts discovered so far: ${discoveredHosts.join(', ')}${colors.reset}`);
+      }
+      if (sandboxTrace) {
+        if (sandboxTrace.writePaths.length > 0) {
+          console.log(`${colors.dim}Filesystem writes: ${sandboxTrace.writePaths.join(', ')}${colors.reset}`);
+        }
+        if (sandboxTrace.socketPaths.length > 0) {
+          console.log(`${colors.dim}Socket access: ${sandboxTrace.socketPaths.join(', ')}${colors.reset}`);
+        }
+      }
+    }
   }
+
+  // Always stop the proxy
+  await discoveryProxy.stop();
 
   return {
     success: allSucceeded,
@@ -459,6 +623,10 @@ async function runJob(
       jobStatus = 'failure';
       if (result.error) {
         console.log(`    ${colors.red}Error: ${result.error}${colors.reset}`);
+      } else if (result.exitCode !== undefined && result.exitCode !== 0) {
+        console.log(`    ${colors.red}Exit code: ${result.exitCode}${colors.reset}`);
+      } else {
+        console.log(`    ${colors.red}Step failed${colors.reset}`);
       }
       // Stop on first failure (unless continue-on-error)
       if (!step['continue-on-error']) {
@@ -584,6 +752,10 @@ async function runReusableWorkflowJob(
         overallStatus = 'failure';
         if (result.error) {
           console.log(`      ${colors.red}Error: ${result.error}${colors.reset}`);
+        } else if (result.exitCode !== undefined && result.exitCode !== 0) {
+          console.log(`      ${colors.red}Exit code: ${result.exitCode}${colors.reset}`);
+        } else {
+          console.log(`      ${colors.red}Step failed${colors.reset}`);
         }
         if (!step['continue-on-error']) {
           break;
@@ -757,35 +929,153 @@ async function resolveSecrets(
 
 /**
  * Handle --updaterc flag to generate/update .localmostrc.
+ *
+ * Uses the hosts discovered during the workflow run to generate
+ * a .localmostrc file with only the hosts your workflow actually needs.
  */
 async function handleUpdateRc(
   cwd: string,
   workflow: ParsedWorkflow,
-  _context: ExecutionContext
+  discoveredHosts: string[],
+  sandboxTrace?: SandboxTraceResult
 ): Promise<void> {
   console.log();
-  console.log(`${colors.bold}Discovery mode:${colors.reset}`);
-  console.log('Recording access patterns for .localmostrc generation.');
+  console.log(`${colors.bold}Discovery Results:${colors.reset}`);
+
+  // Report network access
+  if (discoveredHosts.length === 0) {
+    console.log(`  Network: ${colors.dim}No network access detected${colors.reset}`);
+  } else {
+    console.log(`  Network: ${discoveredHosts.length} host(s) discovered`);
+    for (const host of discoveredHosts.slice(0, 5)) {
+      console.log(`    ${colors.dim}- ${host}${colors.reset}`);
+    }
+    if (discoveredHosts.length > 5) {
+      console.log(`    ${colors.dim}... and ${discoveredHosts.length - 5} more${colors.reset}`);
+    }
+  }
+
+  // Report filesystem access
+  const readPaths = sandboxTrace?.readPaths || [];
+  const writePaths = sandboxTrace?.writePaths || [];
+  const socketPaths = sandboxTrace?.socketPaths || [];
+
+  if (readPaths.length === 0 && writePaths.length === 0) {
+    console.log(`  Filesystem: ${colors.dim}No access outside workDir${colors.reset}`);
+  } else {
+    if (readPaths.length > 0) {
+      console.log(`  Filesystem reads: ${readPaths.length} path(s) need read access`);
+      for (const p of readPaths.slice(0, 3)) {
+        console.log(`    ${colors.dim}- ${p}${colors.reset}`);
+      }
+      if (readPaths.length > 3) {
+        console.log(`    ${colors.dim}... and ${readPaths.length - 3} more${colors.reset}`);
+      }
+    }
+    if (writePaths.length > 0) {
+      console.log(`  Filesystem writes: ${writePaths.length} path(s) need write access`);
+      for (const p of writePaths.slice(0, 3)) {
+        console.log(`    ${colors.dim}- ${p}${colors.reset}`);
+      }
+      if (writePaths.length > 3) {
+        console.log(`    ${colors.dim}... and ${writePaths.length - 3} more${colors.reset}`);
+      }
+    }
+  }
+
+  // Report socket access
+  if (socketPaths.length > 0) {
+    console.log(`  Sockets: ${socketPaths.length} socket(s) need access`);
+    for (const p of socketPaths) {
+      console.log(`    ${colors.dim}- ${p}${colors.reset}`);
+    }
+  }
+
   console.log();
 
-  // In a full implementation, would parse sandbox logs for actual access
-  // For now, generate a template based on the workflow
+  // Check if there's anything to add
+  if (discoveredHosts.length === 0 && readPaths.length === 0 && writePaths.length === 0 && socketPaths.length === 0) {
+    console.log(`${colors.yellow}No access to configure.${colors.reset}`);
+    console.log('This may happen if:');
+    console.log('  - Your workflow doesn\'t make network requests');
+    console.log('  - The tools used don\'t respect HTTP_PROXY environment variable');
+    console.log('  - All filesystem access was within the working directory');
+    return;
+  }
 
   const existingPath = findLocalmostrc(cwd);
   if (existingPath) {
-    console.log(`Would update: ${existingPath}`);
-    // TODO: Actually update the existing config
+    // Parse existing config and merge
+    const result = parseLocalmostrc(existingPath);
+    if (result.success && result.config) {
+      const existing = result.config;
+
+      // Calculate new items to add
+      const existingHosts = new Set(existing.shared?.network?.allow || []);
+      const newHosts = discoveredHosts.filter(h => !existingHosts.has(h));
+
+      const existingReadPaths = new Set(existing.shared?.filesystem?.read || []);
+      const newReadPaths = readPaths.filter(p => !existingReadPaths.has(p));
+
+      const existingWritePaths = new Set(existing.shared?.filesystem?.write || []);
+      const newWritePaths = writePaths.filter(p => !existingWritePaths.has(p));
+
+      const existingSocketPaths = new Set(existing.shared?.sockets?.allow || []);
+      const newSocketPaths = socketPaths.filter(p => !existingSocketPaths.has(p));
+
+      if (newHosts.length === 0 && newReadPaths.length === 0 && newWritePaths.length === 0 && newSocketPaths.length === 0) {
+        console.log(`${colors.green}✓${colors.reset} ${path.relative(cwd, existingPath)} already includes all discovered access.`);
+        return;
+      }
+
+      // Merge new items into existing config
+      const updatedConfig: LocalmostrcConfig = {
+        ...existing,
+        shared: {
+          ...existing.shared,
+          network: {
+            ...existing.shared?.network,
+            allow: [...(existing.shared?.network?.allow || []), ...newHosts],
+          },
+          filesystem: (newReadPaths.length > 0 || newWritePaths.length > 0 || existing.shared?.filesystem) ? {
+            ...existing.shared?.filesystem,
+            read: newReadPaths.length > 0 ? [...(existing.shared?.filesystem?.read || []), ...newReadPaths] : existing.shared?.filesystem?.read,
+            write: newWritePaths.length > 0 ? [...(existing.shared?.filesystem?.write || []), ...newWritePaths] : existing.shared?.filesystem?.write,
+          } : undefined,
+          sockets: newSocketPaths.length > 0 || existing.shared?.sockets ? {
+            ...existing.shared?.sockets,
+            allow: [...(existing.shared?.sockets?.allow || []), ...newSocketPaths],
+          } : undefined,
+        },
+      };
+
+      const content = serializeLocalmostrc(updatedConfig);
+      fs.writeFileSync(existingPath, content);
+      console.log(`${colors.green}✓${colors.reset} Updated ${path.relative(cwd, existingPath)}`);
+      const changes: string[] = [];
+      if (newHosts.length > 0) changes.push(`${newHosts.length} host(s)`);
+      if (newReadPaths.length > 0) changes.push(`${newReadPaths.length} read path(s)`);
+      if (newWritePaths.length > 0) changes.push(`${newWritePaths.length} write path(s)`);
+      if (newSocketPaths.length > 0) changes.push(`${newSocketPaths.length} socket(s)`);
+      console.log(`  Added ${changes.join(', ')}.`);
+    } else {
+      console.log(`${colors.yellow}Warning:${colors.reset} Could not parse existing .localmostrc: ${result.errors[0]?.message}`);
+    }
   } else {
+    // Create new config with discovered access
     const newConfig: LocalmostrcConfig = {
       version: LOCALMOSTRC_VERSION,
       shared: {
-        network: {
-          allow: [
-            '*.github.com',
-            'github.com',
-            'registry.npmjs.org',
-          ],
-        },
+        network: discoveredHosts.length > 0 ? {
+          allow: discoveredHosts,
+        } : undefined,
+        filesystem: (readPaths.length > 0 || writePaths.length > 0) ? {
+          read: readPaths.length > 0 ? readPaths : undefined,
+          write: writePaths.length > 0 ? writePaths : undefined,
+        } : undefined,
+        sockets: socketPaths.length > 0 ? {
+          allow: socketPaths,
+        } : undefined,
       },
       workflows: {
         [workflow.name]: {},
@@ -795,8 +1085,12 @@ async function handleUpdateRc(
     const content = serializeLocalmostrc(newConfig);
     const rcPath = path.join(cwd, '.localmostrc');
     fs.writeFileSync(rcPath, content);
-    console.log(`Created ${rcPath}:`);
-    console.log(colors.dim + content + colors.reset);
+    const items: string[] = [];
+    if (discoveredHosts.length > 0) items.push(`${discoveredHosts.length} host(s)`);
+    if (readPaths.length > 0) items.push(`${readPaths.length} read path(s)`);
+    if (writePaths.length > 0) items.push(`${writePaths.length} write path(s)`);
+    if (socketPaths.length > 0) items.push(`${socketPaths.length} socket(s)`);
+    console.log(`${colors.green}✓${colors.reset} Created .localmostrc with ${items.join(', ')}.`);
   }
 }
 
@@ -838,6 +1132,8 @@ export function parseTestArgs(args: string[]): TestOptions {
         throw new Error(`Invalid secrets mode: ${mode}. Use stub, prompt, or abort.`);
       }
       options.secretMode = mode;
+    } else if (arg === '--debug') {
+      options.debug = true;
     } else if (!arg.startsWith('-')) {
       options.workflow = arg;
     }

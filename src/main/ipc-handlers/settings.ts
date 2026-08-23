@@ -77,6 +77,9 @@ export const registerSettingsHandlers = (): void => {
     if (settings.userFilter !== undefined) {
       storeState.setUserFilter(settings.userFilter);
     }
+    if (settings.sandboxPolicyLevel !== undefined) {
+      storeState.setSandboxPolicyLevel(settings.sandboxPolicyLevel);
+    }
     if (settings.power !== undefined) {
       storeState.setPower(settings.power);
     }

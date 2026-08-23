@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faXmark, faLightbulb, faMoon, faDesktop } from '@fortawesome/free-solid-svg-icons';
-import { SleepProtection, BatteryPauseThreshold } from '../../shared/types';
+import { SleepProtection, BatteryPauseThreshold, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../../shared/types';
 import { GITHUB_APP_SETTINGS_URL, PRIVACY_POLICY_URL, REPOSITORY_URL } from '../../shared/constants';
 import { useAppConfig, useRunner, useUpdate } from '../contexts';
 import UserFilterSettings from './UserFilterSettings';
@@ -37,6 +37,8 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     setToolCacheLocation,
     userFilter,
     setUserFilter,
+    sandboxPolicyLevel,
+    setSandboxPolicyLevel,
     power,
     setPauseOnBattery,
     setPauseOnVideoCall,
@@ -429,15 +431,42 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
           </section>
         )}
 
-        {/* User Filter Section */}
+        {/* Job Security Section */}
         {user && isConfigured && (
           <section className={styles.settingsSection}>
-            <h3>Job Filtering</h3>
-            <UserFilterSettings
-              userFilter={userFilter}
-              currentUserLogin={user.login}
-              onFilterChange={setUserFilter}
-            />
+            <h3>Job Security</h3>
+
+            {/* Sandbox Policy Subsection */}
+            <div className={styles.subsection}>
+              <h4>Sandbox Policy</h4>
+              <div className={shared.formGroup}>
+                <label>Policy level</label>
+                <div className={styles.buttonGroup}>
+                  {(['strict', 'moderate', 'permissive'] as const).map((level) => (
+                    <button
+                      key={level}
+                      className={`${styles.optionButton} ${sandboxPolicyLevel === level ? styles.active : ''}`}
+                      onClick={() => setSandboxPolicyLevel(level)}
+                    >
+                      {SANDBOX_POLICY_LEVEL_DESCRIPTIONS[level].label}
+                    </button>
+                  ))}
+                </div>
+                <p className={shared.formHint}>
+                  {SANDBOX_POLICY_LEVEL_DESCRIPTIONS[sandboxPolicyLevel].description}
+                </p>
+              </div>
+            </div>
+
+            {/* User Filtering Subsection */}
+            <div className={styles.subsection}>
+              <h4>User Filtering</h4>
+              <UserFilterSettings
+                userFilter={userFilter}
+                currentUserLogin={user.login}
+                onFilterChange={setUserFilter}
+              />
+            </div>
           </section>
         )}
 

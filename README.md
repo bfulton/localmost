@@ -215,6 +215,7 @@ npm run make
 Current release: **0.3.0 — Test Locally, Secure by Default**
 - Run workflows locally before pushing with `localmost test`
 - Declarative sandbox policies with `.localmostrc`
+- Sandbox policy levels (strict / moderate / permissive) enforced by the local proxy
 - Contributor-based job filtering for public repos
 - Secure secrets management in macOS Keychain
 - Environment comparison with GitHub runners
@@ -223,6 +224,7 @@ Future feature ideas:
 
 - **Block untrusted jobs before they start** - Contributor filtering currently cancels a disallowed workflow run through the GitHub API *after* the runner has begun executing it, so untrusted steps run briefly before cancellation lands. Hold the job at pickup until the check passes.
 - **Wire up the policy cache** - `src/main/policy-cache.ts` implements caching, diffing, and an approval flow for `.localmostrc` changes, but nothing imports it yet. The background runner does not read repo policy at all.
+- **Coalesce discovery output** - `localmost test --updaterc` records every path it observes, including each ancestor directory and content-addressed cache blobs, producing thousands of redundant entries. Roll accessed paths up to directory rules and never emit `/` or `~`.
 - **Quick actions** - Re-run failed job, cancel all jobs.
 - **Spotlight integration** - Check status or pause builds from Spotlight.
 - **Artifact inspector** - Browse uploaded artifacts without leaving the app.

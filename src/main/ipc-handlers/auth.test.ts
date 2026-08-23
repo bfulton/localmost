@@ -79,6 +79,7 @@ describe('auth IPC handlers', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    jest.useFakeTimers();
     handlers = {};
 
     // Capture the handlers when registered
@@ -87,6 +88,10 @@ describe('auth IPC handlers', () => {
     });
 
     registerAuthHandlers();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
   });
 
   describe('github:auth-device-flow', () => {
@@ -108,7 +113,9 @@ describe('auth IPC handlers', () => {
         accessToken: 'test-token',
       });
 
-      const result = await handlers['github:auth-device-flow']();
+      const resultPromise = handlers['github:auth-device-flow']();
+      await jest.runAllTimersAsync();
+      const result = await resultPromise;
 
       expect(result.success).toBe(true);
       expect(result.user).toEqual(mockUser);
@@ -121,7 +128,9 @@ describe('auth IPC handlers', () => {
         accessToken: 'test-token',
       });
 
-      await handlers['github:auth-device-flow']();
+      const resultPromise = handlers['github:auth-device-flow']();
+      await jest.runAllTimersAsync();
+      await resultPromise;
 
       expect(clipboard.writeText).toHaveBeenCalledWith('ABCD-1234');
     });
@@ -132,7 +141,9 @@ describe('auth IPC handlers', () => {
         accessToken: 'test-token',
       });
 
-      await handlers['github:auth-device-flow']();
+      const resultPromise = handlers['github:auth-device-flow']();
+      await jest.runAllTimersAsync();
+      await resultPromise;
 
       expect(mockSetDeviceCode).toHaveBeenCalledWith({
         userCode: 'ABCD-1234',
@@ -147,7 +158,9 @@ describe('auth IPC handlers', () => {
         accessToken: 'test-token',
       });
 
-      await handlers['github:auth-device-flow']();
+      const resultPromise = handlers['github:auth-device-flow']();
+      await jest.runAllTimersAsync();
+      await resultPromise;
 
       // First call sets the device code, second call clears it
       expect(mockSetDeviceCode).toHaveBeenLastCalledWith(null);
@@ -156,7 +169,9 @@ describe('auth IPC handlers', () => {
     it('should clear auth state on error', async () => {
       mockWaitForAuth.mockRejectedValue(new Error('Auth failed'));
 
-      const result = await handlers['github:auth-device-flow']();
+      const resultPromise = handlers['github:auth-device-flow']();
+      await jest.runAllTimersAsync();
+      const result = await resultPromise;
 
       expect(result.success).toBe(false);
       expect(mockSetDeviceCode).toHaveBeenLastCalledWith(null);

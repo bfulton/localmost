@@ -21,6 +21,17 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   - Per-workflow policy overrides
   - Discovery mode with `localmost test --updaterc`
   - Policy validation with `localmost policy validate`
+- **Sandbox Policy Levels**: Choose enforcement strength in Settings under Job Security
+  - `strict` (default): only runner infrastructure plus hosts declared in `.localmostrc`
+  - `moderate`: also allows GitHub Actions infrastructure, common registries, and tool caches
+  - `permissive`: no restrictions, for trusted repos or debugging
+  - Per-job summary of allowed and blocked hosts in the runner log
+- **Proxy-Enforced Network Policy**: Hostname filtering moved from `sandbox-exec` to the local proxy
+  - macOS `sandbox-exec` cannot filter by hostname; its `(remote ...)` filter only matches
+    IP addresses and ports, so the previous domain patterns never took effect
+  - The sandbox now permits only localhost TCP and routes egress through the proxy,
+    which enforces the hostname allowlist
+  - Unix socket access is denied by default and opted into via a `sockets.allow` policy section
 - **Contributor-Based Job Filtering**: Decide which jobs may run by who is involved
   - Scope: everyone, the workflow trigger author, or every contributor to the repo
   - Allowed users: just you, or an explicit allowlist

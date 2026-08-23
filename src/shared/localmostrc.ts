@@ -7,7 +7,7 @@
 import * as yaml from 'js-yaml';
 import * as fs from 'fs';
 import * as path from 'path';
-import { SandboxPolicy, NetworkPolicy, FilesystemPolicy, EnvPolicy } from './sandbox-profile';
+import { SandboxPolicy, NetworkPolicy, FilesystemPolicy, SocketsPolicy, EnvPolicy } from './sandbox-profile';
 
 // =============================================================================
 // Types
@@ -198,6 +198,11 @@ function validatePolicy(policy: unknown, path: string, errors: ParseError[]): vo
     validateFilesystemPolicy(p.filesystem, `${path}.filesystem`, errors);
   }
 
+  // Validate sockets policy
+  if (p.sockets !== undefined) {
+    validateSocketsPolicy(p.sockets, `${path}.sockets`, errors);
+  }
+
   // Validate env policy
   if (p.env !== undefined) {
     validateEnvPolicy(p.env, `${path}.env`, errors);
@@ -236,6 +241,19 @@ function validateFilesystemPolicy(policy: unknown, path: string, errors: ParseEr
   }
   if (p.deny !== undefined) {
     validateStringArray(p.deny, `${path}.deny`, errors);
+  }
+}
+
+function validateSocketsPolicy(policy: unknown, path: string, errors: ParseError[]): void {
+  if (typeof policy !== 'object' || policy === null) {
+    errors.push({ message: `${path} must be an object` });
+    return;
+  }
+
+  const p = policy as Record<string, unknown>;
+
+  if (p.allow !== undefined) {
+    validateStringArray(p.allow, `${path}.allow`, errors);
   }
 }
 
@@ -340,6 +358,19 @@ function mergeFilesystemPolicy(
 }
 
 /**
+ * Merge sockets policies.
+ */
+function mergeSocketsPolicy(base?: SocketsPolicy, override?: SocketsPolicy): SocketsPolicy | undefined {
+  if (!base && !override) {
+    return undefined;
+  }
+
+  return {
+    allow: mergeArrays(base?.allow, override?.allow),
+  };
+}
+
+/**
  * Merge env policies.
  */
 function mergeEnvPolicy(base?: EnvPolicy, override?: EnvPolicy): EnvPolicy | undefined {
@@ -361,6 +392,7 @@ export function mergePolicies(base: SandboxPolicy, override: SandboxPolicy): San
   return {
     network: mergeNetworkPolicy(base.network, override.network),
     filesystem: mergeFilesystemPolicy(base.filesystem, override.filesystem),
+    sockets: mergeSocketsPolicy(base.sockets, override.sockets),
     env: mergeEnvPolicy(base.env, override.env),
   };
 }
@@ -463,6 +495,14 @@ function serializePolicy(policy: SandboxPolicy, indent: string): string[] {
     }
   }
 
+  if (policy.sockets?.allow?.length) {
+    lines.push(`${indent}sockets:`);
+    lines.push(`${indent}  allow:`);
+    for (const socketPath of policy.sockets.allow) {
+      lines.push(`${indent}    - "${socketPath}"`);
+    }
+  }
+
   if (policy.env) {
     lines.push(`${indent}env:`);
     if (policy.env.allow?.length) {
@@ -531,6 +571,9 @@ function diffPolicies(
   diffArrays(oldPolicy.filesystem?.read, newPolicy.filesystem?.read, `${prefix}.filesystem.read`, diffs);
   diffArrays(oldPolicy.filesystem?.write, newPolicy.filesystem?.write, `${prefix}.filesystem.write`, diffs);
   diffArrays(oldPolicy.filesystem?.deny, newPolicy.filesystem?.deny, `${prefix}.filesystem.deny`, diffs);
+
+  // Sockets
+  diffArrays(oldPolicy.sockets?.allow, newPolicy.sockets?.allow, `${prefix}.sockets.allow`, diffs);
 
   // Env
   diffArrays(oldPolicy.env?.allow, newPolicy.env?.allow, `${prefix}.env.allow`, diffs);
