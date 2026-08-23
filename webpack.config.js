@@ -95,6 +95,7 @@ const rendererConfig = {
       path: false,
       fs: false,
       os: false,
+      child_process: false,
       crypto: false,
       buffer: false,
       stream: false,
