@@ -113,8 +113,9 @@ function isLoginAllowed(
   const loginLower = login.toLowerCase();
 
   if (allowedUsers === 'just-me') {
-    // If we don't know who we are, allow (fail open)
-    if (!currentUserLogin) return true;
+    // Filtering was explicitly enabled, so an unidentifiable current user means
+    // we cannot confirm the actor is us. Fail closed rather than allow everyone.
+    if (!currentUserLogin) return false;
     return loginLower === currentUserLogin.toLowerCase();
   }
 

@@ -357,7 +357,7 @@ describe('RunnerManager', () => {
       expect(helper.isUserAllowed('user3')).toBe(false);
     });
 
-    it('should allow user when just-me but no current user is set', () => {
+    it('should block users when just-me but no current user is known', () => {
       const manager = new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
@@ -367,8 +367,9 @@ describe('RunnerManager', () => {
       });
       const helper = new RunnerManagerTestHelper(manager);
 
-      // Should return true (allow) when current user is unknown
-      expect(helper.isUserAllowed('anyuser')).toBe(true);
+      // Filtering was explicitly enabled. If we cannot identify ourselves we
+      // cannot confirm the actor is us, so the job must not run.
+      expect(helper.isUserAllowed('anyuser')).toBe(false);
     });
 
     it('should handle empty allowlist', () => {
@@ -386,6 +387,99 @@ describe('RunnerManager', () => {
   });
 
   // fetchActionsUrl was removed - job URLs are now extracted directly from job details
+
+  describe('contributors scope enforcement', () => {
+    const JOB = {
+      name: 'build',
+      repository: 'owner/repo',
+      startedAt: '2026-01-01T00:00:00Z',
+      id: 'job-1',
+      targetDisplayName: 'owner/repo',
+      githubRunId: 42,
+      githubActor: 'trusted',
+      githubSha: 'abc1234def5678',
+    };
+
+    const CONTRIBUTORS_FILTER = {
+      scope: 'contributors' as const,
+      allowedUsers: 'just-me' as const,
+      allowlist: [],
+    };
+
+    function setup(overrides: Record<string, unknown>) {
+      const cancelWorkflowRun = jest.fn().mockResolvedValue(undefined);
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getUserFilter: () => CONTRIBUTORS_FILTER,
+        getCurrentUserLogin: () => 'trusted',
+        cancelWorkflowRun,
+        ...overrides,
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, { name: 'runner-1', currentJob: { ...JOB } });
+      return { helper, cancelWorkflowRun };
+    }
+
+    it('allows the job when every contributor is allowed', async () => {
+      const { helper, cancelWorkflowRun } = setup({
+        getAllContributors: async () => new Set(['trusted']),
+      });
+
+      await helper.checkJobUserFilter(1, 'runner-1');
+
+      expect(cancelWorkflowRun).not.toHaveBeenCalled();
+    });
+
+    it('cancels the job when a contributor is not allowed', async () => {
+      const { helper, cancelWorkflowRun } = setup({
+        getAllContributors: async () => new Set(['trusted', 'stranger']),
+      });
+
+      await helper.checkJobUserFilter(1, 'runner-1');
+
+      expect(cancelWorkflowRun).toHaveBeenCalledWith('owner', 'repo', 42);
+    });
+
+    it('cancels the job when the contributor lookup fails', async () => {
+      const { helper, cancelWorkflowRun } = setup({
+        getAllContributors: async () => {
+          throw new Error('API is down');
+        },
+      });
+
+      await helper.checkJobUserFilter(1, 'runner-1');
+
+      expect(cancelWorkflowRun).toHaveBeenCalledWith('owner', 'repo', 42);
+    });
+
+    it('cancels the job when there is no SHA to check contributors against', async () => {
+      const { helper, cancelWorkflowRun } = setup({
+        getAllContributors: async () => new Set(['trusted']),
+      });
+      helper.setInstance(1, {
+        name: 'runner-1',
+        currentJob: { ...JOB, githubSha: undefined },
+      });
+
+      // Must not silently downgrade to the weaker trigger-author check:
+      // the trigger author is allowed here, but the contributors are unknown.
+      await helper.checkJobUserFilter(1, 'runner-1');
+
+      expect(cancelWorkflowRun).toHaveBeenCalledWith('owner', 'repo', 42);
+    });
+
+    it('cancels the job when contributor lookup is unavailable', async () => {
+      const { helper, cancelWorkflowRun } = setup({
+        getAllContributors: undefined,
+      });
+
+      await helper.checkJobUserFilter(1, 'runner-1');
+
+      expect(cancelWorkflowRun).toHaveBeenCalledWith('owner', 'repo', 42);
+    });
+  });
 
   describe('getStatus with shutting_down', () => {
     it('should return shutting_down status when stopping is true', () => {

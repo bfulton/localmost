@@ -25,6 +25,7 @@ interface RunnerInstance {
     githubRunId?: number;
     githubJobId?: number;
     githubActor?: string;
+    githubSha?: string;
   } | null;
   name: string;
   jobsCompleted: number;
@@ -39,6 +40,7 @@ interface RunnerManagerInternals {
   stopping: boolean;
   startedAt: string | null;
   isUserAllowed(actorLogin: string): boolean;
+  checkJobUserFilter(instanceNum: number, runnerName: string): Promise<void>;
 }
 
 /**
@@ -97,5 +99,12 @@ export class RunnerManagerTestHelper {
    */
   isUserAllowed(actorLogin: string): boolean {
     return this.internals.isUserAllowed(actorLogin);
+  }
+
+  /**
+   * Run the job user filter check for an instance.
+   */
+  checkJobUserFilter(instanceNum: number, runnerName: string): Promise<void> {
+    return this.internals.checkJobUserFilter(instanceNum, runnerName);
   }
 }

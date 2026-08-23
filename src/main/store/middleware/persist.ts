@@ -9,7 +9,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'js-yaml';
 import { getAppDataDir, getConfigPath } from '../../paths';
-import { decryptValue } from '../../encryption';
 import { bootLog } from '../../log-file';
 import { store, getState } from '../index';
 import { ConfigSlice, defaultConfigState } from '../types';

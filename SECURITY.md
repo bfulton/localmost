@@ -77,6 +77,7 @@ localmost is an Electron desktop application that manages GitHub Actions self-ho
 - **OAuth Device Flow**: Uses GitHub's Device Flow for user authentication, appropriate for desktop applications that cannot securely store client secrets
 - **Token Management**: Access tokens and refresh tokens are obtained via the GitHub App OAuth flow
 - **Token Refresh**: Expired tokens are automatically refreshed using refresh tokens
+- **Access tokens are never written to disk**: They live only in memory. Only the refresh token is persisted, and a fresh access token is obtained at startup
 - **Required Permissions**:
   - `Administration: Read & Write` - Register and remove self-hosted runners on repositories
   - `Actions: Read & Write` - Check workflow status and cancel running jobs
@@ -86,7 +87,7 @@ localmost is an Electron desktop application that manages GitHub Actions self-ho
 ## Credential Storage
 
 - **Location**: Configuration stored in `~/.localmost/config.yaml`
-- **Encryption**: Sensitive tokens (access token, refresh token) are encrypted using Electron's `safeStorage` API
+- **Encryption**: The persisted refresh token is encrypted using Electron's `safeStorage` API
   - Uses macOS Keychain for secure storage
   - Encryption key is managed by the operating system and tied to the user account
   - Encrypted values are stored with an `encrypted:` prefix followed by base64-encoded ciphertext

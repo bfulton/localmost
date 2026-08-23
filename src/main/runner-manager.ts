@@ -1304,19 +1304,15 @@ export class RunnerManager {
       }
     } else if (scope === 'contributors') {
       // Check all repository contributors
+      // The 'contributors' scope was chosen precisely because checking the
+      // trigger author alone is not sufficient. If the check cannot be
+      // performed, fail closed rather than silently downgrading to it.
       if (!githubSha) {
-        this.log('warn', `checkJobUserFilter: no SHA for contributors check, falling back to trigger check`);
-        // Fall back to trigger check if no SHA available
-        if (!isUserAllowed(githubActor, userFilter, currentUser)) {
-          shouldCancel = true;
-          reason = `trigger author '${githubActor}' not in allowed users (no SHA for contributors check)`;
-        }
+        shouldCancel = true;
+        reason = 'cannot verify contributors: no commit SHA for this job';
       } else if (!this.getAllContributors) {
-        this.log('warn', 'checkJobUserFilter: getAllContributors not available, falling back to trigger check');
-        if (!isUserAllowed(githubActor, userFilter, currentUser)) {
-          shouldCancel = true;
-          reason = `trigger author '${githubActor}' not in allowed users (contributors check unavailable)`;
-        }
+        shouldCancel = true;
+        reason = 'cannot verify contributors: contributor lookup unavailable';
       } else {
         try {
           // Get all contributors/authors for the repo at this SHA
