@@ -7,10 +7,12 @@ let electronApp: ElectronApplication | null = null;
 let testConfigDir: string | null = null;
 
 export async function launchElectron(): Promise<{ app: ElectronApplication; page: Page }> {
-  // Use the production webpack build (file:// URLs, no dev server needed)
-  // The architecture-specific path is created by electron-forge during build
-  const arch = process.arch;
-  const mainPath = path.join(__dirname, '..', '.webpack', arch, 'main');
+  // Use the production webpack build (file:// URLs, no dev server needed).
+  // This is the package.json "main" entry that `npm run build` produces.
+  const mainPath = path.join(__dirname, '..', 'dist', 'main.js');
+  if (!fs.existsSync(mainPath)) {
+    throw new Error(`Electron main bundle not found at ${mainPath}. Run "npm run build" first.`);
+  }
 
   // Create an isolated temp config directory for test reproducibility and safety
   // This prevents tests from using/modifying the user's real ~/.localmost settings
