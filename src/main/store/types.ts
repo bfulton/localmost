@@ -22,6 +22,7 @@ import {
   RunnerProxyStatus,
   UpdateStatus,
   UpdateSettings,
+  SandboxPolicyLevel,
   DEFAULT_POWER_CONFIG,
   DEFAULT_NOTIFICATIONS_CONFIG,
 } from '../../shared/types';
@@ -58,6 +59,9 @@ export interface ConfigSlice {
 
   // User filter
   userFilter: UserFilterConfig;
+
+  // Sandbox policy level
+  sandboxPolicyLevel: SandboxPolicyLevel;
 
   // Power settings
   power: PowerConfig;
@@ -187,6 +191,7 @@ export interface ConfigActions {
   setPreserveWorkDir: (setting: 'never' | 'session' | 'always') => void;
   setToolCacheLocation: (setting: ToolCacheLocation) => void;
   setUserFilter: (filter: UserFilterConfig) => void;
+  setSandboxPolicyLevel: (level: SandboxPolicyLevel) => void;
   setPower: (config: PowerConfig) => void;
   setNotifications: (config: NotificationsConfig) => void;
   setLaunchAtLogin: (enabled: boolean) => void;
@@ -274,6 +279,7 @@ export const defaultConfigState: ConfigSlice = {
   preserveWorkDir: 'never',
   toolCacheLocation: 'persistent',
   userFilter: { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] },
+  sandboxPolicyLevel: 'strict',
   power: DEFAULT_POWER_CONFIG,
   notifications: DEFAULT_NOTIFICATIONS_CONFIG,
   launchAtLogin: false,

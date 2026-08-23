@@ -12,6 +12,7 @@ import {
   LogLevel,
   ToolCacheLocation,
   UserFilterConfig,
+  SandboxPolicyLevel,
   PowerConfig,
   BatteryPauseThreshold,
   NotificationsConfig,
@@ -59,6 +60,10 @@ interface AppConfigContextValue {
   userFilter: UserFilterConfig;
   setUserFilter: (filter: UserFilterConfig) => Promise<void>;
 
+  // Sandbox policy level
+  sandboxPolicyLevel: SandboxPolicyLevel;
+  setSandboxPolicyLevel: (level: SandboxPolicyLevel) => Promise<void>;
+
   // Power settings
   power: PowerConfig;
   setPower: (config: PowerConfig) => Promise<void>;
@@ -105,6 +110,7 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
   const storePreserveWorkDir = useStore((state) => state?.config?.preserveWorkDir ?? 'never');
   const storeToolCacheLocation = useStore((state) => state?.config?.toolCacheLocation ?? 'persistent');
   const storeUserFilter = useStore((state) => state?.config?.userFilter ?? { mode: 'just-me' as const, allowlist: [] });
+  const storeSandboxPolicyLevel = useStore((state) => state?.config?.sandboxPolicyLevel ?? 'strict');
   const storePower = useStore((state) => state?.config?.power ?? DEFAULT_POWER_CONFIG);
   const storeNotifications = useStore((state) => state?.config?.notifications ?? DEFAULT_NOTIFICATIONS_CONFIG);
   const storeIsOnline = useStore((state) => state?.ui?.isOnline ?? true);
@@ -133,6 +139,7 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     preserveWorkDir: 'never' | 'session' | 'always';
     toolCacheLocation: ToolCacheLocation;
     userFilter: UserFilterConfig;
+    sandboxPolicyLevel: SandboxPolicyLevel;
     power: PowerConfig;
     notifications: NotificationsConfig;
     isOnline: boolean;
@@ -149,6 +156,7 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     preserveWorkDir: 'never',
     toolCacheLocation: 'persistent',
     userFilter: { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] },
+    sandboxPolicyLevel: 'strict',
     power: DEFAULT_POWER_CONFIG,
     notifications: DEFAULT_NOTIFICATIONS_CONFIG,
     isOnline: true,
@@ -167,6 +175,7 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
   const preserveWorkDir = isZubridgeReady ? storePreserveWorkDir : fallbackState.preserveWorkDir;
   const toolCacheLocation = isZubridgeReady ? storeToolCacheLocation : fallbackState.toolCacheLocation;
   const userFilter = isZubridgeReady ? storeUserFilter : fallbackState.userFilter;
+  const sandboxPolicyLevel = isZubridgeReady ? storeSandboxPolicyLevel : fallbackState.sandboxPolicyLevel;
   const power = isZubridgeReady ? storePower : fallbackState.power;
   const notifications = isZubridgeReady ? storeNotifications : fallbackState.notifications;
   const isOnline = isZubridgeReady ? storeIsOnline : fallbackState.isOnline;
@@ -220,6 +229,9 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
           userFilter: settings.userFilter && ['everyone', 'trigger', 'contributors'].includes((settings.userFilter as UserFilterConfig).scope)
             ? (settings.userFilter as UserFilterConfig)
             : prev.userFilter,
+          sandboxPolicyLevel: settings.sandboxPolicyLevel && ['strict', 'moderate', 'permissive'].includes(settings.sandboxPolicyLevel as string)
+            ? (settings.sandboxPolicyLevel as SandboxPolicyLevel)
+            : prev.sandboxPolicyLevel,
           power: settings.power ? { ...DEFAULT_POWER_CONFIG, ...(settings.power as PowerConfig) } : prev.power,
           notifications: settings.notifications ? { ...DEFAULT_NOTIFICATIONS_CONFIG, ...(settings.notifications as NotificationsConfig) } : prev.notifications,
           isLoading: false,
@@ -361,6 +373,15 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     }
   }, []);
 
+  const setSandboxPolicyLevel = useCallback(async (level: SandboxPolicyLevel) => {
+    setFallbackState(prev => ({ ...prev, sandboxPolicyLevel: level }));
+    try {
+      await window.localmost.settings.set({ sandboxPolicyLevel: level });
+    } catch {
+      // Optimistic update handled by zubridge sync
+    }
+  }, []);
+
   const setPower = useCallback(async (config: PowerConfig) => {
     setFallbackState(prev => ({ ...prev, power: config }));
     try {
@@ -448,6 +469,8 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     setToolCacheLocation,
     userFilter,
     setUserFilter,
+    sandboxPolicyLevel,
+    setSandboxPolicyLevel,
     power,
     setPower,
     setPauseOnBattery,

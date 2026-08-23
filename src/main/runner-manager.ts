@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as yaml from 'js-yaml';
-import { RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig } from '../shared/types';
+import { RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
 import { spawnSandboxed } from './process-sandbox';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
@@ -11,6 +11,7 @@ import { RunnerDownloader } from './runner-downloader';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
 import { loadConfig } from './config';
 import { normalizeFilterConfig, isUserAllowed, areAllUsersAllowed, parseRepository } from './runner/user-filter';
+import { getState } from './store';
 
 /**
  * Get the hostname without .local suffix (common on macOS).
@@ -640,19 +641,23 @@ export class RunnerManager {
   }
 
   private async startInstanceProxy(instanceNum: number): Promise<ProxyServer> {
+    const policyLevel = getState().config.sandboxPolicyLevel || 'strict';
+
     const proxy = new ProxyServer({
+      policyLevel,
       onLog: (entry: ProxyLogEntry) => {
         // Skip logging routine localhost message polling (very noisy)
         if (!entry.blocked && (entry.host === 'localhost' || entry.host === '127.0.0.1')) {
           return;
         }
         const status = entry.blocked ? 'BLOCKED' : 'ALLOWED';
-        this.log('info', `[proxy ${instanceNum}] ${status} ${entry.method} ${entry.host}:${entry.port}${entry.path || ''}`);
+        const reasonSuffix = entry.reason ? ` (${entry.reason})` : '';
+        this.log('info', `[proxy ${instanceNum}] ${status} ${entry.method} ${entry.host}:${entry.port}${entry.path || ''}${reasonSuffix}`);
       },
     });
 
     const port = await proxy.start();
-    this.log('debug', `Proxy server for instance ${instanceNum} started on port ${port}`);
+    this.log('debug', `Proxy server for instance ${instanceNum} started on port ${port} with ${policyLevel} policy`);
     this.proxyServers.set(instanceNum, proxy);
     return proxy;
   }
@@ -1241,10 +1246,41 @@ export class RunnerManager {
         runTimeSeconds,
       });
 
+      // Log sandbox policy summary for the completed job
+      this.logSandboxSummary(instanceNum, jobName);
+
       instance.currentJob = null;
       instance.status = 'listening';
       this.updateAggregateStatus();
     }
+  }
+
+  /**
+   * Log a summary of sandbox policy enforcement for a completed job.
+   */
+  private logSandboxSummary(instanceNum: number, jobName: string): void {
+    const proxy = this.proxyServers.get(instanceNum);
+    if (!proxy) return;
+
+    const stats = proxy.getStats();
+    const policyLevel = proxy.getPolicyLevel();
+    const policyLabel = SANDBOX_POLICY_LEVEL_DESCRIPTIONS[policyLevel]?.label || policyLevel;
+
+    this.log('info', `[instance ${instanceNum}] Sandbox summary for '${jobName}' (${policyLabel} policy):`);
+    this.log('info', `[instance ${instanceNum}]   Network: ${stats.allowedCount} allowed, ${stats.blockedCount} blocked`);
+
+    if (stats.blockedHosts.size > 0) {
+      const blockedList = Array.from(stats.blockedHosts).slice(0, 10).join(', ');
+      const moreCount = stats.blockedHosts.size > 10 ? ` (+${stats.blockedHosts.size - 10} more)` : '';
+      this.log('warn', `[instance ${instanceNum}]   Blocked hosts: ${blockedList}${moreCount}`);
+
+      if (policyLevel === 'strict') {
+        this.log('info', `[instance ${instanceNum}]   To allow these hosts, add them to your .localmostrc file, or change sandbox policy level in Settings > Job Security.`);
+      }
+    }
+
+    // Reset stats for next job
+    proxy.resetStats();
   }
 
   /**

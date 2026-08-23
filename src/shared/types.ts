@@ -282,6 +282,8 @@ export interface AppSettings {
   preserveWorkDir?: PreserveWorkDir;
   /** Tool cache location. Defaults to 'persistent' (shared across restarts) */
   toolCacheLocation?: ToolCacheLocation;
+  /** Sandbox policy level for all sandbox restrictions. Defaults to 'strict' */
+  sandboxPolicyLevel?: SandboxPolicyLevel;
 }
 
 export interface DeviceCodeInfo {
@@ -342,6 +344,36 @@ export interface GitHubUserSearchResult {
   avatar_url: string;
   name: string | null;
 }
+
+// =============================================================================
+// Sandbox Policy Level Types
+// =============================================================================
+
+/**
+ * Sandbox policy level controls what restrictions are enforced during job execution.
+ * This affects network access, filesystem access, and all other sandbox-exec restrictions.
+ *
+ * - strict: Only access explicitly listed in .localmostrc is allowed. Most secure option.
+ * - moderate: GitHub Actions infrastructure, common registries, and standard tool caches are allowed by default.
+ * - permissive: All access is allowed. Use only for trusted repositories or debugging.
+ */
+export type SandboxPolicyLevel = 'strict' | 'moderate' | 'permissive';
+
+/** Human-readable descriptions for sandbox policy level options */
+export const SANDBOX_POLICY_LEVEL_DESCRIPTIONS: Record<SandboxPolicyLevel, { label: string; description: string }> = {
+  strict: {
+    label: 'Strict',
+    description: 'Only access explicitly listed in .localmostrc is allowed. Network connections, filesystem writes, and other operations must be pre-approved.',
+  },
+  moderate: {
+    label: 'Moderate',
+    description: 'GitHub Actions infrastructure, common package registries, and standard tool caches are allowed. This is the previous default behavior.',
+  },
+  permissive: {
+    label: 'Permissive',
+    description: 'All access is allowed with no restrictions. Use only for trusted repositories or when debugging policy issues.',
+  },
+};
 
 // =============================================================================
 // Auto-Update Types

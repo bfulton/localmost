@@ -4,12 +4,18 @@
  * Provides a local proxy that:
  * - Logs all outbound connections (destination host:port)
  * - Supports HTTP CONNECT for HTTPS tunneling
- * - Can be configured to allow/deny specific hosts
+ * - Enforces network access based on sandbox policy level
  */
 
 import * as http from 'http';
 import * as net from 'net';
 import { URL } from 'url';
+import { SandboxPolicyLevel } from '../shared/types';
+import {
+  MODERATE_NETWORK_ALLOWLIST,
+  STRICT_NETWORK_ALLOWLIST,
+  RUNNER_INFRASTRUCTURE_ALLOWLIST,
+} from '../shared/network-allowlist';
 
 export interface ProxyLogEntry {
   timestamp: string;
@@ -18,6 +24,8 @@ export interface ProxyLogEntry {
   port: number;
   path?: string;
   blocked: boolean;
+  /** Why the request was allowed/blocked */
+  reason?: 'infrastructure' | 'policy' | 'allowlist' | 'moderate-default' | 'permissive';
 }
 
 export type ProxyLogCallback = (entry: ProxyLogEntry) => void;
@@ -25,85 +33,143 @@ export type ProxyLogCallback = (entry: ProxyLogEntry) => void;
 export interface ProxyServerOptions {
   port?: number;
   onLog?: ProxyLogCallback;
+  /** Hosts allowed by .localmostrc policy (used in strict mode, merged in moderate mode) */
   allowedHosts?: string[];
+  /** Sandbox policy level - controls network access restrictions */
+  policyLevel?: SandboxPolicyLevel;
 }
 
-// Default allowed hosts for GitHub Actions runners
-const DEFAULT_ALLOWED_HOSTS = [
-  // Local broker proxy (for multi-target support)
-  'localhost',
-  '127.0.0.1',
+/** Statistics tracked per proxy session for job summary */
+export interface ProxyStats {
+  allowedCount: number;
+  blockedCount: number;
+  /** Unique hosts that were allowed */
+  allowedHosts: Set<string>;
+  /** Unique hosts that were blocked */
+  blockedHosts: Set<string>;
+}
 
-  // GitHub API and services
-  'github.com',
-  'api.github.com',
-  'codeload.github.com',
-  'objects.githubusercontent.com',
-  'raw.githubusercontent.com',
-  'github-releases.githubusercontent.com',
-  'release-assets.githubusercontent.com',
-  'github-registry-files.githubusercontent.com',
-  'ghcr.io',
-  'pkg.github.com',
-
-  // Node.js (for actions/setup-node)
-  'nodejs.org',
-
-  // GitHub Actions specific
-  '*.actions.githubusercontent.com', // Covers all regional pipeline hosts (pipelinesghubeus22, etc.)
-  'pipelines.actions.githubusercontent.com',
-  'results-receiver.actions.githubusercontent.com',
-  'vstoken.actions.githubusercontent.com',
-  'token.actions.githubusercontent.com',
-  'artifactcache.actions.githubusercontent.com',
-  '*.blob.core.windows.net', // Azure blob storage for caches/artifacts
-
-  // Common package registries (runners often need these)
-  'registry.npmjs.org',
-  'pypi.org',
-  'files.pythonhosted.org',
-  'rubygems.org',
-  'crates.io',
-  'static.crates.io',
-];
+// Re-export for backwards compatibility
+export { MODERATE_NETWORK_ALLOWLIST } from '../shared/network-allowlist';
 
 export class ProxyServer {
   private server: http.Server | null = null;
   private port: number;
   private onLog: ProxyLogCallback;
-  private allowedHosts: string[];
+  private policyAllowedHosts: string[];
+  private policyLevel: SandboxPolicyLevel;
   private connections: Set<net.Socket> = new Set();
+  private stats: ProxyStats = {
+    allowedCount: 0,
+    blockedCount: 0,
+    allowedHosts: new Set(),
+    blockedHosts: new Set(),
+  };
 
   constructor(options: ProxyServerOptions = {}) {
     this.port = options.port || 0; // 0 = auto-assign
     this.onLog = options.onLog || (() => {});
-    this.allowedHosts = options.allowedHosts || DEFAULT_ALLOWED_HOSTS;
+    this.policyAllowedHosts = options.allowedHosts || [];
+    this.policyLevel = options.policyLevel || 'strict';
   }
 
   /**
-   * Check if a host is allowed through the proxy
+   * Check if a host is allowed through the proxy based on policy level.
+   * Returns { allowed: boolean, reason: string } for logging.
    */
-  private isHostAllowed(host: string): boolean {
+  private checkHostAccess(host: string): { allowed: boolean; reason: ProxyLogEntry['reason'] } {
     const normalizedHost = host.toLowerCase();
 
-    return this.allowedHosts.some(pattern => {
+    // Permissive: allow everything
+    if (this.policyLevel === 'permissive') {
+      return { allowed: true, reason: 'permissive' };
+    }
+
+    // Helper to check if host matches a pattern
+    const matchesPattern = (pattern: string): boolean => {
       if (pattern.startsWith('*.')) {
-        // Wildcard match: *.example.com matches sub.example.com
         const suffix = pattern.slice(1); // Remove *
         return normalizedHost.endsWith(suffix);
       }
       return normalizedHost === pattern.toLowerCase();
-    });
+    };
+
+    // Runner infrastructure is allowed at every level - without it the runner
+    // daemon cannot register or poll for jobs.
+    if (RUNNER_INFRASTRUCTURE_ALLOWLIST.some(matchesPattern)) {
+      return { allowed: true, reason: 'infrastructure' };
+    }
+
+    // Check policy allowlist (from .localmostrc)
+    if (this.policyAllowedHosts.some(matchesPattern)) {
+      return { allowed: true, reason: 'policy' };
+    }
+
+    // For moderate policy, also check the moderate defaults
+    if (this.policyLevel === 'moderate') {
+      if (MODERATE_NETWORK_ALLOWLIST.some(matchesPattern)) {
+        return { allowed: true, reason: 'moderate-default' };
+      }
+    }
+
+    // For strict policy, nothing beyond infrastructure unless declared
+    if (this.policyLevel === 'strict') {
+      if (STRICT_NETWORK_ALLOWLIST.some(matchesPattern)) {
+        return { allowed: true, reason: 'allowlist' };
+      }
+    }
+
+    // Not allowed
+    return { allowed: false, reason: undefined };
   }
 
   /**
-   * Log a proxy request
+   * Log a proxy request and update stats
    */
   private log(entry: Omit<ProxyLogEntry, 'timestamp'>): void {
+    // Update stats
+    if (entry.blocked) {
+      this.stats.blockedCount++;
+      this.stats.blockedHosts.add(entry.host);
+    } else {
+      this.stats.allowedCount++;
+      this.stats.allowedHosts.add(entry.host);
+    }
+
     this.onLog({
       timestamp: new Date().toISOString(),
       ...entry,
     });
+  }
+
+  /**
+   * Get current proxy statistics
+   */
+  getStats(): ProxyStats {
+    return {
+      ...this.stats,
+      allowedHosts: new Set(this.stats.allowedHosts),
+      blockedHosts: new Set(this.stats.blockedHosts),
+    };
+  }
+
+  /**
+   * Reset statistics (e.g., between jobs)
+   */
+  resetStats(): void {
+    this.stats = {
+      allowedCount: 0,
+      blockedCount: 0,
+      allowedHosts: new Set(),
+      blockedHosts: new Set(),
+    };
+  }
+
+  /**
+   * Get the current policy level
+   */
+  getPolicyLevel(): SandboxPolicyLevel {
+    return this.policyLevel;
   }
 
   /**
@@ -117,8 +183,8 @@ export class ProxyServer {
     const [host, portStr] = (req.url || '').split(':');
     const port = parseInt(portStr, 10) || 443;
 
-    const allowed = this.isHostAllowed(host);
-    this.log({ method: 'CONNECT', host, port, blocked: !allowed });
+    const { allowed, reason } = this.checkHostAccess(host);
+    this.log({ method: 'CONNECT', host, port, blocked: !allowed, reason });
 
     if (!allowed) {
       clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
@@ -167,12 +233,12 @@ export class ProxyServer {
       const port = parseInt(url.port, 10) || 80;
       const path = url.pathname + url.search;
 
-      const allowed = this.isHostAllowed(host);
-      this.log({ method: req.method || 'GET', host, port, path, blocked: !allowed });
+      const { allowed, reason } = this.checkHostAccess(host);
+      this.log({ method: req.method || 'GET', host, port, path, blocked: !allowed, reason });
 
       if (!allowed) {
         res.writeHead(403, { 'Content-Type': 'text/plain' });
-        res.end('Blocked by proxy: host not in allowlist');
+        res.end(`Blocked by sandbox policy (${this.policyLevel}): host '${host}' not in allowlist`);
         return;
       }
 

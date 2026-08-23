@@ -22,10 +22,13 @@ describe('Sandbox Profile Generator', () => {
   // generateSandboxProfile - Basic structure
   // ===========================================================================
 
+  const DEFAULT_PROXY_PORT = 8080;
+
   describe('generateSandboxProfile - Basic structure', () => {
     it('should generate valid sandbox profile structure', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
       });
 
       expect(profile).toContain('(version 1)');
@@ -36,6 +39,7 @@ describe('Sandbox Profile Generator', () => {
     it('should use allow default in permissive mode', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
         permissive: true,
       });
 
@@ -46,6 +50,7 @@ describe('Sandbox Profile Generator', () => {
     it('should include trace to stderr by default', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
       });
 
       expect(profile).toContain('(trace "/dev/stderr")');
@@ -54,6 +59,7 @@ describe('Sandbox Profile Generator', () => {
     it('should use custom log file when specified', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
         logFile: '/tmp/sandbox.log',
       });
 
@@ -66,18 +72,41 @@ describe('Sandbox Profile Generator', () => {
   // ===========================================================================
 
   describe('generateSandboxProfile - File access', () => {
-    it('should allow read access to filesystem', () => {
+    it('should allow read access only to workDir and temp by default', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
       });
 
       expect(profile).toContain('(allow file-read*');
-      expect(profile).toContain('(subpath "/")');
+      expect(profile).toContain('(subpath "/path/to/project")');
+      expect(profile).toContain('(subpath "/tmp")');
+      // System paths should NOT be allowed by default
+      expect(profile).not.toContain('(subpath "/System")');
+      expect(profile).not.toContain('(subpath "/Library")');
+      expect(profile).not.toContain('(subpath "/usr")');
+    });
+
+    it('should allow policy-defined system read paths', () => {
+      const profile = generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
+        policy: {
+          filesystem: {
+            read: ['/System', '/Library', '/usr', '/bin', '/Applications'],
+          },
+        },
+      });
+
+      expect(profile).toContain('(subpath "/System")');
+      expect(profile).toContain('(subpath "/Library")');
+      expect(profile).toContain('(subpath "/usr")');
     });
 
     it('should allow write to work directory', () => {
       const profile = generateSandboxProfile({
         workDir: '/my/project',
+        proxyPort: DEFAULT_PROXY_PORT,
       });
 
       expect(profile).toContain('(allow file-write*');
@@ -87,6 +116,7 @@ describe('Sandbox Profile Generator', () => {
     it('should allow write to system temp directories', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
       });
 
       expect(profile).toContain('(subpath "/tmp")');
@@ -98,6 +128,7 @@ describe('Sandbox Profile Generator', () => {
     it('should allow write to package manager caches', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
       });
 
       expect(profile).toContain('.npm');
@@ -109,6 +140,7 @@ describe('Sandbox Profile Generator', () => {
     it('should allow write to localmost directories', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
       });
 
       expect(profile).toContain('.localmost');
@@ -117,6 +149,7 @@ describe('Sandbox Profile Generator', () => {
     it('should allow policy-defined write paths', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
         policy: {
           filesystem: {
             write: ['/custom/path', './relative/path'],
@@ -127,9 +160,25 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).toContain('(subpath "/custom/path")');
     });
 
+    it('should allow policy-defined read paths', () => {
+      const profile = generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
+        policy: {
+          filesystem: {
+            read: ['/custom/data', '~/mydata'],
+          },
+        },
+      });
+
+      expect(profile).toContain('Policy-defined read access');
+      expect(profile).toContain('(subpath "/custom/data")');
+    });
+
     it('should expand ~ in filesystem paths', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
         policy: {
           filesystem: {
             write: ['~/custom'],
@@ -143,6 +192,7 @@ describe('Sandbox Profile Generator', () => {
     it('should handle ** wildcards in paths', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
         policy: {
           filesystem: {
             write: ['./build/**'],
@@ -156,6 +206,7 @@ describe('Sandbox Profile Generator', () => {
     it('should deny specified filesystem paths', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
         policy: {
           filesystem: {
             deny: ['/secret/path'],
@@ -171,6 +222,7 @@ describe('Sandbox Profile Generator', () => {
     it('should allow device files', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
       });
 
       expect(profile).toContain('(literal "/dev/null")');
@@ -185,33 +237,35 @@ describe('Sandbox Profile Generator', () => {
   // ===========================================================================
 
   describe('generateSandboxProfile - Network access', () => {
-    it('should allow all network when no policy defined', () => {
+    it('should restrict network to localhost', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: 9999,
       });
 
-      expect(profile).toContain('(allow network*)');
-    });
-
-    it('should restrict network to allowlist when policy defined', () => {
-      const profile = generateSandboxProfile({
-        workDir: '/path/to/project',
-        policy: {
-          network: {
-            allow: ['github.com'],
-          },
-        },
-      });
-
-      expect(profile).toContain('(allow network-outbound');
-      // Domain dots are escaped in the regex pattern
-      expect(profile).toContain('github');
+      // Network should be restricted to localhost (proxy handles filtering)
+      expect(profile).toContain('(local ip)');
+      expect(profile).toContain('proxy at port 9999');
       expect(profile).not.toContain('(allow network*)');
     });
 
-    it('should always allow localhost', () => {
+    it('should restrict Unix sockets to working directory', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: 8080,
+      });
+
+      // Unix sockets only allowed in workDir (not blanket allow)
+      expect(profile).toContain('network-bind (subpath "/path/to/project")');
+      expect(profile).toContain('network-outbound (subpath "/path/to/project")');
+      expect(profile).not.toContain('(local unix-socket)');
+    });
+
+    it('should allow traffic to localhost regardless of policy', () => {
+      // Policy is for proxy-level filtering, sandbox just restricts to localhost
+      const profile = generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: 8080,
         policy: {
           network: {
             allow: ['github.com'],
@@ -220,49 +274,7 @@ describe('Sandbox Profile Generator', () => {
       });
 
       expect(profile).toContain('(local ip)');
-    });
-
-    it('should handle wildcard domains', () => {
-      const profile = generateSandboxProfile({
-        workDir: '/path/to/project',
-        policy: {
-          network: {
-            allow: ['*.github.com'],
-          },
-        },
-      });
-
-      expect(profile).toContain('remote regex');
-      expect(profile).toContain('github\\\\.com');
-    });
-
-    it('should deny specified domains', () => {
-      const profile = generateSandboxProfile({
-        workDir: '/path/to/project',
-        policy: {
-          network: {
-            deny: ['evil.com'],
-          },
-        },
-      });
-
-      expect(profile).toContain('(deny network-outbound');
-      // Domain dots are escaped in the regex pattern
-      expect(profile).toContain('evil');
-    });
-
-    it('should allow all network in permissive mode even with policy', () => {
-      const profile = generateSandboxProfile({
-        workDir: '/path/to/project',
-        permissive: true,
-        policy: {
-          network: {
-            allow: ['github.com'],
-          },
-        },
-      });
-
-      expect(profile).toContain('(allow network*)');
+      expect(profile).not.toContain('github.com');
     });
   });
 
@@ -274,6 +286,7 @@ describe('Sandbox Profile Generator', () => {
     it('should allow process operations', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
       });
 
       expect(profile).toContain('(allow process*)');
@@ -282,6 +295,7 @@ describe('Sandbox Profile Generator', () => {
     it('should allow signal operations', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
       });
 
       expect(profile).toContain('(allow signal)');
@@ -290,6 +304,7 @@ describe('Sandbox Profile Generator', () => {
     it('should allow mach and ipc operations', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
       });
 
       expect(profile).toContain('(allow mach*)');
@@ -299,6 +314,7 @@ describe('Sandbox Profile Generator', () => {
     it('should allow system operations needed for builds', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
       });
 
       expect(profile).toContain('(allow sysctl*)');
@@ -309,6 +325,7 @@ describe('Sandbox Profile Generator', () => {
     it('should allow Xcode preferences', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
       });
 
       expect(profile).toContain('com.apple.dt.Xcode');
@@ -320,23 +337,38 @@ describe('Sandbox Profile Generator', () => {
   // ===========================================================================
 
   describe('generateDiscoveryProfile', () => {
-    it('should generate permissive profile', () => {
+    it('should use deny default with (with report) allows for system log reporting', () => {
       const profile = generateDiscoveryProfile({
         workDir: '/path/to/project',
-        logFile: '/tmp/discovery.log',
+        proxyPort: DEFAULT_PROXY_PORT,
+        logFile: '/tmp/discovery.log',  // Not used anymore - reports go to system log
       });
 
-      expect(profile).toContain('(allow default)');
-      expect(profile).toContain('(trace "/tmp/discovery.log")');
+      expect(profile).toContain('(deny default)');
+      // File operations with (with report) for logging to system log
+      expect(profile).toContain('(allow file-read* (with report))');
+      expect(profile).toContain('(allow file-write* (with report))');
     });
 
-    it('should use permissive mode flag', () => {
+    it('should identify as discovery profile', () => {
       const profile = generateDiscoveryProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
         logFile: '/tmp/discovery.log',
       });
 
-      expect(profile).toContain('PERMISSIVE mode');
+      expect(profile).toContain('DISCOVERY PROFILE');
+    });
+
+    it('should still restrict network to localhost', () => {
+      const profile = generateDiscoveryProfile({
+        workDir: '/path/to/project',
+        proxyPort: 9999,
+        logFile: '/tmp/discovery.log',
+      });
+
+      expect(profile).toContain('(local ip)');
+      expect(profile).toContain('proxy at port 9999');
     });
   });
 
@@ -376,6 +408,7 @@ describe('Sandbox Profile Generator', () => {
     it('should escape quotes in paths', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/with"quote',
+        proxyPort: DEFAULT_PROXY_PORT,
       });
 
       expect(profile).toContain('/path/with\\"quote');
@@ -384,16 +417,18 @@ describe('Sandbox Profile Generator', () => {
     it('should handle empty policy', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
         policy: {},
       });
 
       expect(profile).toContain('(version 1)');
-      expect(profile).toContain('(allow network*)');
+      expect(profile).toContain('(local ip)');
     });
 
     it('should handle policy with empty arrays', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
         policy: {
           network: { allow: [] },
           filesystem: { write: [], deny: [] },

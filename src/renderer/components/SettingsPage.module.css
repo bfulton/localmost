@@ -363,3 +363,55 @@
   font-size: 13px;
   color: var(--text-secondary);
 }
+
+/* Subsection Styles (for Job Security) */
+.subsection {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.subsection:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+.subsection h4 {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-secondary);
+  margin-bottom: 12px;
+}
+
+/* Button Group (for policy level selector) */
+.buttonGroup {
+  display: flex;
+  gap: 8px;
+}
+
+.optionButton {
+  flex: 1;
+  padding: 12px 16px;
+  background: var(--bg-primary);
+  border: 2px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.optionButton:hover {
+  border-color: var(--text-secondary);
+  color: var(--text-primary);
+}
+
+.optionButton.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--bg-tertiary);
+}

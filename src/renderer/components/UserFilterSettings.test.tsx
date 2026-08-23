@@ -26,7 +26,7 @@ describe('UserFilterSettings', () => {
       // Verify all scope buttons are rendered
       expect(screen.getByRole('button', { name: 'Everyone' })).toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'Trigger author' })).toBeInTheDocument();
-      expect(screen.getByRole('button', { name: 'All contributors' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Repo contributors' })).toBeInTheDocument();
       // Verify hint text for everyone scope
       expect(screen.getByText(/Accept workflow jobs triggered by any user/)).toBeInTheDocument();
     });
@@ -61,7 +61,7 @@ describe('UserFilterSettings', () => {
       );
 
       await act(async () => {
-        fireEvent.click(screen.getByRole('button', { name: 'All contributors' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Repo contributors' }));
       });
 
       expect(mockOnFilterChange).toHaveBeenCalledWith({
