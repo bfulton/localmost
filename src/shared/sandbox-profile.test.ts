@@ -72,6 +72,20 @@ describe('Sandbox Profile Generator', () => {
   // ===========================================================================
 
   describe('generateSandboxProfile - File access', () => {
+    it('should always allow reading the root directory node', () => {
+      // Without this, dyld aborts every sandboxed process with SIGABRT before
+      // it runs: reading "/" itself is required to resolve any absolute path.
+      // It must be a literal, not a subpath, or it would grant the whole disk.
+      const profile = generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
+        strictMode: true,
+      });
+
+      expect(profile).toContain('(literal "/")');
+      expect(profile).not.toContain('(subpath "/")');
+    });
+
     it('should allow read access only to workDir and temp by default', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',

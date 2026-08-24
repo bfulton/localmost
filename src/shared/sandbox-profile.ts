@@ -131,6 +131,13 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push(';; ------------------------------------------------------------');
   lines.push('');
 
+  // The root directory node itself must be readable or dyld aborts every
+  // process with SIGABRT before it runs. This is a literal, not a subpath:
+  // (subpath "/") would grant read access to the entire disk.
+  lines.push(';; Root directory node - required to resolve absolute paths');
+  lines.push('(allow file-read* (literal "/"))');
+  lines.push('');
+
   // Minimal read access - device files only (always needed)
   lines.push(';; Device files - read access');
   lines.push('(allow file-read*');
