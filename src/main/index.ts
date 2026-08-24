@@ -299,6 +299,15 @@ app.whenReady().then(async () => {
   const brokerProxyService = new BrokerProxyService();
   setBrokerProxyService(brokerProxyService);
 
+  // Report the runner version we actually have installed. GitHub rejects polls
+  // from deprecated runner versions with 403 RunnerVersionTooOld, which leaves
+  // every runner offline and every job queued.
+  const installedRunnerVersion = runnerDownloader.getInstalledVersion();
+  if (installedRunnerVersion) {
+    brokerProxyService.setRunnerVersion(installedRunnerVersion);
+    logger?.info(`[BrokerProxy] Reporting runner version ${installedRunnerVersion}`);
+  }
+
   // Set capacity check callback - broker proxy will only acquire jobs when we have capacity AND not paused
   brokerProxyService.setCanAcceptJobCallback(() => {
     // Don't accept jobs if resource monitor says we should be paused

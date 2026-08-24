@@ -1,6 +1,7 @@
  
 import { jest } from '@jest/globals';
 import { EventEmitter } from 'events';
+import { FALLBACK_RUNNER_VERSION } from '../shared/constants';
 
 // Mock http module
 const mockServerListen = jest.fn<(port: number, callback: () => void) => void>();
@@ -132,6 +133,24 @@ describe('BrokerProxyService', () => {
     it('should create service with custom port', () => {
       const s = new BrokerProxyService(9999);
       expect(s.getPort()).toBe(9999);
+    });
+  });
+
+  describe('runner version reported to GitHub', () => {
+    it('uses the installed runner version when one is provided', () => {
+      const service = new BrokerProxyService();
+      service.setRunnerVersion('2.336.0');
+
+      expect(service.getRunnerVersion()).toBe('2.336.0');
+    });
+
+    it('defaults to the shared fallback rather than a private copy', () => {
+      const service = new BrokerProxyService();
+
+      // GitHub rejects deprecated runner versions with 403 RunnerVersionTooOld,
+      // which silently prevents every runner from coming online. The default
+      // must track the shared constant, not a separate hardcoded string.
+      expect(service.getRunnerVersion()).toBe(FALLBACK_RUNNER_VERSION);
     });
   });
 

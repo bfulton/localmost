@@ -17,6 +17,7 @@ import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import { getLogger } from './app-state';
 import type { Target, RunnerProxyStatus } from '../shared/types';
+import { FALLBACK_RUNNER_VERSION } from '../shared/constants';
 import {
   SessionPersistence,
   OAuthTokenManager,
@@ -198,7 +199,22 @@ export class BrokerProxyService extends EventEmitter {
   private jobAssignments: Map<string, JobAssignment> = new Map();
   private isRunning = false;
   private isShuttingDown = false;
-  private runnerVersion = '2.330.0';
+  /**
+   * Runner version reported to GitHub when polling. GitHub rejects deprecated
+   * versions with 403 RunnerVersionTooOld, which stops runners coming online,
+   * so this tracks the installed runner rather than a hardcoded string.
+   */
+  private runnerVersion: string = FALLBACK_RUNNER_VERSION;
+
+  /** Report the version of the runner actually installed on this machine. */
+  setRunnerVersion(version: string): void {
+    this.runnerVersion = version;
+  }
+
+  getRunnerVersion(): string {
+    return this.runnerVersion;
+  }
+
   private pollInterval: NodeJS.Timeout | null = null;
   private isPolling = false;  // Prevent concurrent poll execution
   private messageQueues: Map<string, Array<string>> = new Map();  // Per-target message queues
@@ -939,7 +955,14 @@ export class BrokerProxyService extends EventEmitter {
         log()?.info(`[BrokerProxy] Poll ${state.target.displayName}/${instance.instanceNum}: got message (${response.body.length} bytes)`);
         return { hasMessage: true, body: response.body };
       }
-      log()?.debug(`[BrokerProxy] Poll ${state.target.displayName}/${instance.instanceNum}: no message (status=${response.statusCode})`);
+      // 202 means "long poll expired, no message" - the normal idle response.
+      // Anything else is a failure that would otherwise keep every runner
+      // offline forever, so surface it rather than hiding it at debug level.
+      if (response.statusCode !== 202 && response.statusCode !== 204) {
+        log()?.warn(`[BrokerProxy] Poll ${state.target.displayName}/${instance.instanceNum} failed: status=${response.statusCode} ${response.body?.slice(0, 200) ?? ''}`);
+      } else {
+        log()?.debug(`[BrokerProxy] Poll ${state.target.displayName}/${instance.instanceNum}: no message (status=${response.statusCode})`);
+      }
       return { hasMessage: false, body: '' };
     } catch (error) {
       const hadError = !!instance.error;
