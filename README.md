@@ -224,6 +224,7 @@ Future feature ideas:
 
 - **Block untrusted jobs before they start** - Contributor filtering currently cancels a disallowed workflow run through the GitHub API *after* the runner has begun executing it, so untrusted steps run briefly before cancellation lands. Hold the job at pickup until the check passes.
 - **Wire up the policy cache** - `src/main/policy-cache.ts` implements caching, diffing, and an approval flow for `.localmostrc` changes, but nothing imports it yet. The background runner does not read repo policy at all.
+- **Make the minimum policy easy to learn** - `strict` denies everything not declared, which means a bare policy cannot even exec `/bin/bash`. Discovery should produce a runnable starting policy in one step: report the minimum a workflow needs, distinguish that baseline from workflow-specific access, and explain a denial when a step dies rather than leaving a bare SIGABRT.
 - **Coalesce discovery output** - `localmost test --updaterc` records every path it observes, including each ancestor directory and content-addressed cache blobs, producing thousands of redundant entries. Roll accessed paths up to directory rules. Note `/` must still be emitted, but as a literal (the root node is required); only the blanket `subpath` form is wrong.
 - **Quick actions** - Re-run failed job, cancel all jobs.
 - **Spotlight integration** - Check status or pause builds from Spotlight.
