@@ -222,7 +222,7 @@ Current release: **0.3.0 — Test Locally, Secure by Default**
 
 Future feature ideas:
 
-- **Block untrusted jobs before they start** - Contributor filtering currently cancels a disallowed workflow run through the GitHub API *after* the runner has begun executing it, so untrusted steps run briefly before cancellation lands. Hold the job at pickup until the check passes.
+- **Fail a blocked job visibly** - a job refused by the filter is cancelled through the GitHub API before any worker starts, so it appears as cancelled rather than failing with a message explaining why.
 - **Approve policy changes before they take effect** - the runner now reads a repository's `.localmostrc` network allowlist at job time, but `src/main/policy-cache.ts` - which caches a repo's policy, diffs it, and asks for approval when it changes - is still unimported. Until it is wired up, a repository can widen its own allowlist without the machine's owner being asked.
 - **Make the minimum policy easy to learn** - `strict` denies everything not declared, which means a bare policy cannot even exec `/bin/bash`. Discovery should produce a runnable starting policy in one step: report the minimum a workflow needs, distinguish that baseline from workflow-specific access, and explain a denial when a step dies rather than leaving a bare SIGABRT.
 - **Coalesce discovery output** - `localmost test --updaterc` records every path it observes, including each ancestor directory and content-addressed cache blobs, producing thousands of redundant entries. Roll accessed paths up to directory rules. Note `/` must still be emitted, but as a literal (the root node is required); only the blanket `subpath` form is wrong.
