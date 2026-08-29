@@ -96,7 +96,7 @@ export const MAX_RUNNER_COUNT = 8;
 export const DEFAULT_MAX_JOB_HISTORY = 10;
 
 /** Fallback runner version if GitHub API fails */
-export const FALLBACK_RUNNER_VERSION = '2.330.0';
+export const FALLBACK_RUNNER_VERSION = '2.336.0';
 
 // =============================================================================
 // UI Defaults

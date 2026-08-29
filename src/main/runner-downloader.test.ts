@@ -25,6 +25,7 @@ jest.mock('./process-sandbox', () => ({
 }));
 
 import { RunnerDownloader } from './runner-downloader';
+import { FALLBACK_RUNNER_VERSION } from '../shared/constants';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -50,7 +51,7 @@ describe('RunnerDownloader', () => {
 
   describe('setDownloadVersion / getDownloadVersion', () => {
     it('should return fallback version when no version set', () => {
-      expect(downloader.getDownloadVersion()).toBe('2.330.0');
+      expect(downloader.getDownloadVersion()).toBe(FALLBACK_RUNNER_VERSION);
     });
 
     it('should return set version after setDownloadVersion', () => {
@@ -61,7 +62,7 @@ describe('RunnerDownloader', () => {
     it('should reset to fallback when set to null', () => {
       downloader.setDownloadVersion('2.320.0');
       downloader.setDownloadVersion(null);
-      expect(downloader.getDownloadVersion()).toBe('2.330.0');
+      expect(downloader.getDownloadVersion()).toBe(FALLBACK_RUNNER_VERSION);
     });
   });
 
@@ -111,8 +112,8 @@ describe('RunnerDownloader', () => {
       const versions = await downloader.getAvailableVersions();
 
       expect(versions).toEqual([{
-        version: '2.330.0',
-        url: 'https://github.com/actions/runner/releases/tag/v2.330.0',
+        version: FALLBACK_RUNNER_VERSION,
+        url: `https://github.com/actions/runner/releases/tag/v${FALLBACK_RUNNER_VERSION}`,
         publishedAt: '',
       }]);
     });
@@ -123,7 +124,7 @@ describe('RunnerDownloader', () => {
       const versions = await downloader.getAvailableVersions();
 
       expect(versions).toHaveLength(1);
-      expect(versions[0].version).toBe('2.330.0');
+      expect(versions[0].version).toBe(FALLBACK_RUNNER_VERSION);
     });
   });
 
@@ -154,7 +155,7 @@ describe('RunnerDownloader', () => {
     it('should fall back to download version if no arc directory', () => {
       (fs.existsSync as jest.Mock).mockReturnValue(false);
 
-      expect(downloader.getVersion()).toBe('2.330.0');
+      expect(downloader.getVersion()).toBe(FALLBACK_RUNNER_VERSION);
     });
   });
 
@@ -163,7 +164,7 @@ describe('RunnerDownloader', () => {
       (fs.existsSync as jest.Mock).mockReturnValue(false);
 
       const url = downloader.getVersionUrl();
-      expect(url).toBe('https://github.com/actions/runner/releases/tag/v2.330.0');
+      expect(url).toBe(`https://github.com/actions/runner/releases/tag/v${FALLBACK_RUNNER_VERSION}`);
     });
   });
 

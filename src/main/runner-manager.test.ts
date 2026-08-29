@@ -386,6 +386,49 @@ describe('RunnerManager', () => {
 
   // fetchActionsUrl was removed - job URLs are now extracted directly from job details
 
+  describe('job completion', () => {
+    it('handles a repeated completion line only once', async () => {
+      // The runner can emit its completion line more than once. The handler
+      // awaits the GitHub conclusion lookup before clearing currentJob, so a
+      // second line arriving during that await would re-enter and report the
+      // same job as completed twice.
+      let releaseConclusion: (value: string) => void = () => {};
+      const conclusionPending = new Promise<string>((resolve) => {
+        releaseConclusion = resolve;
+      });
+
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getJobConclusion: () => conclusionPending,
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, {
+        name: 'runner-1',
+        status: 'busy',
+        currentJob: {
+          name: 'build',
+          repository: 'owner/repo',
+          startedAt: new Date().toISOString(),
+          id: 'job-1',
+          githubJobId: 999,
+        },
+      });
+
+      const line = 'Job build completed with result: Succeeded';
+      const first = helper.parseRunnerOutput(1, line);
+      const second = helper.parseRunnerOutput(1, line);
+      releaseConclusion('success');
+      await Promise.all([first, second]);
+
+      const completions = mockOnLog.mock.calls.filter(
+        ([entry]) => typeof entry?.message === 'string' && entry.message.includes('Job completed:')
+      );
+      expect(completions).toHaveLength(1);
+    });
+  });
+
   describe('getStatus with shutting_down', () => {
     it('should return shutting_down status when stopping is true', () => {
       const helper = new RunnerManagerTestHelper(runnerManager);
