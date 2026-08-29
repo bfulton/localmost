@@ -553,6 +553,63 @@ describe('RunnerManager', () => {
     });
   });
 
+  describe('repository network policy', () => {
+    it('applies the hosts a repo declares to that instance proxy', async () => {
+      const setPolicyAllowedHosts = jest.fn();
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicyHosts: async () => ['index.crates.io'],
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, {
+        name: 'runner-1',
+        currentJob: {
+          name: 'build',
+          repository: 'owner/repo',
+          startedAt: new Date().toISOString(),
+          id: 'job-1',
+          targetDisplayName: 'owner/repo',
+          githubSha: 'abc1234',
+        },
+      });
+      helper.setProxy(1, { setPolicyAllowedHosts });
+
+      await helper.applyRepoPolicy(1);
+
+      expect(setPolicyAllowedHosts).toHaveBeenCalledWith(['index.crates.io']);
+    });
+
+    it('does nothing when the job has no commit SHA to read policy at', async () => {
+      const setPolicyAllowedHosts = jest.fn();
+      const getRepoPolicyHosts = jest.fn().mockResolvedValue([] as never);
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicyHosts: getRepoPolicyHosts as never,
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, {
+        name: 'runner-1',
+        currentJob: {
+          name: 'build',
+          repository: 'owner/repo',
+          startedAt: new Date().toISOString(),
+          id: 'job-1',
+          targetDisplayName: 'owner/repo',
+        },
+      });
+      helper.setProxy(1, { setPolicyAllowedHosts });
+
+      await helper.applyRepoPolicy(1);
+
+      expect(getRepoPolicyHosts).not.toHaveBeenCalled();
+      expect(setPolicyAllowedHosts).not.toHaveBeenCalled();
+    });
+  });
+
   describe('slot release after a job', () => {
     function busyManager() {
       const manager = new RunnerManager({

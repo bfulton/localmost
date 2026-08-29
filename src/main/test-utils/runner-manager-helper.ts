@@ -43,6 +43,8 @@ interface RunnerManagerInternals {
   checkJobUserFilter(instanceNum: number, runnerName: string): Promise<void>;
   parseRunnerOutput(instanceNum: number, line: string): Promise<void>;
   releaseInstanceSlot(instanceNum: number): void;
+  applyRepoPolicy(instanceNum: number): Promise<void>;
+  proxyServers: Map<number, unknown>;
 }
 
 /**
@@ -122,5 +124,17 @@ export class RunnerManagerTestHelper {
    */
   releaseInstanceSlot(instanceNum: number): void {
     this.internals.releaseInstanceSlot(instanceNum);
+  }
+
+  /**
+   * Apply the repository's .localmostrc policy to an instance's proxy.
+   */
+  applyRepoPolicy(instanceNum: number): Promise<void> {
+    return this.internals.applyRepoPolicy(instanceNum);
+  }
+
+  /** Register a stub proxy for an instance. */
+  setProxy(instanceNum: number, proxy: unknown): void {
+    this.internals.proxyServers.set(instanceNum, proxy);
   }
 }

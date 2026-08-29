@@ -71,6 +71,42 @@ describe('ProxyServer host access', () => {
   });
 
   // =========================================================================
+  // Policy applied at job time
+  // =========================================================================
+
+  describe('policy hosts set after construction', () => {
+    it('allows a host added from a repository policy', () => {
+      // The proxy is created when the runner starts, before we know which
+      // repository the job belongs to, so .localmostrc hosts have to be applied
+      // once the job is assigned.
+      const proxy = makeProxy('strict');
+      expect(checkHost(proxy, 'index.crates.io').allowed).toBe(false);
+
+      proxy.setPolicyAllowedHosts(['index.crates.io']);
+
+      const decision = checkHost(proxy, 'index.crates.io');
+      expect(decision.allowed).toBe(true);
+      expect(decision.reason).toBe('policy');
+    });
+
+    it('replaces the previous job policy rather than accumulating', () => {
+      const proxy = makeProxy('strict');
+      proxy.setPolicyAllowedHosts(['a.example.com']);
+      proxy.setPolicyAllowedHosts(['b.example.com']);
+
+      expect(checkHost(proxy, 'a.example.com').allowed).toBe(false);
+      expect(checkHost(proxy, 'b.example.com').allowed).toBe(true);
+    });
+
+    it('still allows infrastructure when a policy is applied', () => {
+      const proxy = makeProxy('strict');
+      proxy.setPolicyAllowedHosts(['index.crates.io']);
+
+      expect(checkHost(proxy, 'github.com').allowed).toBe(true);
+    });
+  });
+
+  // =========================================================================
   // Strict policy
   // =========================================================================
 
