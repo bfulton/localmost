@@ -18,6 +18,9 @@ import { updateTrayMenu } from '../tray-init';
 import { IPC_CHANNELS, GitHubRepo, GitHubUserSearchResult } from '../../shared/types';
 import { store } from '../store/init';
 
+/** Pending browser-open timer for the device flow, cleared on cancel. */
+let pendingBrowserOpen: NodeJS.Timeout | null = null;
+
 /**
  * Validate that a URL is a legitimate GitHub URL before opening externally.
  * This prevents phishing attacks if the GitHub API were compromised.
@@ -127,8 +130,13 @@ export const registerAuthHandlers = (): void => {
       // Give the user a moment to see the code was copied before the browser
       // takes focus. Scheduled rather than awaited: this is a presentation
       // delay, and awaiting it blocks the IPC handler for a second and a half.
+      // Cancelling clears the timer, so a quick cancel does not still pop the
+      // browser open afterwards.
       const verificationUri = status.verificationUri;
-      setTimeout(() => openGitHubVerificationUrl(verificationUri), 1500);
+      pendingBrowserOpen = setTimeout(() => {
+        pendingBrowserOpen = null;
+        openGitHubVerificationUrl(verificationUri);
+      }, 1500);
 
       // Wait for user to complete auth
       const result = await waitForAuth();
@@ -161,6 +169,10 @@ export const registerAuthHandlers = (): void => {
   ipcMain.handle(IPC_CHANNELS.GITHUB_AUTH_CANCEL, () => {
     const githubAuth = getGitHubAuth();
     githubAuth?.abortPolling();
+    if (pendingBrowserOpen) {
+      clearTimeout(pendingBrowserOpen);
+      pendingBrowserOpen = null;
+    }
     // Clear device code and auth state when cancelled
     store.getState().setDeviceCode(null);
     store.getState().setIsAuthenticating(false);
