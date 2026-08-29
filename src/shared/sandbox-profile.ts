@@ -644,12 +644,39 @@ export function parseSandboxTrace(
 
   // Don't consolidate read paths - return them as discovered
   // This gives the user full visibility into what was accessed
-  const consolidateReads = (paths: Set<string>): string[] => {
-    return Array.from(paths).sort();
+  /**
+   * Reduce recorded paths to the shortest set that expresses the same policy.
+   *
+   * The trace records every ancestor directory as well as each file touched,
+   * and each entry is written back as a (subpath ...) rule, so any path under
+   * one already listed adds nothing. Keeping them produced .localmostrc files
+   * with thousands of lines where a few dozen say the same thing.
+   *
+   * The filesystem root is dropped entirely: reading it is required and the
+   * generated profile always allows it as a literal, whereas recording it here
+   * would be written back as (subpath "/") and grant the whole disk.
+   */
+  const consolidate = (paths: Set<string>): string[] => {
+    const candidates = Array.from(paths)
+      .filter(p => p !== '/' && p !== '~' && p !== '')
+      .sort();
+
+    const kept: string[] = [];
+    for (const candidate of candidates) {
+      const covered = kept.some(
+        existing => candidate === existing || candidate.startsWith(`${existing}/`)
+      );
+      if (!covered) {
+        kept.push(candidate);
+      }
+    }
+    return kept;
   };
 
+  const consolidateReads = consolidate;
+
   return {
-    writePaths: consolidateWrites(writePaths),
+    writePaths: consolidate(consolidateWrites(writePaths).reduce((set, p) => set.add(p), new Set<string>())),
     readPaths: consolidateReads(readPaths),
     socketPaths: Array.from(socketPaths).sort(),
   };

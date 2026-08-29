@@ -6,6 +6,7 @@ import {
   generateSandboxProfile,
   generateDiscoveryProfile,
   DEFAULT_SANDBOX_POLICY,
+  parseSandboxTrace,
 } from './sandbox-profile';
 
 // Mock os module
@@ -349,6 +350,42 @@ describe('Sandbox Profile Generator', () => {
   // ===========================================================================
   // generateDiscoveryProfile
   // ===========================================================================
+
+  describe('parseSandboxTrace consolidation', () => {
+    function trace(paths: string[]): string {
+      return paths
+        .map((p, i) => `kernel: (Sandbox) Sandbox: bash(${100 + i}) allow file-read-data ${p}`)
+        .join('\n');
+    }
+
+    it('drops paths already covered by a listed ancestor', () => {
+      // A policy entry is emitted as (subpath ...), so every descendant the
+      // trace also recorded is pure redundancy. Discovery previously kept all
+      // of them, producing thousands of lines that said nothing new.
+      const result = parseSandboxTrace(
+        trace(['/opt/homebrew', '/opt/homebrew/bin', '/opt/homebrew/bin/git', '/usr/lib']),
+        '/work'
+      );
+
+      expect(result.readPaths).toEqual(['/opt/homebrew', '/usr/lib']);
+    });
+
+    it('never emits the filesystem root as a policy entry', () => {
+      // Reading the root node is required and the generated profile always
+      // allows it as a literal. Recording "/" here would be written back as
+      // (subpath "/"), silently granting the whole disk.
+      const result = parseSandboxTrace(trace(['/', '/usr/lib']), '/work');
+
+      expect(result.readPaths).not.toContain('/');
+      expect(result.readPaths).toContain('/usr/lib');
+    });
+
+    it('keeps unrelated siblings', () => {
+      const result = parseSandboxTrace(trace(['/usr/lib', '/usr/bin']), '/work');
+
+      expect(result.readPaths.sort()).toEqual(['/usr/bin', '/usr/lib']);
+    });
+  });
 
   describe('generateDiscoveryProfile', () => {
     it('should use deny default with (with report) allows for system log reporting', () => {
