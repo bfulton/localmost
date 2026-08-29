@@ -24,14 +24,25 @@ export async function launchElectron(): Promise<{ app: ElectronApplication; page
   // This prevents tests from using/modifying the user's real ~/.localmost settings
   testConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'localmost-e2e-'));
 
-  electronApp = await electron.launch({
-    args: [mainPath],
-    env: {
-      ...process.env,
-      NODE_ENV: 'test',
-      LOCALMOST_CONFIG_DIR: testConfigDir,
-    },
-  });
+  try {
+    electronApp = await electron.launch({
+      args: [mainPath],
+      env: {
+        ...process.env,
+        NODE_ENV: 'test',
+        LOCALMOST_CONFIG_DIR: testConfigDir,
+      },
+    });
+  } catch (err) {
+    // localmost holds a single-instance lock, so a copy running on this machine
+    // makes the test instance quit during startup. Playwright reports that as a
+    // closed browser target, which gives no hint at the real cause.
+    throw new Error(
+      `Failed to launch Electron: ${(err as Error).message}\n` +
+        'If localmost is already running (for example the installed app), quit it first - ' +
+        'its single-instance lock causes the test instance to exit immediately.'
+    );
+  }
 
   const page = await electronApp.firstWindow();
 
