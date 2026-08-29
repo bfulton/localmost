@@ -65,6 +65,8 @@ export const MODERATE_NETWORK_ALLOWLIST = [
   'rubygems.org',
   'crates.io',
   'static.crates.io',
+  'index.crates.io', // cargo 1.70+ sparse index, fetched before any crate
+  'static.rust-lang.org', // rustup toolchain downloads
   'api.nuget.org',
 
   // Apple/Xcode
