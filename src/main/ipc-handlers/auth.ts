@@ -18,8 +18,16 @@ import { updateTrayMenu } from '../tray-init';
 import { IPC_CHANNELS, GitHubRepo, GitHubUserSearchResult } from '../../shared/types';
 import { store } from '../store/init';
 
-/** Pending browser-open timer for the device flow, cleared on cancel. */
+/** Pending browser-open timer for the device flow. */
 let pendingBrowserOpen: NodeJS.Timeout | null = null;
+
+/** Cancel a scheduled browser open; safe to call when none is pending. */
+function clearPendingBrowserOpen(): void {
+  if (pendingBrowserOpen) {
+    clearTimeout(pendingBrowserOpen);
+    pendingBrowserOpen = null;
+  }
+}
 
 /**
  * Validate that a URL is a legitimate GitHub URL before opening externally.
@@ -92,7 +100,15 @@ export const registerAuthHandlers = (): void => {
       openGitHubVerificationUrl(status.verificationUri);
 
       // Wait for user to complete auth
-      const result = await waitForAuth();
+      let result;
+      try {
+        result = await waitForAuth();
+      } finally {
+        // The flow is over either way, so the pending open is no longer wanted.
+        // Without this a fast completion still pops the browser afterwards, and
+        // unit tests are left with a dangling timer.
+        clearPendingBrowserOpen();
+      }
       setAuthState(result);
       updateTrayMenu();
 
@@ -169,10 +185,7 @@ export const registerAuthHandlers = (): void => {
   ipcMain.handle(IPC_CHANNELS.GITHUB_AUTH_CANCEL, () => {
     const githubAuth = getGitHubAuth();
     githubAuth?.abortPolling();
-    if (pendingBrowserOpen) {
-      clearTimeout(pendingBrowserOpen);
-      pendingBrowserOpen = null;
-    }
+    clearPendingBrowserOpen();
     // Clear device code and auth state when cancelled
     store.getState().setDeviceCode(null);
     store.getState().setIsAuthenticating(false);
