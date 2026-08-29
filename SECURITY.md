@@ -72,6 +72,34 @@ localmost is an Electron desktop application that manages GitHub Actions self-ho
 - **A compromised GitHub account**: If an attacker has access to your GitHub account, they can modify workflows that run on your runner.
 - **Allowlisted hosts**: Data can be exfiltrated to any host on the network allowlist (GitHub, npm, etc.).
 
+## Network Policy
+
+Job traffic is routed through a local proxy, which decides each connection by
+hostname. macOS `sandbox-exec` cannot filter by hostname - its `(remote ...)`
+filter matches only addresses and ports - so the sandbox permits localhost only
+and the proxy makes the decision.
+
+Three levels are available in Settings under Job Security:
+
+- **strict** (default): runner infrastructure, plus whatever the repository's
+  `.localmostrc` declares
+- **moderate**: also GitHub Actions infrastructure, common package registries
+  and tool caches
+- **permissive**: unrestricted
+
+A small set of hosts is allowed at every level, because the Actions runner is
+launched with `HTTP_PROXY` pointed at this proxy and cannot register or poll for
+jobs without them: `localhost`, `127.0.0.1`, `github.com`, `api.github.com`,
+`*.actions.githubusercontent.com` and `*.blob.core.windows.net`. A single proxy
+cannot distinguish the runner's own requests from a job's, so jobs reach those
+hosts too.
+
+`codeload.github.com` is deliberately **not** in that set, even though the
+runner uses it to download actions during job setup. Actions are third-party
+code, and allowing it grants a job the ability to fetch any tarball from GitHub.
+Under `strict` a repository that uses actions declares the host in its own
+`.localmostrc`; the runner log names any blocked host and points at that file.
+
 ## Authentication
 
 - **OAuth Device Flow**: Uses GitHub's Device Flow for user authentication, appropriate for desktop applications that cannot securely store client secrets
