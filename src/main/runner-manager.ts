@@ -71,6 +71,8 @@ interface RunnerManagerOptions {
   getJobConclusion?: (owner: string, repo: string, jobId: number) => Promise<string | null>;
   /** Get all contributors/authors for a repo at a given commit SHA (for contributor filtering) */
   getAllContributors?: (owner: string, repo: string, sha: string) => Promise<Set<string>>;
+  /** Hosts a repository's .localmostrc allows, for the job about to run. */
+  getRepoPolicyHosts?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<string[]>;
   /** Called when a job starts or completes (for notifications) */
   onJobEvent?: (event: JobEvent) => void;
 }
@@ -92,6 +94,7 @@ export class RunnerManager {
   private cancelWorkflowRun?: (owner: string, repo: string, runId: number) => Promise<void>;
   private getJobConclusion?: (owner: string, repo: string, jobId: number) => Promise<string | null>;
   private getAllContributors?: (owner: string, repo: string, sha: string) => Promise<Set<string>>;
+  private getRepoPolicyHosts?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<string[]>;
   private onJobEvent?: (event: JobEvent) => void;
   private jobHistory: JobHistoryEntry[] = [];
   private jobIdCounter = 0;
@@ -160,6 +163,7 @@ export class RunnerManager {
     this.cancelWorkflowRun = options.cancelWorkflowRun;
     this.getJobConclusion = options.getJobConclusion;
     this.getAllContributors = options.getAllContributors;
+    this.getRepoPolicyHosts = options.getRepoPolicyHosts;
     this.onJobEvent = options.onJobEvent;
 
     this.downloader = new RunnerDownloader();
@@ -1183,6 +1187,11 @@ export class RunnerManager {
         this.log('debug', `User filter check failed: ${(err as Error).message}`);
       });
 
+      // Apply the repository's own network policy to this instance's proxy
+      this.applyRepoPolicy(instanceNum).catch((err) => {
+        this.log('debug', `Repo policy load failed: ${(err as Error).message}`);
+      });
+
       // Scale up if all runners are busy
       const idleCount = this.countIdleRunners();
       if (idleCount === 0 && this.instances.size < this.runnerCount) {
@@ -1264,6 +1273,32 @@ export class RunnerManager {
 
       instance.status = 'listening';
       this.updateAggregateStatus();
+    }
+  }
+
+  /**
+   * Load the repository's .localmostrc and apply its network allowlist to the
+   * proxy serving this instance.
+   *
+   * Without this the proxy only ever knows the built-in allowlists, so a repo
+   * cannot declare the hosts its own build needs and `strict` is unusable for
+   * anything beyond runner infrastructure.
+   */
+  private async applyRepoPolicy(instanceNum: number): Promise<void> {
+    const instance = this.instances.get(instanceNum);
+    const proxy = this.proxyServers.get(instanceNum);
+    if (!instance?.currentJob || !proxy || !this.getRepoPolicyHosts) return;
+
+    const { targetDisplayName, githubSha, name: jobName } = instance.currentJob;
+    if (!targetDisplayName || !githubSha) return;
+
+    const repoInfo = parseRepository(targetDisplayName);
+    if (!repoInfo) return;
+
+    const hosts = await this.getRepoPolicyHosts(repoInfo.owner, repoInfo.repo, githubSha, jobName);
+    proxy.setPolicyAllowedHosts(hosts);
+    if (hosts.length > 0) {
+      this.log('info', `[instance ${instanceNum}] Applied ${hosts.length} host(s) from ${targetDisplayName} .localmostrc`);
     }
   }
 

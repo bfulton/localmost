@@ -99,6 +99,7 @@ import {
 
 // Zustand store
 import { initStore, connectWindow, cleanupStore, store } from './store/init';
+import { parseLocalmostrcContent, getEffectivePolicy } from '../shared/localmostrc';
 
 // ============================================================================
 // App Initialization
@@ -241,6 +242,27 @@ app.whenReady().then(async () => {
         throw new Error('Not authenticated');
       }
       return contributorCache.getAllAuthors(accessToken, owner, repo, sha);
+    },
+    getRepoPolicyHosts: async (owner: string, repo: string, sha: string, workflowName: string) => {
+      const accessToken = await getValidAccessToken();
+      if (!accessToken) {
+        throw new Error('Not authenticated');
+      }
+      const auth = getGitHubAuth() || new GitHubAuth();
+      const content = await auth.getFileContent(accessToken, owner, repo, '.localmostrc', sha);
+      if (!content) {
+        return [];
+      }
+
+      const parsed = parseLocalmostrcContent(content);
+      if (!parsed.success || !parsed.config) {
+        const detail = parsed.errors?.map(e => e.message).join('; ') || 'unknown error';
+        logger?.warn(`[Policy] ${owner}/${repo} .localmostrc could not be parsed: ${detail}`);
+        return [];
+      }
+
+      const policy = getEffectivePolicy(parsed.config, workflowName);
+      return policy.network?.allow || [];
     },
     onJobEvent: (event: JobEvent) => {
       logger?.info(`Job event: ${event.type} ${event.jobName}`);

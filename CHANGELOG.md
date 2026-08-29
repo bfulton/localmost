@@ -32,6 +32,9 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   - The sandbox now permits only localhost TCP and routes egress through the proxy,
     which enforces the hostname allowlist
   - Unix socket access is denied by default and opted into via a `sockets.allow` policy section
+- **Per-Repository Network Policy**: The runner reads `.localmostrc` from the repository at the job's commit and applies its `network.allow` to that job's proxy
+  - Lets a repository declare the hosts its own build needs, rather than relying only on the built-in allowlists
+  - Applies per job, so one repository's hosts never leak into another's
 - **Contributor-Based Job Filtering**: Decide which jobs may run by who is involved
   - Scope: everyone, the workflow trigger author, or every contributor to the repo
   - Allowed users: just you, or an explicit allowlist

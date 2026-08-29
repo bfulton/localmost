@@ -168,6 +168,21 @@ export class ProxyServer {
   /**
    * Get the current policy level
    */
+  /**
+   * Apply the hosts a repository's .localmostrc allows for the current job.
+   *
+   * The proxy is created when a runner starts, before the job - and therefore
+   * the repository - is known, so the policy arrives later. Replaces any
+   * previous job's hosts rather than accumulating across jobs.
+   */
+  setPolicyAllowedHosts(hosts: string[]): void {
+    this.policyAllowedHosts = [...hosts];
+  }
+
+  getPolicyAllowedHosts(): string[] {
+    return [...this.policyAllowedHosts];
+  }
+
   getPolicyLevel(): SandboxPolicyLevel {
     return this.policyLevel;
   }
