@@ -87,6 +87,8 @@ export interface JobHistoryEntry {
   startedAt: string;
   completedAt?: string;
   runTimeSeconds?: number;
+  /** Why the job ended, when it did not complete normally */
+  error?: string;
   actionsUrl?: string;
   /** GitHub workflow run ID - for direct cancellation */
   githubRunId?: number;

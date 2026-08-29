@@ -124,10 +124,10 @@ export class HeartbeatManager {
     // Clear all heartbeats in parallel with a short timeout for fast shutdown
     const clearPromises = this.targets.map(async (target) => {
       try {
-        if (target.level === 'org' && target.org) {
+        if (target.level === 'org' && target.org && this.setOrgVariable) {
           await this.setOrgVariable(target.org, HEARTBEAT_VARIABLE_NAME, staleTimestamp);
           this.log('info', `Cleared heartbeat for org ${target.org}`);
-        } else if (target.level === 'repo' && target.owner && target.repo) {
+        } else if (target.level === 'repo' && target.owner && target.repo && this.setRepoVariable) {
           await this.setRepoVariable(target.owner, target.repo, HEARTBEAT_VARIABLE_NAME, staleTimestamp);
           this.log('info', `Cleared heartbeat for ${target.owner}/${target.repo}`);
         }

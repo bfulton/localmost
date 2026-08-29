@@ -25,6 +25,7 @@
     "prebuild": "npm run icons && npm run build-info",
     "build-info": "node scripts/generate-build-info.js",
     "lint": "eslint src --ext .ts,.tsx",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
     "icons:svg": "node scripts/generate-icons.js",
     "icons": "npm run icons:svg && npm run icons:convert",
     "icons:convert": "node scripts/convert-icons.js",

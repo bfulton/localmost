@@ -15,7 +15,13 @@ import {
   formatPolicyDiff,
 } from '../shared/localmostrc';
 import { getAppDataDir } from './paths';
-import { log } from './logging';
+import { getLogger } from './app-state';
+
+const log = {
+  debug: (message: string) => getLogger()?.debug(message),
+  info: (message: string) => getLogger()?.info(message),
+  warn: (message: string) => getLogger()?.warn(message),
+};
 
 // =============================================================================
 // Types
