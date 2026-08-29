@@ -372,6 +372,35 @@ describe('RunnerManager', () => {
       expect(helper.isUserAllowed('anyuser')).toBe(false);
     });
 
+    it('blocks users when the filter config has an unrecognized allowedUsers', () => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        // Config comes off disk and can be hand-edited or written by an older
+        // build. An unknown value must not fall through to "allow".
+        getUserFilter: () => ({ scope: 'trigger', allowedUsers: 'bogus', allowlist: [] } as never),
+        getCurrentUserLogin: () => 'testuser',
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+
+      expect(helper.isUserAllowed('anyuser')).toBe(false);
+    });
+
+    it('blocks users when the filter config has an unrecognized scope', () => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getUserFilter: () => ({ scope: 'bogus', allowedUsers: 'just-me', allowlist: [] } as never),
+        getCurrentUserLogin: () => 'testuser',
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+
+      expect(helper.isUserAllowed('otheruser')).toBe(false);
+      expect(helper.isUserAllowed('testuser')).toBe(true);
+    });
+
     it('should handle empty allowlist', () => {
       const manager = new RunnerManager({
         onLog: mockOnLog,

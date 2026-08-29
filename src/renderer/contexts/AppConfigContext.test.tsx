@@ -638,7 +638,7 @@ describe('AppConfigContext', () => {
       });
     });
 
-    it('should handle invalid user filter scope in settings', async () => {
+    it('falls back to a restrictive scope when the stored scope is invalid', async () => {
       mockLocalmost.settings.get.mockResolvedValue({
         userFilter: {
           scope: 'invalid-scope',
@@ -657,8 +657,9 @@ describe('AppConfigContext', () => {
         expect(screen.getByTestId('is-loading').textContent).toBe('false');
       });
 
-      // Should fall back to default
-      expect(screen.getByTestId('user-filter-scope').textContent).toBe('everyone');
+      // Falls back to the restrictive scope, not 'everyone'. An unreadable
+      // filter config must not be interpreted as "run everyone's code".
+      expect(screen.getByTestId('user-filter-scope').textContent).toBe('trigger');
     });
   });
 });

@@ -243,8 +243,16 @@ export function savePersistedConfig(): void {
       try {
         const existingContent = fs.readFileSync(configPath, 'utf-8');
         const existingConfig = (yaml.load(existingContent, { schema: yaml.JSON_SCHEMA }) as AppConfig) || {};
-        if (existingConfig.auth) {
-          configToSave.auth = existingConfig.auth;
+        // Copy forward only the fields we intend to persist. Copying the
+        // section verbatim would keep a legacy accessToken/expiresAt written by
+        // an older build on disk forever, which is exactly what
+        // "access tokens are never written to disk" promises not to happen.
+        const existingAuth = existingConfig.auth;
+        if (existingAuth?.refreshToken) {
+          configToSave.auth = {
+            refreshToken: existingAuth.refreshToken,
+            user: existingAuth.user,
+          };
         }
       } catch (readErr) {
         bootLog('warn', `Failed to read existing config for auth preservation: ${(readErr as Error).message}`);

@@ -6,6 +6,7 @@
  */
 
 import React, { createContext, useContext, useEffect, useRef, useCallback, useState, ReactNode } from 'react';
+import { normalizeUserFilterConfig } from '../../shared/user-filter-config';
 import {
   LogEntry,
   SleepProtection,
@@ -226,8 +227,12 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
           sleepProtectionConsented: settings.sleepProtectionConsented || prev.sleepProtectionConsented,
           preserveWorkDir: (settings.preserveWorkDir as 'never' | 'session' | 'always') || prev.preserveWorkDir,
           toolCacheLocation: (settings.toolCacheLocation as ToolCacheLocation) || prev.toolCacheLocation,
-          userFilter: settings.userFilter && ['everyone', 'trigger', 'contributors'].includes((settings.userFilter as UserFilterConfig).scope)
-            ? (settings.userFilter as UserFilterConfig)
+          // Normalize rather than accepting only the new shape: a config still
+          // using the legacy `mode` field would otherwise be discarded here and
+          // silently replaced by the default, so the UI would show a policy
+          // different from the one the runner is enforcing.
+          userFilter: settings.userFilter
+            ? normalizeUserFilterConfig(settings.userFilter as UserFilterConfig)
             : prev.userFilter,
           sandboxPolicyLevel: settings.sandboxPolicyLevel && ['strict', 'moderate', 'permissive'].includes(settings.sandboxPolicyLevel as string)
             ? (settings.sandboxPolicyLevel as SandboxPolicyLevel)

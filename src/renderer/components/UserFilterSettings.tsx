@@ -87,6 +87,9 @@ const UserFilterSettings: React.FC<UserFilterSettingsProps> = ({
     if (!query.trim()) {
       setSearchResults([]);
       currentSearchRef.current = '';
+      // Any in-flight search is now stale, so its finally block will not clear
+      // this. Without clearing here the spinner stays up indefinitely.
+      setIsSearching(false);
       return;
     }
 

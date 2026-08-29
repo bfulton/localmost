@@ -11,44 +11,22 @@
  */
 
 import type { UserFilterConfig, FilterScope, AllowedUsers } from '../../shared/types';
+import { normalizeUserFilterConfig } from '../../shared/user-filter-config';
 
 /**
- * Normalize a filter config, handling legacy 'mode' field.
- * Returns the effective scope and allowedUsers.
+ * Normalize a filter config, handling the legacy 'mode' field.
+ * Delegates to the shared implementation so the enforced policy and the policy
+ * shown in the UI cannot drift apart.
  */
 export function normalizeFilterConfig(
   userFilter: UserFilterConfig | undefined
 ): { scope: FilterScope; allowedUsers: AllowedUsers; allowlist: string[] } {
-  if (!userFilter) {
-    return { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] };
-  }
-
-  // Handle new format
-  if (userFilter.scope) {
-    return {
-      scope: userFilter.scope,
-      allowedUsers: userFilter.allowedUsers || 'just-me',
-      allowlist: (userFilter.allowlist || []).map(u => u.login.toLowerCase()),
-    };
-  }
-
-  // Handle legacy 'mode' field
-  if (userFilter.mode) {
-    switch (userFilter.mode) {
-      case 'everyone':
-        return { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] };
-      case 'just-me':
-        return { scope: 'trigger', allowedUsers: 'just-me', allowlist: [] };
-      case 'allowlist':
-        return {
-          scope: 'trigger',
-          allowedUsers: 'allowlist',
-          allowlist: (userFilter.allowlist || []).map(u => u.login.toLowerCase()),
-        };
-    }
-  }
-
-  return { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] };
+  const normalized = normalizeUserFilterConfig(userFilter);
+  return {
+    scope: normalized.scope,
+    allowedUsers: normalized.allowedUsers,
+    allowlist: normalized.allowlist.map(u => u.login.toLowerCase()),
+  };
 }
 
 /**
@@ -128,7 +106,9 @@ function isLoginAllowed(
     return allowlist.includes(loginLower);
   }
 
-  return true;
+  // Unreachable once normalizeFilterConfig has validated the value, but this is
+  // the branch that decides whether a stranger may run code on this machine.
+  return false;
 }
 
 /**
