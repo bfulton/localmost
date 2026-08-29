@@ -34,13 +34,11 @@ export async function launchElectron(): Promise<{ app: ElectronApplication; page
       },
     });
   } catch (err) {
-    // localmost holds a single-instance lock, so a copy running on this machine
-    // makes the test instance quit during startup. Playwright reports that as a
-    // closed browser target, which gives no hint at the real cause.
+    // Playwright reports a failed startup as a closed browser target, which
+    // gives no hint at the cause. Point at the app's own stderr instead.
     throw new Error(
-      `Failed to launch Electron: ${(err as Error).message}\n` +
-        'If localmost is already running (for example the installed app), quit it first - ' +
-        'its single-instance lock causes the test instance to exit immediately.'
+      `Failed to launch Electron from ${mainPath}: ${(err as Error).message}\n` +
+        'Check the launch output above for the main process error.'
     );
   }
 

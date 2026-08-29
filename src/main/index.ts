@@ -4,6 +4,7 @@
  */
 
 import { app, BrowserWindow, Notification } from 'electron';
+import * as nodePath from 'path';
 import { RunnerManager, JobEvent } from './runner-manager';
 import { GitHubAuth } from './github-auth';
 import { RunnerDownloader } from './runner-downloader';
@@ -114,6 +115,15 @@ installSecurityHandlers();
 // ============================================================================
 // Single Instance Lock
 // ============================================================================
+
+// Electron keys the single-instance lock - and its caches - on userData, which
+// LOCALMOST_CONFIG_DIR does not affect. Without redirecting it, a test run on a
+// machine with localmost already open loses the lock and quits during startup.
+// Point userData inside the test config directory so a test instance is fully
+// isolated from an installed app.
+if (process.env.LOCALMOST_CONFIG_DIR) {
+  app.setPath('userData', nodePath.join(process.env.LOCALMOST_CONFIG_DIR, 'electron-user-data'));
+}
 
 const gotTheLock = app.requestSingleInstanceLock();
 
