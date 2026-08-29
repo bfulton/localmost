@@ -180,6 +180,41 @@ describe('BrokerProxyService', () => {
   });
 
   describe('removeTarget', () => {
+    interface RetryInternals {
+      targets: Map<string, unknown>;
+      sessionRetryTimeouts: Map<string, NodeJS.Timeout>;
+      scheduleSessionRetry(state: unknown, instance: unknown): void;
+    }
+
+    it('cancels pending session retries for the removed target', () => {
+      const target = createMockTarget();
+      service.addTarget(target, createMockCredentials());
+
+      const internals = service as unknown as RetryInternals;
+      internals.scheduleSessionRetry(internals.targets.get(target.id), { instanceNum: 1 });
+      expect(internals.sessionRetryTimeouts.size).toBe(1);
+
+      service.removeTarget(target.id);
+
+      // A retry that outlives its target retries forever against credentials
+      // that no longer exist, logging an OAuth failure every interval.
+      expect(internals.sessionRetryTimeouts.size).toBe(0);
+    });
+
+    it('leaves retries for other targets alone', () => {
+      service.addTarget(createMockTarget({ id: 'target-1' }), createMockCredentials());
+      service.addTarget(createMockTarget({ id: 'target-2' }), createMockCredentials());
+
+      const internals = service as unknown as RetryInternals;
+      internals.scheduleSessionRetry(internals.targets.get('target-1'), { instanceNum: 1 });
+      internals.scheduleSessionRetry(internals.targets.get('target-2'), { instanceNum: 1 });
+
+      service.removeTarget('target-1');
+
+      expect(Array.from(internals.sessionRetryTimeouts.keys())).toEqual(['target-2/1']);
+    });
+
+
     it('should remove a target', () => {
       const target = createMockTarget();
       const creds = createMockCredentials();

@@ -308,6 +308,10 @@ export class BrokerProxyService extends EventEmitter {
       this.deleteUpstreamSession(state).catch((err) => {
         log()?.warn(`[BrokerProxy] Failed to delete upstream session for ${state.target.displayName}: ${(err as Error).message}`);
       });
+      // Cancel pending retries first. A retry that outlives its target keeps
+      // rescheduling itself against credentials that no longer exist, logging
+      // an OAuth failure every interval for a target the user has removed.
+      this.cancelSessionRetriesForTarget(targetId);
       this.targets.delete(targetId);
       log()?.info( `[BrokerProxy] Removed target: ${state.target.displayName}`);
     }
@@ -913,6 +917,19 @@ export class BrokerProxyService extends EventEmitter {
     }, BrokerProxyService.SESSION_RETRY_INTERVAL_MS);
 
     this.sessionRetryTimeouts.set(retryKey, timeout);
+  }
+
+  /**
+   * Cancel pending session retries belonging to a single target.
+   */
+  private cancelSessionRetriesForTarget(targetId: string): void {
+    const prefix = `${targetId}/`;
+    for (const [key, timeout] of this.sessionRetryTimeouts) {
+      if (key.startsWith(prefix)) {
+        clearTimeout(timeout);
+        this.sessionRetryTimeouts.delete(key);
+      }
+    }
   }
 
   /**

@@ -39,6 +39,7 @@ interface RunnerManagerInternals {
   stopping: boolean;
   startedAt: string | null;
   isUserAllowed(actorLogin: string): boolean;
+  parseRunnerOutput(instanceNum: number, line: string): Promise<void>;
 }
 
 /**
@@ -97,5 +98,12 @@ export class RunnerManagerTestHelper {
    */
   isUserAllowed(actorLogin: string): boolean {
     return this.internals.isUserAllowed(actorLogin);
+  }
+
+  /**
+   * Feed a line of runner output through the parser.
+   */
+  parseRunnerOutput(instanceNum: number, line: string): Promise<void> {
+    return this.internals.parseRunnerOutput(instanceNum, line);
   }
 }
