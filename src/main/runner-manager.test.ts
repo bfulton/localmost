@@ -553,6 +553,45 @@ describe('RunnerManager', () => {
     });
   });
 
+  describe('slot release after a job', () => {
+    function busyManager() {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      for (let i = 1; i <= 4; i++) {
+        helper.setInstance(i, { name: `runner-${i}`, status: 'busy' });
+      }
+      return { manager, helper };
+    }
+
+    it('frees the slot so the next job can be accepted', () => {
+      // A worker restarted after finishing cannot take another job: the broker
+      // only routes messages to workers spawned for a specific target. Holding
+      // the slot made the broker report "At capacity" forever once every slot
+      // had run once, with nothing actually running.
+      const { manager, helper } = busyManager();
+      expect(manager.hasAvailableSlot()).toBe(false);
+
+      helper.releaseInstanceSlot(1);
+
+      expect(manager.hasAvailableSlot()).toBe(true);
+    });
+
+    it('frees every slot as its job finishes, not just the scaled-up ones', () => {
+      const { manager, helper } = busyManager();
+
+      for (let i = 1; i <= 4; i++) {
+        helper.releaseInstanceSlot(i);
+      }
+
+      expect(helper.instances.size).toBe(0);
+      expect(manager.hasAvailableSlot()).toBe(true);
+    });
+  });
+
   describe('getStatus with shutting_down', () => {
     it('should return shutting_down status when stopping is true', () => {
       const helper = new RunnerManagerTestHelper(runnerManager);

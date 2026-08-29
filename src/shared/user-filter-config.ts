@@ -60,6 +60,10 @@ export function normalizeUserFilterConfig(
     case 'allowlist':
       return { scope: 'trigger', allowedUsers: 'allowlist', allowlist };
     default:
-      return { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] };
+      // A config object that matches neither shape is unreadable, not absent.
+      // Falling back to 'everyone' here would widen access on malformed input,
+      // which is what the guarantee above exists to prevent. An absent config
+      // is handled earlier and still means no filtering.
+      return { scope: 'trigger', allowedUsers: 'just-me', allowlist };
   }
 }

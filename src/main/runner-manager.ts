@@ -847,24 +847,7 @@ export class RunnerManager {
 
         instance.jobsCompleted++;
         this.log('info', `Runner instance ${instanceNum} completed job #${instance.jobsCompleted}`);
-
-        // Scale down if there are other idle runners
-        const idleCount = this.countIdleRunners();
-        if (instanceNum > 1 && idleCount > 0) {
-          this.log('info', `Scaling down: not restarting instance ${instanceNum}`);
-          instance.status = 'offline';
-          this.instances.delete(instanceNum);
-          this.updateAggregateStatus();
-          return;
-        }
-
-        // Recycle this runner (rebuild sandbox and restart)
-        this.log('info', `Recycling runner instance ${instanceNum}...`);
-        this.startInstance(instanceNum).catch((err) => {
-          this.log('error', `Failed to restart instance ${instanceNum}: ${err.message}`);
-          instance.status = 'error';
-          this.updateAggregateStatus();
-        });
+        this.releaseInstanceSlot(instanceNum);
       });
 
       this.instances.set(instanceNum, instance);
@@ -996,6 +979,29 @@ export class RunnerManager {
     this.startedAt = null;
     this.stopping = false;
     this.updateStatus('offline');
+  }
+
+  /**
+   * Release an instance's slot after it finishes a job.
+   *
+   * Workers are spawned per job: the broker only routes a job message to a
+   * worker that was started for that specific target, and deliberately refuses
+   * to hand one to a worker with no target assignment. A worker restarted after
+   * finishing therefore cannot accept anything, while still occupying a slot
+   * that hasAvailableSlot() and spawnWorkerForJob() both consider taken.
+   *
+   * Keeping one meant that once every slot had run a job, the broker reported
+   * "At capacity" for every subsequent job and stopped accepting work entirely,
+   * with nothing actually running. Free the slot instead and let the next job
+   * spawn a fresh worker bound to its target.
+   */
+  private releaseInstanceSlot(instanceNum: number): void {
+    const instance = this.instances.get(instanceNum);
+    if (instance) {
+      instance.status = 'offline';
+    }
+    this.instances.delete(instanceNum);
+    this.updateAggregateStatus();
   }
 
   private countIdleRunners(): number {

@@ -652,11 +652,22 @@ export class GitHubAuth {
     try {
       // Use compare API to get commits between two refs
       const data = await client.get<{
+        total_commits: number;
         commits: Array<{
           author: { login: string } | null;
           commit: { author: { name: string } | null };
         }>;
       }>(`/repos/${owner}/${repo}/compare/${baseSha}...${headSha}`);
+
+      // The compare API caps the commits it returns (250) while still
+      // reporting the true total. A truncated response would silently omit
+      // authors, and callers gate job execution on this set.
+      const returned = data.commits?.length ?? 0;
+      if (typeof data.total_commits === 'number' && data.total_commits > returned) {
+        throw new Error(
+          `compare returned ${returned} of ${data.total_commits} commits; author list would be incomplete`
+        );
+      }
 
       for (const commit of data.commits || []) {
         // Prefer the GitHub user login if available
