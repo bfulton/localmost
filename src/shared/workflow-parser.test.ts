@@ -15,6 +15,7 @@ import {
   extractSecretReferences,
   extractEnvReferences,
   Workflow,
+  resolveReusableWorkflowPath,
 } from './workflow-parser';
 
 // Mock fs
@@ -144,6 +145,27 @@ jobs:
   // ===========================================================================
   // Job Dependency Ordering
   // ===========================================================================
+
+  describe('resolveReusableWorkflowPath', () => {
+    const caller = '/repo/.github/workflows/ci.yml';
+
+    it('resolves a local reusable workflow', () => {
+      expect(resolveReusableWorkflowPath('./.github/workflows/build.yml', caller))
+        .toBe('/repo/.github/workflows/build.yml');
+    });
+
+    it('refuses a reference that escapes the repository', () => {
+      // `uses:` comes from the workflow file, which is repository content. A
+      // traversal here would make `localmost test` read arbitrary local files.
+      expect(resolveReusableWorkflowPath('./../../../etc/passwd', caller)).toBeNull();
+      expect(resolveReusableWorkflowPath('./../secrets.yml', caller)).toBeNull();
+    });
+
+    it('returns null for remote references', () => {
+      expect(resolveReusableWorkflowPath('owner/repo/.github/workflows/x.yml@main', caller))
+        .toBeNull();
+    });
+  });
 
   describe('reusable workflow job validation', () => {
     it('rejects a job that both calls a reusable workflow and defines steps', () => {

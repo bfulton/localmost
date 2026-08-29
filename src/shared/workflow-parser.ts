@@ -542,7 +542,16 @@ export function resolveReusableWorkflowPath(
   // Local workflow reference: ./.github/workflows/workflow.yaml
   if (uses.startsWith('./')) {
     const repoRoot = path.dirname(path.dirname(path.dirname(callerWorkflowPath)));
-    return path.join(repoRoot, uses.slice(2));
+    const resolved = path.resolve(repoRoot, uses.slice(2));
+
+    // `uses:` is repository content. Without this check a value like
+    // ./../../etc/passwd escapes the repository and makes `localmost test`
+    // read arbitrary local files.
+    const root = path.resolve(repoRoot);
+    if (resolved !== root && !resolved.startsWith(`${root}${path.sep}`)) {
+      return null;
+    }
+    return resolved;
   }
 
   // Remote workflow reference: owner/repo/.github/workflows/workflow.yaml@ref
