@@ -224,7 +224,10 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
           maxLogScrollback: settings.maxLogScrollback ? Number(settings.maxLogScrollback) : prev.maxLogScrollback,
           maxJobHistory: settings.maxJobHistory ? Number(settings.maxJobHistory) : prev.maxJobHistory,
           sleepProtection: (settings.sleepProtection as SleepProtection) || prev.sleepProtection,
-          sleepProtectionConsented: settings.sleepProtectionConsented || prev.sleepProtectionConsented,
+          sleepProtectionConsented:
+            typeof settings.sleepProtectionConsented === 'boolean'
+              ? settings.sleepProtectionConsented
+              : prev.sleepProtectionConsented,
           preserveWorkDir: (settings.preserveWorkDir as 'never' | 'session' | 'always') || prev.preserveWorkDir,
           toolCacheLocation: (settings.toolCacheLocation as ToolCacheLocation) || prev.toolCacheLocation,
           // Normalize rather than accepting only the new shape: a config still

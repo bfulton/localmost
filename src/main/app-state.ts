@@ -35,7 +35,8 @@ import {
 
 // Auth state structure
 export interface AuthState {
-  accessToken: string;
+  /** Absent until the first refresh: access tokens are never persisted. */
+  accessToken?: string;
   refreshToken?: string;
   expiresAt?: number;
   user: GitHubUser;

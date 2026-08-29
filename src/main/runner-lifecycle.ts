@@ -300,7 +300,9 @@ const ensureProxyRegistrations = async (
       if (!proxyRunner) {
         logger?.info(`[Proxy] Re-registering missing proxy for ${target.displayName}...`);
         try {
-          await proxyManager.register(target);
+          const config = loadConfig();
+          const count = config.runnerConfig?.runnerCount || DEFAULT_RUNNER_COUNT;
+          await proxyManager.registerAll(target, count);
           logger?.info(`[Proxy] Successfully re-registered proxy for ${target.displayName}`);
         } catch (regErr) {
           logger?.error(`[Proxy] Failed to re-register proxy for ${target.displayName}: ${(regErr as Error).message}`);

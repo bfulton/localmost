@@ -126,7 +126,7 @@ export class JobHistoryManager {
         const endTime = updates.completedAt
           ? new Date(updates.completedAt).getTime()
           : Date.now();
-        job.duration = Math.round((endTime - startTime) / 1000);
+        job.runTimeSeconds = Math.round((endTime - startTime) / 1000);
       }
 
       this.save();

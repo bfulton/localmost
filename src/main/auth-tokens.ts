@@ -117,7 +117,7 @@ export const getValidAccessToken = async (): Promise<string | null> => {
     }
   }
 
-  return authState.accessToken;
+  return authState.accessToken ?? null;
 };
 
 /** Running job info for cancellation */

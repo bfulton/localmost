@@ -163,7 +163,8 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
         // Check auth status
         const authStatus = await window.localmost.github.getAuthStatus();
         if (authStatus.isAuthenticated && authStatus.user) {
-          setFallbackState(prev => ({ ...prev, user: authStatus.user }));
+          const user = authStatus.user;
+          setFallbackState(prev => ({ ...prev, user }));
           loadReposAndOrgs();
         }
 
@@ -310,10 +311,12 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
       window.localmost.github.getOrgs(),
     ]);
     if (reposResult.success && reposResult.repos) {
-      setFallbackState(prev => ({ ...prev, repos: reposResult.repos }));
+      const repos = reposResult.repos;
+      setFallbackState(prev => ({ ...prev, repos }));
     }
     if (orgsResult.success && orgsResult.orgs) {
-      setFallbackState(prev => ({ ...prev, orgs: orgsResult.orgs }));
+      const orgs = orgsResult.orgs;
+      setFallbackState(prev => ({ ...prev, orgs }));
     }
   };
 
@@ -350,7 +353,8 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
     const result = await window.localmost.github.startDeviceFlow();
 
     if (result.success && result.user) {
-      setFallbackState(prev => ({ ...prev, user: result.user }));
+      const user = result.user;
+      setFallbackState(prev => ({ ...prev, user }));
       loadReposAndOrgs();
     } else {
       setFallbackState(prev => ({ ...prev, error: result.error || 'Authentication failed' }));
