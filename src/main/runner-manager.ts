@@ -1184,17 +1184,24 @@ export class RunnerManager {
     // Detect job completion
     const jobCompleteMatch = line.match(/Job .+ completed with result:\s*(\w+)/i);
     if (jobCompleteMatch && instance.currentJob) {
+      // Claim the job synchronously. The conclusion lookup below awaits, and
+      // the runner can emit its completion line more than once; leaving
+      // currentJob set across the await lets a second line re-enter and
+      // report the same job as completed twice.
+      const job = instance.currentJob;
+      instance.currentJob = null;
+
       const completedAt = new Date().toISOString();
 
       // Compute runtime in seconds
-      const startTime = new Date(instance.currentJob.startedAt).getTime();
+      const startTime = new Date(job.startedAt).getTime();
       const endTime = new Date(completedAt).getTime();
       const runTimeSeconds = Math.round((endTime - startTime) / 1000);
 
-      const jobId = instance.currentJob.id;
-      const githubJobId = instance.currentJob.githubJobId;
-      const repository = instance.currentJob.repository;
-      const jobName = instance.currentJob.name;
+      const jobId = job.id;
+      const githubJobId = job.githubJobId;
+      const repository = job.repository;
+      const jobName = job.name;
 
       // Query GitHub API for the actual conclusion (authoritative source)
       let status: JobStatus = 'completed'; // Default fallback
@@ -1241,7 +1248,6 @@ export class RunnerManager {
         runTimeSeconds,
       });
 
-      instance.currentJob = null;
       instance.status = 'listening';
       this.updateAggregateStatus();
     }

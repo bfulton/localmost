@@ -81,16 +81,19 @@ export class Logger {
   }
 
   /**
-   * Log a debug message (only in development).
+   * Log a debug message.
+   *
+   * Whether this is recorded is the sink's decision, based on the user's
+   * configured log level. Gating it on NODE_ENV here made every debug call a
+   * no-op in packaged builds, so the "debug" option in Settings did nothing
+   * and debug-only diagnostics were unreachable in the app people actually run.
    */
   debug(message: string): void {
-    if (process.env.NODE_ENV === 'development') {
-      this.sink({
-        timestamp: new Date().toISOString(),
-        level: 'debug',
-        message: this.formatMessage(message),
-      });
-    }
+    this.sink({
+      timestamp: new Date().toISOString(),
+      level: 'debug',
+      message: this.formatMessage(message),
+    });
   }
 }
 

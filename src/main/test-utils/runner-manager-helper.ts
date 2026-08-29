@@ -41,6 +41,7 @@ interface RunnerManagerInternals {
   startedAt: string | null;
   isUserAllowed(actorLogin: string): boolean;
   checkJobUserFilter(instanceNum: number, runnerName: string): Promise<void>;
+  parseRunnerOutput(instanceNum: number, line: string): Promise<void>;
 }
 
 /**
@@ -106,5 +107,12 @@ export class RunnerManagerTestHelper {
    */
   checkJobUserFilter(instanceNum: number, runnerName: string): Promise<void> {
     return this.internals.checkJobUserFilter(instanceNum, runnerName);
+  }
+
+  /**
+   * Feed a line of runner output through the parser.
+   */
+  parseRunnerOutput(instanceNum: number, line: string): Promise<void> {
+    return this.internals.parseRunnerOutput(instanceNum, line);
   }
 }
