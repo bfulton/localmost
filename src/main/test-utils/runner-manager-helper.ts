@@ -42,6 +42,7 @@ interface RunnerManagerInternals {
   isUserAllowed(actorLogin: string): boolean;
   checkJobUserFilter(instanceNum: number, runnerName: string): Promise<void>;
   parseRunnerOutput(instanceNum: number, line: string): Promise<void>;
+  releaseInstanceSlot(instanceNum: number): void;
 }
 
 /**
@@ -114,5 +115,12 @@ export class RunnerManagerTestHelper {
    */
   parseRunnerOutput(instanceNum: number, line: string): Promise<void> {
     return this.internals.parseRunnerOutput(instanceNum, line);
+  }
+
+  /**
+   * Release an instance slot as the process-exit handler does.
+   */
+  releaseInstanceSlot(instanceNum: number): void {
+    this.internals.releaseInstanceSlot(instanceNum);
   }
 }
