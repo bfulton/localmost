@@ -38,8 +38,9 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
 - **Contributor-Based Job Filtering**: Decide which jobs may run by who is involved
   - Scope: everyone, the workflow trigger author, or every contributor to the repo
   - Allowed users: just you, or an explicit allowlist
-  - Disallowed jobs are cancelled through the GitHub API, and the check fails
-    closed when contributors cannot be determined
+  - The decision is made before a worker is spawned, so a disallowed job never
+    starts; the run is then cancelled through the GitHub API
+  - The check fails closed when contributors cannot be determined
 - **Reusable Workflow Support** in `localmost test`
   - Local `uses: ./.github/workflows/...` references
   - `workflow_call` inputs and outputs, passed to dependent jobs via `needs`

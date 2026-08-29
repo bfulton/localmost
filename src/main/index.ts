@@ -362,6 +362,26 @@ app.whenReady().then(async () => {
         actionsUrl = `https://github.com/${githubInfo.githubRepo}/actions/runs/${githubInfo.githubRunId}/job/${githubInfo.githubJobId}`;
         getLogger()?.info(`Constructed actions URL: ${actionsUrl}`);
       }
+      // Decide whether this job may run before any worker exists. Cancelling
+      // after a worker has started leaves untrusted steps executing for as long
+      // as the check takes.
+      const [owner, repo] = (githubInfo.githubRepo || target.displayName).split('/');
+      if (owner && repo && githubInfo.githubActor) {
+        const verdict = await runnerManager.evaluateJobFilter(
+          owner,
+          repo,
+          githubInfo.githubActor,
+          githubInfo.githubSha
+        );
+        if (!verdict.allowed) {
+          getLogger()?.warn(`Job ${jobId} not allowed: ${verdict.reason}. Not starting a worker.`);
+          if (githubInfo.githubRunId) {
+            await runnerManager.cancelRun(owner, repo, githubInfo.githubRunId, verdict.reason);
+          }
+          return;
+        }
+      }
+
       runnerManager.setPendingTargetContext('next', targetId, target.displayName, actionsUrl, githubInfo.githubRunId, githubInfo.githubJobId, githubInfo.githubActor, githubInfo.githubSha, githubInfo.githubRef);
 
       // Spawn a worker to handle this job

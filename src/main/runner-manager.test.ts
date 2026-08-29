@@ -553,6 +553,71 @@ describe('RunnerManager', () => {
     });
   });
 
+  describe('evaluateJobFilter', () => {
+    function manager(opts: Record<string, unknown>) {
+      return new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        ...opts,
+      } as never);
+    }
+
+    it('allows any job when the scope is everyone', async () => {
+      const m = manager({ getUserFilter: () => ({ scope: 'everyone', allowedUsers: 'just-me', allowlist: [] }) });
+
+      await expect(m.evaluateJobFilter('o', 'r', 'stranger')).resolves.toEqual({ allowed: true, reason: '' });
+    });
+
+    it('blocks a disallowed trigger author', async () => {
+      const m = manager({
+        getUserFilter: () => ({ scope: 'trigger', allowedUsers: 'just-me', allowlist: [] }),
+        getCurrentUserLogin: () => 'me',
+      });
+
+      const verdict = await m.evaluateJobFilter('o', 'r', 'stranger');
+      expect(verdict.allowed).toBe(false);
+      expect(verdict.reason).toMatch(/stranger/);
+    });
+
+    it('blocks when a contributor is not allowed', async () => {
+      const m = manager({
+        getUserFilter: () => ({ scope: 'contributors', allowedUsers: 'just-me', allowlist: [] }),
+        getCurrentUserLogin: () => 'me',
+        getAllContributors: async () => new Set(['me', 'stranger']),
+      });
+
+      const verdict = await m.evaluateJobFilter('o', 'r', 'me', 'abc123');
+      expect(verdict.allowed).toBe(false);
+      expect(verdict.reason).toMatch(/stranger/);
+    });
+
+    it('fails closed when the contributor lookup throws', async () => {
+      const m = manager({
+        getUserFilter: () => ({ scope: 'contributors', allowedUsers: 'just-me', allowlist: [] }),
+        getCurrentUserLogin: () => 'me',
+        getAllContributors: async () => {
+          throw new Error('API down');
+        },
+      });
+
+      const verdict = await m.evaluateJobFilter('o', 'r', 'me', 'abc123');
+      expect(verdict.allowed).toBe(false);
+      expect(verdict.reason).toMatch(/API down/);
+    });
+
+    it('fails closed when there is no SHA to check contributors at', async () => {
+      const m = manager({
+        getUserFilter: () => ({ scope: 'contributors', allowedUsers: 'just-me', allowlist: [] }),
+        getCurrentUserLogin: () => 'me',
+        getAllContributors: async () => new Set(['me']),
+      });
+
+      const verdict = await m.evaluateJobFilter('o', 'r', 'me');
+      expect(verdict.allowed).toBe(false);
+    });
+  });
+
   describe('repository network policy', () => {
     it('applies the hosts a repo declares to that instance proxy', async () => {
       const setPolicyAllowedHosts = jest.fn();

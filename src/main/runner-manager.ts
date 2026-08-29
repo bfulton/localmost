@@ -1339,13 +1339,78 @@ export class RunnerManager {
   }
 
   /**
-   * Check if a job should be allowed based on user filter.
-   * If not allowed, attempts to cancel the workflow run.
+   * Decide whether a job may run, without reference to any runner instance.
+   *
+   * Exposed so the decision can be made before a worker is spawned. Cancelling
+   * after the fact leaves untrusted steps running for as long as the check takes.
    *
    * Supports three scopes:
    * - 'everyone': No filtering, all jobs allowed
    * - 'trigger': Check the workflow trigger author only
    * - 'contributors': Check all repository contributors/commit authors
+   */
+  async evaluateJobFilter(
+    owner: string,
+    repo: string,
+    githubActor: string,
+    githubSha?: string
+  ): Promise<{ allowed: boolean; reason: string }> {
+    const userFilter = this.getUserFilter?.();
+    const { scope } = normalizeFilterConfig(userFilter);
+    const currentUser = this.getCurrentUserLogin?.();
+
+    if (scope === 'everyone') {
+      return { allowed: true, reason: '' };
+    }
+
+    if (scope === 'trigger') {
+      if (!isUserAllowed(githubActor, userFilter, currentUser)) {
+        return { allowed: false, reason: `trigger author '${githubActor}' not in allowed users` };
+      }
+      return { allowed: true, reason: '' };
+    }
+
+    // 'contributors' was chosen precisely because the trigger author alone is
+    // not sufficient, so a check that cannot be performed fails closed.
+    if (!githubSha) {
+      return { allowed: false, reason: 'cannot verify contributors: no commit SHA for this job' };
+    }
+    if (!this.getAllContributors) {
+      return { allowed: false, reason: 'cannot verify contributors: contributor lookup unavailable' };
+    }
+
+    try {
+      const contributors = await this.getAllContributors(owner, repo, githubSha);
+      const result = areAllUsersAllowed(contributors, userFilter, currentUser);
+      if (!result.allowed) {
+        const list = result.disallowedUsers.slice(0, 3).join(', ');
+        const more = result.disallowedUsers.length > 3 ? ` and ${result.disallowedUsers.length - 3} more` : '';
+        return { allowed: false, reason: `repo has disallowed contributors: ${list}${more}` };
+      }
+      return { allowed: true, reason: '' };
+    } catch (err) {
+      return { allowed: false, reason: `contributor check failed: ${(err as Error).message}` };
+    }
+  }
+
+  /**
+   * Cancel a workflow run that must not proceed.
+   */
+  async cancelRun(owner: string, repo: string, githubRunId: number, reason: string): Promise<void> {
+    if (!this.cancelWorkflowRun) {
+      this.log('warn', 'Cannot cancel: cancelWorkflowRun not available');
+      return;
+    }
+    try {
+      await this.cancelWorkflowRun(owner, repo, githubRunId);
+      this.log('info', `Cancelled workflow run ${githubRunId}: ${reason}`);
+    } catch (cancelErr) {
+      this.log('warn', `Failed to cancel workflow run ${githubRunId}: ${(cancelErr as Error).message}`);
+    }
+  }
+
+  /**
+   * Backstop for a job that reached a runner without passing evaluateJobFilter.
    */
   private async checkJobUserFilter(instanceNum: number, _runnerName: string): Promise<void> {
     const instance = this.instances.get(instanceNum);
@@ -1357,86 +1422,22 @@ export class RunnerManager {
       return;
     }
 
-    const userFilter = this.getUserFilter?.();
-    const { scope } = normalizeFilterConfig(userFilter);
-
-    // No filtering in everyone scope
-    if (scope === 'everyone') {
-      return;
-    }
-
-    // Parse owner/repo from target display name (e.g., "owner/repo")
     const repoInfo = parseRepository(targetDisplayName);
     if (!repoInfo) {
       this.log('warn', `Cannot parse owner/repo from target: ${targetDisplayName}`);
       return;
     }
-    const { owner, repo } = repoInfo;
-    const currentUser = this.getCurrentUserLogin?.();
 
-    let shouldCancel = false;
-    let reason = '';
+    const { allowed, reason } = await this.evaluateJobFilter(
+      repoInfo.owner,
+      repoInfo.repo,
+      githubActor,
+      githubSha
+    );
+    if (allowed) return;
 
-    if (scope === 'trigger') {
-      // Check if the trigger author is allowed
-      if (!isUserAllowed(githubActor, userFilter, currentUser)) {
-        shouldCancel = true;
-        reason = `trigger author '${githubActor}' not in allowed users`;
-      } else {
-        this.log('debug', `Job triggered by '${githubActor}' is allowed`);
-      }
-    } else if (scope === 'contributors') {
-      // Check all repository contributors
-      // The 'contributors' scope was chosen precisely because checking the
-      // trigger author alone is not sufficient. If the check cannot be
-      // performed, fail closed rather than silently downgrading to it.
-      if (!githubSha) {
-        shouldCancel = true;
-        reason = 'cannot verify contributors: no commit SHA for this job';
-      } else if (!this.getAllContributors) {
-        shouldCancel = true;
-        reason = 'cannot verify contributors: contributor lookup unavailable';
-      } else {
-        try {
-          // Get all contributors/authors for the repo at this SHA
-          const contributors = await this.getAllContributors(owner, repo, githubSha);
-          this.log('debug', `checkJobUserFilter: found ${contributors.size} contributors for ${owner}/${repo} at ${githubSha.slice(0, 7)}`);
-
-          // Check if all contributors are allowed
-          const result = areAllUsersAllowed(contributors, userFilter, currentUser);
-
-          if (!result.allowed) {
-            shouldCancel = true;
-            const disallowedList = result.disallowedUsers.slice(0, 3).join(', ');
-            const suffix = result.disallowedUsers.length > 3 ? ` and ${result.disallowedUsers.length - 3} more` : '';
-            reason = `repo has disallowed contributors: ${disallowedList}${suffix}`;
-          } else {
-            this.log('debug', `All ${contributors.size} contributors for ${owner}/${repo} are allowed`);
-          }
-        } catch (err) {
-          // If contributor check fails, fail safe (cancel the job)
-          this.log('warn', `Failed to get contributors: ${(err as Error).message}, cancelling job for safety`);
-          shouldCancel = true;
-          reason = `contributor check failed: ${(err as Error).message}`;
-        }
-      }
-    }
-
-    if (shouldCancel) {
-      this.log('info', `Job not allowed: ${reason}. Cancelling workflow run.`);
-
-      if (!this.cancelWorkflowRun) {
-        this.log('warn', 'Cannot cancel: cancelWorkflowRun not available');
-        return;
-      }
-
-      try {
-        await this.cancelWorkflowRun(owner, repo, githubRunId);
-        this.log('info', `Cancelled workflow run ${githubRunId}: ${reason}`);
-      } catch (cancelErr) {
-        this.log('warn', `Failed to cancel workflow run ${githubRunId}: ${(cancelErr as Error).message}`);
-      }
-    }
+    this.log('info', `Job not allowed: ${reason}. Cancelling workflow run.`);
+    await this.cancelRun(repoInfo.owner, repoInfo.repo, githubRunId, reason);
   }
 
   private addJobToHistory(job: JobHistoryEntry): void {
