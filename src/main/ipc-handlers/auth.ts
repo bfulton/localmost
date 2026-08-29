@@ -124,11 +124,11 @@ export const registerAuthHandlers = (): void => {
         copiedToClipboard: true,
       });
 
-      // Wait briefly so user can see the code was copied before browser opens
-      await new Promise(resolve => setTimeout(resolve, 1500));
-
-      // Open the verification URL in the browser (with validation)
-      openGitHubVerificationUrl(status.verificationUri);
+      // Give the user a moment to see the code was copied before the browser
+      // takes focus. Scheduled rather than awaited: this is a presentation
+      // delay, and awaiting it blocks the IPC handler for a second and a half.
+      const verificationUri = status.verificationUri;
+      setTimeout(() => openGitHubVerificationUrl(verificationUri), 1500);
 
       // Wait for user to complete auth
       const result = await waitForAuth();

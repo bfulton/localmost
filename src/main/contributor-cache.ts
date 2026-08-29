@@ -95,11 +95,13 @@ export class ContributorCache {
           this.log(`[ContributorCache] Found ${newAuthors.length} new author(s) in commits`);
         }
       } catch (error) {
-        // If we can't get commits (e.g., SHA not found after force push),
-        // we should re-fetch the full contributor list to be safe
-        this.log(`[ContributorCache] Failed to get commits, re-fetching contributors: ${(error as Error).message}`);
-        entry = await this.fetchAndCache(accessToken, owner, repo);
-        return new Set(entry.contributors);
+        // Refresh the cache so the next attempt starts from current data, then
+        // propagate. Returning the contributor list here would look like
+        // success while silently omitting whoever authored the new commits,
+        // and callers gate job execution on this set.
+        this.log(`[ContributorCache] Failed to get commits for ${owner}/${repo}: ${(error as Error).message}`);
+        await this.fetchAndCache(accessToken, owner, repo).catch(() => undefined);
+        throw error;
       }
     }
 

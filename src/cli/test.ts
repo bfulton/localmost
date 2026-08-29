@@ -618,7 +618,7 @@ async function runReusableWorkflowJob(
 /**
  * Extract job outputs from step outputs using the job's output definitions.
  */
-function extractJobOutputs(
+export function extractJobOutputs(
   job: WorkflowJob,
   stepOutputs: Record<string, Record<string, string>>
 ): Record<string, string> | undefined {
@@ -630,7 +630,7 @@ function extractJobOutputs(
 
   for (const [outputName, expression] of Object.entries(job.outputs)) {
     // Parse expressions like ${{ steps.check.outputs.runner }}
-    const match = expression.match(/\$\{\{\s*steps\.(\w+)\.outputs\.(\w+)\s*\}\}/);
+    const match = expression.match(/\$\{\{\s*steps\.([\w-]+)\.outputs\.([\w-]+)\s*\}\}/);
     if (match) {
       const [, stepId, outputKey] = match;
       const value = stepOutputs[stepId]?.[outputKey];
@@ -646,7 +646,7 @@ function extractJobOutputs(
 /**
  * Extract workflow-level outputs from job outputs.
  */
-function extractWorkflowOutputs(
+export function extractWorkflowOutputs(
   workflow: ReusableWorkflow,
   jobOutputs: JobOutputs
 ): Record<string, string> | undefined {
@@ -658,7 +658,7 @@ function extractWorkflowOutputs(
 
   for (const [outputName, outputDef] of Object.entries(workflow.outputs)) {
     // Parse expressions like ${{ jobs.check.outputs.runner }}
-    const match = outputDef.value.match(/\$\{\{\s*jobs\.(\w+)\.outputs\.(\w+)\s*\}\}/);
+    const match = outputDef.value.match(/\$\{\{\s*jobs\.([\w-]+)\.outputs\.([\w-]+)\s*\}\}/);
     if (match) {
       const [, jobId, outputKey] = match;
       const value = jobOutputs[jobId]?.[outputKey];

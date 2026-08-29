@@ -665,9 +665,12 @@ export class GitHubAuth {
         }
       }
     } catch (error) {
-      // If compare fails (e.g., baseSha not found), return empty
-      // This can happen if the repo was force-pushed
-      console.error(`Failed to get commit authors: ${(error as Error).message}`);
+      // Do not swallow this. An empty result is indistinguishable from "no new
+      // authors", and callers use the author set to decide whether untrusted
+      // contributors are involved in a job.
+      throw new Error(
+        `Failed to compare ${baseSha}...${headSha} for ${owner}/${repo}: ${(error as Error).message}`
+      );
     }
 
     return Array.from(authors);

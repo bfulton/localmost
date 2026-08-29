@@ -157,7 +157,7 @@
 }
 
 /* Spinner */
-@keyframes spin {
+@keyframes sharedSpin {
   to { transform: rotate(360deg); }
 }
 
@@ -167,7 +167,7 @@
   border: 2px solid var(--border);
   border-top-color: var(--accent);
   border-radius: 50%;
-  animation: spin 1s linear infinite;
+  animation: sharedSpin 1s linear infinite;
 }
 
 /* Waiting Indicator */

@@ -176,8 +176,14 @@ export function parseWorkflowContent(content: string, filePath: string): ParsedW
   for (const [jobId, job] of Object.entries(workflow.jobs)) {
     // Check if this is a reusable workflow call
     if (job.uses) {
-      // Reusable workflow jobs don't have runs-on or steps
-      // They reference another workflow file
+      // A reusable workflow call references another workflow file and cannot
+      // also define its own execution. Accepting the combination would run the
+      // job as a reusable call and silently drop the steps it declares.
+      if (job['runs-on'] || (job.steps && job.steps.length > 0)) {
+        throw new Error(
+          `Job "${jobId}" uses a reusable workflow and must not also define 'runs-on' or 'steps'`
+        );
+      }
       continue;
     }
 
