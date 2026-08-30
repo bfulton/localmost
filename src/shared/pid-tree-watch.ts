@@ -189,6 +189,14 @@ export class PidTreeWatcher {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
+    // Without this listener a failed exec - no python3, script not executable -
+    // emits an unhandled 'error' event and takes the process down. Discovery
+    // degrades to unfiltered logs, which is far better than a crash.
+    this.process.on('error', (err: Error) => {
+      console.error('[pid_tree_watch] failed to start:', err.message);
+      this.process = null;
+    });
+
     this.process.stdout?.on('data', (data: Buffer) => {
       const lines = data.toString().split('\n');
       for (const line of lines) {
