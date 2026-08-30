@@ -49,6 +49,14 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   - Compare against any GitHub runner label
   - Suggestions for pinning versions in workflows
 
+### Fixed
+- Jobs are no longer dropped after being acquired from GitHub. The broker
+  checked capacity, then acquired the job over the network before any worker
+  existed, so concurrent jobs could take the last slot in between; the job was
+  then never run and failed on its own timeout with no steps recorded. Worker
+  slots are now claimed in a single step, and a job waits for a slot rather
+  than being discarded.
+
 ### Changed
 - CLI restructured with standalone commands that don't require the app
 - Improved help text with examples for all commands
