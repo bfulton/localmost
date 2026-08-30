@@ -35,11 +35,14 @@ let logFileStream: fs.WriteStream | null = null;
  * Helper to find asset files in various locations (dev vs packaged app).
  */
 export const findAsset = (filename: string): string | undefined => {
+  // Icons are generated into build/generated and copied to Resources/generated
+  // when packaged. __dirname is build/dist in a dev run and inside the asar
+  // when packaged, so both the sibling and the repo-root form are tried.
   const possiblePaths = [
-    // Development: icons are generated into build/generated
     path.join(app.getAppPath(), 'build', 'generated', filename),
-    path.join(__dirname, '..', '..', 'generated', filename),
-    path.join(__dirname, '..', '..', '..', 'build', 'generated', filename),
+    // Dev run: __dirname is <repo>/build/dist, so generated is one level up.
+    path.join(__dirname, '..', 'generated', filename),
+    path.join(__dirname, '..', '..', 'build', 'generated', filename),
     // Packaged app: extraResource copies 'generated' folder to Resources/
     path.join(process.resourcesPath || '', 'generated', filename),
   ];

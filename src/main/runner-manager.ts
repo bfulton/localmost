@@ -644,6 +644,14 @@ export class RunnerManager {
   }
 
   async spawnWorkerForJob(): Promise<void> {
+    // Take the context before waiting for a slot. 'next' is a single shared
+    // slot, so a job arriving during the wait would otherwise overwrite it and
+    // this worker would start with another repository's context.
+    const claimedContext = this.pendingTargetContext.get('next');
+    if (claimedContext) {
+      this.pendingTargetContext.delete('next');
+    }
+
     // Wait briefly for a slot rather than dropping the job. By this point the
     // broker has already acquired it from GitHub, so returning without running
     // it leaves GitHub waiting on a runner that never reports - the job then
@@ -656,12 +664,17 @@ export class RunnerManager {
     }
 
     if (instanceNum === null) {
+      // Put it back: this worker never started, so the context still describes
+      // a job that something else may yet pick up.
+      if (claimedContext) {
+        this.pendingTargetContext.set('next', claimedContext);
+      }
       this.log('error', 'No worker slot became available; this job will not run');
       return;
     }
 
-    // Get the target context for this job (set by broker proxy before calling this)
-    const targetContext = this.pendingTargetContext.get('next');
+    // Get the target context for this job (claimed above, before the wait)
+    const targetContext = claimedContext;
     if (!targetContext) {
       this.log('error', 'No target context for spawned worker');
       this.releaseSlotReservation(instanceNum);
@@ -715,7 +728,13 @@ export class RunnerManager {
         // won the queue, this is the one that has to carry its policy.
         const target = this.getJobTarget?.(jobId);
         if (!target?.targetDisplayName || !target.githubSha) {
-          this.log('warn', `[instance ${instanceNum}] No target for acquired job ${jobId}; leaving policy closed`);
+          // Saying the policy is closed is not the same as closing it. This
+          // proxy may still hold the last job's hosts, so clear them: an
+          // unidentifiable job gets nothing rather than someone else's grants.
+          const staleProxy = this.proxyServers.get(instanceNum);
+          staleProxy?.setPolicyAllowedHosts([]);
+          staleProxy?.setPolicyLevel('strict');
+          this.log('warn', `[instance ${instanceNum}] No target for acquired job ${jobId}; policy closed`);
           return;
         }
         await this.applyPolicyForTarget(

@@ -5,7 +5,6 @@ const fs = require('fs');
 const path = require('path');
 const { format: formatIcns } = require('icns-lib');
 
-const assetsDir = path.join(__dirname, '..', 'assets');
 const generatedDir = path.join(__dirname, '..', 'build', 'generated');
 
 async function convertIcons() {

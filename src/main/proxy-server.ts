@@ -326,19 +326,29 @@ export class ProxyServer {
   ): void {
     const chunks: Buffer[] = [];
     req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', async () => {
+    req.on('end', () => {
       const body = Buffer.concat(chunks);
+      let jobId: string | undefined;
       try {
         const parsed = JSON.parse(body.toString());
-        const jobId = parsed.jobMessageId || parsed.jobRequestId || parsed.requestId;
-        if (jobId) {
-          await this.onJobAcquired?.(String(jobId));
-        }
+        const raw = parsed.jobMessageId || parsed.jobRequestId || parsed.requestId;
+        if (raw) jobId = String(raw);
       } catch {
-        // Leave the policy as it stands. Failing to read the id is not a
-        // reason to widen access, and the job simply keeps what is installed.
+        // Unreadable body: the policy stays as installed. Failing to read an
+        // id is not a reason to widen access.
       }
-      this.forwardBufferedRequest(req, res, host, port, path, body);
+
+      // The callback resolves the policy, so a rejection must neither become an
+      // unhandled rejection nor swallow the request. Forward either way; the
+      // policy that is installed is what the forwarded request is checked
+      // against, and a failed resolution leaves it no wider than it was.
+      const resolved = jobId
+        ? Promise.resolve(this.onJobAcquired?.(jobId)).catch(() => undefined)
+        : Promise.resolve(undefined);
+
+      resolved.finally(() => {
+        this.forwardBufferedRequest(req, res, host, port, path, body);
+      });
     });
   }
 
@@ -358,7 +368,10 @@ export class ProxyServer {
       return;
     }
 
+    // The body is replayed whole, so it is no longer chunked. Leaving both
+    // headers on the request makes some servers reject it or frame it wrongly.
     const headers = { ...req.headers, 'content-length': String(body.length) };
+    delete headers['transfer-encoding'];
     const proxyReq = http.request(
       { hostname: host, port, path, method: req.method, headers },
       (proxyRes) => {

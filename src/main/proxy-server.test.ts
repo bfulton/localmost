@@ -263,3 +263,42 @@ describe('resolving policy when a worker claims a job', () => {
     }
   });
 });
+
+describe('acquirejob forwarding is resilient', () => {
+  it('still forwards when policy resolution rejects', async () => {
+    // A rejecting resolver must not become an unhandled rejection or strand
+    // the runner's acquirejob request.
+    const proxy = new ProxyServer({
+      policyLevel: 'strict',
+      onJobAcquired: async () => {
+        throw new Error('resolution failed');
+      },
+    });
+    await proxy.start();
+
+    const body = JSON.stringify({ jobMessageId: 'msg-1' });
+    try {
+      const status = await new Promise<number>((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port: proxy.getPort(),
+            path: 'http://127.0.0.1:1/acquirejob',
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'content-length': String(body.length) },
+          },
+          (res: http.IncomingMessage) => {
+            res.resume();
+            resolve(res.statusCode || 0);
+          }
+        );
+        req.on('error', reject);
+        req.end(body);
+      });
+
+      expect(status).toBe(502);
+    } finally {
+      await proxy.stop();
+    }
+  });
+});

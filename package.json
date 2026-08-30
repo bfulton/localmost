@@ -14,7 +14,7 @@
     "node": ">=22.12.0"
   },
   "bin": {
-    "localmost": "./dist/cli.js"
+    "localmost": "./build/dist/cli.js"
   },
   "scripts": {
     "start": "npm run prebuild && npm run build:dev && electron .",

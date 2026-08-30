@@ -50,7 +50,7 @@ const mainConfig = {
     // Inject the entry point constants that electron-forge normally provides
     new webpack.DefinePlugin({
       // Use path.join with __dirname for cross-platform compatibility
-      // __dirname in packaged app points to the app.asar/dist directory
+      // __dirname in the packaged app points at app.asar/build/dist
       // In dev mode, also use file:// since we don't run a dev server
       MAIN_WINDOW_WEBPACK_ENTRY: isProduction
         ? '`file://${require("path").join(__dirname, "renderer", "index.html")}`'
