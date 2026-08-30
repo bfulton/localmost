@@ -302,3 +302,44 @@ describe('acquirejob forwarding is resilient', () => {
     }
   });
 });
+
+describe('acquirejob body limits', () => {
+  it('rejects an oversized body instead of buffering it', async () => {
+    // Any request to a path ending in /acquirejob reaches this code, so an
+    // unbounded buffer is memory a workflow gets to choose the size of.
+    let resolverCalled = false;
+    const proxy = new ProxyServer({
+      policyLevel: 'strict',
+      onJobAcquired: async () => {
+        resolverCalled = true;
+      },
+    });
+    await proxy.start();
+
+    const body = 'x'.repeat(200 * 1024);
+    try {
+      const status = await new Promise<number>((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port: proxy.getPort(),
+            path: 'http://127.0.0.1:1/acquirejob',
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+          },
+          (res: http.IncomingMessage) => {
+            res.resume();
+            resolve(res.statusCode || 0);
+          }
+        );
+        req.on('error', () => resolve(0));
+        req.end(body);
+      });
+
+      expect(status).toBe(413);
+      expect(resolverCalled).toBe(false);
+    } finally {
+      await proxy.stop();
+    }
+  });
+});

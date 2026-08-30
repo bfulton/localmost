@@ -63,6 +63,8 @@ export class ProxyServer {
   private port: number;
   private onLog: ProxyLogCallback;
   private policyAllowedHosts: string[];
+  private static readonly MAX_ACQUIRE_BODY_BYTES = 64 * 1024;
+
   private policyLevel: SandboxPolicyLevel;
   private onJobAcquired?: (jobId: string) => Promise<void>;
   private connections: Set<net.Socket> = new Set();
@@ -324,9 +326,40 @@ export class ProxyServer {
     port: number,
     path: string
   ): void {
+    // Check the destination before reading anything. Buffering first would let
+    // any request to a path ending in /acquirejob consume memory even when the
+    // host is blocked outright.
+    const { allowed, reason } = this.checkHostAccess(host);
+    if (!allowed) {
+      this.log({ method: req.method || 'POST', host, port, path, blocked: true, reason });
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end(`Blocked by sandbox policy (${this.policyLevel}): host '${host}' not in allowlist`);
+      req.resume();
+      return;
+    }
+
+    // A real acquirejob body is a small JSON object. Anything larger is not one,
+    // so stop reading rather than buffering whatever a workflow decides to send.
     const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    let size = 0;
+    let tooLarge = false;
+
+    req.on('data', (chunk: Buffer) => {
+      if (tooLarge) return;
+      size += chunk.length;
+      if (size > ProxyServer.MAX_ACQUIRE_BODY_BYTES) {
+        tooLarge = true;
+        chunks.length = 0;
+        res.writeHead(413, { 'Content-Type': 'text/plain' });
+        res.end('acquirejob body too large');
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+
     req.on('end', () => {
+      if (tooLarge) return;
       const body = Buffer.concat(chunks);
       let jobId: string | undefined;
       try {

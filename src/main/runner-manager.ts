@@ -12,7 +12,6 @@ import { RunnerDownloader } from './runner-downloader';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
 import { loadConfig } from './config';
 import { normalizeFilterConfig, isUserAllowed, areAllUsersAllowed, parseRepository } from './runner/user-filter';
-import { getState } from './store';
 
 /**
  * Get the hostname without .local suffix (common on macOS).
@@ -719,10 +718,10 @@ export class RunnerManager {
   }
 
   private async startInstanceProxy(instanceNum: number): Promise<ProxyServer> {
-    const policyLevel = getState().config.sandboxPolicyLevel || 'strict';
-
     const proxy = new ProxyServer({
-      policyLevel,
+      // Closed until a job is claimed. The level belongs to the repository's
+      // policy now, and is installed when a worker announces which job it took.
+      policyLevel: 'strict',
       onJobAcquired: async (jobId: string) => {
         // The worker behind this proxy just claimed a job. Whichever instance
         // won the queue, this is the one that has to carry its policy.
@@ -756,7 +755,7 @@ export class RunnerManager {
     });
 
     const port = await proxy.start();
-    this.log('debug', `Proxy server for instance ${instanceNum} started on port ${port} with ${policyLevel} policy`);
+    this.log('debug', `Proxy server for instance ${instanceNum} started on port ${port}; policy installed when a job is claimed`);
     this.proxyServers.set(instanceNum, proxy);
     return proxy;
   }
