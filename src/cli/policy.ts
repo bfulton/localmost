@@ -169,7 +169,6 @@ function printPolicy(policy: PrintablePolicy): void {
 }
 
 /**
-/**
  * Read the policy the background runner has cached for a repository.
  *
  * The app writes this as JSON with its approval state; reading it as a raw

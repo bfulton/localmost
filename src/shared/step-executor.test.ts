@@ -1,3 +1,6 @@
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { maskSecrets, buildStepEnvironment } from './step-executor';
 
 describe('maskSecrets', () => {
@@ -26,8 +29,14 @@ describe('maskSecrets', () => {
 });
 
 describe('buildStepEnvironment', () => {
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'step-env-'));
+
+  afterAll(() => {
+    fs.rmSync(workDir, { recursive: true, force: true });
+  });
+
   const ctx = {
-    workDir: '/work',
+    workDir,
     proxyPort: 1234,
     workflowEnv: {},
     jobEnv: {},
@@ -55,6 +64,8 @@ describe('buildStepEnvironment', () => {
       { 'runs-on': 'self-hosted', steps: [] } as never
     );
 
-    expect(env.HOME).toBe('/work/.home');
+    expect(env.HOME).toBe(path.join(workDir, '.home'));
+    // Every step gets this HOME, so it has to exist by the time one runs.
+    expect(fs.existsSync(env.HOME)).toBe(true);
   });
 });

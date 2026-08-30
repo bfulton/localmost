@@ -292,7 +292,8 @@ export function recordPolicyDecision(repository: string, decision: 'approved' | 
  */
 export type PolicyDecision =
   | { action: 'allow'; reason: 'no-policy' | 'unchanged' | 'narrowed' }
-  | { action: 'needs-approval'; request: PolicyApprovalRequest };
+  | { action: 'needs-approval'; request: PolicyApprovalRequest }
+  | { action: 'invalid'; reason: string };
 
 /**
  * Decide whether a job may run under the repository's current policy.
@@ -315,9 +316,11 @@ export function decidePolicyForJob(
 
   const parseResult = parseLocalmostrcContent(localmostrcContent);
   if (!parseResult.success || !parseResult.config) {
-    // An unreadable policy grants nothing; the job runs on the baseline.
-    log.warn(`Invalid .localmostrc for ${repository}: ${parseResult.errors[0]?.message}`);
-    return { action: 'allow', reason: 'no-policy' };
+    // The repository has a policy; we just cannot read it. Running anyway would
+    // mean deciding on a file nobody has reviewed, so hold the job instead.
+    const detail = parseResult.errors[0]?.message ?? 'unknown error';
+    log.warn(`Invalid .localmostrc for ${repository}: ${detail}`);
+    return { action: 'invalid', reason: detail };
   }
 
   const newConfig = parseResult.config;

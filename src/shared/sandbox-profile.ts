@@ -93,25 +93,33 @@ function escapePath(pathStr: string): string {
  * offered as the starting point for a new policy (`localmost policy init`),
  * and discovery records them like any other access.
  *
+ * These are subpaths of the OS install, deliberately not their parents:
+ * /usr would include /usr/local, and /Library would include
+ * /Library/Application Support, both of which hold third-party software and
+ * application data that a workflow has no reason to read.
+ *
  * /etc, /var and /tmp are the symlink nodes into /private that those paths are
  * reached through. /usr/bin/git and /usr/bin/python3 are shims that execute
- * out of the active developer directory, hence Xcode.app and /Library/Developer.
+ * out of the active developer directory, hence Xcode.app.
  */
 export const MACOS_BASELINE_READ_PATHS = [
   '/etc',
   '/var',
   '/tmp',
-  '/Applications',
   '/bin',
   '/sbin',
-  '/usr',
+  '/usr/bin',
+  '/usr/lib',
+  '/usr/libexec',
+  '/usr/sbin',
+  '/usr/share',
   '/System',
-  '/Library',
+  '/Library/Developer',
+  '/Library/Preferences',
   '/private/etc',
   '/private/var/db',
   '/private/var/select',
   '/Applications/Xcode.app',
-  '/Library/Developer',
 ];
 
 /**

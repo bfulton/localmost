@@ -171,19 +171,28 @@ async function checkRepoPolicyApproval(
   const repository = `${owner}/${repo}`;
   try {
     const accessToken = await getValidAccessToken();
-    if (!accessToken || !sha) return null;
+    if (!accessToken) {
+      return `cannot check ${repository} policy: not authenticated`;
+    }
+    if (!sha) {
+      // Without a commit there is no way to know which policy would apply.
+      return `cannot check ${repository} policy: no commit SHA for this job`;
+    }
 
     const auth = getGitHubAuth() || new GitHubAuth();
     const content = await auth.getFileContent(accessToken, owner, repo, '.localmostrc', sha);
     const decision = decidePolicyForJob(repository, content);
 
     if (decision.action === 'allow') return null;
+    if (decision.action === 'invalid') {
+      return `${repository} has a .localmostrc that could not be parsed: ${decision.reason}`;
+    }
 
     recordPendingPolicy(repository, decision.request.newConfig);
     getLogger()?.warn(formatApprovalRequest(decision.request));
     return decision.request.isNewRepo
-      ? `${repository} has a .localmostrc that has not been approved. Review it with "localmost policy diff" and approve with "localmost policy approve ${repository}".`
-      : `${repository} .localmostrc changed since it was approved. Review with "localmost policy diff" and approve with "localmost policy approve ${repository}".`;
+      ? `${repository} has a .localmostrc that has not been approved. Review and approve it in Settings > Job Security, or run "localmost policy approve" in a clone of the repository.`
+      : `${repository} .localmostrc changed since it was approved. Review and approve it in Settings > Job Security, or run "localmost policy approve" in a clone of the repository.`;
   } catch (err) {
     // Fail closed: an unverifiable policy must not be applied silently.
     return `could not verify ${repository} policy: ${(err as Error).message}`;
@@ -423,7 +432,7 @@ app.whenReady().then(async () => {
         if (!verdict.allowed) {
           runnerManager.recordRefusedJob({
             repository: target.displayName,
-            jobName: 'job',
+            jobName: githubInfo.githubJobId ? `job ${githubInfo.githubJobId}` : jobId,
             reason: verdict.reason,
             actionsUrl,
             githubRunId: githubInfo.githubRunId,
@@ -440,7 +449,7 @@ app.whenReady().then(async () => {
         if (policyReason) {
           runnerManager.recordRefusedJob({
             repository: target.displayName,
-            jobName: 'job',
+            jobName: githubInfo.githubJobId ? `job ${githubInfo.githubJobId}` : jobId,
             reason: policyReason,
             actionsUrl,
             githubRunId: githubInfo.githubRunId,

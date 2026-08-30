@@ -18,6 +18,7 @@ const PolicyApprovals: React.FC = () => {
   const load = useCallback(async () => {
     try {
       setPolicies(await window.localmost.policy.list());
+      setError(null);
     } catch (err) {
       setError((err as Error).message);
     }

@@ -20,27 +20,43 @@ import { getLogger } from '../app-state';
 /**
  * Describe what a policy grants, in the terms a reviewer cares about.
  */
-function summarizeGrants(config: {
-  shared?: {
-    network?: { allow?: string[] };
-    filesystem?: { read?: string[]; write?: string[] };
-    sockets?: { allow?: string[] };
-  };
-}): string[] {
-  const grants: string[] = [];
-  const shared = config.shared || {};
+interface PolicySection {
+  network?: { allow?: string[] };
+  filesystem?: { read?: string[]; write?: string[] };
+  sockets?: { allow?: string[] };
+}
 
-  for (const host of shared.network?.allow || []) {
-    grants.push(`network: ${host}`);
+function describeSection(section: PolicySection, prefix: string): string[] {
+  const grants: string[] = [];
+  for (const host of section.network?.allow || []) {
+    grants.push(`${prefix}network: ${host}`);
   }
-  for (const p of shared.filesystem?.read || []) {
-    grants.push(`read: ${p}`);
+  for (const p of section.filesystem?.read || []) {
+    grants.push(`${prefix}read: ${p}`);
   }
-  for (const p of shared.filesystem?.write || []) {
-    grants.push(`write: ${p}`);
+  for (const p of section.filesystem?.write || []) {
+    grants.push(`${prefix}write: ${p}`);
   }
-  for (const p of shared.sockets?.allow || []) {
-    grants.push(`socket: ${p}`);
+  for (const p of section.sockets?.allow || []) {
+    grants.push(`${prefix}socket: ${p}`);
+  }
+  return grants;
+}
+
+/**
+ * Describe everything a policy grants, in the terms a reviewer cares about.
+ *
+ * Per-workflow sections are included: a policy can grant access under
+ * `workflows:` that appears nowhere in `shared`, and approving what the UI
+ * showed would otherwise approve more than was shown.
+ */
+function summarizeGrants(config: {
+  shared?: PolicySection;
+  workflows?: Record<string, PolicySection>;
+}): string[] {
+  const grants = describeSection(config.shared || {}, '');
+  for (const [workflow, section] of Object.entries(config.workflows || {})) {
+    grants.push(...describeSection(section || {}, `${workflow}: `));
   }
   return grants;
 }

@@ -75,6 +75,23 @@ describe('decidePolicyForJob', () => {
     expect(decidePolicyForJob(REPO, POLICY).action).toBe('needs-approval');
   });
 
+  it('holds a job whose .localmostrc cannot be parsed', () => {
+    // A repository that has a policy but an unreadable one is the worst case to
+    // guess at: allowing it runs code under a file nobody has reviewed, so the
+    // job must not be treated as if the repository were unpoliced.
+    const decision = decidePolicyForJob(REPO, 'version: 1\nshared: [not a mapping');
+
+    expect(decision.action).toBe('invalid');
+  });
+
+  it('does not fall back to the approved policy when the new one is unparseable', () => {
+    const first = decidePolicyForJob(REPO, POLICY);
+    if (first.action !== 'needs-approval') throw new Error('expected approval');
+    cachePolicyConfig(REPO, first.request.newConfig, true);
+
+    expect(decidePolicyForJob(REPO, ': : :').action).toBe('invalid');
+  });
+
   it('allows a repository that removes its policy', () => {
     cachePolicyConfig(REPO, { version: 1, shared: {} }, true);
 

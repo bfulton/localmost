@@ -74,6 +74,20 @@ export interface JobExecutionOptions {
 // =============================================================================
 
 /**
+ * Create the workspace-local HOME a step runs with.
+ *
+ * Every step gets HOME inside the workspace, so every path that builds a step
+ * environment needs the directory to exist - not just `run:` steps.
+ */
+export function ensureStepHome(workDir: string): string {
+  const stepHome = path.join(workDir, '.home');
+  if (!fs.existsSync(stepHome)) {
+    fs.mkdirSync(stepHome, { recursive: true });
+  }
+  return stepHome;
+}
+
+/**
  * Replace secret values with *** wherever they appear.
  *
  * A step can print a secret by accident - `set -x`, a curl error echoing a
@@ -106,7 +120,7 @@ export function buildStepEnvironment(
     // the runner's home, and pointing at the real one both diverges from that
     // and sends every tool looking for dotfiles the sandbox denies - git dies
     // on ~/.gitconfig before it does anything.
-    HOME: path.join(ctx.workDir, '.home'),
+    HOME: ensureStepHome(ctx.workDir),
     USER: process.env.USER || '',
     SHELL: process.env.SHELL || '/bin/bash',
     TERM: process.env.TERM || 'xterm-256color',
@@ -373,12 +387,7 @@ async function executeRunStep(
   // as long as the step runs, and another account should not be able to read it.
   fs.writeFileSync(scriptFile, script, { mode: 0o700 });
 
-  // HOME points inside the workspace; make sure it exists so tools that write
-  // there (git config, npm, caches) do not fail on a missing directory.
-  const stepHome = path.join(ctx.workDir, '.home');
-  if (!fs.existsSync(stepHome)) {
-    fs.mkdirSync(stepHome, { recursive: true });
-  }
+  ensureStepHome(ctx.workDir);
 
   try {
     const result = await runInSandbox(

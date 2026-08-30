@@ -73,7 +73,7 @@ localmost is an Electron desktop application that manages GitHub Actions self-ho
 - **A compromised GitHub account**: If an attacker has access to your GitHub account, they can modify workflows that run on your runner.
 - **Allowlisted hosts**: Data can be exfiltrated to any host the active policy allows. Under `strict` that is runner infrastructure plus whatever the repository declares; looser levels allow more.
 - **Approved policies**: Once you approve a repository's `.localmostrc`, everything it declares is granted until the file changes again. Approval is a judgement about that content.
-- **Read access to system paths**: The OS baseline is readable by every job. It is Apple-shipped, read-only and identical on every machine, but it is not zero access.
+- **Declared system paths**: A policy that declares OS read paths grants them for the whole job. `localmost policy init` seeds that list with OS subpaths (`/usr/bin`, `/usr/lib`, `/System`, `/Library/Developer` and similar) because nothing runs without them. It deliberately excludes `/usr/local`, `/Library/Application Support` and `/Applications`, which hold third-party software and application data - but a policy is free to add them back, and approving one means accepting that.
 
 ## Network Policy
 
