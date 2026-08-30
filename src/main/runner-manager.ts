@@ -1218,6 +1218,14 @@ export class RunnerManager {
       // Get target context if available (from broker-proxy-service)
       const targetContext = this.consumePendingTargetContext(instance.name);
 
+      // Keep it against this instance. An idle worker that picks a job up
+      // never went through spawnWorkerForJob, so this is the only record of
+      // which repository the job belongs to - and the policy cannot be
+      // resolved without it.
+      if (targetContext) {
+        this.pendingTargetContext.set(String(instanceNum), targetContext);
+      }
+
       // Use target display name (owner/repo format) for repository if available
       const repository = targetContext?.targetDisplayName || this.config?.url || 'unknown';
 
