@@ -200,7 +200,13 @@ function generateSandboxProfile(instanceDir: string, proxyPort?: number): string
 ;; what the policy documentation promises. Listed rather than subtracted, so
 ;; adding a path is a deliberate act.
 (allow file-read*
+  ;; Directory nodes on the way down, so path traversal works. These are the
+  ;; directories themselves, not their contents: .NET requires read on every
+  ;; directory up the hierarchy to open anything beneath it.
   (literal "/")
+  (literal "/Users")
+  (literal "${homeDir}")
+  (literal "${appDataDir}")
   (subpath "/bin")
   (subpath "/sbin")
   (subpath "/usr/bin")
