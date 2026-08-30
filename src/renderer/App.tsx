@@ -78,7 +78,7 @@ const AppContent: React.FC = () => {
 
   return (
     <>
-      <div className={styles.titlebar}>
+      <div className={styles.titlebar} data-testid="titlebar">
         <h1>localmost</h1>
       </div>
 
