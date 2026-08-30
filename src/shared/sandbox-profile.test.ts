@@ -73,6 +73,60 @@ describe('Sandbox Profile Generator', () => {
   // ===========================================================================
 
   describe('generateSandboxProfile - File access', () => {
+    it('grants no system paths that the policy has not declared', () => {
+      // Reading a .localmostrc should tell you everything a job may touch, so
+      // nothing is granted implicitly. The one exception is the root directory
+      // node, which is not an access grant - it is what makes an absolute path
+      // resolvable at all.
+      const profile = generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
+        strictMode: true,
+      });
+
+      for (const notGranted of ['/bin', '/usr', '/System', '/Library', '/Applications/Xcode.app']) {
+        expect(profile).not.toContain(`(subpath "${notGranted}")`);
+      }
+      expect(profile).toContain('(allow file-read* (literal "/"))');
+    });
+
+    it('grants system paths once the policy declares them', () => {
+      const profile = generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
+        policy: { filesystem: { read: ['/bin', '/usr'] } },
+      });
+
+      expect(profile).toContain('(subpath "/bin")');
+      expect(profile).toContain('(subpath "/usr")');
+    });
+
+    it('never turns a declared "/" into a subpath', () => {
+      // Discovery can observe a read of the root node. Writing it back as a
+      // subpath would grant the entire disk and make every other entry moot.
+      const profile = generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
+        policy: { filesystem: { read: ['/', '/bin'] } },
+      });
+
+      expect(profile).not.toContain('(subpath "/")');
+      expect(profile).toContain('(subpath "/bin")');
+    });
+
+    it('does not grant the baseline as write access', () => {
+      const profile = generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
+        strictMode: true,
+      });
+
+      const writeSection = profile.slice(profile.indexOf(';; Write access'));
+      expect(writeSection).not.toContain('(subpath "/usr")');
+      expect(writeSection).not.toContain('(subpath "/System")');
+    });
+
+
     it('should always allow reading the root directory node', () => {
       // Without this, dyld aborts every sandboxed process with SIGABRT before
       // it runs: reading "/" itself is required to resolve any absolute path.
@@ -87,7 +141,7 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).not.toContain('(subpath "/")');
     });
 
-    it('should allow read access only to workDir and temp by default', () => {
+    it('reads the workDir and temp, and nothing of the user, by default', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
         proxyPort: DEFAULT_PROXY_PORT,
@@ -96,10 +150,11 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).toContain('(allow file-read*');
       expect(profile).toContain('(subpath "/path/to/project")');
       expect(profile).toContain('(subpath "/tmp")');
-      // System paths should NOT be allowed by default
-      expect(profile).not.toContain('(subpath "/System")');
-      expect(profile).not.toContain('(subpath "/Library")');
-      expect(profile).not.toContain('(subpath "/usr")');
+
+      // A blanket root subpath would grant the whole disk and make every other
+      // rule meaningless.
+      expect(profile).not.toContain('(subpath "/")');
+      expect(profile).not.toContain('(subpath "/Users")');
     });
 
     it('should allow policy-defined system read paths', () => {
@@ -363,27 +418,36 @@ describe('Sandbox Profile Generator', () => {
       // trace also recorded is pure redundancy. Discovery previously kept all
       // of them, producing thousands of lines that said nothing new.
       const result = parseSandboxTrace(
-        trace(['/opt/homebrew', '/opt/homebrew/bin', '/opt/homebrew/bin/git', '/usr/lib']),
+        trace(['/opt/homebrew', '/opt/homebrew/bin', '/opt/homebrew/bin/git', '/opt/other']),
         '/work'
       );
 
-      expect(result.readPaths).toEqual(['/opt/homebrew', '/usr/lib']);
+      expect(result.readPaths).toEqual(['/opt/homebrew', '/opt/other']);
+    });
+
+    it('records system paths, since nothing grants them implicitly', () => {
+      const result = parseSandboxTrace(
+        trace(['/usr/bin/curl', '/opt/homebrew/bin/git']),
+        '/work'
+      );
+
+      expect(result.readPaths.sort()).toEqual(['/opt/homebrew/bin/git', '/usr/bin/curl']);
     });
 
     it('never emits the filesystem root as a policy entry', () => {
       // Reading the root node is required and the generated profile always
       // allows it as a literal. Recording "/" here would be written back as
       // (subpath "/"), silently granting the whole disk.
-      const result = parseSandboxTrace(trace(['/', '/usr/lib']), '/work');
+      const result = parseSandboxTrace(trace(['/', '/opt/homebrew']), '/work');
 
       expect(result.readPaths).not.toContain('/');
-      expect(result.readPaths).toContain('/usr/lib');
+      expect(result.readPaths).toContain('/opt/homebrew');
     });
 
     it('keeps unrelated siblings', () => {
-      const result = parseSandboxTrace(trace(['/usr/lib', '/usr/bin']), '/work');
+      const result = parseSandboxTrace(trace(['/opt/a', '/opt/b']), '/work');
 
-      expect(result.readPaths.sort()).toEqual(['/usr/bin', '/usr/lib']);
+      expect(result.readPaths.sort()).toEqual(['/opt/a', '/opt/b']);
     });
   });
 

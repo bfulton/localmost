@@ -5,6 +5,7 @@ import { SleepProtection, BatteryPauseThreshold, SANDBOX_POLICY_LEVEL_DESCRIPTIO
 import { GITHUB_APP_SETTINGS_URL, PRIVACY_POLICY_URL, REPOSITORY_URL } from '../../shared/constants';
 import { useAppConfig, useRunner, useUpdate } from '../contexts';
 import UserFilterSettings from './UserFilterSettings';
+import PolicyApprovals from './PolicyApprovals';
 import styles from './SettingsPage.module.css';
 import shared from '../styles/shared.module.css';
 
@@ -435,6 +436,12 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
         {user && isConfigured && (
           <section className={styles.settingsSection} data-testid="settings-section">
             <h3>Job Security</h3>
+
+            {/* Repository policy approvals */}
+            <div className={styles.subsection}>
+              <h4>Repository Policies</h4>
+              <PolicyApprovals />
+            </div>
 
             {/* Sandbox Policy Subsection */}
             <div className={styles.subsection}>

@@ -74,6 +74,87 @@ export interface JobExecutionOptions {
 // =============================================================================
 
 /**
+ * How many trailing characters could still turn out to be the start of a secret.
+ */
+function partialSecretSuffixLength(text: string, values: string[]): number {
+  let hold = 0;
+  for (const value of values) {
+    for (let n = Math.min(value.length - 1, text.length); n > hold; n--) {
+      if (text.endsWith(value.slice(0, n))) {
+        hold = n;
+        break;
+      }
+    }
+  }
+  return hold;
+}
+
+/**
+ * Mask secrets across a stream whose chunk boundaries are arbitrary.
+ *
+ * Masking each chunk on its own misses any secret the runtime happens to split
+ * in two, which is the case that matters: the halves look innocuous and the
+ * value lands in the log intact. This holds back the longest tail that could
+ * still become a secret, and releases it once the next chunk decides.
+ *
+ * `flush` must be called at end of stream to emit whatever is still held.
+ */
+export function createSecretMasker(secrets: Record<string, string>): {
+  push(chunk: string): string;
+  flush(): string;
+} {
+  const values = Object.values(secrets).filter((v) => v && v.length >= 4);
+  let held = '';
+
+  return {
+    push(chunk: string): string {
+      if (values.length === 0) return chunk;
+      const masked = maskSecrets(held + chunk, secrets);
+      const hold = partialSecretSuffixLength(masked, values);
+      held = hold > 0 ? masked.slice(masked.length - hold) : '';
+      return hold > 0 ? masked.slice(0, masked.length - hold) : masked;
+    },
+    flush(): string {
+      const out = maskSecrets(held, secrets);
+      held = '';
+      return out;
+    },
+  };
+}
+
+/**
+ * Create the workspace-local HOME a step runs with.
+ *
+ * Every step gets HOME inside the workspace, so every path that builds a step
+ * environment needs the directory to exist - not just `run:` steps.
+ */
+export function ensureStepHome(workDir: string): string {
+  const stepHome = path.join(workDir, '.home');
+  if (!fs.existsSync(stepHome)) {
+    fs.mkdirSync(stepHome, { recursive: true });
+  }
+  return stepHome;
+}
+
+/**
+ * Replace secret values with *** wherever they appear.
+ *
+ * A step can print a secret by accident - `set -x`, a curl error echoing a
+ * URL, a tool dumping its config - and localmost streams step output to the
+ * console and the log file. GitHub masks secrets in job logs for the same
+ * reason; without it, running a workflow locally is a way to spill one.
+ */
+export function maskSecrets(text: string, secrets: Record<string, string>): string {
+  let masked = text;
+  for (const value of Object.values(secrets)) {
+    // Very short values would match everywhere and make output unreadable.
+    if (!value || value.length < 4) continue;
+    masked = masked.split(value).join('***');
+  }
+  return masked;
+}
+
+/**
  * Build the full environment for step execution.
  */
 export function buildStepEnvironment(
@@ -84,7 +165,11 @@ export function buildStepEnvironment(
   const env: Record<string, string> = {
     // Preserve PATH and essential system vars
     PATH: process.env.PATH || '',
-    HOME: process.env.HOME || os.homedir(),
+    // A home inside the workspace, not the user's. GitHub Actions gives a step
+    // the runner's home, and pointing at the real one both diverges from that
+    // and sends every tool looking for dotfiles the sandbox denies - git dies
+    // on ~/.gitconfig before it does anything.
+    HOME: ensureStepHome(ctx.workDir),
     USER: process.env.USER || '',
     SHELL: process.env.SHELL || '/bin/bash',
     TERM: process.env.TERM || 'xterm-256color',
@@ -145,10 +230,10 @@ export function buildStepEnvironment(
     env[`MATRIX_${key.toUpperCase()}`] = String(value);
   }
 
-  // Expose secrets (with masking warning)
-  for (const [name, value] of Object.entries(ctx.secrets)) {
-    env[name] = value;
-  }
+  // Secrets are deliberately not exported here. GitHub does not put them in a
+  // step's environment; they reach a step only through ${{ secrets.X }}, which
+  // includes an explicit `env:` mapping. Exporting them all would hand every
+  // secret to every child process of every step.
 
   return env;
 }
@@ -347,7 +432,11 @@ async function executeRunStep(
 
   // Create temp script file
   const scriptFile = path.join(ctx.workDir, `.step-${Date.now()}.sh`);
-  fs.writeFileSync(scriptFile, script, { mode: 0o755 });
+  // 0700, not 0755: expanding ${{ secrets.X }} puts the value in this file for
+  // as long as the step runs, and another account should not be able to read it.
+  fs.writeFileSync(scriptFile, script, { mode: 0o700 });
+
+  ensureStepHome(ctx.workDir);
 
   try {
     const result = await runInSandbox(
@@ -360,6 +449,7 @@ async function executeRunStep(
         onOutput: ctx.onOutput,
         sandboxLogFile: ctx.sandboxLogFile,
         collectedPids: ctx.collectedPids,
+        secrets: ctx.secrets,
       },
       ctx.policy,
       ctx.permissive
@@ -497,6 +587,7 @@ async function executeActionFromPath(
         onOutput: ctx.onOutput,
         sandboxLogFile: ctx.sandboxLogFile,
         collectedPids: ctx.collectedPids,
+        secrets: ctx.secrets,
       },
       ctx.policy,
       ctx.permissive
@@ -981,6 +1072,8 @@ async function runInSandbox(
     onOutput?: (line: string, stream: 'stdout' | 'stderr') => void;
     sandboxLogFile?: string;
     collectedPids?: Set<number>;
+    /** Values to redact from anything the step prints */
+    secrets?: Record<string, string>;
   },
   policy?: SandboxPolicy,
   permissive?: boolean
@@ -988,6 +1081,7 @@ async function runInSandbox(
   return new Promise((resolve, reject) => {
     let spawnArgs: string[];
     let spawnCommand: string;
+    let usedSandbox = false;
 
     if (process.platform === 'darwin') {
       let profile: string;
@@ -1034,6 +1128,7 @@ async function runInSandbox(
       }
 
       spawnCommand = '/usr/bin/sandbox-exec';
+      usedSandbox = true;
       spawnArgs = ['-f', profilePath, command, ...args];
     } else {
       spawnCommand = command;
@@ -1058,26 +1153,47 @@ async function runInSandbox(
       pidWatcher.start(proc.pid);
     }
 
-    proc.stdout?.on('data', (data: Buffer) => {
-      const lines = data.toString().split('\n');
-      for (const line of lines) {
-        if (line) {
-          options.onOutput?.(line, 'stdout');
-        }
-      }
-    });
+    const secrets = options.secrets || {};
 
-    proc.stderr?.on('data', (data: Buffer) => {
-      const lines = data.toString().split('\n');
-      for (const line of lines) {
-        if (line) {
-          stderrLines.push(line);
-          options.onOutput?.(line, 'stderr');
-        }
-      }
-    });
+    // Chunk boundaries are arbitrary, so both masking and line splitting have to
+    // carry state across chunks; doing either per chunk leaks secrets and breaks
+    // lines in half.
+    const makeSink = (stream: 'stdout' | 'stderr') => {
+      const masker = createSecretMasker(secrets);
+      let pending = '';
+
+      const emit = (line: string) => {
+        if (!line) return;
+        if (stream === 'stderr') stderrLines.push(line);
+        options.onOutput?.(line, stream);
+      };
+
+      return {
+        write(chunk: string) {
+          pending += masker.push(chunk);
+          const lines = pending.split('\n');
+          pending = lines.pop() ?? '';
+          for (const line of lines) emit(line);
+        },
+        end() {
+          pending += masker.flush();
+          for (const line of pending.split('\n')) emit(line);
+          pending = '';
+        },
+      };
+    };
+
+    const stdoutSink = makeSink('stdout');
+    const stderrSink = makeSink('stderr');
+
+    proc.stdout?.on('data', (data: Buffer) => stdoutSink.write(data.toString()));
+    proc.stderr?.on('data', (data: Buffer) => stderrSink.write(data.toString()));
 
     proc.on('close', (code) => {
+      // Release any output still held back for masking or an unterminated line.
+      stdoutSink.end();
+      stderrSink.end();
+
       // Stop PID watcher and collect all PIDs
       if (pidWatcher && options.collectedPids) {
         const watchedPids = pidWatcher.stop();
@@ -1086,8 +1202,23 @@ async function runInSandbox(
         }
       }
 
-      // Keep last 10 lines of stderr for error reporting
-      const stderr = stderrLines.slice(-10).join('\n');
+      // Already masked on the way in, but the error surfaces in job history
+      // and notifications, so mask again rather than rely on that.
+      let stderr = maskSecrets(stderrLines.slice(-10).join('\n'), secrets);
+
+      // A sandboxed process that dies on SIGABRT with nothing on stderr has
+      // almost always been denied something it needed before it could run -
+      // dyld cannot even load the binary. The bare exit code says none of that.
+      const abortedSilently = code === 134 && stderrLines.length === 0;
+      if (abortedSilently && usedSandbox) {
+        stderr =
+          'The step was stopped by the sandbox before it could run. ' +
+          'Its policy is probably missing a read path the process needs. ' +
+          'Run "localmost test --updaterc" to discover what it wants, or ' +
+          '"localmost policy init" to start from a policy that runs.';
+        options.onOutput?.(stderr, 'stderr');
+      }
+
       resolve({ exitCode: code ?? 1, stderr });
     });
 

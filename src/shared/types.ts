@@ -207,6 +207,10 @@ export const IPC_CHANNELS = {
   UPDATE_STATUS: 'update:status',
 
   // Targets (multi-target runner support)
+  POLICY_LIST: 'policy:list',
+  POLICY_APPROVE: 'policy:approve',
+  POLICY_REJECT: 'policy:reject',
+
   TARGETS_LIST: 'targets:list',
   TARGETS_ADD: 'targets:add',
   TARGETS_REMOVE: 'targets:remove',
@@ -345,6 +349,15 @@ export interface GitHubUserSearchResult {
   login: string;
   avatar_url: string;
   name: string | null;
+}
+
+/** A repository policy the runner has recorded, for review in the app. */
+export interface PolicySummary {
+  repository: string;
+  approved: boolean;
+  cachedAt: string;
+  /** Human-readable summary of what the policy grants */
+  grants: string[];
 }
 
 // =============================================================================

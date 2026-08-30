@@ -2,13 +2,17 @@
 
 A checked-in file that explicitly declares what network and filesystem access a workflow needs.
 
+> **Status:** implemented in 0.3.0. This document describes the design; where the
+> shipped behaviour differs it is noted inline.
+
 ## Problem
 
-The current sandbox uses a global allowlist (GitHub, npm, PyPI, etc.). This is:
+Before 0.3.0 the sandbox used a single global allowlist (GitHub, npm, PyPI, etc.).
+That was:
 
-1. **Too permissive** — Every repo gets access to everything on the allowlist
+1. **Too permissive** — Every repo got access to everything on the allowlist
 2. **Not auditable** — No visibility into what a specific project actually needs
-3. **Reactive** — You find out about new access requirements when things fail
+3. **Reactive** — You found out about new access requirements when things failed
 
 ## Solution
 
@@ -285,9 +289,25 @@ No .localmostrc found. Run with --updaterc to generate.
 Running in permissive mode (not recommended for untrusted code).
 ```
 
-### Conflict with global allowlist
+### Relationship to the policy level
 
-When a `.localmostrc` exists, it **replaces** the global allowlist entirely for that repo. This is intentional — the repo author knows what they need.
+**Shipped behaviour differs from this design.** A `.localmostrc` does not replace
+anything; it adds to whatever the configured policy level already allows:
+
+- `strict` (the default): runner infrastructure, a read-only OS baseline, and
+  whatever the repo declares. This is closest to the original intent.
+- `moderate`: additionally GitHub Actions infrastructure, common registries and
+  tool caches.
+- `permissive`: no network restrictions.
+
+One thing is granted regardless of the repo's policy: the hosts the Actions
+runner itself needs to register and poll for jobs. That is the runner's own
+connection to GitHub rather than anything the job asked for, and the runner
+cannot function without it. Because a single proxy serves both, jobs reach those
+hosts too. Filesystem access is never granted implicitly — see SECURITY.md.
+
+A repo's policy only takes effect once approved — see
+`localmost policy approve`.
 
 ### CI vs local differences
 
@@ -302,7 +322,7 @@ network:
 
 ## Security Benefits
 
-1. **Least privilege by default** — No more global allowlist. Each repo declares exactly what it needs.
+1. **Least privilege by default** — `strict` is the default. Each repo declares what it needs beyond the baseline.
 
 2. **Auditable** — The file is in git. You can grep your org for repos that access unusual domains.
 

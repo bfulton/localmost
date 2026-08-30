@@ -86,6 +86,43 @@ function escapePath(pathStr: string): string {
 // Network filtering by hostname is handled by the proxy server, not the sandbox.
 
 /**
+ * The read paths a macOS workflow needs before it can run anything.
+ *
+ * Nothing grants these implicitly - a policy has to declare them, so that
+ * reading a .localmostrc tells you everything a job may touch. They are
+ * offered as the starting point for a new policy (`localmost policy init`),
+ * and discovery records them like any other access.
+ *
+ * These are subpaths of the OS install, deliberately not their parents:
+ * /usr would include /usr/local, and /Library would include
+ * /Library/Application Support, both of which hold third-party software and
+ * application data that a workflow has no reason to read.
+ *
+ * /etc, /var and /tmp are the symlink nodes into /private that those paths are
+ * reached through. /usr/bin/git and /usr/bin/python3 are shims that execute
+ * out of the active developer directory, hence Xcode.app.
+ */
+export const MACOS_BASELINE_READ_PATHS = [
+  '/etc',
+  '/var',
+  '/tmp',
+  '/bin',
+  '/sbin',
+  '/usr/bin',
+  '/usr/lib',
+  '/usr/libexec',
+  '/usr/sbin',
+  '/usr/share',
+  '/System',
+  '/Library/Developer',
+  '/Library/Preferences',
+  '/private/etc',
+  '/private/var/db',
+  '/private/var/select',
+  '/Applications/Xcode.app',
+];
+
+/**
  * Generate a macOS sandbox-exec profile from a policy.
  */
 export function generateSandboxProfile(options: SandboxProfileOptions): string {
@@ -132,8 +169,10 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push('');
 
   // The root directory node itself must be readable or dyld aborts every
-  // process with SIGABRT before it runs. This is a literal, not a subpath:
-  // (subpath "/") would grant read access to the entire disk.
+  // process with SIGABRT before it runs. This is the one thing granted without
+  // being declared, and it is not an access grant: it permits reading the root
+  // directory entry so that absolute paths resolve. It is a literal, never a
+  // subpath - (subpath "/") would grant the entire disk.
   lines.push(';; Root directory node - required to resolve absolute paths');
   lines.push('(allow file-read* (literal "/"))');
   lines.push('');
@@ -169,6 +208,11 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
     lines.push('(allow file-read*');
     for (const pattern of policy.filesystem.read) {
       const expanded = expandPath(pattern);
+      if (expanded === '/') {
+        // Declaring "/" means the root node, which is already granted. Writing
+        // it as a subpath would silently hand over the whole disk.
+        continue;
+      }
       if (expanded.includes('**')) {
         const base = expanded.replace('/**', '').replace('**/', '');
         lines.push(`  (subpath "${escapePath(base)}")`);
@@ -662,6 +706,9 @@ export function parseSandboxTrace(
    */
   const consolidate = (paths: Set<string>): string[] => {
     const candidates = Array.from(paths)
+      // "/" is the one thing granted without being declared, so recording it
+      // adds nothing - and as a policy entry it would be written back as
+      // (subpath "/"), granting the whole disk.
       .filter(p => p !== '/' && p !== '~' && p !== '')
       .sort();
 

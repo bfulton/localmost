@@ -100,7 +100,13 @@ import {
 
 // Zustand store
 import { initStore, connectWindow, cleanupStore, store } from './store/init';
-import { parseLocalmostrcContent, getEffectivePolicy } from '../shared/localmostrc';
+import { getEffectivePolicy } from '../shared/localmostrc';
+import {
+  decidePolicyForJob,
+  recordPendingPolicy,
+  getCachedPolicy,
+  formatApprovalRequest,
+} from './policy-cache';
 
 // ============================================================================
 // App Initialization
@@ -148,6 +154,50 @@ if (!gotTheLock) {
 // ============================================================================
 // App Ready
 // ============================================================================
+
+
+/**
+ * Check whether a repository's .localmostrc has been approved for use.
+ *
+ * Returns a reason to refuse the job, or null to proceed. A repository with no
+ * policy is never refused: it runs on the built-in baseline, which grants
+ * nothing beyond what every job already gets.
+ */
+async function checkRepoPolicyApproval(
+  owner: string,
+  repo: string,
+  sha?: string
+): Promise<string | null> {
+  const repository = `${owner}/${repo}`;
+  try {
+    const accessToken = await getValidAccessToken();
+    if (!accessToken) {
+      return `cannot check ${repository} policy: not authenticated`;
+    }
+    if (!sha) {
+      // Without a commit there is no way to know which policy would apply.
+      return `cannot check ${repository} policy: no commit SHA for this job`;
+    }
+
+    const auth = getGitHubAuth() || new GitHubAuth();
+    const content = await auth.getFileContent(accessToken, owner, repo, '.localmostrc', sha);
+    const decision = decidePolicyForJob(repository, content);
+
+    if (decision.action === 'allow') return null;
+    if (decision.action === 'invalid') {
+      return `${repository} has a .localmostrc that could not be parsed: ${decision.reason}`;
+    }
+
+    recordPendingPolicy(repository, decision.request.newConfig);
+    getLogger()?.warn(formatApprovalRequest(decision.request));
+    return decision.request.isNewRepo
+      ? `${repository} has a .localmostrc that has not been approved. Review and approve it in Settings > Job Security, or run "localmost policy approve" in a clone of the repository.`
+      : `${repository} .localmostrc changed since it was approved. Review and approve it in Settings > Job Security, or run "localmost policy approve" in a clone of the repository.`;
+  } catch (err) {
+    // Fail closed: an unverifiable policy must not be applied silently.
+    return `could not verify ${repository} policy: ${(err as Error).message}`;
+  }
+}
 
 app.whenReady().then(async () => {
   // Set restrictive umask so all files/directories are user-only (no group/world access)
@@ -253,25 +303,16 @@ app.whenReady().then(async () => {
       }
       return contributorCache.getAllAuthors(accessToken, owner, repo, sha);
     },
-    getRepoPolicyHosts: async (owner: string, repo: string, sha: string, workflowName: string) => {
-      const accessToken = await getValidAccessToken();
-      if (!accessToken) {
-        throw new Error('Not authenticated');
-      }
-      const auth = getGitHubAuth() || new GitHubAuth();
-      const content = await auth.getFileContent(accessToken, owner, repo, '.localmostrc', sha);
-      if (!content) {
+    getRepoPolicyHosts: async (owner: string, repo: string, _sha: string, workflowName: string) => {
+      // Apply the policy that was approved, not whatever is in the repository
+      // right now. A job only reaches this point once its policy has been
+      // approved, and applying the approved copy means an unreviewed change
+      // cannot take effect through a race.
+      const cached = getCachedPolicy(`${owner}/${repo}`);
+      if (!cached?.approved) {
         return [];
       }
-
-      const parsed = parseLocalmostrcContent(content);
-      if (!parsed.success || !parsed.config) {
-        const detail = parsed.errors?.map(e => e.message).join('; ') || 'unknown error';
-        logger?.warn(`[Policy] ${owner}/${repo} .localmostrc could not be parsed: ${detail}`);
-        return [];
-      }
-
-      const policy = getEffectivePolicy(parsed.config, workflowName);
+      const policy = getEffectivePolicy(cached.config, workflowName);
       return policy.network?.allow || [];
     },
     onJobEvent: (event: JobEvent) => {
@@ -290,7 +331,12 @@ app.whenReady().then(async () => {
         let title: string;
         let body: string;
 
-        if (event.type === 'started') {
+        if (event.type === 'refused') {
+          // Say why. Otherwise this is indistinguishable from someone
+          // pressing cancel on GitHub.
+          title = 'Job Refused';
+          body = `${repoShort}: ${event.reason ?? 'blocked by policy'}`;
+        } else if (event.type === 'started') {
           title = 'Job Started';
           body = `${event.jobName} on ${repoShort}`;
         } else {
@@ -384,9 +430,32 @@ app.whenReady().then(async () => {
           githubInfo.githubSha
         );
         if (!verdict.allowed) {
-          getLogger()?.warn(`Job ${jobId} not allowed: ${verdict.reason}. Not starting a worker.`);
+          runnerManager.recordRefusedJob({
+            repository: target.displayName,
+            jobName: githubInfo.githubJobId ? `job ${githubInfo.githubJobId}` : jobId,
+            reason: verdict.reason,
+            actionsUrl,
+            githubRunId: githubInfo.githubRunId,
+          });
           if (githubInfo.githubRunId) {
             await runnerManager.cancelRun(owner, repo, githubInfo.githubRunId, verdict.reason);
+          }
+          return;
+        }
+
+        // A .localmostrc grants access beyond the baseline, so a new or
+        // changed one needs the machine owner's consent before it takes effect.
+        const policyReason = await checkRepoPolicyApproval(owner, repo, githubInfo.githubSha);
+        if (policyReason) {
+          runnerManager.recordRefusedJob({
+            repository: target.displayName,
+            jobName: githubInfo.githubJobId ? `job ${githubInfo.githubJobId}` : jobId,
+            reason: policyReason,
+            actionsUrl,
+            githubRunId: githubInfo.githubRunId,
+          });
+          if (githubInfo.githubRunId) {
+            await runnerManager.cancelRun(owner, repo, githubInfo.githubRunId, policyReason);
           }
           return;
         }

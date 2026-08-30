@@ -65,6 +65,10 @@ export interface TestOptions {
   job?: string;
   /** Run in discovery mode to generate .localmostrc */
   updaterc?: boolean;
+  /** Skip the confirmation prompt when --updaterc rewrites a policy */
+  assumeYes?: boolean;
+  /** Path to a KEY=value file holding secret values */
+  secretFile?: string;
   /** Run full matrix (default: first combination only) */
   fullMatrix?: boolean;
   /** Specific matrix combination */
@@ -275,7 +279,7 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
 
   if (secretNames.length > 0) {
     console.log(`Secrets required: ${secretNames.join(', ')}`);
-    secrets = await resolveSecrets(repository, secretNames, options.secretMode || 'stub');
+    secrets = await resolveSecrets(repository, secretNames, options.secretMode || 'stub', options.secretFile);
     console.log();
   }
 
@@ -562,7 +566,7 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     const sandboxTrace = parseSandboxTrace(logContent, workspace.path, collectedPids);
 
     if (allSucceeded) {
-      await handleUpdateRc(cwd, workflow, discoveredHosts, sandboxTrace);
+      await handleUpdateRc(cwd, workflow, discoveredHosts, sandboxTrace, !!options.assumeYes);
     } else {
       console.log();
       console.log(`${colors.yellow}Skipping .localmostrc generation - workflow failed.${colors.reset}`);
@@ -908,36 +912,173 @@ function resolveWorkflowPath(input: string | undefined, cwd: string): string {
   throw new Error(`Workflow not found: ${input}`);
 }
 
+
+/**
+ * List what a discovery run wants to add, and ask before writing it.
+ *
+ * `.localmostrc` is checked in and grants sandbox access, so a discovery run
+ * must not widen it silently. Without a terminal to ask on, nothing is written
+ * unless --yes was passed.
+ */
+async function confirmPolicyChange(
+  additions: { label: string; items: string[] }[],
+  assumeYes: boolean
+): Promise<boolean> {
+  console.log();
+  console.log(`${colors.bold}These will be added to .localmostrc:${colors.reset}`);
+  for (const { label, items } of additions) {
+    if (items.length === 0) continue;
+    console.log(`  ${colors.bold}${label}${colors.reset}`);
+    for (const item of items) {
+      console.log(`    ${colors.green}+${colors.reset} ${item}`);
+    }
+  }
+  console.log();
+
+  if (assumeYes) return true;
+
+  if (!process.stdin.isTTY) {
+    console.log(`${colors.yellow}Not writing:${colors.reset} no terminal to confirm on. Re-run with --yes to apply.`);
+    return false;
+  }
+
+  const readline = await import('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const answer = await new Promise<string>(resolve => {
+    rl.question('Apply these changes? [y/N] ', a => {
+      rl.close();
+      resolve(a);
+    });
+  });
+  const yes = /^y(es)?$/i.test(answer.trim());
+  if (!yes) console.log('Not writing.');
+  return yes;
+}
+
 /**
  * Resolve secrets from environment variables or stub them.
+ */
+/**
+ * Read secrets from a KEY=value file, in the shape people already keep them.
+ */
+function readSecretFile(filePath: string): Record<string, string> {
+  const resolved = path.resolve(filePath);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Secret file not found: ${filePath}`);
+  }
+
+  const secrets: Record<string, string> = {};
+  for (const rawLine of fs.readFileSync(resolved, 'utf-8').split('\n')) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq === -1) continue;
+    const name = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (name) secrets[name] = value;
+  }
+  return secrets;
+}
+
+/**
+ * Ask for a secret without echoing it to the terminal.
+ */
+async function promptForSecret(name: string): Promise<string> {
+  const readline = await import('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+
+  const asStream = rl as unknown as { output: NodeJS.WriteStream; _writeToOutput?: (s: string) => void };
+  const prompt = `  ${name}: `;
+  asStream._writeToOutput = (chunk: string) => {
+    // Echo the prompt, never the value being typed.
+    if (chunk.includes(name)) asStream.output.write(chunk);
+  };
+
+  const value = await new Promise<string>(resolve => {
+    rl.question(prompt, answer => {
+      rl.close();
+      resolve(answer);
+    });
+  });
+  process.stdout.write('\n');
+  return value;
+}
+
+/**
+ * Resolve the secrets a workflow references.
+ *
+ * Order is: a --secret-file entry, then the environment, then whatever the
+ * chosen mode does about what is left. Nothing is written to disk, and values
+ * are masked out of step output by the executor.
  */
 async function resolveSecrets(
   _repository: string,
   names: string[],
-  mode: 'stub' | 'prompt' | 'abort'
+  mode: 'stub' | 'prompt' | 'abort',
+  secretFile?: string
 ): Promise<Record<string, string>> {
   const result: Record<string, string> = {};
+  const fromFile = secretFile ? readSecretFile(secretFile) : {};
+  const stubbed: string[] = [];
 
   for (const name of names) {
+    const fileValue = fromFile[name];
+    if (fileValue !== undefined) {
+      result[name] = fileValue;
+      console.log(`  ${success(name)} (from secret file)`);
+      continue;
+    }
+
     const envValue = process.env[name];
     if (envValue !== undefined) {
       result[name] = envValue;
       console.log(`  ${success(name)} (from environment)`);
-    } else {
-      switch (mode) {
-        case 'abort':
-          throw new Error(`Missing secret: ${name}. Set it as an environment variable.`);
-        case 'stub':
-          result[name] = '';
-          console.log(`  ${skipped(name)} (stubbed)`);
-          break;
-        case 'prompt':
-          // In a full implementation, would prompt for input
-          result[name] = '';
-          console.log(`  ${skipped(name)} (would prompt)`);
-          break;
-      }
+      continue;
     }
+
+    switch (mode) {
+      case 'abort':
+        throw new Error(
+          `Missing secret: ${name}. Set it in the environment or pass --secret-file.`
+        );
+
+      case 'prompt': {
+        if (!process.stdin.isTTY) {
+          throw new Error(
+            `Missing secret: ${name}. There is no terminal to prompt on - set it in the environment or pass --secret-file.`
+          );
+        }
+        result[name] = await promptForSecret(name);
+        console.log(`  ${success(name)} (entered)`);
+        break;
+      }
+
+      case 'stub':
+        result[name] = '';
+        stubbed.push(name);
+        console.log(`  ${skipped(name)} (stubbed - empty string)`);
+        break;
+    }
+  }
+
+  if (stubbed.length > 0) {
+    // An empty string is a value, and a step will act on it: deploying with an
+    // empty token or publishing with an empty key does not look like a failure
+    // until afterwards.
+    console.log();
+    console.log(
+      `${colors.yellow}Warning:${colors.reset} ${stubbed.join(', ')} ${stubbed.length === 1 ? 'was' : 'were'} replaced with an empty string.`
+    );
+    console.log(
+      `  Steps using ${stubbed.length === 1 ? 'it' : 'them'} will run anyway and may behave differently than on GitHub.`
+    );
+    console.log('  Use --secret-file, set them in the environment, or --secrets abort to stop instead.');
   }
 
   return result;
@@ -953,7 +1094,8 @@ async function handleUpdateRc(
   cwd: string,
   workflow: ParsedWorkflow,
   discoveredHosts: string[],
-  sandboxTrace?: SandboxTraceResult
+  sandboxTrace: SandboxTraceResult | undefined,
+  assumeYes: boolean
 ): Promise<void> {
   console.log();
   console.log(`${colors.bold}Discovery Results:${colors.reset}`);
@@ -1065,15 +1207,20 @@ async function handleUpdateRc(
         },
       };
 
+      const approved = await confirmPolicyChange(
+        [
+          { label: 'network.allow', items: newHosts },
+          { label: 'filesystem.read', items: newReadPaths },
+          { label: 'filesystem.write', items: newWritePaths },
+          { label: 'sockets.allow', items: newSocketPaths },
+        ],
+        assumeYes
+      );
+      if (!approved) return;
+
       const content = serializeLocalmostrc(updatedConfig);
       fs.writeFileSync(existingPath, content);
       console.log(`${colors.green}✓${colors.reset} Updated ${path.relative(cwd, existingPath)}`);
-      const changes: string[] = [];
-      if (newHosts.length > 0) changes.push(`${newHosts.length} host(s)`);
-      if (newReadPaths.length > 0) changes.push(`${newReadPaths.length} read path(s)`);
-      if (newWritePaths.length > 0) changes.push(`${newWritePaths.length} write path(s)`);
-      if (newSocketPaths.length > 0) changes.push(`${newSocketPaths.length} socket(s)`);
-      console.log(`  Added ${changes.join(', ')}.`);
     } else {
       console.log(`${colors.yellow}Warning:${colors.reset} Could not parse existing .localmostrc: ${result.errors[0]?.message}`);
     }
@@ -1098,15 +1245,21 @@ async function handleUpdateRc(
       },
     };
 
+    const approved = await confirmPolicyChange(
+      [
+        { label: 'network.allow', items: discoveredHosts },
+        { label: 'filesystem.read', items: readPaths },
+        { label: 'filesystem.write', items: writePaths },
+        { label: 'sockets.allow', items: socketPaths },
+      ],
+      assumeYes
+    );
+    if (!approved) return;
+
     const content = serializeLocalmostrc(newConfig);
     const rcPath = path.join(cwd, '.localmostrc');
     fs.writeFileSync(rcPath, content);
-    const items: string[] = [];
-    if (discoveredHosts.length > 0) items.push(`${discoveredHosts.length} host(s)`);
-    if (readPaths.length > 0) items.push(`${readPaths.length} read path(s)`);
-    if (writePaths.length > 0) items.push(`${writePaths.length} write path(s)`);
-    if (socketPaths.length > 0) items.push(`${socketPaths.length} socket(s)`);
-    console.log(`${colors.green}✓${colors.reset} Created .localmostrc with ${items.join(', ')}.`);
+    console.log(`${colors.green}✓${colors.reset} Created .localmostrc`);
   }
 }
 
@@ -1126,6 +1279,12 @@ export function parseTestArgs(args: string[]): TestOptions {
 
     if (arg === '--updaterc' || arg === '-u') {
       options.updaterc = true;
+    } else if (arg === '--yes' || arg === '-y') {
+      options.assumeYes = true;
+    } else if (arg === '--secret-file') {
+      const value = args[++i];
+      if (!value) throw new Error('--secret-file requires a path');
+      options.secretFile = value;
     } else if (arg === '--full-matrix' || arg === '-f') {
       options.fullMatrix = true;
     } else if (arg === '--matrix' || arg === '-m') {
@@ -1179,12 +1338,14 @@ ${colors.bold}OPTIONS:${colors.reset}
   -m, --matrix <spec>  Run specific matrix combination (e.g., "os=macos,node=18")
   -f, --full-matrix Run all matrix combinations
   -u, --updaterc    Discovery mode: record access and generate .localmostrc
+  -y, --yes         Apply --updaterc changes without confirming
   -n, --dry-run     Show what would run without executing
   -v, --verbose     Show command output
   --staged          Use staged changes only (git diff --staged)
   --no-ignore       Include files ignored by .gitignore
   -e, --env         Show environment comparison after run
   --secrets <mode>  Handle missing secrets: stub (default), prompt, abort
+  --secret-file <p> Read secrets from a KEY=value file
 
 ${colors.bold}EXAMPLES:${colors.reset}
   localmost test                    Run default workflow
@@ -1194,8 +1355,8 @@ ${colors.bold}EXAMPLES:${colors.reset}
   localmost test -v --env           Verbose output with environment diff
 
 ${colors.bold}ENVIRONMENT:${colors.reset}
-  Uses your local machine as the runner. Set up secrets with:
-    localmost secrets set SECRET_NAME
+  Uses your local machine as the runner. Secrets come from the environment or
+  a --secret-file; they are never written to disk and are masked out of output.
 
 ${colors.bold}SANDBOX:${colors.reset}
   Workflows run in a sandbox. Configure access in .localmostrc:

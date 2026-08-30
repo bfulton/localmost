@@ -677,6 +677,39 @@ describe('RunnerManager', () => {
     });
   });
 
+  describe('refused jobs', () => {
+    it('records the refusal and its reason where the user will see it', () => {
+      const onJobEvent = jest.fn();
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        onJobEvent,
+      });
+
+      manager.recordRefusedJob({
+        repository: 'owner/repo',
+        jobName: 'build',
+        reason: 'policy not approved',
+        githubRunId: 42,
+      });
+
+      const history = manager.getJobHistory();
+      expect(history).toHaveLength(1);
+      expect(history[0]).toMatchObject({
+        repository: 'owner/repo',
+        status: 'cancelled',
+        error: 'policy not approved',
+      });
+
+      // A refusal must not look like a job that started.
+      expect(onJobEvent).toHaveBeenCalledTimes(1);
+      expect(onJobEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'refused', reason: 'policy not approved' })
+      );
+    });
+  });
+
   describe('slot reservation', () => {
     function managerWith(count: number) {
       const manager = new RunnerManager({

@@ -21,8 +21,15 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   - Per-workflow policy overrides
   - Discovery mode with `localmost test --updaterc`
   - Policy validation with `localmost policy validate`
+- **Policy Approval**: A repository's `.localmostrc` takes effect only once approved
+  - A new or changed policy holds the job and cancels the run, with the diff logged
+  - Review with `localmost policy diff`, approve with `localmost policy approve`
+  - A repository with no policy is never held: it runs on the baseline, which
+    grants nothing extra
+  - The approved copy is applied, so a change pushed after approval cannot take
+    effect until it is reviewed
 - **Sandbox Policy Levels**: Choose enforcement strength in Settings under Job Security
-  - `strict` (default): only runner infrastructure plus hosts declared in `.localmostrc`
+  - `strict` (default): runner infrastructure plus what `.localmostrc` declares. Filesystem access is never granted implicitly, so a policy states everything a job may touch
   - `moderate`: also allows GitHub Actions infrastructure, common registries, and tool caches
   - `permissive`: no restrictions, for trusted repos or debugging
   - Per-job summary of allowed and blocked hosts in the runner log
@@ -49,7 +56,28 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   - Compare against any GitHub runner label
   - Suggestions for pinning versions in workflows
 
+### Security
+- Secret values are masked out of step output. A step that printed one - `set -x`,
+  a tool dumping its config - previously spilled it into the console and the log
+  file.
+- Secrets are no longer exported into every step's environment. They reach a step
+  only through `${{ secrets.X }}`, as on GitHub, rather than being visible to
+  every child process.
+- `localmost test` gained `--secret-file`, and `--secrets prompt` now actually
+  prompts without echoing. A stubbed secret is announced instead of silently
+  becoming an empty string.
+- The step script, which contains expanded secrets while a step runs, is written
+  0700 rather than 0755.
+- The broker no longer logs the head of a job payload, which carries the job's
+  secrets, and drops the payload once the worker has taken it instead of holding
+  it for the life of the process.
+
 ### Fixed
+- A step under `strict` no longer dies with an unexplained SIGABRT. The root
+  directory node is now readable, so an absolute path can resolve; a policy that
+  is missing something fails with the path that was blocked. `HOME` also pointed
+  at the user's real home directory rather than the workspace, so tools failed on
+  dotfiles the sandbox denies.
 - Jobs are no longer dropped after being acquired from GitHub. The broker
   checked capacity, then acquired the job over the network before any worker
   existed, so concurrent jobs could take the last slot in between; the job was

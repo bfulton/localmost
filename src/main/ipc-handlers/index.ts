@@ -9,6 +9,7 @@ import { registerSettingsHandlers } from './settings';
 import { registerAppHandlers } from './app';
 import { registerUpdateHandlers } from './updater';
 import { registerTargetHandlers } from './targets';
+import { registerPolicyHandlers } from './policy';
 import { registerResourceHandlers } from './resource';
 
 /**
@@ -21,5 +22,6 @@ export const setupIpcHandlers = (): void => {
   registerAppHandlers();
   registerUpdateHandlers();
   registerTargetHandlers();
+  registerPolicyHandlers();
   registerResourceHandlers();
 };

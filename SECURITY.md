@@ -60,9 +60,10 @@ localmost is an Electron desktop application that manages GitHub Actions self-ho
 
 ### What localmost protects against
 
-- **Filesystem writes**: Workflows cannot write to files outside the runner directory and temp paths
-- **Home directory access**: Workflows cannot access `~/.ssh`, `~/.aws`, `~/.config`, or other sensitive dotfiles
-- **Network exfiltration**: Workflows can only connect to allowlisted hosts (GitHub, npm, PyPI, etc.)
+- **Filesystem writes**: Under `strict`, workflows can write only to the workspace and temp paths. `moderate` and `permissive` additionally allow writes to standard tool caches (`~/.npm`, `~/.cargo`, `~/.gradle`, `~/Library/Caches` and similar)
+- **Home directory access**: Workflows cannot read `~/.ssh`, `~/.aws`, `~/.config`, or other dotfiles at any level. `HOME` points inside the workspace, not at your home directory
+- **Filesystem reads**: A job can read its workspace and temp paths. Everything else, including system paths, must be declared in `.localmostrc`
+- **Network exfiltration**: Workflows can only connect to hosts the policy level allows. Under the default `strict` that is runner infrastructure plus what the repository declares — not npm, PyPI or other registries
 - **Credential exposure**: OAuth tokens are encrypted at rest using macOS Keychain
 
 ### What localmost trusts (does NOT protect against)
@@ -70,7 +71,9 @@ localmost is an Electron desktop application that manages GitHub Actions self-ho
 - **GitHub's infrastructure**: OAuth, API responses, and runner binary distribution are trusted. If GitHub is compromised, localmost provides no additional protection.
 - **Malware on your machine**: If your system is already compromised, localmost cannot protect you.
 - **A compromised GitHub account**: If an attacker has access to your GitHub account, they can modify workflows that run on your runner.
-- **Allowlisted hosts**: Data can be exfiltrated to any host on the network allowlist (GitHub, npm, etc.).
+- **Allowlisted hosts**: Data can be exfiltrated to any host the active policy allows. Under `strict` that is runner infrastructure plus whatever the repository declares; looser levels allow more.
+- **Approved policies**: Once you approve a repository's `.localmostrc`, everything it declares is granted until the file changes again. Approval is a judgement about that content.
+- **Declared system paths**: A policy that declares OS read paths grants them for the whole job. `localmost policy init` seeds that list with OS subpaths (`/usr/bin`, `/usr/lib`, `/System`, `/Library/Developer` and similar) because nothing runs without them. It deliberately excludes `/usr/local`, `/Library/Application Support` and `/Applications`, which hold third-party software and application data - but a policy is free to add them back, and approving one means accepting that.
 
 ## Network Policy
 
@@ -94,11 +97,53 @@ jobs without them: `localhost`, `127.0.0.1`, `github.com`, `api.github.com`,
 cannot distinguish the runner's own requests from a job's, so jobs reach those
 hosts too.
 
+Filesystem access is not granted implicitly. A job can read its workspace and
+temp directories; everything else — including system paths like `/usr` and the
+Xcode developer directory that most tools need — must be declared in
+`.localmostrc`. Reading a repository's policy therefore tells you everything a
+job may touch. `localmost policy init` starts from a policy that runs, and
+`localmost test --updaterc` records what a workflow actually needs.
+
+The single exception is the root directory node, which permits an absolute path
+to resolve at all. It grants no access to anything inside.
+
+A repository's `.localmostrc` only takes effect once approved. When the runner
+sees a new or changed policy it refuses the job and cancels the run; review it
+with `localmost policy diff` and approve with `localmost policy approve`. A
+repository with no policy is never held for approval — it gets the baseline,
+which grants nothing extra.
+
 `codeload.github.com` is deliberately **not** in that set, even though the
 runner uses it to download actions during job setup. Actions are third-party
 code, and allowing it grants a job the ability to fetch any tarball from GitHub.
 Under `strict` a repository that uses actions declares the host in its own
 `.localmostrc`; the runner log names any blocked host and points at that file.
+
+## Workflow Secrets
+
+`localmost test` runs a workflow locally, where GitHub is not there to supply
+`${{ secrets.X }}`. Values come from a `--secret-file` (`KEY=value` lines) or the
+environment, in that order. `--secrets prompt` asks for anything still missing
+without echoing it.
+
+- **Never stored.** localmost has no secret store. Nothing is written to disk,
+  and nothing persists between runs.
+- **Masked in output.** Secret values are replaced with `***` in everything a
+  step prints, so a step that echoes one does not spill it into the console or
+  the log file.
+- **Not in the environment.** Secrets reach a step only through
+  `${{ secrets.X }}`, including an explicit `env:` mapping. They are not
+  exported into every step's environment, where every child process would see
+  them.
+- **Missing secrets are announced.** With the default `stub` mode a missing
+  secret becomes an empty string and the run says so; a step will act on that
+  empty value, so `--secrets abort` is the safer choice for anything that
+  deploys or publishes.
+
+For jobs run by the background runner, secrets come from GitHub in the job
+payload as they would on any self-hosted runner. They pass through the local
+proxy in transit, are handed to the runner binary, and are not parsed, logged
+or stored by localmost.
 
 ## Authentication
 

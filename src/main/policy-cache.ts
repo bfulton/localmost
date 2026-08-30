@@ -271,6 +271,92 @@ export function validatePolicyForJob(
 }
 
 /**
+ * Append an approval decision to an audit log.
+ *
+ * Approving a policy widens what someone else's code may do on this machine,
+ * so the decision is worth a durable record separate from the cache entry,
+ * which only ever holds the current state.
+ */
+export function recordPolicyDecision(repository: string, decision: 'approved' | 'rejected'): void {
+  try {
+    ensureCacheDir();
+    const line = JSON.stringify({ at: new Date().toISOString(), repository, decision });
+    fs.appendFileSync(path.join(getPolicyCacheDir(), 'decisions.log'), `${line}\n`);
+  } catch (err) {
+    log.warn(`Could not record policy decision for ${repository}: ${(err as Error).message}`);
+  }
+}
+
+/**
+ * What should happen to a job, given the repository's current .localmostrc.
+ */
+export type PolicyDecision =
+  | { action: 'allow'; reason: 'no-policy' | 'unchanged' | 'narrowed' }
+  | { action: 'needs-approval'; request: PolicyApprovalRequest }
+  | { action: 'invalid'; reason: string };
+
+/**
+ * Decide whether a job may run under the repository's current policy.
+ *
+ * A .localmostrc grants access beyond the built-in baseline, so its arrival or
+ * change is a request for more privilege and needs the machine owner's consent.
+ * A repository with no policy is not asked about: it gets the baseline, which
+ * grants nothing extra. Removing a policy is likewise allowed without asking -
+ * it can only reduce access.
+ */
+export function decidePolicyForJob(
+  repository: string,
+  localmostrcContent: string | null
+): PolicyDecision {
+  const cached = getCachedPolicy(repository);
+
+  if (!localmostrcContent) {
+    return { action: 'allow', reason: cached ? 'narrowed' : 'no-policy' };
+  }
+
+  const parseResult = parseLocalmostrcContent(localmostrcContent);
+  if (!parseResult.success || !parseResult.config) {
+    // The repository has a policy; we just cannot read it. Running anyway would
+    // mean deciding on a file nobody has reviewed, so hold the job instead.
+    const detail = parseResult.errors[0]?.message ?? 'unknown error';
+    log.warn(`Invalid .localmostrc for ${repository}: ${detail}`);
+    return { action: 'invalid', reason: detail };
+  }
+
+  const newConfig = parseResult.config;
+
+  if (cached?.approved) {
+    const diffs = diffConfigs(cached.config, newConfig);
+    if (diffs.length === 0) {
+      return { action: 'allow', reason: 'unchanged' };
+    }
+    return {
+      action: 'needs-approval',
+      request: { repository, oldConfig: cached.config, newConfig, diffs, isNewRepo: false },
+    };
+  }
+
+  return {
+    action: 'needs-approval',
+    request: {
+      repository,
+      oldConfig: cached?.config,
+      newConfig,
+      diffs: cached ? diffConfigs(cached.config, newConfig) : [],
+      isNewRepo: !cached,
+    },
+  };
+}
+
+/**
+ * Record a policy as awaiting approval, so the CLI can show what is pending.
+ */
+export function recordPendingPolicy(repository: string, config: LocalmostrcConfig): void {
+  cachePolicyConfig(repository, config, false);
+}
+
+
+/**
  * Format a policy approval request for notification.
  */
 export function formatApprovalRequest(request: PolicyApprovalRequest): string {
