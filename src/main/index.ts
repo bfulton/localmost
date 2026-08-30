@@ -322,7 +322,12 @@ app.whenReady().then(async () => {
         let title: string;
         let body: string;
 
-        if (event.type === 'started') {
+        if (event.type === 'refused') {
+          // Say why. Otherwise this is indistinguishable from someone
+          // pressing cancel on GitHub.
+          title = 'Job Refused';
+          body = `${repoShort}: ${event.reason ?? 'blocked by policy'}`;
+        } else if (event.type === 'started') {
           title = 'Job Started';
           body = `${event.jobName} on ${repoShort}`;
         } else {
@@ -416,7 +421,13 @@ app.whenReady().then(async () => {
           githubInfo.githubSha
         );
         if (!verdict.allowed) {
-          getLogger()?.warn(`Job ${jobId} not allowed: ${verdict.reason}. Not starting a worker.`);
+          runnerManager.recordRefusedJob({
+            repository: target.displayName,
+            jobName: 'job',
+            reason: verdict.reason,
+            actionsUrl,
+            githubRunId: githubInfo.githubRunId,
+          });
           if (githubInfo.githubRunId) {
             await runnerManager.cancelRun(owner, repo, githubInfo.githubRunId, verdict.reason);
           }
@@ -427,7 +438,13 @@ app.whenReady().then(async () => {
         // changed one needs the machine owner's consent before it takes effect.
         const policyReason = await checkRepoPolicyApproval(owner, repo, githubInfo.githubSha);
         if (policyReason) {
-          getLogger()?.warn(`Job ${jobId} held: ${policyReason}`);
+          runnerManager.recordRefusedJob({
+            repository: target.displayName,
+            jobName: 'job',
+            reason: policyReason,
+            actionsUrl,
+            githubRunId: githubInfo.githubRunId,
+          });
           if (githubInfo.githubRunId) {
             await runnerManager.cancelRun(owner, repo, githubInfo.githubRunId, policyReason);
           }

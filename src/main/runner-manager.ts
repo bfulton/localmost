@@ -43,7 +43,7 @@ interface RunnerInstance {
 }
 
 /** Job event types for notifications */
-export type JobEventType = 'started' | 'completed';
+export type JobEventType = 'started' | 'completed' | 'refused';
 
 /** Job event data for notifications */
 export interface JobEvent {
@@ -51,6 +51,8 @@ export interface JobEvent {
   jobName: string;
   repository: string;
   status?: 'completed' | 'failed' | 'cancelled';
+  /** Why a refused job was not run */
+  reason?: string;
 }
 
 interface RunnerManagerOptions {
@@ -1443,6 +1445,44 @@ export class RunnerManager {
   }
 
   /**
+   * Record a job this runner refused, so the refusal is visible.
+   *
+   * A refused job never reaches a worker, so without this it appears on GitHub
+   * as a plain cancellation and does not show up in the app at all - leaving no
+   * way to tell a policy refusal from someone pressing cancel.
+   */
+  recordRefusedJob(details: {
+    repository: string;
+    jobName: string;
+    reason: string;
+    actionsUrl?: string;
+    githubRunId?: number;
+  }): void {
+    const now = new Date().toISOString();
+    this.addJobToHistory({
+      id: `refused-${details.githubRunId ?? Date.now()}`,
+      jobName: details.jobName,
+      repository: details.repository,
+      status: 'cancelled',
+      startedAt: now,
+      completedAt: now,
+      runTimeSeconds: 0,
+      error: details.reason,
+      actionsUrl: details.actionsUrl,
+      githubRunId: details.githubRunId,
+    }, false);
+
+    this.log('warn', `Refused ${details.repository}: ${details.reason}`);
+    this.onJobEvent?.({
+      type: 'refused',
+      jobName: details.jobName,
+      repository: details.repository,
+      status: 'cancelled',
+      reason: details.reason,
+    });
+  }
+
+  /**
    * Cancel a workflow run that must not proceed.
    */
   async cancelRun(owner: string, repo: string, githubRunId: number, reason: string): Promise<void> {
@@ -1489,7 +1529,7 @@ export class RunnerManager {
     await this.cancelRun(repoInfo.owner, repoInfo.repo, githubRunId, reason);
   }
 
-  private addJobToHistory(job: JobHistoryEntry): void {
+  private addJobToHistory(job: JobHistoryEntry, announceStart = true): void {
     this.log('debug', `Adding job to history: ${job.id} (${job.jobName})`);
     this.jobHistory.push(job);
     if (this.jobHistory.length > this.maxJobHistory) {
@@ -1497,6 +1537,8 @@ export class RunnerManager {
     }
     this.saveJobHistory();
     this.onJobHistoryUpdate([...this.jobHistory]); // Send a copy to trigger React update
+
+    if (!announceStart) return;
 
     // Notify about job start
     this.onJobEvent?.({
