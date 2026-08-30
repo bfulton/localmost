@@ -73,6 +73,40 @@ describe('Sandbox Profile Generator', () => {
   // ===========================================================================
 
   describe('generateSandboxProfile - File access', () => {
+    it('grants read access to the OS toolchain even with no policy at all', () => {
+      // strict is the default, so a repository with no .localmostrc still has
+      // to be able to run a step. Read-only access to Apple-provided paths is
+      // not where the boundary is: network egress, writes, and the home
+      // directory are. Without this a bare strict policy cannot exec /bin/bash.
+      const profile = generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
+        strictMode: true,
+      });
+
+      for (const required of ['/bin', '/usr', '/System', '/Library', '/private/etc']) {
+        expect(profile).toContain(`(subpath "${required}")`);
+      }
+      // The toolchain /usr/bin/git and /usr/bin/python3 shim to
+      expect(profile).toContain('(subpath "/Applications/Xcode.app")');
+      expect(profile).toContain('(subpath "/Library/Developer")');
+      // Top-level symlink nodes these paths are reached through
+      expect(profile).toContain('(literal "/etc")');
+    });
+
+    it('does not grant the baseline as write access', () => {
+      const profile = generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
+        strictMode: true,
+      });
+
+      const writeSection = profile.slice(profile.indexOf(';; Write access'));
+      expect(writeSection).not.toContain('(subpath "/usr")');
+      expect(writeSection).not.toContain('(subpath "/System")');
+    });
+
+
     it('should always allow reading the root directory node', () => {
       // Without this, dyld aborts every sandboxed process with SIGABRT before
       // it runs: reading "/" itself is required to resolve any absolute path.
@@ -87,7 +121,7 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).not.toContain('(subpath "/")');
     });
 
-    it('should allow read access only to workDir and temp by default', () => {
+    it('reads the workDir, temp and the OS baseline - and nothing of the user', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
         proxyPort: DEFAULT_PROXY_PORT,
@@ -96,10 +130,13 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).toContain('(allow file-read*');
       expect(profile).toContain('(subpath "/path/to/project")');
       expect(profile).toContain('(subpath "/tmp")');
-      // System paths should NOT be allowed by default
-      expect(profile).not.toContain('(subpath "/System")');
-      expect(profile).not.toContain('(subpath "/Library")');
-      expect(profile).not.toContain('(subpath "/usr")');
+      // Apple-shipped paths are readable so a step can actually run.
+      expect(profile).toContain('(subpath "/usr")');
+
+      // The user's own files are what must stay out. A blanket root subpath
+      // would grant the whole disk and make every other rule meaningless.
+      expect(profile).not.toContain('(subpath "/")');
+      expect(profile).not.toContain('(subpath "/Users")');
     });
 
     it('should allow policy-defined system read paths', () => {

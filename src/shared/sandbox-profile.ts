@@ -86,6 +86,37 @@ function escapePath(pathStr: string): string {
 // Network filtering by hostname is handled by the proxy server, not the sandbox.
 
 /**
+ * Top-level nodes that must be readable for absolute paths to resolve.
+ *
+ * These are the directory entries themselves, not their contents: /etc, /var
+ * and /tmp are symlinks into /private, and reaching anything through them
+ * requires reading the link.
+ */
+const SYSTEM_READ_NODES = ['/', '/etc', '/var', '/tmp', '/Applications'];
+
+/**
+ * Read-only OS paths granted at every policy level.
+ *
+ * Everything here is shipped by Apple and identical on every machine, so
+ * requiring each repository to declare it would make strict unusable without
+ * making anyone safer. /usr/bin/git and /usr/bin/python3 are shims that
+ * execute out of the active developer directory, which is why Xcode.app and
+ * /Library/Developer are included.
+ */
+const SYSTEM_READ_PATHS = [
+  '/bin',
+  '/sbin',
+  '/usr',
+  '/System',
+  '/Library',
+  '/private/etc',
+  '/private/var/db',
+  '/private/var/select',
+  '/Applications/Xcode.app',
+  '/Library/Developer',
+];
+
+/**
  * Generate a macOS sandbox-exec profile from a policy.
  */
 export function generateSandboxProfile(options: SandboxProfileOptions): string {
@@ -136,6 +167,22 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   // (subpath "/") would grant read access to the entire disk.
   lines.push(';; Root directory node - required to resolve absolute paths');
   lines.push('(allow file-read* (literal "/"))');
+  lines.push('');
+
+  // Read-only access to the paths any process needs to start and to the
+  // developer toolchain Apple ships. strict is the default, so without this a
+  // repository with no .localmostrc could not run a single step: /bin/bash
+  // itself would be unreadable. This is not where the boundary lies - network
+  // egress, writes, and the home directory are - and none of it is writable.
+  lines.push(';; OS baseline - read access');
+  lines.push('(allow file-read*');
+  for (const node of SYSTEM_READ_NODES) {
+    lines.push(`  (literal "${node}")`);
+  }
+  for (const dir of SYSTEM_READ_PATHS) {
+    lines.push(`  (subpath "${dir}")`);
+  }
+  lines.push(')');
   lines.push('');
 
   // Minimal read access - device files only (always needed)

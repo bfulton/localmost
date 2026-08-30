@@ -84,7 +84,11 @@ export function buildStepEnvironment(
   const env: Record<string, string> = {
     // Preserve PATH and essential system vars
     PATH: process.env.PATH || '',
-    HOME: process.env.HOME || os.homedir(),
+    // A home inside the workspace, not the user's. GitHub Actions gives a step
+    // the runner's home, and pointing at the real one both diverges from that
+    // and sends every tool looking for dotfiles the sandbox denies - git dies
+    // on ~/.gitconfig before it does anything.
+    HOME: path.join(ctx.workDir, '.home'),
     USER: process.env.USER || '',
     SHELL: process.env.SHELL || '/bin/bash',
     TERM: process.env.TERM || 'xterm-256color',
@@ -348,6 +352,13 @@ async function executeRunStep(
   // Create temp script file
   const scriptFile = path.join(ctx.workDir, `.step-${Date.now()}.sh`);
   fs.writeFileSync(scriptFile, script, { mode: 0o755 });
+
+  // HOME points inside the workspace; make sure it exists so tools that write
+  // there (git config, npm, caches) do not fail on a missing directory.
+  const stepHome = path.join(ctx.workDir, '.home');
+  if (!fs.existsSync(stepHome)) {
+    fs.mkdirSync(stepHome, { recursive: true });
+  }
 
   try {
     const result = await runInSandbox(
