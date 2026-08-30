@@ -291,25 +291,9 @@ export function recordPolicyDecision(repository: string, decision: 'approved' | 
  * What should happen to a job, given the repository's current .localmostrc.
  */
 export type PolicyDecision =
-  | {
-      action: 'allow';
-      reason: 'no-policy' | 'unchanged' | 'narrowed';
-      /** The policy that was allowed, when it differs from the cached one. */
-      config?: LocalmostrcConfig;
-    }
+  | { action: 'allow'; reason: 'no-policy' | 'unchanged' | 'narrowed' }
   | { action: 'needs-approval'; request: PolicyApprovalRequest }
   | { action: 'invalid'; reason: string };
-
-/**
- * Whether a single change grants access that was not granted before.
- *
- * Direction is not the same as add-versus-remove: an entry added to a deny
- * list takes access away, and removing one hands it back. Reading `type`
- * alone would wave through exactly the change that needs consent.
- */
-function widensAccess(diff: PolicyDiff): boolean {
-  return diff.path.endsWith('.deny') ? diff.type === 'removed' : diff.type === 'added';
-}
 
 /**
  * Decide whether a job may run under the repository's current policy.
@@ -345,11 +329,6 @@ export function decidePolicyForJob(
     const diffs = diffConfigs(cached.config, newConfig);
     if (diffs.length === 0) {
       return { action: 'allow', reason: 'unchanged' };
-    }
-    // Consent is about privilege the owner has not granted yet. A policy that
-    // only gives access up needs none, so editing one down costs no round trip.
-    if (!diffs.some(widensAccess)) {
-      return { action: 'allow', reason: 'narrowed', config: newConfig };
     }
     return {
       action: 'needs-approval',
