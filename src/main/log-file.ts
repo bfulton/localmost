@@ -13,13 +13,16 @@ const logsDir = getLogsDir();
 
 /**
  * Early boot logger for errors before the main logger is initialized.
- * Writes directly to stderr since log file may not be ready.
+ * Writes to log file, and to stderr only for warnings/errors.
  */
-export const bootLog = (level: 'info' | 'warn' | 'error', message: string): void => {
+export const bootLog = (level: 'info' | 'warn' | 'error' | 'debug', message: string): void => {
   const timestamp = new Date().toISOString();
   const line = `[BOOT] ${timestamp} [${level.toUpperCase()}] ${message}\n`;
-  process.stderr.write(line);
-  // Also try to write to log file if stream is available
+  // Only write warnings and errors to stderr (not routine info/debug)
+  if (level === 'warn' || level === 'error') {
+    process.stderr.write(line);
+  }
+  // Always write to log file if stream is available
   if (logFileStream) {
     logFileStream.write(line);
   }

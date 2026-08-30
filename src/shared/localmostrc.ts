@@ -69,9 +69,6 @@ export function findLocalmostrc(repoRoot: string): string | null {
  * Parse a .localmostrc file.
  */
 export function parseLocalmostrc(filePath: string): ParseResult {
-  const errors: ParseError[] = [];
-  const warnings: string[] = [];
-
   if (!fs.existsSync(filePath)) {
     return {
       success: false,

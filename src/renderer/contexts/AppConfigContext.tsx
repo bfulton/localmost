@@ -6,6 +6,7 @@
  */
 
 import React, { createContext, useContext, useEffect, useRef, useCallback, useState, ReactNode } from 'react';
+import { normalizeUserFilterConfig } from '../../shared/user-filter-config';
 import {
   LogEntry,
   SleepProtection,
@@ -148,7 +149,7 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     sleepProtectionConsented: false,
     preserveWorkDir: 'never',
     toolCacheLocation: 'persistent',
-    userFilter: { mode: 'just-me', allowlist: [] },
+    userFilter: { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] },
     power: DEFAULT_POWER_CONFIG,
     notifications: DEFAULT_NOTIFICATIONS_CONFIG,
     isOnline: true,
@@ -217,8 +218,12 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
           sleepProtectionConsented: settings.sleepProtectionConsented || prev.sleepProtectionConsented,
           preserveWorkDir: (settings.preserveWorkDir as 'never' | 'session' | 'always') || prev.preserveWorkDir,
           toolCacheLocation: (settings.toolCacheLocation as ToolCacheLocation) || prev.toolCacheLocation,
-          userFilter: settings.userFilter && ['just-me', 'allowlist', 'anyone'].includes((settings.userFilter as UserFilterConfig).mode)
-            ? (settings.userFilter as UserFilterConfig)
+          // Normalize rather than accepting only the new shape: a config still
+          // using the legacy `mode` field would otherwise be discarded here and
+          // silently replaced by the default, so the UI would show a policy
+          // different from the one the runner is enforcing.
+          userFilter: settings.userFilter
+            ? normalizeUserFilterConfig(settings.userFilter as UserFilterConfig)
             : prev.userFilter,
           power: settings.power ? { ...DEFAULT_POWER_CONFIG, ...(settings.power as PowerConfig) } : prev.power,
           notifications: settings.notifications ? { ...DEFAULT_NOTIFICATIONS_CONFIG, ...(settings.notifications as NotificationsConfig) } : prev.notifications,

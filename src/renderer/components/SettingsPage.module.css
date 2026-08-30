@@ -137,6 +137,27 @@
   letter-spacing: 2px;
 }
 
+.codeWithCopied {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.copiedBadge {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--success);
+  background: rgba(34, 197, 94, 0.15);
+  padding: 4px 10px;
+  border-radius: 4px;
+  animation: fadeIn 0.2s ease-out;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateX(-8px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
 /* Download Section */
 .downloadSection {
   display: flex;

@@ -77,6 +77,18 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
   const [avatarError, setAvatarError] = useState(false);
   const [launchAtLogin, setLaunchAtLogin] = useState(false);
   const [hideOnStart, setHideOnStart] = useState(false);
+  const [showCopiedNotice, setShowCopiedNotice] = useState(false);
+
+  // Show copied notice when device code is copied, auto-hide after 4s
+  useEffect(() => {
+    if (deviceCode?.copiedToClipboard) {
+      setShowCopiedNotice(true);
+      const timer = setTimeout(() => setShowCopiedNotice(false), 4000);
+      return () => clearTimeout(timer);
+    } else {
+      setShowCopiedNotice(false);
+    }
+  }, [deviceCode?.copiedToClipboard]);
 
   // Load startup settings
   useEffect(() => {
@@ -219,11 +231,22 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
               {deviceCode && (
                 <div className={styles.deviceCodeCompact}>
                   <p>Enter code on GitHub:</p>
-                  <code className={styles.userCodeSmall}>{deviceCode.userCode}</code>
+                  <div className={styles.codeWithCopied}>
+                    <code className={styles.userCodeSmall}>{deviceCode.userCode}</code>
+                    {showCopiedNotice && (
+                      <span className={styles.copiedBadge}>Copied!</span>
+                    )}
+                  </div>
                   <div className={shared.waitingIndicator}>
                     <div className={shared.spinner} />
                     <span>Waiting...</span>
                   </div>
+                  <button
+                    className={shared.btnSecondary}
+                    onClick={() => window.localmost.github.cancelAuth()}
+                  >
+                    Cancel
+                  </button>
                 </div>
               )}
 

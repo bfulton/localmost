@@ -10,6 +10,7 @@ import { RunnerDownloader } from './runner-downloader';
 import { HeartbeatManager } from './heartbeat-manager';
 import { BrokerProxyService } from './broker-proxy-service';
 import { TargetManager } from './target-manager';
+import { ContributorCache } from './contributor-cache';
 
 // State management
 import {
@@ -97,7 +98,7 @@ import {
 } from './runner-state-service';
 
 // Zustand store
-import { initStore, connectWindow, cleanupStore } from './store/init';
+import { initStore, connectWindow, cleanupStore, store } from './store/init';
 
 // ============================================================================
 // App Initialization
@@ -200,6 +201,9 @@ app.whenReady().then(async () => {
   const githubAuth = new GitHubAuth();
   setGitHubAuth(githubAuth);
 
+  // Contributor cache for user filtering
+  const contributorCache = new ContributorCache(githubAuth, (msg) => logger?.debug(msg));
+
   const runnerManager = new RunnerManager({
     onLog: sendLog,
     onStatusChange: sendStatusUpdate,
@@ -230,6 +234,13 @@ app.whenReady().then(async () => {
         throw new Error('Not authenticated');
       }
       return auth.getJobConclusion(accessToken, owner, repo, jobId);
+    },
+    getAllContributors: async (owner: string, repo: string, sha: string) => {
+      const accessToken = await getValidAccessToken();
+      if (!accessToken) {
+        throw new Error('Not authenticated');
+      }
+      return contributorCache.getAllAuthors(accessToken, owner, repo, sha);
     },
     onJobEvent: (event: JobEvent) => {
       logger?.info(`Job event: ${event.type} ${event.jobName}`);
@@ -319,7 +330,7 @@ app.whenReady().then(async () => {
 
   // Wire up broker proxy to runner manager: when a job is received, spawn a worker
   brokerProxyService.on('job-received', async (targetId: string, jobId: string, _registeredRunnerName: string, githubInfo) => {
-    getLogger()?.info(`[job-received event] targetId=${targetId}, jobId=${jobId}, runId=${githubInfo.githubRunId}, actor=${githubInfo.githubActor}`);
+    getLogger()?.info(`[job-received event] targetId=${targetId}, jobId=${jobId}, runId=${githubInfo.githubRunId}, actor=${githubInfo.githubActor}, sha=${githubInfo.githubSha?.slice(0, 7)}`);
     const target = targetManager.getTargets().find(t => t.id === targetId);
     if (target) {
       getLogger()?.info(`Spawning worker for job ${jobId} from ${target.displayName}...`);
@@ -329,7 +340,7 @@ app.whenReady().then(async () => {
         actionsUrl = `https://github.com/${githubInfo.githubRepo}/actions/runs/${githubInfo.githubRunId}/job/${githubInfo.githubJobId}`;
         getLogger()?.info(`Constructed actions URL: ${actionsUrl}`);
       }
-      runnerManager.setPendingTargetContext('next', targetId, target.displayName, actionsUrl, githubInfo.githubRunId, githubInfo.githubJobId, githubInfo.githubActor);
+      runnerManager.setPendingTargetContext('next', targetId, target.displayName, actionsUrl, githubInfo.githubRunId, githubInfo.githubJobId, githubInfo.githubActor, githubInfo.githubSha, githubInfo.githubRef);
 
       // Spawn a worker to handle this job
       try {
@@ -363,8 +374,19 @@ app.whenReady().then(async () => {
     logger?.warn(`Startup cleanup failed: ${(err as Error).message}. Will retry when runner starts.`);
   }
 
-  if (config.auth) {
+  if (config.auth?.refreshToken) {
+    // Set initial auth state with refresh token (no access token yet)
     setAuthState(config.auth);
+    // Update store so zubridge syncs user to renderer
+    if (config.auth.user) {
+      store.getState().setUser(config.auth.user);
+    }
+    // Get fresh access token on startup
+    logger?.info('Getting fresh access token on startup...');
+    const token = await forceRefreshToken();
+    if (!token) {
+      logger?.warn('Failed to refresh access token on startup - user may need to re-authenticate');
+    }
   }
   if (config.sleepProtection) {
     setSleepProtectionSetting(config.sleepProtection as SleepProtection);
@@ -437,9 +459,18 @@ app.whenReady().then(async () => {
   // Start monitoring (will evaluate conditions and emit events as needed)
   resourceMonitor.start();
 
+  // Determine if window should be hidden on start
+  // Only hide if setting is enabled AND runner is configured (don't hide setup wizard)
+  const isRunnerConfigured = runnerManager.isConfigured();
+  logger?.info(`hideOnStart check: hideOnStart=${config.hideOnStart}, isConfigured=${isRunnerConfigured}`);
+  const shouldHideOnStart = config.hideOnStart && isRunnerConfigured;
+  if (shouldHideOnStart) {
+    logger?.info('Window will be hidden on start (hideOnStart enabled)');
+  }
+
   // Create UI
   createMenu();
-  createWindow();
+  createWindow({ show: !shouldHideOnStart });
   initTray();
   setDockIcon();
   setupIpcHandlers();
@@ -449,6 +480,20 @@ app.whenReady().then(async () => {
   if (newMainWindow) {
     connectWindow(newMainWindow);
   }
+
+  // Initialize store with current state so renderer has data immediately
+  const isDownloaded = runnerDownloader.isDownloaded();
+  store.getState().setIsDownloaded(isDownloaded);
+  if (isDownloaded) {
+    const version = runnerDownloader.getVersion();
+    const url = runnerDownloader.getVersionUrl();
+    store.getState().setRunnerVersion({ version, url });
+  }
+  store.getState().setIsConfigured(runnerManager.isConfigured());
+  store.getState().setTargets(config.targets || []);
+
+  // Mark initial loading as complete so renderer shows the UI
+  store.getState().setIsInitialLoading(false);
 
   // Initialize auto-updater
   const mainWindow = getMainWindow();

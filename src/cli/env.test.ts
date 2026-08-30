@@ -1,5 +1,5 @@
-import { jest, describe, it, expect, beforeEach } from '@jest/globals';
-import { parseEnvArgs, EnvOptions } from './env';
+import { describe, it, expect } from '@jest/globals';
+import { parseEnvArgs } from './env';
 
 describe('CLI env command', () => {
   describe('parseEnvArgs', () => {

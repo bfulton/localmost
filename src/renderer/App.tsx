@@ -30,10 +30,16 @@ const AppContent: React.FC = () => {
 
   // Check if setup is needed and redirect to settings
   // Must wait for BOTH contexts to finish loading before checking setup state
+  // Only redirect from status page - don't interrupt if user is in setup flow (settings/targets)
   useEffect(() => {
     const isLoading = isConfigLoading || isRunnerLoading;
     if (!isLoading && (!user || !isDownloaded || !isConfigured)) {
-      setView('settings');
+      setView((currentView) => {
+        if (currentView === 'status') {
+          return 'settings';
+        }
+        return currentView;
+      });
     }
   }, [isConfigLoading, isRunnerLoading, user, isDownloaded, isConfigured]);
 

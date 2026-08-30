@@ -86,6 +86,9 @@ export const registerSettingsHandlers = (): void => {
     if (settings.launchAtLogin !== undefined) {
       storeState.setLaunchAtLogin(settings.launchAtLogin);
     }
+    if (settings.hideOnStart !== undefined) {
+      storeState.setHideOnStart(settings.hideOnStart);
+    }
     if (settings.targets !== undefined) {
       storeState.setTargets(settings.targets);
     }

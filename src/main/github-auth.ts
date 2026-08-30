@@ -595,4 +595,122 @@ export class GitHubAuth {
 
     return usersWithNames;
   }
+
+  /**
+   * Get all contributors for a repository.
+   * Returns array of contributor logins (paginated).
+   */
+  async getContributors(
+    accessToken: string,
+    owner: string,
+    repo: string
+  ): Promise<string[]> {
+    const client = new GitHubClient(accessToken);
+    const contributors: string[] = [];
+    let page = 1;
+    const perPage = 100;
+
+    while (true) {
+      const data = await client.get<Array<{ login: string }>>(
+        `/repos/${owner}/${repo}/contributors`,
+        { params: { per_page: String(perPage), page: String(page), anon: '0' } }
+      );
+
+      if (!data || data.length === 0) {
+        break;
+      }
+
+      for (const contributor of data) {
+        if (contributor.login) {
+          contributors.push(contributor.login.toLowerCase());
+        }
+      }
+
+      if (data.length < perPage) {
+        break;
+      }
+      page++;
+    }
+
+    return contributors;
+  }
+
+  /**
+   * Get commit authors between two SHAs.
+   * Returns array of author logins for commits from baseSha to headSha.
+   */
+  async getCommitAuthors(
+    accessToken: string,
+    owner: string,
+    repo: string,
+    baseSha: string,
+    headSha: string
+  ): Promise<string[]> {
+    const client = new GitHubClient(accessToken);
+    const authors = new Set<string>();
+
+    try {
+      // Use compare API to get commits between two refs
+      const data = await client.get<{
+        total_commits: number;
+        commits: Array<{
+          author: { login: string } | null;
+          commit: { author: { name: string } | null };
+        }>;
+      }>(`/repos/${owner}/${repo}/compare/${baseSha}...${headSha}`);
+
+      // The compare API caps the commits it returns (250) while still
+      // reporting the true total. A truncated response would silently omit
+      // authors, and callers gate job execution on this set.
+      const returned = data.commits?.length ?? 0;
+      if (typeof data.total_commits === 'number' && data.total_commits > returned) {
+        throw new Error(
+          `compare returned ${returned} of ${data.total_commits} commits; author list would be incomplete`
+        );
+      }
+
+      for (const commit of data.commits || []) {
+        // Prefer the GitHub user login if available
+        if (commit.author?.login) {
+          authors.add(commit.author.login.toLowerCase());
+        }
+      }
+    } catch (error) {
+      // Do not swallow this. An empty result is indistinguishable from "no new
+      // authors", and callers use the author set to decide whether untrusted
+      // contributors are involved in a job.
+      throw new Error(
+        `Failed to compare ${baseSha}...${headSha} for ${owner}/${repo}: ${(error as Error).message}`
+      );
+    }
+
+    return Array.from(authors);
+  }
+
+  /**
+   * Get default branch info for a repository.
+   * Returns the branch name and current HEAD SHA.
+   */
+  async getDefaultBranch(
+    accessToken: string,
+    owner: string,
+    repo: string
+  ): Promise<{ name: string; sha: string }> {
+    const client = new GitHubClient(accessToken);
+
+    // Get repo info to find default branch name
+    const repoData = await client.get<{ default_branch: string }>(
+      `/repos/${owner}/${repo}`
+    );
+
+    // Get the branch to find HEAD SHA
+    const branchData = await client.get<{ commit: { sha: string } }>(
+      `/repos/${owner}/${repo}/branches/${repoData.default_branch}`
+    );
+
+    return {
+      name: repoData.default_branch,
+      sha: branchData.commit.sha,
+    };
+  }
 }

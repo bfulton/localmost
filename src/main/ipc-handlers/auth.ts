@@ -2,13 +2,12 @@
  * IPC handlers for GitHub authentication.
  */
 
-import { ipcMain, shell } from 'electron';
+import { ipcMain, shell, clipboard } from 'electron';
 import { GitHubAuth, DEFAULT_CLIENT_ID } from '../github-auth';
 import { toUserError } from '../user-error';
 import { loadConfig, saveConfig } from '../config';
 import { getValidAccessToken } from '../auth-tokens';
 import {
-  getMainWindow,
   getGitHubAuth,
   setGitHubAuth,
   getAuthState,
@@ -17,6 +16,18 @@ import {
 } from '../app-state';
 import { updateTrayMenu } from '../tray-init';
 import { IPC_CHANNELS, GitHubRepo, GitHubUserSearchResult } from '../../shared/types';
+import { store } from '../store/init';
+
+/** Pending browser-open timer for the device flow. */
+let pendingBrowserOpen: NodeJS.Timeout | null = null;
+
+/** Cancel a scheduled browser open; safe to call when none is pending. */
+function clearPendingBrowserOpen(): void {
+  if (pendingBrowserOpen) {
+    clearTimeout(pendingBrowserOpen);
+    pendingBrowserOpen = null;
+  }
+}
 
 /**
  * Validate that a URL is a legitimate GitHub URL before opening externally.
@@ -35,11 +46,11 @@ function isValidGitHubUrl(url: string): boolean {
  * Safely open a GitHub verification URL in the user's browser.
  * Validates the URL is actually GitHub before opening.
  */
-function openGitHubVerificationUrl(url: string, logger?: { error: (msg: string) => void }): void {
+function openGitHubVerificationUrl(url: string): void {
   if (isValidGitHubUrl(url)) {
     shell.openExternal(url);
   } else {
-    logger?.error(`Refusing to open suspicious verification URL: ${url}`);
+    getLogger()?.error(`Refusing to open suspicious verification URL: ${url}`);
   }
 }
 
@@ -86,10 +97,18 @@ export const registerAuthHandlers = (): void => {
       const { status, waitForAuth } = await githubAuth.startDeviceFlow();
 
       // Open the verification URL (with validation)
-      openGitHubVerificationUrl(status.verificationUri, logger);
+      openGitHubVerificationUrl(status.verificationUri);
 
       // Wait for user to complete auth
-      const result = await waitForAuth();
+      let result;
+      try {
+        result = await waitForAuth();
+      } finally {
+        // The flow is over either way, so the pending open is no longer wanted.
+        // Without this a fast completion still pops the browser afterwards, and
+        // unit tests are left with a dangling timer.
+        clearPendingBrowserOpen();
+      }
       setAuthState(result);
       updateTrayMenu();
 
@@ -107,22 +126,42 @@ export const registerAuthHandlers = (): void => {
     const clientId = config.githubClientId || DEFAULT_CLIENT_ID;
 
     try {
+      // Mark auth as in progress
+      store.getState().setIsAuthenticating(true);
+
       const githubAuth = new GitHubAuth(clientId);
       setGitHubAuth(githubAuth);
       const { status, waitForAuth } = await githubAuth.startDeviceFlow();
 
-      // Send the code to the renderer to display
-      const mainWindow = getMainWindow();
-      mainWindow?.webContents.send(IPC_CHANNELS.GITHUB_DEVICE_CODE, {
+      // Copy code to clipboard for easy pasting
+      clipboard.writeText(status.userCode);
+
+      // Set device code in store (syncs to renderer via zubridge)
+      store.getState().setDeviceCode({
         userCode: status.userCode,
         verificationUri: status.verificationUri,
+        copiedToClipboard: true,
       });
 
-      // Open the verification URL in the browser (with validation)
-      openGitHubVerificationUrl(status.verificationUri, logger);
+      // Give the user a moment to see the code was copied before the browser
+      // takes focus. Scheduled rather than awaited: this is a presentation
+      // delay, and awaiting it blocks the IPC handler for a second and a half.
+      // Cancelling clears the timer, so a quick cancel does not still pop the
+      // browser open afterwards.
+      const verificationUri = status.verificationUri;
+      pendingBrowserOpen = setTimeout(() => {
+        pendingBrowserOpen = null;
+        openGitHubVerificationUrl(verificationUri);
+      }, 1500);
 
       // Wait for user to complete auth
       const result = await waitForAuth();
+
+      // Update store with user and clear auth flow state
+      store.getState().setUser(result.user);
+      store.getState().setDeviceCode(null);
+      store.getState().setIsAuthenticating(false);
+
       setAuthState(result);
       updateTrayMenu();
 
@@ -133,6 +172,10 @@ export const registerAuthHandlers = (): void => {
 
       return { success: true, user: result.user };
     } catch (error) {
+      // Clear device code and auth state on error
+      store.getState().setDeviceCode(null);
+      store.getState().setIsAuthenticating(false);
+
       const { userMessage, technicalDetails } = toUserError(error, 'Authentication');
       logger?.error(technicalDetails);
       return { success: false, error: userMessage };
@@ -142,11 +185,19 @@ export const registerAuthHandlers = (): void => {
   ipcMain.handle(IPC_CHANNELS.GITHUB_AUTH_CANCEL, () => {
     const githubAuth = getGitHubAuth();
     githubAuth?.abortPolling();
+    clearPendingBrowserOpen();
+    // Clear device code and auth state when cancelled
+    store.getState().setDeviceCode(null);
+    store.getState().setIsAuthenticating(false);
     return { success: true };
   });
 
   ipcMain.handle(IPC_CHANNELS.GITHUB_AUTH_STATUS, () => {
     const authState = getAuthState();
+    // Update store so zubridge syncs to renderer
+    if (authState?.user) {
+      store.getState().setUser(authState.user);
+    }
     return {
       isAuthenticated: !!authState,
       user: authState?.user,
@@ -154,6 +205,8 @@ export const registerAuthHandlers = (): void => {
   });
 
   ipcMain.handle(IPC_CHANNELS.GITHUB_AUTH_LOGOUT, () => {
+    // Clear user from store
+    store.getState().logout();
     setAuthState(null);
     // Clear saved auth
     const config = loadConfig();
@@ -173,6 +226,8 @@ export const registerAuthHandlers = (): void => {
 
     try {
       const repos = await githubAuth.getInstalledRepos(accessToken);
+      // Update store so zubridge syncs to renderer
+      store.getState().setRepos(repos);
       return { success: true, repos };
     } catch (error) {
       const { userMessage, technicalDetails } = toUserError(error, 'Fetching repositories');
@@ -191,6 +246,8 @@ export const registerAuthHandlers = (): void => {
 
     try {
       const orgs = await githubAuth.getInstalledOrgs(accessToken);
+      // Update store so zubridge syncs to renderer
+      store.getState().setOrgs(orgs);
       return { success: true, orgs };
     } catch (error) {
       const { userMessage, technicalDetails } = toUserError(error, 'Fetching organizations');

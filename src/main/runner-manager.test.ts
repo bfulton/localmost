@@ -295,12 +295,12 @@ describe('RunnerManager', () => {
   });
 
   describe('user filtering', () => {
-    it('should allow all users when filter mode is everyone', () => {
+    it('should allow all users when filter scope is everyone', () => {
       const manager = new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getUserFilter: () => ({ mode: 'everyone', allowlist: [] }),
+        getUserFilter: () => ({ scope: 'everyone', allowedUsers: 'just-me', allowlist: [] }),
         getCurrentUserLogin: () => 'testuser',
       });
       const helper = new RunnerManagerTestHelper(manager);
@@ -320,12 +320,12 @@ describe('RunnerManager', () => {
       expect(helper.isUserAllowed('anyuser')).toBe(true);
     });
 
-    it('should only allow current user when filter mode is just-me', () => {
+    it('should only allow current user when trigger scope with just-me', () => {
       const manager = new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getUserFilter: () => ({ mode: 'just-me', allowlist: [] }),
+        getUserFilter: () => ({ scope: 'trigger', allowedUsers: 'just-me', allowlist: [] }),
         getCurrentUserLogin: () => 'testuser',
       });
       const helper = new RunnerManagerTestHelper(manager);
@@ -335,13 +335,14 @@ describe('RunnerManager', () => {
       expect(helper.isUserAllowed('otheruser')).toBe(false);
     });
 
-    it('should only allow users in allowlist when filter mode is allowlist', () => {
+    it('should only allow users in allowlist when trigger scope with allowlist', () => {
       const manager = new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
         getUserFilter: () => ({
-          mode: 'allowlist',
+          scope: 'trigger',
+          allowedUsers: 'allowlist',
           allowlist: [
             { login: 'user1', avatar_url: '', name: null },
             { login: 'user2', avatar_url: '', name: null },
@@ -356,18 +357,48 @@ describe('RunnerManager', () => {
       expect(helper.isUserAllowed('user3')).toBe(false);
     });
 
-    it('should allow user when just-me mode but no current user is set', () => {
+    it('should block users when just-me but no current user is known', () => {
       const manager = new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getUserFilter: () => ({ mode: 'just-me', allowlist: [] }),
+        getUserFilter: () => ({ scope: 'trigger', allowedUsers: 'just-me', allowlist: [] }),
         getCurrentUserLogin: () => undefined,
       });
       const helper = new RunnerManagerTestHelper(manager);
 
-      // Should return true (allow) when current user is unknown
-      expect(helper.isUserAllowed('anyuser')).toBe(true);
+      // Filtering was explicitly enabled. If we cannot identify ourselves we
+      // cannot confirm the actor is us, so the job must not run.
+      expect(helper.isUserAllowed('anyuser')).toBe(false);
+    });
+
+    it('blocks users when the filter config has an unrecognized allowedUsers', () => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        // Config comes off disk and can be hand-edited or written by an older
+        // build. An unknown value must not fall through to "allow".
+        getUserFilter: () => ({ scope: 'trigger', allowedUsers: 'bogus', allowlist: [] } as never),
+        getCurrentUserLogin: () => 'testuser',
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+
+      expect(helper.isUserAllowed('anyuser')).toBe(false);
+    });
+
+    it('blocks users when the filter config has an unrecognized scope', () => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getUserFilter: () => ({ scope: 'bogus', allowedUsers: 'just-me', allowlist: [] } as never),
+        getCurrentUserLogin: () => 'testuser',
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+
+      expect(helper.isUserAllowed('otheruser')).toBe(false);
+      expect(helper.isUserAllowed('testuser')).toBe(true);
     });
 
     it('should handle empty allowlist', () => {
@@ -375,7 +406,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getUserFilter: () => ({ mode: 'allowlist', allowlist: [] }),
+        getUserFilter: () => ({ scope: 'trigger', allowedUsers: 'allowlist', allowlist: [] }),
       });
       const helper = new RunnerManagerTestHelper(manager);
 
@@ -385,6 +416,99 @@ describe('RunnerManager', () => {
   });
 
   // fetchActionsUrl was removed - job URLs are now extracted directly from job details
+
+  describe('contributors scope enforcement', () => {
+    const JOB = {
+      name: 'build',
+      repository: 'owner/repo',
+      startedAt: '2026-01-01T00:00:00Z',
+      id: 'job-1',
+      targetDisplayName: 'owner/repo',
+      githubRunId: 42,
+      githubActor: 'trusted',
+      githubSha: 'abc1234def5678',
+    };
+
+    const CONTRIBUTORS_FILTER = {
+      scope: 'contributors' as const,
+      allowedUsers: 'just-me' as const,
+      allowlist: [],
+    };
+
+    function setup(overrides: Record<string, unknown>) {
+      const cancelWorkflowRun = jest.fn().mockResolvedValue(undefined);
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getUserFilter: () => CONTRIBUTORS_FILTER,
+        getCurrentUserLogin: () => 'trusted',
+        cancelWorkflowRun,
+        ...overrides,
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, { name: 'runner-1', currentJob: { ...JOB } });
+      return { helper, cancelWorkflowRun };
+    }
+
+    it('allows the job when every contributor is allowed', async () => {
+      const { helper, cancelWorkflowRun } = setup({
+        getAllContributors: async () => new Set(['trusted']),
+      });
+
+      await helper.checkJobUserFilter(1, 'runner-1');
+
+      expect(cancelWorkflowRun).not.toHaveBeenCalled();
+    });
+
+    it('cancels the job when a contributor is not allowed', async () => {
+      const { helper, cancelWorkflowRun } = setup({
+        getAllContributors: async () => new Set(['trusted', 'stranger']),
+      });
+
+      await helper.checkJobUserFilter(1, 'runner-1');
+
+      expect(cancelWorkflowRun).toHaveBeenCalledWith('owner', 'repo', 42);
+    });
+
+    it('cancels the job when the contributor lookup fails', async () => {
+      const { helper, cancelWorkflowRun } = setup({
+        getAllContributors: async () => {
+          throw new Error('API is down');
+        },
+      });
+
+      await helper.checkJobUserFilter(1, 'runner-1');
+
+      expect(cancelWorkflowRun).toHaveBeenCalledWith('owner', 'repo', 42);
+    });
+
+    it('cancels the job when there is no SHA to check contributors against', async () => {
+      const { helper, cancelWorkflowRun } = setup({
+        getAllContributors: async () => new Set(['trusted']),
+      });
+      helper.setInstance(1, {
+        name: 'runner-1',
+        currentJob: { ...JOB, githubSha: undefined },
+      });
+
+      // Must not silently downgrade to the weaker trigger-author check:
+      // the trigger author is allowed here, but the contributors are unknown.
+      await helper.checkJobUserFilter(1, 'runner-1');
+
+      expect(cancelWorkflowRun).toHaveBeenCalledWith('owner', 'repo', 42);
+    });
+
+    it('cancels the job when contributor lookup is unavailable', async () => {
+      const { helper, cancelWorkflowRun } = setup({
+        getAllContributors: undefined,
+      });
+
+      await helper.checkJobUserFilter(1, 'runner-1');
+
+      expect(cancelWorkflowRun).toHaveBeenCalledWith('owner', 'repo', 42);
+    });
+  });
 
   describe('job completion', () => {
     it('handles a repeated completion line only once', async () => {
@@ -426,6 +550,45 @@ describe('RunnerManager', () => {
         ([entry]) => typeof entry?.message === 'string' && entry.message.includes('Job completed:')
       );
       expect(completions).toHaveLength(1);
+    });
+  });
+
+  describe('slot release after a job', () => {
+    function busyManager() {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      for (let i = 1; i <= 4; i++) {
+        helper.setInstance(i, { name: `runner-${i}`, status: 'busy' });
+      }
+      return { manager, helper };
+    }
+
+    it('frees the slot so the next job can be accepted', () => {
+      // A worker restarted after finishing cannot take another job: the broker
+      // only routes messages to workers spawned for a specific target. Holding
+      // the slot made the broker report "At capacity" forever once every slot
+      // had run once, with nothing actually running.
+      const { manager, helper } = busyManager();
+      expect(manager.hasAvailableSlot()).toBe(false);
+
+      helper.releaseInstanceSlot(1);
+
+      expect(manager.hasAvailableSlot()).toBe(true);
+    });
+
+    it('frees every slot as its job finishes, not just the scaled-up ones', () => {
+      const { manager, helper } = busyManager();
+
+      for (let i = 1; i <= 4; i++) {
+        helper.releaseInstanceSlot(i);
+      }
+
+      expect(helper.instances.size).toBe(0);
+      expect(manager.hasAvailableSlot()).toBe(true);
     });
   });
 

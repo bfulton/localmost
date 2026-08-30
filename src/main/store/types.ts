@@ -273,7 +273,7 @@ export const defaultConfigState: ConfigSlice = {
   sleepProtectionConsented: false,
   preserveWorkDir: 'never',
   toolCacheLocation: 'persistent',
-  userFilter: { mode: 'just-me', allowlist: [] },
+  userFilter: { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] },
   power: DEFAULT_POWER_CONFIG,
   notifications: DEFAULT_NOTIFICATIONS_CONFIG,
   launchAtLogin: false,

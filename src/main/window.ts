@@ -15,16 +15,24 @@ import { REPOSITORY_URL, PRIVACY_POLICY_URL } from '../shared/constants';
 declare const MAIN_WINDOW_WEBPACK_ENTRY: string;
 declare const MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY: string;
 
+interface CreateWindowOptions {
+  show?: boolean;
+}
+
 /**
  * Create the main application window.
+ * @param options.show - Whether to show the window immediately (default: true)
  */
-export const createWindow = (): void => {
+export const createWindow = (options: CreateWindowOptions = {}): void => {
+  const { show = true } = options;
+
   const mainWindow = new BrowserWindow({
     title: 'localmost',
     width: 900,
     height: 700,
     minWidth: 600,
     minHeight: 500,
+    show,
     titleBarStyle: 'hiddenInset',
     trafficLightPosition: { x: 16, y: 16 },
     backgroundColor: '#1a1a1a',

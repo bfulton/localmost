@@ -1,5 +1,5 @@
-import { jest, describe, it, expect, beforeEach } from '@jest/globals';
-import { parseTestArgs, TestOptions } from './test';
+import { describe, it, expect } from '@jest/globals';
+import { parseTestArgs, extractJobOutputs, extractWorkflowOutputs } from './test';
 
 describe('CLI test command', () => {
   describe('parseTestArgs', () => {
@@ -162,6 +162,29 @@ describe('CLI test command', () => {
 
     it('formats minutes and seconds', () => {
       expect(formatDuration(125000)).toBe('2m 5s');
+    });
+  });
+});
+
+describe('output expression resolution', () => {
+  // GitHub Actions allows hyphens in step ids, job ids and output names, e.g.
+  // ${{ steps.build-image.outputs.docker-tag }}. A \w-only pattern silently
+  // fails to resolve those, leaving the expression unsubstituted.
+  it('resolves step outputs whose ids contain hyphens', () => {
+    const job = { outputs: { image: '${{ steps.build-image.outputs.docker-tag }}' } };
+    const stepOutputs = { 'build-image': { 'docker-tag': 'sha-abc123' } };
+
+    expect(extractJobOutputs(job as never, stepOutputs)).toEqual({ image: 'sha-abc123' });
+  });
+
+  it('resolves workflow outputs whose job ids contain hyphens', () => {
+    const workflow = {
+      outputs: { image: { value: '${{ jobs.build-image.outputs.docker-tag }}' } },
+    };
+    const jobOutputs = { 'build-image': { 'docker-tag': 'sha-abc123' } };
+
+    expect(extractWorkflowOutputs(workflow as never, jobOutputs as never)).toEqual({
+      image: 'sha-abc123',
     });
   });
 });

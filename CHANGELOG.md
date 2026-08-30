@@ -21,22 +21,22 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   - Per-workflow policy overrides
   - Discovery mode with `localmost test --updaterc`
   - Policy validation with `localmost policy validate`
+- **Contributor-Based Job Filtering**: Decide which jobs may run by who is involved
+  - Scope: everyone, the workflow trigger author, or every contributor to the repo
+  - Allowed users: just you, or an explicit allowlist
+  - Disallowed jobs are cancelled through the GitHub API, and the check fails
+    closed when contributors cannot be determined
+- **Reusable Workflow Support** in `localmost test`
+  - Local `uses: ./.github/workflows/...` references
+  - `workflow_call` inputs and outputs, passed to dependent jobs via `needs`
 - **Environment Comparison**: Detect differences between local and GitHub runner environments
   - `localmost env` command shows local tooling versions
   - Compare against any GitHub runner label
   - Suggestions for pinning versions in workflows
-- **Policy Cache**: Background runner caches and validates `.localmostrc` changes
-  - Requires approval when policy changes
-  - Diff display for policy modifications
 
 ### Changed
 - CLI restructured with standalone commands that don't require the app
 - Improved help text with examples for all commands
-
-## [0.2.1] - 2025-12-26
-
-### Fixed
-- Minor bug fixes
 
 ## [0.2.0] - 2025-12-26
 
@@ -57,7 +57,6 @@ Core improvements to architecture to enable multiple targets.
 
 Initial release of localmost, a Mac app which manages GitHub Actions runners.
 
-[0.3.0]: https://github.com/bfulton/localmost/compare/v0.2.1...HEAD
-[0.2.1]: https://github.com/bfulton/localmost/compare/v0.2.0...v0.2.1
+[0.3.0]: https://github.com/bfulton/localmost/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/bfulton/localmost/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bfulton/localmost/releases/tag/v0.1.0

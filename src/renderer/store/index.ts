@@ -6,7 +6,7 @@
  */
 
 import { createUseStore, useDispatch as useZubridgeDispatch } from '@zubridge/electron';
-import type { AppState, AppStore } from '../../main/store/types';
+import type { AppState } from '../../main/store/types';
 
 // Create the store hook - this connects to the main process store via zubridge
 export const useStore = createUseStore<AppState>();

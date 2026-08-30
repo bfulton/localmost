@@ -25,6 +25,7 @@ interface RunnerInstance {
     githubRunId?: number;
     githubJobId?: number;
     githubActor?: string;
+    githubSha?: string;
   } | null;
   name: string;
   jobsCompleted: number;
@@ -39,7 +40,9 @@ interface RunnerManagerInternals {
   stopping: boolean;
   startedAt: string | null;
   isUserAllowed(actorLogin: string): boolean;
+  checkJobUserFilter(instanceNum: number, runnerName: string): Promise<void>;
   parseRunnerOutput(instanceNum: number, line: string): Promise<void>;
+  releaseInstanceSlot(instanceNum: number): void;
 }
 
 /**
@@ -101,9 +104,23 @@ export class RunnerManagerTestHelper {
   }
 
   /**
+   * Run the job user filter check for an instance.
+   */
+  checkJobUserFilter(instanceNum: number, runnerName: string): Promise<void> {
+    return this.internals.checkJobUserFilter(instanceNum, runnerName);
+  }
+
+  /**
    * Feed a line of runner output through the parser.
    */
   parseRunnerOutput(instanceNum: number, line: string): Promise<void> {
     return this.internals.parseRunnerOutput(instanceNum, line);
+  }
+
+  /**
+   * Release an instance slot as the process-exit handler does.
+   */
+  releaseInstanceSlot(instanceNum: number): void {
+    this.internals.releaseInstanceSlot(instanceNum);
   }
 }

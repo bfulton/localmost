@@ -145,6 +145,36 @@ jobs:
   // Job Dependency Ordering
   // ===========================================================================
 
+  describe('reusable workflow job validation', () => {
+    it('rejects a job that both calls a reusable workflow and defines steps', () => {
+      // GitHub does not allow this combination. Skipping validation for any job
+      // with `uses` means such a workflow is accepted and then mis-executed:
+      // treated as a reusable call, with its steps silently dropped.
+      const content = `
+name: Bad
+on: push
+jobs:
+  build:
+    uses: ./.github/workflows/other.yml
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+`;
+      expect(() => parseWorkflowContent(content, 'bad.yml')).toThrow(/build/);
+    });
+
+    it('accepts a well-formed reusable workflow call', () => {
+      const content = `
+name: Good
+on: push
+jobs:
+  build:
+    uses: ./.github/workflows/other.yml
+`;
+      expect(() => parseWorkflowContent(content, 'good.yml')).not.toThrow();
+    });
+  });
+
   describe('job ordering with dependencies', () => {
     it('should order jobs based on needs (single dependency)', () => {
       const content = `
