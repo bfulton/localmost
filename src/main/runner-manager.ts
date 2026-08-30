@@ -879,6 +879,13 @@ export class RunnerManager {
         env.AGENT_TOOLSDIRECTORY = toolCacheDir; // Some actions check this instead
       }
 
+      // The sandbox confines the runner to this proxy, and that rule only
+      // matches when the kernel can attribute the connection to loopback. A
+      // dual-stack socket connecting to an IPv4-mapped address is reported
+      // with no host at all, so the connection is denied; IPv4-only keeps it
+      // attributable.
+      env.DOTNET_SYSTEM_NET_DISABLEIPV6 = '1';
+
       env.http_proxy = proxyUrl;
       env.https_proxy = proxyUrl;
       env.HTTP_PROXY = proxyUrl;

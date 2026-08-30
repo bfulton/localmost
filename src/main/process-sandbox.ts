@@ -250,7 +250,9 @@ function generateSandboxProfile(instanceDir: string, proxyPort?: number): string
   (subpath "${homeDir}/Library/Caches")
   (literal "/dev/null")
   (literal "/dev/random")
-  (literal "/dev/urandom"))
+  (literal "/dev/urandom")
+  (literal "/dev/dtracehelper")
+  (literal "/dev/tty"))
 
 ;; Never readable, whatever a future path above might overlap: the secrets a
 ;; developer machine keeps and this app's own credential store.
@@ -307,9 +309,13 @@ ${proxyPort ? `(allow network-outbound (remote ip "localhost:${proxyPort}"))` : 
 (allow network-outbound (remote unix-socket))
 (deny network-outbound (literal "${cliSocket}"))
 
-;; Binding a local port is how test servers and build tools talk to themselves.
+;; Binding a local port is how test servers and build tools talk to themselves,
+;; and a unix socket is how many test suites do the same. Binding creates a
+;; socket where the job can already write; connecting to this app's own socket
+;; stays denied above.
 (allow network-bind (local ip "localhost:*"))
 (allow network-inbound (local ip "localhost:*"))
+(allow network-bind (local unix-socket))
 
 ;; ------------------------------------------------------------
 ;; MACH/IPC OPERATIONS - Permissive (required by system frameworks)
