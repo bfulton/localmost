@@ -62,7 +62,7 @@ localmost is an Electron desktop application that manages GitHub Actions self-ho
 
 - **Filesystem writes**: Under `strict`, workflows can write only to the workspace and temp paths. `moderate` and `permissive` additionally allow writes to standard tool caches (`~/.npm`, `~/.cargo`, `~/.gradle`, `~/Library/Caches` and similar)
 - **Home directory access**: Workflows cannot read `~/.ssh`, `~/.aws`, `~/.config`, or other dotfiles at any level. `HOME` points inside the workspace, not at your home directory
-- **Filesystem reads**: Read access is limited to the workspace, temp paths, and a read-only baseline of Apple-shipped system paths that any process needs to start. Anything else must be declared in `.localmostrc`
+- **Filesystem reads**: A job can read its workspace and temp paths. Everything else, including system paths, must be declared in `.localmostrc`
 - **Network exfiltration**: Workflows can only connect to hosts the policy level allows. Under the default `strict` that is runner infrastructure plus what the repository declares — not npm, PyPI or other registries
 - **Credential exposure**: OAuth tokens are encrypted at rest using macOS Keychain
 
@@ -97,10 +97,15 @@ jobs without them: `localhost`, `127.0.0.1`, `github.com`, `api.github.com`,
 cannot distinguish the runner's own requests from a job's, so jobs reach those
 hosts too.
 
-Read access to Apple-shipped system paths (`/bin`, `/usr`, `/System`, `/Library`,
-`/private/etc`, and the active Xcode developer directory) is likewise granted at
-every level. Without it nothing can start: `/bin/bash` itself would be
-unreadable. It is read-only and grants no access to your own files.
+Filesystem access is not granted implicitly. A job can read its workspace and
+temp directories; everything else — including system paths like `/usr` and the
+Xcode developer directory that most tools need — must be declared in
+`.localmostrc`. Reading a repository's policy therefore tells you everything a
+job may touch. `localmost policy init` starts from a policy that runs, and
+`localmost test --updaterc` records what a workflow actually needs.
+
+The single exception is the root directory node, which permits an absolute path
+to resolve at all. It grants no access to anything inside.
 
 A repository's `.localmostrc` only takes effect once approved. When the runner
 sees a new or changed policy it refuses the job and cancels the run; review it

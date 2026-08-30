@@ -999,6 +999,7 @@ async function runInSandbox(
   return new Promise((resolve, reject) => {
     let spawnArgs: string[];
     let spawnCommand: string;
+    let usedSandbox = false;
 
     if (process.platform === 'darwin') {
       let profile: string;
@@ -1045,6 +1046,7 @@ async function runInSandbox(
       }
 
       spawnCommand = '/usr/bin/sandbox-exec';
+      usedSandbox = true;
       spawnArgs = ['-f', profilePath, command, ...args];
     } else {
       spawnCommand = command;
@@ -1098,7 +1100,21 @@ async function runInSandbox(
       }
 
       // Keep last 10 lines of stderr for error reporting
-      const stderr = stderrLines.slice(-10).join('\n');
+      let stderr = stderrLines.slice(-10).join('\n');
+
+      // A sandboxed process that dies on SIGABRT with nothing on stderr has
+      // almost always been denied something it needed before it could run -
+      // dyld cannot even load the binary. The bare exit code says none of that.
+      const abortedSilently = code === 134 && stderrLines.length === 0;
+      if (abortedSilently && usedSandbox) {
+        stderr =
+          'The step was stopped by the sandbox before it could run. ' +
+          'Its policy is probably missing a read path the process needs. ' +
+          'Run "localmost test --updaterc" to discover what it wants, or ' +
+          '"localmost policy init" to start from a policy that runs.';
+        options.onOutput?.(stderr, 'stderr');
+      }
+
       resolve({ exitCode: code ?? 1, stderr });
     });
 

@@ -300,10 +300,11 @@ anything; it adds to whatever the configured policy level already allows:
   tool caches.
 - `permissive`: no network restrictions.
 
-Two things are always granted regardless of the repo's policy, because nothing
-works without them: the hosts the Actions runner itself needs to register and
-poll for jobs, and read-only access to Apple-shipped system paths. Both are
-documented in SECURITY.md.
+One thing is granted regardless of the repo's policy: the hosts the Actions
+runner itself needs to register and poll for jobs. That is the runner's own
+connection to GitHub rather than anything the job asked for, and the runner
+cannot function without it. Because a single proxy serves both, jobs reach those
+hosts too. Filesystem access is never granted implicitly — see SECURITY.md.
 
 A repo's policy only takes effect once approved — see
 `localmost policy approve`.

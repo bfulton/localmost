@@ -73,25 +73,45 @@ describe('Sandbox Profile Generator', () => {
   // ===========================================================================
 
   describe('generateSandboxProfile - File access', () => {
-    it('grants read access to the OS toolchain even with no policy at all', () => {
-      // strict is the default, so a repository with no .localmostrc still has
-      // to be able to run a step. Read-only access to Apple-provided paths is
-      // not where the boundary is: network egress, writes, and the home
-      // directory are. Without this a bare strict policy cannot exec /bin/bash.
+    it('grants no system paths that the policy has not declared', () => {
+      // Reading a .localmostrc should tell you everything a job may touch, so
+      // nothing is granted implicitly. The one exception is the root directory
+      // node, which is not an access grant - it is what makes an absolute path
+      // resolvable at all.
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
         proxyPort: DEFAULT_PROXY_PORT,
         strictMode: true,
       });
 
-      for (const required of ['/bin', '/usr', '/System', '/Library', '/private/etc']) {
-        expect(profile).toContain(`(subpath "${required}")`);
+      for (const notGranted of ['/bin', '/usr', '/System', '/Library', '/Applications/Xcode.app']) {
+        expect(profile).not.toContain(`(subpath "${notGranted}")`);
       }
-      // The toolchain /usr/bin/git and /usr/bin/python3 shim to
-      expect(profile).toContain('(subpath "/Applications/Xcode.app")');
-      expect(profile).toContain('(subpath "/Library/Developer")');
-      // Top-level symlink nodes these paths are reached through
-      expect(profile).toContain('(literal "/etc")');
+      expect(profile).toContain('(allow file-read* (literal "/"))');
+    });
+
+    it('grants system paths once the policy declares them', () => {
+      const profile = generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
+        policy: { filesystem: { read: ['/bin', '/usr'] } },
+      });
+
+      expect(profile).toContain('(subpath "/bin")');
+      expect(profile).toContain('(subpath "/usr")');
+    });
+
+    it('never turns a declared "/" into a subpath', () => {
+      // Discovery can observe a read of the root node. Writing it back as a
+      // subpath would grant the entire disk and make every other entry moot.
+      const profile = generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
+        policy: { filesystem: { read: ['/', '/bin'] } },
+      });
+
+      expect(profile).not.toContain('(subpath "/")');
+      expect(profile).toContain('(subpath "/bin")');
     });
 
     it('does not grant the baseline as write access', () => {
@@ -121,7 +141,7 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).not.toContain('(subpath "/")');
     });
 
-    it('reads the workDir, temp and the OS baseline - and nothing of the user', () => {
+    it('reads the workDir and temp, and nothing of the user, by default', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
         proxyPort: DEFAULT_PROXY_PORT,
@@ -130,11 +150,9 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).toContain('(allow file-read*');
       expect(profile).toContain('(subpath "/path/to/project")');
       expect(profile).toContain('(subpath "/tmp")');
-      // Apple-shipped paths are readable so a step can actually run.
-      expect(profile).toContain('(subpath "/usr")');
 
-      // The user's own files are what must stay out. A blanket root subpath
-      // would grant the whole disk and make every other rule meaningless.
+      // A blanket root subpath would grant the whole disk and make every other
+      // rule meaningless.
       expect(profile).not.toContain('(subpath "/")');
       expect(profile).not.toContain('(subpath "/Users")');
     });
@@ -407,15 +425,13 @@ describe('Sandbox Profile Generator', () => {
       expect(result.readPaths).toEqual(['/opt/homebrew', '/opt/other']);
     });
 
-    it('omits paths the profile already grants', () => {
-      // The generated profile always allows these, so recording them would pad
-      // the policy with entries nobody needs to review.
+    it('records system paths, since nothing grants them implicitly', () => {
       const result = parseSandboxTrace(
-        trace(['/usr/bin/curl', '/System/Library/Foo', '/opt/homebrew/bin/git']),
+        trace(['/usr/bin/curl', '/opt/homebrew/bin/git']),
         '/work'
       );
 
-      expect(result.readPaths).toEqual(['/opt/homebrew/bin/git']);
+      expect(result.readPaths.sort()).toEqual(['/opt/homebrew/bin/git', '/usr/bin/curl']);
     });
 
     it('never emits the filesystem root as a policy entry', () => {

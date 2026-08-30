@@ -86,24 +86,22 @@ function escapePath(pathStr: string): string {
 // Network filtering by hostname is handled by the proxy server, not the sandbox.
 
 /**
- * Top-level nodes that must be readable for absolute paths to resolve.
+ * The read paths a macOS workflow needs before it can run anything.
  *
- * These are the directory entries themselves, not their contents: /etc, /var
- * and /tmp are symlinks into /private, and reaching anything through them
- * requires reading the link.
- */
-const SYSTEM_READ_NODES = ['/', '/etc', '/var', '/tmp', '/Applications'];
-
-/**
- * Read-only OS paths granted at every policy level.
+ * Nothing grants these implicitly - a policy has to declare them, so that
+ * reading a .localmostrc tells you everything a job may touch. They are
+ * offered as the starting point for a new policy (`localmost policy init`),
+ * and discovery records them like any other access.
  *
- * Everything here is shipped by Apple and identical on every machine, so
- * requiring each repository to declare it would make strict unusable without
- * making anyone safer. /usr/bin/git and /usr/bin/python3 are shims that
- * execute out of the active developer directory, which is why Xcode.app and
- * /Library/Developer are included.
+ * /etc, /var and /tmp are the symlink nodes into /private that those paths are
+ * reached through. /usr/bin/git and /usr/bin/python3 are shims that execute
+ * out of the active developer directory, hence Xcode.app and /Library/Developer.
  */
-const SYSTEM_READ_PATHS = [
+export const MACOS_BASELINE_READ_PATHS = [
+  '/etc',
+  '/var',
+  '/tmp',
+  '/Applications',
   '/bin',
   '/sbin',
   '/usr',
@@ -163,26 +161,12 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push('');
 
   // The root directory node itself must be readable or dyld aborts every
-  // process with SIGABRT before it runs. This is a literal, not a subpath:
-  // (subpath "/") would grant read access to the entire disk.
+  // process with SIGABRT before it runs. This is the one thing granted without
+  // being declared, and it is not an access grant: it permits reading the root
+  // directory entry so that absolute paths resolve. It is a literal, never a
+  // subpath - (subpath "/") would grant the entire disk.
   lines.push(';; Root directory node - required to resolve absolute paths');
   lines.push('(allow file-read* (literal "/"))');
-  lines.push('');
-
-  // Read-only access to the paths any process needs to start and to the
-  // developer toolchain Apple ships. strict is the default, so without this a
-  // repository with no .localmostrc could not run a single step: /bin/bash
-  // itself would be unreadable. This is not where the boundary lies - network
-  // egress, writes, and the home directory are - and none of it is writable.
-  lines.push(';; OS baseline - read access');
-  lines.push('(allow file-read*');
-  for (const node of SYSTEM_READ_NODES) {
-    lines.push(`  (literal "${node}")`);
-  }
-  for (const dir of SYSTEM_READ_PATHS) {
-    lines.push(`  (subpath "${dir}")`);
-  }
-  lines.push(')');
   lines.push('');
 
   // Minimal read access - device files only (always needed)
@@ -216,6 +200,11 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
     lines.push('(allow file-read*');
     for (const pattern of policy.filesystem.read) {
       const expanded = expandPath(pattern);
+      if (expanded === '/') {
+        // Declaring "/" means the root node, which is already granted. Writing
+        // it as a subpath would silently hand over the whole disk.
+        continue;
+      }
       if (expanded.includes('**')) {
         const base = expanded.replace('/**', '').replace('**/', '');
         lines.push(`  (subpath "${escapePath(base)}")`);
@@ -707,16 +696,12 @@ export function parseSandboxTrace(
    * generated profile always allows it as a literal, whereas recording it here
    * would be written back as (subpath "/") and grant the whole disk.
    */
-  const coveredByBaseline = (p: string): boolean =>
-    SYSTEM_READ_NODES.includes(p) ||
-    SYSTEM_READ_PATHS.some(base => p === base || p.startsWith(`${base}/`));
-
   const consolidate = (paths: Set<string>): string[] => {
     const candidates = Array.from(paths)
+      // "/" is the one thing granted without being declared, so recording it
+      // adds nothing - and as a policy entry it would be written back as
+      // (subpath "/"), granting the whole disk.
       .filter(p => p !== '/' && p !== '~' && p !== '')
-      // Anything the profile already grants would only pad the policy. A
-      // discovered policy has to be reviewable to be worth approving.
-      .filter(p => !coveredByBaseline(p))
       .sort();
 
     const kept: string[] = [];

@@ -23,6 +23,7 @@ import {
 } from '../shared/localmostrc';
 import { getAppDataDirWithoutElectron } from '../shared/paths';
 import { getRepositoryFromDir } from '../shared/workspace';
+import { MACOS_BASELINE_READ_PATHS } from '../shared/sandbox-profile';
 
 // ANSI colors
 const colors = {
@@ -349,6 +350,9 @@ function handleInit(): void {
     return;
   }
 
+  // Start from a policy that actually runs. Nothing is granted implicitly, so
+  // without the read paths a macOS process needs, the first step would die
+  // before executing anything.
   const template: LocalmostrcConfig = {
     version: LOCALMOSTRC_VERSION,
     shared: {
@@ -358,6 +362,9 @@ function handleInit(): void {
           'github.com',
           'registry.npmjs.org',
         ],
+      },
+      filesystem: {
+        read: [...MACOS_BASELINE_READ_PATHS],
       },
     },
   };
