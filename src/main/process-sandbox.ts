@@ -103,6 +103,9 @@ function validateExecutablePath(executablePath: string): string {
  * - Sandbox write restrictions (this profile)
  * - Network proxy with domain filtering (separate layer)
  */
+/** The broker's port, mirrored from BrokerProxyService's default. */
+export const DEFAULT_BROKER_PORT = 8787;
+
 /**
  * Where the runner keeps downloaded toolchains, shared across jobs.
  * Mirrors RunnerDownloader.getToolCacheDir.
@@ -111,7 +114,11 @@ function getToolCacheDirPath(): string {
   return path.join(getRunnerDir(), 'tool-cache');
 }
 
-function generateSandboxProfile(instanceDir: string, proxyPort?: number): string {
+function generateSandboxProfile(
+  instanceDir: string,
+  proxyPort?: number,
+  brokerPort: number = DEFAULT_BROKER_PORT
+): string {
   const escapedDir = instanceDir.replace(/"/g, '\\"');
   const homeDir = os.homedir().replace(/"/g, '\\"');
   const appDataDir = getRunnerBaseDir().replace(/"/g, '\\"');
@@ -298,7 +305,17 @@ function generateSandboxProfile(instanceDir: string, proxyPort?: number): string
 ;; directly. sandbox-exec cannot filter by hostname, which is why the proxy
 ;; exists - but it can make the proxy the only way out.
 (deny network*)
-${proxyPort ? `(allow network-outbound (remote ip "localhost:${proxyPort}"))` : ';; No proxy port supplied: no outbound network at all'}
+
+;; Loopback is allowed: build and test suites routinely start a server and talk
+;; to it, and nothing leaves the machine this way. Everything else must go
+;; through the proxy, which is itself on loopback.
+(allow network-outbound (remote ip "localhost:*"))
+${proxyPort ? `(allow network-outbound (remote ip "localhost:${proxyPort}"))` : ';; No proxy port supplied: the proxy is unreachable'}
+
+;; ...except this app's own control channels. The broker carries job payloads
+;; including secrets, and the runner reaches it through the proxy rather than
+;; directly, so a job has no reason to open it.
+(deny network-outbound (remote ip "localhost:${brokerPort}"))
 
 ;; .NET asks the kernel about network availability over AF_SYSTEM before it
 ;; will open a connection; denying it surfaces as "Permission denied" on the
