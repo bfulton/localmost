@@ -553,6 +553,171 @@ describe('RunnerManager', () => {
     });
   });
 
+  describe('evaluateJobFilter', () => {
+    function manager(opts: Record<string, unknown>) {
+      return new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        ...opts,
+      } as never);
+    }
+
+    it('allows any job when the scope is everyone', async () => {
+      const m = manager({ getUserFilter: () => ({ scope: 'everyone', allowedUsers: 'just-me', allowlist: [] }) });
+
+      await expect(m.evaluateJobFilter('o', 'r', 'stranger')).resolves.toEqual({ allowed: true, reason: '' });
+    });
+
+    it('blocks a disallowed trigger author', async () => {
+      const m = manager({
+        getUserFilter: () => ({ scope: 'trigger', allowedUsers: 'just-me', allowlist: [] }),
+        getCurrentUserLogin: () => 'me',
+      });
+
+      const verdict = await m.evaluateJobFilter('o', 'r', 'stranger');
+      expect(verdict.allowed).toBe(false);
+      expect(verdict.reason).toMatch(/stranger/);
+    });
+
+    it('blocks when a contributor is not allowed', async () => {
+      const m = manager({
+        getUserFilter: () => ({ scope: 'contributors', allowedUsers: 'just-me', allowlist: [] }),
+        getCurrentUserLogin: () => 'me',
+        getAllContributors: async () => new Set(['me', 'stranger']),
+      });
+
+      const verdict = await m.evaluateJobFilter('o', 'r', 'me', 'abc123');
+      expect(verdict.allowed).toBe(false);
+      expect(verdict.reason).toMatch(/stranger/);
+    });
+
+    it('fails closed when the contributor lookup throws', async () => {
+      const m = manager({
+        getUserFilter: () => ({ scope: 'contributors', allowedUsers: 'just-me', allowlist: [] }),
+        getCurrentUserLogin: () => 'me',
+        getAllContributors: async () => {
+          throw new Error('API down');
+        },
+      });
+
+      const verdict = await m.evaluateJobFilter('o', 'r', 'me', 'abc123');
+      expect(verdict.allowed).toBe(false);
+      expect(verdict.reason).toMatch(/API down/);
+    });
+
+    it('fails closed when there is no SHA to check contributors at', async () => {
+      const m = manager({
+        getUserFilter: () => ({ scope: 'contributors', allowedUsers: 'just-me', allowlist: [] }),
+        getCurrentUserLogin: () => 'me',
+        getAllContributors: async () => new Set(['me']),
+      });
+
+      const verdict = await m.evaluateJobFilter('o', 'r', 'me');
+      expect(verdict.allowed).toBe(false);
+    });
+  });
+
+  describe('repository network policy', () => {
+    it('applies the hosts a repo declares to that instance proxy', async () => {
+      const setPolicyAllowedHosts = jest.fn();
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicyHosts: async () => ['index.crates.io'],
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, {
+        name: 'runner-1',
+        currentJob: {
+          name: 'build',
+          repository: 'owner/repo',
+          startedAt: new Date().toISOString(),
+          id: 'job-1',
+          targetDisplayName: 'owner/repo',
+          githubSha: 'abc1234',
+        },
+      });
+      helper.setProxy(1, { setPolicyAllowedHosts });
+
+      await helper.applyRepoPolicy(1);
+
+      expect(setPolicyAllowedHosts).toHaveBeenCalledWith(['index.crates.io']);
+    });
+
+    it('clears the previous job policy when this job has no commit SHA', async () => {
+      const setPolicyAllowedHosts = jest.fn();
+      const getRepoPolicyHosts = jest.fn().mockResolvedValue([] as never);
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicyHosts: getRepoPolicyHosts as never,
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, {
+        name: 'runner-1',
+        currentJob: {
+          name: 'build',
+          repository: 'owner/repo',
+          startedAt: new Date().toISOString(),
+          id: 'job-1',
+          targetDisplayName: 'owner/repo',
+        },
+      });
+      helper.setProxy(1, { setPolicyAllowedHosts });
+
+      await helper.applyRepoPolicy(1);
+
+      // A proxy outlives one job, so leaving the previous job's hosts in place
+      // would grant them to a different repository.
+      expect(getRepoPolicyHosts).not.toHaveBeenCalled();
+      expect(setPolicyAllowedHosts).toHaveBeenCalledWith([]);
+    });
+  });
+
+  describe('slot reservation', () => {
+    function managerWith(count: number) {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.runnerCount = count;
+      return { manager, helper };
+    }
+
+    it('never hands the same slot to two jobs', () => {
+      // The broker acquires a job from GitHub before a worker exists. Two jobs
+      // arriving together must not be given the same slot, or one is acquired
+      // upstream and then never run.
+      const { helper } = managerWith(2);
+
+      expect(helper.reserveSlot()).toBe(1);
+      expect(helper.reserveSlot()).toBe(2);
+      expect(helper.reserveSlot()).toBeNull();
+    });
+
+    it('reuses a slot once its reservation is released', () => {
+      const { helper } = managerWith(1);
+
+      const slot = helper.reserveSlot();
+      expect(slot).toBe(1);
+      helper.releaseSlotReservation(1);
+
+      expect(helper.reserveSlot()).toBe(1);
+    });
+
+    it('does not reserve a slot held by a running instance', () => {
+      const { helper } = managerWith(2);
+      helper.setInstance(1, { name: 'runner-1', status: 'busy' });
+
+      expect(helper.reserveSlot()).toBe(2);
+    });
+  });
+
   describe('slot release after a job', () => {
     function busyManager() {
       const manager = new RunnerManager({

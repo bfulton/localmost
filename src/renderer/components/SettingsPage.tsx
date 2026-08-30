@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faXmark, faLightbulb, faMoon, faDesktop } from '@fortawesome/free-solid-svg-icons';
-import { SleepProtection, BatteryPauseThreshold } from '../../shared/types';
+import { SleepProtection, BatteryPauseThreshold, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../../shared/types';
 import { GITHUB_APP_SETTINGS_URL, PRIVACY_POLICY_URL, REPOSITORY_URL } from '../../shared/constants';
 import { useAppConfig, useRunner, useUpdate } from '../contexts';
 import UserFilterSettings from './UserFilterSettings';
@@ -37,6 +37,8 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     setToolCacheLocation,
     userFilter,
     setUserFilter,
+    sandboxPolicyLevel,
+    setSandboxPolicyLevel,
     power,
     setPauseOnBattery,
     setPauseOnVideoCall,
@@ -146,7 +148,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
   };
 
   return (
-    <div className={styles.settingsPage}>
+    <div className={styles.settingsPage} data-testid="settings-page">
       <div className={shared.pageHeader}>
         <h2>Settings</h2>
         <button className={shared.btnIcon} onClick={onBack} title="Close settings">
@@ -154,9 +156,9 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
         </button>
       </div>
 
-      <div className={styles.settingsContent}>
+      <div className={styles.settingsContent} data-testid="page-content">
         {/* Startup Section */}
-        <section className={styles.settingsSection}>
+        <section className={styles.settingsSection} data-testid="settings-section">
           <h3>Startup</h3>
           <div className={shared.formGroup}>
             <label className={shared.toggleRow}>
@@ -189,7 +191,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
         </section>
 
         {/* GitHub Account Section */}
-        <section className={styles.settingsSection}>
+        <section className={styles.settingsSection} data-testid="settings-section">
           <h3>GitHub Account</h3>
           {user ? (
             <div className={styles.accountInfo}>
@@ -261,7 +263,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
         </section>
 
         {/* Runner Download Section */}
-        <section className={styles.settingsSection}>
+        <section className={styles.settingsSection} data-testid="settings-section">
           <div className={styles.sectionHeaderRow}>
             <h3>Runner Binary</h3>
             {isDownloaded && runnerVersion.version && (
@@ -333,7 +335,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
 
         {/* Runner Configuration Section */}
         {user && isDownloaded && (
-          <section id="runner-config-section" className={styles.settingsSection}>
+          <section id="runner-config-section" className={styles.settingsSection} data-testid="settings-section">
             <h3>Runner Configuration</h3>
 
             {onOpenTargets && (
@@ -429,20 +431,47 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
           </section>
         )}
 
-        {/* User Filter Section */}
+        {/* Job Security Section */}
         {user && isConfigured && (
-          <section className={styles.settingsSection}>
-            <h3>Job Filtering</h3>
-            <UserFilterSettings
-              userFilter={userFilter}
-              currentUserLogin={user.login}
-              onFilterChange={setUserFilter}
-            />
+          <section className={styles.settingsSection} data-testid="settings-section">
+            <h3>Job Security</h3>
+
+            {/* Sandbox Policy Subsection */}
+            <div className={styles.subsection}>
+              <h4>Sandbox Policy</h4>
+              <div className={shared.formGroup}>
+                <label>Policy level</label>
+                <div className={styles.buttonGroup}>
+                  {(['strict', 'moderate', 'permissive'] as const).map((level) => (
+                    <button
+                      key={level}
+                      className={`${styles.optionButton} ${sandboxPolicyLevel === level ? styles.active : ''}`}
+                      onClick={() => setSandboxPolicyLevel(level)}
+                    >
+                      {SANDBOX_POLICY_LEVEL_DESCRIPTIONS[level].label}
+                    </button>
+                  ))}
+                </div>
+                <p className={shared.formHint}>
+                  {SANDBOX_POLICY_LEVEL_DESCRIPTIONS[sandboxPolicyLevel].description}
+                </p>
+              </div>
+            </div>
+
+            {/* User Filtering Subsection */}
+            <div className={styles.subsection}>
+              <h4>User Filtering</h4>
+              <UserFilterSettings
+                userFilter={userFilter}
+                currentUserLogin={user.login}
+                onFilterChange={setUserFilter}
+              />
+            </div>
           </section>
         )}
 
         {/* Power Section */}
-        <section id="power-section" className={styles.settingsSection}>
+        <section id="power-section" className={styles.settingsSection} data-testid="settings-section">
           <h3>Power</h3>
           <div className={shared.formGroup}>
             <label>Prevent sleep</label>
@@ -490,7 +519,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
         </section>
 
         {/* Notifications Section */}
-        <section className={styles.settingsSection}>
+        <section className={styles.settingsSection} data-testid="settings-section">
           <h3>Notifications</h3>
           <div className={shared.formGroup}>
             <label className={shared.toggleRow}>
@@ -566,7 +595,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
         )}
 
         {/* History Section */}
-        <section className={styles.settingsSection}>
+        <section className={styles.settingsSection} data-testid="settings-section">
           <h3>History</h3>
           <div className={shared.formGroup}>
             <label>Max recent jobs</label>
@@ -622,7 +651,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
         </section>
 
         {/* Appearance Section */}
-        <section className={styles.settingsSection}>
+        <section className={styles.settingsSection} data-testid="settings-section">
           <h3>Appearance</h3>
           <div className={styles.themeSelector}>
             <button
@@ -650,7 +679,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
         </section>
 
         {/* Updates Section */}
-        <section className={styles.settingsSection}>
+        <section className={styles.settingsSection} data-testid="settings-section">
           <div className={styles.sectionHeaderRow}>
             <h3>Updates</h3>
             <span className={styles.versionLink}>v{updateStatus.currentVersion}</span>
@@ -692,7 +721,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
         </section>
 
         {/* About Section */}
-        <section className={styles.settingsSection}>
+        <section className={styles.settingsSection} data-testid="settings-section">
           <h3>About</h3>
           <div className={styles.aboutLinks}>
             <a

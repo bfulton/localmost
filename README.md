@@ -215,14 +215,17 @@ npm run make
 Current release: **0.3.0 — Test Locally, Secure by Default**
 - Run workflows locally before pushing with `localmost test`
 - Declarative sandbox policies with `.localmostrc`
+- Sandbox policy levels (strict / moderate / permissive) enforced by the local proxy
 - Contributor-based job filtering for public repos
 - Secure secrets management in macOS Keychain
 - Environment comparison with GitHub runners
 
 Future feature ideas:
 
-- **Block untrusted jobs before they start** - Contributor filtering currently cancels a disallowed workflow run through the GitHub API *after* the runner has begun executing it, so untrusted steps run briefly before cancellation lands. Hold the job at pickup until the check passes.
-- **Wire up the policy cache** - `src/main/policy-cache.ts` implements caching, diffing, and an approval flow for `.localmostrc` changes, but nothing imports it yet. The background runner does not read repo policy at all.
+- **Fail a blocked job visibly** - a job refused by the filter is cancelled through the GitHub API before any worker starts, so it appears as cancelled rather than failing with a message explaining why.
+- **Approve policy changes before they take effect** - the runner now reads a repository's `.localmostrc` network allowlist at job time, but `src/main/policy-cache.ts` - which caches a repo's policy, diffs it, and asks for approval when it changes - is still unimported. Until it is wired up, a repository can widen its own allowlist without the machine's owner being asked.
+- **Make the minimum policy easy to learn** - `strict` denies everything not declared, which means a bare policy cannot even exec `/bin/bash`. Discovery should produce a runnable starting policy in one step: report the minimum a workflow needs, distinguish that baseline from workflow-specific access, and explain a denial when a step dies rather than leaving a bare SIGABRT.
+- **Roll discovery output up further** - `--updaterc` now drops paths already covered by a listed ancestor, which removes the bulk of the redundancy. It still records content-addressed cache paths (npm's `_cacache/content-v2/sha512/...`) verbatim, which differ per machine and per dependency change; those want rolling up to their cache directory.
 - **Quick actions** - Re-run failed job, cancel all jobs.
 - **Spotlight integration** - Check status or pause builds from Spotlight.
 - **Artifact inspector** - Browse uploaded artifacts without leaving the app.

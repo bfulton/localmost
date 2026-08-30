@@ -10,7 +10,8 @@ import * as path from 'path';
 import * as os from 'os';
 import { spawn, SpawnOptions } from 'child_process';
 import { WorkflowStep, WorkflowJob, MatrixCombination } from './workflow-parser';
-import { SandboxPolicy, generateSandboxProfile } from './sandbox-profile';
+import { SandboxPolicy, generateSandboxProfile, generateDiscoveryProfile } from './sandbox-profile';
+import { PidTreeWatcher } from './pid-tree-watch';
 import { parseActionRef, fetchAction, isInterceptedAction, readActionMetadata } from './action-fetcher';
 import { getGitInfo } from './workspace';
 
@@ -32,6 +33,8 @@ export interface StepResult {
 export interface ExecutionContext {
   /** Working directory (GITHUB_WORKSPACE) */
   workDir: string;
+  /** Port of the proxy server for network isolation */
+  proxyPort: number;
   /** Workflow-level environment variables */
   workflowEnv: Record<string, string>;
   /** Job-level environment variables */
@@ -50,6 +53,10 @@ export interface ExecutionContext {
   policy?: SandboxPolicy;
   /** Whether running in permissive/discovery mode */
   permissive?: boolean;
+  /** Log file for sandbox trace output (for discovery mode) */
+  sandboxLogFile?: string;
+  /** Collected PIDs from sandbox processes (for discovery mode log filtering) */
+  collectedPids?: Set<number>;
   /** Callback for step output */
   onOutput?: (line: string, stream: 'stdout' | 'stderr') => void;
   /** Callback for step status changes */
@@ -343,13 +350,16 @@ async function executeRunStep(
   fs.writeFileSync(scriptFile, script, { mode: 0o755 });
 
   try {
-    const exitCode = await runInSandbox(
+    const result = await runInSandbox(
       shell,
       [scriptFile],
       {
         cwd: workingDir,
         env,
+        proxyPort: ctx.proxyPort,
         onOutput: ctx.onOutput,
+        sandboxLogFile: ctx.sandboxLogFile,
+        collectedPids: ctx.collectedPids,
       },
       ctx.policy,
       ctx.permissive
@@ -363,10 +373,11 @@ async function executeRunStep(
 
     return {
       name: stepName,
-      status: exitCode === 0 ? 'success' : 'failure',
-      exitCode,
+      status: result.exitCode === 0 ? 'success' : 'failure',
+      exitCode: result.exitCode,
       duration: 0,
       outputs,
+      error: result.exitCode !== 0 && result.stderr ? result.stderr : undefined,
     };
   } finally {
     // Ensure cleanup
@@ -476,13 +487,16 @@ async function executeActionFromPath(
     }
 
     const mainPath = path.join(actionPath, main);
-    const exitCode = await runInSandbox(
+    const result = await runInSandbox(
       'node',
       [mainPath],
       {
         cwd: actionPath,
         env,
+        proxyPort: ctx.proxyPort,
         onOutput: ctx.onOutput,
+        sandboxLogFile: ctx.sandboxLogFile,
+        collectedPids: ctx.collectedPids,
       },
       ctx.policy,
       ctx.permissive
@@ -492,10 +506,11 @@ async function executeActionFromPath(
 
     return {
       name: stepName,
-      status: exitCode === 0 ? 'success' : 'failure',
-      exitCode,
+      status: result.exitCode === 0 ? 'success' : 'failure',
+      exitCode: result.exitCode,
       duration: 0,
       outputs,
+      error: result.exitCode !== 0 && result.stderr ? result.stderr : undefined,
     };
   }
 
@@ -948,6 +963,11 @@ function executeDownloadArtifactIntercept(
 // Sandbox Execution
 // =============================================================================
 
+interface SandboxResult {
+  exitCode: number;
+  stderr: string;
+}
+
 /**
  * Run a command in the sandbox.
  */
@@ -957,26 +977,61 @@ async function runInSandbox(
   options: {
     cwd: string;
     env: Record<string, string>;
+    proxyPort: number;
     onOutput?: (line: string, stream: 'stdout' | 'stderr') => void;
+    sandboxLogFile?: string;
+    collectedPids?: Set<number>;
   },
   policy?: SandboxPolicy,
   permissive?: boolean
-): Promise<number> {
+): Promise<SandboxResult> {
   return new Promise((resolve, reject) => {
     let spawnArgs: string[];
     let spawnCommand: string;
 
-    if (process.platform === 'darwin' && policy) {
-      // Generate sandbox profile
-      const profile = generateSandboxProfile({
-        workDir: options.cwd,
-        policy,
-        permissive,
-      });
+    if (process.platform === 'darwin') {
+      let profile: string;
+
+      const isDiscovery = !!permissive && !!options.sandboxLogFile;
+      if (isDiscovery) {
+        // Discovery mode: use special profile that logs all access
+        profile = generateDiscoveryProfile({
+          workDir: options.cwd,
+          proxyPort: options.proxyPort,
+          logFile: options.sandboxLogFile ?? '',
+        });
+      } else {
+        // Strict mode: no policy provided and not permissive
+        // In strict mode, we block access to user caches (~/.npm, etc.)
+        const strictMode = !policy && !permissive;
+
+        // Enforcement mode: apply sandbox with policy restrictions
+        profile = generateSandboxProfile({
+          workDir: options.cwd,
+          proxyPort: options.proxyPort,
+          policy: policy || {},  // Empty policy = no network allowlist
+          permissive: false,
+          strictMode,
+          logFile: options.sandboxLogFile,
+        });
+      }
 
       // Write profile to temp file
       const profilePath = path.join(os.tmpdir(), `localmost-sandbox-${Date.now()}.sb`);
       fs.writeFileSync(profilePath, profile);
+
+      // Save a copy for inspection, but only when discovering: a normal run
+      // should not write into the workspace, which may be the user's checkout
+      // or an action's own directory. Keyed off discovery mode, not
+      // sandboxLogFile - the CLI sets that on every run, discovery or not.
+      if (isDiscovery) {
+        const debugProfilePath = path.join(options.cwd, '.debug', 'sandbox-profile.sb');
+        const debugDir = path.dirname(debugProfilePath);
+        if (!fs.existsSync(debugDir)) {
+          fs.mkdirSync(debugDir, { recursive: true });
+        }
+        fs.writeFileSync(debugProfilePath, profile);
+      }
 
       spawnCommand = '/usr/bin/sandbox-exec';
       spawnArgs = ['-f', profilePath, command, ...args];
@@ -993,6 +1048,15 @@ async function runInSandbox(
     };
 
     const proc = spawn(spawnCommand, spawnArgs, spawnOptions);
+    const stderrLines: string[] = [];
+
+    // Track process tree using kqueue-based PidTreeWatcher for discovery mode
+    let pidWatcher: PidTreeWatcher | undefined;
+    if (options.collectedPids && proc.pid) {
+      options.collectedPids.add(proc.pid);
+      pidWatcher = new PidTreeWatcher();
+      pidWatcher.start(proc.pid);
+    }
 
     proc.stdout?.on('data', (data: Buffer) => {
       const lines = data.toString().split('\n');
@@ -1007,16 +1071,30 @@ async function runInSandbox(
       const lines = data.toString().split('\n');
       for (const line of lines) {
         if (line) {
+          stderrLines.push(line);
           options.onOutput?.(line, 'stderr');
         }
       }
     });
 
     proc.on('close', (code) => {
-      resolve(code ?? 1);
+      // Stop PID watcher and collect all PIDs
+      if (pidWatcher && options.collectedPids) {
+        const watchedPids = pidWatcher.stop();
+        for (const pid of watchedPids) {
+          options.collectedPids.add(pid);
+        }
+      }
+
+      // Keep last 10 lines of stderr for error reporting
+      const stderr = stderrLines.slice(-10).join('\n');
+      resolve({ exitCode: code ?? 1, stderr });
     });
 
     proc.on('error', (err) => {
+      if (pidWatcher) {
+        pidWatcher.stop();
+      }
       reject(err);
     });
   });

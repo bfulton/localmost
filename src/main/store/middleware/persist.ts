@@ -36,6 +36,7 @@ const PERSISTED_CONFIG_KEYS: (keyof ConfigSlice)[] = [
   'preserveWorkDir',
   'toolCacheLocation',
   'userFilter',
+  'sandboxPolicyLevel',
   'power',
   'notifications',
   'launchAtLogin',
@@ -138,6 +139,11 @@ export function loadPersistedConfig(): void {
         configUpdates.userFilter = { scope, allowedUsers, allowlist };
         bootLog('info', `Migrated userFilter from mode='${filter.mode}' to scope='${scope}', allowedUsers='${allowedUsers}'`);
       }
+    }
+
+    // Sandbox policy level
+    if (diskConfig.sandboxPolicyLevel && ['strict', 'moderate', 'permissive'].includes(diskConfig.sandboxPolicyLevel)) {
+      configUpdates.sandboxPolicyLevel = diskConfig.sandboxPolicyLevel;
     }
 
     // Power settings

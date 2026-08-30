@@ -39,9 +39,9 @@ interface StatusItemProps {
 }
 
 const StatusItem: React.FC<StatusItemProps> = ({ label, status, statusType, detail, spinning, link, rightDetail, onRightDetailClick }) => (
-  <div className={styles.statusItem}>
+  <div className={styles.statusItem} data-testid="status-item">
     <div className={styles.statusItemHeader}>
-      <span className={styles.statusItemLabel}>{label}</span>
+      <span className={styles.statusItemLabel} data-testid="status-item-label">{label}</span>
       <div className={styles.statusItemIndicator}>
         <div
           className={spinning ? styles.statusItemDotSpinning : styles.statusItemDot}
@@ -120,9 +120,9 @@ const RunnerStatusItem: React.FC<RunnerStatusItemProps> = ({
   const targetsDisplay = getTargetsDisplay();
 
   return (
-  <div className={styles.statusItemExpandable}>
+  <div className={styles.statusItemExpandable} data-testid="status-item">
     <div className={styles.statusItemHeader}>
-      <span className={styles.statusItemLabel}>Runner</span>
+      <span className={styles.statusItemLabel} data-testid="status-item-label">Runner</span>
       <div className={styles.statusItemRight}>
         <div className={styles.statusItemIndicator}>
           <div className={styles.statusItemDot} data-status={statusType} />
@@ -290,9 +290,9 @@ const JobStatusItem: React.FC<JobStatusItemProps> = ({
   };
 
   return (
-    <div className={styles.statusItemExpandable}>
+    <div className={styles.statusItemExpandable} data-testid="status-item">
       <div className={styles.statusItemHeader}>
-        <span className={styles.statusItemLabel}>
+        <span className={styles.statusItemLabel} data-testid="status-item-label">
           Job {jobHistory.length > 0 && <span className={styles.jobCount}>({jobHistory.length >= maxJobHistory ? `>${maxJobHistory}` : jobHistory.length})</span>}
         </span>
         <div className={styles.statusItemRight}>
@@ -716,7 +716,7 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
   };
 
   return (
-    <div className={styles.statusPage}>
+    <div className={styles.statusPage} data-testid="status-page">
       <div className={shared.pageHeader}>
         <h2>Status</h2>
         <button className={shared.btnIcon} onClick={() => onOpenSettings()} title="Settings">
@@ -724,7 +724,7 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
         </button>
       </div>
 
-      <div className={styles.statusContent}>
+      <div className={styles.statusContent} data-testid="page-content">
         <div className={styles.statusItems}>
         <StatusItem
           label="GitHub"
@@ -764,7 +764,7 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
       </div>
 
       <div className={logsExpanded ? styles.logsPanelExpanded : styles.logsPanelCollapsed}>
-        <div className={styles.logsHeader} onClick={() => !logsExpanded && setLogsExpanded(true)}>
+        <div className={styles.logsHeader} data-testid="logs-header" onClick={() => !logsExpanded && setLogsExpanded(true)}>
           <h3>Logs {!logsExpanded && logs.length > 0 && <span className={styles.logCount}>({logs.length >= maxLogScrollback ? `>${maxLogScrollback}` : logs.length})</span>}</h3>
           <div className={shared.flexGap4}>
             {logsExpanded && (
@@ -839,7 +839,7 @@ const StatusPage: React.FC<StatusPageProps> = ({ onOpenSettings }) => {
                 </button>
               )}
             </div>
-            <div className={styles.logsContent} ref={logsContentRef}>
+            <div className={styles.logsContent} ref={logsContentRef} data-testid="logs-content">
               {logs.length === 0 ? (
                 <div className={styles.logsEmpty}>No logs yet</div>
               ) : (

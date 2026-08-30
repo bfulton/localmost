@@ -535,6 +535,21 @@ export function parseReusableWorkflow(filePath: string): ReusableWorkflow {
  * Resolve the file path for a reusable workflow reference.
  * Handles local references like "./.github/workflows/check.yaml".
  */
+/**
+ * Resolve symlinks where possible, falling back to the given path.
+ *
+ * A path that does not exist yet cannot be a symlink escape, so returning it
+ * unchanged is safe and lets the caller report a missing file normally.
+ */
+function realPathOrSelf(p: string): string {
+  try {
+    const real = fs.realpathSync(p);
+    return typeof real === 'string' ? real : p;
+  } catch {
+    return p;
+  }
+}
+
 export function resolveReusableWorkflowPath(
   uses: string,
   callerWorkflowPath: string
@@ -542,7 +557,20 @@ export function resolveReusableWorkflowPath(
   // Local workflow reference: ./.github/workflows/workflow.yaml
   if (uses.startsWith('./')) {
     const repoRoot = path.dirname(path.dirname(path.dirname(callerWorkflowPath)));
-    return path.join(repoRoot, uses.slice(2));
+    const resolved = path.resolve(repoRoot, uses.slice(2));
+
+    // `uses:` is repository content. Without this check a value like
+    // ./../../etc/passwd escapes the repository and makes `localmost test`
+    // read arbitrary local files.
+    //
+    // Compare real paths: a lexical check alone is satisfied by a symlink
+    // inside the repository that points outside it.
+    const realRoot = realPathOrSelf(path.resolve(repoRoot));
+    const realResolved = realPathOrSelf(resolved);
+    if (realResolved !== realRoot && !realResolved.startsWith(`${realRoot}${path.sep}`)) {
+      return null;
+    }
+    return resolved;
   }
 
   // Remote workflow reference: owner/repo/.github/workflows/workflow.yaml@ref

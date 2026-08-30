@@ -688,6 +688,43 @@ export class GitHubAuth {
   }
 
   /**
+   * Read a file from a repository at a given ref.
+   *
+   * Returns null when the file does not exist, which is the common case: most
+   * repositories have no .localmostrc. Other failures throw, so a policy that
+   * exists but cannot be read is never silently treated as absent.
+   */
+  async getFileContent(
+    accessToken: string,
+    owner: string,
+    repo: string,
+    filePath: string,
+    ref: string
+  ): Promise<string | null> {
+    const client = new GitHubClient(accessToken);
+
+    try {
+      const data = await client.get<{ content?: string; encoding?: string }>(
+        `/repos/${owner}/${repo}/contents/${filePath}`,
+        { params: { ref } }
+      );
+
+      if (!data.content) {
+        return null;
+      }
+      if (data.encoding && data.encoding !== 'base64') {
+        throw new Error(`Unexpected encoding '${data.encoding}' for ${filePath}`);
+      }
+      return Buffer.from(data.content, 'base64').toString('utf-8');
+    } catch (error) {
+      if ((error as { status?: number }).status === 404) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Get default branch info for a repository.
    * Returns the branch name and current HEAD SHA.
    */

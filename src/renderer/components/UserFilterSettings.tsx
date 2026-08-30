@@ -176,7 +176,7 @@ const UserFilterSettings: React.FC<UserFilterSettingsProps> = ({
             className={userFilter.scope === 'contributors' ? styles.modeOptionActive : styles.modeOption}
             onClick={() => handleScopeChange('contributors')}
           >
-            All contributors
+            Repo contributors
           </button>
         </div>
         <p className={shared.formHint}>{getScopeHint()}</p>

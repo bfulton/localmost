@@ -18,6 +18,7 @@ import {
   SleepProtection,
   ToolCacheLocation,
   UserFilterConfig,
+  SandboxPolicyLevel,
   PowerConfig,
   NotificationsConfig,
   GitHubUser,
@@ -92,6 +93,10 @@ export const store = createStore<AppStore>()(
 
     setUserFilter: (userFilter: UserFilterConfig) => {
       set((state) => ({ config: { ...state.config, userFilter } }));
+    },
+
+    setSandboxPolicyLevel: (sandboxPolicyLevel: SandboxPolicyLevel) => {
+      set((state) => ({ config: { ...state.config, sandboxPolicyLevel } }));
     },
 
     setPower: (power: PowerConfig) => {

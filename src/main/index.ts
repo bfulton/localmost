@@ -4,6 +4,7 @@
  */
 
 import { app, BrowserWindow, Notification } from 'electron';
+import * as nodePath from 'path';
 import { RunnerManager, JobEvent } from './runner-manager';
 import { GitHubAuth } from './github-auth';
 import { RunnerDownloader } from './runner-downloader';
@@ -99,6 +100,7 @@ import {
 
 // Zustand store
 import { initStore, connectWindow, cleanupStore, store } from './store/init';
+import { parseLocalmostrcContent, getEffectivePolicy } from '../shared/localmostrc';
 
 // ============================================================================
 // App Initialization
@@ -113,6 +115,15 @@ installSecurityHandlers();
 // ============================================================================
 // Single Instance Lock
 // ============================================================================
+
+// Electron keys the single-instance lock - and its caches - on userData, which
+// LOCALMOST_CONFIG_DIR does not affect. Without redirecting it, a test run on a
+// machine with localmost already open loses the lock and quits during startup.
+// Point userData inside the test config directory so a test instance is fully
+// isolated from an installed app.
+if (process.env.LOCALMOST_CONFIG_DIR) {
+  app.setPath('userData', nodePath.join(process.env.LOCALMOST_CONFIG_DIR, 'electron-user-data'));
+}
 
 const gotTheLock = app.requestSingleInstanceLock();
 
@@ -242,6 +253,27 @@ app.whenReady().then(async () => {
       }
       return contributorCache.getAllAuthors(accessToken, owner, repo, sha);
     },
+    getRepoPolicyHosts: async (owner: string, repo: string, sha: string, workflowName: string) => {
+      const accessToken = await getValidAccessToken();
+      if (!accessToken) {
+        throw new Error('Not authenticated');
+      }
+      const auth = getGitHubAuth() || new GitHubAuth();
+      const content = await auth.getFileContent(accessToken, owner, repo, '.localmostrc', sha);
+      if (!content) {
+        return [];
+      }
+
+      const parsed = parseLocalmostrcContent(content);
+      if (!parsed.success || !parsed.config) {
+        const detail = parsed.errors?.map(e => e.message).join('; ') || 'unknown error';
+        logger?.warn(`[Policy] ${owner}/${repo} .localmostrc could not be parsed: ${detail}`);
+        return [];
+      }
+
+      const policy = getEffectivePolicy(parsed.config, workflowName);
+      return policy.network?.allow || [];
+    },
     onJobEvent: (event: JobEvent) => {
       logger?.info(`Job event: ${event.type} ${event.jobName}`);
 
@@ -340,6 +372,26 @@ app.whenReady().then(async () => {
         actionsUrl = `https://github.com/${githubInfo.githubRepo}/actions/runs/${githubInfo.githubRunId}/job/${githubInfo.githubJobId}`;
         getLogger()?.info(`Constructed actions URL: ${actionsUrl}`);
       }
+      // Decide whether this job may run before any worker exists. Cancelling
+      // after a worker has started leaves untrusted steps executing for as long
+      // as the check takes.
+      const [owner, repo] = (githubInfo.githubRepo || target.displayName).split('/');
+      if (owner && repo && githubInfo.githubActor) {
+        const verdict = await runnerManager.evaluateJobFilter(
+          owner,
+          repo,
+          githubInfo.githubActor,
+          githubInfo.githubSha
+        );
+        if (!verdict.allowed) {
+          getLogger()?.warn(`Job ${jobId} not allowed: ${verdict.reason}. Not starting a worker.`);
+          if (githubInfo.githubRunId) {
+            await runnerManager.cancelRun(owner, repo, githubInfo.githubRunId, verdict.reason);
+          }
+          return;
+        }
+      }
+
       runnerManager.setPendingTargetContext('next', targetId, target.displayName, actionsUrl, githubInfo.githubRunId, githubInfo.githubJobId, githubInfo.githubActor, githubInfo.githubSha, githubInfo.githubRef);
 
       // Spawn a worker to handle this job

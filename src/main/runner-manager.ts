@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as yaml from 'js-yaml';
-import { RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig } from '../shared/types';
+import { RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
 import { spawnSandboxed } from './process-sandbox';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
@@ -11,6 +11,7 @@ import { RunnerDownloader } from './runner-downloader';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
 import { loadConfig } from './config';
 import { normalizeFilterConfig, isUserAllowed, areAllUsersAllowed, parseRepository } from './runner/user-filter';
+import { getState } from './store';
 
 /**
  * Get the hostname without .local suffix (common on macOS).
@@ -70,6 +71,8 @@ interface RunnerManagerOptions {
   getJobConclusion?: (owner: string, repo: string, jobId: number) => Promise<string | null>;
   /** Get all contributors/authors for a repo at a given commit SHA (for contributor filtering) */
   getAllContributors?: (owner: string, repo: string, sha: string) => Promise<Set<string>>;
+  /** Hosts a repository's .localmostrc allows, for the job about to run. */
+  getRepoPolicyHosts?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<string[]>;
   /** Called when a job starts or completes (for notifications) */
   onJobEvent?: (event: JobEvent) => void;
 }
@@ -91,6 +94,7 @@ export class RunnerManager {
   private cancelWorkflowRun?: (owner: string, repo: string, runId: number) => Promise<void>;
   private getJobConclusion?: (owner: string, repo: string, jobId: number) => Promise<string | null>;
   private getAllContributors?: (owner: string, repo: string, sha: string) => Promise<Set<string>>;
+  private getRepoPolicyHosts?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<string[]>;
   private onJobEvent?: (event: JobEvent) => void;
   private jobHistory: JobHistoryEntry[] = [];
   private jobIdCounter = 0;
@@ -118,7 +122,16 @@ export class RunnerManager {
   private toolCacheLocation: 'persistent' | 'per-sandbox' = 'persistent';
 
   // Track instances currently being started/rebuilt to prevent concurrent operations
+  /** How long to wait for a worker slot before giving up on an acquired job. */
+  private static readonly SLOT_WAIT_MS = 60_000;
+
   private startingInstances: Set<number> = new Set();
+  /**
+   * Slots claimed for a job that has been acquired from GitHub but whose worker
+   * has not started yet. Separate from startingInstances, which startInstance
+   * uses as its own re-entry guard.
+   */
+  private reservedSlots: Set<number> = new Set();
 
   // Path to job history file
   private readonly jobHistoryPath: string;
@@ -159,6 +172,7 @@ export class RunnerManager {
     this.cancelWorkflowRun = options.cancelWorkflowRun;
     this.getJobConclusion = options.getJobConclusion;
     this.getAllContributors = options.getAllContributors;
+    this.getRepoPolicyHosts = options.getRepoPolicyHosts;
     this.onJobEvent = options.onJobEvent;
 
     this.downloader = new RunnerDownloader();
@@ -590,20 +604,44 @@ export class RunnerManager {
    * Spawn a worker to handle a job received by the broker proxy.
    * Finds an available instance slot and starts a worker there.
    */
-  async spawnWorkerForJob(): Promise<void> {
-    // Find an available instance slot
-    let instanceNum: number | null = null;
-
+  /**
+   * Claim a worker slot, synchronously, for a job that is about to start.
+   *
+   * The claim has to happen in one step. The broker checks capacity, then
+   * acquires the job from GitHub - a network round trip - before a worker
+   * exists, so two jobs arriving together would otherwise pick the same slot
+   * and one of them would be acquired upstream and never run.
+   */
+  private reserveSlot(): number | null {
     for (let i = 1; i <= this.runnerCount; i++) {
+      if (this.reservedSlots.has(i) || this.startingInstances.has(i)) continue;
       const instance = this.instances.get(i);
       if (!instance || instance.status === 'offline' || instance.status === 'error') {
-        instanceNum = i;
-        break;
+        this.reservedSlots.add(i);
+        return i;
       }
+    }
+    return null;
+  }
+
+  private releaseSlotReservation(instanceNum: number): void {
+    this.reservedSlots.delete(instanceNum);
+  }
+
+  async spawnWorkerForJob(): Promise<void> {
+    // Wait briefly for a slot rather than dropping the job. By this point the
+    // broker has already acquired it from GitHub, so returning without running
+    // it leaves GitHub waiting on a runner that never reports - the job then
+    // fails after its timeout with no steps recorded.
+    let instanceNum = this.reserveSlot();
+    const waitUntil = Date.now() + RunnerManager.SLOT_WAIT_MS;
+    while (instanceNum === null && Date.now() < waitUntil) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      instanceNum = this.reserveSlot();
     }
 
     if (instanceNum === null) {
-      this.log('warn', 'No available worker slots, job may need to wait');
+      this.log('error', 'No worker slot became available; this job will not run');
       return;
     }
 
@@ -611,6 +649,7 @@ export class RunnerManager {
     const targetContext = this.pendingTargetContext.get('next');
     if (!targetContext) {
       this.log('error', 'No target context for spawned worker');
+      this.releaseSlotReservation(instanceNum);
       return;
     }
 
@@ -627,32 +666,44 @@ export class RunnerManager {
         );
       } catch (err) {
         this.log('error', `Failed to copy proxy credentials: ${(err as Error).message}`);
+        this.releaseSlotReservation(instanceNum);
         return;
       }
     } else {
       this.log('error', `Proxy credentials not found for target ${targetContext.targetId}`);
+      this.releaseSlotReservation(instanceNum);
       return;
     }
 
     // Configure and start the instance
     // The instance will connect to broker proxy and pick up the queued job
-    await this.startInstance(instanceNum);
+    try {
+      await this.startInstance(instanceNum);
+    } finally {
+      // startInstance has taken over the slot (or failed); either way the
+      // reservation has served its purpose.
+      this.releaseSlotReservation(instanceNum);
+    }
   }
 
   private async startInstanceProxy(instanceNum: number): Promise<ProxyServer> {
+    const policyLevel = getState().config.sandboxPolicyLevel || 'strict';
+
     const proxy = new ProxyServer({
+      policyLevel,
       onLog: (entry: ProxyLogEntry) => {
         // Skip logging routine localhost message polling (very noisy)
         if (!entry.blocked && (entry.host === 'localhost' || entry.host === '127.0.0.1')) {
           return;
         }
         const status = entry.blocked ? 'BLOCKED' : 'ALLOWED';
-        this.log('info', `[proxy ${instanceNum}] ${status} ${entry.method} ${entry.host}:${entry.port}${entry.path || ''}`);
+        const reasonSuffix = entry.reason ? ` (${entry.reason})` : '';
+        this.log('info', `[proxy ${instanceNum}] ${status} ${entry.method} ${entry.host}:${entry.port}${entry.path || ''}${reasonSuffix}`);
       },
     });
 
     const port = await proxy.start();
-    this.log('debug', `Proxy server for instance ${instanceNum} started on port ${port}`);
+    this.log('debug', `Proxy server for instance ${instanceNum} started on port ${port} with ${policyLevel} policy`);
     this.proxyServers.set(instanceNum, proxy);
     return proxy;
   }
@@ -1178,6 +1229,11 @@ export class RunnerManager {
         this.log('debug', `User filter check failed: ${(err as Error).message}`);
       });
 
+      // Apply the repository's own network policy to this instance's proxy
+      this.applyRepoPolicy(instanceNum).catch((err) => {
+        this.log('debug', `Repo policy load failed: ${(err as Error).message}`);
+      });
+
       // Scale up if all runners are busy
       const idleCount = this.countIdleRunners();
       if (idleCount === 0 && this.instances.size < this.runnerCount) {
@@ -1254,9 +1310,73 @@ export class RunnerManager {
         runTimeSeconds,
       });
 
+      // Log sandbox policy summary for the completed job
+      this.logSandboxSummary(instanceNum, jobName);
+
       instance.status = 'listening';
       this.updateAggregateStatus();
     }
+  }
+
+  /**
+   * Load the repository's .localmostrc and apply its network allowlist to the
+   * proxy serving this instance.
+   *
+   * Without this the proxy only ever knows the built-in allowlists, so a repo
+   * cannot declare the hosts its own build needs and `strict` is unusable for
+   * anything beyond runner infrastructure.
+   */
+  private async applyRepoPolicy(instanceNum: number): Promise<void> {
+    const instance = this.instances.get(instanceNum);
+    const proxy = this.proxyServers.get(instanceNum);
+    if (!proxy) return;
+
+    // Clear first. Proxies outlive a single job, so returning early below would
+    // otherwise leave the previous job's .localmostrc hosts installed and grant
+    // them to a different repository.
+    proxy.setPolicyAllowedHosts([]);
+
+    if (!instance?.currentJob || !this.getRepoPolicyHosts) return;
+
+    const { targetDisplayName, githubSha, name: jobName } = instance.currentJob;
+    if (!targetDisplayName || !githubSha) return;
+
+    const repoInfo = parseRepository(targetDisplayName);
+    if (!repoInfo) return;
+
+    const hosts = await this.getRepoPolicyHosts(repoInfo.owner, repoInfo.repo, githubSha, jobName);
+    proxy.setPolicyAllowedHosts(hosts);
+    if (hosts.length > 0) {
+      this.log('info', `[instance ${instanceNum}] Applied ${hosts.length} host(s) from ${targetDisplayName} .localmostrc`);
+    }
+  }
+
+  /**
+   * Log a summary of sandbox policy enforcement for a completed job.
+   */
+  private logSandboxSummary(instanceNum: number, jobName: string): void {
+    const proxy = this.proxyServers.get(instanceNum);
+    if (!proxy) return;
+
+    const stats = proxy.getStats();
+    const policyLevel = proxy.getPolicyLevel();
+    const policyLabel = SANDBOX_POLICY_LEVEL_DESCRIPTIONS[policyLevel]?.label || policyLevel;
+
+    this.log('info', `[instance ${instanceNum}] Sandbox summary for '${jobName}' (${policyLabel} policy):`);
+    this.log('info', `[instance ${instanceNum}]   Network: ${stats.allowedCount} allowed, ${stats.blockedCount} blocked`);
+
+    if (stats.blockedHosts.size > 0) {
+      const blockedList = Array.from(stats.blockedHosts).slice(0, 10).join(', ');
+      const moreCount = stats.blockedHosts.size > 10 ? ` (+${stats.blockedHosts.size - 10} more)` : '';
+      this.log('warn', `[instance ${instanceNum}]   Blocked hosts: ${blockedList}${moreCount}`);
+
+      if (policyLevel === 'strict') {
+        this.log('info', `[instance ${instanceNum}]   To allow these hosts, add them to your .localmostrc file, or change sandbox policy level in Settings > Job Security.`);
+      }
+    }
+
+    // Reset stats for next job
+    proxy.resetStats();
   }
 
   /**
@@ -1268,13 +1388,78 @@ export class RunnerManager {
   }
 
   /**
-   * Check if a job should be allowed based on user filter.
-   * If not allowed, attempts to cancel the workflow run.
+   * Decide whether a job may run, without reference to any runner instance.
+   *
+   * Exposed so the decision can be made before a worker is spawned. Cancelling
+   * after the fact leaves untrusted steps running for as long as the check takes.
    *
    * Supports three scopes:
    * - 'everyone': No filtering, all jobs allowed
    * - 'trigger': Check the workflow trigger author only
    * - 'contributors': Check all repository contributors/commit authors
+   */
+  async evaluateJobFilter(
+    owner: string,
+    repo: string,
+    githubActor: string,
+    githubSha?: string
+  ): Promise<{ allowed: boolean; reason: string }> {
+    const userFilter = this.getUserFilter?.();
+    const { scope } = normalizeFilterConfig(userFilter);
+    const currentUser = this.getCurrentUserLogin?.();
+
+    if (scope === 'everyone') {
+      return { allowed: true, reason: '' };
+    }
+
+    if (scope === 'trigger') {
+      if (!isUserAllowed(githubActor, userFilter, currentUser)) {
+        return { allowed: false, reason: `trigger author '${githubActor}' not in allowed users` };
+      }
+      return { allowed: true, reason: '' };
+    }
+
+    // 'contributors' was chosen precisely because the trigger author alone is
+    // not sufficient, so a check that cannot be performed fails closed.
+    if (!githubSha) {
+      return { allowed: false, reason: 'cannot verify contributors: no commit SHA for this job' };
+    }
+    if (!this.getAllContributors) {
+      return { allowed: false, reason: 'cannot verify contributors: contributor lookup unavailable' };
+    }
+
+    try {
+      const contributors = await this.getAllContributors(owner, repo, githubSha);
+      const result = areAllUsersAllowed(contributors, userFilter, currentUser);
+      if (!result.allowed) {
+        const list = result.disallowedUsers.slice(0, 3).join(', ');
+        const more = result.disallowedUsers.length > 3 ? ` and ${result.disallowedUsers.length - 3} more` : '';
+        return { allowed: false, reason: `repo has disallowed contributors: ${list}${more}` };
+      }
+      return { allowed: true, reason: '' };
+    } catch (err) {
+      return { allowed: false, reason: `contributor check failed: ${(err as Error).message}` };
+    }
+  }
+
+  /**
+   * Cancel a workflow run that must not proceed.
+   */
+  async cancelRun(owner: string, repo: string, githubRunId: number, reason: string): Promise<void> {
+    if (!this.cancelWorkflowRun) {
+      this.log('warn', 'Cannot cancel: cancelWorkflowRun not available');
+      return;
+    }
+    try {
+      await this.cancelWorkflowRun(owner, repo, githubRunId);
+      this.log('info', `Cancelled workflow run ${githubRunId}: ${reason}`);
+    } catch (cancelErr) {
+      this.log('warn', `Failed to cancel workflow run ${githubRunId}: ${(cancelErr as Error).message}`);
+    }
+  }
+
+  /**
+   * Backstop for a job that reached a runner without passing evaluateJobFilter.
    */
   private async checkJobUserFilter(instanceNum: number, _runnerName: string): Promise<void> {
     const instance = this.instances.get(instanceNum);
@@ -1286,86 +1471,22 @@ export class RunnerManager {
       return;
     }
 
-    const userFilter = this.getUserFilter?.();
-    const { scope } = normalizeFilterConfig(userFilter);
-
-    // No filtering in everyone scope
-    if (scope === 'everyone') {
-      return;
-    }
-
-    // Parse owner/repo from target display name (e.g., "owner/repo")
     const repoInfo = parseRepository(targetDisplayName);
     if (!repoInfo) {
       this.log('warn', `Cannot parse owner/repo from target: ${targetDisplayName}`);
       return;
     }
-    const { owner, repo } = repoInfo;
-    const currentUser = this.getCurrentUserLogin?.();
 
-    let shouldCancel = false;
-    let reason = '';
+    const { allowed, reason } = await this.evaluateJobFilter(
+      repoInfo.owner,
+      repoInfo.repo,
+      githubActor,
+      githubSha
+    );
+    if (allowed) return;
 
-    if (scope === 'trigger') {
-      // Check if the trigger author is allowed
-      if (!isUserAllowed(githubActor, userFilter, currentUser)) {
-        shouldCancel = true;
-        reason = `trigger author '${githubActor}' not in allowed users`;
-      } else {
-        this.log('debug', `Job triggered by '${githubActor}' is allowed`);
-      }
-    } else if (scope === 'contributors') {
-      // Check all repository contributors
-      // The 'contributors' scope was chosen precisely because checking the
-      // trigger author alone is not sufficient. If the check cannot be
-      // performed, fail closed rather than silently downgrading to it.
-      if (!githubSha) {
-        shouldCancel = true;
-        reason = 'cannot verify contributors: no commit SHA for this job';
-      } else if (!this.getAllContributors) {
-        shouldCancel = true;
-        reason = 'cannot verify contributors: contributor lookup unavailable';
-      } else {
-        try {
-          // Get all contributors/authors for the repo at this SHA
-          const contributors = await this.getAllContributors(owner, repo, githubSha);
-          this.log('debug', `checkJobUserFilter: found ${contributors.size} contributors for ${owner}/${repo} at ${githubSha.slice(0, 7)}`);
-
-          // Check if all contributors are allowed
-          const result = areAllUsersAllowed(contributors, userFilter, currentUser);
-
-          if (!result.allowed) {
-            shouldCancel = true;
-            const disallowedList = result.disallowedUsers.slice(0, 3).join(', ');
-            const suffix = result.disallowedUsers.length > 3 ? ` and ${result.disallowedUsers.length - 3} more` : '';
-            reason = `repo has disallowed contributors: ${disallowedList}${suffix}`;
-          } else {
-            this.log('debug', `All ${contributors.size} contributors for ${owner}/${repo} are allowed`);
-          }
-        } catch (err) {
-          // If contributor check fails, fail safe (cancel the job)
-          this.log('warn', `Failed to get contributors: ${(err as Error).message}, cancelling job for safety`);
-          shouldCancel = true;
-          reason = `contributor check failed: ${(err as Error).message}`;
-        }
-      }
-    }
-
-    if (shouldCancel) {
-      this.log('info', `Job not allowed: ${reason}. Cancelling workflow run.`);
-
-      if (!this.cancelWorkflowRun) {
-        this.log('warn', 'Cannot cancel: cancelWorkflowRun not available');
-        return;
-      }
-
-      try {
-        await this.cancelWorkflowRun(owner, repo, githubRunId);
-        this.log('info', `Cancelled workflow run ${githubRunId}: ${reason}`);
-      } catch (cancelErr) {
-        this.log('warn', `Failed to cancel workflow run ${githubRunId}: ${(cancelErr as Error).message}`);
-      }
-    }
+    this.log('info', `Job not allowed: ${reason}. Cancelling workflow run.`);
+    await this.cancelRun(repoInfo.owner, repoInfo.repo, githubRunId, reason);
   }
 
   private addJobToHistory(job: JobHistoryEntry): void {

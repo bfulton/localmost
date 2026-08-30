@@ -1,5 +1,5 @@
 import { test, expect, ElectronApplication, Page } from '@playwright/test';
-import { launchElectron, closeElectron } from './electron';
+import { launchElectron, closeElectron, getConsoleErrors } from './electron';
 
 test.describe('localmost App', () => {
   let app: ElectronApplication;
@@ -35,7 +35,7 @@ test.describe('localmost App', () => {
   });
 
   test('should display the app title', async () => {
-    const title = await page.locator('.titlebar h1').textContent();
+    const title = await page.locator('[data-testid="titlebar"] h1').textContent();
     expect(title).toBe('localmost');
   });
 
@@ -69,25 +69,25 @@ test.describe('Settings Page', () => {
       await settingsButton.click();
     }
 
-    await expect(page.locator('text=GitHub Account')).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'GitHub Account' })).toBeVisible();
   });
 
   test('should display sign in button when not authenticated', async () => {
-    await expect(page.locator('text=Sign in with GitHub')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Sign in with GitHub' })).toBeVisible();
   });
 
   test('should display Runner Binary section', async () => {
-    await expect(page.locator('text=Runner Binary')).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Runner Binary' })).toBeVisible();
   });
 
   test('should display Appearance section', async () => {
-    await expect(page.locator('text=Appearance')).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Appearance' })).toBeVisible();
   });
 
   test('should have theme options', async () => {
-    await expect(page.locator('text=Light')).toBeVisible();
-    await expect(page.locator('text=Dark')).toBeVisible();
-    await expect(page.locator('text=Auto')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Light' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Dark' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Auto' })).toBeVisible();
   });
 
   test('should change theme when clicking theme option', async () => {
@@ -102,11 +102,11 @@ test.describe('Settings Page', () => {
   });
 
   test('should display Power section', async () => {
-    await expect(page.locator('text=Power')).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Power' })).toBeVisible();
   });
 
   test('should display History section', async () => {
-    await expect(page.locator('text=History')).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'History' })).toBeVisible();
   });
 
   test('should close settings when clicking close button', async () => {
@@ -147,11 +147,11 @@ test.describe('Status Page', () => {
   });
 
   test('should display Runner status item', async () => {
-    await expect(page.locator('.status-item-label:has-text("Runner")')).toBeVisible();
+    await expect(page.locator('[data-testid="status-item-label"]:has-text("Runner")')).toBeVisible();
   });
 
   test('should display Job status item', async () => {
-    await expect(page.locator('.status-item-label:has-text("Job")')).toBeVisible();
+    await expect(page.locator('[data-testid="status-item-label"]:has-text("Job")')).toBeVisible();
   });
 
   test('should display Logs section', async () => {
@@ -159,14 +159,14 @@ test.describe('Status Page', () => {
   });
 
   test('should expand logs when clicked', async () => {
-    const logsHeader = page.locator('.logs-header');
+    const logsHeader = page.locator('[data-testid="logs-header"]');
     await logsHeader.click();
 
     // Wait for expansion
     await page.waitForTimeout(300);
 
     // Check if expanded (should show "No logs yet" or log entries)
-    const logsContent = page.locator('.logs-content');
+    const logsContent = page.locator('[data-testid="logs-content"]');
     await expect(logsContent).toBeVisible();
   });
 
@@ -275,22 +275,23 @@ test.describe('UI Components', () => {
   });
 
   test('should have a titlebar', async () => {
-    await expect(page.locator('.titlebar')).toBeVisible();
+    await expect(page.locator('[data-testid="titlebar"]')).toBeVisible();
   });
 
   test('should have proper app name in titlebar', async () => {
-    const title = await page.locator('.titlebar h1').textContent();
+    const title = await page.locator('[data-testid="titlebar"] h1').textContent();
     expect(title?.toLowerCase()).toContain('localmost');
   });
 
   test('should have a main content area', async () => {
-    await expect(page.locator('.page-container')).toBeVisible();
+    await expect(page.locator('[data-testid="status-page"], [data-testid="settings-page"]')).toBeVisible();
   });
 
   test('should have scrollable content', async () => {
-    // Check that the page container has proper styling for scrolling
-    const container = page.locator('.page-container');
-    await expect(container).toBeVisible();
+    const overflowY = await page
+      .locator('[data-testid="page-content"]')
+      .evaluate((el) => getComputedStyle(el).overflowY);
+    expect(['auto', 'scroll', 'overlay']).toContain(overflowY);
   });
 });
 
@@ -315,26 +316,26 @@ test.describe('Settings Sections', () => {
   });
 
   test('should display all settings sections', async () => {
-    await expect(page.locator('text=GitHub Account')).toBeVisible();
-    await expect(page.locator('text=Runner Binary')).toBeVisible();
-    await expect(page.locator('text=History')).toBeVisible();
-    await expect(page.locator('text=Power')).toBeVisible();
-    await expect(page.locator('text=Appearance')).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'GitHub Account' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Runner Binary' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'History' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Power' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Appearance' })).toBeVisible();
   });
 
   test('should have version display in Runner Binary section', async () => {
     // Should show either version info or "Not downloaded"
-    const versionText = page.locator('.settings-section:has-text("Runner Binary")');
+    const versionText = page.locator('[data-testid="settings-section"]:has-text("Runner Binary")');
     await expect(versionText).toBeVisible();
   });
 
   test('should have sleep protection options in Power section', async () => {
-    const powerSection = page.locator('.settings-section:has-text("Power")');
+    const powerSection = page.locator('[data-testid="settings-section"]:has-text("Power")');
     await expect(powerSection).toBeVisible();
   });
 
   test('should have job history setting in History section', async () => {
-    const historySection = page.locator('.settings-section:has-text("History")');
+    const historySection = page.locator('[data-testid="settings-section"]:has-text("History")');
     await expect(historySection).toBeVisible();
   });
 });
@@ -361,19 +362,19 @@ test.describe('Status Indicators', () => {
 
   test('should show GitHub connection status', async () => {
     // Should show either "Connected" or "Sign in"
-    const githubStatus = page.locator('.status-item:has-text("GitHub")');
+    const githubStatus = page.locator('[data-testid="status-item"]').filter({ has: page.locator('[data-testid="status-item-label"]', { hasText: 'GitHub' }) }).first();
     await expect(githubStatus).toBeVisible();
   });
 
   test('should show runner status', async () => {
     // Should show status like "Offline", "Listening", "Busy"
-    const runnerStatus = page.locator('.status-item:has-text("Runner")');
+    const runnerStatus = page.locator('[data-testid="status-item"]').filter({ has: page.locator('[data-testid="status-item-label"]', { hasText: 'Runner' }) }).first();
     await expect(runnerStatus).toBeVisible();
   });
 
   test('should show job status', async () => {
     // Should show "Idle" or job name
-    const jobStatus = page.locator('.status-item:has-text("Job")');
+    const jobStatus = page.locator('[data-testid="status-item"]').filter({ has: page.locator('[data-testid="status-item-label"]', { hasText: 'Job' }) }).first();
     await expect(jobStatus).toBeVisible();
   });
 });
@@ -393,18 +394,12 @@ test.describe('Error Handling', () => {
   });
 
   test('should not show any console errors on load', async () => {
-    const errors: string[] = [];
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') {
-        errors.push(msg.text());
-      }
-    });
-
-    // Give the app time to initialize
+    // Errors are collected from launch (see electron.ts). Attaching the
+    // listener here would miss everything that happened during load.
     await page.waitForTimeout(1000);
 
     // Filter out expected errors (like network requests in test environment)
-    const unexpectedErrors = errors.filter(
+    const unexpectedErrors = getConsoleErrors().filter(
       (e) => !e.includes('net::ERR') && !e.includes('Failed to load resource')
     );
 
@@ -412,10 +407,14 @@ test.describe('Error Handling', () => {
   });
 
   test('should handle keyboard navigation', async () => {
-    // Tab should move focus between interactive elements
+    // Tab should move focus onto an actually interactive element
     await page.keyboard.press('Tab');
-    const focusedElement = await page.evaluate(() => document.activeElement?.tagName);
-    expect(focusedElement).toBeDefined();
+    const focused = await page.evaluate(() => {
+      const el = document.activeElement;
+      return el ? { tag: el.tagName } : null;
+    });
+    expect(focused).not.toBeNull();
+    expect(['BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'A']).toContain(focused!.tag);
   });
 });
 
@@ -441,7 +440,7 @@ test.describe('Responsive Layout', () => {
     await window.setViewportSize({ width: 400, height: 300 });
 
     // Check that main elements are still visible
-    await expect(page.locator('.titlebar')).toBeVisible();
+    await expect(page.locator('[data-testid="titlebar"]')).toBeVisible();
   });
 
   test('should handle larger window sizes', async () => {
@@ -451,6 +450,6 @@ test.describe('Responsive Layout', () => {
     await window.setViewportSize({ width: 800, height: 600 });
 
     // Check that layout adapts
-    await expect(page.locator('.page-container')).toBeVisible();
+    await expect(page.locator('[data-testid="status-page"], [data-testid="settings-page"]')).toBeVisible();
   });
 });
