@@ -298,6 +298,11 @@ function generateSandboxProfile(instanceDir: string, proxyPort?: number): string
 (deny network*)
 ${proxyPort ? `(allow network-outbound (remote ip "localhost:${proxyPort}"))` : ';; No proxy port supplied: no outbound network at all'}
 
+;; .NET asks the kernel about network availability over AF_SYSTEM before it
+;; will open a connection; denying it surfaces as "Permission denied" on the
+;; proxy connect rather than as anything about sockets.
+(allow system-socket)
+
 ;; Local sockets stay available: system frameworks need them to function.
 (allow network-outbound (remote unix-socket))
 (deny network-outbound (literal "${cliSocket}"))
