@@ -56,6 +56,22 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   - Compare against any GitHub runner label
   - Suggestions for pinning versions in workflows
 
+### Security
+- Secret values are masked out of step output. A step that printed one - `set -x`,
+  a tool dumping its config - previously spilled it into the console and the log
+  file.
+- Secrets are no longer exported into every step's environment. They reach a step
+  only through `${{ secrets.X }}`, as on GitHub, rather than being visible to
+  every child process.
+- `localmost test` gained `--secret-file`, and `--secrets prompt` now actually
+  prompts without echoing. A stubbed secret is announced instead of silently
+  becoming an empty string.
+- The step script, which contains expanded secrets while a step runs, is written
+  0700 rather than 0755.
+- The broker no longer logs the head of a job payload, which carries the job's
+  secrets, and drops the payload once the worker has taken it instead of holding
+  it for the life of the process.
+
 ### Fixed
 - A step under `strict` no longer dies with an unexplained SIGABRT. The root
   directory node is now readable, so an absolute path can resolve; a policy that

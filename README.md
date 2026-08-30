@@ -227,7 +227,6 @@ Future feature ideas:
 
 - **Fail a blocked job visibly** - a job refused by the filter is cancelled through the GitHub API before any worker starts, so it appears as cancelled rather than failing with a message explaining why.
 - **Roll discovery output up further** - `--updaterc` now drops paths already covered by a listed ancestor, which removes the bulk of the redundancy. It still records content-addressed cache paths (npm's `_cacache/content-v2/sha512/...`) verbatim, which differ per machine and per dependency change; those want rolling up to their cache directory.
-- **Workflow secrets** - `localmost test` reads secrets from environment variables, stubs anything missing, and `--secrets prompt` is a placeholder that also stubs. Storing secrets in the Keychain, prompting for them, and `localmost secrets list` / `clear` are all unbuilt.
 - **Approve policies in the app** - approval is CLI-only today (`localmost policy diff`, `localmost policy approve`). The app refuses the job and logs the diff, but there is no UI to review and accept it, and no audit log of approvals.
 - **Show a diff when `--updaterc` rewrites a policy** - it writes directly, with no diff and no confirmation, so a discovery run can widen a checked-in policy without the change being obvious.
 - **Homebrew formula** - `npx localmost` works; `brew install localmost` does not exist.

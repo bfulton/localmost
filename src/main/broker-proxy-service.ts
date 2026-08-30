@@ -541,7 +541,7 @@ export class BrokerProxyService extends EventEmitter {
         (innerBody && typeof innerBody === 'object' && JSON.stringify(innerBody).toLowerCase().includes('cancel'));
       if (isCancelLike) {
         log()?.info(`[BrokerProxy] CANCEL signal detected! messageType=${messageType}, target=${state.target.displayName}/${instance.instanceNum}`);
-        log()?.info(`[BrokerProxy] Cancel message body: ${body.slice(0, 500)}`);
+        log()?.debug(`[BrokerProxy] Cancel message received (${body.length} bytes)`);
         // Acknowledge cancel messages immediately so they don't block job requests
         // Cancel signals are only relevant if there's an active job to cancel
         await this.acknowledgeMessageUpstream(state, instance, messageId);
@@ -1006,6 +1006,22 @@ export class BrokerProxyService extends EventEmitter {
   }
 
   /**
+   * Drop a stored job payload once it has been handed to the worker.
+   *
+   * The payload carries the job's secrets, so it should not outlive its single
+   * use. Details are stored under both the job id and the message id, so both
+   * keys are cleared.
+   */
+  private forgetAcquiredJob(jobId: string): void {
+    const details = this.acquiredJobDetails.get(jobId);
+    this.acquiredJobDetails.delete(jobId);
+    if (!details) return;
+    for (const [key, value] of this.acquiredJobDetails) {
+      if (value === details) this.acquiredJobDetails.delete(key);
+    }
+  }
+
+  /**
    * Acknowledge a message to GitHub so it won't be sent again.
    */
   private async acknowledgeMessageUpstream(state: TargetState, instance: RunnerInstanceState, messageId: string): Promise<void> {
@@ -1070,7 +1086,10 @@ export class BrokerProxyService extends EventEmitter {
         },
       }, reqBody);
 
-      log()?.info(`[BrokerProxy] Acquire response: status=${response.statusCode}, body=${response.body.slice(0, 200)}`);
+      // Log the status only. The acquirejob response carries the job's secrets
+      // and their masks; a formatting change upstream would otherwise start
+      // spilling the head of them into the log file.
+      log()?.info(`[BrokerProxy] Acquire response: status=${response.statusCode}`);
 
       if (response.statusCode === 200) {
         return response.body;
@@ -1413,6 +1432,12 @@ export class BrokerProxyService extends EventEmitter {
       log()?.info(`[BrokerProxy] acquirejob: returning stored details for ${jobId}`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(jobDetails);
+
+      // The worker acquires a job once. Holding the payload after that keeps
+      // the job's secrets in memory for the life of the process, and the map
+      // was never cleared.
+      this.forgetAcquiredJob(jobId);
+      return;
     } else {
       log()?.warn(`[BrokerProxy] acquirejob: no stored details for ${jobId}`);
       res.writeHead(404, { 'Content-Type': 'application/json' });

@@ -67,6 +67,8 @@ export interface TestOptions {
   updaterc?: boolean;
   /** Skip the confirmation prompt when --updaterc rewrites a policy */
   assumeYes?: boolean;
+  /** Path to a KEY=value file holding secret values */
+  secretFile?: string;
   /** Run full matrix (default: first combination only) */
   fullMatrix?: boolean;
   /** Specific matrix combination */
@@ -277,7 +279,7 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
 
   if (secretNames.length > 0) {
     console.log(`Secrets required: ${secretNames.join(', ')}`);
-    secrets = await resolveSecrets(repository, secretNames, options.secretMode || 'stub');
+    secrets = await resolveSecrets(repository, secretNames, options.secretMode || 'stub', options.secretFile);
     console.log();
   }
 
@@ -956,33 +958,127 @@ async function confirmPolicyChange(
 /**
  * Resolve secrets from environment variables or stub them.
  */
+/**
+ * Read secrets from a KEY=value file, in the shape people already keep them.
+ */
+function readSecretFile(filePath: string): Record<string, string> {
+  const resolved = path.resolve(filePath);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Secret file not found: ${filePath}`);
+  }
+
+  const secrets: Record<string, string> = {};
+  for (const rawLine of fs.readFileSync(resolved, 'utf-8').split('\n')) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq === -1) continue;
+    const name = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (name) secrets[name] = value;
+  }
+  return secrets;
+}
+
+/**
+ * Ask for a secret without echoing it to the terminal.
+ */
+async function promptForSecret(name: string): Promise<string> {
+  const readline = await import('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+
+  const asStream = rl as unknown as { output: NodeJS.WriteStream; _writeToOutput?: (s: string) => void };
+  const prompt = `  ${name}: `;
+  asStream._writeToOutput = (chunk: string) => {
+    // Echo the prompt, never the value being typed.
+    if (chunk.includes(name)) asStream.output.write(chunk);
+  };
+
+  const value = await new Promise<string>(resolve => {
+    rl.question(prompt, answer => {
+      rl.close();
+      resolve(answer);
+    });
+  });
+  process.stdout.write('\n');
+  return value;
+}
+
+/**
+ * Resolve the secrets a workflow references.
+ *
+ * Order is: a --secret-file entry, then the environment, then whatever the
+ * chosen mode does about what is left. Nothing is written to disk, and values
+ * are masked out of step output by the executor.
+ */
 async function resolveSecrets(
   _repository: string,
   names: string[],
-  mode: 'stub' | 'prompt' | 'abort'
+  mode: 'stub' | 'prompt' | 'abort',
+  secretFile?: string
 ): Promise<Record<string, string>> {
   const result: Record<string, string> = {};
+  const fromFile = secretFile ? readSecretFile(secretFile) : {};
+  const stubbed: string[] = [];
 
   for (const name of names) {
+    const fileValue = fromFile[name];
+    if (fileValue !== undefined) {
+      result[name] = fileValue;
+      console.log(`  ${success(name)} (from secret file)`);
+      continue;
+    }
+
     const envValue = process.env[name];
     if (envValue !== undefined) {
       result[name] = envValue;
       console.log(`  ${success(name)} (from environment)`);
-    } else {
-      switch (mode) {
-        case 'abort':
-          throw new Error(`Missing secret: ${name}. Set it as an environment variable.`);
-        case 'stub':
-          result[name] = '';
-          console.log(`  ${skipped(name)} (stubbed)`);
-          break;
-        case 'prompt':
-          // In a full implementation, would prompt for input
-          result[name] = '';
-          console.log(`  ${skipped(name)} (would prompt)`);
-          break;
-      }
+      continue;
     }
+
+    switch (mode) {
+      case 'abort':
+        throw new Error(
+          `Missing secret: ${name}. Set it in the environment or pass --secret-file.`
+        );
+
+      case 'prompt': {
+        if (!process.stdin.isTTY) {
+          throw new Error(
+            `Missing secret: ${name}. There is no terminal to prompt on - set it in the environment or pass --secret-file.`
+          );
+        }
+        result[name] = await promptForSecret(name);
+        console.log(`  ${success(name)} (entered)`);
+        break;
+      }
+
+      case 'stub':
+        result[name] = '';
+        stubbed.push(name);
+        console.log(`  ${skipped(name)} (stubbed - empty string)`);
+        break;
+    }
+  }
+
+  if (stubbed.length > 0) {
+    // An empty string is a value, and a step will act on it: deploying with an
+    // empty token or publishing with an empty key does not look like a failure
+    // until afterwards.
+    console.log();
+    console.log(
+      `${colors.yellow}Warning:${colors.reset} ${stubbed.join(', ')} ${stubbed.length === 1 ? 'was' : 'were'} replaced with an empty string.`
+    );
+    console.log(
+      `  Steps using ${stubbed.length === 1 ? 'it' : 'them'} will run anyway and may behave differently than on GitHub.`
+    );
+    console.log('  Use --secret-file, set them in the environment, or --secrets abort to stop instead.');
   }
 
   return result;
@@ -1185,6 +1281,10 @@ export function parseTestArgs(args: string[]): TestOptions {
       options.updaterc = true;
     } else if (arg === '--yes' || arg === '-y') {
       options.assumeYes = true;
+    } else if (arg === '--secret-file') {
+      const value = args[++i];
+      if (!value) throw new Error('--secret-file requires a path');
+      options.secretFile = value;
     } else if (arg === '--full-matrix' || arg === '-f') {
       options.fullMatrix = true;
     } else if (arg === '--matrix' || arg === '-m') {
@@ -1245,6 +1345,7 @@ ${colors.bold}OPTIONS:${colors.reset}
   --no-ignore       Include files ignored by .gitignore
   -e, --env         Show environment comparison after run
   --secrets <mode>  Handle missing secrets: stub (default), prompt, abort
+  --secret-file <p> Read secrets from a KEY=value file
 
 ${colors.bold}EXAMPLES:${colors.reset}
   localmost test                    Run default workflow
@@ -1254,8 +1355,8 @@ ${colors.bold}EXAMPLES:${colors.reset}
   localmost test -v --env           Verbose output with environment diff
 
 ${colors.bold}ENVIRONMENT:${colors.reset}
-  Uses your local machine as the runner. Set up secrets with:
-    localmost secrets set SECRET_NAME
+  Uses your local machine as the runner. Secrets come from the environment or
+  a --secret-file; they are never written to disk and are masked out of output.
 
 ${colors.bold}SANDBOX:${colors.reset}
   Workflows run in a sandbox. Configure access in .localmostrc:

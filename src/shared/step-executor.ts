@@ -74,6 +74,24 @@ export interface JobExecutionOptions {
 // =============================================================================
 
 /**
+ * Replace secret values with *** wherever they appear.
+ *
+ * A step can print a secret by accident - `set -x`, a curl error echoing a
+ * URL, a tool dumping its config - and localmost streams step output to the
+ * console and the log file. GitHub masks secrets in job logs for the same
+ * reason; without it, running a workflow locally is a way to spill one.
+ */
+export function maskSecrets(text: string, secrets: Record<string, string>): string {
+  let masked = text;
+  for (const value of Object.values(secrets)) {
+    // Very short values would match everywhere and make output unreadable.
+    if (!value || value.length < 4) continue;
+    masked = masked.split(value).join('***');
+  }
+  return masked;
+}
+
+/**
  * Build the full environment for step execution.
  */
 export function buildStepEnvironment(
@@ -149,10 +167,10 @@ export function buildStepEnvironment(
     env[`MATRIX_${key.toUpperCase()}`] = String(value);
   }
 
-  // Expose secrets (with masking warning)
-  for (const [name, value] of Object.entries(ctx.secrets)) {
-    env[name] = value;
-  }
+  // Secrets are deliberately not exported here. GitHub does not put them in a
+  // step's environment; they reach a step only through ${{ secrets.X }}, which
+  // includes an explicit `env:` mapping. Exporting them all would hand every
+  // secret to every child process of every step.
 
   return env;
 }
@@ -351,7 +369,9 @@ async function executeRunStep(
 
   // Create temp script file
   const scriptFile = path.join(ctx.workDir, `.step-${Date.now()}.sh`);
-  fs.writeFileSync(scriptFile, script, { mode: 0o755 });
+  // 0700, not 0755: expanding ${{ secrets.X }} puts the value in this file for
+  // as long as the step runs, and another account should not be able to read it.
+  fs.writeFileSync(scriptFile, script, { mode: 0o700 });
 
   // HOME points inside the workspace; make sure it exists so tools that write
   // there (git config, npm, caches) do not fail on a missing directory.
@@ -371,6 +391,7 @@ async function executeRunStep(
         onOutput: ctx.onOutput,
         sandboxLogFile: ctx.sandboxLogFile,
         collectedPids: ctx.collectedPids,
+        secrets: ctx.secrets,
       },
       ctx.policy,
       ctx.permissive
@@ -508,6 +529,7 @@ async function executeActionFromPath(
         onOutput: ctx.onOutput,
         sandboxLogFile: ctx.sandboxLogFile,
         collectedPids: ctx.collectedPids,
+        secrets: ctx.secrets,
       },
       ctx.policy,
       ctx.permissive
@@ -992,6 +1014,8 @@ async function runInSandbox(
     onOutput?: (line: string, stream: 'stdout' | 'stderr') => void;
     sandboxLogFile?: string;
     collectedPids?: Set<number>;
+    /** Values to redact from anything the step prints */
+    secrets?: Record<string, string>;
   },
   policy?: SandboxPolicy,
   permissive?: boolean
@@ -1071,8 +1095,10 @@ async function runInSandbox(
       pidWatcher.start(proc.pid);
     }
 
+    const secrets = options.secrets || {};
+
     proc.stdout?.on('data', (data: Buffer) => {
-      const lines = data.toString().split('\n');
+      const lines = maskSecrets(data.toString(), secrets).split('\n');
       for (const line of lines) {
         if (line) {
           options.onOutput?.(line, 'stdout');
@@ -1081,7 +1107,7 @@ async function runInSandbox(
     });
 
     proc.stderr?.on('data', (data: Buffer) => {
-      const lines = data.toString().split('\n');
+      const lines = maskSecrets(data.toString(), secrets).split('\n');
       for (const line of lines) {
         if (line) {
           stderrLines.push(line);
@@ -1099,8 +1125,9 @@ async function runInSandbox(
         }
       }
 
-      // Keep last 10 lines of stderr for error reporting
-      let stderr = stderrLines.slice(-10).join('\n');
+      // Already masked on the way in, but the error surfaces in job history
+      // and notifications, so mask again rather than rely on that.
+      let stderr = maskSecrets(stderrLines.slice(-10).join('\n'), secrets);
 
       // A sandboxed process that dies on SIGABRT with nothing on stderr has
       // almost always been denied something it needed before it could run -

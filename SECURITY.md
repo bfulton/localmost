@@ -119,6 +119,32 @@ code, and allowing it grants a job the ability to fetch any tarball from GitHub.
 Under `strict` a repository that uses actions declares the host in its own
 `.localmostrc`; the runner log names any blocked host and points at that file.
 
+## Workflow Secrets
+
+`localmost test` runs a workflow locally, where GitHub is not there to supply
+`${{ secrets.X }}`. Values come from a `--secret-file` (`KEY=value` lines) or the
+environment, in that order. `--secrets prompt` asks for anything still missing
+without echoing it.
+
+- **Never stored.** localmost has no secret store. Nothing is written to disk,
+  and nothing persists between runs.
+- **Masked in output.** Secret values are replaced with `***` in everything a
+  step prints, so a step that echoes one does not spill it into the console or
+  the log file.
+- **Not in the environment.** Secrets reach a step only through
+  `${{ secrets.X }}`, including an explicit `env:` mapping. They are not
+  exported into every step's environment, where every child process would see
+  them.
+- **Missing secrets are announced.** With the default `stub` mode a missing
+  secret becomes an empty string and the run says so; a step will act on that
+  empty value, so `--secrets abort` is the safer choice for anything that
+  deploys or publishes.
+
+For jobs run by the background runner, secrets come from GitHub in the job
+payload as they would on any self-hosted runner. They pass through the local
+proxy in transit, are handed to the runner binary, and are not parsed, logged
+or stored by localmost.
+
 ## Authentication
 
 - **OAuth Device Flow**: Uses GitHub's Device Flow for user authentication, appropriate for desktop applications that cannot securely store client secrets
