@@ -3,7 +3,8 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as yaml from 'js-yaml';
-import { RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
+import {
+  SandboxPolicyLevel, RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
 import { spawnSandboxed } from './process-sandbox';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
@@ -11,7 +12,6 @@ import { RunnerDownloader } from './runner-downloader';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
 import { loadConfig } from './config';
 import { normalizeFilterConfig, isUserAllowed, areAllUsersAllowed, parseRepository } from './runner/user-filter';
-import { getState } from './store';
 
 /**
  * Get the hostname without .local suffix (common on macOS).
@@ -55,6 +55,14 @@ export interface JobEvent {
   reason?: string;
 }
 
+/** What a repository's approved policy means for one job at runtime. */
+export interface RepoPolicyRuntime {
+  /** Hosts the policy declares, on top of runner infrastructure. */
+  hosts: string[];
+  /** The level the policy asks for; strict when it declares none. */
+  level: SandboxPolicyLevel;
+}
+
 interface RunnerManagerOptions {
   onLog: (entry: LogEntry) => void;
   onStatusChange: (state: RunnerState) => void;
@@ -73,8 +81,10 @@ interface RunnerManagerOptions {
   getJobConclusion?: (owner: string, repo: string, jobId: number) => Promise<string | null>;
   /** Get all contributors/authors for a repo at a given commit SHA (for contributor filtering) */
   getAllContributors?: (owner: string, repo: string, sha: string) => Promise<Set<string>>;
-  /** Hosts a repository's .localmostrc allows, for the job about to run. */
-  getRepoPolicyHosts?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<string[]>;
+  /** The repository and commit a job belongs to, from the broker. */
+  getJobTarget?: (jobId: string) => { targetDisplayName: string; githubSha?: string } | undefined;
+  /** The repository's approved policy, resolved for the job about to run. */
+  getRepoPolicy?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<RepoPolicyRuntime>;
   /** Called when a job starts or completes (for notifications) */
   onJobEvent?: (event: JobEvent) => void;
 }
@@ -96,7 +106,8 @@ export class RunnerManager {
   private cancelWorkflowRun?: (owner: string, repo: string, runId: number) => Promise<void>;
   private getJobConclusion?: (owner: string, repo: string, jobId: number) => Promise<string | null>;
   private getAllContributors?: (owner: string, repo: string, sha: string) => Promise<Set<string>>;
-  private getRepoPolicyHosts?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<string[]>;
+  private getRepoPolicy?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<RepoPolicyRuntime>;
+  private getJobTarget?: (jobId: string) => { targetDisplayName: string; githubSha?: string } | undefined;
   private onJobEvent?: (event: JobEvent) => void;
   private jobHistory: JobHistoryEntry[] = [];
   private jobIdCounter = 0;
@@ -174,7 +185,8 @@ export class RunnerManager {
     this.cancelWorkflowRun = options.cancelWorkflowRun;
     this.getJobConclusion = options.getJobConclusion;
     this.getAllContributors = options.getAllContributors;
-    this.getRepoPolicyHosts = options.getRepoPolicyHosts;
+    this.getRepoPolicy = options.getRepoPolicy;
+    this.getJobTarget = options.getJobTarget;
     this.onJobEvent = options.onJobEvent;
 
     this.downloader = new RunnerDownloader();
@@ -631,6 +643,14 @@ export class RunnerManager {
   }
 
   async spawnWorkerForJob(): Promise<void> {
+    // Take the context before waiting for a slot. 'next' is a single shared
+    // slot, so a job arriving during the wait would otherwise overwrite it and
+    // this worker would start with another repository's context.
+    const claimedContext = this.pendingTargetContext.get('next');
+    if (claimedContext) {
+      this.pendingTargetContext.delete('next');
+    }
+
     // Wait briefly for a slot rather than dropping the job. By this point the
     // broker has already acquired it from GitHub, so returning without running
     // it leaves GitHub waiting on a runner that never reports - the job then
@@ -643,12 +663,17 @@ export class RunnerManager {
     }
 
     if (instanceNum === null) {
+      // Put it back: this worker never started, so the context still describes
+      // a job that something else may yet pick up.
+      if (claimedContext) {
+        this.pendingTargetContext.set('next', claimedContext);
+      }
       this.log('error', 'No worker slot became available; this job will not run');
       return;
     }
 
-    // Get the target context for this job (set by broker proxy before calling this)
-    const targetContext = this.pendingTargetContext.get('next');
+    // Get the target context for this job (claimed above, before the wait)
+    const targetContext = claimedContext;
     if (!targetContext) {
       this.log('error', 'No target context for spawned worker');
       this.releaseSlotReservation(instanceNum);
@@ -656,6 +681,10 @@ export class RunnerManager {
     }
 
     this.log('info', `Spawning worker ${instanceNum} for incoming job from ${targetContext.targetDisplayName}...`);
+
+    // Keyed by instance so startInstance can install the policy for this job
+    // before the runner starts; 'next' is consumed by whichever worker registers.
+    this.pendingTargetContext.set(String(instanceNum), targetContext);
 
     // Copy proxy credentials to this instance's config before building sandbox
     const proxyDir = path.join(getRunnerDir(), 'proxies', targetContext.targetId);
@@ -689,10 +718,31 @@ export class RunnerManager {
   }
 
   private async startInstanceProxy(instanceNum: number): Promise<ProxyServer> {
-    const policyLevel = getState().config.sandboxPolicyLevel || 'strict';
-
     const proxy = new ProxyServer({
-      policyLevel,
+      // Closed until a job is claimed. The level belongs to the repository's
+      // policy now, and is installed when a worker announces which job it took.
+      policyLevel: 'strict',
+      onJobAcquired: async (jobId: string) => {
+        // The worker behind this proxy just claimed a job. Whichever instance
+        // won the queue, this is the one that has to carry its policy.
+        const target = this.getJobTarget?.(jobId);
+        if (!target?.targetDisplayName || !target.githubSha) {
+          // Saying the policy is closed is not the same as closing it. This
+          // proxy may still hold the last job's hosts, so clear them: an
+          // unidentifiable job gets nothing rather than someone else's grants.
+          const staleProxy = this.proxyServers.get(instanceNum);
+          staleProxy?.setPolicyAllowedHosts([]);
+          staleProxy?.setPolicyLevel('strict');
+          this.log('warn', `[instance ${instanceNum}] No target for acquired job ${jobId}; policy closed`);
+          return;
+        }
+        await this.applyPolicyForTarget(
+          instanceNum,
+          target.targetDisplayName,
+          target.githubSha,
+          ''
+        );
+      },
       onLog: (entry: ProxyLogEntry) => {
         // Skip logging routine localhost message polling (very noisy)
         if (!entry.blocked && (entry.host === 'localhost' || entry.host === '127.0.0.1')) {
@@ -705,7 +755,7 @@ export class RunnerManager {
     });
 
     const port = await proxy.start();
-    this.log('debug', `Proxy server for instance ${instanceNum} started on port ${port} with ${policyLevel} policy`);
+    this.log('debug', `Proxy server for instance ${instanceNum} started on port ${port}; policy installed when a job is claimed`);
     this.proxyServers.set(instanceNum, proxy);
     return proxy;
   }
@@ -798,6 +848,20 @@ export class RunnerManager {
       let proxy = this.proxyServers.get(instanceNum);
       if (!proxy) {
         proxy = await this.startInstanceProxy(instanceNum);
+      }
+
+      // Install the policy before the runner process exists. A reused proxy
+      // still holds the last job's hosts until this runs.
+      proxy.setPolicyAllowedHosts([]);
+      proxy.setPolicyLevel('strict');
+      const startupContext = this.pendingTargetContext.get(String(instanceNum));
+      if (startupContext?.targetDisplayName && startupContext.githubSha) {
+        await this.applyPolicyForTarget(
+          instanceNum,
+          startupContext.targetDisplayName,
+          startupContext.githubSha,
+          ''
+        );
       }
 
       const proxyUrl = proxy.getProxyUrl();
@@ -1191,6 +1255,14 @@ export class RunnerManager {
       // Get target context if available (from broker-proxy-service)
       const targetContext = this.consumePendingTargetContext(instance.name);
 
+      // Keep it against this instance. An idle worker that picks a job up
+      // never went through spawnWorkerForJob, so this is the only record of
+      // which repository the job belongs to - and the policy cannot be
+      // resolved without it.
+      if (targetContext) {
+        this.pendingTargetContext.set(String(instanceNum), targetContext);
+      }
+
       // Use target display name (owner/repo format) for repository if available
       const repository = targetContext?.targetDisplayName || this.config?.url || 'unknown';
 
@@ -1328,29 +1400,62 @@ export class RunnerManager {
    * cannot declare the hosts its own build needs and `strict` is unusable for
    * anything beyond runner infrastructure.
    */
+  /**
+   * Install a repository's approved policy on an instance's proxy.
+   *
+   * Proxies are reused across jobs, so this must run before the runner for a
+   * job can make any request. Applying it from the runner's "job started" log
+   * line is too late: the runner fetches its actions during setup, and an
+   * instance that never reached that line would keep the previous job's hosts.
+   */
+  private async applyPolicyForTarget(
+    instanceNum: number,
+    targetDisplayName: string,
+    githubSha: string,
+    workflowName: string
+  ): Promise<void> {
+    const proxy = this.proxyServers.get(instanceNum);
+    if (!proxy || !this.getRepoPolicy) return;
+
+    const repoInfo = parseRepository(targetDisplayName);
+    if (!repoInfo) return;
+
+    const { hosts, level } = await this.getRepoPolicy(
+      repoInfo.owner,
+      repoInfo.repo,
+      githubSha,
+      workflowName
+    );
+    proxy.setPolicyAllowedHosts(hosts);
+    proxy.setPolicyLevel(level);
+    if (hosts.length > 0 || level !== 'strict') {
+      this.log('info', `[instance ${instanceNum}] Applied ${level} policy with ${hosts.length} host(s) from ${targetDisplayName} .localmostrc`);
+    }
+  }
+
   private async applyRepoPolicy(instanceNum: number): Promise<void> {
     const instance = this.instances.get(instanceNum);
     const proxy = this.proxyServers.get(instanceNum);
     if (!proxy) return;
 
-    // Clear first. Proxies outlive a single job, so returning early below would
-    // otherwise leave the previous job's .localmostrc hosts installed and grant
-    // them to a different repository.
-    proxy.setPolicyAllowedHosts([]);
+    // This refines a policy that acquirejob has already installed for the job
+    // the worker actually claimed, purely to pick up any per-workflow section
+    // now that the job name is known. It must never clear: clearing here wiped
+    // a correct policy whenever this path could not identify the job, and the
+    // job then ran with no hosts. Staleness is handled where a job is claimed.
+    if (!instance?.currentJob || !this.getRepoPolicy) return;
 
-    if (!instance?.currentJob || !this.getRepoPolicyHosts) return;
-
-    const { targetDisplayName, githubSha, name: jobName } = instance.currentJob;
+    const spawnContext = this.pendingTargetContext.get(String(instanceNum));
+    const targetDisplayName = instance.currentJob.targetDisplayName ?? spawnContext?.targetDisplayName;
+    const githubSha = instance.currentJob.githubSha ?? spawnContext?.githubSha;
     if (!targetDisplayName || !githubSha) return;
 
-    const repoInfo = parseRepository(targetDisplayName);
-    if (!repoInfo) return;
-
-    const hosts = await this.getRepoPolicyHosts(repoInfo.owner, repoInfo.repo, githubSha, jobName);
-    proxy.setPolicyAllowedHosts(hosts);
-    if (hosts.length > 0) {
-      this.log('info', `[instance ${instanceNum}] Applied ${hosts.length} host(s) from ${targetDisplayName} .localmostrc`);
-    }
+    await this.applyPolicyForTarget(
+      instanceNum,
+      targetDisplayName,
+      githubSha,
+      instance.currentJob.name
+    );
   }
 
   /**

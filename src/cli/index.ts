@@ -345,7 +345,8 @@ function findAppPath(): string | null {
 function getDevCheckoutRoot(): string | null {
   const cliPath = getCliRealPath();
   const cliDir = path.dirname(cliPath);
-  const projectRoot = path.dirname(cliDir); // Go up from dist/ to project root
+  // build/dist/cli.js -> build/dist -> build -> project root
+  const projectRoot = path.dirname(path.dirname(cliDir));
 
   if (fs.existsSync(path.join(projectRoot, 'package.json'))) {
     return projectRoot;

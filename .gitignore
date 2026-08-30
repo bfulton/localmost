@@ -1,17 +1,22 @@
-# Dependencies
+# Everything generated - builds, bundles, icons, test output, coverage.
+# Kept in one directory so this file does not have to track each of them.
+build/
+
 node_modules/
 
-# Build output
-dist/
-.webpack/
-out/
-stats.json
+# Generated source: written by scripts/generate-build-info.js at build time.
+# It lives in src/ because the app imports it as a module.
+src/shared/build-info.ts
 
-# Electron Forge
-*.dmg
-*.zip
+# Local runner state and downloaded runner binaries
+.localmost/
+bundled-runner/
 
-# IDE
+# Local environment and tooling
+.env
+.env.local
+.envrc
+.claude/
 .idea/
 .vscode/
 *.swp
@@ -20,32 +25,3 @@ stats.json
 # OS
 .DS_Store
 Thumbs.db
-
-# Logs
-*.log
-npm-debug.log*
-
-# Environment
-.env
-.env.local
-
-# Runner data (local development)
-.localmost/
-
-# Generated icons (SVGs and PNGs built at compile time)
-assets/generated/
-
-# Auto-generated build info
-src/shared/build-info.ts
-
-# Playwright test output
-playwright-report/
-test-results/
-
-.claude/
-release/
-
-.envrc
-
-# Downloaded runner binaries (not bundled, downloaded at runtime)
-bundled-runner/

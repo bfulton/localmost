@@ -354,6 +354,9 @@ function handleInit(): void {
   // before executing anything.
   const template: LocalmostrcConfig = {
     version: LOCALMOSTRC_VERSION,
+    // Declared rather than left implicit, so the level a repository runs at is
+    // visible in the file and shows up in the diff if it ever changes.
+    level: 'strict',
     shared: {
       network: {
         allow: [

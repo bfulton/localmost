@@ -39,7 +39,7 @@ const mainConfig = {
   target: 'electron-main',
   entry: './src/main/index.ts',
   output: {
-    path: path.resolve(__dirname, 'dist'),
+    path: path.resolve(__dirname, 'build/dist'),
     filename: 'main.js',
   },
   node: {
@@ -50,14 +50,14 @@ const mainConfig = {
     // Inject the entry point constants that electron-forge normally provides
     new webpack.DefinePlugin({
       // Use path.join with __dirname for cross-platform compatibility
-      // __dirname in packaged app points to the app.asar/dist directory
+      // __dirname in the packaged app points at app.asar/build/dist
       // In dev mode, also use file:// since we don't run a dev server
       MAIN_WINDOW_WEBPACK_ENTRY: isProduction
         ? '`file://${require("path").join(__dirname, "renderer", "index.html")}`'
-        : JSON.stringify(`file://${path.resolve(__dirname, 'dist/renderer/index.html')}`),
+        : JSON.stringify(`file://${path.resolve(__dirname, 'build/dist/renderer/index.html')}`),
       MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY: isProduction
         ? 'require("path").join(__dirname, "preload.js")'
-        : JSON.stringify(path.resolve(__dirname, 'dist/preload.js')),
+        : JSON.stringify(path.resolve(__dirname, 'build/dist/preload.js')),
     }),
   ],
   // Don't bundle electron
@@ -75,7 +75,7 @@ const preloadConfig = {
   target: 'electron-preload',
   entry: './src/main/preload.ts',
   output: {
-    path: path.resolve(__dirname, 'dist'),
+    path: path.resolve(__dirname, 'build/dist'),
     filename: 'preload.js',
   },
   // Disable automatic Node.js externalization for sandboxed preload
@@ -125,7 +125,7 @@ const rendererConfig = {
   target: 'web', // Use 'web' target for renderer with context isolation
   entry: './src/renderer/index.tsx',
   output: {
-    path: path.resolve(__dirname, 'dist/renderer'),
+    path: path.resolve(__dirname, 'build/dist/renderer'),
     filename: '[name].js',
     chunkFilename: '[name].js',
     publicPath: './',

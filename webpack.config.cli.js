@@ -14,7 +14,7 @@ module.exports = {
   target: 'node',
   entry: './src/cli/index.ts',
   output: {
-    path: path.resolve(__dirname, 'dist'),
+    path: path.resolve(__dirname, 'build/dist'),
     filename: 'cli.js',
   },
   resolve: {

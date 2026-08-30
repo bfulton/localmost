@@ -37,6 +37,12 @@ export interface ProxyServerOptions {
   allowedHosts?: string[];
   /** Sandbox policy level - controls network access restrictions */
   policyLevel?: SandboxPolicyLevel;
+  /**
+   * Called when the worker behind this proxy announces which job it is taking.
+   * Awaited before the request is forwarded, so the job's policy is in place
+   * before the runner can fetch anything for it.
+   */
+  onJobAcquired?: (jobId: string) => Promise<void>;
 }
 
 /** Statistics tracked per proxy session for job summary */
@@ -57,7 +63,10 @@ export class ProxyServer {
   private port: number;
   private onLog: ProxyLogCallback;
   private policyAllowedHosts: string[];
+  private static readonly MAX_ACQUIRE_BODY_BYTES = 64 * 1024;
+
   private policyLevel: SandboxPolicyLevel;
+  private onJobAcquired?: (jobId: string) => Promise<void>;
   private connections: Set<net.Socket> = new Set();
   private stats: ProxyStats = {
     allowedCount: 0,
@@ -71,6 +80,7 @@ export class ProxyServer {
     this.onLog = options.onLog || (() => {});
     this.policyAllowedHosts = options.allowedHosts || [];
     this.policyLevel = options.policyLevel || 'strict';
+    this.onJobAcquired = options.onJobAcquired;
   }
 
   /**
@@ -185,6 +195,16 @@ export class ProxyServer {
     return [...this.policyAllowedHosts];
   }
 
+  /**
+   * Set the level for the job about to run.
+   *
+   * A proxy outlives a single job and serves whichever repository the instance
+   * picks up next, so the level has to be reset per job the way hosts are.
+   */
+  setPolicyLevel(level: SandboxPolicyLevel): void {
+    this.policyLevel = level;
+  }
+
   getPolicyLevel(): SandboxPolicyLevel {
     return this.policyLevel;
   }
@@ -250,6 +270,14 @@ export class ProxyServer {
       const port = parseInt(url.port, 10) || 80;
       const path = url.pathname + url.search;
 
+      // A worker takes a job by POSTing acquirejob through its own proxy. That
+      // is where this proxy learns which repository it is serving, before the
+      // runner fetches a single action for it.
+      if (this.onJobAcquired && req.method === 'POST' && url.pathname.endsWith('/acquirejob')) {
+        this.handleAcquireJobRequest(req, res, host, port, path);
+        return;
+      }
+
       const { allowed, reason } = this.checkHostAccess(host);
       this.log({ method: req.method || 'GET', host, port, path, blocked: !allowed, reason });
 
@@ -283,6 +311,112 @@ export class ProxyServer {
       res.writeHead(400, { 'Content-Type': 'text/plain' });
       res.end(`Bad request: ${(err as Error).message}`);
     }
+  }
+
+  /**
+   * Forward an acquirejob request, applying the job's policy first.
+   *
+   * The body has to be buffered to read the job id, so it is replayed to the
+   * upstream request rather than piped.
+   */
+  private handleAcquireJobRequest(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    host: string,
+    port: number,
+    path: string
+  ): void {
+    // Check the destination before reading anything. Buffering first would let
+    // any request to a path ending in /acquirejob consume memory even when the
+    // host is blocked outright.
+    const { allowed, reason } = this.checkHostAccess(host);
+    if (!allowed) {
+      this.log({ method: req.method || 'POST', host, port, path, blocked: true, reason });
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end(`Blocked by sandbox policy (${this.policyLevel}): host '${host}' not in allowlist`);
+      req.resume();
+      return;
+    }
+
+    // A real acquirejob body is a small JSON object. Anything larger is not one,
+    // so stop reading rather than buffering whatever a workflow decides to send.
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let tooLarge = false;
+
+    req.on('data', (chunk: Buffer) => {
+      if (tooLarge) return;
+      size += chunk.length;
+      if (size > ProxyServer.MAX_ACQUIRE_BODY_BYTES) {
+        tooLarge = true;
+        chunks.length = 0;
+        res.writeHead(413, { 'Content-Type': 'text/plain' });
+        res.end('acquirejob body too large');
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+
+    req.on('end', () => {
+      if (tooLarge) return;
+      const body = Buffer.concat(chunks);
+      let jobId: string | undefined;
+      try {
+        const parsed = JSON.parse(body.toString());
+        const raw = parsed.jobMessageId || parsed.jobRequestId || parsed.requestId;
+        if (raw) jobId = String(raw);
+      } catch {
+        // Unreadable body: the policy stays as installed. Failing to read an
+        // id is not a reason to widen access.
+      }
+
+      // The callback resolves the policy, so a rejection must neither become an
+      // unhandled rejection nor swallow the request. Forward either way; the
+      // policy that is installed is what the forwarded request is checked
+      // against, and a failed resolution leaves it no wider than it was.
+      const resolved = jobId
+        ? Promise.resolve(this.onJobAcquired?.(jobId)).catch(() => undefined)
+        : Promise.resolve(undefined);
+
+      resolved.finally(() => {
+        this.forwardBufferedRequest(req, res, host, port, path, body);
+      });
+    });
+  }
+
+  private forwardBufferedRequest(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    host: string,
+    port: number,
+    path: string,
+    body: Buffer
+  ): void {
+    const { allowed, reason } = this.checkHostAccess(host);
+    this.log({ method: req.method || 'POST', host, port, path, blocked: !allowed, reason });
+    if (!allowed) {
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end(`Blocked by sandbox policy (${this.policyLevel}): host '${host}' not in allowlist`);
+      return;
+    }
+
+    // The body is replayed whole, so it is no longer chunked. Leaving both
+    // headers on the request makes some servers reject it or frame it wrongly.
+    const headers = { ...req.headers, 'content-length': String(body.length) };
+    delete headers['transfer-encoding'];
+    const proxyReq = http.request(
+      { hostname: host, port, path, method: req.method, headers },
+      (proxyRes) => {
+        res.writeHead(proxyRes.statusCode || 500, proxyRes.headers);
+        proxyRes.pipe(res);
+      }
+    );
+    proxyReq.on('error', (err) => {
+      res.writeHead(502, { 'Content-Type': 'text/plain' });
+      res.end(`Proxy error: ${err.message}`);
+    });
+    proxyReq.end(body);
   }
 
   /**

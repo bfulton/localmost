@@ -100,7 +100,7 @@ import {
 
 // Zustand store
 import { initStore, connectWindow, cleanupStore, store } from './store/init';
-import { getEffectivePolicy } from '../shared/localmostrc';
+import { getEffectivePolicy, effectivePolicyLevel } from '../shared/localmostrc';
 import {
   decidePolicyForJob,
   recordPendingPolicy,
@@ -303,17 +303,22 @@ app.whenReady().then(async () => {
       }
       return contributorCache.getAllAuthors(accessToken, owner, repo, sha);
     },
-    getRepoPolicyHosts: async (owner: string, repo: string, _sha: string, workflowName: string) => {
+    getJobTarget: (jobId: string) => brokerProxyService.getJobTarget(jobId),
+    getRepoPolicy: async (owner: string, repo: string, _sha: string, workflowName: string) => {
       // Apply the policy that was approved, not whatever is in the repository
       // right now. A job only reaches this point once its policy has been
       // approved, and applying the approved copy means an unreviewed change
-      // cannot take effect through a race.
+      // cannot take effect through a race. That covers the level too: it is
+      // declared in the same file and approved with the rest of it.
       const cached = getCachedPolicy(`${owner}/${repo}`);
       if (!cached?.approved) {
-        return [];
+        return { hosts: [], level: 'strict' as const };
       }
       const policy = getEffectivePolicy(cached.config, workflowName);
-      return policy.network?.allow || [];
+      return {
+        hosts: policy.network?.allow || [],
+        level: effectivePolicyLevel(cached.config),
+      };
     },
     onJobEvent: (event: JobEvent) => {
       logger?.info(`Job event: ${event.type} ${event.jobName}`);

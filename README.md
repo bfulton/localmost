@@ -218,7 +218,7 @@ npm run make
 Current release: **0.3.0 — Test Locally, Secure by Default**
 - Run workflows locally before pushing with `localmost test`
 - Declarative sandbox policies with `.localmostrc`
-- Sandbox policy levels (strict / moderate / permissive) enforced by the local proxy
+- Sandbox policy levels (strict / moderate / permissive) declared per repository and enforced by the local proxy
 - Contributor-based job filtering for public repos
 - Repository policies require approval before the runner applies them
 - Environment comparison with GitHub runners

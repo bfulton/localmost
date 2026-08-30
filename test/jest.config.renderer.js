@@ -1,4 +1,6 @@
 module.exports = {
+  // This config lives in test/, but every path in it is repo-relative.
+  rootDir: '..',
   preset: 'ts-jest',
   testEnvironment: 'jsdom',
   roots: ['<rootDir>/src/renderer'],

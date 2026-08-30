@@ -222,6 +222,9 @@ export class BrokerProxyService extends EventEmitter {
   private messageQueues: Map<string, Array<string>> = new Map();  // Per-target message queues
   private seenMessageIds: Set<string> = new Set();
   private pendingTargetAssignments: string[] = [];  // Queue of target IDs for upcoming sessions
+  /** Repository and commit for a job, keyed by both jobId and messageId. */
+  private jobTargets: Map<string, { targetDisplayName: string; githubSha?: string }> = new Map();
+
   private jobRunServiceUrls: Map<string, string> = new Map();  // jobId -> run_service_url
   private acquiredJobDetails: Map<string, string> = new Map();  // jobId -> job details
   private jobInfo: Map<string, { billingOwnerId?: string; runServiceUrl: string }> = new Map();
@@ -522,6 +525,14 @@ export class BrokerProxyService extends EventEmitter {
 
       // Queue target assignment for the worker that will be spawned
       this.pendingTargetAssignments.push(targetId);
+
+      // Record the repository this job belongs to under every id the runner
+      // might present. A worker announces which job it is taking via
+      // acquirejob, and that is the only binding of job to worker that does
+      // not race: the queue decides which worker wins, not the spawn.
+      const jobTarget = { targetDisplayName: state.target.displayName, githubSha };
+      this.jobTargets.set(jobId, jobTarget);
+      this.jobTargets.set(messageId, jobTarget);
 
       // Emit event to spawn worker for job messages only
       // Include IDs so we can construct the job URL and check user filter directly
@@ -1371,6 +1382,13 @@ export class BrokerProxyService extends EventEmitter {
     }
     res.writeHead(200);
     res.end();
+  }
+
+  /**
+   * The repository and commit a job belongs to, by jobId or messageId.
+   */
+  getJobTarget(jobId: string): { targetDisplayName: string; githubSha?: string } | undefined {
+    return this.jobTargets.get(jobId);
   }
 
   /**

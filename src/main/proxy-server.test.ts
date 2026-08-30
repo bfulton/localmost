@@ -5,6 +5,7 @@
  * cannot filter by hostname, so every allow/block decision happens here.
  */
 
+import * as http from 'http';
 import { ProxyServer } from './proxy-server';
 import { SandboxPolicyLevel } from '../shared/types';
 
@@ -202,5 +203,143 @@ describe('ProxyServer host access', () => {
       const proxy = new ProxyServer({});
       expect(checkHost(proxy, 'github.com').allowed).toBe(true);
     });
+  });
+});
+
+describe('resolving policy when a worker claims a job', () => {
+  const startProxy = async (onJobAcquired: (jobId: string) => Promise<void>) => {
+    const proxy = new ProxyServer({ policyLevel: 'strict', onJobAcquired });
+    await proxy.start();
+    return proxy;
+  };
+
+  const postAcquire = (port: number, body: string) =>
+    new Promise<number>((resolve, reject) => {
+      const req = http.request(
+        {
+          hostname: '127.0.0.1',
+          port,
+          path: 'http://127.0.0.1:1/acquirejob',
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'content-length': String(body.length) },
+        },
+        (res: http.IncomingMessage) => {
+          res.resume();
+          resolve(res.statusCode || 0);
+        }
+      );
+      req.on('error', reject);
+      req.end(body);
+    });
+
+  it('applies the job policy before the request is forwarded', async () => {
+    // Ordering is the whole point: the runner fetches its actions right after
+    // this call, so a policy applied afterwards is applied too late.
+    const seen: string[] = [];
+    const proxy = await startProxy(async (jobId) => {
+      seen.push(jobId);
+    });
+
+    try {
+      await postAcquire(proxy.getPort(), JSON.stringify({ jobMessageId: 'msg-42' }));
+      expect(seen).toEqual(['msg-42']);
+    } finally {
+      await proxy.stop();
+    }
+  });
+
+  it('still forwards the request when the body carries no job id', async () => {
+    const proxy = await startProxy(async () => {
+      throw new Error('should not be called');
+    });
+
+    try {
+      const status = await postAcquire(proxy.getPort(), 'not json');
+      // 127.0.0.1 is infrastructure, so this reaches an upstream that is not
+      // listening: a 502 proves it was forwarded rather than dropped.
+      expect(status).toBe(502);
+    } finally {
+      await proxy.stop();
+    }
+  });
+});
+
+describe('acquirejob forwarding is resilient', () => {
+  it('still forwards when policy resolution rejects', async () => {
+    // A rejecting resolver must not become an unhandled rejection or strand
+    // the runner's acquirejob request.
+    const proxy = new ProxyServer({
+      policyLevel: 'strict',
+      onJobAcquired: async () => {
+        throw new Error('resolution failed');
+      },
+    });
+    await proxy.start();
+
+    const body = JSON.stringify({ jobMessageId: 'msg-1' });
+    try {
+      const status = await new Promise<number>((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port: proxy.getPort(),
+            path: 'http://127.0.0.1:1/acquirejob',
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'content-length': String(body.length) },
+          },
+          (res: http.IncomingMessage) => {
+            res.resume();
+            resolve(res.statusCode || 0);
+          }
+        );
+        req.on('error', reject);
+        req.end(body);
+      });
+
+      expect(status).toBe(502);
+    } finally {
+      await proxy.stop();
+    }
+  });
+});
+
+describe('acquirejob body limits', () => {
+  it('rejects an oversized body instead of buffering it', async () => {
+    // Any request to a path ending in /acquirejob reaches this code, so an
+    // unbounded buffer is memory a workflow gets to choose the size of.
+    let resolverCalled = false;
+    const proxy = new ProxyServer({
+      policyLevel: 'strict',
+      onJobAcquired: async () => {
+        resolverCalled = true;
+      },
+    });
+    await proxy.start();
+
+    const body = 'x'.repeat(200 * 1024);
+    try {
+      const status = await new Promise<number>((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port: proxy.getPort(),
+            path: 'http://127.0.0.1:1/acquirejob',
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+          },
+          (res: http.IncomingMessage) => {
+            res.resume();
+            resolve(res.statusCode || 0);
+          }
+        );
+        req.on('error', () => resolve(0));
+        req.end(body);
+      });
+
+      expect(status).toBe(413);
+      expect(resolverCalled).toBe(false);
+    } finally {
+      await proxy.stop();
+    }
   });
 });

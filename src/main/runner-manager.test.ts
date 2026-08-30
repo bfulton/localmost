@@ -27,6 +27,8 @@ jest.mock('./proxy-server', () => ({
     stop: jest.fn().mockResolvedValue(undefined),
     getProxyUrl: jest.fn().mockReturnValue('http://localhost:12345'),
     getPort: jest.fn().mockReturnValue(12345),
+    setPolicyAllowedHosts: jest.fn(),
+    setPolicyLevel: jest.fn(),
   })),
 }));
 
@@ -625,7 +627,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicyHosts: async () => ['index.crates.io'],
+        getRepoPolicy: async () => ({ hosts: ['index.crates.io'], level: 'strict' as const }),
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setInstance(1, {
@@ -639,21 +641,25 @@ describe('RunnerManager', () => {
           githubSha: 'abc1234',
         },
       });
-      helper.setProxy(1, { setPolicyAllowedHosts });
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyLevel: jest.fn() });
 
       await helper.applyRepoPolicy(1);
 
       expect(setPolicyAllowedHosts).toHaveBeenCalledWith(['index.crates.io']);
     });
 
-    it('clears the previous job policy when this job has no commit SHA', async () => {
+    it('leaves an installed policy alone when it cannot identify the job', async () => {
+      // This path only refines a policy that acquirejob already installed for
+      // the job the worker claimed. Clearing here wiped a correct policy
+      // whenever the job could not be identified, and the job ran with no
+      // hosts - four concurrent runs failed that way before this changed.
       const setPolicyAllowedHosts = jest.fn();
-      const getRepoPolicyHosts = jest.fn().mockResolvedValue([] as never);
+      const getRepoPolicy = jest.fn().mockResolvedValue({ hosts: [], level: 'strict' } as never);
       const manager = new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicyHosts: getRepoPolicyHosts as never,
+        getRepoPolicy: getRepoPolicy as never,
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setInstance(1, {
@@ -666,18 +672,144 @@ describe('RunnerManager', () => {
           targetDisplayName: 'owner/repo',
         },
       });
-      helper.setProxy(1, { setPolicyAllowedHosts });
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyLevel: jest.fn() });
 
       await helper.applyRepoPolicy(1);
 
-      // A proxy outlives one job, so leaving the previous job's hosts in place
-      // would grant them to a different repository.
-      expect(getRepoPolicyHosts).not.toHaveBeenCalled();
-      expect(setPolicyAllowedHosts).toHaveBeenCalledWith([]);
+      expect(getRepoPolicy).not.toHaveBeenCalled();
+      expect(setPolicyAllowedHosts).not.toHaveBeenCalled();
     });
-  });
 
-  describe('refused jobs', () => {
+    it('does not leave one repository\'s hosts on a proxy reused by another', async () => {
+      // Proxies outlive a job. Instance 3 once ran a job whose policy was never
+      // installed and inherited the previous repo's hosts; the guard is that
+      // every job sets the policy for its own target before the runner starts.
+      const setPolicyAllowedHosts = jest.fn();
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async (owner: string, repo: string) =>
+          repo === 'first'
+            ? { hosts: ['first.example'], level: 'strict' as const }
+            : { hosts: ['second.example'], level: 'strict' as const },
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyLevel: jest.fn() });
+
+      const runJob = async (repo: string) => {
+        helper.setInstance(1, {
+          name: 'runner-1',
+          currentJob: {
+            name: 'build',
+            repository: `owner/${repo}`,
+            startedAt: new Date().toISOString(),
+            id: `job-${repo}`,
+            targetDisplayName: `owner/${repo}`,
+            githubSha: 'abc1234',
+          },
+        });
+        await helper.applyRepoPolicy(1);
+      };
+
+      await runJob('first');
+      await runJob('second');
+
+      expect(setPolicyAllowedHosts).toHaveBeenLastCalledWith(['second.example']);
+      expect(setPolicyAllowedHosts).not.toHaveBeenLastCalledWith(['first.example']);
+    });
+
+    it('keeps the policy when the job record is missing its commit SHA', async () => {
+      // Concurrent jobs can leave currentJob without a SHA. Clearing and
+      // bailing out there wiped the policy installed when the instance was
+      // spawned, and the job ran with no hosts - three runs failed this way.
+      const setPolicyAllowedHosts = jest.fn();
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({ hosts: ['codeload.github.com'], level: 'strict' as const }),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setPendingTargetContext('3', {
+        targetId: 't1',
+        targetDisplayName: 'owner/repo',
+        githubSha: 'abc1234',
+      });
+      helper.setInstance(3, {
+        name: 'runner-3',
+        currentJob: {
+          name: 'build',
+          repository: 'owner/repo',
+          startedAt: new Date().toISOString(),
+          id: 'job-3',
+        },
+      });
+      helper.setProxy(3, { setPolicyAllowedHosts, setPolicyLevel: jest.fn() });
+
+      await helper.applyRepoPolicy(3);
+
+      expect(setPolicyAllowedHosts).toHaveBeenLastCalledWith(['codeload.github.com']);
+    });
+
+    it('applies the level the repository declares, per job', async () => {
+      // Instances are pooled across repositories, so a level captured when the
+      // proxy started could belong to whichever repo happened to run first.
+      const setPolicyLevel = jest.fn();
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({ hosts: [], level: 'moderate' as const }),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, {
+        name: 'runner-1',
+        currentJob: {
+          name: 'build',
+          repository: 'owner/repo',
+          startedAt: new Date().toISOString(),
+          id: 'job-1',
+          targetDisplayName: 'owner/repo',
+          githubSha: 'abc1234',
+        },
+      });
+      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyLevel });
+
+      await helper.applyRepoPolicy(1);
+
+      expect(setPolicyLevel).toHaveBeenCalledWith('moderate');
+    });
+
+    it('applies strict with no hosts when a repository has no approved policy', async () => {
+      const setPolicyAllowedHosts = jest.fn();
+      const setPolicyLevel = jest.fn();
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({ hosts: [], level: 'strict' as const }),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, {
+        name: 'runner-1',
+        currentJob: {
+          name: 'build',
+          repository: 'owner/repo',
+          startedAt: new Date().toISOString(),
+          id: 'job-1',
+          targetDisplayName: 'owner/repo',
+          githubSha: 'abc1234',
+        },
+      });
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyLevel });
+
+      await helper.applyRepoPolicy(1);
+
+      expect(setPolicyAllowedHosts).toHaveBeenCalledWith([]);
+      expect(setPolicyLevel).toHaveBeenCalledWith('strict');
+    });
+
     it('records the refusal and its reason where the user will see it', () => {
       const onJobEvent = jest.fn();
       const manager = new RunnerManager({

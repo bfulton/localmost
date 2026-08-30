@@ -289,7 +289,6 @@ export interface AppSettings {
   /** Tool cache location. Defaults to 'persistent' (shared across restarts) */
   toolCacheLocation?: ToolCacheLocation;
   /** Sandbox policy level for all sandbox restrictions. Defaults to 'strict' */
-  sandboxPolicyLevel?: SandboxPolicyLevel;
 }
 
 export interface DeviceCodeInfo {

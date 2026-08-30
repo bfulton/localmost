@@ -7,7 +7,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const generatedDir = path.join(__dirname, '..', 'assets', 'generated');
+const generatedDir = path.join(__dirname, '..', 'build', 'generated');
 
 // Ensure generated directory exists
 if (!fs.existsSync(generatedDir)) {
@@ -206,4 +206,4 @@ for (let i = 0; i < PULSE_FRAMES; i++) {
     createTrayPausedTemplate(44, intensities[i])
   );
 }
-console.log(`SVG icons created in assets/generated/ (including ${PULSE_FRAMES} busy + ${PULSE_FRAMES} not-ready + ${PULSE_FRAMES} paused pulse frames)`);
+console.log(`SVG icons created in build/generated/ (including ${PULSE_FRAMES} busy + ${PULSE_FRAMES} not-ready + ${PULSE_FRAMES} paused pulse frames)`);

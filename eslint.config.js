@@ -9,8 +9,7 @@ module.exports = [
     ignores: [
       'node_modules/',
       '.webpack/',
-      'out/',
-      'dist/',
+      'build/',
       '*.config.js',
       'scripts/',
     ],

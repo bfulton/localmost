@@ -8,7 +8,7 @@ import * as yaml from 'js-yaml';
 import { getAppDataDir, getConfigPath } from './paths';
 import { encryptValue, decryptValue } from './encryption';
 import { bootLog } from './log-file';
-import { GitHubUser, SleepProtection, LogLevel, UserFilterConfig, Target, PowerConfig, NotificationsConfig, SandboxPolicyLevel, UpdateSettings } from '../shared/types';
+import { GitHubUser, SleepProtection, LogLevel, UserFilterConfig, Target, PowerConfig, NotificationsConfig, UpdateSettings } from '../shared/types';
 
 // Config paths - uses centralized path management
 const configDir = getAppDataDir();
@@ -28,7 +28,6 @@ export const SETTABLE_CONFIG_KEYS = [
   'logLevel',
   'runnerLogLevel',
   'userFilter',
-  'sandboxPolicyLevel',  // Sandbox policy level for all restrictions
   'targets',
   'maxConcurrentJobs',
   'power',  // Power settings (battery/video call pausing)
@@ -62,7 +61,6 @@ export interface AppConfig {
   preserveWorkDir?: 'always' | 'never';
   userFilter?: UserFilterConfig;
   /** Sandbox policy level for all restrictions. Defaults to 'strict' */
-  sandboxPolicyLevel?: SandboxPolicyLevel;
   /** Auto-update preferences */
   updateSettings?: UpdateSettings;
   /** Multi-target configuration - list of repos/orgs to register runners for */

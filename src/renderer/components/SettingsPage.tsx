@@ -38,8 +38,6 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     setToolCacheLocation,
     userFilter,
     setUserFilter,
-    sandboxPolicyLevel,
-    setSandboxPolicyLevel,
     power,
     setPauseOnBattery,
     setPauseOnVideoCall,
@@ -446,23 +444,22 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
             {/* Sandbox Policy Subsection */}
             <div className={styles.subsection}>
               <h4>Sandbox Policy</h4>
-              <div className={shared.formGroup}>
-                <label>Policy level</label>
-                <div className={styles.buttonGroup}>
-                  {(['strict', 'moderate', 'permissive'] as const).map((level) => (
-                    <button
-                      key={level}
-                      className={`${styles.optionButton} ${sandboxPolicyLevel === level ? styles.active : ''}`}
-                      onClick={() => setSandboxPolicyLevel(level)}
-                    >
-                      {SANDBOX_POLICY_LEVEL_DESCRIPTIONS[level].label}
-                    </button>
-                  ))}
-                </div>
-                <p className={shared.formHint}>
-                  {SANDBOX_POLICY_LEVEL_DESCRIPTIONS[sandboxPolicyLevel].description}
-                </p>
-              </div>
+              <p className={shared.formHint}>
+                Each repository declares its own policy level in its{' '}
+                <code>.localmostrc</code>, alongside the hosts and paths it
+                needs. A repository that declares none runs strict. Changing the
+                level is a policy change like any other, so it appears in the
+                approval above before it takes effect.
+              </p>
+              <ul className={shared.formHint}>
+                {(['strict', 'moderate', 'permissive'] as const).map((level) => (
+                  <li key={level}>
+                    <strong>{SANDBOX_POLICY_LEVEL_DESCRIPTIONS[level].label}</strong>
+                    {' — '}
+                    {SANDBOX_POLICY_LEVEL_DESCRIPTIONS[level].description}
+                  </li>
+                ))}
+              </ul>
             </div>
 
             {/* User Filtering Subsection */}

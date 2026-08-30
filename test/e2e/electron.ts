@@ -15,7 +15,7 @@ let testConfigDir: string | null = null;
 export async function launchElectron(): Promise<{ app: ElectronApplication; page: Page }> {
   // Use the production webpack build (file:// URLs, no dev server needed).
   // This is the package.json "main" entry that `npm run build` produces.
-  const mainPath = path.join(__dirname, '..', 'dist', 'main.js');
+  const mainPath = path.join(__dirname, '..', '..', 'build', 'dist', 'main.js');
   if (!fs.existsSync(mainPath)) {
     throw new Error(`Electron main bundle not found at ${mainPath}. Run "npm run build" first.`);
   }

@@ -136,6 +136,16 @@ export class RunnerManagerTestHelper {
     return this.internals.applyRepoPolicy(instanceNum);
   }
 
+  /** Seed the target context recorded when an instance is spawned for a job. */
+  setPendingTargetContext(
+    key: string,
+    context: { targetId: string; targetDisplayName: string; githubSha?: string }
+  ): void {
+    (this.manager as never as {
+      pendingTargetContext: Map<string, unknown>;
+    }).pendingTargetContext.set(key, context);
+  }
+
   /** Register a stub proxy for an instance. */
   setProxy(instanceNum: number, proxy: unknown): void {
     this.internals.proxyServers.set(instanceNum, proxy);

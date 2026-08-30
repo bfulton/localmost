@@ -74,19 +74,19 @@ const packagerConfig = {
   executableName: 'localmost',
   appBundleId: 'com.localmost.app',
   appCategoryType: 'public.app-category.developer-tools',
-  icon: path.join(__dirname, 'assets', 'generated', 'icon'),
+  icon: path.join(__dirname, 'build', 'generated', 'icon'),
   asar: true,
   darwinDarkModeSupport: true,
   extraResource: [
-    path.join(__dirname, 'assets', 'generated'),
-    path.join(__dirname, 'dist', 'cli.js'),
+    path.join(__dirname, 'build', 'generated'),
+    path.join(__dirname, 'build', 'dist', 'cli.js'),
     path.join(__dirname, 'scripts', 'localmost-cli'),
-    path.join(__dirname, 'build', 'app-update.yml'),
+    path.join(__dirname, 'packaging', 'app-update.yml'),
   ],
-  // Only include dist/, package.json, and LICENSE in the app bundle
+  // Only the built app code, package.json and LICENSE go in the bundle.
+  // build/ also holds forge's own output, so allow only build/dist within it.
   ignore: [
-    // Ignore everything except dist/, package.json, LICENSE
-    /^\/(?!dist\/|dist$|package\.json$|LICENSE$)/,
+    /^\/(?!build$|build\/dist(\/|$)|package\.json$|LICENSE$)/,
     // Also exclude source maps
     /\.map$/,
   ],
@@ -97,8 +97,8 @@ if (shouldSign) {
   packagerConfig.osxSign = {
     identity: signingIdentity,
     hardenedRuntime: true,
-    entitlements: path.join(__dirname, 'entitlements.plist'),
-    'entitlements-inherit': path.join(__dirname, 'entitlements.inherit.plist'),
+    entitlements: path.join(__dirname, 'packaging', 'entitlements.plist'),
+    'entitlements-inherit': path.join(__dirname, 'packaging', 'entitlements.inherit.plist'),
     'gatekeeper-assess': false,
   };
 
@@ -113,6 +113,7 @@ if (shouldSign) {
 }
 
 module.exports = {
+  outDir: 'build/out',
   packagerConfig,
   rebuildConfig: {},
   hooks: {
@@ -158,7 +159,7 @@ module.exports = {
     {
       name: '@electron-forge/maker-dmg',
       config: {
-        icon: path.join(__dirname, 'assets', 'generated', 'icon.icns'),
+        icon: path.join(__dirname, 'build', 'generated', 'icon.icns'),
         format: 'ULFO',
       },
     },

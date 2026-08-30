@@ -3,11 +3,11 @@
  *
  * Handles parsing, validation, and merging of declarative sandbox policies.
  */
-
 import * as yaml from 'js-yaml';
 import * as fs from 'fs';
 import * as path from 'path';
 import { SandboxPolicy, NetworkPolicy, FilesystemPolicy, SocketsPolicy, EnvPolicy } from './sandbox-profile';
+import { SandboxPolicyLevel } from './types';
 
 // =============================================================================
 // Types
@@ -27,6 +27,11 @@ export interface WorkflowPolicy extends SandboxPolicy {
 export interface LocalmostrcConfig {
   /** Config file version */
   version: number;
+  /**
+   * How much the sandbox grants before this policy adds to it.
+   * Absent means strict - see effectivePolicyLevel.
+   */
+  level?: SandboxPolicyLevel;
   /** Shared policy applied to all workflows */
   shared?: SandboxPolicy;
   /** Per-workflow policy overrides */
@@ -94,6 +99,18 @@ export function parseLocalmostrc(filePath: string): ParseResult {
 /**
  * Parse .localmostrc content string.
  */
+const POLICY_LEVELS: SandboxPolicyLevel[] = ['strict', 'moderate', 'permissive'];
+
+/**
+ * The level a policy asks for, which is strict unless it says otherwise.
+ *
+ * Silence has to mean the tightest setting: a policy that declares nothing
+ * should not inherit whatever the machine was last left on.
+ */
+export function effectivePolicyLevel(config?: LocalmostrcConfig | null): SandboxPolicyLevel {
+  return config?.level ?? 'strict';
+}
+
 export function parseLocalmostrcContent(content: string): ParseResult {
   const errors: ParseError[] = [];
   const warnings: string[] = [];
@@ -137,6 +154,13 @@ export function parseLocalmostrcContent(content: string): ParseResult {
     });
   }
 
+  // Validate level
+  if (config.level !== undefined && !POLICY_LEVELS.includes(config.level as SandboxPolicyLevel)) {
+    errors.push({
+      message: `"level" must be one of: ${POLICY_LEVELS.join(', ')}`,
+    });
+  }
+
   // Validate shared policy
   if (config.shared !== undefined) {
     validatePolicy(config.shared, 'shared', errors);
@@ -161,6 +185,7 @@ export function parseLocalmostrcContent(content: string): ParseResult {
   // Build a properly typed config object
   const typedConfig: LocalmostrcConfig = {
     version: typeof config.version === 'number' ? config.version : LOCALMOSTRC_VERSION,
+    level: config.level as SandboxPolicyLevel | undefined,
     shared: config.shared as SandboxPolicy | undefined,
     workflows: config.workflows as Record<string, WorkflowPolicy> | undefined,
   };
@@ -426,6 +451,9 @@ export function serializeLocalmostrc(config: LocalmostrcConfig): string {
   const lines: string[] = [];
 
   lines.push(`version: ${config.version}`);
+  if (config.level) {
+    lines.push(`level: ${config.level}`);
+  }
   lines.push('');
 
   if (config.shared) {
@@ -538,6 +566,14 @@ export interface PolicyDiff {
  */
 export function diffConfigs(oldConfig: LocalmostrcConfig, newConfig: LocalmostrcConfig): PolicyDiff[] {
   const diffs: PolicyDiff[] = [];
+
+  // The level decides how much the sandbox grants before anything below is
+  // read, so a change to it is the largest change a policy can make.
+  const oldLevel = effectivePolicyLevel(oldConfig);
+  const newLevel = effectivePolicyLevel(newConfig);
+  if (oldLevel !== newLevel) {
+    diffs.push({ path: 'level', type: 'changed', oldValue: oldLevel, newValue: newLevel });
+  }
 
   // Compare shared policies
   diffPolicies(oldConfig.shared || {}, newConfig.shared || {}, 'shared', diffs);
