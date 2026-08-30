@@ -129,7 +129,7 @@ Run workflow steps in the sandbox.
 - [x] Clear error messages when access is denied
   - [x] Show which policy would allow it
   - [x] Suggest `localmost test --updaterc` to add
-- [x] Fallback behavior when no `.localmostrc` exists — **changed during implementation**: the default is `strict`, not permissive. A repository with no policy runs on a read-only OS baseline with no network beyond runner infrastructure. Shipping permissive-by-default would mean a machine owner inherits blame for whatever someone else's workflow does.
+- [x] Fallback behavior when no `.localmostrc` exists — shipped as `strict`, not permissive. A repository with no policy runs on a read-only OS baseline with no network beyond runner infrastructure.
 
 ### Phase 8: Background Runner Integration
 

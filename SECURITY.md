@@ -100,8 +100,7 @@ hosts too.
 Read access to Apple-shipped system paths (`/bin`, `/usr`, `/System`, `/Library`,
 `/private/etc`, and the active Xcode developer directory) is likewise granted at
 every level. Without it nothing can start: `/bin/bash` itself would be
-unreadable. It is read-only, identical on every machine, and is not where the
-boundary lies.
+unreadable. It is read-only and grants no access to your own files.
 
 A repository's `.localmostrc` only takes effect once approved. When the runner
 sees a new or changed policy it refuses the job and cancels the run; review it
