@@ -8,6 +8,7 @@ jest.mock('fs', () => ({
   existsSync: jest.fn(),
   writeFileSync: jest.fn(),
   unlinkSync: jest.fn(),
+  mkdirSync: jest.fn(),
 }));
 
 // Mock child_process
@@ -59,6 +60,7 @@ describe('Process Sandbox', () => {
           existsSync: jest.fn().mockReturnValue(true),
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
+          mkdirSync: jest.fn(),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -84,6 +86,7 @@ describe('Process Sandbox', () => {
           existsSync: jest.fn().mockReturnValue(true),
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
+          mkdirSync: jest.fn(),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -108,6 +111,7 @@ describe('Process Sandbox', () => {
           existsSync: jest.fn().mockReturnValue(true),
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
+          mkdirSync: jest.fn(),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -129,6 +133,7 @@ describe('Process Sandbox', () => {
           existsSync: jest.fn().mockReturnValue(true),
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
+          mkdirSync: jest.fn(),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -147,6 +152,7 @@ describe('Process Sandbox', () => {
           existsSync: jest.fn().mockReturnValue(true),
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
+          mkdirSync: jest.fn(),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -166,6 +172,7 @@ describe('Process Sandbox', () => {
           existsSync: jest.fn().mockReturnValue(true),
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
+          mkdirSync: jest.fn(),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -185,6 +192,7 @@ describe('Process Sandbox', () => {
           existsSync: jest.fn().mockReturnValue(true),
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
+          mkdirSync: jest.fn(),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -229,6 +237,7 @@ describe('Process Sandbox', () => {
           existsSync: jest.fn().mockReturnValue(true),
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
+          mkdirSync: jest.fn(),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -266,6 +275,7 @@ describe('Process Sandbox', () => {
           existsSync: jest.fn().mockReturnValue(true),
           writeFileSync: mockWriteFileSync,
           unlinkSync: jest.fn(),
+          mkdirSync: jest.fn(),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -294,23 +304,32 @@ describe('Process Sandbox', () => {
           existsSync: jest.fn().mockReturnValue(true),
           writeFileSync: mockWriteFileSync,
           unlinkSync: jest.fn(),
+          mkdirSync: jest.fn(),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
 
         const instanceDir = path.join(os.homedir(), '.localmost', 'runner-2');
         const runnerPath = path.join(instanceDir, 'run.sh');
-        sandboxedSpawn(runnerPath, [], { cwd: instanceDir });
+        sandboxedSpawn(runnerPath, [], { cwd: instanceDir, proxyPort: 4242 });
 
         // Get the profile from the writeFileSync call
         const profile = mockWriteFileSync.mock.calls[0][1];
 
-        // Profile should deny by default
         expect(profile).toContain('(deny default)');
-        // Profile should allow network access
-        expect(profile).toContain('(allow network*)');
-        // Profile should trace to stderr for debugging
         expect(profile).toContain('(trace "/dev/stderr")');
+
+        // Egress goes through the filtering proxy or nowhere. Raw sockets made
+        // the host policy advisory: a workflow could ignore HTTP_PROXY and
+        // connect straight out, which is exactly what the policy forbids.
+        expect(profile).toContain('(deny network*)');
+        expect(profile).not.toContain('(allow network*)');
+        expect(profile).toContain('(allow network-outbound (remote ip "localhost:4242"))');
+
+        // The app's own control plane is never writable by a job: a job that
+        // can write the approval cache can approve its own policy.
+        expect(profile).toContain('(deny file-write*');
+        expect(profile).toMatch(/deny file-write\*[\s\S]*policies/);
       });
     });
 
@@ -325,6 +344,7 @@ describe('Process Sandbox', () => {
           existsSync: jest.fn().mockReturnValue(true),
           writeFileSync: mockWriteFileSync,
           unlinkSync: jest.fn(),
+          mkdirSync: jest.fn(),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');

@@ -61,9 +61,9 @@ localmost is an Electron desktop application that manages GitHub Actions self-ho
 ### What localmost protects against
 
 - **Filesystem writes**: Under `strict`, workflows can write only to the workspace and temp paths. `moderate` and `permissive` additionally allow writes to standard tool caches (`~/.npm`, `~/.cargo`, `~/.gradle`, `~/Library/Caches` and similar)
-- **Home directory access**: Workflows cannot read `~/.ssh`, `~/.aws`, `~/.config`, or other dotfiles at any level. `HOME` points inside the workspace, not at your home directory
-- **Filesystem reads**: A job can read its workspace and temp paths. Everything else, including system paths, must be declared in `.localmostrc`
-- **Network exfiltration**: Workflows can only connect to hosts the policy level allows. Under `strict` that is runner infrastructure plus what the repository declares — not npm, PyPI or other registries
+- **Home directory access**: Workflows cannot read `~/.ssh`, `~/.aws`, `~/.config` or the other credential locations listed above, at any level. `HOME` points inside the workspace, not at your home directory
+- **Filesystem reads**: A job can read the OS, the standard toolchain locations (`/opt/homebrew`, `/usr/local`, Xcode), the package-manager caches it can write, and its own workspace. It cannot read `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.config`, `~/Library/Keychains`, `~/.netrc`, `~/.npmrc`, or this app's own credential store and approval cache
+- **Network exfiltration**: A job's sandbox permits no outbound connection except to its own filtering proxy, so the host policy holds even for code that ignores `HTTP_PROXY` and opens a raw socket. Under `strict` the reachable set is runner infrastructure plus what the repository declares — not npm, PyPI or other registries
 - **Credential exposure**: OAuth tokens are encrypted at rest using macOS Keychain
 
 ### Policy levels
@@ -82,6 +82,8 @@ The level is part of the policy, so changing it is a policy change: it appears
 in the approval diff and takes effect only once approved. A repository cannot
 loosen its own sandbox without the machine owner agreeing to it.
 
+- **The app's own control plane**: A job cannot write the approval cache, the settings file, or reach the CLI control socket. Without this, a workflow could approve its own policy and the approval gate would mean nothing
+
 ### What localmost trusts (does NOT protect against)
 
 - **GitHub's infrastructure**: OAuth, API responses, and runner binary distribution are trusted. If GitHub is compromised, localmost provides no additional protection.
@@ -89,6 +91,7 @@ loosen its own sandbox without the machine owner agreeing to it.
 - **A compromised GitHub account**: If an attacker has access to your GitHub account, they can modify workflows that run on your runner.
 - **Allowlisted hosts**: Data can be exfiltrated to any host the active policy allows. Under `strict` that is runner infrastructure plus whatever the repository declares; looser levels allow more.
 - **Approved policies**: Once you approve a repository's `.localmostrc`, everything it declares is granted until the file changes again. Approval is a judgement about that content.
+- **Per-job filesystem policy**: A repository's `filesystem` declarations are not applied per job. The sandbox profile is fixed when a runner process starts, which happens before the runner claims a job, so the filesystem boundary is the fixed one described above. The `network` section *is* applied per job, at the moment a worker claims it. Treat `filesystem` entries as documentation of intent, not as an enforced narrowing.
 - **Declared system paths**: A policy that declares OS read paths grants them for the whole job. `localmost policy init` seeds that list with OS subpaths (`/usr/bin`, `/usr/lib`, `/System`, `/Library/Developer` and similar) because nothing runs without them. It deliberately excludes `/usr/local`, `/Library/Application Support` and `/Applications`, which hold third-party software and application data - but a policy is free to add them back, and approving one means accepting that.
 
 ## Network Policy

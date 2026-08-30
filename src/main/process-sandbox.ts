@@ -11,8 +11,16 @@
 import { spawn, ChildProcess, SpawnOptions } from 'child_process';
 import * as path from 'path';
 import * as os from 'os';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
-import { getAppDataDir, isAppSandboxed } from './paths';
+import {
+  getAppDataDir,
+  getConfigPath,
+  getCliSocketPath,
+  getRunnerDir,
+  getUserDataDir,
+  isAppSandboxed,
+} from './paths';
 
 /**
  * Allowed executable patterns within the runner directory.
@@ -95,10 +103,27 @@ function validateExecutablePath(executablePath: string): string {
  * - Sandbox write restrictions (this profile)
  * - Network proxy with domain filtering (separate layer)
  */
-function generateSandboxProfile(instanceDir: string): string {
+/**
+ * Where the runner keeps downloaded toolchains, shared across jobs.
+ * Mirrors RunnerDownloader.getToolCacheDir.
+ */
+function getToolCacheDirPath(): string {
+  return path.join(getRunnerDir(), 'tool-cache');
+}
+
+function generateSandboxProfile(instanceDir: string, proxyPort?: number): string {
   const escapedDir = instanceDir.replace(/"/g, '\\"');
   const homeDir = os.homedir().replace(/"/g, '\\"');
   const appDataDir = getRunnerBaseDir().replace(/"/g, '\\"');
+  // The app's own control plane: approvals, settings and the CLI socket. A job
+  // that can write these can approve its own policy, so it is carved out of
+  // the app data directory rather than trusted to leave it alone.
+  const toolCacheDir = getToolCacheDirPath().replace(/"/g, '\\"');
+  const policiesDir = `${appDataDir}/policies`;
+  const configFile = getConfigPath().replace(/"/g, '\\"');
+  const runnerDir = getRunnerDir().replace(/"/g, '\\"');
+  const userDataDir = getUserDataDir().replace(/"/g, '\\"');
+  const cliSocket = getCliSocketPath().replace(/"/g, '\\"');
   const tmpDir = os.tmpdir().replace(/"/g, '\\"');
 
   return `
@@ -127,13 +152,21 @@ function generateSandboxProfile(instanceDir: string): string {
 (allow file-ioctl
   (subpath "${escapedDir}"))
 
-;; App data directory (tool cache, other instances)
+;; Tool cache only. The rest of the app data directory holds the approval
+;; cache, settings and the CLI socket - a job that can write those can approve
+;; its own policy, so it does not get the directory wholesale.
 (allow file-write*
-  (subpath "${appDataDir}"))
+  (subpath "${toolCacheDir}"))
 
-;; File ioctl for git file locking in app data directory
+;; File ioctl for git file locking in the tool cache
 (allow file-ioctl
-  (subpath "${appDataDir}"))
+  (subpath "${toolCacheDir}"))
+
+;; Belt and braces: never writable, whatever else matches above.
+(deny file-write*
+  (subpath "${policiesDir}")
+  (literal "${configFile}")
+  (literal "${cliSocket}"))
 
 ;; System temp directories (many tools require this)
 ;; Note: /var is a symlink to /private/var on macOS, and sandbox
@@ -161,12 +194,73 @@ function generateSandboxProfile(instanceDir: string): string {
   (subpath "${homeDir}/go")
   (subpath "${homeDir}/Library/Caches"))
 
-;; READ ACCESS - Broad to allow tools to function
+;; READ ACCESS - the OS, the toolchains, and this job's own directories.
+;; Reading everything meant a workflow could read ~/.ssh private keys, AWS
+;; credentials and this app's own credential store, which is the opposite of
+;; what the policy documentation promises. Listed rather than subtracted, so
+;; adding a path is a deliberate act.
 (allow file-read*
-  (subpath "/")
+  (literal "/")
+  (subpath "/bin")
+  (subpath "/sbin")
+  (subpath "/usr/bin")
+  (subpath "/usr/lib")
+  (subpath "/usr/libexec")
+  (subpath "/usr/sbin")
+  (subpath "/usr/share")
+  (subpath "/System")
+  (subpath "/Library/Developer")
+  (subpath "/Library/Preferences")
+  (subpath "/Library/Frameworks")
+  (subpath "/private/etc")
+  (subpath "/private/var/db")
+  (subpath "/private/var/select")
+  (subpath "/private/var/folders")
+  (subpath "/etc")
+  (subpath "/var")
+  (subpath "/tmp")
+  (subpath "/private/tmp")
+  (subpath "/Applications/Xcode.app")
+  ;; Toolchains people actually build with
+  (subpath "/opt/homebrew")
+  (subpath "/usr/local")
+  ;; This job's own workspace, the runner install and the shared tool cache
+  (subpath "${escapedDir}")
+  (subpath "${runnerDir}")
+  (subpath "${toolCacheDir}")
+  ;; Package manager caches, which are writable below and so must be readable
+  (subpath "${homeDir}/.npm")
+  (subpath "${homeDir}/.yarn")
+  (subpath "${homeDir}/.pnpm-store")
+  (subpath "${homeDir}/.cache")
+  (subpath "${homeDir}/.cargo")
+  (subpath "${homeDir}/.rustup")
+  (subpath "${homeDir}/.gradle")
+  (subpath "${homeDir}/.m2")
+  (subpath "${homeDir}/.nuget")
+  (subpath "${homeDir}/.dotnet")
+  (subpath "${homeDir}/.local")
+  (subpath "${homeDir}/go")
+  (subpath "${homeDir}/Library/Caches")
   (literal "/dev/null")
   (literal "/dev/random")
   (literal "/dev/urandom"))
+
+;; Never readable, whatever a future path above might overlap: the secrets a
+;; developer machine keeps and this app's own credential store.
+(deny file-read*
+  (subpath "${homeDir}/.ssh")
+  (subpath "${homeDir}/.aws")
+  (subpath "${homeDir}/.gnupg")
+  (subpath "${homeDir}/.kube")
+  (subpath "${homeDir}/.docker")
+  (subpath "${homeDir}/.config")
+  (subpath "${homeDir}/Library/Keychains")
+  (subpath "${userDataDir}")
+  (subpath "${policiesDir}")
+  (literal "${configFile}")
+  (literal "${homeDir}/.netrc")
+  (literal "${homeDir}/.npmrc"))
 
 ;; Device files that need read/write access (git, many tools redirect to /dev/null)
 (allow file-write*
@@ -176,7 +270,8 @@ function generateSandboxProfile(instanceDir: string): string {
   (literal "/dev/tty")
   (literal "/dev/dtracehelper"))
 
-;; Allow file metadata operations everywhere (ls, stat, etc.)
+;; Metadata (ls, stat) stays broad: tools walk paths they cannot open, and
+;; existence is not the secret. The contents above remain denied.
 (allow file-read-metadata)
 
 ;; ------------------------------------------------------------
@@ -189,7 +284,21 @@ function generateSandboxProfile(instanceDir: string): string {
 ;; NETWORK ACCESS - Permissive (runner contacts many services)
 ;; Note: Network filtering is done at the proxy layer, not here
 ;; ------------------------------------------------------------
-(allow network*)
+;; Outbound traffic is confined to this instance's filtering proxy. The proxy
+;; is what enforces the host policy; leaving raw sockets open made that policy
+;; advisory, since a workflow could simply ignore HTTP_PROXY and connect out
+;; directly. sandbox-exec cannot filter by hostname, which is why the proxy
+;; exists - but it can make the proxy the only way out.
+(deny network*)
+${proxyPort ? `(allow network-outbound (remote ip "localhost:${proxyPort}"))` : ';; No proxy port supplied: no outbound network at all'}
+
+;; Local sockets stay available: system frameworks need them to function.
+(allow network-outbound (remote unix-socket))
+(deny network-outbound (literal "${cliSocket}"))
+
+;; Binding a local port is how test servers and build tools talk to themselves.
+(allow network-bind (local ip "localhost:*"))
+(allow network-inbound (local ip "localhost:*"))
 
 ;; ------------------------------------------------------------
 ;; MACH/IPC OPERATIONS - Permissive (required by system frameworks)
@@ -258,8 +367,6 @@ export function spawnSandboxed(
 
   // Extract custom options (don't pass to spawn)
   const { proxyPort, logPrefix, onLog, ...spawnOptions } = options;
-  // proxyPort is extracted but currently unused - reserved for future proxy routing
-  void proxyPort;
 
   // Create a prefixed logger - only logs if onLog callback is provided
   const prefix = logPrefix ? `[${logPrefix}] ` : '';
@@ -270,11 +377,21 @@ export function spawnSandboxed(
 
   // Use sandbox-exec for OS-level isolation on macOS
   if (process.platform === 'darwin') {
-    const profile = generateSandboxProfile(instanceDir);
+    const profile = generateSandboxProfile(instanceDir, proxyPort);
 
-    // Write profile to temp file for debugging and to avoid shell escaping issues
-    const profilePath = path.join(os.tmpdir(), `sandbox-profile-${Date.now()}.sb`);
-    fs.writeFileSync(profilePath, profile, 'utf-8');
+    // The profile is the thing that confines the job, so it must not live
+    // anywhere a job can write. os.tmpdir() is granted to every sandbox, and
+    // the name was predictable from the clock: a job could plant a symlink at
+    // the next path and have the app write through it, or swap the profile
+    // used by the next spawn. It goes in the app's own directory instead,
+    // created exclusively so an existing entry is never followed.
+    const profileDir = path.join(getRunnerDir(), 'sandbox-profiles');
+    fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+    const profilePath = path.join(
+      profileDir,
+      `sandbox-profile-${crypto.randomBytes(16).toString('hex')}.sb`
+    );
+    fs.writeFileSync(profilePath, profile, { encoding: 'utf-8', mode: 0o600, flag: 'wx' });
     log.debug(`Wrote sandbox profile to: ${profilePath}`);
     log.debug(`Spawning: sandbox-exec -f ${profilePath} ${validatedPath} ${args.join(' ')}`);
     log.debug(`Working directory: ${instanceDir}`);
