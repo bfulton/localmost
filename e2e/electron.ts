@@ -20,6 +20,11 @@ export async function launchElectron(): Promise<{ app: ElectronApplication; page
     throw new Error(`Electron main bundle not found at ${mainPath}. Run "npm run build" first.`);
   }
 
+  // Close anything still running before replacing the module-level handles.
+  // A suite whose afterAll did not run would otherwise leak an Electron process
+  // and its temp directory for the rest of the run.
+  await closeElectron();
+
   // Create an isolated temp config directory for test reproducibility and safety
   // This prevents tests from using/modifying the user's real ~/.localmost settings
   testConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'localmost-e2e-'));
