@@ -27,6 +27,8 @@ jest.mock('./proxy-server', () => ({
     stop: jest.fn().mockResolvedValue(undefined),
     getProxyUrl: jest.fn().mockReturnValue('http://localhost:12345'),
     getPort: jest.fn().mockReturnValue(12345),
+    setPolicyAllowedHosts: jest.fn(),
+    setPolicyLevel: jest.fn(),
   })),
 }));
 
@@ -674,6 +676,45 @@ describe('RunnerManager', () => {
       // would grant them to a different repository.
       expect(getRepoPolicy).not.toHaveBeenCalled();
       expect(setPolicyAllowedHosts).toHaveBeenCalledWith([]);
+    });
+
+    it('does not leave one repository\'s hosts on a proxy reused by another', async () => {
+      // Proxies outlive a job. Instance 3 once ran a job whose policy was never
+      // installed and inherited the previous repo's hosts; the guard is that
+      // every job sets the policy for its own target before the runner starts.
+      const setPolicyAllowedHosts = jest.fn();
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async (owner: string, repo: string) =>
+          repo === 'first'
+            ? { hosts: ['first.example'], level: 'strict' as const }
+            : { hosts: ['second.example'], level: 'strict' as const },
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyLevel: jest.fn() });
+
+      const runJob = async (repo: string) => {
+        helper.setInstance(1, {
+          name: 'runner-1',
+          currentJob: {
+            name: 'build',
+            repository: `owner/${repo}`,
+            startedAt: new Date().toISOString(),
+            id: `job-${repo}`,
+            targetDisplayName: `owner/${repo}`,
+            githubSha: 'abc1234',
+          },
+        });
+        await helper.applyRepoPolicy(1);
+      };
+
+      await runJob('first');
+      await runJob('second');
+
+      expect(setPolicyAllowedHosts).toHaveBeenLastCalledWith(['second.example']);
+      expect(setPolicyAllowedHosts).not.toHaveBeenLastCalledWith(['first.example']);
     });
 
     it('applies the level the repository declares, per job', async () => {
