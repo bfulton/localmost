@@ -125,27 +125,38 @@ function querySandboxLogs(sinceSeconds: number): string {
     return '';
   }
 
+  // Query the unified log for sandbox reports.
+  // Use /bin/bash explicitly and write to a temp file to avoid pipe issues.
+  // Note /usr/bin/log, not `log`: zsh has a `log` builtin that shadows it.
+  const stamp = Date.now();
+  const tmpFile = `/tmp/localmost-sandbox-log-${stamp}.txt`;
+  const scriptFile = `/tmp/localmost-query-log-${stamp}.sh`;
+
   try {
-    // Query the unified log for sandbox reports
-    // Use /bin/bash explicitly and write to temp file to avoid pipe issues
-    const tmpFile = `/tmp/localmost-sandbox-log-${Date.now()}.txt`;
     const script = `#!/bin/bash
-log show --last ${sinceSeconds}s 2>/dev/null | grep "kernel: (Sandbox)" > "${tmpFile}" || true
+/usr/bin/log show --last ${sinceSeconds}s 2>/dev/null | grep "kernel: (Sandbox)" > "${tmpFile}" || true
 `;
-    const scriptFile = `/tmp/localmost-query-log-${Date.now()}.sh`;
     fs.writeFileSync(scriptFile, script);
     execSync(`/bin/bash "${scriptFile}"`, { encoding: 'utf-8' });
 
     let output = '';
     if (fs.existsSync(tmpFile)) {
       output = fs.readFileSync(tmpFile, 'utf-8');
-      fs.unlinkSync(tmpFile);
     }
-    fs.unlinkSync(scriptFile);
     return output;
   } catch {
     // If log command fails, return empty string
     return '';
+  } finally {
+    // Cleanup belongs here: on the previous success-only path a throw left the
+    // script and its output behind in /tmp for good.
+    for (const file of [tmpFile, scriptFile]) {
+      try {
+        if (fs.existsSync(file)) fs.unlinkSync(file);
+      } catch {
+        // Best effort
+      }
+    }
   }
 }
 

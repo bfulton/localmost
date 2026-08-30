@@ -88,7 +88,9 @@ export class ProxyServer {
     // Helper to check if host matches a pattern
     const matchesPattern = (pattern: string): boolean => {
       if (pattern.startsWith('*.')) {
-        const suffix = pattern.slice(1); // Remove *
+        // Lowercase the suffix too: patterns come from .localmostrc and are
+        // hand-written, so *.GitHub.com must match api.github.com.
+        const suffix = pattern.slice(1).toLowerCase(); // Remove *
         return normalizedHost.endsWith(suffix);
       }
       return normalizedHost === pattern.toLowerCase();

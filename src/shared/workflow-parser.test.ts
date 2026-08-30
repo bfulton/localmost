@@ -161,6 +161,15 @@ jobs:
       expect(resolveReusableWorkflowPath('./../secrets.yml', caller)).toBeNull();
     });
 
+    it('refuses an escape through a symlink inside the repository', () => {
+      // A lexical check alone is satisfied by ./link/secret.yml where the
+      // repository contains link -> somewhere outside it.
+      mockFs.realpathSync.mockImplementation(((p: string) =>
+        p === '/repo/link/secret.yml' ? '/elsewhere/secret.yml' : p) as never);
+
+      expect(resolveReusableWorkflowPath('./link/secret.yml', caller)).toBeNull();
+    });
+
     it('returns null for remote references', () => {
       expect(resolveReusableWorkflowPath('owner/repo/.github/workflows/x.yml@main', caller))
         .toBeNull();

@@ -1019,13 +1019,17 @@ async function runInSandbox(
       const profilePath = path.join(os.tmpdir(), `localmost-sandbox-${Date.now()}.sb`);
       fs.writeFileSync(profilePath, profile);
 
-      // Debug: save profile to workdir for inspection
-      const debugProfilePath = path.join(options.cwd, '.debug', 'sandbox-profile.sb');
-      const debugDir = path.dirname(debugProfilePath);
-      if (!fs.existsSync(debugDir)) {
-        fs.mkdirSync(debugDir, { recursive: true });
+      // Save a copy for inspection, but only when discovering: a normal run
+      // should not write into the workspace, which may be the user's checkout
+      // or an action's own directory.
+      if (options.sandboxLogFile) {
+        const debugProfilePath = path.join(options.cwd, '.debug', 'sandbox-profile.sb');
+        const debugDir = path.dirname(debugProfilePath);
+        if (!fs.existsSync(debugDir)) {
+          fs.mkdirSync(debugDir, { recursive: true });
+        }
+        fs.writeFileSync(debugProfilePath, profile);
       }
-      fs.writeFileSync(debugProfilePath, profile);
 
       spawnCommand = '/usr/bin/sandbox-exec';
       spawnArgs = ['-f', profilePath, command, ...args];

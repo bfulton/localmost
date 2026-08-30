@@ -522,7 +522,10 @@ export function parseSandboxTrace(
   //   kernel: (Sandbox) Sandbox: <process>(<pid>) allow <operation> <path>
   // Example: kernel: (Sandbox) Sandbox: ls(77572) allow file-read-data /usr
   // Example: kernel: (Sandbox) Sandbox: bash(1234) allow file-write-data /tmp/foo
-  const traceRegex = /Sandbox:\s+(\w+)\((\d+)\)\s+(allow|deny)\s+(\S+)\s+(.+)$/gm;
+  // Process names routinely contain hyphens and dots (git-remote-https,
+  // com.apple.WebKit), so \w alone silently skips those lines and leaves the
+  // discovered policy incomplete.
+  const traceRegex = /Sandbox:\s+([^(\s]+)\((\d+)\)\s+(allow|deny)\s+(\S+)\s+(.+)$/gm;
 
   let match;
   while ((match = traceRegex.exec(traceContent)) !== null) {
