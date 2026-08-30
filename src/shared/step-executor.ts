@@ -74,6 +74,55 @@ export interface JobExecutionOptions {
 // =============================================================================
 
 /**
+ * How many trailing characters could still turn out to be the start of a secret.
+ */
+function partialSecretSuffixLength(text: string, values: string[]): number {
+  let hold = 0;
+  for (const value of values) {
+    for (let n = Math.min(value.length - 1, text.length); n > hold; n--) {
+      if (text.endsWith(value.slice(0, n))) {
+        hold = n;
+        break;
+      }
+    }
+  }
+  return hold;
+}
+
+/**
+ * Mask secrets across a stream whose chunk boundaries are arbitrary.
+ *
+ * Masking each chunk on its own misses any secret the runtime happens to split
+ * in two, which is the case that matters: the halves look innocuous and the
+ * value lands in the log intact. This holds back the longest tail that could
+ * still become a secret, and releases it once the next chunk decides.
+ *
+ * `flush` must be called at end of stream to emit whatever is still held.
+ */
+export function createSecretMasker(secrets: Record<string, string>): {
+  push(chunk: string): string;
+  flush(): string;
+} {
+  const values = Object.values(secrets).filter((v) => v && v.length >= 4);
+  let held = '';
+
+  return {
+    push(chunk: string): string {
+      if (values.length === 0) return chunk;
+      const masked = maskSecrets(held + chunk, secrets);
+      const hold = partialSecretSuffixLength(masked, values);
+      held = hold > 0 ? masked.slice(masked.length - hold) : '';
+      return hold > 0 ? masked.slice(0, masked.length - hold) : masked;
+    },
+    flush(): string {
+      const out = maskSecrets(held, secrets);
+      held = '';
+      return out;
+    },
+  };
+}
+
+/**
  * Create the workspace-local HOME a step runs with.
  *
  * Every step gets HOME inside the workspace, so every path that builds a step
@@ -1106,26 +1155,45 @@ async function runInSandbox(
 
     const secrets = options.secrets || {};
 
-    proc.stdout?.on('data', (data: Buffer) => {
-      const lines = maskSecrets(data.toString(), secrets).split('\n');
-      for (const line of lines) {
-        if (line) {
-          options.onOutput?.(line, 'stdout');
-        }
-      }
-    });
+    // Chunk boundaries are arbitrary, so both masking and line splitting have to
+    // carry state across chunks; doing either per chunk leaks secrets and breaks
+    // lines in half.
+    const makeSink = (stream: 'stdout' | 'stderr') => {
+      const masker = createSecretMasker(secrets);
+      let pending = '';
 
-    proc.stderr?.on('data', (data: Buffer) => {
-      const lines = maskSecrets(data.toString(), secrets).split('\n');
-      for (const line of lines) {
-        if (line) {
-          stderrLines.push(line);
-          options.onOutput?.(line, 'stderr');
-        }
-      }
-    });
+      const emit = (line: string) => {
+        if (!line) return;
+        if (stream === 'stderr') stderrLines.push(line);
+        options.onOutput?.(line, stream);
+      };
+
+      return {
+        write(chunk: string) {
+          pending += masker.push(chunk);
+          const lines = pending.split('\n');
+          pending = lines.pop() ?? '';
+          for (const line of lines) emit(line);
+        },
+        end() {
+          pending += masker.flush();
+          for (const line of pending.split('\n')) emit(line);
+          pending = '';
+        },
+      };
+    };
+
+    const stdoutSink = makeSink('stdout');
+    const stderrSink = makeSink('stderr');
+
+    proc.stdout?.on('data', (data: Buffer) => stdoutSink.write(data.toString()));
+    proc.stderr?.on('data', (data: Buffer) => stderrSink.write(data.toString()));
 
     proc.on('close', (code) => {
+      // Release any output still held back for masking or an unterminated line.
+      stdoutSink.end();
+      stderrSink.end();
+
       // Stop PID watcher and collect all PIDs
       if (pidWatcher && options.collectedPids) {
         const watchedPids = pidWatcher.stop();
