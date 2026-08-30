@@ -104,6 +104,7 @@ import { getEffectivePolicy } from '../shared/localmostrc';
 import {
   decidePolicyForJob,
   recordPendingPolicy,
+  cachePolicyConfig,
   getCachedPolicy,
   formatApprovalRequest,
 } from './policy-cache';
@@ -183,7 +184,12 @@ async function checkRepoPolicyApproval(
     const content = await auth.getFileContent(accessToken, owner, repo, '.localmostrc', sha);
     const decision = decidePolicyForJob(repository, content);
 
-    if (decision.action === 'allow') return null;
+    if (decision.action === 'allow') {
+      // A narrowed policy becomes the approved one, so widening back out later
+      // is recognised as a new grant rather than a return to something known.
+      if (decision.config) cachePolicyConfig(repository, decision.config, true);
+      return null;
+    }
     if (decision.action === 'invalid') {
       return `${repository} has a .localmostrc that could not be parsed: ${decision.reason}`;
     }

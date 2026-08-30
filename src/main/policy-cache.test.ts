@@ -92,6 +92,58 @@ describe('decidePolicyForJob', () => {
     expect(decidePolicyForJob(REPO, ': : :').action).toBe('invalid');
   });
 
+  describe('a change that only narrows access', () => {
+    const TWO_HOSTS = 'version: 1\nshared:\n  network:\n    allow:\n      - "index.crates.io"\n      - "registry.npmjs.org"\n';
+    const ONE_HOST = 'version: 1\nshared:\n  network:\n    allow:\n      - "index.crates.io"\n';
+    const DENIES = 'version: 1\nshared:\n  network:\n    allow:\n      - "index.crates.io"\n    deny:\n      - "evil.example"\n';
+
+    const approve = (content: string) => {
+      const d = decidePolicyForJob(REPO, content);
+      if (d.action !== 'needs-approval') throw new Error('expected approval');
+      cachePolicyConfig(REPO, d.request.newConfig, true);
+    };
+
+    it('runs without asking again when a host is dropped', () => {
+      // Giving up access cannot hurt the machine owner, so making them
+      // re-approve it is friction that buys nothing.
+      approve(TWO_HOSTS);
+
+      expect(decidePolicyForJob(REPO, ONE_HOST)).toMatchObject({
+        action: 'allow',
+        reason: 'narrowed',
+      });
+    });
+
+    it('runs without asking when a deny entry is added', () => {
+      approve(ONE_HOST);
+
+      expect(decidePolicyForJob(REPO, DENIES)).toMatchObject({ action: 'allow' });
+    });
+
+    it('still asks when a deny entry is removed', () => {
+      // Dropping a deny widens access even though it is a removal.
+      approve(DENIES);
+
+      expect(decidePolicyForJob(REPO, ONE_HOST).action).toBe('needs-approval');
+    });
+
+    it('still asks when a change both adds and removes', () => {
+      approve(ONE_HOST);
+
+      expect(decidePolicyForJob(REPO, TWO_HOSTS).action).toBe('needs-approval');
+    });
+
+    it('asks again if the narrowed policy widens back out', () => {
+      approve(TWO_HOSTS);
+      const narrowed = decidePolicyForJob(REPO, ONE_HOST);
+      if (narrowed.action !== 'allow' || !narrowed.config) throw new Error('expected narrowed config');
+      cachePolicyConfig(REPO, narrowed.config, true);
+
+      // The narrower policy is the approved one now, so going back is a widening.
+      expect(decidePolicyForJob(REPO, TWO_HOSTS).action).toBe('needs-approval');
+    });
+  });
+
   it('allows a repository that removes its policy', () => {
     cachePolicyConfig(REPO, { version: 1, shared: {} }, true);
 
