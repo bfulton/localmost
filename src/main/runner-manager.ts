@@ -1420,20 +1420,13 @@ export class RunnerManager {
     const proxy = this.proxyServers.get(instanceNum);
     if (!proxy) return;
 
-    // Clear first. Proxies outlive a single job, so returning early below would
-    // otherwise leave the previous job's .localmostrc hosts installed and grant
-    // them to a different repository. The level resets for the same reason: an
-    // instance that ran a permissive repo must not carry that into the next job.
-    proxy.setPolicyAllowedHosts([]);
-    proxy.setPolicyLevel('strict');
-
+    // This refines a policy that acquirejob has already installed for the job
+    // the worker actually claimed, purely to pick up any per-workflow section
+    // now that the job name is known. It must never clear: clearing here wiped
+    // a correct policy whenever this path could not identify the job, and the
+    // job then ran with no hosts. Staleness is handled where a job is claimed.
     if (!instance?.currentJob || !this.getRepoPolicy) return;
 
-    // currentJob is filled from whichever pending context the runner matched,
-    // and under concurrent jobs that lookup can come up short. The context
-    // stored when this instance was spawned describes this instance's job, so
-    // fall back to it rather than clearing the policy the startup path
-    // installed and leaving the job with no hosts at all.
     const spawnContext = this.pendingTargetContext.get(String(instanceNum));
     const targetDisplayName = instance.currentJob.targetDisplayName ?? spawnContext?.targetDisplayName;
     const githubSha = instance.currentJob.githubSha ?? spawnContext?.githubSha;
