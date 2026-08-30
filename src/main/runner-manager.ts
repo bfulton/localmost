@@ -1402,10 +1402,22 @@ export class RunnerManager {
 
     if (!instance?.currentJob || !this.getRepoPolicy) return;
 
-    const { targetDisplayName, githubSha, name: jobName } = instance.currentJob;
+    // currentJob is filled from whichever pending context the runner matched,
+    // and under concurrent jobs that lookup can come up short. The context
+    // stored when this instance was spawned describes this instance's job, so
+    // fall back to it rather than clearing the policy the startup path
+    // installed and leaving the job with no hosts at all.
+    const spawnContext = this.pendingTargetContext.get(String(instanceNum));
+    const targetDisplayName = instance.currentJob.targetDisplayName ?? spawnContext?.targetDisplayName;
+    const githubSha = instance.currentJob.githubSha ?? spawnContext?.githubSha;
     if (!targetDisplayName || !githubSha) return;
 
-    await this.applyPolicyForTarget(instanceNum, targetDisplayName, githubSha, jobName);
+    await this.applyPolicyForTarget(
+      instanceNum,
+      targetDisplayName,
+      githubSha,
+      instance.currentJob.name
+    );
   }
 
   /**

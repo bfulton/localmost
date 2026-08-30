@@ -717,6 +717,39 @@ describe('RunnerManager', () => {
       expect(setPolicyAllowedHosts).not.toHaveBeenLastCalledWith(['first.example']);
     });
 
+    it('keeps the policy when the job record is missing its commit SHA', async () => {
+      // Concurrent jobs can leave currentJob without a SHA. Clearing and
+      // bailing out there wiped the policy installed when the instance was
+      // spawned, and the job ran with no hosts - three runs failed this way.
+      const setPolicyAllowedHosts = jest.fn();
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({ hosts: ['codeload.github.com'], level: 'strict' as const }),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setPendingTargetContext('3', {
+        targetId: 't1',
+        targetDisplayName: 'owner/repo',
+        githubSha: 'abc1234',
+      });
+      helper.setInstance(3, {
+        name: 'runner-3',
+        currentJob: {
+          name: 'build',
+          repository: 'owner/repo',
+          startedAt: new Date().toISOString(),
+          id: 'job-3',
+        },
+      });
+      helper.setProxy(3, { setPolicyAllowedHosts, setPolicyLevel: jest.fn() });
+
+      await helper.applyRepoPolicy(3);
+
+      expect(setPolicyAllowedHosts).toHaveBeenLastCalledWith(['codeload.github.com']);
+    });
+
     it('applies the level the repository declares, per job', async () => {
       // Instances are pooled across repositories, so a level captured when the
       // proxy started could belong to whichever repo happened to run first.
