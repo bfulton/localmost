@@ -9,7 +9,7 @@
     "type": "git",
     "url": "https://github.com/bfulton/localmost.git"
   },
-  "main": "dist/main.js",
+  "main": "build/dist/main.js",
   "engines": {
     "node": ">=22.12.0"
   },
@@ -18,9 +18,9 @@
   },
   "scripts": {
     "start": "npm run prebuild && npm run build:dev && electron .",
-    "start:dev": "npm run prebuild && concurrently \"npm run watch\" \"wait-on dist/main.js && electron .\"",
+    "start:dev": "npm run prebuild && concurrently \"npm run watch\" \"wait-on build/dist/main.js && electron .\"",
     "build": "npm run prebuild && cross-env NODE_ENV=production webpack --config webpack.config.js && npm run build:cli",
-    "build:cli": "cross-env NODE_ENV=production webpack --config webpack.config.cli.js && chmod +x dist/cli.js",
+    "build:cli": "cross-env NODE_ENV=production webpack --config webpack.config.cli.js && chmod +x build/dist/cli.js",
     "build:dev": "cross-env NODE_ENV=development webpack --config webpack.config.js",
     "watch": "cross-env NODE_ENV=development webpack --config webpack.config.js --watch",
     "package": "npm run build && electron-forge package",
@@ -34,15 +34,15 @@
     "icons": "npm run icons:svg && npm run icons:convert",
     "icons:convert": "node scripts/convert-icons.js",
     "pretest": "npm run build-info",
-    "test": "jest --config jest.config.js && jest --config jest.config.renderer.js",
-    "test:main": "jest --config jest.config.js",
-    "test:renderer": "jest --config jest.config.renderer.js",
-    "test:watch": "jest --config jest.config.js --watch",
-    "test:coverage": "jest --config jest.config.js --coverage",
+    "test": "jest --config test/jest.config.js && jest --config test/jest.config.renderer.js",
+    "test:main": "jest --config test/jest.config.js",
+    "test:renderer": "jest --config test/jest.config.renderer.js",
+    "test:watch": "jest --config test/jest.config.js --watch",
+    "test:coverage": "jest --config test/jest.config.js --coverage",
     "build:e2e": "npm run build && electron-forge package",
-    "test:e2e": "npm run build:e2e && npx playwright test",
-    "clean": "rm -rf dist release",
-    "analyze": "cross-env NODE_ENV=production webpack --config webpack.config.js --profile --json > stats.json && webpack-bundle-analyzer stats.json"
+    "test:e2e": "npm run build:e2e && npx playwright test --config test/playwright.config.ts",
+    "clean": "rm -rf build",
+    "analyze": "cross-env NODE_ENV=production webpack --config webpack.config.js --profile --json > build/stats.json && webpack-bundle-analyzer build/stats.json"
   },
   "devDependencies": {
     "@electron-forge/cli": "^7.11.2",

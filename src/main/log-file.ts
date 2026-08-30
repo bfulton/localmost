@@ -36,10 +36,10 @@ let logFileStream: fs.WriteStream | null = null;
  */
 export const findAsset = (filename: string): string | undefined => {
   const possiblePaths = [
-    // Development: assets folder in project root
-    path.join(app.getAppPath(), 'assets', 'generated', filename),
-    path.join(__dirname, '..', '..', 'assets', 'generated', filename),
-    path.join(__dirname, '..', 'assets', 'generated', filename),
+    // Development: icons are generated into build/generated
+    path.join(app.getAppPath(), 'build', 'generated', filename),
+    path.join(__dirname, '..', '..', 'generated', filename),
+    path.join(__dirname, '..', '..', '..', 'build', 'generated', filename),
     // Packaged app: extraResource copies 'generated' folder to Resources/
     path.join(process.resourcesPath || '', 'generated', filename),
   ];

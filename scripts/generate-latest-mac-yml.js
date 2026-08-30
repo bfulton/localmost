@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const pkg = require('../package.json');
 const version = pkg.version;
 
-const outDir = path.join(__dirname, '..', 'out', 'make');
+const outDir = path.join(__dirname, '..', 'build', 'out', 'make');
 
 function sha512(filePath) {
   const data = fs.readFileSync(filePath);
@@ -45,7 +45,7 @@ if (fs.existsSync(x64Dmg)) {
 }
 
 if (files.length === 0) {
-  console.error('No DMG files found in out/make/');
+  console.error('No DMG files found in build/out/make/');
   process.exit(1);
 }
 

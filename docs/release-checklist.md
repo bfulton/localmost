@@ -19,7 +19,7 @@
   export APPLE_APP_SPECIFIC_PASSWORD="xxxx-xxxx-xxxx-xxxx"
   export APPLE_TEAM_ID="XXXXXXXXXX"
   ```
-- [ ] `rm -rf out/make`
+- [ ] `rm -rf build/out/make`
 - [ ] `npm run make -- --arch=x64`
 - [ ] Verify output shows:
   - `Signing: Developer ID Application: ...`
@@ -48,9 +48,9 @@
   - Target: main
   - Release title: X.Y.Z
   - Release notes: copy from CHANGELOG.md
-  - Attach `out/make/localmost-X.Y.Z-arm64.dmg`
-  - Attach `out/make/localmost-X.Y.Z-x64.dmg`
-  - Attach `out/make/latest-mac.yml`
+  - Attach `build/out/make/localmost-X.Y.Z-arm64.dmg`
+  - Attach `build/out/make/localmost-X.Y.Z-x64.dmg`
+  - Attach `build/out/make/latest-mac.yml`
 - [ ] Publish release
 - [ ] Bump the release version in [package.json](https://github.com/bfulton/localmost/edit/main/package.json)
 - [ ] Update [CHANGELOG.md](https://github.com/bfulton/localmost/edit/main/CHANGELOG.md) with proper release dates and links, and section for next unreleased version

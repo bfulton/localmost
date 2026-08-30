@@ -1,4 +1,6 @@
 module.exports = {
+  // This config lives in test/, but every path in it is repo-relative.
+  rootDir: '..',
   preset: 'ts-jest',
   testEnvironment: 'node',
   roots: ['<rootDir>/src'],
@@ -10,7 +12,7 @@ module.exports = {
     '!src/main/index.ts',
     '!src/main/preload.ts',
   ],
-  coverageDirectory: 'coverage',
+  coverageDirectory: 'build/coverage',
   setupFilesAfterEnv: ['<rootDir>/test/setup.ts'],
   moduleNameMapper: {
     '^electron$': '<rootDir>/test/mocks/electron.ts',
