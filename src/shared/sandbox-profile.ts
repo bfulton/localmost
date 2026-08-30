@@ -403,11 +403,12 @@ export function generateDiscoveryProfile(options: {
     '(allow network-outbound (local ip))',
     '(allow network-inbound (local ip))',
     '',
-    `;; Unix sockets: working directory and reporting`,
+    `;; Unix sockets: working directory only. Deliberately no blanket
+    ;; (allow network-* (with report)): that would let a tool ignoring
+    ;; HTTP_PROXY reach the internet directly, bypassing the proxy that
+    ;; records which hosts a workflow actually needs.`,
     `(allow network-bind (subpath "${escapedWorkDir}"))`,
     `(allow network-outbound (subpath "${escapedWorkDir}"))`,
-    '(allow network-bind (with report))',
-    '(allow network-outbound (with report))',
     '',
     ';; ------------------------------------------------------------',
     ';; PROCESS/SYSTEM OPERATIONS - Allow all (no reporting needed)',

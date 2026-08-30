@@ -992,12 +992,13 @@ async function runInSandbox(
     if (process.platform === 'darwin') {
       let profile: string;
 
-      if (permissive && options.sandboxLogFile) {
+      const isDiscovery = !!permissive && !!options.sandboxLogFile;
+      if (isDiscovery) {
         // Discovery mode: use special profile that logs all access
         profile = generateDiscoveryProfile({
           workDir: options.cwd,
           proxyPort: options.proxyPort,
-          logFile: options.sandboxLogFile,
+          logFile: options.sandboxLogFile ?? '',
         });
       } else {
         // Strict mode: no policy provided and not permissive
@@ -1021,8 +1022,9 @@ async function runInSandbox(
 
       // Save a copy for inspection, but only when discovering: a normal run
       // should not write into the workspace, which may be the user's checkout
-      // or an action's own directory.
-      if (options.sandboxLogFile) {
+      // or an action's own directory. Keyed off discovery mode, not
+      // sandboxLogFile - the CLI sets that on every run, discovery or not.
+      if (isDiscovery) {
         const debugProfilePath = path.join(options.cwd, '.debug', 'sandbox-profile.sb');
         const debugDir = path.dirname(debugProfilePath);
         if (!fs.existsSync(debugDir)) {

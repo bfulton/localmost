@@ -646,7 +646,7 @@ describe('RunnerManager', () => {
       expect(setPolicyAllowedHosts).toHaveBeenCalledWith(['index.crates.io']);
     });
 
-    it('does nothing when the job has no commit SHA to read policy at', async () => {
+    it('clears the previous job policy when this job has no commit SHA', async () => {
       const setPolicyAllowedHosts = jest.fn();
       const getRepoPolicyHosts = jest.fn().mockResolvedValue([] as never);
       const manager = new RunnerManager({
@@ -670,8 +670,10 @@ describe('RunnerManager', () => {
 
       await helper.applyRepoPolicy(1);
 
+      // A proxy outlives one job, so leaving the previous job's hosts in place
+      // would grant them to a different repository.
       expect(getRepoPolicyHosts).not.toHaveBeenCalled();
-      expect(setPolicyAllowedHosts).not.toHaveBeenCalled();
+      expect(setPolicyAllowedHosts).toHaveBeenCalledWith([]);
     });
   });
 

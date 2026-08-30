@@ -1329,7 +1329,14 @@ export class RunnerManager {
   private async applyRepoPolicy(instanceNum: number): Promise<void> {
     const instance = this.instances.get(instanceNum);
     const proxy = this.proxyServers.get(instanceNum);
-    if (!instance?.currentJob || !proxy || !this.getRepoPolicyHosts) return;
+    if (!proxy) return;
+
+    // Clear first. Proxies outlive a single job, so returning early below would
+    // otherwise leave the previous job's .localmostrc hosts installed and grant
+    // them to a different repository.
+    proxy.setPolicyAllowedHosts([]);
+
+    if (!instance?.currentJob || !this.getRepoPolicyHosts) return;
 
     const { targetDisplayName, githubSha, name: jobName } = instance.currentJob;
     if (!targetDisplayName || !githubSha) return;

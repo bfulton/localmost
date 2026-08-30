@@ -298,6 +298,11 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     },
   });
   const proxyPort = await discoveryProxy.start();
+
+  // Everything after the proxy starts runs inside try/finally: a throw in
+  // workspace setup, parsing or job execution would otherwise leave the proxy
+  // listening and holding its sockets.
+  try {
   if (options.updaterc) {
     console.log(`Discovery proxy listening on port ${proxyPort}`);
     console.log();
@@ -577,9 +582,6 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     }
   }
 
-  // Always stop the proxy
-  await discoveryProxy.stop();
-
   return {
     success: allSucceeded,
     workflow: workflow.name,
@@ -587,6 +589,9 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     duration,
     environmentDiffs,
   };
+  } finally {
+    await discoveryProxy.stop();
+  }
 }
 
 // =============================================================================

@@ -159,6 +159,14 @@ export class DiscoveryProxy {
     const [host, portStr] = (req.url || '').split(':');
     const port = parseInt(portStr, 10) || 443;
 
+    // A CONNECT without a host would otherwise be recorded as an empty host and
+    // then dialled, so reject it outright.
+    if (!host) {
+      clientSocket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+      clientSocket.destroy();
+      return;
+    }
+
     // Track this access
     this.accessedHosts.add(host);
     const allowed = this.isHostAllowed(host);
