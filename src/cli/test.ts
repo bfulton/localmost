@@ -65,6 +65,8 @@ export interface TestOptions {
   job?: string;
   /** Run in discovery mode to generate .localmostrc */
   updaterc?: boolean;
+  /** Skip the confirmation prompt when --updaterc rewrites a policy */
+  assumeYes?: boolean;
   /** Run full matrix (default: first combination only) */
   fullMatrix?: boolean;
   /** Specific matrix combination */
@@ -562,7 +564,7 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     const sandboxTrace = parseSandboxTrace(logContent, workspace.path, collectedPids);
 
     if (allSucceeded) {
-      await handleUpdateRc(cwd, workflow, discoveredHosts, sandboxTrace);
+      await handleUpdateRc(cwd, workflow, discoveredHosts, sandboxTrace, !!options.assumeYes);
     } else {
       console.log();
       console.log(`${colors.yellow}Skipping .localmostrc generation - workflow failed.${colors.reset}`);
@@ -908,6 +910,49 @@ function resolveWorkflowPath(input: string | undefined, cwd: string): string {
   throw new Error(`Workflow not found: ${input}`);
 }
 
+
+/**
+ * List what a discovery run wants to add, and ask before writing it.
+ *
+ * `.localmostrc` is checked in and grants sandbox access, so a discovery run
+ * must not widen it silently. Without a terminal to ask on, nothing is written
+ * unless --yes was passed.
+ */
+async function confirmPolicyChange(
+  additions: { label: string; items: string[] }[],
+  assumeYes: boolean
+): Promise<boolean> {
+  console.log();
+  console.log(`${colors.bold}These will be added to .localmostrc:${colors.reset}`);
+  for (const { label, items } of additions) {
+    if (items.length === 0) continue;
+    console.log(`  ${colors.bold}${label}${colors.reset}`);
+    for (const item of items) {
+      console.log(`    ${colors.green}+${colors.reset} ${item}`);
+    }
+  }
+  console.log();
+
+  if (assumeYes) return true;
+
+  if (!process.stdin.isTTY) {
+    console.log(`${colors.yellow}Not writing:${colors.reset} no terminal to confirm on. Re-run with --yes to apply.`);
+    return false;
+  }
+
+  const readline = await import('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const answer = await new Promise<string>(resolve => {
+    rl.question('Apply these changes? [y/N] ', a => {
+      rl.close();
+      resolve(a);
+    });
+  });
+  const yes = /^y(es)?$/i.test(answer.trim());
+  if (!yes) console.log('Not writing.');
+  return yes;
+}
+
 /**
  * Resolve secrets from environment variables or stub them.
  */
@@ -953,7 +998,8 @@ async function handleUpdateRc(
   cwd: string,
   workflow: ParsedWorkflow,
   discoveredHosts: string[],
-  sandboxTrace?: SandboxTraceResult
+  sandboxTrace: SandboxTraceResult | undefined,
+  assumeYes: boolean
 ): Promise<void> {
   console.log();
   console.log(`${colors.bold}Discovery Results:${colors.reset}`);
@@ -1065,15 +1111,20 @@ async function handleUpdateRc(
         },
       };
 
+      const approved = await confirmPolicyChange(
+        [
+          { label: 'network.allow', items: newHosts },
+          { label: 'filesystem.read', items: newReadPaths },
+          { label: 'filesystem.write', items: newWritePaths },
+          { label: 'sockets.allow', items: newSocketPaths },
+        ],
+        assumeYes
+      );
+      if (!approved) return;
+
       const content = serializeLocalmostrc(updatedConfig);
       fs.writeFileSync(existingPath, content);
       console.log(`${colors.green}✓${colors.reset} Updated ${path.relative(cwd, existingPath)}`);
-      const changes: string[] = [];
-      if (newHosts.length > 0) changes.push(`${newHosts.length} host(s)`);
-      if (newReadPaths.length > 0) changes.push(`${newReadPaths.length} read path(s)`);
-      if (newWritePaths.length > 0) changes.push(`${newWritePaths.length} write path(s)`);
-      if (newSocketPaths.length > 0) changes.push(`${newSocketPaths.length} socket(s)`);
-      console.log(`  Added ${changes.join(', ')}.`);
     } else {
       console.log(`${colors.yellow}Warning:${colors.reset} Could not parse existing .localmostrc: ${result.errors[0]?.message}`);
     }
@@ -1098,15 +1149,21 @@ async function handleUpdateRc(
       },
     };
 
+    const approved = await confirmPolicyChange(
+      [
+        { label: 'network.allow', items: discoveredHosts },
+        { label: 'filesystem.read', items: readPaths },
+        { label: 'filesystem.write', items: writePaths },
+        { label: 'sockets.allow', items: socketPaths },
+      ],
+      assumeYes
+    );
+    if (!approved) return;
+
     const content = serializeLocalmostrc(newConfig);
     const rcPath = path.join(cwd, '.localmostrc');
     fs.writeFileSync(rcPath, content);
-    const items: string[] = [];
-    if (discoveredHosts.length > 0) items.push(`${discoveredHosts.length} host(s)`);
-    if (readPaths.length > 0) items.push(`${readPaths.length} read path(s)`);
-    if (writePaths.length > 0) items.push(`${writePaths.length} write path(s)`);
-    if (socketPaths.length > 0) items.push(`${socketPaths.length} socket(s)`);
-    console.log(`${colors.green}✓${colors.reset} Created .localmostrc with ${items.join(', ')}.`);
+    console.log(`${colors.green}✓${colors.reset} Created .localmostrc`);
   }
 }
 
@@ -1126,6 +1183,8 @@ export function parseTestArgs(args: string[]): TestOptions {
 
     if (arg === '--updaterc' || arg === '-u') {
       options.updaterc = true;
+    } else if (arg === '--yes' || arg === '-y') {
+      options.assumeYes = true;
     } else if (arg === '--full-matrix' || arg === '-f') {
       options.fullMatrix = true;
     } else if (arg === '--matrix' || arg === '-m') {
@@ -1179,6 +1238,7 @@ ${colors.bold}OPTIONS:${colors.reset}
   -m, --matrix <spec>  Run specific matrix combination (e.g., "os=macos,node=18")
   -f, --full-matrix Run all matrix combinations
   -u, --updaterc    Discovery mode: record access and generate .localmostrc
+  -y, --yes         Apply --updaterc changes without confirming
   -n, --dry-run     Show what would run without executing
   -v, --verbose     Show command output
   --staged          Use staged changes only (git diff --staged)

@@ -400,27 +400,38 @@ describe('Sandbox Profile Generator', () => {
       // trace also recorded is pure redundancy. Discovery previously kept all
       // of them, producing thousands of lines that said nothing new.
       const result = parseSandboxTrace(
-        trace(['/opt/homebrew', '/opt/homebrew/bin', '/opt/homebrew/bin/git', '/usr/lib']),
+        trace(['/opt/homebrew', '/opt/homebrew/bin', '/opt/homebrew/bin/git', '/opt/other']),
         '/work'
       );
 
-      expect(result.readPaths).toEqual(['/opt/homebrew', '/usr/lib']);
+      expect(result.readPaths).toEqual(['/opt/homebrew', '/opt/other']);
+    });
+
+    it('omits paths the profile already grants', () => {
+      // The generated profile always allows these, so recording them would pad
+      // the policy with entries nobody needs to review.
+      const result = parseSandboxTrace(
+        trace(['/usr/bin/curl', '/System/Library/Foo', '/opt/homebrew/bin/git']),
+        '/work'
+      );
+
+      expect(result.readPaths).toEqual(['/opt/homebrew/bin/git']);
     });
 
     it('never emits the filesystem root as a policy entry', () => {
       // Reading the root node is required and the generated profile always
       // allows it as a literal. Recording "/" here would be written back as
       // (subpath "/"), silently granting the whole disk.
-      const result = parseSandboxTrace(trace(['/', '/usr/lib']), '/work');
+      const result = parseSandboxTrace(trace(['/', '/opt/homebrew']), '/work');
 
       expect(result.readPaths).not.toContain('/');
-      expect(result.readPaths).toContain('/usr/lib');
+      expect(result.readPaths).toContain('/opt/homebrew');
     });
 
     it('keeps unrelated siblings', () => {
-      const result = parseSandboxTrace(trace(['/usr/lib', '/usr/bin']), '/work');
+      const result = parseSandboxTrace(trace(['/opt/a', '/opt/b']), '/work');
 
-      expect(result.readPaths.sort()).toEqual(['/usr/bin', '/usr/lib']);
+      expect(result.readPaths.sort()).toEqual(['/opt/a', '/opt/b']);
     });
   });
 

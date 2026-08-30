@@ -707,9 +707,16 @@ export function parseSandboxTrace(
    * generated profile always allows it as a literal, whereas recording it here
    * would be written back as (subpath "/") and grant the whole disk.
    */
+  const coveredByBaseline = (p: string): boolean =>
+    SYSTEM_READ_NODES.includes(p) ||
+    SYSTEM_READ_PATHS.some(base => p === base || p.startsWith(`${base}/`));
+
   const consolidate = (paths: Set<string>): string[] => {
     const candidates = Array.from(paths)
       .filter(p => p !== '/' && p !== '~' && p !== '')
+      // Anything the profile already grants would only pad the policy. A
+      // discovered policy has to be reviewable to be worth approving.
+      .filter(p => !coveredByBaseline(p))
       .sort();
 
     const kept: string[] = [];
