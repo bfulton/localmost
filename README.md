@@ -153,9 +153,12 @@ You can change this at any time in your GitHub settings under **Applications > I
 
 ### Token Security
 
-localmost uses OAuth device flow authentication. Your access token is:
-- Encrypted with macOS Keychain and stored locally
-- Scoped only to the repositories you explicitly grant access to
+localmost uses OAuth device flow authentication.
+
+- Your access token is never written to disk. It lives in memory, and a fresh one
+  is obtained on each start
+- Only the refresh token is stored, encrypted with macOS Keychain
+- Access is scoped to the repositories you explicitly grant
 - Revocable at any time from your GitHub settings
 
 ## CLI Companion
@@ -217,15 +220,17 @@ Current release: **0.3.0 — Test Locally, Secure by Default**
 - Declarative sandbox policies with `.localmostrc`
 - Sandbox policy levels (strict / moderate / permissive) enforced by the local proxy
 - Contributor-based job filtering for public repos
-- Secure secrets management in macOS Keychain
+- Repository policies require approval before the runner applies them
 - Environment comparison with GitHub runners
 
 Future feature ideas:
 
 - **Fail a blocked job visibly** - a job refused by the filter is cancelled through the GitHub API before any worker starts, so it appears as cancelled rather than failing with a message explaining why.
-- **Approve policy changes before they take effect** - the runner now reads a repository's `.localmostrc` network allowlist at job time, but `src/main/policy-cache.ts` - which caches a repo's policy, diffs it, and asks for approval when it changes - is still unimported. Until it is wired up, a repository can widen its own allowlist without the machine's owner being asked.
-- **Make the minimum policy easy to learn** - `strict` denies everything not declared, which means a bare policy cannot even exec `/bin/bash`. Discovery should produce a runnable starting policy in one step: report the minimum a workflow needs, distinguish that baseline from workflow-specific access, and explain a denial when a step dies rather than leaving a bare SIGABRT.
 - **Roll discovery output up further** - `--updaterc` now drops paths already covered by a listed ancestor, which removes the bulk of the redundancy. It still records content-addressed cache paths (npm's `_cacache/content-v2/sha512/...`) verbatim, which differ per machine and per dependency change; those want rolling up to their cache directory.
+- **Workflow secrets** - `localmost test` reads secrets from environment variables, stubs anything missing, and `--secrets prompt` is a placeholder that also stubs. Storing secrets in the Keychain, prompting for them, and `localmost secrets list` / `clear` are all unbuilt.
+- **Approve policies in the app** - approval is CLI-only today (`localmost policy diff`, `localmost policy approve`). The app refuses the job and logs the diff, but there is no UI to review and accept it, and no audit log of approvals.
+- **Show a diff when `--updaterc` rewrites a policy** - it writes directly, with no diff and no confirmation, so a discovery run can widen a checked-in policy without the change being obvious.
+- **Homebrew formula** - `npx localmost` works; `brew install localmost` does not exist.
 - **Quick actions** - Re-run failed job, cancel all jobs.
 - **Spotlight integration** - Check status or pause builds from Spotlight.
 - **Artifact inspector** - Browse uploaded artifacts without leaving the app.

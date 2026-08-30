@@ -21,8 +21,15 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   - Per-workflow policy overrides
   - Discovery mode with `localmost test --updaterc`
   - Policy validation with `localmost policy validate`
+- **Policy Approval**: A repository's `.localmostrc` takes effect only once approved
+  - A new or changed policy holds the job and cancels the run, with the diff logged
+  - Review with `localmost policy diff`, approve with `localmost policy approve`
+  - A repository with no policy is never held: it runs on the baseline, which
+    grants nothing extra
+  - The approved copy is applied, so a change pushed after approval cannot take
+    effect until it is reviewed
 - **Sandbox Policy Levels**: Choose enforcement strength in Settings under Job Security
-  - `strict` (default): only runner infrastructure plus hosts declared in `.localmostrc`
+  - `strict` (default): runner infrastructure, a read-only OS baseline, plus hosts declared in `.localmostrc`
   - `moderate`: also allows GitHub Actions infrastructure, common registries, and tool caches
   - `permissive`: no restrictions, for trusted repos or debugging
   - Per-job summary of allowed and blocked hosts in the runner log
@@ -50,6 +57,11 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   - Suggestions for pinning versions in workflows
 
 ### Fixed
+- `strict` is usable without a `.localmostrc`. The sandbox denied read access to
+  `/bin` and `/usr`, so every step died before running; the profile now always
+  grants read-only access to Apple-shipped system paths. `HOME` also pointed at
+  the user's real home directory rather than the workspace, so tools failed on
+  dotfiles the sandbox denies.
 - Jobs are no longer dropped after being acquired from GitHub. The broker
   checked capacity, then acquired the job over the network before any worker
   existed, so concurrent jobs could take the last slot in between; the job was
