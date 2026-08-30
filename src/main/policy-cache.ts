@@ -271,6 +271,72 @@ export function validatePolicyForJob(
 }
 
 /**
+ * What should happen to a job, given the repository's current .localmostrc.
+ */
+export type PolicyDecision =
+  | { action: 'allow'; reason: 'no-policy' | 'unchanged' | 'narrowed' }
+  | { action: 'needs-approval'; request: PolicyApprovalRequest };
+
+/**
+ * Decide whether a job may run under the repository's current policy.
+ *
+ * A .localmostrc grants access beyond the built-in baseline, so its arrival or
+ * change is a request for more privilege and needs the machine owner's consent.
+ * A repository with no policy is not asked about: it gets the baseline, which
+ * grants nothing extra. Removing a policy is likewise allowed without asking -
+ * it can only reduce access.
+ */
+export function decidePolicyForJob(
+  repository: string,
+  localmostrcContent: string | null
+): PolicyDecision {
+  const cached = getCachedPolicy(repository);
+
+  if (!localmostrcContent) {
+    return { action: 'allow', reason: cached ? 'narrowed' : 'no-policy' };
+  }
+
+  const parseResult = parseLocalmostrcContent(localmostrcContent);
+  if (!parseResult.success || !parseResult.config) {
+    // An unreadable policy grants nothing; the job runs on the baseline.
+    log.warn(`Invalid .localmostrc for ${repository}: ${parseResult.errors[0]?.message}`);
+    return { action: 'allow', reason: 'no-policy' };
+  }
+
+  const newConfig = parseResult.config;
+
+  if (cached?.approved) {
+    const diffs = diffConfigs(cached.config, newConfig);
+    if (diffs.length === 0) {
+      return { action: 'allow', reason: 'unchanged' };
+    }
+    return {
+      action: 'needs-approval',
+      request: { repository, oldConfig: cached.config, newConfig, diffs, isNewRepo: false },
+    };
+  }
+
+  return {
+    action: 'needs-approval',
+    request: {
+      repository,
+      oldConfig: cached?.config,
+      newConfig,
+      diffs: cached ? diffConfigs(cached.config, newConfig) : [],
+      isNewRepo: !cached,
+    },
+  };
+}
+
+/**
+ * Record a policy as awaiting approval, so the CLI can show what is pending.
+ */
+export function recordPendingPolicy(repository: string, config: LocalmostrcConfig): void {
+  cachePolicyConfig(repository, config, false);
+}
+
+
+/**
  * Format a policy approval request for notification.
  */
 export function formatApprovalRequest(request: PolicyApprovalRequest): string {

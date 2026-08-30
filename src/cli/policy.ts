@@ -168,6 +168,33 @@ function printPolicy(policy: PrintablePolicy): void {
 }
 
 /**
+/**
+ * Read the policy the background runner has cached for a repository.
+ *
+ * The app writes this as JSON with its approval state; reading it as a raw
+ * .localmostrc, as this used to, meant the CLI could never see what the runner
+ * had actually recorded.
+ */
+function readCachedPolicy(repository: string): {
+  path: string;
+  entry: { repository: string; config: LocalmostrcConfig; approved: boolean; cachedAt?: string } | null;
+} {
+  const cachedPath = path.join(
+    getAppDataDirWithoutElectron(),
+    'policies',
+    repository.replace('/', '_') + '.json'
+  );
+  if (!fs.existsSync(cachedPath)) {
+    return { path: cachedPath, entry: null };
+  }
+  try {
+    return { path: cachedPath, entry: JSON.parse(fs.readFileSync(cachedPath, 'utf-8')) };
+  } catch {
+    return { path: cachedPath, entry: null };
+  }
+}
+
+/**
  * Compare local .localmostrc to cached version.
  */
 function handleDiff(): void {
@@ -196,35 +223,85 @@ function handleDiff(): void {
     return;
   }
 
-  const cachedPath = path.join(
-    getAppDataDirWithoutElectron(),
-    'policies',
-    repository.replace('/', '_') + '.yml'
-  );
+  const { entry } = readCachedPolicy(repository);
 
-  if (!fs.existsSync(cachedPath)) {
-    console.log('No cached policy found.');
+  if (!entry) {
+    console.log('No cached policy found - the runner has not seen this repository yet.');
     console.log(`Local policy: ${path.relative(cwd, localPath)}`);
     return;
   }
 
-  const cachedResult = parseLocalmostrc(cachedPath);
-  if (!cachedResult.success || !cachedResult.config) {
-    console.log('Cached policy is invalid.');
-    return;
-  }
-
   // Compute diff
-  const diffs = diffConfigs(cachedResult.config, localResult.config);
+  const diffs = diffConfigs(entry.config, localResult.config);
 
   if (diffs.length === 0) {
-    console.log(`${colors.green}\u2713${colors.reset} Policy unchanged`);
+    console.log(
+      entry.approved
+        ? `${colors.green}\u2713${colors.reset} Policy unchanged and approved`
+        : `${colors.yellow}!${colors.reset} Policy unchanged but not yet approved - run "localmost policy approve"`
+    );
     return;
   }
 
   console.log(`${colors.bold}Policy changes:${colors.reset}`);
   console.log();
   console.log(formatPolicyDiff(diffs));
+}
+
+/**
+ * Approve the repository's current policy for use by the background runner.
+ */
+function handleApprove(): void {
+  const cwd = process.cwd();
+  const repository = getRepositoryFromDir(cwd);
+  if (!repository) {
+    console.log('Could not detect repository.');
+    process.exit(1);
+  }
+
+  const localPath = findLocalmostrc(cwd);
+  if (!localPath) {
+    console.log('No .localmostrc found - there is nothing to approve.');
+    return;
+  }
+
+  const localResult = parseLocalmostrc(localPath);
+  if (!localResult.success || !localResult.config) {
+    console.log(`${colors.red}Invalid .localmostrc - fix it before approving:${colors.reset}`);
+    for (const error of localResult.errors) {
+      console.log(`  ${error.message}`);
+    }
+    process.exit(1);
+  }
+
+  const { path: cachedPath, entry } = readCachedPolicy(repository);
+  if (entry) {
+    const diffs = diffConfigs(entry.config, localResult.config);
+    if (diffs.length > 0) {
+      console.log(`${colors.bold}Approving these changes:${colors.reset}`);
+      console.log();
+      console.log(formatPolicyDiff(diffs));
+      console.log();
+    }
+  }
+
+  fs.mkdirSync(path.dirname(cachedPath), { recursive: true });
+  fs.writeFileSync(
+    cachedPath,
+    JSON.stringify(
+      {
+        repository,
+        config: localResult.config,
+        cachedAt: new Date().toISOString(),
+        approved: true,
+      },
+      null,
+      2
+    )
+  );
+
+  console.log(`${colors.green}\u2713${colors.reset} Approved policy for ${repository}`);
+  console.log('The runner will apply it to the next job from this repository.');
 }
 
 /**
@@ -325,6 +402,10 @@ export function runPolicy(
     case 'diff':
       handleDiff();
       break;
+    case 'approve':
+      handleApprove();
+      break;
+
     case 'validate':
     case 'check':
       handleValidate();
@@ -380,6 +461,7 @@ ${colors.bold}USAGE:${colors.reset}
 ${colors.bold}SUBCOMMANDS:${colors.reset}
   show              Display current policy (default)
   diff              Compare local vs cached policy
+  approve           Approve this repo's policy for the background runner
   validate          Validate .localmostrc syntax
   init              Create a new .localmostrc template
 
