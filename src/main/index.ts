@@ -303,6 +303,7 @@ app.whenReady().then(async () => {
       }
       return contributorCache.getAllAuthors(accessToken, owner, repo, sha);
     },
+    getJobTarget: (jobId: string) => brokerProxyService.getJobTarget(jobId),
     getRepoPolicy: async (owner: string, repo: string, _sha: string, workflowName: string) => {
       // Apply the policy that was approved, not whatever is in the repository
       // right now. A job only reaches this point once its policy has been

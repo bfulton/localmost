@@ -37,6 +37,12 @@ export interface ProxyServerOptions {
   allowedHosts?: string[];
   /** Sandbox policy level - controls network access restrictions */
   policyLevel?: SandboxPolicyLevel;
+  /**
+   * Called when the worker behind this proxy announces which job it is taking.
+   * Awaited before the request is forwarded, so the job's policy is in place
+   * before the runner can fetch anything for it.
+   */
+  onJobAcquired?: (jobId: string) => Promise<void>;
 }
 
 /** Statistics tracked per proxy session for job summary */
@@ -58,6 +64,7 @@ export class ProxyServer {
   private onLog: ProxyLogCallback;
   private policyAllowedHosts: string[];
   private policyLevel: SandboxPolicyLevel;
+  private onJobAcquired?: (jobId: string) => Promise<void>;
   private connections: Set<net.Socket> = new Set();
   private stats: ProxyStats = {
     allowedCount: 0,
@@ -71,6 +78,7 @@ export class ProxyServer {
     this.onLog = options.onLog || (() => {});
     this.policyAllowedHosts = options.allowedHosts || [];
     this.policyLevel = options.policyLevel || 'strict';
+    this.onJobAcquired = options.onJobAcquired;
   }
 
   /**
@@ -260,6 +268,14 @@ export class ProxyServer {
       const port = parseInt(url.port, 10) || 80;
       const path = url.pathname + url.search;
 
+      // A worker takes a job by POSTing acquirejob through its own proxy. That
+      // is where this proxy learns which repository it is serving, before the
+      // runner fetches a single action for it.
+      if (this.onJobAcquired && req.method === 'POST' && url.pathname.endsWith('/acquirejob')) {
+        this.handleAcquireJobRequest(req, res, host, port, path);
+        return;
+      }
+
       const { allowed, reason } = this.checkHostAccess(host);
       this.log({ method: req.method || 'GET', host, port, path, blocked: !allowed, reason });
 
@@ -293,6 +309,68 @@ export class ProxyServer {
       res.writeHead(400, { 'Content-Type': 'text/plain' });
       res.end(`Bad request: ${(err as Error).message}`);
     }
+  }
+
+  /**
+   * Forward an acquirejob request, applying the job's policy first.
+   *
+   * The body has to be buffered to read the job id, so it is replayed to the
+   * upstream request rather than piped.
+   */
+  private handleAcquireJobRequest(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    host: string,
+    port: number,
+    path: string
+  ): void {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', async () => {
+      const body = Buffer.concat(chunks);
+      try {
+        const parsed = JSON.parse(body.toString());
+        const jobId = parsed.jobMessageId || parsed.jobRequestId || parsed.requestId;
+        if (jobId) {
+          await this.onJobAcquired?.(String(jobId));
+        }
+      } catch {
+        // Leave the policy as it stands. Failing to read the id is not a
+        // reason to widen access, and the job simply keeps what is installed.
+      }
+      this.forwardBufferedRequest(req, res, host, port, path, body);
+    });
+  }
+
+  private forwardBufferedRequest(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    host: string,
+    port: number,
+    path: string,
+    body: Buffer
+  ): void {
+    const { allowed, reason } = this.checkHostAccess(host);
+    this.log({ method: req.method || 'POST', host, port, path, blocked: !allowed, reason });
+    if (!allowed) {
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end(`Blocked by sandbox policy (${this.policyLevel}): host '${host}' not in allowlist`);
+      return;
+    }
+
+    const headers = { ...req.headers, 'content-length': String(body.length) };
+    const proxyReq = http.request(
+      { hostname: host, port, path, method: req.method, headers },
+      (proxyRes) => {
+        res.writeHead(proxyRes.statusCode || 500, proxyRes.headers);
+        proxyRes.pipe(res);
+      }
+    );
+    proxyReq.on('error', (err) => {
+      res.writeHead(502, { 'Content-Type': 'text/plain' });
+      res.end(`Proxy error: ${err.message}`);
+    });
+    proxyReq.end(body);
   }
 
   /**

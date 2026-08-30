@@ -82,6 +82,8 @@ interface RunnerManagerOptions {
   getJobConclusion?: (owner: string, repo: string, jobId: number) => Promise<string | null>;
   /** Get all contributors/authors for a repo at a given commit SHA (for contributor filtering) */
   getAllContributors?: (owner: string, repo: string, sha: string) => Promise<Set<string>>;
+  /** The repository and commit a job belongs to, from the broker. */
+  getJobTarget?: (jobId: string) => { targetDisplayName: string; githubSha?: string } | undefined;
   /** The repository's approved policy, resolved for the job about to run. */
   getRepoPolicy?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<RepoPolicyRuntime>;
   /** Called when a job starts or completes (for notifications) */
@@ -106,6 +108,7 @@ export class RunnerManager {
   private getJobConclusion?: (owner: string, repo: string, jobId: number) => Promise<string | null>;
   private getAllContributors?: (owner: string, repo: string, sha: string) => Promise<Set<string>>;
   private getRepoPolicy?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<RepoPolicyRuntime>;
+  private getJobTarget?: (jobId: string) => { targetDisplayName: string; githubSha?: string } | undefined;
   private onJobEvent?: (event: JobEvent) => void;
   private jobHistory: JobHistoryEntry[] = [];
   private jobIdCounter = 0;
@@ -184,6 +187,7 @@ export class RunnerManager {
     this.getJobConclusion = options.getJobConclusion;
     this.getAllContributors = options.getAllContributors;
     this.getRepoPolicy = options.getRepoPolicy;
+    this.getJobTarget = options.getJobTarget;
     this.onJobEvent = options.onJobEvent;
 
     this.downloader = new RunnerDownloader();
@@ -706,6 +710,21 @@ export class RunnerManager {
 
     const proxy = new ProxyServer({
       policyLevel,
+      onJobAcquired: async (jobId: string) => {
+        // The worker behind this proxy just claimed a job. Whichever instance
+        // won the queue, this is the one that has to carry its policy.
+        const target = this.getJobTarget?.(jobId);
+        if (!target?.targetDisplayName || !target.githubSha) {
+          this.log('warn', `[instance ${instanceNum}] No target for acquired job ${jobId}; leaving policy closed`);
+          return;
+        }
+        await this.applyPolicyForTarget(
+          instanceNum,
+          target.targetDisplayName,
+          target.githubSha,
+          ''
+        );
+      },
       onLog: (entry: ProxyLogEntry) => {
         // Skip logging routine localhost message polling (very noisy)
         if (!entry.blocked && (entry.host === 'localhost' || entry.host === '127.0.0.1')) {
