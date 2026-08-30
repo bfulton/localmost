@@ -2,6 +2,11 @@ import '@testing-library/jest-dom';
 
 // Type for mocked localmost API
 export interface MockLocalmost {
+  policy: {
+    list: jest.Mock;
+    approve: jest.Mock;
+    reject: jest.Mock;
+  };
   github: {
     getAuthStatus: jest.Mock;
     startDeviceFlow: jest.Mock;
@@ -81,6 +86,11 @@ declare global {
 
 // Mock window.localmost API
 const mockLocalmost: MockLocalmost = {
+  policy: {
+    list: jest.fn().mockResolvedValue([]),
+    approve: jest.fn().mockResolvedValue({ success: true }),
+    reject: jest.fn().mockResolvedValue({ success: true }),
+  },
   github: {
     getAuthStatus: jest.fn().mockResolvedValue({ isAuthenticated: false }),
     startDeviceFlow: jest.fn(),

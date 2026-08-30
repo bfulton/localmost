@@ -271,6 +271,23 @@ export function validatePolicyForJob(
 }
 
 /**
+ * Append an approval decision to an audit log.
+ *
+ * Approving a policy widens what someone else's code may do on this machine,
+ * so the decision is worth a durable record separate from the cache entry,
+ * which only ever holds the current state.
+ */
+export function recordPolicyDecision(repository: string, decision: 'approved' | 'rejected'): void {
+  try {
+    ensureCacheDir();
+    const line = JSON.stringify({ at: new Date().toISOString(), repository, decision });
+    fs.appendFileSync(path.join(getPolicyCacheDir(), 'decisions.log'), `${line}\n`);
+  } catch (err) {
+    log.warn(`Could not record policy decision for ${repository}: ${(err as Error).message}`);
+  }
+}
+
+/**
  * What should happen to a job, given the repository's current .localmostrc.
  */
 export type PolicyDecision =

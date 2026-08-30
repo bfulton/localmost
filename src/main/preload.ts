@@ -20,6 +20,7 @@ import {
   RunnerProxyStatus,
   Result,
   ResourcePauseState,
+  PolicySummary,
 } from '../shared/types';
 
 // Initialize zubridge preload handlers
@@ -146,6 +147,12 @@ contextBridge.exposeInMainWorld('localmost', {
   },
 
   // Targets (multi-target runner support)
+  policy: {
+    list: () => ipcRenderer.invoke(IPC_CHANNELS.POLICY_LIST),
+    approve: (repository: string) => ipcRenderer.invoke(IPC_CHANNELS.POLICY_APPROVE, repository),
+    reject: (repository: string) => ipcRenderer.invoke(IPC_CHANNELS.POLICY_REJECT, repository),
+  },
+
   targets: {
     list: () => ipcRenderer.invoke(IPC_CHANNELS.TARGETS_LIST),
     add: (type: 'repo' | 'org', owner: string, repo?: string) =>
@@ -237,6 +244,11 @@ export interface LocalmostAPI {
     install: () => Promise<{ success: boolean; error?: string }>;
     getStatus: () => Promise<UpdateStatus>;
     onStatusChange: (callback: (status: UpdateStatus) => void) => () => void;
+  };
+  policy: {
+    list: () => Promise<PolicySummary[]>;
+    approve: (repository: string) => Promise<Result>;
+    reject: (repository: string) => Promise<Result>;
   };
   targets: {
     list: () => Promise<Target[]>;
