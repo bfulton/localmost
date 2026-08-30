@@ -39,7 +39,8 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # Electron 43 requires Node >= 22.12.0 (see engines in package.json)
+          node-version: '22'
           # Only cache npm on GitHub-hosted runners (self-hosted has persistent storage)
           cache: ${{ needs.check.outputs.runner != 'self-hosted' && 'npm' || '' }}
 

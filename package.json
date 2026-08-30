@@ -10,6 +10,9 @@
     "url": "https://github.com/bfulton/localmost.git"
   },
   "main": "dist/main.js",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "bin": {
     "localmost": "./dist/cli.js"
   },
