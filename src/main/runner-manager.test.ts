@@ -625,7 +625,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicyHosts: async () => ['index.crates.io'],
+        getRepoPolicy: async () => ({ hosts: ['index.crates.io'], level: 'strict' as const }),
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setInstance(1, {
@@ -639,7 +639,7 @@ describe('RunnerManager', () => {
           githubSha: 'abc1234',
         },
       });
-      helper.setProxy(1, { setPolicyAllowedHosts });
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyLevel: jest.fn() });
 
       await helper.applyRepoPolicy(1);
 
@@ -648,12 +648,12 @@ describe('RunnerManager', () => {
 
     it('clears the previous job policy when this job has no commit SHA', async () => {
       const setPolicyAllowedHosts = jest.fn();
-      const getRepoPolicyHosts = jest.fn().mockResolvedValue([] as never);
+      const getRepoPolicy = jest.fn().mockResolvedValue({ hosts: [], level: 'strict' } as never);
       const manager = new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicyHosts: getRepoPolicyHosts as never,
+        getRepoPolicy: getRepoPolicy as never,
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setInstance(1, {
@@ -666,14 +666,69 @@ describe('RunnerManager', () => {
           targetDisplayName: 'owner/repo',
         },
       });
-      helper.setProxy(1, { setPolicyAllowedHosts });
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyLevel: jest.fn() });
 
       await helper.applyRepoPolicy(1);
 
       // A proxy outlives one job, so leaving the previous job's hosts in place
       // would grant them to a different repository.
-      expect(getRepoPolicyHosts).not.toHaveBeenCalled();
+      expect(getRepoPolicy).not.toHaveBeenCalled();
       expect(setPolicyAllowedHosts).toHaveBeenCalledWith([]);
+    });
+
+    it('applies the level the repository declares, per job', async () => {
+      // Instances are pooled across repositories, so a level captured when the
+      // proxy started could belong to whichever repo happened to run first.
+      const setPolicyLevel = jest.fn();
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({ hosts: [], level: 'moderate' as const }),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, {
+        name: 'runner-1',
+        currentJob: {
+          name: 'build',
+          repository: 'owner/repo',
+          startedAt: new Date().toISOString(),
+          id: 'job-1',
+          targetDisplayName: 'owner/repo',
+          githubSha: 'abc1234',
+        },
+      });
+      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyLevel });
+
+      await helper.applyRepoPolicy(1);
+
+      expect(setPolicyLevel).toHaveBeenCalledWith('moderate');
+    });
+
+    it('falls back to strict when a job carries no repository policy', async () => {
+      const setPolicyLevel = jest.fn();
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, {
+        name: 'runner-1',
+        currentJob: {
+          name: 'build',
+          repository: 'owner/repo',
+          startedAt: new Date().toISOString(),
+          id: 'job-1',
+          targetDisplayName: 'owner/repo',
+          githubSha: 'abc1234',
+        },
+      });
+      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyLevel });
+
+      await helper.applyRepoPolicy(1);
+
+      expect(setPolicyLevel).toHaveBeenCalledWith('strict');
     });
   });
 

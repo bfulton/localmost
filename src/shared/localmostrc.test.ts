@@ -7,6 +7,7 @@ import {
   findLocalmostrc,
   parseLocalmostrc,
   parseLocalmostrcContent,
+  effectivePolicyLevel,
   mergePolicies,
   getEffectivePolicy,
   getRequiredSecrets,
@@ -719,5 +720,79 @@ workflows: just-a-string
 
       expect(result).toBe('No changes');
     });
+  });
+});
+
+describe('policy level', () => {
+  const withLevel = (level: string) => `version: 1\nlevel: ${level}\n`;
+
+  it('parses a declared level', () => {
+    const result = parseLocalmostrcContent(withLevel('moderate'));
+
+    expect(result.success).toBe(true);
+    expect(result.config?.level).toBe('moderate');
+  });
+
+  it('defaults to strict when the policy does not declare one', () => {
+    // Absent means strict, not "whatever the machine happens to be set to":
+    // a policy that says nothing must not be the loosest thing that ever ran.
+    const result = parseLocalmostrcContent('version: 1\n');
+
+    expect(result.success).toBe(true);
+    expect(effectivePolicyLevel(result.config)).toBe('strict');
+  });
+
+  it('rejects a level that is not one of the three', () => {
+    const result = parseLocalmostrcContent(withLevel('wide-open'));
+
+    expect(result.success).toBe(false);
+    expect(result.errors[0].message).toMatch(/level/);
+  });
+
+  it('reports a loosened level as a change needing approval', () => {
+    // The whole design rests on every policy change reaching the diff. A level
+    // that changed silently would hand a repo the loosest sandbox unreviewed.
+    const oldConfig = parseLocalmostrcContent(withLevel('strict')).config!;
+    const newConfig = parseLocalmostrcContent(withLevel('permissive')).config!;
+
+    const diffs = diffConfigs(oldConfig, newConfig);
+
+    expect(diffs).toContainEqual(
+      expect.objectContaining({ path: 'level', type: 'changed', oldValue: 'strict', newValue: 'permissive' })
+    );
+  });
+
+  it('reports a level appearing where there was none', () => {
+    const oldConfig = parseLocalmostrcContent('version: 1\n').config!;
+    const newConfig = parseLocalmostrcContent(withLevel('permissive')).config!;
+
+    const diffs = diffConfigs(oldConfig, newConfig);
+
+    expect(diffs.some((d) => d.path === 'level')).toBe(true);
+  });
+
+  it('reports no change when the level is unchanged', () => {
+    const a = parseLocalmostrcContent(withLevel('moderate')).config!;
+    const b = parseLocalmostrcContent(withLevel('moderate')).config!;
+
+    expect(diffConfigs(a, b)).toEqual([]);
+  });
+});
+
+describe('serializing a declared level', () => {
+  it('round-trips the level through serialize and parse', () => {
+    // Discovery rewrites this file. Dropping the level on the way through
+    // would quietly reset a repository to strict and break its next run.
+    const config = parseLocalmostrcContent('version: 1\nlevel: moderate\n').config!;
+
+    const reparsed = parseLocalmostrcContent(serializeLocalmostrc(config)).config!;
+
+    expect(reparsed.level).toBe('moderate');
+  });
+
+  it('writes no level when the policy declares none', () => {
+    const config = parseLocalmostrcContent('version: 1\n').config!;
+
+    expect(serializeLocalmostrc(config)).not.toContain('level:');
   });
 });

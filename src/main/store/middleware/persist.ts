@@ -141,11 +141,6 @@ export function loadPersistedConfig(): void {
       }
     }
 
-    // Sandbox policy level
-    if (diskConfig.sandboxPolicyLevel && ['strict', 'moderate', 'permissive'].includes(diskConfig.sandboxPolicyLevel)) {
-      configUpdates.sandboxPolicyLevel = diskConfig.sandboxPolicyLevel;
-    }
-
     // Power settings
     if (diskConfig.power) {
       configUpdates.power = {

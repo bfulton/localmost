@@ -63,8 +63,24 @@ localmost is an Electron desktop application that manages GitHub Actions self-ho
 - **Filesystem writes**: Under `strict`, workflows can write only to the workspace and temp paths. `moderate` and `permissive` additionally allow writes to standard tool caches (`~/.npm`, `~/.cargo`, `~/.gradle`, `~/Library/Caches` and similar)
 - **Home directory access**: Workflows cannot read `~/.ssh`, `~/.aws`, `~/.config`, or other dotfiles at any level. `HOME` points inside the workspace, not at your home directory
 - **Filesystem reads**: A job can read its workspace and temp paths. Everything else, including system paths, must be declared in `.localmostrc`
-- **Network exfiltration**: Workflows can only connect to hosts the policy level allows. Under the default `strict` that is runner infrastructure plus what the repository declares — not npm, PyPI or other registries
+- **Network exfiltration**: Workflows can only connect to hosts the policy level allows. Under `strict` that is runner infrastructure plus what the repository declares — not npm, PyPI or other registries
 - **Credential exposure**: OAuth tokens are encrypted at rest using macOS Keychain
+
+### Policy levels
+
+A repository declares its level in `.localmostrc`:
+
+```yaml
+version: 1
+level: strict    # strict (default) | moderate | permissive
+```
+
+A repository that declares no level runs `strict`. Silence means the tightest
+setting, so a policy that says nothing cannot inherit something looser.
+
+The level is part of the policy, so changing it is a policy change: it appears
+in the approval diff and takes effect only once approved. A repository cannot
+loosen its own sandbox without the machine owner agreeing to it.
 
 ### What localmost trusts (does NOT protect against)
 

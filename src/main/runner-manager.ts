@@ -3,7 +3,8 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as yaml from 'js-yaml';
-import { RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
+import {
+  SandboxPolicyLevel, RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
 import { spawnSandboxed } from './process-sandbox';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
@@ -55,6 +56,14 @@ export interface JobEvent {
   reason?: string;
 }
 
+/** What a repository's approved policy means for one job at runtime. */
+export interface RepoPolicyRuntime {
+  /** Hosts the policy declares, on top of runner infrastructure. */
+  hosts: string[];
+  /** The level the policy asks for; strict when it declares none. */
+  level: SandboxPolicyLevel;
+}
+
 interface RunnerManagerOptions {
   onLog: (entry: LogEntry) => void;
   onStatusChange: (state: RunnerState) => void;
@@ -73,8 +82,8 @@ interface RunnerManagerOptions {
   getJobConclusion?: (owner: string, repo: string, jobId: number) => Promise<string | null>;
   /** Get all contributors/authors for a repo at a given commit SHA (for contributor filtering) */
   getAllContributors?: (owner: string, repo: string, sha: string) => Promise<Set<string>>;
-  /** Hosts a repository's .localmostrc allows, for the job about to run. */
-  getRepoPolicyHosts?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<string[]>;
+  /** The repository's approved policy, resolved for the job about to run. */
+  getRepoPolicy?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<RepoPolicyRuntime>;
   /** Called when a job starts or completes (for notifications) */
   onJobEvent?: (event: JobEvent) => void;
 }
@@ -96,7 +105,7 @@ export class RunnerManager {
   private cancelWorkflowRun?: (owner: string, repo: string, runId: number) => Promise<void>;
   private getJobConclusion?: (owner: string, repo: string, jobId: number) => Promise<string | null>;
   private getAllContributors?: (owner: string, repo: string, sha: string) => Promise<Set<string>>;
-  private getRepoPolicyHosts?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<string[]>;
+  private getRepoPolicy?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<RepoPolicyRuntime>;
   private onJobEvent?: (event: JobEvent) => void;
   private jobHistory: JobHistoryEntry[] = [];
   private jobIdCounter = 0;
@@ -174,7 +183,7 @@ export class RunnerManager {
     this.cancelWorkflowRun = options.cancelWorkflowRun;
     this.getJobConclusion = options.getJobConclusion;
     this.getAllContributors = options.getAllContributors;
-    this.getRepoPolicyHosts = options.getRepoPolicyHosts;
+    this.getRepoPolicy = options.getRepoPolicy;
     this.onJobEvent = options.onJobEvent;
 
     this.downloader = new RunnerDownloader();
@@ -1335,10 +1344,12 @@ export class RunnerManager {
 
     // Clear first. Proxies outlive a single job, so returning early below would
     // otherwise leave the previous job's .localmostrc hosts installed and grant
-    // them to a different repository.
+    // them to a different repository. The level resets for the same reason: an
+    // instance that ran a permissive repo must not carry that into the next job.
     proxy.setPolicyAllowedHosts([]);
+    proxy.setPolicyLevel('strict');
 
-    if (!instance?.currentJob || !this.getRepoPolicyHosts) return;
+    if (!instance?.currentJob || !this.getRepoPolicy) return;
 
     const { targetDisplayName, githubSha, name: jobName } = instance.currentJob;
     if (!targetDisplayName || !githubSha) return;
@@ -1346,10 +1357,16 @@ export class RunnerManager {
     const repoInfo = parseRepository(targetDisplayName);
     if (!repoInfo) return;
 
-    const hosts = await this.getRepoPolicyHosts(repoInfo.owner, repoInfo.repo, githubSha, jobName);
+    const { hosts, level } = await this.getRepoPolicy(
+      repoInfo.owner,
+      repoInfo.repo,
+      githubSha,
+      jobName
+    );
     proxy.setPolicyAllowedHosts(hosts);
-    if (hosts.length > 0) {
-      this.log('info', `[instance ${instanceNum}] Applied ${hosts.length} host(s) from ${targetDisplayName} .localmostrc`);
+    proxy.setPolicyLevel(level);
+    if (hosts.length > 0 || level !== 'strict') {
+      this.log('info', `[instance ${instanceNum}] Applied ${level} policy with ${hosts.length} host(s) from ${targetDisplayName} .localmostrc`);
     }
   }
 

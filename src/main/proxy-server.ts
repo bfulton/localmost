@@ -185,6 +185,16 @@ export class ProxyServer {
     return [...this.policyAllowedHosts];
   }
 
+  /**
+   * Set the level for the job about to run.
+   *
+   * A proxy outlives a single job and serves whichever repository the instance
+   * picks up next, so the level has to be reset per job the way hosts are.
+   */
+  setPolicyLevel(level: SandboxPolicyLevel): void {
+    this.policyLevel = level;
+  }
+
   getPolicyLevel(): SandboxPolicyLevel {
     return this.policyLevel;
   }
