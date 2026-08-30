@@ -675,6 +675,47 @@ describe('RunnerManager', () => {
     });
   });
 
+  describe('slot reservation', () => {
+    function managerWith(count: number) {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.runnerCount = count;
+      return { manager, helper };
+    }
+
+    it('never hands the same slot to two jobs', () => {
+      // The broker acquires a job from GitHub before a worker exists. Two jobs
+      // arriving together must not be given the same slot, or one is acquired
+      // upstream and then never run.
+      const { helper } = managerWith(2);
+
+      expect(helper.reserveSlot()).toBe(1);
+      expect(helper.reserveSlot()).toBe(2);
+      expect(helper.reserveSlot()).toBeNull();
+    });
+
+    it('reuses a slot once its reservation is released', () => {
+      const { helper } = managerWith(1);
+
+      const slot = helper.reserveSlot();
+      expect(slot).toBe(1);
+      helper.releaseSlotReservation(1);
+
+      expect(helper.reserveSlot()).toBe(1);
+    });
+
+    it('does not reserve a slot held by a running instance', () => {
+      const { helper } = managerWith(2);
+      helper.setInstance(1, { name: 'runner-1', status: 'busy' });
+
+      expect(helper.reserveSlot()).toBe(2);
+    });
+  });
+
   describe('slot release after a job', () => {
     function busyManager() {
       const manager = new RunnerManager({

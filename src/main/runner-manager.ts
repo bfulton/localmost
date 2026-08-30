@@ -122,7 +122,16 @@ export class RunnerManager {
   private toolCacheLocation: 'persistent' | 'per-sandbox' = 'persistent';
 
   // Track instances currently being started/rebuilt to prevent concurrent operations
+  /** How long to wait for a worker slot before giving up on an acquired job. */
+  private static readonly SLOT_WAIT_MS = 60_000;
+
   private startingInstances: Set<number> = new Set();
+  /**
+   * Slots claimed for a job that has been acquired from GitHub but whose worker
+   * has not started yet. Separate from startingInstances, which startInstance
+   * uses as its own re-entry guard.
+   */
+  private reservedSlots: Set<number> = new Set();
 
   // Path to job history file
   private readonly jobHistoryPath: string;
@@ -595,20 +604,44 @@ export class RunnerManager {
    * Spawn a worker to handle a job received by the broker proxy.
    * Finds an available instance slot and starts a worker there.
    */
-  async spawnWorkerForJob(): Promise<void> {
-    // Find an available instance slot
-    let instanceNum: number | null = null;
-
+  /**
+   * Claim a worker slot, synchronously, for a job that is about to start.
+   *
+   * The claim has to happen in one step. The broker checks capacity, then
+   * acquires the job from GitHub - a network round trip - before a worker
+   * exists, so two jobs arriving together would otherwise pick the same slot
+   * and one of them would be acquired upstream and never run.
+   */
+  private reserveSlot(): number | null {
     for (let i = 1; i <= this.runnerCount; i++) {
+      if (this.reservedSlots.has(i) || this.startingInstances.has(i)) continue;
       const instance = this.instances.get(i);
       if (!instance || instance.status === 'offline' || instance.status === 'error') {
-        instanceNum = i;
-        break;
+        this.reservedSlots.add(i);
+        return i;
       }
+    }
+    return null;
+  }
+
+  private releaseSlotReservation(instanceNum: number): void {
+    this.reservedSlots.delete(instanceNum);
+  }
+
+  async spawnWorkerForJob(): Promise<void> {
+    // Wait briefly for a slot rather than dropping the job. By this point the
+    // broker has already acquired it from GitHub, so returning without running
+    // it leaves GitHub waiting on a runner that never reports - the job then
+    // fails after its timeout with no steps recorded.
+    let instanceNum = this.reserveSlot();
+    const waitUntil = Date.now() + RunnerManager.SLOT_WAIT_MS;
+    while (instanceNum === null && Date.now() < waitUntil) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      instanceNum = this.reserveSlot();
     }
 
     if (instanceNum === null) {
-      this.log('warn', 'No available worker slots, job may need to wait');
+      this.log('error', 'No worker slot became available; this job will not run');
       return;
     }
 
@@ -616,6 +649,7 @@ export class RunnerManager {
     const targetContext = this.pendingTargetContext.get('next');
     if (!targetContext) {
       this.log('error', 'No target context for spawned worker');
+      this.releaseSlotReservation(instanceNum);
       return;
     }
 
@@ -632,16 +666,24 @@ export class RunnerManager {
         );
       } catch (err) {
         this.log('error', `Failed to copy proxy credentials: ${(err as Error).message}`);
+        this.releaseSlotReservation(instanceNum);
         return;
       }
     } else {
       this.log('error', `Proxy credentials not found for target ${targetContext.targetId}`);
+      this.releaseSlotReservation(instanceNum);
       return;
     }
 
     // Configure and start the instance
     // The instance will connect to broker proxy and pick up the queued job
-    await this.startInstance(instanceNum);
+    try {
+      await this.startInstance(instanceNum);
+    } finally {
+      // startInstance has taken over the slot (or failed); either way the
+      // reservation has served its purpose.
+      this.releaseSlotReservation(instanceNum);
+    }
   }
 
   private async startInstanceProxy(instanceNum: number): Promise<ProxyServer> {

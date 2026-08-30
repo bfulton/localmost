@@ -43,6 +43,9 @@ interface RunnerManagerInternals {
   checkJobUserFilter(instanceNum: number, runnerName: string): Promise<void>;
   parseRunnerOutput(instanceNum: number, line: string): Promise<void>;
   releaseInstanceSlot(instanceNum: number): void;
+  reserveSlot(): number | null;
+  releaseSlotReservation(instanceNum: number): void;
+  runnerCount: number;
   applyRepoPolicy(instanceNum: number): Promise<void>;
   proxyServers: Map<number, unknown>;
 }
@@ -136,5 +139,19 @@ export class RunnerManagerTestHelper {
   /** Register a stub proxy for an instance. */
   setProxy(instanceNum: number, proxy: unknown): void {
     this.internals.proxyServers.set(instanceNum, proxy);
+  }
+
+  /** Reserve a worker slot as spawnWorkerForJob does. */
+  reserveSlot(): number | null {
+    return this.internals.reserveSlot();
+  }
+
+  /** Release a slot reservation. */
+  releaseSlotReservation(instanceNum: number): void {
+    this.internals.releaseSlotReservation(instanceNum);
+  }
+
+  set runnerCount(value: number) {
+    this.internals.runnerCount = value;
   }
 }
