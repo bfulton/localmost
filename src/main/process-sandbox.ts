@@ -533,18 +533,20 @@ export function spawnSandboxed(
       shell: false,
     });
 
-    // Clean up profile file when process exits successfully
+    // Remove the profile whatever the exit was. These used to live in the
+    // system temp directory, which the OS clears; they live in the app's own
+    // directory now, so keeping them on failure would accumulate forever.
+    // Set LOCALMOST_KEEP_SANDBOX_PROFILES to keep them for debugging.
     child.on('exit', (code, signal) => {
       log.debug(`sandbox-exec exited with code=${code}, signal=${signal}`);
-      if (code === 0) {
+      if (!process.env.LOCALMOST_KEEP_SANDBOX_PROFILES) {
         try {
           fs.unlinkSync(profilePath);
         } catch (unlinkErr) {
           log.debug(`Failed to cleanup sandbox profile: ${(unlinkErr as Error).message}`);
         }
       } else {
-        // Keep profile file for debugging on error
-        log.error(`Keeping sandbox profile for debugging: ${profilePath}`);
+        log.debug(`Keeping sandbox profile for debugging: ${profilePath}`);
       }
     });
 

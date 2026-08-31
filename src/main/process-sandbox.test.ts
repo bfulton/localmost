@@ -337,6 +337,33 @@ describe('Process Sandbox', () => {
       });
     });
 
+    it('removes the profile even when the sandboxed process fails', () => {
+      // Profiles moved out of the system temp directory, which the OS clears,
+      // into the app's own. Keeping them on failure accumulated them forever.
+      jest.isolateModules(() => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        const mockProcess = createMockProcess(12355);
+        const localMockSpawn = jest.fn().mockReturnValue(mockProcess);
+        const mockUnlinkSync = jest.fn();
+        jest.doMock('child_process', () => ({ spawn: localMockSpawn }));
+        jest.doMock('fs', () => ({
+          existsSync: jest.fn().mockReturnValue(true),
+          writeFileSync: jest.fn(),
+          unlinkSync: mockUnlinkSync,
+          mkdirSync: jest.fn(),
+        }));
+
+        const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
+        const instanceDir = path.join(os.homedir(), '.localmost', 'runner-2');
+        sandboxedSpawn(path.join(instanceDir, 'run.sh'), [], { cwd: instanceDir });
+
+        // A non-zero exit: a profile denial, a signal, a runner crash.
+        mockProcess.emit('exit', 1, null);
+
+        expect(mockUnlinkSync).toHaveBeenCalled();
+      });
+    });
+
     it('opens direct egress only when registration asks for it', () => {
       // Runner registration reaches GitHub without a proxy. If this stopped
       // being emitted, adding a repository would fail with no obvious cause.
