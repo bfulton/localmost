@@ -337,6 +337,37 @@ describe('Process Sandbox', () => {
       });
     });
 
+    it('opens direct egress only when registration asks for it', () => {
+      // Runner registration reaches GitHub without a proxy. If this stopped
+      // being emitted, adding a repository would fail with no obvious cause.
+      jest.isolateModules(() => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        const mockProcess = createMockProcess(12354);
+        const localMockSpawn = jest.fn().mockReturnValue(mockProcess);
+        const mockWriteFileSync = jest.fn();
+        jest.doMock('child_process', () => ({ spawn: localMockSpawn }));
+        jest.doMock('fs', () => ({
+          existsSync: jest.fn().mockReturnValue(true),
+          writeFileSync: mockWriteFileSync,
+          unlinkSync: jest.fn(),
+          mkdirSync: jest.fn(),
+        }));
+
+        const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
+        const instanceDir = path.join(os.homedir(), '.localmost', 'runner-2');
+        sandboxedSpawn(path.join(instanceDir, 'config.sh'), [], {
+          cwd: instanceDir,
+          allowDirectNetwork: true,
+        });
+        const profile = mockWriteFileSync.mock.calls[0][1];
+
+        expect(profile).toMatch(/^\(allow network-outbound\)$/m);
+        // Still denies by default and still keeps the control plane closed.
+        expect(profile).toContain('(deny network*)');
+        expect(profile).toMatch(/deny file-write\*[\s\S]*policies/);
+      });
+    });
+
     it('grants no toolchains or caches under strict', () => {
       jest.isolateModules(() => {
         Object.defineProperty(process, 'platform', { value: 'darwin' });

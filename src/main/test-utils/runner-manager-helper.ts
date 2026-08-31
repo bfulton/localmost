@@ -12,6 +12,8 @@ import { ChildProcess } from 'child_process';
  * Internal runner instance state (mirrors private type).
  */
 interface RunnerInstance {
+  /** Hash of the approved policy this worker's profile was built from. */
+  policyStamp?: string;
   process: ChildProcess | null;
   status: RunnerStatus;
   currentJob: {

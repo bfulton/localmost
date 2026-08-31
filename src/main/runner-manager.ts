@@ -1435,6 +1435,13 @@ export class RunnerManager {
    * line is too late: the runner fetches its actions during setup, and an
    * instance that never reached that line would keep the previous job's hosts.
    */
+  /** Identity of an approved policy, for detecting drift after a spawn. */
+  private stampFor(policy: RepoPolicyRuntime): string {
+    return createHash('sha256')
+      .update(JSON.stringify([policy.level, policy.readPaths, policy.writePaths, policy.hosts]))
+      .digest('hex');
+  }
+
   /**
    * The filesystem boundary for a worker about to be spawned.
    *
@@ -1449,13 +1456,6 @@ export class RunnerManager {
    * a busy worker keeps the job it already claimed, which was validated
    * against the policy in force when it claimed it, and exits after it anyway.
    */
-  /** Identity of an approved policy, for detecting drift after a spawn. */
-  private stampFor(policy: RepoPolicyRuntime): string {
-    return createHash('sha256')
-      .update(JSON.stringify([policy.level, policy.readPaths, policy.writePaths, policy.hosts]))
-      .digest('hex');
-  }
-
   async retireWorkersForRepository(repository: string): Promise<void> {
     for (const [instanceNum, instance] of this.instances) {
       const target = instance.currentJob?.targetDisplayName
@@ -1479,8 +1479,17 @@ export class RunnerManager {
 
   private async resolveFilesystemPolicy(
     context?: { targetDisplayName?: string; githubSha?: string }
-  ): Promise<SandboxFilesystemPolicy & { stamp: string }> {
-    const closed = { level: 'strict' as SandboxPolicyLevel, read: [], write: [], stamp: 'none' };
+  ): Promise<SandboxFilesystemPolicy & { stamp?: string }> {
+    // No stamp rather than a sentinel: a sentinel is truthy, so it would fail
+    // the drift check against every real hash and the worker would refuse
+    // every job. The profile it got is the closed one, which is the safe
+    // state to run under, so there is nothing to detect drift from.
+    const closed = {
+      level: 'strict' as SandboxPolicyLevel,
+      read: [],
+      write: [],
+      stamp: undefined,
+    };
     if (!context?.targetDisplayName || !context.githubSha || !this.getRepoPolicy) return closed;
 
     const repoInfo = parseRepository(context.targetDisplayName);
