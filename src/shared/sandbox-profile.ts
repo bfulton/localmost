@@ -61,7 +61,11 @@ export interface SandboxProfileOptions {
 // =============================================================================
 
 /**
- * Expand path patterns with ~ and ** wildcards.
+ * Expand a leading ~ to the user's home directory.
+ *
+ * Only ~; wildcards in a pattern are handled where sandbox rules are built.
+ * Shared with the runner profile so a policy path means the same thing on both
+ * paths - a declared "~/.npm" must not become a directory called ~.
  */
 export function expandPath(pattern: string): string {
   let expanded = pattern;
