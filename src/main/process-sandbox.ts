@@ -368,10 +368,19 @@ ${allowDirectNetwork ? ';; Runner registration talks to GitHub directly: app-dri
 ;; class: connecting to any unix socket reaches privileged system services and
 ;; is broader than anything else in this profile.
 (allow network-outbound
+  ;; The system sockets the runtime needs, named rather than granted as a
+  ;; class: reaching any unix socket would reach privileged system services.
   (literal "/private/var/run/mDNSResponder")
   (literal "/var/run/mDNSResponder")
   (literal "/private/var/run/syslog")
-  (literal "/var/run/syslog"))
+  (literal "/var/run/syslog")
+  ;; Sockets the job itself created. Test suites bind one and connect to it,
+  ;; so this is scoped to the same directories binding is.
+  (subpath "${escapedDir}")
+  (subpath "${tmpDir}")
+  (subpath "/tmp")
+  (subpath "/private/tmp")
+  (subpath "/private/var/folders"))
 
 ;; Binding a local port is how test servers and build tools talk to themselves,
 ;; and a unix socket is how many test suites do the same. Binding creates a
