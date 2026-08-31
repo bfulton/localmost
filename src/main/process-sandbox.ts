@@ -431,7 +431,6 @@ ${allowDirectNetwork ? ';; Runner registration talks to GitHub directly: app-dri
 export type SandboxLogCallback = (level: 'debug' | 'error', message: string) => void;
 
 export interface SandboxOptions extends SpawnOptions {
-  /** Proxy server port for network isolation (used by proxy layer, not sandbox profile) */
   /**
    * Let this process reach the network directly instead of only its proxy.
    *
