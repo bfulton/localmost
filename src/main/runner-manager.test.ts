@@ -627,7 +627,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: ['index.crates.io'], level: 'strict' as const }),
+        getRepoPolicy: async () => ({ hosts: ['index.crates.io'], level: 'strict' as const, readPaths: [], writePaths: [] }),
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setInstance(1, {
@@ -654,7 +654,7 @@ describe('RunnerManager', () => {
       // whenever the job could not be identified, and the job ran with no
       // hosts - four concurrent runs failed that way before this changed.
       const setPolicyAllowedHosts = jest.fn();
-      const getRepoPolicy = jest.fn().mockResolvedValue({ hosts: [], level: 'strict' } as never);
+      const getRepoPolicy = jest.fn().mockResolvedValue({ hosts: [], level: 'strict', readPaths: [], writePaths: [] } as never);
       const manager = new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
@@ -691,8 +691,8 @@ describe('RunnerManager', () => {
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
         getRepoPolicy: async (owner: string, repo: string) =>
           repo === 'first'
-            ? { hosts: ['first.example'], level: 'strict' as const }
-            : { hosts: ['second.example'], level: 'strict' as const },
+            ? { hosts: ['first.example'], level: 'strict' as const, readPaths: [], writePaths: [] }
+            : { hosts: ['second.example'], level: 'strict' as const, readPaths: [], writePaths: [] },
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setProxy(1, { setPolicyAllowedHosts, setPolicyLevel: jest.fn() });
@@ -728,7 +728,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: ['codeload.github.com'], level: 'strict' as const }),
+        getRepoPolicy: async () => ({ hosts: ['codeload.github.com'], level: 'strict' as const, readPaths: [], writePaths: [] }),
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setPendingTargetContext('3', {
@@ -752,6 +752,195 @@ describe('RunnerManager', () => {
       expect(setPolicyAllowedHosts).toHaveBeenLastCalledWith(['codeload.github.com']);
     });
 
+    it('runs the job when a worker was never stamped', async () => {
+      // An unstamped worker got the closed profile, which is the safe one to
+      // run under. A truthy sentinel here failed the drift check against every
+      // real hash, so such a worker refused every job.
+      const setPolicyAllowedHosts = jest.fn();
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({
+          hosts: ['codeload.github.com'],
+          level: 'strict' as const,
+          readPaths: [],
+          writePaths: [],
+        }),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, {
+        name: 'runner-1',
+        currentJob: {
+          name: 'build',
+          repository: 'owner/repo',
+          startedAt: new Date().toISOString(),
+          id: 'job-1',
+          targetDisplayName: 'owner/repo',
+          githubSha: 'abc1234',
+        },
+      });
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyLevel: jest.fn() });
+
+      await helper.applyRepoPolicy(1);
+
+      expect(setPolicyAllowedHosts).toHaveBeenLastCalledWith(['codeload.github.com']);
+    });
+
+    it('does not stop the worker that just claimed the job', async () => {
+      // currentJob is only set when the runner logs "Running job", which is
+      // after the claim. Retiring on drift without excluding the claimant
+      // stopped a worker whose job GitHub had already handed out, and the run
+      // then failed on timeout with no steps - the 601s failure this avoids.
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({
+          hosts: ['codeload.github.com'],
+          level: 'strict' as const,
+          readPaths: [],
+          writePaths: [],
+        }),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      // Spawning records this, which is how retirement identifies the repo a
+      // worker belongs to before its job starts.
+      helper.setPendingTargetContext('1', {
+        targetId: 't1',
+        targetDisplayName: 'owner/repo',
+        githubSha: 'abc1234',
+      });
+      helper.setInstance(1, {
+        name: 'runner-1',
+        policyStamp: 'a-stamp-from-an-older-policy',
+        // No currentJob: the runner has not logged "Running job" yet.
+      });
+      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyLevel: jest.fn() });
+      const stopInstance = jest
+        .spyOn(manager, 'stopInstance')
+        .mockResolvedValue(undefined as never);
+
+      await helper.applyPolicyOnClaim(1, 'owner/repo', 'abc1234');
+
+      expect(stopInstance).not.toHaveBeenCalledWith(1);
+    });
+
+    it('does not re-decide a job that is already running', async () => {
+      // The job-started path refines a policy; it must not apply drift. A
+      // policy approved mid-job would otherwise cut the network out from under
+      // the job that retireWorkersForRepository promises to leave alone.
+      const setPolicyAllowedHosts = jest.fn();
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({
+          hosts: ['codeload.github.com'],
+          level: 'strict' as const,
+          readPaths: [],
+          writePaths: [],
+        }),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, {
+        name: 'runner-1',
+        policyStamp: 'a-stamp-from-an-older-policy',
+        currentJob: {
+          name: 'build',
+          repository: 'owner/repo',
+          startedAt: new Date().toISOString(),
+          id: 'job-1',
+          targetDisplayName: 'owner/repo',
+          githubSha: 'abc1234',
+        },
+      });
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyLevel: jest.fn() });
+
+      await helper.applyRepoPolicy(1);
+
+      expect(setPolicyAllowedHosts).toHaveBeenLastCalledWith(['codeload.github.com']);
+    });
+
+    it('does not read a per-workflow host list as policy drift', async () => {
+      // Hosts are resolved per workflow and applied per job; the profile is
+      // not. Including them in the stamp made any repository with a workflows:
+      // network section look like it had drifted, and its jobs were refused.
+      const setPolicyAllowedHosts = jest.fn();
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async (_o: string, _r: string, _s: string, workflowName: string) => ({
+          hosts: workflowName === 'build' ? ['build-only.example'] : [],
+          level: 'strict' as const,
+          readPaths: ['~/.npm'],
+          writePaths: ['~/.npm'],
+        }),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      const stamped = manager as unknown as {
+        stampFor(p: { level: string; readPaths: string[]; writePaths: string[] }): string;
+      };
+      helper.setInstance(1, {
+        name: 'runner-1',
+        // Stamped at spawn, where the workflow name is not yet known.
+        policyStamp: stamped.stampFor({
+          level: 'strict',
+          readPaths: ['~/.npm'],
+          writePaths: ['~/.npm'],
+        }),
+        currentJob: {
+          name: 'build',
+          repository: 'owner/repo',
+          startedAt: new Date().toISOString(),
+          id: 'job-1',
+          targetDisplayName: 'owner/repo',
+          githubSha: 'abc1234',
+        },
+      });
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyLevel: jest.fn() });
+
+      await helper.applyRepoPolicy(1);
+
+      expect(setPolicyAllowedHosts).toHaveBeenLastCalledWith(['build-only.example']);
+    });
+
+    it('constrains a claim when the policy changed after the worker started', async () => {
+      const setPolicyAllowedHosts = jest.fn();
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({
+          hosts: ['codeload.github.com'],
+          level: 'strict' as const,
+          readPaths: [],
+          writePaths: [],
+        }),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, {
+        name: 'runner-1',
+        policyStamp: 'a-stamp-from-an-older-policy',
+        currentJob: {
+          name: 'build',
+          repository: 'owner/repo',
+          startedAt: new Date().toISOString(),
+          id: 'job-1',
+          targetDisplayName: 'owner/repo',
+          githubSha: 'abc1234',
+        },
+      });
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyLevel: jest.fn() });
+
+      await helper.applyPolicyOnClaim(1, 'owner/repo', 'abc1234');
+
+      // The filesystem half is fixed in the profile, so the declared hosts are
+      // withheld and the job is left with runner infrastructure only.
+      expect(setPolicyAllowedHosts).toHaveBeenLastCalledWith([]);
+    });
+
     it('applies the level the repository declares, per job', async () => {
       // Instances are pooled across repositories, so a level captured when the
       // proxy started could belong to whichever repo happened to run first.
@@ -760,7 +949,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: [], level: 'moderate' as const }),
+        getRepoPolicy: async () => ({ hosts: [], level: 'moderate' as const, readPaths: [], writePaths: [] }),
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setInstance(1, {
@@ -788,7 +977,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: [], level: 'strict' as const }),
+        getRepoPolicy: async () => ({ hosts: [], level: 'strict' as const, readPaths: [], writePaths: [] }),
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setInstance(1, {

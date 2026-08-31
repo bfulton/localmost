@@ -60,10 +60,10 @@ localmost is an Electron desktop application that manages GitHub Actions self-ho
 
 ### What localmost protects against
 
-- **Filesystem writes**: Under `strict`, workflows can write only to the workspace and temp paths. `moderate` and `permissive` additionally allow writes to standard tool caches (`~/.npm`, `~/.cargo`, `~/.gradle`, `~/Library/Caches` and similar)
-- **Home directory access**: Workflows cannot read `~/.ssh`, `~/.aws`, `~/.config`, or other dotfiles at any level. `HOME` points inside the workspace, not at your home directory
-- **Filesystem reads**: A job can read its workspace and temp paths. Everything else, including system paths, must be declared in `.localmostrc`
-- **Network exfiltration**: Workflows can only connect to hosts the policy level allows. Under `strict` that is runner infrastructure plus what the repository declares — not npm, PyPI or other registries
+- **Filesystem writes**: Under `strict`, workflows write only to the workspace, temp, and whatever their `.localmostrc` declares. `moderate` and `permissive` additionally allow writes to the standard tool caches (`~/.npm`, `~/.cargo`, `~/.gradle`, `~/Library/Caches` and similar)
+- **Home directory access**: Workflows cannot read `~/.ssh`, `~/.aws`, `~/.config` or the other credential locations listed above, at any level. `HOME` points inside the workspace, not at your home directory
+- **Filesystem reads**: Under `strict` a job reads the OS, the runner's own directories, its workspace, and whatever its `.localmostrc` declares - nothing else. `moderate` and `permissive` additionally grant the standard toolchain locations (`/opt/homebrew`, `/usr/local`, Xcode) and the package-manager caches. At every level a job is denied `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.config`, `~/Library/Keychains`, `~/.netrc`, `~/.npmrc`, this app's credential store and approval cache, and the credential files kept inside the package-manager caches (`~/.m2/settings.xml`, `~/.gradle/gradle.properties`, cargo credentials, `NuGet.Config`)
+- **Network exfiltration**: A job's sandbox permits no outbound connection except to its own filtering proxy, so the host policy holds even for code that ignores `HTTP_PROXY` and opens a raw socket. Under `strict` the reachable set is runner infrastructure plus what the repository declares — not npm, PyPI or other registries
 - **Credential exposure**: OAuth tokens are encrypted at rest using macOS Keychain
 
 ### Policy levels
@@ -78,9 +78,24 @@ level: strict    # strict (default) | moderate | permissive
 A repository that declares no level runs `strict`. Silence means the tightest
 setting, so a policy that says nothing cannot inherit something looser.
 
+The level governs both halves of the policy. On the network side, `strict`
+grants runner infrastructure plus declared hosts, while `moderate` adds the
+common package registries. On the filesystem side, `strict` grants the runner's
+floor plus declared paths, while `moderate` adds the toolchain locations and
+package-manager caches.
+
+Because a sandbox profile is fixed when a worker starts, approving a policy
+retires that repository's idle workers. If a worker still claims a job after
+its policy changed, the job runs under the boundary approved when that worker
+started - which the machine owner approved, just not most recently - with its
+network cut back to runner infrastructure, and the worker is retired
+afterwards. A job already running is left alone.
+
 The level is part of the policy, so changing it is a policy change: it appears
 in the approval diff and takes effect only once approved. A repository cannot
 loosen its own sandbox without the machine owner agreeing to it.
+
+- **The app's own control plane**: A job cannot write the approval cache, the settings file, or reach the CLI control socket. Without this, a workflow could approve its own policy and the approval gate would mean nothing
 
 ### What localmost trusts (does NOT protect against)
 
@@ -89,6 +104,9 @@ loosen its own sandbox without the machine owner agreeing to it.
 - **A compromised GitHub account**: If an attacker has access to your GitHub account, they can modify workflows that run on your runner.
 - **Allowlisted hosts**: Data can be exfiltrated to any host the active policy allows. Under `strict` that is runner infrastructure plus whatever the repository declares; looser levels allow more.
 - **Approved policies**: Once you approve a repository's `.localmostrc`, everything it declares is granted until the file changes again. Approval is a judgement about that content.
+- **Per-workflow filesystem sections**: A `workflows:` section can narrow or widen *network* access per workflow, because hosts are applied to the proxy when a job is claimed. Filesystem paths are taken from `shared:` only — the sandbox profile is built before the runner knows which workflow it will run, and cannot change afterwards.
+
+- **The runner's own floor**: A job's sandbox also contains the runner process, so the profile must grant what the runner needs to function - the OS, its own installation, the tool cache, the workspace and temp. A repository cannot narrow below that floor, only add to it.
 - **Declared system paths**: A policy that declares OS read paths grants them for the whole job. `localmost policy init` seeds that list with OS subpaths (`/usr/bin`, `/usr/lib`, `/System`, `/Library/Developer` and similar) because nothing runs without them. It deliberately excludes `/usr/local`, `/Library/Application Support` and `/Applications`, which hold third-party software and application data - but a policy is free to add them back, and approving one means accepting that.
 
 ## Network Policy

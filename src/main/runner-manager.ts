@@ -1,12 +1,13 @@
 import { ChildProcess } from 'child_process';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as yaml from 'js-yaml';
 import {
   SandboxPolicyLevel, RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
-import { spawnSandboxed } from './process-sandbox';
+import { SandboxFilesystemPolicy, spawnSandboxed } from './process-sandbox';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { RunnerDownloader } from './runner-downloader';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
@@ -21,6 +22,12 @@ function getCleanHostname(): string {
 }
 
 interface RunnerInstance {
+  /**
+   * Hash of the approved policy this worker's sandbox profile was built from.
+   * The profile is fixed at spawn, so a worker whose stamp no longer matches
+   * the approved policy must not serve a job under it.
+   */
+  policyStamp?: string;
   process: ChildProcess | null;
   status: RunnerStatus;
   currentJob: {
@@ -61,6 +68,10 @@ export interface RepoPolicyRuntime {
   hosts: string[];
   /** The level the policy asks for; strict when it declares none. */
   level: SandboxPolicyLevel;
+  /** Paths the policy declares readable, applied when the worker is spawned. */
+  readPaths: string[];
+  /** Paths the policy declares writable, applied when the worker is spawned. */
+  writePaths: string[];
 }
 
 interface RunnerManagerOptions {
@@ -740,7 +751,8 @@ export class RunnerManager {
           instanceNum,
           target.targetDisplayName,
           target.githubSha,
-          ''
+          '',
+          true
         );
       },
       onLog: (entry: ProxyLogEntry) => {
@@ -879,10 +891,24 @@ export class RunnerManager {
         env.AGENT_TOOLSDIRECTORY = toolCacheDir; // Some actions check this instead
       }
 
+      // The sandbox confines the runner to this proxy, and that rule only
+      // matches when the kernel can attribute the connection to loopback. A
+      // dual-stack socket connecting to an IPv4-mapped address is reported
+      // with no host at all, so the connection is denied; IPv4-only keeps it
+      // attributable.
+      env.DOTNET_SYSTEM_NET_DISABLEIPV6 = '1';
+
       env.http_proxy = proxyUrl;
       env.https_proxy = proxyUrl;
       env.HTTP_PROXY = proxyUrl;
       env.HTTPS_PROXY = proxyUrl;
+
+      // A worker is credentialed for one repository and runs a single job, so
+      // the filesystem boundary can come from that repository's approved
+      // policy. The profile is fixed at spawn, which is why a policy change
+      // must retire the workers built under the old one.
+      const startupContextForPolicy = this.pendingTargetContext.get(String(instanceNum));
+      const filesystemPolicy = await this.resolveFilesystemPolicy(startupContextForPolicy);
 
       instance.process = spawnSandboxed(runnerBinary, ['--once'], {
         cwd: sandboxDir,
@@ -890,8 +916,9 @@ export class RunnerManager {
         stdio: ['ignore', 'pipe', 'pipe'],
         // Create a new process group so we can kill all child processes
         detached: true,
-        proxyPort: proxy.getPort(),
+        filesystemPolicy,
       });
+      instance.policyStamp = filesystemPolicy.stamp;
 
       // Don't set 'running' until we see "Listening for Jobs"
       // instance.status stays 'offline' until confirmed
@@ -1408,11 +1435,104 @@ export class RunnerManager {
    * line is too late: the runner fetches its actions during setup, and an
    * instance that never reached that line would keep the previous job's hosts.
    */
+  /**
+   * Identity of the half of a policy that is baked into the sandbox profile.
+   *
+   * Hosts are deliberately excluded: they are resolved per workflow and
+   * applied to the proxy on every job, so including them made a repository
+   * with a per-workflow network section look like it had drifted and its jobs
+   * were refused. Only what the profile fixed at spawn belongs here.
+   */
+  private stampFor(policy: Pick<RepoPolicyRuntime, 'level' | 'readPaths' | 'writePaths'>): string {
+    return createHash('sha256')
+      .update(JSON.stringify([policy.level, policy.readPaths, policy.writePaths]))
+      .digest('hex');
+  }
+
+  /**
+   * The filesystem boundary for a worker about to be spawned.
+   *
+   * Falls back to strict with nothing declared, which is what a repository
+   * with no approved policy gets: the runner's own floor and nothing else.
+   */
+  /**
+   * Retire the workers a repository's policy change has made stale.
+   *
+   * A worker's sandbox profile is fixed at spawn, so one built under the old
+   * policy would run the next job under it. Idle workers are stopped now;
+   * a busy worker keeps the job it already claimed, which was validated
+   * against the policy in force when it claimed it, and exits after it anyway.
+   */
+  async retireWorkersForRepository(repository: string, exceptInstance?: number): Promise<void> {
+    for (const [instanceNum, instance] of this.instances) {
+      // A worker that has just claimed a job looks idle: currentJob is not set
+      // until the runner logs "Running job". Stopping it would strand a job
+      // GitHub has already handed out, and the run would fail on timeout with
+      // no steps recorded. It is --once, so it retires after this job anyway.
+      if (instanceNum === exceptInstance) continue;
+      const target = instance.currentJob?.targetDisplayName
+        ?? this.pendingTargetContext.get(String(instanceNum))?.targetDisplayName;
+      if (target !== repository) continue;
+
+      if (instance.currentJob) {
+        // Leave the stamp alone. Overwriting it made the drift check fire on
+        // the job this worker is already running - the one this branch exists
+        // to protect. The worker exits after it anyway, being --once.
+        this.log('info', `[instance ${instanceNum}] Policy changed for ${repository}; this worker exits after its current job`);
+        continue;
+      }
+
+      this.log('info', `[instance ${instanceNum}] Policy changed for ${repository}; retiring idle worker`);
+      try {
+        await this.stopInstance(instanceNum);
+      } catch (err) {
+        this.log('warn', `Could not retire instance ${instanceNum}: ${(err as Error).message}`);
+      }
+    }
+  }
+
+  private async resolveFilesystemPolicy(
+    context?: { targetDisplayName?: string; githubSha?: string }
+  ): Promise<SandboxFilesystemPolicy & { stamp?: string }> {
+    // No stamp rather than a sentinel: a sentinel is truthy, so it would fail
+    // the drift check against every real hash and the worker would refuse
+    // every job. The profile it got is the closed one, which is the safe
+    // state to run under, so there is nothing to detect drift from.
+    const closed = {
+      level: 'strict' as SandboxPolicyLevel,
+      read: [],
+      write: [],
+      stamp: undefined,
+    };
+    if (!context?.targetDisplayName || !context.githubSha || !this.getRepoPolicy) return closed;
+
+    const repoInfo = parseRepository(context.targetDisplayName);
+    if (!repoInfo) return closed;
+
+    try {
+      const policy = await this.getRepoPolicy(repoInfo.owner, repoInfo.repo, context.githubSha, '');
+      return {
+        level: policy.level,
+        read: policy.readPaths,
+        write: policy.writePaths,
+        stamp: this.stampFor(policy),
+      };
+    } catch {
+      return closed;
+    }
+  }
+
   private async applyPolicyForTarget(
     instanceNum: number,
     targetDisplayName: string,
     githubSha: string,
-    workflowName: string
+    workflowName: string,
+    /**
+     * Whether this is the worker claiming a job. Drift is only meaningful
+     * there: once a job is running, its boundary is already fixed and
+     * re-deciding mid-job would constrain the job this check exists to protect.
+     */
+    isClaim = false
   ): Promise<void> {
     const proxy = this.proxyServers.get(instanceNum);
     if (!proxy || !this.getRepoPolicy) return;
@@ -1420,12 +1540,38 @@ export class RunnerManager {
     const repoInfo = parseRepository(targetDisplayName);
     if (!repoInfo) return;
 
-    const { hosts, level } = await this.getRepoPolicy(
+    const policy = await this.getRepoPolicy(
       repoInfo.owner,
       repoInfo.repo,
       githubSha,
       workflowName
     );
+    const { hosts, level } = policy;
+
+    // The filesystem half of the policy is baked into the sandbox profile at
+    // spawn and cannot be changed now. If the approved policy has moved since,
+    // this worker would run the job under the old boundary - so it is refused
+    // rather than run. Approving through the app retires workers eagerly; this
+    // also covers approving through the CLI, which writes the cache directly.
+    const instance = this.instances.get(instanceNum);
+    const currentStamp = this.stampFor(policy);
+    if (isClaim && instance?.policyStamp && instance.policyStamp !== currentStamp) {
+      // The filesystem half is fixed in this worker's profile and cannot be
+      // updated, so the job runs under the boundary that was approved when the
+      // worker started. That boundary was approved by the machine owner, just
+      // not most recently. Network is cut back to runner infrastructure and the
+      // worker is retired so nothing further lands on it - this constrains the
+      // job rather than refusing it, which the proxy cannot do on its own.
+      proxy.setPolicyAllowedHosts([]);
+      proxy.setPolicyLevel('strict');
+      this.log(
+        'warn',
+        `[instance ${instanceNum}] ${targetDisplayName} policy changed since this worker started; running with runner infrastructure only and retiring the worker`
+      );
+      await this.retireWorkersForRepository(targetDisplayName, instanceNum);
+      return;
+    }
+
     proxy.setPolicyAllowedHosts(hosts);
     proxy.setPolicyLevel(level);
     if (hosts.length > 0 || level !== 'strict') {

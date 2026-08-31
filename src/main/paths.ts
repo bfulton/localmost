@@ -58,6 +58,14 @@ export function getAppDataDir(): string {
 }
 
 /**
+ * Electron's userData directory, where the browser profile and the encrypted
+ * credential store live. Distinct from getAppDataDir, which may be ~/.localmost.
+ */
+export function getUserDataDir(): string {
+  return app.getPath('userData');
+}
+
+/**
  * Get the runner data directory.
  * This is where runner binaries, configs, and sandboxes are stored.
  */

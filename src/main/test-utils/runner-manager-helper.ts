@@ -12,6 +12,8 @@ import { ChildProcess } from 'child_process';
  * Internal runner instance state (mirrors private type).
  */
 interface RunnerInstance {
+  /** Hash of the approved policy this worker's profile was built from. */
+  policyStamp?: string;
   process: ChildProcess | null;
   status: RunnerStatus;
   currentJob: {
@@ -134,6 +136,23 @@ export class RunnerManagerTestHelper {
    */
   applyRepoPolicy(instanceNum: number): Promise<void> {
     return this.internals.applyRepoPolicy(instanceNum);
+  }
+
+  /** Apply a repository's policy as the claim path does, where drift is checked. */
+  applyPolicyOnClaim(
+    instanceNum: number,
+    targetDisplayName: string,
+    githubSha: string
+  ): Promise<void> {
+    return (this.manager as never as {
+      applyPolicyForTarget(
+        n: number,
+        t: string,
+        sha: string,
+        workflow: string,
+        isClaim: boolean
+      ): Promise<void>;
+    }).applyPolicyForTarget(instanceNum, targetDisplayName, githubSha, '', true);
   }
 
   /** Seed the target context recorded when an instance is spawned for a job. */

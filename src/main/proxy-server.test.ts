@@ -318,7 +318,7 @@ describe('acquirejob body limits', () => {
 
     const body = 'x'.repeat(200 * 1024);
     try {
-      const status = await new Promise<number>((resolve, reject) => {
+      const status = await new Promise<number>((resolve) => {
         const req = http.request(
           {
             hostname: '127.0.0.1',

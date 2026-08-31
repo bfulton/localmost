@@ -452,7 +452,11 @@ export class ProxyServer {
    * Uses localhost to match sandbox-exec network rules
    */
   getProxyUrl(): string {
-    return `http://localhost:${this.port}`;
+    // A literal address, not "localhost". The proxy binds 127.0.0.1 only, and
+    // the sandbox rule that confines a job to this proxy matches a direct
+    // connection to the loopback address; resolving the name first produced a
+    // connection the kernel could not attribute, and it was denied.
+    return `http://127.0.0.1:${this.port}`;
   }
 
   /**
