@@ -787,6 +787,50 @@ describe('RunnerManager', () => {
       expect(setPolicyAllowedHosts).toHaveBeenLastCalledWith(['codeload.github.com']);
     });
 
+    it('does not read a per-workflow host list as policy drift', async () => {
+      // Hosts are resolved per workflow and applied per job; the profile is
+      // not. Including them in the stamp made any repository with a workflows:
+      // network section look like it had drifted, and its jobs were refused.
+      const setPolicyAllowedHosts = jest.fn();
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async (_o: string, _r: string, _s: string, workflowName: string) => ({
+          hosts: workflowName === 'build' ? ['build-only.example'] : [],
+          level: 'strict' as const,
+          readPaths: ['~/.npm'],
+          writePaths: ['~/.npm'],
+        }),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      const stamped = manager as unknown as {
+        stampFor(p: { level: string; readPaths: string[]; writePaths: string[] }): string;
+      };
+      helper.setInstance(1, {
+        name: 'runner-1',
+        // Stamped at spawn, where the workflow name is not yet known.
+        policyStamp: stamped.stampFor({
+          level: 'strict',
+          readPaths: ['~/.npm'],
+          writePaths: ['~/.npm'],
+        }),
+        currentJob: {
+          name: 'build',
+          repository: 'owner/repo',
+          startedAt: new Date().toISOString(),
+          id: 'job-1',
+          targetDisplayName: 'owner/repo',
+          githubSha: 'abc1234',
+        },
+      });
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyLevel: jest.fn() });
+
+      await helper.applyRepoPolicy(1);
+
+      expect(setPolicyAllowedHosts).toHaveBeenLastCalledWith(['build-only.example']);
+    });
+
     it('refuses the job when the policy changed after the worker started', async () => {
       const setPolicyAllowedHosts = jest.fn();
       const manager = new RunnerManager({

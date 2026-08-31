@@ -316,10 +316,16 @@ app.whenReady().then(async () => {
       }
       const policy = getEffectivePolicy(cached.config, workflowName);
       return {
+        // Network is resolved per workflow and applied to the proxy per job.
         hosts: policy.network?.allow || [],
         level: effectivePolicyLevel(cached.config),
-        readPaths: policy.filesystem?.read || [],
-        writePaths: policy.filesystem?.write || [],
+        // Filesystem comes from the shared section only. The sandbox profile
+        // is built before the workflow is known and cannot change afterwards,
+        // so a per-workflow filesystem section could not be applied - and
+        // resolving it here would differ between spawn and claim and read as
+        // policy drift.
+        readPaths: cached.config.shared?.filesystem?.read || [],
+        writePaths: cached.config.shared?.filesystem?.write || [],
       };
     },
     onJobEvent: (event: JobEvent) => {

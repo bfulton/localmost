@@ -101,6 +101,8 @@ loosen its own sandbox without the machine owner agreeing to it.
 - **A compromised GitHub account**: If an attacker has access to your GitHub account, they can modify workflows that run on your runner.
 - **Allowlisted hosts**: Data can be exfiltrated to any host the active policy allows. Under `strict` that is runner infrastructure plus whatever the repository declares; looser levels allow more.
 - **Approved policies**: Once you approve a repository's `.localmostrc`, everything it declares is granted until the file changes again. Approval is a judgement about that content.
+- **Per-workflow filesystem sections**: A `workflows:` section can narrow or widen *network* access per workflow, because hosts are applied to the proxy when a job is claimed. Filesystem paths are taken from `shared:` only — the sandbox profile is built before the runner knows which workflow it will run, and cannot change afterwards.
+
 - **The runner's own floor**: A job's sandbox also contains the runner process, so the profile must grant what the runner needs to function - the OS, its own installation, the tool cache, the workspace and temp. A repository cannot narrow below that floor, only add to it.
 - **Declared system paths**: A policy that declares OS read paths grants them for the whole job. `localmost policy init` seeds that list with OS subpaths (`/usr/bin`, `/usr/lib`, `/System`, `/Library/Developer` and similar) because nothing runs without them. It deliberately excludes `/usr/local`, `/Library/Application Support` and `/Applications`, which hold third-party software and application data - but a policy is free to add them back, and approving one means accepting that.
 

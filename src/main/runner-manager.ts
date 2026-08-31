@@ -1435,10 +1435,17 @@ export class RunnerManager {
    * line is too late: the runner fetches its actions during setup, and an
    * instance that never reached that line would keep the previous job's hosts.
    */
-  /** Identity of an approved policy, for detecting drift after a spawn. */
-  private stampFor(policy: RepoPolicyRuntime): string {
+  /**
+   * Identity of the half of a policy that is baked into the sandbox profile.
+   *
+   * Hosts are deliberately excluded: they are resolved per workflow and
+   * applied to the proxy on every job, so including them made a repository
+   * with a per-workflow network section look like it had drifted and its jobs
+   * were refused. Only what the profile fixed at spawn belongs here.
+   */
+  private stampFor(policy: Pick<RepoPolicyRuntime, 'level' | 'readPaths' | 'writePaths'>): string {
     return createHash('sha256')
-      .update(JSON.stringify([policy.level, policy.readPaths, policy.writePaths, policy.hosts]))
+      .update(JSON.stringify([policy.level, policy.readPaths, policy.writePaths]))
       .digest('hex');
   }
 
