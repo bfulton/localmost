@@ -275,7 +275,16 @@ function generateSandboxProfile(
   (subpath "${policiesDir}")
   (literal "${configFile}")
   (literal "${homeDir}/.netrc")
-  (literal "${homeDir}/.npmrc"))
+  (literal "${homeDir}/.npmrc")
+  ;; Credentials that live inside the package-manager caches granted above.
+  ;; The cache directories have to be readable for builds to work, so the
+  ;; secret files within them are subtracted by name.
+  (literal "${homeDir}/.m2/settings.xml")
+  (literal "${homeDir}/.m2/settings-security.xml")
+  (literal "${homeDir}/.gradle/gradle.properties")
+  (literal "${homeDir}/.cargo/credentials")
+  (literal "${homeDir}/.cargo/credentials.toml")
+  (literal "${homeDir}/.nuget/NuGet/NuGet.Config"))
 
 ;; Device files that need read/write access (git, many tools redirect to /dev/null)
 (allow file-write*
