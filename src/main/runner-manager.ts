@@ -1463,8 +1463,13 @@ export class RunnerManager {
    * a busy worker keeps the job it already claimed, which was validated
    * against the policy in force when it claimed it, and exits after it anyway.
    */
-  async retireWorkersForRepository(repository: string): Promise<void> {
+  async retireWorkersForRepository(repository: string, exceptInstance?: number): Promise<void> {
     for (const [instanceNum, instance] of this.instances) {
+      // A worker that has just claimed a job looks idle: currentJob is not set
+      // until the runner logs "Running job". Stopping it would strand a job
+      // GitHub has already handed out, and the run would fail on timeout with
+      // no steps recorded. It is --once, so it retires after this job anyway.
+      if (instanceNum === exceptInstance) continue;
       const target = instance.currentJob?.targetDisplayName
         ?? this.pendingTargetContext.get(String(instanceNum))?.targetDisplayName;
       if (target !== repository) continue;
@@ -1563,7 +1568,7 @@ export class RunnerManager {
         'warn',
         `[instance ${instanceNum}] ${targetDisplayName} policy changed since this worker started; running with runner infrastructure only and retiring the worker`
       );
-      await this.retireWorkersForRepository(targetDisplayName);
+      await this.retireWorkersForRepository(targetDisplayName, instanceNum);
       return;
     }
 

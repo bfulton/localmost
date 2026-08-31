@@ -787,6 +787,45 @@ describe('RunnerManager', () => {
       expect(setPolicyAllowedHosts).toHaveBeenLastCalledWith(['codeload.github.com']);
     });
 
+    it('does not stop the worker that just claimed the job', async () => {
+      // currentJob is only set when the runner logs "Running job", which is
+      // after the claim. Retiring on drift without excluding the claimant
+      // stopped a worker whose job GitHub had already handed out, and the run
+      // then failed on timeout with no steps - the 601s failure this avoids.
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({
+          hosts: ['codeload.github.com'],
+          level: 'strict' as const,
+          readPaths: [],
+          writePaths: [],
+        }),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      // Spawning records this, which is how retirement identifies the repo a
+      // worker belongs to before its job starts.
+      helper.setPendingTargetContext('1', {
+        targetId: 't1',
+        targetDisplayName: 'owner/repo',
+        githubSha: 'abc1234',
+      });
+      helper.setInstance(1, {
+        name: 'runner-1',
+        policyStamp: 'a-stamp-from-an-older-policy',
+        // No currentJob: the runner has not logged "Running job" yet.
+      });
+      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyLevel: jest.fn() });
+      const stopInstance = jest
+        .spyOn(manager, 'stopInstance')
+        .mockResolvedValue(undefined as never);
+
+      await helper.applyPolicyOnClaim(1, 'owner/repo', 'abc1234');
+
+      expect(stopInstance).not.toHaveBeenCalledWith(1);
+    });
+
     it('does not re-decide a job that is already running', async () => {
       // The job-started path refines a policy; it must not apply drift. A
       // policy approved mid-job would otherwise cut the network out from under
