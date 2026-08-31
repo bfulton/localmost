@@ -138,6 +138,23 @@ export class RunnerManagerTestHelper {
     return this.internals.applyRepoPolicy(instanceNum);
   }
 
+  /** Apply a repository's policy as the claim path does, where drift is checked. */
+  applyPolicyOnClaim(
+    instanceNum: number,
+    targetDisplayName: string,
+    githubSha: string
+  ): Promise<void> {
+    return (this.manager as never as {
+      applyPolicyForTarget(
+        n: number,
+        t: string,
+        sha: string,
+        workflow: string,
+        isClaim: boolean
+      ): Promise<void>;
+    }).applyPolicyForTarget(instanceNum, targetDisplayName, githubSha, '', true);
+  }
+
   /** Seed the target context recorded when an instance is spawned for a job. */
   setPendingTargetContext(
     key: string,

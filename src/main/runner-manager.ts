@@ -751,7 +751,8 @@ export class RunnerManager {
           instanceNum,
           target.targetDisplayName,
           target.githubSha,
-          ''
+          '',
+          true
         );
       },
       onLog: (entry: ProxyLogEntry) => {
@@ -1470,8 +1471,10 @@ export class RunnerManager {
       if (target !== repository) continue;
 
       if (instance.currentJob) {
-        this.log('info', `[instance ${instanceNum}] Policy changed for ${repository}; retiring after the current job`);
-        instance.policyStamp = 'stale';
+        // Leave the stamp alone. Overwriting it made the drift check fire on
+        // the job this worker is already running - the one this branch exists
+        // to protect. The worker exits after it anyway, being --once.
+        this.log('info', `[instance ${instanceNum}] Policy changed for ${repository}; this worker exits after its current job`);
         continue;
       }
 
@@ -1519,7 +1522,13 @@ export class RunnerManager {
     instanceNum: number,
     targetDisplayName: string,
     githubSha: string,
-    workflowName: string
+    workflowName: string,
+    /**
+     * Whether this is the worker claiming a job. Drift is only meaningful
+     * there: once a job is running, its boundary is already fixed and
+     * re-deciding mid-job would constrain the job this check exists to protect.
+     */
+    isClaim = false
   ): Promise<void> {
     const proxy = this.proxyServers.get(instanceNum);
     if (!proxy || !this.getRepoPolicy) return;
@@ -1542,12 +1551,18 @@ export class RunnerManager {
     // also covers approving through the CLI, which writes the cache directly.
     const instance = this.instances.get(instanceNum);
     const currentStamp = this.stampFor(policy);
-    if (instance?.policyStamp && instance.policyStamp !== currentStamp) {
+    if (isClaim && instance?.policyStamp && instance.policyStamp !== currentStamp) {
+      // The filesystem half is fixed in this worker's profile and cannot be
+      // updated, so the job runs under the boundary that was approved when the
+      // worker started. That boundary was approved by the machine owner, just
+      // not most recently. Network is cut back to runner infrastructure and the
+      // worker is retired so nothing further lands on it - this constrains the
+      // job rather than refusing it, which the proxy cannot do on its own.
       proxy.setPolicyAllowedHosts([]);
       proxy.setPolicyLevel('strict');
       this.log(
         'warn',
-        `[instance ${instanceNum}] ${targetDisplayName} policy changed since this worker started; refusing the job rather than running it under the old sandbox`
+        `[instance ${instanceNum}] ${targetDisplayName} policy changed since this worker started; running with runner infrastructure only and retiring the worker`
       );
       await this.retireWorkersForRepository(targetDisplayName);
       return;

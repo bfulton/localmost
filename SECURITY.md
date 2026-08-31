@@ -85,8 +85,11 @@ floor plus declared paths, while `moderate` adds the toolchain locations and
 package-manager caches.
 
 Because a sandbox profile is fixed when a worker starts, approving a policy
-retires that repository's idle workers, and a worker whose policy has changed
-since it started refuses the job rather than running it under the old boundary.
+retires that repository's idle workers. If a worker still claims a job after
+its policy changed, the job runs under the boundary approved when that worker
+started - which the machine owner approved, just not most recently - with its
+network cut back to runner infrastructure, and the worker is retired
+afterwards. A job already running is left alone.
 
 The level is part of the policy, so changing it is a policy change: it appears
 in the approval diff and takes effect only once approved. A repository cannot

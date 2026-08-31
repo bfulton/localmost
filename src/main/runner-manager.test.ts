@@ -787,6 +787,42 @@ describe('RunnerManager', () => {
       expect(setPolicyAllowedHosts).toHaveBeenLastCalledWith(['codeload.github.com']);
     });
 
+    it('does not re-decide a job that is already running', async () => {
+      // The job-started path refines a policy; it must not apply drift. A
+      // policy approved mid-job would otherwise cut the network out from under
+      // the job that retireWorkersForRepository promises to leave alone.
+      const setPolicyAllowedHosts = jest.fn();
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({
+          hosts: ['codeload.github.com'],
+          level: 'strict' as const,
+          readPaths: [],
+          writePaths: [],
+        }),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, {
+        name: 'runner-1',
+        policyStamp: 'a-stamp-from-an-older-policy',
+        currentJob: {
+          name: 'build',
+          repository: 'owner/repo',
+          startedAt: new Date().toISOString(),
+          id: 'job-1',
+          targetDisplayName: 'owner/repo',
+          githubSha: 'abc1234',
+        },
+      });
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyLevel: jest.fn() });
+
+      await helper.applyRepoPolicy(1);
+
+      expect(setPolicyAllowedHosts).toHaveBeenLastCalledWith(['codeload.github.com']);
+    });
+
     it('does not read a per-workflow host list as policy drift', async () => {
       // Hosts are resolved per workflow and applied per job; the profile is
       // not. Including them in the stamp made any repository with a workflows:
@@ -831,7 +867,7 @@ describe('RunnerManager', () => {
       expect(setPolicyAllowedHosts).toHaveBeenLastCalledWith(['build-only.example']);
     });
 
-    it('refuses the job when the policy changed after the worker started', async () => {
+    it('constrains a claim when the policy changed after the worker started', async () => {
       const setPolicyAllowedHosts = jest.fn();
       const manager = new RunnerManager({
         onLog: mockOnLog,
@@ -859,10 +895,10 @@ describe('RunnerManager', () => {
       });
       helper.setProxy(1, { setPolicyAllowedHosts, setPolicyLevel: jest.fn() });
 
-      await helper.applyRepoPolicy(1);
+      await helper.applyPolicyOnClaim(1, 'owner/repo', 'abc1234');
 
-      // The filesystem half is fixed in the profile, so the job must not run
-      // under the boundary that was approved before the change.
+      // The filesystem half is fixed in the profile, so the declared hosts are
+      // withheld and the job is left with runner infrastructure only.
       expect(setPolicyAllowedHosts).toHaveBeenLastCalledWith([]);
     });
 
