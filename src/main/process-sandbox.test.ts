@@ -311,7 +311,7 @@ describe('Process Sandbox', () => {
 
         const instanceDir = path.join(os.homedir(), '.localmost', 'runner-2');
         const runnerPath = path.join(instanceDir, 'run.sh');
-        sandboxedSpawn(runnerPath, [], { cwd: instanceDir, proxyPort: 4242 });
+        sandboxedSpawn(runnerPath, [], { cwd: instanceDir });
 
         // Get the profile from the writeFileSync call
         const profile = mockWriteFileSync.mock.calls[0][1];

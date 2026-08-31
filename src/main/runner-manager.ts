@@ -916,7 +916,6 @@ export class RunnerManager {
         stdio: ['ignore', 'pipe', 'pipe'],
         // Create a new process group so we can kill all child processes
         detached: true,
-        proxyPort: proxy.getPort(),
         filesystemPolicy,
       });
       instance.policyStamp = filesystemPolicy.stamp;

@@ -126,13 +126,24 @@ export interface SandboxFilesystemPolicy {
   write: string[];
 }
 
-function generateSandboxProfile(
-  instanceDir: string,
-  proxyPort?: number,
-  brokerPort: number = DEFAULT_BROKER_PORT,
+/** Everything the runner profile is built from. */
+interface RunnerProfileOptions {
+  /** The instance directory this worker runs in. */
+  instanceDir: string;
+  /** The broker's port, denied to jobs because it carries job payloads. */
+  brokerPort?: number;
+  /** Registration only: reach the network without going through a proxy. */
+  allowDirectNetwork?: boolean;
+  /** The repository's approved policy; strict with nothing declared by default. */
+  filesystemPolicy?: SandboxFilesystemPolicy;
+}
+
+function generateSandboxProfile({
+  instanceDir,
+  brokerPort = DEFAULT_BROKER_PORT,
   allowDirectNetwork = false,
-  filesystemPolicy: SandboxFilesystemPolicy = { level: 'strict', read: [], write: [] }
-): string {
+  filesystemPolicy = { level: 'strict', read: [], write: [] },
+}: RunnerProfileOptions): string {
   const escapedDir = instanceDir.replace(/"/g, '\\"');
   const homeDir = os.homedir().replace(/"/g, '\\"');
   const appDataDir = getRunnerBaseDir().replace(/"/g, '\\"');
@@ -421,7 +432,6 @@ export type SandboxLogCallback = (level: 'debug' | 'error', message: string) => 
 
 export interface SandboxOptions extends SpawnOptions {
   /** Proxy server port for network isolation (used by proxy layer, not sandbox profile) */
-  proxyPort?: number;
   /**
    * Let this process reach the network directly instead of only its proxy.
    *
@@ -478,7 +488,6 @@ export function spawnSandboxed(
 
   // Extract custom options (don't pass to spawn)
   const {
-    proxyPort,
     allowDirectNetwork,
     filesystemPolicy,
     logPrefix,
@@ -495,13 +504,11 @@ export function spawnSandboxed(
 
   // Use sandbox-exec for OS-level isolation on macOS
   if (process.platform === 'darwin') {
-    const profile = generateSandboxProfile(
+    const profile = generateSandboxProfile({
       instanceDir,
-      proxyPort,
-      undefined,
       allowDirectNetwork,
-      filesystemPolicy
-    );
+      filesystemPolicy,
+    });
 
     // The profile is the thing that confines the job, so it must not live
     // anywhere a job can write. os.tmpdir() is granted to every sandbox, and
