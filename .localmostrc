@@ -9,7 +9,12 @@ shared:
       - "registry.npmjs.org"
       - "nodejs.org"
   filesystem:
+    # Under strict the sandbox grants the OS, the runner's own directories and
+    # the workspace. Anything a build needs beyond that is declared here.
+    write:
+      - "~/.npm"
     read:
+      - "~/.npm"
       - "/etc"
       - "/var"
       - "/tmp"

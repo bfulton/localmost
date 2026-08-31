@@ -312,12 +312,14 @@ app.whenReady().then(async () => {
       // declared in the same file and approved with the rest of it.
       const cached = getCachedPolicy(`${owner}/${repo}`);
       if (!cached?.approved) {
-        return { hosts: [], level: 'strict' as const };
+        return { hosts: [], level: 'strict' as const, readPaths: [], writePaths: [] };
       }
       const policy = getEffectivePolicy(cached.config, workflowName);
       return {
         hosts: policy.network?.allow || [],
         level: effectivePolicyLevel(cached.config),
+        readPaths: policy.filesystem?.read || [],
+        writePaths: policy.filesystem?.write || [],
       };
     },
     onJobEvent: (event: JobEvent) => {

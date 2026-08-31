@@ -627,7 +627,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: ['index.crates.io'], level: 'strict' as const }),
+        getRepoPolicy: async () => ({ hosts: ['index.crates.io'], level: 'strict' as const, readPaths: [], writePaths: [] }),
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setInstance(1, {
@@ -654,7 +654,7 @@ describe('RunnerManager', () => {
       // whenever the job could not be identified, and the job ran with no
       // hosts - four concurrent runs failed that way before this changed.
       const setPolicyAllowedHosts = jest.fn();
-      const getRepoPolicy = jest.fn().mockResolvedValue({ hosts: [], level: 'strict' } as never);
+      const getRepoPolicy = jest.fn().mockResolvedValue({ hosts: [], level: 'strict', readPaths: [], writePaths: [] } as never);
       const manager = new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
@@ -691,8 +691,8 @@ describe('RunnerManager', () => {
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
         getRepoPolicy: async (owner: string, repo: string) =>
           repo === 'first'
-            ? { hosts: ['first.example'], level: 'strict' as const }
-            : { hosts: ['second.example'], level: 'strict' as const },
+            ? { hosts: ['first.example'], level: 'strict' as const, readPaths: [], writePaths: [] }
+            : { hosts: ['second.example'], level: 'strict' as const, readPaths: [], writePaths: [] },
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setProxy(1, { setPolicyAllowedHosts, setPolicyLevel: jest.fn() });
@@ -728,7 +728,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: ['codeload.github.com'], level: 'strict' as const }),
+        getRepoPolicy: async () => ({ hosts: ['codeload.github.com'], level: 'strict' as const, readPaths: [], writePaths: [] }),
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setPendingTargetContext('3', {
@@ -760,7 +760,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: [], level: 'moderate' as const }),
+        getRepoPolicy: async () => ({ hosts: [], level: 'moderate' as const, readPaths: [], writePaths: [] }),
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setInstance(1, {
@@ -788,7 +788,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: [], level: 'strict' as const }),
+        getRepoPolicy: async () => ({ hosts: [], level: 'strict' as const, readPaths: [], writePaths: [] }),
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setInstance(1, {

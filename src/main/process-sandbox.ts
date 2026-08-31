@@ -13,6 +13,8 @@ import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
+import { SandboxPolicyLevel } from '../shared/types';
+import { expandPath } from '../shared/sandbox-profile';
 import {
   getAppDataDir,
   getConfigPath,
@@ -114,10 +116,22 @@ function getToolCacheDirPath(): string {
   return path.join(getRunnerDir(), 'tool-cache');
 }
 
+/** What a repository's approved policy contributes to the sandbox profile. */
+export interface SandboxFilesystemPolicy {
+  /** The level the repository declared; strict when it declared none. */
+  level: SandboxPolicyLevel;
+  /** Paths the policy declares readable, beyond the floor. */
+  read: string[];
+  /** Paths the policy declares writable, beyond the workspace. */
+  write: string[];
+}
+
 function generateSandboxProfile(
   instanceDir: string,
   proxyPort?: number,
-  brokerPort: number = DEFAULT_BROKER_PORT
+  brokerPort: number = DEFAULT_BROKER_PORT,
+  allowDirectNetwork = false,
+  filesystemPolicy: SandboxFilesystemPolicy = { level: 'strict', read: [], write: [] }
 ): string {
   const escapedDir = instanceDir.replace(/"/g, '\\"');
   const homeDir = os.homedir().replace(/"/g, '\\"');
@@ -131,6 +145,49 @@ function generateSandboxProfile(
   const runnerDir = getRunnerDir().replace(/"/g, '\\"');
   const userDataDir = getUserDataDir().replace(/"/g, '\\"');
   const cliSocket = getCliSocketPath().replace(/"/g, '\\"');
+
+  // Toolchains and package-manager caches are a convenience for jobs, not
+  // something the runner needs. Under strict a repository declares what it
+  // wants; moderate and permissive keep them, which is the same split the
+  // network allowlists already use.
+  const toolchainPaths =
+    filesystemPolicy.level === 'strict'
+      ? []
+      : [
+          '/opt/homebrew',
+          '/usr/local',
+          '/Applications/Xcode.app',
+          '/Library/Developer',
+          `${homeDir}/.npm`,
+          `${homeDir}/.yarn`,
+          `${homeDir}/.pnpm-store`,
+          `${homeDir}/.cache`,
+          `${homeDir}/.cargo`,
+          `${homeDir}/.rustup`,
+          `${homeDir}/.gradle`,
+          `${homeDir}/.m2`,
+          `${homeDir}/.nuget`,
+          `${homeDir}/.dotnet`,
+          `${homeDir}/.local`,
+          `${homeDir}/go`,
+          `${homeDir}/Library/Caches`,
+        ];
+  // Policies are written with ~ for the user's home, the same as the CLI path
+  // expands. Without this a declared "~/.npm" would name a directory called ~.
+  const subpaths = (paths: string[]) =>
+    paths
+      .map((entry) => `  (subpath "${expandPath(entry).replace(/"/g, '\\"')}")`)
+      .join('\n');
+  const policyReads = subpaths(filesystemPolicy.read);
+  const policyWrites = subpaths(filesystemPolicy.write);
+  const toolchainRules = subpaths(toolchainPaths);
+  const cacheWritePaths =
+    filesystemPolicy.level === 'strict'
+      ? []
+      : toolchainPaths.filter((entry) => entry.startsWith(homeDir));
+  const cacheWriteRules = cacheWritePaths.length
+    ? `(allow file-write*\n${subpaths(cacheWritePaths)})`
+    : ';; strict: caches are not writable unless the policy declares them';
   const tmpDir = os.tmpdir().replace(/"/g, '\\"');
 
   return `
@@ -142,8 +199,8 @@ function generateSandboxProfile(
 
 ;; ============================================================
 ;; LOCALMOST RUNNER SANDBOX PROFILE
-;; Restricts file writes to safe directories while allowing
-;; the GitHub Actions runner to function.
+;; Reads and writes are allowlists, outbound network is confined to this
+;; instance's filtering proxy, and the app's own control plane is denied.
 ;; ============================================================
 
 ;; ------------------------------------------------------------
@@ -185,21 +242,12 @@ function generateSandboxProfile(
   (subpath "/var/folders")
   (subpath "/private/var/folders"))
 
-;; User cache directories (npm, cargo, pip, etc.)
-(allow file-write*
-  (subpath "${homeDir}/.npm")
-  (subpath "${homeDir}/.yarn")
-  (subpath "${homeDir}/.pnpm-store")
-  (subpath "${homeDir}/.cache")
-  (subpath "${homeDir}/.cargo")
-  (subpath "${homeDir}/.rustup")
-  (subpath "${homeDir}/.gradle")
-  (subpath "${homeDir}/.m2")
-  (subpath "${homeDir}/.nuget")
-  (subpath "${homeDir}/.dotnet")
-  (subpath "${homeDir}/.local")
-  (subpath "${homeDir}/go")
-  (subpath "${homeDir}/Library/Caches"))
+;; Package-manager caches. Under strict a repository declares the ones it
+;; needs; moderate and permissive keep them, matching the read side.
+${cacheWriteRules}
+
+;; Paths the repository's approved policy declares writable.
+${policyWrites ? `(allow file-write*\n${policyWrites})` : ';; No policy-declared write paths'}
 
 ;; READ ACCESS - the OS, the toolchains, and this job's own directories.
 ;; Reading everything meant a workflow could read ~/.ssh private keys, AWS
@@ -233,28 +281,12 @@ function generateSandboxProfile(
   (subpath "/var")
   (subpath "/tmp")
   (subpath "/private/tmp")
-  (subpath "/Applications/Xcode.app")
-  ;; Toolchains people actually build with
-  (subpath "/opt/homebrew")
-  (subpath "/usr/local")
   ;; This job's own workspace, the runner install and the shared tool cache
   (subpath "${escapedDir}")
   (subpath "${runnerDir}")
   (subpath "${toolCacheDir}")
-  ;; Package manager caches, which are writable below and so must be readable
-  (subpath "${homeDir}/.npm")
-  (subpath "${homeDir}/.yarn")
-  (subpath "${homeDir}/.pnpm-store")
-  (subpath "${homeDir}/.cache")
-  (subpath "${homeDir}/.cargo")
-  (subpath "${homeDir}/.rustup")
-  (subpath "${homeDir}/.gradle")
-  (subpath "${homeDir}/.m2")
-  (subpath "${homeDir}/.nuget")
-  (subpath "${homeDir}/.dotnet")
-  (subpath "${homeDir}/.local")
-  (subpath "${homeDir}/go")
-  (subpath "${homeDir}/Library/Caches")
+${toolchainRules}
+${policyReads}
   (literal "/dev/null")
   (literal "/dev/random")
   (literal "/dev/urandom")
@@ -306,7 +338,8 @@ function generateSandboxProfile(
 
 ;; ------------------------------------------------------------
 ;; NETWORK ACCESS - Permissive (runner contacts many services)
-;; Note: Network filtering is done at the proxy layer, not here
+;; Hostname filtering is done at the proxy layer - sandbox-exec cannot express
+;; it - so the sandbox's job is to make the proxy the only way out.
 ;; ------------------------------------------------------------
 ;; Outbound traffic is confined to this instance's filtering proxy. The proxy
 ;; is what enforces the host policy; leaving raw sockets open made that policy
@@ -319,7 +352,7 @@ function generateSandboxProfile(
 ;; to it, and nothing leaves the machine this way. Everything else must go
 ;; through the proxy, which is itself on loopback.
 (allow network-outbound (remote ip "localhost:*"))
-${proxyPort ? `(allow network-outbound (remote ip "localhost:${proxyPort}"))` : ';; No proxy port supplied: the proxy is unreachable'}
+${allowDirectNetwork ? ';; Runner registration talks to GitHub directly: app-driven, no workflow\n;; code involved, and there is no instance proxy at configuration time.\n(allow network-outbound)' : ''}
 
 ;; ...except this app's own control channels. The broker carries job payloads
 ;; including secrets, and the runner reaches it through the proxy rather than
@@ -331,9 +364,14 @@ ${proxyPort ? `(allow network-outbound (remote ip "localhost:${proxyPort}"))` : 
 ;; proxy connect rather than as anything about sockets.
 (allow system-socket)
 
-;; Local sockets stay available: system frameworks need them to function.
-(allow network-outbound (remote unix-socket))
-(deny network-outbound (literal "${cliSocket}"))
+;; Only the system sockets the runtime needs, named rather than granted as a
+;; class: connecting to any unix socket reaches privileged system services and
+;; is broader than anything else in this profile.
+(allow network-outbound
+  (literal "/private/var/run/mDNSResponder")
+  (literal "/var/run/mDNSResponder")
+  (literal "/private/var/run/syslog")
+  (literal "/var/run/syslog"))
 
 ;; Binding a local port is how test servers and build tools talk to themselves,
 ;; and a unix socket is how many test suites do the same. Binding creates a
@@ -341,7 +379,15 @@ ${proxyPort ? `(allow network-outbound (remote ip "localhost:${proxyPort}"))` : 
 ;; stays denied above.
 (allow network-bind (local ip "localhost:*"))
 (allow network-inbound (local ip "localhost:*"))
-(allow network-bind (local unix-socket))
+;; Test suites bind unix sockets in the workspace and temp. Binding creates a
+;; file where the job can already write, so it is scoped to those directories
+;; rather than granted everywhere.
+(allow network-bind
+  (subpath "${escapedDir}")
+  (subpath "${tmpDir}")
+  (subpath "/tmp")
+  (subpath "/private/tmp")
+  (subpath "/private/var/folders"))
 
 ;; ------------------------------------------------------------
 ;; MACH/IPC OPERATIONS - Permissive (required by system frameworks)
@@ -367,6 +413,19 @@ export type SandboxLogCallback = (level: 'debug' | 'error', message: string) => 
 export interface SandboxOptions extends SpawnOptions {
   /** Proxy server port for network isolation (used by proxy layer, not sandbox profile) */
   proxyPort?: number;
+  /**
+   * Let this process reach the network directly instead of only its proxy.
+   *
+   * For registering a runner with GitHub, which the app drives with the user's
+   * own token and which runs no workflow code. Job execution never sets it:
+   * that is exactly what the proxy confinement is for.
+   */
+  allowDirectNetwork?: boolean;
+  /**
+   * The repository's approved policy, which decides how much filesystem the
+   * job gets. Absent means strict with nothing declared.
+   */
+  filesystemPolicy?: SandboxFilesystemPolicy;
   /** Log prefix for identifying this process (e.g., runner instance ID) */
   logPrefix?: string;
   /** Optional callback for logging sandbox events */
@@ -409,7 +468,14 @@ export function spawnSandboxed(
   }
 
   // Extract custom options (don't pass to spawn)
-  const { proxyPort, logPrefix, onLog, ...spawnOptions } = options;
+  const {
+    proxyPort,
+    allowDirectNetwork,
+    filesystemPolicy,
+    logPrefix,
+    onLog,
+    ...spawnOptions
+  } = options;
 
   // Create a prefixed logger - only logs if onLog callback is provided
   const prefix = logPrefix ? `[${logPrefix}] ` : '';
@@ -420,7 +486,13 @@ export function spawnSandboxed(
 
   // Use sandbox-exec for OS-level isolation on macOS
   if (process.platform === 'darwin') {
-    const profile = generateSandboxProfile(instanceDir, proxyPort);
+    const profile = generateSandboxProfile(
+      instanceDir,
+      proxyPort,
+      undefined,
+      allowDirectNetwork,
+      filesystemPolicy
+    );
 
     // The profile is the thing that confines the job, so it must not live
     // anywhere a job can write. os.tmpdir() is granted to every sandbox, and

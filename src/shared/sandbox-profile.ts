@@ -63,7 +63,7 @@ export interface SandboxProfileOptions {
 /**
  * Expand path patterns with ~ and ** wildcards.
  */
-function expandPath(pattern: string): string {
+export function expandPath(pattern: string): string {
   let expanded = pattern;
 
   // Expand ~

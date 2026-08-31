@@ -15,7 +15,8 @@ import {
   removeCachedPolicy,
   recordPolicyDecision,
 } from '../policy-cache';
-import { getLogger } from '../app-state';
+import {
+  getRunnerManager, getLogger } from '../app-state';
 
 /**
  * Describe what a policy grants, in the terms a reviewer cares about.
@@ -73,10 +74,14 @@ export const registerPolicyHandlers = (): void => {
     }));
   });
 
-  ipcMain.handle(IPC_CHANNELS.POLICY_APPROVE, (_event, repository: string): Result => {
+  ipcMain.handle(IPC_CHANNELS.POLICY_APPROVE, async (_event, repository: string): Promise<Result> => {
     try {
       approvePolicy(repository);
       recordPolicyDecision(repository, 'approved');
+      // Workers already running carry a sandbox profile built from the policy
+      // that was approved before this one; retire them so the next job for
+      // this repository runs under what was just approved.
+      await getRunnerManager()?.retireWorkersForRepository(repository);
       log()?.info(`[Policy] Approved policy for ${repository}`);
       return { success: true };
     } catch (error) {

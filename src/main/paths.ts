@@ -42,14 +42,6 @@ export function isAppSandboxed(): boolean {
  *
  * Environment variable LOCALMOST_CONFIG_DIR can override this for testing.
  */
-/**
- * Electron's userData directory, where the browser profile and the encrypted
- * credential store live. Distinct from getAppDataDir, which may be ~/.localmost.
- */
-export function getUserDataDir(): string {
-  return app.getPath('userData');
-}
-
 export function getAppDataDir(): string {
   // Allow environment variable override for testing
   if (process.env.LOCALMOST_CONFIG_DIR) {
@@ -63,6 +55,14 @@ export function getAppDataDir(): string {
 
   // For non-sandboxed apps, use traditional location for backwards compatibility
   return path.join(os.homedir(), '.localmost');
+}
+
+/**
+ * Electron's userData directory, where the browser profile and the encrypted
+ * credential store live. Distinct from getAppDataDir, which may be ~/.localmost.
+ */
+export function getUserDataDir(): string {
+  return app.getPath('userData');
 }
 
 /**

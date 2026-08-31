@@ -1,12 +1,13 @@
 import { ChildProcess } from 'child_process';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as yaml from 'js-yaml';
 import {
   SandboxPolicyLevel, RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
-import { spawnSandboxed } from './process-sandbox';
+import { SandboxFilesystemPolicy, spawnSandboxed } from './process-sandbox';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { RunnerDownloader } from './runner-downloader';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
@@ -21,6 +22,12 @@ function getCleanHostname(): string {
 }
 
 interface RunnerInstance {
+  /**
+   * Hash of the approved policy this worker's sandbox profile was built from.
+   * The profile is fixed at spawn, so a worker whose stamp no longer matches
+   * the approved policy must not serve a job under it.
+   */
+  policyStamp?: string;
   process: ChildProcess | null;
   status: RunnerStatus;
   currentJob: {
@@ -61,6 +68,10 @@ export interface RepoPolicyRuntime {
   hosts: string[];
   /** The level the policy asks for; strict when it declares none. */
   level: SandboxPolicyLevel;
+  /** Paths the policy declares readable, applied when the worker is spawned. */
+  readPaths: string[];
+  /** Paths the policy declares writable, applied when the worker is spawned. */
+  writePaths: string[];
 }
 
 interface RunnerManagerOptions {
@@ -891,6 +902,13 @@ export class RunnerManager {
       env.HTTP_PROXY = proxyUrl;
       env.HTTPS_PROXY = proxyUrl;
 
+      // A worker is credentialed for one repository and runs a single job, so
+      // the filesystem boundary can come from that repository's approved
+      // policy. The profile is fixed at spawn, which is why a policy change
+      // must retire the workers built under the old one.
+      const startupContextForPolicy = this.pendingTargetContext.get(String(instanceNum));
+      const filesystemPolicy = await this.resolveFilesystemPolicy(startupContextForPolicy);
+
       instance.process = spawnSandboxed(runnerBinary, ['--once'], {
         cwd: sandboxDir,
         env,
@@ -898,7 +916,9 @@ export class RunnerManager {
         // Create a new process group so we can kill all child processes
         detached: true,
         proxyPort: proxy.getPort(),
+        filesystemPolicy,
       });
+      instance.policyStamp = filesystemPolicy.stamp;
 
       // Don't set 'running' until we see "Listening for Jobs"
       // instance.status stays 'offline' until confirmed
@@ -1415,6 +1435,70 @@ export class RunnerManager {
    * line is too late: the runner fetches its actions during setup, and an
    * instance that never reached that line would keep the previous job's hosts.
    */
+  /**
+   * The filesystem boundary for a worker about to be spawned.
+   *
+   * Falls back to strict with nothing declared, which is what a repository
+   * with no approved policy gets: the runner's own floor and nothing else.
+   */
+  /**
+   * Retire the workers a repository's policy change has made stale.
+   *
+   * A worker's sandbox profile is fixed at spawn, so one built under the old
+   * policy would run the next job under it. Idle workers are stopped now;
+   * a busy worker keeps the job it already claimed, which was validated
+   * against the policy in force when it claimed it, and exits after it anyway.
+   */
+  /** Identity of an approved policy, for detecting drift after a spawn. */
+  private stampFor(policy: RepoPolicyRuntime): string {
+    return createHash('sha256')
+      .update(JSON.stringify([policy.level, policy.readPaths, policy.writePaths, policy.hosts]))
+      .digest('hex');
+  }
+
+  async retireWorkersForRepository(repository: string): Promise<void> {
+    for (const [instanceNum, instance] of this.instances) {
+      const target = instance.currentJob?.targetDisplayName
+        ?? this.pendingTargetContext.get(String(instanceNum))?.targetDisplayName;
+      if (target !== repository) continue;
+
+      if (instance.currentJob) {
+        this.log('info', `[instance ${instanceNum}] Policy changed for ${repository}; retiring after the current job`);
+        instance.policyStamp = 'stale';
+        continue;
+      }
+
+      this.log('info', `[instance ${instanceNum}] Policy changed for ${repository}; retiring idle worker`);
+      try {
+        await this.stopInstance(instanceNum);
+      } catch (err) {
+        this.log('warn', `Could not retire instance ${instanceNum}: ${(err as Error).message}`);
+      }
+    }
+  }
+
+  private async resolveFilesystemPolicy(
+    context?: { targetDisplayName?: string; githubSha?: string }
+  ): Promise<SandboxFilesystemPolicy & { stamp: string }> {
+    const closed = { level: 'strict' as SandboxPolicyLevel, read: [], write: [], stamp: 'none' };
+    if (!context?.targetDisplayName || !context.githubSha || !this.getRepoPolicy) return closed;
+
+    const repoInfo = parseRepository(context.targetDisplayName);
+    if (!repoInfo) return closed;
+
+    try {
+      const policy = await this.getRepoPolicy(repoInfo.owner, repoInfo.repo, context.githubSha, '');
+      return {
+        level: policy.level,
+        read: policy.readPaths,
+        write: policy.writePaths,
+        stamp: this.stampFor(policy),
+      };
+    } catch {
+      return closed;
+    }
+  }
+
   private async applyPolicyForTarget(
     instanceNum: number,
     targetDisplayName: string,
@@ -1427,12 +1511,32 @@ export class RunnerManager {
     const repoInfo = parseRepository(targetDisplayName);
     if (!repoInfo) return;
 
-    const { hosts, level } = await this.getRepoPolicy(
+    const policy = await this.getRepoPolicy(
       repoInfo.owner,
       repoInfo.repo,
       githubSha,
       workflowName
     );
+    const { hosts, level } = policy;
+
+    // The filesystem half of the policy is baked into the sandbox profile at
+    // spawn and cannot be changed now. If the approved policy has moved since,
+    // this worker would run the job under the old boundary - so it is refused
+    // rather than run. Approving through the app retires workers eagerly; this
+    // also covers approving through the CLI, which writes the cache directly.
+    const instance = this.instances.get(instanceNum);
+    const currentStamp = this.stampFor(policy);
+    if (instance?.policyStamp && instance.policyStamp !== currentStamp) {
+      proxy.setPolicyAllowedHosts([]);
+      proxy.setPolicyLevel('strict');
+      this.log(
+        'warn',
+        `[instance ${instanceNum}] ${targetDisplayName} policy changed since this worker started; refusing the job rather than running it under the old sandbox`
+      );
+      await this.retireWorkersForRepository(targetDisplayName);
+      return;
+    }
+
     proxy.setPolicyAllowedHosts(hosts);
     proxy.setPolicyLevel(level);
     if (hosts.length > 0 || level !== 'strict') {

@@ -405,6 +405,9 @@ export class RunnerDownloader {
       const config = spawnSandboxed(configScript, args, {
         cwd: sandboxDir,
         stdio: ['ignore', 'pipe', 'pipe'],
+        // Registration contacts GitHub with the user's token and runs no
+        // workflow code; there is no instance proxy at this point.
+        allowDirectNetwork: true,
       });
 
       let stdout = '';

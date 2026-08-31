@@ -324,12 +324,103 @@ describe('Process Sandbox', () => {
         // connect straight out, which is exactly what the policy forbids.
         expect(profile).toContain('(deny network*)');
         expect(profile).not.toContain('(allow network*)');
-        expect(profile).toContain('(allow network-outbound (remote ip "localhost:4242"))');
+        // Loopback only: the proxy lives there, and nothing leaves the machine
+        // this way. A job that ignores HTTP_PROXY reaches nothing.
+        expect(profile).toContain('(allow network-outbound (remote ip "localhost:*"))');
+        // The escape hatch for runner registration stays off unless asked for.
+        expect(profile).not.toMatch(/\(allow network-outbound\)\s*$/m);
 
         // The app's own control plane is never writable by a job: a job that
         // can write the approval cache can approve its own policy.
         expect(profile).toContain('(deny file-write*');
         expect(profile).toMatch(/deny file-write\*[\s\S]*policies/);
+      });
+    });
+
+    it('grants no toolchains or caches under strict', () => {
+      jest.isolateModules(() => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        const mockProcess = createMockProcess(12351);
+        const localMockSpawn = jest.fn().mockReturnValue(mockProcess);
+        const mockWriteFileSync = jest.fn();
+        jest.doMock('child_process', () => ({ spawn: localMockSpawn }));
+        jest.doMock('fs', () => ({
+          existsSync: jest.fn().mockReturnValue(true),
+          writeFileSync: mockWriteFileSync,
+          unlinkSync: jest.fn(),
+          mkdirSync: jest.fn(),
+        }));
+
+        const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
+        const instanceDir = path.join(os.homedir(), '.localmost', 'runner-2');
+        sandboxedSpawn(path.join(instanceDir, 'run.sh'), [], {
+          cwd: instanceDir,
+          filesystemPolicy: { level: 'strict', read: ['/opt/declared'], write: [] },
+        });
+        const profile = mockWriteFileSync.mock.calls[0][1];
+
+        // Strict means what the repository declared, not a convenient default.
+        expect(profile).toContain('(subpath "/opt/declared")');
+        // The grants are gone; the credential denies for those trees remain,
+        // so assert on the grant form rather than any mention of the path.
+        expect(profile).not.toContain('(subpath "/opt/homebrew")');
+        expect(profile).not.toContain(`(subpath "${path.join(os.homedir(), '.cargo')}")`);
+        expect(profile).toContain(`${path.join(os.homedir(), '.cargo')}/credentials`);
+      });
+    });
+
+    it('keeps toolchains and caches under moderate', () => {
+      jest.isolateModules(() => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        const mockProcess = createMockProcess(12352);
+        const localMockSpawn = jest.fn().mockReturnValue(mockProcess);
+        const mockWriteFileSync = jest.fn();
+        jest.doMock('child_process', () => ({ spawn: localMockSpawn }));
+        jest.doMock('fs', () => ({
+          existsSync: jest.fn().mockReturnValue(true),
+          writeFileSync: mockWriteFileSync,
+          unlinkSync: jest.fn(),
+          mkdirSync: jest.fn(),
+        }));
+
+        const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
+        const instanceDir = path.join(os.homedir(), '.localmost', 'runner-2');
+        sandboxedSpawn(path.join(instanceDir, 'run.sh'), [], {
+          cwd: instanceDir,
+          filesystemPolicy: { level: 'moderate', read: [], write: [] },
+        });
+        const profile = mockWriteFileSync.mock.calls[0][1];
+
+        expect(profile).toContain('/opt/homebrew');
+        expect(profile).toContain(path.join(os.homedir(), '.cargo'));
+      });
+    });
+
+    it('never grants credentials kept inside those caches', () => {
+      jest.isolateModules(() => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        const mockProcess = createMockProcess(12353);
+        const localMockSpawn = jest.fn().mockReturnValue(mockProcess);
+        const mockWriteFileSync = jest.fn();
+        jest.doMock('child_process', () => ({ spawn: localMockSpawn }));
+        jest.doMock('fs', () => ({
+          existsSync: jest.fn().mockReturnValue(true),
+          writeFileSync: mockWriteFileSync,
+          unlinkSync: jest.fn(),
+          mkdirSync: jest.fn(),
+        }));
+
+        const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
+        const instanceDir = path.join(os.homedir(), '.localmost', 'runner-2');
+        sandboxedSpawn(path.join(instanceDir, 'run.sh'), [], {
+          cwd: instanceDir,
+          filesystemPolicy: { level: 'permissive', read: [], write: [] },
+        });
+        const profile = mockWriteFileSync.mock.calls[0][1];
+
+        // Even at the loosest level the publishing credentials stay denied.
+        expect(profile).toMatch(/deny file-read\*[\s\S]*settings\.xml/);
+        expect(profile).toMatch(/deny file-read\*[\s\S]*gradle\.properties/);
       });
     });
 
