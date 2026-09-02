@@ -448,5 +448,205 @@ describe('extractGitHubJobInfo', () => {
     ] } });
 
     expect(info.githubWorkflow).toBe('integration');
+describe('message routing', () => {
+  interface Instance { sessionId?: string; runner: { agentName: string } }
+  interface RoutingInternals {
+    targets: Map<string, { target: Target; instances: Map<number, Instance> }>;
+    messageQueues: Map<string, string[]>;
+    pendingTargetAssignments: string[];
+    localSessions: Map<string, { targetId?: string }>;
+    handleRequest(req: unknown, res: unknown): Promise<void>;
+    processMessage(state: unknown, instance: unknown, body: string): Promise<void>;
+  }
+
+  // Broker messages as GitHub delivers them: the inner body is a JSON string.
+  const jobMessage = JSON.stringify({
+    messageId: 2,
+    messageType: 'RunnerJobRequest',
+    body: JSON.stringify({ runner_request_id: 'req-1' }),
+  });
+  const refreshMessage = JSON.stringify({
+    messageId: 1,
+    messageType: 'RunnerRefreshConfig',
+    body: JSON.stringify({ config_type: 'runner' }),
+  });
+  const cancelMessage = JSON.stringify({
+    messageId: 3,
+    messageType: 'JobCancellation',
+    body: JSON.stringify({ jobId: 'req-1' }),
+  });
+
+  const fakeRequest = (method: string, url: string, body = '') => {
+    const req = new EventEmitter() as EventEmitter & {
+      method: string; url: string; headers: Record<string, string>;
+      [Symbol.asyncIterator]: () => AsyncGenerator<Buffer>;
+    };
+    req.method = method;
+    req.url = url;
+    req.headers = {};
+    req[Symbol.asyncIterator] = async function* () { if (body) yield Buffer.from(body); };
+    return req;
+  };
+
+  const fakeResponse = () => {
+    let ended = false;
+    const res = new EventEmitter() as EventEmitter & {
+      statusCode: number; body: string; writableEnded: boolean;
+      writeHead: (code: number) => unknown; end: (chunk?: unknown) => unknown;
+    };
+    Object.defineProperty(res, 'writableEnded', { get: () => ended });
+    res.writeHead = (code) => { res.statusCode = code; return res; };
+    res.end = (chunk) => { res.body = chunk ? String(chunk) : ''; ended = true; res.emit('close'); return res; };
+    return res;
+  };
+
+  let service: BrokerProxyService;
+  let internals: RoutingInternals;
+
+  const request = async (method: string, url: string, body?: string) => {
+    const res = fakeResponse();
+    await internals.handleRequest(fakeRequest(method, url, body), res);
+    return res;
+  };
+
+  const addTargetWithRunner = (id: string, agentName: string) => {
+    const target = createMockTarget({ id, displayName: id });
+    const cred = createMockInstanceCredentials(1);
+    service.addTarget(target, [{ ...cred, runner: { ...cred.runner, agentName } }]);
+    // An upstream session already exists, so /session doesn't try to create one.
+    internals.targets.get(id)!.instances.get(1)!.sessionId = `upstream-${id}`;
+    return target;
+  };
+
+  const createSession = async (body?: string): Promise<string> => {
+    const res = await request('POST', '/session', body);
+    expect(res.statusCode).toBe(201);
+    return JSON.parse(res.body).sessionId;
+  };
+
+  beforeEach(() => {
+    service = new BrokerProxyService(8787);
+    internals = service as unknown as RoutingInternals;
+    // Upstream calls (acknowledge) succeed silently.
+    mockHttpsRequest.mockImplementation((...args: unknown[]) => {
+      const callback = args[1] as (res: EventEmitter) => void;
+      const req = new EventEmitter() as EventEmitter & { setTimeout: () => void; write: () => void; end: () => void };
+      req.setTimeout = () => {};
+      req.write = () => {};
+      req.end = () => {
+        const res = new EventEmitter() as EventEmitter & { statusCode: number };
+        res.statusCode = 200;
+        callback(res);
+        res.emit('end');
+      };
+      return req;
+    });
+  });
+
+  it('delivers the queued job before a stale RunnerRefreshConfig', async () => {
+    // GitHub pushes RunnerRefreshConfig between jobs. If the next worker's first
+    // poll returns that instead of its job, the runner rewrites its config and
+    // restarts its session, and the job is never delivered.
+    const target = addTargetWithRunner('target-a', 'runner-a.1');
+    internals.messageQueues.set(target.id, [refreshMessage, jobMessage]);
+    internals.pendingTargetAssignments.push(target.id);
+
+    const sessionId = await createSession();
+    const res = await request('GET', `/message?sessionId=${sessionId}`);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).messageType).toBe('RunnerJobRequest');
+  });
+
+  it('drops RunnerRefreshConfig instead of queuing it for the next worker', async () => {
+    const target = addTargetWithRunner('target-a', 'runner-a.1');
+    const state = internals.targets.get(target.id)!;
+
+    await internals.processMessage(state, state.instances.get(1), refreshMessage);
+
+    expect(internals.messageQueues.get(target.id) ?? []).toEqual([]);
+  });
+
+  it('queues a JobCancellation behind the job it is for', async () => {
+    const target = addTargetWithRunner('target-a', 'runner-a.1');
+    internals.messageQueues.set(target.id, [jobMessage]);
+    const state = internals.targets.get(target.id)!;
+
+    await internals.processMessage(state, state.instances.get(1), cancelMessage);
+
+    expect(internals.messageQueues.get(target.id)).toEqual([jobMessage, cancelMessage]);
+  });
+
+  it('queues a JobCancellation for a job a worker is running', async () => {
+    const target = addTargetWithRunner('target-a', 'runner-a.1');
+    internals.messageQueues.set(target.id, [jobMessage]);
+    internals.pendingTargetAssignments.push(target.id);
+    const sessionId = await createSession();
+    await request('GET', `/message?sessionId=${sessionId}`);
+    const state = internals.targets.get(target.id)!;
+
+    await internals.processMessage(state, state.instances.get(1), cancelMessage);
+
+    expect(internals.messageQueues.get(target.id)).toEqual([cancelMessage]);
+  });
+
+  it('drops a JobCancellation for a job that is neither queued nor running', async () => {
+    // GitHub redelivers a cancellation for a while after the job ends. Queued
+    // for a target with no worker, it would be handed to the next worker.
+    const target = addTargetWithRunner('target-a', 'runner-a.1');
+    const state = internals.targets.get(target.id)!;
+
+    await internals.processMessage(state, state.instances.get(1), cancelMessage);
+
+    expect(internals.messageQueues.get(target.id) ?? []).toEqual([]);
+  });
+
+  it("answers the runner's own acknowledge locally", async () => {
+    const res = await request('POST', '/acknowledge?sessionId=abc', JSON.stringify({ runnerRequestId: 'req-1' }));
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toBe('{}');
+  });
+
+  it('rejects an oversized session request instead of buffering it', async () => {
+    const res = await request('POST', '/session', 'x'.repeat(65 * 1024));
+
+    expect(res.statusCode).toBe(413);
+  });
+
+  describe('session to target binding', () => {
+    it.each([
+      ['agent.name in the body', JSON.stringify({ agent: { name: 'runner-b.1' } })],
+      ['agentName in the body', JSON.stringify({ agentName: 'runner-b.1' })],
+    ])('binds by %s without a pending assignment', async (_label, body) => {
+      // A runner that restarts its session (the .runner_migrated path) calls
+      // /session again after the pending assignment was consumed. It must keep
+      // its target rather than end up polling for nothing forever.
+      addTargetWithRunner('target-a', 'runner-a.1');
+      const targetB = addTargetWithRunner('target-b', 'runner-b.1');
+
+      const sessionId = await createSession(body);
+
+      expect(internals.localSessions.get(sessionId)?.targetId).toBe(targetB.id);
+    });
+
+    it('consumes the matching pending assignment, not the first one', async () => {
+      const targetA = addTargetWithRunner('target-a', 'runner-a.1');
+      const targetB = addTargetWithRunner('target-b', 'runner-b.1');
+      internals.pendingTargetAssignments.push(targetA.id, targetB.id);
+
+      await createSession(JSON.stringify({ agent: { name: 'runner-b.1' } }));
+
+      expect(internals.pendingTargetAssignments).toEqual([targetA.id]);
+    });
+
+    it('falls back to the pending assignment when the request names no runner', async () => {
+      const targetA = addTargetWithRunner('target-a', 'runner-a.1');
+      internals.pendingTargetAssignments.push(targetA.id);
+
+      const sessionId = await createSession();
+
+      expect(internals.localSessions.get(sessionId)?.targetId).toBe(targetA.id);
+    });
   });
 });

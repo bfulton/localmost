@@ -174,6 +174,70 @@ function createJWT(clientId: string, authorizationUrl: string, privateKey: crypt
 }
 
 // ============================================================================
+// Broker Message Helpers
+// ============================================================================
+
+/**
+ * True for a job assignment. JobCancellation is a signal about a job, not a
+ * job; RunnerRefreshConfig and AgentRefresh are runner housekeeping.
+ */
+function isJobAssignmentMessage(message: string): boolean {
+  try {
+    const messageType = String(JSON.parse(message).messageType || '').toLowerCase();
+    return messageType.includes('job') && !messageType.includes('cancel');
+  } catch {
+    return false;
+  }
+}
+
+/** The job a broker message is about, under either name GitHub uses for it. */
+function jobIdFromMessage(message: string): string | undefined {
+  try {
+    const parsed = JSON.parse(message);
+    const innerBody = typeof parsed.body === 'string' ? JSON.parse(parsed.body) : parsed.body;
+    return innerBody?.jobId || innerBody?.runner_request_id || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The runner name a session request carries, in either shape the runner uses. */
+function agentNameFromSessionRequest(body: string): string | undefined {
+  try {
+    const parsed = JSON.parse(body);
+    const name = parsed?.agent?.name ?? parsed?.agentName;
+    return typeof name === 'string' && name ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Largest request body the proxy reads; a runner's are a few hundred bytes. */
+const MAX_REQUEST_BODY_BYTES = 64 * 1024;
+
+class RequestBodyTooLargeError extends Error {
+  constructor() {
+    super('request body too large');
+  }
+}
+
+/**
+ * Read a request body in full, or throw once it exceeds the limit. The stream
+ * is drained either way: leaving the loop early destroys the socket, and the
+ * 413 would never reach the client.
+ */
+async function readRequestBody(req: http.IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size <= MAX_REQUEST_BODY_BYTES) chunks.push(chunk as Buffer);
+  }
+  if (size > MAX_REQUEST_BODY_BYTES) throw new RequestBodyTooLargeError();
+  return Buffer.concat(chunks).toString();
+}
+
+// ============================================================================
 // Broker Proxy Service
 // ============================================================================
 
@@ -554,24 +618,47 @@ export class BrokerProxyService extends EventEmitter {
       this.emit('job-received', state.target.id, jobId, instance.runner.agentName, githubInfo);
       this.emitStatusUpdate();
     } else {
-      // Non-job messages (including cancel signals) must also be forwarded to the runner
-      // Log more details for debugging cancel signal delivery
-      const isCancelLike = messageType.toLowerCase().includes('cancel') ||
+      const isCancelLike = messageTypeLower.includes('cancel') ||
         (innerBody && typeof innerBody === 'object' && JSON.stringify(innerBody).toLowerCase().includes('cancel'));
-      if (isCancelLike) {
-        log()?.info(`[BrokerProxy] CANCEL signal detected! messageType=${messageType}, target=${state.target.displayName}/${instance.instanceNum}`);
-        log()?.debug(`[BrokerProxy] Cancel message received (${body.length} bytes)`);
-        // Acknowledge cancel messages immediately so they don't block job requests
-        // Cancel signals are only relevant if there's an active job to cancel
+      if (!isCancelLike) {
+        // Only jobs and cancellations are forwarded. Anything else, such as
+        // RunnerRefreshConfig or AgentRefresh, makes the runner rewrite its
+        // config and restart its session. Queued between jobs it reaches the
+        // next worker before its job, which then never arrives. localmost
+        // owns the runner registration, so nothing is lost by dropping it.
+        log()?.warn(`[BrokerProxy] Dropping ${messageType} from ${state.target.displayName}/${instance.instanceNum}: not forwarded to runners`);
         await this.acknowledgeMessageUpstream(state, instance, messageId);
-      } else {
-        log()?.info(`[BrokerProxy] Non-job message (${messageType}) received from ${state.target.displayName}/${instance.instanceNum}, forwarding to runner`);
+        return;
+      }
+
+      log()?.info(`[BrokerProxy] CANCEL signal detected! messageType=${messageType}, target=${state.target.displayName}/${instance.instanceNum}`);
+      log()?.debug(`[BrokerProxy] Cancel message received (${body.length} bytes)`);
+      // Acknowledge cancel messages immediately so they don't block job requests
+      await this.acknowledgeMessageUpstream(state, instance, messageId);
+
+      // GitHub redelivers a cancellation until the job ends, and for a while
+      // after. One for a job no worker here holds or will hold has nothing to
+      // cancel; queued, it would only be handed to the next worker.
+      if (jobId && !this.isJobLive(jobId)) {
+        log()?.info(`[BrokerProxy] Dropping cancellation for ${jobId}: not queued or running here`);
+        return;
       }
       if (!this.messageQueues.has(targetId)) {
         this.messageQueues.set(targetId, []);
       }
       this.messageQueues.get(targetId)!.push(body);
     }
+  }
+
+  /** Whether a job is queued for a worker here or held by a live worker session. */
+  private isJobLive(jobId: string): boolean {
+    for (const session of this.localSessions.values()) {
+      if (session.currentJobId === jobId) return true;
+    }
+    for (const queue of this.messageQueues.values()) {
+      if (queue.some(message => jobIdFromMessage(message) === jobId)) return true;
+    }
+    return false;
   }
 
   /**
@@ -1134,14 +1221,18 @@ export class BrokerProxyService extends EventEmitter {
 
     try {
       if (method === 'POST' && url.pathname === '/session') {
-        await this.handleSessionCreate(res);
+        await this.handleSessionCreate(req, res);
       } else if (method === 'GET' && url.pathname === '/message') {
         await this.handleMessagePoll(res, url);
       } else if (method === 'DELETE' && url.pathname === '/session') {
         await this.handleSessionDelete(res, url);
       } else if (method === 'POST' && url.pathname === '/acknowledge') {
         // Handle acknowledge locally - the broker proxy already received the message
-        // when it polled GitHub, so workers don't need to acknowledge upstream
+        // when it polled GitHub, so workers don't need to acknowledge upstream.
+        // The request is logged because it shows the shape GitHub's acknowledge
+        // endpoint expects, which acknowledgeMessageUpstream does not yet match.
+        const ackBody = await readRequestBody(req);
+        log()?.info(`[BrokerProxy] Runner acknowledge${url.search}: ${ackBody.slice(0, 300)}`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end('{}');
       } else if (method === 'POST' && url.pathname === '/acquirejob') {
@@ -1152,17 +1243,47 @@ export class BrokerProxyService extends EventEmitter {
         await this.handleForward(req, res, url);
       }
     } catch (error) {
+      if (error instanceof RequestBodyTooLargeError) {
+        res.writeHead(413, { 'Content-Type': 'text/plain' });
+        res.end('request body too large');
+        return;
+      }
       log()?.error( `[BrokerProxy] Error handling ${method} ${url.pathname}: ${(error as Error).message}`);
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: (error as Error).message }));
     }
   }
 
-  private async handleSessionCreate(res: http.ServerResponse): Promise<void> {
+  /**
+   * The target a new worker session belongs to.
+   *
+   * The pending assignment queue covers the first session after a spawn, but a
+   * runner that restarts its session calls /session again after that entry
+   * was consumed. It names itself in the request, so binding by that name
+   * keeps its target rather than leaving it polling for nothing.
+   */
+  private resolveSessionTarget(agentName: string | undefined): string | undefined {
+    if (agentName) {
+      for (const state of this.targets.values()) {
+        for (const instance of state.instances.values()) {
+          if (instance.runner.agentName !== agentName) continue;
+          const pending = this.pendingTargetAssignments.indexOf(state.target.id);
+          if (pending >= 0) this.pendingTargetAssignments.splice(pending, 1);
+          return state.target.id;
+        }
+      }
+      log()?.warn(`[BrokerProxy] Session request names unknown runner ${agentName}; using pending assignment`);
+    }
+    return this.pendingTargetAssignments.shift();
+  }
+
+  private async handleSessionCreate(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const sessionId = crypto.randomUUID();
 
-    // Assign this session to a target (from pending assignments queue)
-    const targetId = this.pendingTargetAssignments.shift();
+    const requestBody = await readRequestBody(req);
+    const agentName = agentNameFromSessionRequest(requestBody);
+    log()?.info(`[BrokerProxy] Session request from ${agentName ?? 'unnamed runner'}: ${requestBody.slice(0, 300)}`);
+    const targetId = this.resolveSessionTarget(agentName);
     log()?.debug(`[BrokerProxy] Creating local session ${sessionId} for target ${targetId || 'unknown'}`);
 
     // Only create upstream sessions for instances that don't already have them
@@ -1206,18 +1327,6 @@ export class BrokerProxyService extends EventEmitter {
 
     const session = this.localSessions.get(sessionId)!;
     const targetId = session.targetId;
-
-    // Helper to check if a message is a job assignment (vs cancel or other signal)
-    const isJobAssignmentMessage = (message: string): boolean => {
-      try {
-        const parsed = JSON.parse(message);
-        const messageType = (parsed.messageType || '').toLowerCase();
-        // JobCancellation is NOT a job assignment - it's a signal to cancel
-        return messageType.includes('job') && !messageType.includes('cancel');
-      } catch {
-        return false;
-      }
-    };
 
     // If this worker already has a job, only deliver non-job messages (like cancel signals).
     // Don't give them another job message.
@@ -1293,24 +1402,19 @@ export class BrokerProxyService extends EventEmitter {
         return undefined;
       }
       const queue = this.messageQueues.get(targetId);
-      return queue?.shift();
+      if (!queue || queue.length === 0) return undefined;
+      // The job goes first. A cancellation queued ahead of it is for a job
+      // this worker doesn't hold yet; it follows on the next poll.
+      const jobIndex = queue.findIndex(isJobAssignmentMessage);
+      return queue.splice(Math.max(jobIndex, 0), 1)[0];
     };
 
     // Helper to extract job ID from message and mark session
     const markSessionWithJob = (message: string): void => {
-      try {
-        const parsed = JSON.parse(message);
-        let innerBody = parsed.body;
-        if (typeof innerBody === 'string') {
-          innerBody = JSON.parse(innerBody);
-        }
-        const jobId = innerBody?.jobId || innerBody?.runner_request_id;
-        if (jobId) {
-          session.currentJobId = jobId;
-          log()?.debug(`[BrokerProxy] Marked session ${sessionId} with job ${jobId}`);
-        }
-      } catch {
-        // Could not parse, still deliver the message
+      const jobId = jobIdFromMessage(message);
+      if (jobId) {
+        session.currentJobId = jobId;
+        log()?.debug(`[BrokerProxy] Marked session ${sessionId} with job ${jobId}`);
       }
     };
 
