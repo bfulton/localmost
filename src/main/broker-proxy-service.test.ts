@@ -448,6 +448,9 @@ describe('extractGitHubJobInfo', () => {
     ] } });
 
     expect(info.githubWorkflow).toBe('integration');
+  });
+});
+
 describe('message routing', () => {
   interface Instance { sessionId?: string; runner: { agentName: string } }
   interface RoutingInternals {
@@ -615,17 +618,27 @@ describe('message routing', () => {
   });
 
   describe('session to target binding', () => {
-    it('binds by the agent name in the body without a pending assignment', async () => {
-      const body = JSON.stringify({ agent: { name: 'runner-b.1' } });
-      // A runner that restarts its session (the .runner_migrated path) calls
-      // /session again after the pending assignment was consumed. It must keep
-      // its target rather than end up polling for nothing forever.
+    it('leaves a session unbound when its target has no job waiting', async () => {
+      // A listener spawned ahead of any job runs in the generic sandbox, not
+      // the repository's approved policy. Binding it would let it win the next
+      // job and fail it (seen live: cargo denied reading ~/.rustup).
       addTargetWithRunner('target-a', 'runner-a.1');
-      const targetB = addTargetWithRunner('target-b', 'runner-b.1');
+      addTargetWithRunner('target-b', 'runner-b.1');
 
-      const sessionId = await createSession(body);
+      const sessionId = await createSession(JSON.stringify({ agent: { name: 'runner-b.1' } }));
 
-      expect(internals.localSessions.get(sessionId)?.targetId).toBe(targetB.id);
+      expect(internals.localSessions.get(sessionId)?.targetId).toBeUndefined();
+    });
+
+    it("never hands a named session another target's pending assignment", async () => {
+      const targetA = addTargetWithRunner('target-a', 'runner-a.1');
+      addTargetWithRunner('target-b', 'runner-b.1');
+      internals.pendingTargetAssignments.push(targetA.id);
+
+      const sessionId = await createSession(JSON.stringify({ agent: { name: 'runner-b.1' } }));
+
+      expect(internals.localSessions.get(sessionId)?.targetId).toBeUndefined();
+      expect(internals.pendingTargetAssignments).toEqual([targetA.id]);
     });
 
     it('consumes the matching pending assignment, not the first one', async () => {

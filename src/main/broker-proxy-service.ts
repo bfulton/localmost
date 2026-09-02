@@ -1254,26 +1254,28 @@ export class BrokerProxyService extends EventEmitter {
   }
 
   /**
-   * The target a new worker session belongs to.
+   * The target a new worker session belongs to, or none.
    *
-   * The pending assignment queue covers the first session after a spawn, but a
-   * runner that restarts its session calls /session again after that entry
-   * was consumed. It names itself in the request, so binding by that name
-   * keeps its target rather than leaving it polling for nothing.
+   * A worker spawned for a job carries the repository's approved sandbox
+   * policy; a listener spawned ahead of any job runs in the generic sandbox
+   * and must not be handed one. The runner names itself in the request, so a
+   * session is bound only when the target it is registered under has a job
+   * waiting, and it takes that entry rather than whichever is first. An
+   * unnamed request falls back to the positional queue.
    */
   private resolveSessionTarget(agentName: string | undefined): string | undefined {
-    if (agentName) {
-      for (const state of this.targets.values()) {
-        for (const instance of state.instances.values()) {
-          if (instance.runner.agentName !== agentName) continue;
-          const pending = this.pendingTargetAssignments.indexOf(state.target.id);
-          if (pending >= 0) this.pendingTargetAssignments.splice(pending, 1);
-          return state.target.id;
-        }
+    if (!agentName) return this.pendingTargetAssignments.shift();
+    for (const state of this.targets.values()) {
+      for (const instance of state.instances.values()) {
+        if (instance.runner.agentName !== agentName) continue;
+        const pending = this.pendingTargetAssignments.indexOf(state.target.id);
+        if (pending < 0) return undefined;
+        this.pendingTargetAssignments.splice(pending, 1);
+        return state.target.id;
       }
-      log()?.warn(`[BrokerProxy] Session request names unknown runner ${agentName}; using pending assignment`);
     }
-    return this.pendingTargetAssignments.shift();
+    log()?.warn(`[BrokerProxy] Session request names unknown runner ${agentName}; leaving it unbound`);
+    return undefined;
   }
 
   private async handleSessionCreate(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
