@@ -201,11 +201,10 @@ function jobIdFromMessage(message: string): string | undefined {
   }
 }
 
-/** The runner name a session request carries, in either shape the runner uses. */
+/** The runner name a session request carries; the runner sends it as `agent.name`. */
 function agentNameFromSessionRequest(body: string): string | undefined {
   try {
-    const parsed = JSON.parse(body);
-    const name = parsed?.agent?.name ?? parsed?.agentName;
+    const name = JSON.parse(body)?.agent?.name;
     return typeof name === 'string' && name ? name : undefined;
   } catch {
     return undefined;
@@ -1282,7 +1281,7 @@ export class BrokerProxyService extends EventEmitter {
 
     const requestBody = await readRequestBody(req);
     const agentName = agentNameFromSessionRequest(requestBody);
-    log()?.info(`[BrokerProxy] Session request from ${agentName ?? 'unnamed runner'}: ${requestBody.slice(0, 300)}`);
+    log()?.info(`[BrokerProxy] Session request from ${agentName ?? 'unnamed runner'}`);
     const targetId = this.resolveSessionTarget(agentName);
     log()?.debug(`[BrokerProxy] Creating local session ${sessionId} for target ${targetId || 'unknown'}`);
 

@@ -615,10 +615,8 @@ describe('message routing', () => {
   });
 
   describe('session to target binding', () => {
-    it.each([
-      ['agent.name in the body', JSON.stringify({ agent: { name: 'runner-b.1' } })],
-      ['agentName in the body', JSON.stringify({ agentName: 'runner-b.1' })],
-    ])('binds by %s without a pending assignment', async (_label, body) => {
+    it('binds by the agent name in the body without a pending assignment', async () => {
+      const body = JSON.stringify({ agent: { name: 'runner-b.1' } });
       // A runner that restarts its session (the .runner_migrated path) calls
       // /session again after the pending assignment was consumed. It must keep
       // its target rather than end up polling for nothing forever.
