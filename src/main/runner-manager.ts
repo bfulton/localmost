@@ -5,6 +5,12 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as yaml from 'js-yaml';
 import {
+  dockerSandboxGrants,
+  resolveDockerEndpoint,
+  type DockerAccessLevel,
+  type DockerEndpoint,
+} from '../shared/docker-access';
+import {
   SandboxPolicyLevel, RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
 import { SandboxFilesystemPolicy, spawnSandboxed } from './process-sandbox';
@@ -72,6 +78,8 @@ export interface RepoPolicyRuntime {
   readPaths: string[];
   /** Paths the policy declares writable, applied when the worker is spawned. */
   writePaths: string[];
+  /** Docker access the policy declares; 'off' when it declares none. */
+  docker: DockerAccessLevel;
 }
 
 interface RunnerManagerOptions {
@@ -910,13 +918,24 @@ export class RunnerManager {
       const startupContextForPolicy = this.pendingTargetContext.get(String(instanceNum));
       const filesystemPolicy = await this.resolveFilesystemPolicy(startupContextForPolicy);
 
+      // Resolved here, outside the sandbox, so the job never has to discover
+      // the endpoint - which is what lets ~/.docker stay closed at socket level.
+      const dockerEndpoint = resolveDockerEndpoint();
+      this.warnIfDockerUnavailable(filesystemPolicy.docker, dockerEndpoint);
+      const dockerGrants = dockerSandboxGrants(
+        filesystemPolicy.docker,
+        dockerEndpoint,
+        os.homedir()
+      );
+
       instance.process = spawnSandboxed(runnerBinary, ['--once'], {
         cwd: sandboxDir,
-        env,
+        env: { ...env, ...dockerGrants.env },
         stdio: ['ignore', 'pipe', 'pipe'],
         // Create a new process group so we can kill all child processes
         detached: true,
         filesystemPolicy,
+        dockerGrants,
       });
       instance.policyStamp = filesystemPolicy.stamp;
 
@@ -1443,10 +1462,28 @@ export class RunnerManager {
    * with a per-workflow network section look like it had drifted and its jobs
    * were refused. Only what the profile fixed at spawn belongs here.
    */
-  private stampFor(policy: Pick<RepoPolicyRuntime, 'level' | 'readPaths' | 'writePaths'>): string {
+  private stampFor(
+    policy: Pick<RepoPolicyRuntime, 'level' | 'readPaths' | 'writePaths' | 'docker'>
+  ): string {
     return createHash('sha256')
-      .update(JSON.stringify([policy.level, policy.readPaths, policy.writePaths]))
+      .update(JSON.stringify([policy.level, policy.readPaths, policy.writePaths, policy.docker]))
       .digest('hex');
+  }
+
+  /**
+   * A declared level with no reachable daemon runs without the grant. Say so:
+   * the job must not look like it had access it did not get.
+   */
+  private warnIfDockerUnavailable(
+    level: DockerAccessLevel,
+    endpoint: DockerEndpoint | null
+  ): void {
+    if (level === 'off' || endpoint) return;
+    this.log(
+      'warn',
+      `Policy declares docker: ${level}, but no daemon socket resolved - ` +
+        'running without Docker access'
+    );
   }
 
   /**
@@ -1493,13 +1530,14 @@ export class RunnerManager {
 
   private async resolveFilesystemPolicy(
     context?: { targetDisplayName?: string; githubSha?: string }
-  ): Promise<SandboxFilesystemPolicy & { stamp?: string }> {
+  ): Promise<SandboxFilesystemPolicy & { stamp?: string; docker: DockerAccessLevel }> {
     // No stamp rather than a sentinel: a sentinel is truthy, so it would fail
     // the drift check against every real hash and the worker would refuse
     // every job. The profile it got is the closed one, which is the safe
     // state to run under, so there is nothing to detect drift from.
     const closed = {
       level: 'strict' as SandboxPolicyLevel,
+      docker: 'off' as DockerAccessLevel,
       read: [],
       write: [],
       stamp: undefined,
@@ -1513,6 +1551,7 @@ export class RunnerManager {
       const policy = await this.getRepoPolicy(repoInfo.owner, repoInfo.repo, context.githubSha, '');
       return {
         level: policy.level,
+        docker: policy.docker,
         read: policy.readPaths,
         write: policy.writePaths,
         stamp: this.stampFor(policy),

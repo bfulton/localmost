@@ -312,7 +312,13 @@ app.whenReady().then(async () => {
       // declared in the same file and approved with the rest of it.
       const cached = getCachedPolicy(`${owner}/${repo}`);
       if (!cached?.approved) {
-        return { hosts: [], level: 'strict' as const, readPaths: [], writePaths: [] };
+        return {
+          hosts: [],
+          level: 'strict' as const,
+          readPaths: [],
+          writePaths: [],
+          docker: 'off' as const,
+        };
       }
       const policy = getEffectivePolicy(cached.config, workflowName);
       return {
@@ -326,6 +332,9 @@ app.whenReady().then(async () => {
         // policy drift.
         readPaths: cached.config.shared?.filesystem?.read || [],
         writePaths: cached.config.shared?.filesystem?.write || [],
+        // Docker access, like filesystem, comes from the shared section only:
+        // the profile is built before the workflow is known.
+        docker: cached.config.shared?.docker ?? 'off',
       };
     },
     onJobEvent: (event: JobEvent) => {
