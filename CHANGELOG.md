@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, and enforce least-privilege sandboxing.
 
 ### Added
+- **Opt-in Docker access**: an approved `.localmostrc` may declare
+  `docker: socket | contexts | credentials` to let jobs reach the Docker daemon,
+  applied by the runner and `localmost test` alike. Default off. A job with Docker
+  access is not sandboxed - see `docs/roadmap/docker-access.md`
 - **Workflow Test Mode**: Run workflows locally before pushing with `localmost test`
   - Intercepts `actions/checkout` to use local working tree
   - Intercepts `actions/cache` for local caching
@@ -55,6 +59,10 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   - `localmost env` command shows local tooling versions
   - Compare against any GitHub runner label
   - Suggestions for pinning versions in workflows
+
+### Removed
+- **`sockets:` policy key**: it was honoured by `localmost test` only, never by the
+  runner, and accepted arbitrary socket paths. Declare `docker:` instead
 
 ### Security
 - Secret values are masked out of step output. A step that printed one - `set -x`,

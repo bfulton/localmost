@@ -3,8 +3,8 @@
 A `.localmostrc` key that lets an approved repository reach the Docker daemon, at
 a declared level, from inside the runner sandbox.
 
-> **Status:** designed, not implemented. This document describes the intended
-> behaviour and the decisions behind it.
+> **Status:** implemented in 0.3.0. This document describes the design; where the
+> shipped behaviour differs it is noted inline.
 
 ## Problem
 

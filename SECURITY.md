@@ -191,6 +191,17 @@ or stored by localmost.
   - `Metadata: Read` - Access basic repository information (required by GitHub for all apps)
   - `Self-hosted runners: Read & Write` (org-level) - Register runners at the organization level
 
+### Docker Access
+
+A repository may declare `docker:` in its approved `.localmostrc`. At any level
+from `socket` upward, jobs from that repository are **not sandboxed**: containers
+are not subject to the seatbelt profile, so a job can bind-mount host paths into
+a container and read or write them - including paths the profile denies, such as
+`~/.ssh` - and can make network connections that bypass the policy's allowlist.
+
+Default is off. It takes effect only through the normal policy approval, so the
+diff shown at approval time is what grants it. See `docs/roadmap/docker-access.md`.
+
 ## Credential Storage
 
 - **Location**: Configuration stored in `~/.localmost/config.yaml`

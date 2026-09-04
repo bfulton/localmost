@@ -221,13 +221,13 @@ Current release: **0.3.0 — Test Locally, Secure by Default**
 - Sandbox policy levels (strict / moderate / permissive) declared per repository and enforced by the local proxy
 - Contributor-based job filtering for public repos
 - Repository policies require approval before the runner applies them
+- Opt-in [Docker daemon access](docs/roadmap/docker-access.md) declared per repo, off by default
 - Environment comparison with GitHub runners
 
 Future feature ideas:
 
 - **Fail a blocked job visibly** - a job refused by the filter is cancelled through the GitHub API before any worker starts, so it appears as cancelled rather than failing with a message explaining why.
 - **Roll discovery output up further** - `--updaterc` now drops paths already covered by a listed ancestor, which removes the bulk of the redundancy. It still records content-addressed cache paths (npm's `_cacache/content-v2/sha512/...`) verbatim, which differ per machine and per dependency change; those want rolling up to their cache directory.
-- **[Docker access](docs/roadmap/docker-access.md)** - an opt-in `.localmostrc` key letting an approved repo reach the Docker daemon, at a declared level, since container workflows currently have no way to ask for the socket.
 - **Approve policies in the app** - approval is CLI-only today (`localmost policy diff`, `localmost policy approve`). The app refuses the job and logs the diff, but there is no UI to review and accept it, and no audit log of approvals.
 - **Show a diff when `--updaterc` rewrites a policy** - it writes directly, with no diff and no confirmation, so a discovery run can widen a checked-in policy without the change being obvious.
 - **Homebrew formula** - `npx localmost` works; `brew install localmost` does not exist.
