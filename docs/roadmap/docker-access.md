@@ -19,11 +19,14 @@ and there is no way to ask for it:
    unconditional deny-read list in `process-sandbox.ts`, alongside `~/.ssh`,
    `~/.aws`, `~/.gnupg` and `Library/Keychains`, so the CLI cannot resolve its
    endpoint or read `config.json`.
-3. **The mechanism that exists is orphaned.** `SocketsPolicy` in
+3. **The mechanism that exists is half-wired.** `SocketsPolicy` in
    `src/shared/sandbox-profile.ts` emits `network-bind`, `network-outbound` and
    `file-write*` for a declared socket path, and names `/var/run/docker.sock` as
-   its example — but nothing outside tests constructs it, and the runner profile
-   is built by `process-sandbox.ts`, a different code path entirely.
+   its example. `shared.sockets.allow` is a validated key that already reaches
+   the `localmost test` profile (`src/cli/test.ts`), but the runner profile is
+   built by `process-sandbox.ts`, a different code path that ignores it. So the
+   one existing way to ask for a socket works locally, does nothing on the
+   runner, and accepts arbitrary paths.
 
 The result is silent degradation: container-based workflows find the daemon
 unreachable, tests that need it skip, and the operator has no way to opt in even
@@ -160,9 +163,13 @@ by the profile and fails at connect — a clean failure, not a hang. Documented
 rather than prevented; granting whatever a context names would defeat the closed
 enum.
 
-**Per-workflow overrides.** `docker:` is settable in a `workflows:` block like
-other keys, and the workflow value wins. A repository that needs Docker in one
-job does not have to grant it to all of them.
+**Shared section only.** `docker:` is read from `shared:`, not from a
+`workflows:` block. The runner's sandbox profile is built before the workflow is
+known, which is already why per-workflow `filesystem:` sections are not applied
+(`src/main/index.ts`). Docker access changes the same profile, so a workflow-level
+value could only be honoured by `localmost test` — reintroducing exactly the
+runner/test divergence this design set out to avoid. A `docker:` key inside a
+`workflows:` block is a validation error rather than a silently ignored setting.
 
 **Policy changes require re-approval.** Adding or raising `docker:` changes the
 policy, so the existing approval flow holds the job and cancels the run until the
