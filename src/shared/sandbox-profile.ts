@@ -8,7 +8,11 @@
 
 import * as os from 'os';
 import * as path from 'path';
-import type { DockerAccessLevel } from './docker-access';
+import {
+  dockerSandboxGrants,
+  type DockerAccessLevel,
+  type DockerEndpoint,
+} from './docker-access';
 
 // =============================================================================
 // Types
@@ -51,6 +55,10 @@ export interface SandboxProfileOptions {
   proxyPort: number;
   /** Policy to enforce */
   policy?: SandboxPolicy;
+  /** Resolved Docker endpoint, or null when none was found. */
+  dockerEndpoint?: DockerEndpoint | null;
+  /** Home directory, for the ~/.docker paths a level opens. */
+  homeDir?: string;
   /** Whether to run in permissive mode (log violations but don't block) */
   permissive?: boolean;
   /** Log file for sandbox violations */
@@ -371,6 +379,30 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
       lines.push(`(allow network-outbound (literal "${escaped}"))`);
       // Also need file-write for socket operations
       lines.push(`(allow file-write* (literal "${escaped}"))`);
+    }
+    lines.push('');
+  }
+
+  // Docker access, from the level the policy declared. The same grants the
+  // runner profile emits, so localmost test predicts what the runner does.
+  const dockerGrants = dockerSandboxGrants(
+    policy?.docker,
+    options.dockerEndpoint ?? null,
+    options.homeDir ?? os.homedir()
+  );
+  if (dockerGrants.socketLiterals.length > 0) {
+    lines.push(';; Docker access declared by the repository policy');
+    for (const socket of dockerGrants.socketLiterals) {
+      const escaped = escapePath(socket);
+      lines.push(`(allow network-outbound (literal "${escaped}"))`);
+      lines.push(`(allow file-read* (literal "${escaped}"))`);
+      lines.push(`(allow file-write* (literal "${escaped}"))`);
+    }
+    for (const file of dockerGrants.readLiterals) {
+      lines.push(`(allow file-read* (literal "${escapePath(file)}"))`);
+    }
+    for (const dir of dockerGrants.readSubpaths) {
+      lines.push(`(allow file-read* (subpath "${escapePath(dir)}"))`);
     }
     lines.push('');
   }
