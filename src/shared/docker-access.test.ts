@@ -83,14 +83,24 @@ describe('resolveDockerEndpoint', () => {
     });
   });
 
-  it('returns null for a dangling symlink, which is what a stopped daemon leaves', () => {
-    // /var/run/docker.sock survives Docker Desktop quitting; its target does not.
+  it('returns null when a path exists but cannot be resolved', () => {
+    // Covers the socket being removed between the two calls. Note a dangling
+    // /var/run/docker.sock - what a stopped Docker Desktop leaves behind - does
+    // not reach here: existsSync follows symlinks, so it reports false and the
+    // candidate is skipped. Verified against the real machine.
     const fs: DockerFsProbe = {
       exists: p => p === '/var/run/docker.sock',
       realpath: () => {
         throw new Error('ENOENT');
       },
     };
+
+    expect(resolveDockerEndpoint({ env: {}, homeDir, fs })).toBeNull();
+  });
+
+  it('returns null when the daemon is stopped, leaving a dangling symlink', () => {
+    // existsSync follows the link, so a dangling one simply is not there.
+    const fs = probe({});
 
     expect(resolveDockerEndpoint({ env: {}, homeDir, fs })).toBeNull();
   });
