@@ -128,9 +128,11 @@ localmost uses a GitHub App for authentication. During installation, you'll be a
 |------------|-------|---------|
 | **Administration** | Read & Write | Register and remove self-hosted runners on repositories |
 | **Actions** | Read & Write | Check workflow status and cancel running jobs |
+| **Variables** | Read & Write | Write the `LOCALMOST_HEARTBEAT` variable that workflows check |
 | **Contents** | Read | Fetch the repository's `.localmostrc` sandbox policy |
 | **Metadata** | Read | Access basic repository information (required by GitHub for all apps) |
 | **Self-hosted runners** (org) | Read & Write | Register and remove self-hosted runners at the organization level |
+| **Variables** (org) | Read & Write | Write the `LOCALMOST_HEARTBEAT` variable at the organization level |
 
 ### Why Administration Permission?
 
