@@ -20,21 +20,27 @@ jest.mock('./config', () => ({
 }));
 
 // Mock app-state
+const mockBrokerAddTarget = jest.fn();
+const mockBrokerRemoveTarget = jest.fn();
+const mockGetBrokerProxyService = jest.fn<() => unknown>();
 jest.mock('./app-state', () => ({
   getLogger: jest.fn(() => ({
     info: jest.fn(),
     warn: jest.fn(),
     error: jest.fn(),
   })),
+  getBrokerProxyService: () => mockGetBrokerProxyService(),
 }));
 
 // Mock runner-proxy-manager
 const mockRegisterAll = jest.fn<() => Promise<Array<{ instanceNum: number }>>>();
 const mockUnregisterAll = jest.fn<() => Promise<void>>();
+const mockLoadAllCredentials = jest.fn<() => unknown[]>();
 jest.mock('./runner-proxy-manager', () => ({
   getRunnerProxyManager: jest.fn(() => ({
     registerAll: mockRegisterAll,
     unregisterAll: mockUnregisterAll,
+    loadAllCredentials: mockLoadAllCredentials,
   })),
 }));
 
@@ -49,6 +55,11 @@ describe('TargetManager', () => {
     mockLoadConfig.mockReturnValue({ targets: [], maxConcurrentJobs: 4 });
     mockRegisterAll.mockResolvedValue([{ instanceNum: 1 }, { instanceNum: 2 }, { instanceNum: 3 }, { instanceNum: 4 }]);
     mockUnregisterAll.mockResolvedValue(undefined);
+    mockLoadAllCredentials.mockReturnValue([{ runner: { agentName: 'localmost.test-host.testowner-testrepo.1' } }]);
+    mockGetBrokerProxyService.mockReturnValue({
+      addTarget: mockBrokerAddTarget,
+      removeTarget: mockBrokerRemoveTarget,
+    });
     manager = new TargetManager();
   });
 
@@ -321,4 +332,125 @@ describe('TargetManager', () => {
       expect(instance1).toBe(instance2);
     });
   });
+
+  describe('findTargetByRef', () => {
+    const repoTarget: Target = {
+      id: '3116ec9a',
+      type: 'repo',
+      owner: 'testowner',
+      repo: 'testrepo',
+      displayName: 'testowner/testrepo',
+      url: 'https://github.com/testowner/testrepo',
+      proxyRunnerName: 'localmost.test-host.testowner-testrepo',
+      enabled: true,
+      addedAt: '2024-01-01T00:00:00.000Z',
+    };
+    const orgTarget: Target = {
+      id: '26c43c63',
+      type: 'org',
+      owner: 'testorg',
+      displayName: 'testorg',
+      url: 'https://github.com/testorg',
+      proxyRunnerName: 'localmost.test-host.testorg',
+      enabled: true,
+      addedAt: '2024-01-01T00:00:00.000Z',
+    };
+
+    beforeEach(() => {
+      mockLoadConfig.mockReturnValue({ targets: [repoTarget, orgTarget], maxConcurrentJobs: 4 });
+    });
+
+    it('resolves owner/repo', () => {
+      expect(manager.findTargetByRef('testowner/testrepo')).toEqual(repoTarget);
+    });
+
+    it('resolves a bare owner to an org target', () => {
+      expect(manager.findTargetByRef('testorg')).toEqual(orgTarget);
+    });
+
+    it('resolves a target id', () => {
+      expect(manager.findTargetByRef('3116ec9a')).toEqual(repoTarget);
+    });
+
+    it('ignores case', () => {
+      expect(manager.findTargetByRef('TestOwner/TestRepo')).toEqual(repoTarget);
+    });
+
+    it('returns undefined when nothing matches', () => {
+      expect(manager.findTargetByRef('nobody/nothing')).toBeUndefined();
+    });
+  });
+
+  describe('addTargetAndAttach', () => {
+    it('attaches the new target to a running broker proxy', async () => {
+      const result = await manager.addTargetAndAttach('repo', 'testowner', 'testrepo');
+
+      expect(result.success).toBe(true);
+      expect(mockBrokerAddTarget).toHaveBeenCalledTimes(1);
+      const [attached, credentials] = mockBrokerAddTarget.mock.calls[0] as [Target, unknown[]];
+      expect(attached.displayName).toBe('testowner/testrepo');
+      expect(credentials).toHaveLength(1);
+    });
+
+    it('still succeeds when no broker proxy is running', async () => {
+      mockGetBrokerProxyService.mockReturnValue(null);
+
+      const result = await manager.addTargetAndAttach('repo', 'testowner', 'testrepo');
+
+      expect(result.success).toBe(true);
+      expect(mockBrokerAddTarget).not.toHaveBeenCalled();
+    });
+
+    it('does not attach when registration fails', async () => {
+      mockRegisterAll.mockRejectedValue(new Error('bad credentials'));
+
+      const result = await manager.addTargetAndAttach('repo', 'testowner', 'testrepo');
+
+      expect(result.success).toBe(false);
+      expect(mockBrokerAddTarget).not.toHaveBeenCalled();
+    });
+
+    it('does not attach when no credentials were stored', async () => {
+      mockLoadAllCredentials.mockReturnValue([]);
+
+      const result = await manager.addTargetAndAttach('repo', 'testowner', 'testrepo');
+
+      expect(result.success).toBe(true);
+      expect(mockBrokerAddTarget).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('removeTargetAndDetach', () => {
+    const target: Target = {
+      id: 'test-1',
+      type: 'repo',
+      owner: 'testowner',
+      repo: 'testrepo',
+      displayName: 'testowner/testrepo',
+      url: 'https://github.com/testowner/testrepo',
+      proxyRunnerName: 'localmost.test-host.testowner-testrepo',
+      enabled: true,
+      addedAt: '2024-01-01T00:00:00.000Z',
+    };
+
+    it('detaches from the broker proxy before removing', async () => {
+      mockLoadConfig.mockReturnValue({ targets: [target], maxConcurrentJobs: 4 });
+
+      const result = await manager.removeTargetAndDetach('test-1');
+
+      expect(result.success).toBe(true);
+      expect(mockBrokerRemoveTarget).toHaveBeenCalledWith('test-1');
+      expect(mockUnregisterAll).toHaveBeenCalled();
+    });
+
+    it('returns an error for an unknown target', async () => {
+      mockLoadConfig.mockReturnValue({ targets: [], maxConcurrentJobs: 4 });
+
+      const result = await manager.removeTargetAndDetach('nope');
+
+      expect(result.success).toBe(false);
+      expect(mockBrokerRemoveTarget).not.toHaveBeenCalled();
+    });
+  });
+
 });

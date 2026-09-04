@@ -8,7 +8,7 @@
 import * as os from 'os';
 import * as crypto from 'crypto';
 import { loadConfig, saveConfig } from './config';
-import { getLogger } from './app-state';
+import { getLogger, getBrokerProxyService } from './app-state';
 import { getRunnerProxyManager } from './runner-proxy-manager';
 import type { Target, Result } from '../shared/types';
 
@@ -133,6 +133,58 @@ export class TargetManager {
 
     log()?.info(`[TargetManager] Target added: ${target.displayName}`);
     return { success: true, data: target };
+  }
+
+
+  /**
+   * Find a target by `owner/repo`, a bare `owner` (org targets), or target id.
+   * Matching is case-insensitive.
+   */
+  findTargetByRef(ref: string): Target | undefined {
+    const needle = ref.trim().toLowerCase();
+    if (!needle) return undefined;
+
+    return this.getTargets().find(t =>
+      t.id.toLowerCase() === needle || t.displayName.toLowerCase() === needle
+    );
+  }
+
+  /**
+   * Add a target and attach it to the running broker proxy, so jobs are
+   * picked up without restarting the app.
+   */
+  async addTargetAndAttach(
+    type: 'repo' | 'org',
+    owner: string,
+    repo?: string
+  ): Promise<Result<Target>> {
+    const result = await this.addTarget(type, owner, repo);
+
+    if (result.success && result.data) {
+      const brokerProxy = getBrokerProxyService();
+      if (brokerProxy) {
+        const credentials = getRunnerProxyManager().loadAllCredentials(result.data.id);
+        if (credentials.length > 0) {
+          brokerProxy.addTarget(result.data, credentials);
+        }
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Detach a target from the running broker proxy, then remove it and
+   * unregister its runner proxies from GitHub.
+   */
+  async removeTargetAndDetach(targetId: string): Promise<Result> {
+    if (!this.getTarget(targetId)) {
+      return { success: false, error: 'Target not found' };
+    }
+
+    getBrokerProxyService()?.removeTarget(targetId);
+
+    return this.removeTarget(targetId);
   }
 
   /**

@@ -181,7 +181,20 @@ localmost resume
 
 # View recent job history
 localmost jobs
+
+# Manage the repos/orgs this machine runs jobs for
+localmost targets                            # List targets
+localmost targets add bfulton/voight-kampff  # Register runners for a repo
+localmost targets add my-org --org           # Register runners for an org
+localmost targets disable bfulton/supdb      # Stop accepting its jobs
+localmost targets remove bfulton/supdb       # Unregister its runners
+localmost targets list --json                # Machine-readable output
 ```
+
+Adding a target registers one runner per concurrent job slot with GitHub, and the
+running app picks up the new target without a restart. Removing one unregisters
+those runners; `remove` asks for confirmation unless you pass `--yes`, and refuses
+to run unconfirmed outside a terminal. Every subcommand accepts `--json`.
 
 ### Installing the CLI
 

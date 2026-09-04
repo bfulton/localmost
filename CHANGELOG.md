@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, and enforce least-privilege sandboxing.
 
 ### Added
+- **Target management from the CLI**: `localmost targets` lists, adds, removes, enables, and disables targets
+  - `localmost targets add <owner>/<repo>` registers runners without opening the app
+  - `--org` for organization targets, `--json` on every subcommand for scripting
+  - `remove` confirms interactively and requires `--yes` outside a terminal
 - **Workflow Test Mode**: Run workflows locally before pushing with `localmost test`
   - Intercepts `actions/checkout` to use local working tree
   - Intercepts `actions/cache` for local caching

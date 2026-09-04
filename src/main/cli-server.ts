@@ -11,52 +11,48 @@ import { app } from 'electron';
 import { getCliSocketPath } from './paths';
 import { getRunnerManager, getHeartbeatManager, getAuthState } from './app-state';
 import { getSnapshot, selectRunnerStatus, selectEffectivePauseState } from './runner-state-service';
-import { RunnerState, JobHistoryEntry, ResourcePauseState } from '../shared/types';
+import { getTargetManager } from './target-manager';
+import { getRunnerProxyManager } from './runner-proxy-manager';
+import type { Target } from '../shared/types';
+import type {
+  CliRequest,
+  CliResponse,
+  StatusResponse,
+  JobsResponse,
+  ActionResponse,
+  TargetsListResponse,
+  TargetMutationResponse,
+  ErrorResponse,
+  TargetSummary,
+} from '../shared/cli-protocol';
 
-/** CLI command request */
-export interface CliRequest {
-  command: 'status' | 'pause' | 'resume' | 'jobs' | 'quit';
-}
+// Re-exported so importers of ./cli-server keep working.
+export type {
+  CliRequest,
+  CliResponse,
+  StatusResponse,
+  JobsResponse,
+  ActionResponse,
+  TargetsListResponse,
+  TargetMutationResponse,
+  ErrorResponse,
+  TargetSummary,
+};
 
-/** CLI response for status command */
-export interface StatusResponse {
-  success: true;
-  command: 'status';
-  data: {
-    runner: RunnerState;
-    runnerName: string;
-    heartbeat: {
-      isRunning: boolean;
-    };
-    authenticated: boolean;
-    userName?: string;
-    resourcePause?: ResourcePauseState;
-  };
-}
-
-/** CLI response for jobs command */
-export interface JobsResponse {
-  success: true;
-  command: 'jobs';
-  data: {
-    jobs: JobHistoryEntry[];
-  };
-}
-
-/** CLI response for pause/resume/quit commands */
-export interface ActionResponse {
-  success: true;
-  command: 'pause' | 'resume' | 'quit';
-  message: string;
-}
-
-/** CLI error response */
-export interface ErrorResponse {
-  success: false;
-  error: string;
-}
-
-export type CliResponse = StatusResponse | JobsResponse | ActionResponse | ErrorResponse;
+/**
+ * Describe a target for the CLI, including how many runner proxies are
+ * registered for it.
+ */
+const toTargetSummary = (target: Target): TargetSummary => ({
+  id: target.id,
+  displayName: target.displayName,
+  type: target.type,
+  url: target.url,
+  enabled: target.enabled,
+  proxyRunnerName: target.proxyRunnerName,
+  runnerCount: getRunnerProxyManager().loadAllCredentials(target.id).length,
+  addedAt: target.addedAt,
+});
 
 /**
  * CLI Server class - manages Unix domain socket for CLI communication.
@@ -276,6 +272,88 @@ export class CliServer {
         } catch (err) {
           return { success: false, error: `Failed to resume: ${(err as Error).message}` };
         }
+      }
+
+      case 'targets-list': {
+        const targets = getTargetManager().getTargets().map(toTargetSummary);
+        return {
+          success: true,
+          command: 'targets-list',
+          data: { targets },
+        };
+      }
+
+      case 'targets-add': {
+        const { type, owner, repo } = request.args || {};
+        if (!type || !owner) {
+          return { success: false, error: 'Missing target type or owner' };
+        }
+
+        const result = await getTargetManager().addTargetAndAttach(type, owner, repo);
+        if (!result.success) {
+          return { success: false, error: result.error };
+        }
+        if (!result.data) {
+          return { success: false, error: 'Failed to add target' };
+        }
+
+        return {
+          success: true,
+          command: 'targets-add',
+          data: { target: toTargetSummary(result.data) },
+        };
+      }
+
+      case 'targets-remove': {
+        const ref = request.args?.ref;
+        if (!ref) {
+          return { success: false, error: 'Missing target reference' };
+        }
+
+        const target = getTargetManager().findTargetByRef(ref);
+        if (!target) {
+          return { success: false, error: `No target matching "${ref}"` };
+        }
+
+        // Capture the summary before the credentials are deleted.
+        const summary = toTargetSummary(target);
+
+        const result = await getTargetManager().removeTargetAndDetach(target.id);
+        if (!result.success) {
+          return { success: false, error: result.error };
+        }
+
+        return {
+          success: true,
+          command: 'targets-remove',
+          data: { target: summary },
+        };
+      }
+
+      case 'targets-update': {
+        const { ref, enabled } = request.args || {};
+        if (!ref || typeof enabled !== 'boolean') {
+          return { success: false, error: 'Missing target reference or enabled state' };
+        }
+
+        const target = getTargetManager().findTargetByRef(ref);
+        if (!target) {
+          return { success: false, error: `No target matching "${ref}"` };
+        }
+
+        const result = await getTargetManager().updateTarget(target.id, { enabled });
+        if (!result.success) {
+          return { success: false, error: result.error };
+        }
+        if (!result.data) {
+          return { success: false, error: 'Failed to update target' };
+        }
+
+        return {
+          success: true,
+          command: 'targets-update',
+          data: { target: toTargetSummary(result.data) },
+        };
       }
 
       case 'quit': {
