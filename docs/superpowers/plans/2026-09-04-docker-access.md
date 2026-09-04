@@ -735,7 +735,7 @@ In `SandboxProfileOptions` add:
   homeDir?: string;
 ```
 
-In the builder, after the existing "Policy-defined socket access" block, emit from the level. The existing `sockets:` emission stays as it is — Task 7 deals with that key:
+In the builder, replace the "Policy-defined socket access" block with emission from the level. Task 7 removes the `sockets:` key that fed the old block:
 
 ```typescript
   // Docker access, from the policy's declared level
@@ -943,66 +943,86 @@ git commit -m "Carry the docker level from approved policy into the worker profi
 
 ---
 
-### Task 7: Inject DOCKER_HOST, and settle the legacy sockets key
+### Task 7: Inject DOCKER_HOST and remove the sockets key
 
 **Files:**
 - Modify: `src/main/runner-manager.ts:913-915` (the `env` passed to `spawnSandboxed`)
 - Modify: `src/cli/test.ts:265` (effective policy → profile options)
-- Modify: `src/shared/localmostrc.ts` (`validateSocketsPolicy` ~line 272)
-- Test: `src/main/runner-manager.test.ts`, `src/shared/localmostrc.test.ts`
+- Modify: `src/shared/localmostrc.ts` (`validatePolicy` ~line 227, delete `validateSocketsPolicy` ~line 272)
+- Modify: `src/shared/sandbox-profile.ts` (delete `SocketsPolicy` ~line 27, its field on `SandboxPolicy`, and the emission block ~line 360)
+- Test: `src/main/runner-manager.test.ts`, `src/shared/localmostrc.test.ts`, `src/shared/sandbox-profile.test.ts`
 
 **Interfaces:**
 - Consumes: `DockerGrants.env` from Task 3.
-- Produces: no new exports.
+- Produces: `SocketsPolicy` and `SandboxPolicy.sockets` are gone.
 
-`shared.sockets.allow` is a validated key that already reaches the `localmost test` profile and is ignored by the runner, accepting arbitrary socket paths. It keeps working — removing a shipped key is a breaking policy change — but it warns and points at `docker:`, and it is not wired into the runner path.
+`shared.sockets.allow` reached the `localmost test` profile with arbitrary socket
+paths and was ignored by the runner, so it worked locally and did nothing on the
+runner — and it let a repository name any socket, which is what the closed enum
+exists to prevent. No approved policy declares it and `localmostrc.md` never
+documented it. It is removed rather than deprecated, and rejected with an error
+naming `docker:` so a policy that used it fails loudly instead of quietly losing
+behaviour.
 
 - [ ] **Step 1: Write the failing test**
 
 ```typescript
 // src/shared/localmostrc.test.ts
-it('warns that sockets is superseded by docker and is test-mode only', () => {
+it('rejects the removed sockets key, pointing at docker', () => {
   const result = parseLocalmostrcContent(
     'version: 1\nshared:\n  sockets:\n    allow:\n      - /var/run/docker.sock\n'
   );
-  expect(result.success).toBe(true);
-  expect(result.warnings.join('\n')).toMatch(/docker:/);
-  expect(result.warnings.join('\n')).toMatch(/localmost test/);
+  expect(result.success).toBe(false);
+  expect(result.errors[0].message).toMatch(/docker:/);
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `npx jest --config test/jest.config.js src/shared/localmostrc.test.ts -t sockets`
-Expected: FAIL — no warning is produced.
-
-- [ ] **Step 3: Write minimal implementation**
-
-`validatePolicy` collects warnings alongside errors; pass the warnings array into `validateSocketsPolicy` and push:
-
 ```typescript
-    warnings.push(
-      `${path}.sockets is honoured by "localmost test" only and is not applied to ` +
-      'runner jobs. Declare docker access with `docker:` instead, which the runner ' +
-      'and test mode both apply.'
-    );
+// src/main/runner-manager.test.ts
+it('injects DOCKER_HOST into the job environment when a socket is granted', () => {
+  const grants = dockerSandboxGrants(
+    'socket',
+    { socketPath: '/Users/dev/.docker/run/docker.sock' },
+    '/Users/dev'
+  );
+  const env = { PATH: '/usr/bin', ...grants.env };
+
+  expect(env.DOCKER_HOST).toBe('unix:///Users/dev/.docker/run/docker.sock');
+  expect(env.PATH).toBe('/usr/bin');
+});
 ```
 
-Inject the env in `runner-manager.ts`, where `env` is built for `spawnSandboxed`:
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `npx jest --config test/jest.config.js src/shared/localmostrc.test.ts -t sockets`
+Expected: FAIL — `sockets:` still validates successfully.
+
+- [ ] **Step 3: Remove the key and inject the env**
+
+In `src/shared/sandbox-profile.ts`, delete the `SocketsPolicy` interface, the
+`sockets?: SocketsPolicy` field on `SandboxPolicy`, and the "Policy-defined
+socket access" emission block.
+
+In `src/shared/localmostrc.ts`, delete `validateSocketsPolicy` and replace its
+call in `validatePolicy` with a rejection:
 
 ```typescript
-      const dockerGrants = dockerSandboxGrants(
-        filesystemPolicy.docker,
-        resolveDockerEndpoint(),
-        os.homedir()
-      );
+  // Removed in favour of docker:, which is applied by the runner as well as
+  // by localmost test, and cannot name an arbitrary socket.
+  if (p.sockets !== undefined) {
+    errors.push({
+      message:
+        `${path}.sockets is no longer supported. Use \`docker:\` in shared to ` +
+        'declare Docker access (off, socket, contexts, credentials).',
+    });
+  }
+```
 
-      instance.process = spawnSandboxed(runnerBinary, ['--once'], {
-        cwd: sandboxDir,
+In `runner-manager.ts`, spread the grant env into the job environment at the
+spawn built in Task 6:
+
+```typescript
         env: { ...env, ...dockerGrants.env },
-        ...
-        dockerGrants,
-      });
 ```
 
 In `src/cli/test.ts`, pass the endpoint through to the profile options:
@@ -1016,14 +1036,15 @@ In `src/cli/test.ts`, pass the endpoint through to the profile options:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `npx jest --config test/jest.config.js src/shared/localmostrc.test.ts src/main/runner-manager.test.ts`
-Expected: PASS
+Run: `npx jest --config test/jest.config.js`
+Expected: PASS. Any existing `sockets:` test in `sandbox-profile.test.ts` is
+deleted with the feature, not adapted.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/main/runner-manager.ts src/cli/test.ts src/shared/localmostrc.ts src/shared/localmostrc.test.ts
-git commit -m "Inject DOCKER_HOST and mark the sockets key test-mode only"
+git add src/main/runner-manager.ts src/cli/test.ts src/shared/localmostrc.ts src/shared/sandbox-profile.ts src/shared/localmostrc.test.ts src/shared/sandbox-profile.test.ts src/main/runner-manager.test.ts
+git commit -m "Inject DOCKER_HOST and remove the superseded sockets key"
 ```
 
 ---
@@ -1164,6 +1185,8 @@ diff shown at approval time is what grants it.
 - [ ] **Step 3: Add the changelog entry**
 
 ```markdown
+- **Removed `sockets:`**: the key reached `localmost test` only, never the runner,
+  and accepted arbitrary socket paths. Declare `docker:` instead
 - **Opt-in Docker access**: an approved `.localmostrc` may declare
   `docker: socket | contexts | credentials` to let jobs reach the Docker daemon.
   Default off. A job with Docker access is not sandboxed - see

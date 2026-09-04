@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { SandboxPolicy, NetworkPolicy, FilesystemPolicy, SocketsPolicy, EnvPolicy } from './sandbox-profile';
 import { SandboxPolicyLevel } from './types';
+import { DOCKER_ACCESS_LEVELS, isDockerAccessLevel } from './docker-access';
 
 // =============================================================================
 // Types
@@ -231,6 +232,23 @@ function validatePolicy(policy: unknown, path: string, errors: ParseError[]): vo
   // Validate env policy
   if (p.env !== undefined) {
     validateEnvPolicy(p.env, `${path}.env`, errors);
+  }
+
+  // Validate docker access level. The sandbox profile is built before the
+  // workflow is known, so this is only meaningful in the shared section - the
+  // same reason per-workflow filesystem sections are not applied.
+  if (p.docker !== undefined) {
+    if (path !== 'shared') {
+      errors.push({
+        message:
+          `${path}.docker is not supported: docker access is declared in shared, ` +
+          'because the sandbox profile is built before the workflow is known',
+      });
+    } else if (!isDockerAccessLevel(p.docker)) {
+      errors.push({
+        message: `${path}.docker must be one of: ${DOCKER_ACCESS_LEVELS.join(', ')}`,
+      });
+    }
   }
 }
 

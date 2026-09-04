@@ -8,6 +8,7 @@
 
 import * as os from 'os';
 import * as path from 'path';
+import type { DockerAccessLevel } from './docker-access';
 
 // =============================================================================
 // Types
@@ -39,6 +40,8 @@ export interface SandboxPolicy {
   filesystem?: FilesystemPolicy;
   sockets?: SocketsPolicy;
   env?: EnvPolicy;
+  /** Docker daemon access. Read from `shared:` only - see docker-access.ts. */
+  docker?: DockerAccessLevel;
 }
 
 export interface SandboxProfileOptions {

@@ -796,3 +796,30 @@ describe('serializing a declared level', () => {
     expect(serializeLocalmostrc(config)).not.toContain('level:');
   });
 });
+
+describe('docker access', () => {
+  it('accepts a declared docker level', () => {
+    const result = parseLocalmostrcContent('version: 1\nshared:\n  docker: socket\n');
+    expect(result.success).toBe(true);
+    expect(result.config?.shared?.docker).toBe('socket');
+  });
+
+  it('rejects docker: true, which does not say which level was meant', () => {
+    const result = parseLocalmostrcContent('version: 1\nshared:\n  docker: true\n');
+    expect(result.success).toBe(false);
+    expect(result.errors[0].message).toMatch(/off, socket, contexts, credentials/);
+  });
+
+  it('rejects an unknown docker level', () => {
+    const result = parseLocalmostrcContent('version: 1\nshared:\n  docker: daemon\n');
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects docker inside a workflows block', () => {
+    const result = parseLocalmostrcContent(
+      'version: 1\nworkflows:\n  build:\n    docker: socket\n'
+    );
+    expect(result.success).toBe(false);
+    expect(result.errors[0].message).toMatch(/shared/);
+  });
+});
