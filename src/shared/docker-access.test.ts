@@ -3,7 +3,9 @@ import {
   DOCKER_ACCESS_LEVELS,
   isDockerAccessLevel,
   resolveDockerEndpoint,
+  dockerSandboxGrants,
   DockerFsProbe,
+  DockerGrants,
 } from './docker-access';
 
 /** A fake machine: paths that exist, and where symlinks point. */
@@ -95,5 +97,57 @@ describe('resolveDockerEndpoint', () => {
 
   it('returns null when nothing is present', () => {
     expect(resolveDockerEndpoint({ env: {}, homeDir, fs: probe({}) })).toBeNull();
+  });
+});
+
+describe('dockerSandboxGrants', () => {
+  const homeDir = '/Users/dev';
+  const endpoint = { socketPath: '/Users/dev/.docker/run/docker.sock' };
+  const empty: DockerGrants = { socketLiterals: [], readLiterals: [], readSubpaths: [], env: {} };
+
+  it('grants nothing when the level is off', () => {
+    expect(dockerSandboxGrants('off', endpoint, homeDir)).toEqual(empty);
+  });
+
+  it('grants nothing when no level is declared', () => {
+    expect(dockerSandboxGrants(undefined, endpoint, homeDir)).toEqual(empty);
+  });
+
+  it('grants nothing when no daemon socket resolved', () => {
+    expect(dockerSandboxGrants('credentials', null, homeDir)).toEqual(empty);
+  });
+
+  it('grants the socket and injects DOCKER_HOST at socket level', () => {
+    expect(dockerSandboxGrants('socket', endpoint, homeDir)).toEqual({
+      socketLiterals: ['/Users/dev/.docker/run/docker.sock'],
+      readLiterals: [],
+      readSubpaths: [],
+      env: { DOCKER_HOST: 'unix:///Users/dev/.docker/run/docker.sock' },
+    });
+  });
+
+  it('does not open config.json at socket level', () => {
+    const grants = dockerSandboxGrants('socket', endpoint, homeDir);
+    expect(grants.readLiterals).not.toContain('/Users/dev/.docker/config.json');
+  });
+
+  it('adds the contexts directory at contexts level', () => {
+    const grants = dockerSandboxGrants('contexts', endpoint, homeDir);
+    expect(grants.readSubpaths).toEqual(['/Users/dev/.docker/contexts']);
+    expect(grants.readLiterals).toEqual([]);
+  });
+
+  it('adds config.json at credentials level, keeping the lower grants', () => {
+    const grants = dockerSandboxGrants('credentials', endpoint, homeDir);
+    expect(grants.socketLiterals).toEqual(['/Users/dev/.docker/run/docker.sock']);
+    expect(grants.readSubpaths).toEqual(['/Users/dev/.docker/contexts']);
+    expect(grants.readLiterals).toEqual(['/Users/dev/.docker/config.json']);
+  });
+
+  it('never grants the ~/.docker directory itself', () => {
+    for (const level of ['socket', 'contexts', 'credentials'] as const) {
+      const grants = dockerSandboxGrants(level, endpoint, homeDir);
+      expect(grants.readSubpaths).not.toContain('/Users/dev/.docker');
+    }
   });
 });

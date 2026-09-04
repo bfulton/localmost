@@ -82,3 +82,51 @@ export function resolveDockerEndpoint(options?: {
 
   return null;
 }
+
+/** What a level opens in a sandbox profile. */
+export interface DockerGrants {
+  /** Socket paths to allow network-outbound, file-read* and file-write* on. */
+  socketLiterals: string[];
+  /** Single files to allow file-read* on. */
+  readLiterals: string[];
+  /** Directories to allow file-read* on. */
+  readSubpaths: string[];
+  /** Environment to inject into the job. */
+  env: Record<string, string>;
+}
+
+/** Rank a level so cumulative comparisons read as comparisons. */
+const rank = (level: DockerAccessLevel): number => DOCKER_ACCESS_LEVELS.indexOf(level);
+
+/**
+ * What a declared level opens, given the resolved endpoint. Empty when the
+ * level is off or absent, or when no daemon socket was found - the declaration
+ * is a permission, not a requirement.
+ */
+export function dockerSandboxGrants(
+  level: DockerAccessLevel | undefined,
+  endpoint: DockerEndpoint | null,
+  homeDir: string
+): DockerGrants {
+  if (!level || level === 'off' || !endpoint) {
+    return { socketLiterals: [], readLiterals: [], readSubpaths: [], env: {} };
+  }
+
+  const grants: DockerGrants = {
+    socketLiterals: [endpoint.socketPath],
+    readLiterals: [],
+    readSubpaths: [],
+    // The job never has to discover the endpoint, which is what lets the rest
+    // of ~/.docker stay closed at socket level.
+    env: { DOCKER_HOST: `unix://${endpoint.socketPath}` },
+  };
+
+  if (rank(level) >= rank('contexts')) {
+    grants.readSubpaths.push(`${homeDir}/.docker/contexts`);
+  }
+  if (rank(level) >= rank('credentials')) {
+    grants.readLiterals.push(`${homeDir}/.docker/config.json`);
+  }
+
+  return grants;
+}
