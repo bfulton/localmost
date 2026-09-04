@@ -106,12 +106,16 @@ export class HeartbeatManager {
   /**
    * Remove a target from the heartbeat, marking it stale so workflows stop
    * dispatching jobs to runners that are going away.
+   *
+   * Clearing is not gated on the heartbeat running: a paused runner has
+   * stopped the timer but may have written a recent timestamp moments before,
+   * which would keep the target looking online for the rest of the window.
    */
   async removeTarget(target: HeartbeatTarget): Promise<void> {
     const before = this.targets.length;
     this.targets = this.targets.filter(t => !sameTarget(t, target));
 
-    if (this.targets.length === before || !this.isRunning()) {
+    if (this.targets.length === before) {
       return;
     }
 

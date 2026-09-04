@@ -223,6 +223,29 @@ describe('TargetManager', () => {
       expect(mockSaveConfig).not.toHaveBeenCalled();
     });
 
+
+    it('rejects a duplicate that differs only by case', async () => {
+      const existing: Target = {
+        id: 'test-1',
+        type: 'repo',
+        owner: 'testowner',
+        repo: 'testrepo',
+        displayName: 'testowner/testrepo',
+        url: 'https://github.com/testowner/testrepo',
+        proxyRunnerName: 'localmost.test-host.testowner-testrepo',
+        enabled: true,
+        addedAt: '2024-01-01T00:00:00.000Z',
+      };
+      mockLoadConfig.mockReturnValue({ targets: [existing], maxConcurrentJobs: 4 });
+
+      // The proxy runner name is lowercased, so these two would register
+      // runners under identical names and --replace each other.
+      const result = await manager.addTarget('repo', 'TestOwner', 'TestRepo');
+
+      expect(result.success).toBe(false);
+      expect(mockRegisterAll).not.toHaveBeenCalled();
+    });
+
     it('syncs the saved targets to the store', async () => {
       await manager.addTarget('repo', 'testowner', 'testrepo');
 
@@ -427,6 +450,21 @@ describe('TargetManager', () => {
 
     it('ignores case', () => {
       expect(manager.findTargetByRef('TestOwner/TestRepo')).toEqual(repoTarget);
+    });
+
+
+    it('prefers an exact match over a case-insensitive one', () => {
+      const variant: Target = { ...repoTarget, id: 'other', displayName: 'TestOwner/TestRepo' };
+      mockLoadConfig.mockReturnValue({ targets: [variant, repoTarget], maxConcurrentJobs: 4 });
+
+      expect(manager.findTargetByRef('testowner/testrepo')?.id).toBe('3116ec9a');
+    });
+
+    it('returns undefined when a ref matches several targets only by case', () => {
+      const variant: Target = { ...repoTarget, id: 'other', displayName: 'TestOwner/TestRepo' };
+      mockLoadConfig.mockReturnValue({ targets: [variant, repoTarget], maxConcurrentJobs: 4 });
+
+      expect(manager.findTargetByRef('TESTOWNER/TESTREPO')).toBeUndefined();
     });
 
     it('returns undefined when nothing matches', () => {

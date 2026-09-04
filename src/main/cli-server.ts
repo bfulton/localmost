@@ -40,6 +40,14 @@ export type {
 };
 
 /**
+ * Coerce a request field to a trimmed non-empty string, or null. Requests
+ * arrive as arbitrary JSON over the socket, so nothing here can be assumed
+ * to be the type the CLI would have sent.
+ */
+const asName = (value: unknown): string | null =>
+  typeof value === 'string' && value.trim() ? value.trim() : null;
+
+/**
  * Describe a target for the CLI, including how many runner proxies are
  * registered for it.
  */
@@ -285,11 +293,26 @@ export class CliServer {
 
       case 'targets-add': {
         const { type, owner, repo } = request.args || {};
-        if (!type || !owner) {
-          return { success: false, error: 'Missing target type or owner' };
+
+        if (type !== 'repo' && type !== 'org') {
+          return { success: false, error: 'Invalid target type: expected "repo" or "org"' };
         }
 
-        const result = await getTargetManager().addTargetAndAttach(type, owner, repo);
+        const ownerName = asName(owner);
+        if (!ownerName) {
+          return { success: false, error: 'Missing or invalid target owner' };
+        }
+
+        const repoName = asName(repo);
+        if (type === 'repo' && !repoName) {
+          return { success: false, error: 'Missing or invalid repo name for a repo target' };
+        }
+
+        const result = await getTargetManager().addTargetAndAttach(
+          type,
+          ownerName,
+          type === 'repo' ? repoName! : undefined
+        );
         if (!result.success) {
           return { success: false, error: result.error };
         }
@@ -305,9 +328,9 @@ export class CliServer {
       }
 
       case 'targets-remove': {
-        const ref = request.args?.ref;
+        const ref = asName(request.args?.ref);
         if (!ref) {
-          return { success: false, error: 'Missing target reference' };
+          return { success: false, error: 'Missing or invalid target reference' };
         }
 
         const target = getTargetManager().findTargetByRef(ref);
@@ -331,9 +354,13 @@ export class CliServer {
       }
 
       case 'targets-update': {
-        const { ref, enabled } = request.args || {};
-        if (!ref || typeof enabled !== 'boolean') {
-          return { success: false, error: 'Missing target reference or enabled state' };
+        const { enabled } = request.args || {};
+        const ref = asName(request.args?.ref);
+        if (!ref) {
+          return { success: false, error: 'Missing or invalid target reference' };
+        }
+        if (typeof enabled !== 'boolean') {
+          return { success: false, error: 'Missing or invalid enabled state' };
         }
 
         const target = getTargetManager().findTargetByRef(ref);

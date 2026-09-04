@@ -202,12 +202,20 @@ export function findSummaryByRef(
   targets: TargetSummary[],
   ref: string
 ): TargetSummary | undefined {
-  const needle = ref.trim().toLowerCase();
-  if (!needle) return undefined;
+  const trimmed = ref.trim();
+  if (!trimmed) return undefined;
 
-  return targets.find(
+  // Matches TargetManager.findTargetByRef: an exact match wins, and an
+  // ambiguous case-insensitive one resolves to nothing rather than guessing.
+  const exact = targets.find(t => t.id === trimmed || t.displayName === trimmed);
+  if (exact) return exact;
+
+  const needle = trimmed.toLowerCase();
+  const matches = targets.filter(
     t => t.id.toLowerCase() === needle || t.displayName.toLowerCase() === needle
   );
+
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 /** Read a line from stdin, for confirmation prompts. */
@@ -222,7 +230,13 @@ export function createPrompt(): (question: string) => Promise<string> {
     });
 }
 
-const MISSING_REF = 'Missing target: expected owner/repo (or --org <owner> for an organization)';
+/** `add` names a target that does not exist yet, so an id is not an option. */
+const MISSING_ADD_REF =
+  'Missing target: expected owner/repo (or --org <owner> for an organization)';
+
+/** Every other subcommand resolves an existing target. */
+const MISSING_REF =
+  'Missing target: expected owner/repo, an org owner, or a target id';
 
 /**
  * Run a targets subcommand. Returns the process exit code.
@@ -262,7 +276,7 @@ export async function runTargets(
     }
 
     case 'add': {
-      if (!ref) return fail(MISSING_REF);
+      if (!ref) return fail(MISSING_ADD_REF);
 
       let parsed: TargetRef;
       try {

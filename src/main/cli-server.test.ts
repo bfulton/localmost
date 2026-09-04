@@ -467,6 +467,81 @@ describe('CliServer', () => {
       expect(response.success).toBe(false);
       expect(mockUpdateTarget).not.toHaveBeenCalled();
     });
+
+    it('rejects an add with an unknown target type', async () => {
+      await server.start();
+
+      const response = await sendRequest({
+        command: 'targets-add',
+        args: { type: 'foo' as 'repo', owner: 'bfulton', repo: 'supdb' },
+      }) as { success: boolean; error: string };
+
+      expect(response.success).toBe(false);
+      expect(response.error).toMatch(/type/i);
+      expect(mockAddTargetAndAttach).not.toHaveBeenCalled();
+    });
+
+    it('rejects an add whose owner is not a string', async () => {
+      await server.start();
+
+      const response = await sendRequest({
+        command: 'targets-add',
+        args: { type: 'repo', owner: 42 as unknown as string, repo: 'supdb' },
+      }) as { success: boolean };
+
+      expect(response.success).toBe(false);
+      expect(mockAddTargetAndAttach).not.toHaveBeenCalled();
+    });
+
+    it('rejects an add for a repo target with no repo', async () => {
+      await server.start();
+
+      const response = await sendRequest({
+        command: 'targets-add',
+        args: { type: 'repo', owner: 'bfulton' },
+      }) as { success: boolean };
+
+      expect(response.success).toBe(false);
+      expect(mockAddTargetAndAttach).not.toHaveBeenCalled();
+    });
+
+    it('trims whitespace around an added target', async () => {
+      mockAddTargetAndAttach.mockResolvedValue({ success: true, data: target });
+      await server.start();
+
+      await sendRequest({
+        command: 'targets-add',
+        args: { type: 'repo', owner: '  bfulton  ', repo: ' supdb ' },
+      });
+
+      expect(mockAddTargetAndAttach).toHaveBeenCalledWith('repo', 'bfulton', 'supdb');
+    });
+
+    it('reports a structured error when ref is not a string', async () => {
+      await server.start();
+
+      const response = await sendRequest({
+        command: 'targets-remove',
+        args: { ref: 42 as unknown as string },
+      }) as { success: boolean; error: string };
+
+      expect(response.success).toBe(false);
+      expect(response.error).not.toMatch(/invalid request/i);
+      expect(mockFindTargetByRef).not.toHaveBeenCalled();
+    });
+
+    it('reports a structured error when an update ref is not a string', async () => {
+      await server.start();
+
+      const response = await sendRequest({
+        command: 'targets-update',
+        args: { ref: {} as unknown as string, enabled: true },
+      }) as { success: boolean; error: string };
+
+      expect(response.success).toBe(false);
+      expect(response.error).not.toMatch(/invalid request/i);
+      expect(mockFindTargetByRef).not.toHaveBeenCalled();
+    });
   });
 
 });

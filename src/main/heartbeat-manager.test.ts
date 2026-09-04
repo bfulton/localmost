@@ -115,12 +115,19 @@ describe('HeartbeatManager', () => {
       );
     });
 
-    it('does not call GitHub when the heartbeat is not running', async () => {
+    it('marks the target stale even when the heartbeat is not running', async () => {
+      // The runner can be paused (which stops the heartbeat) while a target
+      // still holds a recent timestamp, so removal must clear it either way.
       manager.setTargets([supdb, voightKampff]);
 
       await manager.removeTarget(voightKampff);
 
-      expect(setRepoVariable).not.toHaveBeenCalled();
+      expect(setRepoVariable).toHaveBeenCalledWith(
+        'bfulton',
+        'voight-kampff',
+        HEARTBEAT_VARIABLE_NAME,
+        STALE_TIMESTAMP
+      );
     });
 
     it('ignores a target that was never added', async () => {

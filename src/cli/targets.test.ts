@@ -229,6 +229,16 @@ describe('findSummaryByRef', () => {
   it('returns undefined when nothing matches', () => {
     expect(findSummaryByRef([summary], 'bfulton/other')).toBeUndefined();
   });
+
+  it('prefers an exact match over a case-insensitive one', () => {
+    const variant = { ...summary, id: 'other', displayName: 'BFulton/SupDB' };
+    expect(findSummaryByRef([variant, summary], 'bfulton/supdb')?.id).toBe('3116ec9a');
+  });
+
+  it('returns undefined when several targets match only by case', () => {
+    const variant = { ...summary, id: 'other', displayName: 'BFulton/SupDB' };
+    expect(findSummaryByRef([variant, summary], 'BFULTON/SUPDB')).toBeUndefined();
+  });
 });
 
 describe('runTargets', () => {
@@ -319,6 +329,14 @@ describe('runTargets', () => {
 
     expect(code).toBe(0);
     expect(sent).toEqual([{ command: 'targets-add', args: { type: 'org', owner: 'bfulton' } }]);
+  });
+
+  it('names every accepted ref form when remove is given no target', async () => {
+    const code = await runTargets('remove', undefined, {}, makeDeps(listResponder));
+
+    expect(code).toBe(1);
+    expect(sent).toHaveLength(0);
+    expect(stderr.join('\n')).toMatch(/target id/i);
   });
 
   it('fails when add is given no target', async () => {

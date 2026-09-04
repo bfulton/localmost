@@ -101,12 +101,17 @@ export class TargetManager {
       return { success: false, error: 'Repository name is required for repo targets' };
     }
 
-    // Check for duplicates
+    // Check for duplicates. GitHub owners and repos are case-insensitive, and
+    // the proxy runner name is lowercased, so two targets differing only by
+    // case would register runners under the same names.
+    const sameName = (a: string | undefined, b: string | undefined): boolean =>
+      (a || '').toLowerCase() === (b || '').toLowerCase();
+
     const existing = this.getTargets();
     const isDuplicate = existing.some(t =>
       t.type === type &&
-      t.owner === owner &&
-      (type === 'org' || t.repo === repo)
+      sameName(t.owner, owner) &&
+      (type === 'org' || sameName(t.repo, repo))
     );
     if (isDuplicate) {
       return { success: false, error: 'This target already exists' };
@@ -154,12 +159,24 @@ export class TargetManager {
    * Matching is case-insensitive.
    */
   findTargetByRef(ref: string): Target | undefined {
-    const needle = ref.trim().toLowerCase();
-    if (!needle) return undefined;
+    const trimmed = ref.trim();
+    if (!trimmed) return undefined;
 
-    return this.getTargets().find(t =>
+    const targets = this.getTargets();
+
+    // An exact match wins outright.
+    const exact = targets.find(t => t.id === trimmed || t.displayName === trimmed);
+    if (exact) return exact;
+
+    // Otherwise fall back to case-insensitive matching, but only when it
+    // identifies a single target - a config carrying case variants would
+    // otherwise resolve to whichever happened to be listed first.
+    const needle = trimmed.toLowerCase();
+    const matches = targets.filter(t =>
       t.id.toLowerCase() === needle || t.displayName.toLowerCase() === needle
     );
+
+    return matches.length === 1 ? matches[0] : undefined;
   }
 
   /**
