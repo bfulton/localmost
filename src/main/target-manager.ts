@@ -8,7 +8,9 @@
 import * as os from 'os';
 import * as crypto from 'crypto';
 import { loadConfig, saveConfig } from './config';
-import { getLogger, getBrokerProxyService } from './app-state';
+import { getLogger, getBrokerProxyService, getHeartbeatManager } from './app-state';
+import { toHeartbeatTarget } from './heartbeat-manager';
+import { store } from './store/init';
 import { getRunnerProxyManager } from './runner-proxy-manager';
 import type { Target, Result } from '../shared/types';
 
@@ -51,6 +53,16 @@ const generateUrl = (target: Pick<Target, 'type' | 'owner' | 'repo'>): string =>
   return target.type === 'org'
     ? `https://github.com/${target.owner}`
     : `https://github.com/${target.owner}/${target.repo}`;
+};
+
+/**
+ * Keep the store's copy of targets in step with what was just written to
+ * config. The store persists `targets` on quit, so a stale copy there would
+ * overwrite a target added or removed by anything the renderer didn't drive
+ * (the CLI, for instance).
+ */
+const syncTargetsToStore = (targets: Target[]): void => {
+  store.getState().setTargets(targets);
 };
 
 // ============================================================================
@@ -130,6 +142,7 @@ export class TargetManager {
     const config = loadConfig();
     config.targets = [...(config.targets || []), target];
     saveConfig(config);
+    syncTargetsToStore(config.targets);
 
     log()?.info(`[TargetManager] Target added: ${target.displayName}`);
     return { success: true, data: target };
@@ -168,6 +181,10 @@ export class TargetManager {
           brokerProxy.addTarget(result.data, credentials);
         }
       }
+
+      // Heartbeat the new target so workflows see this machine as available
+      // without waiting for an app restart.
+      await getHeartbeatManager()?.addTarget(toHeartbeatTarget(result.data));
     }
 
     return result;
@@ -178,11 +195,15 @@ export class TargetManager {
    * unregister its runner proxies from GitHub.
    */
   async removeTargetAndDetach(targetId: string): Promise<Result> {
-    if (!this.getTarget(targetId)) {
+    const target = this.getTarget(targetId);
+    if (!target) {
       return { success: false, error: 'Target not found' };
     }
 
     getBrokerProxyService()?.removeTarget(targetId);
+
+    // Mark the target offline before its runners are unregistered.
+    await getHeartbeatManager()?.removeTarget(toHeartbeatTarget(target));
 
     return this.removeTarget(targetId);
   }
@@ -214,6 +235,7 @@ export class TargetManager {
     const config = loadConfig();
     config.targets = (config.targets || []).filter(t => t.id !== targetId);
     saveConfig(config);
+    syncTargetsToStore(config.targets);
 
     log()?.info(`[TargetManager] Target removed: ${target.displayName}`);
     return { success: true };
@@ -245,6 +267,7 @@ export class TargetManager {
       t.id === targetId ? updatedTarget : t
     );
     saveConfig(config);
+    syncTargetsToStore(config.targets);
 
     log()?.info(`[TargetManager] Target updated: ${updatedTarget.displayName}`);
     return { success: true, data: updatedTarget };

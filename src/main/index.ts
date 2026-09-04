@@ -8,7 +8,7 @@ import * as nodePath from 'path';
 import { RunnerManager, JobEvent } from './runner-manager';
 import { GitHubAuth } from './github-auth';
 import { RunnerDownloader } from './runner-downloader';
-import { HeartbeatManager } from './heartbeat-manager';
+import { HeartbeatManager, toHeartbeatTarget } from './heartbeat-manager';
 import { BrokerProxyService } from './broker-proxy-service';
 import { TargetManager } from './target-manager';
 import { ContributorCache } from './contributor-cache';
@@ -700,11 +700,7 @@ app.whenReady().then(async () => {
         if (heartbeatManager && authState?.accessToken && githubAuth) {
           // Set up heartbeat for all configured targets
           const targets = config.targets || [];
-          const heartbeatTargets = targets.map(t =>
-            t.type === 'org'
-              ? { level: 'org' as const, org: t.owner }
-              : { level: 'repo' as const, owner: t.owner, repo: t.repo! }
-          );
+          const heartbeatTargets = targets.map(toHeartbeatTarget);
 
           if (heartbeatTargets.length > 0) {
             heartbeatManager.setTargets(heartbeatTargets);

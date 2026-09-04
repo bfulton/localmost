@@ -23,6 +23,9 @@ jest.mock('./config', () => ({
 const mockBrokerAddTarget = jest.fn();
 const mockBrokerRemoveTarget = jest.fn();
 const mockGetBrokerProxyService = jest.fn<() => unknown>();
+const mockHeartbeatAddTarget = jest.fn<(t: unknown) => Promise<void>>();
+const mockHeartbeatRemoveTarget = jest.fn<(t: unknown) => Promise<void>>();
+const mockGetHeartbeatManager = jest.fn<() => unknown>();
 jest.mock('./app-state', () => ({
   getLogger: jest.fn(() => ({
     info: jest.fn(),
@@ -30,6 +33,15 @@ jest.mock('./app-state', () => ({
     error: jest.fn(),
   })),
   getBrokerProxyService: () => mockGetBrokerProxyService(),
+  getHeartbeatManager: () => mockGetHeartbeatManager(),
+}));
+
+// Mock store (targets are persisted from the store on quit, so it must stay in sync)
+const mockSetTargets = jest.fn<(targets: unknown[]) => void>();
+jest.mock('./store/init', () => ({
+  store: {
+    getState: () => ({ setTargets: mockSetTargets }),
+  },
 }));
 
 // Mock runner-proxy-manager
@@ -59,6 +71,12 @@ describe('TargetManager', () => {
     mockGetBrokerProxyService.mockReturnValue({
       addTarget: mockBrokerAddTarget,
       removeTarget: mockBrokerRemoveTarget,
+    });
+    mockHeartbeatAddTarget.mockResolvedValue(undefined);
+    mockHeartbeatRemoveTarget.mockResolvedValue(undefined);
+    mockGetHeartbeatManager.mockReturnValue({
+      addTarget: mockHeartbeatAddTarget,
+      removeTarget: mockHeartbeatRemoveTarget,
     });
     manager = new TargetManager();
   });
@@ -204,6 +222,22 @@ describe('TargetManager', () => {
       expect(result.success === false && result.error).toBe('Failed to register runner: Registration failed');
       expect(mockSaveConfig).not.toHaveBeenCalled();
     });
+
+    it('syncs the saved targets to the store', async () => {
+      await manager.addTarget('repo', 'testowner', 'testrepo');
+
+      expect(mockSetTargets).toHaveBeenCalledTimes(1);
+      const synced = mockSetTargets.mock.calls[0][0] as Array<{ displayName: string }>;
+      expect(synced.map(t => t.displayName)).toEqual(['testowner/testrepo']);
+    });
+
+    it('does not sync the store when registration fails', async () => {
+      mockRegisterAll.mockRejectedValue(new Error('bad credentials'));
+
+      await manager.addTarget('repo', 'testowner', 'testrepo');
+
+      expect(mockSetTargets).not.toHaveBeenCalled();
+    });
   });
 
   describe('removeTarget', () => {
@@ -256,6 +290,25 @@ describe('TargetManager', () => {
 
       expect(result.success).toBe(true);
       expect(mockSaveConfig).toHaveBeenCalledWith({ targets: [] });
+    });
+
+    it('syncs the remaining targets to the store', async () => {
+      const target: Target = {
+        id: 'test-1',
+        type: 'repo',
+        owner: 'testowner',
+        repo: 'testrepo',
+        displayName: 'testowner/testrepo',
+        url: 'https://github.com/testowner/testrepo',
+        proxyRunnerName: 'localmost.test-host.testowner-testrepo',
+        enabled: true,
+        addedAt: '2024-01-01T00:00:00.000Z',
+      };
+      mockLoadConfig.mockReturnValue({ targets: [target], maxConcurrentJobs: 4 });
+
+      await manager.removeTarget('test-1');
+
+      expect(mockSetTargets).toHaveBeenCalledWith([]);
     });
   });
 
@@ -418,6 +471,38 @@ describe('TargetManager', () => {
       expect(result.success).toBe(true);
       expect(mockBrokerAddTarget).not.toHaveBeenCalled();
     });
+
+    it('starts heartbeating the new target', async () => {
+      await manager.addTargetAndAttach('repo', 'testowner', 'testrepo');
+
+      expect(mockHeartbeatAddTarget).toHaveBeenCalledWith({
+        level: 'repo',
+        owner: 'testowner',
+        repo: 'testrepo',
+      });
+    });
+
+    it('heartbeats a new org target at org level', async () => {
+      await manager.addTargetAndAttach('org', 'testorg');
+
+      expect(mockHeartbeatAddTarget).toHaveBeenCalledWith({ level: 'org', org: 'testorg' });
+    });
+
+    it('does not heartbeat when registration fails', async () => {
+      mockRegisterAll.mockRejectedValue(new Error('bad credentials'));
+
+      await manager.addTargetAndAttach('repo', 'testowner', 'testrepo');
+
+      expect(mockHeartbeatAddTarget).not.toHaveBeenCalled();
+    });
+
+    it('still succeeds when no heartbeat manager exists', async () => {
+      mockGetHeartbeatManager.mockReturnValue(null);
+
+      const result = await manager.addTargetAndAttach('repo', 'testowner', 'testrepo');
+
+      expect(result.success).toBe(true);
+    });
   });
 
   describe('removeTargetAndDetach', () => {
@@ -450,6 +535,26 @@ describe('TargetManager', () => {
 
       expect(result.success).toBe(false);
       expect(mockBrokerRemoveTarget).not.toHaveBeenCalled();
+    });
+
+    it('stops heartbeating the removed target', async () => {
+      mockLoadConfig.mockReturnValue({ targets: [target], maxConcurrentJobs: 4 });
+
+      await manager.removeTargetAndDetach('test-1');
+
+      expect(mockHeartbeatRemoveTarget).toHaveBeenCalledWith({
+        level: 'repo',
+        owner: 'testowner',
+        repo: 'testrepo',
+      });
+    });
+
+    it('does not touch the heartbeat for an unknown target', async () => {
+      mockLoadConfig.mockReturnValue({ targets: [], maxConcurrentJobs: 4 });
+
+      await manager.removeTargetAndDetach('nope');
+
+      expect(mockHeartbeatRemoveTarget).not.toHaveBeenCalled();
     });
   });
 
