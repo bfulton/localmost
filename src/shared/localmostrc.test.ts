@@ -823,3 +823,32 @@ describe('docker access', () => {
     expect(result.errors[0].message).toMatch(/shared/);
   });
 });
+
+describe('removed sockets key', () => {
+  it('rejects sockets, pointing at docker', () => {
+    const result = parseLocalmostrcContent(
+      'version: 1\nshared:\n  sockets:\n    allow:\n      - /var/run/docker.sock\n'
+    );
+    expect(result.success).toBe(false);
+    expect(result.errors[0].message).toMatch(/docker:/);
+  });
+});
+
+describe('docker level through policy merging', () => {
+  it('keeps the shared docker level in the effective policy for a workflow', () => {
+    // localmost test builds its profile from the effective policy, so a level
+    // dropped here would apply on the runner and not locally.
+    const config = {
+      version: 1,
+      shared: { docker: 'socket' as const, network: { allow: ['github.com'] } },
+      workflows: { build: { network: { allow: ['npmjs.org'] } } },
+    };
+
+    expect(getEffectivePolicy(config, 'build').docker).toBe('socket');
+  });
+
+  it('keeps the shared docker level for a workflow with no overrides', () => {
+    const config = { version: 1, shared: { docker: 'credentials' as const } };
+    expect(getEffectivePolicy(config, 'anything').docker).toBe('credentials');
+  });
+});

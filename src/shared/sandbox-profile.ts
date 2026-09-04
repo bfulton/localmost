@@ -29,11 +29,6 @@ export interface FilesystemPolicy {
   deny?: string[];
 }
 
-export interface SocketsPolicy {
-  /** Unix domain socket paths to allow connections to (e.g., /var/run/docker.sock) */
-  allow?: string[];
-}
-
 export interface EnvPolicy {
   allow?: string[];
   deny?: string[];
@@ -42,7 +37,6 @@ export interface EnvPolicy {
 export interface SandboxPolicy {
   network?: NetworkPolicy;
   filesystem?: FilesystemPolicy;
-  sockets?: SocketsPolicy;
   env?: EnvPolicy;
   /** Docker daemon access. Read from `shared:` only - see docker-access.ts. */
   docker?: DockerAccessLevel;
@@ -367,21 +361,6 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push(`(allow network-bind (subpath "${escapedWorkDir}"))`);
   lines.push(`(allow network-outbound (subpath "${escapedWorkDir}"))`);
   lines.push('');
-
-  // Policy-defined socket access
-  if (policy?.sockets?.allow) {
-    lines.push(';; Policy-defined socket access');
-    for (const socketPath of policy.sockets.allow) {
-      const expanded = expandPath(socketPath);
-      const escaped = escapePath(expanded);
-      // Allow both bind and outbound for socket paths
-      lines.push(`(allow network-bind (literal "${escaped}"))`);
-      lines.push(`(allow network-outbound (literal "${escaped}"))`);
-      // Also need file-write for socket operations
-      lines.push(`(allow file-write* (literal "${escaped}"))`);
-    }
-    lines.push('');
-  }
 
   // Docker access, from the level the policy declared. The same grants the
   // runner profile emits, so localmost test predicts what the runner does.

@@ -11,6 +11,7 @@ import * as os from 'os';
 import { spawn, SpawnOptions } from 'child_process';
 import { WorkflowStep, WorkflowJob, MatrixCombination } from './workflow-parser';
 import { SandboxPolicy, generateSandboxProfile, generateDiscoveryProfile } from './sandbox-profile';
+import { dockerSandboxGrants, resolveDockerEndpoint } from './docker-access';
 import { PidTreeWatcher } from './pid-tree-watch';
 import { parseActionRef, fetchAction, isInterceptedAction, readActionMetadata } from './action-fetcher';
 import { getGitInfo } from './workspace';
@@ -1107,6 +1108,10 @@ async function runInSandbox(
           permissive: false,
           strictMode,
           logFile: options.sandboxLogFile,
+            // Resolved out here, outside the sandbox, exactly as the runner does
+          // it - so localmost test and the runner grant the same socket.
+          dockerEndpoint: resolveDockerEndpoint(),
+          homeDir: os.homedir(),
         });
       }
 
@@ -1135,9 +1140,17 @@ async function runInSandbox(
       spawnArgs = args;
     }
 
+    // The runner sets DOCKER_HOST for a job whose policy declares docker, so
+    // the CLI does too: the point of test mode is predicting the runner.
+    const dockerEnv = dockerSandboxGrants(
+      policy?.docker,
+      resolveDockerEndpoint(),
+      os.homedir()
+    ).env;
+
     const spawnOptions: SpawnOptions = {
       cwd: options.cwd,
-      env: options.env,
+      env: { ...options.env, ...dockerEnv },
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
     };

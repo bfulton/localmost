@@ -1141,18 +1141,24 @@ async function handleUpdateRc(
     }
   }
 
-  // Report socket access
+  // Report socket access. There is no policy key for arbitrary sockets: the
+  // only socket a policy can ask for is the Docker daemon, via `docker:`.
   if (socketPaths.length > 0) {
-    console.log(`  Sockets: ${socketPaths.length} socket(s) need access`);
+    console.log(`  Sockets: ${socketPaths.length} socket(s) were reached`);
     for (const p of socketPaths) {
       console.log(`    ${colors.dim}- ${p}${colors.reset}`);
+    }
+    if (socketPaths.some(p => p.includes('docker.sock'))) {
+      console.log(
+        `    ${colors.yellow}Declare Docker access with \`docker: socket\` in shared${colors.reset}`
+      );
     }
   }
 
   console.log();
 
   // Check if there's anything to add
-  if (discoveredHosts.length === 0 && readPaths.length === 0 && writePaths.length === 0 && socketPaths.length === 0) {
+  if (discoveredHosts.length === 0 && readPaths.length === 0 && writePaths.length === 0) {
     console.log(`${colors.yellow}No access to configure.${colors.reset}`);
     console.log('This may happen if:');
     console.log('  - Your workflow doesn\'t make network requests');
@@ -1178,10 +1184,7 @@ async function handleUpdateRc(
       const existingWritePaths = new Set(existing.shared?.filesystem?.write || []);
       const newWritePaths = writePaths.filter(p => !existingWritePaths.has(p));
 
-      const existingSocketPaths = new Set(existing.shared?.sockets?.allow || []);
-      const newSocketPaths = socketPaths.filter(p => !existingSocketPaths.has(p));
-
-      if (newHosts.length === 0 && newReadPaths.length === 0 && newWritePaths.length === 0 && newSocketPaths.length === 0) {
+      if (newHosts.length === 0 && newReadPaths.length === 0 && newWritePaths.length === 0) {
         console.log(`${colors.green}✓${colors.reset} ${path.relative(cwd, existingPath)} already includes all discovered access.`);
         return;
       }
@@ -1200,10 +1203,6 @@ async function handleUpdateRc(
             read: newReadPaths.length > 0 ? [...(existing.shared?.filesystem?.read || []), ...newReadPaths] : existing.shared?.filesystem?.read,
             write: newWritePaths.length > 0 ? [...(existing.shared?.filesystem?.write || []), ...newWritePaths] : existing.shared?.filesystem?.write,
           } : undefined,
-          sockets: newSocketPaths.length > 0 || existing.shared?.sockets ? {
-            ...existing.shared?.sockets,
-            allow: [...(existing.shared?.sockets?.allow || []), ...newSocketPaths],
-          } : undefined,
         },
       };
 
@@ -1212,7 +1211,6 @@ async function handleUpdateRc(
           { label: 'network.allow', items: newHosts },
           { label: 'filesystem.read', items: newReadPaths },
           { label: 'filesystem.write', items: newWritePaths },
-          { label: 'sockets.allow', items: newSocketPaths },
         ],
         assumeYes
       );
@@ -1235,9 +1233,6 @@ async function handleUpdateRc(
         filesystem: (readPaths.length > 0 || writePaths.length > 0) ? {
           read: readPaths.length > 0 ? readPaths : undefined,
           write: writePaths.length > 0 ? writePaths : undefined,
-        } : undefined,
-        sockets: socketPaths.length > 0 ? {
-          allow: socketPaths,
         } : undefined,
       },
       workflows: {
