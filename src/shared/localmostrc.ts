@@ -487,6 +487,10 @@ export function serializeLocalmostrc(config: LocalmostrcConfig): string {
 function serializePolicy(policy: SandboxPolicy, indent: string): string[] {
   const lines: string[] = [];
 
+  if (policy.docker !== undefined) {
+    lines.push(`${indent}docker: ${policy.docker}`);
+  }
+
   if (policy.network) {
     lines.push(`${indent}network:`);
     if (policy.network.allow?.length) {
@@ -601,6 +605,22 @@ function diffPolicies(
   diffArrays(oldPolicy.filesystem?.read, newPolicy.filesystem?.read, `${prefix}.filesystem.read`, diffs);
   diffArrays(oldPolicy.filesystem?.write, newPolicy.filesystem?.write, `${prefix}.filesystem.write`, diffs);
   diffArrays(oldPolicy.filesystem?.deny, newPolicy.filesystem?.deny, `${prefix}.filesystem.deny`, diffs);
+
+  // Docker access. Scalar, and the largest change this section can make:
+  // above `off` the job is no longer confined by the sandbox at all.
+  if (oldPolicy.docker !== newPolicy.docker) {
+    diffs.push({
+      path: `${prefix}.docker`,
+      type:
+        oldPolicy.docker === undefined
+          ? 'added'
+          : newPolicy.docker === undefined
+            ? 'removed'
+            : 'changed',
+      oldValue: oldPolicy.docker,
+      newValue: newPolicy.docker,
+    });
+  }
 
   // Env
   diffArrays(oldPolicy.env?.allow, newPolicy.env?.allow, `${prefix}.env.allow`, diffs);

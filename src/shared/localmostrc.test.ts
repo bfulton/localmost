@@ -852,3 +852,37 @@ describe('docker level through policy merging', () => {
     expect(getEffectivePolicy(config, 'anything').docker).toBe('credentials');
   });
 });
+
+describe('docker level in the approval diff', () => {
+  it('reports a docker level change as its own diff entry', () => {
+    // With the repo policy as the only gate, the diff shown at approval time
+    // is the whole of the access control for this capability.
+    const before = { version: 1, shared: { docker: 'off' as const } };
+    const after = { version: 1, shared: { docker: 'credentials' as const } };
+
+    const docker = diffConfigs(before, after).find(d => d.path === 'shared.docker');
+
+    expect(docker).toEqual({
+      path: 'shared.docker',
+      type: 'changed',
+      oldValue: 'off',
+      newValue: 'credentials',
+    });
+  });
+
+  it('reports newly declared docker access as added', () => {
+    const diffs = diffConfigs({ version: 1 }, { version: 1, shared: { docker: 'socket' as const } });
+    expect(diffs.find(d => d.path === 'shared.docker')?.type).toBe('added');
+  });
+
+  it('reports removed docker access', () => {
+    const diffs = diffConfigs({ version: 1, shared: { docker: 'socket' as const } }, { version: 1 });
+    expect(diffs.find(d => d.path === 'shared.docker')?.type).toBe('removed');
+  });
+
+  it('round-trips a docker level through serialization', () => {
+    const config = { version: 1, shared: { docker: 'contexts' as const } };
+    const reparsed = parseLocalmostrcContent(serializeLocalmostrc(config));
+    expect(reparsed.config?.shared?.docker).toBe('contexts');
+  });
+});
