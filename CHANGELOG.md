@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, and enforce least-privilege sandboxing.
 
 ### Added
+- **GitHub App now requests `Contents: Read`**: needed to fetch `.localmostrc` from private
+  repositories. Existing installations will be prompted to accept the new permission; until
+  accepted, jobs from private repos with a policy are refused rather than run under a weaker
+  sandbox
 - **Workflow Test Mode**: Run workflows locally before pushing with `localmost test`
   - Intercepts `actions/checkout` to use local working tree
   - Intercepts `actions/cache` for local caching

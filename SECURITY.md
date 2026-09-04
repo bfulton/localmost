@@ -188,6 +188,7 @@ or stored by localmost.
 - **Required Permissions**:
   - `Administration: Read & Write` - Register and remove self-hosted runners on repositories
   - `Actions: Read & Write` - Check workflow status and cancel running jobs
+  - `Contents: Read` - Fetch the repository's `.localmostrc` sandbox policy at the job's commit
   - `Metadata: Read` - Access basic repository information (required by GitHub for all apps)
   - `Self-hosted runners: Read & Write` (org-level) - Register runners at the organization level
 
