@@ -43,16 +43,42 @@ const daemonResponds = (): boolean => {
   }
 };
 
-const runnable = Boolean(endpoint) && daemonResponds();
+/**
+ * Whether seatbelt can be applied from here at all.
+ *
+ * A localmost job already runs under a profile, and sandbox-exec cannot be
+ * nested inside one - so on the self-hosted runner this suite would fail for a
+ * reason that says nothing about the grant. CI covers that path properly, by
+ * reaching the daemon from a real job: see .github/workflows/docker.yaml.
+ */
+const canApplySeatbelt = (): boolean => {
+  const probePath = path.join(os.tmpdir(), `localmost-seatbelt-probe-${process.pid}.sb`);
+  fs.writeFileSync(probePath, '(version 1)(allow default)');
+  try {
+    execFileSync('/usr/bin/sandbox-exec', ['-f', probePath, '/usr/bin/true'], {
+      timeout: 5000,
+      stdio: 'ignore',
+    });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    fs.unlinkSync(probePath);
+  }
+};
+
+const runnable = Boolean(endpoint) && daemonResponds() && canApplySeatbelt();
 
 if (!runnable) {
   // Say why, so a silent skip is not mistaken for coverage.
   const reason =
     process.platform !== 'darwin'
       ? `platform is ${process.platform}, seatbelt is macOS only`
-      : endpoint
-        ? 'no daemon answered on the socket'
-        : 'no Docker socket resolved';
+      : !endpoint
+        ? 'no Docker socket resolved'
+        : !daemonResponds()
+          ? 'no daemon answered on the socket'
+          : 'seatbelt cannot be applied from here (already inside a sandboxed job)';
   console.log(`[docker-access.sandbox] skipped: ${reason}`);
 }
 
