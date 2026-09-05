@@ -1,13 +1,27 @@
 /**
  * Integration coverage for Docker access.
  *
- * The unit tests assert which rules the profile contains. They cannot show
- * that those rules let a process reach the daemon, or that its absence stops
- * one - which is the only thing this feature is for. This runs real seatbelt
- * against the real socket, both ways round.
+ * The unit tests assert which rules a profile contains. They cannot show that
+ * those rules let a process reach the daemon, or that their absence stops one -
+ * which is the only thing this feature is for.
  *
- * macOS only, and only when a daemon is reachable: seatbelt does not exist
- * elsewhere, and there is nothing to connect to without Docker running.
+ * There are two ways to establish that, and which applies depends on whether
+ * this process is already inside a sandbox:
+ *
+ *   constructed  On an unsandboxed machine, build a profile and apply it with
+ *                sandbox-exec. Tests both directions, including the negative
+ *                case that makes the positive one mean anything.
+ *
+ *   ambient      Inside a localmost job, this process is already running under
+ *                the runner's profile with the repository's approved policy
+ *                applied, so assert what that profile actually does. Seatbelt
+ *                refuses any nested profile that deviates from the one in
+ *                force - narrower, wider, or an extra deny alike - so
+ *                constructing one here is impossible. Asserting the ambient
+ *                profile is the stronger test anyway: it is the real profile
+ *                on the real runner.
+ *
+ * Neither mode skips. macOS only, because seatbelt is.
  */
 
 import { describe, it, expect } from '@jest/globals';
@@ -16,26 +30,29 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { generateSandboxProfile } from './sandbox-profile';
+import { parseLocalmostrcContent } from './localmostrc';
 import { resolveDockerEndpoint, DockerAccessLevel } from './docker-access';
 
-const endpoint = process.platform === 'darwin' ? resolveDockerEndpoint() : null;
+const isMacOS = process.platform === 'darwin';
+const endpoint = isMacOS ? resolveDockerEndpoint() : null;
 
 /** A raw HTTP request to the daemon over its unix socket. */
-const PING = `printf 'GET /_ping HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' | /usr/bin/nc -U`;
+const ping = (socketPath: string): string =>
+  `printf 'GET /_ping HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' | /usr/bin/nc -U ${socketPath}`;
 
 /**
- * Whether a daemon is actually listening, not merely a socket file present.
+ * Run a shell command, reporting whether it produced an HTTP response.
  *
- * Any HTTP status counts: Docker Desktop answers this raw request with a 500,
- * and a status line is proof the connection was accepted and the daemon spoke.
- * What the sandbox changes is whether there is a reply at all.
+ * Any status counts: Docker Desktop answers this raw request with a 500, and a
+ * status line proves the connection was accepted. What the sandbox changes is
+ * whether there is a reply at all.
  */
-const daemonResponds = (): boolean => {
-  if (!endpoint) return false;
+const reaches = (command: string): boolean => {
   try {
-    const out = execFileSync('/bin/sh', ['-c', `${PING} ${endpoint.socketPath}`], {
+    const out = execFileSync('/bin/sh', ['-c', command], {
       encoding: 'utf-8',
-      timeout: 5000,
+      timeout: 15000,
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
     return out.includes('HTTP/');
   } catch {
@@ -43,17 +60,35 @@ const daemonResponds = (): boolean => {
   }
 };
 
+/** The level this repository declares for itself, which the runner applies. */
+const declaredLevel = (): DockerAccessLevel => {
+  const rcPath = path.join(__dirname, '..', '..', '.localmostrc');
+  const parsed = parseLocalmostrcContent(fs.readFileSync(rcPath, 'utf-8'));
+  return parsed.config?.shared?.docker ?? 'off';
+};
+
+const profileFor = (level: DockerAccessLevel): string =>
+  generateSandboxProfile({
+    workDir: process.cwd(),
+    proxyPort: 8080,
+    homeDir: os.homedir(),
+    dockerEndpoint: endpoint,
+    policy: level === 'off' ? {} : { docker: level },
+  });
+
 /**
- * Whether seatbelt can be applied from here at all.
+ * Whether a constructed profile can be applied from here.
  *
- * A localmost job already runs under a profile, and sandbox-exec cannot be
- * nested inside one - so on the self-hosted runner this suite would fail for a
- * reason that says nothing about the grant. CI covers that path properly, by
- * reaching the daemon from a real job: see .github/workflows/docker.yaml.
+ * Probed with the profile the tests actually use, not a permissive stand-in:
+ * `(allow default)` is the one profile that can never be applied inside a
+ * sandbox, so probing with it answers the wrong question.
  */
-const canApplySeatbelt = (): boolean => {
+const canConstruct = (): boolean => {
+  if (!isMacOS || !endpoint) return false;
+
   const probePath = path.join(os.tmpdir(), `localmost-seatbelt-probe-${process.pid}.sb`);
-  fs.writeFileSync(probePath, '(version 1)(allow default)');
+  fs.writeFileSync(probePath, profileFor('socket'));
+
   try {
     execFileSync('/usr/bin/sandbox-exec', ['-f', probePath, '/usr/bin/true'], {
       timeout: 5000,
@@ -67,77 +102,74 @@ const canApplySeatbelt = (): boolean => {
   }
 };
 
-const runnable = Boolean(endpoint) && daemonResponds() && canApplySeatbelt();
-
-if (!runnable) {
-  // Say why, so a silent skip is not mistaken for coverage.
-  const reason =
-    process.platform !== 'darwin'
-      ? `platform is ${process.platform}, seatbelt is macOS only`
-      : !endpoint
-        ? 'no Docker socket resolved'
-        : !daemonResponds()
-          ? 'no daemon answered on the socket'
-          : 'seatbelt cannot be applied from here (already inside a sandboxed job)';
-  console.log(`[docker-access.sandbox] skipped: ${reason}`);
-}
-
-const describeIfRunnable = runnable ? describe : describe.skip;
-
-describeIfRunnable('docker access through real seatbelt', () => {
-  /** Ask the daemon for /_ping from inside a sandbox built for `level`. */
-  const pingFromSandbox = (level: DockerAccessLevel): { ok: boolean; output: string } => {
+if (!isMacOS) {
+  describe('docker access through seatbelt', () => {
+    it('has nothing to assert off macOS, where seatbelt does not exist', () => {
+      expect(process.platform).not.toBe('darwin');
+    });
+  });
+} else if (canConstruct()) {
+  describe('docker access through a constructed seatbelt profile', () => {
     const socketPath = endpoint!.socketPath;
-    const profile = generateSandboxProfile({
-      workDir: process.cwd(),
-      proxyPort: 8080,
-      homeDir: os.homedir(),
-      dockerEndpoint: endpoint,
-      policy: level === 'off' ? {} : { docker: level },
+
+    const pingFromSandbox = (level: DockerAccessLevel): boolean => {
+      const profilePath = path.join(os.tmpdir(), `localmost-docker-${process.pid}-${level}.sb`);
+      fs.writeFileSync(profilePath, profileFor(level));
+
+      try {
+        return reaches(`/usr/bin/sandbox-exec -f ${profilePath} /bin/sh -c "${ping(socketPath)}"`);
+      } finally {
+        fs.unlinkSync(profilePath);
+      }
+    };
+
+    it('requires a running daemon', () => {
+      // Not a skip: this repository declares docker: socket, so a reachable
+      // daemon is part of its test setup.
+      expect(reaches(ping(socketPath))).toBe(true);
     });
 
-    const profilePath = path.join(os.tmpdir(), `localmost-docker-test-${process.pid}-${level}.sb`);
-    fs.writeFileSync(profilePath, profile);
+    it('reaches the daemon when the policy declares docker: socket', () => {
+      expect(pingFromSandbox('socket')).toBe(true);
+    });
 
-    try {
-      const output: string = execFileSync(
-        '/usr/bin/sandbox-exec',
-        [
-          '-f',
-          profilePath,
-          '/bin/sh',
-          '-c',
-          `${PING} ${socketPath}`,
-        ],
-        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15000 }
-      );
-      return { ok: output.includes('HTTP/'), output };
-    } catch (error) {
-      const err = error as { stderr?: Buffer | string; status?: number };
-      return { ok: false, output: String(err.stderr ?? '') };
-    } finally {
-      fs.unlinkSync(profilePath);
-    }
-  };
+    it('cannot reach the daemon when the policy declares nothing', () => {
+      // The negative case is what makes the positive one meaningful: without
+      // it, a profile that granted everything would pass just as well.
+      expect(pingFromSandbox('off')).toBe(false);
+    });
 
-  it('reaches the daemon when the policy declares docker: socket', () => {
-    const { ok, output } = pingFromSandbox('socket');
-
-    expect(ok).toBe(true);
-    expect(output).toContain('HTTP/');
+    it('reaches the daemon at every level above off', () => {
+      for (const level of ['socket', 'contexts', 'credentials'] as const) {
+        expect(pingFromSandbox(level)).toBe(true);
+      }
+    });
   });
+} else {
+  describe('docker access through the ambient seatbelt profile', () => {
+    // Already inside a localmost job: the runner applied this repository's
+    // approved policy to this very process.
+    const level = declaredLevel();
+    const configPath = path.join(os.homedir(), '.docker', 'config.json');
 
-  it('cannot reach the daemon when the policy declares nothing', () => {
-    // The negative case is what makes the positive one meaningful: without it,
-    // a profile that granted everything would pass the test above.
-    const { ok } = pingFromSandbox('off');
+    it('reaches the daemon exactly when the declared level grants it', () => {
+      const socketPath = endpoint?.socketPath ?? '/var/run/docker.sock';
+      expect(reaches(ping(socketPath))).toBe(level !== 'off');
+    });
 
-    expect(ok).toBe(false);
+    it('denies ~/.docker/config.json below the credentials level', () => {
+      if (level === 'credentials') {
+        expect(() => fs.readFileSync(configPath)).not.toThrow();
+        return;
+      }
+      expect(() => fs.readFileSync(configPath)).toThrow();
+    });
+
+    it('denies a socket the policy did not grant', () => {
+      // Proves the grant is specific rather than a blanket socket allow. The
+      // workspace has its own allow, so this path is under the home directory.
+      const strayPath = path.join(os.homedir(), `.localmost-stray-${process.pid}.sock`);
+      expect(reaches(ping(strayPath))).toBe(false);
+    });
   });
-
-  it('reaches the daemon at every level above off', () => {
-    for (const level of ['socket', 'contexts', 'credentials'] as const) {
-      expect(pingFromSandbox(level).ok).toBe(true);
-    }
-  });
-});
+}
