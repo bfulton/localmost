@@ -796,3 +796,93 @@ describe('serializing a declared level', () => {
     expect(serializeLocalmostrc(config)).not.toContain('level:');
   });
 });
+
+describe('docker access', () => {
+  it('accepts a declared docker level', () => {
+    const result = parseLocalmostrcContent('version: 1\nshared:\n  docker: socket\n');
+    expect(result.success).toBe(true);
+    expect(result.config?.shared?.docker).toBe('socket');
+  });
+
+  it('rejects docker: true, which does not say which level was meant', () => {
+    const result = parseLocalmostrcContent('version: 1\nshared:\n  docker: true\n');
+    expect(result.success).toBe(false);
+    expect(result.errors[0].message).toMatch(/off, socket, contexts, credentials/);
+  });
+
+  it('rejects an unknown docker level', () => {
+    const result = parseLocalmostrcContent('version: 1\nshared:\n  docker: daemon\n');
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects docker inside a workflows block', () => {
+    const result = parseLocalmostrcContent(
+      'version: 1\nworkflows:\n  build:\n    docker: socket\n'
+    );
+    expect(result.success).toBe(false);
+    expect(result.errors[0].message).toMatch(/shared/);
+  });
+});
+
+describe('removed sockets key', () => {
+  it('rejects sockets, pointing at docker', () => {
+    const result = parseLocalmostrcContent(
+      'version: 1\nshared:\n  sockets:\n    allow:\n      - /var/run/docker.sock\n'
+    );
+    expect(result.success).toBe(false);
+    expect(result.errors[0].message).toMatch(/docker:/);
+  });
+});
+
+describe('docker level through policy merging', () => {
+  it('keeps the shared docker level in the effective policy for a workflow', () => {
+    // localmost test builds its profile from the effective policy, so a level
+    // dropped here would apply on the runner and not locally.
+    const config = {
+      version: 1,
+      shared: { docker: 'socket' as const, network: { allow: ['github.com'] } },
+      workflows: { build: { network: { allow: ['npmjs.org'] } } },
+    };
+
+    expect(getEffectivePolicy(config, 'build').docker).toBe('socket');
+  });
+
+  it('keeps the shared docker level for a workflow with no overrides', () => {
+    const config = { version: 1, shared: { docker: 'credentials' as const } };
+    expect(getEffectivePolicy(config, 'anything').docker).toBe('credentials');
+  });
+});
+
+describe('docker level in the approval diff', () => {
+  it('reports a docker level change as its own diff entry', () => {
+    // With the repo policy as the only gate, the diff shown at approval time
+    // is the whole of the access control for this capability.
+    const before = { version: 1, shared: { docker: 'off' as const } };
+    const after = { version: 1, shared: { docker: 'credentials' as const } };
+
+    const docker = diffConfigs(before, after).find(d => d.path === 'shared.docker');
+
+    expect(docker).toEqual({
+      path: 'shared.docker',
+      type: 'changed',
+      oldValue: 'off',
+      newValue: 'credentials',
+    });
+  });
+
+  it('reports newly declared docker access as added', () => {
+    const diffs = diffConfigs({ version: 1 }, { version: 1, shared: { docker: 'socket' as const } });
+    expect(diffs.find(d => d.path === 'shared.docker')?.type).toBe('added');
+  });
+
+  it('reports removed docker access', () => {
+    const diffs = diffConfigs({ version: 1, shared: { docker: 'socket' as const } }, { version: 1 });
+    expect(diffs.find(d => d.path === 'shared.docker')?.type).toBe('removed');
+  });
+
+  it('round-trips a docker level through serialization', () => {
+    const config = { version: 1, shared: { docker: 'contexts' as const } };
+    const reparsed = parseLocalmostrcContent(serializeLocalmostrc(config));
+    expect(reparsed.config?.shared?.docker).toBe('contexts');
+  });
+});

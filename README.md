@@ -250,6 +250,7 @@ Current release: **0.3.0 — Test Locally, Secure by Default**
 - Sandbox policy levels (strict / moderate / permissive) declared per repository and enforced by the local proxy
 - Contributor-based job filtering for public repos
 - Repository policies require approval before the runner applies them
+- Opt-in [Docker daemon access](docs/roadmap/docker-access.md) declared per repo, off by default
 - Environment comparison with GitHub runners
 
 Future feature ideas:
