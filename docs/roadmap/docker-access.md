@@ -61,24 +61,35 @@ named above — no level grants the directory itself.
 
 ## What This Actually Grants
 
-**A job with Docker access is not sandboxed.** This is the central fact about the
-feature and belongs anywhere it is documented.
+**Above `off`, the sandbox is no longer the boundary for container work.** This
+is the fact that shapes the feature and belongs anywhere it is documented.
 
 The network and filesystem allowlists widen what the sandboxed process may do,
-and the seatbelt profile still contains it. Docker access is different in kind:
-the container is not subject to the profile at all. A job that can reach the
-daemon can
+and the seatbelt profile still contains it. Docker access is different in kind,
+because the container is not subject to the profile at all. A job that can reach
+the daemon can
 
-- bind-mount host paths into a container and read or write them —
-  `docker run -v /Users/you:/host` reaches the `~/.ssh` this profile explicitly
-  denies, because Docker Desktop shares `/Users` by default;
-- make arbitrary outbound network connections from inside a container, bypassing
-  the policy's network allowlist entirely.
+- bind-mount host paths into a container and read or write them, including paths
+  this same policy denies. Verified on a default Docker Desktop install, which
+  shares `/Users`: with `docker: socket`, `docker run -v ~/.ssh:/host-ssh alpine
+  ls /host-ssh` lists private keys the profile denies outright;
+- make arbitrary outbound connections from inside a container, which do not pass
+  through the job's proxy and so are not subject to the network allowlist.
 
-So `docker: socket` is closer in effect to `level: permissive` plus unrestricted
-egress than it is to adding a host to the network allowlist. The design does not
-try to hide that behind a mechanism; it makes the level visible at approval time
-and states the consequence in the docs.
+So `docker:` is not another entry in the allowlist. It decides whether the rest
+of the file is enforceable at all for anything routed through a container - the
+`filesystem.deny` list and the network allowlist included.
+
+Two separate questions are easy to run together here, so to be explicit:
+
+- **What grants it.** Only an approved `.localmostrc`. There is no second,
+  machine-level switch (see the decision below), so the approval diff is the
+  whole of the access control.
+- **What is still enforced once granted.** For the job process itself, the
+  profile applies as before. For anything it does through a container, nothing.
+
+The design does not try to soften that behind a mechanism. It makes the level
+visible at approval time and states the consequence in the docs.
 
 ## Key Design Decisions
 

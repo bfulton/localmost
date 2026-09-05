@@ -196,14 +196,28 @@ or stored by localmost.
 
 ### Docker Access
 
-A repository may declare `docker:` in its approved `.localmostrc`. At any level
-from `socket` upward, jobs from that repository are **not sandboxed**: containers
-are not subject to the seatbelt profile, so a job can bind-mount host paths into
-a container and read or write them - including paths the profile denies, such as
-`~/.ssh` - and can make network connections that bypass the policy's allowlist.
+A repository may declare `docker:` in its approved `.localmostrc`. Above `off`,
+the sandbox stops being the boundary for anything the job routes through a
+container.
 
-Default is off. It takes effect only through the normal policy approval, so the
-diff shown at approval time is what grants it. See `docs/roadmap/docker-access.md`.
+Containers do not run under the seatbelt profile. So a job can bind-mount host
+paths into one and read or write them - including paths the same policy file
+denies. This is verified, not theoretical: with `docker: socket` on a default
+Docker Desktop install, `docker run -v ~/.ssh:/host-ssh alpine ls /host-ssh`
+lists private keys the profile denies outright. Network egress from a container
+likewise does not pass through the job's proxy, so the policy's host allowlist
+does not apply to it.
+
+The practical consequence is that `docker:` is not another entry in the
+allowlist. It decides whether the rest of the file is enforceable at all for
+container work: the `filesystem.deny` list, the network allowlist and the
+unconditional credential denials all become advisory for anything a container
+touches.
+
+Nothing but the approved `.localmostrc` grants it - there is no machine-level
+switch to withhold it - so the approval diff is where that decision gets made.
+That is why a change to `docker:` is surfaced with the same prominence as a
+change to `level:`. Default is off.
 
 ## Credential Storage
 
