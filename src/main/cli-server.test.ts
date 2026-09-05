@@ -57,6 +57,31 @@ jest.mock('./runner-state-service', () => ({
   selectEffectivePauseState: () => mockSelectEffectivePauseState(),
 }));
 
+// Mock target-manager
+const mockGetTargets = jest.fn<() => unknown[]>();
+const mockFindTargetByRef = jest.fn<(ref: string) => unknown>();
+const mockAddTargetAndAttach = jest.fn<(...args: unknown[]) => Promise<unknown>>();
+const mockRemoveTargetAndDetach = jest.fn<(id: string) => Promise<unknown>>();
+const mockUpdateTarget = jest.fn<(...args: unknown[]) => Promise<unknown>>();
+
+jest.mock('./target-manager', () => ({
+  getTargetManager: () => ({
+    getTargets: mockGetTargets,
+    findTargetByRef: mockFindTargetByRef,
+    addTargetAndAttach: mockAddTargetAndAttach,
+    removeTargetAndDetach: mockRemoveTargetAndDetach,
+    updateTarget: mockUpdateTarget,
+  }),
+}));
+
+// Mock runner-proxy-manager (runner counts for target summaries)
+const mockLoadAllCredentials = jest.fn<(targetId: string) => unknown[]>();
+jest.mock('./runner-proxy-manager', () => ({
+  getRunnerProxyManager: () => ({
+    loadAllCredentials: mockLoadAllCredentials,
+  }),
+}));
+
 import { CliServer, CliRequest } from './cli-server';
 
 describe('CliServer', () => {
@@ -97,6 +122,15 @@ describe('CliServer', () => {
     mockHeartbeatIsRunning.mockReturnValue(true);
     mockSelectRunnerStatus.mockReturnValue({ status: 'listening' });
     mockSelectEffectivePauseState.mockReturnValue({ isPaused: false, reason: null });
+
+    mockGetTargets.mockReset();
+    mockFindTargetByRef.mockReset();
+    mockAddTargetAndAttach.mockReset();
+    mockRemoveTargetAndDetach.mockReset();
+    mockUpdateTarget.mockReset();
+    mockLoadAllCredentials.mockReset();
+    mockGetTargets.mockReturnValue([]);
+    mockLoadAllCredentials.mockReturnValue([{ instanceNum: 1 }, { instanceNum: 2 }, { instanceNum: 3 }, { instanceNum: 4 }]);
   });
 
   afterEach(async () => {
@@ -315,4 +349,199 @@ describe('CliServer', () => {
     await server.stop();
     expect(fs.existsSync(testSocketPath)).toBe(false);
   });
+
+  describe('target commands', () => {
+    const target = {
+      id: '3116ec9a',
+      type: 'repo',
+      owner: 'bfulton',
+      repo: 'supdb',
+      displayName: 'bfulton/supdb',
+      url: 'https://github.com/bfulton/supdb',
+      proxyRunnerName: 'localmost.test.bfulton-supdb',
+      enabled: true,
+      addedAt: '2026-08-22T14:33:57.884Z',
+    };
+
+    it('lists targets with their runner counts', async () => {
+      mockGetTargets.mockReturnValue([target]);
+      await server.start();
+
+      const response = await sendRequest({ command: 'targets-list' }) as {
+        success: boolean;
+        data: { targets: Array<{ displayName: string; runnerCount: number; enabled: boolean }> };
+      };
+
+      expect(response.success).toBe(true);
+      expect(response.data.targets).toEqual([
+        expect.objectContaining({
+          id: '3116ec9a',
+          displayName: 'bfulton/supdb',
+          runnerCount: 4,
+          enabled: true,
+          proxyRunnerName: 'localmost.test.bfulton-supdb',
+        }),
+      ]);
+    });
+
+    it('adds a repo target', async () => {
+      mockAddTargetAndAttach.mockResolvedValue({ success: true, data: target });
+      await server.start();
+
+      const response = await sendRequest({
+        command: 'targets-add',
+        args: { type: 'repo', owner: 'bfulton', repo: 'supdb' },
+      }) as { success: boolean; data: { target: { displayName: string; runnerCount: number } } };
+
+      expect(mockAddTargetAndAttach).toHaveBeenCalledWith('repo', 'bfulton', 'supdb');
+      expect(response.success).toBe(true);
+      expect(response.data.target.displayName).toBe('bfulton/supdb');
+      expect(response.data.target.runnerCount).toBe(4);
+    });
+
+    it('surfaces an add failure as an error response', async () => {
+      mockAddTargetAndAttach.mockResolvedValue({ success: false, error: 'This target already exists' });
+      await server.start();
+
+      const response = await sendRequest({
+        command: 'targets-add',
+        args: { type: 'repo', owner: 'bfulton', repo: 'supdb' },
+      });
+
+      expect(response).toEqual({ success: false, error: 'This target already exists' });
+    });
+
+    it('removes a target resolved from its ref', async () => {
+      mockFindTargetByRef.mockReturnValue(target);
+      mockRemoveTargetAndDetach.mockResolvedValue({ success: true });
+      await server.start();
+
+      const response = await sendRequest({
+        command: 'targets-remove',
+        args: { ref: 'bfulton/supdb' },
+      }) as { success: boolean; data: { target: { displayName: string } } };
+
+      expect(mockRemoveTargetAndDetach).toHaveBeenCalledWith('3116ec9a');
+      expect(response.success).toBe(true);
+      expect(response.data.target.displayName).toBe('bfulton/supdb');
+    });
+
+    it('errors when the ref matches no target', async () => {
+      mockFindTargetByRef.mockReturnValue(undefined);
+      await server.start();
+
+      const response = await sendRequest({
+        command: 'targets-remove',
+        args: { ref: 'bfulton/nope' },
+      }) as { success: boolean; error: string };
+
+      expect(response.success).toBe(false);
+      expect(response.error).toContain('bfulton/nope');
+      expect(mockRemoveTargetAndDetach).not.toHaveBeenCalled();
+    });
+
+    it('disables a target', async () => {
+      mockFindTargetByRef.mockReturnValue(target);
+      mockUpdateTarget.mockResolvedValue({ success: true, data: { ...target, enabled: false } });
+      await server.start();
+
+      const response = await sendRequest({
+        command: 'targets-update',
+        args: { ref: 'bfulton/supdb', enabled: false },
+      }) as { success: boolean; data: { target: { enabled: boolean } } };
+
+      expect(mockUpdateTarget).toHaveBeenCalledWith('3116ec9a', { enabled: false });
+      expect(response.success).toBe(true);
+      expect(response.data.target.enabled).toBe(false);
+    });
+
+    it('errors when updating a ref that matches no target', async () => {
+      mockFindTargetByRef.mockReturnValue(undefined);
+      await server.start();
+
+      const response = await sendRequest({
+        command: 'targets-update',
+        args: { ref: 'bfulton/nope', enabled: true },
+      }) as { success: boolean };
+
+      expect(response.success).toBe(false);
+      expect(mockUpdateTarget).not.toHaveBeenCalled();
+    });
+
+    it('rejects an add with an unknown target type', async () => {
+      await server.start();
+
+      const response = await sendRequest({
+        command: 'targets-add',
+        args: { type: 'foo' as 'repo', owner: 'bfulton', repo: 'supdb' },
+      }) as { success: boolean; error: string };
+
+      expect(response.success).toBe(false);
+      expect(response.error).toMatch(/type/i);
+      expect(mockAddTargetAndAttach).not.toHaveBeenCalled();
+    });
+
+    it('rejects an add whose owner is not a string', async () => {
+      await server.start();
+
+      const response = await sendRequest({
+        command: 'targets-add',
+        args: { type: 'repo', owner: 42 as unknown as string, repo: 'supdb' },
+      }) as { success: boolean };
+
+      expect(response.success).toBe(false);
+      expect(mockAddTargetAndAttach).not.toHaveBeenCalled();
+    });
+
+    it('rejects an add for a repo target with no repo', async () => {
+      await server.start();
+
+      const response = await sendRequest({
+        command: 'targets-add',
+        args: { type: 'repo', owner: 'bfulton' },
+      }) as { success: boolean };
+
+      expect(response.success).toBe(false);
+      expect(mockAddTargetAndAttach).not.toHaveBeenCalled();
+    });
+
+    it('trims whitespace around an added target', async () => {
+      mockAddTargetAndAttach.mockResolvedValue({ success: true, data: target });
+      await server.start();
+
+      await sendRequest({
+        command: 'targets-add',
+        args: { type: 'repo', owner: '  bfulton  ', repo: ' supdb ' },
+      });
+
+      expect(mockAddTargetAndAttach).toHaveBeenCalledWith('repo', 'bfulton', 'supdb');
+    });
+
+    it('reports a structured error when ref is not a string', async () => {
+      await server.start();
+
+      const response = await sendRequest({
+        command: 'targets-remove',
+        args: { ref: 42 as unknown as string },
+      }) as { success: boolean; error: string };
+
+      expect(response.success).toBe(false);
+      expect(response.error).not.toMatch(/invalid request/i);
+      expect(mockFindTargetByRef).not.toHaveBeenCalled();
+    });
+
+    it('reports a structured error when an update ref is not a string', async () => {
+      await server.start();
+
+      const response = await sendRequest({
+        command: 'targets-update',
+        args: { ref: {} as unknown as string, enabled: true },
+      }) as { success: boolean; error: string };
+
+      expect(response.success).toBe(false);
+      expect(response.error).not.toMatch(/invalid request/i);
+      expect(mockFindTargetByRef).not.toHaveBeenCalled();
+    });
+  });
+
 });

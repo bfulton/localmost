@@ -554,3 +554,42 @@ describe('Sandbox Profile Generator', () => {
     });
   });
 });
+
+describe('docker access in the test-mode profile', () => {
+  const base = {
+    workDir: '/Users/dev/project',
+    proxyPort: 8080,
+    homeDir: '/Users/dev',
+    dockerEndpoint: { socketPath: '/Users/dev/.docker/run/docker.sock' },
+  };
+
+  it('emits no docker rules without a declared level', () => {
+    const profile = generateSandboxProfile({ ...base, policy: {} });
+    expect(profile).not.toContain('docker.sock');
+  });
+
+  it('allows the socket at socket level', () => {
+    const profile = generateSandboxProfile({ ...base, policy: { docker: 'socket' } });
+    expect(profile).toContain(
+      '(allow network-outbound (literal "/Users/dev/.docker/run/docker.sock"))'
+    );
+  });
+
+  it('allows config.json only at credentials level', () => {
+    const contexts = generateSandboxProfile({ ...base, policy: { docker: 'contexts' } });
+    const credentials = generateSandboxProfile({ ...base, policy: { docker: 'credentials' } });
+    expect(contexts).not.toContain('config.json');
+    expect(credentials).toContain(
+      '(allow file-read* (literal "/Users/dev/.docker/config.json"))'
+    );
+  });
+
+  it('emits nothing when no daemon socket resolved', () => {
+    const profile = generateSandboxProfile({
+      ...base,
+      dockerEndpoint: null,
+      policy: { docker: 'credentials' },
+    });
+    expect(profile).not.toContain('docker.sock');
+  });
+});

@@ -125,6 +125,15 @@ shared:
       - "~/.aws/*"               # Explicit paranoia
       - "~/.ssh/id_*"
 
+  # Docker daemon access. Cumulative; default off. Declared in shared only -
+  # the sandbox profile is built before the workflow is known.
+  #   socket      - the daemon socket, with DOCKER_HOST set for the job
+  #   contexts    - the above, plus ~/.docker/contexts
+  #   credentials - the above, plus ~/.docker/config.json
+  # A job that can reach the daemon is not sandboxed: containers are not
+  # subject to the profile. See docs/roadmap/docker-access.md
+  docker: socket
+
   env:
     allow:
       - DEVELOPER_DIR
@@ -247,6 +256,17 @@ Discovered access for build.yml:
 
 Add to .localmostrc under workflows.build? [y/n]
 ```
+
+### Docker access
+
+`docker:` opens the daemon socket, and nothing else under `~/.docker` beyond the
+paths its level names. At `contexts`, a job that selects a context pointing at a
+different socket has that connection denied by the sandbox - the grant covers
+the daemon socket localmost resolved, not whatever a context names.
+
+There is no key for arbitrary unix sockets. `localmost test --updaterc` reports
+sockets a run reached, but writes no socket declaration; the only socket a policy
+can ask for is the Docker daemon.
 
 ## Why Checked Into Git
 

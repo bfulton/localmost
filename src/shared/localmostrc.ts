@@ -6,8 +6,9 @@
 import * as yaml from 'js-yaml';
 import * as fs from 'fs';
 import * as path from 'path';
-import { SandboxPolicy, NetworkPolicy, FilesystemPolicy, SocketsPolicy, EnvPolicy } from './sandbox-profile';
+import { SandboxPolicy, NetworkPolicy, FilesystemPolicy, EnvPolicy } from './sandbox-profile';
 import { SandboxPolicyLevel } from './types';
+import { DOCKER_ACCESS_LEVELS, isDockerAccessLevel } from './docker-access';
 
 // =============================================================================
 // Types
@@ -223,14 +224,36 @@ function validatePolicy(policy: unknown, path: string, errors: ParseError[]): vo
     validateFilesystemPolicy(p.filesystem, `${path}.filesystem`, errors);
   }
 
-  // Validate sockets policy
+  // Removed in favour of docker:, which the runner applies as well as
+  // localmost test, and which cannot name an arbitrary socket.
   if (p.sockets !== undefined) {
-    validateSocketsPolicy(p.sockets, `${path}.sockets`, errors);
+    errors.push({
+      message:
+        `${path}.sockets is no longer supported. Use \`docker:\` in shared to ` +
+        'declare Docker access (off, socket, contexts, credentials).',
+    });
   }
 
   // Validate env policy
   if (p.env !== undefined) {
     validateEnvPolicy(p.env, `${path}.env`, errors);
+  }
+
+  // Validate docker access level. The sandbox profile is built before the
+  // workflow is known, so this is only meaningful in the shared section - the
+  // same reason per-workflow filesystem sections are not applied.
+  if (p.docker !== undefined) {
+    if (path !== 'shared') {
+      errors.push({
+        message:
+          `${path}.docker is not supported: docker access is declared in shared, ` +
+          'because the sandbox profile is built before the workflow is known',
+      });
+    } else if (!isDockerAccessLevel(p.docker)) {
+      errors.push({
+        message: `${path}.docker must be one of: ${DOCKER_ACCESS_LEVELS.join(', ')}`,
+      });
+    }
   }
 }
 
@@ -266,19 +289,6 @@ function validateFilesystemPolicy(policy: unknown, path: string, errors: ParseEr
   }
   if (p.deny !== undefined) {
     validateStringArray(p.deny, `${path}.deny`, errors);
-  }
-}
-
-function validateSocketsPolicy(policy: unknown, path: string, errors: ParseError[]): void {
-  if (typeof policy !== 'object' || policy === null) {
-    errors.push({ message: `${path} must be an object` });
-    return;
-  }
-
-  const p = policy as Record<string, unknown>;
-
-  if (p.allow !== undefined) {
-    validateStringArray(p.allow, `${path}.allow`, errors);
   }
 }
 
@@ -385,16 +395,6 @@ function mergeFilesystemPolicy(
 /**
  * Merge sockets policies.
  */
-function mergeSocketsPolicy(base?: SocketsPolicy, override?: SocketsPolicy): SocketsPolicy | undefined {
-  if (!base && !override) {
-    return undefined;
-  }
-
-  return {
-    allow: mergeArrays(base?.allow, override?.allow),
-  };
-}
-
 /**
  * Merge env policies.
  */
@@ -417,8 +417,10 @@ export function mergePolicies(base: SandboxPolicy, override: SandboxPolicy): San
   return {
     network: mergeNetworkPolicy(base.network, override.network),
     filesystem: mergeFilesystemPolicy(base.filesystem, override.filesystem),
-    sockets: mergeSocketsPolicy(base.sockets, override.sockets),
     env: mergeEnvPolicy(base.env, override.env),
+    // Docker access is declared in shared and nowhere else: a workflow cannot
+    // raise or lower it, so the base value carries through unchanged.
+    docker: base.docker,
   };
 }
 
@@ -485,6 +487,10 @@ export function serializeLocalmostrc(config: LocalmostrcConfig): string {
 function serializePolicy(policy: SandboxPolicy, indent: string): string[] {
   const lines: string[] = [];
 
+  if (policy.docker !== undefined) {
+    lines.push(`${indent}docker: ${policy.docker}`);
+  }
+
   if (policy.network) {
     lines.push(`${indent}network:`);
     if (policy.network.allow?.length) {
@@ -520,14 +526,6 @@ function serializePolicy(policy: SandboxPolicy, indent: string): string[] {
       for (const path of policy.filesystem.deny) {
         lines.push(`${indent}    - "${path}"`);
       }
-    }
-  }
-
-  if (policy.sockets?.allow?.length) {
-    lines.push(`${indent}sockets:`);
-    lines.push(`${indent}  allow:`);
-    for (const socketPath of policy.sockets.allow) {
-      lines.push(`${indent}    - "${socketPath}"`);
     }
   }
 
@@ -608,8 +606,21 @@ function diffPolicies(
   diffArrays(oldPolicy.filesystem?.write, newPolicy.filesystem?.write, `${prefix}.filesystem.write`, diffs);
   diffArrays(oldPolicy.filesystem?.deny, newPolicy.filesystem?.deny, `${prefix}.filesystem.deny`, diffs);
 
-  // Sockets
-  diffArrays(oldPolicy.sockets?.allow, newPolicy.sockets?.allow, `${prefix}.sockets.allow`, diffs);
+  // Docker access. Scalar, and the largest change this section can make:
+  // above `off` the job is no longer confined by the sandbox at all.
+  if (oldPolicy.docker !== newPolicy.docker) {
+    diffs.push({
+      path: `${prefix}.docker`,
+      type:
+        oldPolicy.docker === undefined
+          ? 'added'
+          : newPolicy.docker === undefined
+            ? 'removed'
+            : 'changed',
+      oldValue: oldPolicy.docker,
+      newValue: newPolicy.docker,
+    });
+  }
 
   // Env
   diffArrays(oldPolicy.env?.allow, newPolicy.env?.allow, `${prefix}.env.allow`, diffs);

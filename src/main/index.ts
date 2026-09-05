@@ -8,7 +8,7 @@ import * as nodePath from 'path';
 import { RunnerManager, JobEvent } from './runner-manager';
 import { GitHubAuth } from './github-auth';
 import { RunnerDownloader } from './runner-downloader';
-import { HeartbeatManager } from './heartbeat-manager';
+import { HeartbeatManager, toHeartbeatTarget } from './heartbeat-manager';
 import { BrokerProxyService } from './broker-proxy-service';
 import { TargetManager } from './target-manager';
 import { ContributorCache } from './contributor-cache';
@@ -312,7 +312,13 @@ app.whenReady().then(async () => {
       // declared in the same file and approved with the rest of it.
       const cached = getCachedPolicy(`${owner}/${repo}`);
       if (!cached?.approved) {
-        return { hosts: [], level: 'strict' as const, readPaths: [], writePaths: [] };
+        return {
+          hosts: [],
+          level: 'strict' as const,
+          readPaths: [],
+          writePaths: [],
+          docker: 'off' as const,
+        };
       }
       const policy = getEffectivePolicy(cached.config, workflowName);
       return {
@@ -326,6 +332,9 @@ app.whenReady().then(async () => {
         // policy drift.
         readPaths: cached.config.shared?.filesystem?.read || [],
         writePaths: cached.config.shared?.filesystem?.write || [],
+        // Docker access, like filesystem, comes from the shared section only:
+        // the profile is built before the workflow is known.
+        docker: cached.config.shared?.docker ?? 'off',
       };
     },
     onJobEvent: (event: JobEvent) => {
@@ -700,11 +709,7 @@ app.whenReady().then(async () => {
         if (heartbeatManager && authState?.accessToken && githubAuth) {
           // Set up heartbeat for all configured targets
           const targets = config.targets || [];
-          const heartbeatTargets = targets.map(t =>
-            t.type === 'org'
-              ? { level: 'org' as const, org: t.owner }
-              : { level: 'repo' as const, owner: t.owner, repo: t.repo! }
-          );
+          const heartbeatTargets = targets.map(toHeartbeatTarget);
 
           if (heartbeatTargets.length > 0) {
             heartbeatManager.setTargets(heartbeatTargets);

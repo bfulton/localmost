@@ -188,8 +188,36 @@ or stored by localmost.
 - **Required Permissions**:
   - `Administration: Read & Write` - Register and remove self-hosted runners on repositories
   - `Actions: Read & Write` - Check workflow status and cancel running jobs
+  - `Variables: Read & Write` - Write the `LOCALMOST_HEARTBEAT` variable that workflows check
+  - `Contents: Read` - Fetch the repository's `.localmostrc` sandbox policy at the job's commit
   - `Metadata: Read` - Access basic repository information (required by GitHub for all apps)
   - `Self-hosted runners: Read & Write` (org-level) - Register runners at the organization level
+  - `Variables: Read & Write` (org-level) - Write the `LOCALMOST_HEARTBEAT` variable at the organization level
+
+### Docker Access
+
+A repository may declare `docker:` in its approved `.localmostrc`. Above `off`,
+the sandbox stops being the boundary for anything the job routes through a
+container.
+
+Containers do not run under the seatbelt profile. So a job can bind-mount host
+paths into one and read or write them - including paths the same policy file
+denies. This is verified, not theoretical: with `docker: socket` on a default
+Docker Desktop install, `docker run -v ~/.ssh:/host-ssh alpine ls /host-ssh`
+lists private keys the profile denies outright. Network egress from a container
+likewise does not pass through the job's proxy, so the policy's host allowlist
+does not apply to it.
+
+The practical consequence is that `docker:` is not another entry in the
+allowlist. It decides whether the rest of the file is enforceable at all for
+container work: the `filesystem.deny` list, the network allowlist and the
+unconditional credential denials all become advisory for anything a container
+touches.
+
+Nothing but the approved `.localmostrc` grants it - there is no machine-level
+switch to withhold it - so the approval diff is where that decision gets made.
+That is why a change to `docker:` is surfaced with the same prominence as a
+change to `level:`. Default is off.
 
 ## Credential Storage
 

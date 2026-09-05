@@ -2,6 +2,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
 import { EventEmitter } from 'events';
+import { dockerSandboxGrants } from '../shared/docker-access';
 
 // Mock fs
 jest.mock('fs', () => ({
@@ -263,6 +264,125 @@ describe('Process Sandbox', () => {
       jest.resetModules();
     });
 
+  describe('docker access in the runner profile', () => {
+    const endpoint = { socketPath: '/Users/dev/.docker/run/docker.sock' };
+
+    /** Build a profile with the grants a level produces, and return its text. */
+    const profileFor = (level: 'off' | 'socket' | 'contexts' | 'credentials'): string => {
+      // Computed out here: the grants are plain data, and requiring the module
+      // inside the isolated registry below leaves the profile unwritten.
+      const dockerGrants = dockerSandboxGrants(level, endpoint, '/Users/dev');
+      let profile = '';
+      jest.isolateModules(() => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        const mockProcess = createMockProcess(12360);
+        const localMockSpawn = jest.fn().mockReturnValue(mockProcess);
+        const mockWriteFileSync = jest.fn();
+        jest.doMock('child_process', () => ({ spawn: localMockSpawn }));
+        jest.doMock('fs', () => ({
+          existsSync: jest.fn().mockReturnValue(true),
+          writeFileSync: mockWriteFileSync,
+          unlinkSync: jest.fn(),
+          mkdirSync: jest.fn(),
+        }));
+
+        const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
+
+        const instanceDir = path.join(os.homedir(), '.localmost', 'runner-3');
+        sandboxedSpawn(path.join(instanceDir, 'run.sh'), [], {
+          cwd: instanceDir,
+          dockerGrants,
+        });
+
+        profile = mockWriteFileSync.mock.calls[0][1];
+      });
+      return profile;
+    };
+
+    it('emits no docker rules when the level is off', () => {
+      expect(profileFor('off')).not.toContain('docker.sock');
+    });
+
+    it('allows the resolved socket at socket level', () => {
+      const profile = profileFor('socket');
+      expect(profile).toContain(
+        '(allow network-outbound (literal "/Users/dev/.docker/run/docker.sock"))'
+      );
+      expect(profile).toContain(
+        '(allow file-write* (literal "/Users/dev/.docker/run/docker.sock"))'
+      );
+    });
+
+    it('emits the socket allow after the deny block, so the literal wins', () => {
+      // The Docker Desktop socket lives inside the denied ~/.docker, and
+      // seatbelt takes the last matching rule.
+      const profile = profileFor('socket');
+      const deny = profile.indexOf('(deny file-read*');
+      const allow = profile.indexOf(
+        '(allow file-read* (literal "/Users/dev/.docker/run/docker.sock"))'
+      );
+      expect(deny).toBeGreaterThan(-1);
+      expect(allow).toBeGreaterThan(deny);
+    });
+
+    it('keeps config.json denied at socket level', () => {
+      expect(profileFor('socket')).not.toContain('config.json');
+    });
+
+    it('keeps config.json denied at contexts level, adding only the directory', () => {
+      const profile = profileFor('contexts');
+      expect(profile).toContain('(allow file-read* (subpath "/Users/dev/.docker/contexts"))');
+      expect(profile).not.toContain('config.json');
+    });
+
+    it('allows config.json at credentials level', () => {
+      expect(profileFor('credentials')).toContain(
+        '(allow file-read* (literal "/Users/dev/.docker/config.json"))'
+      );
+    });
+
+    it('escapes quotes in a socket path, as the rest of the profile does', () => {
+      // The path can come from the operator's DOCKER_HOST or home directory
+      // and lands in a security DSL, where an unescaped quote would close the
+      // literal early and change what the rule means.
+      let profile = '';
+      jest.isolateModules(() => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        const mockProcess = createMockProcess(12361);
+        const mockWriteFileSync = jest.fn();
+        jest.doMock('child_process', () => ({ spawn: jest.fn().mockReturnValue(mockProcess) }));
+        jest.doMock('fs', () => ({
+          existsSync: jest.fn().mockReturnValue(true),
+          writeFileSync: mockWriteFileSync,
+          unlinkSync: jest.fn(),
+          mkdirSync: jest.fn(),
+        }));
+
+        const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
+        const instanceDir = path.join(os.homedir(), '.localmost', 'runner-4');
+        sandboxedSpawn(path.join(instanceDir, 'run.sh'), [], {
+          cwd: instanceDir,
+          dockerGrants: dockerSandboxGrants(
+            'socket',
+            { socketPath: '/tmp/od"d/docker.sock' },
+            '/Users/dev'
+          ),
+        });
+
+        profile = mockWriteFileSync.mock.calls[0][1];
+      });
+
+      expect(profile).toContain('(allow network-outbound (literal "/tmp/od\\"d/docker.sock"))');
+      expect(profile).not.toContain('(allow network-outbound (literal "/tmp/od"d/docker.sock"))');
+    });
+
+    it('never grants the ~/.docker directory itself', () => {
+      for (const level of ['socket', 'contexts', 'credentials'] as const) {
+        expect(profileFor(level)).not.toContain('(allow file-read* (subpath "/Users/dev/.docker"))');
+      }
+    });
+  });
+
     it('should use sandbox-exec on macOS', () => {
       // Re-require after platform change
       jest.isolateModules(() => {
@@ -519,5 +639,7 @@ describe('Process Sandbox', () => {
       });
     });
   });
+
+
 
 });

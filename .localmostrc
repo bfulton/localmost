@@ -2,6 +2,11 @@ version: 1
 level: strict
 
 shared:
+  # The test suite exercises Docker access end to end: docker-access.sandbox.test.ts
+  # runs real seatbelt against the real daemon, and CI runs containers below.
+  # A job with this is not sandboxed - see docs/roadmap/docker-access.md.
+  docker: socket
+
   network:
     allow:
       - "*.github.com"
