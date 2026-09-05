@@ -1,0 +1,46 @@
+name: Docker access check
+description: >
+  Reach the Docker daemon, run a container, and confirm the policy level
+  boundary holds. Used from both the Linux and localmost runner jobs so the
+  two check exactly the same things.
+
+runs:
+  using: composite
+  steps:
+    - name: Reach the daemon
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "DOCKER_HOST=${DOCKER_HOST:-<unset>}"
+
+        if ! docker version --format 'client {{.Client.Version}} / server {{.Server.Version}}'; then
+          echo "::error::No reachable Docker daemon."
+          echo "On the localmost runner this means the docker: socket grant did not"
+          echo "apply, or Docker Desktop is not running on the host."
+          exit 1
+        fi
+
+    - name: Run a container
+      shell: bash
+      run: |
+        set -euo pipefail
+        # The daemon pulls this, outside the sandbox, so it does not go through
+        # the job's proxy allowlist. That is the documented cost of granting
+        # Docker: see docs/roadmap/docker-access.md.
+        docker run --rm alpine:3 echo "container ran"
+
+    - name: Check the level boundary holds
+      shell: bash
+      run: |
+        set -euo pipefail
+        # DOCKER_HOST is set only by localmost, so it marks the sandboxed run.
+        if [ -z "${DOCKER_HOST:-}" ]; then
+          echo "Not the sandboxed path (no DOCKER_HOST); nothing to check"
+          exit 0
+        fi
+
+        if cat "$HOME/.docker/config.json" >/dev/null 2>&1; then
+          echo "::error::~/.docker/config.json was readable at docker: socket"
+          exit 1
+        fi
+        echo "config.json is denied, as socket level requires"

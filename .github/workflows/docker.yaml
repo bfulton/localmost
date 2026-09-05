@@ -1,0 +1,42 @@
+name: Docker Access
+
+# Exercises the docker: socket grant this repo declares in .localmostrc.
+#
+# Two jobs run the same composite action:
+#
+#   docker-linux     GitHub-hosted, Docker native, nothing sandboxed. Confirms
+#                    the workflow itself is sound where localmost is absent.
+#   docker-localmost The self-hosted runner, where the daemon is only reachable
+#                    because the sandbox profile allows its socket. This is the
+#                    end-to-end test of the grant, and it is skipped when no
+#                    localmost runner is online.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  check:
+    uses: ./.github/workflows/check.yaml
+    with:
+      fallback: ubuntu-latest
+
+  docker-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/docker-access
+
+  docker-localmost:
+    needs: check
+    if: needs.check.outputs.runner == 'self-hosted'
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/docker-access
