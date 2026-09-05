@@ -14,6 +14,10 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   - `localmost targets add <owner>/<repo>` registers runners without opening the app
   - `--org` for organization targets, `--json` on every subcommand for scripting
   - `remove` confirms interactively and requires `--yes` outside a terminal
+- **GitHub App now requests `Contents: Read`**: needed to fetch `.localmostrc` from private
+  repositories. Existing installations will be prompted to accept the new permission; until
+  accepted, jobs from private repos with a policy are refused rather than run under a weaker
+  sandbox
 - **Workflow Test Mode**: Run workflows locally before pushing with `localmost test`
   - Intercepts `actions/checkout` to use local working tree
   - Intercepts `actions/cache` for local caching

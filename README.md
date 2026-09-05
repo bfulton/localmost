@@ -128,8 +128,11 @@ localmost uses a GitHub App for authentication. During installation, you'll be a
 |------------|-------|---------|
 | **Administration** | Read & Write | Register and remove self-hosted runners on repositories |
 | **Actions** | Read & Write | Check workflow status and cancel running jobs |
+| **Variables** | Read & Write | Write the `LOCALMOST_HEARTBEAT` variable that workflows check |
+| **Contents** | Read | Fetch the repository's `.localmostrc` sandbox policy |
 | **Metadata** | Read | Access basic repository information (required by GitHub for all apps) |
 | **Self-hosted runners** (org) | Read & Write | Register and remove self-hosted runners at the organization level |
+| **Variables** (org) | Read & Write | Write the `LOCALMOST_HEARTBEAT` variable at the organization level |
 
 ### Why Administration Permission?
 
@@ -142,6 +145,19 @@ While this permission could theoretically allow other administrative actions, lo
 localmost is open source — you can verify this by [searching for `actions/runners` in the codebase](https://github.com/bfulton/localmost/search?q=actions%2Frunners).
 
 For organization-level runners, the narrower `Self-hosted runners: Read & Write` permission is used instead of Administration.
+
+### Why Contents Permission?
+
+Sandbox policies live in the repository, so localmost reads `.localmostrc` at the
+commit a job is running, before deciding what that job is allowed to reach. GitHub
+has no narrower scope for reading a single file, so this grants read access to
+repository contents — but localmost requests it read-only and calls the contents
+API from exactly one place, for exactly that file
+([`getFileContent`](https://github.com/bfulton/localmost/search?q=getFileContent)).
+
+Without it, a private repository's policy cannot be read at all: the API answers
+`Resource not accessible by integration`, and localmost refuses the job and cancels
+the run rather than falling back to a weaker sandbox.
 
 ### Repository Access
 
