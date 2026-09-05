@@ -32,7 +32,7 @@ jest.mock('./proxy-server', () => ({
   })),
 }));
 
-import { RunnerManager } from './runner-manager';
+import { RunnerManager, UNCLAIMED_WORKER_TIMEOUT_MS } from './runner-manager';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -1119,6 +1119,86 @@ describe('RunnerManager', () => {
 
       expect(helper.instances.size).toBe(0);
       expect(manager.hasAvailableSlot()).toBe(true);
+    });
+  });
+
+  describe('reaping a worker that never acquired a job', () => {
+    function idlePool() {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      for (let i = 1; i <= 4; i++) {
+        helper.setInstance(i, { name: `runner-${i}`, status: 'listening', currentJob: null });
+      }
+      return { manager, helper };
+    }
+
+    it('frees the slot of a worker that never acquired a job', () => {
+      // A worker spawned for a job that the broker never routed to it sits in
+      // `listening` forever. It is `--once`, so it never exits, so the exit
+      // handler that releases its slot never runs. Once every slot is held by
+      // one of these the broker reports "At capacity" for every job and the
+      // pool stops accepting work with nothing running.
+      const { manager, helper } = idlePool();
+      expect(manager.hasAvailableSlot()).toBe(false);
+
+      helper.reapUnclaimedWorker(1);
+
+      expect(manager.hasAvailableSlot()).toBe(true);
+      expect(helper.instances.has(1)).toBe(false);
+    });
+
+    it('reclaims a worker that is still unclaimed when the deadline passes', () => {
+      jest.useFakeTimers();
+      try {
+        const { manager, helper } = idlePool();
+        helper.armAcquireDeadline(1);
+        expect(manager.hasAvailableSlot()).toBe(false);
+
+        jest.advanceTimersByTime(UNCLAIMED_WORKER_TIMEOUT_MS);
+
+        expect(manager.hasAvailableSlot()).toBe(true);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('does not reclaim a worker whose deadline was disarmed by acquiring a job', () => {
+      jest.useFakeTimers();
+      try {
+        const { manager, helper } = idlePool();
+        helper.armAcquireDeadline(1);
+        helper.disarmAcquireDeadline(1);
+
+        jest.advanceTimersByTime(UNCLAIMED_WORKER_TIMEOUT_MS);
+
+        expect(helper.instances.has(1)).toBe(true);
+        expect(manager.hasAvailableSlot()).toBe(false);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('leaves a worker that did acquire a job alone', () => {
+      const { manager, helper } = idlePool();
+      helper.setInstance(1, {
+        name: 'runner-1',
+        status: 'busy',
+        currentJob: {
+          name: 'build',
+          repository: 'bfulton/localmost',
+          startedAt: new Date().toISOString(),
+          id: 'job-1',
+        },
+      });
+
+      helper.reapUnclaimedWorker(1);
+
+      expect(helper.instances.has(1)).toBe(true);
+      expect(manager.hasAvailableSlot()).toBe(false);
     });
   });
 

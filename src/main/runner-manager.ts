@@ -108,8 +108,19 @@ interface RunnerManagerOptions {
   onJobEvent?: (event: JobEvent) => void;
 }
 
+/**
+ * How long a worker spawned for a specific job may sit without acquiring it
+ * before its slot is reclaimed.
+ *
+ * GitHub keeps retrying assignment for about ten minutes, so this is well
+ * inside the window where the job can still land on another worker.
+ */
+export const UNCLAIMED_WORKER_TIMEOUT_MS = 2 * 60 * 1000;
+
 export class RunnerManager {
   private instances: Map<number, RunnerInstance> = new Map();
+  /** Deadlines for workers spawned for a job that have not yet acquired one. */
+  private acquireDeadlines: Map<number, NodeJS.Timeout> = new Map();
   private runnerCount = DEFAULT_RUNNER_COUNT;
   private startedAt: string | null = null;
   private config: RunnerConfig | null = null;
@@ -1009,6 +1020,13 @@ export class RunnerManager {
       });
 
       this.instances.set(instanceNum, instance);
+      // Spawned for a specific job: if the broker never routes that job here,
+      // this worker will long-poll forever and hold its slot. Give it a
+      // deadline. A worker with no pending target was not spawned for a job
+      // and is not subject to one.
+      if (this.pendingTargetContext.has(String(instanceNum))) {
+        this.armAcquireDeadline(instanceNum);
+      }
       // Successfully started - clear the starting flag
       this.startingInstances.delete(instanceNum);
     } catch (error) {
@@ -1132,6 +1150,9 @@ export class RunnerManager {
       this.proxyServers.clear();
     }
 
+    for (const instanceNum of [...this.acquireDeadlines.keys()]) {
+      this.disarmAcquireDeadline(instanceNum);
+    }
     this.instances.clear();
     this.startingInstances.clear();
     this.startedAt = null;
@@ -1153,7 +1174,56 @@ export class RunnerManager {
    * with nothing actually running. Free the slot instead and let the next job
    * spawn a fresh worker bound to its target.
    */
+  /**
+   * Release the slot of a worker that was spawned for a job but never got one.
+   *
+   * A worker is `--once`: it long-polls until a job arrives, runs it, and
+   * exits. When the broker never routes a job to it - the message was skipped
+   * at capacity, or the session bound to a different worker - it waits
+   * forever, so the exit handler that frees its slot never runs. Once every
+   * slot is held by one of these, the broker reports "At capacity" for every
+   * subsequent job and the pool stops accepting work with nothing running.
+   *
+   * This is the same death spiral releaseInstanceSlot() addresses for workers
+   * that finish a job, reached by the path where no job ever starts.
+   */
+  /** Start the acquisition deadline for a worker spawned for a specific job. */
+  private armAcquireDeadline(instanceNum: number): void {
+    this.disarmAcquireDeadline(instanceNum);
+    const timer = setTimeout(() => {
+      this.acquireDeadlines.delete(instanceNum);
+      this.reapUnclaimedWorker(instanceNum);
+    }, UNCLAIMED_WORKER_TIMEOUT_MS);
+    timer.unref?.();
+    this.acquireDeadlines.set(instanceNum, timer);
+  }
+
+  /** Stand down the deadline once the worker has its job, or has gone away. */
+  private disarmAcquireDeadline(instanceNum: number): void {
+    const timer = this.acquireDeadlines.get(instanceNum);
+    if (timer) {
+      clearTimeout(timer);
+      this.acquireDeadlines.delete(instanceNum);
+    }
+  }
+
+  private reapUnclaimedWorker(instanceNum: number): void {
+    const instance = this.instances.get(instanceNum);
+    if (!instance) return;
+
+    // It got what it was spawned for; leave it alone.
+    if (instance.currentJob || instance.status === 'busy') return;
+
+    this.log(
+      'warn',
+      `Runner instance ${instanceNum} never acquired a job, reclaiming its slot`
+    );
+    instance.process?.kill('SIGTERM');
+    this.releaseInstanceSlot(instanceNum);
+  }
+
   private releaseInstanceSlot(instanceNum: number): void {
+    this.disarmAcquireDeadline(instanceNum);
     const instance = this.instances.get(instanceNum);
     if (instance) {
       instance.status = 'offline';
@@ -1311,6 +1381,9 @@ export class RunnerManager {
 
       // Use target display name (owner/repo format) for repository if available
       const repository = targetContext?.targetDisplayName || this.config?.url || 'unknown';
+
+      // It got its job; the acquisition deadline no longer applies.
+      this.disarmAcquireDeadline(instanceNum);
 
       instance.currentJob = {
         name: jobName,

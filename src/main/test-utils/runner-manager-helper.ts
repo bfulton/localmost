@@ -45,6 +45,9 @@ interface RunnerManagerInternals {
   checkJobUserFilter(instanceNum: number, runnerName: string): Promise<void>;
   parseRunnerOutput(instanceNum: number, line: string): Promise<void>;
   releaseInstanceSlot(instanceNum: number): void;
+  reapUnclaimedWorker(instanceNum: number): void;
+  armAcquireDeadline(instanceNum: number): void;
+  disarmAcquireDeadline(instanceNum: number): void;
   reserveSlot(): number | null;
   releaseSlotReservation(instanceNum: number): void;
   runnerCount: number;
@@ -127,6 +130,18 @@ export class RunnerManagerTestHelper {
   /**
    * Release an instance slot as the process-exit handler does.
    */
+  reapUnclaimedWorker(instanceNum: number): void {
+    this.internals.reapUnclaimedWorker(instanceNum);
+  }
+
+  armAcquireDeadline(instanceNum: number): void {
+    this.internals.armAcquireDeadline(instanceNum);
+  }
+
+  disarmAcquireDeadline(instanceNum: number): void {
+    this.internals.disarmAcquireDeadline(instanceNum);
+  }
+
   releaseInstanceSlot(instanceNum: number): void {
     this.internals.releaseInstanceSlot(instanceNum);
   }
