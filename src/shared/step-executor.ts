@@ -1108,8 +1108,8 @@ async function runInSandbox(
           permissive: false,
           strictMode,
           logFile: options.sandboxLogFile,
-            // Resolved out here, outside the sandbox, exactly as the runner does
-          // it - so localmost test and the runner grant the same socket.
+          // Resolved out here, outside the sandbox, exactly as the runner
+          // does it - so localmost test and the runner grant the same socket.
           dockerEndpoint: resolveDockerEndpoint(),
           homeDir: os.homedir(),
         });

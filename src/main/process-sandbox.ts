@@ -157,16 +157,21 @@ function generateSandboxProfile({
     if (!grants) return '';
     const lines: string[] = [];
 
+    // These paths reach us from the operator's DOCKER_HOST or home directory,
+    // and land in a security DSL, so they are escaped like every other path
+    // interpolated into this profile.
+    const quote = (value: string): string => value.replace(/"/g, '\\"');
+
     for (const socket of grants.socketLiterals) {
-      lines.push(`(allow network-outbound (literal "${socket}"))`);
-      lines.push(`(allow file-read* (literal "${socket}"))`);
-      lines.push(`(allow file-write* (literal "${socket}"))`);
+      lines.push(`(allow network-outbound (literal "${quote(socket)}"))`);
+      lines.push(`(allow file-read* (literal "${quote(socket)}"))`);
+      lines.push(`(allow file-write* (literal "${quote(socket)}"))`);
     }
     for (const file of grants.readLiterals) {
-      lines.push(`(allow file-read* (literal "${file}"))`);
+      lines.push(`(allow file-read* (literal "${quote(file)}"))`);
     }
     for (const dir of grants.readSubpaths) {
-      lines.push(`(allow file-read* (subpath "${dir}"))`);
+      lines.push(`(allow file-read* (subpath "${quote(dir)}"))`);
     }
 
     if (lines.length === 0) return '';

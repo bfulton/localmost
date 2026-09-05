@@ -1159,6 +1159,16 @@ async function handleUpdateRc(
 
   // Check if there's anything to add
   if (discoveredHosts.length === 0 && readPaths.length === 0 && writePaths.length === 0) {
+    if (socketPaths.length > 0) {
+      // Sockets were reached, but no policy key declares one, so there is
+      // genuinely nothing to write - saying "no access" would contradict the
+      // socket list printed just above.
+      console.log(`${colors.yellow}Nothing to write to .localmostrc.${colors.reset}`);
+      console.log('The only access recorded was to unix sockets, which no policy key declares.');
+      console.log('Docker is the exception: declare it with `docker:` in the shared section.');
+      return;
+    }
+
     console.log(`${colors.yellow}No access to configure.${colors.reset}`);
     console.log('This may happen if:');
     console.log('  - Your workflow doesn\'t make network requests');

@@ -38,7 +38,7 @@ const endpoint = isMacOS ? resolveDockerEndpoint() : null;
 
 /** A raw HTTP request to the daemon over its unix socket. */
 const ping = (socketPath: string): string =>
-  `printf 'GET /_ping HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' | /usr/bin/nc -U ${socketPath}`;
+  `printf 'GET /_ping HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' | /usr/bin/nc -U '${socketPath}'`;
 
 /**
  * Run a shell command, reporting whether it produced an HTTP response.
@@ -117,7 +117,7 @@ if (!isMacOS) {
       fs.writeFileSync(profilePath, profileFor(level));
 
       try {
-        return reaches(`/usr/bin/sandbox-exec -f ${profilePath} /bin/sh -c "${ping(socketPath)}"`);
+        return reaches(`/usr/bin/sandbox-exec -f '${profilePath}' /bin/sh -c "${ping(socketPath)}"`);
       } finally {
         fs.unlinkSync(profilePath);
       }

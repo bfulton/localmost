@@ -341,6 +341,41 @@ describe('Process Sandbox', () => {
       );
     });
 
+    it('escapes quotes in a socket path, as the rest of the profile does', () => {
+      // The path can come from the operator's DOCKER_HOST or home directory
+      // and lands in a security DSL, where an unescaped quote would close the
+      // literal early and change what the rule means.
+      let profile = '';
+      jest.isolateModules(() => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        const mockProcess = createMockProcess(12361);
+        const mockWriteFileSync = jest.fn();
+        jest.doMock('child_process', () => ({ spawn: jest.fn().mockReturnValue(mockProcess) }));
+        jest.doMock('fs', () => ({
+          existsSync: jest.fn().mockReturnValue(true),
+          writeFileSync: mockWriteFileSync,
+          unlinkSync: jest.fn(),
+          mkdirSync: jest.fn(),
+        }));
+
+        const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
+        const instanceDir = path.join(os.homedir(), '.localmost', 'runner-4');
+        sandboxedSpawn(path.join(instanceDir, 'run.sh'), [], {
+          cwd: instanceDir,
+          dockerGrants: dockerSandboxGrants(
+            'socket',
+            { socketPath: '/tmp/od"d/docker.sock' },
+            '/Users/dev'
+          ),
+        });
+
+        profile = mockWriteFileSync.mock.calls[0][1];
+      });
+
+      expect(profile).toContain('(allow network-outbound (literal "/tmp/od\\"d/docker.sock"))');
+      expect(profile).not.toContain('(allow network-outbound (literal "/tmp/od"d/docker.sock"))');
+    });
+
     it('never grants the ~/.docker directory itself', () => {
       for (const level of ['socket', 'contexts', 'credentials'] as const) {
         expect(profileFor(level)).not.toContain('(allow file-read* (subpath "/Users/dev/.docker"))');
