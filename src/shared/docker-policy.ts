@@ -214,3 +214,120 @@ export function mergeDockerPolicy(base?: DockerPolicy, override?: DockerPolicy):
   if (base?.privileged || override?.privileged) merged.privileged = true;
   return merged;
 }
+
+// =============================================================================
+// Diffing
+// =============================================================================
+
+/** Structurally the parser's PolicyDiff, declared here to avoid importing it. */
+export interface DockerPolicyDiff {
+  path: string;
+  type: 'added' | 'removed' | 'changed';
+  oldValue?: string;
+  newValue?: string;
+}
+
+/** A mount as one string, in the shape a -v flag takes, so it diffs per grant. */
+const mountKey = (m: DockerMount): string => `${m.path}:${m.mode}`;
+
+function diffLists(oldList: string[] | undefined, newList: string[] | undefined, path: string, diffs: DockerPolicyDiff[]): void {
+  const oldSet = new Set(oldList ?? []);
+  const newSet = new Set(newList ?? []);
+  for (const item of newSet) {
+    if (!oldSet.has(item)) diffs.push({ path, type: 'added', newValue: item });
+  }
+  for (const item of oldSet) {
+    if (!newSet.has(item)) diffs.push({ path, type: 'removed', oldValue: item });
+  }
+}
+
+function diffScalar(oldValue: string | undefined, newValue: string | undefined, path: string, diffs: DockerPolicyDiff[]): void {
+  if (oldValue === newValue) return;
+  if (oldValue === undefined) diffs.push({ path, type: 'added', newValue });
+  else if (newValue === undefined) diffs.push({ path, type: 'removed', oldValue });
+  else diffs.push({ path, type: 'changed', oldValue, newValue });
+}
+
+/**
+ * Every grant that changed between two docker policies, one entry per image,
+ * registry or mount. With the repository as the only gate, the approval diff
+ * is the whole of the access control, so nothing under docker: collapses
+ * into a single line.
+ */
+export function diffDockerPolicy(
+  oldP: DockerPolicy | undefined,
+  newP: DockerPolicy | undefined,
+  prefix: string
+): DockerPolicyDiff[] {
+  const diffs: DockerPolicyDiff[] = [];
+  diffLists(oldP?.pull?.registries, newP?.pull?.registries, `${prefix}.pull.registries`, diffs);
+  diffLists(oldP?.run?.images, newP?.run?.images, `${prefix}.run.images`, diffs);
+  diffLists(oldP?.run?.mounts?.map(mountKey), newP?.run?.mounts?.map(mountKey), `${prefix}.run.mounts`, diffs);
+  diffScalar(oldP?.run?.network, newP?.run?.network, `${prefix}.run.network`, diffs);
+  diffScalar(oldP?.build?.context, newP?.build?.context, `${prefix}.build.context`, diffs);
+  // false grants nothing, the same as absent.
+  diffScalar(oldP?.privileged ? 'true' : undefined, newP?.privileged ? 'true' : undefined, `${prefix}.privileged`, diffs);
+  return diffs;
+}
+
+// =============================================================================
+// Serialization
+// =============================================================================
+
+const quote = (value: string): string => JSON.stringify(value);
+
+/**
+ * The docker block as .localmostrc lines under `indent`, in the shape the
+ * documentation shows. Empty when the policy grants nothing.
+ */
+export function serializeDockerPolicy(policy: DockerPolicy, indent: string): string[] {
+  if (isEmptyDockerPolicy(policy)) return [];
+  const lines: string[] = [`${indent}docker:`];
+  const i1 = `${indent}  `;
+  const i2 = `${indent}    `;
+  const i3 = `${indent}      `;
+
+  if (policy.pull) {
+    lines.push(`${i1}pull:`);
+    if (policy.pull.registries.length === 0) {
+      lines.push(`${i2}registries: []`);
+    } else {
+      lines.push(`${i2}registries:`);
+      for (const registry of policy.pull.registries) lines.push(`${i3}- ${quote(registry)}`);
+    }
+  }
+
+  if (policy.run) {
+    const { images, mounts, network } = policy.run;
+    if (!images?.length && !mounts?.length && network === undefined) {
+      lines.push(`${i1}run: {}`);
+    } else {
+      lines.push(`${i1}run:`);
+      if (images?.length) {
+        lines.push(`${i2}images:`);
+        for (const image of images) lines.push(`${i3}- ${quote(image)}`);
+      }
+      if (mounts?.length) {
+        lines.push(`${i2}mounts:`);
+        for (const mount of mounts) {
+          lines.push(`${i3}- path: ${quote(mount.path)}`);
+          lines.push(`${i3}  mode: ${mount.mode}`);
+        }
+      }
+      if (network !== undefined) lines.push(`${i2}network: ${network}`);
+    }
+  }
+
+  if (policy.build) {
+    if (policy.build.context === undefined) {
+      lines.push(`${i1}build: {}`);
+    } else {
+      lines.push(`${i1}build:`);
+      lines.push(`${i2}context: ${quote(policy.build.context)}`);
+    }
+  }
+
+  if (policy.privileged) lines.push(`${i1}privileged: true`);
+
+  return lines;
+}

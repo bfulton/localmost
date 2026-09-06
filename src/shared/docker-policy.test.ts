@@ -1,5 +1,12 @@
 import { describe, it, expect } from '@jest/globals';
-import { isEmptyDockerPolicy, validateDockerPolicy, mergeDockerPolicy, DockerPolicy } from './docker-policy';
+import {
+  isEmptyDockerPolicy,
+  validateDockerPolicy,
+  mergeDockerPolicy,
+  diffDockerPolicy,
+  serializeDockerPolicy,
+  DockerPolicy,
+} from './docker-policy';
 
 describe('docker policy', () => {
   it('treats an absent or all-empty docker policy as empty', () => {
@@ -149,5 +156,117 @@ describe('mergeDockerPolicy', () => {
     const merged = mergeDockerPolicy({ run: { images: ['postgres:16'] } }, { pull: { registries: ['docker.io'] } });
     expect(merged?.build).toBeUndefined();
     expect(Object.keys(merged!).sort()).toEqual(['pull', 'run']);
+  });
+});
+
+describe('diffDockerPolicy', () => {
+  it('reports each added docker grant so the approval diff shows it', () => {
+    const diffs = diffDockerPolicy(undefined, { run: { images: ['postgres:16'] }, pull: { registries: ['docker.io'] } }, 'shared.docker');
+    const paths = diffs.map((d) => d.path);
+    expect(paths).toContain('shared.docker.run.images');
+    expect(paths).toContain('shared.docker.pull.registries');
+    expect(diffs.every((d) => d.type === 'added')).toBe(true);
+  });
+
+  it('names the value of each list entry, one entry per line', () => {
+    const diffs = diffDockerPolicy(
+      { run: { images: ['postgres:16'] } },
+      { run: { images: ['postgres:16', 'redis:7'] }, pull: { registries: ['docker.io', 'ghcr.io'] } },
+      'shared.docker',
+    );
+    expect(diffs).toEqual(expect.arrayContaining([
+      { path: 'shared.docker.run.images', type: 'added', newValue: 'redis:7' },
+      { path: 'shared.docker.pull.registries', type: 'added', newValue: 'docker.io' },
+      { path: 'shared.docker.pull.registries', type: 'added', newValue: 'ghcr.io' },
+    ]));
+    expect(diffs).toHaveLength(3);
+  });
+
+  it('reports removed grants', () => {
+    const diffs = diffDockerPolicy({ run: { images: ['postgres:16'] }, build: { context: './' } }, undefined, 'shared.docker');
+    expect(diffs).toEqual(expect.arrayContaining([
+      { path: 'shared.docker.run.images', type: 'removed', oldValue: 'postgres:16' },
+      { path: 'shared.docker.build.context', type: 'removed', oldValue: './' },
+    ]));
+    expect(diffs).toHaveLength(2);
+  });
+
+  it('shows a mount as path:mode, so widening ro to rw reads as a removal and an addition', () => {
+    const diffs = diffDockerPolicy(
+      { run: { mounts: [{ path: './', mode: 'ro' }] } },
+      { run: { mounts: [{ path: './', mode: 'rw' }] } },
+      'workflows.integration.docker',
+    );
+    expect(diffs).toEqual(expect.arrayContaining([
+      { path: 'workflows.integration.docker.run.mounts', type: 'added', newValue: './:rw' },
+      { path: 'workflows.integration.docker.run.mounts', type: 'removed', oldValue: './:ro' },
+    ]));
+    expect(diffs).toHaveLength(2);
+  });
+
+  it('reports scalar changes to network, context and privileged', () => {
+    const diffs = diffDockerPolicy(
+      { run: { network: 'bridge' }, build: { context: './' } },
+      { run: { network: 'none' }, build: { context: './' }, privileged: true },
+      'shared.docker',
+    );
+    expect(diffs).toEqual(expect.arrayContaining([
+      { path: 'shared.docker.run.network', type: 'changed', oldValue: 'bridge', newValue: 'none' },
+      { path: 'shared.docker.privileged', type: 'added', newValue: 'true' },
+    ]));
+    expect(diffs).toHaveLength(2);
+  });
+
+  it('reports nothing when the grants are the same, however they are spelled', () => {
+    const a: DockerPolicy = { run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'ro' }] }, privileged: false };
+    const b: DockerPolicy = { run: { mounts: [{ path: './', mode: 'ro' }], images: ['postgres:16'] } };
+    expect(diffDockerPolicy(a, b, 'shared.docker')).toEqual([]);
+    expect(diffDockerPolicy(undefined, {}, 'shared.docker')).toEqual([]);
+    expect(diffDockerPolicy(undefined, undefined, 'shared.docker')).toEqual([]);
+  });
+});
+
+describe('serializeDockerPolicy', () => {
+  it('writes the block under the given indent in the documented shape', () => {
+    const lines = serializeDockerPolicy({
+      pull: { registries: ['docker.io'] },
+      run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'ro' }], network: 'bridge' },
+      build: { context: './' },
+      privileged: true,
+    }, '  ');
+    expect(lines).toEqual([
+      '  docker:',
+      '    pull:',
+      '      registries:',
+      '        - "docker.io"',
+      '    run:',
+      '      images:',
+      '        - "postgres:16"',
+      '      mounts:',
+      '        - path: "./"',
+      '          mode: ro',
+      '      network: bridge',
+      '    build:',
+      '      context: "./"',
+      '    privileged: true',
+    ]);
+  });
+
+  it('writes only the actions the policy declares', () => {
+    expect(serializeDockerPolicy({ run: { images: ['redis:7'] } }, '    ')).toEqual([
+      '    docker:',
+      '      run:',
+      '        images:',
+      '          - "redis:7"',
+    ]);
+  });
+
+  it('keeps a bare action, since run with no conditions still permits start and wait', () => {
+    expect(serializeDockerPolicy({ run: {} }, '')).toEqual(['docker:', '  run: {}']);
+  });
+
+  it('writes nothing for a policy that grants nothing', () => {
+    expect(serializeDockerPolicy({}, '  ')).toEqual([]);
+    expect(serializeDockerPolicy({ privileged: false }, '  ')).toEqual([]);
   });
 });

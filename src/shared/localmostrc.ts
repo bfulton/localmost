@@ -8,7 +8,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { SandboxPolicy, NetworkPolicy, FilesystemPolicy, EnvPolicy } from './sandbox-profile';
 import { SandboxPolicyLevel } from './types';
-import { validateDockerPolicy, mergeDockerPolicy } from './docker-policy';
+import {
+  validateDockerPolicy,
+  mergeDockerPolicy,
+  diffDockerPolicy,
+  serializeDockerPolicy,
+} from './docker-policy';
 
 // =============================================================================
 // Types
@@ -475,8 +480,8 @@ export function serializeLocalmostrc(config: LocalmostrcConfig): string {
 function serializePolicy(policy: SandboxPolicy, indent: string): string[] {
   const lines: string[] = [];
 
-  if (policy.docker !== undefined) {
-    lines.push(`${indent}docker: ${policy.docker}`);
+  if (policy.docker) {
+    lines.push(...serializeDockerPolicy(policy.docker, indent));
   }
 
   if (policy.network) {
@@ -594,21 +599,9 @@ function diffPolicies(
   diffArrays(oldPolicy.filesystem?.write, newPolicy.filesystem?.write, `${prefix}.filesystem.write`, diffs);
   diffArrays(oldPolicy.filesystem?.deny, newPolicy.filesystem?.deny, `${prefix}.filesystem.deny`, diffs);
 
-  // Docker access. Scalar, and the largest change this section can make:
-  // above `off` the job is no longer confined by the sandbox at all.
-  if (oldPolicy.docker !== newPolicy.docker) {
-    diffs.push({
-      path: `${prefix}.docker`,
-      type:
-        oldPolicy.docker === undefined
-          ? 'added'
-          : newPolicy.docker === undefined
-            ? 'removed'
-            : 'changed',
-      oldValue: oldPolicy.docker,
-      newValue: newPolicy.docker,
-    });
-  }
+  // Docker. One entry per grant: what a container may pull, run and mount is
+  // decided by this diff alone, so nothing under docker: collapses into a line.
+  diffs.push(...diffDockerPolicy(oldPolicy.docker, newPolicy.docker, `${prefix}.docker`));
 
   // Env
   diffArrays(oldPolicy.env?.allow, newPolicy.env?.allow, `${prefix}.env.allow`, diffs);
