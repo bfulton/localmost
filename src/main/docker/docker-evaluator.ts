@@ -43,6 +43,13 @@ export interface DockerVerdict {
   reason?: string;
   /** The policy that would permit it, as YAML under `docker:` (for --updaterc discovery). */
   policyHint?: string;
+  /**
+   * A create body whose mount sources are rewritten to the paths this verdict
+   * actually checked. Forwarding the spelling the client sent would let the
+   * daemon resolve it a second time, and the job can swap a symlink in the gap
+   * between the two resolutions; forwarding what was checked closes that.
+   */
+  rewrittenBody?: unknown;
 }
 
 const ALLOW: DockerVerdict = { allowed: true };
@@ -330,7 +337,12 @@ function declaredMountPermits(declared: DockerMount, root: string, resolved: str
   return declared.mode === 'rw' || mode === 'ro';
 }
 
-function checkMounts(hostConfig: Record<string, unknown>, ctx: DockerEvalContext, declared: DockerMount[]): DockerVerdict {
+function checkMounts(
+  hostConfig: Record<string, unknown>,
+  ctx: DockerEvalContext,
+  declared: DockerMount[],
+  resolutions?: Map<string, string>
+): DockerVerdict {
   const requests = collectMounts(hostConfig);
   if (typeof requests === 'string') return deny(requests);
   const realpath = ctx.realpath ?? ((p: string) => fs.realpathSync(p));
@@ -356,6 +368,7 @@ function checkMounts(hostConfig: Record<string, unknown>, ctx: DockerEvalContext
         hints.mount(relative, mode)
       );
     }
+    resolutions?.set(source, resolved);
   }
   return ALLOW;
 }
@@ -363,6 +376,43 @@ function checkMounts(hostConfig: Record<string, unknown>, ctx: DockerEvalContext
 // -----------------------------------------------------------------------------
 // Actions
 // -----------------------------------------------------------------------------
+
+/** A copy of the create body with every bind source replaced by its resolved path. */
+function pinMountSources(body: Record<string, unknown>, resolved: Map<string, string>): unknown {
+  const pinned: Record<string, unknown> = { ...body };
+  for (const hostConfigKey of Object.keys(pinned)) {
+    if (hostConfigKey.toLowerCase() !== 'hostconfig') continue;
+    const hostConfig = pinned[hostConfigKey];
+    if (!isPlainObject(hostConfig)) continue;
+    const copy: Record<string, unknown> = { ...hostConfig };
+    for (const key of Object.keys(copy)) {
+      const name = key.toLowerCase();
+      if (name === 'binds' && Array.isArray(copy[key])) {
+        copy[key] = (copy[key] as unknown[]).map((bind) => {
+          if (typeof bind !== 'string') return bind;
+          const parts = bind.split(':');
+          const target = resolved.get(parts[0]);
+          if (target === undefined) return bind;
+          return [target, ...parts.slice(1)].join(':');
+        });
+      }
+      if (name === 'mounts' && Array.isArray(copy[key])) {
+        copy[key] = (copy[key] as unknown[]).map((mount) => {
+          if (!isPlainObject(mount)) return mount;
+          const entry: Record<string, unknown> = { ...mount };
+          for (const mountKey of Object.keys(entry)) {
+            if (mountKey.toLowerCase() !== 'source') continue;
+            const source = entry[mountKey];
+            if (typeof source === 'string' && resolved.has(source)) entry[mountKey] = resolved.get(source);
+          }
+          return entry;
+        });
+      }
+    }
+    pinned[hostConfigKey] = copy;
+  }
+  return pinned;
+}
 
 function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: DockerPolicy): DockerVerdict {
   const body = req.body;
@@ -445,7 +495,13 @@ function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: Dock
     );
   }
 
-  return checkMounts(hostConfig, ctx, policy.run.mounts ?? []);
+  // Pin every mount source to the path that was actually checked, so the
+  // daemon mounts what the filter judged rather than re-resolving a name the
+  // job can point somewhere else in between.
+  const resolutions = new Map<string, string>();
+  const verdict = checkMounts(hostConfig, ctx, policy.run.mounts ?? [], resolutions);
+  if (!verdict.allowed || resolutions.size === 0) return verdict;
+  return { allowed: true, rewrittenBody: pinMountSources(body, resolutions) };
 }
 
 function evaluatePull(req: DockerRequest, policy: DockerPolicy): DockerVerdict {

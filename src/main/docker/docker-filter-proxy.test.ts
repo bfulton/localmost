@@ -665,3 +665,33 @@ describe('upgrade requests', () => {
     expect(head).not.toMatch(/101/);
   });
 });
+
+describe('mount sources are pinned before forwarding', () => {
+  it('sends the daemon the resolved path, so a swapped symlink cannot change what is mounted', async () => {
+    const dir = tmp();
+    const workspace = fs.realpathSync.native(dir);
+    const real = path.join(workspace, 'inside');
+    const link = path.join(workspace, 'link');
+    fs.mkdirSync(real);
+    fs.symlinkSync(real, link);
+
+    const daemon = await fakeDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, {
+      backend: { name: 'test', supportsPrivileged: false, resolveEndpoint: () => ({ socketPath: daemon.sock }), workspaceMountRoot: () => workspace },
+    });
+    proxy.bind('owner/repo', { run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'rw' }], network: 'bridge' } });
+
+    const reply = await request(sock, 'POST', '/v1.45/containers/create', {
+      Image: 'postgres:16',
+      HostConfig: { Binds: [`${link}:/ws`] },
+    });
+    expect(reply.status).toBe(201);
+
+    // The filter resolved `link` to decide. If it forwards the spelling it was
+    // given, the daemon resolves it again at mount time and the job can swap
+    // the symlink in between.
+    const create = daemon.seen.find((s) => s.url.includes('/containers/create'))!;
+    const binds = (JSON.parse(create.body.toString()) as { HostConfig: { Binds: string[] } }).HostConfig.Binds;
+    expect(binds[0]).toBe(`${real}:/ws`);
+  });
+});

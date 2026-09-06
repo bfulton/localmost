@@ -258,7 +258,7 @@ export class DockerFilterProxy {
   }
 
   /** Null when the request may proceed; otherwise the status and message that refuse it. */
-  private decide(req: DockerRequest): { status: number; message: string } | null {
+  private decide(req: DockerRequest): { refusal: { status: number; message: string } | null; rewrittenBody?: unknown } {
     if (req.apiVersion) {
       const version = parseApiVersion(req.apiVersion);
       if (
@@ -269,7 +269,7 @@ export class DockerFilterProxy {
           `API version ${req.apiVersion} is not supported by the localmost docker socket ` +
           `(supported: v${bareVersion(this.minApiVersion)} to v${bareVersion(this.maxApiVersion)})`;
         this.onLog({ level: 'info', message: `refused ${req.method} ${req.path}: ${message}` });
-        return { status: 400, message };
+        return { refusal: { status: 400, message } };
       }
     }
 
@@ -287,9 +287,9 @@ export class DockerFilterProxy {
         message: `denied ${req.method} ${req.path}: ${message}`,
         ...(verdict.policyHint !== undefined ? { policyHint: verdict.policyHint } : {}),
       });
-      return { status: 403, message };
+      return { refusal: { status: 403, message } };
     }
-    return null;
+    return { refusal: null, rewrittenBody: verdict.rewrittenBody };
   }
 
   /** Said once per socket: a declaration is a permission, not a requirement. */
@@ -351,13 +351,17 @@ export class DockerFilterProxy {
     res: http.ServerResponse,
     bufferedBody: Buffer | null
   ): void {
-    const refusal = this.decide(parsed);
+    const { refusal, rewrittenBody } = this.decide(parsed);
     if (refusal) {
       this.writeRefusal(res, refusal.status, refusal.message);
       if (bufferedBody === null) this.endAfterDrain(req, res);
       else res.end();
       return;
     }
+    // The verdict may pin the body it approved - mount sources resolved to the
+    // paths actually checked - so the daemon mounts what the filter judged
+    // rather than re-resolving a name the job can repoint in between.
+    const body = rewrittenBody !== undefined ? Buffer.from(JSON.stringify(rewrittenBody)) : bufferedBody;
     const endpoint = this.backend.resolveEndpoint();
     if (!endpoint) {
       this.warnNoDaemon();
@@ -366,7 +370,7 @@ export class DockerFilterProxy {
       else res.end();
       return;
     }
-    this.forward(parsed, req, res, bufferedBody, endpoint.socketPath);
+    this.forward(parsed, req, res, body, endpoint.socketPath);
   }
 
   /** The URL as forwarded: an unversioned request is pinned to the version we understand. */
@@ -597,7 +601,7 @@ export class DockerFilterProxy {
       return;
     }
 
-    const refusal = this.decide(parsed);
+    const { refusal } = this.decide(parsed);
     if (refusal) {
       this.refuseRaw(client, refusal.status, refusal.message);
       return;
