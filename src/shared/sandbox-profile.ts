@@ -8,11 +8,7 @@
 
 import * as os from 'os';
 import * as path from 'path';
-import {
-  dockerSandboxGrants,
-  type DockerAccessLevel,
-  type DockerEndpoint,
-} from './docker-access';
+import type { DockerPolicy } from './docker-policy';
 
 // =============================================================================
 // Types
@@ -38,8 +34,8 @@ export interface SandboxPolicy {
   network?: NetworkPolicy;
   filesystem?: FilesystemPolicy;
   env?: EnvPolicy;
-  /** Docker daemon access. Read from `shared:` only - see docker-access.ts. */
-  docker?: DockerAccessLevel;
+  /** Container work, checked per request by the filtering socket - see docker-policy.ts. */
+  docker?: DockerPolicy;
 }
 
 export interface SandboxProfileOptions {
@@ -49,10 +45,6 @@ export interface SandboxProfileOptions {
   proxyPort: number;
   /** Policy to enforce */
   policy?: SandboxPolicy;
-  /** Resolved Docker endpoint, or null when none was found. */
-  dockerEndpoint?: DockerEndpoint | null;
-  /** Home directory, for the ~/.docker paths a level opens. */
-  homeDir?: string;
   /** Whether to run in permissive mode (log violations but don't block) */
   permissive?: boolean;
   /** Log file for sandbox violations */
@@ -362,29 +354,11 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push(`(allow network-outbound (subpath "${escapedWorkDir}"))`);
   lines.push('');
 
-  // Docker access, from the level the policy declared. The same grants the
-  // runner profile emits, so localmost test predicts what the runner does.
-  const dockerGrants = dockerSandboxGrants(
-    policy?.docker,
-    options.dockerEndpoint ?? null,
-    options.homeDir ?? os.homedir()
-  );
-  if (dockerGrants.socketLiterals.length > 0) {
-    lines.push(';; Docker access declared by the repository policy');
-    for (const socket of dockerGrants.socketLiterals) {
-      const escaped = escapePath(socket);
-      lines.push(`(allow network-outbound (literal "${escaped}"))`);
-      lines.push(`(allow file-read* (literal "${escaped}"))`);
-      lines.push(`(allow file-write* (literal "${escaped}"))`);
-    }
-    for (const file of dockerGrants.readLiterals) {
-      lines.push(`(allow file-read* (literal "${escapePath(file)}"))`);
-    }
-    for (const dir of dockerGrants.readSubpaths) {
-      lines.push(`(allow file-read* (subpath "${escapePath(dir)}"))`);
-    }
-    lines.push('');
-  }
+  // No daemon socket is opened here. A docker policy is a set of requests the
+  // filtering socket may forward, not a level that unlocks the daemon, and
+  // handing the daemon over would let a container reach every host path the
+  // profile denies. The runner serves that socket per worker; the test-mode
+  // profile does not yet, so a job under localmost test runs without Docker.
 
   // ------------------------------------------------------------
   // PROCESS OPERATIONS

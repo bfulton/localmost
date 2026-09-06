@@ -148,3 +148,69 @@ function validateStringArray(value: unknown, path: string, push: (message: strin
     if (typeof item !== 'string') push(`${path}[${i}] must be a string`);
   });
 }
+
+// =============================================================================
+// Merging
+// =============================================================================
+
+function mergeStrings(base?: string[], override?: string[]): string[] | undefined {
+  if (!base && !override) return undefined;
+  return Array.from(new Set([...(base ?? []), ...(override ?? [])]));
+}
+
+function mergeMounts(base?: DockerMount[], override?: DockerMount[]): DockerMount[] | undefined {
+  if (!base && !override) return undefined;
+  const seen = new Set<string>();
+  const merged: DockerMount[] = [];
+  for (const mount of [...(base ?? []), ...(override ?? [])]) {
+    // An rw grant is a different grant from an ro one on the same path, so
+    // both survive; the evaluator picks the one that permits the request.
+    const key = `${mount.path}:${mount.mode}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push({ path: mount.path, mode: mount.mode });
+  }
+  return merged;
+}
+
+function mergePull(base?: DockerPullPolicy, override?: DockerPullPolicy): DockerPullPolicy | undefined {
+  if (!base && !override) return undefined;
+  return { registries: mergeStrings(base?.registries, override?.registries) ?? [] };
+}
+
+function mergeRun(base?: DockerRunPolicy, override?: DockerRunPolicy): DockerRunPolicy | undefined {
+  if (!base && !override) return undefined;
+  const run: DockerRunPolicy = {};
+  const images = mergeStrings(base?.images, override?.images);
+  if (images) run.images = images;
+  const mounts = mergeMounts(base?.mounts, override?.mounts);
+  if (mounts) run.mounts = mounts;
+  const network = override?.network ?? base?.network;
+  if (network !== undefined) run.network = network;
+  return run;
+}
+
+function mergeBuild(base?: DockerBuildPolicy, override?: DockerBuildPolicy): DockerBuildPolicy | undefined {
+  if (!base && !override) return undefined;
+  const context = override?.context ?? base?.context;
+  return context !== undefined ? { context } : {};
+}
+
+/**
+ * Compose a shared docker policy with a workflow's. Additive, like the rest
+ * of the policy: lists concatenate (deduplicated), `network` and `context`
+ * take the workflow's value when it gives one, and `privileged` is granted
+ * if either side asks for it. Undefined when neither side grants anything.
+ */
+export function mergeDockerPolicy(base?: DockerPolicy, override?: DockerPolicy): DockerPolicy | undefined {
+  if (isEmptyDockerPolicy(base) && isEmptyDockerPolicy(override)) return undefined;
+  const merged: DockerPolicy = {};
+  const pull = mergePull(base?.pull, override?.pull);
+  if (pull) merged.pull = pull;
+  const run = mergeRun(base?.run, override?.run);
+  if (run) merged.run = run;
+  const build = mergeBuild(base?.build, override?.build);
+  if (build) merged.build = build;
+  if (base?.privileged || override?.privileged) merged.privileged = true;
+  return merged;
+}

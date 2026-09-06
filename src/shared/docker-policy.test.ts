@@ -1,5 +1,5 @@
 import { describe, it, expect } from '@jest/globals';
-import { isEmptyDockerPolicy, validateDockerPolicy, DockerPolicy } from './docker-policy';
+import { isEmptyDockerPolicy, validateDockerPolicy, mergeDockerPolicy, DockerPolicy } from './docker-policy';
 
 describe('docker policy', () => {
   it('treats an absent or all-empty docker policy as empty', () => {
@@ -83,5 +83,71 @@ describe('validateDockerPolicy', () => {
   it('reports under the path it was given, so workflow scope reads the same', () => {
     const errs = collect({ exec: {} }, 'workflows.integration.docker');
     expect(errs[0]).toMatch(/^workflows\.integration\.docker/);
+  });
+});
+
+describe('mergeDockerPolicy', () => {
+  it('composes shared and workflow docker policy additively', () => {
+    const merged = mergeDockerPolicy(
+      { run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'ro' }] } },
+      { run: { mounts: [{ path: './tmp/fixtures', mode: 'rw' }] } },
+    );
+    expect(merged?.run?.images).toEqual(['postgres:16']);
+    expect(merged?.run?.mounts).toEqual([
+      { path: './', mode: 'ro' },
+      { path: './tmp/fixtures', mode: 'rw' },
+    ]);
+  });
+
+  it('dedupes repeated images, registries and mounts', () => {
+    const merged = mergeDockerPolicy(
+      { pull: { registries: ['docker.io'] }, run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'ro' }] } },
+      { pull: { registries: ['docker.io', 'ghcr.io'] }, run: { images: ['postgres:16', 'redis:7'], mounts: [{ path: './', mode: 'ro' }] } },
+    );
+    expect(merged?.pull?.registries).toEqual(['docker.io', 'ghcr.io']);
+    expect(merged?.run?.images).toEqual(['postgres:16', 'redis:7']);
+    expect(merged?.run?.mounts).toEqual([{ path: './', mode: 'ro' }]);
+  });
+
+  it('keeps an rw mount distinct from an ro mount of the same path', () => {
+    const merged = mergeDockerPolicy(
+      { run: { mounts: [{ path: './', mode: 'ro' }] } },
+      { run: { mounts: [{ path: './', mode: 'rw' }] } },
+    );
+    expect(merged?.run?.mounts).toEqual([{ path: './', mode: 'ro' }, { path: './', mode: 'rw' }]);
+  });
+
+  it('lets the workflow override network and build context, and ORs privileged', () => {
+    const merged = mergeDockerPolicy(
+      { run: { network: 'bridge' }, build: { context: './' }, privileged: false },
+      { run: { network: 'none' }, build: { context: './docker' }, privileged: true },
+    );
+    expect(merged?.run?.network).toBe('none');
+    expect(merged?.build?.context).toBe('./docker');
+    expect(merged?.privileged).toBe(true);
+  });
+
+  it('keeps the shared network and context when the workflow says nothing', () => {
+    const merged = mergeDockerPolicy(
+      { run: { network: 'bridge' }, build: { context: './' } },
+      { run: { images: ['redis:7'] } },
+    );
+    expect(merged?.run?.network).toBe('bridge');
+    expect(merged?.build?.context).toBe('./');
+    expect(merged?.privileged).toBeUndefined();
+  });
+
+  it('passes a lone side through and yields undefined when both are empty', () => {
+    const only: DockerPolicy = { run: { images: ['postgres:16'] } };
+    expect(mergeDockerPolicy(only, undefined)).toEqual(only);
+    expect(mergeDockerPolicy(undefined, only)).toEqual(only);
+    expect(mergeDockerPolicy(undefined, undefined)).toBeUndefined();
+    expect(mergeDockerPolicy({}, {})).toBeUndefined();
+  });
+
+  it('does not invent an action neither side declared', () => {
+    const merged = mergeDockerPolicy({ run: { images: ['postgres:16'] } }, { pull: { registries: ['docker.io'] } });
+    expect(merged?.build).toBeUndefined();
+    expect(Object.keys(merged!).sort()).toEqual(['pull', 'run']);
   });
 });

@@ -8,7 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { SandboxPolicy, NetworkPolicy, FilesystemPolicy, EnvPolicy } from './sandbox-profile';
 import { SandboxPolicyLevel } from './types';
-import { validateDockerPolicy } from './docker-policy';
+import { validateDockerPolicy, mergeDockerPolicy } from './docker-policy';
 
 // =============================================================================
 // Types
@@ -408,9 +408,7 @@ export function mergePolicies(base: SandboxPolicy, override: SandboxPolicy): San
     network: mergeNetworkPolicy(base.network, override.network),
     filesystem: mergeFilesystemPolicy(base.filesystem, override.filesystem),
     env: mergeEnvPolicy(base.env, override.env),
-    // Docker access is declared in shared and nowhere else: a workflow cannot
-    // raise or lower it, so the base value carries through unchanged.
-    docker: base.docker,
+    docker: mergeDockerPolicy(base.docker, override.docker),
   };
 }
 

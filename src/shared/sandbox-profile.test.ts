@@ -556,40 +556,30 @@ describe('Sandbox Profile Generator', () => {
 });
 
 describe('docker access in the test-mode profile', () => {
-  const base = {
-    workDir: '/Users/dev/project',
-    proxyPort: 8080,
-    homeDir: '/Users/dev',
-    dockerEndpoint: { socketPath: '/Users/dev/.docker/run/docker.sock' },
-  };
+  const base = { workDir: '/Users/dev/project', proxyPort: 8080 };
 
-  it('emits no docker rules without a declared level', () => {
+  it('emits no docker rules without a docker policy', () => {
     const profile = generateSandboxProfile({ ...base, policy: {} });
     expect(profile).not.toContain('docker.sock');
   });
 
-  it('allows the socket at socket level', () => {
-    const profile = generateSandboxProfile({ ...base, policy: { docker: 'socket' } });
-    expect(profile).toContain(
-      '(allow network-outbound (literal "/Users/dev/.docker/run/docker.sock"))'
-    );
-  });
-
-  it('allows config.json only at credentials level', () => {
-    const contexts = generateSandboxProfile({ ...base, policy: { docker: 'contexts' } });
-    const credentials = generateSandboxProfile({ ...base, policy: { docker: 'credentials' } });
-    expect(contexts).not.toContain('config.json');
-    expect(credentials).toContain(
-      '(allow file-read* (literal "/Users/dev/.docker/config.json"))'
-    );
-  });
-
-  it('emits nothing when no daemon socket resolved', () => {
+  it('never opens the daemon socket or ~/.docker from a docker policy', () => {
+    // A policy names requests the filtering socket may forward. It is not a
+    // level that unlocks the daemon: a job handed the daemon socket can
+    // bind-mount every host path this profile denies.
     const profile = generateSandboxProfile({
       ...base,
-      dockerEndpoint: null,
-      policy: { docker: 'credentials' },
+      policy: {
+        docker: {
+          pull: { registries: ['docker.io'] },
+          run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'rw' }] },
+          build: { context: './' },
+          privileged: true,
+        },
+      },
     });
     expect(profile).not.toContain('docker.sock');
+    expect(profile).not.toContain('config.json');
+    expect(profile).not.toMatch(/\(allow [^\n]*\.docker/);
   });
 });
