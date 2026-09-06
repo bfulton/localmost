@@ -187,6 +187,44 @@ export interface GitHubJobInfo {
   githubRef?: string;    // Branch/tag ref (e.g., refs/heads/main)
 }
 
+/** One entry of a GitHub context dict: {"t":2,"d":[{"k":"run_id","v":"123"},...]} */
+interface ContextDictEntry {
+  k: string;
+  v: string;
+}
+
+/**
+ * Pull the job's GitHub identity out of the broker job details' contextData.
+ * Pure, so the mapping from context keys to job info can be tested directly.
+ */
+export function extractGitHubJobInfo(contextData: {
+  github?: { d?: ContextDictEntry[] };
+  job?: { d?: ContextDictEntry[] };
+} | undefined): GitHubJobInfo {
+  const info: GitHubJobInfo = {};
+
+  const github = contextData?.github;
+  if (github?.d && Array.isArray(github.d)) {
+    for (const item of github.d) {
+      if (item.k === 'run_id') info.githubRunId = parseInt(item.v, 10);
+      if (item.k === 'repository') info.githubRepo = item.v;
+      if (item.k === 'actor') info.githubActor = item.v;
+      if (item.k === 'sha') info.githubSha = item.v;
+      if (item.k === 'ref') info.githubRef = item.v;
+    }
+  }
+
+  // Job ID (check_run_id) is in the job context
+  const job = contextData?.job;
+  if (job?.d && Array.isArray(job.d)) {
+    for (const item of job.d) {
+      if (item.k === 'check_run_id') info.githubJobId = parseInt(item.v, 10);
+    }
+  }
+
+  return info;
+}
+
 export interface BrokerProxyEvents {
   'status-update': (status: RunnerProxyStatus[]) => void;
   'job-received': (targetId: string, jobId: string, registeredRunnerName: string, githubInfo: GitHubJobInfo) => void;
@@ -451,12 +489,7 @@ export class BrokerProxyService extends EventEmitter {
       // Acquire job from GitHub immediately using target's credentials
       // This claims the job so GitHub won't keep sending it on subsequent polls
       // Note: GitHub uses runner_request_id (UUID) as jobMessageId, not the broker's numeric messageId
-      let githubRunId: number | undefined;
-      let githubJobId: number | undefined;
-      let githubRepo: string | undefined;
-      let githubActor: string | undefined;
-      let githubSha: string | undefined;
-      let githubRef: string | undefined;
+      let githubInfo: GitHubJobInfo = {};
       if (runServiceUrl) {
         const jobDetails = await this.acquireJobUpstream(state, instance, jobId, runServiceUrl, billingOwnerId);
         if (jobDetails) {
@@ -467,28 +500,8 @@ export class BrokerProxyService extends EventEmitter {
           // Extract run_id, job ID, actor, sha, ref from job details
           try {
             const parsed = JSON.parse(jobDetails);
-
-            // GitHub context uses a dict format: {"t":2,"d":[{"k":"run_id","v":"123"},...]}}
-            const github = parsed.contextData?.github;
-            if (github?.d && Array.isArray(github.d)) {
-              for (const item of github.d) {
-                if (item.k === 'run_id') githubRunId = parseInt(item.v, 10);
-                if (item.k === 'repository') githubRepo = item.v;
-                if (item.k === 'actor') githubActor = item.v;
-                if (item.k === 'sha') githubSha = item.v;
-                if (item.k === 'ref') githubRef = item.v;
-              }
-            }
-
-            // Job ID (check_run_id) is in the job context
-            const job = parsed.contextData?.job;
-            if (job?.d && Array.isArray(job.d)) {
-              for (const item of job.d) {
-                if (item.k === 'check_run_id') githubJobId = parseInt(item.v, 10);
-              }
-            }
-
-            log()?.info(`[BrokerProxy] Extracted: run_id=${githubRunId}, job_id=${githubJobId}, repo=${githubRepo}, actor=${githubActor}, sha=${githubSha?.slice(0, 7)}`);
+            githubInfo = extractGitHubJobInfo(parsed.contextData);
+            log()?.info(`[BrokerProxy] Extracted: run_id=${githubInfo.githubRunId}, job_id=${githubInfo.githubJobId}, repo=${githubInfo.githubRepo}, actor=${githubInfo.githubActor}, sha=${githubInfo.githubSha?.slice(0, 7)}`);
           } catch (e) {
             log()?.warn(`[BrokerProxy] Failed to parse job details for IDs: ${(e as Error).message}`);
           }
@@ -530,20 +543,13 @@ export class BrokerProxyService extends EventEmitter {
       // might present. A worker announces which job it is taking via
       // acquirejob, and that is the only binding of job to worker that does
       // not race: the queue decides which worker wins, not the spawn.
-      const jobTarget = { targetDisplayName: state.target.displayName, githubSha };
+      const jobTarget = { targetDisplayName: state.target.displayName, githubSha: githubInfo.githubSha };
       this.jobTargets.set(jobId, jobTarget);
       this.jobTargets.set(messageId, jobTarget);
 
       // Emit event to spawn worker for job messages only
       // Include IDs so we can construct the job URL and check user filter directly
-      this.emit('job-received', state.target.id, jobId, instance.runner.agentName, {
-        githubRunId,
-        githubJobId,
-        githubRepo,
-        githubActor,
-        githubSha,
-        githubRef,
-      });
+      this.emit('job-received', state.target.id, jobId, instance.runner.agentName, githubInfo);
       this.emitStatusUpdate();
     } else {
       // Non-job messages (including cancel signals) must also be forwarded to the runner
