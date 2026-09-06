@@ -24,9 +24,11 @@ permissions:
   contents: read
 
 jobs:
-  # No runner-selection job here: both legs below name their runner outright,
-  # so calling the reusable check would add a third copy of it to every PR's
-  # status list and decide nothing.
+  check:
+    uses: ./.github/workflows/check.yaml
+    with:
+      fallback: ubuntu-latest
+
   docker-linux:
     runs-on: ubuntu-latest
     steps:
