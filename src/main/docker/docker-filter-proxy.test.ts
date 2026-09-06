@@ -610,3 +610,58 @@ describe('container ownership tracking', () => {
     expect((await request(sock, 'GET', '/v1.45/containers/theirs999/json')).status).toBe(403);
   });
 });
+
+const rawUpgrade = (sock: string, method: string, url: string): Promise<{ head: string; socket: net.Socket }> =>
+  new Promise((resolve, reject) => {
+    const socket = net.connect(sock);
+    let buffered = '';
+    const onData = (data: Buffer) => {
+      buffered += data.toString();
+      const end = buffered.indexOf('\r\n\r\n');
+      if (end === -1) return;
+      socket.off('data', onData);
+      resolve({ head: buffered.slice(0, end), socket });
+    };
+    socket.on('data', onData);
+    socket.on('error', reject);
+    socket.on('connect', () => {
+      socket.write(`${method} ${url} HTTP/1.1\r\nHost: docker\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n`);
+    });
+  });
+
+describe('upgrade requests', () => {
+  it('does not turn a permitted baseline read into a raw daemon tunnel', async () => {
+    const dir = tmp();
+    const daemon = await fakeDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
+
+    // GET /_ping is in the always-on baseline, so the policy permits it. If an
+    // Upgrade header alone opens a raw pipe, the job holds an unfiltered socket
+    // to the daemon and can pipeline anything over it.
+    const { head, socket } = await rawUpgrade(sock, 'GET', '/v1.45/_ping');
+    expect(head).not.toMatch(/101/);
+
+    // Prove no tunnel: a denied request written on the same socket must not be
+    // answered by the daemon.
+    const smuggled = await new Promise<string>((resolve) => {
+      let got = '';
+      socket.on('data', (d: Buffer) => { got += d.toString(); });
+      socket.write('GET /v1.45/containers/json HTTP/1.1\r\nHost: docker\r\n\r\n');
+      setTimeout(() => resolve(got), 300);
+    });
+    socket.destroy();
+    expect(smuggled).not.toMatch(/"ok"\s*:\s*true|Names|\[\s*\{/);
+  });
+
+  it('refuses an upgrade on a container the socket does not own', async () => {
+    const dir = tmp();
+    const daemon = await fakeAttachDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
+
+    const { head, socket } = await attach(sock, '/v1.45/containers/theirs999/attach?stream=1');
+    socket.destroy();
+    expect(head).not.toMatch(/101/);
+  });
+});

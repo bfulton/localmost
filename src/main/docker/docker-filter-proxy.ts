@@ -49,6 +49,9 @@ const MAX_JSON_BODY_BYTES = 1024 * 1024;
 /** How much of an upload is drained so an early answer reaches the client, before the connection is cut. */
 const MAX_DRAIN_BYTES = 8 * MAX_JSON_BODY_BYTES;
 
+/** A response head larger than this is not an upgrade handshake. */
+const MAX_UPGRADE_HEAD_BYTES = 64 * 1024;
+
 /** Hop-by-hop headers: each leg of the relay decides these for itself. */
 const HOP_BY_HOP = ['connection', 'keep-alive', 'proxy-connection'];
 
@@ -582,6 +585,18 @@ export class DockerFilterProxy {
     const url = req.url ?? '/';
     const parsed = parseDockerRequest({ method, url, headers, body: Buffer.alloc(0) });
 
+    // Only attach is an upgrade. Without this, any request the policy permits
+    // - including a baseline /_ping - could be sent with an Upgrade header to
+    // open a raw pipe to the daemon, and everything pipelined over that pipe
+    // would bypass the filter entirely.
+    const action = classifyDockerRequest(parsed);
+    if (action !== 'attach') {
+      const message = `${parsed.method} ${parsed.path} cannot be upgraded through the localmost docker socket`;
+      this.onLog({ level: 'info', message: `denied upgrade ${parsed.method} ${parsed.path}: ${message}` });
+      this.refuseRaw(client, 400, message);
+      return;
+    }
+
     const refusal = this.decide(parsed);
     if (refusal) {
       this.refuseRaw(client, refusal.status, refusal.message);
@@ -605,8 +620,38 @@ export class DockerFilterProxy {
       }
       upstream.write(lines.join('\r\n') + '\r\n\r\n');
       if (head.length > 0) upstream.write(head);
-      upstream.pipe(client);
-      client.pipe(upstream);
+
+      // Pipe only once the daemon has actually agreed to upgrade. Piping on
+      // connect would hand the job a raw socket even when the daemon answered
+      // with an ordinary response, which is a tunnel by another name.
+      let banner = '';
+      const onUpstreamHead = (chunk: Buffer): void => {
+        banner += chunk.toString('latin1');
+        const end = banner.indexOf('\r\n\r\n');
+        if (end === -1) {
+          // A daemon that never finishes a response head is not upgrading.
+          if (banner.length > MAX_UPGRADE_HEAD_BYTES) {
+            upstream.destroy();
+            client.destroy();
+          }
+          return;
+        }
+        upstream.off('data', onUpstreamHead);
+
+        const statusLine = banner.slice(0, banner.indexOf('\r\n'));
+        if (!/^HTTP\/1\.[01] 101\b/.test(statusLine)) {
+          // Relay what the daemon said, then close. No raw pipe is established.
+          client.write(Buffer.from(banner, 'latin1'));
+          client.end();
+          upstream.destroy();
+          return;
+        }
+
+        client.write(Buffer.from(banner, 'latin1'));
+        upstream.pipe(client);
+        client.pipe(upstream);
+      };
+      upstream.on('data', onUpstreamHead);
     });
     this.connections.add(upstream);
     upstream.on('close', () => this.connections.delete(upstream));

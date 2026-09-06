@@ -55,6 +55,31 @@ const deny = (reason: string, policyHint?: string): DockerVerdict =>
 // OWN containers, which is enforced per id below.
 const BASELINE: ReadonlySet<DockerAction> = new Set(['ping', 'version', 'info']);
 
+/**
+ * Every value whose key case-insensitively equals `name`.
+ *
+ * The daemon decodes these bodies with Go's encoding/json, which matches a
+ * struct field by exact name and then, as a documented fallback, case
+ * -insensitively. Reading `hostConfig.Privileged` in JS therefore sees nothing
+ * in a body that says "privileged", while the daemon honours it - so the
+ * filter must consider every casing, not the one it expects.
+ */
+function valuesFor(obj: Record<string, unknown>, name: string): unknown[] {
+  const wanted = name.toLowerCase();
+  const out: unknown[] = [];
+  for (const [key, value] of Object.entries(obj)) {
+    if (key.toLowerCase() === wanted) out.push(value);
+  }
+  return out;
+}
+
+/** The value the daemon would use: the exact-cased key if present, else any case-insensitive match. */
+function pick(obj: Record<string, unknown>, name: string): unknown {
+  if (Object.prototype.hasOwnProperty.call(obj, name)) return obj[name];
+  const matches = valuesFor(obj, name);
+  return matches.length > 0 ? matches[0] : undefined;
+}
+
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
@@ -215,8 +240,8 @@ function parseMount(mount: unknown): MountRequest | string | null {
 
 function collectMounts(hostConfig: Record<string, unknown>): MountRequest[] | string {
   const requests: MountRequest[] = [];
-  const binds = hostConfig.Binds;
-  if (!isUnset(binds)) {
+  for (const binds of valuesFor(hostConfig, 'Binds')) {
+    if (isUnset(binds)) continue;
     if (!Array.isArray(binds)) return 'HostConfig.Binds must be an array';
     for (const bind of binds) {
       if (typeof bind !== 'string') return 'each entry of HostConfig.Binds must be a string';
@@ -225,8 +250,8 @@ function collectMounts(hostConfig: Record<string, unknown>): MountRequest[] | st
       requests.push(parsed);
     }
   }
-  const mounts = hostConfig.Mounts;
-  if (!isUnset(mounts)) {
+  for (const mounts of valuesFor(hostConfig, 'Mounts')) {
+    if (isUnset(mounts)) continue;
     if (!Array.isArray(mounts)) return 'HostConfig.Mounts must be an array';
     for (const mount of mounts) {
       const parsed = parseMount(mount);
@@ -286,12 +311,13 @@ function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: Dock
     return deny('the repository docker policy declares no run action', image ? hints.image(image) : hints.run);
   }
 
-  const hostConfig = body.HostConfig ?? {};
+  const hostConfig = pick(body, 'HostConfig') ?? {};
   if (!isPlainObject(hostConfig)) return deny('HostConfig must be an object');
 
   // Host-reaching settings first: none of these can be permitted by policy,
   // so the verdict does not depend on anything else in the request.
-  if (hostConfig.Privileged === true) {
+  const privilegedValues = valuesFor(hostConfig, 'Privileged');
+  if (privilegedValues.some((v) => v === true)) {
     if (!policy.privileged) {
       return deny(
         'privileged containers are not declared in the repository docker policy; `privileged: true` requires a managed VM backend',
@@ -301,33 +327,47 @@ function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: Dock
     if (!ctx.supportsPrivileged) {
       return deny('the repository docker policy declares privileged, which requires a managed VM backend; this daemon is not one');
     }
-  } else if (!isUnset(hostConfig.Privileged) && hostConfig.Privileged !== false) {
+  } else if (privilegedValues.some((v) => !isUnset(v) && v !== false)) {
     return deny('HostConfig.Privileged must be a boolean');
   }
   for (const gate of HOST_CONFIG_GATES) {
-    if (!gate.permitted(hostConfig[gate.key])) {
+    // Every casing must pass: one that does not is a value the daemon honours.
+    if (!valuesFor(hostConfig, gate.key).every((v) => gate.permitted(v))) {
       return deny(`${gate.flag} (HostConfig.${gate.key}) reaches the host and cannot be permitted by policy`);
     }
   }
 
   // Image.
-  if (typeof body.Image !== 'string' || body.Image === '') return deny('container create requires an Image');
-  const wanted = normalizeImage(body.Image);
-  if (!(policy.run.images ?? []).some((declared) => normalizeImage(declared) === wanted)) {
-    return deny(
-      `image "${body.Image}" is not declared in the repository docker policy (run.images)`,
-      hints.image(body.Image)
-    );
+  const imageValues = valuesFor(body, 'Image');
+  const image = pick(body, 'Image');
+  if (typeof image !== 'string' || image === '') return deny('container create requires an Image');
+  // Every casing must name a declared image: the daemon uses one of them, and
+  // which one is not worth depending on.
+  for (const candidate of imageValues) {
+    if (typeof candidate !== 'string' || candidate === '') return deny('container create requires an Image');
+    const wanted = normalizeImage(candidate);
+    if (!(policy.run.images ?? []).some((declared) => normalizeImage(declared) === wanted)) {
+      return deny(
+        `image "${candidate}" is not declared in the repository docker policy (run.images)`,
+        hints.image(candidate)
+      );
+    }
   }
 
   // Network. Absent, empty and "default" are the daemon default, bridge.
-  const rawMode = hostConfig.NetworkMode;
-  let mode: string;
-  if (isUnset(rawMode) || rawMode === '' || rawMode === 'default') mode = 'bridge';
-  else if (typeof rawMode === 'string') mode = rawMode;
-  else return deny('HostConfig.NetworkMode must be a string');
-  if (mode === 'host' || mode.startsWith('container:')) {
-    return deny(`--network=${mode} (HostConfig.NetworkMode) reaches the host and cannot be permitted by policy`);
+  const modeValues = valuesFor(hostConfig, 'NetworkMode');
+  const rawModes: unknown[] = modeValues.length > 0 ? modeValues : [undefined];
+  let mode = 'bridge';
+  for (const rawMode of rawModes) {
+    let candidate: string;
+    if (isUnset(rawMode) || rawMode === '' || rawMode === 'default') candidate = 'bridge';
+    else if (typeof rawMode === 'string') candidate = rawMode;
+    else return deny('HostConfig.NetworkMode must be a string');
+    if (candidate === 'host' || candidate.startsWith('container:')) {
+      return deny(`--network=${candidate} (HostConfig.NetworkMode) reaches the host and cannot be permitted by policy`);
+    }
+    // The most restrictive reading wins when casings disagree.
+    if (candidate !== 'bridge') mode = candidate;
   }
   if (mode !== 'none' && mode !== policy.run.network) {
     return deny(

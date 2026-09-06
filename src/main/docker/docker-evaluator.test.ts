@@ -334,3 +334,46 @@ describe('policy hints', () => {
     }
   });
 });
+
+describe('Go case-insensitive JSON decoding', () => {
+  // The daemon decodes the create body with Go's encoding/json, which matches
+  // struct fields case-insensitively as a documented fallback. So a key the
+  // filter reads as absent is honoured by the daemon: every HostConfig gate is
+  // bypassed by changing one letter.
+  const p = { run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'ro' as const }], network: 'bridge' } };
+
+  it('refuses a lowercased HostConfig carrying privileged and a root bind', () => {
+    const v = evaluateDockerRequest(
+      mk('POST', '/v1.45/containers/create', {
+        Image: 'postgres:16',
+        hostconfig: { privileged: true, binds: ['/:/host:rw'], pidmode: 'host' },
+      }),
+      ctx(p)
+    );
+    expect(v.allowed).toBe(false);
+  });
+
+  it('refuses odd casings of the gated keys inside a correctly-cased HostConfig', () => {
+    for (const hostConfig of [
+      { Privileged: true },
+      { PRIVILEGED: true },
+      { privileged: true },
+      { BINDS: ['/etc:/x'] },
+      { binds: ['/etc:/x'] },
+      { networkmode: 'host' },
+      { NETWORKMODE: 'host' },
+      { pidMode: 'host' },
+      { devices: [{ PathOnHost: '/dev/kmsg' }] },
+    ]) {
+      const v = evaluateDockerRequest(
+        mk('POST', '/v1.45/containers/create', { Image: 'postgres:16', HostConfig: hostConfig }),
+        ctx(p)
+      );
+      expect([JSON.stringify(hostConfig), v.allowed]).toEqual([JSON.stringify(hostConfig), false]);
+    }
+  });
+
+  it('still permits a correctly-cased create the policy allows', () => {
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/create', { Image: 'postgres:16' }), ctx(p)).allowed).toBe(true);
+  });
+});
