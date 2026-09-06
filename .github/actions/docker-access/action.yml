@@ -15,8 +15,9 @@ runs:
 
         if ! docker version --format 'client {{.Client.Version}} / server {{.Server.Version}}'; then
           echo "::error::No reachable Docker daemon."
-          echo "On the localmost runner this means the docker: socket grant did not"
-          echo "apply, or Docker Desktop is not running on the host."
+          echo "On the localmost runner this means the repository's docker policy was"
+          echo "not approved or not bound to the job's socket, or Docker Desktop is"
+          echo "not running on the host."
           exit 1
         fi
 
@@ -24,12 +25,12 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        # The daemon pulls this, outside the sandbox, so it does not go through
-        # the job's proxy allowlist. That is the documented cost of granting
-        # Docker: see docs/roadmap/docker-access.md.
+        # The pull and the run both go through the filtering socket localmost
+        # serves the job, which checks the registry (pull.registries) and the
+        # image (run.images) against the repository's docker policy.
         docker run --rm alpine:3 echo "container ran"
 
-    - name: Check the level boundary holds
+    - name: Check credentials never enter the sandbox
       shell: bash
       run: |
         set -euo pipefail
@@ -40,7 +41,7 @@ runs:
         fi
 
         if cat "$HOME/.docker/config.json" >/dev/null 2>&1; then
-          echo "::error::~/.docker/config.json was readable at docker: socket"
+          echo "::error::~/.docker/config.json was readable; registry credentials must never enter the sandbox"
           exit 1
         fi
-        echo "config.json is denied, as socket level requires"
+        echo "config.json is denied: credentials are attached by the filtering socket, never read by the job"
