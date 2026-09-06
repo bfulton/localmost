@@ -457,7 +457,7 @@ describe('message routing', () => {
     targets: Map<string, { target: Target; instances: Map<number, Instance> }>;
     messageQueues: Map<string, string[]>;
     pendingTargetAssignments: string[];
-    localSessions: Map<string, { targetId?: string }>;
+    localSessions: Map<string, { targetId?: string; currentJobId?: string }>;
     handleRequest(req: unknown, res: unknown): Promise<void>;
     processMessage(state: unknown, instance: unknown, body: string): Promise<void>;
   }
@@ -591,6 +591,40 @@ describe('message routing', () => {
     await internals.processMessage(state, state.instances.get(1), cancelMessage);
 
     expect(internals.messageQueues.get(target.id)).toEqual([cancelMessage]);
+  });
+
+  it('does not hand a cancellation to a worker that holds no job', async () => {
+    // With no job queued, taking the head of the queue gave a jobless worker a
+    // cancellation meant for whoever runs that job - and marked its session as
+    // holding a job it never had.
+    const target = addTargetWithRunner('target-a', 'runner-a.1');
+    internals.messageQueues.set(target.id, [cancelMessage]);
+    internals.pendingTargetAssignments.push(target.id);
+    const sessionId = await createSession();
+
+    // Nothing is deliverable, so the handler long-polls rather than answering.
+    // That is the point: the cancellation stays put. Assert the state instead
+    // of awaiting a response that correctly never comes.
+    const pending = request('GET', `/message?sessionId=${sessionId}`);
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(internals.messageQueues.get(target.id)).toEqual([cancelMessage]);
+    expect(internals.localSessions.get(sessionId)?.currentJobId).toBeUndefined();
+    void pending;
+  });
+
+  it('does hand the cancellation to the worker actually running that job', async () => {
+    const target = addTargetWithRunner('target-a', 'runner-a.1');
+    internals.messageQueues.set(target.id, [jobMessage]);
+    internals.pendingTargetAssignments.push(target.id);
+    const sessionId = await createSession();
+    await request('GET', `/message?sessionId=${sessionId}`); // takes the job
+    internals.messageQueues.set(target.id, [cancelMessage]);
+
+    const res = await request('GET', `/message?sessionId=${sessionId}`);
+
+    expect(res.body).toContain('Cancel');
+    expect(internals.messageQueues.get(target.id)).toEqual([]);
   });
 
   it('drops a JobCancellation for a job that is neither queued nor running', async () => {

@@ -1415,7 +1415,16 @@ export class BrokerProxyService extends EventEmitter {
       // The job goes first. A cancellation queued ahead of it is for a job
       // this worker doesn't hold yet; it follows on the next poll.
       const jobIndex = queue.findIndex(isJobAssignmentMessage);
-      return queue.splice(Math.max(jobIndex, 0), 1)[0];
+      if (jobIndex >= 0) return queue.splice(jobIndex, 1)[0];
+
+      // No job queued. Taking the head anyway handed a worker holding no job
+      // somebody else's cancellation - stealing it from the worker that runs
+      // that job, and marking this session as holding a job it never had. A
+      // cancellation goes only to the worker whose job it names.
+      const held = session.currentJobId;
+      if (!held) return undefined;
+      const mine = queue.findIndex(message => jobIdFromMessage(message) === held);
+      return mine >= 0 ? queue.splice(mine, 1)[0] : undefined;
     };
 
     // Helper to extract job ID from message and mark session
