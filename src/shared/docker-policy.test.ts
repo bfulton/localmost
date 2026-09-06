@@ -400,3 +400,13 @@ describe('run.networks grammar', () => {
     expect(diffs[0].newValue).toMatch(/vk-\*/);
   });
 });
+
+describe('network entries in the approval diff', () => {
+  it('says internal or routable explicitly, since both are consent-relevant', () => {
+    const diffs = diffDockerPolicy(undefined, {
+      run: { networks: [{ name: 'vk-*', internal: true }, { name: 'open', internal: false }] },
+    }, 'shared.docker');
+    const values = diffs.filter((d) => d.path.endsWith('run.networks')).map((d) => d.newValue);
+    expect(values).toEqual(expect.arrayContaining(['vk-* (internal)', 'open (routable)']));
+  });
+});

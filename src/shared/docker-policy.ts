@@ -20,7 +20,6 @@ export interface DockerMount {
   mode: MountMode;
 }
 
-/** Container create, start, attach, wait and remove. */
 /** A network the job may create: a name glob, and whether it is internal. */
 export interface DockerNetworkPolicy {
   /** Anchored glob; `*` matches any run of characters. */
@@ -33,6 +32,7 @@ export interface DockerNetworkPolicy {
   internal: boolean;
 }
 
+/** Container create, start, attach, wait, kill, stop, remove and logs. */
 export interface DockerRunPolicy {
   images?: string[];
   networks?: DockerNetworkPolicy[];
@@ -306,7 +306,9 @@ export interface DockerPolicyDiff {
 
 /** A mount as one string, in the shape a -v flag takes, so it diffs per grant. */
 const mountKey = (m: DockerMount): string => `${m.path}:${m.mode}`;
-const networkKey = (n: DockerNetworkPolicy): string => `${n.name}${n.internal ? ' (internal)' : ''}`;
+// Both states are named: a routable network is a real grant, and showing it as
+// a bare name left the approval diff silent about the part that matters.
+const networkKey = (n: DockerNetworkPolicy): string => `${n.name} (${n.internal ? 'internal' : 'routable'})`;
 
 function diffLists(oldList: string[] | undefined, newList: string[] | undefined, path: string, diffs: DockerPolicyDiff[]): void {
   const oldSet = new Set(oldList ?? []);

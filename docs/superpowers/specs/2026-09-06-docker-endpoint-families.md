@@ -59,9 +59,16 @@ does not recognise**. That is the same allowlist-of-the-grammar principle the
 original spec applies to `HostConfig`, applied to a second body.
 
 Recognised keys on `POST /networks/create`: `Name`, `Internal`, `CheckDuplicate`,
-`Labels`. `Driver` is permitted only when absent or exactly `bridge`. Everything
-else — `IPAM`, `Options`, `Attachable`, `Ingress`, `ConfigOnly`, `ConfigFrom`,
-`EnableIPv6`, `Scope` — is refused, naming the key.
+`Labels`. `Driver` is permitted only when absent or exactly `bridge`.
+
+The rest — `Scope`, `IPAM`, `Options`, `Attachable`, `Ingress`, `ConfigOnly`,
+`ConfigFrom`, `EnableIPv6` — are **gated by value rather than refused outright**,
+the same way `HostConfig` treats the keys a plain `docker run` always sends. The
+CLI sends all eight unconditionally with inert defaults, so refusing them made
+the feature reachable only from a hand-written API client. The default passes;
+anything meaningful (a subnet, a non-default IPAM driver, driver options, an
+attachable or ingress or config-only network, a config source, a scope) is
+refused, naming the key.
 
 `GET /networks/{id}` and `DELETE /networks/{id}` are scoped to networks this
 socket created, exactly as per-container endpoints are scoped to containers it

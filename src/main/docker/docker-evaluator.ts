@@ -473,7 +473,7 @@ function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: Dock
   for (const candidate of imageValues) {
     if (typeof candidate !== 'string' || candidate === '') return deny('container create requires an Image');
     const wanted = normalizeImage(candidate);
-    if (!(policy.run.images ?? []).some((declared) => normalizeImage(declared) === wanted)) {
+    if (!(policy.run.images ?? []).some((declared) => globMatches(normalizeImage(declared), wanted))) {
       return deny(
         `image "${candidate}" is not declared in the repository docker policy (run.images)`,
         hints.image(candidate)
@@ -548,8 +548,36 @@ const BUILD_PARAMS_KNOWN: ReadonlySet<string> = new Set([
   'platform', 'version', 'buildid', 'session',
 ]);
 
-/** Keys a network create may carry. Driver is permitted only as the default. */
+/** Keys a network create may carry freely: they name the network or are inert. */
 const NETWORK_CREATE_KNOWN: ReadonlySet<string> = new Set(['name', 'internal', 'checkduplicate', 'labels', 'driver']);
+
+/** Is an IPAM block the default one the CLI always sends, granting nothing? */
+const isDefaultIpam = (v: unknown): boolean => {
+  if (isUnset(v)) return true;
+  if (!isPlainObject(v)) return false;
+  const driver = pick(v, 'Driver');
+  if (!isUnset(driver) && driver !== '' && driver !== 'default') return false;
+  return isEmptyObject(pick(v, 'Options')) && isEmptyArray(pick(v, 'Config'));
+};
+
+/**
+ * Keys the docker CLI sends on every `network create` with an inert value.
+ *
+ * Refusing them outright made the feature reachable only from a hand-written
+ * API client - the CLI sends all of these unconditionally. So they are gated by
+ * value, exactly as HostConfig gates the keys a plain `docker run` always
+ * sends: the default passes, anything meaningful is refused.
+ */
+const NETWORK_CREATE_GATES: ReadonlyArray<{ key: string; permitted: (v: unknown) => boolean; why: string }> = [
+  { key: 'Scope', permitted: isEmptyString, why: 'a scope reaches beyond this daemon' },
+  { key: 'IPAM', permitted: isDefaultIpam, why: 'an IPAM driver or subnet places the network on a chosen address range' },
+  { key: 'Options', permitted: isEmptyObject, why: 'driver options can bind a bridge to a host address' },
+  { key: 'Attachable', permitted: (v) => isUnset(v) || v === false, why: 'an attachable network can be joined from outside this job' },
+  { key: 'Ingress', permitted: (v) => isUnset(v) || v === false, why: 'an ingress network is swarm routing mesh' },
+  { key: 'ConfigOnly', permitted: (v) => isUnset(v) || v === false, why: 'a config-only network is a template for others' },
+  { key: 'ConfigFrom', permitted: (v) => isUnset(v) || isEmptyObject(v), why: 'it copies configuration from another network' },
+  { key: 'EnableIPv6', permitted: (v) => isUnset(v) || v === false, why: 'IPv6 is not part of what the grammar can describe' },
+];
 
 /** An anchored glob: `*` matches any run of characters, and nothing else is special. */
 function globMatches(pattern: string, value: string): boolean {
@@ -568,36 +596,49 @@ function evaluateNetworkCreate(req: DockerRequest, policy: DockerPolicy): Docker
   const body = req.body;
   if (!isPlainObject(body)) return deny('network create requires a JSON body');
 
+  const gatedKeys = new Set(NETWORK_CREATE_GATES.map((g) => g.key.toLowerCase()));
   for (const key of Object.keys(body)) {
-    if (!NETWORK_CREATE_KNOWN.has(key.toLowerCase())) {
-      // A macvlan or ipvlan network puts the container on the physical LAN,
-      // which is worse than host networking, and Options can bind a bridge to
-      // a host address. The filter creates a plain bridge or nothing.
-      return deny(`network create parameter "${key}" is not one the localmost docker socket understands`);
+    const name = key.toLowerCase();
+    if (NETWORK_CREATE_KNOWN.has(name) || gatedKeys.has(name)) continue;
+    return deny(`network create parameter "${key}" is not one the localmost docker socket understands`);
+  }
+  for (const gate of NETWORK_CREATE_GATES) {
+    // Every casing must pass: the daemon decodes these case-insensitively.
+    if (!valuesFor(body, gate.key).every((v) => gate.permitted(v))) {
+      return deny(`network ${gate.key} is not permitted: ${gate.why}`);
     }
   }
 
-  const driver = pick(body, 'Driver');
-  if (!isUnset(driver) && driver !== '' && driver !== 'bridge') {
-    return deny(`network driver "${String(driver)}" is not permitted; the localmost docker socket creates bridge networks only`);
+  // The filter creates a plain bridge or nothing. macvlan and ipvlan put a
+  // container on the physical LAN, which is worse than host networking.
+  for (const driver of valuesFor(body, 'Driver')) {
+    if (!isUnset(driver) && driver !== '' && driver !== 'bridge') {
+      return deny(`network driver "${String(driver)}" is not permitted; the localmost docker socket creates bridge networks only`);
+    }
   }
 
-  const name = pick(body, 'Name');
-  if (typeof name !== 'string' || name === '') return deny('network create requires a Name');
-  const internal = valuesFor(body, 'Internal').some((v) => v === true);
+  const names = valuesFor(body, 'Name');
+  if (names.length === 0) return deny('network create requires a Name');
+  const internalValues = valuesFor(body, 'Internal');
+  const internal = internalValues.length > 0 && internalValues.every((v) => v === true);
 
-  const match = declared.find((n) => globMatches(n.name, name));
-  if (!match) {
-    return deny(
-      `network "${name}" is not declared in the repository docker policy (run.networks)`,
-      hints.network_declaration(name, internal)
-    );
-  }
-  if (match.internal && !internal) {
-    return deny(
-      `network "${name}" is declared internal, so it cannot be created routable`,
-      hints.network_declaration(match.name, false)
-    );
+  // Every casing must name a declared network, since which one the daemon uses
+  // is not worth depending on.
+  for (const name of names) {
+    if (typeof name !== 'string' || name === '') return deny('network create requires a Name');
+    const match = declared.find((n) => globMatches(n.name, name));
+    if (!match) {
+      return deny(
+        `network "${name}" is not declared in the repository docker policy (run.networks)`,
+        hints.network_declaration(name, internal)
+      );
+    }
+    if (match.internal && !internal) {
+      return deny(
+        `network "${name}" is declared internal, so it cannot be created routable`,
+        hints.network_declaration(match.name, false)
+      );
+    }
   }
   return ALLOW;
 }
@@ -712,7 +753,7 @@ export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext
       const ref = imageRefFrom(req);
       if (!ref) return deny(`${req.method} ${req.path} is not permitted through the localmost docker socket`);
       const wanted = normalizeImage(ref);
-      if (!(policy.run.images ?? []).some((declared) => normalizeImage(declared) === wanted)) {
+      if (!(policy.run.images ?? []).some((declared) => globMatches(normalizeImage(declared), wanted))) {
         return deny(
           `image "${ref}" is not declared in the repository docker policy (run.images)`,
           hints.image(ref)

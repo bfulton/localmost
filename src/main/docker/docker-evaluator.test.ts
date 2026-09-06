@@ -525,7 +525,7 @@ describe('networks', () => {
   });
 
   it('refuses any create key the grammar cannot spell, driver above all', () => {
-    for (const extra of [{ Driver: 'macvlan' }, { Options: { parent: 'en0' } }, { IPAM: { Config: [] } }, { Attachable: true }, { Ingress: true }, { ConfigOnly: true }]) {
+    for (const extra of [{ Driver: 'macvlan' }, { Options: { parent: 'en0' } }, { IPAM: { Config: [{ Subnet: '10.0.0.0/8' }] } }, { Attachable: true }, { Ingress: true }, { ConfigOnly: true }]) {
       const body = { Name: 'vk-run1', Internal: true, ...extra };
       expect([Object.keys(extra)[0], create(body).allowed]).toEqual([Object.keys(extra)[0], false]);
     }
@@ -580,5 +580,68 @@ describe('image inspect', () => {
   it('never lists or deletes images, which are daemon-wide', () => {
     expect(evaluateDockerRequest(mk('GET', '/v1.45/images/json'), ctx(p)).allowed).toBe(false);
     expect(evaluateDockerRequest(mk('DELETE', '/v1.45/images/alpine:3'), ctx(p)).allowed).toBe(false);
+  });
+});
+
+describe('network create as the real CLI sends it', () => {
+  const p: DockerPolicy = { run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] } };
+  // Captured off the wire from docker CLI 29.3.1. Every one of these keys is
+  // sent unconditionally, with an inert default.
+  const cliBody = (over: Record<string, unknown> = {}) => ({
+    Name: 'vk-probe-net', Driver: 'bridge', Scope: '',
+    IPAM: { Driver: 'default', Options: {}, Config: [] },
+    Internal: true, Attachable: false, Ingress: false, ConfigOnly: false,
+    ConfigFrom: null, Options: {}, Labels: {}, ...over,
+  });
+  const create = (body: unknown, c = ctx(p)) => evaluateDockerRequest(mk('POST', '/v1.45/networks/create', body), c);
+
+  it('permits what `docker network create --internal` actually sends', () => {
+    expect(create(cliBody()).allowed).toBe(true);
+  });
+
+  it('still refuses those same keys when they carry a meaningful value', () => {
+    for (const over of [
+      { Scope: 'swarm' },
+      { IPAM: { Driver: 'default', Options: {}, Config: [{ Subnet: '10.0.0.0/8' }] } },
+      { IPAM: { Driver: 'macvlan', Options: {}, Config: [] } },
+      { IPAM: { Driver: 'default', Options: { parent: 'en0' }, Config: [] } },
+      { Attachable: true }, { Ingress: true }, { ConfigOnly: true },
+      { ConfigFrom: { Network: 'other' } },
+      { Options: { 'com.docker.network.bridge.host_binding_ipv4': '0.0.0.0' } },
+      { EnableIPv6: true },
+    ]) {
+      expect([Object.keys(over)[0], create(cliBody(over)).allowed]).toEqual([Object.keys(over)[0], false]);
+    }
+  });
+
+  it('is fail-closed when casings disagree, as Go would decode them', () => {
+    // Go matches struct fields case-insensitively, so a second casing with a
+    // different value may be the one the daemon honours.
+    expect(create({ ...cliBody(), internal: false }).allowed).toBe(false);
+    expect(create({ ...cliBody(), name: 'not-declared' }).allowed).toBe(false);
+    expect(create({ ...cliBody(), driver: 'macvlan' }).allowed).toBe(false);
+  });
+});
+
+describe('image globs', () => {
+  // A content-addressed tag cannot be known when the policy is written.
+  const p: DockerPolicy = { run: { images: ['vk/grader:*', 'alpine:3'], network: 'bridge' } };
+
+  it('permits creating and inspecting an image matching a declared glob', () => {
+    const body = { Image: 'vk/grader:7f2-0123456789ab' };
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/create', body), ctx(p)).allowed).toBe(true);
+    expect(evaluateDockerRequest(mk('GET', '/v1.45/images/vk%2Fgrader%3A7f2-0123456789ab/json'), ctx(p)).allowed).toBe(true);
+  });
+
+  it('anchors the glob, so a lookalike repository does not match', () => {
+    for (const image of ['evil/vk/grader:x', 'notvk/grader:x', 'vk/grader-evil:x']) {
+      expect([image, evaluateDockerRequest(mk('POST', '/v1.45/containers/create', { Image: image }), ctx(p)).allowed])
+        .toEqual([image, false]);
+    }
+  });
+
+  it('leaves an exact declaration exact', () => {
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/create', { Image: 'alpine:3' }), ctx(p)).allowed).toBe(true);
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/create', { Image: 'alpine:4' }), ctx(p)).allowed).toBe(false);
   });
 });

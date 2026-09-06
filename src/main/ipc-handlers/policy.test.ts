@@ -40,3 +40,13 @@ describe('summarizeGrants', () => {
     expect(grants).toEqual(['network: example.com', 'write: ~/.npm']);
   });
 });
+
+describe('network grants on the approval screen', () => {
+  it('shows a declared network and whether it is routable', () => {
+    const grants = summarizeGrants({
+      shared: { docker: { run: { networks: [{ name: 'vk-*', internal: true }, { name: 'build', internal: false }] } } },
+    });
+    expect(grants.join('\n')).toMatch(/docker network create: vk-\* \(internal\)/);
+    expect(grants.join('\n')).toMatch(/docker network create: build \(routable\)/);
+  });
+});
