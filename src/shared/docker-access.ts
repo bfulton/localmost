@@ -1,28 +1,14 @@
 /**
- * Docker daemon access, declared per repository in .localmostrc.
+ * Finding the operator's Docker daemon.
  *
- * A job that can reach the daemon is not sandboxed: containers are not subject
- * to the seatbelt profile, so a bind mount reaches host paths the profile
- * denies. See docs/roadmap/docker-access.md.
+ * This runs in the app, outside the sandbox. The job never sees the endpoint
+ * found here: it talks to the filtering socket the app serves it, and the
+ * desktop backend forwards what that socket permits to the daemon resolved
+ * here. See docs/superpowers/specs/2026-09-05-docker-isolation-design.md.
  */
 
 import * as fsNode from 'fs';
 import * as os from 'os';
-
-/** How much Docker surface a repository's policy opens. Cumulative. */
-export type DockerAccessLevel = 'off' | 'socket' | 'contexts' | 'credentials';
-
-/** In increasing order of access. */
-export const DOCKER_ACCESS_LEVELS: readonly DockerAccessLevel[] = [
-  'off',
-  'socket',
-  'contexts',
-  'credentials',
-];
-
-export function isDockerAccessLevel(value: unknown): value is DockerAccessLevel {
-  return typeof value === 'string' && (DOCKER_ACCESS_LEVELS as readonly string[]).includes(value);
-}
 
 /** The daemon socket, as a resolved real path. */
 export interface DockerEndpoint {
@@ -81,52 +67,4 @@ export function resolveDockerEndpoint(options?: {
   }
 
   return null;
-}
-
-/** What a level opens in a sandbox profile. */
-export interface DockerGrants {
-  /** Socket paths to allow network-outbound, file-read* and file-write* on. */
-  socketLiterals: string[];
-  /** Single files to allow file-read* on. */
-  readLiterals: string[];
-  /** Directories to allow file-read* on. */
-  readSubpaths: string[];
-  /** Environment to inject into the job. */
-  env: Record<string, string>;
-}
-
-/** Rank a level so cumulative comparisons read as comparisons. */
-const rank = (level: DockerAccessLevel): number => DOCKER_ACCESS_LEVELS.indexOf(level);
-
-/**
- * What a declared level opens, given the resolved endpoint. Empty when the
- * level is off or absent, or when no daemon socket was found - the declaration
- * is a permission, not a requirement.
- */
-export function dockerSandboxGrants(
-  level: DockerAccessLevel | undefined,
-  endpoint: DockerEndpoint | null,
-  homeDir: string
-): DockerGrants {
-  if (!level || level === 'off' || !endpoint) {
-    return { socketLiterals: [], readLiterals: [], readSubpaths: [], env: {} };
-  }
-
-  const grants: DockerGrants = {
-    socketLiterals: [endpoint.socketPath],
-    readLiterals: [],
-    readSubpaths: [],
-    // The job never has to discover the endpoint, which is what lets the rest
-    // of ~/.docker stay closed at socket level.
-    env: { DOCKER_HOST: `unix://${endpoint.socketPath}` },
-  };
-
-  if (rank(level) >= rank('contexts')) {
-    grants.readSubpaths.push(`${homeDir}/.docker/contexts`);
-  }
-  if (rank(level) >= rank('credentials')) {
-    grants.readLiterals.push(`${homeDir}/.docker/config.json`);
-  }
-
-  return grants;
 }
