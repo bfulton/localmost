@@ -1177,68 +1177,78 @@ async function handleUpdateRc(
     return;
   }
 
+  const discovered: DiscoveredAccess = { hosts: discoveredHosts, readPaths, writePaths };
   const existingPath = findLocalmostrc(cwd);
+  let existing: LocalmostrcConfig | undefined;
   if (existingPath) {
-    // Parse existing config and merge
     const result = parseLocalmostrc(existingPath);
-    if (result.success && result.config) {
-      const existing = result.config;
-
-      // Calculate new items to add
-      const existingHosts = new Set(existing.shared?.network?.allow || []);
-      const newHosts = discoveredHosts.filter(h => !existingHosts.has(h));
-
-      const existingReadPaths = new Set(existing.shared?.filesystem?.read || []);
-      const newReadPaths = readPaths.filter(p => !existingReadPaths.has(p));
-
-      const existingWritePaths = new Set(existing.shared?.filesystem?.write || []);
-      const newWritePaths = writePaths.filter(p => !existingWritePaths.has(p));
-
-      if (newHosts.length === 0 && newReadPaths.length === 0 && newWritePaths.length === 0) {
-        console.log(`${colors.green}✓${colors.reset} ${path.relative(cwd, existingPath)} already includes all discovered access.`);
-        return;
-      }
-
-      // Merge new items into existing config
-      const updatedConfig: LocalmostrcConfig = {
-        ...existing,
-        shared: {
-          ...existing.shared,
-          network: {
-            ...existing.shared?.network,
-            allow: [...(existing.shared?.network?.allow || []), ...newHosts],
-          },
-          filesystem: (newReadPaths.length > 0 || newWritePaths.length > 0 || existing.shared?.filesystem) ? {
-            ...existing.shared?.filesystem,
-            read: newReadPaths.length > 0 ? [...(existing.shared?.filesystem?.read || []), ...newReadPaths] : existing.shared?.filesystem?.read,
-            write: newWritePaths.length > 0 ? [...(existing.shared?.filesystem?.write || []), ...newWritePaths] : existing.shared?.filesystem?.write,
-          } : undefined,
-        },
-      };
-
-      const approved = await confirmPolicyChange(
-        [
-          { label: 'network.allow', items: newHosts },
-          { label: 'filesystem.read', items: newReadPaths },
-          { label: 'filesystem.write', items: newWritePaths },
-        ],
-        assumeYes
-      );
-      if (!approved) return;
-
-      const content = serializeLocalmostrc(updatedConfig);
-      fs.writeFileSync(existingPath, content);
-      console.log(`${colors.green}✓${colors.reset} Updated ${path.relative(cwd, existingPath)}`);
-    } else {
+    if (!result.success || !result.config) {
       console.log(`${colors.yellow}Warning:${colors.reset} Could not parse existing .localmostrc: ${result.errors[0]?.message}`);
+      return;
     }
+    existing = result.config;
+  }
+
+  const { config, additions } = mergeDiscoveredAccess(existing, discovered, workflow.name);
+  if (existingPath && additions.length === 0) {
+    console.log(`${colors.green}✓${colors.reset} ${path.relative(cwd, existingPath)} already includes all discovered access.`);
+    return;
+  }
+
+  const approved = await confirmPolicyChange(
+    existingPath ? additions : [...additions, { label: 'sockets.allow', items: socketPaths }],
+    assumeYes
+  );
+  if (!approved) return;
+
+  const content = serializeLocalmostrc(config);
+  if (existingPath) {
+    fs.writeFileSync(existingPath, content);
+    console.log(`${colors.green}✓${colors.reset} Updated ${path.relative(cwd, existingPath)}`);
   } else {
-    // Create new config with discovered access
-    const newConfig: LocalmostrcConfig = {
+    fs.writeFileSync(path.join(cwd, '.localmostrc'), content);
+    console.log(`${colors.green}✓${colors.reset} Created .localmostrc`);
+  }
+}
+
+/** What a discovery run found that a policy could grant. */
+export interface DiscoveredAccess {
+  /** Hosts reached through the discovery proxy. */
+  hosts: string[];
+  /** Paths outside the workspace that were read. */
+  readPaths: string[];
+  /** Paths outside the workspace that were written. */
+  writePaths: string[];
+}
+
+/** One policy key and the values a discovery run would add under it. */
+export interface PolicyAddition {
+  label: string;
+  items: string[];
+}
+
+const nonEmpty = (additions: PolicyAddition[]): PolicyAddition[] =>
+  additions.filter((a) => a.items.length > 0);
+
+/**
+ * Merge what a discovery run found into a .localmostrc, listing each grant it
+ * adds. An existing policy keeps everything it has and gains only what it
+ * lacks; with none, a new one is started from the discovered access with an
+ * empty entry for the workflow. Empty `additions` means nothing is new.
+ */
+export function mergeDiscoveredAccess(
+  existing: LocalmostrcConfig | undefined,
+  discovered: DiscoveredAccess,
+  workflowName: string
+): { config: LocalmostrcConfig; additions: PolicyAddition[] } {
+  const { hosts, readPaths, writePaths } = discovered;
+
+  if (!existing) {
+    const config: LocalmostrcConfig = {
       version: LOCALMOSTRC_VERSION,
       shared: {
-        network: discoveredHosts.length > 0 ? {
-          allow: discoveredHosts,
+        network: hosts.length > 0 ? {
+          allow: hosts,
         } : undefined,
         filesystem: (readPaths.length > 0 || writePaths.length > 0) ? {
           read: readPaths.length > 0 ? readPaths : undefined,
@@ -1246,26 +1256,49 @@ async function handleUpdateRc(
         } : undefined,
       },
       workflows: {
-        [workflow.name]: {},
+        [workflowName]: {},
       },
     };
-
-    const approved = await confirmPolicyChange(
-      [
-        { label: 'network.allow', items: discoveredHosts },
-        { label: 'filesystem.read', items: readPaths },
-        { label: 'filesystem.write', items: writePaths },
-        { label: 'sockets.allow', items: socketPaths },
-      ],
-      assumeYes
-    );
-    if (!approved) return;
-
-    const content = serializeLocalmostrc(newConfig);
-    const rcPath = path.join(cwd, '.localmostrc');
-    fs.writeFileSync(rcPath, content);
-    console.log(`${colors.green}✓${colors.reset} Created .localmostrc`);
+    const additions = nonEmpty([
+      { label: 'network.allow', items: hosts },
+      { label: 'filesystem.read', items: readPaths },
+      { label: 'filesystem.write', items: writePaths },
+    ]);
+    return { config, additions };
   }
+
+  // Calculate new items to add
+  const existingHosts = new Set(existing.shared?.network?.allow || []);
+  const newHosts = hosts.filter(h => !existingHosts.has(h));
+
+  const existingReadPaths = new Set(existing.shared?.filesystem?.read || []);
+  const newReadPaths = readPaths.filter(p => !existingReadPaths.has(p));
+
+  const existingWritePaths = new Set(existing.shared?.filesystem?.write || []);
+  const newWritePaths = writePaths.filter(p => !existingWritePaths.has(p));
+
+  // Merge new items into existing config
+  const config: LocalmostrcConfig = {
+    ...existing,
+    shared: {
+      ...existing.shared,
+      network: {
+        ...existing.shared?.network,
+        allow: [...(existing.shared?.network?.allow || []), ...newHosts],
+      },
+      filesystem: (newReadPaths.length > 0 || newWritePaths.length > 0 || existing.shared?.filesystem) ? {
+        ...existing.shared?.filesystem,
+        read: newReadPaths.length > 0 ? [...(existing.shared?.filesystem?.read || []), ...newReadPaths] : existing.shared?.filesystem?.read,
+        write: newWritePaths.length > 0 ? [...(existing.shared?.filesystem?.write || []), ...newWritePaths] : existing.shared?.filesystem?.write,
+      } : undefined,
+    },
+  };
+  const additions = nonEmpty([
+    { label: 'network.allow', items: newHosts },
+    { label: 'filesystem.read', items: newReadPaths },
+    { label: 'filesystem.write', items: newWritePaths },
+  ]);
+  return { config, additions };
 }
 
 // =============================================================================

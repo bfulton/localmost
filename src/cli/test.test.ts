@@ -1,5 +1,6 @@
 import { describe, it, expect } from '@jest/globals';
-import { parseTestArgs, extractJobOutputs, extractWorkflowOutputs } from './test';
+import { parseTestArgs, extractJobOutputs, extractWorkflowOutputs, mergeDiscoveredAccess, DiscoveredAccess } from './test';
+import { LocalmostrcConfig, LOCALMOSTRC_VERSION } from '../shared/localmostrc';
 
 describe('CLI test command', () => {
   describe('parseTestArgs', () => {
@@ -186,5 +187,60 @@ describe('output expression resolution', () => {
     expect(extractWorkflowOutputs(workflow as never, jobOutputs as never)).toEqual({
       image: 'sha-abc123',
     });
+  });
+});
+
+describe('mergeDiscoveredAccess', () => {
+  const discovered = (partial: Partial<DiscoveredAccess>): DiscoveredAccess => ({
+    hosts: [], readPaths: [], writePaths: [], ...partial,
+  });
+
+  it('adds the hosts and paths an existing policy lacks, and lists only those', () => {
+    const existing: LocalmostrcConfig = {
+      version: 1,
+      shared: { network: { allow: ['github.com'] }, filesystem: { read: ['/usr'] } },
+      workflows: { deploy: { network: { allow: ['api.example.com'] } } },
+    };
+
+    const { config, additions } = mergeDiscoveredAccess(existing, discovered({
+      hosts: ['github.com', 'registry.npmjs.org'],
+      readPaths: ['/usr', '/opt/homebrew'],
+      writePaths: ['~/Library/Caches/pip'],
+    }), 'ci');
+
+    expect(config.shared?.network?.allow).toEqual(['github.com', 'registry.npmjs.org']);
+    expect(config.shared?.filesystem?.read).toEqual(['/usr', '/opt/homebrew']);
+    expect(config.shared?.filesystem?.write).toEqual(['~/Library/Caches/pip']);
+    expect(config.workflows).toEqual(existing.workflows);
+    expect(additions).toEqual([
+      { label: 'network.allow', items: ['registry.npmjs.org'] },
+      { label: 'filesystem.read', items: ['/opt/homebrew'] },
+      { label: 'filesystem.write', items: ['~/Library/Caches/pip'] },
+    ]);
+  });
+
+  it('has nothing to add when the existing policy already covers what was discovered', () => {
+    const existing: LocalmostrcConfig = { version: 1, shared: { network: { allow: ['github.com'] } } };
+
+    const { additions } = mergeDiscoveredAccess(existing, discovered({ hosts: ['github.com'] }), 'ci');
+
+    expect(additions).toEqual([]);
+  });
+
+  it('starts a new policy from the discovered access, with an empty entry for the workflow', () => {
+    const { config, additions } = mergeDiscoveredAccess(undefined, discovered({
+      hosts: ['github.com'],
+      writePaths: ['~/.npm'],
+    }), 'ci');
+
+    expect(config).toEqual({
+      version: LOCALMOSTRC_VERSION,
+      shared: { network: { allow: ['github.com'] }, filesystem: { write: ['~/.npm'] } },
+      workflows: { ci: {} },
+    });
+    expect(additions).toEqual([
+      { label: 'network.allow', items: ['github.com'] },
+      { label: 'filesystem.write', items: ['~/.npm'] },
+    ]);
   });
 });
