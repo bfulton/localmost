@@ -579,10 +579,20 @@ const NETWORK_CREATE_GATES: ReadonlyArray<{ key: string; permitted: (v: unknown)
   { key: 'EnableIPv6', permitted: (v) => isUnset(v) || v === false, why: 'IPv6 is not part of what the grammar can describe' },
 ];
 
-/** An anchored glob: `*` matches any run of characters, and nothing else is special. */
+/**
+ * An anchored glob. `*` matches any run of characters except `/`, and nothing
+ * else is special.
+ *
+ * Anchored so a declared name cannot be widened by a prefix: `vk-*` does not
+ * match `other-vk-abc`. Stopping at `/` for the same reason one level down - a
+ * glob that silently spans path separators reads as narrower than it is, so
+ * `vk/*` reaches one level under `vk` and no further, and each extra segment
+ * has to be asked for. A tag glob is unaffected, since a tag cannot contain a
+ * slash: `vk/grader:*` still covers a content-addressed tag.
+ */
 function globMatches(pattern: string, value: string): boolean {
   const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, (c) => (c === '*' ? '\u0000' : `\\${c}`));
-  return new RegExp(`^${escaped.split('\u0000').join('.*')}$`).test(value);
+  return new RegExp(`^${escaped.split('\u0000').join('[^/]*')}$`).test(value);
 }
 
 function evaluateNetworkCreate(req: DockerRequest, policy: DockerPolicy): DockerVerdict {

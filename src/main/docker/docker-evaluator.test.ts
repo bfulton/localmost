@@ -645,3 +645,28 @@ describe('image globs', () => {
     expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/create', { Image: 'alpine:4' }), ctx(p)).allowed).toBe(false);
   });
 });
+
+describe('what * spans in a declared glob', () => {
+  const withImages = (images: string[]) => ctx({ run: { images, network: 'bridge' } });
+  const create = (image: string, images: string[]) =>
+    evaluateDockerRequest(mk('POST', '/v1.45/containers/create', { Image: image }), withImages(images)).allowed;
+
+  it('spans a tag but not a path separator', () => {
+    // The spec left this open. Decided here: `*` stops at `/`, so a declared
+    // repository cannot be widened into deeper paths by a reference that adds
+    // segments. A tag glob - the content-addressed case - is unaffected,
+    // because a tag cannot contain a slash.
+    expect(create('vk/grader:7f2-0123456789ab', ['vk/grader:*'])).toBe(true);
+    expect(create('vk/grader:a/b', ['vk/grader:*'])).toBe(false);
+  });
+
+  it('still anchors, so a lookalike repository never matches', () => {
+    expect(create('evil/vk/grader:x', ['vk/grader:*'])).toBe(false);
+  });
+
+  it('needs a segment of its own to span one', () => {
+    // `vk/*:*` reaches one level under vk, and no further.
+    expect(create('vk/app:1', ['vk/*:*'])).toBe(true);
+    expect(create('vk/team/app:1', ['vk/*:*'])).toBe(false);
+  });
+});

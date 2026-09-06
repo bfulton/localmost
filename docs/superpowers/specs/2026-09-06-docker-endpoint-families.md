@@ -145,10 +145,15 @@ Per family, and in the same executable-escape style as the original spec:
 
 ## Open questions
 
-- Whether `name` globs should be anchored (`vk-*` matching `vk-abc` but not
-  `other-vk-abc`). Leaning yes — anchored, with `*` matching within a segment —
-  since an unanchored glob in a security grammar reads as more permissive than
-  it looks.
+- ~~Whether `name` globs should be anchored.~~ **Decided: yes, anchored, and
+  `*` stops at `/`.** A consumer measured the first implementation and found
+  that while it anchored correctly, `*` crossed path separators — `vk/grader:*`
+  matched `vk/grader:a/b` — which answered the question empirically in the
+  direction nobody wanted. Both halves now hold, for the same reason: a glob
+  that quietly spans more than it appears to reads as narrower than it is.
+  `vk/*` reaches one level under `vk` and no further; each extra segment has to
+  be asked for. Tag globs are unaffected, since a tag cannot contain a slash,
+  so `vk/grader:*` still covers a content-addressed tag.
 - Whether an owned network should be deleted automatically when the job's worker
   exits, as the socket itself is. Leaning yes, for the same reason: nothing
   should outlive the job that created it.
