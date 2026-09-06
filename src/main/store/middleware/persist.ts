@@ -12,7 +12,7 @@ import { getAppDataDir, getConfigPath } from '../../paths';
 import { bootLog } from '../../log-file';
 import { store, getState } from '../index';
 import { ConfigSlice, defaultConfigState } from '../types';
-import { AppConfig } from '../../config';
+import { AppConfig, CONFIG_VERSION, isConfigFromNewerBuild } from '../../config';
 
 // Debounce timer for persistence
 let persistTimer: NodeJS.Timeout | null = null;
@@ -20,6 +20,12 @@ const PERSIST_DEBOUNCE_MS = 500;
 
 // Track if we're currently loading to avoid save loops
 let isLoading = false;
+
+// Set when the config on disk must not be overwritten: it could not be read or
+// parsed (a truncated file left by an interrupted write, say), or it was written
+// by a newer build. While this is true we refuse to persist, so a transient bad
+// read or an older bundle can never turn into a permanent overwrite.
+let saveBlocked = false;
 
 /**
  * Keys from ConfigSlice that should be persisted to disk.
@@ -51,6 +57,7 @@ const PERSISTED_CONFIG_KEYS: (keyof ConfigSlice)[] = [
  */
 export function loadPersistedConfig(): void {
   isLoading = true;
+  saveBlocked = false;
 
   try {
     const configPath = getConfigPath();
@@ -80,6 +87,24 @@ export function loadPersistedConfig(): void {
 
     const yamlContent = fs.readFileSync(configPath, 'utf-8');
     const diskConfig = (yaml.load(yamlContent, { schema: yaml.JSON_SCHEMA }) as AppConfig) || {};
+
+    // The file exists but yielded nothing usable — almost always a truncated
+    // or corrupted write. Do NOT fall through to applying an empty config and
+    // then saving defaults over it; that is how a recoverable glitch becomes
+    // permanent data loss. Refuse to persist until a good load succeeds.
+    if (!diskConfig || Object.keys(diskConfig).length === 0) {
+      saveBlocked = true;
+      bootLog('error', `Config at ${configPath} exists but parsed to nothing; refusing to overwrite it with defaults`);
+      return;
+    }
+
+    // Written by a newer build than this one. Apply what we understand so the
+    // session still reflects the user's settings, but block saving so this
+    // (older) build cannot downgrade and lose fields it doesn't know about.
+    if (isConfigFromNewerBuild(diskConfig.configVersion)) {
+      saveBlocked = true;
+      bootLog('error', `Config at ${configPath} was written by a newer build (version ${diskConfig.configVersion} > ${CONFIG_VERSION}); refusing to overwrite it`);
+    }
 
     // Map disk config to store state
     const configUpdates: Partial<ConfigSlice> = {};
@@ -200,7 +225,10 @@ export function loadPersistedConfig(): void {
 
     bootLog('info', 'Loaded config from disk');
   } catch (e) {
-    bootLog('warn', `Failed to load config: ${(e as Error).message}`);
+    // A file we could not read is not the same as no file. Treat it like a
+    // failed parse: keep the on-disk copy, refuse to overwrite it.
+    saveBlocked = true;
+    bootLog('error', `Failed to load config, refusing to overwrite it: ${(e as Error).message}`);
   } finally {
     isLoading = false;
   }
@@ -216,13 +244,21 @@ export function savePersistedConfig(): void {
     return;
   }
 
+  // The load marked the on-disk config off-limits (unreadable, or from a newer
+  // build). Persisting now would stamp this build's view over it, making any
+  // loss permanent. Stay our hand until a good load from a compatible file resets this.
+  if (saveBlocked) {
+    bootLog('error', 'Skipping config save: the on-disk config is unreadable or from a newer build; refusing to overwrite it');
+    return;
+  }
+
   try {
     const configPath = getConfigPath();
     const configDir = getAppDataDir();
     const state = getState();
 
     // Build config object from store state
-    const configToSave: Record<string, unknown> = {};
+    const configToSave: Record<string, unknown> = { configVersion: CONFIG_VERSION };
 
     // Copy persisted keys
     for (const key of PERSISTED_CONFIG_KEYS) {
