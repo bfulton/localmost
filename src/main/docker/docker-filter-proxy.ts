@@ -86,6 +86,13 @@ export class DockerFilterProxy {
   private server: http.Server | null = null;
   private socketPath: string | null = null;
   private policy: DockerPolicy | null = null;
+  /**
+   * Containers created through this socket. The daemon is shared with the
+   * operator and with other jobs, so a per-container request is permitted only
+   * against one of these - otherwise a job could read, start or remove another
+   * job's container by naming its id.
+   */
+  private readonly ownContainerIds = new Set<string>();
   private repository: string | undefined;
   private readonly backend: DockerBackend;
   private readonly onLog: (entry: DockerFilterProxyLogEntry) => void;
@@ -267,6 +274,7 @@ export class DockerFilterProxy {
       policy: this.policy,
       workspaceRoot: this.workspaceRoot(),
       supportsPrivileged: this.backend.supportsPrivileged,
+      ownContainerIds: this.ownContainerIds,
       realpath: this.realpath,
     });
     if (!verdict.allowed) {
@@ -411,7 +419,9 @@ export class DockerFilterProxy {
             ? this.relayPing(upstreamRes, res)
             : action === 'version'
               ? this.relayVersion(upstreamRes, res)
-              : this.relay(upstreamRes, res);
+              : action === 'create'
+                ? this.relayCreate(upstreamRes, res)
+                : this.relay(upstreamRes, res);
         relayed.then(() => {
           answered = true;
           if (bufferedBody !== null) {
@@ -483,6 +493,38 @@ export class DockerFilterProxy {
   }
 
   /** The daemon's /version, with ApiVersion clamped the same way. */
+  /**
+   * Relay a container create and record the id the daemon assigned, so the
+   * verbs that follow - inspect, start, attach, wait, remove - can be scoped
+   * to containers this job actually created. The body is small and the client
+   * needs the id before it can proceed, so buffering it costs nothing.
+   */
+  private relayCreate(upstreamRes: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    return new Promise((resolve) => {
+      const chunks: Buffer[] = [];
+      upstreamRes.on('data', (c: Buffer) => chunks.push(c));
+      upstreamRes.on('end', () => {
+        const raw = Buffer.concat(chunks);
+        // Only a created container is owned; an error response names none.
+        const status = upstreamRes.statusCode ?? 502;
+        if (status >= 200 && status < 300) {
+          try {
+            const parsed = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
+            if (typeof parsed.Id === 'string' && parsed.Id.length > 0) this.ownContainerIds.add(parsed.Id);
+          } catch {
+            // An unreadable create response leaves the container unowned: the
+            // job cannot address it, which fails closed rather than open.
+          }
+        }
+        const headers = { ...this.relayedHeaders(upstreamRes), 'content-length': String(raw.length) };
+        delete headers['transfer-encoding'];
+        res.writeHead(status, headers);
+        if (raw.length > 0) res.write(raw);
+        resolve();
+      });
+    });
+  }
+
   private relayVersion(upstreamRes: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     return new Promise((resolve) => {
       const chunks: Buffer[] = [];

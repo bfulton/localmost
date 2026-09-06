@@ -389,6 +389,13 @@ describe('DockerFilterProxy forwarding', () => {
     const sock = path.join(dir, 'wait.sock');
     let releaseBody: () => void = () => {};
     const daemon = http.createServer((req, res) => {
+      // The CLI creates the container before it waits on it, and the socket
+      // only addresses containers it created, so the create is served too.
+      if (req.url?.includes('/containers/create')) {
+        res.writeHead(201, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ Id: 'abc', Warnings: [] }));
+        return;
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.flushHeaders();
       new Promise<void>((r) => { releaseBody = r; }).then(() => res.end(JSON.stringify({ StatusCode: 0 })));
@@ -396,7 +403,9 @@ describe('DockerFilterProxy forwarding', () => {
     servers.push(daemon);
     await new Promise<void>((r) => daemon.listen(sock, () => r()));
     const { proxy, sock: proxySock } = await startProxy(dir, { backend: backendWith(sock, dir) });
-    proxy.bind('owner/repo', { run: { images: ['postgres:16'] } });
+    proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
+    // Own the container first, as `docker run` does.
+    expect((await request(proxySock, 'POST', '/v1.45/containers/create', { Image: 'postgres:16' })).status).toBe(201);
 
     const headersSeen = new Promise<number>((resolve, reject) => {
       const req = http.request({ socketPath: proxySock, path: '/v1.45/containers/abc/wait?condition=next-exit', method: 'POST', agent: false }, (res) => {
@@ -463,6 +472,16 @@ const fakeAttachDaemon = (dir: string): Promise<{ sock: string; heads: string[] 
         buffered += data.toString();
         const end = buffered.indexOf('\r\n\r\n');
         if (end === -1) return;
+        // The socket only attaches to a container it created, so this fake
+        // answers the create that precedes the attach, then upgrades.
+        if (buffered.slice(0, end).includes('/containers/create')) {
+          const payload = JSON.stringify({ Id: 'abc123', Warnings: [] });
+          socket.write(
+            `HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: ${payload.length}\r\nConnection: close\r\n\r\n${payload}`
+          );
+          buffered = '';
+          return;
+        }
         heads.push(buffered.slice(0, end));
         upgraded = true;
         socket.write('HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Type: application/vnd.docker.raw-stream\r\n\r\n');
@@ -500,7 +519,9 @@ describe('DockerFilterProxy attach', () => {
     const dir = tmp();
     const daemon = await fakeAttachDaemon(dir);
     const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
-    proxy.bind('owner/repo', { run: { images: ['postgres:16'] } });
+    proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
+    // Own the container first, as `docker run` does before attaching.
+    expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'postgres:16' })).status).toBe(201);
 
     const { head, socket } = await attach(sock, '/v1.45/containers/abc123/attach?stream=1&stdin=1&stdout=1', 'X-Registry-Auth: forged\r\n');
     expect(head).toMatch(/^HTTP\/1\.1 101/);
@@ -554,5 +575,38 @@ describe('an HTTP/1.0 client of the served socket', () => {
 
     expect(received).toMatch(/^HTTP\/1\.[01] 200/);
     expect(received).toContain('OK');
+  });
+});
+
+describe('container ownership tracking', () => {
+  it('permits the run verbs on a container it created, and refuses one it did not', async () => {
+    const dir = tmp();
+    const daemon = await fakeDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
+
+    // Before any create, the socket owns nothing: the whole `docker run`
+    // sequence must be refused against an id it never handed out.
+    const foreignStart = await request(sock, 'POST', '/v1.45/containers/theirs999/start');
+    expect(foreignStart.status).toBe(403);
+
+    // The fake daemon answers create with Id 'abc123'.
+    const created = await request(sock, 'POST', '/v1.45/containers/create', { Image: 'postgres:16' });
+    expect(created.status).toBe(201);
+
+    // Now the verbs the CLI issues next must go through for that container.
+    for (const [method, url] of [
+      ['GET', '/v1.45/containers/abc123/json'],
+      ['POST', '/v1.45/containers/abc123/start'],
+      ['POST', '/v1.45/containers/abc123/wait'],
+      ['DELETE', '/v1.45/containers/abc123'],
+    ] as const) {
+      const res = await request(sock, method, url);
+      expect({ url, status: res.status }).toEqual({ url, status: expect.any(Number) });
+      expect(res.status).toBeLessThan(400);
+    }
+
+    // ...and a container belonging to someone else still does not.
+    expect((await request(sock, 'GET', '/v1.45/containers/theirs999/json')).status).toBe(403);
   });
 });

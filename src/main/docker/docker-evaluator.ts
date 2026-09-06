@@ -14,7 +14,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { DockerPolicy, DockerMount, MountMode } from '../../shared/docker-policy';
-import { DockerRequest, DockerAction, classifyDockerRequest } from './docker-request';
+import { DockerRequest, DockerAction, classifyDockerRequest, containerIdFrom } from './docker-request';
 
 export interface DockerEvalContext {
   /** The bound policy; null until the worker claims a job, which denies all. */
@@ -27,6 +27,12 @@ export interface DockerEvalContext {
   workspaceRoot: string;
   /** Whether the backend may honour `privileged`. Stage 1: false. */
   supportsPrivileged: boolean;
+  /**
+   * Ids of containers created through this socket. Per-container reads and
+   * writes are permitted only against these: the daemon is shared with the
+   * operator and with other jobs, so an unscoped id reaches outside this job.
+   */
+  ownContainerIds?: ReadonlySet<string>;
   /** Injected for tests; defaults to fs.realpathSync. Must throw when the path does not exist. */
   realpath?: (p: string) => string;
 }
@@ -44,7 +50,10 @@ const deny = (reason: string, policyHint?: string): DockerVerdict =>
   policyHint === undefined ? { allowed: false, reason } : { allowed: false, reason, policyHint };
 
 /** Permitted with no declaration: every client needs them to start, and none reach the host. */
-const BASELINE: ReadonlySet<DockerAction> = new Set(['ping', 'version', 'info', 'inspect']);
+// Reads that tell a client nothing about the host: every client needs them to
+// start. Container reads are NOT here - the baseline is reads about the job's
+// OWN containers, which is enforced per id below.
+const BASELINE: ReadonlySet<DockerAction> = new Set(['ping', 'version', 'info']);
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -60,7 +69,7 @@ const hints = {
   image: (image: string) => `docker:\n  run:\n    images:\n      - ${yamlString(image)}`,
   mount: (relative: string, mode: MountMode) =>
     `docker:\n  run:\n    mounts:\n      - path: ${yamlString(relative)}\n        mode: ${mode}`,
-  network: (mode: string) => `docker:\n  run:\n    network: ${mode}`,
+  network: (mode: string) => `docker:\n  run:\n    network: ${yamlString(mode)}`,
   registry: (registry: string) => `docker:\n  pull:\n    registries:\n      - ${registry}`,
   build: 'docker:\n  build:\n    context: "./"',
   privileged: 'docker:\n  privileged: true',
@@ -361,6 +370,24 @@ function evaluateBuild(req: DockerRequest, policy: DockerPolicy): DockerVerdict 
   return ALLOW;
 }
 
+/**
+ * Permit a per-container request only against a container this socket created.
+ * The daemon accepts a unique id prefix, so a known id whose prefix was given
+ * counts as the same container; anything else is another job's, or the
+ * operator's, and is refused.
+ */
+function evaluateOwnContainer(req: DockerRequest, ctx: DockerEvalContext): DockerVerdict {
+  const id = containerIdFrom(req);
+  if (!id) return deny(`${req.method} ${req.path} is not permitted through the localmost docker socket`);
+
+  const own = ctx.ownContainerIds;
+  if (own && (own.has(id) || [...own].some((known) => known.startsWith(id)))) return ALLOW;
+
+  return deny(
+    `container "${id}" was not created through this job's docker socket; only this job's own containers can be addressed`
+  );
+}
+
 // -----------------------------------------------------------------------------
 // Entry point
 // -----------------------------------------------------------------------------
@@ -378,13 +405,19 @@ export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext
   switch (action) {
     case 'create':
       return evaluateCreate(req, ctx, policy);
+    case 'inspect':
+      return evaluateOwnContainer(req, ctx);
+    case 'list':
+      // No policy key grants it: it would enumerate the whole daemon.
+      return deny(
+        'listing containers is not permitted through the localmost docker socket; it would enumerate containers outside this job'
+      );
     case 'start':
     case 'attach':
     case 'wait':
     case 'remove':
-      return policy.run
-        ? ALLOW
-        : deny('the repository docker policy declares no run action', hints.run);
+      if (!policy.run) return deny('the repository docker policy declares no run action', hints.run);
+      return evaluateOwnContainer(req, ctx);
     case 'pull':
       return evaluatePull(req, policy);
     case 'build':

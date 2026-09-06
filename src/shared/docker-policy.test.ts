@@ -1,4 +1,5 @@
 import { describe, it, expect } from '@jest/globals';
+import { parseLocalmostrcContent } from './localmostrc';
 import {
   isEmptyDockerPolicy,
   validateDockerPolicy,
@@ -252,7 +253,7 @@ describe('serializeDockerPolicy', () => {
       '      mounts:',
       '        - path: "./"',
       '          mode: ro',
-      '      network: bridge',
+      '      network: "bridge"',
       '    build:',
       '      context: "./"',
       '    privileged: true',
@@ -297,5 +298,19 @@ describe('parseDockerPolicyHint', () => {
     expect(parseDockerPolicyHint('docker:\n  run: {}\nnetwork: {}')).toBeUndefined(); // more than docker
     expect(parseDockerPolicyHint('docker:\n  run:\n    images: [x')).toBeUndefined(); // not YAML
     expect(parseDockerPolicyHint('')).toBeUndefined();
+  });
+});
+
+describe('serializeDockerPolicy quoting', () => {
+  it('quotes a network value so it cannot break or inject YAML', () => {
+    // `network` is user-controlled and also flows from --updaterc discovery
+    // hints, so an unquoted scalar could terminate the value and add keys.
+    const hostile = 'bridge\n    privileged: true';
+    const yaml = serializeDockerPolicy({ run: { network: hostile } }, '');
+    const reparsed = parseLocalmostrcContent(`version: 1\nshared:\n  ${yaml.join('\n  ')}\n`);
+
+    expect(reparsed.success).toBe(true);
+    expect(reparsed.config?.shared?.docker?.run?.network).toBe(hostile);
+    expect(reparsed.config?.shared?.docker?.privileged).toBeUndefined();
   });
 });

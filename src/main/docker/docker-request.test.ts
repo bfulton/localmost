@@ -72,7 +72,7 @@ describe('classifyDockerRequest', () => {
     ['GET', '/v1.45/version', 'version'],
     ['GET', '/v1.45/info', 'info'],
     ['GET', '/v1.45/containers/abc123/json', 'inspect'],
-    ['GET', '/v1.45/containers/json', 'inspect'],
+    ['GET', '/v1.45/containers/json', 'list'],
     ['POST', '/v1.45/images/create', 'pull'],
     ['POST', '/v1.45/containers/create', 'create'],
     ['POST', '/v1.45/containers/abc123/start', 'start'],

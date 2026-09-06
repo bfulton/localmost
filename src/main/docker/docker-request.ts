@@ -18,6 +18,7 @@ export type DockerAction =
   | 'version'
   | 'info'
   | 'inspect'
+  | 'list'
   | 'pull'
   | 'create'
   | 'start'
@@ -98,7 +99,9 @@ const ENDPOINTS: ReadonlyArray<{ method: string; path: RegExp; action: DockerAct
   { method: 'GET', path: /^\/version$/, action: 'version' },
   { method: 'GET', path: /^\/info$/, action: 'info' },
   { method: 'GET', path: new RegExp(`^/containers/${ID}/json$`), action: 'inspect' },
-  { method: 'GET', path: /^\/containers\/json$/, action: 'inspect' },
+  // Listing is its own action, never the baseline: it enumerates every
+  // container on the daemon, including other jobs'.
+  { method: 'GET', path: /^\/containers\/json$/, action: 'list' },
   { method: 'POST', path: /^\/images\/create$/, action: 'pull' },
   { method: 'POST', path: /^\/containers\/create$/, action: 'create' },
   { method: 'POST', path: new RegExp(`^/containers/${ID}/start$`), action: 'start' },
@@ -107,6 +110,28 @@ const ENDPOINTS: ReadonlyArray<{ method: string; path: RegExp; action: DockerAct
   { method: 'DELETE', path: new RegExp(`^/containers/${ID}$`), action: 'remove' },
   { method: 'POST', path: /^\/build$/, action: 'build' },
 ];
+
+/** Per-container endpoints, for scoping an action to the containers this socket created. */
+const CONTAINER_ID_PATHS: ReadonlyArray<RegExp> = [
+  new RegExp(`^/containers/(${ID})/json$`),
+  new RegExp(`^/containers/(${ID})/start$`),
+  new RegExp(`^/containers/(${ID})/attach$`),
+  new RegExp(`^/containers/(${ID})/wait$`),
+  new RegExp(`^/containers/(${ID})$`),
+];
+
+/**
+ * The container a request addresses, or undefined when it addresses none.
+ * The daemon accepts a unique id prefix as well as the full id, so a caller
+ * comparing against known ids must account for prefixes.
+ */
+export function containerIdFrom(req: DockerRequest): string | undefined {
+  for (const pattern of CONTAINER_ID_PATHS) {
+    const match = pattern.exec(req.path);
+    if (match) return match[1];
+  }
+  return undefined;
+}
 
 export function classifyDockerRequest(req: DockerRequest): DockerAction {
   for (const endpoint of ENDPOINTS) {

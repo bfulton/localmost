@@ -14,9 +14,13 @@ const mk = (method: string, url: string, body?: unknown) => parseDockerRequest({
   method, url, headers: body ? { 'content-type': 'application/json' } : {},
   body: body ? Buffer.from(JSON.stringify(body)) : Buffer.alloc(0),
 });
-const ctx = (policy: DockerPolicy | null, extra: Partial<DockerEvalContext> = {}): DockerEvalContext => ({
-  policy, workspaceRoot: '/ws', supportsPrivileged: false, realpath: (p: string) => p, ...extra,
-});
+const ctx = (
+  policy: DockerPolicy | null,
+  extraOrIds: Partial<DockerEvalContext> | string[] = {}
+): DockerEvalContext => {
+  const extra = Array.isArray(extraOrIds) ? { ownContainerIds: new Set(extraOrIds) } : extraOrIds;
+  return { policy, workspaceRoot: '/ws', supportsPrivileged: false, realpath: (p: string) => p, ...extra };
+};
 
 describe('evaluateDockerRequest', () => {
   it('permits the always-on baseline with no declaration', () => {
@@ -25,10 +29,36 @@ describe('evaluateDockerRequest', () => {
     }
   });
 
-  it('permits reads about containers as part of the baseline, even before a policy is bound', () => {
-    expect(evaluateDockerRequest(mk('GET', '/v1.45/containers/json'), ctx(null)).allowed).toBe(true);
-    expect(evaluateDockerRequest(mk('GET', '/v1.45/containers/abc/json'), ctx(null)).allowed).toBe(true);
+  it('permits only the always-on baseline before a policy is bound', () => {
     expect(evaluateDockerRequest(mk('GET', '/v1.45/_ping'), ctx(null)).allowed).toBe(true);
+    // Not a container read: the baseline is reads about the job's OWN
+    // containers, and before a policy is bound the job owns none.
+    expect(evaluateDockerRequest(mk('GET', '/v1.45/containers/json'), ctx(null)).allowed).toBe(false);
+    expect(evaluateDockerRequest(mk('GET', '/v1.45/containers/abc/json'), ctx(null)).allowed).toBe(false);
+  });
+
+  it('never lists the host\'s containers, whatever the policy declares', () => {
+    // `docker ps` would otherwise enumerate every container on the machine,
+    // including other jobs' - a host metadata leak no policy key can grant.
+    const bound = ctx({ run: { images: ['postgres:16'] } });
+    expect(evaluateDockerRequest(mk('GET', '/v1.45/containers/json'), bound).allowed).toBe(false);
+  });
+
+  it('scopes container reads and writes to containers created through this socket', () => {
+    const own = ctx({ run: { images: ['postgres:16'] } }, ['mine123']);
+    const reqs: Array<[string, string]> = [
+      ['GET', '/v1.45/containers/%s/json'],
+      ['POST', '/v1.45/containers/%s/start'],
+      ['POST', '/v1.45/containers/%s/attach'],
+      ['POST', '/v1.45/containers/%s/wait'],
+      ['DELETE', '/v1.45/containers/%s'],
+    ];
+    for (const [method, tpl] of reqs) {
+      expect(evaluateDockerRequest(mk(method, tpl.replace('%s', 'mine123')), own).allowed).toBe(true);
+      // Another job's container on the same daemon: reading it leaks, and
+      // starting or removing it reaches outside this job entirely.
+      expect(evaluateDockerRequest(mk(method, tpl.replace('%s', 'theirs999')), own).allowed).toBe(false);
+    }
   });
 
   it('denies everything when no policy is bound', () => {
@@ -171,7 +201,7 @@ describe('the SECURITY.md escapes', () => {
     const undeclared = ctx({ run: { images: ['postgres:16'] } });
     const v = create({ Image: 'postgres:16' }, undeclared);
     expect(v.allowed).toBe(false);
-    expect(v.policyHint).toMatch(/network: bridge/);
+    expect(v.policyHint).toMatch(/network: "bridge"/);
     const hostDeclared = ctx({ run: { images: ['postgres:16'], network: 'host' } });
     expect(create({ Image: 'postgres:16', HostConfig: { NetworkMode: 'host' } }, hostDeclared).allowed).toBe(false);
   });
@@ -255,7 +285,9 @@ describe('the SECURITY.md escapes', () => {
 
 describe('verb-to-endpoint mapping', () => {
   it('maps each run sub-verb to the run policy', () => {
-    const p = ctx({ run: { images: ['postgres:16'] } });
+    // Owned: this test is about the verb-to-policy mapping, not about
+    // ownership, which is asserted separately.
+    const p = ctx({ run: { images: ['postgres:16'] } }, ['abc']);
     for (const [m, u] of [['POST', '/v1.45/containers/abc/start'], ['POST', '/v1.45/containers/abc/attach?stream=1'], ['POST', '/v1.45/containers/abc/wait'], ['DELETE', '/v1.45/containers/abc?v=1']] as const) {
       expect(evaluateDockerRequest(mk(m, u), p).allowed).toBe(true);
     }
@@ -291,11 +323,13 @@ describe('policy hints', () => {
       { req: mk('POST', '/v1.45/containers/abc/start'), policy: { pull: { registries: ['docker.io'] } } },
     ];
     for (const { req, policy } of cases) {
-      const denied = evaluateDockerRequest(req, ctx(policy));
+      // Owned throughout: a hint names the POLICY that would permit a request,
+      // and ownership is a separate gate no policy key can grant.
+      const denied = evaluateDockerRequest(req, ctx(policy, ['abc']));
       expect([req.raw.url, denied.allowed]).toEqual([req.raw.url, false]);
       const hinted = parseDockerPolicyHint(denied.policyHint ?? '');
       expect([req.raw.url, hinted]).not.toEqual([req.raw.url, undefined]);
-      const permitted = evaluateDockerRequest(req, ctx(mergeDockerPolicy(policy, hinted) ?? {}));
+      const permitted = evaluateDockerRequest(req, ctx(mergeDockerPolicy(policy, hinted) ?? {}, ['abc']));
       expect([req.raw.url, permitted.allowed]).toEqual([req.raw.url, true]);
     }
   });

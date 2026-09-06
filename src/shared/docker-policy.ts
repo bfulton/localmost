@@ -320,7 +320,7 @@ export function serializeDockerPolicy(policy: DockerPolicy, indent: string): str
           lines.push(`${i3}  mode: ${mount.mode}`);
         }
       }
-      if (network !== undefined) lines.push(`${i2}network: ${network}`);
+      if (network !== undefined) lines.push(`${i2}network: ${quote(network)}`);
     }
   }
 
