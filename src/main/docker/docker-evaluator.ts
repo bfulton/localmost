@@ -575,17 +575,18 @@ function evaluateBuild(req: DockerRequest, policy: DockerPolicy): DockerVerdict 
 }
 
 /**
- * Permit a per-container request only against a container this socket created.
- * The daemon accepts a unique id prefix, so a known id whose prefix was given
- * counts as the same container; anything else is another job's, or the
- * operator's, and is refused.
+ * Permit a per-container request only against a container this socket created,
+ * addressed by the id the daemon assigned or the name the job asked for.
+ * Anything else is another job's container, or the operator's, and is refused.
  */
 function evaluateOwnContainer(req: DockerRequest, ctx: DockerEvalContext): DockerVerdict {
   const id = containerIdFrom(req);
   if (!id) return deny(`${req.method} ${req.path} is not permitted through the localmost docker socket`);
 
-  const own = ctx.ownContainerIds;
-  if (own && (own.has(id) || [...own].some((known) => known.startsWith(id)))) return ALLOW;
+  // Exact match only. A bare prefix used to count, on the reasoning that the
+  // daemon accepts one - but a prefix of a container this job has since
+  // removed can resolve on the shared daemon to somebody else's.
+  if (ctx.ownContainerIds?.has(id)) return ALLOW;
 
   return deny(
     `container "${id}" was not created through this job's docker socket; only this job's own containers can be addressed`

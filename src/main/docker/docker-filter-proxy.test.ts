@@ -726,3 +726,40 @@ describe('a request target the filter cannot read', () => {
     expect(proxy.isRunning()).toBe(true);
   });
 });
+
+describe('which containers a job may address', () => {
+  const setup = async () => {
+    const dir = tmp();
+    const daemon = await fakeDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
+    return { sock, daemon };
+  };
+
+  it('lets a job address the container it created by --name', async () => {
+    const { sock } = await setup();
+    // docker run --name mine ... -> POST /containers/create?name=mine, and
+    // every later call addresses it as "mine", never as the id.
+    expect((await request(sock, 'POST', '/v1.45/containers/create?name=mine', { Image: 'postgres:16' })).status).toBe(201);
+    expect((await request(sock, 'POST', '/v1.45/containers/mine/start')).status).toBeLessThan(400);
+    expect((await request(sock, 'GET', '/v1.45/containers/mine/json')).status).toBeLessThan(400);
+  });
+
+  it('forgets a container once it is removed, so its name cannot be reused', async () => {
+    const { sock } = await setup();
+    await request(sock, 'POST', '/v1.45/containers/create?name=mine', { Image: 'postgres:16' });
+    expect((await request(sock, 'DELETE', '/v1.45/containers/mine')).status).toBeLessThan(400);
+    // The container is gone; the daemon may hand that name to anyone next.
+    expect((await request(sock, 'GET', '/v1.45/containers/mine/json')).status).toBe(403);
+    expect((await request(sock, 'GET', '/v1.45/containers/abc123/json')).status).toBe(403);
+  });
+
+  it('does not accept a bare prefix of an owned id', async () => {
+    const { sock } = await setup();
+    // The fake daemon answers create with Id abc123. A prefix could resolve on
+    // the real daemon to a container this job never created.
+    expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'postgres:16' })).status).toBe(201);
+    expect((await request(sock, 'GET', '/v1.45/containers/abc123/json')).status).toBeLessThan(400);
+    expect((await request(sock, 'GET', '/v1.45/containers/ab/json')).status).toBe(403);
+  });
+});

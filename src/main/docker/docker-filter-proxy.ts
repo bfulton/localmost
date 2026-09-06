@@ -17,7 +17,7 @@ import * as net from 'net';
 import * as path from 'path';
 import { DockerPolicy } from '../../shared/docker-policy';
 import { DockerBackend } from './docker-backend';
-import { DockerRequest, classifyDockerRequest, parseDockerRequest } from './docker-request';
+import { DockerRequest, classifyDockerRequest, containerIdFrom, parseDockerRequest } from './docker-request';
 import { evaluateDockerRequest, registryOf } from './docker-evaluator';
 
 export interface DockerFilterProxyLogEntry {
@@ -96,6 +96,8 @@ export class DockerFilterProxy {
    * job's container by naming its id.
    */
   private readonly ownContainerIds = new Set<string>();
+  /** Each identifier this socket may address, mapped to the container it names. */
+  private readonly ownContainerAliases = new Map<string, string>();
   private repository: string | undefined;
   private readonly backend: DockerBackend;
   private readonly onLog: (entry: DockerFilterProxyLogEntry) => void;
@@ -124,6 +126,23 @@ export class DockerFilterProxy {
     }
     this.attachRegistryAuth = options.attachRegistryAuth;
     this.realpath = options.realpath ?? ((p) => fs.realpathSync(p));
+  }
+
+  /** Record an identifier the job may use for a container it created. */
+  private own(alias: string, containerId: string): void {
+    this.ownContainerAliases.set(alias, containerId);
+    this.ownContainerIds.add(alias);
+  }
+
+  /** Forget every identifier for a container the job has removed. */
+  private disown(alias: string): void {
+    const containerId = this.ownContainerAliases.get(alias);
+    if (containerId === undefined) return;
+    for (const [known, owner] of [...this.ownContainerAliases]) {
+      if (owner !== containerId) continue;
+      this.ownContainerAliases.delete(known);
+      this.ownContainerIds.delete(known);
+    }
   }
 
   /**
@@ -428,13 +447,20 @@ export class DockerFilterProxy {
       { socketPath, path: this.forwardedUrl(parsed), method: parsed.method, headers, agent: this.upstreamAgent },
       (upstreamRes) => {
         upstreamRes.on('error', () => res.destroy());
+        // A container the daemon actually removed is no longer this job's to
+        // address; its name in particular may be handed to anyone next.
+        const removedStatus = upstreamRes.statusCode ?? 502;
+        if (action === 'remove' && removedStatus >= 200 && removedStatus < 300) {
+          const addressed = containerIdFrom(parsed);
+          if (addressed) this.disown(addressed);
+        }
         const relayed =
           action === 'ping'
             ? this.relayPing(upstreamRes, res)
             : action === 'version'
               ? this.relayVersion(upstreamRes, res)
               : action === 'create'
-                ? this.relayCreate(upstreamRes, res)
+                ? this.relayCreate(upstreamRes, res, parsed)
                 : this.relay(upstreamRes, res);
         relayed.then(() => {
           answered = true;
@@ -513,7 +539,7 @@ export class DockerFilterProxy {
    * to containers this job actually created. The body is small and the client
    * needs the id before it can proceed, so buffering it costs nothing.
    */
-  private relayCreate(upstreamRes: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  private relayCreate(upstreamRes: http.IncomingMessage, res: http.ServerResponse, requested: DockerRequest): Promise<void> {
     return new Promise((resolve) => {
       const chunks: Buffer[] = [];
       upstreamRes.on('data', (c: Buffer) => chunks.push(c));
@@ -524,7 +550,14 @@ export class DockerFilterProxy {
         if (status >= 200 && status < 300) {
           try {
             const parsed = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
-            if (typeof parsed.Id === 'string' && parsed.Id.length > 0) this.ownContainerIds.add(parsed.Id);
+            if (typeof parsed.Id === 'string' && parsed.Id.length > 0) {
+              // A job addresses its container by whichever identifier it
+              // knows: the id the daemon just assigned, or the --name it
+              // asked for, which is the only one it ever sees when it uses one.
+              this.own(parsed.Id, parsed.Id);
+              const name = requested.query.name;
+              if (name) this.own(name, parsed.Id);
+            }
           } catch {
             // An unreadable create response leaves the container unowned: the
             // job cannot address it, which fails closed rather than open.
