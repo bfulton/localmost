@@ -363,3 +363,40 @@ describe('privileged at validation time', () => {
     expect(collect({ privileged: false })).toEqual([]);
   });
 });
+
+describe('run.networks grammar', () => {
+  const collect = (value: unknown, path = 'shared.docker') => {
+    const errs: string[] = [];
+    validateDockerPolicy(value, path, (m) => errs.push(m));
+    return errs;
+  };
+
+  it('accepts a declared network by name glob and internal flag', () => {
+    expect(collect({ run: { networks: [{ name: 'vk-*', internal: true }] } })).toEqual([]);
+    expect(collect({ run: { networks: [{ name: 'build', internal: false }] } })).toEqual([]);
+  });
+
+  it('requires internal to be stated, so a routable network is never the default', () => {
+    expect(collect({ run: { networks: [{ name: 'vk-*' }] } }).join('\n')).toMatch(/internal/i);
+  });
+
+  it('refuses a network key the grammar cannot spell, driver above all', () => {
+    for (const entry of [{ name: 'x', internal: true, driver: 'macvlan' }, { name: 'x', internal: true, options: {} }, { name: 'x', internal: true, ipam: {} }]) {
+      expect([Object.keys(entry).join(','), collect({ run: { networks: [entry] } }).length > 0]).toEqual([Object.keys(entry).join(','), true]);
+    }
+  });
+
+  it('composes shared and workflow networks additively', () => {
+    const merged = mergeDockerPolicy(
+      { run: { networks: [{ name: 'vk-*', internal: true }] } },
+      { run: { networks: [{ name: 'build', internal: false }] } }
+    );
+    expect(merged?.run?.networks).toEqual([{ name: 'vk-*', internal: true }, { name: 'build', internal: false }]);
+  });
+
+  it('shows a declared network in the approval diff', () => {
+    const diffs = diffDockerPolicy(undefined, { run: { networks: [{ name: 'vk-*', internal: true }] } }, 'shared.docker');
+    expect(diffs.map((d) => d.path)).toContain('shared.docker.run.networks');
+    expect(diffs[0].newValue).toMatch(/vk-\*/);
+  });
+});

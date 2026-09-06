@@ -763,3 +763,53 @@ describe('which containers a job may address', () => {
     expect((await request(sock, 'GET', '/v1.45/containers/ab/json')).status).toBe(403);
   });
 });
+
+describe('networks a job creates', () => {
+  it('may be read, joined and deleted, and are forgotten once removed', async () => {
+    const dir = tmp();
+    const daemon = await networkDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', {
+      run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] },
+    });
+
+    expect((await request(sock, 'POST', '/v1.45/networks/create', { Name: 'vk-1', Internal: true })).status).toBe(201);
+
+    // Both the id the daemon assigned and the name the job asked for.
+    expect((await request(sock, 'GET', '/v1.45/networks/net123')).status).toBeLessThan(400);
+    expect((await request(sock, 'GET', '/v1.45/networks/vk-1')).status).toBeLessThan(400);
+    // A container may join it.
+    expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3', HostConfig: { NetworkMode: 'vk-1' } })).status).toBe(201);
+    // Someone else's network is still refused.
+    expect((await request(sock, 'GET', '/v1.45/networks/theirs')).status).toBe(403);
+
+    expect((await request(sock, 'DELETE', '/v1.45/networks/vk-1')).status).toBeLessThan(400);
+    expect((await request(sock, 'GET', '/v1.45/networks/vk-1')).status).toBe(403);
+    expect((await request(sock, 'GET', '/v1.45/networks/net123')).status).toBe(403);
+  });
+});
+
+/** A fake daemon that also answers network create. */
+const networkDaemon = (dir: string): Promise<{ sock: string }> =>
+  new Promise((resolve) => {
+    const sock = path.join(dir, 'netd.sock');
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
+      req.on('end', () => {
+        const p = req.url!.replace(/^\/v\d+\.\d+/, '').split('?')[0];
+        if (p === '/networks/create') {
+          res.writeHead(201, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ Id: 'net123', Warning: '' }));
+        } else if (p === '/containers/create') {
+          res.writeHead(201, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ Id: 'abc123', Warnings: [] }));
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        }
+      });
+    });
+    servers.push(server);
+    server.listen(sock, () => resolve({ sock }));
+  });

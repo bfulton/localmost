@@ -17,7 +17,7 @@ import * as net from 'net';
 import * as path from 'path';
 import { DockerPolicy } from '../../shared/docker-policy';
 import { DockerBackend } from './docker-backend';
-import { DockerRequest, classifyDockerRequest, containerIdFrom, parseDockerRequest } from './docker-request';
+import { DockerRequest, classifyDockerRequest, containerIdFrom, networkIdFrom, parseDockerRequest } from './docker-request';
 import { evaluateDockerRequest, registryOf } from './docker-evaluator';
 
 export interface DockerFilterProxyLogEntry {
@@ -82,6 +82,9 @@ function flattenHeaders(headers: http.IncomingHttpHeaders): Record<string, strin
   return out;
 }
 
+const isPlainRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
+
 const isJsonContentType = (contentType: string | undefined): boolean =>
   contentType !== undefined && contentType.split(';')[0].trim().toLowerCase() === 'application/json';
 
@@ -98,6 +101,9 @@ export class DockerFilterProxy {
   private readonly ownContainerIds = new Set<string>();
   /** Each identifier this socket may address, mapped to the container it names. */
   private readonly ownContainerAliases = new Map<string, string>();
+  /** Networks created through this socket, by id and by the name the job asked for. */
+  private readonly ownNetworkIds = new Set<string>();
+  private readonly ownNetworkAliases = new Map<string, string>();
   private repository: string | undefined;
   private readonly backend: DockerBackend;
   private readonly onLog: (entry: DockerFilterProxyLogEntry) => void;
@@ -132,6 +138,23 @@ export class DockerFilterProxy {
   private own(alias: string, containerId: string): void {
     this.ownContainerAliases.set(alias, containerId);
     this.ownContainerIds.add(alias);
+  }
+
+  /** Record an identifier for a network the job created. */
+  private ownNetwork(alias: string, networkId: string): void {
+    this.ownNetworkAliases.set(alias, networkId);
+    this.ownNetworkIds.add(alias);
+  }
+
+  /** Forget every identifier for a network the job has removed. */
+  private disownNetwork(alias: string): void {
+    const networkId = this.ownNetworkAliases.get(alias);
+    if (networkId === undefined) return;
+    for (const [known, owner] of [...this.ownNetworkAliases]) {
+      if (owner !== networkId) continue;
+      this.ownNetworkAliases.delete(known);
+      this.ownNetworkIds.delete(known);
+    }
   }
 
   /** Forget every identifier for a container the job has removed. */
@@ -304,6 +327,7 @@ export class DockerFilterProxy {
       workspaceRoot: this.workspaceRoot(),
       supportsPrivileged: this.backend.supportsPrivileged,
       ownContainerIds: this.ownContainerIds,
+      ownNetworkIds: this.ownNetworkIds,
       realpath: this.realpath,
     });
     if (!verdict.allowed) {
@@ -454,6 +478,10 @@ export class DockerFilterProxy {
           const addressed = containerIdFrom(parsed);
           if (addressed) this.disown(addressed);
         }
+        if (action === 'network-remove' && removedStatus >= 200 && removedStatus < 300) {
+          const addressed = networkIdFrom(parsed);
+          if (addressed) this.disownNetwork(addressed);
+        }
         const relayed =
           action === 'ping'
             ? this.relayPing(upstreamRes, res)
@@ -461,7 +489,9 @@ export class DockerFilterProxy {
               ? this.relayVersion(upstreamRes, res)
               : action === 'create'
                 ? this.relayCreate(upstreamRes, res, parsed)
-                : this.relay(upstreamRes, res);
+                : action === 'network-create'
+                  ? this.relayNetworkCreate(upstreamRes, res, parsed)
+                  : this.relay(upstreamRes, res);
         relayed.then(() => {
           answered = true;
           if (bufferedBody !== null) {
@@ -539,6 +569,37 @@ export class DockerFilterProxy {
    * to containers this job actually created. The body is small and the client
    * needs the id before it can proceed, so buffering it costs nothing.
    */
+  /** Relay a network create and record the network, by id and by requested name. */
+  private relayNetworkCreate(upstreamRes: http.IncomingMessage, res: http.ServerResponse, requested: DockerRequest): Promise<void> {
+    return new Promise((resolve) => {
+      const chunks: Buffer[] = [];
+      upstreamRes.on('data', (c: Buffer) => chunks.push(c));
+      upstreamRes.on('end', () => {
+        const raw = Buffer.concat(chunks);
+        const status = upstreamRes.statusCode ?? 502;
+        if (status >= 200 && status < 300) {
+          try {
+            const parsed = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
+            if (typeof parsed.Id === 'string' && parsed.Id.length > 0) {
+              this.ownNetwork(parsed.Id, parsed.Id);
+              const body = requested.body;
+              const name = isPlainRecord(body) ? body.Name : undefined;
+              if (typeof name === 'string' && name.length > 0) this.ownNetwork(name, parsed.Id);
+            }
+          } catch {
+            // An unreadable create response leaves the network unowned, which
+            // fails closed: the job cannot address what it cannot name.
+          }
+        }
+        const headers = { ...this.relayedHeaders(upstreamRes), 'content-length': String(raw.length) };
+        delete headers['transfer-encoding'];
+        res.writeHead(status, headers);
+        if (raw.length > 0) res.write(raw);
+        resolve();
+      });
+    });
+  }
+
   private relayCreate(upstreamRes: http.IncomingMessage, res: http.ServerResponse, requested: DockerRequest): Promise<void> {
     return new Promise((resolve) => {
       const chunks: Buffer[] = [];

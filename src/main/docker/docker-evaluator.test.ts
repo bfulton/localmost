@@ -505,3 +505,52 @@ describe('build query parameters', () => {
     expect(build('?t=app%3Alatest&dockerfile=Dockerfile&rm=1&buildargs=%7B%7D&labels=%7B%7D&shmsize=0&version=1').allowed).toBe(true);
   });
 });
+
+describe('networks', () => {
+  const p: DockerPolicy = { run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] } };
+  const create = (body: unknown, c = ctx(p)) => evaluateDockerRequest(mk('POST', '/v1.45/networks/create', body), c);
+
+  it('permits creating a declared internal network', () => {
+    expect(create({ Name: 'vk-run1', Internal: true, CheckDuplicate: true }).allowed).toBe(true);
+  });
+
+  it('refuses a name no declaration matches, anchoring the glob', () => {
+    expect(create({ Name: 'other', Internal: true }).allowed).toBe(false);
+    expect(create({ Name: 'not-vk-run1', Internal: true }).allowed).toBe(false);
+  });
+
+  it('refuses a routable network where the declaration says internal', () => {
+    expect(create({ Name: 'vk-run1', Internal: false }).allowed).toBe(false);
+    expect(create({ Name: 'vk-run1' }).allowed).toBe(false);
+  });
+
+  it('refuses any create key the grammar cannot spell, driver above all', () => {
+    for (const extra of [{ Driver: 'macvlan' }, { Options: { parent: 'en0' } }, { IPAM: { Config: [] } }, { Attachable: true }, { Ingress: true }, { ConfigOnly: true }]) {
+      const body = { Name: 'vk-run1', Internal: true, ...extra };
+      expect([Object.keys(extra)[0], create(body).allowed]).toEqual([Object.keys(extra)[0], false]);
+    }
+    // The default driver, stated explicitly, is the one the filter would use anyway.
+    expect(create({ Name: 'vk-run1', Internal: true, Driver: 'bridge' }).allowed).toBe(true);
+  });
+
+  it('never lists the daemon\'s networks', () => {
+    expect(evaluateDockerRequest(mk('GET', '/v1.45/networks'), ctx(p)).allowed).toBe(false);
+  });
+
+  it('scopes reading and deleting a network to ones this socket created', () => {
+    const own = ctx(p, { ownNetworkIds: new Set(['net123']) });
+    expect(evaluateDockerRequest(mk('GET', '/v1.45/networks/net123'), own).allowed).toBe(true);
+    expect(evaluateDockerRequest(mk('DELETE', '/v1.45/networks/net123'), own).allowed).toBe(true);
+    expect(evaluateDockerRequest(mk('GET', '/v1.45/networks/theirs'), own).allowed).toBe(false);
+    expect(evaluateDockerRequest(mk('DELETE', '/v1.45/networks/theirs'), own).allowed).toBe(false);
+  });
+
+  it('lets a container join a network this job created, which is the point of declaring one', () => {
+    const own = ctx(p, { ownNetworkIds: new Set(['vk-run1']) });
+    const body = { Image: 'alpine:3', HostConfig: { NetworkMode: 'vk-run1' } };
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/create', body), own).allowed).toBe(true);
+    // An arbitrary network the job did not create is still refused.
+    const other = { Image: 'alpine:3', HostConfig: { NetworkMode: 'someone-elses' } };
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/create', other), own).allowed).toBe(false);
+  });
+});

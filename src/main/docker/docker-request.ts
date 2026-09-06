@@ -28,6 +28,10 @@ export type DockerAction =
   | 'kill'
   | 'stop'
   | 'logs'
+  | 'network-create'
+  | 'network-inspect'
+  | 'network-remove'
+  | 'network-list'
   | 'build'
   | 'other';
 
@@ -141,8 +145,25 @@ const ENDPOINTS: ReadonlyArray<{ method: string; path: RegExp; action: DockerAct
   // A read about the job's own container, like inspect.
   { method: 'GET', path: new RegExp(`^/containers/${ID}/logs$`), action: 'logs' },
   { method: 'DELETE', path: new RegExp(`^/containers/${ID}$`), action: 'remove' },
+  { method: 'POST', path: /^\/networks\/create$/, action: 'network-create' },
+  { method: 'GET', path: new RegExp(`^/networks/${ID}$`), action: 'network-inspect' },
+  { method: 'DELETE', path: new RegExp(`^/networks/${ID}$`), action: 'network-remove' },
+  // Listing enumerates the daemon, like the container list; no key grants it.
+  { method: 'GET', path: /^\/networks$/, action: 'network-list' },
   { method: 'POST', path: /^\/build$/, action: 'build' },
 ];
+
+/** Per-network endpoints, for scoping to networks this socket created. */
+const NETWORK_ID_PATHS: ReadonlyArray<RegExp> = [new RegExp(`^/networks/(${ID})$`)];
+
+/** The network a request addresses, or undefined when it addresses none. */
+export function networkIdFrom(req: DockerRequest): string | undefined {
+  for (const pattern of NETWORK_ID_PATHS) {
+    const match = pattern.exec(req.path);
+    if (match) return match[1];
+  }
+  return undefined;
+}
 
 /** Per-container endpoints, for scoping an action to the containers this socket created. */
 const CONTAINER_ID_PATHS: ReadonlyArray<RegExp> = [

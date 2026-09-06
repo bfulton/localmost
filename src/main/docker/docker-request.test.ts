@@ -87,7 +87,10 @@ describe('classifyDockerRequest', () => {
 
   it('classifies everything outside the map as other', () => {
     const others: Array<[string, string]> = [
-      ['POST', '/v1.45/networks/create'],
+      // /networks/create is a mapped action now; these are not.
+      ['PUT', '/v1.45/networks/create'],
+      ['POST', '/v1.45/networks/net123'],
+      ['POST', '/v1.45/volumes/create'],
       ['POST', '/v1.45/containers/abc123/exec'],
       ['GET', '/v1.45/build'],
       ['GET', '/v1.45/containers/create'],

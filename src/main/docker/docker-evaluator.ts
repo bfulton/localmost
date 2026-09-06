@@ -13,8 +13,8 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { DockerPolicy, DockerMount, MountMode } from '../../shared/docker-policy';
-import { DockerRequest, DockerAction, classifyDockerRequest, containerIdFrom } from './docker-request';
+import { DockerPolicy, DockerMount, DockerNetworkPolicy, MountMode } from '../../shared/docker-policy';
+import { DockerRequest, DockerAction, classifyDockerRequest, containerIdFrom, networkIdFrom } from './docker-request';
 
 export interface DockerEvalContext {
   /** The bound policy; null until the worker claims a job, which denies all. */
@@ -33,6 +33,12 @@ export interface DockerEvalContext {
    * operator and with other jobs, so an unscoped id reaches outside this job.
    */
   ownContainerIds?: ReadonlySet<string>;
+  /**
+   * Networks created through this socket, by id and by name. A container may
+   * join one of these as well as the declared `run.network`, which is the
+   * whole point of letting a job create one.
+   */
+  ownNetworkIds?: ReadonlySet<string>;
   /** Injected for tests; defaults to fs.realpathSync. Must throw when the path does not exist. */
   realpath?: (p: string) => string;
 }
@@ -105,6 +111,8 @@ const hints = {
   registry: (registry: string) => `docker:\n  pull:\n    registries:\n      - ${registry}`,
   build: 'docker:\n  build:\n    context: "./"',
   privileged: 'docker:\n  privileged: true',
+  network_declaration: (name: string, internal: boolean) =>
+    `docker:\n  run:\n    networks:\n      - name: ${yamlString(name)}\n        internal: ${internal}`,
 };
 
 // -----------------------------------------------------------------------------
@@ -488,7 +496,10 @@ function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: Dock
     // The most restrictive reading wins when casings disagree.
     if (candidate !== 'bridge') mode = candidate;
   }
-  if (mode !== 'none' && mode !== policy.run.network) {
+  // A network this job created is as good as the declared one: creating it was
+  // already checked against run.networks, and refusing to join it would make
+  // declaring one pointless.
+  if (mode !== 'none' && mode !== policy.run.network && !ctx.ownNetworkIds?.has(mode)) {
     return deny(
       `network mode "${mode}" is not declared in the repository docker policy (run.network)`,
       hints.network(mode)
@@ -536,6 +547,68 @@ const BUILD_PARAMS_KNOWN: ReadonlySet<string> = new Set([
   'shmsize', 'memory', 'memswap', 'cpushares', 'cpusetcpus', 'cpuperiod', 'cpuquota', 'squash',
   'platform', 'version', 'buildid', 'session',
 ]);
+
+/** Keys a network create may carry. Driver is permitted only as the default. */
+const NETWORK_CREATE_KNOWN: ReadonlySet<string> = new Set(['name', 'internal', 'checkduplicate', 'labels', 'driver']);
+
+/** An anchored glob: `*` matches any run of characters, and nothing else is special. */
+function globMatches(pattern: string, value: string): boolean {
+  const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, (c) => (c === '*' ? '\u0000' : `\\${c}`));
+  return new RegExp(`^${escaped.split('\u0000').join('.*')}$`).test(value);
+}
+
+function evaluateNetworkCreate(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
+  const declared: DockerNetworkPolicy[] = policy.run?.networks ?? [];
+  if (declared.length === 0) {
+    return deny(
+      'the repository docker policy declares no networks',
+      hints.network_declaration('name-of-your-network', true)
+    );
+  }
+  const body = req.body;
+  if (!isPlainObject(body)) return deny('network create requires a JSON body');
+
+  for (const key of Object.keys(body)) {
+    if (!NETWORK_CREATE_KNOWN.has(key.toLowerCase())) {
+      // A macvlan or ipvlan network puts the container on the physical LAN,
+      // which is worse than host networking, and Options can bind a bridge to
+      // a host address. The filter creates a plain bridge or nothing.
+      return deny(`network create parameter "${key}" is not one the localmost docker socket understands`);
+    }
+  }
+
+  const driver = pick(body, 'Driver');
+  if (!isUnset(driver) && driver !== '' && driver !== 'bridge') {
+    return deny(`network driver "${String(driver)}" is not permitted; the localmost docker socket creates bridge networks only`);
+  }
+
+  const name = pick(body, 'Name');
+  if (typeof name !== 'string' || name === '') return deny('network create requires a Name');
+  const internal = valuesFor(body, 'Internal').some((v) => v === true);
+
+  const match = declared.find((n) => globMatches(n.name, name));
+  if (!match) {
+    return deny(
+      `network "${name}" is not declared in the repository docker policy (run.networks)`,
+      hints.network_declaration(name, internal)
+    );
+  }
+  if (match.internal && !internal) {
+    return deny(
+      `network "${name}" is declared internal, so it cannot be created routable`,
+      hints.network_declaration(match.name, false)
+    );
+  }
+  return ALLOW;
+}
+
+/** Permit a per-network request only against a network this socket created. */
+function evaluateOwnNetwork(req: DockerRequest, ctx: DockerEvalContext): DockerVerdict {
+  const id = networkIdFrom(req);
+  if (!id) return deny(`${req.method} ${req.path} is not permitted through the localmost docker socket`);
+  if (ctx.ownNetworkIds?.has(id)) return ALLOW;
+  return deny(`network "${id}" was not created through this job's docker socket`);
+}
 
 function evaluateBuild(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
   if (!policy.build) return deny('the repository docker policy declares no build action', hints.build);
@@ -631,6 +704,15 @@ export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext
       return evaluatePull(req, policy);
     case 'build':
       return evaluateBuild(req, policy);
+    case 'network-create':
+      return evaluateNetworkCreate(req, policy);
+    case 'network-inspect':
+    case 'network-remove':
+      return evaluateOwnNetwork(req, ctx);
+    case 'network-list':
+      return deny(
+        'listing networks is not permitted through the localmost docker socket; it would enumerate networks outside this job'
+      );
     default:
       return deny(`${req.method} ${req.path} is not permitted through the localmost docker socket`);
   }
