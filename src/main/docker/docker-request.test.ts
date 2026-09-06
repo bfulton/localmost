@@ -1,5 +1,5 @@
 import { describe, it, expect } from '@jest/globals';
-import { parseDockerRequest, classifyDockerRequest, DockerAction } from './docker-request';
+import { parseDockerRequest, classifyDockerRequest, containerIdFrom, DockerAction } from './docker-request';
 
 const mk = (method: string, url: string, headers: Record<string, string> = {}, body = Buffer.alloc(0)) =>
   parseDockerRequest({ method, url, headers, body });
@@ -100,6 +100,24 @@ describe('classifyDockerRequest', () => {
     ];
     for (const [method, url] of others) {
       expect(classifyDockerRequest(mk(method, url))).toBe('other');
+    }
+  });
+});
+
+describe('container lifecycle endpoints the run action covers', () => {
+  const mk = (m: string, u: string) => parseDockerRequest({ method: m, url: u, headers: {}, body: Buffer.alloc(0) });
+
+  it.each([
+    ['POST', '/v1.45/containers/abc/kill', 'kill'],
+    ['POST', '/v1.45/containers/abc/stop', 'stop'],
+    ['GET', '/v1.45/containers/abc/logs?stdout=1', 'logs'],
+  ])('maps %s %s to %s', (method, url, action) => {
+    expect(classifyDockerRequest(mk(method, url))).toBe(action);
+  });
+
+  it('extracts the container id from each of them, so they can be scoped', () => {
+    for (const [m, u] of [['POST', '/v1.45/containers/abc/kill'], ['POST', '/v1.45/containers/abc/stop'], ['GET', '/v1.45/containers/abc/logs']] as const) {
+      expect(containerIdFrom(mk(m, u))).toBe('abc');
     }
   });
 });

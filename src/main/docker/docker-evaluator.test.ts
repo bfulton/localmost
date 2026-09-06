@@ -377,3 +377,25 @@ describe('Go case-insensitive JSON decoding', () => {
     expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/create', { Image: 'postgres:16' }), ctx(p)).allowed).toBe(true);
   });
 });
+
+describe('kill, stop and logs on the job\'s own container', () => {
+  const p = { run: { images: ['postgres:16'], network: 'bridge' } };
+
+  it('permits them on an owned container and refuses them on one it did not create', () => {
+    const own = ctx(p, ['mine123']);
+    for (const [method, tpl] of [
+      ['POST', '/v1.45/containers/%s/kill'],
+      ['POST', '/v1.45/containers/%s/stop'],
+      ['GET', '/v1.45/containers/%s/logs?stdout=1&stderr=1'],
+    ] as const) {
+      expect([tpl, evaluateDockerRequest(mk(method, tpl.replace('%s', 'mine123')), own).allowed]).toEqual([tpl, true]);
+      expect([tpl, evaluateDockerRequest(mk(method, tpl.replace('%s', 'theirs999')), own).allowed]).toEqual([tpl, false]);
+    }
+  });
+
+  it('refuses kill and stop when the policy declares no run action', () => {
+    const noRun = ctx({ pull: { registries: ['docker.io'] } }, ['mine123']);
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/mine123/kill'), noRun).allowed).toBe(false);
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/mine123/stop'), noRun).allowed).toBe(false);
+  });
+});

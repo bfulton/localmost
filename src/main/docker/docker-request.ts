@@ -25,6 +25,9 @@ export type DockerAction =
   | 'attach'
   | 'wait'
   | 'remove'
+  | 'kill'
+  | 'stop'
+  | 'logs'
   | 'build'
   | 'other';
 
@@ -107,6 +110,10 @@ const ENDPOINTS: ReadonlyArray<{ method: string; path: RegExp; action: DockerAct
   { method: 'POST', path: new RegExp(`^/containers/${ID}/start$`), action: 'start' },
   { method: 'POST', path: new RegExp(`^/containers/${ID}/attach$`), action: 'attach' },
   { method: 'POST', path: new RegExp(`^/containers/${ID}/wait$`), action: 'wait' },
+  { method: 'POST', path: new RegExp(`^/containers/${ID}/kill$`), action: 'kill' },
+  { method: 'POST', path: new RegExp(`^/containers/${ID}/stop$`), action: 'stop' },
+  // A read about the job's own container, like inspect.
+  { method: 'GET', path: new RegExp(`^/containers/${ID}/logs$`), action: 'logs' },
   { method: 'DELETE', path: new RegExp(`^/containers/${ID}$`), action: 'remove' },
   { method: 'POST', path: /^\/build$/, action: 'build' },
 ];
@@ -117,6 +124,9 @@ const CONTAINER_ID_PATHS: ReadonlyArray<RegExp> = [
   new RegExp(`^/containers/(${ID})/start$`),
   new RegExp(`^/containers/(${ID})/attach$`),
   new RegExp(`^/containers/(${ID})/wait$`),
+  new RegExp(`^/containers/(${ID})/kill$`),
+  new RegExp(`^/containers/(${ID})/stop$`),
+  new RegExp(`^/containers/(${ID})/logs$`),
   new RegExp(`^/containers/(${ID})$`),
 ];
 

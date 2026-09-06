@@ -446,6 +446,8 @@ export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext
     case 'create':
       return evaluateCreate(req, ctx, policy);
     case 'inspect':
+    case 'logs':
+      // Reads about the job's own container: the documented baseline, scoped.
       return evaluateOwnContainer(req, ctx);
     case 'list':
       // No policy key grants it: it would enumerate the whole daemon.
@@ -456,6 +458,8 @@ export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext
     case 'attach':
     case 'wait':
     case 'remove':
+    case 'kill':
+    case 'stop':
       if (!policy.run) return deny('the repository docker policy declares no run action', hints.run);
       return evaluateOwnContainer(req, ctx);
     case 'pull':
