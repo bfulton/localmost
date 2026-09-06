@@ -19,7 +19,13 @@ export interface DockerBackend {
   /** The daemon endpoint to forward approved requests to, or null when none. */
   resolveEndpoint(): DockerEndpoint | null;
   /** Absolute host path that job mounts must resolve inside (the job workspace). */
-  workspaceMountRoot(sandboxDir: string): string;
+  /**
+   * The directory declared mount paths resolve against: the repository
+   * checkout when the socket is bound to one, since that is what `./` means to
+   * whoever wrote the policy. Without a repository - a socket not yet bound -
+   * the work folder is the widest honest answer.
+   */
+  workspaceMountRoot(sandboxDir: string, repository?: string): string;
 }
 
 export interface DesktopBackendOptions {
@@ -51,7 +57,12 @@ export class DesktopBackend implements DockerBackend {
     return this.opts.resolve ? this.opts.resolve() : resolveDockerEndpoint();
   }
 
-  workspaceMountRoot(sandboxDir: string): string {
-    return path.join(sandboxDir, this.opts.workspaceSubdir ?? RUNNER_WORK_FOLDER);
+  workspaceMountRoot(sandboxDir: string, repository?: string): string {
+    const work = path.join(sandboxDir, this.opts.workspaceSubdir ?? RUNNER_WORK_FOLDER);
+    // The runner checks out into _work/<repo>/<repo>, which is GITHUB_WORKSPACE
+    // and what a policy's `./` refers to. Rooting at _work made anything
+    // narrower than `./` unmatchable, since ./tmp resolved to _work/tmp.
+    const name = repository?.split('/').pop();
+    return name ? path.join(work, name, name) : work;
   }
 }

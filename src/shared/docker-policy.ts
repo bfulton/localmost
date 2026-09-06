@@ -89,6 +89,15 @@ export function validateDockerPolicy(value: unknown, path: string, push: (messag
   if (value.build !== undefined) validateBuild(value.build, `${path}.build`, push);
   if (value.privileged !== undefined && typeof value.privileged !== 'boolean') {
     push(`${path}.privileged must be a boolean`);
+  } else if (value.privileged === true) {
+    // Kept in the grammar so the capability gap stays visible, and refused
+    // until a backend exists that can contain it. Accepting the declaration
+    // here and then refusing every request it implies would read as a broken
+    // policy rather than a stage that has not shipped.
+    push(
+      `${path}.privileged requires a managed VM backend, which this build does not have; ` +
+        'remove it, or run the work without privileged containers'
+    );
   }
 }
 

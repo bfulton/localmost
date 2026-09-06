@@ -967,7 +967,6 @@ describe('docker policy through serialization', () => {
           pull: { registries: ['docker.io', 'ghcr.io'] },
           run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'ro' }], network: 'bridge' },
           build: { context: './' },
-          privileged: true,
         },
       },
       workflows: {

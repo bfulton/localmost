@@ -45,12 +45,13 @@ describe('validateDockerPolicy', () => {
     expect(collect({ run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'ro' }], network: 'bridge' } })).toEqual([]);
   });
 
-  it('accepts pull, build and privileged alongside run', () => {
+  it('accepts pull, build and run together', () => {
+    // privileged is deliberately absent: it is rejected until a managed VM
+    // backend exists, and has a case of its own below.
     expect(collect({
       pull: { registries: ['docker.io', 'ghcr.io'] },
       run: { images: ['postgres:16'] },
       build: { context: './' },
-      privileged: true,
     })).toEqual([]);
   });
 
@@ -341,5 +342,24 @@ describe('diffDockerPolicy on bare action blocks', () => {
     const diffs = diffDockerPolicy({ run: { images: ['a'] } }, { run: { images: ['b'] } }, 'shared.docker');
     expect(diffs.map((d) => d.path)).not.toContain('shared.docker.run');
     expect(diffs.map((d) => d.path)).toContain('shared.docker.run.images');
+  });
+});
+
+describe('privileged at validation time', () => {
+  const collect = (value: unknown, path = 'shared.docker') => {
+    const errs: string[] = [];
+    validateDockerPolicy(value, path, (m) => errs.push(m));
+    return errs;
+  };
+
+  it('rejects privileged: true, naming the backend it would require', () => {
+    // The design keeps privileged in the grammar so the gap stays honest, and
+    // rejects it until a managed VM can contain it. Accepting it here and
+    // refusing every request later reads as a broken policy, not a stage.
+    expect(collect({ privileged: true }).join('\n')).toMatch(/managed VM/i);
+  });
+
+  it('accepts privileged: false, which grants nothing', () => {
+    expect(collect({ privileged: false })).toEqual([]);
   });
 });

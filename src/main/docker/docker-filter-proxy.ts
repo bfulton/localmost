@@ -225,7 +225,7 @@ export class DockerFilterProxy {
 
   /** The workspace the backend roots mounts at, resolved so symlinked sandbox dirs compare equal. */
   private workspaceRoot(): string {
-    const root = this.backend.workspaceMountRoot(path.dirname(this.socketPath ?? ''));
+    const root = this.backend.workspaceMountRoot(path.dirname(this.socketPath ?? ''), this.repository);
     try {
       return this.realpath(root);
     } catch {

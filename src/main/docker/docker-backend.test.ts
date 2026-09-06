@@ -54,3 +54,18 @@ describe('DesktopBackend', () => {
     expect(backend.workspaceMountRoot('/tmp/sandbox/1')).toBe('/tmp/sandbox/1/checkout');
   });
 });
+
+describe('the root that declared mount paths resolve against', () => {
+  const backend = new DesktopBackend({ resolve: () => null });
+
+  it('is the repository checkout, which is what "./" means in a workflow', () => {
+    // The runner checks out into _work/<repo>/<repo> (GITHUB_WORKSPACE). Rooting
+    // at _work instead made every declared path narrower than "./" unmatchable:
+    // "./tmp/fixtures" resolved to _work/tmp/fixtures, which never exists.
+    expect(backend.workspaceMountRoot('/s/1', 'bfulton/localmost')).toBe('/s/1/_work/localmost/localmost');
+  });
+
+  it('falls back to the work folder when no repository is bound yet', () => {
+    expect(backend.workspaceMountRoot('/s/1')).toBe('/s/1/_work');
+  });
+});
