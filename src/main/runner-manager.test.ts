@@ -37,6 +37,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { LogEntry, RunnerState, JobHistoryEntry } from '../shared/types';
+import { DockerPolicy } from '../shared/docker-policy';
 import { spawnSandboxed } from './process-sandbox';
 import { createMockProcess, RunnerManagerTestHelper } from './test-utils';
 
@@ -650,7 +651,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: ['index.crates.io'], level: 'strict' as const, readPaths: [], writePaths: [], docker: 'off' as const }),
+        getRepoPolicy: async () => ({ hosts: ['index.crates.io'], level: 'strict' as const, readPaths: [], writePaths: [], docker: {} }),
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setInstance(1, {
@@ -682,8 +683,7 @@ describe('RunnerManager', () => {
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
         getRepoPolicy: async (_owner, _repo, _sha, workflowName) => {
           seen.push(workflowName);
-          // docker is still the access level here; Task 8 makes it a DockerPolicy ({}).
-          return { hosts: [], level: 'strict' as const, readPaths: [], writePaths: [], docker: 'off' as const };
+          return { hosts: [], level: 'strict' as const, readPaths: [], writePaths: [], docker: {} };
         },
       });
       const helper = new RunnerManagerTestHelper(manager);
@@ -708,7 +708,7 @@ describe('RunnerManager', () => {
       // whenever the job could not be identified, and the job ran with no
       // hosts - four concurrent runs failed that way before this changed.
       const setPolicyAllowedHosts = jest.fn();
-      const getRepoPolicy = jest.fn().mockResolvedValue({ hosts: [], level: 'strict', readPaths: [], writePaths: [], docker: 'off' as const } as never);
+      const getRepoPolicy = jest.fn().mockResolvedValue({ hosts: [], level: 'strict', readPaths: [], writePaths: [], docker: {} } as never);
       const manager = new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
@@ -745,8 +745,8 @@ describe('RunnerManager', () => {
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
         getRepoPolicy: async (owner: string, repo: string) =>
           repo === 'first'
-            ? { hosts: ['first.example'], level: 'strict' as const, readPaths: [], writePaths: [], docker: 'off' as const }
-            : { hosts: ['second.example'], level: 'strict' as const, readPaths: [], writePaths: [], docker: 'off' as const },
+            ? { hosts: ['first.example'], level: 'strict' as const, readPaths: [], writePaths: [], docker: {} }
+            : { hosts: ['second.example'], level: 'strict' as const, readPaths: [], writePaths: [], docker: {} },
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setProxy(1, { setPolicyAllowedHosts, setPolicyLevel: jest.fn() });
@@ -782,7 +782,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: ['codeload.github.com'], level: 'strict' as const, readPaths: [], writePaths: [], docker: 'off' as const }),
+        getRepoPolicy: async () => ({ hosts: ['codeload.github.com'], level: 'strict' as const, readPaths: [], writePaths: [], docker: {} }),
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setPendingTargetContext('3', {
@@ -820,7 +820,7 @@ describe('RunnerManager', () => {
           level: 'strict' as const,
           readPaths: [],
           writePaths: [],
-          docker: 'off' as const,
+          docker: {},
         }),
       });
       const helper = new RunnerManagerTestHelper(manager);
@@ -856,7 +856,7 @@ describe('RunnerManager', () => {
           level: 'strict' as const,
           readPaths: [],
           writePaths: [],
-          docker: 'off' as const,
+          docker: {},
         }),
       });
       const helper = new RunnerManagerTestHelper(manager);
@@ -896,7 +896,7 @@ describe('RunnerManager', () => {
           level: 'strict' as const,
           readPaths: [],
           writePaths: [],
-          docker: 'off' as const,
+          docker: {},
         }),
       });
       const helper = new RunnerManagerTestHelper(manager);
@@ -933,7 +933,7 @@ describe('RunnerManager', () => {
           level: 'strict' as const,
           readPaths: ['~/.npm'],
           writePaths: ['~/.npm'],
-          docker: 'off' as const,
+          docker: {},
         }),
       });
       const helper = new RunnerManagerTestHelper(manager);
@@ -942,7 +942,7 @@ describe('RunnerManager', () => {
           level: string;
           readPaths: string[];
           writePaths: string[];
-          docker: string;
+          docker: DockerPolicy;
         }): string;
       };
       helper.setInstance(1, {
@@ -952,7 +952,7 @@ describe('RunnerManager', () => {
           level: 'strict',
           readPaths: ['~/.npm'],
           writePaths: ['~/.npm'],
-          docker: 'off' as const,
+          docker: {},
         }),
         currentJob: {
           name: 'build',
@@ -981,7 +981,7 @@ describe('RunnerManager', () => {
           level: 'strict' as const,
           readPaths: [],
           writePaths: [],
-          docker: 'off' as const,
+          docker: {},
         }),
       });
       const helper = new RunnerManagerTestHelper(manager);
@@ -1014,7 +1014,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: [], level: 'moderate' as const, readPaths: [], writePaths: [], docker: 'off' as const }),
+        getRepoPolicy: async () => ({ hosts: [], level: 'moderate' as const, readPaths: [], writePaths: [], docker: {} }),
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setInstance(1, {
@@ -1042,7 +1042,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: [], level: 'strict' as const, readPaths: [], writePaths: [], docker: 'off' as const }),
+        getRepoPolicy: async () => ({ hosts: [], level: 'strict' as const, readPaths: [], writePaths: [], docker: {} }),
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setInstance(1, {
@@ -1304,9 +1304,9 @@ describe('docker access', () => {
       onJobHistoryUpdate: jest.fn(),
     });
 
-  it('changes the policy stamp when the docker level changes', () => {
+  it('changes the policy stamp when the docker policy changes', () => {
     const manager = makeManager();
-    const stamp = (docker: 'off' | 'socket') =>
+    const stamp = (docker: DockerPolicy) =>
       (manager as any).stampFor({
         level: 'strict',
         readPaths: [],
@@ -1314,9 +1314,10 @@ describe('docker access', () => {
         docker,
       });
 
-    // A worker spawned under one level must not claim a job approved under
-    // another: the grant is baked into the profile at spawn.
-    expect(stamp('off')).not.toEqual(stamp('socket'));
+    // A worker spawned under one docker policy must not claim a job approved
+    // under another.
+    expect(stamp({})).not.toEqual(stamp({ run: { images: ['postgres:16'] } }));
+    expect(stamp({ run: { images: ['postgres:16'] } })).toEqual(stamp({ run: { images: ['postgres:16'] } }));
   });
 
   it('warns when a policy declares docker but no daemon socket resolved', () => {

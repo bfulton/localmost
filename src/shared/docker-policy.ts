@@ -99,6 +99,10 @@ function validateRun(value: unknown, path: string, push: (message: string) => vo
   if (value.mounts !== undefined) validateMounts(value.mounts, `${path}.mounts`, push);
   if (value.network !== undefined && typeof value.network !== 'string') {
     push(`${path}.network must be a string`);
+  } else if (value.network === 'host' || (typeof value.network === 'string' && value.network.startsWith('container:'))) {
+    // Host networking reaches the host, and a shared namespace reaches another
+    // container; neither can be named, so neither can be requested.
+    push(`${path}.network cannot be ${value.network}: it reaches outside the container and cannot be granted`);
   }
 }
 

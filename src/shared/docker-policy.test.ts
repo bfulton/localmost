@@ -77,6 +77,12 @@ describe('validateDockerPolicy', () => {
     expect(collect({ run: 'yes' }).join('\n')).toMatch(/shared\.docker\.run must be an object/i);
   });
 
+  it('cannot spell host networking or a shared network namespace', () => {
+    expect(collect({ run: { network: 'host' } }).join('\n')).toMatch(/shared\.docker\.run\.network cannot be host/i);
+    expect(collect({ run: { network: 'container:abc' } }).join('\n')).toMatch(/cannot be container:abc/i);
+    expect(collect({ run: { network: 'none' } })).toEqual([]);
+  });
+
   it('requires registries on pull', () => {
     expect(collect({ pull: {} }).join('\n')).toMatch(/shared\.docker\.pull\.registries must be an array/i);
     expect(collect({ pull: { registries: 'docker.io' } }).join('\n')).toMatch(/shared\.docker\.pull\.registries must be an array/i);

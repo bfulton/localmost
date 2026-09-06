@@ -10,6 +10,7 @@ import {
   type DockerAccessLevel,
   type DockerEndpoint,
 } from '../shared/docker-access';
+import type { DockerPolicy } from '../shared/docker-policy';
 import {
   SandboxPolicyLevel, RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
@@ -79,8 +80,8 @@ export interface RepoPolicyRuntime {
   readPaths: string[];
   /** Paths the policy declares writable, applied when the worker is spawned. */
   writePaths: string[];
-  /** Docker access the policy declares; 'off' when it declares none. */
-  docker: DockerAccessLevel;
+  /** The docker actions the policy declares, merged across shared and workflow; empty when it declares none. */
+  docker: DockerPolicy;
 }
 
 interface RunnerManagerOptions {

@@ -317,7 +317,7 @@ app.whenReady().then(async () => {
           level: 'strict' as const,
           readPaths: [],
           writePaths: [],
-          docker: 'off' as const,
+          docker: {},
         };
       }
       const policy = getEffectivePolicy(cached.config, workflowName);
@@ -332,9 +332,9 @@ app.whenReady().then(async () => {
         // policy drift.
         readPaths: cached.config.shared?.filesystem?.read || [],
         writePaths: cached.config.shared?.filesystem?.write || [],
-        // Docker access, like filesystem, comes from the shared section only:
-        // the profile is built before the workflow is known.
-        docker: cached.config.shared?.docker ?? 'off',
+        // Docker composes across shared and workflow: the socket is bound to
+        // the merged policy when the job is claimed, after the workflow is known.
+        docker: policy.docker ?? {},
       };
     },
     onJobEvent: (event: JobEvent) => {
