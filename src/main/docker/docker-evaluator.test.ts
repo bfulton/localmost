@@ -554,3 +554,31 @@ describe('networks', () => {
     expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/create', other), own).allowed).toBe(false);
   });
 });
+
+describe('image inspect', () => {
+  const p: DockerPolicy = { run: { images: ['alpine:3', 'ghcr.io/o/app:1'], network: 'bridge' }, pull: { registries: ['docker.io'] } };
+  const inspect = (ref: string, c = ctx(p)) =>
+    evaluateDockerRequest(mk('GET', `/v1.45/images/${encodeURIComponent(ref)}/json`), c);
+
+  it('permits inspecting an image the policy already names', () => {
+    // Scoped by the policy rather than by a second ownership ledger: an
+    // inspect of an image run.images already grants discloses nothing new.
+    expect(inspect('alpine:3').allowed).toBe(true);
+    expect(inspect('docker.io/library/alpine:3').allowed).toBe(true);
+    expect(inspect('ghcr.io/o/app:1').allowed).toBe(true);
+  });
+
+  it('refuses an image the policy does not name', () => {
+    expect(inspect('postgres:16').allowed).toBe(false);
+    expect(inspect('ghcr.io/o/other:1').allowed).toBe(false);
+  });
+
+  it('refuses it when the policy declares no run action at all', () => {
+    expect(inspect('alpine:3', ctx({ pull: { registries: ['docker.io'] } })).allowed).toBe(false);
+  });
+
+  it('never lists or deletes images, which are daemon-wide', () => {
+    expect(evaluateDockerRequest(mk('GET', '/v1.45/images/json'), ctx(p)).allowed).toBe(false);
+    expect(evaluateDockerRequest(mk('DELETE', '/v1.45/images/alpine:3'), ctx(p)).allowed).toBe(false);
+  });
+});

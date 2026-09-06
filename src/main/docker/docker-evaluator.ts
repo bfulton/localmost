@@ -14,7 +14,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { DockerPolicy, DockerMount, DockerNetworkPolicy, MountMode } from '../../shared/docker-policy';
-import { DockerRequest, DockerAction, classifyDockerRequest, containerIdFrom, networkIdFrom } from './docker-request';
+import { DockerRequest, DockerAction, classifyDockerRequest, containerIdFrom, imageRefFrom, networkIdFrom } from './docker-request';
 
 export interface DockerEvalContext {
   /** The bound policy; null until the worker claims a job, which denies all. */
@@ -704,6 +704,22 @@ export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext
       return evaluatePull(req, policy);
     case 'build':
       return evaluateBuild(req, policy);
+    case 'image-inspect': {
+      // Scoped by the policy, not by a second ownership ledger: an inspect of
+      // an image run.images already names discloses nothing the policy has not
+      // granted, and the container ledger has already produced one defect.
+      if (!policy.run) return deny('the repository docker policy declares no run action', hints.run);
+      const ref = imageRefFrom(req);
+      if (!ref) return deny(`${req.method} ${req.path} is not permitted through the localmost docker socket`);
+      const wanted = normalizeImage(ref);
+      if (!(policy.run.images ?? []).some((declared) => normalizeImage(declared) === wanted)) {
+        return deny(
+          `image "${ref}" is not declared in the repository docker policy (run.images)`,
+          hints.image(ref)
+        );
+      }
+      return ALLOW;
+    }
     case 'network-create':
       return evaluateNetworkCreate(req, policy);
     case 'network-inspect':

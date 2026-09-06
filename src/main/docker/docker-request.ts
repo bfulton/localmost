@@ -32,6 +32,7 @@ export type DockerAction =
   | 'network-inspect'
   | 'network-remove'
   | 'network-list'
+  | 'image-inspect'
   | 'build'
   | 'other';
 
@@ -136,6 +137,9 @@ const ENDPOINTS: ReadonlyArray<{ method: string; path: RegExp; action: DockerAct
   // container on the daemon, including other jobs'.
   { method: 'GET', path: /^\/containers\/json$/, action: 'list' },
   { method: 'POST', path: /^\/images\/create$/, action: 'pull' },
+  // The reference may carry a registry, a path and a tag, so it is anything up
+  // to the trailing /json. Listing is deliberately absent: it is daemon-wide.
+  { method: 'GET', path: /^\/images\/(?!json$).+\/json$/, action: 'image-inspect' },
   { method: 'POST', path: /^\/containers\/create$/, action: 'create' },
   { method: 'POST', path: new RegExp(`^/containers/${ID}/start$`), action: 'start' },
   { method: 'POST', path: new RegExp(`^/containers/${ID}/attach$`), action: 'attach' },
@@ -152,6 +156,17 @@ const ENDPOINTS: ReadonlyArray<{ method: string; path: RegExp; action: DockerAct
   { method: 'GET', path: /^\/networks$/, action: 'network-list' },
   { method: 'POST', path: /^\/build$/, action: 'build' },
 ];
+
+/** The image reference an inspect addresses, decoded, or undefined. */
+export function imageRefFrom(req: DockerRequest): string | undefined {
+  const match = /^\/images\/(.+)\/json$/.exec(req.path);
+  if (!match) return undefined;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return match[1];
+  }
+}
 
 /** Per-network endpoints, for scoping to networks this socket created. */
 const NETWORK_ID_PATHS: ReadonlyArray<RegExp> = [new RegExp(`^/networks/(${ID})$`)];

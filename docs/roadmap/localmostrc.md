@@ -290,7 +290,7 @@ Actions are CLI-shaped, so a policy reads the way a workflow author thinks:
 | Action | Covers | Conditions |
 |---|---|---|
 | `pull` | image pulls | `registries` — the registry each pulled image comes from |
-| `run` | container create, start, attach, wait and remove | `images` — the image a container is created from; `mounts` — workspace paths a container may bind, each `ro` or `rw`; `network` — the container's network mode |
+| `run` | container create, start, attach, wait, kill, stop, remove and logs; creating a declared network; inspecting a declared image | `images` — the image a container is created from, and the only images it may inspect; `networks` — networks the job may create, each an anchored name glob plus whether it is `internal`; `mounts` — workspace paths a container may bind, each `ro` or `rw`; `network` — the container's network mode |
 | `build` | image builds | `context` — which directory the workflow builds from, for the reader and the approval diff |
 
 Conditions are checked against the request itself. Mount paths are resolved
