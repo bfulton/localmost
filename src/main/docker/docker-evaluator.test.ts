@@ -399,3 +399,82 @@ describe('kill, stop and logs on the job\'s own container', () => {
     expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/mine123/stop'), noRun).allowed).toBe(false);
   });
 });
+
+describe('volume mounts that are really bind mounts', () => {
+  const p = { run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'ro' as const }], network: 'bridge' } };
+
+  it('refuses an anonymous volume whose local-driver options bind a host path', () => {
+    // The local driver with type=none,o=bind,device=<path> IS a bind mount -
+    // the same thing compose exposes as driver_opts. The entry has no Source,
+    // so it looked like container-lifecycle storage and skipped every check.
+    const v = evaluateDockerRequest(
+      mk('POST', '/v1.45/containers/create', {
+        Image: 'postgres:16',
+        HostConfig: {
+          Mounts: [{
+            Type: 'volume',
+            Target: '/host',
+            VolumeOptions: { DriverConfig: { Name: 'local', Options: { type: 'none', o: 'bind', device: '/Users/me/.ssh' } } },
+          }],
+        },
+      }),
+      ctx(p)
+    );
+    expect(v.allowed).toBe(false);
+  });
+
+  it('refuses it whatever the casing of the driver keys', () => {
+    const v = evaluateDockerRequest(
+      mk('POST', '/v1.45/containers/create', {
+        Image: 'postgres:16',
+        HostConfig: { Mounts: [{ type: 'volume', target: '/host', volumeoptions: { driverconfig: { Name: 'local', Options: { device: '/' } } } }] },
+      }),
+      ctx(p)
+    );
+    expect(v.allowed).toBe(false);
+  });
+
+  it('still permits a plain anonymous volume and a tmpfs, which reach no host path', () => {
+    for (const m of [{ Type: 'volume', Target: '/data' }, { Type: 'tmpfs', Target: '/tmp' }]) {
+      expect([m.Type, evaluateDockerRequest(mk('POST', '/v1.45/containers/create', { Image: 'postgres:16', HostConfig: { Mounts: [m] } }), ctx(p)).allowed])
+        .toEqual([m.Type, true]);
+    }
+  });
+});
+
+describe('HostConfig is an allowlist, not a blocklist', () => {
+  const p = { run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'ro' as const }], network: 'bridge' } };
+  const create = (hostConfig: Record<string, unknown>) =>
+    evaluateDockerRequest(mk('POST', '/v1.45/containers/create', { Image: 'postgres:16', HostConfig: hostConfig }), ctx(p));
+
+  it('refuses publishing container ports onto the operator host', () => {
+    // -p 8080:80. Nothing in the grammar can name it, and it exposes a
+    // service on the operator's interfaces, outside the proxy's egress control.
+    expect(create({ PortBindings: { '80/tcp': [{ HostPort: '8080' }] } }).allowed).toBe(false);
+    expect(create({ PublishAllPorts: true }).allowed).toBe(false);
+  });
+
+  it('refuses any HostConfig key the grammar cannot name, even one invented later', () => {
+    for (const key of ['StorageOpt', 'SomeFutureEscape', 'Anything', 'NextApiVersionKey']) {
+      expect([key, create({ [key]: ['x'] }).allowed]).toEqual([key, false]);
+    }
+  });
+
+  it('refuses the keys that only reach outside the container when non-empty', () => {
+    expect(create({ Links: ['other:db'] }).allowed).toBe(false);
+    expect(create({ VolumeDriver: 'local' }).allowed).toBe(false);
+    expect(create({ ExtraHosts: ['evil:1.2.3.4'] }).allowed).toBe(false);
+    expect(create({ GroupAdd: ['staff'] }).allowed).toBe(false);
+    expect(create({ Cgroup: '/other' }).allowed).toBe(false);
+  });
+
+  it('refuses a --cidfile that would write to a host path, while allowing the empty default', () => {
+    expect(create({ ContainerIDFile: '/tmp/pwned.cid' }).allowed).toBe(false);
+    expect(create({ ContainerIDFile: '' }).allowed).toBe(true);
+  });
+
+  it('still permits the keys a plain docker run actually sends', () => {
+    expect(create({}).allowed).toBe(true);
+    expect(create({ AutoRemove: true, NetworkMode: 'bridge', Binds: [], RestartPolicy: { Name: '', MaximumRetryCount: 0 }, LogConfig: { Type: '', Config: {} }, ConsoleSize: [0, 0] }).allowed).toBe(true);
+  });
+});

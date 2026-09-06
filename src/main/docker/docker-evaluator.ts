@@ -152,8 +152,56 @@ const oneOf = (...allowed: string[]) => (v: unknown): boolean => isUnset(v) || a
  * only permitted values are the defaults the docker CLI sends for it; the
  * shapes are bounded by the API version the proxy pins.
  */
+/**
+ * HostConfig keys the filter understands and will forward.
+ *
+ * An allowlist, not a blocklist: enumerating the dangerous keys means every
+ * key nobody thought of - and every key a future API version adds - is
+ * forwarded unexamined. PortBindings was exactly that, publishing a container
+ * port on the operator's interfaces, outside the proxy that controls the job's
+ * egress. A key absent from this list is refused, which is the same principle
+ * the grammar applies to itself: what cannot be named cannot be requested.
+ *
+ * These are the keys an ordinary `docker run` sends. Each is either inert
+ * (resource limits, logging, restart behaviour) or gated below.
+ */
+const HOST_CONFIG_KNOWN: ReadonlySet<string> = new Set([
+  // Gated below by value, or checked by the mount and network logic.
+  'privileged', 'binds', 'mounts', 'networkmode', 'containeridfile', 'portbindings', 'publishallports',
+  'pidmode', 'ipcmode', 'utsmode', 'usernsmode', 'cgroupnsmode', 'cgroupparent', 'cgroup',
+  'devices', 'devicerequests', 'devicecgrouprules', 'securityopt', 'capadd', 'sysctls', 'runtime',
+  'isolation', 'maskedpaths', 'readonlypaths', 'volumesfrom', 'extrahosts', 'groupadd', 'links',
+  'volumedriver',
+  // Inert: they bound the container, they do not widen it. Dropping capabilities
+  // and setting resource limits or DNS search only ever restricts.
+  'capdrop', 'autoremove', 'restartpolicy', 'logconfig', 'consolesize', 'readonlyrootfs', 'init',
+  'oomscoreadj', 'oomkilldisable', 'shmsize', 'memory', 'memoryswap', 'memoryreservation',
+  'memoryswappiness', 'kernelmemory', 'nanocpus', 'cpushares', 'cpuperiod', 'cpuquota',
+  'cpurealtimeperiod', 'cpurealtimeruntime', 'cpusetcpus', 'cpusetmems', 'cpucount', 'cpupercent',
+  'blkioweight', 'blkioweightdevice', 'blkiodevicereadbps', 'blkiodevicewritebps',
+  'blkiodevicereadiops', 'blkiodevicewriteiops', 'pidslimit', 'dns', 'dnsoptions', 'dnssearch',
+  'annotations', 'tmpfs', 'ulimits', 'iomaximumbandwidth', 'iomaximumiops',
+]);
+
 const HOST_CONFIG_GATES: ReadonlyArray<{ key: string; permitted: (v: unknown) => boolean; flag: string }> = [
+  // The daemon writes the new container's id to this HOST path, so a non-empty
+  // value creates or truncates a file anywhere the daemon can reach. The CLI
+  // always sends it, empty.
+  { key: 'ContainerIDFile', permitted: isEmptyString, flag: '--cidfile' },
+  // Publishing binds a listening socket on the operator's interfaces, exposing
+  // a container service to their network and outside the proxy that controls
+  // this job's egress. The CLI sends both, empty, on every run.
+  { key: 'PortBindings', permitted: isEmptyObject, flag: '-p/--publish' },
+  { key: 'PublishAllPorts', permitted: (v: unknown) => isUnset(v) || v === false, flag: '-P/--publish-all' },
   { key: 'PidMode', permitted: isEmptyString, flag: '--pid' },
+  // Each is sent empty by every ordinary run, and each reaches outside the
+  // container when it is not: a cgroup to join, hosts entries, extra groups,
+  // a link to another job's container, or a volume driver that can bind-mount.
+  { key: 'Cgroup', permitted: isEmptyString, flag: '--cgroup' },
+  { key: 'ExtraHosts', permitted: isEmptyArray, flag: '--add-host' },
+  { key: 'GroupAdd', permitted: isEmptyArray, flag: '--group-add' },
+  { key: 'Links', permitted: isEmptyArray, flag: '--link' },
+  { key: 'VolumeDriver', permitted: isEmptyString, flag: '--volume-driver' },
   { key: 'IpcMode', permitted: oneOf('', 'private', 'none', 'shareable'), flag: '--ipc' },
   { key: 'UTSMode', permitted: isEmptyString, flag: '--uts' },
   { key: 'UsernsMode', permitted: isEmptyString, flag: '--userns' },
@@ -217,25 +265,38 @@ function parseBind(bind: string): MountRequest | string {
 /** Parse one entry of HostConfig.Mounts; null when it needs no host check. */
 function parseMount(mount: unknown): MountRequest | string | null {
   if (!isPlainObject(mount)) return 'each entry of HostConfig.Mounts must be an object';
-  const type = mount.Type;
+  const type = pick(mount, 'Type');
   if (type === 'tmpfs') return null;
   if (type === 'volume') {
-    if (isEmptyString(mount.Source)) return null; // anonymous: lives with the container
-    return `"${mount.Source}" is a named volume, not a workspace path; only declared workspace mounts are permitted`;
+    // A volume is only container-lifecycle storage while it uses the default
+    // driver with no options. The built-in local driver with
+    // type=none,o=bind,device=<path> IS a bind mount - the mechanism compose
+    // exposes as driver_opts - so an "anonymous" volume carrying driver
+    // options reaches an arbitrary host path, read-write, having skipped every
+    // mount check because it declares no Source.
+    const volumeOptions = pick(mount, 'VolumeOptions');
+    if (isPlainObject(volumeOptions) && !isUnset(pick(volumeOptions, 'DriverConfig'))) {
+      return 'a volume with DriverConfig is not permitted: a volume driver can bind-mount a host path, which only a declared workspace mount may do';
+    }
+    if (isEmptyString(pick(mount, 'Source'))) return null; // anonymous: lives with the container
+    return `"${String(pick(mount, 'Source'))}" is a named volume, not a workspace path; only declared workspace mounts are permitted`;
   }
   if (type !== 'bind') return `mount type "${String(type)}" is not permitted`;
-  if (typeof mount.Source !== 'string' || !path.isAbsolute(mount.Source)) {
+  const source = pick(mount, 'Source');
+  if (typeof source !== 'string' || !path.isAbsolute(source)) {
     return 'a bind mount needs an absolute Source';
   }
-  const options = mount.BindOptions;
+  const options = pick(mount, 'BindOptions');
   if (options !== undefined && options !== null) {
     if (!isPlainObject(options)) return 'BindOptions must be an object';
-    const propagation = options.Propagation ?? '';
+    const propagation = pick(options, 'Propagation') ?? '';
     if (!PROPAGATIONS.has(propagation as string)) {
       return `mount propagation "${String(propagation)}" is not permitted`;
     }
   }
-  return { source: mount.Source, mode: mount.ReadOnly === true ? 'ro' : 'rw' };
+  // Any casing that says read-only counts; a mount is rw only when none does.
+  const readOnly = valuesFor(mount, 'ReadOnly').some((v) => v === true);
+  return { source, mode: readOnly ? 'ro' : 'rw' };
 }
 
 function collectMounts(hostConfig: Record<string, unknown>): MountRequest[] | string {
@@ -330,6 +391,14 @@ function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: Dock
   } else if (privilegedValues.some((v) => !isUnset(v) && v !== false)) {
     return deny('HostConfig.Privileged must be a boolean');
   }
+  for (const key of Object.keys(hostConfig)) {
+    if (!HOST_CONFIG_KNOWN.has(key.toLowerCase())) {
+      return deny(
+        `HostConfig.${key} is not a setting the localmost docker socket understands, so it cannot be forwarded`
+      );
+    }
+  }
+
   for (const gate of HOST_CONFIG_GATES) {
     // Every casing must pass: one that does not is a value the daemon honours.
     if (!valuesFor(hostConfig, gate.key).every((v) => gate.permitted(v))) {
