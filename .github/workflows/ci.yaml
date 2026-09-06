@@ -12,7 +12,10 @@ permissions:
 
 jobs:
   check:
-    # Use the check workflow from the same ref (branch/SHA) as this workflow
+    # Use the check workflow from the same ref (branch/SHA) as this workflow.
+    # Named to distinguish it from the other workflows' check jobs; the job id
+    # stays `check`, which is what `needs:` below refers to.
+    name: ci runner
     uses: ./.github/workflows/check.yaml
     with:
       fallback: ubuntu-latest  # This repo builds on Linux; typical users would use macos-latest

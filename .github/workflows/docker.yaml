@@ -25,13 +25,28 @@ permissions:
 
 jobs:
   check:
+    # Named so it is tellable apart from the other workflows' check jobs in the
+    # PR checks list, where three of them appear.
+    name: docker runner
     uses: ./.github/workflows/check.yaml
     with:
       fallback: ubuntu-latest
 
   docker-linux:
+    # Reads the check output so a stale heartbeat is stated rather than left to
+    # be inferred from a job that sits queued. This job is the one that can say
+    # it: it always runs, on a GitHub-hosted runner, while docker-localmost is
+    # by design waiting for a runner that may not be online yet.
+    needs: check
     runs-on: ubuntu-latest
     steps:
+      - name: Say whether a localmost runner is online
+        run: |
+          if [ "${{ needs.check.outputs.runner }}" = "self-hosted" ]; then
+            echo "localmost runner is online; docker-localmost will run on it"
+          else
+            echo "::warning::No localmost heartbeat - docker-localmost stays queued until a runner comes online. That is the intended behaviour, not a failure: the job exists to exercise the filtering socket, which only localmost serves."
+          fi
       - uses: actions/checkout@v4
       - uses: ./.github/actions/docker-access
 

@@ -49,7 +49,12 @@ const REPOSITORY = 'owner/repo';
  */
 const policy: DockerPolicy = {
   pull: { registries: ['docker.io'] },
-  run: { images: [IMAGE], mounts: [{ path: './', mode: 'ro' }], network: 'bridge' },
+  run: {
+    images: [IMAGE],
+    mounts: [{ path: './', mode: 'ro' }],
+    network: 'bridge',
+    networks: [{ name: 'localmost-e2e-*', internal: true }],
+  },
 };
 
 /** The docker CLI a job would run, found on PATH the way the job's shell finds it. */
@@ -110,6 +115,7 @@ test.describe('a job using docker through the filtering socket', () => {
   let workspace: string;
   let env: NodeJS.ProcessEnv;
   const nonce = `hello-${process.pid}-${Date.now()}`;
+  const network = `localmost-e2e-${process.pid}`;
 
   // A real directory outside any workspace, so the refusal is "outside the job
   // workspace" rather than "cannot be resolved". Stands in for ~/.ssh.
@@ -163,6 +169,8 @@ test.describe('a job using docker through the filtering socket', () => {
   });
 
   test.afterAll(async () => {
+    // Before the proxy stops, and tolerant of a test that already removed it.
+    if (env) await docker('network', 'rm', network).catch(() => undefined);
     await proxy?.stop();
     if (scratch) fs.rmSync(scratch, { recursive: true, force: true });
     if (jobWorkspace) fs.rmSync(jobWorkspace, { recursive: true, force: true });
@@ -230,6 +238,51 @@ test.describe('a job using docker through the filtering socket', () => {
     if (logs) {
       const denial = logsSince(at).find((l) => l.policyHint !== undefined);
       expect(denial?.policyHint).toMatch(/path: "\.\/"\n\s*mode: rw/);
+    }
+  });
+  test('creates a declared network, joins a container to it, and removes it', async () => {
+    // The unit tests judge a body this file cannot see. Twice a create body
+    // they accepted was refused on the wire, because the real CLI sends keys
+    // the allowlist was never shown - so the network path is driven by the
+    // real CLI here, not only by fixtures.
+    const at = mark();
+
+    const created = await docker('network', 'create', '--internal', network);
+    expect(created.code, created.stderr).toBe(0);
+
+    // Addressable by the name the job chose, not only by the id the daemon
+    // assigned: the proxy records both when it relays the create.
+    const inspect = await docker('network', 'inspect', network);
+    expect(inspect.code, inspect.stderr).toBe(0);
+
+    const joined = await docker('run', '--rm', '--network', network, IMAGE, 'true');
+    expect(joined.code, joined.stderr).toBe(0);
+
+    const removed = await docker('network', 'rm', network);
+    expect(removed.code, removed.stderr).toBe(0);
+
+    if (logs) {
+      const since = logsSince(at);
+      expect(since.some((l) => /forwarded POST \/networks\/create/.test(l.message))).toBe(true);
+      expect(since.filter((l) => /^(denied|refused) /.test(l.message))).toEqual([]);
+    }
+  });
+
+  test('refuses a network the policy does not declare, and one declared internal made routable', async () => {
+    const at = mark();
+
+    const undeclared = await docker('network', 'create', 'not-declared-by-policy');
+    expect(undeclared.code).not.toBe(0);
+    expect(undeclared.stderr).toMatch(/not declared in the repository docker policy \(run\.networks\)/);
+
+    // The name matches, but dropping --internal asks for a routable network,
+    // which is strictly more reachable than what the policy granted.
+    const routable = await docker('network', 'create', `${network}-routable`);
+    expect(routable.code).not.toBe(0);
+    expect(routable.stderr).toMatch(/declared internal, so it cannot be created routable/);
+
+    if (logs) {
+      expect(logsSince(at).some((l) => /denied POST \/networks\/create/.test(l.message))).toBe(true);
     }
   });
 });

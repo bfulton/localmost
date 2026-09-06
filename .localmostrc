@@ -15,6 +15,13 @@ shared:
         - path: ./
           mode: ro
       network: bridge
+      # The docker e2e creates one network per run, joins a container to it and
+      # removes it, so the network path has real-CLI coverage rather than unit
+      # tests alone - twice now a body the tests accepted was refused on the
+      # wire. Internal: these carry no traffic off the machine.
+      networks:
+        - name: "localmost-e2e-*"
+          internal: true
 
   network:
     allow:
