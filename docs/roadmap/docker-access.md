@@ -3,8 +3,14 @@
 A `.localmostrc` key that lets an approved repository reach the Docker daemon, at
 a declared level, from inside the runner sandbox.
 
-> **Status:** implemented in 0.3.0. This document describes the design; where the
-> shipped behaviour differs it is noted inline.
+> **Status:** superseded by
+> [Docker Isolation — Owning the Socket, Then the Daemon](../superpowers/specs/2026-09-05-docker-isolation-design.md).
+> The level enum described here landed in pre-release 0.3.0 builds and was
+> replaced before release by a filtering Docker socket that localmost owns, so
+> container work is checked against the repository's policy instead of escaping
+> it. The problem statement below still holds; the solution, and everything the
+> "What This Actually Grants" section says a job can do, no longer does. Kept as
+> the record of the access model the spec argues from.
 
 ## Problem
 

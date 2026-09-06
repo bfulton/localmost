@@ -250,7 +250,7 @@ Current release: **0.3.0 — Test Locally, Secure by Default**
 - Sandbox policy levels (strict / moderate / permissive) declared per repository and enforced by the local proxy
 - Contributor-based job filtering for public repos
 - Repository policies require approval before the runner applies them
-- Opt-in [Docker daemon access](docs/roadmap/docker-access.md) declared per repo, off by default
+- Opt-in [container work through a filtering Docker socket](docs/superpowers/specs/2026-09-05-docker-isolation-design.md) declared per repo as `pull`, `run` and `build` actions; anything unlisted is denied, and registry credentials never enter the sandbox
 - Environment comparison with GitHub runners
 
 Future feature ideas:
@@ -266,6 +266,7 @@ Future feature ideas:
 - **Disk space monitoring** - Warn or pause when disk is low, auto-clean old work dirs.
 - **Linux and Windows host support** - Run self-hosted runners on non-Mac machines for projects that need them.
 - **Higher parallelism cap** - Parallelize proxy registration to support 16+ concurrent runners (currently capped at 8 due to serial registration time).
+- **Managed Docker VM** - Run the daemon behind the filtering socket in a VM whose only mount is the workspace, so a filter defect is contained, container egress is policed, and `privileged` becomes grantable.
 - **Ephemeral VM isolation** - Run each job in a fresh lightweight VM for stronger isolation between jobs.
 
 Bugs and quick improvements:

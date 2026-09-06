@@ -18,10 +18,16 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   repositories. Existing installations will be prompted to accept the new permission; until
   accepted, jobs from private repos with a policy are refused rather than run under a weaker
   sandbox
-- **Opt-in Docker access**: an approved `.localmostrc` may declare
-  `docker: socket | contexts | credentials` to let jobs reach the Docker daemon,
-  applied by the runner and `localmost test` alike. Default off. A job with Docker
-  access is not sandboxed - see `docs/roadmap/docker-access.md`
+- **Opt-in container work through a filtering Docker socket**: an approved
+  `.localmostrc` may declare the `pull`, `run` and `build` actions a job needs,
+  with the registries, images, workspace mounts (`ro`/`rw`), network mode and
+  build context each covers. The job is never handed the daemon socket: each
+  worker gets a socket localmost owns, and only declared requests are forwarded
+  to the daemon. Anything unlisted is denied, host bind mounts and
+  `--privileged`/`--pid=host`/`--network=host`/`--device` are refused, and
+  registry credentials are attached by the proxy so the job never reads
+  `~/.docker/config.json`. Default off. Allowed in `shared` and per workflow.
+  See `docs/superpowers/specs/2026-09-05-docker-isolation-design.md`
 - **Workflow Test Mode**: Run workflows locally before pushing with `localmost test`
   - Intercepts `actions/checkout` to use local working tree
   - Intercepts `actions/cache` for local caching
@@ -89,6 +95,10 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   it for the life of the process.
 
 ### Fixed
+- Per-workflow policy sections now match the workflow filename, as documented.
+  They were matched against the job name scraped from the runner's output, so a
+  `workflows.<name>` section fired only when a job happened to share its
+  workflow's name.
 - A step under `strict` no longer dies with an unexplained SIGABRT. The root
   directory node is now readable, so an absolute path can resolve; a policy that
   is missing something fails with the path that was blocked. `HOME` also pointed
@@ -102,6 +112,15 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   than being discarded.
 
 ### Changed
+- **Breaking policy change**: `docker: socket | contexts | credentials`, accepted
+  by pre-release 0.3.0 builds, is now a validation error naming the actions that
+  replace it. Migrate by declaring what the job does: `socket` and `contexts`
+  become `run:` (with `images`, plus `mounts` and `network` if the job binds the
+  workspace or needs a network mode) and `pull:` naming the registries it pulls
+  from; `credentials` becomes a private registry listed under `pull.registries`.
+  The proxy authenticates on the job's behalf, so the job no longer reads
+  `~/.docker/config.json` and nothing under `~/.docker` is opened at any level.
+  `localmost test --updaterc` writes the actions from a run's denials
 - CLI restructured with standalone commands that don't require the app
 - Improved help text with examples for all commands
 
