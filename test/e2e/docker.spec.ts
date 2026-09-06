@@ -39,6 +39,9 @@ import { DockerPolicy } from '../../src/shared/docker-policy';
 
 const IMAGE = 'alpine:3';
 
+/** The repository this socket is bound to; the checkout layout follows from it. */
+const REPOSITORY = 'owner/repo';
+
 /**
  * What a repository using Docker declares: one image, the workspace read-only,
  * the default network. Outside a job this file binds it; inside a job the
@@ -129,10 +132,12 @@ test.describe('a job using docker through the filtering socket', () => {
       workspace = fs.realpathSync.native(jobWorkspace);
     } else {
       const backend = new DesktopBackend();
-      // The checkout dir the backend roots mounts at, resolved as the daemon
-      // sees it: tmpdir is under /var, a symlink.
-      const workDir = backend.workspaceMountRoot(scratch);
-      fs.mkdirSync(workDir);
+      // The checkout the backend roots mounts at, for the repository this
+      // socket is bound to below: the runner lays it out as
+      // _work/<repo>/<repo>, and declared paths resolve against it. Resolved
+      // as the daemon sees it, since tmpdir is under /var, a symlink.
+      const workDir = backend.workspaceMountRoot(scratch, REPOSITORY);
+      fs.mkdirSync(workDir, { recursive: true });
       workspace = fs.realpathSync.native(workDir);
 
       socketPath = path.join(scratch, 'docker.sock');
@@ -140,7 +145,7 @@ test.describe('a job using docker through the filtering socket', () => {
       logs = captured;
       proxy = new DockerFilterProxy({ backend, onLog: (entry) => captured.push(entry) });
       await proxy.start(socketPath);
-      proxy.bind('owner/repo', policy);
+      proxy.bind(REPOSITORY, policy);
     }
     fs.writeFileSync(path.join(workspace, 'hello.txt'), `${nonce}\n`);
 
