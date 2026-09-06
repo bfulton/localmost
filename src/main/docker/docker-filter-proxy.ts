@@ -144,6 +144,16 @@ export class DockerFilterProxy {
 
     return new Promise((resolve, reject) => {
       const server = http.createServer((req, res) => this.handleRequest(req, res));
+      // Every answer here arrives after a round trip to the daemon, so it is
+      // written after a client that half-closes on sending (an HTTP/1.0
+      // client, `nc -U`, a health probe) has already sent its FIN. By default
+      // an http.Server treats that FIN as the end of the exchange and ends its
+      // own side, and the late response is dropped on the floor: the client
+      // reads nothing and waits for a close that never comes. Keep the write
+      // side open until the response is ended. The flag is a real property of
+      // http.Server (the HTTP-layer counterpart of net's allowHalfOpen) that
+      // @types/node does not declare, hence the cast.
+      (server as http.Server & { httpAllowHalfOpen: boolean }).httpAllowHalfOpen = true;
       server.on('upgrade', (req, socket, head) => this.handleUpgrade(req, socket as net.Socket, head));
       server.on('connection', (socket) => {
         this.connections.add(socket);

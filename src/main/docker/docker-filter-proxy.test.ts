@@ -525,3 +525,34 @@ describe('DockerFilterProxy attach', () => {
     socket.destroy();
   });
 });
+
+describe('an HTTP/1.0 client of the served socket', () => {
+  it('receives the relayed response and sees the connection close, rather than hanging', async () => {
+    const dir = tmp();
+    const daemon = await fakeDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', { run: { images: ['postgres:16'] } });
+
+    // What `printf ... | nc -U` does: send the request, half-close, then wait
+    // for the server to answer and close. An HTTP/1.0 client has no
+    // Content-Length contract to lean on; EOF is how it knows it is done.
+    const received = await new Promise<string>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      const client = net.connect(sock);
+      const timer = setTimeout(() => {
+        client.destroy();
+        reject(new Error(`connection not closed within 3s; received ${Buffer.concat(chunks).length} bytes`));
+      }, 3000);
+      client.on('connect', () => {
+        client.write('GET /_ping HTTP/1.0\r\nHost: localhost\r\n\r\n');
+        client.end();
+      });
+      client.on('data', (c: Buffer) => chunks.push(c));
+      client.on('error', (e) => { clearTimeout(timer); reject(e); });
+      client.on('close', () => { clearTimeout(timer); resolve(Buffer.concat(chunks).toString()); });
+    });
+
+    expect(received).toMatch(/^HTTP\/1\.[01] 200/);
+    expect(received).toContain('OK');
+  });
+});
