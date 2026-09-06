@@ -1295,6 +1295,12 @@ export class RunnerManager {
       instance.status = 'offline';
     }
     this.instances.delete(instanceNum);
+    // The context describes the job this slot just finished. Left behind, the
+    // next worker to take the slot is judged against the previous repository -
+    // its docker socket refuses the job it is actually running, and a spawn
+    // that records no context of its own would resolve the previous
+    // repository's filesystem policy.
+    this.pendingTargetContext.delete(String(instanceNum));
     this.updateAggregateStatus();
   }
 

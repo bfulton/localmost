@@ -1612,3 +1612,32 @@ describe('a worker constrained by policy drift stays constrained', () => {
     expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith([]);
   });
 });
+
+describe('a released slot does not carry the finished job\'s context', () => {
+  it('does not judge the next worker in that slot against the previous repository', async () => {
+    const docker = { run: { images: ['alpine:3'] } };
+    const manager = new RunnerManager({
+      onLog: jest.fn(), onStatusChange: jest.fn(), onJobHistoryUpdate: jest.fn(),
+      getRepoPolicy: async () => ({ hosts: [], level: 'strict' as const, readPaths: [], writePaths: [], docker }),
+    });
+    const helper = new RunnerManagerTestHelper(manager);
+
+    // Slot 1 ran a job for owner/first, then the worker went away.
+    helper.setInstance(1, { name: 'runner-1', status: 'listening' });
+    helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/first', githubSha: 'aaa1111' });
+    helper.releaseInstanceSlot(1);
+
+    // The slot is reused for a different repository, by a worker that did not
+    // go through spawnWorkerForJob and so records no context of its own.
+    const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn() };
+    helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyLevel: jest.fn() });
+    helper.setDockerProxy(1, dockerSocket);
+    helper.setInstance(1, { name: 'runner-1', status: 'busy', claimedRepository: 'owner/second' });
+
+    await helper.applyPolicyOnClaim(1, 'owner/second', 'bbb2222');
+
+    // With the previous job's context still in the slot, this worker is judged
+    // against owner/first and its socket never opens for the job it is running.
+    expect(dockerSocket.bind).toHaveBeenCalledWith('owner/second', docker);
+  });
+});
