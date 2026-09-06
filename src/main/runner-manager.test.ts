@@ -1530,3 +1530,47 @@ describe('docker access', () => {
     expect(stamp({ run: { images: ['postgres:16'] } })).toEqual(stamp({ run: { images: ['postgres:16'] } }));
   });
 });
+
+describe('job-start detection against injected output', () => {
+  const startedNames = (events: JobEvent[]) => events.filter((e) => e.type === 'started').map((e) => e.jobName);
+
+  const setup = () => {
+    const events: JobEvent[] = [];
+    const manager = new RunnerManager({
+      onLog: jest.fn(),
+      onStatusChange: jest.fn(),
+      onJobHistoryUpdate: jest.fn(),
+      onJobEvent: (e: JobEvent) => events.push(e),
+    });
+    const helper = new RunnerManagerTestHelper(manager);
+    helper.setInstance(1, { name: 'runner-1', status: 'listening' });
+    return { helper, events };
+  };
+
+  it('ignores "Running job:" embedded in a line the job merely printed', async () => {
+    const { helper, events } = setup();
+
+    // A commit message, PR title or any echoed text can carry this. Here it
+    // arrives the way it really did: inside the job's contextData JSON.
+    await helper.parseRunnerOutput(1, '{"k":"message","v":"fix: match the `Running job: <name>` line properly"}');
+
+    expect(startedNames(events)).toEqual([]);
+  });
+
+  it('ignores a second job start on a worker already running one', async () => {
+    const { helper, events } = setup();
+
+    await helper.parseRunnerOutput(1, 'Running job: build');
+    // The runner is --once: one spawn runs exactly one job, so anything after
+    // the first start is not a job, whatever it calls itself.
+    await helper.parseRunnerOutput(1, 'Running job: evil');
+
+    expect(startedNames(events)).toEqual(['build']);
+  });
+
+  it('still detects a genuine job start', async () => {
+    const { helper, events } = setup();
+    await helper.parseRunnerOutput(1, 'Running job: build');
+    expect(startedNames(events)).toEqual(['build']);
+  });
+});

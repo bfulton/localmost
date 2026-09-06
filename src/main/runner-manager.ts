@@ -1419,14 +1419,25 @@ export class RunnerManager {
       return;
     }
 
-    // Detect job start
-    const jobStartMatch = line.match(/Running job:\s*(.+)/i);
+    // Detect job start.
+    //
+    // Anchored, because this reads the job's own output: any text a job prints
+    // can contain "Running job: x" - a commit message, a PR title, a checked-out
+    // file - and an unanchored match turned that into a phantom job, complete
+    // with history entry, notification, and a worker marked busy. The runner
+    // emits this at the start of a line, optionally behind its own timestamp.
+    const jobStartMatch = line.match(/^\s*(?:\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?:?\s*)?Running job:\s*(.+?)\s*$/i);
     if (jobStartMatch) {
       const jobName = jobStartMatch[1].trim();
 
-      // Avoid duplicate job start detection
-      if (instance.status === 'busy' && instance.currentJob?.name === jobName) {
-        this.log('debug', `[instance ${instanceNum}] Ignoring duplicate job start: ${jobName}`);
+      // A worker runs with --once: one spawn is exactly one job. So a start on
+      // a worker that already has a job is never a second job - it is the job's
+      // output echoing something that looks like one.
+      if (instance.status === 'busy' || instance.currentJob) {
+        this.log(
+          'debug',
+          `[instance ${instanceNum}] Ignoring job start while already running ${instance.currentJob?.name ?? 'a job'}: ${jobName}`
+        );
         return;
       }
 
