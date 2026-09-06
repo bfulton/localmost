@@ -82,6 +82,21 @@ function flattenHeaders(headers: http.IncomingHttpHeaders): Record<string, strin
   return out;
 }
 
+/**
+ * A key read the way the daemon reads it, for the one field this file records.
+ *
+ * The evaluator judges every body case-insensitively because Go's decoder
+ * does; recording ownership case-sensitively meant a client that sent `name`
+ * created a network the evaluator had approved and the proxy then refused to
+ * let it address. Unambiguous by construction: a body with two casings of one
+ * key never reaches here, the evaluator refuses it.
+ */
+const readFolded = (obj: Record<string, unknown>, name: string): unknown => {
+  const wanted = name.toLowerCase();
+  for (const [key, value] of Object.entries(obj)) if (key.toLowerCase() === wanted) return value;
+  return undefined;
+};
+
 const isPlainRecord = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
 
@@ -583,7 +598,7 @@ export class DockerFilterProxy {
             if (typeof parsed.Id === 'string' && parsed.Id.length > 0) {
               this.ownNetwork(parsed.Id, parsed.Id);
               const body = requested.body;
-              const name = isPlainRecord(body) ? body.Name : undefined;
+              const name = isPlainRecord(body) ? readFolded(body, 'Name') : undefined;
               if (typeof name === 'string' && name.length > 0) this.ownNetwork(name, parsed.Id);
             }
           } catch {

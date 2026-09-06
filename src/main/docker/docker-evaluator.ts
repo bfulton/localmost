@@ -727,6 +727,47 @@ function evaluateOwnContainer(req: DockerRequest, ctx: DockerEvalContext): Docke
 // Entry point
 // -----------------------------------------------------------------------------
 
+/**
+ * The first key in `value` that has a case-variant twin, named with its path.
+ *
+ * Measured against a real daemon rather than reasoned about: a create body
+ * carrying `HostConfig`, `hostconfig` and `HOSTCONFIG` came back with fields
+ * from ALL THREE - Go decodes each key into the same struct field in document
+ * order, so nested objects merge, while scalars and arrays inside one object
+ * are last-wins. There is no single value a filter can read and be right
+ * about: reading the first misses what the later ones added, and reading the
+ * last misses what the first one set.
+ *
+ * So the ambiguity is refused instead of modelled. Go's encoder emits unique,
+ * exactly-cased keys, so no real client sends a case-variant duplicate; a body
+ * that does is either a client the filter does not model or an attempt to be
+ * judged on one value and served another.
+ */
+function caseAmbiguity(value: unknown, at = 'the request body'): string | undefined {
+  if (Array.isArray(value)) {
+    for (const [i, item] of value.entries()) {
+      const found = caseAmbiguity(item, `${at}[${i}]`);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  if (!isPlainObject(value)) return undefined;
+  const seen = new Map<string, string>();
+  for (const key of Object.keys(value)) {
+    const folded = key.toLowerCase();
+    const first = seen.get(folded);
+    if (first !== undefined) {
+      return `${at} names both "${first}" and "${key}", which the daemon reads as the same key: it decodes them case-insensitively and merges or overwrites, so the value it would use is not the value this filter can read. Send each key once.`;
+    }
+    seen.set(folded, key);
+  }
+  for (const [key, child] of Object.entries(value)) {
+    const found = caseAmbiguity(child, `${at}.${key}`);
+    if (found) return found;
+  }
+  return undefined;
+}
+
 export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext): DockerVerdict {
   const action = classifyDockerRequest(req);
   if (BASELINE.has(action)) return ALLOW;
@@ -736,6 +777,11 @@ export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext
 
   // A body the parser could not read is a request the filter cannot judge.
   if (req.bodyError) return deny(req.bodyError);
+
+  // Nor can it judge a body whose keys the daemon would read differently than
+  // it does. Checked once, here, so every action with a body is covered.
+  const ambiguous = caseAmbiguity(req.body);
+  if (ambiguous) return deny(ambiguous);
 
   switch (action) {
     case 'create':

@@ -701,3 +701,62 @@ describe('BuildKit endpoints', () => {
     expect(evaluateDockerRequest(mk('POST', '/v1.45/build?t=app%3A1'), ctx(p)).allowed).toBe(true);
   });
 });
+
+describe('duplicate keys that differ only in case', () => {
+  const runPolicy: DockerPolicy = { run: { images: ['alpine:3'], network: 'bridge' } };
+
+  it('refuses a body carrying two casings of the same key, rather than guessing which one counts', () => {
+    // Measured against a real daemon: with `HostConfig`, `hostconfig` and
+    // `HOSTCONFIG` all present, Go's decoder MERGED all three into one struct
+    // (AutoRemove from the first, Memory from the second, OomScoreAdj from the
+    // third). Scalars and arrays inside one object are last-wins instead.
+    // No filter can read one of those objects and know what the daemon will
+    // do, and picking the last is as wrong as picking the first - the merge
+    // keeps fields from both. Go's encoder never emits case-variant duplicates,
+    // so a body containing them is not a client we model.
+    const v = evaluateDockerRequest(
+      mk('POST', '/v1.45/containers/create', {
+        Image: 'alpine:3',
+        HostConfig: { NetworkMode: 'bridge' },
+        hostconfig: { Binds: ['/etc:/host-etc'] },
+      }),
+      ctx(runPolicy)
+    );
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/case/i);
+    expect(v.reason).toMatch(/HostConfig|hostconfig/);
+  });
+
+  it('finds them however deep they are nested', () => {
+    const v = evaluateDockerRequest(
+      mk('POST', '/v1.45/containers/create', {
+        Image: 'alpine:3',
+        HostConfig: { NetworkMode: 'bridge', Mounts: [{ Type: 'bind', Source: '/ws', type: 'tmpfs' }] },
+      }),
+      ctx(runPolicy)
+    );
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/case/i);
+  });
+
+  it('leaves an ordinary body alone, including keys that merely resemble each other', () => {
+    const v = evaluateDockerRequest(
+      mk('POST', '/v1.45/containers/create', {
+        Image: 'alpine:3',
+        HostConfig: { NetworkMode: 'bridge', Memory: 0, MemorySwap: 0, Binds: [] },
+      }),
+      ctx(runPolicy)
+    );
+    expect(v.allowed).toBe(true);
+  });
+
+  it('applies to every action with a body, not just create', () => {
+    const p: DockerPolicy = { run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-1', internal: true }] } };
+    const v = evaluateDockerRequest(
+      mk('POST', '/v1.45/networks/create', { Name: 'vk-1', Internal: true, internal: false }),
+      ctx(p)
+    );
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/case/i);
+  });
+});

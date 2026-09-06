@@ -190,6 +190,19 @@ Per family, and in the same executable-escape style as the original spec:
   grammar does not guess at intent it can ask for - so validation rejects a
   tagless glob with a message naming `vk/*:*`. Exact references are untouched:
   `alpine` still means `alpine:latest`, which is what it looks like.
+- ~~What the filter should do when a body spells one key two ways.~~
+  **Decided: refuse the body.** Review raised this as a case-folding bypass and
+  proposed reading the last duplicate, on the theory that Go's decoder is
+  last-wins. Measured against a real daemon instead: a create body carrying
+  `HostConfig`, `hostconfig` and `HOSTCONFIG` came back with fields from **all
+  three** - Go decodes each key into the same struct field in document order,
+  so nested objects merge, while scalars and arrays inside one object are
+  last-wins. Reading the last is therefore as wrong as reading the first, and
+  emulating the merge means reimplementing `encoding/json`. Since Go's encoder
+  emits unique exactly-cased keys, no real client sends a case-variant
+  duplicate - the real CLI's bodies are clean, which the e2e exercises - so the
+  ambiguity is refused recursively at the evaluator's entry, once, for every
+  action with a body.
 - Whether an owned network should be deleted automatically when the job's worker
   exits, as the socket itself is. Leaning yes, for the same reason: nothing
   should outlive the job that created it.

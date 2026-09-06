@@ -787,6 +787,24 @@ describe('networks a job creates', () => {
     expect((await request(sock, 'GET', '/v1.45/networks/vk-1')).status).toBe(403);
     expect((await request(sock, 'GET', '/v1.45/networks/net123')).status).toBe(403);
   });
+
+  it('are recorded under the name whatever casing the client spelled the key with', async () => {
+    // The daemon decodes `name` into the same field as `Name`, so it creates
+    // the network either way, and the evaluator already judges either way.
+    // Reading only `Name` here left the network created but unaddressable: the
+    // job could not join, inspect or delete what it had just made.
+    const dir = tmp();
+    const daemon = await networkDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', {
+      run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] },
+    });
+
+    expect((await request(sock, 'POST', '/v1.45/networks/create', { name: 'vk-1', internal: true })).status).toBe(201);
+
+    expect((await request(sock, 'GET', '/v1.45/networks/vk-1')).status).toBeLessThan(400);
+    expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3', HostConfig: { NetworkMode: 'vk-1' } })).status).toBe(201);
+  });
 });
 
 /** A fake daemon that also answers network create. */
