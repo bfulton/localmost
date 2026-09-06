@@ -10,6 +10,8 @@
  * Pure and shared between the main process and the CLI.
  */
 
+import * as yaml from 'js-yaml';
+
 export type MountMode = 'ro' | 'rw';
 
 /** A workspace path the container may bind, and whether it may write to it. */
@@ -334,4 +336,29 @@ export function serializeDockerPolicy(policy: DockerPolicy, indent: string): str
   if (policy.privileged) lines.push(`${i1}privileged: true`);
 
   return lines;
+}
+
+// =============================================================================
+// Discovery
+// =============================================================================
+
+/**
+ * Read a policy hint back into the policy it names. A hint is what a denial
+ * logs: the YAML fragment, rooted at `docker:`, that would have permitted the
+ * request. It ends up written into a checked-in policy, so anything that is
+ * not exactly a valid docker block - a parse error, another key, an action
+ * the grammar rejects - yields nothing rather than widening the file.
+ */
+export function parseDockerPolicyHint(hint: string): DockerPolicy | undefined {
+  let loaded: unknown;
+  try {
+    loaded = yaml.load(hint);
+  } catch {
+    return undefined;
+  }
+  if (!isPlainObject(loaded) || Object.keys(loaded).length !== 1 || !('docker' in loaded)) return undefined;
+  const errors: string[] = [];
+  validateDockerPolicy(loaded.docker, 'docker', (m) => errors.push(m));
+  if (errors.length > 0) return undefined;
+  return loaded.docker as DockerPolicy;
 }

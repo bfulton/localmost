@@ -243,4 +243,77 @@ describe('mergeDiscoveredAccess', () => {
       { label: 'filesystem.write', items: ['~/.npm'] },
     ]);
   });
+
+  it('turns a denied docker request into a docker policy suggestion in --updaterc output', () => {
+    // What a filtered denial logs: the YAML under docker: that would have permitted the request.
+    const hint = 'docker:\n  run:\n    images:\n      - "postgres:16"';
+    const existing: LocalmostrcConfig = { version: 1, shared: { network: { allow: ['github.com'] } } };
+
+    const { config, additions } = mergeDiscoveredAccess(existing, discovered({ dockerHints: [hint] }), 'ci');
+
+    expect(config.shared?.docker?.run?.images).toContain('postgres:16');
+    expect(config.shared?.network?.allow).toEqual(['github.com']);
+    expect(additions).toEqual([{ label: 'docker.run.images', items: ['postgres:16'] }]);
+  });
+
+  it('folds several docker denials into one policy and adds only what the existing one lacks', () => {
+    const existing: LocalmostrcConfig = {
+      version: 1,
+      shared: { docker: { run: { images: ['postgres:16'], network: 'bridge' } } },
+    };
+    const hints = [
+      'docker:\n  run:\n    images:\n      - "postgres:16"',
+      'docker:\n  run:\n    images:\n      - "redis:7"',
+      'docker:\n  run:\n    mounts:\n      - path: "./tmp/fixtures"\n        mode: rw',
+      'docker:\n  pull:\n    registries:\n      - ghcr.io',
+    ];
+
+    const { config, additions } = mergeDiscoveredAccess(existing, discovered({ dockerHints: hints }), 'ci');
+
+    expect(config.shared?.docker).toEqual({
+      pull: { registries: ['ghcr.io'] },
+      run: { images: ['postgres:16', 'redis:7'], mounts: [{ path: './tmp/fixtures', mode: 'rw' }], network: 'bridge' },
+    });
+    expect(additions).toEqual([
+      { label: 'docker.pull.registries', items: ['ghcr.io'] },
+      { label: 'docker.run.images', items: ['redis:7'] },
+      { label: 'docker.run.mounts', items: ['./tmp/fixtures:rw'] },
+    ]);
+  });
+
+  it('has nothing to add when the existing docker policy already permits the denied request', () => {
+    const existing: LocalmostrcConfig = { version: 1, shared: { docker: { run: { images: ['postgres:16'] } } } };
+    const hint = 'docker:\n  run:\n    images:\n      - "postgres:16"';
+
+    const { config, additions } = mergeDiscoveredAccess(existing, discovered({ dockerHints: [hint] }), 'ci');
+
+    expect(additions).toEqual([]);
+    expect(config.shared?.docker).toEqual(existing.shared?.docker);
+  });
+
+  it('lists a bare run action as its own grant, since the diff has no item to show for it', () => {
+    const existing: LocalmostrcConfig = { version: 1, shared: { docker: { pull: { registries: ['docker.io'] } } } };
+
+    const { config, additions } = mergeDiscoveredAccess(existing, discovered({ dockerHints: ['docker:\n  run: {}'] }), 'ci');
+
+    expect(config.shared?.docker).toEqual({ pull: { registries: ['docker.io'] }, run: {} });
+    expect(additions).toEqual([{ label: 'docker.run', items: ['{}'] }]);
+  });
+
+  it('starts a new policy with a docker block from the hints alone', () => {
+    const { config, additions } = mergeDiscoveredAccess(undefined, discovered({
+      dockerHints: ['docker:\n  build:\n    context: "./"'],
+    }), 'ci');
+
+    expect(config.shared?.docker).toEqual({ build: { context: './' } });
+    expect(config.workflows).toEqual({ ci: {} });
+    expect(additions).toEqual([{ label: 'docker.build.context', items: ['./'] }]);
+  });
+
+  it('ignores a hint that is not a valid docker policy rather than widening the file', () => {
+    const { config, additions } = mergeDiscoveredAccess(undefined, discovered({ dockerHints: ['docker: socket'] }), 'ci');
+
+    expect(config.shared?.docker).toBeUndefined();
+    expect(additions).toEqual([]);
+  });
 });

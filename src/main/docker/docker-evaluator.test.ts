@@ -7,8 +7,8 @@
 
 import { describe, it, expect } from '@jest/globals';
 import { evaluateDockerRequest, DockerEvalContext } from './docker-evaluator';
-import { parseDockerRequest } from './docker-request';
-import { DockerPolicy } from '../../shared/docker-policy';
+import { parseDockerRequest, DockerRequest } from './docker-request';
+import { DockerPolicy, mergeDockerPolicy, parseDockerPolicyHint } from '../../shared/docker-policy';
 
 const mk = (method: string, url: string, body?: unknown) => parseDockerRequest({
   method, url, headers: body ? { 'content-type': 'application/json' } : {},
@@ -273,5 +273,30 @@ describe('verb-to-endpoint mapping', () => {
     expect(evaluateDockerRequest(mk('POST', '/v1.45/build'), runOnly).allowed).toBe(false);
     const pullOnly = ctx({ pull: { registries: ['docker.io'] } });
     expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/create', { Image: 'postgres:16' }), pullOnly).allowed).toBe(false);
+  });
+});
+
+describe('policy hints', () => {
+  // The hint is what --updaterc writes, so it has to be the policy that would
+  // have permitted the request - no more, no less - in the shape the parser reads.
+  it('name exactly the policy that permits the denied request, in the shape --updaterc reads', () => {
+    const cases: Array<{ req: DockerRequest; policy: DockerPolicy }> = [
+      { req: mk('POST', '/v1.45/containers/create', { Image: 'redis:7' }), policy: { run: { network: 'bridge' } } },
+      { req: mk('POST', '/v1.45/containers/create', { Image: 'redis:7' }), policy: { run: { images: ['redis:7'] } } },
+      { req: mk('POST', '/v1.45/containers/create', { Image: 'postgres:16', HostConfig: { Binds: ['/ws/tmp/fixtures:/f'] } }), policy: { run: { images: ['postgres:16'], network: 'bridge' } } },
+      { req: mk('POST', '/v1.45/containers/create', { Image: 'postgres:16', HostConfig: { NetworkMode: 'ci-net' } }), policy: { run: { images: ['postgres:16'], network: 'bridge' } } },
+      { req: mk('POST', '/v1.45/images/create?fromImage=ghcr.io%2Ffoo&tag=1'), policy: { pull: { registries: ['docker.io'] } } },
+      { req: mk('POST', '/v1.45/images/create?fromImage=postgres&tag=16'), policy: {} },
+      { req: mk('POST', '/v1.45/build'), policy: {} },
+      { req: mk('POST', '/v1.45/containers/abc/start'), policy: { pull: { registries: ['docker.io'] } } },
+    ];
+    for (const { req, policy } of cases) {
+      const denied = evaluateDockerRequest(req, ctx(policy));
+      expect([req.raw.url, denied.allowed]).toEqual([req.raw.url, false]);
+      const hinted = parseDockerPolicyHint(denied.policyHint ?? '');
+      expect([req.raw.url, hinted]).not.toEqual([req.raw.url, undefined]);
+      const permitted = evaluateDockerRequest(req, ctx(mergeDockerPolicy(policy, hinted) ?? {}));
+      expect([req.raw.url, permitted.allowed]).toEqual([req.raw.url, true]);
+    }
   });
 });

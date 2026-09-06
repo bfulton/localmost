@@ -44,7 +44,8 @@ import {
   serializeLocalmostrc,
   LOCALMOSTRC_VERSION,
 } from '../shared/localmostrc';
-import { SandboxPolicy, parseSandboxTrace, SandboxTraceResult } from '../shared/sandbox-profile';
+import { SandboxPolicy, parseSandboxTrace } from '../shared/sandbox-profile';
+import { DockerPolicy, diffDockerPolicy, mergeDockerPolicy, parseDockerPolicyHint } from '../shared/docker-policy';
 import { DiscoveryProxy } from '../shared/discovery-proxy';
 import { createWorkspace, cleanupWorkspaces, getGitInfo, getRepositoryFromDir } from '../shared/workspace';
 import {
@@ -566,7 +567,13 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     const sandboxTrace = parseSandboxTrace(logContent, workspace.path, collectedPids);
 
     if (allSucceeded) {
-      await handleUpdateRc(cwd, workflow, discoveredHosts, sandboxTrace, !!options.assumeYes);
+      await handleUpdateRc(
+        cwd,
+        workflow,
+        { hosts: discoveredHosts, readPaths: sandboxTrace.readPaths, writePaths: sandboxTrace.writePaths },
+        sandboxTrace.socketPaths,
+        !!options.assumeYes
+      );
     } else {
       console.log();
       console.log(`${colors.yellow}Skipping .localmostrc generation - workflow failed.${colors.reset}`);
@@ -1087,16 +1094,20 @@ async function resolveSecrets(
 /**
  * Handle --updaterc flag to generate/update .localmostrc.
  *
- * Uses the hosts discovered during the workflow run to generate
- * a .localmostrc file with only the hosts your workflow actually needs.
+ * Uses the access discovered during the workflow run to generate a
+ * .localmostrc file with only what your workflow actually needs. Socket
+ * paths are reported but never written: no policy key declares one.
  */
 async function handleUpdateRc(
   cwd: string,
   workflow: ParsedWorkflow,
-  discoveredHosts: string[],
-  sandboxTrace: SandboxTraceResult | undefined,
+  discovered: DiscoveredAccess,
+  socketPaths: string[],
   assumeYes: boolean
 ): Promise<void> {
+  const { hosts: discoveredHosts, readPaths, writePaths } = discovered;
+  const dockerHints = discovered.dockerHints ?? [];
+
   console.log();
   console.log(`${colors.bold}Discovery Results:${colors.reset}`);
 
@@ -1114,10 +1125,6 @@ async function handleUpdateRc(
   }
 
   // Report filesystem access
-  const readPaths = sandboxTrace?.readPaths || [];
-  const writePaths = sandboxTrace?.writePaths || [];
-  const socketPaths = sandboxTrace?.socketPaths || [];
-
   if (readPaths.length === 0 && writePaths.length === 0) {
     console.log(`  Filesystem: ${colors.dim}No access outside workDir${colors.reset}`);
   } else {
@@ -1141,8 +1148,15 @@ async function handleUpdateRc(
     }
   }
 
-  // Report socket access. There is no policy key for arbitrary sockets: the
-  // only socket a policy can ask for is the Docker daemon, via `docker:`.
+  // Report what the filtering docker socket refused. Each denial's hint is
+  // the policy that would have permitted it, and those are what get written.
+  if (dockerHints.length > 0) {
+    console.log(`  Docker: ${dockerHints.length} request(s) refused by the filtering socket`);
+  }
+
+  // Report socket access. There is no policy key for unix sockets: the only
+  // socket a job is handed is the one localmost serves, and what it may do
+  // through that is declared by action under `docker:`, not by path.
   if (socketPaths.length > 0) {
     console.log(`  Sockets: ${socketPaths.length} socket(s) were reached`);
     for (const p of socketPaths) {
@@ -1150,7 +1164,7 @@ async function handleUpdateRc(
     }
     if (socketPaths.some(p => p.includes('docker.sock'))) {
       console.log(
-        `    ${colors.yellow}Declare Docker access with \`docker: socket\` in shared${colors.reset}`
+        `    ${colors.yellow}Docker is declared by action under \`docker:\` (pull, run, build), not as a socket${colors.reset}`
       );
     }
   }
@@ -1158,14 +1172,14 @@ async function handleUpdateRc(
   console.log();
 
   // Check if there's anything to add
-  if (discoveredHosts.length === 0 && readPaths.length === 0 && writePaths.length === 0) {
+  if (discoveredHosts.length === 0 && readPaths.length === 0 && writePaths.length === 0 && dockerHints.length === 0) {
     if (socketPaths.length > 0) {
       // Sockets were reached, but no policy key declares one, so there is
       // genuinely nothing to write - saying "no access" would contradict the
       // socket list printed just above.
       console.log(`${colors.yellow}Nothing to write to .localmostrc.${colors.reset}`);
       console.log('The only access recorded was to unix sockets, which no policy key declares.');
-      console.log('Docker is the exception: declare it with `docker:` in the shared section.');
+      console.log('Docker is declared by action under `docker:` (pull, run, build) - see docs/roadmap/localmostrc.md.');
       return;
     }
 
@@ -1177,7 +1191,6 @@ async function handleUpdateRc(
     return;
   }
 
-  const discovered: DiscoveredAccess = { hosts: discoveredHosts, readPaths, writePaths };
   const existingPath = findLocalmostrc(cwd);
   let existing: LocalmostrcConfig | undefined;
   if (existingPath) {
@@ -1190,15 +1203,16 @@ async function handleUpdateRc(
   }
 
   const { config, additions } = mergeDiscoveredAccess(existing, discovered, workflow.name);
-  if (existingPath && additions.length === 0) {
-    console.log(`${colors.green}✓${colors.reset} ${path.relative(cwd, existingPath)} already includes all discovered access.`);
+  if (additions.length === 0) {
+    if (existingPath) {
+      console.log(`${colors.green}✓${colors.reset} ${path.relative(cwd, existingPath)} already includes all discovered access.`);
+    } else {
+      console.log(`${colors.yellow}Nothing to write to .localmostrc.${colors.reset}`);
+    }
     return;
   }
 
-  const approved = await confirmPolicyChange(
-    existingPath ? additions : [...additions, { label: 'sockets.allow', items: socketPaths }],
-    assumeYes
-  );
+  const approved = await confirmPolicyChange(additions, assumeYes);
   if (!approved) return;
 
   const content = serializeLocalmostrc(config);
@@ -1219,6 +1233,11 @@ export interface DiscoveredAccess {
   readPaths: string[];
   /** Paths outside the workspace that were written. */
   writePaths: string[];
+  /**
+   * What the filtering docker socket refused, as the hints its denials log:
+   * each the YAML under `docker:` that would have permitted the request.
+   */
+  dockerHints?: string[];
 }
 
 /** One policy key and the values a discovery run would add under it. */
@@ -1229,6 +1248,37 @@ export interface PolicyAddition {
 
 const nonEmpty = (additions: PolicyAddition[]): PolicyAddition[] =>
   additions.filter((a) => a.items.length > 0);
+
+/** The docker policy a run's denials asked for, folded from their hints; undefined when none read. */
+function dockerPolicyFromHints(hints: string[]): DockerPolicy | undefined {
+  let policy: DockerPolicy | undefined;
+  for (const hint of hints) {
+    const parsed = parseDockerPolicyHint(hint);
+    if (parsed) policy = mergeDockerPolicy(policy, parsed);
+  }
+  return policy;
+}
+
+/**
+ * The docker grants `merged` has that `existing` lacks, one addition per
+ * policy key, named the way the approval diff names them. A bare action
+ * (`run: {}`) is a grant with no item for the diff to show, so it is listed
+ * on its own.
+ */
+function dockerAdditions(existing: DockerPolicy | undefined, merged: DockerPolicy | undefined): PolicyAddition[] {
+  const byLabel = new Map<string, string[]>();
+  for (const diff of diffDockerPolicy(existing, merged, 'docker')) {
+    if (diff.newValue === undefined) continue;
+    const item = diff.type === 'changed' ? `${diff.newValue} (was ${diff.oldValue})` : diff.newValue;
+    byLabel.set(diff.path, [...(byLabel.get(diff.path) ?? []), item]);
+  }
+  for (const action of ['run', 'build'] as const) {
+    if (!merged?.[action] || existing?.[action]) continue;
+    if ([...byLabel.keys()].some((label) => label.startsWith(`docker.${action}.`))) continue;
+    byLabel.set(`docker.${action}`, ['{}']);
+  }
+  return [...byLabel].map(([label, items]) => ({ label, items }));
+}
 
 /**
  * Merge what a discovery run found into a .localmostrc, listing each grant it
@@ -1242,6 +1292,7 @@ export function mergeDiscoveredAccess(
   workflowName: string
 ): { config: LocalmostrcConfig; additions: PolicyAddition[] } {
   const { hosts, readPaths, writePaths } = discovered;
+  const suggestedDocker = dockerPolicyFromHints(discovered.dockerHints ?? []);
 
   if (!existing) {
     const config: LocalmostrcConfig = {
@@ -1254,6 +1305,7 @@ export function mergeDiscoveredAccess(
           read: readPaths.length > 0 ? readPaths : undefined,
           write: writePaths.length > 0 ? writePaths : undefined,
         } : undefined,
+        ...(suggestedDocker ? { docker: suggestedDocker } : {}),
       },
       workflows: {
         [workflowName]: {},
@@ -1263,6 +1315,7 @@ export function mergeDiscoveredAccess(
       { label: 'network.allow', items: hosts },
       { label: 'filesystem.read', items: readPaths },
       { label: 'filesystem.write', items: writePaths },
+      ...dockerAdditions(undefined, suggestedDocker),
     ]);
     return { config, additions };
   }
@@ -1276,6 +1329,10 @@ export function mergeDiscoveredAccess(
 
   const existingWritePaths = new Set(existing.shared?.filesystem?.write || []);
   const newWritePaths = writePaths.filter(p => !existingWritePaths.has(p));
+
+  // Docker composes additively, so a hint only ever adds to what is declared.
+  const existingDocker = existing.shared?.docker;
+  const docker = suggestedDocker ? mergeDockerPolicy(existingDocker, suggestedDocker) : existingDocker;
 
   // Merge new items into existing config
   const config: LocalmostrcConfig = {
@@ -1291,12 +1348,14 @@ export function mergeDiscoveredAccess(
         read: newReadPaths.length > 0 ? [...(existing.shared?.filesystem?.read || []), ...newReadPaths] : existing.shared?.filesystem?.read,
         write: newWritePaths.length > 0 ? [...(existing.shared?.filesystem?.write || []), ...newWritePaths] : existing.shared?.filesystem?.write,
       } : undefined,
+      ...(docker ? { docker } : {}),
     },
   };
   const additions = nonEmpty([
     { label: 'network.allow', items: newHosts },
     { label: 'filesystem.read', items: newReadPaths },
     { label: 'filesystem.write', items: newWritePaths },
+    ...dockerAdditions(existingDocker, docker),
   ]);
   return { config, additions };
 }

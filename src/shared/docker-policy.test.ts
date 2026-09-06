@@ -5,6 +5,7 @@ import {
   mergeDockerPolicy,
   diffDockerPolicy,
   serializeDockerPolicy,
+  parseDockerPolicyHint,
   DockerPolicy,
 } from './docker-policy';
 
@@ -274,5 +275,27 @@ describe('serializeDockerPolicy', () => {
   it('writes nothing for a policy that grants nothing', () => {
     expect(serializeDockerPolicy({}, '  ')).toEqual([]);
     expect(serializeDockerPolicy({ privileged: false }, '  ')).toEqual([]);
+  });
+});
+
+describe('parseDockerPolicyHint', () => {
+  it('reads the YAML fragment a denial logs back into the policy it names', () => {
+    expect(parseDockerPolicyHint('docker:\n  run:\n    images:\n      - "postgres:16"'))
+      .toEqual({ run: { images: ['postgres:16'] } });
+    expect(parseDockerPolicyHint('docker:\n  run:\n    mounts:\n      - path: "./tmp/fixtures"\n        mode: rw'))
+      .toEqual({ run: { mounts: [{ path: './tmp/fixtures', mode: 'rw' }] } });
+    expect(parseDockerPolicyHint('docker:\n  pull:\n    registries:\n      - ghcr.io'))
+      .toEqual({ pull: { registries: ['ghcr.io'] } });
+    expect(parseDockerPolicyHint('docker:\n  build:\n    context: "./"')).toEqual({ build: { context: './' } });
+    expect(parseDockerPolicyHint('docker:\n  run: {}')).toEqual({ run: {} });
+  });
+
+  it('yields nothing for anything that is not a valid docker policy, so a bad hint never widens one', () => {
+    expect(parseDockerPolicyHint('docker: socket')).toBeUndefined();                 // the old level
+    expect(parseDockerPolicyHint('docker:\n  exec: {}')).toBeUndefined();            // unknown action
+    expect(parseDockerPolicyHint('network:\n  allow:\n    - example.com')).toBeUndefined(); // not docker
+    expect(parseDockerPolicyHint('docker:\n  run: {}\nnetwork: {}')).toBeUndefined(); // more than docker
+    expect(parseDockerPolicyHint('docker:\n  run:\n    images: [x')).toBeUndefined(); // not YAML
+    expect(parseDockerPolicyHint('')).toBeUndefined();
   });
 });
