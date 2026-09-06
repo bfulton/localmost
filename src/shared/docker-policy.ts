@@ -273,6 +273,23 @@ export function diffDockerPolicy(
   diffScalar(oldP?.build?.context, newP?.build?.context, `${prefix}.build.context`, diffs);
   // false grants nothing, the same as absent.
   diffScalar(oldP?.privileged ? 'true' : undefined, newP?.privileged ? 'true' : undefined, `${prefix}.privileged`, diffs);
+
+  // An action block with no conditions is still a grant - `run: {}` permits
+  // creating and running containers - and diffing only conditions showed an
+  // approver nothing for it at all. Named here only when the block is
+  // otherwise invisible, so a block that changed its conditions is not
+  // reported twice.
+  for (const action of ['pull', 'run', 'build'] as const) {
+    const had = oldP?.[action] !== undefined;
+    const has = newP?.[action] !== undefined;
+    if (had === has) continue;
+    if (diffs.some((d) => d.path.startsWith(`${prefix}.${action}.`))) continue;
+    diffs.push(
+      has
+        ? { path: `${prefix}.${action}`, type: 'added', newValue: action }
+        : { path: `${prefix}.${action}`, type: 'removed', oldValue: action }
+    );
+  }
   return diffs;
 }
 

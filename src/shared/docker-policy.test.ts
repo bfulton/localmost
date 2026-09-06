@@ -314,3 +314,32 @@ describe('serializeDockerPolicy quoting', () => {
     expect(reparsed.config?.shared?.docker?.privileged).toBeUndefined();
   });
 });
+
+describe('diffDockerPolicy on bare action blocks', () => {
+  it('reports the action itself appearing, not just its conditions', () => {
+    // `run: {}` permits creating and running containers. Diffing only the
+    // leaves showed nothing, so the grant reached approval invisibly.
+    const cases: Array<[DockerPolicy, string]> = [
+      [{ run: {} }, 'shared.docker.run'],
+      [{ build: {} }, 'shared.docker.build'],
+      [{ pull: { registries: [] } }, 'shared.docker.pull'],
+    ];
+    for (const [block, path] of cases) {
+      const diffs = diffDockerPolicy(undefined, block, 'shared.docker');
+      expect([path, diffs.map((d) => d.path)]).toEqual([path, expect.arrayContaining([path])]);
+      expect([path, diffs.every((d) => d.type === 'added')]).toEqual([path, true]);
+    }
+  });
+
+  it('reports an action being removed as well', () => {
+    const diffs = diffDockerPolicy({ build: {} }, undefined, 'shared.docker');
+    expect(diffs.map((d) => d.path)).toContain('shared.docker.build');
+    expect(diffs[0].type).toBe('removed');
+  });
+
+  it('does not double-report an action that merely changed its conditions', () => {
+    const diffs = diffDockerPolicy({ run: { images: ['a'] } }, { run: { images: ['b'] } }, 'shared.docker');
+    expect(diffs.map((d) => d.path)).not.toContain('shared.docker.run');
+    expect(diffs.map((d) => d.path)).toContain('shared.docker.run.images');
+  });
+});
