@@ -649,13 +649,21 @@ export class BrokerProxyService extends EventEmitter {
     }
   }
 
-  /** Whether a job is queued for a worker here or held by a live worker session. */
+  /**
+   * Whether a job is queued for a worker here or held by a live worker session.
+   *
+   * Only a queued job *assignment* counts. A queued cancellation names the same
+   * job, so counting it made a cancellation evidence of its own liveness: every
+   * redelivery - and GitHub redelivers while a job is unfinished - queued
+   * another copy, unbounded, and the next worker to poll would be handed a
+   * cancellation instead of a job. Which is the stall this class exists to stop.
+   */
   private isJobLive(jobId: string): boolean {
     for (const session of this.localSessions.values()) {
       if (session.currentJobId === jobId) return true;
     }
     for (const queue of this.messageQueues.values()) {
-      if (queue.some(message => jobIdFromMessage(message) === jobId)) return true;
+      if (queue.some(message => isJobAssignmentMessage(message) && jobIdFromMessage(message) === jobId)) return true;
     }
     return false;
   }

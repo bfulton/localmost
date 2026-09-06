@@ -604,6 +604,20 @@ describe('message routing', () => {
     expect(internals.messageQueues.get(target.id) ?? []).toEqual([]);
   });
 
+  it('does not let a queued cancellation keep itself alive across redeliveries', async () => {
+    // GitHub redelivers a cancellation while the job is unfinished. A queued
+    // cancellation names the job, so counting it as evidence the job is live
+    // made every redelivery queue another copy - unbounded, and the next
+    // worker to poll gets a cancellation instead of a job.
+    const target = addTargetWithRunner('target-a', 'runner-a.1');
+    const state = internals.targets.get(target.id)!;
+    internals.messageQueues.set(target.id, [cancelMessage]);
+
+    await internals.processMessage(state, state.instances.get(1), cancelMessage);
+
+    expect(internals.messageQueues.get(target.id)).toEqual([cancelMessage]);
+  });
+
   it("answers the runner's own acknowledge locally", async () => {
     const res = await request('POST', '/acknowledge?sessionId=abc', JSON.stringify({ runnerRequestId: 'req-1' }));
 
