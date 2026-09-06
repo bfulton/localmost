@@ -9,8 +9,9 @@ name: Docker Access
 #   docker-localmost The self-hosted runner, where the daemon is reachable only
 #                    through the filtering socket localmost serves the job
 #                    (DOCKER_HOST), checked against the policy. This is the
-#                    end-to-end test of the policy on a real job, and it is
-#                    skipped when no localmost runner is online.
+#                    end-to-end test of the policy on a real job. It runs on
+#                    every push: with no localmost runner online it queues for
+#                    one rather than reporting a skip.
 on:
   push:
     branches: [main]
@@ -35,8 +36,6 @@ jobs:
       - uses: ./.github/actions/docker-access
 
   docker-localmost:
-    needs: check
-    if: needs.check.outputs.runner == 'self-hosted'
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
