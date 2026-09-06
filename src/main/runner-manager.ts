@@ -38,6 +38,8 @@ interface RunnerInstance {
    * the approved policy must not serve a job under it.
    */
   policyStamp?: string;
+  /** Set when a claim found the approved policy had moved; the worker stays constrained. */
+  policyDrifted?: boolean;
   /**
    * The repository whose job this worker claimed, as the broker reported it.
    * The docker socket opens only for this repository, and only when it is
@@ -1733,6 +1735,14 @@ export class RunnerManager {
     // this worker would run the job under the old boundary - so it is refused
     // rather than run. Approving through the app retires workers eagerly; this
     // also covers approving through the CLI, which writes the cache directly.
+    if (instance?.policyDrifted) {
+      this.log(
+        'debug',
+        `[instance ${instanceNum}] Policy drifted for this worker; leaving it constrained rather than reapplying`
+      );
+      return;
+    }
+
     const currentStamp = this.stampFor(policy);
     if (isClaim && instance?.policyStamp && instance.policyStamp !== currentStamp) {
       // The filesystem half is fixed in this worker's profile and cannot be
@@ -1742,7 +1752,11 @@ export class RunnerManager {
       // worker is retired so nothing further lands on it - this constrains the
       // job rather than refusing it, which the proxy cannot do on its own.
       // The docker socket stays as it was born, closed: nothing on this path
-      // opens it.
+      // opens it. Sticky, because the job-start refresh runs without isClaim
+      // and so never re-checks drift - without this it fell straight through
+      // to the widening below, restoring the hosts and rebinding the socket
+      // this branch had just closed.
+      if (instance) instance.policyDrifted = true;
       proxy.setPolicyAllowedHosts([]);
       proxy.setPolicyLevel('strict');
       this.log(

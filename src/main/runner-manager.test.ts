@@ -1574,3 +1574,41 @@ describe('job-start detection against injected output', () => {
     expect(startedNames(events)).toEqual(['build']);
   });
 });
+
+describe('a worker constrained by policy drift stays constrained', () => {
+  it('does not reopen the docker socket or restore hosts when the job starts', async () => {
+    const docker = { pull: { registries: ['docker.io'] }, run: { images: ['alpine:3'] } };
+    const manager = new RunnerManager({
+      onLog: jest.fn(),
+      onStatusChange: jest.fn(),
+      onJobHistoryUpdate: jest.fn(),
+      getRepoPolicy: async () => ({
+        hosts: ['example.com'], level: 'strict' as const, readPaths: [], writePaths: [], docker,
+      }),
+    });
+    const helper = new RunnerManagerTestHelper(manager);
+    const proxy = { setPolicyAllowedHosts: jest.fn(), setPolicyLevel: jest.fn(), getStats: jest.fn(), getPolicyLevel: jest.fn() };
+    const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn() };
+    helper.setProxy(1, proxy);
+    helper.setDockerProxy(1, dockerSocket);
+    // A stamp that cannot match the policy above: the approved policy moved
+    // after this worker was built, so its profile is out of date.
+    helper.setInstance(1, {
+      name: 'runner-1', status: 'busy', policyStamp: 'stale-stamp',
+      currentJob: { name: 'build', repository: 'owner/repo', startedAt: 'now', id: 'job-1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' },
+    });
+    helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
+
+    // The claim detects drift: network cut to nothing, docker socket left closed.
+    await helper.applyPolicyOnClaim(1, 'owner/repo', 'abc1234');
+    expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith([]);
+    expect(dockerSocket.bind).not.toHaveBeenCalled();
+
+    // The job-start refresh must not undo that. It runs without isClaim, so it
+    // never re-checks drift, and it used to fall straight through to widening.
+    await helper.applyRepoPolicy(1);
+
+    expect(dockerSocket.bind).not.toHaveBeenCalled();
+    expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith([]);
+  });
+});
