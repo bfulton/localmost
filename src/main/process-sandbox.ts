@@ -136,6 +136,8 @@ interface RunnerProfileOptions {
   allowDirectNetwork?: boolean;
   /** The repository's approved policy; strict with nothing declared by default. */
   filesystemPolicy?: SandboxFilesystemPolicy;
+  /** The filtering docker socket the app serves this worker, if it has one. */
+  dockerSocket?: string;
 }
 
 function generateSandboxProfile({
@@ -143,7 +145,31 @@ function generateSandboxProfile({
   brokerPort = DEFAULT_BROKER_PORT,
   allowDirectNetwork = false,
   filesystemPolicy = { level: 'strict', read: [], write: [] },
+  dockerSocket,
 }: RunnerProfileOptions): string {
+  // The worker's own docker socket, served by the app: every request on it is
+  // checked against the repository policy before it reaches a daemon. Connect
+  // and read, never write - the sandbox directory around it is writable, so
+  // the socket is subtracted by name after that allow (seatbelt takes the last
+  // matching rule) and the job cannot unlink it and bind its own in its place.
+  // The daemon's socket is never granted: it lives under ~/.docker, which the
+  // deny block keeps closed in full.
+  const dockerRules = ((socket?: string): string => {
+    if (!socket) return '';
+    // Built from the sandbox directory and landing in a security DSL, so it
+    // is escaped like every other path interpolated into this profile.
+    const quoted = socket.replace(/"/g, '\\"');
+    return [
+      ';; This worker\'s filtering docker socket, served by the app. Every request',
+      ';; is checked against the repository policy before it reaches a daemon.',
+      `(allow network-outbound (literal "${quoted}"))`,
+      `(allow file-read* (literal "${quoted}"))`,
+      ';; Not writable, so the job cannot replace it with a socket of its own.',
+      `(deny file-write* (literal "${quoted}"))`,
+      '',
+    ].join('\n');
+  })(dockerSocket);
+
   const escapedDir = instanceDir.replace(/"/g, '\\"');
   const homeDir = os.homedir().replace(/"/g, '\\"');
   const appDataDir = getRunnerBaseDir().replace(/"/g, '\\"');
@@ -328,6 +354,7 @@ ${policyReads}
   (literal "${homeDir}/.cargo/credentials")
   (literal "${homeDir}/.cargo/credentials.toml")
   (literal "${homeDir}/.nuget/NuGet/NuGet.Config"))
+${dockerRules}
 
 ;; Device files that need read/write access (git, many tools redirect to /dev/null)
 (allow file-write*
@@ -444,6 +471,11 @@ export interface SandboxOptions extends SpawnOptions {
    * job gets. Absent means strict with nothing declared.
    */
   filesystemPolicy?: SandboxFilesystemPolicy;
+  /**
+   * The filtering docker socket the app serves this worker. The job connects
+   * to it and nothing else; the daemon's own socket stays denied.
+   */
+  dockerSocket?: string;
   /** Log prefix for identifying this process (e.g., runner instance ID) */
   logPrefix?: string;
   /** Optional callback for logging sandbox events */
@@ -489,6 +521,7 @@ export function spawnSandboxed(
   const {
     allowDirectNetwork,
     filesystemPolicy,
+    dockerSocket,
     logPrefix,
     onLog,
     ...spawnOptions
@@ -507,6 +540,7 @@ export function spawnSandboxed(
       instanceDir,
       allowDirectNetwork,
       filesystemPolicy,
+      dockerSocket,
     });
 
     // The profile is the thing that confines the job, so it must not live

@@ -59,6 +59,14 @@ jobs:
       - name: Run tests
         run: npm test
 
+      # A real docker CLI, a real daemon, and the filtering socket between them.
+      # Outside a job it serves the socket itself over the runner's native
+      # daemon; inside a localmost job it drives the socket the runner serves,
+      # bound to this repository's own .localmostrc. It fails, never skips, when
+      # Docker is absent - so it runs on every leg.
+      - name: Run docker end-to-end
+        run: npx playwright test test/e2e/docker.spec.ts --config test/playwright.config.ts
+
       - name: Build
         run: npm run build
 

@@ -64,6 +64,7 @@ localmost is an Electron desktop application that manages GitHub Actions self-ho
 - **Home directory access**: Workflows cannot read `~/.ssh`, `~/.aws`, `~/.config` or the other credential locations listed above, at any level. `HOME` points inside the workspace, not at your home directory
 - **Filesystem reads**: Under `strict` a job reads the OS, the runner's own directories, its workspace, and whatever its `.localmostrc` declares - nothing else. `moderate` and `permissive` additionally grant the standard toolchain locations (`/opt/homebrew`, `/usr/local`, Xcode) and the package-manager caches. At every level a job is denied `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.config`, `~/Library/Keychains`, `~/.netrc`, `~/.npmrc`, this app's credential store and approval cache, and the credential files kept inside the package-manager caches (`~/.m2/settings.xml`, `~/.gradle/gradle.properties`, cargo credentials, `NuGet.Config`)
 - **Network exfiltration**: A job's sandbox permits no outbound connection except to its own filtering proxy, so the host policy holds even for code that ignores `HTTP_PROXY` and opens a raw socket. Under `strict` the reachable set is runner infrastructure plus what the repository declares — not npm, PyPI or other registries
+- **Container work**: A job is never handed the Docker daemon socket. It talks to a filtering socket localmost owns, which forwards only the `pull`, `run` and `build` requests the repository's approved `.localmostrc` declares - see Docker Access below
 - **Credential exposure**: OAuth tokens are encrypted at rest using macOS Keychain
 
 ### Policy levels
@@ -105,6 +106,7 @@ loosen its own sandbox without the machine owner agreeing to it.
 - **Allowlisted hosts**: Data can be exfiltrated to any host the active policy allows. Under `strict` that is runner infrastructure plus whatever the repository declares; looser levels allow more.
 - **Approved policies**: Once you approve a repository's `.localmostrc`, everything it declares is granted until the file changes again. Approval is a judgement about that content.
 - **Per-workflow filesystem sections**: A `workflows:` section can narrow or widen *network* access per workflow, because hosts are applied to the proxy when a job is claimed. Filesystem paths are taken from `shared:` only — the sandbox profile is built before the runner knows which workflow it will run, and cannot change afterwards.
+- **Container egress**: Traffic from inside a container leaves through the daemon's network, not the job's proxy, so the host allowlist does not apply to it. The Docker filter decides what a container may be created with, not what it connects to once running - see Docker Access below.
 
 - **The runner's own floor**: A job's sandbox also contains the runner process, so the profile must grant what the runner needs to function - the OS, its own installation, the tool cache, the workspace and temp. A repository cannot narrow below that floor, only add to it.
 - **Declared system paths**: A policy that declares OS read paths grants them for the whole job. `localmost policy init` seeds that list with OS subpaths (`/usr/bin`, `/usr/lib`, `/System`, `/Library/Developer` and similar) because nothing runs without them. It deliberately excludes `/usr/local`, `/Library/Application Support` and `/Applications`, which hold third-party software and application data - but a policy is free to add them back, and approving one means accepting that.
@@ -188,8 +190,64 @@ or stored by localmost.
 - **Required Permissions**:
   - `Administration: Read & Write` - Register and remove self-hosted runners on repositories
   - `Actions: Read & Write` - Check workflow status and cancel running jobs
+  - `Variables: Read & Write` - Write the `LOCALMOST_HEARTBEAT` variable that workflows check
+  - `Contents: Read` - Fetch the repository's `.localmostrc` sandbox policy at the job's commit
   - `Metadata: Read` - Access basic repository information (required by GitHub for all apps)
   - `Self-hosted runners: Read & Write` (org-level) - Register runners at the organization level
+  - `Variables: Read & Write` (org-level) - Write the `LOCALMOST_HEARTBEAT` variable at the organization level
+
+### Docker Access
+
+A repository may declare `docker:` in its approved `.localmostrc`. The job is
+never handed the daemon socket. localmost serves a unix socket of its own inside
+the worker's sandbox directory and points `DOCKER_HOST` at it; a filtering proxy
+behind that socket parses every Docker API request, checks it against the policy
+bound to that worker, and forwards only what passes to the daemon. The socket is
+created denying everything, is bound to the repository's policy when the job is
+claimed, and is destroyed with the job. A worker that claims a job for a
+repository other than the one its socket is bound to gets no docker access at
+all. The profile denies `~/.docker` in full; the only socket a job can reach is
+the one localmost serves, and it cannot unlink or replace it.
+
+What the filter refuses, each of which is an executable test against the proxy:
+
+- a bind mount of any host path outside the job workspace - `docker run -v
+  ~/.ssh:/host-ssh` is refused - including `../` traversal and a symlink that
+  resolves outside the workspace, since paths are resolved before they are
+  checked;
+- mounting the daemon socket into a container;
+- `--privileged`, `--pid=host`, `--network=host`, `--device`, and the other
+  host-reaching container settings (`IpcMode`, `UtsMode`, `UsernsMode`,
+  `CgroupParent`, `SecurityOpt`), none of which has a spelling in the policy
+  grammar;
+- an image, registry, mount, network mode or build context the policy did not
+  declare;
+- any endpoint, API version or request body the proxy does not fully
+  understand. The filter fails closed: a request it cannot evaluate is refused,
+  not passed through.
+
+Registry credentials never enter the sandbox. The proxy attaches authentication
+to a pull on the job's behalf; the job does not read `~/.docker/config.json` and
+never holds the secret.
+
+What the filter does not contain:
+
+- **Container egress.** Traffic from inside a container leaves through the
+  daemon's network, not the job's proxy, so the policy's host allowlist does not
+  apply to it. The filter constrains what a container is created with, not what
+  it connects to once running.
+- **A filter defect.** The daemon is the operator's own, so a request that
+  passes the filter runs with the daemon's reach. There is no second boundary
+  behind the filter yet. That is what the managed-VM backend in the design adds,
+  and why `privileged` is rejected until it exists.
+
+Nothing but the approved `.localmostrc` grants any of this - there is no
+machine-level switch to withhold it - so the approval diff is where that
+decision gets made. Every grant under `docker:` is surfaced in the diff with the
+same prominence as a change to `level:`. Default is off: a repository that
+declares nothing under `docker:` has only the baseline of `/_ping`, `/version`,
+`/info` and reads about its own containers, none of which reach the host. The
+design is in `docs/superpowers/specs/2026-09-05-docker-isolation-design.md`.
 
 ## Credential Storage
 
@@ -283,6 +341,7 @@ localmost adds isolation layers that the stock GitHub Actions Runner lacks:
 | File system (write) | Runner working directory and temp dirs only |
 | File system (read) | Essential system paths (`/usr/bin`, `/System/Library`, Xcode) |
 | Network | Allowlisted hosts only (GitHub, npm, PyPI, etc.) via HTTP proxy |
+| Docker daemon | Through a filtering socket; only declared `pull`/`run`/`build` requests are forwarded |
 | Home directory | **Denied** — no access to `~/.ssh`, `~/.aws`, etc. |
 | Other applications | **Denied** — no access to `/Applications` (except Xcode) |
 

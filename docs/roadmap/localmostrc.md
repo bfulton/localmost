@@ -1,6 +1,6 @@
 # .localmostrc — Declarative Sandbox Policy
 
-A checked-in file that explicitly declares what network and filesystem access a workflow needs.
+A checked-in file that explicitly declares what network, filesystem and container access a workflow needs.
 
 > **Status:** implemented in 0.3.0. This document describes the design; where the
 > shipped behaviour differs it is noted inline.
@@ -125,6 +125,24 @@ shared:
       - "~/.aws/*"               # Explicit paranoia
       - "~/.ssh/id_*"
 
+  # Container work. The job talks to a filtering socket localmost owns, not
+  # the daemon; only the actions declared here are forwarded, and anything
+  # unlisted is denied. Allowed in shared and per workflow. See "Docker
+  # access" below.
+  docker:
+    pull:
+      registries:
+        - docker.io
+    run:
+      images:
+        - "postgres:16"
+      mounts:
+        - path: ./               # Workspace paths only, resolved through symlinks
+          mode: ro               # ro | rw
+      network: bridge
+    build:
+      context: ./
+
   env:
     allow:
       - DEVELOPER_DIR
@@ -148,6 +166,13 @@ workflows:
     secrets:
       require:
         - APPSTORE_CONNECT_KEY
+
+  integration:
+    docker:                      # Composes with shared.docker
+      run:
+        mounts:
+          - path: ./tmp/fixtures
+            mode: rw
 ```
 
 ### Wildcards
@@ -247,6 +272,65 @@ Discovered access for build.yml:
 
 Add to .localmostrc under workflows.build? [y/n]
 ```
+
+### Docker access
+
+`docker:` does not open the daemon socket. Each worker gets a unix socket of its
+own, served by localmost outside the sandbox, and `DOCKER_HOST` points the job at
+it. A filtering proxy behind that socket parses every Docker API request, checks
+it against the approved policy, and forwards only what is permitted to the daemon
+localmost resolved from the operator's own Docker configuration. Colima and
+Podman work without the repository naming a path.
+
+Actions are CLI-shaped, so a policy reads the way a workflow author thinks:
+
+| Action | Covers | Conditions |
+|---|---|---|
+| `pull` | image pulls | `registries` — the registry each pulled image comes from |
+| `run` | container create, start, attach, wait and remove | `images` — the image a container is created from; `mounts` — workspace paths a container may bind, each `ro` or `rw`; `network` — the container's network mode |
+| `build` | image builds | `context` — where the build context may resolve |
+
+Conditions are checked against the request itself. Mount and context paths are
+resolved through symlinks and must stay inside the job workspace, so `../`
+traversal and absolute host paths fail structurally rather than by pattern
+match, and a container may write to a mount only where the policy says `rw`.
+Anything not listed is denied: an undeclared image, registry, mount or network
+mode, and every endpoint the proxy does not understand.
+
+A small baseline needs no declaration: `/_ping`, `/version`, `/info`, and reads
+about the job's own containers. Every client needs them to start, and none reach
+the host.
+
+There is no key at any level for `--pid=host`, `--network=host`, `--device`,
+mounting the daemon socket into a container, or the other host-reaching
+container settings; what cannot be named cannot be requested. `privileged` is
+the one exception, because docker-in-docker and qemu emulation need it. It
+exists in the grammar and is rejected at approval time unless the daemon runs in
+a managed VM, which localmost does not yet provide (stage 2 of the design). At
+stage 1 it is a policy that cannot be satisfied, and the error says why.
+
+Registry credentials never enter the sandbox. The proxy attaches authentication
+to a pull on the job's behalf, so a private registry needs only its name under
+`pull.registries`; the job never reads `~/.docker/config.json`.
+
+`docker:` is allowed in `shared:` and under `workflows:`, and the two compose
+additively like the rest of the policy. The socket is bound to the merged policy
+when the job is claimed, so a workflow can add an `rw` mount that the shared
+policy does not grant. Each denial logs the policy line that would have permitted
+the request, and `localmost test --updaterc` writes docker policy from those the
+same way it writes network and filesystem policy.
+
+The old levels — `docker: socket | contexts | credentials` — are rejected with an
+error naming the actions that replace them, on the same reasoning `docker: true`
+was rejected: guessing which grant a coarse level meant is worse than failing in
+a key that governs what a container may reach.
+
+There is still no key for arbitrary unix sockets. `localmost test --updaterc`
+reports sockets a run reached, but writes no socket declaration; the only socket
+a job is handed is the one localmost serves.
+
+The design, including what the filter does and does not contain, is in
+[docs/superpowers/specs/2026-09-05-docker-isolation-design.md](../superpowers/specs/2026-09-05-docker-isolation-design.md).
 
 ## Why Checked Into Git
 

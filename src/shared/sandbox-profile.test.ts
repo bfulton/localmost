@@ -554,3 +554,32 @@ describe('Sandbox Profile Generator', () => {
     });
   });
 });
+
+describe('docker access in the test-mode profile', () => {
+  const base = { workDir: '/Users/dev/project', proxyPort: 8080 };
+
+  it('emits no docker rules without a docker policy', () => {
+    const profile = generateSandboxProfile({ ...base, policy: {} });
+    expect(profile).not.toContain('docker.sock');
+  });
+
+  it('never opens the daemon socket or ~/.docker from a docker policy', () => {
+    // A policy names requests the filtering socket may forward. It is not a
+    // level that unlocks the daemon: a job handed the daemon socket can
+    // bind-mount every host path this profile denies.
+    const profile = generateSandboxProfile({
+      ...base,
+      policy: {
+        docker: {
+          pull: { registries: ['docker.io'] },
+          run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'rw' }] },
+          build: { context: './' },
+          privileged: true,
+        },
+      },
+    });
+    expect(profile).not.toContain('docker.sock');
+    expect(profile).not.toContain('config.json');
+    expect(profile).not.toMatch(/\(allow [^\n]*\.docker/);
+  });
+});

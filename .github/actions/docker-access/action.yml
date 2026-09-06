@@ -1,0 +1,47 @@
+name: Docker access check
+description: >
+  Reach the Docker daemon, run a container, and confirm the policy level
+  boundary holds. Used from both the Linux and localmost runner jobs so the
+  two check exactly the same things.
+
+runs:
+  using: composite
+  steps:
+    - name: Reach the daemon
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "DOCKER_HOST=${DOCKER_HOST:-<unset>}"
+
+        if ! docker version --format 'client {{.Client.Version}} / server {{.Server.Version}}'; then
+          echo "::error::No reachable Docker daemon."
+          echo "On the localmost runner this means the repository's docker policy was"
+          echo "not approved or not bound to the job's socket, or Docker Desktop is"
+          echo "not running on the host."
+          exit 1
+        fi
+
+    - name: Run a container
+      shell: bash
+      run: |
+        set -euo pipefail
+        # The pull and the run both go through the filtering socket localmost
+        # serves the job, which checks the registry (pull.registries) and the
+        # image (run.images) against the repository's docker policy.
+        docker run --rm alpine:3 echo "container ran"
+
+    - name: Check credentials never enter the sandbox
+      shell: bash
+      run: |
+        set -euo pipefail
+        # DOCKER_HOST is set only by localmost, so it marks the sandboxed run.
+        if [ -z "${DOCKER_HOST:-}" ]; then
+          echo "Not the sandboxed path (no DOCKER_HOST); nothing to check"
+          exit 0
+        fi
+
+        if cat "$HOME/.docker/config.json" >/dev/null 2>&1; then
+          echo "::error::~/.docker/config.json was readable; registry credentials must never enter the sandbox"
+          exit 1
+        fi
+        echo "config.json is denied: credentials are attached by the filtering socket, never read by the job"

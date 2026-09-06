@@ -2,6 +2,20 @@ version: 1
 level: strict
 
 shared:
+  # Container work goes through a filtering socket localmost owns and checks
+  # against this allowlist; anything not named here is refused. CI's docker
+  # jobs and the docker e2e pull alpine:3 from Docker Hub and mount the
+  # workspace read-only. See docs/superpowers/specs/2026-09-05-docker-isolation-design.md.
+  docker:
+    pull:
+      registries: [docker.io]
+    run:
+      images: ["alpine:3"]
+      mounts:
+        - path: ./
+          mode: ro
+      network: bridge
+
   network:
     allow:
       - "*.github.com"

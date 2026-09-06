@@ -15,6 +15,21 @@ const configDir = getAppDataDir();
 const configPath = getConfigPath();
 
 /**
+ * On-disk config format version. Bump when the format changes in a way an older
+ * build would mishandle. Every save stamps this; loaders/savers refuse to write
+ * over a file that carries a HIGHER version, so a stale or older app bundle
+ * sharing the same config dir cannot silently downgrade (and lose) it.
+ */
+export const CONFIG_VERSION = 1;
+
+/**
+ * True when a config on disk was written by a newer build than this one.
+ * An absent or non-numeric version is legacy, not newer.
+ */
+export const isConfigFromNewerBuild = (version: unknown): boolean =>
+  typeof version === 'number' && version > CONFIG_VERSION;
+
+/**
  * Keys that can be set via the SETTINGS_SET IPC handler.
  * This is the source of truth - TypeScript derives the type from this array.
  * Note: 'auth' and 'githubClientId' are intentionally excluded (set via auth flow).
@@ -37,6 +52,8 @@ export const SETTABLE_CONFIG_KEYS = [
 export type SettableConfigKey = typeof SETTABLE_CONFIG_KEYS[number];
 
 export interface AppConfig {
+  /** On-disk config format version. Used to refuse downgrades by an older build. */
+  configVersion?: number;
   githubClientId?: string;
   auth?: {
     accessToken?: string;  // Optional - obtained fresh on startup, not persisted
@@ -132,8 +149,24 @@ export const saveConfig = (config: AppConfig): void => {
   try {
     fs.mkdirSync(configDir, { recursive: true });
 
+    // Refuse to downgrade a config written by a newer build. Reading only the
+    // version keeps this cheap and tolerant of an otherwise-unreadable file
+    // (the atomic write below still replaces genuine corruption).
+    if (fs.existsSync(configPath)) {
+      try {
+        const existing = yaml.load(fs.readFileSync(configPath, 'utf-8'), { schema: yaml.JSON_SCHEMA }) as AppConfig | undefined;
+        if (existing && isConfigFromNewerBuild(existing.configVersion)) {
+          bootLog('error', `Refusing to save config: on-disk version ${existing.configVersion} is newer than this build (${CONFIG_VERSION}); a downgrade would clobber it`);
+          return;
+        }
+      } catch {
+        // Unreadable existing config: not a version downgrade. Fall through and
+        // let the normal (atomic) save replace it.
+      }
+    }
+
     // Create a copy to avoid mutating the original config
-    const configToSave = { ...config };
+    const configToSave: AppConfig = { ...config, configVersion: CONFIG_VERSION };
 
     // Only persist refreshToken and user - access tokens are obtained fresh on startup
     if (configToSave.auth) {
@@ -149,7 +182,13 @@ export const saveConfig = (config: AppConfig): void => {
       }
     }
 
-    fs.writeFileSync(configPath, yaml.dump(configToSave, { indent: 2, lineWidth: -1 }));
+    // Atomic write: serialize to a temp file, then rename over the real one.
+    // A rename is atomic, so a reader (or a second app instance) never sees a
+    // half-written file, and a failure part-way through leaves the previous
+    // config intact instead of truncating it in place.
+    const tempPath = `${configPath}.tmp`;
+    fs.writeFileSync(tempPath, yaml.dump(configToSave, { indent: 2, lineWidth: -1 }));
+    fs.renameSync(tempPath, configPath);
   } catch (e) {
     bootLog('error', `Failed to save config: ${(e as Error).message}`);
   }

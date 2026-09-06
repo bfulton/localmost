@@ -6,9 +6,10 @@
 import { app, BrowserWindow, Notification } from 'electron';
 import * as nodePath from 'path';
 import { RunnerManager, JobEvent } from './runner-manager';
+import { DesktopBackend } from './docker/docker-backend';
 import { GitHubAuth } from './github-auth';
 import { RunnerDownloader } from './runner-downloader';
-import { HeartbeatManager } from './heartbeat-manager';
+import { HeartbeatManager, toHeartbeatTarget } from './heartbeat-manager';
 import { BrokerProxyService } from './broker-proxy-service';
 import { TargetManager } from './target-manager';
 import { ContributorCache } from './contributor-cache';
@@ -304,6 +305,9 @@ app.whenReady().then(async () => {
       return contributorCache.getAllAuthors(accessToken, owner, repo, sha);
     },
     getJobTarget: (jobId: string) => brokerProxyService.getJobTarget(jobId),
+    // Stage 1: approved container requests go to the operator's own daemon.
+    // The socket the job sees is localmost's; the daemon's is never handed over.
+    dockerBackend: new DesktopBackend(),
     getRepoPolicy: async (owner: string, repo: string, _sha: string, workflowName: string) => {
       // Apply the policy that was approved, not whatever is in the repository
       // right now. A job only reaches this point once its policy has been
@@ -312,7 +316,13 @@ app.whenReady().then(async () => {
       // declared in the same file and approved with the rest of it.
       const cached = getCachedPolicy(`${owner}/${repo}`);
       if (!cached?.approved) {
-        return { hosts: [], level: 'strict' as const, readPaths: [], writePaths: [] };
+        return {
+          hosts: [],
+          level: 'strict' as const,
+          readPaths: [],
+          writePaths: [],
+          docker: {},
+        };
       }
       const policy = getEffectivePolicy(cached.config, workflowName);
       return {
@@ -326,6 +336,9 @@ app.whenReady().then(async () => {
         // policy drift.
         readPaths: cached.config.shared?.filesystem?.read || [],
         writePaths: cached.config.shared?.filesystem?.write || [],
+        // Docker composes across shared and workflow: the socket is bound to
+        // the merged policy when the job is claimed, after the workflow is known.
+        docker: policy.docker ?? {},
       };
     },
     onJobEvent: (event: JobEvent) => {
@@ -474,7 +487,7 @@ app.whenReady().then(async () => {
         }
       }
 
-      runnerManager.setPendingTargetContext('next', targetId, target.displayName, actionsUrl, githubInfo.githubRunId, githubInfo.githubJobId, githubInfo.githubActor, githubInfo.githubSha, githubInfo.githubRef);
+      runnerManager.setPendingTargetContext('next', targetId, target.displayName, actionsUrl, githubInfo.githubRunId, githubInfo.githubJobId, githubInfo.githubActor, githubInfo.githubSha, githubInfo.githubRef, githubInfo.githubWorkflow);
 
       // Spawn a worker to handle this job
       try {
@@ -700,11 +713,7 @@ app.whenReady().then(async () => {
         if (heartbeatManager && authState?.accessToken && githubAuth) {
           // Set up heartbeat for all configured targets
           const targets = config.targets || [];
-          const heartbeatTargets = targets.map(t =>
-            t.type === 'org'
-              ? { level: 'org' as const, org: t.owner }
-              : { level: 'repo' as const, owner: t.owner, repo: t.repo! }
-          );
+          const heartbeatTargets = targets.map(toHeartbeatTarget);
 
           if (heartbeatTargets.length > 0) {
             heartbeatManager.setTargets(heartbeatTargets);

@@ -14,6 +14,8 @@ import { ChildProcess } from 'child_process';
 interface RunnerInstance {
   /** Hash of the approved policy this worker's profile was built from. */
   policyStamp?: string;
+  /** The repository whose job this worker claimed, as the broker reported it. */
+  claimedRepository?: string;
   process: ChildProcess | null;
   status: RunnerStatus;
   currentJob: {
@@ -28,6 +30,7 @@ interface RunnerInstance {
     githubJobId?: number;
     githubActor?: string;
     githubSha?: string;
+    githubWorkflow?: string;
   } | null;
   name: string;
   jobsCompleted: number;
@@ -45,11 +48,15 @@ interface RunnerManagerInternals {
   checkJobUserFilter(instanceNum: number, runnerName: string): Promise<void>;
   parseRunnerOutput(instanceNum: number, line: string): Promise<void>;
   releaseInstanceSlot(instanceNum: number): void;
+  reapUnclaimedWorker(instanceNum: number): void;
+  armAcquireDeadline(instanceNum: number): void;
+  disarmAcquireDeadline(instanceNum: number): void;
   reserveSlot(): number | null;
   releaseSlotReservation(instanceNum: number): void;
   runnerCount: number;
   applyRepoPolicy(instanceNum: number): Promise<void>;
   proxyServers: Map<number, unknown>;
+  dockerProxies: Map<number, unknown>;
 }
 
 /**
@@ -127,6 +134,18 @@ export class RunnerManagerTestHelper {
   /**
    * Release an instance slot as the process-exit handler does.
    */
+  reapUnclaimedWorker(instanceNum: number): void {
+    this.internals.reapUnclaimedWorker(instanceNum);
+  }
+
+  armAcquireDeadline(instanceNum: number): void {
+    this.internals.armAcquireDeadline(instanceNum);
+  }
+
+  disarmAcquireDeadline(instanceNum: number): void {
+    this.internals.disarmAcquireDeadline(instanceNum);
+  }
+
   releaseInstanceSlot(instanceNum: number): void {
     this.internals.releaseInstanceSlot(instanceNum);
   }
@@ -158,7 +177,7 @@ export class RunnerManagerTestHelper {
   /** Seed the target context recorded when an instance is spawned for a job. */
   setPendingTargetContext(
     key: string,
-    context: { targetId: string; targetDisplayName: string; githubSha?: string }
+    context: { targetId: string; targetDisplayName: string; githubSha?: string; githubWorkflow?: string }
   ): void {
     (this.manager as never as {
       pendingTargetContext: Map<string, unknown>;
@@ -168,6 +187,16 @@ export class RunnerManagerTestHelper {
   /** Register a stub proxy for an instance. */
   setProxy(instanceNum: number, proxy: unknown): void {
     this.internals.proxyServers.set(instanceNum, proxy);
+  }
+
+  /** The filtering docker socket minted for an instance, if one is running. */
+  dockerProxy(instanceNum: number): unknown {
+    return this.internals.dockerProxies.get(instanceNum);
+  }
+
+  /** Register a stub docker socket for an instance, as spawning would. */
+  setDockerProxy(instanceNum: number, proxy: unknown): void {
+    this.internals.dockerProxies.set(instanceNum, proxy);
   }
 
   /** Reserve a worker slot as spawnWorkerForJob does. */

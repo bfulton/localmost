@@ -45,7 +45,7 @@ jest.mock('./app-state', () => ({
   })),
 }));
 
-import { BrokerProxyService } from './broker-proxy-service';
+import { BrokerProxyService, extractGitHubJobInfo } from './broker-proxy-service';
 import type { Target } from '../shared/types';
 
 // Helper to create mock credentials for a single instance
@@ -406,5 +406,47 @@ describe('BrokerProxyService', () => {
       // Starting again should work (polling was properly cleaned up)
       await expect(service.start()).resolves.not.toThrow();
     });
+  });
+});
+
+describe('extractGitHubJobInfo', () => {
+  // The broker's job details carry GitHub context as a dict:
+  // {"t":2,"d":[{"k":"run_id","v":"123"},...]}
+  it('reads the run, repository, actor, sha and ref from the github context and the check run id from the job context', () => {
+    const info = extractGitHubJobInfo({
+      github: { d: [
+        { k: 'run_id', v: '123' },
+        { k: 'repository', v: 'owner/repo' },
+        { k: 'actor', v: 'octocat' },
+        { k: 'sha', v: 'abc1234def' },
+        { k: 'ref', v: 'refs/heads/main' },
+      ] },
+      job: { d: [{ k: 'check_run_id', v: '456' }] },
+    });
+
+    expect(info).toEqual({
+      githubRunId: 123,
+      githubJobId: 456,
+      githubRepo: 'owner/repo',
+      githubActor: 'octocat',
+      githubSha: 'abc1234def',
+      githubRef: 'refs/heads/main',
+    });
+  });
+
+  it('identifies nothing when the context is absent', () => {
+    expect(extractGitHubJobInfo(undefined)).toEqual({});
+  });
+
+  it('extracts github.workflow into the job info', () => {
+    // Per-workflow policy keys on the workflow, which only this field names;
+    // the job name the runner prints later is a different thing.
+    const info = extractGitHubJobInfo({ github: { d: [
+      { k: 'run_id', v: '123' },
+      { k: 'repository', v: 'owner/repo' },
+      { k: 'workflow', v: 'integration' },
+    ] } });
+
+    expect(info.githubWorkflow).toBe('integration');
   });
 });

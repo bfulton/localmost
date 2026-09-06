@@ -4,6 +4,9 @@ import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as yaml from 'js-yaml';
+import type { DockerPolicy } from '../shared/docker-policy';
+import { DesktopBackend, DockerBackend } from './docker/docker-backend';
+import { DockerFilterProxy } from './docker/docker-filter-proxy';
 import {
   SandboxPolicyLevel, RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
@@ -13,6 +16,13 @@ import { RunnerDownloader } from './runner-downloader';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
 import { loadConfig } from './config';
 import { normalizeFilterConfig, isUserAllowed, areAllUsersAllowed, parseRepository } from './runner/user-filter';
+
+/**
+ * The filtering docker socket a worker gets, at the root of its sandbox
+ * directory. Short and fixed: macOS caps unix socket paths at 104 bytes and
+ * truncates silently past that.
+ */
+const DOCKER_SOCKET_NAME = 'docker.sock';
 
 /**
  * Get the hostname without .local suffix (common on macOS).
@@ -28,6 +38,12 @@ interface RunnerInstance {
    * the approved policy must not serve a job under it.
    */
   policyStamp?: string;
+  /**
+   * The repository whose job this worker claimed, as the broker reported it.
+   * The docker socket opens only for this repository, and only when it is
+   * also the one the worker was spawned for.
+   */
+  claimedRepository?: string;
   process: ChildProcess | null;
   status: RunnerStatus;
   currentJob: {
@@ -43,6 +59,7 @@ interface RunnerInstance {
     githubActor?: string;     // Username who triggered the workflow
     githubSha?: string;       // Commit SHA that triggered the workflow
     githubRef?: string;       // Branch/tag ref (e.g., refs/heads/main)
+    githubWorkflow?: string;  // Workflow name from github.workflow (keys workflows.<name> policy)
   } | null;
   name: string;
   jobsCompleted: number;
@@ -72,6 +89,8 @@ export interface RepoPolicyRuntime {
   readPaths: string[];
   /** Paths the policy declares writable, applied when the worker is spawned. */
   writePaths: string[];
+  /** The docker actions the policy declares, merged across shared and workflow; empty when it declares none. */
+  docker: DockerPolicy;
 }
 
 interface RunnerManagerOptions {
@@ -98,10 +117,25 @@ interface RunnerManagerOptions {
   getRepoPolicy?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<RepoPolicyRuntime>;
   /** Called when a job starts or completes (for notifications) */
   onJobEvent?: (event: JobEvent) => void;
+  /** The daemon a worker's permitted container requests go to. The operator's own by default. */
+  dockerBackend?: DockerBackend;
+  /** Registry credentials, attached to a pull by the worker's socket so the job never holds them. */
+  attachRegistryAuth?: (registry: string) => string | undefined;
 }
+
+/**
+ * How long a worker spawned for a specific job may sit without acquiring it
+ * before its slot is reclaimed.
+ *
+ * GitHub keeps retrying assignment for about ten minutes, so this is well
+ * inside the window where the job can still land on another worker.
+ */
+export const UNCLAIMED_WORKER_TIMEOUT_MS = 2 * 60 * 1000;
 
 export class RunnerManager {
   private instances: Map<number, RunnerInstance> = new Map();
+  /** Deadlines for workers spawned for a job that have not yet acquired one. */
+  private acquireDeadlines: Map<number, NodeJS.Timeout> = new Map();
   private runnerCount = DEFAULT_RUNNER_COUNT;
   private startedAt: string | null = null;
   private config: RunnerConfig | null = null;
@@ -126,6 +160,12 @@ export class RunnerManager {
 
   // Proxy servers for network isolation and logging (one per instance)
   private proxyServers: Map<number, ProxyServer> = new Map();
+
+  // Filtering docker sockets, one per spawn: minted with the worker, bound
+  // to its repository's policy on claim, stopped when it exits.
+  private dockerProxies: Map<number, DockerFilterProxy> = new Map();
+  private readonly dockerBackend: DockerBackend;
+  private readonly attachRegistryAuth?: (registry: string) => string | undefined;
 
   // Flag to track intentional stops vs job completion restarts
   private stopping = false;
@@ -162,7 +202,7 @@ export class RunnerManager {
 
   // Pending target context for jobs received from broker
   // Maps runner name (or 'next') to target context
-  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string; githubSha?: string; githubRef?: string }> = new Map();
+  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string; githubSha?: string; githubRef?: string; githubWorkflow?: string }> = new Map();
 
   /**
    * Validate that a child path stays within the expected base directory.
@@ -199,6 +239,8 @@ export class RunnerManager {
     this.getRepoPolicy = options.getRepoPolicy;
     this.getJobTarget = options.getJobTarget;
     this.onJobEvent = options.onJobEvent;
+    this.dockerBackend = options.dockerBackend ?? new DesktopBackend();
+    this.attachRegistryAuth = options.attachRegistryAuth;
 
     this.downloader = new RunnerDownloader();
     this.configPath = getConfigPath();
@@ -325,9 +367,10 @@ export class RunnerManager {
    * @param githubActor The username who triggered the workflow (for user filtering)
    * @param githubSha The commit SHA that triggered the workflow
    * @param githubRef The branch/tag ref (e.g., refs/heads/main)
+   * @param githubWorkflow The workflow name (github.workflow), which keys per-workflow policy
    */
-  setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string, actionsUrl?: string, githubRunId?: number, githubJobId?: number, githubActor?: string, githubSha?: string, githubRef?: string): void {
-    this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName, actionsUrl, githubRunId, githubJobId, githubActor, githubSha, githubRef });
+  setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string, actionsUrl?: string, githubRunId?: number, githubJobId?: number, githubActor?: string, githubSha?: string, githubRef?: string, githubWorkflow?: string): void {
+    this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName, actionsUrl, githubRunId, githubJobId, githubActor, githubSha, githubRef, githubWorkflow });
     this.log('debug', `Set pending target context for ${runnerName}: ${targetDisplayName} (runId=${githubRunId}, jobId=${githubJobId}, actor=${githubActor}, sha=${githubSha?.slice(0, 7)})`);
   }
 
@@ -335,7 +378,7 @@ export class RunnerManager {
    * Consume pending target context for a runner.
    * Returns and removes the context if found.
    */
-  private consumePendingTargetContext(runnerName: string): { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string; githubSha?: string; githubRef?: string } | undefined {
+  private consumePendingTargetContext(runnerName: string): { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string; githubSha?: string; githubRef?: string; githubWorkflow?: string } | undefined {
     // Try exact match first, then fall back to 'next'
     let context = this.pendingTargetContext.get(runnerName);
     if (context) {
@@ -785,6 +828,38 @@ export class RunnerManager {
   }
 
   /**
+   * Serve a worker its own filtering docker socket, before the worker exists.
+   *
+   * The socket is born denying everything: a speculatively spawned worker
+   * has a socket before it has a job, and default-deny is the state it
+   * starts in rather than one set afterwards. Policy is bound on claim.
+   */
+  private async startDockerProxy(instanceNum: number, socketPath: string): Promise<DockerFilterProxy> {
+    // A leftover from a spawn that failed after this point.
+    await this.stopDockerProxy(instanceNum);
+    const socket = new DockerFilterProxy({
+      backend: this.dockerBackend,
+      attachRegistryAuth: this.attachRegistryAuth,
+      onLog: (entry) => this.log(entry.level, `[docker ${instanceNum}] ${entry.message}`),
+    });
+    await socket.start(socketPath);
+    this.dockerProxies.set(instanceNum, socket);
+    this.log('debug', `Docker socket for instance ${instanceNum} listening at ${socketPath}; bound when a job is claimed`);
+    return socket;
+  }
+
+  private async stopDockerProxy(instanceNum: number): Promise<void> {
+    const socket = this.dockerProxies.get(instanceNum);
+    if (!socket) return;
+    this.dockerProxies.delete(instanceNum);
+    try {
+      await socket.stop();
+    } catch {
+      // Already stopped, or its directory already rebuilt - gone either way.
+    }
+  }
+
+  /**
    * Start a single runner instance. Used for initial start and re-registration.
    */
   async startInstance(instanceNum: number): Promise<void> {
@@ -910,6 +985,13 @@ export class RunnerManager {
       const startupContextForPolicy = this.pendingTargetContext.get(String(instanceNum));
       const filesystemPolicy = await this.resolveFilesystemPolicy(startupContextForPolicy);
 
+      // The job's docker socket is one localmost serves, not the daemon's.
+      // It lives in the sandbox directory, which is rebuilt per job, so it
+      // is created and destroyed with the job and no cleanup path exists.
+      const dockerSocketPath = path.join(sandboxDir, DOCKER_SOCKET_NAME);
+      const dockerSocket = await this.startDockerProxy(instanceNum, dockerSocketPath);
+      env.DOCKER_HOST = `unix://${dockerSocketPath}`;
+
       instance.process = spawnSandboxed(runnerBinary, ['--once'], {
         cwd: sandboxDir,
         env,
@@ -917,6 +999,7 @@ export class RunnerManager {
         // Create a new process group so we can kill all child processes
         detached: true,
         filesystemPolicy,
+        dockerSocket: dockerSocketPath,
       });
       instance.policyStamp = filesystemPolicy.stamp;
 
@@ -955,6 +1038,12 @@ export class RunnerManager {
         instance.process = null;
         instance.currentJob = null;
 
+        // Minted for this spawn, so it dies with it - unless a later spawn
+        // for the same slot has already replaced it.
+        if (this.dockerProxies.get(instanceNum) === dockerSocket) {
+          this.stopDockerProxy(instanceNum).catch(() => {});
+        }
+
         // Intentional stop - don't restart
         if (signal === 'SIGTERM' || signal === 'SIGINT' || this.stopping) {
           this.log('info', `Runner instance ${instanceNum} stopped`);
@@ -990,6 +1079,13 @@ export class RunnerManager {
       });
 
       this.instances.set(instanceNum, instance);
+      // Spawned for a specific job: if the broker never routes that job here,
+      // this worker will long-poll forever and hold its slot. Give it a
+      // deadline. A worker with no pending target was not spawned for a job
+      // and is not subject to one.
+      if (this.pendingTargetContext.has(String(instanceNum))) {
+        this.armAcquireDeadline(instanceNum);
+      }
       // Successfully started - clear the starting flag
       this.startingInstances.delete(instanceNum);
     } catch (error) {
@@ -997,6 +1093,7 @@ export class RunnerManager {
       instance.status = 'error';
       this.instances.set(instanceNum, instance);
       this.startingInstances.delete(instanceNum);
+      await this.stopDockerProxy(instanceNum);
     }
   }
 
@@ -1113,6 +1210,13 @@ export class RunnerManager {
       this.proxyServers.clear();
     }
 
+    // Each worker's docker socket dies with its process; this catches the
+    // ones whose exit never reached us.
+    await Promise.all([...this.dockerProxies.keys()].map((instanceNum) => this.stopDockerProxy(instanceNum)));
+
+    for (const instanceNum of [...this.acquireDeadlines.keys()]) {
+      this.disarmAcquireDeadline(instanceNum);
+    }
     this.instances.clear();
     this.startingInstances.clear();
     this.startedAt = null;
@@ -1134,7 +1238,56 @@ export class RunnerManager {
    * with nothing actually running. Free the slot instead and let the next job
    * spawn a fresh worker bound to its target.
    */
+  /**
+   * Release the slot of a worker that was spawned for a job but never got one.
+   *
+   * A worker is `--once`: it long-polls until a job arrives, runs it, and
+   * exits. When the broker never routes a job to it - the message was skipped
+   * at capacity, or the session bound to a different worker - it waits
+   * forever, so the exit handler that frees its slot never runs. Once every
+   * slot is held by one of these, the broker reports "At capacity" for every
+   * subsequent job and the pool stops accepting work with nothing running.
+   *
+   * This is the same death spiral releaseInstanceSlot() addresses for workers
+   * that finish a job, reached by the path where no job ever starts.
+   */
+  /** Start the acquisition deadline for a worker spawned for a specific job. */
+  private armAcquireDeadline(instanceNum: number): void {
+    this.disarmAcquireDeadline(instanceNum);
+    const timer = setTimeout(() => {
+      this.acquireDeadlines.delete(instanceNum);
+      this.reapUnclaimedWorker(instanceNum);
+    }, UNCLAIMED_WORKER_TIMEOUT_MS);
+    timer.unref?.();
+    this.acquireDeadlines.set(instanceNum, timer);
+  }
+
+  /** Stand down the deadline once the worker has its job, or has gone away. */
+  private disarmAcquireDeadline(instanceNum: number): void {
+    const timer = this.acquireDeadlines.get(instanceNum);
+    if (timer) {
+      clearTimeout(timer);
+      this.acquireDeadlines.delete(instanceNum);
+    }
+  }
+
+  private reapUnclaimedWorker(instanceNum: number): void {
+    const instance = this.instances.get(instanceNum);
+    if (!instance) return;
+
+    // It got what it was spawned for; leave it alone.
+    if (instance.currentJob || instance.status === 'busy') return;
+
+    this.log(
+      'warn',
+      `Runner instance ${instanceNum} never acquired a job, reclaiming its slot`
+    );
+    instance.process?.kill('SIGTERM');
+    this.releaseInstanceSlot(instanceNum);
+  }
+
   private releaseInstanceSlot(instanceNum: number): void {
+    this.disarmAcquireDeadline(instanceNum);
     const instance = this.instances.get(instanceNum);
     if (instance) {
       instance.status = 'offline';
@@ -1279,8 +1432,12 @@ export class RunnerManager {
 
       instance.status = 'busy';
 
-      // Get target context if available (from broker-proxy-service)
-      const targetContext = this.consumePendingTargetContext(instance.name);
+      // Get target context if available. spawnWorkerForJob stores it under the
+      // numeric instance id, so look there first; consume also falls back to
+      // 'next' for an idle worker that picked the job up without a spawn. (The
+      // full runner name is never a storage key, so looking it up always missed
+      // and left every job reporting its repository as 'unknown'.)
+      const targetContext = this.consumePendingTargetContext(String(instanceNum));
 
       // Keep it against this instance. An idle worker that picks a job up
       // never went through spawnWorkerForJob, so this is the only record of
@@ -1292,6 +1449,9 @@ export class RunnerManager {
 
       // Use target display name (owner/repo format) for repository if available
       const repository = targetContext?.targetDisplayName || this.config?.url || 'unknown';
+
+      // It got its job; the acquisition deadline no longer applies.
+      this.disarmAcquireDeadline(instanceNum);
 
       instance.currentJob = {
         name: jobName,
@@ -1306,6 +1466,7 @@ export class RunnerManager {
         githubActor: targetContext?.githubActor,
         githubSha: targetContext?.githubSha,
         githubRef: targetContext?.githubRef,
+        githubWorkflow: targetContext?.githubWorkflow,
       };
 
       this.log('debug', `[instance ${instanceNum}] Job started: ${jobName} (id: ${instance.currentJob.id})${targetContext ? ` from ${targetContext.targetDisplayName}` : ''}${instance.currentJob.actionsUrl ? ` url=${instance.currentJob.actionsUrl}` : ''}`);
@@ -1443,9 +1604,11 @@ export class RunnerManager {
    * with a per-workflow network section look like it had drifted and its jobs
    * were refused. Only what the profile fixed at spawn belongs here.
    */
-  private stampFor(policy: Pick<RepoPolicyRuntime, 'level' | 'readPaths' | 'writePaths'>): string {
+  private stampFor(
+    policy: Pick<RepoPolicyRuntime, 'level' | 'readPaths' | 'writePaths' | 'docker'>
+  ): string {
     return createHash('sha256')
-      .update(JSON.stringify([policy.level, policy.readPaths, policy.writePaths]))
+      .update(JSON.stringify([policy.level, policy.readPaths, policy.writePaths, policy.docker]))
       .digest('hex');
   }
 
@@ -1540,6 +1703,12 @@ export class RunnerManager {
     const repoInfo = parseRepository(targetDisplayName);
     if (!repoInfo) return;
 
+    // What the worker claimed, as the broker reported it. Recorded before
+    // anything below can bail so the docker socket is judged against it
+    // however the rest of the policy fares.
+    const instance = this.instances.get(instanceNum);
+    if (isClaim && instance) instance.claimedRepository = targetDisplayName;
+
     const policy = await this.getRepoPolicy(
       repoInfo.owner,
       repoInfo.repo,
@@ -1553,7 +1722,6 @@ export class RunnerManager {
     // this worker would run the job under the old boundary - so it is refused
     // rather than run. Approving through the app retires workers eagerly; this
     // also covers approving through the CLI, which writes the cache directly.
-    const instance = this.instances.get(instanceNum);
     const currentStamp = this.stampFor(policy);
     if (isClaim && instance?.policyStamp && instance.policyStamp !== currentStamp) {
       // The filesystem half is fixed in this worker's profile and cannot be
@@ -1562,6 +1730,8 @@ export class RunnerManager {
       // not most recently. Network is cut back to runner infrastructure and the
       // worker is retired so nothing further lands on it - this constrains the
       // job rather than refusing it, which the proxy cannot do on its own.
+      // The docker socket stays as it was born, closed: nothing on this path
+      // opens it.
       proxy.setPolicyAllowedHosts([]);
       proxy.setPolicyLevel('strict');
       this.log(
@@ -1574,9 +1744,37 @@ export class RunnerManager {
 
     proxy.setPolicyAllowedHosts(hosts);
     proxy.setPolicyLevel(level);
+    this.bindDockerSocket(instanceNum, targetDisplayName, policy.docker);
     if (hosts.length > 0 || level !== 'strict') {
       this.log('info', `[instance ${instanceNum}] Applied ${level} policy with ${hosts.length} host(s) from ${targetDisplayName} .localmostrc`);
     }
+  }
+
+  /**
+   * Bind a worker's docker socket to the repository whose job it runs.
+   *
+   * The socket is born denying everything and opens only for the repository
+   * this worker was spawned for and claimed its job from. A worker spawned
+   * for one repository that claims another's job would otherwise run that
+   * job with the first repository's container grants; its socket stays
+   * closed instead - and stays closed when the job-started line later
+   * attributes the job to the spawn repository, which is why the claim is
+   * recorded on the instance rather than checked once.
+   */
+  private bindDockerSocket(instanceNum: number, repository: string, docker: DockerPolicy): void {
+    const socket = this.dockerProxies.get(instanceNum);
+    if (!socket) return;
+
+    const spawnedFor = this.pendingTargetContext.get(String(instanceNum))?.targetDisplayName ?? repository;
+    const claimedFor = this.instances.get(instanceNum)?.claimedRepository ?? repository;
+    if (spawnedFor !== repository || claimedFor !== repository) {
+      this.log(
+        'warn',
+        `[instance ${instanceNum}] Docker socket stays closed: spawned for ${spawnedFor}, claimed ${claimedFor}, policy is for ${repository}`
+      );
+      return;
+    }
+    socket.bind(repository, docker);
   }
 
   private async applyRepoPolicy(instanceNum: number): Promise<void> {
@@ -1586,7 +1784,7 @@ export class RunnerManager {
 
     // This refines a policy that acquirejob has already installed for the job
     // the worker actually claimed, purely to pick up any per-workflow section
-    // now that the job name is known. It must never clear: clearing here wiped
+    // now that the job has started. It must never clear: clearing here wiped
     // a correct policy whenever this path could not identify the job, and the
     // job then ran with no hosts. Staleness is handled where a job is claimed.
     if (!instance?.currentJob || !this.getRepoPolicy) return;
@@ -1596,11 +1794,15 @@ export class RunnerManager {
     const githubSha = instance.currentJob.githubSha ?? spawnContext?.githubSha;
     if (!targetDisplayName || !githubSha) return;
 
+    // workflows.<name> keys on the workflow, which the broker read from
+    // github.workflow. The job name the runner prints is a different thing
+    // and only ever matched a section by coincidence; it stays as the fallback
+    // for a job the broker never saw.
     await this.applyPolicyForTarget(
       instanceNum,
       targetDisplayName,
       githubSha,
-      instance.currentJob.name
+      instance.currentJob.githubWorkflow ?? instance.currentJob.name
     );
   }
 

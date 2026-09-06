@@ -8,6 +8,7 @@ Repo Permissions
 - Read and write access to administration (also to register runner)
 - Read and write access to action variables (also to set runner-check timestamp)
 - Read and write access to actions (to check on jobs and cancel them)
+- Read access to contents (to fetch localmost policy files)
 - Read access to metadata (required by GitHub)
 
 More permission detail and full source at: https://github.com/bfulton/localmost

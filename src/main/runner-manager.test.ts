@@ -32,16 +32,57 @@ jest.mock('./proxy-server', () => ({
   })),
 }));
 
-import { RunnerManager } from './runner-manager';
+// Mock the filtering docker socket. A real one binds a unix socket inside the
+// sandbox directory, which does not exist under the mocked fs. The stub keeps
+// the one piece of state the manager reasons about: which repository it is
+// bound to, and that it is bound to none until told.
+jest.mock('./docker/docker-filter-proxy', () => ({
+  DockerFilterProxy: jest.fn().mockImplementation((options: unknown) => {
+    let repository: string | undefined;
+    return {
+      options,
+      start: jest.fn().mockResolvedValue(undefined),
+      stop: jest.fn().mockResolvedValue(undefined),
+      bind: jest.fn((repo: string) => {
+        repository = repo;
+      }),
+      boundRepository: jest.fn(() => repository),
+    };
+  }),
+}));
+
+import { RunnerManager, UNCLAIMED_WORKER_TIMEOUT_MS, JobEvent } from './runner-manager';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { LogEntry, RunnerState, JobHistoryEntry } from '../shared/types';
+import { DockerPolicy } from '../shared/docker-policy';
 import { spawnSandboxed } from './process-sandbox';
+import { DockerFilterProxy } from './docker/docker-filter-proxy';
+import type { DockerBackend } from './docker/docker-backend';
 import { createMockProcess, RunnerManagerTestHelper } from './test-utils';
 
 // Get the mocked function
 const mockSpawnSandboxed = spawnSandboxed as jest.MockedFunction<typeof spawnSandboxed>;
+
+/** What the mocked DockerFilterProxy hands back: the manager's view of a worker's socket. */
+interface DockerSocketStub {
+  options: {
+    backend?: DockerBackend;
+    onLog?: (entry: { level: 'info' | 'warn' | 'debug'; message: string }) => void;
+    attachRegistryAuth?: (registry: string) => string | undefined;
+  };
+  start: jest.Mock;
+  stop: jest.Mock;
+  bind: jest.Mock;
+  boundRepository: () => string | undefined;
+}
+const dockerSocketOf = (helper: RunnerManagerTestHelper, instanceNum: number): DockerSocketStub =>
+  helper.dockerProxy(instanceNum) as DockerSocketStub;
+const dockerSocketStub = (): DockerSocketStub =>
+  new DockerFilterProxy({} as never) as unknown as DockerSocketStub;
+/** Let the fire-and-forget policy application that follows "Running job" settle. */
+const settle = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
 // Mock fs
 jest.mock('fs', () => ({
@@ -419,6 +460,29 @@ describe('RunnerManager', () => {
 
   // fetchActionsUrl was removed - job URLs are now extracted directly from job details
 
+  describe('job-started target context', () => {
+    it('reports the target repository, not "unknown", when a spawned worker starts its job', async () => {
+      const events: JobEvent[] = [];
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        onJobEvent: (e) => events.push(e),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, { name: 'localmost.host.owner-repo.1', status: 'listening' });
+
+      // spawnWorkerForJob stores the job's target context under the numeric
+      // instance id, which is where the job-started handler must look for it.
+      helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo' });
+
+      await helper.parseRunnerOutput(1, 'Running job: build');
+
+      const started = events.find((e) => e.type === 'started');
+      expect(started?.repository).toBe('owner/repo');
+    });
+  });
+
   describe('contributors scope enforcement', () => {
     const JOB = {
       name: 'build',
@@ -627,7 +691,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: ['index.crates.io'], level: 'strict' as const, readPaths: [], writePaths: [] }),
+        getRepoPolicy: async () => ({ hosts: ['index.crates.io'], level: 'strict' as const, readPaths: [], writePaths: [], docker: {} }),
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setInstance(1, {
@@ -648,13 +712,43 @@ describe('RunnerManager', () => {
       expect(setPolicyAllowedHosts).toHaveBeenCalledWith(['index.crates.io']);
     });
 
+    it('binds per-workflow policy by the github workflow name, not the scraped job name', async () => {
+      // workflows.<name> keys on the workflow, but the only name the runner
+      // prints is the job's. The broker reads github.workflow; it has to reach
+      // the policy lookup or a per-workflow section never fires.
+      const seen: string[] = [];
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async (_owner, _repo, _sha, workflowName) => {
+          seen.push(workflowName);
+          return { hosts: [], level: 'strict' as const, readPaths: [], writePaths: [], docker: {} };
+        },
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, { name: 'runner-1', status: 'listening' });
+      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyLevel: jest.fn() });
+      helper.setPendingTargetContext('1', {
+        targetId: 't1',
+        targetDisplayName: 'owner/repo',
+        githubSha: 'abc1234',
+        githubWorkflow: 'integration',
+      });
+
+      await helper.parseRunnerOutput(1, 'Running job: Build and test'); // job name != workflow name
+
+      expect(seen).toContain('integration');
+      expect(seen).not.toContain('Build and test');
+    });
+
     it('leaves an installed policy alone when it cannot identify the job', async () => {
       // This path only refines a policy that acquirejob already installed for
       // the job the worker claimed. Clearing here wiped a correct policy
       // whenever the job could not be identified, and the job ran with no
       // hosts - four concurrent runs failed that way before this changed.
       const setPolicyAllowedHosts = jest.fn();
-      const getRepoPolicy = jest.fn().mockResolvedValue({ hosts: [], level: 'strict', readPaths: [], writePaths: [] } as never);
+      const getRepoPolicy = jest.fn().mockResolvedValue({ hosts: [], level: 'strict', readPaths: [], writePaths: [], docker: {} } as never);
       const manager = new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
@@ -691,8 +785,8 @@ describe('RunnerManager', () => {
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
         getRepoPolicy: async (owner: string, repo: string) =>
           repo === 'first'
-            ? { hosts: ['first.example'], level: 'strict' as const, readPaths: [], writePaths: [] }
-            : { hosts: ['second.example'], level: 'strict' as const, readPaths: [], writePaths: [] },
+            ? { hosts: ['first.example'], level: 'strict' as const, readPaths: [], writePaths: [], docker: {} }
+            : { hosts: ['second.example'], level: 'strict' as const, readPaths: [], writePaths: [], docker: {} },
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setProxy(1, { setPolicyAllowedHosts, setPolicyLevel: jest.fn() });
@@ -728,7 +822,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: ['codeload.github.com'], level: 'strict' as const, readPaths: [], writePaths: [] }),
+        getRepoPolicy: async () => ({ hosts: ['codeload.github.com'], level: 'strict' as const, readPaths: [], writePaths: [], docker: {} }),
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setPendingTargetContext('3', {
@@ -766,6 +860,7 @@ describe('RunnerManager', () => {
           level: 'strict' as const,
           readPaths: [],
           writePaths: [],
+          docker: {},
         }),
       });
       const helper = new RunnerManagerTestHelper(manager);
@@ -801,6 +896,7 @@ describe('RunnerManager', () => {
           level: 'strict' as const,
           readPaths: [],
           writePaths: [],
+          docker: {},
         }),
       });
       const helper = new RunnerManagerTestHelper(manager);
@@ -840,6 +936,7 @@ describe('RunnerManager', () => {
           level: 'strict' as const,
           readPaths: [],
           writePaths: [],
+          docker: {},
         }),
       });
       const helper = new RunnerManagerTestHelper(manager);
@@ -876,11 +973,17 @@ describe('RunnerManager', () => {
           level: 'strict' as const,
           readPaths: ['~/.npm'],
           writePaths: ['~/.npm'],
+          docker: {},
         }),
       });
       const helper = new RunnerManagerTestHelper(manager);
       const stamped = manager as unknown as {
-        stampFor(p: { level: string; readPaths: string[]; writePaths: string[] }): string;
+        stampFor(p: {
+          level: string;
+          readPaths: string[];
+          writePaths: string[];
+          docker: DockerPolicy;
+        }): string;
       };
       helper.setInstance(1, {
         name: 'runner-1',
@@ -889,6 +992,7 @@ describe('RunnerManager', () => {
           level: 'strict',
           readPaths: ['~/.npm'],
           writePaths: ['~/.npm'],
+          docker: {},
         }),
         currentJob: {
           name: 'build',
@@ -917,6 +1021,7 @@ describe('RunnerManager', () => {
           level: 'strict' as const,
           readPaths: [],
           writePaths: [],
+          docker: {},
         }),
       });
       const helper = new RunnerManagerTestHelper(manager);
@@ -949,7 +1054,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: [], level: 'moderate' as const, readPaths: [], writePaths: [] }),
+        getRepoPolicy: async () => ({ hosts: [], level: 'moderate' as const, readPaths: [], writePaths: [], docker: {} }),
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setInstance(1, {
@@ -977,7 +1082,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: [], level: 'strict' as const, readPaths: [], writePaths: [] }),
+        getRepoPolicy: async () => ({ hosts: [], level: 'strict' as const, readPaths: [], writePaths: [], docker: {} }),
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setInstance(1, {
@@ -1111,6 +1216,86 @@ describe('RunnerManager', () => {
     });
   });
 
+  describe('reaping a worker that never acquired a job', () => {
+    function idlePool() {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      for (let i = 1; i <= 4; i++) {
+        helper.setInstance(i, { name: `runner-${i}`, status: 'listening', currentJob: null });
+      }
+      return { manager, helper };
+    }
+
+    it('frees the slot of a worker that never acquired a job', () => {
+      // A worker spawned for a job that the broker never routed to it sits in
+      // `listening` forever. It is `--once`, so it never exits, so the exit
+      // handler that releases its slot never runs. Once every slot is held by
+      // one of these the broker reports "At capacity" for every job and the
+      // pool stops accepting work with nothing running.
+      const { manager, helper } = idlePool();
+      expect(manager.hasAvailableSlot()).toBe(false);
+
+      helper.reapUnclaimedWorker(1);
+
+      expect(manager.hasAvailableSlot()).toBe(true);
+      expect(helper.instances.has(1)).toBe(false);
+    });
+
+    it('reclaims a worker that is still unclaimed when the deadline passes', () => {
+      jest.useFakeTimers();
+      try {
+        const { manager, helper } = idlePool();
+        helper.armAcquireDeadline(1);
+        expect(manager.hasAvailableSlot()).toBe(false);
+
+        jest.advanceTimersByTime(UNCLAIMED_WORKER_TIMEOUT_MS);
+
+        expect(manager.hasAvailableSlot()).toBe(true);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('does not reclaim a worker whose deadline was disarmed by acquiring a job', () => {
+      jest.useFakeTimers();
+      try {
+        const { manager, helper } = idlePool();
+        helper.armAcquireDeadline(1);
+        helper.disarmAcquireDeadline(1);
+
+        jest.advanceTimersByTime(UNCLAIMED_WORKER_TIMEOUT_MS);
+
+        expect(helper.instances.has(1)).toBe(true);
+        expect(manager.hasAvailableSlot()).toBe(false);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('leaves a worker that did acquire a job alone', () => {
+      const { manager, helper } = idlePool();
+      helper.setInstance(1, {
+        name: 'runner-1',
+        status: 'busy',
+        currentJob: {
+          name: 'build',
+          repository: 'bfulton/localmost',
+          startedAt: new Date().toISOString(),
+          id: 'job-1',
+        },
+      });
+
+      helper.reapUnclaimedWorker(1);
+
+      expect(helper.instances.has(1)).toBe(true);
+      expect(manager.hasAvailableSlot()).toBe(false);
+    });
+  });
+
   describe('getStatus with shutting_down', () => {
     it('should return shutting_down status when stopping is true', () => {
       const helper = new RunnerManagerTestHelper(runnerManager);
@@ -1120,6 +1305,176 @@ describe('RunnerManager', () => {
       const status = runnerManager.getStatus();
 
       expect(status.status).toBe('shutting_down');
+    });
+  });
+
+  describe('docker socket per worker', () => {
+    const noHosts = { hosts: [], level: 'strict' as const, readPaths: [], writePaths: [] };
+    const runPolicy: DockerPolicy = { run: { images: ['postgres:16'] } };
+
+    it('starts a default-deny docker socket for a spawned worker and points DOCKER_HOST at it', async () => {
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+
+      await runnerManager.start();
+
+      const socket = dockerSocketOf(new RunnerManagerTestHelper(runnerManager), 1);
+      expect(socket).toBeDefined();
+      const socketPath = '/Users/test/.localmost/runner/sandbox/1/docker.sock';
+      expect(socket.start).toHaveBeenCalledWith(socketPath);
+      // Born denying everything: nothing is bound until a job is claimed.
+      expect(socket.boundRepository()).toBeUndefined();
+      // Listening before the runner exists, so the job's first request finds it.
+      expect(socket.start.mock.invocationCallOrder[0]).toBeLessThan(mockSpawnSandboxed.mock.invocationCallOrder[0]);
+      const options = mockSpawnSandboxed.mock.calls[0][2]!;
+      expect(options.env?.DOCKER_HOST).toBe(`unix://${socketPath}`);
+      // The profile grants this socket by name; the daemon's is no longer handed over.
+      expect(options).toHaveProperty('dockerSocket', socketPath);
+      expect(options).not.toHaveProperty('dockerGrants');
+    });
+
+    it("builds each worker's docker socket on the configured backend and registry auth", async () => {
+      const dockerBackend: DockerBackend = {
+        name: 'test',
+        supportsPrivileged: false,
+        resolveEndpoint: () => null,
+        workspaceMountRoot: (dir) => dir,
+      };
+      const attachRegistryAuth = jest.fn();
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        dockerBackend,
+        attachRegistryAuth,
+      });
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+
+      await manager.start();
+
+      const socket = dockerSocketOf(new RunnerManagerTestHelper(manager), 1);
+      expect(socket.options.backend).toBe(dockerBackend);
+      expect(socket.options.attachRegistryAuth).toBe(attachRegistryAuth);
+    });
+
+    it("forwards the docker socket's log entries to the runner log", async () => {
+      // The socket warns when no daemon is behind it and logs each denial
+      // with its policy hint; neither is any use unless it reaches the log.
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+      await runnerManager.start();
+      const socket = dockerSocketOf(new RunnerManagerTestHelper(runnerManager), 1);
+
+      socket.options.onLog?.({ level: 'warn', message: 'no Docker daemon resolved; the job runs without Docker' });
+
+      expect(mockOnLog).toHaveBeenCalledWith(
+        expect.objectContaining({ level: 'warn', message: expect.stringContaining('no Docker daemon resolved') })
+      );
+    });
+
+    it('binds the socket to the claimed repository with its per-workflow docker policy once the job runs', async () => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async (_owner, _repo, _sha, workflowName) => ({
+          ...noHosts,
+          docker: workflowName === 'integration' ? runPolicy : {},
+        }),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, { name: 'runner-1', status: 'listening' });
+      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyLevel: jest.fn() });
+      const socket = dockerSocketStub();
+      helper.setDockerProxy(1, socket);
+      helper.setPendingTargetContext('1', {
+        targetId: 't1',
+        targetDisplayName: 'owner/repo',
+        githubSha: 'abc1234',
+        githubWorkflow: 'integration',
+      });
+
+      await helper.parseRunnerOutput(1, 'Running job: Build and test');
+      await settle();
+
+      expect(socket.boundRepository()).toBe('owner/repo');
+      expect(socket.bind).toHaveBeenLastCalledWith('owner/repo', runPolicy);
+    });
+
+    it('binds on claim only when the claimed repository is the one the worker was spawned for', async () => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({ ...noHosts, docker: runPolicy }),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      const sockets: DockerSocketStub[] = [];
+      for (const instanceNum of [1, 2]) {
+        helper.setPendingTargetContext(String(instanceNum), {
+          targetId: 't1',
+          targetDisplayName: 'owner/repo',
+          githubSha: 'abc1234',
+        });
+        helper.setInstance(instanceNum, { name: `runner-${instanceNum}`, status: 'listening' });
+        helper.setProxy(instanceNum, { setPolicyAllowedHosts: jest.fn(), setPolicyLevel: jest.fn() });
+        const socket = dockerSocketStub();
+        helper.setDockerProxy(instanceNum, socket);
+        sockets.push(socket);
+      }
+
+      await helper.applyPolicyOnClaim(1, 'owner/repo', 'abc1234');
+      // A worker spawned for one repository that claims another's job must not
+      // inherit the first repository's grants: the socket stays as it was born.
+      await helper.applyPolicyOnClaim(2, 'other/repo', 'abc1234');
+
+      expect(sockets[0].boundRepository()).toBe('owner/repo');
+      expect(sockets[1].bind).not.toHaveBeenCalled();
+      expect(sockets[1].boundRepository()).toBeUndefined();
+      expect(mockOnLog).toHaveBeenCalledWith(
+        expect.objectContaining({ level: 'warn', message: expect.stringMatching(/other\/repo/) })
+      );
+    });
+
+    it('keeps the socket closed for the job that follows a mismatched claim', async () => {
+      // The job-started line is attributed to the repository the worker was
+      // spawned for, which is the one whose grants must not be inherited. The
+      // refusal at claim has to hold when that line arrives.
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({ ...noHosts, docker: runPolicy }),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
+      helper.setInstance(1, { name: 'runner-1', status: 'listening' });
+      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyLevel: jest.fn() });
+      const socket = dockerSocketStub();
+      helper.setDockerProxy(1, socket);
+
+      await helper.applyPolicyOnClaim(1, 'other/repo', 'abc1234');
+      await helper.parseRunnerOutput(1, 'Running job: build');
+      await settle();
+
+      expect(socket.bind).not.toHaveBeenCalled();
+      expect(socket.boundRepository()).toBeUndefined();
+    });
+
+    it('stops the docker socket when the worker exits', async () => {
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      const proc = createMockProcess(12345);
+      mockSpawnSandboxed.mockReturnValue(proc);
+      await runnerManager.start();
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      const socket = dockerSocketOf(helper, 1);
+
+      proc.emit('exit', 0, null);
+      await settle();
+
+      expect(socket.stop).toHaveBeenCalled();
+      expect(helper.dockerProxy(1)).toBeUndefined();
     });
   });
 
@@ -1148,5 +1503,30 @@ describe('RunnerManager', () => {
       expect(status.status).toBe('busy');
       expect(status.jobName).toBe('test-job');
     });
+  });
+});
+
+describe('docker access', () => {
+  const makeManager = () =>
+    new RunnerManager({
+      onLog: jest.fn(),
+      onStatusChange: jest.fn(),
+      onJobHistoryUpdate: jest.fn(),
+    });
+
+  it('changes the policy stamp when the docker policy changes', () => {
+    const manager = makeManager();
+    const stamp = (docker: DockerPolicy) =>
+      (manager as any).stampFor({
+        level: 'strict',
+        readPaths: [],
+        writePaths: [],
+        docker,
+      });
+
+    // A worker spawned under one docker policy must not claim a job approved
+    // under another.
+    expect(stamp({})).not.toEqual(stamp({ run: { images: ['postgres:16'] } }));
+    expect(stamp({ run: { images: ['postgres:16'] } })).toEqual(stamp({ run: { images: ['postgres:16'] } }));
   });
 });

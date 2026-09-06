@@ -8,6 +8,7 @@
 
 import * as os from 'os';
 import * as path from 'path';
+import type { DockerPolicy } from './docker-policy';
 
 // =============================================================================
 // Types
@@ -24,11 +25,6 @@ export interface FilesystemPolicy {
   deny?: string[];
 }
 
-export interface SocketsPolicy {
-  /** Unix domain socket paths to allow connections to (e.g., /var/run/docker.sock) */
-  allow?: string[];
-}
-
 export interface EnvPolicy {
   allow?: string[];
   deny?: string[];
@@ -37,8 +33,9 @@ export interface EnvPolicy {
 export interface SandboxPolicy {
   network?: NetworkPolicy;
   filesystem?: FilesystemPolicy;
-  sockets?: SocketsPolicy;
   env?: EnvPolicy;
+  /** Container work, checked per request by the filtering socket - see docker-policy.ts. */
+  docker?: DockerPolicy;
 }
 
 export interface SandboxProfileOptions {
@@ -357,20 +354,11 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push(`(allow network-outbound (subpath "${escapedWorkDir}"))`);
   lines.push('');
 
-  // Policy-defined socket access
-  if (policy?.sockets?.allow) {
-    lines.push(';; Policy-defined socket access');
-    for (const socketPath of policy.sockets.allow) {
-      const expanded = expandPath(socketPath);
-      const escaped = escapePath(expanded);
-      // Allow both bind and outbound for socket paths
-      lines.push(`(allow network-bind (literal "${escaped}"))`);
-      lines.push(`(allow network-outbound (literal "${escaped}"))`);
-      // Also need file-write for socket operations
-      lines.push(`(allow file-write* (literal "${escaped}"))`);
-    }
-    lines.push('');
-  }
+  // No daemon socket is opened here. A docker policy is a set of requests the
+  // filtering socket may forward, not a level that unlocks the daemon, and
+  // handing the daemon over would let a container reach every host path the
+  // profile denies. The runner serves that socket per worker; the test-mode
+  // profile does not yet, so a job under localmost test runs without Docker.
 
   // ------------------------------------------------------------
   // PROCESS OPERATIONS

@@ -6,8 +6,14 @@
 import * as yaml from 'js-yaml';
 import * as fs from 'fs';
 import * as path from 'path';
-import { SandboxPolicy, NetworkPolicy, FilesystemPolicy, SocketsPolicy, EnvPolicy } from './sandbox-profile';
+import { SandboxPolicy, NetworkPolicy, FilesystemPolicy, EnvPolicy } from './sandbox-profile';
 import { SandboxPolicyLevel } from './types';
+import {
+  validateDockerPolicy,
+  mergeDockerPolicy,
+  diffDockerPolicy,
+  serializeDockerPolicy,
+} from './docker-policy';
 
 // =============================================================================
 // Types
@@ -223,14 +229,26 @@ function validatePolicy(policy: unknown, path: string, errors: ParseError[]): vo
     validateFilesystemPolicy(p.filesystem, `${path}.filesystem`, errors);
   }
 
-  // Validate sockets policy
+  // Removed in favour of docker:, which the runner applies as well as
+  // localmost test, and which cannot name an arbitrary socket.
   if (p.sockets !== undefined) {
-    validateSocketsPolicy(p.sockets, `${path}.sockets`, errors);
+    errors.push({
+      message:
+        `${path}.sockets is no longer supported. Use \`docker:\` to declare ` +
+        'container work (pull, run, build).',
+    });
   }
 
   // Validate env policy
   if (p.env !== undefined) {
     validateEnvPolicy(p.env, `${path}.env`, errors);
+  }
+
+  // Validate the docker action block. The filtering socket is bound to the
+  // merged policy when the job is claimed, so docker is valid at both scopes
+  // and validates the same way in each.
+  if (p.docker !== undefined) {
+    validateDockerPolicy(p.docker, `${path}.docker`, (m) => errors.push({ message: m }));
   }
 }
 
@@ -266,19 +284,6 @@ function validateFilesystemPolicy(policy: unknown, path: string, errors: ParseEr
   }
   if (p.deny !== undefined) {
     validateStringArray(p.deny, `${path}.deny`, errors);
-  }
-}
-
-function validateSocketsPolicy(policy: unknown, path: string, errors: ParseError[]): void {
-  if (typeof policy !== 'object' || policy === null) {
-    errors.push({ message: `${path} must be an object` });
-    return;
-  }
-
-  const p = policy as Record<string, unknown>;
-
-  if (p.allow !== undefined) {
-    validateStringArray(p.allow, `${path}.allow`, errors);
   }
 }
 
@@ -385,16 +390,6 @@ function mergeFilesystemPolicy(
 /**
  * Merge sockets policies.
  */
-function mergeSocketsPolicy(base?: SocketsPolicy, override?: SocketsPolicy): SocketsPolicy | undefined {
-  if (!base && !override) {
-    return undefined;
-  }
-
-  return {
-    allow: mergeArrays(base?.allow, override?.allow),
-  };
-}
-
 /**
  * Merge env policies.
  */
@@ -417,8 +412,8 @@ export function mergePolicies(base: SandboxPolicy, override: SandboxPolicy): San
   return {
     network: mergeNetworkPolicy(base.network, override.network),
     filesystem: mergeFilesystemPolicy(base.filesystem, override.filesystem),
-    sockets: mergeSocketsPolicy(base.sockets, override.sockets),
     env: mergeEnvPolicy(base.env, override.env),
+    docker: mergeDockerPolicy(base.docker, override.docker),
   };
 }
 
@@ -485,6 +480,10 @@ export function serializeLocalmostrc(config: LocalmostrcConfig): string {
 function serializePolicy(policy: SandboxPolicy, indent: string): string[] {
   const lines: string[] = [];
 
+  if (policy.docker) {
+    lines.push(...serializeDockerPolicy(policy.docker, indent));
+  }
+
   if (policy.network) {
     lines.push(`${indent}network:`);
     if (policy.network.allow?.length) {
@@ -520,14 +519,6 @@ function serializePolicy(policy: SandboxPolicy, indent: string): string[] {
       for (const path of policy.filesystem.deny) {
         lines.push(`${indent}    - "${path}"`);
       }
-    }
-  }
-
-  if (policy.sockets?.allow?.length) {
-    lines.push(`${indent}sockets:`);
-    lines.push(`${indent}  allow:`);
-    for (const socketPath of policy.sockets.allow) {
-      lines.push(`${indent}    - "${socketPath}"`);
     }
   }
 
@@ -608,8 +599,9 @@ function diffPolicies(
   diffArrays(oldPolicy.filesystem?.write, newPolicy.filesystem?.write, `${prefix}.filesystem.write`, diffs);
   diffArrays(oldPolicy.filesystem?.deny, newPolicy.filesystem?.deny, `${prefix}.filesystem.deny`, diffs);
 
-  // Sockets
-  diffArrays(oldPolicy.sockets?.allow, newPolicy.sockets?.allow, `${prefix}.sockets.allow`, diffs);
+  // Docker. One entry per grant: what a container may pull, run and mount is
+  // decided by this diff alone, so nothing under docker: collapses into a line.
+  diffs.push(...diffDockerPolicy(oldPolicy.docker, newPolicy.docker, `${prefix}.docker`));
 
   // Env
   diffArrays(oldPolicy.env?.allow, newPolicy.env?.allow, `${prefix}.env.allow`, diffs);

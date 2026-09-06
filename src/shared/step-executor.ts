@@ -1135,6 +1135,10 @@ async function runInSandbox(
       spawnArgs = args;
     }
 
+    // No DOCKER_HOST here. The runner points a job at the filtering socket
+    // it serves; test mode does not serve one yet, and the profile keeps the
+    // daemon's own socket closed, so a job under localmost test runs without
+    // Docker rather than with an unfiltered daemon.
     const spawnOptions: SpawnOptions = {
       cwd: options.cwd,
       env: options.env,

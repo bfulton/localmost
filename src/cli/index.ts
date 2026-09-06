@@ -22,65 +22,15 @@ import { getCliSocketPath } from '../shared/paths';
 import { runTest, parseTestArgs, printTestHelp } from './test';
 import { runPolicy, parsePolicyArgs, printPolicyHelp } from './policy';
 import { runEnv, parseEnvArgs, printEnvHelp } from './env';
+import { runTargets, parseTargetsArgs, printTargetsHelp, createPrompt } from './targets';
 
-interface CliRequest {
-  command: 'status' | 'pause' | 'resume' | 'jobs' | 'quit';
-}
-
-interface RunnerState {
-  status: 'offline' | 'starting' | 'listening' | 'busy' | 'error' | 'shutting_down';
-  jobName?: string;
-  repository?: string;
-  startedAt?: string;
-}
-
-interface JobHistoryEntry {
-  id: string;
-  jobName: string;
-  repository: string;
-  status: 'running' | 'completed' | 'failed' | 'cancelled';
-  startedAt: string;
-  completedAt?: string;
-  runTimeSeconds?: number;
-  actionsUrl?: string;
-}
-
-interface ResourcePauseState {
-  isPaused: boolean;
-  reason: string | null;
-}
-
-interface StatusResponse {
-  success: true;
-  command: 'status';
-  data: {
-    runner: RunnerState;
-    runnerName: string;
-    heartbeat: { isRunning: boolean };
-    authenticated: boolean;
-    userName?: string;
-    resourcePause?: ResourcePauseState;
-  };
-}
-
-interface JobsResponse {
-  success: true;
-  command: 'jobs';
-  data: { jobs: JobHistoryEntry[] };
-}
-
-interface ActionResponse {
-  success: true;
-  command: 'pause' | 'resume' | 'quit';
-  message: string;
-}
-
-interface ErrorResponse {
-  success: false;
-  error: string;
-}
-
-type CliResponse = StatusResponse | JobsResponse | ActionResponse | ErrorResponse;
+import type {
+  CliRequest,
+  CliResponse,
+  StatusResponse,
+  JobsResponse,
+  ActionResponse,
+} from '../shared/cli-protocol';
 
 const HELP_TEXT = `
 localmost - Run GitHub Actions locally
@@ -100,6 +50,7 @@ APP COMMANDS (requires running app):
   pause     Pause the runner (stops accepting jobs)
   resume    Resume the runner (start accepting jobs)
   jobs      Show recent job history
+  targets   Manage the repos/orgs this machine runs jobs for
 
 EXAMPLES:
   localmost test                  Run default workflow locally
@@ -108,15 +59,22 @@ EXAMPLES:
   localmost env                   Show environment info
   localmost start                 Launch background app
   localmost status                Check runner status
+  localmost targets               List configured targets
+  localmost targets add o/r       Register runners for a repo
 
 For command-specific help:
   localmost test --help
   localmost policy --help
   localmost env --help
+  localmost targets --help
 
 DOCUMENTATION:
   https://github.com/bfulton/localmost
 `;
+
+/** Most commands answer instantly; registering runners calls the GitHub API. */
+const DEFAULT_TIMEOUT_MS = 5000;
+const TARGETS_TIMEOUT_MS = 60000;
 
 function printHelp(): void {
   console.log(HELP_TEXT.trim());
@@ -231,7 +189,10 @@ function printJobs(response: JobsResponse): void {
   }
 }
 
-async function sendCommand(command: CliRequest['command']): Promise<CliResponse> {
+async function sendCommand(
+  request: CliRequest,
+  timeoutMs = DEFAULT_TIMEOUT_MS
+): Promise<CliResponse> {
   const socketPath = getCliSocketPath();
 
   if (!fs.existsSync(socketPath)) {
@@ -240,7 +201,6 @@ async function sendCommand(command: CliRequest['command']): Promise<CliResponse>
 
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(socketPath, () => {
-      const request: CliRequest = { command };
       socket.write(JSON.stringify(request) + '\n');
     });
 
@@ -275,7 +235,7 @@ async function sendCommand(command: CliRequest['command']): Promise<CliResponse>
       }
     });
 
-    socket.setTimeout(5000, () => {
+    socket.setTimeout(timeoutMs, () => {
       socket.destroy();
       reject(new Error('Connection timed out'));
     });
@@ -428,7 +388,7 @@ async function stopApp(): Promise<void> {
   }
 
   try {
-    const response = await sendCommand('quit');
+    const response = await sendCommand({ command: 'quit' });
 
     if (!response.success) {
       console.error(`Error: ${response.error}`);
@@ -532,6 +492,36 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  // Targets command - manage repos/orgs this machine runs jobs for
+  if (command === 'targets') {
+    if (subArgs.includes('--help') || subArgs.includes('-h')) {
+      printTargetsHelp();
+      process.exit(0);
+    }
+
+    let parsed;
+    try {
+      parsed = parseTargetsArgs(subArgs);
+    } catch (err) {
+      console.error(`Error: ${(err as Error).message}`);
+      console.error('Run "localmost targets --help" for usage information.');
+      process.exit(1);
+    }
+
+    if (!isAppRunning()) {
+      console.error('Error: localmost app is not running (start it with "localmost start")');
+      process.exit(1);
+    }
+
+    const exitCode = await runTargets(parsed.subcommand, parsed.ref, parsed.options, {
+      send: request => sendCommand(request, TARGETS_TIMEOUT_MS),
+      io: { isTTY: Boolean(process.stdin.isTTY), prompt: createPrompt() },
+      out: line => console.log(line),
+      err: line => console.error(line),
+    });
+    process.exit(exitCode);
+  }
+
   if (!['status', 'pause', 'resume', 'jobs'].includes(command)) {
     console.error(`Unknown command: ${command}`);
     console.error('Run "localmost help" for usage information.');
@@ -544,7 +534,7 @@ async function main(): Promise<void> {
   }
 
   try {
-    const response = await sendCommand(command as CliRequest['command']);
+    const response = await sendCommand({ command: command as CliRequest['command'] });
 
     if (!response.success) {
       console.error(`Error: ${response.error}`);

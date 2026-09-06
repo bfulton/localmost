@@ -8,7 +8,9 @@
 import * as os from 'os';
 import * as crypto from 'crypto';
 import { loadConfig, saveConfig } from './config';
-import { getLogger } from './app-state';
+import { getLogger, getBrokerProxyService, getHeartbeatManager } from './app-state';
+import { toHeartbeatTarget } from './heartbeat-manager';
+import { store } from './store/init';
 import { getRunnerProxyManager } from './runner-proxy-manager';
 import type { Target, Result } from '../shared/types';
 
@@ -53,6 +55,16 @@ const generateUrl = (target: Pick<Target, 'type' | 'owner' | 'repo'>): string =>
     : `https://github.com/${target.owner}/${target.repo}`;
 };
 
+/**
+ * Keep the store's copy of targets in step with what was just written to
+ * config. The store persists `targets` on quit, so a stale copy there would
+ * overwrite a target added or removed by anything the renderer didn't drive
+ * (the CLI, for instance).
+ */
+const syncTargetsToStore = (targets: Target[]): void => {
+  store.getState().setTargets(targets);
+};
+
 // ============================================================================
 // Target Manager
 // ============================================================================
@@ -89,12 +101,17 @@ export class TargetManager {
       return { success: false, error: 'Repository name is required for repo targets' };
     }
 
-    // Check for duplicates
+    // Check for duplicates. GitHub owners and repos are case-insensitive, and
+    // the proxy runner name is lowercased, so two targets differing only by
+    // case would register runners under the same names.
+    const sameName = (a: string | undefined, b: string | undefined): boolean =>
+      (a || '').toLowerCase() === (b || '').toLowerCase();
+
     const existing = this.getTargets();
     const isDuplicate = existing.some(t =>
       t.type === type &&
-      t.owner === owner &&
-      (type === 'org' || t.repo === repo)
+      sameName(t.owner, owner) &&
+      (type === 'org' || sameName(t.repo, repo))
     );
     if (isDuplicate) {
       return { success: false, error: 'This target already exists' };
@@ -130,9 +147,82 @@ export class TargetManager {
     const config = loadConfig();
     config.targets = [...(config.targets || []), target];
     saveConfig(config);
+    syncTargetsToStore(config.targets);
 
     log()?.info(`[TargetManager] Target added: ${target.displayName}`);
     return { success: true, data: target };
+  }
+
+
+  /**
+   * Find a target by `owner/repo`, a bare `owner` (org targets), or target id.
+   * Matching is case-insensitive.
+   */
+  findTargetByRef(ref: string): Target | undefined {
+    const trimmed = ref.trim();
+    if (!trimmed) return undefined;
+
+    const targets = this.getTargets();
+
+    // An exact match wins outright.
+    const exact = targets.find(t => t.id === trimmed || t.displayName === trimmed);
+    if (exact) return exact;
+
+    // Otherwise fall back to case-insensitive matching, but only when it
+    // identifies a single target - a config carrying case variants would
+    // otherwise resolve to whichever happened to be listed first.
+    const needle = trimmed.toLowerCase();
+    const matches = targets.filter(t =>
+      t.id.toLowerCase() === needle || t.displayName.toLowerCase() === needle
+    );
+
+    return matches.length === 1 ? matches[0] : undefined;
+  }
+
+  /**
+   * Add a target and attach it to the running broker proxy, so jobs are
+   * picked up without restarting the app.
+   */
+  async addTargetAndAttach(
+    type: 'repo' | 'org',
+    owner: string,
+    repo?: string
+  ): Promise<Result<Target>> {
+    const result = await this.addTarget(type, owner, repo);
+
+    if (result.success && result.data) {
+      const brokerProxy = getBrokerProxyService();
+      if (brokerProxy) {
+        const credentials = getRunnerProxyManager().loadAllCredentials(result.data.id);
+        if (credentials.length > 0) {
+          brokerProxy.addTarget(result.data, credentials);
+        }
+      }
+
+      // Heartbeat the new target so workflows see this machine as available
+      // without waiting for an app restart.
+      await getHeartbeatManager()?.addTarget(toHeartbeatTarget(result.data));
+    }
+
+    return result;
+  }
+
+  /**
+   * Detach a target from the running broker proxy, then remove it and
+   * unregister its runner proxies from GitHub.
+   */
+  async removeTargetAndDetach(targetId: string): Promise<Result> {
+    const target = this.getTarget(targetId);
+    if (!target) {
+      return { success: false, error: 'Target not found' };
+    }
+
+    getBrokerProxyService()?.removeTarget(targetId);
+
+    // Mark the target offline before its runners are unregistered.
+    await getHeartbeatManager()?.removeTarget(toHeartbeatTarget(target));
+
+    return this.removeTarget(targetId);
   }
 
   /**
@@ -162,6 +252,7 @@ export class TargetManager {
     const config = loadConfig();
     config.targets = (config.targets || []).filter(t => t.id !== targetId);
     saveConfig(config);
+    syncTargetsToStore(config.targets);
 
     log()?.info(`[TargetManager] Target removed: ${target.displayName}`);
     return { success: true };
@@ -193,6 +284,7 @@ export class TargetManager {
       t.id === targetId ? updatedTarget : t
     );
     saveConfig(config);
+    syncTargetsToStore(config.targets);
 
     log()?.info(`[TargetManager] Target updated: ${updatedTarget.displayName}`);
     return { success: true, data: updatedTarget };

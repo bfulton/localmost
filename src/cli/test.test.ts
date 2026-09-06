@@ -1,5 +1,6 @@
 import { describe, it, expect } from '@jest/globals';
-import { parseTestArgs, extractJobOutputs, extractWorkflowOutputs } from './test';
+import { parseTestArgs, extractJobOutputs, extractWorkflowOutputs, mergeDiscoveredAccess, DiscoveredAccess } from './test';
+import { LocalmostrcConfig, LOCALMOSTRC_VERSION } from '../shared/localmostrc';
 
 describe('CLI test command', () => {
   describe('parseTestArgs', () => {
@@ -186,5 +187,133 @@ describe('output expression resolution', () => {
     expect(extractWorkflowOutputs(workflow as never, jobOutputs as never)).toEqual({
       image: 'sha-abc123',
     });
+  });
+});
+
+describe('mergeDiscoveredAccess', () => {
+  const discovered = (partial: Partial<DiscoveredAccess>): DiscoveredAccess => ({
+    hosts: [], readPaths: [], writePaths: [], ...partial,
+  });
+
+  it('adds the hosts and paths an existing policy lacks, and lists only those', () => {
+    const existing: LocalmostrcConfig = {
+      version: 1,
+      shared: { network: { allow: ['github.com'] }, filesystem: { read: ['/usr'] } },
+      workflows: { deploy: { network: { allow: ['api.example.com'] } } },
+    };
+
+    const { config, additions } = mergeDiscoveredAccess(existing, discovered({
+      hosts: ['github.com', 'registry.npmjs.org'],
+      readPaths: ['/usr', '/opt/homebrew'],
+      writePaths: ['~/Library/Caches/pip'],
+    }), 'ci');
+
+    expect(config.shared?.network?.allow).toEqual(['github.com', 'registry.npmjs.org']);
+    expect(config.shared?.filesystem?.read).toEqual(['/usr', '/opt/homebrew']);
+    expect(config.shared?.filesystem?.write).toEqual(['~/Library/Caches/pip']);
+    expect(config.workflows).toEqual(existing.workflows);
+    expect(additions).toEqual([
+      { label: 'network.allow', items: ['registry.npmjs.org'] },
+      { label: 'filesystem.read', items: ['/opt/homebrew'] },
+      { label: 'filesystem.write', items: ['~/Library/Caches/pip'] },
+    ]);
+  });
+
+  it('has nothing to add when the existing policy already covers what was discovered', () => {
+    const existing: LocalmostrcConfig = { version: 1, shared: { network: { allow: ['github.com'] } } };
+
+    const { additions } = mergeDiscoveredAccess(existing, discovered({ hosts: ['github.com'] }), 'ci');
+
+    expect(additions).toEqual([]);
+  });
+
+  it('starts a new policy from the discovered access, with an empty entry for the workflow', () => {
+    const { config, additions } = mergeDiscoveredAccess(undefined, discovered({
+      hosts: ['github.com'],
+      writePaths: ['~/.npm'],
+    }), 'ci');
+
+    expect(config).toEqual({
+      version: LOCALMOSTRC_VERSION,
+      shared: { network: { allow: ['github.com'] }, filesystem: { write: ['~/.npm'] } },
+      workflows: { ci: {} },
+    });
+    expect(additions).toEqual([
+      { label: 'network.allow', items: ['github.com'] },
+      { label: 'filesystem.write', items: ['~/.npm'] },
+    ]);
+  });
+
+  it('turns a denied docker request into a docker policy suggestion in --updaterc output', () => {
+    // What a filtered denial logs: the YAML under docker: that would have permitted the request.
+    const hint = 'docker:\n  run:\n    images:\n      - "postgres:16"';
+    const existing: LocalmostrcConfig = { version: 1, shared: { network: { allow: ['github.com'] } } };
+
+    const { config, additions } = mergeDiscoveredAccess(existing, discovered({ dockerHints: [hint] }), 'ci');
+
+    expect(config.shared?.docker?.run?.images).toContain('postgres:16');
+    expect(config.shared?.network?.allow).toEqual(['github.com']);
+    expect(additions).toEqual([{ label: 'docker.run.images', items: ['postgres:16'] }]);
+  });
+
+  it('folds several docker denials into one policy and adds only what the existing one lacks', () => {
+    const existing: LocalmostrcConfig = {
+      version: 1,
+      shared: { docker: { run: { images: ['postgres:16'], network: 'bridge' } } },
+    };
+    const hints = [
+      'docker:\n  run:\n    images:\n      - "postgres:16"',
+      'docker:\n  run:\n    images:\n      - "redis:7"',
+      'docker:\n  run:\n    mounts:\n      - path: "./tmp/fixtures"\n        mode: rw',
+      'docker:\n  pull:\n    registries:\n      - ghcr.io',
+    ];
+
+    const { config, additions } = mergeDiscoveredAccess(existing, discovered({ dockerHints: hints }), 'ci');
+
+    expect(config.shared?.docker).toEqual({
+      pull: { registries: ['ghcr.io'] },
+      run: { images: ['postgres:16', 'redis:7'], mounts: [{ path: './tmp/fixtures', mode: 'rw' }], network: 'bridge' },
+    });
+    expect(additions).toEqual([
+      { label: 'docker.pull.registries', items: ['ghcr.io'] },
+      { label: 'docker.run.images', items: ['redis:7'] },
+      { label: 'docker.run.mounts', items: ['./tmp/fixtures:rw'] },
+    ]);
+  });
+
+  it('has nothing to add when the existing docker policy already permits the denied request', () => {
+    const existing: LocalmostrcConfig = { version: 1, shared: { docker: { run: { images: ['postgres:16'] } } } };
+    const hint = 'docker:\n  run:\n    images:\n      - "postgres:16"';
+
+    const { config, additions } = mergeDiscoveredAccess(existing, discovered({ dockerHints: [hint] }), 'ci');
+
+    expect(additions).toEqual([]);
+    expect(config.shared?.docker).toEqual(existing.shared?.docker);
+  });
+
+  it('lists a bare run action as its own grant, since the diff has no item to show for it', () => {
+    const existing: LocalmostrcConfig = { version: 1, shared: { docker: { pull: { registries: ['docker.io'] } } } };
+
+    const { config, additions } = mergeDiscoveredAccess(existing, discovered({ dockerHints: ['docker:\n  run: {}'] }), 'ci');
+
+    expect(config.shared?.docker).toEqual({ pull: { registries: ['docker.io'] }, run: {} });
+    expect(additions).toEqual([{ label: 'docker.run', items: ['{}'] }]);
+  });
+
+  it('starts a new policy with a docker block from the hints alone', () => {
+    const { config, additions } = mergeDiscoveredAccess(undefined, discovered({
+      dockerHints: ['docker:\n  build:\n    context: "./"'],
+    }), 'ci');
+
+    expect(config.shared?.docker).toEqual({ build: { context: './' } });
+    expect(config.workflows).toEqual({ ci: {} });
+    expect(additions).toEqual([{ label: 'docker.build.context', items: ['./'] }]);
+  });
+
+  it('ignores a hint that is not a valid docker policy rather than widening the file', () => {
+    const { config, additions } = mergeDiscoveredAccess(undefined, discovered({ dockerHints: ['docker: socket'] }), 'ci');
+
+    expect(config.shared?.docker).toBeUndefined();
+    expect(additions).toEqual([]);
   });
 });

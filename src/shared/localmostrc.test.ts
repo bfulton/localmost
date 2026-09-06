@@ -796,3 +796,197 @@ describe('serializing a declared level', () => {
     expect(serializeLocalmostrc(config)).not.toContain('level:');
   });
 });
+
+describe('docker access', () => {
+  const runBlock = [
+    'version: 1',
+    'shared:',
+    '  docker:',
+    '    run:',
+    '      images:',
+    '        - "postgres:16"',
+    '      mounts:',
+    '        - path: ./',
+    '          mode: ro',
+    '',
+  ].join('\n');
+
+  it('accepts a docker action block', () => {
+    const result = parseLocalmostrcContent(runBlock);
+    expect(result.success).toBe(true);
+    expect(result.config?.shared?.docker).toEqual({
+      run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'ro' }] },
+    });
+  });
+
+  it('rejects the old levels with a message naming the actions that replace them', () => {
+    for (const level of ['socket', 'contexts', 'credentials']) {
+      const result = parseLocalmostrcContent(`version: 1\nshared:\n  docker: ${level}\n`);
+      expect(result.success).toBe(false);
+      expect(result.errors[0].message).toMatch(/no longer a level/);
+      expect(result.errors[0].message).toMatch(/`pull`, `run`, `build`/);
+    }
+  });
+
+  it('rejects docker: true, which does not say which grant was meant', () => {
+    const result = parseLocalmostrcContent('version: 1\nshared:\n  docker: true\n');
+    expect(result.success).toBe(false);
+    expect(result.errors[0].message).toMatch(/no longer a level/);
+  });
+
+  it('rejects an unknown docker action', () => {
+    const result = parseLocalmostrcContent('version: 1\nshared:\n  docker:\n    exec: {}\n');
+    expect(result.success).toBe(false);
+    expect(result.errors[0].message).toMatch(/unknown docker action "exec"/);
+  });
+
+  it('accepts docker inside a workflows block', () => {
+    // The socket is bound to the merged policy when the job is claimed, so a
+    // workflow can carry its own docker grants.
+    const result = parseLocalmostrcContent(
+      'version: 1\nworkflows:\n  integration:\n    docker:\n      run:\n        mounts:\n          - path: ./tmp/fixtures\n            mode: rw\n'
+    );
+    expect(result.success).toBe(true);
+    expect(result.config?.workflows?.integration.docker).toEqual({
+      run: { mounts: [{ path: './tmp/fixtures', mode: 'rw' }] },
+    });
+  });
+
+  it('validates a workflow docker block the same way as shared, under its own path', () => {
+    const result = parseLocalmostrcContent(
+      'version: 1\nworkflows:\n  build:\n    docker:\n      run:\n        mounts:\n          - path: ./\n            mode: write\n'
+    );
+    expect(result.success).toBe(false);
+    expect(result.errors[0].message).toMatch(/^workflows\.build\.docker\.run\.mounts\[0\]\.mode/);
+  });
+});
+
+describe('removed sockets key', () => {
+  it('rejects sockets, pointing at docker', () => {
+    const result = parseLocalmostrcContent(
+      'version: 1\nshared:\n  sockets:\n    allow:\n      - /var/run/docker.sock\n'
+    );
+    expect(result.success).toBe(false);
+    expect(result.errors[0].message).toMatch(/docker:/);
+  });
+});
+
+describe('docker policy through policy merging', () => {
+  it('composes the shared and workflow docker policy in the effective policy', () => {
+    // localmost test builds its profile from the effective policy, and the
+    // runner binds it to the socket on claim, so a grant dropped here would
+    // apply in neither place.
+    const config: LocalmostrcConfig = {
+      version: 1,
+      shared: {
+        docker: { run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'ro' }] } },
+        network: { allow: ['github.com'] },
+      },
+      workflows: {
+        integration: { docker: { run: { mounts: [{ path: './tmp/fixtures', mode: 'rw' }] } } },
+      },
+    };
+
+    expect(getEffectivePolicy(config, 'integration').docker).toEqual({
+      run: {
+        images: ['postgres:16'],
+        mounts: [
+          { path: './', mode: 'ro' },
+          { path: './tmp/fixtures', mode: 'rw' },
+        ],
+      },
+    });
+  });
+
+  it('keeps the shared docker policy for a workflow with no overrides', () => {
+    const config: LocalmostrcConfig = { version: 1, shared: { docker: { pull: { registries: ['docker.io'] } } } };
+    expect(getEffectivePolicy(config, 'anything').docker).toEqual({ pull: { registries: ['docker.io'] } });
+  });
+
+  it('leaves docker undefined when neither side declares it', () => {
+    const config: LocalmostrcConfig = { version: 1, shared: { network: { allow: ['github.com'] } } };
+    expect(getEffectivePolicy(config, 'anything').docker).toBeUndefined();
+  });
+});
+
+describe('docker policy in the approval diff', () => {
+  it('reports each new docker grant as its own diff entry', () => {
+    // With the repo policy as the only gate, the diff shown at approval time
+    // is the whole of the access control for this capability.
+    const before: LocalmostrcConfig = { version: 1 };
+    const after: LocalmostrcConfig = {
+      version: 1,
+      shared: { docker: { pull: { registries: ['docker.io'] }, run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'ro' }] } } },
+    };
+
+    const docker = diffConfigs(before, after).filter(d => d.path.startsWith('shared.docker'));
+
+    expect(docker).toEqual(expect.arrayContaining([
+      { path: 'shared.docker.pull.registries', type: 'added', newValue: 'docker.io' },
+      { path: 'shared.docker.run.images', type: 'added', newValue: 'postgres:16' },
+      { path: 'shared.docker.run.mounts', type: 'added', newValue: './:ro' },
+    ]));
+    expect(docker).toHaveLength(3);
+  });
+
+  it('reports a widened mount and a changed network mode', () => {
+    const before: LocalmostrcConfig = { version: 1, shared: { docker: { run: { mounts: [{ path: './', mode: 'ro' }], network: 'none' } } } };
+    const after: LocalmostrcConfig = { version: 1, shared: { docker: { run: { mounts: [{ path: './', mode: 'rw' }], network: 'bridge' } } } };
+
+    expect(diffConfigs(before, after)).toEqual(expect.arrayContaining([
+      { path: 'shared.docker.run.mounts', type: 'removed', oldValue: './:ro' },
+      { path: 'shared.docker.run.mounts', type: 'added', newValue: './:rw' },
+      { path: 'shared.docker.run.network', type: 'changed', oldValue: 'none', newValue: 'bridge' },
+    ]));
+  });
+
+  it('reports removed docker access, per workflow too', () => {
+    const before: LocalmostrcConfig = {
+      version: 1,
+      workflows: { integration: { docker: { run: { images: ['redis:7'] } } } },
+    };
+    const diffs = diffConfigs(before, { version: 1 });
+    expect(diffs).toEqual([{ path: 'workflows.integration.docker.run.images', type: 'removed', oldValue: 'redis:7' }]);
+  });
+
+  it('formats docker grants like every other line of the diff', () => {
+    const after: LocalmostrcConfig = { version: 1, shared: { docker: { run: { images: ['postgres:16'] }, privileged: true } } };
+    const text = formatPolicyDiff(diffConfigs({ version: 1 }, after));
+    expect(text).toContain('+ shared.docker.run.images: postgres:16');
+    expect(text).toContain('+ shared.docker.privileged: true');
+  });
+});
+
+describe('docker policy through serialization', () => {
+  it('round-trips a docker block at both scopes', () => {
+    const config: LocalmostrcConfig = {
+      version: 1,
+      shared: {
+        network: { allow: ['github.com'] },
+        docker: {
+          pull: { registries: ['docker.io', 'ghcr.io'] },
+          run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'ro' }], network: 'bridge' },
+          build: { context: './' },
+          privileged: true,
+        },
+      },
+      workflows: {
+        integration: {
+          docker: { run: { mounts: [{ path: './tmp/fixtures', mode: 'rw' }] } },
+          secrets: { require: ['DB_PASSWORD'] },
+        },
+      },
+    };
+
+    const written = serializeLocalmostrc(config);
+    const reparsed = parseLocalmostrcContent(written);
+
+    expect(reparsed.errors).toEqual([]);
+    expect(reparsed.config).toEqual(config);
+  });
+
+  it('writes no docker block when the policy grants nothing', () => {
+    const config: LocalmostrcConfig = { version: 1, shared: { docker: {}, network: { allow: ['github.com'] } } };
+    expect(serializeLocalmostrc(config)).not.toContain('docker');
+  });
+});
