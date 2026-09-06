@@ -44,6 +44,14 @@ export interface DockerRequest {
   body?: unknown;
   /** Set when the content type promised JSON and the body did not parse. */
   bodyError?: string;
+  /**
+   * Set when the request target is not a plain origin-form path. The filter
+   * refuses these rather than guessing: a target carrying an authority
+   * (`//evil/x`, `http://evil/x`) is read one way by the URL parser here and
+   * another by the daemon, and judging one while forwarding the other is how a
+   * filter gets talked past.
+   */
+  targetError?: string;
   raw: { method: string; url: string; headers: Record<string, string>; body: Buffer };
 }
 
@@ -61,9 +69,27 @@ const isJsonContentType = (contentType: string | undefined): boolean =>
   contentType !== undefined && contentType.split(';')[0].trim().toLowerCase() === 'application/json';
 
 export function parseDockerRequest(raw: DockerRequest['raw']): DockerRequest {
+  // Only origin-form is accepted. Anything else either throws here (`//`,
+  // `http://[`) or parses to a different path than the daemon will read, and
+  // both are refusals rather than guesses.
+  if (!raw.url.startsWith('/') || raw.url.startsWith('//')) {
+    return {
+      method: raw.method, path: raw.url, query: {}, raw,
+      targetError: `request target "${raw.url}" is not a plain path; the localmost docker socket accepts origin-form targets only`,
+    };
+  }
+
   // The base is a placeholder so a path-only URL parses; only pathname and
   // search are read from the result.
-  const url = new URL(raw.url, 'http://docker');
+  let url: URL;
+  try {
+    url = new URL(raw.url, 'http://docker');
+  } catch {
+    return {
+      method: raw.method, path: raw.url, query: {}, raw,
+      targetError: `request target "${raw.url}" could not be parsed`,
+    };
+  }
 
   let path = url.pathname;
   let apiVersion: string | undefined;

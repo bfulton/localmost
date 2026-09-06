@@ -259,6 +259,13 @@ export class DockerFilterProxy {
 
   /** Null when the request may proceed; otherwise the status and message that refuse it. */
   private decide(req: DockerRequest): { refusal: { status: number; message: string } | null; rewrittenBody?: unknown } {
+    // A target the parser could not read is a request the filter cannot judge.
+    // Before this, the parse threw out of the request handler: no refusal was
+    // written and the connection sat open until the client gave up.
+    if (req.targetError) {
+      this.onLog({ level: 'info', message: `refused ${req.method} ${req.raw.url}: ${req.targetError}` });
+      return { refusal: { status: 400, message: req.targetError } };
+    }
     if (req.apiVersion) {
       const version = parseApiVersion(req.apiVersion);
       if (

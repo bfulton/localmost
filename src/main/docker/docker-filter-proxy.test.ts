@@ -695,3 +695,34 @@ describe('mount sources are pinned before forwarding', () => {
     expect(binds[0]).toBe(`${real}:/ws`);
   });
 });
+
+describe('a request target the filter cannot read', () => {
+  it('is refused, and the connection does not hang', async () => {
+    const dir = tmp();
+    const daemon = await fakeDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
+
+    // Resolve on the response head, not on close: HTTP/1.1 keep-alive means a
+    // correctly-answered request leaves the socket open.
+    const answered = await new Promise<string>((resolve, reject) => {
+      let buffered = '';
+      const client = net.connect(sock);
+      const done = (v: string) => { clearTimeout(timer); client.destroy(); resolve(v); };
+      const timer = setTimeout(() => { client.destroy(); reject(new Error('no answer within 3s: the connection hung')); }, 3000);
+      client.on('connect', () => client.write('GET //evil/v1.45/containers/json HTTP/1.1\r\nHost: docker\r\n\r\n'));
+      client.on('data', (c: Buffer) => { buffered += c.toString(); if (buffered.includes('\r\n\r\n')) done(buffered); });
+      client.on('error', (e) => { clearTimeout(timer); reject(e); });
+      client.on('close', () => { clearTimeout(timer); resolve(buffered); });
+    });
+
+    // 400, naming the target: a target the filter cannot read is a bad
+    // request, not a policy denial, and saying so is the difference between
+    // "fix your URL" and "ask your operator for a grant".
+    expect(answered).toMatch(/^HTTP\/1\.[01] 400/);
+    expect(answered).toMatch(/origin-form|could not be parsed/);
+    // Nothing reached the daemon.
+    expect(daemon.seen).toHaveLength(0);
+    expect(proxy.isRunning()).toBe(true);
+  });
+});

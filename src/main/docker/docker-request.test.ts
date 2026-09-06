@@ -121,3 +121,29 @@ describe('container lifecycle endpoints the run action covers', () => {
     }
   });
 });
+
+describe('request targets that are not plain origin-form paths', () => {
+  const parse = (url: string) => parseDockerRequest({ method: 'GET', url, headers: {}, body: Buffer.alloc(0) });
+
+  it('does not throw on a target the URL parser rejects', () => {
+    for (const url of ['//', 'http://[', 'http://user@[::1]:99999/x']) {
+      expect(() => parse(url)).not.toThrow();
+      expect(parse(url).targetError).toBeTruthy();
+    }
+  });
+
+  it('refuses a target carrying an authority, which the filter and the daemon would read differently', () => {
+    // `//evil/x` parses to host=evil, path=/x here, while the daemon reads the
+    // request target as written. Judging one and forwarding the other is how a
+    // filter gets talked past.
+    expect(parse('//evil/v1.45/containers/json').targetError).toBeTruthy();
+    expect(parse('http://evil/v1.45/_ping').targetError).toBeTruthy();
+  });
+
+  it('leaves an ordinary path alone', () => {
+    const req = parse('/v1.45/containers/json?all=1');
+    expect(req.targetError).toBeUndefined();
+    expect(req.path).toBe('/containers/json');
+    expect(req.query.all).toBe('1');
+  });
+});
