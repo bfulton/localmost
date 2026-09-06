@@ -1239,7 +1239,10 @@ export class BrokerProxyService extends EventEmitter {
         // The request is logged because it shows the shape GitHub's acknowledge
         // endpoint expects, which acknowledgeMessageUpstream does not yet match.
         const ackBody = await readRequestBody(req);
-        log()?.info(`[BrokerProxy] Runner acknowledge${url.search}: ${ackBody.slice(0, 300)}`);
+        // JSON-encoded, so a body containing CR/LF cannot forge log lines: the
+        // log file writes messages verbatim. At debug because it is one line
+        // per acknowledge, which is one per message the runner receives.
+        log()?.debug(`[BrokerProxy] Runner acknowledge${url.search}: ${JSON.stringify(ackBody.slice(0, 300))}`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end('{}');
       } else if (method === 'POST' && url.pathname === '/acquirejob') {

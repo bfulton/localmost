@@ -602,15 +602,21 @@ describe('message routing', () => {
     internals.pendingTargetAssignments.push(target.id);
     const sessionId = await createSession();
 
-    // Nothing is deliverable, so the handler long-polls rather than answering.
-    // That is the point: the cancellation stays put. Assert the state instead
-    // of awaiting a response that correctly never comes.
+    // Nothing is deliverable, so the handler long-polls rather than answering -
+    // which is the point. Let it poll, assert the cancellation stayed put, then
+    // end the poll the way it really ends, by a job arriving: that both cleans
+    // the request up and shows the cancellation was skipped rather than eaten.
     const pending = request('GET', `/message?sessionId=${sessionId}`);
-    await new Promise((r) => setTimeout(r, 50));
+    await new Promise((r) => setTimeout(r, 60));
 
     expect(internals.messageQueues.get(target.id)).toEqual([cancelMessage]);
     expect(internals.localSessions.get(sessionId)?.currentJobId).toBeUndefined();
-    void pending;
+
+    internals.messageQueues.get(target.id)!.push(jobMessage);
+    const res = await pending;
+
+    expect(res.body).toBe(jobMessage);
+    expect(internals.messageQueues.get(target.id)).toEqual([cancelMessage]);
   });
 
   it('does hand the cancellation to the worker actually running that job', async () => {
