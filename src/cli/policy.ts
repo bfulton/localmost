@@ -11,7 +11,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { DockerPolicy, describeDockerGrants } from '../shared/docker-policy';
+import { DescribablePolicy, describePolicy } from '../shared/policy-describe';
 import {
   findLocalmostrc,
   parseLocalmostrc,
@@ -102,12 +102,6 @@ shared:
   }
 }
 
-interface PrintablePolicy {
-  network?: { allow?: string[]; deny?: string[] };
-  filesystem?: { read?: string[]; write?: string[]; deny?: string[] };
-  env?: { allow?: string[]; deny?: string[] };
-  docker?: DockerPolicy;
-}
 
 /**
  * Print a policy section.
@@ -116,68 +110,22 @@ interface PrintablePolicy {
  * before running `localmost policy approve`, so what it leaves out is approved
  * unseen.
  */
-export function printPolicy(policy: PrintablePolicy): void {
-  if (!policy || Object.keys(policy).length === 0) {
+export function printPolicy(policy: DescribablePolicy): void {
+  const grants = describePolicy(policy);
+  if (grants.length === 0) {
     console.log('  (empty - uses defaults only)');
     return;
   }
 
-  if (policy.network) {
-    if (policy.network.allow?.length) {
-      console.log('  Network allow:');
-      for (const domain of policy.network.allow) {
-        console.log(`    ${colors.green}+${colors.reset} ${domain}`);
-      }
+  const colorFor: Record<string, string> = { '+': colors.green, '-': colors.red, r: colors.cyan, w: colors.green };
+  let group = '';
+  for (const grant of grants) {
+    if (grant.group !== group) {
+      group = grant.group;
+      console.log(`  ${group}:`);
     }
-    if (policy.network.deny?.length) {
-      console.log('  Network deny:');
-      for (const domain of policy.network.deny) {
-        console.log(`    ${colors.red}-${colors.reset} ${domain}`);
-      }
-    }
-  }
-
-  if (policy.filesystem) {
-    if (policy.filesystem.read?.length) {
-      console.log('  Filesystem read:');
-      for (const filePath of policy.filesystem.read) {
-        console.log(`    ${colors.cyan}r${colors.reset} ${filePath}`);
-      }
-    }
-    if (policy.filesystem.write?.length) {
-      console.log('  Filesystem write:');
-      for (const filePath of policy.filesystem.write) {
-        console.log(`    ${colors.green}w${colors.reset} ${filePath}`);
-      }
-    }
-    if (policy.filesystem.deny?.length) {
-      console.log('  Filesystem deny:');
-      for (const filePath of policy.filesystem.deny) {
-        console.log(`    ${colors.red}-${colors.reset} ${filePath}`);
-      }
-    }
-  }
-
-  // The container grants: images, mounts, networks and whether a created
-  // network is routable. Described by the same code the app uses, so the two
-  // cannot drift into showing different things for one policy.
-  for (const grant of describeDockerGrants(policy.docker, '')) {
-    console.log(`    ${colors.green}+${colors.reset} ${grant}`);
-  }
-
-  if (policy.env) {
-    if (policy.env.allow?.length) {
-      console.log('  Environment allow:');
-      for (const name of policy.env.allow) {
-        console.log(`    ${colors.green}+${colors.reset} ${name}`);
-      }
-    }
-    if (policy.env.deny?.length) {
-      console.log('  Environment deny:');
-      for (const name of policy.env.deny) {
-        console.log(`    ${colors.red}-${colors.reset} ${name}`);
-      }
-    }
+    const color = colorFor[grant.marker] ?? colors.green;
+    console.log(`    ${color}${grant.marker}${colors.reset} ${grant.value}`);
   }
 }
 

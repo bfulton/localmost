@@ -17,7 +17,8 @@ import {
 } from '../policy-cache';
 import {
   getRunnerManager, getLogger } from '../app-state';
-import { DockerPolicy, describeDockerGrants } from '../../shared/docker-policy';
+import { DockerPolicy } from '../../shared/docker-policy';
+import { describePolicy } from '../../shared/policy-describe';
 
 /**
  * Describe what a policy grants, in the terms a reviewer cares about.
@@ -25,7 +26,6 @@ import { DockerPolicy, describeDockerGrants } from '../../shared/docker-policy';
 interface PolicySection {
   network?: { allow?: string[] };
   filesystem?: { read?: string[]; write?: string[] };
-  sockets?: { allow?: string[] };
   docker?: DockerPolicy;
 }
 
@@ -39,21 +39,7 @@ interface PolicySection {
  */
 
 function describeSection(section: PolicySection, prefix: string): string[] {
-  const grants: string[] = [];
-  for (const host of section.network?.allow || []) {
-    grants.push(`${prefix}network: ${host}`);
-  }
-  for (const p of section.filesystem?.read || []) {
-    grants.push(`${prefix}read: ${p}`);
-  }
-  for (const p of section.filesystem?.write || []) {
-    grants.push(`${prefix}write: ${p}`);
-  }
-  for (const p of section.sockets?.allow || []) {
-    grants.push(`${prefix}socket: ${p}`);
-  }
-  grants.push(...describeDockerGrants(section.docker, prefix));
-  return grants;
+  return describePolicy(section, prefix).map((grant) => grant.summary);
 }
 
 /**

@@ -4,6 +4,7 @@
  * Handles parsing, validation, and merging of declarative sandbox policies.
  */
 import * as yaml from 'js-yaml';
+import { POLICY_SECTION_KEYS, WORKFLOW_POLICY_KEYS } from './policy-describe';
 import * as fs from 'fs';
 import * as path from 'path';
 import { SandboxPolicy, NetworkPolicy, FilesystemPolicy, EnvPolicy } from './sandbox-profile';
@@ -178,7 +179,8 @@ export function parseLocalmostrcContent(content: string): ParseResult {
       errors.push({ message: '"workflows" must be an object' });
     } else {
       for (const [workflowName, policy] of Object.entries(config.workflows as Record<string, unknown>)) {
-        validatePolicy(policy, `workflows.${workflowName}`, errors);
+        // A workflow may also require secrets; the shared scope may not.
+        validatePolicy(policy, `workflows.${workflowName}`, errors, WORKFLOW_POLICY_KEYS);
         validateSecretsPolicy(policy, `workflows.${workflowName}`, errors);
       }
     }
@@ -207,7 +209,12 @@ export function parseLocalmostrcContent(content: string): ParseResult {
 /**
  * Validate a sandbox policy object.
  */
-function validatePolicy(policy: unknown, path: string, errors: ParseError[]): void {
+function validatePolicy(
+  policy: unknown,
+  path: string,
+  errors: ParseError[],
+  accepted: readonly string[] = POLICY_SECTION_KEYS
+): void {
   if (policy === null || policy === undefined) {
     return; // Empty policy is valid
   }
@@ -218,6 +225,18 @@ function validatePolicy(policy: unknown, path: string, errors: ParseError[]): vo
   }
 
   const p = policy as Record<string, unknown>;
+
+  // A key nobody parses grants nothing while reading as though it grants
+  // something, and shows up in no approval diff because no parser produced it.
+  // The keys are listed in one place, shared with what describes a policy, so
+  // a new one cannot be accepted without also being shown.
+  for (const key of Object.keys(p)) {
+    if (accepted.includes(key)) continue;
+    if (key === 'sockets') continue; // Has its own message, below.
+    errors.push({
+      message: `${path}.${key} is not a policy key. Accepted keys: ${accepted.join(', ')}.`,
+    });
+  }
 
   // Validate network policy
   if (p.network !== undefined) {

@@ -989,3 +989,47 @@ describe('docker policy through serialization', () => {
     expect(serializeLocalmostrc(config)).not.toContain('docker');
   });
 });
+
+describe('a policy key the grammar does not know', () => {
+  const parse = (body: string) => parseLocalmostrcContent(`version: 1\nshared:\n${body}`);
+
+  it('is refused rather than ignored, since an ignored key grants nothing while looking like it grants', () => {
+    // The failure this prevents: a misspelled key validates clean, shows up in
+    // no approval diff because nothing parses it, and silently applies none of
+    // what it appears to declare. Already seen once with `build:`.
+    const result = parse('  dokcer:\n    run:\n      images: ["alpine:3"]\n');
+    expect(result.success).toBe(false);
+    expect(result.errors.map((e) => e.message).join('\n')).toMatch(/dokcer/);
+  });
+
+  it('names the keys that are accepted, so the fix is in the message', () => {
+    const errors = parse('  filesystm:\n    read: ["/etc"]\n').errors.map((e) => e.message).join('\n');
+    for (const key of ['network', 'filesystem', 'env', 'docker']) expect(errors).toContain(key);
+  });
+
+  it('still accepts every key the grammar does know', () => {
+    const ok = parse(
+      '  network:\n    allow: ["github.com"]\n' +
+      '  filesystem:\n    read: ["/etc"]\n' +
+      '  env:\n    allow: ["CI"]\n' +
+      '  docker:\n    run:\n      images: ["alpine:3"]\n'
+    );
+    expect(ok.errors).toEqual([]);
+    expect(ok.success).toBe(true);
+  });
+});
+
+describe('secrets is a workflow-scoped key', () => {
+  it('is accepted under a workflow', () => {
+    const r = parseLocalmostrcContent(
+      'version: 1\nworkflows:\n  deploy:\n    secrets:\n      require: ["DEPLOY_KEY"]\n'
+    );
+    expect(r.errors).toEqual([]);
+  });
+
+  it('is refused at shared scope, where nothing reads it', () => {
+    const r = parseLocalmostrcContent('version: 1\nshared:\n  secrets:\n    require: ["DEPLOY_KEY"]\n');
+    expect(r.success).toBe(false);
+    expect(r.errors.map((e) => e.message).join('\n')).toMatch(/shared\.secrets is not a policy key/);
+  });
+});
