@@ -8,7 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { SandboxPolicy, NetworkPolicy, FilesystemPolicy, EnvPolicy } from './sandbox-profile';
 import { SandboxPolicyLevel } from './types';
-import { DOCKER_ACCESS_LEVELS, isDockerAccessLevel } from './docker-access';
+import { validateDockerPolicy } from './docker-policy';
 
 // =============================================================================
 // Types
@@ -229,8 +229,8 @@ function validatePolicy(policy: unknown, path: string, errors: ParseError[]): vo
   if (p.sockets !== undefined) {
     errors.push({
       message:
-        `${path}.sockets is no longer supported. Use \`docker:\` in shared to ` +
-        'declare Docker access (off, socket, contexts, credentials).',
+        `${path}.sockets is no longer supported. Use \`docker:\` to declare ` +
+        'container work (pull, run, build).',
     });
   }
 
@@ -239,21 +239,11 @@ function validatePolicy(policy: unknown, path: string, errors: ParseError[]): vo
     validateEnvPolicy(p.env, `${path}.env`, errors);
   }
 
-  // Validate docker access level. The sandbox profile is built before the
-  // workflow is known, so this is only meaningful in the shared section - the
-  // same reason per-workflow filesystem sections are not applied.
+  // Validate the docker action block. The filtering socket is bound to the
+  // merged policy when the job is claimed, so docker is valid at both scopes
+  // and validates the same way in each.
   if (p.docker !== undefined) {
-    if (path !== 'shared') {
-      errors.push({
-        message:
-          `${path}.docker is not supported: docker access is declared in shared, ` +
-          'because the sandbox profile is built before the workflow is known',
-      });
-    } else if (!isDockerAccessLevel(p.docker)) {
-      errors.push({
-        message: `${path}.docker must be one of: ${DOCKER_ACCESS_LEVELS.join(', ')}`,
-      });
-    }
+    validateDockerPolicy(p.docker, `${path}.docker`, (m) => errors.push({ message: m }));
   }
 }
 

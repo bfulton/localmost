@@ -798,29 +798,66 @@ describe('serializing a declared level', () => {
 });
 
 describe('docker access', () => {
-  it('accepts a declared docker level', () => {
-    const result = parseLocalmostrcContent('version: 1\nshared:\n  docker: socket\n');
+  const runBlock = [
+    'version: 1',
+    'shared:',
+    '  docker:',
+    '    run:',
+    '      images:',
+    '        - "postgres:16"',
+    '      mounts:',
+    '        - path: ./',
+    '          mode: ro',
+    '',
+  ].join('\n');
+
+  it('accepts a docker action block', () => {
+    const result = parseLocalmostrcContent(runBlock);
     expect(result.success).toBe(true);
-    expect(result.config?.shared?.docker).toBe('socket');
+    expect(result.config?.shared?.docker).toEqual({
+      run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'ro' }] },
+    });
   });
 
-  it('rejects docker: true, which does not say which level was meant', () => {
+  it('rejects the old levels with a message naming the actions that replace them', () => {
+    for (const level of ['socket', 'contexts', 'credentials']) {
+      const result = parseLocalmostrcContent(`version: 1\nshared:\n  docker: ${level}\n`);
+      expect(result.success).toBe(false);
+      expect(result.errors[0].message).toMatch(/no longer a level/);
+      expect(result.errors[0].message).toMatch(/`pull`, `run`, `build`/);
+    }
+  });
+
+  it('rejects docker: true, which does not say which grant was meant', () => {
     const result = parseLocalmostrcContent('version: 1\nshared:\n  docker: true\n');
     expect(result.success).toBe(false);
-    expect(result.errors[0].message).toMatch(/off, socket, contexts, credentials/);
+    expect(result.errors[0].message).toMatch(/no longer a level/);
   });
 
-  it('rejects an unknown docker level', () => {
-    const result = parseLocalmostrcContent('version: 1\nshared:\n  docker: daemon\n');
+  it('rejects an unknown docker action', () => {
+    const result = parseLocalmostrcContent('version: 1\nshared:\n  docker:\n    exec: {}\n');
     expect(result.success).toBe(false);
+    expect(result.errors[0].message).toMatch(/unknown docker action "exec"/);
   });
 
-  it('rejects docker inside a workflows block', () => {
+  it('accepts docker inside a workflows block', () => {
+    // The socket is bound to the merged policy when the job is claimed, so a
+    // workflow can carry its own docker grants.
     const result = parseLocalmostrcContent(
-      'version: 1\nworkflows:\n  build:\n    docker: socket\n'
+      'version: 1\nworkflows:\n  integration:\n    docker:\n      run:\n        mounts:\n          - path: ./tmp/fixtures\n            mode: rw\n'
+    );
+    expect(result.success).toBe(true);
+    expect(result.config?.workflows?.integration.docker).toEqual({
+      run: { mounts: [{ path: './tmp/fixtures', mode: 'rw' }] },
+    });
+  });
+
+  it('validates a workflow docker block the same way as shared, under its own path', () => {
+    const result = parseLocalmostrcContent(
+      'version: 1\nworkflows:\n  build:\n    docker:\n      run:\n        mounts:\n          - path: ./\n            mode: write\n'
     );
     expect(result.success).toBe(false);
-    expect(result.errors[0].message).toMatch(/shared/);
+    expect(result.errors[0].message).toMatch(/^workflows\.build\.docker\.run\.mounts\[0\]\.mode/);
   });
 });
 
@@ -878,11 +915,5 @@ describe('docker level in the approval diff', () => {
   it('reports removed docker access', () => {
     const diffs = diffConfigs({ version: 1, shared: { docker: 'socket' as const } }, { version: 1 });
     expect(diffs.find(d => d.path === 'shared.docker')?.type).toBe('removed');
-  });
-
-  it('round-trips a docker level through serialization', () => {
-    const config = { version: 1, shared: { docker: 'contexts' as const } };
-    const reparsed = parseLocalmostrcContent(serializeLocalmostrc(config));
-    expect(reparsed.config?.shared?.docker).toBe('contexts');
   });
 });

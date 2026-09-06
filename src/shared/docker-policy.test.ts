@@ -1,5 +1,5 @@
 import { describe, it, expect } from '@jest/globals';
-import { isEmptyDockerPolicy, DockerPolicy } from './docker-policy';
+import { isEmptyDockerPolicy, validateDockerPolicy, DockerPolicy } from './docker-policy';
 
 describe('docker policy', () => {
   it('treats an absent or all-empty docker policy as empty', () => {
@@ -7,5 +7,81 @@ describe('docker policy', () => {
     expect(isEmptyDockerPolicy({})).toBe(true);
     const granted: DockerPolicy = { run: { images: ['postgres:16'] } };
     expect(isEmptyDockerPolicy(granted)).toBe(false);
+  });
+});
+
+describe('validateDockerPolicy', () => {
+  const collect = (value: unknown, path = 'shared.docker') => {
+    const errs: string[] = [];
+    validateDockerPolicy(value, path, (m) => errs.push(m));
+    return errs;
+  };
+
+  it('rejects the old string levels with a message naming the new actions', () => {
+    for (const level of ['socket', 'contexts', 'credentials', 'true']) {
+      const errs = collect(level);
+      expect(errs.join('\n')).toMatch(/no longer.*use `pull`, `run`, `build`/i);
+    }
+  });
+
+  it('rejects docker: true the same way, since YAML reads it as a boolean', () => {
+    expect(collect(true).join('\n')).toMatch(/no longer.*use `pull`, `run`, `build`/i);
+  });
+
+  it('accepts an empty action block, which grants nothing', () => {
+    expect(collect({})).toEqual([]);
+  });
+
+  it('accepts a run policy with images, mounts and network', () => {
+    expect(collect({ run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'ro' }], network: 'bridge' } })).toEqual([]);
+  });
+
+  it('accepts pull, build and privileged alongside run', () => {
+    expect(collect({
+      pull: { registries: ['docker.io', 'ghcr.io'] },
+      run: { images: ['postgres:16'] },
+      build: { context: './' },
+      privileged: true,
+    })).toEqual([]);
+  });
+
+  it('rejects an unknown docker action', () => {
+    expect(collect({ exec: {} }).join('\n')).toMatch(/unknown docker action.*exec/i);
+  });
+
+  it('rejects anything that is not an object of actions', () => {
+    expect(collect(['run']).join('\n')).toMatch(/must be an object of docker actions/i);
+    expect(collect(null).join('\n')).toMatch(/must be an object of docker actions/i);
+    expect(collect(7).join('\n')).toMatch(/must be an object of docker actions/i);
+  });
+
+  it('rejects a mount without a valid mode', () => {
+    expect(collect({ run: { mounts: [{ path: './', mode: 'write' }] } }).join('\n')).toMatch(/mount mode must be 'ro' or 'rw'/i);
+  });
+
+  it('rejects a mount without a path', () => {
+    expect(collect({ run: { mounts: [{ mode: 'ro' }] } }).join('\n')).toMatch(/mounts\[0\]\.path must be a string/i);
+  });
+
+  it('rejects run conditions of the wrong shape, naming the path', () => {
+    expect(collect({ run: { images: 'postgres:16' } }).join('\n')).toMatch(/shared\.docker\.run\.images must be an array/i);
+    expect(collect({ run: { images: [16] } }).join('\n')).toMatch(/shared\.docker\.run\.images\[0\] must be a string/i);
+    expect(collect({ run: { network: ['bridge'] } }).join('\n')).toMatch(/shared\.docker\.run\.network must be a string/i);
+    expect(collect({ run: 'yes' }).join('\n')).toMatch(/shared\.docker\.run must be an object/i);
+  });
+
+  it('requires registries on pull', () => {
+    expect(collect({ pull: {} }).join('\n')).toMatch(/shared\.docker\.pull\.registries must be an array/i);
+    expect(collect({ pull: { registries: 'docker.io' } }).join('\n')).toMatch(/shared\.docker\.pull\.registries must be an array/i);
+  });
+
+  it('checks build context and privileged types', () => {
+    expect(collect({ build: { context: ['./'] } }).join('\n')).toMatch(/shared\.docker\.build\.context must be a string/i);
+    expect(collect({ privileged: 'yes' }).join('\n')).toMatch(/shared\.docker\.privileged must be a boolean/i);
+  });
+
+  it('reports under the path it was given, so workflow scope reads the same', () => {
+    const errs = collect({ exec: {} }, 'workflows.integration.docker');
+    expect(errs[0]).toMatch(/^workflows\.integration\.docker/);
   });
 });
