@@ -993,6 +993,13 @@ export class RunnerManager {
       const dockerSocketPath = path.join(sandboxDir, DOCKER_SOCKET_NAME);
       const dockerSocket = await this.startDockerProxy(instanceNum, dockerSocketPath);
       env.DOCKER_HOST = `unix://${dockerSocketPath}`;
+      // Pin the job to the classic builder. BuildKit - the default since
+      // Docker 23 - does not use POST /build at all: it negotiates a session
+      // and streams the build over gRPC, exporting host filesystem access to
+      // the daemon as it goes. "Which paths may this build read" then stops
+      // being a property of any request the filter can see, so `build:` policy
+      // would describe an endpoint a real `docker build` never calls.
+      env.DOCKER_BUILDKIT = '0';
 
       instance.process = spawnSandboxed(runnerBinary, ['--once'], {
         cwd: sandboxDir,

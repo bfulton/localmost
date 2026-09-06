@@ -33,6 +33,7 @@ export type DockerAction =
   | 'network-remove'
   | 'network-list'
   | 'image-inspect'
+  | 'buildkit'
   | 'build'
   | 'other';
 
@@ -155,6 +156,10 @@ const ENDPOINTS: ReadonlyArray<{ method: string; path: RegExp; action: DockerAct
   // Listing enumerates the daemon, like the container list; no key grants it.
   { method: 'GET', path: /^\/networks$/, action: 'network-list' },
   { method: 'POST', path: /^\/build$/, action: 'build' },
+  // BuildKit's session and stream. Named so the refusal can say why, rather
+  // than falling through to "unknown endpoint".
+  { method: 'POST', path: /^\/grpc$/, action: 'buildkit' },
+  { method: 'POST', path: /^\/session$/, action: 'buildkit' },
 ];
 
 /** The image reference an inspect addresses, decoded, or undefined. */

@@ -291,7 +291,7 @@ Actions are CLI-shaped, so a policy reads the way a workflow author thinks:
 |---|---|---|
 | `pull` | image pulls | `registries` — the registry each pulled image comes from |
 | `run` | container create, start, attach, wait, kill, stop, remove and logs; creating a declared network; inspecting a declared image | `images` — the images a container may be created from, and the only images it may inspect; each entry is an anchored glob where `*` stops at `/`, so a content-addressed tag can be declared as `vk/grader:*` while `vk/*` reaches one level under `vk` and no further; `networks` — networks the job may create, each an anchored name glob plus whether it is `internal`; `mounts` — workspace paths a container may bind, each `ro` or `rw`; `network` — the container's network mode |
-| `build` | image builds | `context` — which directory the workflow builds from, for the reader and the approval diff |
+| `build` | image builds, with the classic builder (jobs run with `DOCKER_BUILDKIT=0`, since a BuildKit build streams over a gRPC session the filter cannot inspect) | `context` — which directory the workflow builds from, for the reader and the approval diff |
 
 Conditions are checked against the request itself. Mount paths are resolved
 through symlinks and must stay inside the job workspace, so `../` traversal and

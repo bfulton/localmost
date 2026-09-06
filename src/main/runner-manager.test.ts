@@ -1328,6 +1328,10 @@ describe('RunnerManager', () => {
       expect(socket.start.mock.invocationCallOrder[0]).toBeLessThan(mockSpawnSandboxed.mock.invocationCallOrder[0]);
       const options = mockSpawnSandboxed.mock.calls[0][2]!;
       expect(options.env?.DOCKER_HOST).toBe(`unix://${socketPath}`);
+      // BuildKit, the default builder since Docker 23, streams a build over a
+      // gRPC session the filter cannot inspect. The classic builder is the one
+      // `build:` policy actually describes, so the job is pinned to it.
+      expect(options.env?.DOCKER_BUILDKIT).toBe('0');
       // The profile grants this socket by name; the daemon's is no longer handed over.
       expect(options).toHaveProperty('dockerSocket', socketPath);
       expect(options).not.toHaveProperty('dockerGrants');

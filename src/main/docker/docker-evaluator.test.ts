@@ -670,3 +670,24 @@ describe('what * spans in a declared glob', () => {
     expect(create('vk/team/app:1', ['vk/*:*'])).toBe(false);
   });
 });
+
+describe('BuildKit endpoints', () => {
+  const p: DockerPolicy = { run: { images: ['alpine:3'], network: 'bridge' }, build: { context: './' } };
+
+  it('refuses a BuildKit session, and says why rather than shrugging', () => {
+    // A real `docker build` on a default install issues zero POST /build: it
+    // negotiates a session and streams over /grpc. Denying it generically read
+    // as "unknown endpoint" when the real answer is "that builder cannot be
+    // filtered, and we pinned you off it".
+    for (const url of ['/v1.45/grpc', '/v1.45/session']) {
+      const v = evaluateDockerRequest(mk('POST', url), ctx(p));
+      expect([url, v.allowed]).toEqual([url, false]);
+      expect(v.reason).toMatch(/BuildKit/i);
+      expect(v.reason).toMatch(/DOCKER_BUILDKIT/);
+    }
+  });
+
+  it('still permits the classic build the policy describes', () => {
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/build?t=app%3A1'), ctx(p)).allowed).toBe(true);
+  });
+});

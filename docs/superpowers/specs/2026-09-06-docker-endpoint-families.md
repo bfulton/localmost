@@ -111,6 +111,32 @@ same endpoint family with the same scoping.
 "reads about the job's own containers", and logs is exactly such a read; refusing
 it contradicts the documented behaviour rather than implementing it.
 
+## Builds use the classic builder
+
+`build:` policy describes `POST /build`, and a real `docker build` on a default
+install never calls it. BuildKit has been the default builder since Docker 23:
+it negotiates a session and streams the build over `POST /grpc`. A consumer
+replayed 1,429 captured API requests from a suite that built about twenty
+images and found **zero** `POST /build` and 63 `POST /grpc`, with
+`DOCKER_BUILDKIT` unset — stock behaviour, not an opt-in.
+
+So the filter pins each job to the classic builder with `DOCKER_BUILDKIT=0`,
+set alongside `DOCKER_HOST` when the worker is spawned.
+
+The alternative was to filter the BuildKit session, and it is not filterable in
+the sense this design means. The session is a bidirectional gRPC stream over
+which the client exports host filesystem access to the daemon; "which paths may
+this build read" stops being a property of a request body, which is the only
+thing the proxy can inspect. Choosing the builder the filter can actually see
+keeps the boundary honest, at the cost of BuildKit's cache and speed. The
+classic builder is deprecated, so this is a stage-1 answer with a shelf life:
+stage 2's managed VM contains a build by construction and would not need it.
+
+`POST /grpc` and `POST /session` are refused by name, saying that jobs are
+pinned to the classic builder — seeing that denial means something set
+`DOCKER_BUILDKIT` back on, which is worth reading as an error rather than as an
+unknown endpoint.
+
 ## What stays denied
 
 `GET /containers/json`, `GET /networks`, `GET /images/json` and

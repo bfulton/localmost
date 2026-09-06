@@ -776,6 +776,13 @@ export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext
     case 'network-inspect':
     case 'network-remove':
       return evaluateOwnNetwork(req, ctx);
+    case 'buildkit':
+      return deny(
+        'BuildKit builds cannot be filtered: the build streams over a gRPC session that exports host ' +
+          'filesystem access to the daemon, so no request carries the paths it reads. Jobs are pinned to ' +
+          'the classic builder with DOCKER_BUILDKIT=0, which `build:` policy does describe - seeing this ' +
+          'means something set DOCKER_BUILDKIT back on.'
+      );
     case 'network-list':
       return deny(
         'listing networks is not permitted through the localmost docker socket; it would enumerate networks outside this job'
