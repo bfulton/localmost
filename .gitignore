@@ -22,6 +22,11 @@ bundled-runner/
 *.swp
 *.swo
 
+# Playwright's defaults, for a run that forgets --config test/playwright.config.ts.
+# The config routes output into build/; these are where it lands without it.
+/test-results/
+/playwright-report/
+
 # OS
 .DS_Store
 Thumbs.db
