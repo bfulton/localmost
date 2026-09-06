@@ -198,11 +198,22 @@ interface ContextDictEntry {
  * Pull the job's GitHub identity out of the broker job details' contextData.
  * Pure, so the mapping from context keys to job info can be tested directly.
  */
+/** The workflow filename, without extension, from a github.workflow_ref value. */
+function workflowFilename(ref: string | undefined): string | undefined {
+  if (!ref) return undefined;
+  // owner/repo/.github/workflows/<file>@<ref>; the ref itself may contain '/'.
+  const path = ref.split('@')[0];
+  const file = path.slice(path.lastIndexOf('/') + 1);
+  if (!file) return undefined;
+  return file.replace(/\.ya?ml$/i, '');
+}
+
 export function extractGitHubJobInfo(contextData: {
   github?: { d?: ContextDictEntry[] };
   job?: { d?: ContextDictEntry[] };
 } | undefined): GitHubJobInfo {
   const info: GitHubJobInfo = {};
+  let workflowRef: string | undefined;
 
   const github = contextData?.github;
   if (github?.d && Array.isArray(github.d)) {
@@ -213,8 +224,17 @@ export function extractGitHubJobInfo(contextData: {
       if (item.k === 'sha') info.githubSha = item.v;
       if (item.k === 'ref') info.githubRef = item.v;
       if (item.k === 'workflow') info.githubWorkflow = item.v;
+      if (item.k === 'workflow_ref') workflowRef = item.v;
     }
   }
+
+  // `.localmostrc` keys under `workflows:` match the workflow FILENAME, but
+  // `github.workflow` is the workflow's `name:` - a free-form string that only
+  // equals the filename by coincidence. `github.workflow_ref` carries the real
+  // path (owner/repo/.github/workflows/<file>@<ref>), so the filename comes
+  // from there when the service sends it, and the name remains the fallback.
+  const fromRef = workflowFilename(workflowRef);
+  if (fromRef) info.githubWorkflow = fromRef;
 
   // Job ID (check_run_id) is in the job context
   const job = contextData?.job;

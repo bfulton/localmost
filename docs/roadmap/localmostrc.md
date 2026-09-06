@@ -250,7 +250,10 @@ workflows:
 - Each workflow gets exactly what it needs, nothing more
 
 **Workflow matching:**
-- Keys under `workflows:` match the workflow filename (without `.yml`/`.yaml`)
+- Keys under `workflows:` match the workflow filename (without `.yml`/`.yaml`),
+  taken from `github.workflow_ref`. Where a job arrives without that — an older
+  runner service — the workflow's `name:` is used instead, so name a section
+  after the file and the two agree
 - `build` matches `.github/workflows/build.yml`
 - For matrix workflows, all jobs in the workflow share the workflow's policy
 
