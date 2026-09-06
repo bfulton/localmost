@@ -586,9 +586,15 @@ const NETWORK_CREATE_GATES: ReadonlyArray<{ key: string; permitted: (v: unknown)
  * Anchored so a declared name cannot be widened by a prefix: `vk-*` does not
  * match `other-vk-abc`. Stopping at `/` for the same reason one level down - a
  * glob that silently spans path separators reads as narrower than it is, so
- * `vk/*` reaches one level under `vk` and no further, and each extra segment
+ * `vk/*:*` reaches one level under `vk` and no further, and each extra segment
  * has to be asked for. A tag glob is unaffected, since a tag cannot contain a
  * slash: `vk/grader:*` still covers a content-addressed tag.
+ *
+ * The tag is a second boundary, and it comes from normalisation rather than
+ * from here: a declaration with no tag normalises to `:latest`, so `vk/*` is
+ * matched as `vk/*:latest` and covers only latest. That reads as far wider
+ * than it is, so validation refuses a tagless glob and names `vk/*:*`; the
+ * behaviour is pinned by test rather than relied upon.
  */
 function globMatches(pattern: string, value: string): boolean {
   const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, (c) => (c === '*' ? '\u0000' : `\\${c}`));

@@ -410,3 +410,31 @@ describe('network entries in the approval diff', () => {
     expect(values).toEqual(expect.arrayContaining(['vk-* (internal)', 'open (routable)']));
   });
 });
+
+describe('a glob in run.images must say what tag it covers', () => {
+  const collect = (value: unknown, path = 'shared.docker') => {
+    const errs: string[] = [];
+    validateDockerPolicy(value, path, (m) => errs.push(m));
+    return errs;
+  };
+
+  it('rejects a tagless glob, naming the form that means what it looks like', () => {
+    // Normalisation appends :latest to a tagless reference, so `vk/*` silently
+    // means "any repo under vk, but only its latest tag" - almost none of them.
+    // Guessing :* instead would be the same class of guess as accepting
+    // `docker: true`, so it is refused with the fix in the message.
+    const errs = collect({ run: { images: ['vk/*'] } }).join('\n');
+    expect(errs).toMatch(/vk\/\*:\*/);
+    expect(errs).toMatch(/tag/i);
+  });
+
+  it('accepts a glob that carries a tag, globbed or exact', () => {
+    expect(collect({ run: { images: ['vk/*:*'] } })).toEqual([]);
+    expect(collect({ run: { images: ['vk/grader:*'] } })).toEqual([]);
+    expect(collect({ run: { images: ['vk/*:1'] } })).toEqual([]);
+  });
+
+  it('leaves exact references alone, tagless or not', () => {
+    expect(collect({ run: { images: ['alpine', 'alpine:3', 'ghcr.io/o/app:1'] } })).toEqual([]);
+  });
+});

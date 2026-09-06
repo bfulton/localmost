@@ -177,9 +177,19 @@ Per family, and in the same executable-escape style as the original spec:
   matched `vk/grader:a/b` — which answered the question empirically in the
   direction nobody wanted. Both halves now hold, for the same reason: a glob
   that quietly spans more than it appears to reads as narrower than it is.
-  `vk/*` reaches one level under `vk` and no further; each extra segment has to
-  be asked for. Tag globs are unaffected, since a tag cannot contain a slash,
-  so `vk/grader:*` still covers a content-addressed tag.
+  `vk/*:*` reaches one level under `vk` and no further; each extra segment has
+  to be asked for. Tag globs are unaffected, since a tag cannot contain a
+  slash, so `vk/grader:*` still covers a content-addressed tag.
+- ~~What a glob with no tag covers.~~ **Decided: nothing - it is refused at
+  validation.** The same consumer measured again and found a second boundary
+  nobody had written down: a reference with no tag normalises to `:latest`, so
+  `vk/*` is matched as `vk/*:latest` and covers only the latest tag of each
+  repository - almost none of what it reads as, and invisible in an approval
+  diff. Two ways out: treat a tagless glob as `:*`, or refuse it. Refusing it
+  wins for the reason `docker: true` is refused rather than interpreted - the
+  grammar does not guess at intent it can ask for - so validation rejects a
+  tagless glob with a message naming `vk/*:*`. Exact references are untouched:
+  `alpine` still means `alpine:latest`, which is what it looks like.
 - Whether an owned network should be deleted automatically when the job's worker
   exits, as the socket itself is. Leaning yes, for the same reason: nothing
   should outlive the job that created it.

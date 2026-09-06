@@ -669,6 +669,16 @@ describe('what * spans in a declared glob', () => {
     expect(create('vk/app:1', ['vk/*:*'])).toBe(true);
     expect(create('vk/team/app:1', ['vk/*:*'])).toBe(false);
   });
+
+  it('is bounded by the tag too, which is why a tagless glob is refused upstream', () => {
+    // Normalisation appends :latest to a tagless reference on both sides, so a
+    // tagless glob is matched as `vk/*:latest` - it covers latest and nothing
+    // else, however wide it reads. validateDockerPolicy rejects the form for
+    // that reason; this pins the behaviour the rejection exists to prevent.
+    expect(create('vk/app', ['vk/*'])).toBe(true);
+    expect(create('vk/app:1', ['vk/*'])).toBe(false);
+    expect(create('vk/app:1', ['vk/*:*'])).toBe(true);
+  });
 });
 
 describe('BuildKit endpoints', () => {

@@ -119,7 +119,26 @@ function validateRun(value: unknown, path: string, push: (message: string) => vo
     push(`${path} must be an object`);
     return;
   }
-  if (value.images !== undefined) validateStringArray(value.images, `${path}.images`, push);
+  if (value.images !== undefined) {
+    validateStringArray(value.images, `${path}.images`, push);
+    if (Array.isArray(value.images)) {
+      for (const image of value.images) {
+        if (typeof image !== 'string' || !image.includes('*')) continue;
+        // A reference with no tag normalises to :latest, so a tagless glob
+        // means "any repository here, but only its latest tag" - which is not
+        // what it looks like, and an approval diff cannot show the difference.
+        // Guessing :* instead would be the same guess this grammar refuses when
+        // it rejects `docker: true`, so say what to write instead.
+        const lastSegment = image.slice(image.lastIndexOf('/') + 1);
+        if (!lastSegment.includes(':') && !lastSegment.includes('@')) {
+          push(
+            `${path}.images entry "${image}" globs a repository but names no tag, which matches only ` +
+              `its "latest" tag. Write "${image}:*" for any tag, or name the tag you mean.`
+          );
+        }
+      }
+    }
+  }
   if (value.mounts !== undefined) validateMounts(value.mounts, `${path}.mounts`, push);
   if (value.networks !== undefined) validateNetworks(value.networks, `${path}.networks`, push);
   if (value.network !== undefined && typeof value.network !== 'string') {
