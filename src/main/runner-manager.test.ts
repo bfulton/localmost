@@ -32,7 +32,7 @@ jest.mock('./proxy-server', () => ({
   })),
 }));
 
-import { RunnerManager, UNCLAIMED_WORKER_TIMEOUT_MS } from './runner-manager';
+import { RunnerManager, UNCLAIMED_WORKER_TIMEOUT_MS, JobEvent } from './runner-manager';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -418,6 +418,29 @@ describe('RunnerManager', () => {
   });
 
   // fetchActionsUrl was removed - job URLs are now extracted directly from job details
+
+  describe('job-started target context', () => {
+    it('reports the target repository, not "unknown", when a spawned worker starts its job', async () => {
+      const events: JobEvent[] = [];
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        onJobEvent: (e) => events.push(e),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, { name: 'localmost.host.owner-repo.1', status: 'listening' });
+
+      // spawnWorkerForJob stores the job's target context under the numeric
+      // instance id, which is where the job-started handler must look for it.
+      helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo' });
+
+      await helper.parseRunnerOutput(1, 'Running job: build');
+
+      const started = events.find((e) => e.type === 'started');
+      expect(started?.repository).toBe('owner/repo');
+    });
+  });
 
   describe('contributors scope enforcement', () => {
     const JOB = {

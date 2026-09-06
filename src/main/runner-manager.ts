@@ -1368,8 +1368,12 @@ export class RunnerManager {
 
       instance.status = 'busy';
 
-      // Get target context if available (from broker-proxy-service)
-      const targetContext = this.consumePendingTargetContext(instance.name);
+      // Get target context if available. spawnWorkerForJob stores it under the
+      // numeric instance id, so look there first; consume also falls back to
+      // 'next' for an idle worker that picked the job up without a spawn. (The
+      // full runner name is never a storage key, so looking it up always missed
+      // and left every job reporting its repository as 'unknown'.)
+      const targetContext = this.consumePendingTargetContext(String(instanceNum));
 
       // Keep it against this instance. An idle worker that picks a job up
       // never went through spawnWorkerForJob, so this is the only record of
