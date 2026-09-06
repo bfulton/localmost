@@ -11,8 +11,9 @@
  * at the root of the sandbox directory, bound on claim to the repository's
  * policy, forwarding to the operator's daemon through the desktop backend.
  *
- * Skipped, with the reason recorded on the test, when there is no daemon to
- * forward to or no CLI to drive. Neither is a silent pass.
+ * This suite never skips. A missing daemon or CLI is a failure that names
+ * what to install: the answer to "no Docker here" is to provision Docker
+ * where the tests run, not to let the suite report green having run nothing.
  */
 
 import { test, expect } from '@playwright/test';
@@ -50,11 +51,11 @@ const findDockerCli = (): string | undefined => {
 };
 const dockerCli = findDockerCli();
 
-/** Why this file cannot run here, if it cannot. */
-const skipReason = !endpoint
-  ? 'no Docker daemon: resolveDockerEndpoint() found no daemon socket on this machine'
+/** What is missing to run this for real, if anything. Reported as a failure, never a skip. */
+const missingReason = !endpoint
+  ? 'no Docker daemon: resolveDockerEndpoint() found no daemon socket. Install and start Docker where these tests run.'
   : !dockerCli
-    ? 'no docker CLI on PATH to drive the socket with'
+    ? 'no docker CLI on PATH to drive the socket with. Install Docker where these tests run.'
     : null;
 
 interface Run {
@@ -64,12 +65,11 @@ interface Run {
 }
 
 test.describe('a job using docker through the filtering socket', () => {
-  if (skipReason) {
-    // Recorded on the tests for the report, and said out loud for the
-    // terminal, whose summary counts skips without saying why.
-    console.warn(`${path.basename(__filename)} skipped: ${skipReason}`);
-    test.skip(true, skipReason);
-  }
+  // First, and never skipped: the suite runs against real Docker or it fails
+  // saying what to install. A green run here means a real job actually worked.
+  test('has a real Docker daemon and CLI to drive, rather than skipping', () => {
+    expect(missingReason, missingReason ?? '').toBeNull();
+  });
 
   const backend = new DesktopBackend();
   const logs: DockerFilterProxyLogEntry[] = [];
@@ -80,6 +80,10 @@ test.describe('a job using docker through the filtering socket', () => {
   const nonce = `hello-${process.pid}-${Date.now()}`;
 
   test.beforeAll(async () => {
+    // Fail here with the real reason, so the tests below do not each fail on
+    // a confusing consequence (a proxy with no endpoint, a spawn of no CLI).
+    if (missingReason) throw new Error(missingReason);
+
     // Short prefix: the socket path is capped at 104 bytes and tmpdir is long.
     sandboxDir = fs.mkdtempSync(path.join(os.tmpdir(), 'localmost-e2e-'));
     // The checkout dir the backend roots mounts at, resolved as the daemon
