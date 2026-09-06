@@ -483,7 +483,7 @@ app.whenReady().then(async () => {
         }
       }
 
-      runnerManager.setPendingTargetContext('next', targetId, target.displayName, actionsUrl, githubInfo.githubRunId, githubInfo.githubJobId, githubInfo.githubActor, githubInfo.githubSha, githubInfo.githubRef);
+      runnerManager.setPendingTargetContext('next', targetId, target.displayName, actionsUrl, githubInfo.githubRunId, githubInfo.githubJobId, githubInfo.githubActor, githubInfo.githubSha, githubInfo.githubRef, githubInfo.githubWorkflow);
 
       // Spawn a worker to handle this job
       try {

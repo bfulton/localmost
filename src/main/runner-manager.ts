@@ -49,6 +49,7 @@ interface RunnerInstance {
     githubActor?: string;     // Username who triggered the workflow
     githubSha?: string;       // Commit SHA that triggered the workflow
     githubRef?: string;       // Branch/tag ref (e.g., refs/heads/main)
+    githubWorkflow?: string;  // Workflow name from github.workflow (keys workflows.<name> policy)
   } | null;
   name: string;
   jobsCompleted: number;
@@ -181,7 +182,7 @@ export class RunnerManager {
 
   // Pending target context for jobs received from broker
   // Maps runner name (or 'next') to target context
-  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string; githubSha?: string; githubRef?: string }> = new Map();
+  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string; githubSha?: string; githubRef?: string; githubWorkflow?: string }> = new Map();
 
   /**
    * Validate that a child path stays within the expected base directory.
@@ -344,9 +345,10 @@ export class RunnerManager {
    * @param githubActor The username who triggered the workflow (for user filtering)
    * @param githubSha The commit SHA that triggered the workflow
    * @param githubRef The branch/tag ref (e.g., refs/heads/main)
+   * @param githubWorkflow The workflow name (github.workflow), which keys per-workflow policy
    */
-  setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string, actionsUrl?: string, githubRunId?: number, githubJobId?: number, githubActor?: string, githubSha?: string, githubRef?: string): void {
-    this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName, actionsUrl, githubRunId, githubJobId, githubActor, githubSha, githubRef });
+  setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string, actionsUrl?: string, githubRunId?: number, githubJobId?: number, githubActor?: string, githubSha?: string, githubRef?: string, githubWorkflow?: string): void {
+    this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName, actionsUrl, githubRunId, githubJobId, githubActor, githubSha, githubRef, githubWorkflow });
     this.log('debug', `Set pending target context for ${runnerName}: ${targetDisplayName} (runId=${githubRunId}, jobId=${githubJobId}, actor=${githubActor}, sha=${githubSha?.slice(0, 7)})`);
   }
 
@@ -354,7 +356,7 @@ export class RunnerManager {
    * Consume pending target context for a runner.
    * Returns and removes the context if found.
    */
-  private consumePendingTargetContext(runnerName: string): { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string; githubSha?: string; githubRef?: string } | undefined {
+  private consumePendingTargetContext(runnerName: string): { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string; githubSha?: string; githubRef?: string; githubWorkflow?: string } | undefined {
     // Try exact match first, then fall back to 'next'
     let context = this.pendingTargetContext.get(runnerName);
     if (context) {
@@ -1402,6 +1404,7 @@ export class RunnerManager {
         githubActor: targetContext?.githubActor,
         githubSha: targetContext?.githubSha,
         githubRef: targetContext?.githubRef,
+        githubWorkflow: targetContext?.githubWorkflow,
       };
 
       this.log('debug', `[instance ${instanceNum}] Job started: ${jobName} (id: ${instance.currentJob.id})${targetContext ? ` from ${targetContext.targetDisplayName}` : ''}${instance.currentJob.actionsUrl ? ` url=${instance.currentJob.actionsUrl}` : ''}`);
@@ -1702,7 +1705,7 @@ export class RunnerManager {
 
     // This refines a policy that acquirejob has already installed for the job
     // the worker actually claimed, purely to pick up any per-workflow section
-    // now that the job name is known. It must never clear: clearing here wiped
+    // now that the job has started. It must never clear: clearing here wiped
     // a correct policy whenever this path could not identify the job, and the
     // job then ran with no hosts. Staleness is handled where a job is claimed.
     if (!instance?.currentJob || !this.getRepoPolicy) return;
@@ -1712,11 +1715,15 @@ export class RunnerManager {
     const githubSha = instance.currentJob.githubSha ?? spawnContext?.githubSha;
     if (!targetDisplayName || !githubSha) return;
 
+    // workflows.<name> keys on the workflow, which the broker read from
+    // github.workflow. The job name the runner prints is a different thing
+    // and only ever matched a section by coincidence; it stays as the fallback
+    // for a job the broker never saw.
     await this.applyPolicyForTarget(
       instanceNum,
       targetDisplayName,
       githubSha,
-      instance.currentJob.name
+      instance.currentJob.githubWorkflow ?? instance.currentJob.name
     );
   }
 

@@ -185,6 +185,7 @@ export interface GitHubJobInfo {
   githubActor?: string;  // Username who triggered the workflow
   githubSha?: string;    // Commit SHA that triggered the workflow
   githubRef?: string;    // Branch/tag ref (e.g., refs/heads/main)
+  githubWorkflow?: string; // Workflow name from github.workflow (keys workflows.<name> policy)
 }
 
 /** One entry of a GitHub context dict: {"t":2,"d":[{"k":"run_id","v":"123"},...]} */
@@ -211,6 +212,7 @@ export function extractGitHubJobInfo(contextData: {
       if (item.k === 'actor') info.githubActor = item.v;
       if (item.k === 'sha') info.githubSha = item.v;
       if (item.k === 'ref') info.githubRef = item.v;
+      if (item.k === 'workflow') info.githubWorkflow = item.v;
     }
   }
 
@@ -501,7 +503,7 @@ export class BrokerProxyService extends EventEmitter {
           try {
             const parsed = JSON.parse(jobDetails);
             githubInfo = extractGitHubJobInfo(parsed.contextData);
-            log()?.info(`[BrokerProxy] Extracted: run_id=${githubInfo.githubRunId}, job_id=${githubInfo.githubJobId}, repo=${githubInfo.githubRepo}, actor=${githubInfo.githubActor}, sha=${githubInfo.githubSha?.slice(0, 7)}`);
+            log()?.info(`[BrokerProxy] Extracted: run_id=${githubInfo.githubRunId}, job_id=${githubInfo.githubJobId}, repo=${githubInfo.githubRepo}, actor=${githubInfo.githubActor}, sha=${githubInfo.githubSha?.slice(0, 7)}, workflow=${githubInfo.githubWorkflow}`);
           } catch (e) {
             log()?.warn(`[BrokerProxy] Failed to parse job details for IDs: ${(e as Error).message}`);
           }

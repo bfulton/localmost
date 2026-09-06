@@ -437,4 +437,16 @@ describe('extractGitHubJobInfo', () => {
   it('identifies nothing when the context is absent', () => {
     expect(extractGitHubJobInfo(undefined)).toEqual({});
   });
+
+  it('extracts github.workflow into the job info', () => {
+    // Per-workflow policy keys on the workflow, which only this field names;
+    // the job name the runner prints later is a different thing.
+    const info = extractGitHubJobInfo({ github: { d: [
+      { k: 'run_id', v: '123' },
+      { k: 'repository', v: 'owner/repo' },
+      { k: 'workflow', v: 'integration' },
+    ] } });
+
+    expect(info.githubWorkflow).toBe('integration');
+  });
 });

@@ -173,7 +173,7 @@ export class RunnerManagerTestHelper {
   /** Seed the target context recorded when an instance is spawned for a job. */
   setPendingTargetContext(
     key: string,
-    context: { targetId: string; targetDisplayName: string; githubSha?: string }
+    context: { targetId: string; targetDisplayName: string; githubSha?: string; githubWorkflow?: string }
   ): void {
     (this.manager as never as {
       pendingTargetContext: Map<string, unknown>;

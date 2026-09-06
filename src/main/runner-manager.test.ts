@@ -671,6 +671,37 @@ describe('RunnerManager', () => {
       expect(setPolicyAllowedHosts).toHaveBeenCalledWith(['index.crates.io']);
     });
 
+    it('binds per-workflow policy by the github workflow name, not the scraped job name', async () => {
+      // workflows.<name> keys on the workflow, but the only name the runner
+      // prints is the job's. The broker reads github.workflow; it has to reach
+      // the policy lookup or a per-workflow section never fires.
+      const seen: string[] = [];
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async (_owner, _repo, _sha, workflowName) => {
+          seen.push(workflowName);
+          // docker is still the access level here; Task 8 makes it a DockerPolicy ({}).
+          return { hosts: [], level: 'strict' as const, readPaths: [], writePaths: [], docker: 'off' as const };
+        },
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, { name: 'runner-1', status: 'listening' });
+      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyLevel: jest.fn() });
+      helper.setPendingTargetContext('1', {
+        targetId: 't1',
+        targetDisplayName: 'owner/repo',
+        githubSha: 'abc1234',
+        githubWorkflow: 'integration',
+      });
+
+      await helper.parseRunnerOutput(1, 'Running job: Build and test'); // job name != workflow name
+
+      expect(seen).toContain('integration');
+      expect(seen).not.toContain('Build and test');
+    });
+
     it('leaves an installed policy alone when it cannot identify the job', async () => {
       // This path only refines a policy that acquirejob already installed for
       // the job the worker claimed. Clearing here wiped a correct policy
