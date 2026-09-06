@@ -11,6 +11,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { DockerPolicy, describeDockerGrants } from '../shared/docker-policy';
 import {
   findLocalmostrc,
   parseLocalmostrc,
@@ -105,12 +106,17 @@ interface PrintablePolicy {
   network?: { allow?: string[]; deny?: string[] };
   filesystem?: { read?: string[]; write?: string[]; deny?: string[] };
   env?: { allow?: string[]; deny?: string[] };
+  docker?: DockerPolicy;
 }
 
 /**
  * Print a policy section.
+ *
+ * Exported so a test can drive it directly: this is what an operator reads
+ * before running `localmost policy approve`, so what it leaves out is approved
+ * unseen.
  */
-function printPolicy(policy: PrintablePolicy): void {
+export function printPolicy(policy: PrintablePolicy): void {
   if (!policy || Object.keys(policy).length === 0) {
     console.log('  (empty - uses defaults only)');
     return;
@@ -150,6 +156,13 @@ function printPolicy(policy: PrintablePolicy): void {
         console.log(`    ${colors.red}-${colors.reset} ${filePath}`);
       }
     }
+  }
+
+  // The container grants: images, mounts, networks and whether a created
+  // network is routable. Described by the same code the app uses, so the two
+  // cannot drift into showing different things for one policy.
+  for (const grant of describeDockerGrants(policy.docker, '')) {
+    console.log(`    ${colors.green}+${colors.reset} ${grant}`);
   }
 
   if (policy.env) {

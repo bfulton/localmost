@@ -17,7 +17,7 @@ import {
 } from '../policy-cache';
 import {
   getRunnerManager, getLogger } from '../app-state';
-import { DockerPolicy } from '../../shared/docker-policy';
+import { DockerPolicy, describeDockerGrants } from '../../shared/docker-policy';
 
 /**
  * Describe what a policy grants, in the terms a reviewer cares about.
@@ -37,36 +37,6 @@ interface PolicySection {
  * screen that showed nothing for it would be asking consent for an invisible
  * capability.
  */
-function describeDocker(docker: DockerPolicy | undefined, prefix: string): string[] {
-  if (!docker) return [];
-  const grants: string[] = [];
-  if (docker.pull) {
-    const registries = docker.pull.registries ?? [];
-    if (registries.length === 0) grants.push(`${prefix}docker pull`);
-    for (const registry of registries) grants.push(`${prefix}docker pull: ${registry}`);
-  }
-  if (docker.run) {
-    const { images = [], mounts = [], network, networks = [] } = docker.run;
-    if (images.length === 0 && mounts.length === 0 && networks.length === 0 && network === undefined) {
-      grants.push(`${prefix}docker run`);
-    }
-    for (const image of images) grants.push(`${prefix}docker run image: ${image}`);
-    for (const mount of mounts) grants.push(`${prefix}docker mount: ${mount.path} (${mount.mode})`);
-    // Creating a network is a grant, and whether it is routable is the part an
-    // operator most needs to see.
-    for (const n of networks) {
-      grants.push(`${prefix}docker network create: ${n.name} (${n.internal ? 'internal' : 'routable'})`);
-    }
-    if (network !== undefined) grants.push(`${prefix}docker network: ${network}`);
-  }
-  if (docker.build) {
-    grants.push(docker.build.context === undefined
-      ? `${prefix}docker build`
-      : `${prefix}docker build: ${docker.build.context}`);
-  }
-  if (docker.privileged) grants.push(`${prefix}docker privileged`);
-  return grants;
-}
 
 function describeSection(section: PolicySection, prefix: string): string[] {
   const grants: string[] = [];
@@ -82,7 +52,7 @@ function describeSection(section: PolicySection, prefix: string): string[] {
   for (const p of section.sockets?.allow || []) {
     grants.push(`${prefix}socket: ${p}`);
   }
-  grants.push(...describeDocker(section.docker, prefix));
+  grants.push(...describeDockerGrants(section.docker, prefix));
   return grants;
 }
 

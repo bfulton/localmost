@@ -480,3 +480,40 @@ export function parseDockerPolicyHint(hint: string): DockerPolicy | undefined {
   if (errors.length > 0) return undefined;
   return loaded.docker as DockerPolicy;
 }
+
+/**
+ * The container grants a docker policy makes, one line each, for anything that
+ * asks an operator to approve them. Shared so the CLI and the app describe the
+ * same policy the same way: `localmost policy show` once rendered network,
+ * filesystem and env only, and approved the docker section unseen.
+ */
+export function describeDockerGrants(docker: DockerPolicy | undefined, prefix: string): string[] {
+  if (!docker) return [];
+  const grants: string[] = [];
+  if (docker.pull) {
+    const registries = docker.pull.registries ?? [];
+    if (registries.length === 0) grants.push(`${prefix}docker pull`);
+    for (const registry of registries) grants.push(`${prefix}docker pull: ${registry}`);
+  }
+  if (docker.run) {
+    const { images = [], mounts = [], network, networks = [] } = docker.run;
+    if (images.length === 0 && mounts.length === 0 && networks.length === 0 && network === undefined) {
+      grants.push(`${prefix}docker run`);
+    }
+    for (const image of images) grants.push(`${prefix}docker run image: ${image}`);
+    for (const mount of mounts) grants.push(`${prefix}docker mount: ${mount.path} (${mount.mode})`);
+    // Creating a network is a grant, and whether it is routable is the part an
+    // operator most needs to see.
+    for (const n of networks) {
+      grants.push(`${prefix}docker network create: ${n.name} (${n.internal ? 'internal' : 'routable'})`);
+    }
+    if (network !== undefined) grants.push(`${prefix}docker network: ${network}`);
+  }
+  if (docker.build) {
+    grants.push(docker.build.context === undefined
+      ? `${prefix}docker build`
+      : `${prefix}docker build: ${docker.build.context}`);
+  }
+  if (docker.privileged) grants.push(`${prefix}docker privileged`);
+  return grants;
+}

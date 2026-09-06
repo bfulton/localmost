@@ -1,5 +1,5 @@
 import { describe, it, expect } from '@jest/globals';
-import { parsePolicyArgs } from './policy';
+import { parsePolicyArgs, printPolicy } from './policy';
 
 describe('CLI policy command', () => {
   describe('parsePolicyArgs', () => {
@@ -80,5 +80,45 @@ describe('CLI policy command', () => {
     it('validates filesystem paths are valid', () => {
       // Would test parseLocalmostrc validation
     });
+  });
+});
+
+describe('policy show renders the docker grants', () => {
+  const capture = (policy: unknown): string => {
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (...args: unknown[]) => void lines.push(args.join(' '));
+    try {
+      printPolicy(policy as never);
+    } finally {
+      console.log = original;
+    }
+    return lines.join('\n');
+  };
+
+  it('names every container grant, since approving is what these are shown for', () => {
+    // `localmost policy approve` writes the whole .localmostrc to the cache,
+    // docker section included, but `show` rendered network, filesystem and env
+    // only - so the container, mount and network grants were approved unseen.
+    const out = capture({
+      docker: {
+        pull: { registries: ['docker.io'] },
+        run: {
+          images: ['alpine:3'],
+          mounts: [{ path: './', mode: 'ro' }],
+          network: 'bridge',
+          networks: [{ name: 'localmost-e2e-*', internal: true }],
+        },
+      },
+    });
+    expect(out).toMatch(/docker pull: docker\.io/);
+    expect(out).toMatch(/docker run image: alpine:3/);
+    expect(out).toMatch(/docker mount: \.\/ \(ro\)/);
+    // Routable vs internal is the part an operator most needs to see.
+    expect(out).toMatch(/docker network create: localmost-e2e-\* \(internal\)/);
+  });
+
+  it('says nothing about docker when none is declared', () => {
+    expect(capture({ network: { allow: ['github.com'] } })).not.toMatch(/docker/i);
   });
 });
