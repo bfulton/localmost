@@ -102,6 +102,7 @@ import {
 // Zustand store
 import { initStore, connectWindow, cleanupStore, store } from './store/init';
 import { getEffectivePolicy, effectivePolicyLevel } from '../shared/localmostrc';
+import { resolveRegistryAuth } from './docker/registry-auth';
 import {
   decidePolicyForJob,
   recordPendingPolicy,
@@ -268,6 +269,10 @@ app.whenReady().then(async () => {
 
   const runnerManager = new RunnerManager({
     onLog: sendLog,
+    // Resolved here, in the app, where ~/.docker is readable. The job never
+    // sees a credential: the filtering socket attaches this to a pull the
+    // policy already permits, so naming a registry is the whole grant.
+    attachRegistryAuth: (registry: string) => resolveRegistryAuth(registry),
     onStatusChange: sendStatusUpdate,
     onJobHistoryUpdate: sendJobHistoryUpdate,
     onReregistrationNeeded: reRegisterSingleInstance,
