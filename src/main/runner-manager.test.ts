@@ -32,6 +32,25 @@ jest.mock('./proxy-server', () => ({
   })),
 }));
 
+// Mock the filtering docker socket. A real one binds a unix socket inside the
+// sandbox directory, which does not exist under the mocked fs. The stub keeps
+// the one piece of state the manager reasons about: which repository it is
+// bound to, and that it is bound to none until told.
+jest.mock('./docker/docker-filter-proxy', () => ({
+  DockerFilterProxy: jest.fn().mockImplementation((options: unknown) => {
+    let repository: string | undefined;
+    return {
+      options,
+      start: jest.fn().mockResolvedValue(undefined),
+      stop: jest.fn().mockResolvedValue(undefined),
+      bind: jest.fn((repo: string) => {
+        repository = repo;
+      }),
+      boundRepository: jest.fn(() => repository),
+    };
+  }),
+}));
+
 import { RunnerManager, UNCLAIMED_WORKER_TIMEOUT_MS, JobEvent } from './runner-manager';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -39,10 +58,31 @@ import * as os from 'os';
 import { LogEntry, RunnerState, JobHistoryEntry } from '../shared/types';
 import { DockerPolicy } from '../shared/docker-policy';
 import { spawnSandboxed } from './process-sandbox';
+import { DockerFilterProxy } from './docker/docker-filter-proxy';
+import type { DockerBackend } from './docker/docker-backend';
 import { createMockProcess, RunnerManagerTestHelper } from './test-utils';
 
 // Get the mocked function
 const mockSpawnSandboxed = spawnSandboxed as jest.MockedFunction<typeof spawnSandboxed>;
+
+/** What the mocked DockerFilterProxy hands back: the manager's view of a worker's socket. */
+interface DockerSocketStub {
+  options: {
+    backend?: DockerBackend;
+    onLog?: (entry: { level: 'info' | 'warn' | 'debug'; message: string }) => void;
+    attachRegistryAuth?: (registry: string) => string | undefined;
+  };
+  start: jest.Mock;
+  stop: jest.Mock;
+  bind: jest.Mock;
+  boundRepository: () => string | undefined;
+}
+const dockerSocketOf = (helper: RunnerManagerTestHelper, instanceNum: number): DockerSocketStub =>
+  helper.dockerProxy(instanceNum) as DockerSocketStub;
+const dockerSocketStub = (): DockerSocketStub =>
+  new DockerFilterProxy({} as never) as unknown as DockerSocketStub;
+/** Let the fire-and-forget policy application that follows "Running job" settle. */
+const settle = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
 // Mock fs
 jest.mock('fs', () => ({
@@ -1268,6 +1308,175 @@ describe('RunnerManager', () => {
     });
   });
 
+  describe('docker socket per worker', () => {
+    const noHosts = { hosts: [], level: 'strict' as const, readPaths: [], writePaths: [] };
+    const runPolicy: DockerPolicy = { run: { images: ['postgres:16'] } };
+
+    it('starts a default-deny docker socket for a spawned worker and points DOCKER_HOST at it', async () => {
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+
+      await runnerManager.start();
+
+      const socket = dockerSocketOf(new RunnerManagerTestHelper(runnerManager), 1);
+      expect(socket).toBeDefined();
+      const socketPath = '/Users/test/.localmost/runner/sandbox/1/docker.sock';
+      expect(socket.start).toHaveBeenCalledWith(socketPath);
+      // Born denying everything: nothing is bound until a job is claimed.
+      expect(socket.boundRepository()).toBeUndefined();
+      // Listening before the runner exists, so the job's first request finds it.
+      expect(socket.start.mock.invocationCallOrder[0]).toBeLessThan(mockSpawnSandboxed.mock.invocationCallOrder[0]);
+      const options = mockSpawnSandboxed.mock.calls[0][2]!;
+      expect(options.env?.DOCKER_HOST).toBe(`unix://${socketPath}`);
+      // The daemon socket is no longer handed to the job.
+      expect(options).not.toHaveProperty('dockerGrants');
+    });
+
+    it("builds each worker's docker socket on the configured backend and registry auth", async () => {
+      const dockerBackend: DockerBackend = {
+        name: 'test',
+        supportsPrivileged: false,
+        resolveEndpoint: () => null,
+        workspaceMountRoot: (dir) => dir,
+      };
+      const attachRegistryAuth = jest.fn();
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        dockerBackend,
+        attachRegistryAuth,
+      });
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+
+      await manager.start();
+
+      const socket = dockerSocketOf(new RunnerManagerTestHelper(manager), 1);
+      expect(socket.options.backend).toBe(dockerBackend);
+      expect(socket.options.attachRegistryAuth).toBe(attachRegistryAuth);
+    });
+
+    it("forwards the docker socket's log entries to the runner log", async () => {
+      // The socket warns when no daemon is behind it and logs each denial
+      // with its policy hint; neither is any use unless it reaches the log.
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+      await runnerManager.start();
+      const socket = dockerSocketOf(new RunnerManagerTestHelper(runnerManager), 1);
+
+      socket.options.onLog?.({ level: 'warn', message: 'no Docker daemon resolved; the job runs without Docker' });
+
+      expect(mockOnLog).toHaveBeenCalledWith(
+        expect.objectContaining({ level: 'warn', message: expect.stringContaining('no Docker daemon resolved') })
+      );
+    });
+
+    it('binds the socket to the claimed repository with its per-workflow docker policy once the job runs', async () => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async (_owner, _repo, _sha, workflowName) => ({
+          ...noHosts,
+          docker: workflowName === 'integration' ? runPolicy : {},
+        }),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, { name: 'runner-1', status: 'listening' });
+      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyLevel: jest.fn() });
+      const socket = dockerSocketStub();
+      helper.setDockerProxy(1, socket);
+      helper.setPendingTargetContext('1', {
+        targetId: 't1',
+        targetDisplayName: 'owner/repo',
+        githubSha: 'abc1234',
+        githubWorkflow: 'integration',
+      });
+
+      await helper.parseRunnerOutput(1, 'Running job: Build and test');
+      await settle();
+
+      expect(socket.boundRepository()).toBe('owner/repo');
+      expect(socket.bind).toHaveBeenLastCalledWith('owner/repo', runPolicy);
+    });
+
+    it('binds on claim only when the claimed repository is the one the worker was spawned for', async () => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({ ...noHosts, docker: runPolicy }),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      const sockets: DockerSocketStub[] = [];
+      for (const instanceNum of [1, 2]) {
+        helper.setPendingTargetContext(String(instanceNum), {
+          targetId: 't1',
+          targetDisplayName: 'owner/repo',
+          githubSha: 'abc1234',
+        });
+        helper.setInstance(instanceNum, { name: `runner-${instanceNum}`, status: 'listening' });
+        helper.setProxy(instanceNum, { setPolicyAllowedHosts: jest.fn(), setPolicyLevel: jest.fn() });
+        const socket = dockerSocketStub();
+        helper.setDockerProxy(instanceNum, socket);
+        sockets.push(socket);
+      }
+
+      await helper.applyPolicyOnClaim(1, 'owner/repo', 'abc1234');
+      // A worker spawned for one repository that claims another's job must not
+      // inherit the first repository's grants: the socket stays as it was born.
+      await helper.applyPolicyOnClaim(2, 'other/repo', 'abc1234');
+
+      expect(sockets[0].boundRepository()).toBe('owner/repo');
+      expect(sockets[1].bind).not.toHaveBeenCalled();
+      expect(sockets[1].boundRepository()).toBeUndefined();
+      expect(mockOnLog).toHaveBeenCalledWith(
+        expect.objectContaining({ level: 'warn', message: expect.stringMatching(/other\/repo/) })
+      );
+    });
+
+    it('keeps the socket closed for the job that follows a mismatched claim', async () => {
+      // The job-started line is attributed to the repository the worker was
+      // spawned for, which is the one whose grants must not be inherited. The
+      // refusal at claim has to hold when that line arrives.
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({ ...noHosts, docker: runPolicy }),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
+      helper.setInstance(1, { name: 'runner-1', status: 'listening' });
+      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyLevel: jest.fn() });
+      const socket = dockerSocketStub();
+      helper.setDockerProxy(1, socket);
+
+      await helper.applyPolicyOnClaim(1, 'other/repo', 'abc1234');
+      await helper.parseRunnerOutput(1, 'Running job: build');
+      await settle();
+
+      expect(socket.bind).not.toHaveBeenCalled();
+      expect(socket.boundRepository()).toBeUndefined();
+    });
+
+    it('stops the docker socket when the worker exits', async () => {
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      const proc = createMockProcess(12345);
+      mockSpawnSandboxed.mockReturnValue(proc);
+      await runnerManager.start();
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      const socket = dockerSocketOf(helper, 1);
+
+      proc.emit('exit', 0, null);
+      await settle();
+
+      expect(socket.stop).toHaveBeenCalled();
+      expect(helper.dockerProxy(1)).toBeUndefined();
+    });
+  });
+
   describe('status aggregation with listening', () => {
     it('should return listening when instance is listening', () => {
       const helper = new RunnerManagerTestHelper(runnerManager);
@@ -1318,26 +1527,5 @@ describe('docker access', () => {
     // under another.
     expect(stamp({})).not.toEqual(stamp({ run: { images: ['postgres:16'] } }));
     expect(stamp({ run: { images: ['postgres:16'] } })).toEqual(stamp({ run: { images: ['postgres:16'] } }));
-  });
-
-  it('warns when a policy declares docker but no daemon socket resolved', () => {
-    const manager = makeManager();
-    const logged: string[] = [];
-    (manager as any).log = (_level: string, message: string) => logged.push(message);
-
-    (manager as any).warnIfDockerUnavailable('socket', null);
-
-    expect(logged.join('\n')).toMatch(/docker/i);
-    expect(logged.join('\n')).toMatch(/no daemon socket/i);
-  });
-
-  it('says nothing when no docker level was declared', () => {
-    const manager = makeManager();
-    const logged: string[] = [];
-    (manager as any).log = (_level: string, message: string) => logged.push(message);
-
-    (manager as any).warnIfDockerUnavailable('off', null);
-
-    expect(logged).toEqual([]);
   });
 });

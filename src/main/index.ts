@@ -6,6 +6,7 @@
 import { app, BrowserWindow, Notification } from 'electron';
 import * as nodePath from 'path';
 import { RunnerManager, JobEvent } from './runner-manager';
+import { DesktopBackend } from './docker/docker-backend';
 import { GitHubAuth } from './github-auth';
 import { RunnerDownloader } from './runner-downloader';
 import { HeartbeatManager, toHeartbeatTarget } from './heartbeat-manager';
@@ -304,6 +305,9 @@ app.whenReady().then(async () => {
       return contributorCache.getAllAuthors(accessToken, owner, repo, sha);
     },
     getJobTarget: (jobId: string) => brokerProxyService.getJobTarget(jobId),
+    // Stage 1: approved container requests go to the operator's own daemon.
+    // The socket the job sees is localmost's; the daemon's is never handed over.
+    dockerBackend: new DesktopBackend(),
     getRepoPolicy: async (owner: string, repo: string, _sha: string, workflowName: string) => {
       // Apply the policy that was approved, not whatever is in the repository
       // right now. A job only reaches this point once its policy has been

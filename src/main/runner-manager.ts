@@ -4,13 +4,9 @@ import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as yaml from 'js-yaml';
-import {
-  dockerSandboxGrants,
-  resolveDockerEndpoint,
-  type DockerAccessLevel,
-  type DockerEndpoint,
-} from '../shared/docker-access';
 import type { DockerPolicy } from '../shared/docker-policy';
+import { DesktopBackend, DockerBackend } from './docker/docker-backend';
+import { DockerFilterProxy } from './docker/docker-filter-proxy';
 import {
   SandboxPolicyLevel, RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
@@ -20,6 +16,13 @@ import { RunnerDownloader } from './runner-downloader';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
 import { loadConfig } from './config';
 import { normalizeFilterConfig, isUserAllowed, areAllUsersAllowed, parseRepository } from './runner/user-filter';
+
+/**
+ * The filtering docker socket a worker gets, at the root of its sandbox
+ * directory. Short and fixed: macOS caps unix socket paths at 104 bytes and
+ * truncates silently past that.
+ */
+const DOCKER_SOCKET_NAME = 'docker.sock';
 
 /**
  * Get the hostname without .local suffix (common on macOS).
@@ -35,6 +38,12 @@ interface RunnerInstance {
    * the approved policy must not serve a job under it.
    */
   policyStamp?: string;
+  /**
+   * The repository whose job this worker claimed, as the broker reported it.
+   * The docker socket opens only for this repository, and only when it is
+   * also the one the worker was spawned for.
+   */
+  claimedRepository?: string;
   process: ChildProcess | null;
   status: RunnerStatus;
   currentJob: {
@@ -108,6 +117,10 @@ interface RunnerManagerOptions {
   getRepoPolicy?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<RepoPolicyRuntime>;
   /** Called when a job starts or completes (for notifications) */
   onJobEvent?: (event: JobEvent) => void;
+  /** The daemon a worker's permitted container requests go to. The operator's own by default. */
+  dockerBackend?: DockerBackend;
+  /** Registry credentials, attached to a pull by the worker's socket so the job never holds them. */
+  attachRegistryAuth?: (registry: string) => string | undefined;
 }
 
 /**
@@ -147,6 +160,12 @@ export class RunnerManager {
 
   // Proxy servers for network isolation and logging (one per instance)
   private proxyServers: Map<number, ProxyServer> = new Map();
+
+  // Filtering docker sockets, one per spawn: minted with the worker, bound
+  // to its repository's policy on claim, stopped when it exits.
+  private dockerProxies: Map<number, DockerFilterProxy> = new Map();
+  private readonly dockerBackend: DockerBackend;
+  private readonly attachRegistryAuth?: (registry: string) => string | undefined;
 
   // Flag to track intentional stops vs job completion restarts
   private stopping = false;
@@ -220,6 +239,8 @@ export class RunnerManager {
     this.getRepoPolicy = options.getRepoPolicy;
     this.getJobTarget = options.getJobTarget;
     this.onJobEvent = options.onJobEvent;
+    this.dockerBackend = options.dockerBackend ?? new DesktopBackend();
+    this.attachRegistryAuth = options.attachRegistryAuth;
 
     this.downloader = new RunnerDownloader();
     this.configPath = getConfigPath();
@@ -807,6 +828,38 @@ export class RunnerManager {
   }
 
   /**
+   * Serve a worker its own filtering docker socket, before the worker exists.
+   *
+   * The socket is born denying everything: a speculatively spawned worker
+   * has a socket before it has a job, and default-deny is the state it
+   * starts in rather than one set afterwards. Policy is bound on claim.
+   */
+  private async startDockerProxy(instanceNum: number, socketPath: string): Promise<DockerFilterProxy> {
+    // A leftover from a spawn that failed after this point.
+    await this.stopDockerProxy(instanceNum);
+    const socket = new DockerFilterProxy({
+      backend: this.dockerBackend,
+      attachRegistryAuth: this.attachRegistryAuth,
+      onLog: (entry) => this.log(entry.level, `[docker ${instanceNum}] ${entry.message}`),
+    });
+    await socket.start(socketPath);
+    this.dockerProxies.set(instanceNum, socket);
+    this.log('debug', `Docker socket for instance ${instanceNum} listening at ${socketPath}; bound when a job is claimed`);
+    return socket;
+  }
+
+  private async stopDockerProxy(instanceNum: number): Promise<void> {
+    const socket = this.dockerProxies.get(instanceNum);
+    if (!socket) return;
+    this.dockerProxies.delete(instanceNum);
+    try {
+      await socket.stop();
+    } catch {
+      // Already stopped, or its directory already rebuilt - gone either way.
+    }
+  }
+
+  /**
    * Start a single runner instance. Used for initial start and re-registration.
    */
   async startInstance(instanceNum: number): Promise<void> {
@@ -932,24 +985,20 @@ export class RunnerManager {
       const startupContextForPolicy = this.pendingTargetContext.get(String(instanceNum));
       const filesystemPolicy = await this.resolveFilesystemPolicy(startupContextForPolicy);
 
-      // Resolved here, outside the sandbox, so the job never has to discover
-      // the endpoint - which is what lets ~/.docker stay closed at socket level.
-      const dockerEndpoint = resolveDockerEndpoint();
-      this.warnIfDockerUnavailable(filesystemPolicy.docker, dockerEndpoint);
-      const dockerGrants = dockerSandboxGrants(
-        filesystemPolicy.docker,
-        dockerEndpoint,
-        os.homedir()
-      );
+      // The job's docker socket is one localmost serves, not the daemon's.
+      // It lives in the sandbox directory, which is rebuilt per job, so it
+      // is created and destroyed with the job and no cleanup path exists.
+      const dockerSocketPath = path.join(sandboxDir, DOCKER_SOCKET_NAME);
+      const dockerSocket = await this.startDockerProxy(instanceNum, dockerSocketPath);
+      env.DOCKER_HOST = `unix://${dockerSocketPath}`;
 
       instance.process = spawnSandboxed(runnerBinary, ['--once'], {
         cwd: sandboxDir,
-        env: { ...env, ...dockerGrants.env },
+        env,
         stdio: ['ignore', 'pipe', 'pipe'],
         // Create a new process group so we can kill all child processes
         detached: true,
         filesystemPolicy,
-        dockerGrants,
       });
       instance.policyStamp = filesystemPolicy.stamp;
 
@@ -987,6 +1036,12 @@ export class RunnerManager {
       instance.process.on('exit', (code, signal) => {
         instance.process = null;
         instance.currentJob = null;
+
+        // Minted for this spawn, so it dies with it - unless a later spawn
+        // for the same slot has already replaced it.
+        if (this.dockerProxies.get(instanceNum) === dockerSocket) {
+          this.stopDockerProxy(instanceNum).catch(() => {});
+        }
 
         // Intentional stop - don't restart
         if (signal === 'SIGTERM' || signal === 'SIGINT' || this.stopping) {
@@ -1037,6 +1092,7 @@ export class RunnerManager {
       instance.status = 'error';
       this.instances.set(instanceNum, instance);
       this.startingInstances.delete(instanceNum);
+      await this.stopDockerProxy(instanceNum);
     }
   }
 
@@ -1152,6 +1208,10 @@ export class RunnerManager {
       await Promise.race([Promise.all(proxyStopPromises), proxyStopTimeout]);
       this.proxyServers.clear();
     }
+
+    // Each worker's docker socket dies with its process; this catches the
+    // ones whose exit never reached us.
+    await Promise.all([...this.dockerProxies.keys()].map((instanceNum) => this.stopDockerProxy(instanceNum)));
 
     for (const instanceNum of [...this.acquireDeadlines.keys()]) {
       this.disarmAcquireDeadline(instanceNum);
@@ -1552,22 +1612,6 @@ export class RunnerManager {
   }
 
   /**
-   * A declared level with no reachable daemon runs without the grant. Say so:
-   * the job must not look like it had access it did not get.
-   */
-  private warnIfDockerUnavailable(
-    level: DockerAccessLevel,
-    endpoint: DockerEndpoint | null
-  ): void {
-    if (level === 'off' || endpoint) return;
-    this.log(
-      'warn',
-      `Policy declares docker: ${level}, but no daemon socket resolved - ` +
-        'running without Docker access'
-    );
-  }
-
-  /**
    * The filesystem boundary for a worker about to be spawned.
    *
    * Falls back to strict with nothing declared, which is what a repository
@@ -1611,14 +1655,13 @@ export class RunnerManager {
 
   private async resolveFilesystemPolicy(
     context?: { targetDisplayName?: string; githubSha?: string }
-  ): Promise<SandboxFilesystemPolicy & { stamp?: string; docker: DockerAccessLevel }> {
+  ): Promise<SandboxFilesystemPolicy & { stamp?: string }> {
     // No stamp rather than a sentinel: a sentinel is truthy, so it would fail
     // the drift check against every real hash and the worker would refuse
     // every job. The profile it got is the closed one, which is the safe
     // state to run under, so there is nothing to detect drift from.
     const closed = {
       level: 'strict' as SandboxPolicyLevel,
-      docker: 'off' as DockerAccessLevel,
       read: [],
       write: [],
       stamp: undefined,
@@ -1632,7 +1675,6 @@ export class RunnerManager {
       const policy = await this.getRepoPolicy(repoInfo.owner, repoInfo.repo, context.githubSha, '');
       return {
         level: policy.level,
-        docker: policy.docker,
         read: policy.readPaths,
         write: policy.writePaths,
         stamp: this.stampFor(policy),
@@ -1660,6 +1702,12 @@ export class RunnerManager {
     const repoInfo = parseRepository(targetDisplayName);
     if (!repoInfo) return;
 
+    // What the worker claimed, as the broker reported it. Recorded before
+    // anything below can bail so the docker socket is judged against it
+    // however the rest of the policy fares.
+    const instance = this.instances.get(instanceNum);
+    if (isClaim && instance) instance.claimedRepository = targetDisplayName;
+
     const policy = await this.getRepoPolicy(
       repoInfo.owner,
       repoInfo.repo,
@@ -1673,7 +1721,6 @@ export class RunnerManager {
     // this worker would run the job under the old boundary - so it is refused
     // rather than run. Approving through the app retires workers eagerly; this
     // also covers approving through the CLI, which writes the cache directly.
-    const instance = this.instances.get(instanceNum);
     const currentStamp = this.stampFor(policy);
     if (isClaim && instance?.policyStamp && instance.policyStamp !== currentStamp) {
       // The filesystem half is fixed in this worker's profile and cannot be
@@ -1682,6 +1729,8 @@ export class RunnerManager {
       // not most recently. Network is cut back to runner infrastructure and the
       // worker is retired so nothing further lands on it - this constrains the
       // job rather than refusing it, which the proxy cannot do on its own.
+      // The docker socket stays as it was born, closed: nothing on this path
+      // opens it.
       proxy.setPolicyAllowedHosts([]);
       proxy.setPolicyLevel('strict');
       this.log(
@@ -1694,9 +1743,37 @@ export class RunnerManager {
 
     proxy.setPolicyAllowedHosts(hosts);
     proxy.setPolicyLevel(level);
+    this.bindDockerSocket(instanceNum, targetDisplayName, policy.docker);
     if (hosts.length > 0 || level !== 'strict') {
       this.log('info', `[instance ${instanceNum}] Applied ${level} policy with ${hosts.length} host(s) from ${targetDisplayName} .localmostrc`);
     }
+  }
+
+  /**
+   * Bind a worker's docker socket to the repository whose job it runs.
+   *
+   * The socket is born denying everything and opens only for the repository
+   * this worker was spawned for and claimed its job from. A worker spawned
+   * for one repository that claims another's job would otherwise run that
+   * job with the first repository's container grants; its socket stays
+   * closed instead - and stays closed when the job-started line later
+   * attributes the job to the spawn repository, which is why the claim is
+   * recorded on the instance rather than checked once.
+   */
+  private bindDockerSocket(instanceNum: number, repository: string, docker: DockerPolicy): void {
+    const socket = this.dockerProxies.get(instanceNum);
+    if (!socket) return;
+
+    const spawnedFor = this.pendingTargetContext.get(String(instanceNum))?.targetDisplayName ?? repository;
+    const claimedFor = this.instances.get(instanceNum)?.claimedRepository ?? repository;
+    if (spawnedFor !== repository || claimedFor !== repository) {
+      this.log(
+        'warn',
+        `[instance ${instanceNum}] Docker socket stays closed: spawned for ${spawnedFor}, claimed ${claimedFor}, policy is for ${repository}`
+      );
+      return;
+    }
+    socket.bind(repository, docker);
   }
 
   private async applyRepoPolicy(instanceNum: number): Promise<void> {
