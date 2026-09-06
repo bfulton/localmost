@@ -85,6 +85,9 @@ function splitRegistry(reference: string): { registry: string; remainder: string
   return { registry, remainder: reference.slice(slash + 1) };
 }
 
+/** The registry an image reference pulls from, as the daemon reads it. */
+export const registryOf = (reference: string): string => splitRegistry(reference).registry;
+
 /**
  * The canonical form of an image reference, so that `postgres:16` and
  * `docker.io/library/postgres:16` name the same image on both sides.
@@ -333,7 +336,7 @@ function evaluatePull(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
     return deny('importing an image (fromSrc) is not permitted; only pulls from a declared registry are');
   }
   if (!fromImage) return deny('image pull requires fromImage');
-  const { registry } = splitRegistry(fromImage);
+  const registry = registryOf(fromImage);
   if (!policy.pull) {
     return deny('the repository docker policy declares no pull action', hints.registry(registry));
   }

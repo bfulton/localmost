@@ -93,6 +93,8 @@ const ID = '[^/]+';
 /** The reviewed verb-to-endpoint map. Order matters only for readability; the patterns are disjoint. */
 const ENDPOINTS: ReadonlyArray<{ method: string; path: RegExp; action: DockerAction }> = [
   { method: 'GET', path: /^\/_ping$/, action: 'ping' },
+  // The CLI pings with HEAD first and falls back to GET; both are the same check.
+  { method: 'HEAD', path: /^\/_ping$/, action: 'ping' },
   { method: 'GET', path: /^\/version$/, action: 'version' },
   { method: 'GET', path: /^\/info$/, action: 'info' },
   { method: 'GET', path: new RegExp(`^/containers/${ID}/json$`), action: 'inspect' },

@@ -68,6 +68,7 @@ describe('classifyDockerRequest', () => {
   // asserted here, so a change to it shows up as a test change.
   const table: Array<[string, string, DockerAction]> = [
     ['GET', '/v1.45/_ping', 'ping'],
+    ['HEAD', '/v1.45/_ping', 'ping'],
     ['GET', '/v1.45/version', 'version'],
     ['GET', '/v1.45/info', 'info'],
     ['GET', '/v1.45/containers/abc123/json', 'inspect'],
