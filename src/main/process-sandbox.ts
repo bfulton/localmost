@@ -14,7 +14,6 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import { SandboxPolicyLevel } from '../shared/types';
-import type { DockerGrants } from '../shared/docker-access';
 import { expandPath } from '../shared/sandbox-profile';
 import {
   getAppDataDir,
@@ -137,8 +136,8 @@ interface RunnerProfileOptions {
   allowDirectNetwork?: boolean;
   /** The repository's approved policy; strict with nothing declared by default. */
   filesystemPolicy?: SandboxFilesystemPolicy;
-  /** What the repository's declared docker level opens; empty when off. */
-  dockerGrants?: DockerGrants;
+  /** The filtering docker socket the app serves this worker, if it has one. */
+  dockerSocket?: string;
 }
 
 function generateSandboxProfile({
@@ -146,43 +145,30 @@ function generateSandboxProfile({
   brokerPort = DEFAULT_BROKER_PORT,
   allowDirectNetwork = false,
   filesystemPolicy = { level: 'strict', read: [], write: [] },
-  dockerGrants,
+  dockerSocket,
 }: RunnerProfileOptions): string {
-  // Docker access, if the repository declared and had a level approved.
-  //
-  // These come after the deny block below on purpose: the Docker Desktop socket
-  // lives inside ~/.docker, which is denied wholesale, and seatbelt takes the
-  // last matching rule. Each grant is a single literal, never the directory.
-  const dockerRules = ((grants?: DockerGrants): string => {
-    if (!grants) return '';
-    const lines: string[] = [];
-
-    // These paths reach us from the operator's DOCKER_HOST or home directory,
-    // and land in a security DSL, so they are escaped like every other path
-    // interpolated into this profile.
-    const quote = (value: string): string => value.replace(/"/g, '\\"');
-
-    for (const socket of grants.socketLiterals) {
-      lines.push(`(allow network-outbound (literal "${quote(socket)}"))`);
-      lines.push(`(allow file-read* (literal "${quote(socket)}"))`);
-      lines.push(`(allow file-write* (literal "${quote(socket)}"))`);
-    }
-    for (const file of grants.readLiterals) {
-      lines.push(`(allow file-read* (literal "${quote(file)}"))`);
-    }
-    for (const dir of grants.readSubpaths) {
-      lines.push(`(allow file-read* (subpath "${quote(dir)}"))`);
-    }
-
-    if (lines.length === 0) return '';
+  // The worker's own docker socket, served by the app: every request on it is
+  // checked against the repository policy before it reaches a daemon. Connect
+  // and read, never write - the sandbox directory around it is writable, so
+  // the socket is subtracted by name after that allow (seatbelt takes the last
+  // matching rule) and the job cannot unlink it and bind its own in its place.
+  // The daemon's socket is never granted: it lives under ~/.docker, which the
+  // deny block keeps closed in full.
+  const dockerRules = ((socket?: string): string => {
+    if (!socket) return '';
+    // Built from the sandbox directory and landing in a security DSL, so it
+    // is escaped like every other path interpolated into this profile.
+    const quoted = socket.replace(/"/g, '\\"');
     return [
-      ';; Docker access, declared by the repository policy and approved. A job',
-      ';; that can reach the daemon can bind-mount host paths into a container,',
-      ';; which this profile cannot constrain. See docs/roadmap/docker-access.md.',
-      ...lines,
+      ';; This worker\'s filtering docker socket, served by the app. Every request',
+      ';; is checked against the repository policy before it reaches a daemon.',
+      `(allow network-outbound (literal "${quoted}"))`,
+      `(allow file-read* (literal "${quoted}"))`,
+      ';; Not writable, so the job cannot replace it with a socket of its own.',
+      `(deny file-write* (literal "${quoted}"))`,
       '',
     ].join('\n');
-  })(dockerGrants);
+  })(dockerSocket);
 
   const escapedDir = instanceDir.replace(/"/g, '\\"');
   const homeDir = os.homedir().replace(/"/g, '\\"');
@@ -486,10 +472,10 @@ export interface SandboxOptions extends SpawnOptions {
    */
   filesystemPolicy?: SandboxFilesystemPolicy;
   /**
-   * What the repository's declared docker level opens. A job that can reach
-   * the daemon is not confined by this profile: see docs/roadmap/docker-access.md.
+   * The filtering docker socket the app serves this worker. The job connects
+   * to it and nothing else; the daemon's own socket stays denied.
    */
-  dockerGrants?: DockerGrants;
+  dockerSocket?: string;
   /** Log prefix for identifying this process (e.g., runner instance ID) */
   logPrefix?: string;
   /** Optional callback for logging sandbox events */
@@ -535,7 +521,7 @@ export function spawnSandboxed(
   const {
     allowDirectNetwork,
     filesystemPolicy,
-    dockerGrants,
+    dockerSocket,
     logPrefix,
     onLog,
     ...spawnOptions
@@ -554,7 +540,7 @@ export function spawnSandboxed(
       instanceDir,
       allowDirectNetwork,
       filesystemPolicy,
-      dockerGrants,
+      dockerSocket,
     });
 
     // The profile is the thing that confines the job, so it must not live

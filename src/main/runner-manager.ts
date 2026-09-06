@@ -999,6 +999,7 @@ export class RunnerManager {
         // Create a new process group so we can kill all child processes
         detached: true,
         filesystemPolicy,
+        dockerSocket: dockerSocketPath,
       });
       instance.policyStamp = filesystemPolicy.stamp;
 

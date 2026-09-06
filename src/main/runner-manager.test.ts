@@ -1328,7 +1328,8 @@ describe('RunnerManager', () => {
       expect(socket.start.mock.invocationCallOrder[0]).toBeLessThan(mockSpawnSandboxed.mock.invocationCallOrder[0]);
       const options = mockSpawnSandboxed.mock.calls[0][2]!;
       expect(options.env?.DOCKER_HOST).toBe(`unix://${socketPath}`);
-      // The daemon socket is no longer handed to the job.
+      // The profile grants this socket by name; the daemon's is no longer handed over.
+      expect(options).toHaveProperty('dockerSocket', socketPath);
       expect(options).not.toHaveProperty('dockerGrants');
     });
 
