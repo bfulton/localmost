@@ -288,12 +288,18 @@ Actions are CLI-shaped, so a policy reads the way a workflow author thinks:
 |---|---|---|
 | `pull` | image pulls | `registries` — the registry each pulled image comes from |
 | `run` | container create, start, attach, wait and remove | `images` — the image a container is created from; `mounts` — workspace paths a container may bind, each `ro` or `rw`; `network` — the container's network mode |
-| `build` | image builds | `context` — where the build context may resolve |
+| `build` | image builds | `context` — which directory the workflow builds from, for the reader and the approval diff |
 
-Conditions are checked against the request itself. Mount and context paths are
-resolved through symlinks and must stay inside the job workspace, so `../`
-traversal and absolute host paths fail structurally rather than by pattern
-match, and a container may write to a mount only where the policy says `rw`.
+Conditions are checked against the request itself. Mount paths are resolved
+through symlinks and must stay inside the job workspace, so `../` traversal and
+absolute host paths fail structurally rather than by pattern match, and a
+container may write to a mount only where the policy says `rw`.
+
+`build.context` is the exception: it is documentation, not a check. A build
+context reaches the daemon as a tar the client already assembled, so there is no
+path in the request to test. A local context is confined by the sandbox profile
+instead — the job can only read what the profile grants — and the filter refuses
+a *remote* context, which would have the daemon fetch it and skip the profile.
 Anything not listed is denied: an undeclared image, registry, mount or network
 mode, and every endpoint the proxy does not understand.
 

@@ -467,6 +467,20 @@ function evaluatePull(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
   return ALLOW;
 }
 
+/**
+ * Build query parameters the filter understands.
+ *
+ * An allowlist for the same reason HostConfig is one: `docker build` carries
+ * its whole configuration in the query string, so anything not enumerated is
+ * forwarded unexamined. `networkmode` is gated separately below, since it is
+ * the same host reach the run path already refuses.
+ */
+const BUILD_PARAMS_KNOWN: ReadonlySet<string> = new Set([
+  't', 'dockerfile', 'q', 'nocache', 'rm', 'forcerm', 'pull', 'buildargs', 'labels', 'target',
+  'shmsize', 'memory', 'memswap', 'cpushares', 'cpusetcpus', 'cpuperiod', 'cpuquota', 'squash',
+  'platform', 'version', 'buildid', 'session',
+]);
+
 function evaluateBuild(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
   if (!policy.build) return deny('the repository docker policy declares no build action', hints.build);
   // The Engine API carries the context as a tar the client assembled from
@@ -476,6 +490,31 @@ function evaluateBuild(req: DockerRequest, policy: DockerPolicy): DockerVerdict 
   if (req.query.remote !== undefined) {
     return deny('a remote build context is not permitted; send the context with the request');
   }
+
+  for (const key of Object.keys(req.query)) {
+    const name = key.toLowerCase();
+    if (name === 'networkmode') continue;
+    if (!BUILD_PARAMS_KNOWN.has(name)) {
+      return deny(`build parameter "${key}" is not one the localmost docker socket understands, so it cannot be forwarded`);
+    }
+  }
+
+  // A build runs containers, and its network is chosen here rather than in a
+  // HostConfig - so the same rule the run path applies has to apply here too,
+  // or `docker build --network host` walks through a door create keeps shut.
+  const rawMode = req.query.networkmode ?? req.query.NetworkMode;
+  if (rawMode !== undefined && rawMode !== '' && rawMode !== 'default') {
+    if (rawMode === 'host' || rawMode.startsWith('container:')) {
+      return deny(`--network=${rawMode} on a build reaches the host and cannot be permitted by policy`);
+    }
+    if (rawMode !== 'none' && rawMode !== policy.run?.network) {
+      return deny(
+        `build network "${rawMode}" is not declared in the repository docker policy (run.network)`,
+        hints.network(rawMode)
+      );
+    }
+  }
+
   return ALLOW;
 }
 

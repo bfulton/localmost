@@ -478,3 +478,30 @@ describe('HostConfig is an allowlist, not a blocklist', () => {
     expect(create({ AutoRemove: true, NetworkMode: 'bridge', Binds: [], RestartPolicy: { Name: '', MaximumRetryCount: 0 }, LogConfig: { Type: '', Config: {} }, ConsoleSize: [0, 0] }).allowed).toBe(true);
   });
 });
+
+describe('build query parameters', () => {
+  const p = { run: { images: ['postgres:16'], network: 'bridge' }, build: { context: './' } };
+  const build = (qs: string, policy: DockerPolicy = p) =>
+    evaluateDockerRequest(mk('POST', `/v1.45/build${qs}`), ctx(policy));
+
+  it('refuses host and container networking, which the run path already forbids', () => {
+    expect(build('?networkmode=host').allowed).toBe(false);
+    expect(build('?networkmode=container%3Aabc').allowed).toBe(false);
+  });
+
+  it('refuses an undeclared build network, and permits the declared one', () => {
+    expect(build('?networkmode=some-other-net').allowed).toBe(false);
+    expect(build('?networkmode=bridge').allowed).toBe(true);
+    expect(build('?networkmode=none').allowed).toBe(true);
+  });
+
+  it('refuses build parameters that reach the host or the daemon config', () => {
+    for (const qs of ['?remote=https%3A%2F%2Fevil%2Fctx', '?extrahosts=evil%3A1.2.3.4', '?cachefrom=%5B%22other%3Alatest%22%5D', '?ulimits=x', '?securityopt=seccomp%3Dunconfined', '?outputs=type%3Dlocal%2Cdest%3D%2Ftmp']) {
+      expect([qs, build(qs).allowed]).toEqual([qs, false]);
+    }
+  });
+
+  it('permits the parameters an ordinary docker build sends', () => {
+    expect(build('?t=app%3Alatest&dockerfile=Dockerfile&rm=1&buildargs=%7B%7D&labels=%7B%7D&shmsize=0&version=1').allowed).toBe(true);
+  });
+});
