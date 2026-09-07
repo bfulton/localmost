@@ -334,3 +334,429 @@ describe('policy hints', () => {
     }
   });
 });
+
+describe('Go case-insensitive JSON decoding', () => {
+  // The daemon decodes the create body with Go's encoding/json, which matches
+  // struct fields case-insensitively as a documented fallback. So a key the
+  // filter reads as absent is honoured by the daemon: every HostConfig gate is
+  // bypassed by changing one letter.
+  const p = { run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'ro' as const }], network: 'bridge' } };
+
+  it('refuses a lowercased HostConfig carrying privileged and a root bind', () => {
+    const v = evaluateDockerRequest(
+      mk('POST', '/v1.45/containers/create', {
+        Image: 'postgres:16',
+        hostconfig: { privileged: true, binds: ['/:/host:rw'], pidmode: 'host' },
+      }),
+      ctx(p)
+    );
+    expect(v.allowed).toBe(false);
+  });
+
+  it('refuses odd casings of the gated keys inside a correctly-cased HostConfig', () => {
+    for (const hostConfig of [
+      { Privileged: true },
+      { PRIVILEGED: true },
+      { privileged: true },
+      { BINDS: ['/etc:/x'] },
+      { binds: ['/etc:/x'] },
+      { networkmode: 'host' },
+      { NETWORKMODE: 'host' },
+      { pidMode: 'host' },
+      { devices: [{ PathOnHost: '/dev/kmsg' }] },
+    ]) {
+      const v = evaluateDockerRequest(
+        mk('POST', '/v1.45/containers/create', { Image: 'postgres:16', HostConfig: hostConfig }),
+        ctx(p)
+      );
+      expect([JSON.stringify(hostConfig), v.allowed]).toEqual([JSON.stringify(hostConfig), false]);
+    }
+  });
+
+  it('still permits a correctly-cased create the policy allows', () => {
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/create', { Image: 'postgres:16' }), ctx(p)).allowed).toBe(true);
+  });
+});
+
+describe('kill, stop and logs on the job\'s own container', () => {
+  const p = { run: { images: ['postgres:16'], network: 'bridge' } };
+
+  it('permits them on an owned container and refuses them on one it did not create', () => {
+    const own = ctx(p, ['mine123']);
+    for (const [method, tpl] of [
+      ['POST', '/v1.45/containers/%s/kill'],
+      ['POST', '/v1.45/containers/%s/stop'],
+      ['GET', '/v1.45/containers/%s/logs?stdout=1&stderr=1'],
+    ] as const) {
+      expect([tpl, evaluateDockerRequest(mk(method, tpl.replace('%s', 'mine123')), own).allowed]).toEqual([tpl, true]);
+      expect([tpl, evaluateDockerRequest(mk(method, tpl.replace('%s', 'theirs999')), own).allowed]).toEqual([tpl, false]);
+    }
+  });
+
+  it('refuses kill and stop when the policy declares no run action', () => {
+    const noRun = ctx({ pull: { registries: ['docker.io'] } }, ['mine123']);
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/mine123/kill'), noRun).allowed).toBe(false);
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/mine123/stop'), noRun).allowed).toBe(false);
+  });
+});
+
+describe('volume mounts that are really bind mounts', () => {
+  const p = { run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'ro' as const }], network: 'bridge' } };
+
+  it('refuses an anonymous volume whose local-driver options bind a host path', () => {
+    // The local driver with type=none,o=bind,device=<path> IS a bind mount -
+    // the same thing compose exposes as driver_opts. The entry has no Source,
+    // so it looked like container-lifecycle storage and skipped every check.
+    const v = evaluateDockerRequest(
+      mk('POST', '/v1.45/containers/create', {
+        Image: 'postgres:16',
+        HostConfig: {
+          Mounts: [{
+            Type: 'volume',
+            Target: '/host',
+            VolumeOptions: { DriverConfig: { Name: 'local', Options: { type: 'none', o: 'bind', device: '/Users/me/.ssh' } } },
+          }],
+        },
+      }),
+      ctx(p)
+    );
+    expect(v.allowed).toBe(false);
+  });
+
+  it('refuses it whatever the casing of the driver keys', () => {
+    const v = evaluateDockerRequest(
+      mk('POST', '/v1.45/containers/create', {
+        Image: 'postgres:16',
+        HostConfig: { Mounts: [{ type: 'volume', target: '/host', volumeoptions: { driverconfig: { Name: 'local', Options: { device: '/' } } } }] },
+      }),
+      ctx(p)
+    );
+    expect(v.allowed).toBe(false);
+  });
+
+  it('still permits a plain anonymous volume and a tmpfs, which reach no host path', () => {
+    for (const m of [{ Type: 'volume', Target: '/data' }, { Type: 'tmpfs', Target: '/tmp' }]) {
+      expect([m.Type, evaluateDockerRequest(mk('POST', '/v1.45/containers/create', { Image: 'postgres:16', HostConfig: { Mounts: [m] } }), ctx(p)).allowed])
+        .toEqual([m.Type, true]);
+    }
+  });
+});
+
+describe('HostConfig is an allowlist, not a blocklist', () => {
+  const p = { run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'ro' as const }], network: 'bridge' } };
+  const create = (hostConfig: Record<string, unknown>) =>
+    evaluateDockerRequest(mk('POST', '/v1.45/containers/create', { Image: 'postgres:16', HostConfig: hostConfig }), ctx(p));
+
+  it('refuses publishing container ports onto the operator host', () => {
+    // -p 8080:80. Nothing in the grammar can name it, and it exposes a
+    // service on the operator's interfaces, outside the proxy's egress control.
+    expect(create({ PortBindings: { '80/tcp': [{ HostPort: '8080' }] } }).allowed).toBe(false);
+    expect(create({ PublishAllPorts: true }).allowed).toBe(false);
+  });
+
+  it('refuses any HostConfig key the grammar cannot name, even one invented later', () => {
+    for (const key of ['StorageOpt', 'SomeFutureEscape', 'Anything', 'NextApiVersionKey']) {
+      expect([key, create({ [key]: ['x'] }).allowed]).toEqual([key, false]);
+    }
+  });
+
+  it('refuses the keys that only reach outside the container when non-empty', () => {
+    expect(create({ Links: ['other:db'] }).allowed).toBe(false);
+    expect(create({ VolumeDriver: 'local' }).allowed).toBe(false);
+    expect(create({ ExtraHosts: ['evil:1.2.3.4'] }).allowed).toBe(false);
+    expect(create({ GroupAdd: ['staff'] }).allowed).toBe(false);
+    expect(create({ Cgroup: '/other' }).allowed).toBe(false);
+  });
+
+  it('refuses a --cidfile that would write to a host path, while allowing the empty default', () => {
+    expect(create({ ContainerIDFile: '/tmp/pwned.cid' }).allowed).toBe(false);
+    expect(create({ ContainerIDFile: '' }).allowed).toBe(true);
+  });
+
+  it('still permits the keys a plain docker run actually sends', () => {
+    expect(create({}).allowed).toBe(true);
+    expect(create({ AutoRemove: true, NetworkMode: 'bridge', Binds: [], RestartPolicy: { Name: '', MaximumRetryCount: 0 }, LogConfig: { Type: '', Config: {} }, ConsoleSize: [0, 0] }).allowed).toBe(true);
+  });
+});
+
+describe('build query parameters', () => {
+  const p = { run: { images: ['postgres:16'], network: 'bridge' }, build: { context: './' } };
+  const build = (qs: string, policy: DockerPolicy = p) =>
+    evaluateDockerRequest(mk('POST', `/v1.45/build${qs}`), ctx(policy));
+
+  it('refuses host and container networking, which the run path already forbids', () => {
+    expect(build('?networkmode=host').allowed).toBe(false);
+    expect(build('?networkmode=container%3Aabc').allowed).toBe(false);
+  });
+
+  it('refuses an undeclared build network, and permits the declared one', () => {
+    expect(build('?networkmode=some-other-net').allowed).toBe(false);
+    expect(build('?networkmode=bridge').allowed).toBe(true);
+    expect(build('?networkmode=none').allowed).toBe(true);
+  });
+
+  it('refuses build parameters that reach the host or the daemon config', () => {
+    for (const qs of ['?remote=https%3A%2F%2Fevil%2Fctx', '?extrahosts=evil%3A1.2.3.4', '?cachefrom=%5B%22other%3Alatest%22%5D', '?ulimits=x', '?securityopt=seccomp%3Dunconfined', '?outputs=type%3Dlocal%2Cdest%3D%2Ftmp']) {
+      expect([qs, build(qs).allowed]).toEqual([qs, false]);
+    }
+  });
+
+  it('permits the parameters an ordinary docker build sends', () => {
+    expect(build('?t=app%3Alatest&dockerfile=Dockerfile&rm=1&buildargs=%7B%7D&labels=%7B%7D&shmsize=0&version=1').allowed).toBe(true);
+  });
+});
+
+describe('networks', () => {
+  const p: DockerPolicy = { run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] } };
+  const create = (body: unknown, c = ctx(p)) => evaluateDockerRequest(mk('POST', '/v1.45/networks/create', body), c);
+
+  it('permits creating a declared internal network', () => {
+    expect(create({ Name: 'vk-run1', Internal: true, CheckDuplicate: true }).allowed).toBe(true);
+  });
+
+  it('refuses a name no declaration matches, anchoring the glob', () => {
+    expect(create({ Name: 'other', Internal: true }).allowed).toBe(false);
+    expect(create({ Name: 'not-vk-run1', Internal: true }).allowed).toBe(false);
+  });
+
+  it('refuses a routable network where the declaration says internal', () => {
+    expect(create({ Name: 'vk-run1', Internal: false }).allowed).toBe(false);
+    expect(create({ Name: 'vk-run1' }).allowed).toBe(false);
+  });
+
+  it('refuses any create key the grammar cannot spell, driver above all', () => {
+    for (const extra of [{ Driver: 'macvlan' }, { Options: { parent: 'en0' } }, { IPAM: { Config: [{ Subnet: '10.0.0.0/8' }] } }, { Attachable: true }, { Ingress: true }, { ConfigOnly: true }]) {
+      const body = { Name: 'vk-run1', Internal: true, ...extra };
+      expect([Object.keys(extra)[0], create(body).allowed]).toEqual([Object.keys(extra)[0], false]);
+    }
+    // The default driver, stated explicitly, is the one the filter would use anyway.
+    expect(create({ Name: 'vk-run1', Internal: true, Driver: 'bridge' }).allowed).toBe(true);
+  });
+
+  it('never lists the daemon\'s networks', () => {
+    expect(evaluateDockerRequest(mk('GET', '/v1.45/networks'), ctx(p)).allowed).toBe(false);
+  });
+
+  it('scopes reading and deleting a network to ones this socket created', () => {
+    const own = ctx(p, { ownNetworkIds: new Set(['net123']) });
+    expect(evaluateDockerRequest(mk('GET', '/v1.45/networks/net123'), own).allowed).toBe(true);
+    expect(evaluateDockerRequest(mk('DELETE', '/v1.45/networks/net123'), own).allowed).toBe(true);
+    expect(evaluateDockerRequest(mk('GET', '/v1.45/networks/theirs'), own).allowed).toBe(false);
+    expect(evaluateDockerRequest(mk('DELETE', '/v1.45/networks/theirs'), own).allowed).toBe(false);
+  });
+
+  it('lets a container join a network this job created, which is the point of declaring one', () => {
+    const own = ctx(p, { ownNetworkIds: new Set(['vk-run1']) });
+    const body = { Image: 'alpine:3', HostConfig: { NetworkMode: 'vk-run1' } };
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/create', body), own).allowed).toBe(true);
+    // An arbitrary network the job did not create is still refused.
+    const other = { Image: 'alpine:3', HostConfig: { NetworkMode: 'someone-elses' } };
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/create', other), own).allowed).toBe(false);
+  });
+});
+
+describe('image inspect', () => {
+  const p: DockerPolicy = { run: { images: ['alpine:3', 'ghcr.io/o/app:1'], network: 'bridge' }, pull: { registries: ['docker.io'] } };
+  const inspect = (ref: string, c = ctx(p)) =>
+    evaluateDockerRequest(mk('GET', `/v1.45/images/${encodeURIComponent(ref)}/json`), c);
+
+  it('permits inspecting an image the policy already names', () => {
+    // Scoped by the policy rather than by a second ownership ledger: an
+    // inspect of an image run.images already grants discloses nothing new.
+    expect(inspect('alpine:3').allowed).toBe(true);
+    expect(inspect('docker.io/library/alpine:3').allowed).toBe(true);
+    expect(inspect('ghcr.io/o/app:1').allowed).toBe(true);
+  });
+
+  it('refuses an image the policy does not name', () => {
+    expect(inspect('postgres:16').allowed).toBe(false);
+    expect(inspect('ghcr.io/o/other:1').allowed).toBe(false);
+  });
+
+  it('refuses it when the policy declares no run action at all', () => {
+    expect(inspect('alpine:3', ctx({ pull: { registries: ['docker.io'] } })).allowed).toBe(false);
+  });
+
+  it('never lists or deletes images, which are daemon-wide', () => {
+    expect(evaluateDockerRequest(mk('GET', '/v1.45/images/json'), ctx(p)).allowed).toBe(false);
+    expect(evaluateDockerRequest(mk('DELETE', '/v1.45/images/alpine:3'), ctx(p)).allowed).toBe(false);
+  });
+});
+
+describe('network create as the real CLI sends it', () => {
+  const p: DockerPolicy = { run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] } };
+  // Captured off the wire from docker CLI 29.3.1. Every one of these keys is
+  // sent unconditionally, with an inert default.
+  const cliBody = (over: Record<string, unknown> = {}) => ({
+    Name: 'vk-probe-net', Driver: 'bridge', Scope: '',
+    IPAM: { Driver: 'default', Options: {}, Config: [] },
+    Internal: true, Attachable: false, Ingress: false, ConfigOnly: false,
+    ConfigFrom: null, Options: {}, Labels: {}, ...over,
+  });
+  const create = (body: unknown, c = ctx(p)) => evaluateDockerRequest(mk('POST', '/v1.45/networks/create', body), c);
+
+  it('permits what `docker network create --internal` actually sends', () => {
+    expect(create(cliBody()).allowed).toBe(true);
+  });
+
+  it('still refuses those same keys when they carry a meaningful value', () => {
+    for (const over of [
+      { Scope: 'swarm' },
+      { IPAM: { Driver: 'default', Options: {}, Config: [{ Subnet: '10.0.0.0/8' }] } },
+      { IPAM: { Driver: 'macvlan', Options: {}, Config: [] } },
+      { IPAM: { Driver: 'default', Options: { parent: 'en0' }, Config: [] } },
+      { Attachable: true }, { Ingress: true }, { ConfigOnly: true },
+      { ConfigFrom: { Network: 'other' } },
+      { Options: { 'com.docker.network.bridge.host_binding_ipv4': '0.0.0.0' } },
+      { EnableIPv6: true },
+    ]) {
+      expect([Object.keys(over)[0], create(cliBody(over)).allowed]).toEqual([Object.keys(over)[0], false]);
+    }
+  });
+
+  it('is fail-closed when casings disagree, as Go would decode them', () => {
+    // Go matches struct fields case-insensitively, so a second casing with a
+    // different value may be the one the daemon honours.
+    expect(create({ ...cliBody(), internal: false }).allowed).toBe(false);
+    expect(create({ ...cliBody(), name: 'not-declared' }).allowed).toBe(false);
+    expect(create({ ...cliBody(), driver: 'macvlan' }).allowed).toBe(false);
+  });
+});
+
+describe('image globs', () => {
+  // A content-addressed tag cannot be known when the policy is written.
+  const p: DockerPolicy = { run: { images: ['vk/grader:*', 'alpine:3'], network: 'bridge' } };
+
+  it('permits creating and inspecting an image matching a declared glob', () => {
+    const body = { Image: 'vk/grader:7f2-0123456789ab' };
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/create', body), ctx(p)).allowed).toBe(true);
+    expect(evaluateDockerRequest(mk('GET', '/v1.45/images/vk%2Fgrader%3A7f2-0123456789ab/json'), ctx(p)).allowed).toBe(true);
+  });
+
+  it('anchors the glob, so a lookalike repository does not match', () => {
+    for (const image of ['evil/vk/grader:x', 'notvk/grader:x', 'vk/grader-evil:x']) {
+      expect([image, evaluateDockerRequest(mk('POST', '/v1.45/containers/create', { Image: image }), ctx(p)).allowed])
+        .toEqual([image, false]);
+    }
+  });
+
+  it('leaves an exact declaration exact', () => {
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/create', { Image: 'alpine:3' }), ctx(p)).allowed).toBe(true);
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/containers/create', { Image: 'alpine:4' }), ctx(p)).allowed).toBe(false);
+  });
+});
+
+describe('what * spans in a declared glob', () => {
+  const withImages = (images: string[]) => ctx({ run: { images, network: 'bridge' } });
+  const create = (image: string, images: string[]) =>
+    evaluateDockerRequest(mk('POST', '/v1.45/containers/create', { Image: image }), withImages(images)).allowed;
+
+  it('spans a tag but not a path separator', () => {
+    // The spec left this open. Decided here: `*` stops at `/`, so a declared
+    // repository cannot be widened into deeper paths by a reference that adds
+    // segments. A tag glob - the content-addressed case - is unaffected,
+    // because a tag cannot contain a slash.
+    expect(create('vk/grader:7f2-0123456789ab', ['vk/grader:*'])).toBe(true);
+    expect(create('vk/grader:a/b', ['vk/grader:*'])).toBe(false);
+  });
+
+  it('still anchors, so a lookalike repository never matches', () => {
+    expect(create('evil/vk/grader:x', ['vk/grader:*'])).toBe(false);
+  });
+
+  it('needs a segment of its own to span one', () => {
+    // `vk/*:*` reaches one level under vk, and no further.
+    expect(create('vk/app:1', ['vk/*:*'])).toBe(true);
+    expect(create('vk/team/app:1', ['vk/*:*'])).toBe(false);
+  });
+
+  it('is bounded by the tag too, which is why a tagless glob is refused upstream', () => {
+    // Normalisation appends :latest to a tagless reference on both sides, so a
+    // tagless glob is matched as `vk/*:latest` - it covers latest and nothing
+    // else, however wide it reads. validateDockerPolicy rejects the form for
+    // that reason; this pins the behaviour the rejection exists to prevent.
+    expect(create('vk/app', ['vk/*'])).toBe(true);
+    expect(create('vk/app:1', ['vk/*'])).toBe(false);
+    expect(create('vk/app:1', ['vk/*:*'])).toBe(true);
+  });
+});
+
+describe('BuildKit endpoints', () => {
+  const p: DockerPolicy = { run: { images: ['alpine:3'], network: 'bridge' }, build: { context: './' } };
+
+  it('refuses a BuildKit session, and says why rather than shrugging', () => {
+    // A real `docker build` on a default install issues zero POST /build: it
+    // negotiates a session and streams over /grpc. Denying it generically read
+    // as "unknown endpoint" when the real answer is "that builder cannot be
+    // filtered, and we pinned you off it".
+    for (const url of ['/v1.45/grpc', '/v1.45/session']) {
+      const v = evaluateDockerRequest(mk('POST', url), ctx(p));
+      expect([url, v.allowed]).toEqual([url, false]);
+      expect(v.reason).toMatch(/BuildKit/i);
+      expect(v.reason).toMatch(/DOCKER_BUILDKIT/);
+    }
+  });
+
+  it('still permits the classic build the policy describes', () => {
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/build?t=app%3A1'), ctx(p)).allowed).toBe(true);
+  });
+});
+
+describe('duplicate keys that differ only in case', () => {
+  const runPolicy: DockerPolicy = { run: { images: ['alpine:3'], network: 'bridge' } };
+
+  it('refuses a body carrying two casings of the same key, rather than guessing which one counts', () => {
+    // Measured against a real daemon: with `HostConfig`, `hostconfig` and
+    // `HOSTCONFIG` all present, Go's decoder MERGED all three into one struct
+    // (AutoRemove from the first, Memory from the second, OomScoreAdj from the
+    // third). Scalars and arrays inside one object are last-wins instead.
+    // No filter can read one of those objects and know what the daemon will
+    // do, and picking the last is as wrong as picking the first - the merge
+    // keeps fields from both. Go's encoder never emits case-variant duplicates,
+    // so a body containing them is not a client we model.
+    const v = evaluateDockerRequest(
+      mk('POST', '/v1.45/containers/create', {
+        Image: 'alpine:3',
+        HostConfig: { NetworkMode: 'bridge' },
+        hostconfig: { Binds: ['/etc:/host-etc'] },
+      }),
+      ctx(runPolicy)
+    );
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/case/i);
+    expect(v.reason).toMatch(/HostConfig|hostconfig/);
+  });
+
+  it('finds them however deep they are nested', () => {
+    const v = evaluateDockerRequest(
+      mk('POST', '/v1.45/containers/create', {
+        Image: 'alpine:3',
+        HostConfig: { NetworkMode: 'bridge', Mounts: [{ Type: 'bind', Source: '/ws', type: 'tmpfs' }] },
+      }),
+      ctx(runPolicy)
+    );
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/case/i);
+  });
+
+  it('leaves an ordinary body alone, including keys that merely resemble each other', () => {
+    const v = evaluateDockerRequest(
+      mk('POST', '/v1.45/containers/create', {
+        Image: 'alpine:3',
+        HostConfig: { NetworkMode: 'bridge', Memory: 0, MemorySwap: 0, Binds: [] },
+      }),
+      ctx(runPolicy)
+    );
+    expect(v.allowed).toBe(true);
+  });
+
+  it('applies to every action with a body, not just create', () => {
+    const p: DockerPolicy = { run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-1', internal: true }] } };
+    const v = evaluateDockerRequest(
+      mk('POST', '/v1.45/networks/create', { Name: 'vk-1', Internal: true, internal: false }),
+      ctx(p)
+    );
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/case/i);
+  });
+});

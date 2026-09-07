@@ -1,0 +1,208 @@
+# Docker Filter — Three Endpoint Families a Real Consumer Needs
+
+An addendum to
+[2026-09-05-docker-isolation-design.md](./2026-09-05-docker-isolation-design.md).
+Everything here extends the stage 1 filter; nothing here changes its shape.
+
+> **Status:** design. Prompted by wiring a container-heavy repository (an agent
+> eval harness) to the shipped filtering socket — the "end-to-end run on a
+> repository that needs the daemon" the original Testing section asks for.
+
+## Problem
+
+`pull`, `run` and `build` covered that consumer's pulls, container lifecycle and
+image builds unchanged, which is the encouraging part. Three families it needs
+classify as `other` and hit `default: deny`:
+
+1. **Networks.** The harness creates an `--internal` network — no route to
+   anything — as its *sealing* mechanism: the agent under test runs with no
+   egress except a broker that accounts for every request. It then reads and
+   deletes that network.
+2. **Image existence.** `docker image inspect` is the natural "do I already have
+   this?" check, deciding build-vs-pull in a build-once-mount flow.
+3. **Killing a container.** Enforcing a wall-clock budget on a container that
+   overruns it.
+
+The first is the one that matters most, because the direction is backwards. An
+`--internal` network makes a container *less* reachable, not more. With networks
+denied, the only containers a job can run are ones on the default bridge — the
+filter currently **forces strictly weaker isolation than the workload wants**,
+which is the opposite of what a sandbox should do. `run.network` does not help:
+it constrains `NetworkMode` at create, and the network has to exist first.
+
+## Solution
+
+Three additions, each reusing a mechanism the filter already has.
+
+### 1. Networks: a declared, owned, bridge-only network
+
+```yaml
+shared:
+  docker:
+    run:
+      networks:
+        - name: vk-*
+          internal: true
+```
+
+`name` is a glob matched against the requested network name. `internal` is the
+only other key, and it is a **requirement, not a default**: a policy that wants a
+routable network must say `internal: false`, so the approval diff shows it.
+
+**The driver is unnameable, and that is the point.** The dangerous value in a
+network create is not `internal: false` — it is `Driver`. A `macvlan` or `ipvlan`
+network puts the container directly on the physical LAN, which is worse than
+`--network=host`, and `Options` can carry
+`com.docker.network.bridge.host_binding_ipv4`. So the grammar cannot spell a
+driver at all: the filter forces `bridge`, and **refuses any create body key it
+does not recognise**. That is the same allowlist-of-the-grammar principle the
+original spec applies to `HostConfig`, applied to a second body.
+
+Recognised keys on `POST /networks/create`: `Name`, `Internal`, `CheckDuplicate`,
+`Labels`. `Driver` is permitted only when absent or exactly `bridge`.
+
+The rest — `Scope`, `IPAM`, `Options`, `Attachable`, `Ingress`, `ConfigOnly`,
+`ConfigFrom`, `EnableIPv6` — are **gated by value rather than refused outright**,
+the same way `HostConfig` treats the keys a plain `docker run` always sends. The
+CLI sends all eight unconditionally with inert defaults, so refusing them made
+the feature reachable only from a hand-written API client. The default passes;
+anything meaningful (a subnet, a non-default IPAM driver, driver options, an
+attachable or ingress or config-only network, a config source, a scope) is
+refused, naming the key.
+
+`GET /networks/{id}` and `DELETE /networks/{id}` are scoped to networks this
+socket created, exactly as per-container endpoints are scoped to containers it
+created. `GET /networks` (list) stays denied: it enumerates the daemon.
+
+**`NetworkMode` must accept an owned network.** This is the part that is easy to
+miss and makes the feature useless without it. Today `evaluateCreate` requires
+`HostConfig.NetworkMode` to equal `policy.run.network`. A job that creates
+`vk-abc` and runs a container with `--network vk-abc` would still be refused. So
+the create gate permits a `NetworkMode` that names a network in the socket's
+owned set, in addition to the declared `run.network`.
+
+### 2. Image reads, scoped by the policy rather than by ownership
+
+`GET /images/{name}/json` is permitted when the reference normalises to an entry
+in `run.images`.
+
+The consumer suggested scoping this the way containers are scoped — to images the
+socket pulled or built. Policy-scoping is better here: an inspect of an image the
+policy *already names* discloses nothing the policy has not already granted, and
+it avoids a second ownership ledger. Ownership bookkeeping is not free — the
+container ledger has already produced one defect (a prefix match that outlives
+the container it described), and a second one would need to reconcile pulls by
+tag with builds by id.
+
+`GET /images/json` (list) and `DELETE /images/{name}` stay denied: both are
+daemon-wide, and the consumer agrees.
+
+### 3. Stopping a container the job owns
+
+`POST /containers/{id}/kill` and `POST /containers/{id}/stop` join
+`start`/`attach`/`wait`/`remove` under the `run` action, with the same
+own-container scoping.
+
+`stop` is not in the request but belongs in the same change: a timeout path that
+can only `kill` is worse than one that can ask politely first, and both are the
+same endpoint family with the same scoping.
+
+`GET /containers/{id}/logs` joins them too. The original spec's baseline is
+"reads about the job's own containers", and logs is exactly such a read; refusing
+it contradicts the documented behaviour rather than implementing it.
+
+## Builds use the classic builder
+
+`build:` policy describes `POST /build`, and a real `docker build` on a default
+install never calls it. BuildKit has been the default builder since Docker 23:
+it negotiates a session and streams the build over `POST /grpc`. A consumer
+replayed 1,429 captured API requests from a suite that built about twenty
+images and found **zero** `POST /build` and 63 `POST /grpc`, with
+`DOCKER_BUILDKIT` unset — stock behaviour, not an opt-in.
+
+So the filter pins each job to the classic builder with `DOCKER_BUILDKIT=0`,
+set alongside `DOCKER_HOST` when the worker is spawned.
+
+The alternative was to filter the BuildKit session, and it is not filterable in
+the sense this design means. The session is a bidirectional gRPC stream over
+which the client exports host filesystem access to the daemon; "which paths may
+this build read" stops being a property of a request body, which is the only
+thing the proxy can inspect. Choosing the builder the filter can actually see
+keeps the boundary honest, at the cost of BuildKit's cache and speed. The
+classic builder is deprecated, so this is a stage-1 answer with a shelf life:
+stage 2's managed VM contains a build by construction and would not need it.
+
+`POST /grpc` and `POST /session` are refused by name, saying that jobs are
+pinned to the classic builder — seeing that denial means something set
+`DOCKER_BUILDKIT` back on, which is worth reading as an error rather than as an
+unknown endpoint.
+
+## What stays denied
+
+`GET /containers/json`, `GET /networks`, `GET /images/json` and
+`DELETE /images/{name}` are daemon-wide by construction — they enumerate or
+mutate things outside the job — and no policy key grants them.
+
+## Not a filter change
+
+Mounts and build contexts must resolve inside the job workspace. A consumer
+building from `tempfile.mkdtemp()` (i.e. `/var/folders/...`) fails that check
+**correctly**; pointing `TMPDIR` inside the workspace is the consumer's fix. It
+is recorded here only because it reads like a filter bug from the outside, and
+the denial message should make the reason obvious enough that it doesn't.
+
+## Testing
+
+Per family, and in the same executable-escape style as the original spec:
+
+- A network create whose name matches no declared pattern is refused; one that
+  matches is permitted.
+- `internal: false` is refused unless declared; `Driver: macvlan`, `Options`,
+  `IPAM` and any unrecognised key are each refused, naming the key.
+- `GET`/`DELETE` of a network the socket did not create is refused.
+- A container created with `NetworkMode` naming an owned network is permitted;
+  one naming an arbitrary network is refused.
+- `GET /images/{name}/json` is permitted for a declared image and refused for an
+  undeclared one; `GET /images/json` is refused.
+- `kill`, `stop` and `logs` are permitted on an owned container and refused on
+  one the socket did not create.
+- An end-to-end run that creates an internal network, runs a container on it,
+  reads its logs, kills it, and deletes the network.
+
+## Open questions
+
+- ~~Whether `name` globs should be anchored.~~ **Decided: yes, anchored, and
+  `*` stops at `/`.** A consumer measured the first implementation and found
+  that while it anchored correctly, `*` crossed path separators — `vk/grader:*`
+  matched `vk/grader:a/b` — which answered the question empirically in the
+  direction nobody wanted. Both halves now hold, for the same reason: a glob
+  that quietly spans more than it appears to reads as narrower than it is.
+  `vk/*:*` reaches one level under `vk` and no further; each extra segment has
+  to be asked for. Tag globs are unaffected, since a tag cannot contain a
+  slash, so `vk/grader:*` still covers a content-addressed tag.
+- ~~What a glob with no tag covers.~~ **Decided: nothing - it is refused at
+  validation.** The same consumer measured again and found a second boundary
+  nobody had written down: a reference with no tag normalises to `:latest`, so
+  `vk/*` is matched as `vk/*:latest` and covers only the latest tag of each
+  repository - almost none of what it reads as, and invisible in an approval
+  diff. Two ways out: treat a tagless glob as `:*`, or refuse it. Refusing it
+  wins for the reason `docker: true` is refused rather than interpreted - the
+  grammar does not guess at intent it can ask for - so validation rejects a
+  tagless glob with a message naming `vk/*:*`. Exact references are untouched:
+  `alpine` still means `alpine:latest`, which is what it looks like.
+- ~~What the filter should do when a body spells one key two ways.~~
+  **Decided: refuse the body.** Review raised this as a case-folding bypass and
+  proposed reading the last duplicate, on the theory that Go's decoder is
+  last-wins. Measured against a real daemon instead: a create body carrying
+  `HostConfig`, `hostconfig` and `HOSTCONFIG` came back with fields from **all
+  three** - Go decodes each key into the same struct field in document order,
+  so nested objects merge, while scalars and arrays inside one object are
+  last-wins. Reading the last is therefore as wrong as reading the first, and
+  emulating the merge means reimplementing `encoding/json`. Since Go's encoder
+  emits unique exactly-cased keys, no real client sends a case-variant
+  duplicate - the real CLI's bodies are clean, which the e2e exercises - so the
+  ambiguity is refused recursively at the evaluator's entry, once, for every
+  action with a body.
+- Whether an owned network should be deleted automatically when the job's worker
+  exits, as the socket itself is. Leaning yes, for the same reason: nothing
+  should outlive the job that created it.

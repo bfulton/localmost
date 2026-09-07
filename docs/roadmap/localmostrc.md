@@ -250,7 +250,10 @@ workflows:
 - Each workflow gets exactly what it needs, nothing more
 
 **Workflow matching:**
-- Keys under `workflows:` match the workflow filename (without `.yml`/`.yaml`)
+- Keys under `workflows:` match the workflow filename (without `.yml`/`.yaml`),
+  taken from `github.workflow_ref`. Where a job arrives without that — an older
+  runner service — the workflow's `name:` is used instead, so name a section
+  after the file and the two agree
 - `build` matches `.github/workflows/build.yml`
 - For matrix workflows, all jobs in the workflow share the workflow's policy
 
@@ -287,13 +290,19 @@ Actions are CLI-shaped, so a policy reads the way a workflow author thinks:
 | Action | Covers | Conditions |
 |---|---|---|
 | `pull` | image pulls | `registries` — the registry each pulled image comes from |
-| `run` | container create, start, attach, wait and remove | `images` — the image a container is created from; `mounts` — workspace paths a container may bind, each `ro` or `rw`; `network` — the container's network mode |
-| `build` | image builds | `context` — where the build context may resolve |
+| `run` | container create, start, attach, wait, kill, stop, remove and logs; creating a declared network; inspecting a declared image | `images` — the images a container may be created from, and the only images it may inspect; each entry is an anchored glob where `*` stops at `/`, so a content-addressed tag can be declared as `vk/grader:*` while `vk/*:*` reaches one level under `vk` and no further; a glob must say which tags it covers, since a tagless reference means `:latest` — `vk/*` is refused, `vk/*:*` accepted; `networks` — networks the job may create, each an anchored name glob plus whether it is `internal`; `mounts` — workspace paths a container may bind, each `ro` or `rw`; `network` — the container's network mode |
+| `build` | image builds, with the classic builder (jobs run with `DOCKER_BUILDKIT=0`, since a BuildKit build streams over a gRPC session the filter cannot inspect) | `context` — which directory the workflow builds from, for the reader and the approval diff |
 
-Conditions are checked against the request itself. Mount and context paths are
-resolved through symlinks and must stay inside the job workspace, so `../`
-traversal and absolute host paths fail structurally rather than by pattern
-match, and a container may write to a mount only where the policy says `rw`.
+Conditions are checked against the request itself. Mount paths are resolved
+through symlinks and must stay inside the job workspace, so `../` traversal and
+absolute host paths fail structurally rather than by pattern match, and a
+container may write to a mount only where the policy says `rw`.
+
+`build.context` is the exception: it is documentation, not a check. A build
+context reaches the daemon as a tar the client already assembled, so there is no
+path in the request to test. A local context is confined by the sandbox profile
+instead — the job can only read what the profile grants — and the filter refuses
+a *remote* context, which would have the daemon fetch it and skip the profile.
 Anything not listed is denied: an undeclared image, registry, mount or network
 mode, and every endpoint the proxy does not understand.
 

@@ -38,6 +38,8 @@ interface RunnerInstance {
    * the approved policy must not serve a job under it.
    */
   policyStamp?: string;
+  /** Set when a claim found the approved policy had moved; the worker stays constrained. */
+  policyDrifted?: boolean;
   /**
    * The repository whose job this worker claimed, as the broker reported it.
    * The docker socket opens only for this repository, and only when it is
@@ -991,6 +993,13 @@ export class RunnerManager {
       const dockerSocketPath = path.join(sandboxDir, DOCKER_SOCKET_NAME);
       const dockerSocket = await this.startDockerProxy(instanceNum, dockerSocketPath);
       env.DOCKER_HOST = `unix://${dockerSocketPath}`;
+      // Pin the job to the classic builder. BuildKit - the default since
+      // Docker 23 - does not use POST /build at all: it negotiates a session
+      // and streams the build over gRPC, exporting host filesystem access to
+      // the daemon as it goes. "Which paths may this build read" then stops
+      // being a property of any request the filter can see, so `build:` policy
+      // would describe an endpoint a real `docker build` never calls.
+      env.DOCKER_BUILDKIT = '0';
 
       instance.process = spawnSandboxed(runnerBinary, ['--once'], {
         cwd: sandboxDir,
@@ -1293,6 +1302,12 @@ export class RunnerManager {
       instance.status = 'offline';
     }
     this.instances.delete(instanceNum);
+    // The context describes the job this slot just finished. Left behind, the
+    // next worker to take the slot is judged against the previous repository -
+    // its docker socket refuses the job it is actually running, and a spawn
+    // that records no context of its own would resolve the previous
+    // repository's filesystem policy.
+    this.pendingTargetContext.delete(String(instanceNum));
     this.updateAggregateStatus();
   }
 
@@ -1419,14 +1434,25 @@ export class RunnerManager {
       return;
     }
 
-    // Detect job start
-    const jobStartMatch = line.match(/Running job:\s*(.+)/i);
+    // Detect job start.
+    //
+    // Anchored, because this reads the job's own output: any text a job prints
+    // can contain "Running job: x" - a commit message, a PR title, a checked-out
+    // file - and an unanchored match turned that into a phantom job, complete
+    // with history entry, notification, and a worker marked busy. The runner
+    // emits this at the start of a line, optionally behind its own timestamp.
+    const jobStartMatch = line.match(/^\s*(?:\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?:?\s*)?Running job:\s*(.+?)\s*$/i);
     if (jobStartMatch) {
       const jobName = jobStartMatch[1].trim();
 
-      // Avoid duplicate job start detection
-      if (instance.status === 'busy' && instance.currentJob?.name === jobName) {
-        this.log('debug', `[instance ${instanceNum}] Ignoring duplicate job start: ${jobName}`);
+      // A worker runs with --once: one spawn is exactly one job. So a start on
+      // a worker that already has a job is never a second job - it is the job's
+      // output echoing something that looks like one.
+      if (instance.status === 'busy' || instance.currentJob) {
+        this.log(
+          'debug',
+          `[instance ${instanceNum}] Ignoring job start while already running ${instance.currentJob?.name ?? 'a job'}: ${jobName}`
+        );
         return;
       }
 
@@ -1722,6 +1748,14 @@ export class RunnerManager {
     // this worker would run the job under the old boundary - so it is refused
     // rather than run. Approving through the app retires workers eagerly; this
     // also covers approving through the CLI, which writes the cache directly.
+    if (instance?.policyDrifted) {
+      this.log(
+        'debug',
+        `[instance ${instanceNum}] Policy drifted for this worker; leaving it constrained rather than reapplying`
+      );
+      return;
+    }
+
     const currentStamp = this.stampFor(policy);
     if (isClaim && instance?.policyStamp && instance.policyStamp !== currentStamp) {
       // The filesystem half is fixed in this worker's profile and cannot be
@@ -1731,7 +1765,11 @@ export class RunnerManager {
       // worker is retired so nothing further lands on it - this constrains the
       // job rather than refusing it, which the proxy cannot do on its own.
       // The docker socket stays as it was born, closed: nothing on this path
-      // opens it.
+      // opens it. Sticky, because the job-start refresh runs without isClaim
+      // and so never re-checks drift - without this it fell straight through
+      // to the widening below, restoring the hosts and rebinding the socket
+      // this branch had just closed.
+      if (instance) instance.policyDrifted = true;
       proxy.setPolicyAllowedHosts([]);
       proxy.setPolicyLevel('strict');
       this.log(

@@ -191,8 +191,14 @@ checked against the request body:
 - **`network`** against `NetworkMode`.
 - **`images`** against the image reference in the create request.
 - **`registries`** against the registry of a pull.
-- **`context`** against the build context path, with the same resolution rules as
-  mounts.
+- **`context`** documents which directory the workflow builds from. It is not
+  checked against the request, because there is nothing in the request to check
+  it against: the Engine API carries a build context as a tar the client already
+  assembled, so the filter never sees a path. What confines a local context is
+  the seatbelt profile - the job can only read what the profile grants, so the
+  tar can only contain workspace content. The filter's job here is to refuse a
+  *remote* context, which would have the daemon fetch the context itself and so
+  bypass the profile entirely.
 
 Anything not listed is denied.
 

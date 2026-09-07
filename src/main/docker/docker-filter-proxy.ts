@@ -17,7 +17,7 @@ import * as net from 'net';
 import * as path from 'path';
 import { DockerPolicy } from '../../shared/docker-policy';
 import { DockerBackend } from './docker-backend';
-import { DockerRequest, classifyDockerRequest, parseDockerRequest } from './docker-request';
+import { DockerRequest, classifyDockerRequest, containerIdFrom, networkIdFrom, parseDockerRequest } from './docker-request';
 import { evaluateDockerRequest, registryOf } from './docker-evaluator';
 
 export interface DockerFilterProxyLogEntry {
@@ -49,6 +49,9 @@ const MAX_JSON_BODY_BYTES = 1024 * 1024;
 /** How much of an upload is drained so an early answer reaches the client, before the connection is cut. */
 const MAX_DRAIN_BYTES = 8 * MAX_JSON_BODY_BYTES;
 
+/** A response head larger than this is not an upgrade handshake. */
+const MAX_UPGRADE_HEAD_BYTES = 64 * 1024;
+
 /** Hop-by-hop headers: each leg of the relay decides these for itself. */
 const HOP_BY_HOP = ['connection', 'keep-alive', 'proxy-connection'];
 
@@ -79,6 +82,24 @@ function flattenHeaders(headers: http.IncomingHttpHeaders): Record<string, strin
   return out;
 }
 
+/**
+ * A key read the way the daemon reads it, for the one field this file records.
+ *
+ * The evaluator judges every body case-insensitively because Go's decoder
+ * does; recording ownership case-sensitively meant a client that sent `name`
+ * created a network the evaluator had approved and the proxy then refused to
+ * let it address. Unambiguous by construction: a body with two casings of one
+ * key never reaches here, the evaluator refuses it.
+ */
+const readFolded = (obj: Record<string, unknown>, name: string): unknown => {
+  const wanted = name.toLowerCase();
+  for (const [key, value] of Object.entries(obj)) if (key.toLowerCase() === wanted) return value;
+  return undefined;
+};
+
+const isPlainRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
+
 const isJsonContentType = (contentType: string | undefined): boolean =>
   contentType !== undefined && contentType.split(';')[0].trim().toLowerCase() === 'application/json';
 
@@ -93,6 +114,11 @@ export class DockerFilterProxy {
    * job's container by naming its id.
    */
   private readonly ownContainerIds = new Set<string>();
+  /** Each identifier this socket may address, mapped to the container it names. */
+  private readonly ownContainerAliases = new Map<string, string>();
+  /** Networks created through this socket, by id and by the name the job asked for. */
+  private readonly ownNetworkIds = new Set<string>();
+  private readonly ownNetworkAliases = new Map<string, string>();
   private repository: string | undefined;
   private readonly backend: DockerBackend;
   private readonly onLog: (entry: DockerFilterProxyLogEntry) => void;
@@ -121,6 +147,40 @@ export class DockerFilterProxy {
     }
     this.attachRegistryAuth = options.attachRegistryAuth;
     this.realpath = options.realpath ?? ((p) => fs.realpathSync(p));
+  }
+
+  /** Record an identifier the job may use for a container it created. */
+  private own(alias: string, containerId: string): void {
+    this.ownContainerAliases.set(alias, containerId);
+    this.ownContainerIds.add(alias);
+  }
+
+  /** Record an identifier for a network the job created. */
+  private ownNetwork(alias: string, networkId: string): void {
+    this.ownNetworkAliases.set(alias, networkId);
+    this.ownNetworkIds.add(alias);
+  }
+
+  /** Forget every identifier for a network the job has removed. */
+  private disownNetwork(alias: string): void {
+    const networkId = this.ownNetworkAliases.get(alias);
+    if (networkId === undefined) return;
+    for (const [known, owner] of [...this.ownNetworkAliases]) {
+      if (owner !== networkId) continue;
+      this.ownNetworkAliases.delete(known);
+      this.ownNetworkIds.delete(known);
+    }
+  }
+
+  /** Forget every identifier for a container the job has removed. */
+  private disown(alias: string): void {
+    const containerId = this.ownContainerAliases.get(alias);
+    if (containerId === undefined) return;
+    for (const [known, owner] of [...this.ownContainerAliases]) {
+      if (owner !== containerId) continue;
+      this.ownContainerAliases.delete(known);
+      this.ownContainerIds.delete(known);
+    }
   }
 
   /**
@@ -203,7 +263,7 @@ export class DockerFilterProxy {
 
   /** The workspace the backend roots mounts at, resolved so symlinked sandbox dirs compare equal. */
   private workspaceRoot(): string {
-    const root = this.backend.workspaceMountRoot(path.dirname(this.socketPath ?? ''));
+    const root = this.backend.workspaceMountRoot(path.dirname(this.socketPath ?? ''), this.repository);
     try {
       return this.realpath(root);
     } catch {
@@ -255,7 +315,14 @@ export class DockerFilterProxy {
   }
 
   /** Null when the request may proceed; otherwise the status and message that refuse it. */
-  private decide(req: DockerRequest): { status: number; message: string } | null {
+  private decide(req: DockerRequest): { refusal: { status: number; message: string } | null; rewrittenBody?: unknown } {
+    // A target the parser could not read is a request the filter cannot judge.
+    // Before this, the parse threw out of the request handler: no refusal was
+    // written and the connection sat open until the client gave up.
+    if (req.targetError) {
+      this.onLog({ level: 'info', message: `refused ${req.method} ${req.raw.url}: ${req.targetError}` });
+      return { refusal: { status: 400, message: req.targetError } };
+    }
     if (req.apiVersion) {
       const version = parseApiVersion(req.apiVersion);
       if (
@@ -266,7 +333,7 @@ export class DockerFilterProxy {
           `API version ${req.apiVersion} is not supported by the localmost docker socket ` +
           `(supported: v${bareVersion(this.minApiVersion)} to v${bareVersion(this.maxApiVersion)})`;
         this.onLog({ level: 'info', message: `refused ${req.method} ${req.path}: ${message}` });
-        return { status: 400, message };
+        return { refusal: { status: 400, message } };
       }
     }
 
@@ -275,6 +342,7 @@ export class DockerFilterProxy {
       workspaceRoot: this.workspaceRoot(),
       supportsPrivileged: this.backend.supportsPrivileged,
       ownContainerIds: this.ownContainerIds,
+      ownNetworkIds: this.ownNetworkIds,
       realpath: this.realpath,
     });
     if (!verdict.allowed) {
@@ -284,9 +352,9 @@ export class DockerFilterProxy {
         message: `denied ${req.method} ${req.path}: ${message}`,
         ...(verdict.policyHint !== undefined ? { policyHint: verdict.policyHint } : {}),
       });
-      return { status: 403, message };
+      return { refusal: { status: 403, message } };
     }
-    return null;
+    return { refusal: null, rewrittenBody: verdict.rewrittenBody };
   }
 
   /** Said once per socket: a declaration is a permission, not a requirement. */
@@ -348,13 +416,17 @@ export class DockerFilterProxy {
     res: http.ServerResponse,
     bufferedBody: Buffer | null
   ): void {
-    const refusal = this.decide(parsed);
+    const { refusal, rewrittenBody } = this.decide(parsed);
     if (refusal) {
       this.writeRefusal(res, refusal.status, refusal.message);
       if (bufferedBody === null) this.endAfterDrain(req, res);
       else res.end();
       return;
     }
+    // The verdict may pin the body it approved - mount sources resolved to the
+    // paths actually checked - so the daemon mounts what the filter judged
+    // rather than re-resolving a name the job can repoint in between.
+    const body = rewrittenBody !== undefined ? Buffer.from(JSON.stringify(rewrittenBody)) : bufferedBody;
     const endpoint = this.backend.resolveEndpoint();
     if (!endpoint) {
       this.warnNoDaemon();
@@ -363,7 +435,7 @@ export class DockerFilterProxy {
       else res.end();
       return;
     }
-    this.forward(parsed, req, res, bufferedBody, endpoint.socketPath);
+    this.forward(parsed, req, res, body, endpoint.socketPath);
   }
 
   /** The URL as forwarded: an unversioned request is pinned to the version we understand. */
@@ -414,14 +486,27 @@ export class DockerFilterProxy {
       { socketPath, path: this.forwardedUrl(parsed), method: parsed.method, headers, agent: this.upstreamAgent },
       (upstreamRes) => {
         upstreamRes.on('error', () => res.destroy());
+        // A container the daemon actually removed is no longer this job's to
+        // address; its name in particular may be handed to anyone next.
+        const removedStatus = upstreamRes.statusCode ?? 502;
+        if (action === 'remove' && removedStatus >= 200 && removedStatus < 300) {
+          const addressed = containerIdFrom(parsed);
+          if (addressed) this.disown(addressed);
+        }
+        if (action === 'network-remove' && removedStatus >= 200 && removedStatus < 300) {
+          const addressed = networkIdFrom(parsed);
+          if (addressed) this.disownNetwork(addressed);
+        }
         const relayed =
           action === 'ping'
             ? this.relayPing(upstreamRes, res)
             : action === 'version'
               ? this.relayVersion(upstreamRes, res)
               : action === 'create'
-                ? this.relayCreate(upstreamRes, res)
-                : this.relay(upstreamRes, res);
+                ? this.relayCreate(upstreamRes, res, parsed)
+                : action === 'network-create'
+                  ? this.relayNetworkCreate(upstreamRes, res, parsed)
+                  : this.relay(upstreamRes, res);
         relayed.then(() => {
           answered = true;
           if (bufferedBody !== null) {
@@ -499,7 +584,38 @@ export class DockerFilterProxy {
    * to containers this job actually created. The body is small and the client
    * needs the id before it can proceed, so buffering it costs nothing.
    */
-  private relayCreate(upstreamRes: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  /** Relay a network create and record the network, by id and by requested name. */
+  private relayNetworkCreate(upstreamRes: http.IncomingMessage, res: http.ServerResponse, requested: DockerRequest): Promise<void> {
+    return new Promise((resolve) => {
+      const chunks: Buffer[] = [];
+      upstreamRes.on('data', (c: Buffer) => chunks.push(c));
+      upstreamRes.on('end', () => {
+        const raw = Buffer.concat(chunks);
+        const status = upstreamRes.statusCode ?? 502;
+        if (status >= 200 && status < 300) {
+          try {
+            const parsed = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
+            if (typeof parsed.Id === 'string' && parsed.Id.length > 0) {
+              this.ownNetwork(parsed.Id, parsed.Id);
+              const body = requested.body;
+              const name = isPlainRecord(body) ? readFolded(body, 'Name') : undefined;
+              if (typeof name === 'string' && name.length > 0) this.ownNetwork(name, parsed.Id);
+            }
+          } catch {
+            // An unreadable create response leaves the network unowned, which
+            // fails closed: the job cannot address what it cannot name.
+          }
+        }
+        const headers = { ...this.relayedHeaders(upstreamRes), 'content-length': String(raw.length) };
+        delete headers['transfer-encoding'];
+        res.writeHead(status, headers);
+        if (raw.length > 0) res.write(raw);
+        resolve();
+      });
+    });
+  }
+
+  private relayCreate(upstreamRes: http.IncomingMessage, res: http.ServerResponse, requested: DockerRequest): Promise<void> {
     return new Promise((resolve) => {
       const chunks: Buffer[] = [];
       upstreamRes.on('data', (c: Buffer) => chunks.push(c));
@@ -510,7 +626,14 @@ export class DockerFilterProxy {
         if (status >= 200 && status < 300) {
           try {
             const parsed = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
-            if (typeof parsed.Id === 'string' && parsed.Id.length > 0) this.ownContainerIds.add(parsed.Id);
+            if (typeof parsed.Id === 'string' && parsed.Id.length > 0) {
+              // A job addresses its container by whichever identifier it
+              // knows: the id the daemon just assigned, or the --name it
+              // asked for, which is the only one it ever sees when it uses one.
+              this.own(parsed.Id, parsed.Id);
+              const name = requested.query.name;
+              if (name) this.own(name, parsed.Id);
+            }
           } catch {
             // An unreadable create response leaves the container unowned: the
             // job cannot address it, which fails closed rather than open.
@@ -582,7 +705,19 @@ export class DockerFilterProxy {
     const url = req.url ?? '/';
     const parsed = parseDockerRequest({ method, url, headers, body: Buffer.alloc(0) });
 
-    const refusal = this.decide(parsed);
+    // Only attach is an upgrade. Without this, any request the policy permits
+    // - including a baseline /_ping - could be sent with an Upgrade header to
+    // open a raw pipe to the daemon, and everything pipelined over that pipe
+    // would bypass the filter entirely.
+    const action = classifyDockerRequest(parsed);
+    if (action !== 'attach') {
+      const message = `${parsed.method} ${parsed.path} cannot be upgraded through the localmost docker socket`;
+      this.onLog({ level: 'info', message: `denied upgrade ${parsed.method} ${parsed.path}: ${message}` });
+      this.refuseRaw(client, 400, message);
+      return;
+    }
+
+    const { refusal } = this.decide(parsed);
     if (refusal) {
       this.refuseRaw(client, refusal.status, refusal.message);
       return;
@@ -605,8 +740,38 @@ export class DockerFilterProxy {
       }
       upstream.write(lines.join('\r\n') + '\r\n\r\n');
       if (head.length > 0) upstream.write(head);
-      upstream.pipe(client);
-      client.pipe(upstream);
+
+      // Pipe only once the daemon has actually agreed to upgrade. Piping on
+      // connect would hand the job a raw socket even when the daemon answered
+      // with an ordinary response, which is a tunnel by another name.
+      let banner = '';
+      const onUpstreamHead = (chunk: Buffer): void => {
+        banner += chunk.toString('latin1');
+        const end = banner.indexOf('\r\n\r\n');
+        if (end === -1) {
+          // A daemon that never finishes a response head is not upgrading.
+          if (banner.length > MAX_UPGRADE_HEAD_BYTES) {
+            upstream.destroy();
+            client.destroy();
+          }
+          return;
+        }
+        upstream.off('data', onUpstreamHead);
+
+        const statusLine = banner.slice(0, banner.indexOf('\r\n'));
+        if (!/^HTTP\/1\.[01] 101\b/.test(statusLine)) {
+          // Relay what the daemon said, then close. No raw pipe is established.
+          client.write(Buffer.from(banner, 'latin1'));
+          client.end();
+          upstream.destroy();
+          return;
+        }
+
+        client.write(Buffer.from(banner, 'latin1'));
+        upstream.pipe(client);
+        client.pipe(upstream);
+      };
+      upstream.on('data', onUpstreamHead);
     });
     this.connections.add(upstream);
     upstream.on('close', () => this.connections.delete(upstream));

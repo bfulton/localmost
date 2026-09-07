@@ -25,11 +25,17 @@ permissions:
 
 jobs:
   check:
+    # Named so it is tellable apart from the other workflows' check jobs in the
+    # PR checks list, where three of them appear.
+    name: docker runner
     uses: ./.github/workflows/check.yaml
     with:
       fallback: ubuntu-latest
 
   docker-linux:
+    # Deliberately independent of the check job: it runs GitHub-hosted whatever
+    # the heartbeat says, so depending on check would only mean a cancelled
+    # check cancels this too. The heartbeat is announced by check itself.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

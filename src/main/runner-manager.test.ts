@@ -1328,6 +1328,10 @@ describe('RunnerManager', () => {
       expect(socket.start.mock.invocationCallOrder[0]).toBeLessThan(mockSpawnSandboxed.mock.invocationCallOrder[0]);
       const options = mockSpawnSandboxed.mock.calls[0][2]!;
       expect(options.env?.DOCKER_HOST).toBe(`unix://${socketPath}`);
+      // BuildKit, the default builder since Docker 23, streams a build over a
+      // gRPC session the filter cannot inspect. The classic builder is the one
+      // `build:` policy actually describes, so the job is pinned to it.
+      expect(options.env?.DOCKER_BUILDKIT).toBe('0');
       // The profile grants this socket by name; the daemon's is no longer handed over.
       expect(options).toHaveProperty('dockerSocket', socketPath);
       expect(options).not.toHaveProperty('dockerGrants');
@@ -1528,5 +1532,116 @@ describe('docker access', () => {
     // under another.
     expect(stamp({})).not.toEqual(stamp({ run: { images: ['postgres:16'] } }));
     expect(stamp({ run: { images: ['postgres:16'] } })).toEqual(stamp({ run: { images: ['postgres:16'] } }));
+  });
+});
+
+describe('job-start detection against injected output', () => {
+  const startedNames = (events: JobEvent[]) => events.filter((e) => e.type === 'started').map((e) => e.jobName);
+
+  const setup = () => {
+    const events: JobEvent[] = [];
+    const manager = new RunnerManager({
+      onLog: jest.fn(),
+      onStatusChange: jest.fn(),
+      onJobHistoryUpdate: jest.fn(),
+      onJobEvent: (e: JobEvent) => events.push(e),
+    });
+    const helper = new RunnerManagerTestHelper(manager);
+    helper.setInstance(1, { name: 'runner-1', status: 'listening' });
+    return { helper, events };
+  };
+
+  it('ignores "Running job:" embedded in a line the job merely printed', async () => {
+    const { helper, events } = setup();
+
+    // A commit message, PR title or any echoed text can carry this. Here it
+    // arrives the way it really did: inside the job's contextData JSON.
+    await helper.parseRunnerOutput(1, '{"k":"message","v":"fix: match the `Running job: <name>` line properly"}');
+
+    expect(startedNames(events)).toEqual([]);
+  });
+
+  it('ignores a second job start on a worker already running one', async () => {
+    const { helper, events } = setup();
+
+    await helper.parseRunnerOutput(1, 'Running job: build');
+    // The runner is --once: one spawn runs exactly one job, so anything after
+    // the first start is not a job, whatever it calls itself.
+    await helper.parseRunnerOutput(1, 'Running job: evil');
+
+    expect(startedNames(events)).toEqual(['build']);
+  });
+
+  it('still detects a genuine job start', async () => {
+    const { helper, events } = setup();
+    await helper.parseRunnerOutput(1, 'Running job: build');
+    expect(startedNames(events)).toEqual(['build']);
+  });
+});
+
+describe('a worker constrained by policy drift stays constrained', () => {
+  it('does not reopen the docker socket or restore hosts when the job starts', async () => {
+    const docker = { pull: { registries: ['docker.io'] }, run: { images: ['alpine:3'] } };
+    const manager = new RunnerManager({
+      onLog: jest.fn(),
+      onStatusChange: jest.fn(),
+      onJobHistoryUpdate: jest.fn(),
+      getRepoPolicy: async () => ({
+        hosts: ['example.com'], level: 'strict' as const, readPaths: [], writePaths: [], docker,
+      }),
+    });
+    const helper = new RunnerManagerTestHelper(manager);
+    const proxy = { setPolicyAllowedHosts: jest.fn(), setPolicyLevel: jest.fn(), getStats: jest.fn(), getPolicyLevel: jest.fn() };
+    const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn() };
+    helper.setProxy(1, proxy);
+    helper.setDockerProxy(1, dockerSocket);
+    // A stamp that cannot match the policy above: the approved policy moved
+    // after this worker was built, so its profile is out of date.
+    helper.setInstance(1, {
+      name: 'runner-1', status: 'busy', policyStamp: 'stale-stamp',
+      currentJob: { name: 'build', repository: 'owner/repo', startedAt: 'now', id: 'job-1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' },
+    });
+    helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
+
+    // The claim detects drift: network cut to nothing, docker socket left closed.
+    await helper.applyPolicyOnClaim(1, 'owner/repo', 'abc1234');
+    expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith([]);
+    expect(dockerSocket.bind).not.toHaveBeenCalled();
+
+    // The job-start refresh must not undo that. It runs without isClaim, so it
+    // never re-checks drift, and it used to fall straight through to widening.
+    await helper.applyRepoPolicy(1);
+
+    expect(dockerSocket.bind).not.toHaveBeenCalled();
+    expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith([]);
+  });
+});
+
+describe('a released slot does not carry the finished job\'s context', () => {
+  it('does not judge the next worker in that slot against the previous repository', async () => {
+    const docker = { run: { images: ['alpine:3'] } };
+    const manager = new RunnerManager({
+      onLog: jest.fn(), onStatusChange: jest.fn(), onJobHistoryUpdate: jest.fn(),
+      getRepoPolicy: async () => ({ hosts: [], level: 'strict' as const, readPaths: [], writePaths: [], docker }),
+    });
+    const helper = new RunnerManagerTestHelper(manager);
+
+    // Slot 1 ran a job for owner/first, then the worker went away.
+    helper.setInstance(1, { name: 'runner-1', status: 'listening' });
+    helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/first', githubSha: 'aaa1111' });
+    helper.releaseInstanceSlot(1);
+
+    // The slot is reused for a different repository, by a worker that did not
+    // go through spawnWorkerForJob and so records no context of its own.
+    const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn() };
+    helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyLevel: jest.fn() });
+    helper.setDockerProxy(1, dockerSocket);
+    helper.setInstance(1, { name: 'runner-1', status: 'busy', claimedRepository: 'owner/second' });
+
+    await helper.applyPolicyOnClaim(1, 'owner/second', 'bbb2222');
+
+    // With the previous job's context still in the slot, this worker is judged
+    // against owner/first and its socket never opens for the job it is running.
+    expect(dockerSocket.bind).toHaveBeenCalledWith('owner/second', docker);
   });
 });

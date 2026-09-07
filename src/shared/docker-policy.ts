@@ -20,9 +20,22 @@ export interface DockerMount {
   mode: MountMode;
 }
 
-/** Container create, start, attach, wait and remove. */
+/** A network the job may create: a name glob, and whether it is internal. */
+export interface DockerNetworkPolicy {
+  /** Anchored glob; `*` matches any run of characters. */
+  name: string;
+  /**
+   * Whether the network is cut off from anything outside it. Required rather
+   * than defaulted: a routable network is a real grant and has to be asked for
+   * in a way the approval diff shows.
+   */
+  internal: boolean;
+}
+
+/** Container create, start, attach, wait, kill, stop, remove and logs. */
 export interface DockerRunPolicy {
   images?: string[];
+  networks?: DockerNetworkPolicy[];
   mounts?: DockerMount[];
   network?: string;
 }
@@ -89,6 +102,15 @@ export function validateDockerPolicy(value: unknown, path: string, push: (messag
   if (value.build !== undefined) validateBuild(value.build, `${path}.build`, push);
   if (value.privileged !== undefined && typeof value.privileged !== 'boolean') {
     push(`${path}.privileged must be a boolean`);
+  } else if (value.privileged === true) {
+    // Kept in the grammar so the capability gap stays visible, and refused
+    // until a backend exists that can contain it. Accepting the declaration
+    // here and then refusing every request it implies would read as a broken
+    // policy rather than a stage that has not shipped.
+    push(
+      `${path}.privileged requires a managed VM backend, which this build does not have; ` +
+        'remove it, or run the work without privileged containers'
+    );
   }
 }
 
@@ -97,8 +119,28 @@ function validateRun(value: unknown, path: string, push: (message: string) => vo
     push(`${path} must be an object`);
     return;
   }
-  if (value.images !== undefined) validateStringArray(value.images, `${path}.images`, push);
+  if (value.images !== undefined) {
+    validateStringArray(value.images, `${path}.images`, push);
+    if (Array.isArray(value.images)) {
+      for (const image of value.images) {
+        if (typeof image !== 'string' || !image.includes('*')) continue;
+        // A reference with no tag normalises to :latest, so a tagless glob
+        // means "any repository here, but only its latest tag" - which is not
+        // what it looks like, and an approval diff cannot show the difference.
+        // Guessing :* instead would be the same guess this grammar refuses when
+        // it rejects `docker: true`, so say what to write instead.
+        const lastSegment = image.slice(image.lastIndexOf('/') + 1);
+        if (!lastSegment.includes(':') && !lastSegment.includes('@')) {
+          push(
+            `${path}.images entry "${image}" globs a repository but names no tag, which matches only ` +
+              `its "latest" tag. Write "${image}:*" for any tag, or name the tag you mean.`
+          );
+        }
+      }
+    }
+  }
   if (value.mounts !== undefined) validateMounts(value.mounts, `${path}.mounts`, push);
+  if (value.networks !== undefined) validateNetworks(value.networks, `${path}.networks`, push);
   if (value.network !== undefined && typeof value.network !== 'string') {
     push(`${path}.network must be a string`);
   } else if (value.network === 'host' || (typeof value.network === 'string' && value.network.startsWith('container:'))) {
@@ -106,6 +148,36 @@ function validateRun(value: unknown, path: string, push: (message: string) => vo
     // container; neither can be named, so neither can be requested.
     push(`${path}.network cannot be ${value.network}: it reaches outside the container and cannot be granted`);
   }
+}
+
+/** Keys a declared network may carry. Driver above all is absent by design. */
+const NETWORK_KEYS: readonly string[] = ['name', 'internal'];
+
+function validateNetworks(value: unknown, path: string, push: (message: string) => void): void {
+  if (!Array.isArray(value)) {
+    push(`${path} must be an array`);
+    return;
+  }
+  value.forEach((entry, i) => {
+    const at = `${path}[${i}]`;
+    if (!isPlainObject(entry)) {
+      push(`${at} must be an object with name and internal`);
+      return;
+    }
+    for (const key of Object.keys(entry)) {
+      if (!NETWORK_KEYS.includes(key)) {
+        // A macvlan or ipvlan network puts the container on the physical LAN,
+        // which is worse than host networking, and driver options can bind a
+        // bridge to a host address. None of it can be named, so none of it can
+        // be asked for; the filter always creates a plain internal bridge.
+        push(`${at}.${key} cannot be declared: a network may only name itself and say whether it is internal`);
+      }
+    }
+    if (typeof entry.name !== 'string' || entry.name === '') push(`${at}.name must be a non-empty string`);
+    if (typeof entry.internal !== 'boolean') {
+      push(`${at}.internal must be stated as true or false: a routable network is a grant of its own`);
+    }
+  });
 }
 
 function validateMounts(value: unknown, path: string, push: (message: string) => void): void {
@@ -191,9 +263,27 @@ function mergeRun(base?: DockerRunPolicy, override?: DockerRunPolicy): DockerRun
   if (images) run.images = images;
   const mounts = mergeMounts(base?.mounts, override?.mounts);
   if (mounts) run.mounts = mounts;
+  const networks = mergeNetworks(base?.networks, override?.networks);
+  if (networks) run.networks = networks;
   const network = override?.network ?? base?.network;
   if (network !== undefined) run.network = network;
   return run;
+}
+
+function mergeNetworks(
+  base?: DockerNetworkPolicy[],
+  override?: DockerNetworkPolicy[]
+): DockerNetworkPolicy[] | undefined {
+  if (!base && !override) return undefined;
+  const merged: DockerNetworkPolicy[] = [];
+  const seen = new Set<string>();
+  for (const entry of [...(base ?? []), ...(override ?? [])]) {
+    const key = `${entry.name}:${entry.internal}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(entry);
+  }
+  return merged.length > 0 ? merged : undefined;
 }
 
 function mergeBuild(base?: DockerBuildPolicy, override?: DockerBuildPolicy): DockerBuildPolicy | undefined {
@@ -235,6 +325,9 @@ export interface DockerPolicyDiff {
 
 /** A mount as one string, in the shape a -v flag takes, so it diffs per grant. */
 const mountKey = (m: DockerMount): string => `${m.path}:${m.mode}`;
+// Both states are named: a routable network is a real grant, and showing it as
+// a bare name left the approval diff silent about the part that matters.
+const networkKey = (n: DockerNetworkPolicy): string => `${n.name} (${n.internal ? 'internal' : 'routable'})`;
 
 function diffLists(oldList: string[] | undefined, newList: string[] | undefined, path: string, diffs: DockerPolicyDiff[]): void {
   const oldSet = new Set(oldList ?? []);
@@ -269,10 +362,28 @@ export function diffDockerPolicy(
   diffLists(oldP?.pull?.registries, newP?.pull?.registries, `${prefix}.pull.registries`, diffs);
   diffLists(oldP?.run?.images, newP?.run?.images, `${prefix}.run.images`, diffs);
   diffLists(oldP?.run?.mounts?.map(mountKey), newP?.run?.mounts?.map(mountKey), `${prefix}.run.mounts`, diffs);
+  diffLists(oldP?.run?.networks?.map(networkKey), newP?.run?.networks?.map(networkKey), `${prefix}.run.networks`, diffs);
   diffScalar(oldP?.run?.network, newP?.run?.network, `${prefix}.run.network`, diffs);
   diffScalar(oldP?.build?.context, newP?.build?.context, `${prefix}.build.context`, diffs);
   // false grants nothing, the same as absent.
   diffScalar(oldP?.privileged ? 'true' : undefined, newP?.privileged ? 'true' : undefined, `${prefix}.privileged`, diffs);
+
+  // An action block with no conditions is still a grant - `run: {}` permits
+  // creating and running containers - and diffing only conditions showed an
+  // approver nothing for it at all. Named here only when the block is
+  // otherwise invisible, so a block that changed its conditions is not
+  // reported twice.
+  for (const action of ['pull', 'run', 'build'] as const) {
+    const had = oldP?.[action] !== undefined;
+    const has = newP?.[action] !== undefined;
+    if (had === has) continue;
+    if (diffs.some((d) => d.path.startsWith(`${prefix}.${action}.`))) continue;
+    diffs.push(
+      has
+        ? { path: `${prefix}.${action}`, type: 'added', newValue: action }
+        : { path: `${prefix}.${action}`, type: 'removed', oldValue: action }
+    );
+  }
   return diffs;
 }
 
@@ -304,14 +415,21 @@ export function serializeDockerPolicy(policy: DockerPolicy, indent: string): str
   }
 
   if (policy.run) {
-    const { images, mounts, network } = policy.run;
-    if (!images?.length && !mounts?.length && network === undefined) {
+    const { images, mounts, network, networks } = policy.run;
+    if (!images?.length && !mounts?.length && !networks?.length && network === undefined) {
       lines.push(`${i1}run: {}`);
     } else {
       lines.push(`${i1}run:`);
       if (images?.length) {
         lines.push(`${i2}images:`);
         for (const image of images) lines.push(`${i3}- ${quote(image)}`);
+      }
+      if (networks?.length) {
+        lines.push(`${i2}networks:`);
+        for (const n of networks) {
+          lines.push(`${i3}- name: ${quote(n.name)}`);
+          lines.push(`${i3}  internal: ${n.internal}`);
+        }
       }
       if (mounts?.length) {
         lines.push(`${i2}mounts:`);
@@ -361,4 +479,41 @@ export function parseDockerPolicyHint(hint: string): DockerPolicy | undefined {
   validateDockerPolicy(loaded.docker, 'docker', (m) => errors.push(m));
   if (errors.length > 0) return undefined;
   return loaded.docker as DockerPolicy;
+}
+
+/**
+ * The container grants a docker policy makes, one line each, for anything that
+ * asks an operator to approve them. Shared so the CLI and the app describe the
+ * same policy the same way: `localmost policy show` once rendered network,
+ * filesystem and env only, and approved the docker section unseen.
+ */
+export function describeDockerGrants(docker: DockerPolicy | undefined, prefix: string): string[] {
+  if (!docker) return [];
+  const grants: string[] = [];
+  if (docker.pull) {
+    const registries = docker.pull.registries ?? [];
+    if (registries.length === 0) grants.push(`${prefix}docker pull`);
+    for (const registry of registries) grants.push(`${prefix}docker pull: ${registry}`);
+  }
+  if (docker.run) {
+    const { images = [], mounts = [], network, networks = [] } = docker.run;
+    if (images.length === 0 && mounts.length === 0 && networks.length === 0 && network === undefined) {
+      grants.push(`${prefix}docker run`);
+    }
+    for (const image of images) grants.push(`${prefix}docker run image: ${image}`);
+    for (const mount of mounts) grants.push(`${prefix}docker mount: ${mount.path} (${mount.mode})`);
+    // Creating a network is a grant, and whether it is routable is the part an
+    // operator most needs to see.
+    for (const n of networks) {
+      grants.push(`${prefix}docker network create: ${n.name} (${n.internal ? 'internal' : 'routable'})`);
+    }
+    if (network !== undefined) grants.push(`${prefix}docker network: ${network}`);
+  }
+  if (docker.build) {
+    grants.push(docker.build.context === undefined
+      ? `${prefix}docker build`
+      : `${prefix}docker build: ${docker.build.context}`);
+  }
+  if (docker.privileged) grants.push(`${prefix}docker privileged`);
+  return grants;
 }

@@ -17,6 +17,8 @@ import {
 } from '../policy-cache';
 import {
   getRunnerManager, getLogger } from '../app-state';
+import { DockerPolicy } from '../../shared/docker-policy';
+import { describePolicy } from '../../shared/policy-describe';
 
 /**
  * Describe what a policy grants, in the terms a reviewer cares about.
@@ -24,24 +26,20 @@ import {
 interface PolicySection {
   network?: { allow?: string[] };
   filesystem?: { read?: string[]; write?: string[] };
-  sockets?: { allow?: string[] };
+  docker?: DockerPolicy;
 }
 
+/**
+ * What a docker policy grants, in the reviewer's terms.
+ *
+ * Every action block is named even when it carries no conditions: `run: {}` is
+ * a real grant - it permits creating and running containers - and an approval
+ * screen that showed nothing for it would be asking consent for an invisible
+ * capability.
+ */
+
 function describeSection(section: PolicySection, prefix: string): string[] {
-  const grants: string[] = [];
-  for (const host of section.network?.allow || []) {
-    grants.push(`${prefix}network: ${host}`);
-  }
-  for (const p of section.filesystem?.read || []) {
-    grants.push(`${prefix}read: ${p}`);
-  }
-  for (const p of section.filesystem?.write || []) {
-    grants.push(`${prefix}write: ${p}`);
-  }
-  for (const p of section.sockets?.allow || []) {
-    grants.push(`${prefix}socket: ${p}`);
-  }
-  return grants;
+  return describePolicy(section, prefix).map((grant) => grant.summary);
 }
 
 /**
@@ -51,7 +49,7 @@ function describeSection(section: PolicySection, prefix: string): string[] {
  * `workflows:` that appears nowhere in `shared`, and approving what the UI
  * showed would otherwise approve more than was shown.
  */
-function summarizeGrants(config: {
+export function summarizeGrants(config: {
   shared?: PolicySection;
   workflows?: Record<string, PolicySection>;
 }): string[] {

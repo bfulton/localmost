@@ -45,12 +45,13 @@ describe('validateDockerPolicy', () => {
     expect(collect({ run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'ro' }], network: 'bridge' } })).toEqual([]);
   });
 
-  it('accepts pull, build and privileged alongside run', () => {
+  it('accepts pull, build and run together', () => {
+    // privileged is deliberately absent: it is rejected until a managed VM
+    // backend exists, and has a case of its own below.
     expect(collect({
       pull: { registries: ['docker.io', 'ghcr.io'] },
       run: { images: ['postgres:16'] },
       build: { context: './' },
-      privileged: true,
     })).toEqual([]);
   });
 
@@ -312,5 +313,128 @@ describe('serializeDockerPolicy quoting', () => {
     expect(reparsed.success).toBe(true);
     expect(reparsed.config?.shared?.docker?.run?.network).toBe(hostile);
     expect(reparsed.config?.shared?.docker?.privileged).toBeUndefined();
+  });
+});
+
+describe('diffDockerPolicy on bare action blocks', () => {
+  it('reports the action itself appearing, not just its conditions', () => {
+    // `run: {}` permits creating and running containers. Diffing only the
+    // leaves showed nothing, so the grant reached approval invisibly.
+    const cases: Array<[DockerPolicy, string]> = [
+      [{ run: {} }, 'shared.docker.run'],
+      [{ build: {} }, 'shared.docker.build'],
+      [{ pull: { registries: [] } }, 'shared.docker.pull'],
+    ];
+    for (const [block, path] of cases) {
+      const diffs = diffDockerPolicy(undefined, block, 'shared.docker');
+      expect([path, diffs.map((d) => d.path)]).toEqual([path, expect.arrayContaining([path])]);
+      expect([path, diffs.every((d) => d.type === 'added')]).toEqual([path, true]);
+    }
+  });
+
+  it('reports an action being removed as well', () => {
+    const diffs = diffDockerPolicy({ build: {} }, undefined, 'shared.docker');
+    expect(diffs.map((d) => d.path)).toContain('shared.docker.build');
+    expect(diffs[0].type).toBe('removed');
+  });
+
+  it('does not double-report an action that merely changed its conditions', () => {
+    const diffs = diffDockerPolicy({ run: { images: ['a'] } }, { run: { images: ['b'] } }, 'shared.docker');
+    expect(diffs.map((d) => d.path)).not.toContain('shared.docker.run');
+    expect(diffs.map((d) => d.path)).toContain('shared.docker.run.images');
+  });
+});
+
+describe('privileged at validation time', () => {
+  const collect = (value: unknown, path = 'shared.docker') => {
+    const errs: string[] = [];
+    validateDockerPolicy(value, path, (m) => errs.push(m));
+    return errs;
+  };
+
+  it('rejects privileged: true, naming the backend it would require', () => {
+    // The design keeps privileged in the grammar so the gap stays honest, and
+    // rejects it until a managed VM can contain it. Accepting it here and
+    // refusing every request later reads as a broken policy, not a stage.
+    expect(collect({ privileged: true }).join('\n')).toMatch(/managed VM/i);
+  });
+
+  it('accepts privileged: false, which grants nothing', () => {
+    expect(collect({ privileged: false })).toEqual([]);
+  });
+});
+
+describe('run.networks grammar', () => {
+  const collect = (value: unknown, path = 'shared.docker') => {
+    const errs: string[] = [];
+    validateDockerPolicy(value, path, (m) => errs.push(m));
+    return errs;
+  };
+
+  it('accepts a declared network by name glob and internal flag', () => {
+    expect(collect({ run: { networks: [{ name: 'vk-*', internal: true }] } })).toEqual([]);
+    expect(collect({ run: { networks: [{ name: 'build', internal: false }] } })).toEqual([]);
+  });
+
+  it('requires internal to be stated, so a routable network is never the default', () => {
+    expect(collect({ run: { networks: [{ name: 'vk-*' }] } }).join('\n')).toMatch(/internal/i);
+  });
+
+  it('refuses a network key the grammar cannot spell, driver above all', () => {
+    for (const entry of [{ name: 'x', internal: true, driver: 'macvlan' }, { name: 'x', internal: true, options: {} }, { name: 'x', internal: true, ipam: {} }]) {
+      expect([Object.keys(entry).join(','), collect({ run: { networks: [entry] } }).length > 0]).toEqual([Object.keys(entry).join(','), true]);
+    }
+  });
+
+  it('composes shared and workflow networks additively', () => {
+    const merged = mergeDockerPolicy(
+      { run: { networks: [{ name: 'vk-*', internal: true }] } },
+      { run: { networks: [{ name: 'build', internal: false }] } }
+    );
+    expect(merged?.run?.networks).toEqual([{ name: 'vk-*', internal: true }, { name: 'build', internal: false }]);
+  });
+
+  it('shows a declared network in the approval diff', () => {
+    const diffs = diffDockerPolicy(undefined, { run: { networks: [{ name: 'vk-*', internal: true }] } }, 'shared.docker');
+    expect(diffs.map((d) => d.path)).toContain('shared.docker.run.networks');
+    expect(diffs[0].newValue).toMatch(/vk-\*/);
+  });
+});
+
+describe('network entries in the approval diff', () => {
+  it('says internal or routable explicitly, since both are consent-relevant', () => {
+    const diffs = diffDockerPolicy(undefined, {
+      run: { networks: [{ name: 'vk-*', internal: true }, { name: 'open', internal: false }] },
+    }, 'shared.docker');
+    const values = diffs.filter((d) => d.path.endsWith('run.networks')).map((d) => d.newValue);
+    expect(values).toEqual(expect.arrayContaining(['vk-* (internal)', 'open (routable)']));
+  });
+});
+
+describe('a glob in run.images must say what tag it covers', () => {
+  const collect = (value: unknown, path = 'shared.docker') => {
+    const errs: string[] = [];
+    validateDockerPolicy(value, path, (m) => errs.push(m));
+    return errs;
+  };
+
+  it('rejects a tagless glob, naming the form that means what it looks like', () => {
+    // Normalisation appends :latest to a tagless reference, so `vk/*` silently
+    // means "any repo under vk, but only its latest tag" - almost none of them.
+    // Guessing :* instead would be the same class of guess as accepting
+    // `docker: true`, so it is refused with the fix in the message.
+    const errs = collect({ run: { images: ['vk/*'] } }).join('\n');
+    expect(errs).toMatch(/vk\/\*:\*/);
+    expect(errs).toMatch(/tag/i);
+  });
+
+  it('accepts a glob that carries a tag, globbed or exact', () => {
+    expect(collect({ run: { images: ['vk/*:*'] } })).toEqual([]);
+    expect(collect({ run: { images: ['vk/grader:*'] } })).toEqual([]);
+    expect(collect({ run: { images: ['vk/*:1'] } })).toEqual([]);
+  });
+
+  it('leaves exact references alone, tagless or not', () => {
+    expect(collect({ run: { images: ['alpine', 'alpine:3', 'ghcr.io/o/app:1'] } })).toEqual([]);
   });
 });

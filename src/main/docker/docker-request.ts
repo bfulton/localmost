@@ -25,6 +25,15 @@ export type DockerAction =
   | 'attach'
   | 'wait'
   | 'remove'
+  | 'kill'
+  | 'stop'
+  | 'logs'
+  | 'network-create'
+  | 'network-inspect'
+  | 'network-remove'
+  | 'network-list'
+  | 'image-inspect'
+  | 'buildkit'
   | 'build'
   | 'other';
 
@@ -41,6 +50,14 @@ export interface DockerRequest {
   body?: unknown;
   /** Set when the content type promised JSON and the body did not parse. */
   bodyError?: string;
+  /**
+   * Set when the request target is not a plain origin-form path. The filter
+   * refuses these rather than guessing: a target carrying an authority
+   * (`//evil/x`, `http://evil/x`) is read one way by the URL parser here and
+   * another by the daemon, and judging one while forwarding the other is how a
+   * filter gets talked past.
+   */
+  targetError?: string;
   raw: { method: string; url: string; headers: Record<string, string>; body: Buffer };
 }
 
@@ -58,9 +75,27 @@ const isJsonContentType = (contentType: string | undefined): boolean =>
   contentType !== undefined && contentType.split(';')[0].trim().toLowerCase() === 'application/json';
 
 export function parseDockerRequest(raw: DockerRequest['raw']): DockerRequest {
+  // Only origin-form is accepted. Anything else either throws here (`//`,
+  // `http://[`) or parses to a different path than the daemon will read, and
+  // both are refusals rather than guesses.
+  if (!raw.url.startsWith('/') || raw.url.startsWith('//')) {
+    return {
+      method: raw.method, path: raw.url, query: {}, raw,
+      targetError: `request target "${raw.url}" is not a plain path; the localmost docker socket accepts origin-form targets only`,
+    };
+  }
+
   // The base is a placeholder so a path-only URL parses; only pathname and
   // search are read from the result.
-  const url = new URL(raw.url, 'http://docker');
+  let url: URL;
+  try {
+    url = new URL(raw.url, 'http://docker');
+  } catch {
+    return {
+      method: raw.method, path: raw.url, query: {}, raw,
+      targetError: `request target "${raw.url}" could not be parsed`,
+    };
+  }
 
   let path = url.pathname;
   let apiVersion: string | undefined;
@@ -103,13 +138,52 @@ const ENDPOINTS: ReadonlyArray<{ method: string; path: RegExp; action: DockerAct
   // container on the daemon, including other jobs'.
   { method: 'GET', path: /^\/containers\/json$/, action: 'list' },
   { method: 'POST', path: /^\/images\/create$/, action: 'pull' },
+  // The reference may carry a registry, a path and a tag, so it is anything up
+  // to the trailing /json. Listing is deliberately absent: it is daemon-wide.
+  { method: 'GET', path: /^\/images\/(?!json$).+\/json$/, action: 'image-inspect' },
   { method: 'POST', path: /^\/containers\/create$/, action: 'create' },
   { method: 'POST', path: new RegExp(`^/containers/${ID}/start$`), action: 'start' },
   { method: 'POST', path: new RegExp(`^/containers/${ID}/attach$`), action: 'attach' },
   { method: 'POST', path: new RegExp(`^/containers/${ID}/wait$`), action: 'wait' },
+  { method: 'POST', path: new RegExp(`^/containers/${ID}/kill$`), action: 'kill' },
+  { method: 'POST', path: new RegExp(`^/containers/${ID}/stop$`), action: 'stop' },
+  // A read about the job's own container, like inspect.
+  { method: 'GET', path: new RegExp(`^/containers/${ID}/logs$`), action: 'logs' },
   { method: 'DELETE', path: new RegExp(`^/containers/${ID}$`), action: 'remove' },
+  { method: 'POST', path: /^\/networks\/create$/, action: 'network-create' },
+  { method: 'GET', path: new RegExp(`^/networks/${ID}$`), action: 'network-inspect' },
+  { method: 'DELETE', path: new RegExp(`^/networks/${ID}$`), action: 'network-remove' },
+  // Listing enumerates the daemon, like the container list; no key grants it.
+  { method: 'GET', path: /^\/networks$/, action: 'network-list' },
   { method: 'POST', path: /^\/build$/, action: 'build' },
+  // BuildKit's session and stream. Named so the refusal can say why, rather
+  // than falling through to "unknown endpoint".
+  { method: 'POST', path: /^\/grpc$/, action: 'buildkit' },
+  { method: 'POST', path: /^\/session$/, action: 'buildkit' },
 ];
+
+/** The image reference an inspect addresses, decoded, or undefined. */
+export function imageRefFrom(req: DockerRequest): string | undefined {
+  const match = /^\/images\/(.+)\/json$/.exec(req.path);
+  if (!match) return undefined;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return match[1];
+  }
+}
+
+/** Per-network endpoints, for scoping to networks this socket created. */
+const NETWORK_ID_PATHS: ReadonlyArray<RegExp> = [new RegExp(`^/networks/(${ID})$`)];
+
+/** The network a request addresses, or undefined when it addresses none. */
+export function networkIdFrom(req: DockerRequest): string | undefined {
+  for (const pattern of NETWORK_ID_PATHS) {
+    const match = pattern.exec(req.path);
+    if (match) return match[1];
+  }
+  return undefined;
+}
 
 /** Per-container endpoints, for scoping an action to the containers this socket created. */
 const CONTAINER_ID_PATHS: ReadonlyArray<RegExp> = [
@@ -117,6 +191,9 @@ const CONTAINER_ID_PATHS: ReadonlyArray<RegExp> = [
   new RegExp(`^/containers/(${ID})/start$`),
   new RegExp(`^/containers/(${ID})/attach$`),
   new RegExp(`^/containers/(${ID})/wait$`),
+  new RegExp(`^/containers/(${ID})/kill$`),
+  new RegExp(`^/containers/(${ID})/stop$`),
+  new RegExp(`^/containers/(${ID})/logs$`),
   new RegExp(`^/containers/(${ID})$`),
 ];
 

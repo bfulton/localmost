@@ -13,8 +13,8 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { DockerPolicy, DockerMount, MountMode } from '../../shared/docker-policy';
-import { DockerRequest, DockerAction, classifyDockerRequest, containerIdFrom } from './docker-request';
+import { DockerPolicy, DockerMount, DockerNetworkPolicy, MountMode } from '../../shared/docker-policy';
+import { DockerRequest, DockerAction, classifyDockerRequest, containerIdFrom, imageRefFrom, networkIdFrom } from './docker-request';
 
 export interface DockerEvalContext {
   /** The bound policy; null until the worker claims a job, which denies all. */
@@ -33,6 +33,12 @@ export interface DockerEvalContext {
    * operator and with other jobs, so an unscoped id reaches outside this job.
    */
   ownContainerIds?: ReadonlySet<string>;
+  /**
+   * Networks created through this socket, by id and by name. A container may
+   * join one of these as well as the declared `run.network`, which is the
+   * whole point of letting a job create one.
+   */
+  ownNetworkIds?: ReadonlySet<string>;
   /** Injected for tests; defaults to fs.realpathSync. Must throw when the path does not exist. */
   realpath?: (p: string) => string;
 }
@@ -43,6 +49,13 @@ export interface DockerVerdict {
   reason?: string;
   /** The policy that would permit it, as YAML under `docker:` (for --updaterc discovery). */
   policyHint?: string;
+  /**
+   * A create body whose mount sources are rewritten to the paths this verdict
+   * actually checked. Forwarding the spelling the client sent would let the
+   * daemon resolve it a second time, and the job can swap a symlink in the gap
+   * between the two resolutions; forwarding what was checked closes that.
+   */
+  rewrittenBody?: unknown;
 }
 
 const ALLOW: DockerVerdict = { allowed: true };
@@ -54,6 +67,31 @@ const deny = (reason: string, policyHint?: string): DockerVerdict =>
 // start. Container reads are NOT here - the baseline is reads about the job's
 // OWN containers, which is enforced per id below.
 const BASELINE: ReadonlySet<DockerAction> = new Set(['ping', 'version', 'info']);
+
+/**
+ * Every value whose key case-insensitively equals `name`.
+ *
+ * The daemon decodes these bodies with Go's encoding/json, which matches a
+ * struct field by exact name and then, as a documented fallback, case
+ * -insensitively. Reading `hostConfig.Privileged` in JS therefore sees nothing
+ * in a body that says "privileged", while the daemon honours it - so the
+ * filter must consider every casing, not the one it expects.
+ */
+function valuesFor(obj: Record<string, unknown>, name: string): unknown[] {
+  const wanted = name.toLowerCase();
+  const out: unknown[] = [];
+  for (const [key, value] of Object.entries(obj)) {
+    if (key.toLowerCase() === wanted) out.push(value);
+  }
+  return out;
+}
+
+/** The value the daemon would use: the exact-cased key if present, else any case-insensitive match. */
+function pick(obj: Record<string, unknown>, name: string): unknown {
+  if (Object.prototype.hasOwnProperty.call(obj, name)) return obj[name];
+  const matches = valuesFor(obj, name);
+  return matches.length > 0 ? matches[0] : undefined;
+}
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -73,6 +111,8 @@ const hints = {
   registry: (registry: string) => `docker:\n  pull:\n    registries:\n      - ${registry}`,
   build: 'docker:\n  build:\n    context: "./"',
   privileged: 'docker:\n  privileged: true',
+  network_declaration: (name: string, internal: boolean) =>
+    `docker:\n  run:\n    networks:\n      - name: ${yamlString(name)}\n        internal: ${internal}`,
 };
 
 // -----------------------------------------------------------------------------
@@ -127,8 +167,56 @@ const oneOf = (...allowed: string[]) => (v: unknown): boolean => isUnset(v) || a
  * only permitted values are the defaults the docker CLI sends for it; the
  * shapes are bounded by the API version the proxy pins.
  */
+/**
+ * HostConfig keys the filter understands and will forward.
+ *
+ * An allowlist, not a blocklist: enumerating the dangerous keys means every
+ * key nobody thought of - and every key a future API version adds - is
+ * forwarded unexamined. PortBindings was exactly that, publishing a container
+ * port on the operator's interfaces, outside the proxy that controls the job's
+ * egress. A key absent from this list is refused, which is the same principle
+ * the grammar applies to itself: what cannot be named cannot be requested.
+ *
+ * These are the keys an ordinary `docker run` sends. Each is either inert
+ * (resource limits, logging, restart behaviour) or gated below.
+ */
+const HOST_CONFIG_KNOWN: ReadonlySet<string> = new Set([
+  // Gated below by value, or checked by the mount and network logic.
+  'privileged', 'binds', 'mounts', 'networkmode', 'containeridfile', 'portbindings', 'publishallports',
+  'pidmode', 'ipcmode', 'utsmode', 'usernsmode', 'cgroupnsmode', 'cgroupparent', 'cgroup',
+  'devices', 'devicerequests', 'devicecgrouprules', 'securityopt', 'capadd', 'sysctls', 'runtime',
+  'isolation', 'maskedpaths', 'readonlypaths', 'volumesfrom', 'extrahosts', 'groupadd', 'links',
+  'volumedriver',
+  // Inert: they bound the container, they do not widen it. Dropping capabilities
+  // and setting resource limits or DNS search only ever restricts.
+  'capdrop', 'autoremove', 'restartpolicy', 'logconfig', 'consolesize', 'readonlyrootfs', 'init',
+  'oomscoreadj', 'oomkilldisable', 'shmsize', 'memory', 'memoryswap', 'memoryreservation',
+  'memoryswappiness', 'kernelmemory', 'nanocpus', 'cpushares', 'cpuperiod', 'cpuquota',
+  'cpurealtimeperiod', 'cpurealtimeruntime', 'cpusetcpus', 'cpusetmems', 'cpucount', 'cpupercent',
+  'blkioweight', 'blkioweightdevice', 'blkiodevicereadbps', 'blkiodevicewritebps',
+  'blkiodevicereadiops', 'blkiodevicewriteiops', 'pidslimit', 'dns', 'dnsoptions', 'dnssearch',
+  'annotations', 'tmpfs', 'ulimits', 'iomaximumbandwidth', 'iomaximumiops',
+]);
+
 const HOST_CONFIG_GATES: ReadonlyArray<{ key: string; permitted: (v: unknown) => boolean; flag: string }> = [
+  // The daemon writes the new container's id to this HOST path, so a non-empty
+  // value creates or truncates a file anywhere the daemon can reach. The CLI
+  // always sends it, empty.
+  { key: 'ContainerIDFile', permitted: isEmptyString, flag: '--cidfile' },
+  // Publishing binds a listening socket on the operator's interfaces, exposing
+  // a container service to their network and outside the proxy that controls
+  // this job's egress. The CLI sends both, empty, on every run.
+  { key: 'PortBindings', permitted: isEmptyObject, flag: '-p/--publish' },
+  { key: 'PublishAllPorts', permitted: (v: unknown) => isUnset(v) || v === false, flag: '-P/--publish-all' },
   { key: 'PidMode', permitted: isEmptyString, flag: '--pid' },
+  // Each is sent empty by every ordinary run, and each reaches outside the
+  // container when it is not: a cgroup to join, hosts entries, extra groups,
+  // a link to another job's container, or a volume driver that can bind-mount.
+  { key: 'Cgroup', permitted: isEmptyString, flag: '--cgroup' },
+  { key: 'ExtraHosts', permitted: isEmptyArray, flag: '--add-host' },
+  { key: 'GroupAdd', permitted: isEmptyArray, flag: '--group-add' },
+  { key: 'Links', permitted: isEmptyArray, flag: '--link' },
+  { key: 'VolumeDriver', permitted: isEmptyString, flag: '--volume-driver' },
   { key: 'IpcMode', permitted: oneOf('', 'private', 'none', 'shareable'), flag: '--ipc' },
   { key: 'UTSMode', permitted: isEmptyString, flag: '--uts' },
   { key: 'UsernsMode', permitted: isEmptyString, flag: '--userns' },
@@ -192,31 +280,44 @@ function parseBind(bind: string): MountRequest | string {
 /** Parse one entry of HostConfig.Mounts; null when it needs no host check. */
 function parseMount(mount: unknown): MountRequest | string | null {
   if (!isPlainObject(mount)) return 'each entry of HostConfig.Mounts must be an object';
-  const type = mount.Type;
+  const type = pick(mount, 'Type');
   if (type === 'tmpfs') return null;
   if (type === 'volume') {
-    if (isEmptyString(mount.Source)) return null; // anonymous: lives with the container
-    return `"${mount.Source}" is a named volume, not a workspace path; only declared workspace mounts are permitted`;
+    // A volume is only container-lifecycle storage while it uses the default
+    // driver with no options. The built-in local driver with
+    // type=none,o=bind,device=<path> IS a bind mount - the mechanism compose
+    // exposes as driver_opts - so an "anonymous" volume carrying driver
+    // options reaches an arbitrary host path, read-write, having skipped every
+    // mount check because it declares no Source.
+    const volumeOptions = pick(mount, 'VolumeOptions');
+    if (isPlainObject(volumeOptions) && !isUnset(pick(volumeOptions, 'DriverConfig'))) {
+      return 'a volume with DriverConfig is not permitted: a volume driver can bind-mount a host path, which only a declared workspace mount may do';
+    }
+    if (isEmptyString(pick(mount, 'Source'))) return null; // anonymous: lives with the container
+    return `"${String(pick(mount, 'Source'))}" is a named volume, not a workspace path; only declared workspace mounts are permitted`;
   }
   if (type !== 'bind') return `mount type "${String(type)}" is not permitted`;
-  if (typeof mount.Source !== 'string' || !path.isAbsolute(mount.Source)) {
+  const source = pick(mount, 'Source');
+  if (typeof source !== 'string' || !path.isAbsolute(source)) {
     return 'a bind mount needs an absolute Source';
   }
-  const options = mount.BindOptions;
+  const options = pick(mount, 'BindOptions');
   if (options !== undefined && options !== null) {
     if (!isPlainObject(options)) return 'BindOptions must be an object';
-    const propagation = options.Propagation ?? '';
+    const propagation = pick(options, 'Propagation') ?? '';
     if (!PROPAGATIONS.has(propagation as string)) {
       return `mount propagation "${String(propagation)}" is not permitted`;
     }
   }
-  return { source: mount.Source, mode: mount.ReadOnly === true ? 'ro' : 'rw' };
+  // Any casing that says read-only counts; a mount is rw only when none does.
+  const readOnly = valuesFor(mount, 'ReadOnly').some((v) => v === true);
+  return { source, mode: readOnly ? 'ro' : 'rw' };
 }
 
 function collectMounts(hostConfig: Record<string, unknown>): MountRequest[] | string {
   const requests: MountRequest[] = [];
-  const binds = hostConfig.Binds;
-  if (!isUnset(binds)) {
+  for (const binds of valuesFor(hostConfig, 'Binds')) {
+    if (isUnset(binds)) continue;
     if (!Array.isArray(binds)) return 'HostConfig.Binds must be an array';
     for (const bind of binds) {
       if (typeof bind !== 'string') return 'each entry of HostConfig.Binds must be a string';
@@ -225,8 +326,8 @@ function collectMounts(hostConfig: Record<string, unknown>): MountRequest[] | st
       requests.push(parsed);
     }
   }
-  const mounts = hostConfig.Mounts;
-  if (!isUnset(mounts)) {
+  for (const mounts of valuesFor(hostConfig, 'Mounts')) {
+    if (isUnset(mounts)) continue;
     if (!Array.isArray(mounts)) return 'HostConfig.Mounts must be an array';
     for (const mount of mounts) {
       const parsed = parseMount(mount);
@@ -244,7 +345,12 @@ function declaredMountPermits(declared: DockerMount, root: string, resolved: str
   return declared.mode === 'rw' || mode === 'ro';
 }
 
-function checkMounts(hostConfig: Record<string, unknown>, ctx: DockerEvalContext, declared: DockerMount[]): DockerVerdict {
+function checkMounts(
+  hostConfig: Record<string, unknown>,
+  ctx: DockerEvalContext,
+  declared: DockerMount[],
+  resolutions?: Map<string, string>
+): DockerVerdict {
   const requests = collectMounts(hostConfig);
   if (typeof requests === 'string') return deny(requests);
   const realpath = ctx.realpath ?? ((p: string) => fs.realpathSync(p));
@@ -270,6 +376,7 @@ function checkMounts(hostConfig: Record<string, unknown>, ctx: DockerEvalContext
         hints.mount(relative, mode)
       );
     }
+    resolutions?.set(source, resolved);
   }
   return ALLOW;
 }
@@ -277,6 +384,43 @@ function checkMounts(hostConfig: Record<string, unknown>, ctx: DockerEvalContext
 // -----------------------------------------------------------------------------
 // Actions
 // -----------------------------------------------------------------------------
+
+/** A copy of the create body with every bind source replaced by its resolved path. */
+function pinMountSources(body: Record<string, unknown>, resolved: Map<string, string>): unknown {
+  const pinned: Record<string, unknown> = { ...body };
+  for (const hostConfigKey of Object.keys(pinned)) {
+    if (hostConfigKey.toLowerCase() !== 'hostconfig') continue;
+    const hostConfig = pinned[hostConfigKey];
+    if (!isPlainObject(hostConfig)) continue;
+    const copy: Record<string, unknown> = { ...hostConfig };
+    for (const key of Object.keys(copy)) {
+      const name = key.toLowerCase();
+      if (name === 'binds' && Array.isArray(copy[key])) {
+        copy[key] = (copy[key] as unknown[]).map((bind) => {
+          if (typeof bind !== 'string') return bind;
+          const parts = bind.split(':');
+          const target = resolved.get(parts[0]);
+          if (target === undefined) return bind;
+          return [target, ...parts.slice(1)].join(':');
+        });
+      }
+      if (name === 'mounts' && Array.isArray(copy[key])) {
+        copy[key] = (copy[key] as unknown[]).map((mount) => {
+          if (!isPlainObject(mount)) return mount;
+          const entry: Record<string, unknown> = { ...mount };
+          for (const mountKey of Object.keys(entry)) {
+            if (mountKey.toLowerCase() !== 'source') continue;
+            const source = entry[mountKey];
+            if (typeof source === 'string' && resolved.has(source)) entry[mountKey] = resolved.get(source);
+          }
+          return entry;
+        });
+      }
+    }
+    pinned[hostConfigKey] = copy;
+  }
+  return pinned;
+}
 
 function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: DockerPolicy): DockerVerdict {
   const body = req.body;
@@ -286,12 +430,13 @@ function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: Dock
     return deny('the repository docker policy declares no run action', image ? hints.image(image) : hints.run);
   }
 
-  const hostConfig = body.HostConfig ?? {};
+  const hostConfig = pick(body, 'HostConfig') ?? {};
   if (!isPlainObject(hostConfig)) return deny('HostConfig must be an object');
 
   // Host-reaching settings first: none of these can be permitted by policy,
   // so the verdict does not depend on anything else in the request.
-  if (hostConfig.Privileged === true) {
+  const privilegedValues = valuesFor(hostConfig, 'Privileged');
+  if (privilegedValues.some((v) => v === true)) {
     if (!policy.privileged) {
       return deny(
         'privileged containers are not declared in the repository docker policy; `privileged: true` requires a managed VM backend',
@@ -301,42 +446,73 @@ function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: Dock
     if (!ctx.supportsPrivileged) {
       return deny('the repository docker policy declares privileged, which requires a managed VM backend; this daemon is not one');
     }
-  } else if (!isUnset(hostConfig.Privileged) && hostConfig.Privileged !== false) {
+  } else if (privilegedValues.some((v) => !isUnset(v) && v !== false)) {
     return deny('HostConfig.Privileged must be a boolean');
   }
+  for (const key of Object.keys(hostConfig)) {
+    if (!HOST_CONFIG_KNOWN.has(key.toLowerCase())) {
+      return deny(
+        `HostConfig.${key} is not a setting the localmost docker socket understands, so it cannot be forwarded`
+      );
+    }
+  }
+
   for (const gate of HOST_CONFIG_GATES) {
-    if (!gate.permitted(hostConfig[gate.key])) {
+    // Every casing must pass: one that does not is a value the daemon honours.
+    if (!valuesFor(hostConfig, gate.key).every((v) => gate.permitted(v))) {
       return deny(`${gate.flag} (HostConfig.${gate.key}) reaches the host and cannot be permitted by policy`);
     }
   }
 
   // Image.
-  if (typeof body.Image !== 'string' || body.Image === '') return deny('container create requires an Image');
-  const wanted = normalizeImage(body.Image);
-  if (!(policy.run.images ?? []).some((declared) => normalizeImage(declared) === wanted)) {
-    return deny(
-      `image "${body.Image}" is not declared in the repository docker policy (run.images)`,
-      hints.image(body.Image)
-    );
+  const imageValues = valuesFor(body, 'Image');
+  const image = pick(body, 'Image');
+  if (typeof image !== 'string' || image === '') return deny('container create requires an Image');
+  // Every casing must name a declared image: the daemon uses one of them, and
+  // which one is not worth depending on.
+  for (const candidate of imageValues) {
+    if (typeof candidate !== 'string' || candidate === '') return deny('container create requires an Image');
+    const wanted = normalizeImage(candidate);
+    if (!(policy.run.images ?? []).some((declared) => globMatches(normalizeImage(declared), wanted))) {
+      return deny(
+        `image "${candidate}" is not declared in the repository docker policy (run.images)`,
+        hints.image(candidate)
+      );
+    }
   }
 
   // Network. Absent, empty and "default" are the daemon default, bridge.
-  const rawMode = hostConfig.NetworkMode;
-  let mode: string;
-  if (isUnset(rawMode) || rawMode === '' || rawMode === 'default') mode = 'bridge';
-  else if (typeof rawMode === 'string') mode = rawMode;
-  else return deny('HostConfig.NetworkMode must be a string');
-  if (mode === 'host' || mode.startsWith('container:')) {
-    return deny(`--network=${mode} (HostConfig.NetworkMode) reaches the host and cannot be permitted by policy`);
+  const modeValues = valuesFor(hostConfig, 'NetworkMode');
+  const rawModes: unknown[] = modeValues.length > 0 ? modeValues : [undefined];
+  let mode = 'bridge';
+  for (const rawMode of rawModes) {
+    let candidate: string;
+    if (isUnset(rawMode) || rawMode === '' || rawMode === 'default') candidate = 'bridge';
+    else if (typeof rawMode === 'string') candidate = rawMode;
+    else return deny('HostConfig.NetworkMode must be a string');
+    if (candidate === 'host' || candidate.startsWith('container:')) {
+      return deny(`--network=${candidate} (HostConfig.NetworkMode) reaches the host and cannot be permitted by policy`);
+    }
+    // The most restrictive reading wins when casings disagree.
+    if (candidate !== 'bridge') mode = candidate;
   }
-  if (mode !== 'none' && mode !== policy.run.network) {
+  // A network this job created is as good as the declared one: creating it was
+  // already checked against run.networks, and refusing to join it would make
+  // declaring one pointless.
+  if (mode !== 'none' && mode !== policy.run.network && !ctx.ownNetworkIds?.has(mode)) {
     return deny(
       `network mode "${mode}" is not declared in the repository docker policy (run.network)`,
       hints.network(mode)
     );
   }
 
-  return checkMounts(hostConfig, ctx, policy.run.mounts ?? []);
+  // Pin every mount source to the path that was actually checked, so the
+  // daemon mounts what the filter judged rather than re-resolving a name the
+  // job can point somewhere else in between.
+  const resolutions = new Map<string, string>();
+  const verdict = checkMounts(hostConfig, ctx, policy.run.mounts ?? [], resolutions);
+  if (!verdict.allowed || resolutions.size === 0) return verdict;
+  return { allowed: true, rewrittenBody: pinMountSources(body, resolutions) };
 }
 
 function evaluatePull(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
@@ -358,6 +534,139 @@ function evaluatePull(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
   return ALLOW;
 }
 
+/**
+ * Build query parameters the filter understands.
+ *
+ * An allowlist for the same reason HostConfig is one: `docker build` carries
+ * its whole configuration in the query string, so anything not enumerated is
+ * forwarded unexamined. `networkmode` is gated separately below, since it is
+ * the same host reach the run path already refuses.
+ */
+const BUILD_PARAMS_KNOWN: ReadonlySet<string> = new Set([
+  't', 'dockerfile', 'q', 'nocache', 'rm', 'forcerm', 'pull', 'buildargs', 'labels', 'target',
+  'shmsize', 'memory', 'memswap', 'cpushares', 'cpusetcpus', 'cpuperiod', 'cpuquota', 'squash',
+  'platform', 'version', 'buildid', 'session',
+]);
+
+/** Keys a network create may carry freely: they name the network or are inert. */
+const NETWORK_CREATE_KNOWN: ReadonlySet<string> = new Set(['name', 'internal', 'checkduplicate', 'labels', 'driver']);
+
+/** Is an IPAM block the default one the CLI always sends, granting nothing? */
+const isDefaultIpam = (v: unknown): boolean => {
+  if (isUnset(v)) return true;
+  if (!isPlainObject(v)) return false;
+  const driver = pick(v, 'Driver');
+  if (!isUnset(driver) && driver !== '' && driver !== 'default') return false;
+  return isEmptyObject(pick(v, 'Options')) && isEmptyArray(pick(v, 'Config'));
+};
+
+/**
+ * Keys the docker CLI sends on every `network create` with an inert value.
+ *
+ * Refusing them outright made the feature reachable only from a hand-written
+ * API client - the CLI sends all of these unconditionally. So they are gated by
+ * value, exactly as HostConfig gates the keys a plain `docker run` always
+ * sends: the default passes, anything meaningful is refused.
+ */
+const NETWORK_CREATE_GATES: ReadonlyArray<{ key: string; permitted: (v: unknown) => boolean; why: string }> = [
+  { key: 'Scope', permitted: isEmptyString, why: 'a scope reaches beyond this daemon' },
+  { key: 'IPAM', permitted: isDefaultIpam, why: 'an IPAM driver or subnet places the network on a chosen address range' },
+  { key: 'Options', permitted: isEmptyObject, why: 'driver options can bind a bridge to a host address' },
+  { key: 'Attachable', permitted: (v) => isUnset(v) || v === false, why: 'an attachable network can be joined from outside this job' },
+  { key: 'Ingress', permitted: (v) => isUnset(v) || v === false, why: 'an ingress network is swarm routing mesh' },
+  { key: 'ConfigOnly', permitted: (v) => isUnset(v) || v === false, why: 'a config-only network is a template for others' },
+  { key: 'ConfigFrom', permitted: (v) => isUnset(v) || isEmptyObject(v), why: 'it copies configuration from another network' },
+  { key: 'EnableIPv6', permitted: (v) => isUnset(v) || v === false, why: 'IPv6 is not part of what the grammar can describe' },
+];
+
+/**
+ * An anchored glob. `*` matches any run of characters except `/`, and nothing
+ * else is special.
+ *
+ * Anchored so a declared name cannot be widened by a prefix: `vk-*` does not
+ * match `other-vk-abc`. Stopping at `/` for the same reason one level down - a
+ * glob that silently spans path separators reads as narrower than it is, so
+ * `vk/*:*` reaches one level under `vk` and no further, and each extra segment
+ * has to be asked for. A tag glob is unaffected, since a tag cannot contain a
+ * slash: `vk/grader:*` still covers a content-addressed tag.
+ *
+ * The tag is a second boundary, and it comes from normalisation rather than
+ * from here: a declaration with no tag normalises to `:latest`, so `vk/*` is
+ * matched as `vk/*:latest` and covers only latest. That reads as far wider
+ * than it is, so validation refuses a tagless glob and names `vk/*:*`; the
+ * behaviour is pinned by test rather than relied upon.
+ */
+function globMatches(pattern: string, value: string): boolean {
+  const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, (c) => (c === '*' ? '\u0000' : `\\${c}`));
+  return new RegExp(`^${escaped.split('\u0000').join('[^/]*')}$`).test(value);
+}
+
+function evaluateNetworkCreate(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
+  const declared: DockerNetworkPolicy[] = policy.run?.networks ?? [];
+  if (declared.length === 0) {
+    return deny(
+      'the repository docker policy declares no networks',
+      hints.network_declaration('name-of-your-network', true)
+    );
+  }
+  const body = req.body;
+  if (!isPlainObject(body)) return deny('network create requires a JSON body');
+
+  const gatedKeys = new Set(NETWORK_CREATE_GATES.map((g) => g.key.toLowerCase()));
+  for (const key of Object.keys(body)) {
+    const name = key.toLowerCase();
+    if (NETWORK_CREATE_KNOWN.has(name) || gatedKeys.has(name)) continue;
+    return deny(`network create parameter "${key}" is not one the localmost docker socket understands`);
+  }
+  for (const gate of NETWORK_CREATE_GATES) {
+    // Every casing must pass: the daemon decodes these case-insensitively.
+    if (!valuesFor(body, gate.key).every((v) => gate.permitted(v))) {
+      return deny(`network ${gate.key} is not permitted: ${gate.why}`);
+    }
+  }
+
+  // The filter creates a plain bridge or nothing. macvlan and ipvlan put a
+  // container on the physical LAN, which is worse than host networking.
+  for (const driver of valuesFor(body, 'Driver')) {
+    if (!isUnset(driver) && driver !== '' && driver !== 'bridge') {
+      return deny(`network driver "${String(driver)}" is not permitted; the localmost docker socket creates bridge networks only`);
+    }
+  }
+
+  const names = valuesFor(body, 'Name');
+  if (names.length === 0) return deny('network create requires a Name');
+  const internalValues = valuesFor(body, 'Internal');
+  const internal = internalValues.length > 0 && internalValues.every((v) => v === true);
+
+  // Every casing must name a declared network, since which one the daemon uses
+  // is not worth depending on.
+  for (const name of names) {
+    if (typeof name !== 'string' || name === '') return deny('network create requires a Name');
+    const match = declared.find((n) => globMatches(n.name, name));
+    if (!match) {
+      return deny(
+        `network "${name}" is not declared in the repository docker policy (run.networks)`,
+        hints.network_declaration(name, internal)
+      );
+    }
+    if (match.internal && !internal) {
+      return deny(
+        `network "${name}" is declared internal, so it cannot be created routable`,
+        hints.network_declaration(match.name, false)
+      );
+    }
+  }
+  return ALLOW;
+}
+
+/** Permit a per-network request only against a network this socket created. */
+function evaluateOwnNetwork(req: DockerRequest, ctx: DockerEvalContext): DockerVerdict {
+  const id = networkIdFrom(req);
+  if (!id) return deny(`${req.method} ${req.path} is not permitted through the localmost docker socket`);
+  if (ctx.ownNetworkIds?.has(id)) return ALLOW;
+  return deny(`network "${id}" was not created through this job's docker socket`);
+}
+
 function evaluateBuild(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
   if (!policy.build) return deny('the repository docker policy declares no build action', hints.build);
   // The Engine API carries the context as a tar the client assembled from
@@ -367,21 +676,47 @@ function evaluateBuild(req: DockerRequest, policy: DockerPolicy): DockerVerdict 
   if (req.query.remote !== undefined) {
     return deny('a remote build context is not permitted; send the context with the request');
   }
+
+  for (const key of Object.keys(req.query)) {
+    const name = key.toLowerCase();
+    if (name === 'networkmode') continue;
+    if (!BUILD_PARAMS_KNOWN.has(name)) {
+      return deny(`build parameter "${key}" is not one the localmost docker socket understands, so it cannot be forwarded`);
+    }
+  }
+
+  // A build runs containers, and its network is chosen here rather than in a
+  // HostConfig - so the same rule the run path applies has to apply here too,
+  // or `docker build --network host` walks through a door create keeps shut.
+  const rawMode = req.query.networkmode ?? req.query.NetworkMode;
+  if (rawMode !== undefined && rawMode !== '' && rawMode !== 'default') {
+    if (rawMode === 'host' || rawMode.startsWith('container:')) {
+      return deny(`--network=${rawMode} on a build reaches the host and cannot be permitted by policy`);
+    }
+    if (rawMode !== 'none' && rawMode !== policy.run?.network) {
+      return deny(
+        `build network "${rawMode}" is not declared in the repository docker policy (run.network)`,
+        hints.network(rawMode)
+      );
+    }
+  }
+
   return ALLOW;
 }
 
 /**
- * Permit a per-container request only against a container this socket created.
- * The daemon accepts a unique id prefix, so a known id whose prefix was given
- * counts as the same container; anything else is another job's, or the
- * operator's, and is refused.
+ * Permit a per-container request only against a container this socket created,
+ * addressed by the id the daemon assigned or the name the job asked for.
+ * Anything else is another job's container, or the operator's, and is refused.
  */
 function evaluateOwnContainer(req: DockerRequest, ctx: DockerEvalContext): DockerVerdict {
   const id = containerIdFrom(req);
   if (!id) return deny(`${req.method} ${req.path} is not permitted through the localmost docker socket`);
 
-  const own = ctx.ownContainerIds;
-  if (own && (own.has(id) || [...own].some((known) => known.startsWith(id)))) return ALLOW;
+  // Exact match only. A bare prefix used to count, on the reasoning that the
+  // daemon accepts one - but a prefix of a container this job has since
+  // removed can resolve on the shared daemon to somebody else's.
+  if (ctx.ownContainerIds?.has(id)) return ALLOW;
 
   return deny(
     `container "${id}" was not created through this job's docker socket; only this job's own containers can be addressed`
@@ -391,6 +726,47 @@ function evaluateOwnContainer(req: DockerRequest, ctx: DockerEvalContext): Docke
 // -----------------------------------------------------------------------------
 // Entry point
 // -----------------------------------------------------------------------------
+
+/**
+ * The first key in `value` that has a case-variant twin, named with its path.
+ *
+ * Measured against a real daemon rather than reasoned about: a create body
+ * carrying `HostConfig`, `hostconfig` and `HOSTCONFIG` came back with fields
+ * from ALL THREE - Go decodes each key into the same struct field in document
+ * order, so nested objects merge, while scalars and arrays inside one object
+ * are last-wins. There is no single value a filter can read and be right
+ * about: reading the first misses what the later ones added, and reading the
+ * last misses what the first one set.
+ *
+ * So the ambiguity is refused instead of modelled. Go's encoder emits unique,
+ * exactly-cased keys, so no real client sends a case-variant duplicate; a body
+ * that does is either a client the filter does not model or an attempt to be
+ * judged on one value and served another.
+ */
+function caseAmbiguity(value: unknown, at = 'the request body'): string | undefined {
+  if (Array.isArray(value)) {
+    for (const [i, item] of value.entries()) {
+      const found = caseAmbiguity(item, `${at}[${i}]`);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  if (!isPlainObject(value)) return undefined;
+  const seen = new Map<string, string>();
+  for (const key of Object.keys(value)) {
+    const folded = key.toLowerCase();
+    const first = seen.get(folded);
+    if (first !== undefined) {
+      return `${at} names both "${first}" and "${key}", which the daemon reads as the same key: it decodes them case-insensitively and merges or overwrites, so the value it would use is not the value this filter can read. Send each key once.`;
+    }
+    seen.set(folded, key);
+  }
+  for (const [key, child] of Object.entries(value)) {
+    const found = caseAmbiguity(child, `${at}.${key}`);
+    if (found) return found;
+  }
+  return undefined;
+}
 
 export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext): DockerVerdict {
   const action = classifyDockerRequest(req);
@@ -402,10 +778,17 @@ export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext
   // A body the parser could not read is a request the filter cannot judge.
   if (req.bodyError) return deny(req.bodyError);
 
+  // Nor can it judge a body whose keys the daemon would read differently than
+  // it does. Checked once, here, so every action with a body is covered.
+  const ambiguous = caseAmbiguity(req.body);
+  if (ambiguous) return deny(ambiguous);
+
   switch (action) {
     case 'create':
       return evaluateCreate(req, ctx, policy);
     case 'inspect':
+    case 'logs':
+      // Reads about the job's own container: the documented baseline, scoped.
       return evaluateOwnContainer(req, ctx);
     case 'list':
       // No policy key grants it: it would enumerate the whole daemon.
@@ -416,12 +799,46 @@ export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext
     case 'attach':
     case 'wait':
     case 'remove':
+    case 'kill':
+    case 'stop':
       if (!policy.run) return deny('the repository docker policy declares no run action', hints.run);
       return evaluateOwnContainer(req, ctx);
     case 'pull':
       return evaluatePull(req, policy);
     case 'build':
       return evaluateBuild(req, policy);
+    case 'image-inspect': {
+      // Scoped by the policy, not by a second ownership ledger: an inspect of
+      // an image run.images already names discloses nothing the policy has not
+      // granted, and the container ledger has already produced one defect.
+      if (!policy.run) return deny('the repository docker policy declares no run action', hints.run);
+      const ref = imageRefFrom(req);
+      if (!ref) return deny(`${req.method} ${req.path} is not permitted through the localmost docker socket`);
+      const wanted = normalizeImage(ref);
+      if (!(policy.run.images ?? []).some((declared) => globMatches(normalizeImage(declared), wanted))) {
+        return deny(
+          `image "${ref}" is not declared in the repository docker policy (run.images)`,
+          hints.image(ref)
+        );
+      }
+      return ALLOW;
+    }
+    case 'network-create':
+      return evaluateNetworkCreate(req, policy);
+    case 'network-inspect':
+    case 'network-remove':
+      return evaluateOwnNetwork(req, ctx);
+    case 'buildkit':
+      return deny(
+        'BuildKit builds cannot be filtered: the build streams over a gRPC session that exports host ' +
+          'filesystem access to the daemon, so no request carries the paths it reads. Jobs are pinned to ' +
+          'the classic builder with DOCKER_BUILDKIT=0, which `build:` policy does describe - seeing this ' +
+          'means something set DOCKER_BUILDKIT back on.'
+      );
+    case 'network-list':
+      return deny(
+        'listing networks is not permitted through the localmost docker socket; it would enumerate networks outside this job'
+      );
     default:
       return deny(`${req.method} ${req.path} is not permitted through the localmost docker socket`);
   }

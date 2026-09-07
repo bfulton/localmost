@@ -12,6 +12,10 @@ permissions:
 
 jobs:
   check:
+    # This workflow deliberately inlines the heartbeat check that check.yaml
+    # offers as a reusable workflow: it is what proves the copy-paste-inline
+    # integration style still works, so the duplication is the point.
+    name: inline runner
     runs-on: ubuntu-latest
     outputs:
       runner: ${{ steps.check.outputs.runner }}

@@ -451,6 +451,28 @@ describe('extractGitHubJobInfo', () => {
   });
 });
 
+describe('the workflow a per-workflow policy section keys on', () => {
+  it('uses the workflow filename, which is what .localmostrc keys are documented to match', () => {
+    const info = extractGitHubJobInfo({ github: { d: [
+      { k: 'workflow', v: 'CI / build and test' },
+      { k: 'workflow_ref', v: 'bfulton/localmost/.github/workflows/ci.yaml@refs/heads/main' },
+    ] } });
+    expect(info.githubWorkflow).toBe('ci');
+  });
+
+  it('handles a .yml extension and a ref containing slashes', () => {
+    const info = extractGitHubJobInfo({ github: { d: [
+      { k: 'workflow_ref', v: 'o/r/.github/workflows/docker-access.yml@refs/pull/35/merge' },
+    ] } });
+    expect(info.githubWorkflow).toBe('docker-access');
+  });
+
+  it('falls back to the workflow name when no ref is supplied', () => {
+    const info = extractGitHubJobInfo({ github: { d: [{ k: 'workflow', v: 'Docker Access' }] } });
+    expect(info.githubWorkflow).toBe('Docker Access');
+  });
+});
+
 describe('message routing', () => {
   interface Instance { sessionId?: string; runner: { agentName: string } }
   interface RoutingInternals {

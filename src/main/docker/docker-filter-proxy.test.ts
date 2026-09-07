@@ -610,3 +610,224 @@ describe('container ownership tracking', () => {
     expect((await request(sock, 'GET', '/v1.45/containers/theirs999/json')).status).toBe(403);
   });
 });
+
+const rawUpgrade = (sock: string, method: string, url: string): Promise<{ head: string; socket: net.Socket }> =>
+  new Promise((resolve, reject) => {
+    const socket = net.connect(sock);
+    let buffered = '';
+    const onData = (data: Buffer) => {
+      buffered += data.toString();
+      const end = buffered.indexOf('\r\n\r\n');
+      if (end === -1) return;
+      socket.off('data', onData);
+      resolve({ head: buffered.slice(0, end), socket });
+    };
+    socket.on('data', onData);
+    socket.on('error', reject);
+    socket.on('connect', () => {
+      socket.write(`${method} ${url} HTTP/1.1\r\nHost: docker\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n`);
+    });
+  });
+
+describe('upgrade requests', () => {
+  it('does not turn a permitted baseline read into a raw daemon tunnel', async () => {
+    const dir = tmp();
+    const daemon = await fakeDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
+
+    // GET /_ping is in the always-on baseline, so the policy permits it. If an
+    // Upgrade header alone opens a raw pipe, the job holds an unfiltered socket
+    // to the daemon and can pipeline anything over it.
+    const { head, socket } = await rawUpgrade(sock, 'GET', '/v1.45/_ping');
+    expect(head).not.toMatch(/101/);
+
+    // Prove no tunnel: a denied request written on the same socket must not be
+    // answered by the daemon.
+    const smuggled = await new Promise<string>((resolve) => {
+      let got = '';
+      socket.on('data', (d: Buffer) => { got += d.toString(); });
+      socket.write('GET /v1.45/containers/json HTTP/1.1\r\nHost: docker\r\n\r\n');
+      setTimeout(() => resolve(got), 300);
+    });
+    socket.destroy();
+    expect(smuggled).not.toMatch(/"ok"\s*:\s*true|Names|\[\s*\{/);
+  });
+
+  it('refuses an upgrade on a container the socket does not own', async () => {
+    const dir = tmp();
+    const daemon = await fakeAttachDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
+
+    const { head, socket } = await attach(sock, '/v1.45/containers/theirs999/attach?stream=1');
+    socket.destroy();
+    expect(head).not.toMatch(/101/);
+  });
+});
+
+describe('mount sources are pinned before forwarding', () => {
+  it('sends the daemon the resolved path, so a swapped symlink cannot change what is mounted', async () => {
+    const dir = tmp();
+    const workspace = fs.realpathSync.native(dir);
+    const real = path.join(workspace, 'inside');
+    const link = path.join(workspace, 'link');
+    fs.mkdirSync(real);
+    fs.symlinkSync(real, link);
+
+    const daemon = await fakeDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, {
+      backend: { name: 'test', supportsPrivileged: false, resolveEndpoint: () => ({ socketPath: daemon.sock }), workspaceMountRoot: () => workspace },
+    });
+    proxy.bind('owner/repo', { run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'rw' }], network: 'bridge' } });
+
+    const reply = await request(sock, 'POST', '/v1.45/containers/create', {
+      Image: 'postgres:16',
+      HostConfig: { Binds: [`${link}:/ws`] },
+    });
+    expect(reply.status).toBe(201);
+
+    // The filter resolved `link` to decide. If it forwards the spelling it was
+    // given, the daemon resolves it again at mount time and the job can swap
+    // the symlink in between.
+    const create = daemon.seen.find((s) => s.url.includes('/containers/create'))!;
+    const binds = (JSON.parse(create.body.toString()) as { HostConfig: { Binds: string[] } }).HostConfig.Binds;
+    expect(binds[0]).toBe(`${real}:/ws`);
+  });
+});
+
+describe('a request target the filter cannot read', () => {
+  it('is refused, and the connection does not hang', async () => {
+    const dir = tmp();
+    const daemon = await fakeDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
+
+    // Resolve on the response head, not on close: HTTP/1.1 keep-alive means a
+    // correctly-answered request leaves the socket open.
+    const answered = await new Promise<string>((resolve, reject) => {
+      let buffered = '';
+      const client = net.connect(sock);
+      const done = (v: string) => { clearTimeout(timer); client.destroy(); resolve(v); };
+      const timer = setTimeout(() => { client.destroy(); reject(new Error('no answer within 3s: the connection hung')); }, 3000);
+      client.on('connect', () => client.write('GET //evil/v1.45/containers/json HTTP/1.1\r\nHost: docker\r\n\r\n'));
+      client.on('data', (c: Buffer) => { buffered += c.toString(); if (buffered.includes('\r\n\r\n')) done(buffered); });
+      client.on('error', (e) => { clearTimeout(timer); reject(e); });
+      client.on('close', () => { clearTimeout(timer); resolve(buffered); });
+    });
+
+    // 400, naming the target: a target the filter cannot read is a bad
+    // request, not a policy denial, and saying so is the difference between
+    // "fix your URL" and "ask your operator for a grant".
+    expect(answered).toMatch(/^HTTP\/1\.[01] 400/);
+    expect(answered).toMatch(/origin-form|could not be parsed/);
+    // Nothing reached the daemon.
+    expect(daemon.seen).toHaveLength(0);
+    expect(proxy.isRunning()).toBe(true);
+  });
+});
+
+describe('which containers a job may address', () => {
+  const setup = async () => {
+    const dir = tmp();
+    const daemon = await fakeDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
+    return { sock, daemon };
+  };
+
+  it('lets a job address the container it created by --name', async () => {
+    const { sock } = await setup();
+    // docker run --name mine ... -> POST /containers/create?name=mine, and
+    // every later call addresses it as "mine", never as the id.
+    expect((await request(sock, 'POST', '/v1.45/containers/create?name=mine', { Image: 'postgres:16' })).status).toBe(201);
+    expect((await request(sock, 'POST', '/v1.45/containers/mine/start')).status).toBeLessThan(400);
+    expect((await request(sock, 'GET', '/v1.45/containers/mine/json')).status).toBeLessThan(400);
+  });
+
+  it('forgets a container once it is removed, so its name cannot be reused', async () => {
+    const { sock } = await setup();
+    await request(sock, 'POST', '/v1.45/containers/create?name=mine', { Image: 'postgres:16' });
+    expect((await request(sock, 'DELETE', '/v1.45/containers/mine')).status).toBeLessThan(400);
+    // The container is gone; the daemon may hand that name to anyone next.
+    expect((await request(sock, 'GET', '/v1.45/containers/mine/json')).status).toBe(403);
+    expect((await request(sock, 'GET', '/v1.45/containers/abc123/json')).status).toBe(403);
+  });
+
+  it('does not accept a bare prefix of an owned id', async () => {
+    const { sock } = await setup();
+    // The fake daemon answers create with Id abc123. A prefix could resolve on
+    // the real daemon to a container this job never created.
+    expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'postgres:16' })).status).toBe(201);
+    expect((await request(sock, 'GET', '/v1.45/containers/abc123/json')).status).toBeLessThan(400);
+    expect((await request(sock, 'GET', '/v1.45/containers/ab/json')).status).toBe(403);
+  });
+});
+
+describe('networks a job creates', () => {
+  it('may be read, joined and deleted, and are forgotten once removed', async () => {
+    const dir = tmp();
+    const daemon = await networkDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', {
+      run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] },
+    });
+
+    expect((await request(sock, 'POST', '/v1.45/networks/create', { Name: 'vk-1', Internal: true })).status).toBe(201);
+
+    // Both the id the daemon assigned and the name the job asked for.
+    expect((await request(sock, 'GET', '/v1.45/networks/net123')).status).toBeLessThan(400);
+    expect((await request(sock, 'GET', '/v1.45/networks/vk-1')).status).toBeLessThan(400);
+    // A container may join it.
+    expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3', HostConfig: { NetworkMode: 'vk-1' } })).status).toBe(201);
+    // Someone else's network is still refused.
+    expect((await request(sock, 'GET', '/v1.45/networks/theirs')).status).toBe(403);
+
+    expect((await request(sock, 'DELETE', '/v1.45/networks/vk-1')).status).toBeLessThan(400);
+    expect((await request(sock, 'GET', '/v1.45/networks/vk-1')).status).toBe(403);
+    expect((await request(sock, 'GET', '/v1.45/networks/net123')).status).toBe(403);
+  });
+
+  it('are recorded under the name whatever casing the client spelled the key with', async () => {
+    // The daemon decodes `name` into the same field as `Name`, so it creates
+    // the network either way, and the evaluator already judges either way.
+    // Reading only `Name` here left the network created but unaddressable: the
+    // job could not join, inspect or delete what it had just made.
+    const dir = tmp();
+    const daemon = await networkDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', {
+      run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] },
+    });
+
+    expect((await request(sock, 'POST', '/v1.45/networks/create', { name: 'vk-1', internal: true })).status).toBe(201);
+
+    expect((await request(sock, 'GET', '/v1.45/networks/vk-1')).status).toBeLessThan(400);
+    expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3', HostConfig: { NetworkMode: 'vk-1' } })).status).toBe(201);
+  });
+});
+
+/** A fake daemon that also answers network create. */
+const networkDaemon = (dir: string): Promise<{ sock: string }> =>
+  new Promise((resolve) => {
+    const sock = path.join(dir, 'netd.sock');
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
+      req.on('end', () => {
+        const p = req.url!.replace(/^\/v\d+\.\d+/, '').split('?')[0];
+        if (p === '/networks/create') {
+          res.writeHead(201, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ Id: 'net123', Warning: '' }));
+        } else if (p === '/containers/create') {
+          res.writeHead(201, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ Id: 'abc123', Warnings: [] }));
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        }
+      });
+    });
+    servers.push(server);
+    server.listen(sock, () => resolve({ sock }));
+  });

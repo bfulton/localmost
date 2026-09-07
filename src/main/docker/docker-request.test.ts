@@ -1,5 +1,5 @@
 import { describe, it, expect } from '@jest/globals';
-import { parseDockerRequest, classifyDockerRequest, DockerAction } from './docker-request';
+import { parseDockerRequest, classifyDockerRequest, containerIdFrom, DockerAction } from './docker-request';
 
 const mk = (method: string, url: string, headers: Record<string, string> = {}, body = Buffer.alloc(0)) =>
   parseDockerRequest({ method, url, headers, body });
@@ -87,7 +87,10 @@ describe('classifyDockerRequest', () => {
 
   it('classifies everything outside the map as other', () => {
     const others: Array<[string, string]> = [
-      ['POST', '/v1.45/networks/create'],
+      // /networks/create is a mapped action now; these are not.
+      ['PUT', '/v1.45/networks/create'],
+      ['POST', '/v1.45/networks/net123'],
+      ['POST', '/v1.45/volumes/create'],
       ['POST', '/v1.45/containers/abc123/exec'],
       ['GET', '/v1.45/build'],
       ['GET', '/v1.45/containers/create'],
@@ -101,5 +104,49 @@ describe('classifyDockerRequest', () => {
     for (const [method, url] of others) {
       expect(classifyDockerRequest(mk(method, url))).toBe('other');
     }
+  });
+});
+
+describe('container lifecycle endpoints the run action covers', () => {
+  const mk = (m: string, u: string) => parseDockerRequest({ method: m, url: u, headers: {}, body: Buffer.alloc(0) });
+
+  it.each([
+    ['POST', '/v1.45/containers/abc/kill', 'kill'],
+    ['POST', '/v1.45/containers/abc/stop', 'stop'],
+    ['GET', '/v1.45/containers/abc/logs?stdout=1', 'logs'],
+  ])('maps %s %s to %s', (method, url, action) => {
+    expect(classifyDockerRequest(mk(method, url))).toBe(action);
+  });
+
+  it('extracts the container id from each of them, so they can be scoped', () => {
+    for (const [m, u] of [['POST', '/v1.45/containers/abc/kill'], ['POST', '/v1.45/containers/abc/stop'], ['GET', '/v1.45/containers/abc/logs']] as const) {
+      expect(containerIdFrom(mk(m, u))).toBe('abc');
+    }
+  });
+});
+
+describe('request targets that are not plain origin-form paths', () => {
+  const parse = (url: string) => parseDockerRequest({ method: 'GET', url, headers: {}, body: Buffer.alloc(0) });
+
+  it('does not throw on a target the URL parser rejects', () => {
+    for (const url of ['//', 'http://[', 'http://user@[::1]:99999/x']) {
+      expect(() => parse(url)).not.toThrow();
+      expect(parse(url).targetError).toBeTruthy();
+    }
+  });
+
+  it('refuses a target carrying an authority, which the filter and the daemon would read differently', () => {
+    // `//evil/x` parses to host=evil, path=/x here, while the daemon reads the
+    // request target as written. Judging one and forwarding the other is how a
+    // filter gets talked past.
+    expect(parse('//evil/v1.45/containers/json').targetError).toBeTruthy();
+    expect(parse('http://evil/v1.45/_ping').targetError).toBeTruthy();
+  });
+
+  it('leaves an ordinary path alone', () => {
+    const req = parse('/v1.45/containers/json?all=1');
+    expect(req.targetError).toBeUndefined();
+    expect(req.path).toBe('/containers/json');
+    expect(req.query.all).toBe('1');
   });
 });
