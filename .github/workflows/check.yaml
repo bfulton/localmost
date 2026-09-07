@@ -53,6 +53,13 @@ jobs:
             echo "No LOCALMOST_HEARTBEAT variable found"
           fi
 
-          # Default: use fallback runner
+          # Default: use fallback runner. Announced here rather than by a
+          # caller, because this is the job that knows: a caller would need
+          # `needs: check` purely to repeat it, which couples a job to one it
+          # does not otherwise depend on and takes it down whenever this one
+          # fails. A job pinned to self-hosted cannot fall back and will queue,
+          # and `timeout-minutes` does not bound time spent waiting for a
+          # runner, so this line is the only warning it gets.
+          echo "::warning title=localmost runner offline::No localmost heartbeat, so this run falls back to $FALLBACK. Any job pinned to the self-hosted runner stays queued until one comes online."
           echo "No localmost runner available, using $FALLBACK"
           echo "runner=$FALLBACK" >> $GITHUB_OUTPUT
