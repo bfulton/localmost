@@ -9,8 +9,8 @@ import * as net from 'net';
 import * as fs from 'fs';
 import { app } from 'electron';
 import { getCliSocketPath } from './paths';
-import { getRunnerManager, getHeartbeatManager, getAuthState } from './app-state';
-import { getSnapshot, selectRunnerStatus, selectEffectivePauseState } from './runner-state-service';
+import { getRunnerManager, getHeartbeatManager, getAuthState, getRunnerState } from './app-state';
+import { getSnapshot, selectEffectivePauseState } from './runner-state-service';
 import { getTargetManager } from './target-manager';
 import { getRunnerProxyManager } from './runner-proxy-manager';
 import type { Target } from '../shared/types';
@@ -190,9 +190,9 @@ export class CliServer {
 
     switch (request.command) {
       case 'status': {
-        // Use state machine for consistent status with UI
+        // Status from the runner; the machine is never told about jobs.
         const snapshot = getSnapshot();
-        const runnerState = snapshot ? selectRunnerStatus(snapshot) : { status: 'offline' as const };
+        const runnerState = getRunnerState();
         const pauseState = snapshot ? selectEffectivePauseState(snapshot) : { isPaused: false, reason: null };
         const runnerName = runnerManager?.getStatusDisplayName() || 'unknown';
 

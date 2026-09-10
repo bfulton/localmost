@@ -6,7 +6,8 @@
  * the XState machine as the source of truth for runner lifecycle.
  */
 
-import { onStateChange, selectRunnerStatus, selectEffectivePauseState } from '../../runner-state-service';
+import { onStateChange, selectEffectivePauseState } from '../../runner-state-service';
+import { getRunnerState } from '../../app-state';
 import { store } from '../index';
 
 /**
@@ -15,8 +16,8 @@ import { store } from '../index';
  */
 export function setupXStateSync(): () => void {
   const unsubscribe = onStateChange((snapshot) => {
-    // Get the runner state from the machine
-    const runnerState = selectRunnerStatus(snapshot);
+    // Runner state from the runner; pause from the machine, which owns it.
+    const runnerState = getRunnerState();
     const pauseState = selectEffectivePauseState(snapshot);
 
     // Update the Zustand store

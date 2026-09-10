@@ -6,6 +6,7 @@
  */
 
 import { BrowserWindow, powerSaveBlocker } from 'electron';
+import { RunnerState } from '../shared/types';
 import { RunnerManager } from './runner-manager';
 import { RunnerDownloader } from './runner-downloader';
 import { GitHubAuth } from './github-auth';
@@ -29,8 +30,6 @@ import {
   isUserPaused as isUserPausedFromMachine,
   isResourcePaused as isResourcePausedFromMachine,
   getBusyInstances as getBusyInstancesFromMachine,
-  selectRunnerStatus,
-  getSnapshot,
 } from './runner-state-service';
 
 // Auth state structure
@@ -191,11 +190,21 @@ export const setRunnerLogLevelSetting = (level: LogLevel): void => {
 // Runner Status (delegated to XState machine)
 // ============================================================================
 
-export const getCurrentRunnerStatus = (): string => {
-  const snapshot = getSnapshot();
-  if (!snapshot) return 'offline';
-  return selectRunnerStatus(snapshot).status;
-};
+/**
+ * What the runner is doing, from the thing that runs it.
+ *
+ * The state machine also models this - it has instances, busyInstances and a
+ * currentJob - but nothing ever sends it JOB_START or JOB_COMPLETE. Those
+ * events are declared on the machine and dispatched by nobody, so it sits in
+ * `listening` with no job for the life of the process, and every surface
+ * reading it reported "no job" straight through a 34-hour one. RunnerManager
+ * is where the job actually is, so status comes from here and the machine
+ * keeps what it does track: the pause overlay.
+ */
+export const getRunnerState = (): RunnerState =>
+  getRunnerManager()?.getStatus() ?? { status: 'offline' };
+
+export const getCurrentRunnerStatus = (): string => getRunnerState().status;
 
 // Note: setCurrentRunnerStatus is no longer used - state changes via events
 // Keeping for backwards compatibility but it's a no-op

@@ -20,6 +20,7 @@ jest.mock('./paths', () => ({
 
 // Mock app-state
 const mockGetStatusDisplayName = jest.fn<() => string>();
+const mockGetStatus = jest.fn<() => { status: string; jobName?: string; repository?: string }>();
 const mockGetJobHistory = jest.fn<() => unknown[]>();
 const mockIsRunning = jest.fn<() => boolean>();
 const mockIsConfigured = jest.fn<() => boolean>();
@@ -29,6 +30,7 @@ const mockHeartbeatIsRunning = jest.fn<() => boolean>();
 const mockHeartbeatStop = jest.fn<() => void>();
 
 jest.mock('./app-state', () => ({
+  getRunnerState: () => mockGetStatus(),
   getRunnerManager: () => ({
     getStatusDisplayName: mockGetStatusDisplayName,
     getJobHistory: mockGetJobHistory,
@@ -121,6 +123,7 @@ describe('CliServer', () => {
     mockIsConfigured.mockReturnValue(true);
     mockHeartbeatIsRunning.mockReturnValue(true);
     mockSelectRunnerStatus.mockReturnValue({ status: 'listening' });
+    mockGetStatus.mockReturnValue({ status: 'listening' });
     mockSelectEffectivePauseState.mockReturnValue({ isPaused: false, reason: null });
 
     mockGetTargets.mockReset();
@@ -541,6 +544,35 @@ describe('CliServer', () => {
       expect(response.success).toBe(false);
       expect(response.error).not.toMatch(/invalid request/i);
       expect(mockFindTargetByRef).not.toHaveBeenCalled();
+    });
+  });
+
+
+  describe('status reports the job the runner is actually running', () => {
+    it('reports a running job, which the state machine never learns about', async () => {
+      // The machine is only ever sent pause and resume events - JOB_START and
+      // JOB_COMPLETE are declared on it and sent by nobody - so it sits in
+      // `listening` with no job for the life of the process. Reading status from
+      // it meant `localmost status` said "Job: Inactive" through a 34-hour job
+      // that `localmost jobs` listed as running the whole time.
+      await server.start();
+      mockGetStatus.mockReturnValue({ status: 'busy', jobName: 'full', repository: 'bfulton/supdb' });
+      mockSelectRunnerStatus.mockReturnValue({ status: 'listening' });
+
+      const response = await sendRequest({ command: 'status' });
+
+      expect((response as { data: { runner: { status: string; jobName?: string } } }).data.runner.status).toBe('busy');
+      expect((response as { data: { runner: { jobName?: string } } }).data.runner.jobName).toBe('full');
+    });
+
+    it('still takes the pause overlay from the machine, which does track it', async () => {
+      await server.start();
+      mockGetStatus.mockReturnValue({ status: 'listening' });
+      mockSelectEffectivePauseState.mockReturnValue({ isPaused: true, reason: 'Paused by user' });
+
+      const response = await sendRequest({ command: 'status' });
+
+      expect((response as { data: { resourcePause: { isPaused: boolean } } }).data.resourcePause.isPaused).toBe(true);
     });
   });
 
