@@ -187,7 +187,7 @@ export const setRunnerLogLevelSetting = (level: LogLevel): void => {
 };
 
 // ============================================================================
-// Runner Status (delegated to XState machine)
+// Runner Status (from RunnerManager; the machine owns only the pause overlay)
 // ============================================================================
 
 /**
@@ -206,11 +206,16 @@ export const getRunnerState = (): RunnerState =>
 
 export const getCurrentRunnerStatus = (): string => getRunnerState().status;
 
-// Note: setCurrentRunnerStatus is no longer used - state changes via events
-// Keeping for backwards compatibility but it's a no-op
+/**
+ * Deprecated no-op, kept because callers still invoke it.
+ *
+ * It used to cache a status string. Nothing reads that cache now:
+ * getRunnerState() asks RunnerManager, which is the only thing that knows.
+ * The comment here used to say status was "managed by the XState machine via
+ * events", which was never true - those events are dispatched by nobody.
+ */
 export const setCurrentRunnerStatus = (_status: string): void => {
-  // Status is now managed by XState machine via events
-  // This function is deprecated - use sendRunnerEvent() instead
+  // Intentionally empty.
 };
 
 // ============================================================================
