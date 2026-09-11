@@ -205,7 +205,12 @@ export class CliServer {
             heartbeat: {
               isRunning: heartbeatManager?.isRunning() || false,
             },
-            authenticated: !!authState,
+            // Authenticated means the app can act as this user. A session
+            // whose refresh token is spent cannot, so it is reported apart
+            // from "not connected at all" - the login is still known, and
+            // reconnecting is a different action from signing in fresh.
+            authenticated: !!authState && !authState.expired,
+            authExpired: !!authState?.expired,
             userName: authState?.user?.login,
             resourcePause: {
               isPaused: pauseState.isPaused,

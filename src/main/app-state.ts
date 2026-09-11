@@ -39,6 +39,13 @@ export interface AuthState {
   refreshToken?: string;
   expiresAt?: number;
   user: GitHubUser;
+  /**
+   * Set when a refresh failed for a reason retrying cannot fix - a revoked or
+   * spent refresh token. The session is over, but the login is kept so the UI
+   * can say who to reconnect as. Cleared by the next successful refresh or
+   * sign-in.
+   */
+  expired?: boolean;
 }
 
 // Mutable state - module-private

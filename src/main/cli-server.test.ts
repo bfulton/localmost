@@ -193,6 +193,7 @@ describe('CliServer', () => {
         runnerName: 'localmost.test',
         heartbeat: { isRunning: true },
         authenticated: true,
+        authExpired: false,
         userName: 'testuser',
         resourcePause: { isPaused: false, reason: null, conditions: [] },
       },

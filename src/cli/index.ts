@@ -111,13 +111,16 @@ function getStatusIcon(status: string): string {
 }
 
 function printStatus(response: StatusResponse): void {
-  const { runner, runnerName, heartbeat, authenticated, userName, resourcePause } = response.data;
+  const { runner, runnerName, heartbeat, authenticated, authExpired, userName, resourcePause } = response.data;
 
   console.log();
 
   // GitHub status (matches Status Page order)
   if (authenticated) {
     console.log(`GitHub:    Connected as @${userName || 'unknown'}`);
+  } else if (authExpired) {
+    console.log(`GitHub:    Session expired for @${userName || 'unknown'}`);
+    console.log(`           Reconnect in the app: Settings > Reconnect`);
   } else {
     console.log(`GitHub:    Not connected`);
   }

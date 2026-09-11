@@ -82,6 +82,20 @@ export const forceRefreshToken = async (): Promise<string | null> => {
       // Only retry network errors, not auth errors
       if (!isNetworkError(lastError)) {
         logger?.error(`Failed to refresh token (not retrying): ${lastError.message}`);
+
+        // Retrying cannot fix this one, so the session is over - and saying so
+        // is the point. Leaving the auth state alone meant the app went on
+        // reporting a signed-in account it could not act as: Settings showed
+        // Sign Out, the CLI said "Connected as", heartbeats retried a dead
+        // token every minute, and the only truthful message was a per-job
+        // "cannot check policy: not authenticated". The login is kept so the
+        // UI can offer to reconnect as the right person.
+        const expiredState = { ...authState, expired: true };
+        setAuthState(expiredState);
+        const config = loadConfig();
+        config.auth = expiredState;
+        saveConfig(config);
+
         return null;
       }
 

@@ -21,6 +21,8 @@ interface RunnerConfig {
 interface RunnerContextValue {
   // Auth state
   user: GitHubUser | null;
+  /** The session is stored but unusable: its refresh token is spent. */
+  authExpired: boolean;
   isAuthenticating: boolean;
   deviceCode: DeviceCodeInfo | null;
   login: () => Promise<void>;
@@ -111,6 +113,8 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
   // Fallback state for when zubridge isn't ready
   const [fallbackState, setFallbackState] = useState({
     user: null as GitHubUser | null,
+    /** A stored session the app can no longer use: known user, no access. */
+    authExpired: false,
     isAuthenticating: false,
     deviceCode: null as DeviceCodeInfo | null,
     repos: [] as GitHubRepo[],
@@ -462,6 +466,7 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
 
   const value: RunnerContextValue = {
     user,
+    authExpired: fallbackState.authExpired,
     isAuthenticating,
     deviceCode,
     login,

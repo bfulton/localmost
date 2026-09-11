@@ -166,6 +166,7 @@ export const IPC_CHANNELS = {
   GITHUB_AUTH_CANCEL: 'github:auth-cancel',
   GITHUB_DEVICE_CODE: 'github:device-code',
   GITHUB_AUTH_STATUS: 'github:auth-status',
+  GITHUB_AUTH_RECONNECT: 'github:auth-reconnect',
   GITHUB_AUTH_LOGOUT: 'github:auth-logout',
   GITHUB_GET_REPOS: 'github:get-repos',
   GITHUB_GET_ORGS: 'github:get-orgs',

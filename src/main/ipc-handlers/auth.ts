@@ -6,7 +6,7 @@ import { ipcMain, shell, clipboard } from 'electron';
 import { GitHubAuth, DEFAULT_CLIENT_ID } from '../github-auth';
 import { toUserError } from '../user-error';
 import { loadConfig, saveConfig } from '../config';
-import { getValidAccessToken } from '../auth-tokens';
+import { getValidAccessToken, forceRefreshToken } from '../auth-tokens';
 import {
   getGitHubAuth,
   setGitHubAuth,
@@ -202,6 +202,26 @@ export const registerAuthHandlers = (): void => {
       isAuthenticated: !!authState,
       user: authState?.user,
     };
+  });
+
+  /**
+   * Recover a session the app can no longer use.
+   *
+   * A refresh is tried first, because the classification that marked the
+   * session expired is a guess about a message from GitHub, and a session that
+   * was re-authorised on GitHub's side comes back without the user having to
+   * do anything. Only when that fails is the device flow worth their time.
+   */
+  ipcMain.handle(IPC_CHANNELS.GITHUB_AUTH_RECONNECT, async () => {
+    const refreshed = await forceRefreshToken();
+    if (refreshed) {
+      const authState = getAuthState();
+      if (authState?.user) store.getState().setUser(authState.user);
+      updateTrayMenu();
+      return { recovered: true };
+    }
+    // Needs the person: hand back a device code for them to enter.
+    return { recovered: false };
   });
 
   ipcMain.handle(IPC_CHANNELS.GITHUB_AUTH_LOGOUT, () => {

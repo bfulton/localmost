@@ -53,6 +53,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     deviceCode,
     login,
     logout,
+    authExpired,
     isDownloaded,
     runnerVersion,
     availableVersions,
@@ -74,6 +75,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
 
   // Local UI state
   const [showSleepConsentDialog, setShowSleepConsentDialog] = useState(false);
+  const [isReconnecting, setIsReconnecting] = useState(false);
   const [pendingSleepSetting, setPendingSleepSetting] = useState<SleepProtection | null>(null);
   const [avatarError, setAvatarError] = useState(false);
   const [launchAtLogin, setLaunchAtLogin] = useState(false);
@@ -217,6 +219,31 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
                   @{user.login}
                 </a>
               </div>
+              {authExpired ? (
+                // Stored but unusable. Said where the account is shown, rather
+                // than leaving the app to look signed in while every job is
+                // refused for "not authenticated".
+                <>
+                  <span className={styles.expiredNotice}>Session expired</span>
+                  <button
+                    className={shared.btnPrimary}
+                    disabled={isReconnecting}
+                    onClick={async () => {
+                      setIsReconnecting(true);
+                      try {
+                        // A refresh first: the session may simply have been
+                        // re-authorised, and then nothing is asked of them.
+                        const { recovered } = await window.localmost.github.reconnect();
+                        if (!recovered) await handleLogin();
+                      } finally {
+                        setIsReconnecting(false);
+                      }
+                    }}
+                  >
+                    {isReconnecting ? 'Reconnecting...' : 'Reconnect'}
+                  </button>
+                </>
+              ) : null}
               <button className={shared.btnSecondary} onClick={logout}>
                 Sign Out
               </button>
