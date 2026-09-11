@@ -11,6 +11,7 @@ import {
   SandboxPolicyLevel, RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
 import { SandboxFilesystemPolicy, spawnSandboxed } from './process-sandbox';
+import { sweepProcessGroup } from './process-group';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { RunnerDownloader } from './runner-downloader';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
@@ -1044,7 +1045,20 @@ export class RunnerManager {
       });
 
       instance.process.on('exit', (code, signal) => {
+        // Captured before the handle is cleared. A worker runs with --once, so
+        // by the time it exits its job is over and nothing of that job should
+        // still be running - but a cancelled job left its step's own process
+        // alive, reparented to launchd where nothing would reap it, burning two
+        // cores and writing to a full disk for over an hour after GitHub had
+        // marked the job cancelled. Swept here rather than in one of the
+        // branches below, because every one of them is a path where the job has
+        // ended.
+        const workerPid = instance.process?.pid;
         instance.process = null;
+        sweepProcessGroup(workerPid, {
+          onLog: (message) => this.log('warn', `[instance ${instanceNum}] ${message}`),
+        });
+
         instance.currentJob = null;
 
         // Minted for this spawn, so it dies with it - unless a later spawn
