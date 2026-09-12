@@ -268,6 +268,45 @@ test.describe('a job using docker through the filtering socket', () => {
     }
   });
 
+  test('joins one container to two of its own networks, the dual-homed bridge', async () => {
+    // The arrangement a job needs to seal a run: the agent sits alone on an
+    // internal network with no route anywhere, and a broker container joins
+    // both that network and a routable one, so it is the only way out. On
+    // macOS the internal network's gateway lives inside Docker Desktop's VM
+    // and cannot be bound from the host at all, so a host-side broker is not
+    // an option - this is the portable shape.
+    //
+    // Both names have to pass: one arrives as HostConfig.NetworkMode, the
+    // other as NetworkingConfig.EndpointsConfig, and until they were held to
+    // the same rule the second was not checked at all.
+    const at = mark();
+    const sealed = `${network}-sealed`;
+    const second = `${network}-second`;
+
+    for (const name of [sealed, second]) {
+      const created = await docker('network', 'create', '--internal', name);
+      expect(created.code, created.stderr).toBe(0);
+    }
+
+    // Both user-defined: docker refuses to mix the default bridge with a
+    // user-defined network ("cannot attach both user-defined and
+    // non-user-defined network-modes"), so a real dual-homed broker declares
+    // its routable side as a network too. Both are internal here because that
+    // is what this repository's policy declares; what the filter has to get
+    // right is that two owned names pass, one through HostConfig.NetworkMode
+    // and one through NetworkingConfig.EndpointsConfig.
+    const dual = await docker(
+      'run', '--rm', '--network', sealed, '--network', second, IMAGE,
+      'sh', '-c', 'ip -o -4 addr show | grep -c eth'
+    );
+    expect(dual.code, dual.stderr).toBe(0);
+    // Two container interfaces: one per network.
+    expect(dual.stdout.trim()).toBe('2');
+
+    expect((await docker('network', 'rm', sealed, second)).code).toBe(0);
+    if (logs) expect(logsSince(at).filter((l) => /^(denied|refused) /.test(l.message))).toEqual([]);
+  });
+
   test('refuses a network the policy does not declare, and one declared internal made routable', async () => {
     const at = mark();
 

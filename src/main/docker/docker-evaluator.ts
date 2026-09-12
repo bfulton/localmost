@@ -506,6 +506,38 @@ function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: Dock
     );
   }
 
+  // The other way a container joins a network at create. NetworkMode names one;
+  // NetworkingConfig.EndpointsConfig names any number, and the daemon attaches
+  // all of them - so it is held to the same rule rather than left as a way to
+  // reach a network the rule above refuses. A job may still join what it
+  // created, which is what a container bridging two of its own networks needs.
+  for (const networkingConfig of valuesFor(body, 'NetworkingConfig')) {
+    if (isUnset(networkingConfig)) continue;
+    if (!isPlainObject(networkingConfig)) return deny('NetworkingConfig must be an object');
+    for (const endpoints of valuesFor(networkingConfig, 'EndpointsConfig')) {
+      if (isUnset(endpoints)) continue;
+      if (!isPlainObject(endpoints)) return deny('NetworkingConfig.EndpointsConfig must be an object');
+      for (const key of Object.keys(endpoints)) {
+        // "default" is what the CLI actually puts here for a plain `docker
+        // run`, and an empty name means the same: the daemon default, bridge.
+        // NetworkMode normalises both already; this must too, or every
+        // ordinary run is refused.
+        const name = key === '' || key === 'default' ? 'bridge' : key;
+        if (name === 'host' || name.startsWith('container:')) {
+          return deny(
+            `--network=${name} (NetworkingConfig.EndpointsConfig) reaches the host and cannot be permitted by policy`
+          );
+        }
+        if (name !== 'none' && name !== policy.run.network && !ctx.ownNetworkIds?.has(name)) {
+          return deny(
+            `network "${name}" (NetworkingConfig.EndpointsConfig) is not declared in the repository docker policy (run.network)`,
+            hints.network(name)
+          );
+        }
+      }
+    }
+  }
+
   // Pin every mount source to the path that was actually checked, so the
   // daemon mounts what the filter judged rather than re-resolving a name the
   // job can point somewhere else in between.

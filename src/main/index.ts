@@ -44,6 +44,7 @@ import {
   getTrayManager,
   getLogger,
   isUserPaused,
+  getRunnerState,
 } from './app-state';
 
 // CLI server
@@ -95,7 +96,6 @@ import {
   stopRunnerStateMachine,
   sendRunnerEvent,
   onStateChange,
-  selectRunnerStatus,
   selectEffectivePauseState,
 } from './runner-state-service';
 
@@ -241,8 +241,11 @@ app.whenReady().then(async () => {
 
     // Send runner status to renderer
     if (mainWindow && !mainWindow.isDestroyed() && !getIsQuitting()) {
-      const runnerStatus = selectRunnerStatus(snapshot);
-      mainWindow.webContents.send(IPC_CHANNELS.RUNNER_STATUS_UPDATE, runnerStatus);
+      // Machine transitions are a good moment to refresh the renderer, but
+      // the status comes from the runner: this channel has two producers,
+      // and one published a machine that is never told about jobs, blanking
+      // a running job whenever the other fired.
+      mainWindow.webContents.send(IPC_CHANNELS.RUNNER_STATUS_UPDATE, getRunnerState());
 
       // Also send pause state
       const pauseState = selectEffectivePauseState(snapshot);

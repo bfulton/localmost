@@ -60,6 +60,8 @@ export interface AppConfig {
     refreshToken?: string;
     expiresAt?: number;  // Unix timestamp (ms) when access token expires
     user: GitHubUser;
+    /** The refresh token is spent: the session is known but unusable. */
+    expired?: boolean;
   };
   runnerConfig?: {
     level: 'repo' | 'org';

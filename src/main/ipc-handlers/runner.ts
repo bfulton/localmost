@@ -19,12 +19,12 @@ import {
   getLogger,
   getIsQuitting,
   getBrokerProxyService,
+  getRunnerState,
 } from '../app-state';
 import { getRunnerProxyManager } from '../runner-proxy-manager';
 import { sendRunnerEvent } from '../runner-state-service';
 import { updateTrayMenu } from '../tray-init';
 import { store } from '../store';
-import { getSnapshot, selectRunnerStatus } from '../runner-state-service';
 import {
   IPC_CHANNELS,
   ConfigureOptions,
@@ -459,9 +459,8 @@ export const registerRunnerHandlers = (): void => {
   });
 
   ipcMain.handle(IPC_CHANNELS.RUNNER_STATUS, () => {
-    // Use state machine for consistent status (same as CLI)
-    const snapshot = getSnapshot();
-    return snapshot ? selectRunnerStatus(snapshot) : { status: 'offline' };
+    // Same source as the CLI: the runner, which is where the job is.
+    return getRunnerState();
   });
 
   // Job history
