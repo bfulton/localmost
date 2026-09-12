@@ -219,10 +219,10 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
                   @{user.login}
                 </a>
               </div>
-              {authExpired ? (
-                // Stored but unusable. Said where the account is shown, rather
-                // than leaving the app to look signed in while every job is
-                // refused for "not authenticated".
+              {authExpired && (
+                // Additive: the account still renders exactly as before, with
+                // a badge and a way out beside it. Nothing about what the app
+                // considers its auth state changes.
                 <>
                   <span className={styles.expiredNotice}>Session expired</span>
                   <button
@@ -243,7 +243,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
                     {isReconnecting ? 'Reconnecting...' : 'Reconnect'}
                   </button>
                 </>
-              ) : null}
+              )}
               <button className={shared.btnSecondary} onClick={logout}>
                 Sign Out
               </button>

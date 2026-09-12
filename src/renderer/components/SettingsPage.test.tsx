@@ -102,6 +102,46 @@ describe('SettingsPage', () => {
     });
   });
 
+  it('offers Reconnect when the session is expired, not just Sign Out', async () => {
+    // The state the app used to hide: a stored session it cannot use. It kept
+    // showing the account with a Sign Out button while every job was refused
+    // for "not authenticated". This test exists because the wiring that
+    // carries `expired` into the context was silently a no-op once - typecheck
+    // and every other test stayed green, because the field has a default.
+    mockLocalmost.github.getAuthStatus.mockResolvedValue({
+      isAuthenticated: true,
+      expired: true,
+      user: { login: 'testuser', name: 'Test User', avatar_url: '' },
+    });
+
+    renderWithProviders(<SettingsPage {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Session expired')).toBeInTheDocument();
+    });
+    expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument();
+    // Additive: the account renders exactly as it always has, badge alongside.
+    // Two attempts at changing what the app considers its auth state - what
+    // `user` is, what isAuthenticated returns - ended in a render loop.
+    expect(screen.getByText('Sign Out')).toBeInTheDocument();
+    expect(screen.getByText('@testuser')).toBeInTheDocument();
+  });
+
+  it('shows no Reconnect button for a healthy session', async () => {
+    mockLocalmost.github.getAuthStatus.mockResolvedValue({
+      isAuthenticated: true,
+      user: { login: 'testuser', name: 'Test User', avatar_url: '' },
+    });
+
+    renderWithProviders(<SettingsPage {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Sign Out')).toBeInTheDocument();
+    });
+    expect(screen.queryByText('Session expired')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Reconnect' })).not.toBeInTheDocument();
+  });
+
   it('should render Runner Binary section', async () => {
     renderWithProviders(<SettingsPage {...defaultProps} />);
 

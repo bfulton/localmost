@@ -166,6 +166,10 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
       try {
         // Check auth status
         const authStatus = await window.localmost.github.getAuthStatus();
+        // Reported only. Everything about how `user` is handled is left
+        // exactly as it was: this flag adds a badge, it does not change what
+        // the app thinks its state is.
+        setFallbackState(prev => ({ ...prev, authExpired: !!authStatus.expired }));
         if (authStatus.isAuthenticated && authStatus.user) {
           const user = authStatus.user;
           setFallbackState(prev => ({ ...prev, user }));

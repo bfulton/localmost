@@ -194,7 +194,7 @@ export interface LocalmostAPI {
     startAuth: () => Promise<{ success: boolean; user?: GitHubUser; error?: string }>;
     startDeviceFlow: () => Promise<{ success: boolean; user?: GitHubUser; error?: string }>;
     cancelAuth: () => Promise<{ success: boolean }>;
-    getAuthStatus: () => Promise<{ isAuthenticated: boolean; user?: GitHubUser }>;
+    getAuthStatus: () => Promise<{ isAuthenticated: boolean; expired?: boolean; user?: GitHubUser }>;
     logout: () => Promise<{ success: boolean }>;
     /** Try to recover an expired session; false means the device flow is needed. */
     reconnect: () => Promise<{ recovered: boolean }>;

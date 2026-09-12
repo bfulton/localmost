@@ -198,8 +198,13 @@ export const registerAuthHandlers = (): void => {
     if (authState?.user) {
       store.getState().setUser(authState.user);
     }
+    // `expired` is reported, not acted on. Withholding the user or flipping
+    // isAuthenticated moves the app into states it has never been in, and two
+    // attempts at that ended in a render loop; the badge is worth far less
+    // than a working app, so this changes nothing except what it reports.
     return {
       isAuthenticated: !!authState,
+      expired: !!authState?.expired,
       user: authState?.user,
     };
   });
