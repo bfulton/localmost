@@ -341,6 +341,37 @@ a job is handed is the one localmost serves.
 The design, including what the filter does and does not contain, is in
 [docs/superpowers/specs/2026-09-05-docker-isolation-design.md](../superpowers/specs/2026-09-05-docker-isolation-design.md).
 
+## When a denial does not look like one
+
+The sandbox returns the kernel's own error for a refused operation, and a tool
+that was reaching for something indirectly reports the symptom rather than the
+cause. Two that have cost real time:
+
+**git dies naming a dylib, not a permission.** `/usr/bin/git` shims through
+`xcrun`, which loads `libxcrun` from the *active* developer directory. Where
+that is Xcode (`xcode-select -p` says `/Applications/Xcode.app/...`) and the
+policy does not grant it, git fails on a missing library. A repository that
+does not otherwise need Xcode can point at the Command Line Tools instead -
+`DEVELOPER_DIR=/Library/Developer/CommandLineTools`, which needs no policy
+change since `/Library/Developer` is already on the read floor. That belongs in
+the repository's workflow: which toolchain a job wants is the repository's
+choice, not the runner's, and a job that really does need Xcode should declare
+`/Applications/Xcode.app` and keep it.
+
+git also treats an unreadable `~/.gitconfig` as fatal rather than as "no
+configuration", so a job may want to skip the user and system config anyway -
+which makes a run independent of whose machine it happened on.
+
+**A bind is refused before the address is checked.** The seatbelt profile
+permits binding localhost, and a denied bind returns `EPERM` (errno 1) whatever
+else was wrong with it. So `Operation not permitted` on an address that does
+not exist on this host looks like a policy problem when it is a topology one.
+On macOS, Docker Desktop runs the daemon in a Linux VM: a bridge network's
+gateway is an interface *inside* that VM, and binding it from the host fails
+with `EADDRNOTAVAIL` (errno 49) with no sandbox involved at all. A host process
+cannot join a container network there. The portable arrangement is a container
+with a foot in both networks - see `run.networks` above.
+
 ## Why Checked Into Git
 
 **Version controlled:**

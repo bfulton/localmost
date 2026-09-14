@@ -61,7 +61,10 @@ export interface StatusResponse {
     heartbeat: {
       isRunning: boolean;
     };
+    /** True only when the app can act as this user right now. */
     authenticated: boolean;
+    /** A stored session whose refresh token is spent: known user, no access. */
+    authExpired?: boolean;
     userName?: string;
     resourcePause?: ResourcePauseState;
   };

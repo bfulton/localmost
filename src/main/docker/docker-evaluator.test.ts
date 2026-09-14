@@ -681,6 +681,38 @@ describe('what * spans in a declared glob', () => {
   });
 });
 
+describe('inspecting the network the policy declares', () => {
+  // Reading a declared network's gateway is read-only and discloses nothing a
+  // job cannot already reach: it is on that network. Refusing it meant
+  // `docker network inspect bridge` returned nothing for a job whose policy
+  // says `network: bridge`, which reads as a broken daemon rather than policy.
+  const p: DockerPolicy = { run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] } };
+
+  it('refuses it, because the response names every container on that network', () => {
+    // This was briefly allowed as a convenience: a job is on the network, so
+    // reading its gateway looks harmless. The response carries a Containers
+    // map with the names and addresses of everything attached - on a shared
+    // network, other jobs' containers and the operator's own. Nothing in the
+    // policy grants that, and the job cannot otherwise see it.
+    expect(evaluateDockerRequest(mk('GET', '/v1.45/networks/bridge'), ctx(p)).allowed).toBe(false);
+  });
+
+  it('still refuses a network that is neither declared nor created here', () => {
+    const v = evaluateDockerRequest(mk('GET', '/v1.45/networks/someone-elses'), ctx(p));
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/was not created through this job/);
+  });
+
+  it('does not turn inspect into a way to delete it', () => {
+    expect(evaluateDockerRequest(mk('DELETE', '/v1.45/networks/bridge'), ctx(p)).allowed).toBe(false);
+  });
+
+  it('grants nothing when the policy declares no network', () => {
+    const bare: DockerPolicy = { run: { images: ['alpine:3'] } };
+    expect(evaluateDockerRequest(mk('GET', '/v1.45/networks/bridge'), ctx(bare)).allowed).toBe(false);
+  });
+});
+
 describe('BuildKit endpoints', () => {
   const p: DockerPolicy = { run: { images: ['alpine:3'], network: 'bridge' }, build: { context: './' } };
 
@@ -758,5 +790,59 @@ describe('duplicate keys that differ only in case', () => {
     );
     expect(v.allowed).toBe(false);
     expect(v.reason).toMatch(/case/i);
+  });
+});
+
+describe('networks attached by NetworkingConfig rather than NetworkMode', () => {
+  // A container can join a network two ways at create: HostConfig.NetworkMode,
+  // which was checked, and NetworkingConfig.EndpointsConfig, which was not -
+  // so the ownership rule could be walked around by naming the network in the
+  // other field. Joining another job's internal network, or any network the
+  // operator created, reaches whatever that network reaches.
+  const p: DockerPolicy = { run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] } };
+  const create = (body: unknown, c = ctx(p)) => evaluateDockerRequest(mk('POST', '/v1.45/containers/create', body), c);
+
+  it('refuses an endpoint naming a network the job neither declared nor created', () => {
+    const v = create({
+      Image: 'alpine:3',
+      HostConfig: { NetworkMode: 'bridge' },
+      NetworkingConfig: { EndpointsConfig: { 'someone-elses-net': {} } },
+    });
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/someone-elses-net/);
+  });
+
+  it('permits an endpoint naming a network this job created, which is the dual-homed case', () => {
+    // A broker container bridging a sealed network to a routable one joins
+    // both: NetworkMode for one, EndpointsConfig for the other.
+    const owned = ctx(p, { ownNetworkIds: new Set(['vk-1']) });
+    const v = create({
+      Image: 'alpine:3',
+      HostConfig: { NetworkMode: 'bridge' },
+      NetworkingConfig: { EndpointsConfig: { 'vk-1': {} } },
+    }, owned);
+    expect(v.allowed).toBe(true);
+  });
+
+  it('permits "default", which is what the real CLI sends for an ordinary docker run', () => {
+    // Captured from the wire: `docker run --rm -v ... alpine:3` sends
+    // NetworkingConfig.EndpointsConfig {"default": {}}. Judging that name
+    // literally refused every container the CLI creates.
+    expect(create({ Image: 'alpine:3', NetworkingConfig: { EndpointsConfig: { default: {} } } }).allowed).toBe(true);
+    expect(create({ Image: 'alpine:3', NetworkingConfig: { EndpointsConfig: { '': {} } } }).allowed).toBe(true);
+  });
+
+  it('permits the declared network, and an absent or empty NetworkingConfig', () => {
+    expect(create({ Image: 'alpine:3', NetworkingConfig: { EndpointsConfig: { bridge: {} } } }).allowed).toBe(true);
+    expect(create({ Image: 'alpine:3', NetworkingConfig: {} }).allowed).toBe(true);
+    expect(create({ Image: 'alpine:3' }).allowed).toBe(true);
+  });
+
+  it('is not fooled by casing, since the daemon reads these keys case-insensitively', () => {
+    const v = create({
+      Image: 'alpine:3',
+      networkingconfig: { endpointsconfig: { 'someone-elses-net': {} } },
+    });
+    expect(v.allowed).toBe(false);
   });
 });

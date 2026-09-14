@@ -44,6 +44,7 @@ import {
   getTrayManager,
   getLogger,
   isUserPaused,
+  getRunnerState,
 } from './app-state';
 
 // CLI server
@@ -63,6 +64,7 @@ import { getValidAccessToken, forceRefreshToken, cancelJobsOnOurRunners } from '
 
 // Runner lifecycle
 import { reRegisterSingleInstance, configureSingleInstance, clearStaleRunnerRegistrations } from './runner-lifecycle';
+import { finishPendingSweeps } from './process-group';
 
 // UI
 import { createWindow, setDockIcon } from './window';
@@ -95,7 +97,6 @@ import {
   stopRunnerStateMachine,
   sendRunnerEvent,
   onStateChange,
-  selectRunnerStatus,
   selectEffectivePauseState,
 } from './runner-state-service';
 
@@ -241,8 +242,11 @@ app.whenReady().then(async () => {
 
     // Send runner status to renderer
     if (mainWindow && !mainWindow.isDestroyed() && !getIsQuitting()) {
-      const runnerStatus = selectRunnerStatus(snapshot);
-      mainWindow.webContents.send(IPC_CHANNELS.RUNNER_STATUS_UPDATE, runnerStatus);
+      // Machine transitions are a good moment to refresh the renderer, but
+      // the status comes from the runner: this channel has two producers,
+      // and one published a machine that is never told about jobs, blanking
+      // a running job whenever the other fired.
+      mainWindow.webContents.send(IPC_CHANNELS.RUNNER_STATUS_UPDATE, getRunnerState());
 
       // Also send pause state
       const pauseState = selectEffectivePauseState(snapshot);
@@ -275,6 +279,13 @@ app.whenReady().then(async () => {
     attachRegistryAuth: (registry: string) => resolveRegistryAuth(registry),
     onStatusChange: sendStatusUpdate,
     onJobHistoryUpdate: sendJobHistoryUpdate,
+    // Bind this job to the worker being spawned for it, by name, so the broker
+    // does not have to infer from arrival order which session belongs to which
+    // job - which is how every job came to be run by the next job's worker.
+    onWorkerReservedForJob: (targetId: string, instanceNum: number) =>
+      getBrokerProxyService()?.expectWorkerForJob(targetId, instanceNum),
+    onWorkerReservationCancelled: (targetId: string, instanceNum: number) =>
+      getBrokerProxyService()?.forgetExpectedWorker(targetId, instanceNum),
     onReregistrationNeeded: reRegisterSingleInstance,
     onConfigurationNeeded: configureSingleInstance,
     getRunnerLogLevel: () => getRunnerLogLevelSetting(),
@@ -841,6 +852,11 @@ app.on('before-quit', async (event) => {
         const runningJobs = runnerManager?.getJobHistory().filter(j => j.status === 'running') || [];
         await cancelJobsOnOurRunners(runningJobs);
         await runnerManager?.stop();
+        // stop() resolves as soon as the worker leaders exit. Any descendant
+        // that ignored SIGTERM is still waiting out a grace period on an
+        // unref'd timer that will not fire once we quit, so finish those now -
+        // after this point nothing is left to reap them.
+        finishPendingSweeps();
       })(),
     ]);
 

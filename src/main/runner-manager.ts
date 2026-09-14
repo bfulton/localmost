@@ -11,6 +11,7 @@ import {
   SandboxPolicyLevel, RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
 import { SandboxFilesystemPolicy, spawnSandboxed } from './process-sandbox';
+import { sweepProcessGroup } from './process-group';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { RunnerDownloader } from './runner-downloader';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
@@ -119,6 +120,14 @@ interface RunnerManagerOptions {
   getRepoPolicy?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<RepoPolicyRuntime>;
   /** Called when a job starts or completes (for notifications) */
   onJobEvent?: (event: JobEvent) => void;
+  /**
+   * Which worker was reserved for an incoming job, once the slot is chosen.
+   * The broker binds that worker's session to the job's target by name, rather
+   * than by whichever session happens to poll first.
+   */
+  onWorkerReservedForJob?: (targetId: string, instanceNum: number) => void;
+  /** Withdraw that reservation when the worker never starts. */
+  onWorkerReservationCancelled?: (targetId: string, instanceNum: number) => void;
   /** The daemon a worker's permitted container requests go to. The operator's own by default. */
   dockerBackend?: DockerBackend;
   /** Registry credentials, attached to a pull by the worker's socket so the job never holds them. */
@@ -156,6 +165,8 @@ export class RunnerManager {
   private getRepoPolicy?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<RepoPolicyRuntime>;
   private getJobTarget?: (jobId: string) => { targetDisplayName: string; githubSha?: string } | undefined;
   private onJobEvent?: (event: JobEvent) => void;
+  private onWorkerReservedForJob?: (targetId: string, instanceNum: number) => void;
+  private onWorkerReservationCancelled?: (targetId: string, instanceNum: number) => void;
   private jobHistory: JobHistoryEntry[] = [];
   private jobIdCounter = 0;
   private maxJobHistory = DEFAULT_MAX_JOB_HISTORY;
@@ -241,6 +252,8 @@ export class RunnerManager {
     this.getRepoPolicy = options.getRepoPolicy;
     this.getJobTarget = options.getJobTarget;
     this.onJobEvent = options.onJobEvent;
+    this.onWorkerReservedForJob = options.onWorkerReservedForJob;
+    this.onWorkerReservationCancelled = options.onWorkerReservationCancelled;
     this.dockerBackend = options.dockerBackend ?? new DesktopBackend();
     this.attachRegistryAuth = options.attachRegistryAuth;
 
@@ -484,11 +497,21 @@ export class RunnerManager {
       };
     }
 
-    // If no instances exist or we're not started, return offline
-    if (this.instances.size === 0 || !this.startedAt) {
+    // Not started is offline. Started with no instances is not: workers are
+    // spawned per job, so an idle pool holds none, and that is the resting
+    // state of a healthy runner rather than a stopped one. Calling it offline
+    // made `localmost status` contradict a running app once the CLI began
+    // reading this instead of the state machine.
+    if (!this.startedAt) {
       return {
         status: 'offline',
         startedAt: undefined,
+      };
+    }
+    if (this.instances.size === 0) {
+      return {
+        status: 'listening',
+        startedAt: this.startedAt,
       };
     }
 
@@ -736,6 +759,13 @@ export class RunnerManager {
       return;
     }
 
+    // Announce the pairing before the worker exists, so its very first session
+    // request already has a binding waiting and cannot lose a race to another
+    // instance polling on the same target.
+    if (targetContext.targetId) {
+      this.onWorkerReservedForJob?.(targetContext.targetId, instanceNum);
+    }
+
     this.log('info', `Spawning worker ${instanceNum} for incoming job from ${targetContext.targetDisplayName}...`);
 
     // Keyed by instance so startInstance can install the policy for this job
@@ -753,11 +783,21 @@ export class RunnerManager {
         );
       } catch (err) {
         this.log('error', `Failed to copy proxy credentials: ${(err as Error).message}`);
+        // The worker never started, so withdraw the binding announced above;
+        // left behind, its name could later claim a job it was not spawned for.
+        if (targetContext.targetId) {
+          this.onWorkerReservationCancelled?.(targetContext.targetId, instanceNum);
+        }
         this.releaseSlotReservation(instanceNum);
         return;
       }
     } else {
       this.log('error', `Proxy credentials not found for target ${targetContext.targetId}`);
+      // The worker never started, so withdraw the binding announced above;
+      // left behind, its name could later claim a job it was not spawned for.
+      if (targetContext.targetId) {
+        this.onWorkerReservationCancelled?.(targetContext.targetId, instanceNum);
+      }
       this.releaseSlotReservation(instanceNum);
       return;
     }
@@ -769,6 +809,11 @@ export class RunnerManager {
     } finally {
       // startInstance has taken over the slot (or failed); either way the
       // reservation has served its purpose.
+      // The worker never started, so withdraw the binding announced above;
+      // left behind, its name could later claim a job it was not spawned for.
+      if (targetContext.targetId) {
+        this.onWorkerReservationCancelled?.(targetContext.targetId, instanceNum);
+      }
       this.releaseSlotReservation(instanceNum);
     }
   }
@@ -1044,7 +1089,20 @@ export class RunnerManager {
       });
 
       instance.process.on('exit', (code, signal) => {
+        // Captured before the handle is cleared. A worker runs with --once, so
+        // by the time it exits its job is over and nothing of that job should
+        // still be running - but a cancelled job left its step's own process
+        // alive, reparented to launchd where nothing would reap it, burning two
+        // cores and writing to a full disk for over an hour after GitHub had
+        // marked the job cancelled. Swept here rather than in one of the
+        // branches below, because every one of them is a path where the job has
+        // ended.
+        const workerPid = instance.process?.pid;
         instance.process = null;
+        sweepProcessGroup(workerPid, {
+          onLog: (message) => this.log('warn', `[instance ${instanceNum}] ${message}`),
+        });
+
         instance.currentJob = null;
 
         // Minted for this spawn, so it dies with it - unless a later spawn
@@ -1287,11 +1345,39 @@ export class RunnerManager {
     // It got what it was spawned for; leave it alone.
     if (instance.currentJob || instance.status === 'busy') return;
 
+    // Say which job died, not just that a slot came back. GitHub fails a job
+    // that reports no progress for 600s; this reap happens at 120s. Without
+    // naming it the app showed a healthy spawn and heartbeats straight through,
+    // and nothing connected the reclaimed slot to the job GitHub failed minutes
+    // later - a consumer had two runs die exactly that way and could not tell
+    // them from an idle runner.
+    const context = this.pendingTargetContext.get(String(instanceNum));
     this.log(
       'warn',
-      `Runner instance ${instanceNum} never acquired a job, reclaiming its slot`
+      `Runner instance ${instanceNum} never acquired a job, reclaiming its slot` +
+        (context?.targetDisplayName ? ` (job from ${context.targetDisplayName})` : '')
     );
+    if (context) {
+      this.recordRefusedJob({
+        repository: context.targetDisplayName,
+        jobName: context.githubWorkflow ?? 'job',
+        reason:
+          'accepted but never started: a runner was spawned for this job and the job was never ' +
+          'routed to it. GitHub fails a job that makes no progress for 600s.',
+        actionsUrl: context.actionsUrl,
+        githubRunId: context.githubRunId,
+        status: 'failed',
+      });
+    }
+    // The whole group, not just the leader. A --once listener that ignores or
+    // is slow to handle SIGTERM leaves descendants behind, and the slot is
+    // released immediately below, so nothing comes back to look for them - the
+    // same leak that left a cancelled benchmark running for over an hour.
+    const workerPid = instance.process?.pid;
     instance.process?.kill('SIGTERM');
+    sweepProcessGroup(workerPid, {
+      onLog: (message) => this.log('warn', `[instance ${instanceNum}] ${message}`),
+    });
     this.releaseInstanceSlot(instanceNum);
   }
 
@@ -1948,13 +2034,16 @@ export class RunnerManager {
     reason: string;
     actionsUrl?: string;
     githubRunId?: number;
+    /** 'cancelled' for a policy refusal; 'failed' for a job that never started. */
+    status?: 'cancelled' | 'failed';
   }): void {
+    const status = details.status ?? 'cancelled';
     const now = new Date().toISOString();
     this.addJobToHistory({
       id: `refused-${details.githubRunId ?? Date.now()}`,
       jobName: details.jobName,
       repository: details.repository,
-      status: 'cancelled',
+      status,
       startedAt: now,
       completedAt: now,
       runTimeSeconds: 0,
@@ -1968,7 +2057,7 @@ export class RunnerManager {
       type: 'refused',
       jobName: details.jobName,
       repository: details.repository,
-      status: 'cancelled',
+      status,
       reason: details.reason,
     });
   }

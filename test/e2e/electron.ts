@@ -2,6 +2,7 @@ import { _electron as electron, ElectronApplication, Page } from '@playwright/te
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import * as yaml from 'js-yaml';
 
 let electronApp: ElectronApplication | null = null;
 let consoleErrors: string[] = [];
@@ -12,7 +13,13 @@ export function getConsoleErrors(): string[] {
 }
 let testConfigDir: string | null = null;
 
-export async function launchElectron(): Promise<{ app: ElectronApplication; page: Page }> {
+/**
+ * @param seedConfig written to config.yaml before launch, so a test can start
+ *   the app in a state it would otherwise take days to reach.
+ */
+export async function launchElectron(
+  seedConfig?: Record<string, unknown>
+): Promise<{ app: ElectronApplication; page: Page }> {
   // Use the production webpack build (file:// URLs, no dev server needed).
   // This is the package.json "main" entry that `npm run build` produces.
   const mainPath = path.join(__dirname, '..', '..', 'build', 'dist', 'main.js');
@@ -28,6 +35,12 @@ export async function launchElectron(): Promise<{ app: ElectronApplication; page
   // Create an isolated temp config directory for test reproducibility and safety
   // This prevents tests from using/modifying the user's real ~/.localmost settings
   testConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'localmost-e2e-'));
+
+  // A test can start the app in a state that would otherwise take days to
+  // reach - an expired session, for one - by writing its config first.
+  if (seedConfig) {
+    fs.writeFileSync(path.join(testConfigDir, 'config.yaml'), yaml.dump(seedConfig));
+  }
 
   try {
     electronApp = await electron.launch({

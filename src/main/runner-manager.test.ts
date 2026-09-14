@@ -154,6 +154,25 @@ describe('RunnerManager', () => {
         startedAt: undefined,
       });
     });
+
+    it('reports a started runner with no worker as listening, not offline', () => {
+      // Workers are spawned per job, so an idle pool legitimately holds zero
+      // instances - that is the normal resting state, not a stopped runner.
+      // Reporting offline for it made `localmost status` say Offline while the
+      // app was up and accepting work, once the CLI began reading this instead
+      // of the state machine.
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      helper.startedAt = new Date().toISOString();
+
+      expect(runnerManager.getStatus().status).toBe('listening');
+    });
+
+    it('still reports offline before the runner is started', () => {
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      helper.startedAt = null;
+
+      expect(runnerManager.getStatus().status).toBe('offline');
+    });
   });
 
   describe('isRunning', () => {
@@ -1243,6 +1262,36 @@ describe('RunnerManager', () => {
 
       expect(manager.hasAvailableSlot()).toBe(true);
       expect(helper.instances.has(1)).toBe(false);
+    });
+
+    it('reports the job that never started, instead of reclaiming the slot in silence', () => {
+      // A consumer watched five runs: two were killed by GitHub at exactly
+      // 600s having never run a step, and localmost showed a healthy spawn
+      // followed by heartbeats straight through - no failure, no refusal,
+      // indistinguishable from an idle runner. The slot was reclaimed at 120s
+      // and nobody was told, so nothing connected the reap to the dead job.
+      const { helper } = idlePool();
+      const events: JobEvent[] = [];
+      helper.setOnJobEvent((e) => events.push(e as JobEvent));
+      helper.setPendingTargetContext('1', {
+        targetId: 't1',
+        targetDisplayName: 'owner/repo',
+        actionsUrl: 'https://github.com/owner/repo/actions/runs/1/job/2',
+        githubRunId: 1,
+        githubJobId: 2,
+        githubWorkflow: 'macos',
+      });
+
+      helper.reapUnclaimedWorker(1);
+
+      expect(events).toHaveLength(1);
+      expect(events[0].repository).toBe('owner/repo');
+      expect(events[0].status).toBe('failed');
+      expect(events[0].reason).toMatch(/never started/i);
+      // And it lands in history, so it is visible after the notification goes.
+      const recorded = mockOnJobHistoryUpdate.mock.calls.at(-1)?.[0] as Array<{ status: string; actionsUrl?: string }>;
+      expect(recorded.at(-1)?.status).toBe('failed');
+      expect(recorded.at(-1)?.actionsUrl).toContain('/job/2');
     });
 
     it('reclaims a worker that is still unclaimed when the deadline passes', () => {
