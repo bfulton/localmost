@@ -127,6 +127,28 @@ describe('SettingsPage', () => {
     expect(screen.getByText('@testuser')).toBeInTheDocument();
   });
 
+  it('shows the device code where Reconnect started it, not only in the signed-out panel', async () => {
+    // Reconnect runs from the signed-in branch, so the code must render there.
+    // The existing panel lives in the signed-out branch, which an expired
+    // session never reaches - so the browser opened asking for a code the app
+    // was not showing anywhere.
+    mockLocalmost.github.getAuthStatus.mockResolvedValue({
+      isAuthenticated: true,
+      expired: true,
+      user: { login: 'testuser', name: 'Test User', avatar_url: '' },
+    });
+    mockLocalmost.github.onDeviceCode.mockImplementation((cb: (c: unknown) => void) => {
+      cb({ userCode: 'ABCD-1234', verificationUri: 'https://github.com/login/device' });
+      return () => undefined;
+    });
+
+    renderWithProviders(<SettingsPage {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('ABCD-1234')).toBeInTheDocument();
+    });
+  });
+
   it('shows no Reconnect button for a healthy session', async () => {
     mockLocalmost.github.getAuthStatus.mockResolvedValue({
       isAuthenticated: true,

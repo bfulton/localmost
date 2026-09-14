@@ -54,6 +54,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     login,
     logout,
     authExpired,
+    refreshAuthExpiry,
     isDownloaded,
     runnerVersion,
     availableVersions,
@@ -219,7 +220,25 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
                   @{user.login}
                 </a>
               </div>
-              {authExpired && (
+              {authExpired && deviceCode && (
+                // Reconnect starts the device flow from here, so the code has
+                // to be shown here too: the panel below lives in the
+                // signed-out branch, which an expired session never reaches.
+                // Without this the browser opened and asked for a code the
+                // app never displayed.
+                <div className={styles.codeWithCopied}>
+                  <code className={styles.userCodeSmall}>{deviceCode.userCode}</code>
+                  {showCopiedNotice && <span className={styles.copiedBadge}>Copied!</span>}
+                  <button
+                    className={shared.btnSecondary}
+                    onClick={() => window.localmost.github.cancelAuth()}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              )}
+
+              {authExpired && !deviceCode && (
                 // Additive: the account still renders exactly as before, with
                 // a badge and a way out beside it. Nothing about what the app
                 // considers its auth state changes.
@@ -235,6 +254,10 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
                         // re-authorised, and then nothing is asked of them.
                         const { recovered } = await window.localmost.github.reconnect();
                         if (!recovered) await handleLogin();
+                        // The flag is read when the provider mounts, so
+                        // without this the badge outlived the fix and the app
+                        // had to be quit and reopened.
+                        await refreshAuthExpiry();
                       } finally {
                         setIsReconnecting(false);
                       }

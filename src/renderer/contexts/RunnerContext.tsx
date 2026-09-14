@@ -23,6 +23,8 @@ interface RunnerContextValue {
   user: GitHubUser | null;
   /** The session is stored but unusable: its refresh token is spent. */
   authExpired: boolean;
+  /** Re-read that flag, for a UI that just tried to fix it. */
+  refreshAuthExpiry: () => Promise<void>;
   isAuthenticating: boolean;
   deviceCode: DeviceCodeInfo | null;
   login: () => Promise<void>;
@@ -159,6 +161,30 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
   const isLoading = isZubridgeReady ? storeIsLoading : fallbackState.isLoading;
   const isInitialLoading = isZubridgeReady ? storeIsInitialLoading : fallbackState.isInitialLoading;
   const error = isZubridgeReady ? storeError : fallbackState.error;
+
+  /**
+   * Re-read whether the session is expired.
+   *
+   * The flag is read when the provider mounts, so a session that recovers
+   * while the app is open went on being reported as expired until the app was
+   * restarted. Bails out when the value is unchanged - returning the same
+   * state object - so a caller cannot turn this into a render loop.
+   */
+  const refreshAuthExpiry = useCallback(async () => {
+    try {
+      const status = await window.localmost.github.getAuthStatus();
+      setFallbackState(prev =>
+        prev.authExpired === !!status.expired ? prev : { ...prev, authExpired: !!status.expired }
+      );
+    } catch {
+      // Leave the last known value; a failed query is not evidence either way.
+    }
+  }, []);
+
+  // Signing in changes the user, and that is the other way a session recovers.
+  useEffect(() => {
+    void refreshAuthExpiry();
+  }, [user, refreshAuthExpiry]);
 
   // Load initial state via IPC (fallback until zubridge syncs)
   useEffect(() => {
@@ -471,6 +497,7 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
   const value: RunnerContextValue = {
     user,
     authExpired: fallbackState.authExpired,
+    refreshAuthExpiry,
     isAuthenticating,
     deviceCode,
     login,

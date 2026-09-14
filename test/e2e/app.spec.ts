@@ -453,3 +453,47 @@ test.describe('Responsive Layout', () => {
     await expect(page.locator('[data-testid="status-page"], [data-testid="settings-page"]')).toBeVisible();
   });
 });
+
+/**
+ * The expired session, in the real app.
+ *
+ * This is the only harness that could have caught what shipped twice. The
+ * renderer unit tests mount jsdom with a static store; the failure was a
+ * feedback loop between main and renderer - the renderer asks for auth status,
+ * main writes the store, zubridge pushes, the renderer re-renders and asks
+ * again - which needs both processes running. It surfaced as React error #185
+ * and a blank "Something went wrong" five seconds after launch.
+ */
+test.describe('an expired session', () => {
+  test.afterAll(async () => {
+    await closeElectron();
+  });
+
+  test('renders the app rather than an error screen', async () => {
+    const { page } = await launchElectron({
+      version: 1,
+      auth: {
+        refreshToken: 'spent-refresh-token',
+        expired: true,
+        user: { login: 'testuser', name: 'Test User', avatar_url: '' },
+      },
+    });
+
+    // The crash replaced the whole app with this.
+    await expect(page.getByText('Something went wrong')).toHaveCount(0);
+
+    // React's loop detector reports here; the packaged app logged exactly this.
+    const loopErrors = getConsoleErrors().filter((e) => /error #185|Maximum update depth/i.test(e));
+    expect(loopErrors, `React render loop:\n${loopErrors.join('\n')}`).toEqual([]);
+
+    // Deliberately not asserting on the badge here. Seeding a refresh token
+    // that GitHub will reject does not reproduce a known-but-expired session
+    // in the real app - it reads as signed out, because the startup refresh
+    // fails before anything is published. What this test is for is the
+    // failure the unit tests structurally cannot see: a loop between main and
+    // renderer. The badge itself is covered on the store-backed path in
+    // SettingsPage.zubridge.test.tsx.
+    await page.waitForSelector('h2');
+    await expect(page.locator('h2').first()).toBeVisible();
+  });
+});
