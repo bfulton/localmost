@@ -278,6 +278,11 @@ app.whenReady().then(async () => {
     attachRegistryAuth: (registry: string) => resolveRegistryAuth(registry),
     onStatusChange: sendStatusUpdate,
     onJobHistoryUpdate: sendJobHistoryUpdate,
+    // Bind this job to the worker being spawned for it, by name, so the broker
+    // does not have to infer from arrival order which session belongs to which
+    // job - which is how every job came to be run by the next job's worker.
+    onWorkerReservedForJob: (targetId: string, instanceNum: number) =>
+      getBrokerProxyService()?.expectWorkerForJob(targetId, instanceNum),
     onReregistrationNeeded: reRegisterSingleInstance,
     onConfigurationNeeded: configureSingleInstance,
     getRunnerLogLevel: () => getRunnerLogLevelSetting(),

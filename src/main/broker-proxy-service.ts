@@ -345,6 +345,23 @@ export class BrokerProxyService extends EventEmitter {
   private messageQueues: Map<string, Array<string>> = new Map();  // Per-target message queues
   private seenMessageIds: Set<string> = new Set();
   private pendingTargetAssignments: string[] = [];  // Queue of target IDs for upcoming sessions
+  /**
+   * Workers spawned for a specific job, by the agent name they will present.
+   *
+   * pendingTargetAssignments distinguishes workers only by target and arrival
+   * order, so with several instances on one target whichever session polls
+   * first consumes the assignment and the worker actually spawned for the job
+   * comes back unbound - and stays unbound, because a session binds once. Since
+   * queues are per-target, every later worker then drains the oldest message: a
+   * consumer measured every job being run by the NEXT job's worker, with the
+   * last job of any burst killed by GitHub at 600s having never started.
+   *
+   * Naming the worker takes ordering out of the decision, while keeping what
+   * the ordering was there to protect: a listener nobody spawned for a job has
+   * no entry here, so it cannot bind and win a job its generic sandbox would
+   * fail to run.
+   */
+  private expectedWorkers: Map<string, string> = new Map();  // agentName -> targetId
   /** Repository and commit for a job, keyed by both jobId and messageId. */
   private jobTargets: Map<string, { targetDisplayName: string; githubSha?: string }> = new Map();
 
@@ -1299,8 +1316,31 @@ export class BrokerProxyService extends EventEmitter {
    * waiting, and it takes that entry rather than whichever is first. An
    * unnamed request falls back to the positional queue.
    */
+  /**
+   * Say which worker was spawned for a job, so its session binds to that job's
+   * target however the polling races.
+   */
+  expectWorkerForJob(targetId: string, instanceNum: number): void {
+    const agentName = this.targets.get(targetId)?.instances.get(instanceNum)?.runner.agentName;
+    if (!agentName) {
+      log()?.warn(
+        `[BrokerProxy] Cannot expect worker ${instanceNum} for target ${targetId}: no agent name known`
+      );
+      return;
+    }
+    this.expectedWorkers.set(agentName, targetId);
+  }
+
   private resolveSessionTarget(agentName: string | undefined): string | undefined {
     if (!agentName) return this.pendingTargetAssignments.shift();
+    // Spawned for a job: bind to it, whoever else is polling.
+    const expected = this.expectedWorkers.get(agentName);
+    if (expected !== undefined) {
+      this.expectedWorkers.delete(agentName);
+      const pending = this.pendingTargetAssignments.indexOf(expected);
+      if (pending >= 0) this.pendingTargetAssignments.splice(pending, 1);
+      return expected;
+    }
     for (const state of this.targets.values()) {
       for (const instance of state.instances.values()) {
         if (instance.runner.agentName !== agentName) continue;

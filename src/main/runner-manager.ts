@@ -120,6 +120,12 @@ interface RunnerManagerOptions {
   getRepoPolicy?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<RepoPolicyRuntime>;
   /** Called when a job starts or completes (for notifications) */
   onJobEvent?: (event: JobEvent) => void;
+  /**
+   * Which worker was reserved for an incoming job, once the slot is chosen.
+   * The broker binds that worker's session to the job's target by name, rather
+   * than by whichever session happens to poll first.
+   */
+  onWorkerReservedForJob?: (targetId: string, instanceNum: number) => void;
   /** The daemon a worker's permitted container requests go to. The operator's own by default. */
   dockerBackend?: DockerBackend;
   /** Registry credentials, attached to a pull by the worker's socket so the job never holds them. */
@@ -157,6 +163,7 @@ export class RunnerManager {
   private getRepoPolicy?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<RepoPolicyRuntime>;
   private getJobTarget?: (jobId: string) => { targetDisplayName: string; githubSha?: string } | undefined;
   private onJobEvent?: (event: JobEvent) => void;
+  private onWorkerReservedForJob?: (targetId: string, instanceNum: number) => void;
   private jobHistory: JobHistoryEntry[] = [];
   private jobIdCounter = 0;
   private maxJobHistory = DEFAULT_MAX_JOB_HISTORY;
@@ -242,6 +249,7 @@ export class RunnerManager {
     this.getRepoPolicy = options.getRepoPolicy;
     this.getJobTarget = options.getJobTarget;
     this.onJobEvent = options.onJobEvent;
+    this.onWorkerReservedForJob = options.onWorkerReservedForJob;
     this.dockerBackend = options.dockerBackend ?? new DesktopBackend();
     this.attachRegistryAuth = options.attachRegistryAuth;
 
@@ -735,6 +743,13 @@ export class RunnerManager {
       this.log('error', 'No target context for spawned worker');
       this.releaseSlotReservation(instanceNum);
       return;
+    }
+
+    // Announce the pairing before the worker exists, so its very first session
+    // request already has a binding waiting and cannot lose a race to another
+    // instance polling on the same target.
+    if (targetContext.targetId) {
+      this.onWorkerReservedForJob?.(targetContext.targetId, instanceNum);
     }
 
     this.log('info', `Spawning worker ${instanceNum} for incoming job from ${targetContext.targetDisplayName}...`);
