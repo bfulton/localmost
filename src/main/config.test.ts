@@ -33,6 +33,22 @@ describe('saveConfig', () => {
     expect(loadConfig().theme).toBe('dark');
   });
 
+  it('remembers that a session is spent, across a restart', async () => {
+    // saveConfig rebuilds auth from refreshToken and user, so the expired flag
+    // was dropped on every write. A restart then loaded the session as healthy
+    // and went back to refreshing a token that can never work - and the app
+    // presented an account it could not act as.
+    saveConfig({ auth: { refreshToken: 'spent', user: { login: 'bfulton' } as never, expired: true } });
+
+    expect(loadConfig().auth?.expired).toBe(true);
+  });
+
+  it('does not invent the flag for a healthy session', () => {
+    saveConfig({ auth: { refreshToken: 'good', user: { login: 'bfulton' } as never } });
+
+    expect(loadConfig().auth?.expired).toBeUndefined();
+  });
+
   it('leaves no temp file behind after a successful save', () => {
     saveConfig({ theme: 'light' });
     expect(fs.existsSync(`${configPath}.tmp`)).toBe(false);

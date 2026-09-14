@@ -17,6 +17,30 @@ const RETRY_DELAYS_MS = [1000, 2000, 4000];
  * Check if an error is a transient network error worth retrying.
  * Auth errors (invalid token, revoked access) should not be retried.
  */
+/**
+ * Whether a refresh failure proves the session is over.
+ *
+ * Not every non-network failure does. refreshAccessToken throws for 429 and
+ * 5xx as well, and for a failed user lookup; treating those as expiry would
+ * strand a live session behind a Reconnect button over a transient upstream
+ * blip. GitHub answers a spent or revoked refresh token with an OAuth error in
+ * the body - misleadingly blaming the client id and secret, neither of which
+ * is at fault - and that is the case worth acting on.
+ */
+const isSpentSession = (error: Error): boolean => {
+  const message = error.message.toLowerCase();
+  if (/\b(429|500|502|503|504)\b/.test(message)) return false;
+  return (
+    message.includes('client_id') ||
+    message.includes('client_secret') ||
+    message.includes('bad_verification_code') ||
+    message.includes('incorrect_client_credentials') ||
+    message.includes('expired_token') ||
+    message.includes('invalid_grant') ||
+    message.includes('unauthorized')
+  );
+};
+
 const isNetworkError = (error: Error): boolean => {
   const message = error.message.toLowerCase();
   return (
@@ -43,12 +67,22 @@ const sleep = (ms: number): Promise<void> =>
  * Retries up to 3 times with exponential backoff for network errors.
  * Returns the new token or null if refresh fails.
  */
-export const forceRefreshToken = async (): Promise<string | null> => {
+export const forceRefreshToken = async (
+  options?: { evenIfExpired?: boolean }
+): Promise<string | null> => {
   const authState = getAuthState();
   const githubAuth = getGitHubAuth();
   const logger = getLogger();
 
   if (!authState?.refreshToken || !githubAuth) {
+    return null;
+  }
+
+  // Already known to be over, so an automatic refresh is just noise: the
+  // periodic one runs every minute, and a revoked session produced thousands of
+  // identical failures that way. A person pressing Reconnect is different -
+  // they may have re-authorised it, and that is the one case worth a request.
+  if (authState.expired && !options?.evenIfExpired) {
     return null;
   }
 
@@ -79,7 +113,7 @@ export const forceRefreshToken = async (): Promise<string | null> => {
     } catch (error) {
       lastError = error as Error;
 
-      // Only retry network errors, not auth errors
+      // Retry a network blip; anything else is not fixed by trying again.
       if (!isNetworkError(lastError)) {
         logger?.error(`Failed to refresh token (not retrying): ${lastError.message}`);
 
@@ -90,12 +124,18 @@ export const forceRefreshToken = async (): Promise<string | null> => {
         // token every minute, and the only truthful message was a per-job
         // "cannot check policy: not authenticated". The login is kept so the
         // UI can offer to reconnect as the right person.
-        const expiredState = { ...authState, expired: true };
+        // Only a definitive auth failure proves the session is over. A 429 or
+        // a 5xx is not evidence of anything except a bad moment upstream.
+        if (!isSpentSession(lastError)) return null;
+
+        // The access token goes with it: getValidAccessToken looks at expiresAt,
+        // which can still be in the future, and would hand out a dead token
+        // while `expired` says the session is unusable.
+        const expiredState = { ...getAuthState(), ...authState, expired: true, accessToken: undefined };
         setAuthState(expiredState);
         const config = loadConfig();
         config.auth = expiredState;
         saveConfig(config);
-
         return null;
       }
 

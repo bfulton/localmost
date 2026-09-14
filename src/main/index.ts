@@ -283,6 +283,8 @@ app.whenReady().then(async () => {
     // job - which is how every job came to be run by the next job's worker.
     onWorkerReservedForJob: (targetId: string, instanceNum: number) =>
       getBrokerProxyService()?.expectWorkerForJob(targetId, instanceNum),
+    onWorkerReservationCancelled: (targetId: string, instanceNum: number) =>
+      getBrokerProxyService()?.forgetExpectedWorker(targetId, instanceNum),
     onReregistrationNeeded: reRegisterSingleInstance,
     onConfigurationNeeded: configureSingleInstance,
     getRunnerLogLevel: () => getRunnerLogLevelSetting(),

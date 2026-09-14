@@ -126,6 +126,8 @@ interface RunnerManagerOptions {
    * than by whichever session happens to poll first.
    */
   onWorkerReservedForJob?: (targetId: string, instanceNum: number) => void;
+  /** Withdraw that reservation when the worker never starts. */
+  onWorkerReservationCancelled?: (targetId: string, instanceNum: number) => void;
   /** The daemon a worker's permitted container requests go to. The operator's own by default. */
   dockerBackend?: DockerBackend;
   /** Registry credentials, attached to a pull by the worker's socket so the job never holds them. */
@@ -164,6 +166,7 @@ export class RunnerManager {
   private getJobTarget?: (jobId: string) => { targetDisplayName: string; githubSha?: string } | undefined;
   private onJobEvent?: (event: JobEvent) => void;
   private onWorkerReservedForJob?: (targetId: string, instanceNum: number) => void;
+  private onWorkerReservationCancelled?: (targetId: string, instanceNum: number) => void;
   private jobHistory: JobHistoryEntry[] = [];
   private jobIdCounter = 0;
   private maxJobHistory = DEFAULT_MAX_JOB_HISTORY;
@@ -250,6 +253,7 @@ export class RunnerManager {
     this.getJobTarget = options.getJobTarget;
     this.onJobEvent = options.onJobEvent;
     this.onWorkerReservedForJob = options.onWorkerReservedForJob;
+    this.onWorkerReservationCancelled = options.onWorkerReservationCancelled;
     this.dockerBackend = options.dockerBackend ?? new DesktopBackend();
     this.attachRegistryAuth = options.attachRegistryAuth;
 
@@ -769,11 +773,21 @@ export class RunnerManager {
         );
       } catch (err) {
         this.log('error', `Failed to copy proxy credentials: ${(err as Error).message}`);
+        // The worker never started, so withdraw the binding announced above;
+        // left behind, its name could later claim a job it was not spawned for.
+        if (targetContext.targetId) {
+          this.onWorkerReservationCancelled?.(targetContext.targetId, instanceNum);
+        }
         this.releaseSlotReservation(instanceNum);
         return;
       }
     } else {
       this.log('error', `Proxy credentials not found for target ${targetContext.targetId}`);
+      // The worker never started, so withdraw the binding announced above;
+      // left behind, its name could later claim a job it was not spawned for.
+      if (targetContext.targetId) {
+        this.onWorkerReservationCancelled?.(targetContext.targetId, instanceNum);
+      }
       this.releaseSlotReservation(instanceNum);
       return;
     }
@@ -785,6 +799,11 @@ export class RunnerManager {
     } finally {
       // startInstance has taken over the slot (or failed); either way the
       // reservation has served its purpose.
+      // The worker never started, so withdraw the binding announced above;
+      // left behind, its name could later claim a job it was not spawned for.
+      if (targetContext.targetId) {
+        this.onWorkerReservationCancelled?.(targetContext.targetId, instanceNum);
+      }
       this.releaseSlotReservation(instanceNum);
     }
   }

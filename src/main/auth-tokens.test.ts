@@ -7,7 +7,13 @@ jest.mock('./config', () => ({
   saveConfig: (c: unknown) => mockSaveConfig(c),
 }));
 
-type Auth = { refreshToken?: string; user: { login: string }; expired?: boolean } | null;
+type Auth = {
+  refreshToken?: string;
+  accessToken?: string;
+  expiresAt?: number;
+  user: { login: string };
+  expired?: boolean;
+} | null;
 let authState: Auth = null;
 const mockRefresh = jest.fn<(t: string) => Promise<unknown>>();
 jest.mock('./app-state', () => ({
@@ -47,6 +53,46 @@ describe('a refresh that can never succeed', () => {
     expect(mockSaveConfig).toHaveBeenCalled();
   });
 
+  it('leaves a recoverable HTTP failure alone: a 500 is not proof of a spent token', async () => {
+    // Review caught this: refreshAccessToken throws for 429 and 5xx too, and
+    // treating every non-network error as expiry would strand a live session
+    // behind a Reconnect button over a transient upstream failure.
+    mockRefresh.mockRejectedValue(new Error('Failed to refresh token: 500'));
+
+    expect(await forceRefreshToken()).toBeNull();
+
+    expect(authState?.expired).toBeUndefined();
+  }, 15000);
+
+  it('drops the access token it can no longer refresh', async () => {
+    // Otherwise getValidAccessToken sees an expiresAt still in the future and
+    // hands out a dead token, while `expired` says the session is unusable.
+    authState = {
+      refreshToken: 'spent-token',
+      accessToken: 'stale',
+      expiresAt: Date.now() + 3_600_000,
+      user: { login: 'bfulton' },
+    };
+    mockRefresh.mockRejectedValue(
+      new Error('Failed to refresh token: The client_id and/or client_secret passed are incorrect.')
+    );
+
+    await forceRefreshToken();
+
+    expect(authState?.expired).toBe(true);
+    expect(authState?.accessToken).toBeUndefined();
+  });
+
+  it('stops trying once the session is known to be spent', async () => {
+    // The periodic refresh calls this every minute. 7763 identical failures is
+    // what that looked like in a real log.
+    authState = { refreshToken: 'spent-token', user: { login: 'bfulton' }, expired: true };
+
+    expect(await forceRefreshToken()).toBeNull();
+
+    expect(mockRefresh).not.toHaveBeenCalled();
+  });
+
   it('leaves a network blip alone, since that session is not expired', async () => {
     mockRefresh.mockRejectedValue(new Error('network timeout: ETIMEDOUT'));
 
@@ -63,7 +109,9 @@ describe('a refresh that can never succeed', () => {
       accessToken: 'fresh', refreshToken: 'next', expiresAt: 1, user: { login: 'bfulton' },
     });
 
-    expect(await forceRefreshToken()).toBe('fresh');
+    // As Reconnect calls it: a person asking is allowed past the guard that
+    // stops the periodic refresh hammering a spent token.
+    expect(await forceRefreshToken({ evenIfExpired: true })).toBe('fresh');
     expect(authState?.expired).toBeFalsy();
   });
 });

@@ -1331,9 +1331,24 @@ export class BrokerProxyService extends EventEmitter {
     this.expectedWorkers.set(agentName, targetId);
   }
 
+  /**
+   * Withdraw an expectation for a worker that never started, so its name cannot
+   * later bind a session to a job it was not spawned for.
+   */
+  forgetExpectedWorker(targetId: string, instanceNum: number): void {
+    const agentName = this.targets.get(targetId)?.instances.get(instanceNum)?.runner.agentName;
+    if (agentName) this.expectedWorkers.delete(agentName);
+  }
+
   private resolveSessionTarget(agentName: string | undefined): string | undefined {
     if (!agentName) return this.pendingTargetAssignments.shift();
-    // Spawned for a job: bind to it, whoever else is polling.
+    // A named session binds only if a worker was spawned for a job under that
+    // name. This is the whole decision: no fallback to "some listener on this
+    // target, if an assignment happens to be queued", because that fallback was
+    // the ordering that let an older unbound listener consume the assignment
+    // before the worker the job was meant for. It also keeps the property the
+    // old gate protected - a listener nobody spawned for a job runs in the
+    // generic sandbox, not the repository's policy, and must not win a job.
     const expected = this.expectedWorkers.get(agentName);
     if (expected !== undefined) {
       this.expectedWorkers.delete(agentName);
@@ -1344,10 +1359,7 @@ export class BrokerProxyService extends EventEmitter {
     for (const state of this.targets.values()) {
       for (const instance of state.instances.values()) {
         if (instance.runner.agentName !== agentName) continue;
-        const pending = this.pendingTargetAssignments.indexOf(state.target.id);
-        if (pending < 0) return undefined;
-        this.pendingTargetAssignments.splice(pending, 1);
-        return state.target.id;
+        return undefined;
       }
     }
     log()?.warn(`[BrokerProxy] Session request names unknown runner ${agentName}; leaving it unbound`);

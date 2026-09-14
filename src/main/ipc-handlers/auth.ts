@@ -218,7 +218,8 @@ export const registerAuthHandlers = (): void => {
    * do anything. Only when that fails is the device flow worth their time.
    */
   ipcMain.handle(IPC_CHANNELS.GITHUB_AUTH_RECONNECT, async () => {
-    const refreshed = await forceRefreshToken();
+    // Explicitly asked for, so it bypasses the give-up-when-expired guard.
+    const refreshed = await forceRefreshToken({ evenIfExpired: true });
     if (refreshed) {
       const authState = getAuthState();
       if (authState?.user) store.getState().setUser(authState.user);

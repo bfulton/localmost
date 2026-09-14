@@ -765,10 +765,14 @@ describe('message routing', () => {
       expect(internals.pendingTargetAssignments).toEqual([targetA.id]);
     });
 
-    it('consumes the matching pending assignment, not the first one', async () => {
+    it('consumes its own target assignment, never another target one', async () => {
+      // The property this has always protected: a session must not take a
+      // different target's assignment. It is now expressed through the
+      // expectation - binding is by name, so ordering cannot get it wrong.
       const targetA = addTargetWithRunner('target-a', 'runner-a.1');
       const targetB = addTargetWithRunner('target-b', 'runner-b.1');
       internals.pendingTargetAssignments.push(targetA.id, targetB.id);
+      service.expectWorkerForJob(targetB.id, 1);
 
       await createSession(JSON.stringify({ agent: { name: 'runner-b.1' } }));
 

@@ -174,12 +174,12 @@ export class RunnerManagerTestHelper {
     }).applyPolicyForTarget(instanceNum, targetDisplayName, githubSha, '', true);
   }
 
-  /** Seed the target context recorded when an instance is spawned for a job. */
   /** Watch the job events the manager emits, as the app does for notifications. */
   setOnJobEvent(handler: (event: unknown) => void): void {
     (this.manager as never as { onJobEvent?: (event: unknown) => void }).onJobEvent = handler;
   }
 
+  /** Seed the target context recorded when an instance is spawned for a job. */
   setPendingTargetContext(
     key: string,
     context: {

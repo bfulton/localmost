@@ -1,4 +1,4 @@
-import { describe, it, expect } from '@jest/globals';
+import { describe, it, expect, afterEach } from '@jest/globals';
 import { spawn } from 'child_process';
 import { sweepProcessGroup } from './process-group';
 
@@ -22,6 +22,18 @@ const waitFor = async (predicate: () => boolean, ms = 5000): Promise<boolean> =>
 };
 
 describe('sweepProcessGroup', () => {
+  /** Anything these tests spawn, killed whatever the assertions did. */
+  const spawned: number[] = [];
+  afterEach(() => {
+    for (const pid of spawned.splice(0)) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        // Already gone, which is the usual case.
+      }
+    }
+  });
+
   /**
    * A worker that exits leaving a child behind, which is exactly what happened
    * to a cancelled job: the Actions worker ended, its step's process did not,
@@ -41,6 +53,7 @@ describe('sweepProcessGroup', () => {
       });
     });
     await waitFor(() => !alive(leader));
+    spawned.push(orphan);
     return { leader, orphan };
   };
 

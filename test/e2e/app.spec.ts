@@ -486,10 +486,11 @@ test.describe('an expired session', () => {
     const loopErrors = getConsoleErrors().filter((e) => /error #185|Maximum update depth/i.test(e));
     expect(loopErrors, `React render loop:\n${loopErrors.join('\n')}`).toEqual([]);
 
-    // Deliberately not asserting on the badge here. Seeding a refresh token
-    // that GitHub will reject does not reproduce a known-but-expired session
-    // in the real app - it reads as signed out, because the startup refresh
-    // fails before anything is published. What this test is for is the
+    // Deliberately not asserting on the badge here, for a reason review pinned
+    // down: decryptValue rejects plaintext credentials by design, so loadConfig
+    // drops this seeded auth outright and the app starts signed out. Seeding a
+    // genuinely expired session would need a token encrypted by safeStorage,
+    // which only exists inside the app. What this test is for is the
     // failure the unit tests structurally cannot see: a loop between main and
     // renderer. The badge itself is covered on the store-backed path in
     // SettingsPage.zubridge.test.tsx.

@@ -182,9 +182,15 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
   }, []);
 
   // Signing in changes the user, and that is the other way a session recovers.
+  //
+  // Keyed on the login, not the user object: getAuthStatus calls setUser on
+  // every invocation, so the bridged store delivers a fresh object each time
+  // and an object-keyed effect would re-run, re-query, and re-render without
+  // end - the update-depth crash this whole feature already caused twice.
+  const userLogin = user?.login ?? null;
   useEffect(() => {
     void refreshAuthExpiry();
-  }, [user, refreshAuthExpiry]);
+  }, [userLogin, refreshAuthExpiry]);
 
   // Load initial state via IPC (fallback until zubridge syncs)
   useEffect(() => {
