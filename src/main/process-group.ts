@@ -17,6 +17,30 @@
 /** How long a process gets to handle SIGTERM before SIGKILL. */
 const GRACE_MS = 10_000;
 
+/** Escalations still waiting out their grace period, by process group. */
+const pendingEscalations = new Map<number, NodeJS.Timeout>();
+
+/**
+ * Kill anything still waiting out a grace period, now.
+ *
+ * Called when the app is quitting: the escalation timers are unref'd so they
+ * do not hold the app open, which means they never fire on the way out - and a
+ * descendant that ignored SIGTERM would then outlive everything that could
+ * reap it.
+ */
+export function finishPendingSweeps(): void {
+  for (const [pid, timer] of pendingEscalations) {
+    clearTimeout(timer);
+    try {
+      process.kill(-pid, 0);
+      process.kill(-pid, 'SIGKILL');
+    } catch {
+      // Already gone.
+    }
+  }
+  pendingEscalations.clear();
+}
+
 /**
  * Kill anything still running in `pid`'s process group, and report whether
  * there was anything to kill.
@@ -59,6 +83,12 @@ export function sweepProcessGroup(
   }, graceMs);
   // Never hold the app open waiting to escalate.
   escalation.unref?.();
+
+  // An unref'd timer does not survive the app quitting, and quit is exactly
+  // when a surviving descendant matters most: nothing will be left to reap it.
+  // finishNow() is the caller's way to say "there is no later" - it forgoes the
+  // grace period and kills immediately.
+  pendingEscalations.set(pid, escalation);
 
   return true;
 }

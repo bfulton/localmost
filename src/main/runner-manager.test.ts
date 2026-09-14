@@ -154,6 +154,25 @@ describe('RunnerManager', () => {
         startedAt: undefined,
       });
     });
+
+    it('reports a started runner with no worker as listening, not offline', () => {
+      // Workers are spawned per job, so an idle pool legitimately holds zero
+      // instances - that is the normal resting state, not a stopped runner.
+      // Reporting offline for it made `localmost status` say Offline while the
+      // app was up and accepting work, once the CLI began reading this instead
+      // of the state machine.
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      helper.startedAt = new Date().toISOString();
+
+      expect(runnerManager.getStatus().status).toBe('listening');
+    });
+
+    it('still reports offline before the runner is started', () => {
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      helper.startedAt = null;
+
+      expect(runnerManager.getStatus().status).toBe('offline');
+    });
   });
 
   describe('isRunning', () => {
@@ -1251,7 +1270,7 @@ describe('RunnerManager', () => {
       // followed by heartbeats straight through - no failure, no refusal,
       // indistinguishable from an idle runner. The slot was reclaimed at 120s
       // and nobody was told, so nothing connected the reap to the dead job.
-      const { manager, helper } = idlePool();
+      const { helper } = idlePool();
       const events: JobEvent[] = [];
       helper.setOnJobEvent((e) => events.push(e as JobEvent));
       helper.setPendingTargetContext('1', {

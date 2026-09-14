@@ -497,11 +497,21 @@ export class RunnerManager {
       };
     }
 
-    // If no instances exist or we're not started, return offline
-    if (this.instances.size === 0 || !this.startedAt) {
+    // Not started is offline. Started with no instances is not: workers are
+    // spawned per job, so an idle pool holds none, and that is the resting
+    // state of a healthy runner rather than a stopped one. Calling it offline
+    // made `localmost status` contradict a running app once the CLI began
+    // reading this instead of the state machine.
+    if (!this.startedAt) {
       return {
         status: 'offline',
         startedAt: undefined,
+      };
+    }
+    if (this.instances.size === 0) {
+      return {
+        status: 'listening',
+        startedAt: this.startedAt,
       };
     }
 
@@ -1359,7 +1369,15 @@ export class RunnerManager {
         status: 'failed',
       });
     }
+    // The whole group, not just the leader. A --once listener that ignores or
+    // is slow to handle SIGTERM leaves descendants behind, and the slot is
+    // released immediately below, so nothing comes back to look for them - the
+    // same leak that left a cancelled benchmark running for over an hour.
+    const workerPid = instance.process?.pid;
     instance.process?.kill('SIGTERM');
+    sweepProcessGroup(workerPid, {
+      onLog: (message) => this.log('warn', `[instance ${instanceNum}] ${message}`),
+    });
     this.releaseInstanceSlot(instanceNum);
   }
 

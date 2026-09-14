@@ -692,15 +692,17 @@ function evaluateNetworkCreate(req: DockerRequest, policy: DockerPolicy): Docker
 }
 
 /** Permit a per-network request only against a network this socket created. */
-function evaluateOwnNetwork(req: DockerRequest, ctx: DockerEvalContext, policy: DockerPolicy): DockerVerdict {
+function evaluateOwnNetwork(req: DockerRequest, ctx: DockerEvalContext): DockerVerdict {
   const id = networkIdFrom(req);
   if (!id) return deny(`${req.method} ${req.path} is not permitted through the localmost docker socket`);
   if (ctx.ownNetworkIds?.has(id)) return ALLOW;
-  // Reading the network the policy already puts containers on discloses nothing
-  // a job cannot reach - it is on that network - and its gateway is the sort of
-  // thing a job legitimately looks up. Reads only: removing it is not the job's
-  // to do, since the job did not create it.
-  if (req.method === 'GET' && id === policy.run?.network) return ALLOW;
+  // Deliberately no exception for the policy's declared network. Inspecting it
+  // reads as harmless - a job is already on that network, and wanting its
+  // gateway is reasonable - but the response carries a Containers map naming
+  // every container attached, with addresses. On a shared network like bridge
+  // that is other jobs' containers and the operator's own, which no policy
+  // here grants and which the job cannot otherwise see. The convenience is not
+  // worth a cross-job disclosure.
   return deny(`network "${id}" was not created through this job's docker socket`);
 }
 
@@ -864,7 +866,7 @@ export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext
       return evaluateNetworkCreate(req, policy);
     case 'network-inspect':
     case 'network-remove':
-      return evaluateOwnNetwork(req, ctx, policy);
+      return evaluateOwnNetwork(req, ctx);
     case 'buildkit':
       return deny(
         'BuildKit builds cannot be filtered: the build streams over a gRPC session that exports host ' +

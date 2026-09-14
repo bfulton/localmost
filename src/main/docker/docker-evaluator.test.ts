@@ -688,8 +688,13 @@ describe('inspecting the network the policy declares', () => {
   // says `network: bridge`, which reads as a broken daemon rather than policy.
   const p: DockerPolicy = { run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] } };
 
-  it('permits inspecting the declared run.network', () => {
-    expect(evaluateDockerRequest(mk('GET', '/v1.45/networks/bridge'), ctx(p)).allowed).toBe(true);
+  it('refuses it, because the response names every container on that network', () => {
+    // This was briefly allowed as a convenience: a job is on the network, so
+    // reading its gateway looks harmless. The response carries a Containers
+    // map with the names and addresses of everything attached - on a shared
+    // network, other jobs' containers and the operator's own. Nothing in the
+    // policy grants that, and the job cannot otherwise see it.
+    expect(evaluateDockerRequest(mk('GET', '/v1.45/networks/bridge'), ctx(p)).allowed).toBe(false);
   });
 
   it('still refuses a network that is neither declared nor created here', () => {

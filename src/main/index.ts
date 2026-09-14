@@ -64,6 +64,7 @@ import { getValidAccessToken, forceRefreshToken, cancelJobsOnOurRunners } from '
 
 // Runner lifecycle
 import { reRegisterSingleInstance, configureSingleInstance, clearStaleRunnerRegistrations } from './runner-lifecycle';
+import { finishPendingSweeps } from './process-group';
 
 // UI
 import { createWindow, setDockIcon } from './window';
@@ -851,6 +852,11 @@ app.on('before-quit', async (event) => {
         const runningJobs = runnerManager?.getJobHistory().filter(j => j.status === 'running') || [];
         await cancelJobsOnOurRunners(runningJobs);
         await runnerManager?.stop();
+        // stop() resolves as soon as the worker leaders exit. Any descendant
+        // that ignored SIGTERM is still waiting out a grace period on an
+        // unref'd timer that will not fire once we quit, so finish those now -
+        // after this point nothing is left to reap them.
+        finishPendingSweeps();
       })(),
     ]);
 
