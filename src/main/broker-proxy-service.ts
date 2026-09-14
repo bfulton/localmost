@@ -610,6 +610,11 @@ export class BrokerProxyService extends EventEmitter {
         this.messageQueues.set(targetId, []);
       }
       this.messageQueues.get(targetId)!.push(rewrittenMessage);
+      log()?.info(
+        `[BrokerProxy] Queued job for target ${targetId}; queue depth now ` +
+          `${this.messageQueues.get(targetId)!.length}. A depth above 1 means an earlier job is ` +
+          'still waiting for a worker to claim it.'
+      );
 
       state.jobsAssigned++;
 
@@ -1316,6 +1321,20 @@ export class BrokerProxyService extends EventEmitter {
     const agentName = agentNameFromSessionRequest(requestBody);
     log()?.info(`[BrokerProxy] Session request from ${agentName ?? 'unnamed runner'}`);
     const targetId = this.resolveSessionTarget(agentName);
+    if (!targetId) {
+      // getMessageForTarget refuses to hand anything to a session with no
+      // target, so this worker cannot receive a queued job however long it
+      // polls. If a job was queued for the target this worker was spawned for,
+      // it waits for some later worker instead - which is what a job sitting
+      // 451s before its first step looks like from outside.
+      const waiting = [...this.messageQueues.entries()]
+        .filter(([, q]) => q.length > 0)
+        .map(([id, q]) => `${id}:${q.length}`);
+      log()?.warn(
+        `[BrokerProxy] Session from ${agentName ?? 'unnamed runner'} resolved to no target; ` +
+          `it can receive no queued job. Queues holding messages: ${waiting.join(', ') || 'none'}`
+      );
+    }
     log()?.debug(`[BrokerProxy] Creating local session ${sessionId} for target ${targetId || 'unknown'}`);
 
     // Only create upstream sessions for instances that don't already have them

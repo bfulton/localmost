@@ -175,9 +175,22 @@ export class RunnerManagerTestHelper {
   }
 
   /** Seed the target context recorded when an instance is spawned for a job. */
+  /** Watch the job events the manager emits, as the app does for notifications. */
+  setOnJobEvent(handler: (event: unknown) => void): void {
+    (this.manager as never as { onJobEvent?: (event: unknown) => void }).onJobEvent = handler;
+  }
+
   setPendingTargetContext(
     key: string,
-    context: { targetId: string; targetDisplayName: string; githubSha?: string; githubWorkflow?: string }
+    context: {
+      targetId: string;
+      targetDisplayName: string;
+      actionsUrl?: string;
+      githubRunId?: number;
+      githubJobId?: number;
+      githubSha?: string;
+      githubWorkflow?: string;
+    }
   ): void {
     (this.manager as never as {
       pendingTargetContext: Map<string, unknown>;

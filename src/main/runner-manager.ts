@@ -1301,10 +1301,30 @@ export class RunnerManager {
     // It got what it was spawned for; leave it alone.
     if (instance.currentJob || instance.status === 'busy') return;
 
+    // Say which job died, not just that a slot came back. GitHub fails a job
+    // that reports no progress for 600s; this reap happens at 120s. Without
+    // naming it the app showed a healthy spawn and heartbeats straight through,
+    // and nothing connected the reclaimed slot to the job GitHub failed minutes
+    // later - a consumer had two runs die exactly that way and could not tell
+    // them from an idle runner.
+    const context = this.pendingTargetContext.get(String(instanceNum));
     this.log(
       'warn',
-      `Runner instance ${instanceNum} never acquired a job, reclaiming its slot`
+      `Runner instance ${instanceNum} never acquired a job, reclaiming its slot` +
+        (context?.targetDisplayName ? ` (job from ${context.targetDisplayName})` : '')
     );
+    if (context) {
+      this.recordRefusedJob({
+        repository: context.targetDisplayName,
+        jobName: context.githubWorkflow ?? 'job',
+        reason:
+          'accepted but never started: a runner was spawned for this job and the job was never ' +
+          'routed to it. GitHub fails a job that makes no progress for 600s.',
+        actionsUrl: context.actionsUrl,
+        githubRunId: context.githubRunId,
+        status: 'failed',
+      });
+    }
     instance.process?.kill('SIGTERM');
     this.releaseInstanceSlot(instanceNum);
   }
@@ -1962,13 +1982,16 @@ export class RunnerManager {
     reason: string;
     actionsUrl?: string;
     githubRunId?: number;
+    /** 'cancelled' for a policy refusal; 'failed' for a job that never started. */
+    status?: 'cancelled' | 'failed';
   }): void {
+    const status = details.status ?? 'cancelled';
     const now = new Date().toISOString();
     this.addJobToHistory({
       id: `refused-${details.githubRunId ?? Date.now()}`,
       jobName: details.jobName,
       repository: details.repository,
-      status: 'cancelled',
+      status,
       startedAt: now,
       completedAt: now,
       runTimeSeconds: 0,
@@ -1982,7 +2005,7 @@ export class RunnerManager {
       type: 'refused',
       jobName: details.jobName,
       repository: details.repository,
-      status: 'cancelled',
+      status,
       reason: details.reason,
     });
   }

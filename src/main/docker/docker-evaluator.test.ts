@@ -681,6 +681,33 @@ describe('what * spans in a declared glob', () => {
   });
 });
 
+describe('inspecting the network the policy declares', () => {
+  // Reading a declared network's gateway is read-only and discloses nothing a
+  // job cannot already reach: it is on that network. Refusing it meant
+  // `docker network inspect bridge` returned nothing for a job whose policy
+  // says `network: bridge`, which reads as a broken daemon rather than policy.
+  const p: DockerPolicy = { run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] } };
+
+  it('permits inspecting the declared run.network', () => {
+    expect(evaluateDockerRequest(mk('GET', '/v1.45/networks/bridge'), ctx(p)).allowed).toBe(true);
+  });
+
+  it('still refuses a network that is neither declared nor created here', () => {
+    const v = evaluateDockerRequest(mk('GET', '/v1.45/networks/someone-elses'), ctx(p));
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/was not created through this job/);
+  });
+
+  it('does not turn inspect into a way to delete it', () => {
+    expect(evaluateDockerRequest(mk('DELETE', '/v1.45/networks/bridge'), ctx(p)).allowed).toBe(false);
+  });
+
+  it('grants nothing when the policy declares no network', () => {
+    const bare: DockerPolicy = { run: { images: ['alpine:3'] } };
+    expect(evaluateDockerRequest(mk('GET', '/v1.45/networks/bridge'), ctx(bare)).allowed).toBe(false);
+  });
+});
+
 describe('BuildKit endpoints', () => {
   const p: DockerPolicy = { run: { images: ['alpine:3'], network: 'bridge' }, build: { context: './' } };
 

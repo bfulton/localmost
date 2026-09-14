@@ -692,10 +692,15 @@ function evaluateNetworkCreate(req: DockerRequest, policy: DockerPolicy): Docker
 }
 
 /** Permit a per-network request only against a network this socket created. */
-function evaluateOwnNetwork(req: DockerRequest, ctx: DockerEvalContext): DockerVerdict {
+function evaluateOwnNetwork(req: DockerRequest, ctx: DockerEvalContext, policy: DockerPolicy): DockerVerdict {
   const id = networkIdFrom(req);
   if (!id) return deny(`${req.method} ${req.path} is not permitted through the localmost docker socket`);
   if (ctx.ownNetworkIds?.has(id)) return ALLOW;
+  // Reading the network the policy already puts containers on discloses nothing
+  // a job cannot reach - it is on that network - and its gateway is the sort of
+  // thing a job legitimately looks up. Reads only: removing it is not the job's
+  // to do, since the job did not create it.
+  if (req.method === 'GET' && id === policy.run?.network) return ALLOW;
   return deny(`network "${id}" was not created through this job's docker socket`);
 }
 
@@ -859,7 +864,7 @@ export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext
       return evaluateNetworkCreate(req, policy);
     case 'network-inspect':
     case 'network-remove':
-      return evaluateOwnNetwork(req, ctx);
+      return evaluateOwnNetwork(req, ctx, policy);
     case 'buildkit':
       return deny(
         'BuildKit builds cannot be filtered: the build streams over a gRPC session that exports host ' +
