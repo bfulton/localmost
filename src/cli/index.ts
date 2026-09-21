@@ -16,6 +16,7 @@
 
 import * as net from 'net';
 import * as fs from 'fs';
+import { isSocketLive } from './app-running';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import { getCliSocketPath } from '../shared/paths';
@@ -247,10 +248,14 @@ async function sendCommand(
 
 /**
  * Check if the app is running by testing socket connection.
+ *
+ * It used to check only that the socket file existed, which a force quit
+ * leaves behind - so `localmost start` reported "already running" forever
+ * afterwards with nothing running, and the only way out was knowing to delete
+ * the file. isSocketLive connects, and clears the file when nothing answers.
  */
-function isAppRunning(): boolean {
-  const socketPath = getCliSocketPath();
-  return fs.existsSync(socketPath);
+async function isAppRunning(): Promise<boolean> {
+  return isSocketLive(getCliSocketPath());
 }
 
 /**
@@ -321,7 +326,7 @@ function getDevCheckoutRoot(): string | null {
  * Start the localmost app.
  */
 async function startApp(): Promise<void> {
-  if (isAppRunning()) {
+  if (await isAppRunning()) {
     console.log('localmost is already running');
     return;
   }
@@ -372,7 +377,7 @@ async function startApp(): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, checkInterval));
     waited += checkInterval;
 
-    if (isAppRunning()) {
+    if (await isAppRunning()) {
       console.log('localmost started successfully');
       return;
     }
@@ -385,7 +390,7 @@ async function startApp(): Promise<void> {
  * Stop the localmost app.
  */
 async function stopApp(): Promise<void> {
-  if (!isAppRunning()) {
+  if (!await isAppRunning()) {
     console.log('localmost is not running');
     return;
   }
@@ -511,7 +516,7 @@ async function main(): Promise<void> {
       process.exit(1);
     }
 
-    if (!isAppRunning()) {
+    if (!await isAppRunning()) {
       console.error('Error: localmost app is not running (start it with "localmost start")');
       process.exit(1);
     }
@@ -531,7 +536,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  if (!isAppRunning()) {
+  if (!await isAppRunning()) {
     console.log('localmost app is not running');
     process.exit(0);
   }
