@@ -1235,6 +1235,64 @@ describe('RunnerManager', () => {
     });
   });
 
+  describe('announcing which worker a job belongs to', () => {
+    it('keeps the announcement when the worker starts', async () => {
+      // The withdrawal was added for the case where the spawn fails, and put in
+      // a finally block - so it also ran on success, eleven seconds before the
+      // worker's session arrived. The broker recorded the pairing, dropped it
+      // again immediately, and then had no expectation to match, which is
+      // exactly what the log showed: "Expecting worker ...1" at 00:35:28 and
+      // "No expectation for ...1" at 00:35:39.
+      const reserved: Array<[string, number]> = [];
+      const cancelled: Array<[string, number]> = [];
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        onWorkerReservedForJob: (t, i) => reserved.push([t, i]),
+        onWorkerReservationCancelled: (t, i) => cancelled.push([t, i]),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.startedAt = new Date().toISOString();
+      helper.setPendingTargetContext('next', { targetId: 't1', targetDisplayName: 'owner/repo' });
+      helper.stubStartInstance(async () => undefined);
+      helper.stubCopyProxyCredentials(async () => undefined);
+      // The proxy credentials directory has to look present, or the spawn takes
+      // a genuine failure path and withdrawing would be correct.
+      (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
+
+      await manager.spawnWorkerForJob();
+
+      expect(reserved).toHaveLength(1);
+      expect(cancelled).toEqual([]);
+    });
+
+    it('withdraws it when the worker cannot be started', async () => {
+      const reserved: Array<[string, number]> = [];
+      const cancelled: Array<[string, number]> = [];
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        onWorkerReservedForJob: (t, i) => reserved.push([t, i]),
+        onWorkerReservationCancelled: (t, i) => cancelled.push([t, i]),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.startedAt = new Date().toISOString();
+      helper.setPendingTargetContext('next', { targetId: 't1', targetDisplayName: 'owner/repo' });
+      helper.stubStartInstance(async () => {
+        throw new Error('sandbox build failed');
+      });
+      helper.stubCopyProxyCredentials(async () => undefined);
+      (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
+
+      await manager.spawnWorkerForJob().catch(() => undefined);
+
+      expect(reserved).toHaveLength(1);
+      expect(cancelled).toHaveLength(1);
+    });
+  });
+
   describe('reaping a worker that never acquired a job', () => {
     function idlePool() {
       const manager = new RunnerManager({

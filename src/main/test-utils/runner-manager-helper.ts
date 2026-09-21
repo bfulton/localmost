@@ -179,6 +179,17 @@ export class RunnerManagerTestHelper {
     (this.manager as never as { onJobEvent?: (event: unknown) => void }).onJobEvent = handler;
   }
 
+  /** Replace startInstance, so a spawn can be made to succeed or fail. */
+  stubStartInstance(impl: (instanceNum: number) => Promise<void>): void {
+    (this.manager as never as { startInstance: unknown }).startInstance = impl;
+  }
+
+  /** Replace the downloader's credential copy, which spawning calls first. */
+  stubCopyProxyCredentials(impl: () => Promise<void>): void {
+    const manager = this.manager as never as { downloader: Record<string, unknown> };
+    manager.downloader = { ...(manager.downloader ?? {}), copyProxyCredentials: impl };
+  }
+
   /** Seed the target context recorded when an instance is spawned for a job. */
   setPendingTargetContext(
     key: string,

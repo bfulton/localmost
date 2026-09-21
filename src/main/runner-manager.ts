@@ -806,14 +806,19 @@ export class RunnerManager {
     // The instance will connect to broker proxy and pick up the queued job
     try {
       await this.startInstance(instanceNum);
-    } finally {
-      // startInstance has taken over the slot (or failed); either way the
-      // reservation has served its purpose.
-      // The worker never started, so withdraw the binding announced above;
-      // left behind, its name could later claim a job it was not spawned for.
+    } catch (err) {
+      // Only here. Withdrawing in the finally below took the announcement back
+      // on the success path too - the broker recorded the pairing and lost it
+      // again seconds before the worker's session arrived, so every session
+      // found no expectation and fell back to arrival order, which is the very
+      // thing the announcement exists to replace.
       if (targetContext.targetId) {
         this.onWorkerReservationCancelled?.(targetContext.targetId, instanceNum);
       }
+      throw err;
+    } finally {
+      // startInstance has taken over the slot (or failed); either way the
+      // reservation has served its purpose.
       this.releaseSlotReservation(instanceNum);
     }
   }
