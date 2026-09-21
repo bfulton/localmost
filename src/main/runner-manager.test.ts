@@ -1235,6 +1235,48 @@ describe('RunnerManager', () => {
     });
   });
 
+  describe('killing stale runner processes', () => {
+    it('never kills a worker this manager is currently running', async () => {
+      // Seen live: auto-start spawned instance 1 as pid 5748, the stale-process
+      // sweep read that pid out of the sandbox it had just written, killed it a
+      // second later, and the pool never came back - the runner sat Offline for
+      // eight hours while heartbeats carried on as if nothing were wrong.
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, {
+        name: 'runner-1',
+        status: 'listening',
+        currentJob: null,
+        process: { pid: 5748, kill: jest.fn() } as never,
+      });
+
+      const killed: number[] = [];
+      const realKill = process.kill;
+      (process as unknown as { kill: unknown }).kill = ((pid: number, sig?: unknown) => {
+        // Signal 0 is the liveness probe; anything else is an actual kill.
+        if (sig !== 0) killed.push(pid);
+        return true;
+      }) as never;
+      try {
+        (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
+        (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
+          { name: '1', isDirectory: () => true },
+        ] as never);
+        (jest.mocked(fs.promises.readFile) as unknown as jest.Mock).mockResolvedValue('5748' as never);
+
+        await helper.killStaleProcesses();
+      } finally {
+        (process as unknown as { kill: unknown }).kill = realKill;
+      }
+
+      expect(killed).not.toContain(5748);
+    });
+  });
+
   describe('announcing which worker a job belongs to', () => {
     it('keeps the announcement when the worker starts', async () => {
       // The withdrawal was added for the case where the spawn fails, and put in

@@ -2192,6 +2192,17 @@ export class RunnerManager {
   }
 
   private async killStaleProcesses(): Promise<void> {
+    // Processes this manager is running right now. A worker writes its pid into
+    // its sandbox as soon as it starts, so a sweep that trusts the file alone
+    // will kill a runner that was spawned seconds earlier: seen live, where
+    // auto-start brought instance 1 up as pid 5748 and this killed it one
+    // second later, leaving the pool empty and the runner Offline for eight
+    // hours while heartbeats carried on as though nothing were wrong.
+    const live = new Set<number>();
+    for (const instance of this.instances.values()) {
+      if (instance.process?.pid) live.add(instance.process.pid);
+    }
+
     // Check sandbox directories for stale PID files
     const sandboxBase = path.join(this.downloader.getBaseDir(), 'sandbox');
     if (!fs.existsSync(sandboxBase)) {
@@ -2219,6 +2230,11 @@ export class RunnerManager {
 
         if (isNaN(pid)) {
           await fs.promises.unlink(pidFile);
+          continue;
+        }
+
+        if (live.has(pid)) {
+          this.log('debug', `Runner process ${pid} is one of ours and running; leaving it alone`);
           continue;
         }
 

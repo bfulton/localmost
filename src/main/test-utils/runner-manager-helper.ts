@@ -190,6 +190,11 @@ export class RunnerManagerTestHelper {
     manager.downloader = { ...(manager.downloader ?? {}), copyProxyCredentials: impl };
   }
 
+  /** Run the stale-process sweep that startup performs. */
+  async killStaleProcesses(): Promise<void> {
+    await (this.manager as never as { killStaleProcesses(): Promise<void> }).killStaleProcesses();
+  }
+
   /** Seed the target context recorded when an instance is spawned for a job. */
   setPendingTargetContext(
     key: string,
