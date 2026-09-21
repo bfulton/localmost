@@ -1,12 +1,19 @@
 /**
  * XState synchronization middleware for Zustand store.
  *
- * Subscribes to the XState runner machine and syncs its state to the Zustand store.
- * This provides a unified view of all app state through Zustand while keeping
- * the XState machine as the source of truth for runner lifecycle.
+ * Subscribes to the XState runner machine and syncs to the Zustand store, so
+ * the app has one view of its state.
+ *
+ * The machine is NOT the source of truth for runner lifecycle. It is only ever
+ * sent pause and resume events - JOB_START and JOB_COMPLETE are declared on it
+ * and dispatched by nobody - so it knows nothing about jobs. A machine
+ * transition is a good moment to refresh, but the runner state published here
+ * comes from RunnerManager, which is where the job is. Pause is the machine's,
+ * and it does track that.
  */
 
-import { onStateChange, selectRunnerStatus, selectEffectivePauseState } from '../../runner-state-service';
+import { onStateChange, selectEffectivePauseState } from '../../runner-state-service';
+import { getRunnerState } from '../../app-state';
 import { store } from '../index';
 
 /**
@@ -15,8 +22,8 @@ import { store } from '../index';
  */
 export function setupXStateSync(): () => void {
   const unsubscribe = onStateChange((snapshot) => {
-    // Get the runner state from the machine
-    const runnerState = selectRunnerStatus(snapshot);
+    // Runner state from the runner; pause from the machine, which owns it.
+    const runnerState = getRunnerState();
     const pauseState = selectEffectivePauseState(snapshot);
 
     // Update the Zustand store

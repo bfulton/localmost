@@ -21,6 +21,10 @@ interface RunnerConfig {
 interface RunnerContextValue {
   // Auth state
   user: GitHubUser | null;
+  /** The session is stored but unusable: its refresh token is spent. */
+  authExpired: boolean;
+  /** Re-read that flag, for a UI that just tried to fix it. */
+  refreshAuthExpiry: () => Promise<void>;
   isAuthenticating: boolean;
   deviceCode: DeviceCodeInfo | null;
   login: () => Promise<void>;
@@ -111,6 +115,8 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
   // Fallback state for when zubridge isn't ready
   const [fallbackState, setFallbackState] = useState({
     user: null as GitHubUser | null,
+    /** A stored session the app can no longer use: known user, no access. */
+    authExpired: false,
     isAuthenticating: false,
     deviceCode: null as DeviceCodeInfo | null,
     repos: [] as GitHubRepo[],
@@ -156,12 +162,46 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
   const isInitialLoading = isZubridgeReady ? storeIsInitialLoading : fallbackState.isInitialLoading;
   const error = isZubridgeReady ? storeError : fallbackState.error;
 
+  /**
+   * Re-read whether the session is expired.
+   *
+   * The flag is read when the provider mounts, so a session that recovers
+   * while the app is open went on being reported as expired until the app was
+   * restarted. Bails out when the value is unchanged - returning the same
+   * state object - so a caller cannot turn this into a render loop.
+   */
+  const refreshAuthExpiry = useCallback(async () => {
+    try {
+      const status = await window.localmost.github.getAuthStatus();
+      setFallbackState(prev =>
+        prev.authExpired === !!status.expired ? prev : { ...prev, authExpired: !!status.expired }
+      );
+    } catch {
+      // Leave the last known value; a failed query is not evidence either way.
+    }
+  }, []);
+
+  // Signing in changes the user, and that is the other way a session recovers.
+  //
+  // Keyed on the login, not the user object: getAuthStatus calls setUser on
+  // every invocation, so the bridged store delivers a fresh object each time
+  // and an object-keyed effect would re-run, re-query, and re-render without
+  // end - the update-depth crash this whole feature already caused twice.
+  const userLogin = user?.login ?? null;
+  useEffect(() => {
+    void refreshAuthExpiry();
+  }, [userLogin, refreshAuthExpiry]);
+
   // Load initial state via IPC (fallback until zubridge syncs)
   useEffect(() => {
     const loadState = async () => {
       try {
         // Check auth status
         const authStatus = await window.localmost.github.getAuthStatus();
+        // Reported only. Everything about how `user` is handled is left
+        // exactly as it was: this flag adds a badge, it does not change what
+        // the app thinks its state is.
+        setFallbackState(prev => ({ ...prev, authExpired: !!authStatus.expired }));
         if (authStatus.isAuthenticated && authStatus.user) {
           const user = authStatus.user;
           setFallbackState(prev => ({ ...prev, user }));
@@ -462,6 +502,8 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
 
   const value: RunnerContextValue = {
     user,
+    authExpired: fallbackState.authExpired,
+    refreshAuthExpiry,
     isAuthenticating,
     deviceCode,
     login,

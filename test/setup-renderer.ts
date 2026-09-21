@@ -12,6 +12,7 @@ export interface MockLocalmost {
     startDeviceFlow: jest.Mock;
     cancelAuth: jest.Mock;
     logout: jest.Mock;
+    reconnect: jest.Mock;
     getRepos: jest.Mock;
     getOrgs: jest.Mock;
     onDeviceCode: jest.Mock;
@@ -50,6 +51,7 @@ export interface MockLocalmost {
   };
   app: {
     getHostname: jest.Mock;
+    onNavigate: (cb: (view: string) => void) => () => void;
     minimize: jest.Mock;
     quit: jest.Mock;
   };
@@ -96,6 +98,7 @@ const mockLocalmost: MockLocalmost = {
     startDeviceFlow: jest.fn(),
     cancelAuth: jest.fn(),
     logout: jest.fn(),
+    reconnect: jest.fn(),
     getRepos: jest.fn().mockResolvedValue({ success: true, repos: [] }),
     getOrgs: jest.fn().mockResolvedValue({ success: true, orgs: [] }),
     onDeviceCode: jest.fn().mockReturnValue(() => {}),
@@ -134,6 +137,7 @@ const mockLocalmost: MockLocalmost = {
   },
   app: {
     getHostname: jest.fn().mockResolvedValue('test-host'),
+    onNavigate: (_cb: (view: string) => void) => () => undefined,
     minimize: jest.fn(),
     quit: jest.fn(),
   },

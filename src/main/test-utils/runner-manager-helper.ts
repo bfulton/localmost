@@ -174,10 +174,39 @@ export class RunnerManagerTestHelper {
     }).applyPolicyForTarget(instanceNum, targetDisplayName, githubSha, '', true);
   }
 
+  /** Watch the job events the manager emits, as the app does for notifications. */
+  setOnJobEvent(handler: (event: unknown) => void): void {
+    (this.manager as never as { onJobEvent?: (event: unknown) => void }).onJobEvent = handler;
+  }
+
+  /** Replace startInstance, so a spawn can be made to succeed or fail. */
+  stubStartInstance(impl: (instanceNum: number) => Promise<void>): void {
+    (this.manager as never as { startInstance: unknown }).startInstance = impl;
+  }
+
+  /** Replace the downloader's credential copy, which spawning calls first. */
+  stubCopyProxyCredentials(impl: () => Promise<void>): void {
+    const manager = this.manager as never as { downloader: Record<string, unknown> };
+    manager.downloader = { ...(manager.downloader ?? {}), copyProxyCredentials: impl };
+  }
+
+  /** Run the stale-process sweep that startup performs. */
+  async killStaleProcesses(): Promise<void> {
+    await (this.manager as never as { killStaleProcesses(): Promise<void> }).killStaleProcesses();
+  }
+
   /** Seed the target context recorded when an instance is spawned for a job. */
   setPendingTargetContext(
     key: string,
-    context: { targetId: string; targetDisplayName: string; githubSha?: string; githubWorkflow?: string }
+    context: {
+      targetId: string;
+      targetDisplayName: string;
+      actionsUrl?: string;
+      githubRunId?: number;
+      githubJobId?: number;
+      githubSha?: string;
+      githubWorkflow?: string;
+    }
   ): void {
     (this.manager as never as {
       pendingTargetContext: Map<string, unknown>;

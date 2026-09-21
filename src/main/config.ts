@@ -60,6 +60,8 @@ export interface AppConfig {
     refreshToken?: string;
     expiresAt?: number;  // Unix timestamp (ms) when access token expires
     user: GitHubUser;
+    /** The refresh token is spent: the session is known but unusable. */
+    expired?: boolean;
   };
   runnerConfig?: {
     level: 'repo' | 'org';
@@ -168,13 +170,17 @@ export const saveConfig = (config: AppConfig): void => {
     // Create a copy to avoid mutating the original config
     const configToSave: AppConfig = { ...config, configVersion: CONFIG_VERSION };
 
-    // Only persist refreshToken and user - access tokens are obtained fresh on startup
+    // Only persist refreshToken and user - access tokens are obtained fresh on
+    // startup - plus whether the session is known to be spent. Dropping that
+    // flag meant a restart forgot, presented the account as healthy, and went
+    // back to refreshing a token that can never work.
     if (configToSave.auth) {
-      const { refreshToken, user } = configToSave.auth;
+      const { refreshToken, user, expired } = configToSave.auth;
       if (refreshToken) {
         configToSave.auth = {
           refreshToken: encryptValue(refreshToken),
           user,
+          ...(expired ? { expired: true } : {}),
         };
       } else {
         // No refresh token means we can't persist auth

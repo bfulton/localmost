@@ -568,6 +568,54 @@ describe('message routing', () => {
     });
   });
 
+  it('binds the worker it was told was spawned for the job, whoever polls first', async () => {
+    // Measured by a consumer over five runs: every job that ran was executed by
+    // the NEXT job's worker, ~10s after that job was assigned, and any job with
+    // no successor inside 600s was killed by GitHub having never run a step.
+    //
+    // pendingTargetAssignments is a list of target ids, so with several
+    // instances on one target arrival order is the only thing telling them
+    // apart. Whichever session polled first consumed the assignment and the
+    // worker actually spawned for the job came back unbound - permanently, and
+    // since queues are per-target every later worker then drained the oldest
+    // message. Naming the worker removes ordering from the decision.
+    const target = addTargetWithRunner('target-a', 'runner-a.1');
+    internals.messageQueues.set(target.id, [jobMessage]);
+    service.expectWorkerForJob(target.id, 1);
+
+    const sessionId = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }));
+    const res = await request('GET', `/message?sessionId=${sessionId}`);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).messageType).toBe('RunnerJobRequest');
+  });
+
+  it('leaves a listener nobody spawned for a job unbound', async () => {
+    // The property that gate protects: a listener spawned ahead of any job runs
+    // in the generic sandbox, not the repository's approved policy. Binding it
+    // would let it win the job and fail on a path the policy never granted.
+    const target = addTargetWithRunner('target-a', 'runner-a.1');
+    internals.messageQueues.set(target.id, [jobMessage]);
+    // Nothing was spawned for this job.
+
+    const sessionId = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }));
+
+    expect(internals.localSessions.get(sessionId)?.targetId).toBeUndefined();
+    expect(internals.messageQueues.get(target.id)).toHaveLength(1);
+  });
+
+  it('expects a worker only once, so a later listener cannot reuse the binding', async () => {
+    const target = addTargetWithRunner('target-a', 'runner-a.1');
+    service.expectWorkerForJob(target.id, 1);
+
+    const first = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }));
+    const second = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }));
+
+    expect(internals.localSessions.get(first)?.targetId).toBe(target.id);
+    expect(internals.localSessions.get(second)?.targetId).toBeUndefined();
+  });
+
+
   it('delivers the queued job before a stale RunnerRefreshConfig', async () => {
     // GitHub pushes RunnerRefreshConfig between jobs. If the next worker's first
     // poll returns that instead of its job, the runner rewrites its config and
@@ -717,10 +765,14 @@ describe('message routing', () => {
       expect(internals.pendingTargetAssignments).toEqual([targetA.id]);
     });
 
-    it('consumes the matching pending assignment, not the first one', async () => {
+    it('consumes its own target assignment, never another target one', async () => {
+      // The property this has always protected: a session must not take a
+      // different target's assignment. It is now expressed through the
+      // expectation - binding is by name, so ordering cannot get it wrong.
       const targetA = addTargetWithRunner('target-a', 'runner-a.1');
       const targetB = addTargetWithRunner('target-b', 'runner-b.1');
       internals.pendingTargetAssignments.push(targetA.id, targetB.id);
+      service.expectWorkerForJob(targetB.id, 1);
 
       await createSession(JSON.stringify({ agent: { name: 'runner-b.1' } }));
 

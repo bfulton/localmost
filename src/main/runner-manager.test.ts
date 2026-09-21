@@ -154,6 +154,25 @@ describe('RunnerManager', () => {
         startedAt: undefined,
       });
     });
+
+    it('reports a started runner with no worker as listening, not offline', () => {
+      // Workers are spawned per job, so an idle pool legitimately holds zero
+      // instances - that is the normal resting state, not a stopped runner.
+      // Reporting offline for it made `localmost status` say Offline while the
+      // app was up and accepting work, once the CLI began reading this instead
+      // of the state machine.
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      helper.startedAt = new Date().toISOString();
+
+      expect(runnerManager.getStatus().status).toBe('listening');
+    });
+
+    it('still reports offline before the runner is started', () => {
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      helper.startedAt = null;
+
+      expect(runnerManager.getStatus().status).toBe('offline');
+    });
   });
 
   describe('isRunning', () => {
@@ -1216,6 +1235,106 @@ describe('RunnerManager', () => {
     });
   });
 
+  describe('killing stale runner processes', () => {
+    it('never kills a worker this manager is currently running', async () => {
+      // Seen live: auto-start spawned instance 1 as pid 5748, the stale-process
+      // sweep read that pid out of the sandbox it had just written, killed it a
+      // second later, and the pool never came back - the runner sat Offline for
+      // eight hours while heartbeats carried on as if nothing were wrong.
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, {
+        name: 'runner-1',
+        status: 'listening',
+        currentJob: null,
+        process: { pid: 5748, kill: jest.fn() } as never,
+      });
+
+      const killed: number[] = [];
+      const realKill = process.kill;
+      (process as unknown as { kill: unknown }).kill = ((pid: number, sig?: unknown) => {
+        // Signal 0 is the liveness probe; anything else is an actual kill.
+        if (sig !== 0) killed.push(pid);
+        return true;
+      }) as never;
+      try {
+        (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
+        (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
+          { name: '1', isDirectory: () => true },
+        ] as never);
+        (jest.mocked(fs.promises.readFile) as unknown as jest.Mock).mockResolvedValue('5748' as never);
+
+        await helper.killStaleProcesses();
+      } finally {
+        (process as unknown as { kill: unknown }).kill = realKill;
+      }
+
+      expect(killed).not.toContain(5748);
+    });
+  });
+
+  describe('announcing which worker a job belongs to', () => {
+    it('keeps the announcement when the worker starts', async () => {
+      // The withdrawal was added for the case where the spawn fails, and put in
+      // a finally block - so it also ran on success, eleven seconds before the
+      // worker's session arrived. The broker recorded the pairing, dropped it
+      // again immediately, and then had no expectation to match, which is
+      // exactly what the log showed: "Expecting worker ...1" at 00:35:28 and
+      // "No expectation for ...1" at 00:35:39.
+      const reserved: Array<[string, number]> = [];
+      const cancelled: Array<[string, number]> = [];
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        onWorkerReservedForJob: (t, i) => reserved.push([t, i]),
+        onWorkerReservationCancelled: (t, i) => cancelled.push([t, i]),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.startedAt = new Date().toISOString();
+      helper.setPendingTargetContext('next', { targetId: 't1', targetDisplayName: 'owner/repo' });
+      helper.stubStartInstance(async () => undefined);
+      helper.stubCopyProxyCredentials(async () => undefined);
+      // The proxy credentials directory has to look present, or the spawn takes
+      // a genuine failure path and withdrawing would be correct.
+      (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
+
+      await manager.spawnWorkerForJob();
+
+      expect(reserved).toHaveLength(1);
+      expect(cancelled).toEqual([]);
+    });
+
+    it('withdraws it when the worker cannot be started', async () => {
+      const reserved: Array<[string, number]> = [];
+      const cancelled: Array<[string, number]> = [];
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        onWorkerReservedForJob: (t, i) => reserved.push([t, i]),
+        onWorkerReservationCancelled: (t, i) => cancelled.push([t, i]),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.startedAt = new Date().toISOString();
+      helper.setPendingTargetContext('next', { targetId: 't1', targetDisplayName: 'owner/repo' });
+      helper.stubStartInstance(async () => {
+        throw new Error('sandbox build failed');
+      });
+      helper.stubCopyProxyCredentials(async () => undefined);
+      (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
+
+      await manager.spawnWorkerForJob().catch(() => undefined);
+
+      expect(reserved).toHaveLength(1);
+      expect(cancelled).toHaveLength(1);
+    });
+  });
+
   describe('reaping a worker that never acquired a job', () => {
     function idlePool() {
       const manager = new RunnerManager({
@@ -1243,6 +1362,36 @@ describe('RunnerManager', () => {
 
       expect(manager.hasAvailableSlot()).toBe(true);
       expect(helper.instances.has(1)).toBe(false);
+    });
+
+    it('reports the job that never started, instead of reclaiming the slot in silence', () => {
+      // A consumer watched five runs: two were killed by GitHub at exactly
+      // 600s having never run a step, and localmost showed a healthy spawn
+      // followed by heartbeats straight through - no failure, no refusal,
+      // indistinguishable from an idle runner. The slot was reclaimed at 120s
+      // and nobody was told, so nothing connected the reap to the dead job.
+      const { helper } = idlePool();
+      const events: JobEvent[] = [];
+      helper.setOnJobEvent((e) => events.push(e as JobEvent));
+      helper.setPendingTargetContext('1', {
+        targetId: 't1',
+        targetDisplayName: 'owner/repo',
+        actionsUrl: 'https://github.com/owner/repo/actions/runs/1/job/2',
+        githubRunId: 1,
+        githubJobId: 2,
+        githubWorkflow: 'macos',
+      });
+
+      helper.reapUnclaimedWorker(1);
+
+      expect(events).toHaveLength(1);
+      expect(events[0].repository).toBe('owner/repo');
+      expect(events[0].status).toBe('failed');
+      expect(events[0].reason).toMatch(/never started/i);
+      // And it lands in history, so it is visible after the notification goes.
+      const recorded = mockOnJobHistoryUpdate.mock.calls.at(-1)?.[0] as Array<{ status: string; actionsUrl?: string }>;
+      expect(recorded.at(-1)?.status).toBe('failed');
+      expect(recorded.at(-1)?.actionsUrl).toContain('/job/2');
     });
 
     it('reclaims a worker that is still unclaimed when the deadline passes', () => {

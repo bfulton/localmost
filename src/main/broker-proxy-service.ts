@@ -345,6 +345,23 @@ export class BrokerProxyService extends EventEmitter {
   private messageQueues: Map<string, Array<string>> = new Map();  // Per-target message queues
   private seenMessageIds: Set<string> = new Set();
   private pendingTargetAssignments: string[] = [];  // Queue of target IDs for upcoming sessions
+  /**
+   * Workers spawned for a specific job, by the agent name they will present.
+   *
+   * pendingTargetAssignments distinguishes workers only by target and arrival
+   * order, so with several instances on one target whichever session polls
+   * first consumes the assignment and the worker actually spawned for the job
+   * comes back unbound - and stays unbound, because a session binds once. Since
+   * queues are per-target, every later worker then drains the oldest message: a
+   * consumer measured every job being run by the NEXT job's worker, with the
+   * last job of any burst killed by GitHub at 600s having never started.
+   *
+   * Naming the worker takes ordering out of the decision, while keeping what
+   * the ordering was there to protect: a listener nobody spawned for a job has
+   * no entry here, so it cannot bind and win a job its generic sandbox would
+   * fail to run.
+   */
+  private expectedWorkers: Map<string, string> = new Map();  // agentName -> targetId
   /** Repository and commit for a job, keyed by both jobId and messageId. */
   private jobTargets: Map<string, { targetDisplayName: string; githubSha?: string }> = new Map();
 
@@ -610,6 +627,11 @@ export class BrokerProxyService extends EventEmitter {
         this.messageQueues.set(targetId, []);
       }
       this.messageQueues.get(targetId)!.push(rewrittenMessage);
+      log()?.info(
+        `[BrokerProxy] Queued job for target ${targetId}; queue depth now ` +
+          `${this.messageQueues.get(targetId)!.length}. A depth above 1 means an earlier job is ` +
+          'still waiting for a worker to claim it.'
+      );
 
       state.jobsAssigned++;
 
@@ -1294,12 +1316,62 @@ export class BrokerProxyService extends EventEmitter {
    * waiting, and it takes that entry rather than whichever is first. An
    * unnamed request falls back to the positional queue.
    */
+  /**
+   * Say which worker was spawned for a job, so its session binds to that job's
+   * target however the polling races.
+   */
+  expectWorkerForJob(targetId: string, instanceNum: number): void {
+    const agentName = this.targets.get(targetId)?.instances.get(instanceNum)?.runner.agentName;
+    if (!agentName) {
+      log()?.warn(
+        `[BrokerProxy] Cannot expect worker ${instanceNum} for target ${targetId}: no agent name known`
+      );
+      return;
+    }
+    this.expectedWorkers.set(agentName, targetId);
+    log()?.info(`[BrokerProxy] Expecting worker ${agentName} for target ${targetId}`);
+  }
+
+  /**
+   * Withdraw an expectation for a worker that never started, so its name cannot
+   * later bind a session to a job it was not spawned for.
+   */
+  forgetExpectedWorker(targetId: string, instanceNum: number): void {
+    const agentName = this.targets.get(targetId)?.instances.get(instanceNum)?.runner.agentName;
+    if (agentName) this.expectedWorkers.delete(agentName);
+  }
+
   private resolveSessionTarget(agentName: string | undefined): string | undefined {
     if (!agentName) return this.pendingTargetAssignments.shift();
+    // A named session binds only if a worker was spawned for a job under that
+    // name. This is the whole decision: no fallback to "some listener on this
+    // target, if an assignment happens to be queued", because that fallback was
+    // the ordering that let an older unbound listener consume the assignment
+    // before the worker the job was meant for. It also keeps the property the
+    // old gate protected - a listener nobody spawned for a job runs in the
+    // generic sandbox, not the repository's policy, and must not win a job.
+    const expected = this.expectedWorkers.get(agentName);
+    if (expected !== undefined) {
+      this.expectedWorkers.delete(agentName);
+      const pending = this.pendingTargetAssignments.indexOf(expected);
+      if (pending >= 0) this.pendingTargetAssignments.splice(pending, 1);
+      return expected;
+    }
     for (const state of this.targets.values()) {
       for (const instance of state.instances.values()) {
         if (instance.runner.agentName !== agentName) continue;
+        // No expectation recorded for this worker. Making that fatal - which it
+        // was, briefly - meant nothing could bind at all when the announcement
+        // did not arrive, and a job that binds late beats a job that never
+        // binds. The pending assignment is the older, order-based path; it is
+        // kept as the fallback it always was, and this says so out loud.
         const pending = this.pendingTargetAssignments.indexOf(state.target.id);
+        log()?.warn(
+          `[BrokerProxy] No expectation for ${agentName}; falling back to arrival order ` +
+            `(pending assignment ${pending >= 0 ? 'present' : 'absent'} for ${state.target.id}). ` +
+            'Expected workers: ' +
+            ([...this.expectedWorkers.keys()].join(', ') || 'none')
+        );
         if (pending < 0) return undefined;
         this.pendingTargetAssignments.splice(pending, 1);
         return state.target.id;
@@ -1316,6 +1388,20 @@ export class BrokerProxyService extends EventEmitter {
     const agentName = agentNameFromSessionRequest(requestBody);
     log()?.info(`[BrokerProxy] Session request from ${agentName ?? 'unnamed runner'}`);
     const targetId = this.resolveSessionTarget(agentName);
+    if (!targetId) {
+      // getMessageForTarget refuses to hand anything to a session with no
+      // target, so this worker cannot receive a queued job however long it
+      // polls. If a job was queued for the target this worker was spawned for,
+      // it waits for some later worker instead - which is what a job sitting
+      // 451s before its first step looks like from outside.
+      const waiting = [...this.messageQueues.entries()]
+        .filter(([, q]) => q.length > 0)
+        .map(([id, q]) => `${id}:${q.length}`);
+      log()?.warn(
+        `[BrokerProxy] Session from ${agentName ?? 'unnamed runner'} resolved to no target; ` +
+          `it can receive no queued job. Queues holding messages: ${waiting.join(', ') || 'none'}`
+      );
+    }
     log()?.debug(`[BrokerProxy] Creating local session ${sessionId} for target ${targetId || 'unknown'}`);
 
     // Only create upstream sessions for instances that don't already have them
