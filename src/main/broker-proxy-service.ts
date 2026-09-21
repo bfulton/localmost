@@ -1329,6 +1329,7 @@ export class BrokerProxyService extends EventEmitter {
       return;
     }
     this.expectedWorkers.set(agentName, targetId);
+    log()?.info(`[BrokerProxy] Expecting worker ${agentName} for target ${targetId}`);
   }
 
   /**
@@ -1359,7 +1360,21 @@ export class BrokerProxyService extends EventEmitter {
     for (const state of this.targets.values()) {
       for (const instance of state.instances.values()) {
         if (instance.runner.agentName !== agentName) continue;
-        return undefined;
+        // No expectation recorded for this worker. Making that fatal - which it
+        // was, briefly - meant nothing could bind at all when the announcement
+        // did not arrive, and a job that binds late beats a job that never
+        // binds. The pending assignment is the older, order-based path; it is
+        // kept as the fallback it always was, and this says so out loud.
+        const pending = this.pendingTargetAssignments.indexOf(state.target.id);
+        log()?.warn(
+          `[BrokerProxy] No expectation for ${agentName}; falling back to arrival order ` +
+            `(pending assignment ${pending >= 0 ? 'present' : 'absent'} for ${state.target.id}). ` +
+            'Expected workers: ' +
+            ([...this.expectedWorkers.keys()].join(', ') || 'none')
+        );
+        if (pending < 0) return undefined;
+        this.pendingTargetAssignments.splice(pending, 1);
+        return state.target.id;
       }
     }
     log()?.warn(`[BrokerProxy] Session request names unknown runner ${agentName}; leaving it unbound`);
