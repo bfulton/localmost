@@ -137,13 +137,33 @@ export const store = createStore<AppStore>()(
     // ==========================================================================
 
     setUser: (user: GitHubUser | null) => {
-      set((state) => ({
-        auth: {
-          ...state.auth,
-          user,
-          isAuthenticated: user !== null,
-        },
-      }));
+      set((state) => {
+        // A write that changes nothing still costs: this store is bridged to
+        // the renderer, so a new object identity is a broadcast and a
+        // re-render for everything watching. The auth status handler calls
+        // this on every query, and rebuilding the auth object each time gave
+        // the renderer a fresh `user` to react to - an effect keyed on it
+        // queried again, and the pair spun across IPC for five days at 100%
+        // CPU without tripping React's update-depth guard, because every turn
+        // was asynchronous. Returning the same state ends that.
+        const current = state.auth.user;
+        const same =
+          current === user ||
+          (current != null &&
+            user != null &&
+            current.login === user.login &&
+            current.name === user.name &&
+            current.avatar_url === user.avatar_url);
+        if (same && state.auth.isAuthenticated === (user !== null)) return state;
+
+        return {
+          auth: {
+            ...state.auth,
+            user,
+            isAuthenticated: user !== null,
+          },
+        };
+      });
     },
 
     setIsAuthenticating: (isAuthenticating: boolean) => {
