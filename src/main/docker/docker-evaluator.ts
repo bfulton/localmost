@@ -534,6 +534,25 @@ function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: Dock
             hints.network(name)
           );
         }
+
+        // The key is only half of it. For a user-defined key, moby's
+        // getNetworkID prefers the entry's NetworkID over the key, and resolves
+        // it as a name, id or id prefix - so an owned key carrying a foreign
+        // NetworkID joins the foreign network while every check here sees the
+        // owned name. Only an empty NetworkID, or one naming the key itself,
+        // means what the key says.
+        const endpoint = endpoints[key];
+        if (isUnset(endpoint)) continue;
+        if (!isPlainObject(endpoint)) {
+          return deny(`NetworkingConfig.EndpointsConfig["${key}"] must be an object`);
+        }
+        for (const networkId of valuesFor(endpoint, 'NetworkID')) {
+          if (isUnset(networkId) || networkId === '' || networkId === key) continue;
+          return deny(
+            `NetworkingConfig.EndpointsConfig["${key}"].NetworkID names a different network than its key; ` +
+              'the daemon would join that network instead, which the policy does not grant'
+          );
+        }
       }
     }
   }

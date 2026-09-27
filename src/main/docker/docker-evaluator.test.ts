@@ -824,6 +824,47 @@ describe('networks attached by NetworkingConfig rather than NetworkMode', () => 
     expect(v.allowed).toBe(true);
   });
 
+  it('refuses an endpoint whose NetworkID names a different network than its key', () => {
+    // Security review: the key was the only part checked, but moby's
+    // getNetworkID returns epConfig.NetworkID over the key whenever the key is
+    // a user-defined network, and FindNetwork takes a name, id or id prefix.
+    // So an owned key with a foreign NetworkID joined the foreign network.
+    const owned = ctx(p, { ownNetworkIds: new Set(['vk-1']) });
+    const v = create({
+      Image: 'alpine:3',
+      HostConfig: { NetworkMode: 'vk-1' },
+      NetworkingConfig: { EndpointsConfig: { 'vk-1': { NetworkID: 'someone-elses-net' } } },
+    }, owned);
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/NetworkID/);
+  });
+
+  it('refuses it in any casing, since the daemon decodes keys case-insensitively', () => {
+    const owned = ctx(p, { ownNetworkIds: new Set(['vk-1']) });
+    const v = create({
+      Image: 'alpine:3',
+      HostConfig: { NetworkMode: 'vk-1' },
+      NetworkingConfig: { EndpointsConfig: { 'vk-1': { networkid: 'abc123' } } },
+    }, owned);
+    expect(v.allowed).toBe(false);
+  });
+
+  it('allows the empty NetworkID the CLI sends, and a NetworkID naming the key itself', () => {
+    const owned = ctx(p, { ownNetworkIds: new Set(['vk-1']) });
+    for (const NetworkID of ['', 'vk-1']) {
+      expect(create({
+        Image: 'alpine:3',
+        HostConfig: { NetworkMode: 'vk-1' },
+        NetworkingConfig: { EndpointsConfig: { 'vk-1': { NetworkID } } },
+      }, owned).allowed).toBe(true);
+    }
+  });
+
+  it('refuses an endpoint value that is not an object', () => {
+    const v = create({ Image: 'alpine:3', NetworkingConfig: { EndpointsConfig: { bridge: 'x' } } });
+    expect(v.allowed).toBe(false);
+  });
+
   it('permits "default", which is what the real CLI sends for an ordinary docker run', () => {
     // Captured from the wire: `docker run --rm -v ... alpine:3` sends
     // NetworkingConfig.EndpointsConfig {"default": {}}. Judging that name
