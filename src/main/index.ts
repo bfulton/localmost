@@ -284,8 +284,8 @@ app.whenReady().then(async () => {
     // job - which is how every job came to be run by the next job's worker.
     onWorkerReservedForJob: (targetId: string, instanceNum: number) =>
       getBrokerProxyService()?.expectWorkerForJob(targetId, instanceNum),
-    onWorkerReservationCancelled: (targetId: string, instanceNum: number) =>
-      getBrokerProxyService()?.forgetExpectedWorker(targetId, instanceNum),
+    onWorkerReservationCancelled: (targetId: string, instanceNum: number, jobId?: string) =>
+      getBrokerProxyService()?.forgetExpectedWorker(targetId, instanceNum, jobId),
     onReregistrationNeeded: reRegisterSingleInstance,
     onConfigurationNeeded: configureSingleInstance,
     getRunnerLogLevel: () => getRunnerLogLevelSetting(),
@@ -503,7 +503,7 @@ app.whenReady().then(async () => {
         }
       }
 
-      runnerManager.setPendingTargetContext('next', targetId, target.displayName, actionsUrl, githubInfo.githubRunId, githubInfo.githubJobId, githubInfo.githubActor, githubInfo.githubSha, githubInfo.githubRef, githubInfo.githubWorkflow);
+      runnerManager.setPendingTargetContext('next', targetId, target.displayName, actionsUrl, githubInfo.githubRunId, githubInfo.githubJobId, githubInfo.githubActor, githubInfo.githubSha, githubInfo.githubRef, githubInfo.githubWorkflow, jobId);
 
       // Spawn a worker to handle this job
       try {

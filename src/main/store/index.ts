@@ -194,7 +194,18 @@ export const store = createStore<AppStore>()(
     // ==========================================================================
 
     setRunnerState: (runnerState: RunnerState) => {
-      set((state) => ({ runner: { ...state.runner, runnerState } }));
+      set((state) => {
+        // Every status change lands here, and many change nothing the store
+        // holds. A write is a broadcast to the renderer - see setUser.
+        const current = state.runner.runnerState;
+        const same =
+          current.status === runnerState.status &&
+          current.jobName === runnerState.jobName &&
+          current.repository === runnerState.repository &&
+          current.startedAt === runnerState.startedAt &&
+          current.error === runnerState.error;
+        return same ? state : { runner: { ...state.runner, runnerState } };
+      });
     },
 
     setIsDownloaded: (isDownloaded: boolean) => {

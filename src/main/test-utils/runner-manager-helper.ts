@@ -206,11 +206,19 @@ export class RunnerManagerTestHelper {
       githubJobId?: number;
       githubSha?: string;
       githubWorkflow?: string;
+      jobId?: string;
     }
   ): void {
     (this.manager as never as {
       pendingTargetContext: Map<string, unknown>;
     }).pendingTargetContext.set(key, context);
+  }
+
+  /** The target context currently recorded under a key, if any. */
+  pendingTargetContext(key: string): unknown {
+    return (this.manager as never as {
+      pendingTargetContext: Map<string, unknown>;
+    }).pendingTargetContext.get(key);
   }
 
   /** Register a stub proxy for an instance. */

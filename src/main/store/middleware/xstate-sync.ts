@@ -12,32 +12,38 @@
  * and it does track that.
  */
 
-import { onStateChange, selectEffectivePauseState } from '../../runner-state-service';
+import {
+  onStateChange,
+  getEffectivePauseState,
+  selectEffectivePauseState,
+} from '../../runner-state-service';
 import { getRunnerState } from '../../app-state';
 import { store } from '../index';
+import type { RunnerState } from '../../../shared/types';
+
+/**
+ * Put the runner's state in the store, with pause from the machine.
+ *
+ * Called on machine transitions and on every RunnerManager status change. The
+ * renderer reads the store once zubridge is ready, so a job starting or ending
+ * has to land here, not only in the IPC status event.
+ */
+export function publishRunnerState(
+  runnerState: RunnerState = getRunnerState(),
+  pauseState: { isPaused: boolean; reason: string | null } = getEffectivePauseState()
+): void {
+  store.getState().setRunnerState({
+    ...runnerState,
+    ...(pauseState.isPaused && { error: pauseState.reason ?? undefined }),
+  });
+}
 
 /**
  * Set up synchronization between XState machine and Zustand store.
  * Returns an unsubscribe function.
  */
 export function setupXStateSync(): () => void {
-  const unsubscribe = onStateChange((snapshot) => {
-    // Runner state from the runner; pause from the machine, which owns it.
-    const runnerState = getRunnerState();
-    const pauseState = selectEffectivePauseState(snapshot);
-
-    // Update the Zustand store
-    store.setState((state) => ({
-      runner: {
-        ...state.runner,
-        runnerState: {
-          ...runnerState,
-          // Add pause info to the runner state if paused
-          ...(pauseState.isPaused && { error: pauseState.reason ?? undefined }),
-        },
-      },
-    }));
+  return onStateChange((snapshot) => {
+    publishRunnerState(getRunnerState(), selectEffectivePauseState(snapshot));
   });
-
-  return unsubscribe;
 }

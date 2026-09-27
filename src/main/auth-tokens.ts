@@ -113,6 +113,15 @@ export const forceRefreshToken = async (
     } catch (error) {
       lastError = error as Error;
 
+      // Another caller may have refreshed while this one was waiting. If the
+      // refresh token has changed since this attempt began, the failure is
+      // about a token that is already retired - the session is fine, and
+      // writing this caller's stale snapshot would undo the renewal.
+      const current = getAuthState();
+      if (current?.refreshToken && current.refreshToken !== authState.refreshToken) {
+        return current.accessToken ?? null;
+      }
+
       // Retry a network blip; anything else is not fixed by trying again.
       if (!isNetworkError(lastError)) {
         logger?.error(`Failed to refresh token (not retrying): ${lastError.message}`);
@@ -131,7 +140,7 @@ export const forceRefreshToken = async (
         // The access token goes with it: getValidAccessToken looks at expiresAt,
         // which can still be in the future, and would hand out a dead token
         // while `expired` says the session is unusable.
-        const expiredState = { ...getAuthState(), ...authState, expired: true, accessToken: undefined };
+        const expiredState = { ...authState, ...getAuthState(), expired: true, accessToken: undefined };
         setAuthState(expiredState);
         const config = loadConfig();
         config.auth = expiredState;

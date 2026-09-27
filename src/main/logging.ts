@@ -13,6 +13,7 @@ import {
   setCurrentRunnerStatus,
 } from './app-state';
 import { updateTrayMenu } from './tray-init';
+import { publishRunnerState } from './store/middleware/xstate-sync';
 import { updateSleepProtection } from './app-state';
 import {
   IPC_CHANNELS,
@@ -70,6 +71,7 @@ export const sendStatusUpdate = (state: RunnerState): void => {
   if (mainWindow && !mainWindow.isDestroyed() && !getIsQuitting()) {
     mainWindow.webContents.send(IPC_CHANNELS.RUNNER_STATUS_UPDATE, state);
   }
+  publishRunnerState(state);
   setCurrentRunnerStatus(state.status);
   updateSleepProtection();
   updateTrayMenu();

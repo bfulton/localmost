@@ -1333,12 +1333,34 @@ export class BrokerProxyService extends EventEmitter {
   }
 
   /**
-   * Withdraw an expectation for a worker that never started, so its name cannot
-   * later bind a session to a job it was not spawned for.
+   * Withdraw a worker that will never take the job it was spawned for, so its
+   * name cannot later bind a session to a job it was not spawned for.
+   *
+   * With the job's id, the job goes too. Queues are per target and drained in
+   * order, so a job left behind is handed to the next worker spawned for the
+   * repository, which runs it in place of its own - the job history has by then
+   * recorded it as failed, and every later job is off by one.
    */
-  forgetExpectedWorker(targetId: string, instanceNum: number): void {
+  forgetExpectedWorker(targetId: string, instanceNum: number, jobId?: string): void {
     const agentName = this.targets.get(targetId)?.instances.get(instanceNum)?.runner.agentName;
-    if (agentName) this.expectedWorkers.delete(agentName);
+    const neverBound = agentName !== undefined && this.expectedWorkers.delete(agentName);
+    if (!jobId) return;
+
+    const queue = this.messageQueues.get(targetId);
+    const index = queue?.findIndex(
+      message => isJobAssignmentMessage(message) && jobIdFromMessage(message) === jobId
+    ) ?? -1;
+    if (!queue || index < 0) return;
+    queue.splice(index, 1);
+    this.jobAssignments.delete(jobId);
+    this.jobTargets.delete(jobId);
+    // Binding consumes an assignment. Only a worker that never bound still has
+    // one; taking one otherwise would strand another job's worker.
+    if (neverBound) {
+      const pending = this.pendingTargetAssignments.indexOf(targetId);
+      if (pending >= 0) this.pendingTargetAssignments.splice(pending, 1);
+    }
+    log()?.info(`[BrokerProxy] Dropped job ${jobId} for ${targetId}: its worker ${instanceNum} will never take it`);
   }
 
   private resolveSessionTarget(agentName: string | undefined): string | undefined {

@@ -127,7 +127,7 @@ interface RunnerManagerOptions {
    */
   onWorkerReservedForJob?: (targetId: string, instanceNum: number) => void;
   /** Withdraw that reservation when the worker never starts. */
-  onWorkerReservationCancelled?: (targetId: string, instanceNum: number) => void;
+  onWorkerReservationCancelled?: (targetId: string, instanceNum: number, jobId?: string) => void;
   /** The daemon a worker's permitted container requests go to. The operator's own by default. */
   dockerBackend?: DockerBackend;
   /** Registry credentials, attached to a pull by the worker's socket so the job never holds them. */
@@ -166,7 +166,7 @@ export class RunnerManager {
   private getJobTarget?: (jobId: string) => { targetDisplayName: string; githubSha?: string } | undefined;
   private onJobEvent?: (event: JobEvent) => void;
   private onWorkerReservedForJob?: (targetId: string, instanceNum: number) => void;
-  private onWorkerReservationCancelled?: (targetId: string, instanceNum: number) => void;
+  private onWorkerReservationCancelled?: (targetId: string, instanceNum: number, jobId?: string) => void;
   private jobHistory: JobHistoryEntry[] = [];
   private jobIdCounter = 0;
   private maxJobHistory = DEFAULT_MAX_JOB_HISTORY;
@@ -215,7 +215,7 @@ export class RunnerManager {
 
   // Pending target context for jobs received from broker
   // Maps runner name (or 'next') to target context
-  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string; githubSha?: string; githubRef?: string; githubWorkflow?: string }> = new Map();
+  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string; githubSha?: string; githubRef?: string; githubWorkflow?: string; jobId?: string }> = new Map();
 
   /**
    * Validate that a child path stays within the expected base directory.
@@ -383,9 +383,10 @@ export class RunnerManager {
    * @param githubSha The commit SHA that triggered the workflow
    * @param githubRef The branch/tag ref (e.g., refs/heads/main)
    * @param githubWorkflow The workflow name (github.workflow), which keys per-workflow policy
+   * @param jobId The broker's id for the job, so a worker that never takes it can give it up
    */
-  setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string, actionsUrl?: string, githubRunId?: number, githubJobId?: number, githubActor?: string, githubSha?: string, githubRef?: string, githubWorkflow?: string): void {
-    this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName, actionsUrl, githubRunId, githubJobId, githubActor, githubSha, githubRef, githubWorkflow });
+  setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string, actionsUrl?: string, githubRunId?: number, githubJobId?: number, githubActor?: string, githubSha?: string, githubRef?: string, githubWorkflow?: string, jobId?: string): void {
+    this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName, actionsUrl, githubRunId, githubJobId, githubActor, githubSha, githubRef, githubWorkflow, jobId });
     this.log('debug', `Set pending target context for ${runnerName}: ${targetDisplayName} (runId=${githubRunId}, jobId=${githubJobId}, actor=${githubActor}, sha=${githubSha?.slice(0, 7)})`);
   }
 
@@ -393,7 +394,7 @@ export class RunnerManager {
    * Consume pending target context for a runner.
    * Returns and removes the context if found.
    */
-  private consumePendingTargetContext(runnerName: string): { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string; githubSha?: string; githubRef?: string; githubWorkflow?: string } | undefined {
+  private consumePendingTargetContext(runnerName: string): { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string; githubSha?: string; githubRef?: string; githubWorkflow?: string; jobId?: string } | undefined {
     // Try exact match first, then fall back to 'next'
     let context = this.pendingTargetContext.get(runnerName);
     if (context) {
@@ -721,6 +722,21 @@ export class RunnerManager {
     this.reservedSlots.delete(instanceNum);
   }
 
+  /**
+   * Give up the job a worker was spawned for, when that worker will never take
+   * it: withdraw the broker's binding and drop the job from its queue, and
+   * forget the job here. Left at the broker, the next worker for the repository
+   * runs it in place of its own; left here, a later start of the slot is built
+   * from the abandoned job's repository and policy.
+   */
+  private abandonJobFor(instanceNum: number): void {
+    const context = this.pendingTargetContext.get(String(instanceNum));
+    if (context?.targetId) {
+      this.onWorkerReservationCancelled?.(context.targetId, instanceNum, context.jobId);
+    }
+    this.pendingTargetContext.delete(String(instanceNum));
+  }
+
   async spawnWorkerForJob(): Promise<void> {
     // Take the context before waiting for a slot. 'next' is a single shared
     // slot, so a job arriving during the wait would otherwise overwrite it and
@@ -783,21 +799,13 @@ export class RunnerManager {
         );
       } catch (err) {
         this.log('error', `Failed to copy proxy credentials: ${(err as Error).message}`);
-        // The worker never started, so withdraw the binding announced above;
-        // left behind, its name could later claim a job it was not spawned for.
-        if (targetContext.targetId) {
-          this.onWorkerReservationCancelled?.(targetContext.targetId, instanceNum);
-        }
+        this.abandonJobFor(instanceNum);
         this.releaseSlotReservation(instanceNum);
         return;
       }
     } else {
       this.log('error', `Proxy credentials not found for target ${targetContext.targetId}`);
-      // The worker never started, so withdraw the binding announced above;
-      // left behind, its name could later claim a job it was not spawned for.
-      if (targetContext.targetId) {
-        this.onWorkerReservationCancelled?.(targetContext.targetId, instanceNum);
-      }
+      this.abandonJobFor(instanceNum);
       this.releaseSlotReservation(instanceNum);
       return;
     }
@@ -806,15 +814,18 @@ export class RunnerManager {
     // The instance will connect to broker proxy and pick up the queued job
     try {
       await this.startInstance(instanceNum);
+      // startInstance reports most failures by marking the instance and
+      // returning. A worker with no process never started.
+      if (!this.instances.get(instanceNum)?.process) {
+        this.abandonJobFor(instanceNum);
+      }
     } catch (err) {
-      // Only here. Withdrawing in the finally below took the announcement back
-      // on the success path too - the broker recorded the pairing and lost it
-      // again seconds before the worker's session arrived, so every session
+      // Only on failure. Withdrawing in the finally below took the announcement
+      // back on the success path too - the broker recorded the pairing and lost
+      // it again seconds before the worker's session arrived, so every session
       // found no expectation and fell back to arrival order, which is the very
       // thing the announcement exists to replace.
-      if (targetContext.targetId) {
-        this.onWorkerReservationCancelled?.(targetContext.targetId, instanceNum);
-      }
+      this.abandonJobFor(instanceNum);
       throw err;
     } finally {
       // startInstance has taken over the slot (or failed); either way the
@@ -1062,8 +1073,9 @@ export class RunnerManager {
       });
       instance.policyStamp = filesystemPolicy.stamp;
 
-      // Don't set 'running' until we see "Listening for Jobs"
-      // instance.status stays 'offline' until confirmed
+      // Don't set 'listening' until we see "Listening for Jobs". Until then
+      // the instance stays 'starting', which keeps its slot from being
+      // reserved for another job.
 
       // Write PID file for orphan detection
       if (instance.process.pid) {
@@ -1107,6 +1119,18 @@ export class RunnerManager {
         sweepProcessGroup(workerPid, {
           onLog: (message) => this.log('warn', `[instance ${instanceNum}] ${message}`),
         });
+
+        // The job this worker was spawned for is over or was never taken; an
+        // armed deadline means never taken. Only while this is still the
+        // slot's worker: a reaped one's exit can land after the next worker
+        // was spawned into the slot, and what is recorded now is that one's.
+        if (this.instances.get(instanceNum) === instance) {
+          if (this.acquireDeadlines.has(instanceNum)) {
+            this.abandonJobFor(instanceNum);
+          }
+          this.disarmAcquireDeadline(instanceNum);
+          this.pendingTargetContext.delete(String(instanceNum));
+        }
 
         instance.currentJob = null;
 
@@ -1383,6 +1407,7 @@ export class RunnerManager {
     sweepProcessGroup(workerPid, {
       onLog: (message) => this.log('warn', `[instance ${instanceNum}] ${message}`),
     });
+    this.abandonJobFor(instanceNum);
     this.releaseInstanceSlot(instanceNum);
   }
 

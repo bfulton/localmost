@@ -616,6 +616,57 @@ describe('message routing', () => {
   });
 
 
+  describe('abandoning a worker that never took its job', () => {
+    const secondJob = JSON.stringify({
+      messageId: 4,
+      messageType: 'RunnerJobRequest',
+      body: JSON.stringify({ runner_request_id: 'req-2' }),
+    });
+
+    it('drops the job it was spawned for, so the next worker is not handed it', () => {
+      // A worker reaped for never acquiring its job left the job queued. The
+      // next worker spawned for the same repository drained the queue in order
+      // and ran the dead job instead of its own - after the history had already
+      // recorded that job as failed.
+      const target = addTargetWithRunner('target-a', 'runner-a.1');
+      internals.messageQueues.set(target.id, [jobMessage]);
+      internals.pendingTargetAssignments.push(target.id);
+      service.expectWorkerForJob(target.id, 1);
+
+      service.forgetExpectedWorker(target.id, 1, 'req-1');
+
+      expect(internals.messageQueues.get(target.id)).toEqual([]);
+      expect(internals.pendingTargetAssignments).toEqual([]);
+    });
+
+    it('leaves the other jobs queued for the same repository alone', () => {
+      const target = addTargetWithRunner('target-a', 'runner-a.1');
+      internals.messageQueues.set(target.id, [jobMessage, secondJob]);
+      internals.pendingTargetAssignments.push(target.id, target.id);
+      service.expectWorkerForJob(target.id, 1);
+
+      service.forgetExpectedWorker(target.id, 1, 'req-1');
+
+      expect(internals.messageQueues.get(target.id)).toEqual([secondJob]);
+      expect(internals.pendingTargetAssignments).toEqual([target.id]);
+    });
+
+    it('does not take an assignment its own session already used', async () => {
+      // Binding consumed this worker's assignment. The one still queued
+      // belongs to another job's worker, which would come back unbound.
+      const target = addTargetWithRunner('target-a', 'runner-a.1');
+      internals.messageQueues.set(target.id, [jobMessage, secondJob]);
+      internals.pendingTargetAssignments.push(target.id, target.id);
+      service.expectWorkerForJob(target.id, 1);
+      await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }));
+
+      service.forgetExpectedWorker(target.id, 1, 'req-1');
+
+      expect(internals.pendingTargetAssignments).toEqual([target.id]);
+      expect(internals.messageQueues.get(target.id)).toEqual([secondJob]);
+    });
+  });
+
   it('delivers the queued job before a stale RunnerRefreshConfig', async () => {
     // GitHub pushes RunnerRefreshConfig between jobs. If the next worker's first
     // poll returns that instead of its job, the runner rewrites its config and

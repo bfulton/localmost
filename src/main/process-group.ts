@@ -73,6 +73,10 @@ export function sweepProcessGroup(
   }
 
   const escalation = setTimeout(() => {
+    // Done with this group either way. Left in the map, finishPendingSweeps()
+    // would later signal -pid, a group id the OS may by then have reused for
+    // something unrelated.
+    pendingEscalations.delete(pid);
     try {
       process.kill(-pid, 0);
       process.kill(-pid, 'SIGKILL');

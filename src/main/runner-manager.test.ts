@@ -1188,6 +1188,18 @@ describe('RunnerManager', () => {
       expect(helper.reserveSlot()).toBe(1);
     });
 
+    it('does not reserve a slot whose worker is still starting', () => {
+      // spawnWorkerForJob drops its reservation as soon as startInstance
+      // returns, long before the runner prints "Listening for Jobs". What holds
+      // the slot from then on is the instance's 'starting' status; were it
+      // claimable, a second job would launch another worker under the same
+      // runner name before the first one's session bound.
+      const { helper } = managerWith(1);
+      helper.setInstance(1, { name: 'runner-1', status: 'starting' });
+
+      expect(helper.reserveSlot()).toBeNull();
+    });
+
     it('does not reserve a slot held by a running instance', () => {
       const { helper } = managerWith(2);
       helper.setInstance(1, { name: 'runner-1', status: 'busy' });
@@ -1297,7 +1309,9 @@ describe('RunnerManager', () => {
       const helper = new RunnerManagerTestHelper(manager);
       helper.startedAt = new Date().toISOString();
       helper.setPendingTargetContext('next', { targetId: 't1', targetDisplayName: 'owner/repo' });
-      helper.stubStartInstance(async () => undefined);
+      helper.stubStartInstance(async (n) => {
+        helper.setInstance(n, { name: `runner-${n}`, status: 'starting', process: createMockProcess(4242) });
+      });
       helper.stubCopyProxyCredentials(async () => undefined);
       // The proxy credentials directory has to look present, or the spawn takes
       // a genuine failure path and withdrawing would be correct.
@@ -1332,6 +1346,101 @@ describe('RunnerManager', () => {
 
       expect(reserved).toHaveLength(1);
       expect(cancelled).toHaveLength(1);
+    });
+  });
+
+  describe('a worker that will never take its job', () => {
+    function recordingManager() {
+      const cancelled: Array<[string, number, string | undefined]> = [];
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        onWorkerReservedForJob: () => undefined,
+        onWorkerReservationCancelled: (t, i, j) => cancelled.push([t, i, j]),
+      });
+      return { manager, helper: new RunnerManagerTestHelper(manager), cancelled };
+    }
+    const context = { targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'req-1' };
+
+    it('gives up its job when it is reaped, so the next worker is not handed it', () => {
+      // The reap recorded the job as failed and left it queued at the broker,
+      // where the next worker for the repository took it in place of its own.
+      const { helper, cancelled } = recordingManager();
+      helper.setInstance(1, { name: 'runner-1', status: 'listening', currentJob: null });
+      helper.setPendingTargetContext('1', context);
+
+      helper.reapUnclaimedWorker(1);
+
+      expect(cancelled).toEqual([['t1', 1, 'req-1']]);
+    });
+
+    it('forgets the job it was spawned for when it cannot be given credentials', async () => {
+      // Left keyed by instance, the failed job's repository and policy would be
+      // what a later start of this slot is built from.
+      const { manager, helper, cancelled } = recordingManager();
+      helper.startedAt = new Date().toISOString();
+      helper.setPendingTargetContext('next', context);
+      helper.stubStartInstance(async () => undefined);
+      (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(false);
+
+      await manager.spawnWorkerForJob();
+
+      expect(cancelled).toEqual([['t1', 1, 'req-1']]);
+      expect(helper.pendingTargetContext('1')).toBeUndefined();
+    });
+
+    it('forgets the job when the start fails without throwing', async () => {
+      // startInstance reports most failures by marking the instance and
+      // returning, so returning is not the same as starting.
+      const { manager, helper, cancelled } = recordingManager();
+      helper.startedAt = new Date().toISOString();
+      helper.setPendingTargetContext('next', context);
+      helper.stubCopyProxyCredentials(async () => undefined);
+      helper.stubStartInstance(async (n) => {
+        helper.setInstance(n, { name: `runner-${n}`, status: 'error', process: null });
+      });
+      (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
+
+      await manager.spawnWorkerForJob();
+
+      expect(cancelled).toEqual([['t1', 1, 'req-1']]);
+      expect(helper.pendingTargetContext('1')).toBeUndefined();
+    });
+
+    it('forgets the job when the worker exits before taking it', async () => {
+      const { manager, helper, cancelled } = recordingManager();
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      const proc = createMockProcess(12345);
+      mockSpawnSandboxed.mockReturnValue(proc);
+      helper.setPendingTargetContext('1', context);
+      await manager.start();
+
+      proc.emit('exit', 1, null);
+      await settle();
+
+      expect(cancelled).toEqual([['t1', 1, 'req-1']]);
+      expect(helper.pendingTargetContext('1')).toBeUndefined();
+    });
+
+    it("leaves the slot's next worker alone when an old worker's exit arrives late", async () => {
+      // A reaped worker is signalled and its slot handed out at once, so its
+      // exit can land after the next worker has been spawned into the slot.
+      const { manager, helper, cancelled } = recordingManager();
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      const proc = createMockProcess(12345);
+      mockSpawnSandboxed.mockReturnValue(proc);
+      helper.setPendingTargetContext('1', context);
+      await manager.start();
+      const next = { targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'req-2' };
+      helper.setInstance(1, { name: 'runner-1', status: 'starting', process: createMockProcess(777) });
+      helper.setPendingTargetContext('1', next);
+
+      proc.emit('exit', 1, null);
+      await settle();
+
+      expect(cancelled).toEqual([]);
+      expect(helper.pendingTargetContext('1')).toBe(next);
     });
   });
 

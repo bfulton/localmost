@@ -93,6 +93,23 @@ describe('a refresh that can never succeed', () => {
     expect(mockRefresh).not.toHaveBeenCalled();
   });
 
+  it('does not mark a session expired that an overlapping refresh just renewed', async () => {
+    // Review: refreshes overlap (startup, heartbeat, reconnect). One rotates
+    // the refresh token; the other, still holding the spent one, is refused
+    // and used to overwrite the fresh state with `expired`.
+    mockRefresh.mockImplementation(async () => {
+      // While this call is in flight, another one succeeds and rotates it.
+      authState = { refreshToken: 'rotated', accessToken: 'fresh', user: { login: 'bfulton' } };
+      throw new Error('Failed to refresh token: The client_id and/or client_secret passed are incorrect.');
+    });
+
+    expect(await forceRefreshToken()).toBe('fresh');
+
+    expect(authState?.expired).toBeUndefined();
+    expect(authState?.refreshToken).toBe('rotated');
+    expect(mockSaveConfig).not.toHaveBeenCalled();
+  });
+
   it('leaves a network blip alone, since that session is not expired', async () => {
     mockRefresh.mockRejectedValue(new Error('network timeout: ETIMEDOUT'));
 

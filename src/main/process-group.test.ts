@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from '@jest/globals';
 import { spawn } from 'child_process';
-import { sweepProcessGroup } from './process-group';
+import { sweepProcessGroup, finishPendingSweeps } from './process-group';
 
 /** Is this pid still alive? Signal 0 checks without delivering anything. */
 const alive = (pid: number): boolean => {
@@ -75,6 +75,32 @@ describe('sweepProcessGroup', () => {
 
     // Nothing left in the group now: a second sweep finds no members.
     expect(sweepProcessGroup(leader)).toBe(false);
+  });
+
+  it('forgets an escalation once it has fired, so quit cannot signal a reused group', async () => {
+    // Review: the timer fired and left its pid in the pending map, so a later
+    // finishPendingSweeps() would SIGKILL -pid - a process group the OS may
+    // since have handed to something unrelated.
+    // Earlier tests sweep with the default ten-second grace; clear theirs so
+    // this one sees only its own escalation.
+    finishPendingSweeps();
+    const { leader, orphan } = await spawnLeaderThatLeavesAnOrphan();
+    sweepProcessGroup(leader, { graceMs: 20 });
+    await waitFor(() => !alive(orphan));
+    await new Promise((r) => setTimeout(r, 60));
+
+    const realKill = process.kill;
+    const signalled: number[] = [];
+    (process as unknown as { kill: unknown }).kill = ((pid: number) => {
+      signalled.push(pid);
+      return true;
+    }) as never;
+    try {
+      finishPendingSweeps();
+    } finally {
+      (process as unknown as { kill: unknown }).kill = realKill;
+    }
+    expect(signalled).toEqual([]);
   });
 
   it('is quiet about a pid that never existed, and about no pid at all', () => {
