@@ -107,8 +107,8 @@ describe('BrokerProxyService', () => {
     service = new BrokerProxyService(8787);
 
     // Default server mock behavior
-    mockServerListen.mockImplementation((_port, callback) => {
-      callback();
+    mockServerListen.mockImplementation((...args: unknown[]) => {
+      (args[args.length - 1] as () => void)();
     });
     mockServerClose.mockImplementation((callback) => {
       callback();
@@ -266,7 +266,9 @@ describe('BrokerProxyService', () => {
       await service.start();
 
       expect(mockCreateServer).toHaveBeenCalled();
-      expect(mockServerListen).toHaveBeenCalledWith(8787, expect.any(Function));
+      // Loopback only. Bound to every interface, anything on the same network
+      // could reach it.
+      expect(mockServerListen).toHaveBeenCalledWith(8787, '127.0.0.1', expect.any(Function));
     });
 
     it('should not start twice', async () => {
@@ -480,6 +482,7 @@ describe('message routing', () => {
     messageQueues: Map<string, string[]>;
     pendingTargetAssignments: string[];
     localSessions: Map<string, { targetId?: string; currentJobId?: string }>;
+    acquiredJobDetails: Map<string, string>;
     handleRequest(req: unknown, res: unknown): Promise<void>;
     processMessage(state: unknown, instance: unknown, body: string): Promise<void>;
   }
@@ -510,6 +513,7 @@ describe('message routing', () => {
     req.url = url;
     req.headers = {};
     req[Symbol.asyncIterator] = async function* () { if (body) yield Buffer.from(body); };
+    (req as unknown as { resume: () => void }).resume = () => {};
     return req;
   };
 
@@ -528,9 +532,19 @@ describe('message routing', () => {
   let service: BrokerProxyService;
   let internals: RoutingInternals;
 
-  const request = async (method: string, url: string, body?: string) => {
+  // Every worker reaches the broker through its own URL, whose path carries a
+  // key the broker issued for that worker's start. Requests go through the
+  // most recently started worker unless a test names another prefix.
+  let workerPrefix = '';
+  const prefixOf = (brokerUrl: string) => new URL(brokerUrl).pathname.replace(/\/$/, '');
+  const startWorker = (instanceNum: number, targetId?: string) => {
+    workerPrefix = prefixOf(service.issueWorkerKey(instanceNum, targetId));
+    return workerPrefix;
+  };
+
+  const request = async (method: string, url: string, body?: string, prefix = workerPrefix) => {
     const res = fakeResponse();
-    await internals.handleRequest(fakeRequest(method, url, body), res);
+    await internals.handleRequest(fakeRequest(method, `${prefix}${url}`, body), res);
     return res;
   };
 
@@ -540,11 +554,12 @@ describe('message routing', () => {
     service.addTarget(target, [{ ...cred, runner: { ...cred.runner, agentName } }]);
     // An upstream session already exists, so /session doesn't try to create one.
     internals.targets.get(id)!.instances.get(1)!.sessionId = `upstream-${id}`;
+    startWorker(1, id);
     return target;
   };
 
-  const createSession = async (body?: string): Promise<string> => {
-    const res = await request('POST', '/session', body);
+  const createSession = async (body?: string, prefix = workerPrefix): Promise<string> => {
+    const res = await request('POST', '/session', body, prefix);
     expect(res.statusCode).toBe(201);
     return JSON.parse(res.body).sessionId;
   };
@@ -615,6 +630,109 @@ describe('message routing', () => {
     expect(internals.localSessions.get(second)?.targetId).toBeUndefined();
   });
 
+
+  describe('who may talk to the broker', () => {
+    const jobWithRunService = JSON.stringify({
+      messageId: 2,
+      messageType: 'RunnerJobRequest',
+      body: JSON.stringify({ runner_request_id: 'req-1', run_service_url: 'http://localhost:8787/' }),
+    });
+
+    it('refuses a request that carries no worker key', async () => {
+      // A job can reach the broker through its own proxy, so the address alone
+      // proves nothing. Only a worker the app started holds a key.
+      addTargetWithRunner('target-a', 'runner-a.1');
+
+      const res = await request('POST', '/session', undefined, '');
+
+      expect(res.statusCode).toBe(403);
+    });
+
+    it('refuses a key once the slot has been started again', async () => {
+      addTargetWithRunner('target-a', 'runner-a.1');
+      const old = workerPrefix;
+      startWorker(1, 'target-a');
+
+      const res = await request('POST', '/session', undefined, old);
+
+      expect(res.statusCode).toBe(403);
+    });
+
+    it('takes the worker from its key, not from the name in the request', async () => {
+      // The name in a session request is whatever the caller writes. A job
+      // naming the worker another job was expected on would take that job.
+      const targetA = addTargetWithRunner('target-a', 'runner-a.1');
+      const cred = createMockInstanceCredentials(2);
+      service.addTarget(createMockTarget({ id: 'target-b', displayName: 'target-b' }), [
+        { ...cred, runner: { ...cred.runner, agentName: 'runner-b.2' } },
+      ]);
+      internals.targets.get('target-b')!.instances.get(2)!.sessionId = 'upstream-b';
+      internals.messageQueues.set(targetA.id, [jobMessage]);
+      service.expectWorkerForJob(targetA.id, 1);
+      const intruder = startWorker(2, 'target-b');
+
+      const sessionId = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }), intruder);
+
+      expect(internals.localSessions.get(sessionId)?.targetId).toBeUndefined();
+      expect(internals.messageQueues.get(targetA.id)).toHaveLength(1);
+    });
+
+    it('hands job details only to the worker the job was delivered to', async () => {
+      const target = addTargetWithRunner('target-a', 'runner-a.1');
+      internals.acquiredJobDetails.set('req-1', JSON.stringify({ jobId: 'req-1' }));
+      internals.acquiredJobDetails.set('2', JSON.stringify({ jobId: 'req-1' }));
+      internals.messageQueues.set(target.id, [jobWithRunService]);
+      service.expectWorkerForJob(target.id, 1);
+
+      const early = await request('POST', '/acquirejob', JSON.stringify({ jobMessageId: 2 }));
+      expect(early.statusCode).toBe(403);
+      expect(internals.acquiredJobDetails.has('2')).toBe(true);
+
+      const sessionId = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }));
+      await request('GET', `/message?sessionId=${sessionId}`);
+      const res = await request('POST', '/acquirejob', JSON.stringify({ jobMessageId: 2 }));
+
+      expect(res.statusCode).toBe(200);
+    });
+
+    it("points a delivered job's run service at the worker's own address", async () => {
+      // The runner sends acquirejob, renewjob and finishjob to run_service_url.
+      // Without its key there, every one of them would be refused.
+      const target = addTargetWithRunner('target-a', 'runner-a.1');
+      internals.messageQueues.set(target.id, [jobWithRunService]);
+      service.expectWorkerForJob(target.id, 1);
+
+      const sessionId = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }));
+      const res = await request('GET', `/message?sessionId=${sessionId}`);
+
+      const inner = JSON.parse(JSON.parse(res.body).body);
+      expect(new URL(inner.run_service_url).pathname).toBe(`${workerPrefix}/`);
+    });
+
+    it("refuses to poll another worker's session", async () => {
+      addTargetWithRunner('target-a', 'runner-a.1');
+      const sessionId = await createSession();
+      const cred = createMockInstanceCredentials(2);
+      service.addTarget(createMockTarget({ id: 'target-b', displayName: 'target-b' }), [cred]);
+      const other = startWorker(2, 'target-b');
+
+      const res = await request('GET', `/message?sessionId=${sessionId}`, undefined, other);
+
+      expect(res.statusCode).toBe(404);
+    });
+
+    it('forwards nothing upstream for a worker holding no job', async () => {
+      // Forwarding used to fall back to the first target with a session, so
+      // any caller could send requests upstream on the runner's credentials.
+      addTargetWithRunner('target-a', 'runner-a.1');
+      mockHttpsRequest.mockClear();
+
+      const res = await request('POST', '/finishjob', JSON.stringify({ planId: 'p', jobId: 'req-9' }));
+
+      expect(res.statusCode).toBe(403);
+      expect(mockHttpsRequest).not.toHaveBeenCalled();
+    });
+  });
 
   describe('abandoning a worker that never took its job', () => {
     const secondJob = JSON.stringify({
@@ -780,6 +898,7 @@ describe('message routing', () => {
   });
 
   it("answers the runner's own acknowledge locally", async () => {
+    startWorker(1);
     const res = await request('POST', '/acknowledge?sessionId=abc', JSON.stringify({ runnerRequestId: 'req-1' }));
 
     expect(res.statusCode).toBe(200);
@@ -787,6 +906,7 @@ describe('message routing', () => {
   });
 
   it('rejects an oversized session request instead of buffering it', async () => {
+    startWorker(1);
     const res = await request('POST', '/session', 'x'.repeat(65 * 1024));
 
     expect(res.statusCode).toBe(413);

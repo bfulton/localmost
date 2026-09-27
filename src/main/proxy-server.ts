@@ -9,6 +9,8 @@
 
 import * as http from 'http';
 import * as net from 'net';
+import * as dns from 'dns';
+import * as crypto from 'crypto';
 import { URL } from 'url';
 import { SandboxPolicyLevel } from '../shared/types';
 import {
@@ -43,6 +45,20 @@ export interface ProxyServerOptions {
    * before the runner can fetch anything for it.
    */
   onJobAcquired?: (jobId: string) => Promise<void>;
+  /**
+   * A shared secret this proxy requires in Proxy-Authorization. Set per worker
+   * so a job cannot send its traffic through another worker's proxy - every
+   * proxy is on loopback, which the sandbox lets any job reach. When unset the
+   * proxy does not require credentials (test-only).
+   */
+  authToken?: string;
+  /**
+   * Resolve a host to its addresses. Injectable for tests; defaults to DNS.
+   * The proxy screens what a name resolves to and connects to that address,
+   * so a name cannot be re-resolved to somewhere else between check and
+   * connect.
+   */
+  lookup?: (host: string) => Promise<string[]>;
 }
 
 /** Statistics tracked per proxy session for job summary */
@@ -58,6 +74,13 @@ export interface ProxyStats {
 // Re-export for backwards compatibility
 export { MODERATE_NETWORK_ALLOWLIST } from '../shared/network-allowlist';
 
+/** Our proxy credentials must not leak to the upstream origin. */
+function stripProxyAuth(headers: http.IncomingHttpHeaders): http.IncomingHttpHeaders {
+  const copy = { ...headers };
+  delete copy['proxy-authorization'];
+  return copy;
+}
+
 export class ProxyServer {
   private server: http.Server | null = null;
   private port: number;
@@ -67,6 +90,8 @@ export class ProxyServer {
 
   private policyLevel: SandboxPolicyLevel;
   private onJobAcquired?: (jobId: string) => Promise<void>;
+  private authToken?: string;
+  private lookup: (host: string) => Promise<string[]>;
   private connections: Set<net.Socket> = new Set();
   private stats: ProxyStats = {
     allowedCount: 0,
@@ -81,6 +106,80 @@ export class ProxyServer {
     this.policyAllowedHosts = options.allowedHosts || [];
     this.policyLevel = options.policyLevel || 'strict';
     this.onJobAcquired = options.onJobAcquired;
+    this.authToken = options.authToken;
+    this.lookup =
+      options.lookup ??
+      (async (host: string) => {
+        const results = await dns.promises.lookup(host, { all: true });
+        return results.map((r) => r.address);
+      });
+  }
+
+  /**
+   * An address the proxy must never connect to: the loopback interface (the
+   * broker and any local service), link-local including the cloud metadata
+   * endpoint 169.254.169.254, and the private and carrier-grade ranges. The
+   * proxy exists to reach declared external hosts; a name that resolves here
+   * is either a misconfiguration or an attempt to reach inside from a job.
+   */
+  private isBlockedAddress(ip: string): boolean {
+    let addr = ip.trim();
+    if (addr.startsWith('[') && addr.endsWith(']')) addr = addr.slice(1, -1);
+    const v = net.isIP(addr);
+    if (v === 4) return this.isBlockedV4(addr);
+    if (v === 6) {
+      const lower = addr.toLowerCase();
+      // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible: screen the v4 part.
+      const mapped = lower.match(/^(?:::ffff:)(\d+\.\d+\.\d+\.\d+)$/);
+      if (mapped) return this.isBlockedV4(mapped[1]);
+      // Loopback (::1) and unspecified (::) are not blocked here: the sandbox
+      // already lets a job reach loopback directly, so the proxy adds nothing,
+      // and the runner's own control traffic to the broker goes over it.
+      if (lower.startsWith('fe8') || lower.startsWith('fe9') || lower.startsWith('fea') || lower.startsWith('feb')) return true; // fe80::/10 link-local
+      if (lower.startsWith('fc') || lower.startsWith('fd')) return true; // fc00::/7 unique-local
+      return false;
+    }
+    // Not an IP literal: treat as unresolvable, which callers reject.
+    return true;
+  }
+
+  private isBlockedV4(addr: string): boolean {
+    const o = addr.split('.').map((n) => parseInt(n, 10));
+    if (o.length !== 4 || o.some((n) => isNaN(n) || n < 0 || n > 255)) return true;
+    const [a, b] = o;
+    // Loopback (127/8) and this-host (0/8) are intentionally not blocked: the
+    // sandbox grants a job direct loopback access, and the broker (also on
+    // loopback) is reached this way, so screening them here changes nothing
+    // and would break the runner's own control traffic.
+    if (a === 10) return true; // private
+    if (a === 172 && b >= 16 && b <= 31) return true; // private
+    if (a === 192 && b === 168) return true; // private
+    if (a === 169 && b === 254) return true; // link-local incl. metadata
+    if (a === 100 && b >= 64 && b <= 127) return true; // carrier-grade NAT
+    if (a === 192 && b === 0 && o[2] === 0) return true; // IETF protocol assignments
+    if (a >= 224) return true; // multicast and reserved
+    return false;
+  }
+
+  /**
+   * Resolve a host and return the single address the proxy will connect to,
+   * or null if it resolves to nothing public. Connecting to this exact
+   * address, rather than to the name again, closes the gap a rebinding DNS
+   * answer would open between the check and the connection.
+   */
+  private async screenTarget(host: string): Promise<string | null> {
+    let candidates: string[];
+    if (net.isIP(host)) {
+      candidates = [host];
+    } else {
+      try {
+        candidates = await this.lookup(host);
+      } catch {
+        return null;
+      }
+    }
+    const safe = candidates.find((ip) => !this.isBlockedAddress(ip));
+    return safe ?? null;
   }
 
   /**
@@ -220,6 +319,12 @@ export class ProxyServer {
     const [host, portStr] = (req.url || '').split(':');
     const port = parseInt(portStr, 10) || 443;
 
+    if (!this.isProxyAuthorized(req)) {
+      clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="localmost"\r\n\r\n');
+      clientSocket.destroy();
+      return;
+    }
+
     const { allowed, reason } = this.checkHostAccess(host);
     this.log({ method: 'CONNECT', host, port, blocked: !allowed, reason });
 
@@ -229,7 +334,24 @@ export class ProxyServer {
       return;
     }
 
-    const serverSocket = net.connect(port, host, () => {
+    void this.connectScreened(host, port, clientSocket, head);
+  }
+
+  private async connectScreened(
+    host: string,
+    port: number,
+    clientSocket: net.Socket,
+    head: Buffer
+  ): Promise<void> {
+    const address = await this.screenTarget(host);
+    if (!address) {
+      this.log({ method: 'CONNECT', host, port, blocked: true, reason: undefined });
+      clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      clientSocket.destroy();
+      return;
+    }
+
+    const serverSocket = net.connect(port, address, () => {
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       serverSocket.write(head);
       serverSocket.pipe(clientSocket);
@@ -264,6 +386,12 @@ export class ProxyServer {
     req: http.IncomingMessage,
     res: http.ServerResponse
   ): void {
+    if (!this.isProxyAuthorized(req)) {
+      res.writeHead(407, { 'Content-Type': 'text/plain', 'Proxy-Authenticate': 'Basic realm="localmost"' });
+      res.end('Proxy authentication required');
+      req.resume();
+      return;
+    }
     try {
       const url = new URL(req.url || '', `http://${req.headers.host}`);
       const host = url.hostname;
@@ -287,26 +415,37 @@ export class ProxyServer {
         return;
       }
 
-      const proxyReq = http.request(
-        {
-          hostname: host,
-          port,
-          path,
-          method: req.method,
-          headers: req.headers,
-        },
-        (proxyRes) => {
-          res.writeHead(proxyRes.statusCode || 500, proxyRes.headers);
-          proxyRes.pipe(res);
+      this.screenTarget(host).then((address) => {
+        if (!address) {
+          this.log({ method: req.method || 'GET', host, port, path, blocked: true, reason: undefined });
+          res.writeHead(403, { 'Content-Type': 'text/plain' });
+          res.end(`Blocked by sandbox policy (${this.policyLevel}): host '${host}' resolves to a non-routable address`);
+          req.resume();
+          return;
         }
-      );
+        const proxyReq = http.request(
+          {
+            // Connect to the screened address, keeping the Host header the
+            // origin expects, so a rebinding answer cannot redirect this.
+            hostname: address,
+            port,
+            path,
+            method: req.method,
+            headers: stripProxyAuth(req.headers),
+          },
+          (proxyRes) => {
+            res.writeHead(proxyRes.statusCode || 500, proxyRes.headers);
+            proxyRes.pipe(res);
+          }
+        );
 
-      proxyReq.on('error', (err) => {
-        res.writeHead(502, { 'Content-Type': 'text/plain' });
-        res.end(`Proxy error: ${err.message}`);
+        proxyReq.on('error', (err) => {
+          res.writeHead(502, { 'Content-Type': 'text/plain' });
+          res.end(`Proxy error: ${err.message}`);
+        });
+
+        req.pipe(proxyReq);
       });
-
-      req.pipe(proxyReq);
     } catch (err) {
       res.writeHead(400, { 'Content-Type': 'text/plain' });
       res.end(`Bad request: ${(err as Error).message}`);
@@ -403,7 +542,7 @@ export class ProxyServer {
 
     // The body is replayed whole, so it is no longer chunked. Leaving both
     // headers on the request makes some servers reject it or frame it wrongly.
-    const headers = { ...req.headers, 'content-length': String(body.length) };
+    const headers = { ...stripProxyAuth(req.headers), 'content-length': String(body.length) };
     delete headers['transfer-encoding'];
     const proxyReq = http.request(
       { hostname: host, port, path, method: req.method, headers },
@@ -456,7 +595,29 @@ export class ProxyServer {
     // the sandbox rule that confines a job to this proxy matches a direct
     // connection to the loopback address; resolving the name first produced a
     // connection the kernel could not attribute, and it was denied.
+    if (this.authToken) {
+      return `http://localmost:${this.authToken}@127.0.0.1:${this.port}`;
+    }
     return `http://127.0.0.1:${this.port}`;
+  }
+
+  /**
+   * Whether a request carries this proxy's token. True when no token is set.
+   * The password is compared in constant time; the username is not a secret.
+   */
+  private isProxyAuthorized(req: http.IncomingMessage): boolean {
+    if (!this.authToken) return true;
+    const header = req.headers['proxy-authorization'];
+    if (typeof header !== 'string' || !header.startsWith('Basic ')) return false;
+    let password: string;
+    try {
+      password = Buffer.from(header.slice(6), 'base64').toString('utf-8').split(':').slice(1).join(':');
+    } catch {
+      return false;
+    }
+    const expected = Buffer.from(this.authToken);
+    const got = Buffer.from(password);
+    return expected.length === got.length && crypto.timingSafeEqual(expected, got);
   }
 
   /**

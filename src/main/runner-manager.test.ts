@@ -22,10 +22,12 @@ jest.mock('./runner-downloader', () => ({
 
 // Mock proxy-server to avoid real HTTP servers in tests
 jest.mock('./proxy-server', () => ({
-  ProxyServer: jest.fn().mockImplementation(() => ({
+  ProxyServer: jest.fn().mockImplementation((options?: { authToken?: string }) => ({
     start: jest.fn().mockResolvedValue(12345),
     stop: jest.fn().mockResolvedValue(undefined),
-    getProxyUrl: jest.fn().mockReturnValue('http://localhost:12345'),
+    getProxyUrl: jest.fn().mockReturnValue(
+      options?.authToken ? `http://localmost:${options.authToken}@127.0.0.1:12345` : 'http://127.0.0.1:12345'
+    ),
     getPort: jest.fn().mockReturnValue(12345),
     setPolicyAllowedHosts: jest.fn(),
     setPolicyLevel: jest.fn(),
@@ -89,10 +91,11 @@ jest.mock('fs', () => ({
   existsSync: jest.fn(),
   readFileSync: jest.fn(),
   writeFileSync: jest.fn(),
+  mkdirSync: jest.fn(),
   promises: {
     mkdir: jest.fn(),
     chmod: jest.fn(),
-    unlink: jest.fn(),
+    unlink: jest.fn().mockResolvedValue(undefined),
     rm: jest.fn().mockResolvedValue(undefined),
     readdir: jest.fn().mockResolvedValue([]),
     readFile: jest.fn().mockResolvedValue(''),
@@ -1276,7 +1279,7 @@ describe('RunnerManager', () => {
       try {
         (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
         (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
-          { name: '1', isDirectory: () => true },
+          { name: '1.pid', isFile: () => true, isDirectory: () => false },
         ] as never);
         (jest.mocked(fs.promises.readFile) as unknown as jest.Mock).mockResolvedValue('5748' as never);
 
@@ -1286,6 +1289,57 @@ describe('RunnerManager', () => {
       }
 
       expect(killed).not.toContain(5748);
+    });
+
+    it('reads pids from the app-owned pids directory, never the job-writable sandbox', async () => {
+      // The pid a job writes into its own sandbox used to steer this sweep: a
+      // job could drop any pid there and have the app SIGKILL it on the next
+      // start. The authoritative pid file lives where the job cannot write.
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(4321));
+      // The startup sweep is not what this test exercises; keep it from
+      // inheriting another test's pid-file mocks or signalling a real pid.
+      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([] as never);
+      (fs.writeFileSync as jest.Mock).mockClear();
+
+      await runnerManager.start();
+
+      const write = (fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => String(f).endsWith('.pid'));
+      expect(write).toBeDefined();
+      // In the app-owned pids directory (getRunnerDir()/pids), never the
+      // job-writable sandbox.
+      expect(String(write![0])).toMatch(/\/\.localmost\/runner\/pids\/1\.pid$/);
+      expect(String(write![0])).not.toContain('/sandbox/');
+    });
+
+    it('refuses to signal pid 1 or lower, whatever a stale file says', async () => {
+      // parseInt('-1') is -1, and process.kill(-1) signals every process the
+      // user owns; kill(0) signals the whole group. A pid file naming either
+      // must be ignored, not obeyed.
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      const killed: number[] = [];
+      const realKill = process.kill;
+      (process as unknown as { kill: unknown }).kill = ((pid: number, sig?: unknown) => {
+        if (sig !== 0) killed.push(pid);
+        return true;
+      }) as never;
+      try {
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
+          { name: '1.pid', isFile: () => true, isDirectory: () => false },
+          { name: '2.pid', isFile: () => true, isDirectory: () => false },
+        ] as never);
+        (jest.mocked(fs.promises.readFile) as unknown as jest.Mock)
+          .mockResolvedValueOnce('-1' as never)
+          .mockResolvedValueOnce('0' as never);
+        (jest.mocked(fs.promises.unlink) as unknown as jest.Mock).mockResolvedValue(undefined as never);
+
+        await helper.killStaleProcesses();
+      } finally {
+        (process as unknown as { kill: unknown }).kill = realKill;
+      }
+
+      expect(killed).toEqual([]);
     });
   });
 
@@ -1346,6 +1400,75 @@ describe('RunnerManager', () => {
 
       expect(reserved).toHaveLength(1);
       expect(cancelled).toHaveLength(1);
+    });
+  });
+
+  describe("a worker's own proxy", () => {
+    it('gives the runner a proxy URL bearing a per-worker token', async () => {
+      // Same setup as the docker-socket test: existsSync true and a spawn stub
+      // bring instance 1 up, which creates its proxy. Every worker's proxy is
+      // on loopback, which the sandbox lets any job reach, so the URL carries a
+      // token as basic-auth credentials: the runner authenticates to its own
+      // proxy and cannot route its traffic through another worker's.
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(9911));
+
+      await runnerManager.start();
+
+      const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+      expect(env.HTTPS_PROXY).toMatch(/^http:\/\/localmost:[0-9a-f]{48}@127\.0\.0\.1:/);
+      expect(env.http_proxy).toBe(env.HTTPS_PROXY);
+      expect(env.HTTP_PROXY).toBe(env.HTTPS_PROXY);
+    });
+  });
+
+  describe("a worker's broker address", () => {
+    it('is issued per start and written into the runner config the worker reads', async () => {
+      // The broker serves only workers holding a key it issued. The key goes
+      // in the sandbox's own .runner, which is the one the runner reads.
+      const issued: Array<[number, string | undefined]> = [];
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        issueBrokerUrl: (n, t) => {
+          issued.push([n, t]);
+          return `http://127.0.0.1:8787/w/${'a'.repeat(64)}/`;
+        },
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (fs.readFileSync as jest.Mock).mockReturnValue(JSON.stringify({ agentName: 'r1', serverUrlV2: 'http://localhost:8787/' }));
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+      helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo' });
+
+      await manager.start();
+
+      expect(issued).toEqual([[1, 't1']]);
+      const write = (fs.writeFileSync as jest.Mock).mock.calls.find(([file]) => String(file).endsWith('sandbox/1/.runner'));
+      expect(write).toBeDefined();
+      expect(JSON.parse(String(write![1])).serverUrlV2).toBe(`http://127.0.0.1:8787/w/${'a'.repeat(64)}/`);
+    });
+
+    it('is revoked when the worker exits', async () => {
+      const revoked: number[] = [];
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        issueBrokerUrl: () => `http://127.0.0.1:8787/w/${'b'.repeat(64)}/`,
+        revokeBrokerUrl: (n) => revoked.push(n),
+      });
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (fs.readFileSync as jest.Mock).mockReturnValue('{}');
+      const proc = createMockProcess(12345);
+      mockSpawnSandboxed.mockReturnValue(proc);
+      await manager.start();
+
+      proc.emit('exit', 0, null);
+      await settle();
+
+      expect(revoked).toEqual([1]);
     });
   });
 
@@ -1590,6 +1713,12 @@ describe('RunnerManager', () => {
       // gRPC session the filter cannot inspect. The classic builder is the one
       // `build:` policy actually describes, so the job is pinned to it.
       expect(options.env?.DOCKER_BUILDKIT).toBe('0');
+      // The job's temp is inside its own sandbox, not the user's shared
+      // $TMPDIR: the sandbox can no longer reach unix sockets in the shared
+      // temp, so a socket bound under TMPDIR has to land somewhere it may use.
+      const socketDir = '/Users/test/.localmost/runner/sandbox/1';
+      expect(options.env?.TMPDIR).toBe(`${socketDir}/_temp`);
+      expect(options.env?.RUNNER_TEMP).toBe(`${socketDir}/_temp`);
       // The profile grants this socket by name; the daemon's is no longer handed over.
       expect(options).toHaveProperty('dockerSocket', socketPath);
       expect(options).not.toHaveProperty('dockerGrants');

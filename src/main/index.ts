@@ -286,6 +286,9 @@ app.whenReady().then(async () => {
       getBrokerProxyService()?.expectWorkerForJob(targetId, instanceNum),
     onWorkerReservationCancelled: (targetId: string, instanceNum: number, jobId?: string) =>
       getBrokerProxyService()?.forgetExpectedWorker(targetId, instanceNum, jobId),
+    issueBrokerUrl: (instanceNum: number, targetId?: string) =>
+      getBrokerProxyService()?.issueWorkerKey(instanceNum, targetId),
+    revokeBrokerUrl: (instanceNum: number) => getBrokerProxyService()?.revokeWorkerKey(instanceNum),
     onReregistrationNeeded: reRegisterSingleInstance,
     onConfigurationNeeded: configureSingleInstance,
     getRunnerLogLevel: () => getRunnerLogLevelSetting(),

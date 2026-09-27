@@ -92,6 +92,7 @@ interface LocalSession {
   workerId?: number;
   targetId?: string;  // Which target this session is handling
   currentJobId?: string;  // Job currently being executed
+  workerKey: string;  // The key of the worker that created it
 }
 
 /** Job assignment tracking */
@@ -362,6 +363,18 @@ export class BrokerProxyService extends EventEmitter {
    * fail to run.
    */
   private expectedWorkers: Map<string, string> = new Map();  // agentName -> targetId
+  /**
+   * Keys the app issued to the workers it started, one live key per slot.
+   *
+   * A job can reach this server through its own proxy, so being on loopback
+   * proves nothing about who is asking. A worker's broker URL carries its key,
+   * and a request without a live key is refused. The key also says which
+   * worker is asking, which the name in a session request cannot: that name is
+   * whatever the caller writes.
+   */
+  private workerKeys: Map<string, { instanceNum: number; targetId?: string }> = new Map();
+  /** Job and message ids delivered to each worker key: all it may acquire or report on. */
+  private deliveredToWorker: Map<string, Set<string>> = new Map();
   /** Repository and commit for a job, keyed by both jobId and messageId. */
   private jobTargets: Map<string, { targetDisplayName: string; githubSha?: string }> = new Map();
 
@@ -480,9 +493,11 @@ export class BrokerProxyService extends EventEmitter {
         reject(err);
       });
 
-      this.server.listen(this.port, () => {
+      // Loopback only. On every interface, anything sharing the network could
+      // reach it.
+      this.server.listen(this.port, '127.0.0.1', () => {
         this.isRunning = true;
-        log()?.info( `[BrokerProxy] Listening on http://localhost:${this.port}`);
+        log()?.info( `[BrokerProxy] Listening on http://127.0.0.1:${this.port}`);
         resolve();
       });
     });
@@ -1263,18 +1278,30 @@ export class BrokerProxyService extends EventEmitter {
   // --------------------------------------------------------------------------
 
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const url = new URL(req.url || '/', `http://localhost:${this.port}`);
+    const url = new URL(req.url || '/', `http://127.0.0.1:${this.port}`);
     const method = req.method || 'GET';
+
+    // /w/<key>/... from a worker this app started; nothing else is served.
+    const keyed = /^\/w\/([0-9a-f]{64})(\/.*)?$/.exec(url.pathname);
+    const key = keyed && this.workerKeys.has(keyed[1]) ? keyed[1] : undefined;
+    if (!keyed || !key) {
+      log()?.warn(`[BrokerProxy] Refused ${method} ${keyed ? 'with a key no worker holds' : url.pathname}`);
+      req.resume();
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not a worker of this app' }));
+      return;
+    }
+    url.pathname = keyed[2] ?? '/';
 
     log()?.debug( `[BrokerProxy] ${method} ${url.pathname}`);
 
     try {
       if (method === 'POST' && url.pathname === '/session') {
-        await this.handleSessionCreate(req, res);
+        await this.handleSessionCreate(req, res, key);
       } else if (method === 'GET' && url.pathname === '/message') {
-        await this.handleMessagePoll(res, url);
+        await this.handleMessagePoll(res, url, key);
       } else if (method === 'DELETE' && url.pathname === '/session') {
-        await this.handleSessionDelete(res, url);
+        await this.handleSessionDelete(res, url, key);
       } else if (method === 'POST' && url.pathname === '/acknowledge') {
         // Handle acknowledge locally - the broker proxy already received the message
         // when it polled GitHub, so workers don't need to acknowledge upstream.
@@ -1289,10 +1316,10 @@ export class BrokerProxyService extends EventEmitter {
         res.end('{}');
       } else if (method === 'POST' && url.pathname === '/acquirejob') {
         // Return stored job details - we already acquired the job from GitHub
-        await this.handleAcquireJob(req, res);
+        await this.handleAcquireJob(req, res, key);
       } else {
         // Forward all other requests (renewjob, finishjob, etc.)
-        await this.handleForward(req, res, url);
+        await this.handleForward(req, res, url, key);
       }
     } catch (error) {
       if (error instanceof RequestBodyTooLargeError) {
@@ -1316,6 +1343,54 @@ export class BrokerProxyService extends EventEmitter {
    * waiting, and it takes that entry rather than whichever is first. An
    * unnamed request falls back to the positional queue.
    */
+  /**
+   * Issue the broker URL for a worker being started in a slot, revoking the
+   * key of whatever ran there before. The target is the one the worker was
+   * spawned for, if any; the worker is then that target's runner in the slot,
+   * whatever its session request says.
+   */
+  issueWorkerKey(instanceNum: number, targetId?: string): string {
+    this.revokeWorkerKey(instanceNum);
+    const key = crypto.randomBytes(32).toString('hex');
+    this.workerKeys.set(key, { instanceNum, targetId });
+    this.deliveredToWorker.set(key, new Set());
+    return this.workerUrl(key);
+  }
+
+  /** Revoke the key of the worker in a slot, and the sessions it opened. */
+  revokeWorkerKey(instanceNum: number): void {
+    for (const [key, worker] of this.workerKeys) {
+      if (worker.instanceNum !== instanceNum) continue;
+      this.workerKeys.delete(key);
+      this.deliveredToWorker.delete(key);
+      for (const [id, session] of this.localSessions) {
+        if (session.workerKey === key) this.localSessions.delete(id);
+      }
+    }
+  }
+
+  private workerUrl(key: string): string {
+    return `http://127.0.0.1:${this.port}/w/${key}/`;
+  }
+
+  /**
+   * A message as the worker it is delivered to should see it: its run service
+   * is that worker's own address, so every job operation carries its key.
+   */
+  private addressedTo(message: string, key: string): string {
+    try {
+      const parsed = JSON.parse(message);
+      if (typeof parsed.body !== 'string') return message;
+      const inner = JSON.parse(parsed.body);
+      if (!inner || typeof inner !== 'object' || !inner.run_service_url) return message;
+      inner.run_service_url = this.workerUrl(key);
+      parsed.body = JSON.stringify(inner);
+      return JSON.stringify(parsed);
+    } catch {
+      return message;
+    }
+  }
+
   /**
    * Say which worker was spawned for a job, so its session binds to that job's
    * target however the polling races.
@@ -1364,7 +1439,9 @@ export class BrokerProxyService extends EventEmitter {
   }
 
   private resolveSessionTarget(agentName: string | undefined): string | undefined {
-    if (!agentName) return this.pendingTargetAssignments.shift();
+    // Every worker is named, by its key if not by its request. An unnamed one
+    // taking whichever assignment is first is how jobs ran on the wrong worker.
+    if (!agentName) return undefined;
     // A named session binds only if a worker was spawned for a job under that
     // name. This is the whole decision: no fallback to "some listener on this
     // target, if an assignment happens to be queued", because that fallback was
@@ -1403,11 +1480,20 @@ export class BrokerProxyService extends EventEmitter {
     return undefined;
   }
 
-  private async handleSessionCreate(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  private async handleSessionCreate(req: http.IncomingMessage, res: http.ServerResponse, key: string): Promise<void> {
     const sessionId = crypto.randomUUID();
 
     const requestBody = await readRequestBody(req);
-    const agentName = agentNameFromSessionRequest(requestBody);
+    const claimed = agentNameFromSessionRequest(requestBody);
+    // A worker spawned for a target is that target's runner in its slot. Its
+    // own claim is not asked: it is the caller's to write.
+    const worker = this.workerKeys.get(key)!;
+    const agentName = worker.targetId
+      ? this.targets.get(worker.targetId)?.instances.get(worker.instanceNum)?.runner.agentName
+      : claimed;
+    if (worker.targetId && claimed && claimed !== agentName) {
+      log()?.warn(`[BrokerProxy] Worker ${worker.instanceNum} named itself ${claimed}; binding it as ${agentName ?? 'nothing'}`);
+    }
     log()?.info(`[BrokerProxy] Session request from ${agentName ?? 'unnamed runner'}`);
     const targetId = this.resolveSessionTarget(agentName);
     if (!targetId) {
@@ -1445,6 +1531,7 @@ export class BrokerProxyService extends EventEmitter {
       id: sessionId,
       createdAt: new Date(),
       targetId,  // Associate session with target
+      workerKey: key,
     });
 
     res.writeHead(201, { 'Content-Type': 'application/json' });
@@ -1456,10 +1543,10 @@ export class BrokerProxyService extends EventEmitter {
     }));
   }
 
-  private async handleMessagePoll(res: http.ServerResponse, url: URL): Promise<void> {
+  private async handleMessagePoll(res: http.ServerResponse, url: URL, key: string): Promise<void> {
     const sessionId = url.searchParams.get('sessionId');
 
-    if (!sessionId || !this.localSessions.has(sessionId)) {
+    if (!sessionId || this.localSessions.get(sessionId)?.workerKey !== key) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Session not found' }));
       return;
@@ -1559,18 +1646,30 @@ export class BrokerProxyService extends EventEmitter {
     };
 
     // Helper to extract job ID from message and mark session
-    const markSessionWithJob = (message: string): void => {
+    // Also records the job as this worker's, under both of its ids: that is
+    // what it may later acquire and report on. Returns the message addressed
+    // to this worker.
+    const markSessionWithJob = (message: string): string => {
       const jobId = jobIdFromMessage(message);
       if (jobId) {
         session.currentJobId = jobId;
+        const delivered = this.deliveredToWorker.get(key);
+        delivered?.add(jobId);
+        try {
+          const messageId = JSON.parse(message).messageId;
+          if (messageId !== undefined && messageId !== null) delivered?.add(String(messageId));
+        } catch {
+          // Unparseable: jobIdFromMessage found nothing either.
+        }
         log()?.debug(`[BrokerProxy] Marked session ${sessionId} with job ${jobId}`);
       }
+      return this.addressedTo(message, key);
     };
 
     // Check queue first (messages are queued by active polling)
-    const message = getMessageForTarget();
-    if (message) {
-      markSessionWithJob(message);
+    const queued = getMessageForTarget();
+    if (queued) {
+      const message = markSessionWithJob(queued);
       log()?.info(`[BrokerProxy] Returning message to worker (target: ${targetId})`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(message);
@@ -1606,9 +1705,9 @@ export class BrokerProxyService extends EventEmitter {
           }
 
           // Check for a message for this target
-          const msg = getMessageForTarget();
-          if (msg) {
-            markSessionWithJob(msg);
+          const next = getMessageForTarget();
+          if (next) {
+            const msg = markSessionWithJob(next);
             log()?.info(`[BrokerProxy] Returning message to worker (long-poll, target: ${targetId})`);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(msg);
@@ -1636,9 +1735,9 @@ export class BrokerProxyService extends EventEmitter {
     await checkForMessage();
   }
 
-  private async handleSessionDelete(res: http.ServerResponse, url: URL): Promise<void> {
+  private async handleSessionDelete(res: http.ServerResponse, url: URL, key: string): Promise<void> {
     const sessionId = url.searchParams.get('sessionId');
-    if (sessionId) {
+    if (sessionId && this.localSessions.get(sessionId)?.workerKey === key) {
       this.localSessions.delete(sessionId);
     }
     res.writeHead(200);
@@ -1657,7 +1756,7 @@ export class BrokerProxyService extends EventEmitter {
    * We already acquired the job from GitHub when we received the job message,
    * so we just return the stored job details.
    */
-  private async handleAcquireJob(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  private async handleAcquireJob(req: http.IncomingMessage, res: http.ServerResponse, key: string): Promise<void> {
     // Read request body to get job ID
     const chunks: Buffer[] = [];
     for await (const chunk of req) {
@@ -1671,7 +1770,9 @@ export class BrokerProxyService extends EventEmitter {
       const bodyJson = JSON.parse(reqBody);
       log()?.info(`[BrokerProxy] acquirejob request body: ${JSON.stringify(bodyJson)}`);
       // Runner uses jobMessageId (which is the message.messageId from the broker)
-      jobId = bodyJson.jobMessageId || bodyJson.jobRequestId || bodyJson.requestId;
+      const raw = bodyJson.jobMessageId || bodyJson.jobRequestId || bodyJson.requestId;
+      // A number on the wire; ids are held as strings everywhere else.
+      if (raw !== undefined && raw !== null) jobId = String(raw);
     } catch {
       log()?.warn(`[BrokerProxy] Could not parse acquirejob body: ${reqBody}`);
     }
@@ -1680,6 +1781,15 @@ export class BrokerProxyService extends EventEmitter {
       log()?.warn(`[BrokerProxy] acquirejob: no job ID found in request`);
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'No job ID in request' }));
+      return;
+    }
+
+    // The payload carries the job's secrets. It goes only to the worker the
+    // job was delivered to.
+    if (!this.deliveredToWorker.get(key)?.has(jobId)) {
+      log()?.warn(`[BrokerProxy] acquirejob: refused ${jobId}, which was not delivered to this worker`);
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Job not delivered to this worker' }));
       return;
     }
 
@@ -1696,8 +1806,8 @@ export class BrokerProxyService extends EventEmitter {
         // Check various possible field names
         const urlField = parsed.runServiceUrl || parsed.run_service_url || parsed.runnerServiceUrl;
         if (urlField) {
-          const proxyUrl = `http://localhost:${this.port}/`;
-          log()?.info(`[BrokerProxy] Rewriting runServiceUrl in acquirejob response: ${urlField} -> ${proxyUrl}`);
+          const proxyUrl = this.workerUrl(key);
+          log()?.info(`[BrokerProxy] Rewriting runServiceUrl in acquirejob response to this worker's address`);
           if (parsed.runServiceUrl) parsed.runServiceUrl = proxyUrl;
           if (parsed.run_service_url) parsed.run_service_url = proxyUrl;
           if (parsed.runnerServiceUrl) parsed.runnerServiceUrl = proxyUrl;
@@ -1727,43 +1837,34 @@ export class BrokerProxyService extends EventEmitter {
   private async handleForward(
     req: http.IncomingMessage,
     res: http.ServerResponse,
-    url: URL
+    url: URL,
+    key: string
   ): Promise<void> {
-    // Determine which target/instance to forward to based on local session ID
+    // Upstream calls go out on a target's runner credentials, so they are made
+    // only for a worker bound to that target, and only about its own jobs.
+    // There used to be a fallback to the first target with a session, which
+    // let any caller send requests upstream as the runner.
+    const worker = this.workerKeys.get(key)!;
     const localSessionId = url.searchParams.get('sessionId');
-    let targetState: TargetState | undefined;
+    const owned = [...this.localSessions.values()].filter(s => s.workerKey === key && s.targetId);
+    const localSession = localSessionId
+      ? owned.find(s => s.id === localSessionId)
+      : owned[owned.length - 1];
+    const targetState = localSession?.targetId ? this.targets.get(localSession.targetId) : undefined;
     let instance: RunnerInstanceState | undefined;
-
-    // Look up local session to find associated target
-    if (localSessionId) {
-      const localSession = this.localSessions.get(localSessionId);
-      if (localSession?.targetId) {
-        targetState = this.targets.get(localSession.targetId);
-        // Find first active instance for this target
-        if (targetState) {
-          for (const inst of targetState.instances.values()) {
-            if (inst.sessionId) {
-              instance = inst;
-              break;
-            }
-          }
-        }
-      }
+    if (targetState) {
+      const own = targetState.instances.get(worker.instanceNum);
+      instance = own?.sessionId
+        ? own
+        : [...targetState.instances.values()].find(inst => inst.sessionId);
     }
 
-    // Fallback to first enabled target with an active instance session
-    if (!targetState || !instance) {
-      for (const state of this.targets.values()) {
-        if (!state.target.enabled) continue;
-        for (const inst of state.instances.values()) {
-          if (inst.sessionId) {
-            targetState = state;
-            instance = inst;
-            break;
-          }
-        }
-        if (instance) break;
-      }
+    if (!targetState) {
+      req.resume();
+      log()?.warn(`[BrokerProxy] Refused to forward ${req.method} ${url.pathname} for worker ${worker.instanceNum}: it holds no bound session`);
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Worker holds no bound session' }));
+      return;
     }
 
     if (!targetState || !instance || !instance.sessionId) {
@@ -1805,6 +1906,12 @@ export class BrokerProxyService extends EventEmitter {
         const opJobId = bodyJson.jobRequestId || bodyJson.requestId || bodyJson.runnerRequestId
           || bodyJson.runner_request_id || bodyJson.jobMessageId;
         log()?.debug(`[BrokerProxy] Looking for run_service_url with jobId: ${opJobId}`);
+        if (opJobId && !this.deliveredToWorker.get(key)?.has(String(opJobId))) {
+          log()?.warn(`[BrokerProxy] Refused ${url.pathname} for ${opJobId}, which was not delivered to this worker`);
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Job not delivered to this worker' }));
+          return;
+        }
         if (opJobId) {
           runServiceUrl = this.jobRunServiceUrls.get(opJobId);
           log()?.info(`[BrokerProxy] Found run_service_url for ${opJobId}: ${runServiceUrl || 'not found'}`);

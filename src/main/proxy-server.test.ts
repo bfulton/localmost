@@ -343,3 +343,103 @@ describe('acquirejob body limits', () => {
     }
   });
 });
+
+describe('screening the address a host resolves to', () => {
+  // The proxy checks the host name, then connects. If it re-resolves, a name
+  // on the allowlist that resolves to an internal address reaches inside: the
+  // broker, a service on loopback, or the cloud metadata endpoint at
+  // 169.254.169.254. The screen refuses those addresses.
+  const screen = (proxy: ProxyServer, ip: string): boolean =>
+    (proxy as unknown as { isBlockedAddress(ip: string): boolean }).isBlockedAddress(ip);
+
+  const proxy = new ProxyServer({ policyLevel: 'permissive' });
+
+  it.each([
+    '10.0.0.5', '172.16.0.1', '172.31.255.255', '192.168.1.1',
+    '169.254.169.254', '100.64.0.1',
+    'fe80::1', 'fc00::1', 'fd12:3456::1',
+    '::ffff:10.0.0.1', '::ffff:169.254.169.254',
+  ])('refuses the internal address %s', (ip) => {
+    expect(screen(proxy, ip)).toBe(true);
+  });
+
+  it.each([
+    '8.8.8.8', '140.82.112.3', '1.1.1.1',
+    '2606:4700:4700::1111',
+    // Loopback is not screened: the sandbox already grants direct loopback
+    // access, and the broker is reached over it.
+    '127.0.0.1', '::1',
+  ])('allows the address %s', (ip) => {
+    expect(screen(proxy, ip)).toBe(false);
+  });
+
+  it('blocks a GET whose allowed host resolves to a private address it could not otherwise reach', async () => {
+    const p = new ProxyServer({ policyLevel: 'permissive', lookup: async () => ['10.1.2.3'] });
+    await p.start();
+    try {
+      const status = await new Promise<number>((resolve, reject) => {
+        const req = http.request(
+          { hostname: '127.0.0.1', port: p.getPort(), path: 'http://rebind.example/', method: 'GET' },
+          (res) => { res.resume(); resolve(res.statusCode || 0); }
+        );
+        req.on('error', reject); req.end();
+      });
+      expect(status).toBe(403);
+    } finally {
+      await p.stop();
+    }
+  });
+});
+
+describe('a worker may use only its own proxy', () => {
+  // Every worker's proxy listens on loopback, and the sandbox lets a job reach
+  // any loopback port - so without a check, one job could send its traffic
+  // through another worker's proxy and inherit that repository's allowlist.
+  // The proxy URL carries a per-worker token; a request without it is refused.
+  const authHeader = (token: string) =>
+    'Basic ' + Buffer.from(`localmost:${token}`).toString('base64');
+
+  const get = (port: number, header?: string) =>
+    new Promise<number>((resolve, reject) => {
+      const headers: Record<string, string> = {};
+      if (header) headers['proxy-authorization'] = header;
+      const req = http.request(
+        { hostname: '127.0.0.1', port, path: 'http://8.8.8.8/', method: 'GET', headers },
+        (res) => { res.resume(); resolve(res.statusCode || 0); }
+      );
+      req.on('error', reject);
+      req.end();
+    });
+
+  it('refuses a request with no proxy credentials', async () => {
+    const p = new ProxyServer({ policyLevel: 'permissive', authToken: 'secret-a', lookup: async () => ['8.8.8.8'] });
+    await p.start();
+    try {
+      expect(await get(p.getPort())).toBe(407);
+    } finally {
+      await p.stop();
+    }
+  });
+
+  it("refuses another worker's token", async () => {
+    const p = new ProxyServer({ policyLevel: 'permissive', authToken: 'secret-a', lookup: async () => ['8.8.8.8'] });
+    await p.start();
+    try {
+      expect(await get(p.getPort(), authHeader('secret-b'))).toBe(407);
+    } finally {
+      await p.stop();
+    }
+  });
+
+  it('carries the token in the proxy URL it hands the worker', async () => {
+    const p = new ProxyServer({ policyLevel: 'strict', authToken: 'secret-a' });
+    await p.start();
+    try {
+      const url = new URL(p.getProxyUrl());
+      expect(url.password).toBe('secret-a');
+      expect(url.hostname).toBe('127.0.0.1');
+    } finally {
+      await p.stop();
+    }
+  });
+});

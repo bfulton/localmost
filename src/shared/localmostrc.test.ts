@@ -295,6 +295,32 @@ shared:
       expect(result.errors[0].message).toContain('must be a string');
     });
 
+    it('rejects a filesystem path that would break out of the sandbox profile', () => {
+      // Filesystem paths are written into the sandbox-exec profile, a quoted
+      // DSL. A path carrying a quote and a newline could close the string and
+      // add its own rules - the user approves what the policy appears to say,
+      // not what it makes the sandbox enforce.
+      const content = [
+        'version: 1',
+        'shared:',
+        '  filesystem:',
+        '    read:',
+        '      - \'/tmp/x")\\n(allow default)\'',
+      ].join('\n');
+      const result = parseLocalmostrcContent(content);
+
+      expect(result.success).toBe(false);
+      expect(result.errors[0].message).toMatch(/must not contain/i);
+    });
+
+    it('rejects a backslash in a filesystem path', () => {
+      const content = 'version: 1\nshared:\n  filesystem:\n    write:\n      - \'/tmp/a\\\\b\'';
+      const result = parseLocalmostrcContent(content);
+
+      expect(result.success).toBe(false);
+      expect(result.errors[0].message).toMatch(/must not contain/i);
+    });
+
     it('should error on invalid workflows type', () => {
       const content = `
 version: 1

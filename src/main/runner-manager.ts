@@ -1,6 +1,6 @@
 import { ChildProcess } from 'child_process';
 import * as path from 'path';
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as yaml from 'js-yaml';
@@ -128,6 +128,13 @@ interface RunnerManagerOptions {
   onWorkerReservedForJob?: (targetId: string, instanceNum: number) => void;
   /** Withdraw that reservation when the worker never starts. */
   onWorkerReservationCancelled?: (targetId: string, instanceNum: number, jobId?: string) => void;
+  /**
+   * The broker address for a worker being started in a slot, carrying a key
+   * the broker checks on every request; the target is the one it is spawned
+   * for, if any. Revoked when the worker exits.
+   */
+  issueBrokerUrl?: (instanceNum: number, targetId?: string) => string | undefined;
+  revokeBrokerUrl?: (instanceNum: number) => void;
   /** The daemon a worker's permitted container requests go to. The operator's own by default. */
   dockerBackend?: DockerBackend;
   /** Registry credentials, attached to a pull by the worker's socket so the job never holds them. */
@@ -167,6 +174,8 @@ export class RunnerManager {
   private onJobEvent?: (event: JobEvent) => void;
   private onWorkerReservedForJob?: (targetId: string, instanceNum: number) => void;
   private onWorkerReservationCancelled?: (targetId: string, instanceNum: number, jobId?: string) => void;
+  private issueBrokerUrl?: (instanceNum: number, targetId?: string) => string | undefined;
+  private revokeBrokerUrl?: (instanceNum: number) => void;
   private jobHistory: JobHistoryEntry[] = [];
   private jobIdCounter = 0;
   private maxJobHistory = DEFAULT_MAX_JOB_HISTORY;
@@ -254,6 +263,8 @@ export class RunnerManager {
     this.onJobEvent = options.onJobEvent;
     this.onWorkerReservedForJob = options.onWorkerReservedForJob;
     this.onWorkerReservationCancelled = options.onWorkerReservationCancelled;
+    this.issueBrokerUrl = options.issueBrokerUrl;
+    this.revokeBrokerUrl = options.revokeBrokerUrl;
     this.dockerBackend = options.dockerBackend ?? new DesktopBackend();
     this.attachRegistryAuth = options.attachRegistryAuth;
 
@@ -839,6 +850,11 @@ export class RunnerManager {
       // Closed until a job is claimed. The level belongs to the repository's
       // policy now, and is installed when a worker announces which job it took.
       policyLevel: 'strict',
+      // Per-worker secret. Every worker's proxy is on loopback, which the
+      // sandbox lets any job reach, so without this a job could route its
+      // traffic through another worker's proxy and take that repository's
+      // allowlist. The token rides in the proxy URL this worker is given.
+      authToken: randomBytes(24).toString('hex'),
       onJobAcquired: async (jobId: string) => {
         // The worker behind this proxy just claimed a job. Whichever instance
         // won the queue, this is the one that has to carry its policy.
@@ -993,6 +1009,29 @@ export class RunnerManager {
       return;
     }
 
+    // This start's broker address. The broker refuses any request without a
+    // key it issued, and takes the worker's identity from the key.
+    const brokerUrl = this.issueBrokerUrl?.(
+      instanceNum,
+      this.pendingTargetContext.get(String(instanceNum))?.targetId
+    );
+    if (brokerUrl) {
+      try {
+        const runnerConfig = JSON.parse(
+          String(fs.readFileSync(runnerConfigFile, 'utf-8')).replace(/^\uFEFF/, '')
+        );
+        runnerConfig.serverUrlV2 = brokerUrl;
+        fs.writeFileSync(runnerConfigFile, JSON.stringify(runnerConfig, null, 2));
+      } catch (error) {
+        this.log('error', `Cannot give instance ${instanceNum} its broker address: ${(error as Error).message}`);
+        this.revokeBrokerUrl?.(instanceNum);
+        instance.status = 'error';
+        this.updateAggregateStatus();
+        this.startingInstances.delete(instanceNum);
+        return;
+      }
+    }
+
     try {
       // Start proxy for this instance (or reuse existing)
       let proxy = this.proxyServers.get(instanceNum);
@@ -1062,6 +1101,22 @@ export class RunnerManager {
       // would describe an endpoint a real `docker build` never calls.
       env.DOCKER_BUILDKIT = '0';
 
+      // Keep the job's temp inside its own sandbox. The default $TMPDIR is a
+      // per-user directory shared with every other process the user runs, and
+      // the sandbox can no longer reach unix sockets there - so a build tool
+      // or test suite that puts a socket under TMPDIR must find TMPDIR in a
+      // place it is allowed to use. The sandbox directory is that place.
+      const jobTmp = path.join(sandboxDir, '_temp');
+      try {
+        fs.mkdirSync(jobTmp, { recursive: true });
+      } catch (err) {
+        this.log('warn', `Could not create job temp dir for instance ${instanceNum}: ${(err as Error).message}`);
+      }
+      env.TMPDIR = jobTmp;
+      env.TMP = jobTmp;
+      env.TEMP = jobTmp;
+      env.RUNNER_TEMP = jobTmp;
+
       instance.process = spawnSandboxed(runnerBinary, ['--once'], {
         cwd: sandboxDir,
         env,
@@ -1077,10 +1132,17 @@ export class RunnerManager {
       // the instance stays 'starting', which keeps its slot from being
       // reserved for another job.
 
-      // Write PID file for orphan detection
+      // Write the PID for orphan detection into a directory only the app can
+      // write. In the sandbox it was steerable: a job could drop any pid into
+      // its own runner.pid and have the startup sweep SIGKILL it.
       if (instance.process.pid) {
-        const pidFile = path.join(sandboxDir, 'runner.pid');
-        fs.writeFileSync(pidFile, instance.process.pid.toString());
+        try {
+          const pidDir = this.pidDir();
+          fs.mkdirSync(pidDir, { recursive: true });
+          fs.writeFileSync(path.join(pidDir, `${instanceNum}.pid`), instance.process.pid.toString());
+        } catch (err) {
+          this.log('warn', `Could not write pid file for instance ${instanceNum}: ${(err as Error).message}`);
+        }
       }
 
       instance.process.stdout?.on('data', (data: Buffer) => {
@@ -1125,6 +1187,7 @@ export class RunnerManager {
         // slot's worker: a reaped one's exit can land after the next worker
         // was spawned into the slot, and what is recorded now is that one's.
         if (this.instances.get(instanceNum) === instance) {
+          this.revokeBrokerUrl?.(instanceNum);
           if (this.acquireDeadlines.has(instanceNum)) {
             this.abandonJobFor(instanceNum);
           }
@@ -2216,10 +2279,45 @@ export class RunnerManager {
     this.onStatusChange(state);
   }
 
+  /** Where worker pids are recorded, outside anything a job can write. */
+  private pidDir(): string {
+    return path.join(getRunnerDir(), 'pids');
+  }
+
+  /**
+   * A pid worth signalling: a positive integer, not this process, and not one
+   * this manager is currently running. Rejects 0 and negatives outright -
+   * process.kill(-1) would signal every process the user owns and kill(0) the
+   * whole group, so a stale or planted file must never reach them.
+   */
+  private sweepablePid(raw: string, live: Set<number>): number | null {
+    const pid = parseInt(raw.trim(), 10);
+    if (isNaN(pid) || pid <= 1 || pid === process.pid || live.has(pid)) return null;
+    return pid;
+  }
+
+  /** The pid files this manager wrote, as [absolute path, pid string]. */
+  private async readPidFiles(): Promise<Array<[string, string]>> {
+    const pidDir = this.pidDir();
+    if (!fs.existsSync(pidDir)) return [];
+    const entries = await fs.promises.readdir(pidDir, { withFileTypes: true });
+    if (!Array.isArray(entries)) return [];
+    const out: Array<[string, string]> = [];
+    for (const entry of entries) {
+      if (entry.isDirectory() || !/^\d+\.pid$/.test(entry.name)) continue;
+      const file = path.join(pidDir, entry.name);
+      try {
+        out.push([file, await fs.promises.readFile(file, 'utf-8')]);
+      } catch {
+        // Unreadable: skip, and leave the file for a later pass.
+      }
+    }
+    return out;
+  }
+
   private async killStaleProcesses(): Promise<void> {
-    // Processes this manager is running right now. A worker writes its pid into
-    // its sandbox as soon as it starts, so a sweep that trusts the file alone
-    // will kill a runner that was spawned seconds earlier: seen live, where
+    // Processes this manager is running right now. A sweep that trusts a pid
+    // file alone will kill a runner spawned seconds earlier: seen live, where
     // auto-start brought instance 1 up as pid 5748 and this killed it one
     // second later, leaving the pool empty and the runner Offline for eight
     // hours while heartbeats carried on as though nothing were wrong.
@@ -2228,115 +2326,55 @@ export class RunnerManager {
       if (instance.process?.pid) live.add(instance.process.pid);
     }
 
-    // Check sandbox directories for stale PID files
-    const sandboxBase = path.join(this.downloader.getBaseDir(), 'sandbox');
-    if (!fs.existsSync(sandboxBase)) {
-      return;
-    }
-
-    const entries = await fs.promises.readdir(sandboxBase, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-
-      // Security: Validate path stays within sandbox base
-      const sandboxDir = this.validateChildPath(sandboxBase, entry.name);
-      if (!sandboxDir) {
-        this.log('warn', `Skipping suspicious sandbox directory: ${entry.name}`);
+    for (const [pidFile, contents] of await this.readPidFiles()) {
+      const pid = this.sweepablePid(contents, live);
+      if (pid === null) {
+        // Either not ours to kill, or a value we refuse to signal. Drop the
+        // file if it names nothing runnable; keep it if it is a live worker.
+        if (!live.has(parseInt(contents.trim(), 10))) {
+          await fs.promises.unlink(pidFile).catch(() => undefined);
+        }
         continue;
       }
-
-      const pidFile = path.join(sandboxDir, 'runner.pid');
-
-      if (!fs.existsSync(pidFile)) continue;
-
       try {
-        const pidStr = await fs.promises.readFile(pidFile, 'utf-8');
-        const pid = parseInt(pidStr.trim(), 10);
-
-        if (isNaN(pid)) {
-          await fs.promises.unlink(pidFile);
-          continue;
-        }
-
-        if (live.has(pid)) {
-          this.log('debug', `Runner process ${pid} is one of ours and running; leaving it alone`);
-          continue;
-        }
-
+        process.kill(pid, 0);
+        this.log('info', `Killing stale runner process ${pid}`);
+        process.kill(pid, 'SIGTERM');
+        await new Promise((resolve) => setTimeout(resolve, 1000));
         try {
           process.kill(pid, 0);
-          this.log('info', `Killing stale runner process ${pid}`);
-          process.kill(pid, 'SIGTERM');
-
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-          try {
-            process.kill(pid, 0);
-            process.kill(pid, 'SIGKILL');
-          } catch {
-            // Process exited after SIGTERM - expected success case
-          }
+          process.kill(pid, 'SIGKILL');
         } catch {
-          // Process doesn't exist (ESRCH) - already dead
+          // Process exited after SIGTERM - expected success case
         }
-
-        await fs.promises.unlink(pidFile);
       } catch {
-        // Failed to read/process PID file - non-fatal, continue with other entries
+        // Process doesn't exist (ESRCH) - already dead
       }
+      await fs.promises.unlink(pidFile).catch(() => undefined);
     }
   }
 
   private async detectStaleRunnerProcesses(): Promise<void> {
-    // Scan PID files in sandbox directories to find orphaned processes
-    const sandboxBase = path.join(getRunnerDir(), 'sandbox');
+    const trackedPids = new Set<number>();
+    for (const [, instance] of this.instances) {
+      if (instance.process?.pid) trackedPids.add(instance.process.pid);
+    }
 
-    if (!fs.existsSync(sandboxBase)) return;
-
+    const orphanedPids: number[] = [];
     try {
-      const entries = await fs.promises.readdir(sandboxBase, { withFileTypes: true });
-
-      // Get PIDs we're currently tracking
-      const trackedPids = new Set<number>();
-      for (const [, instance] of this.instances) {
-        if (instance.process?.pid) {
-          trackedPids.add(instance.process.pid);
-        }
-      }
-
-      const orphanedPids: number[] = [];
-
-      for (const entry of entries) {
-        if (!entry.isDirectory()) continue;
-
-        // Security: Validate path stays within sandbox base
-        const sandboxDir = this.validateChildPath(sandboxBase, entry.name);
-        if (!sandboxDir) {
-          this.log('warn', `Skipping suspicious sandbox directory: ${entry.name}`);
+      for (const [pidFile, contents] of await this.readPidFiles()) {
+        const pid = this.sweepablePid(contents, trackedPids);
+        if (pid === null) {
+          if (!trackedPids.has(parseInt(contents.trim(), 10))) {
+            await fs.promises.unlink(pidFile).catch(() => undefined);
+          }
           continue;
         }
-
-        const pidFile = path.join(sandboxDir, 'runner.pid');
-        if (!fs.existsSync(pidFile)) continue;
-
         try {
-          const pidStr = await fs.promises.readFile(pidFile, 'utf-8');
-          const pid = parseInt(pidStr.trim(), 10);
-
-          if (isNaN(pid) || trackedPids.has(pid)) continue;
-
-          // Check if process is still running (signal 0 doesn't kill, just checks)
-          try {
-            process.kill(pid, 0);
-            // Process exists but we're not tracking it - it's orphaned
-            orphanedPids.push(pid);
-          } catch {
-            // Process doesn't exist - clean up stale PID file
-            await fs.promises.unlink(pidFile).catch(() => {
-              // PID file cleanup failed - non-fatal
-            });
-          }
+          process.kill(pid, 0);
+          orphanedPids.push(pid);
         } catch {
-          // Couldn't read PID file - corrupted or permissions, skip
+          await fs.promises.unlink(pidFile).catch(() => undefined);
         }
       }
 

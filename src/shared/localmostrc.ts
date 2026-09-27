@@ -296,13 +296,13 @@ function validateFilesystemPolicy(policy: unknown, path: string, errors: ParseEr
   const p = policy as Record<string, unknown>;
 
   if (p.read !== undefined) {
-    validateStringArray(p.read, `${path}.read`, errors);
+    validatePathArray(p.read, `${path}.read`, errors);
   }
   if (p.write !== undefined) {
-    validateStringArray(p.write, `${path}.write`, errors);
+    validatePathArray(p.write, `${path}.write`, errors);
   }
   if (p.deny !== undefined) {
-    validateStringArray(p.deny, `${path}.deny`, errors);
+    validatePathArray(p.deny, `${path}.deny`, errors);
   }
 }
 
@@ -352,6 +352,25 @@ function validateStringArray(value: unknown, path: string, errors: ParseError[])
   for (let i = 0; i < value.length; i++) {
     if (typeof value[i] !== 'string') {
       errors.push({ message: `${path}[${i}] must be a string` });
+    }
+  }
+}
+
+/**
+ * A filesystem path from a policy, which is written verbatim into the
+ * sandbox-exec profile - a quoted DSL. A quote or backslash could close or
+ * escape the string, and a control character (a newline especially) could add
+ * a rule of its own. None occurs in a real macOS path, so they are refused
+ * rather than escaped-and-hoped: the user approves what a policy says, and it
+ * must not be able to enforce something else.
+ */
+function validatePathArray(value: unknown, path: string, errors: ParseError[]): void {
+  validateStringArray(value, path, errors);
+  if (!Array.isArray(value)) return;
+  for (let i = 0; i < value.length; i++) {
+    const entry = value[i];
+    if (typeof entry === 'string' && /["\\\x00-\x1f\x7f]/.test(entry)) {
+      errors.push({ message: `${path}[${i}] must not contain quotes, backslashes or control characters` });
     }
   }
 }

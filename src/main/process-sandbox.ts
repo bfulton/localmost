@@ -211,9 +211,12 @@ function generateSandboxProfile({
         ];
   // Policies are written with ~ for the user's home, the same as the CLI path
   // expands. Without this a declared "~/.npm" would name a directory called ~.
+  // Backslash first, then quote, so a policy path (validated to carry neither,
+  // but escaped here as the backstop) cannot escape or close its DSL literal.
+  const escapeForProfile = (value: string) => value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   const subpaths = (paths: string[]) =>
     paths
-      .map((entry) => `  (subpath "${expandPath(entry).replace(/"/g, '\\"')}")`)
+      .map((entry) => `  (subpath "${escapeForProfile(expandPath(entry))}")`)
       .join('\n');
   const policyReads = subpaths(filesystemPolicy.read);
   const policyWrites = subpaths(filesystemPolicy.write);
@@ -318,9 +321,12 @@ ${policyWrites ? `(allow file-write*\n${policyWrites})` : ';; No policy-declared
   (subpath "/var")
   (subpath "/tmp")
   (subpath "/private/tmp")
-  ;; This job's own workspace, the runner install and the shared tool cache
+  ;; This job's own workspace and the shared tool cache. Not the runner
+  ;; directory as a whole: it holds every target's proxy credentials, every
+  ;; instance's registration, the broker's session tokens and the other
+  ;; workers' sandboxes. The job's own sandbox already carries the runner it
+  ;; runs, so it needs nothing else from there.
   (subpath "${escapedDir}")
-  (subpath "${runnerDir}")
   (subpath "${toolCacheDir}")
 ${toolchainRules}
 ${policyReads}
@@ -342,6 +348,13 @@ ${policyReads}
   (subpath "${homeDir}/Library/Keychains")
   (subpath "${userDataDir}")
   (subpath "${policiesDir}")
+  ;; The runner directory's own secrets, denied by name so that neither a
+  ;; toolchain grant nor a policy-declared read path can reopen them. The
+  ;; sandbox root is denied and this job's own sandbox re-allowed just below.
+  (subpath "${runnerDir}/proxies")
+  (subpath "${runnerDir}/config")
+  (subpath "${runnerDir}/sandbox-profiles")
+  (literal "${runnerDir}/broker-sessions.json")
   (literal "${configFile}")
   (literal "${homeDir}/.netrc")
   (literal "${homeDir}/.npmrc")
@@ -354,6 +367,11 @@ ${policyReads}
   (literal "${homeDir}/.cargo/credentials")
   (literal "${homeDir}/.cargo/credentials.toml")
   (literal "${homeDir}/.nuget/NuGet/NuGet.Config"))
+;; No worker may read another worker's sandbox. The root is denied after every
+;; allow above, and this job's own sandbox re-allowed after that - last match
+;; wins, so a policy that named a sibling sandbox still cannot reach it.
+(deny file-read* (subpath "${runnerDir}/sandbox"))
+(allow file-read* (subpath "${escapedDir}"))
 ${dockerRules}
 
 ;; Device files that need read/write access (git, many tools redirect to /dev/null)
@@ -412,13 +430,12 @@ ${allowDirectNetwork ? ';; Runner registration talks to GitHub directly: app-dri
   (literal "/var/run/mDNSResponder")
   (literal "/private/var/run/syslog")
   (literal "/var/run/syslog")
-  ;; Sockets the job itself created. Test suites bind one and connect to it,
-  ;; so this is scoped to the same directories binding is.
-  (subpath "${escapedDir}")
-  (subpath "${tmpDir}")
-  (subpath "/tmp")
-  (subpath "/private/tmp")
-  (subpath "/private/var/folders"))
+  ;; Sockets the job itself created, in its own sandbox. The job's TMPDIR is
+  ;; set there too, so a test suite that binds a socket under TMPDIR lands
+  ;; here. The shared temp directories are deliberately absent: a unix socket
+  ;; under them belongs to one of the user's own processes - an editor, a
+  ;; daemon, an agent - and connecting to it reaches outside the sandbox.
+  (subpath "${escapedDir}"))
 
 ;; Binding a local port is how test servers and build tools talk to themselves,
 ;; and a unix socket is how many test suites do the same. Binding creates a
@@ -426,20 +443,23 @@ ${allowDirectNetwork ? ';; Runner registration talks to GitHub directly: app-dri
 ;; stays denied above.
 (allow network-bind (local ip "localhost:*"))
 (allow network-inbound (local ip "localhost:*"))
-;; Test suites bind unix sockets in the workspace and temp. Binding creates a
-;; file where the job can already write, so it is scoped to those directories
-;; rather than granted everywhere.
+;; Test suites bind unix sockets in the workspace; the job's TMPDIR is in the
+;; sandbox, so a socket bound under TMPDIR is here too. Scoped to the sandbox,
+;; where the job can already write, and not to the shared temp directories the
+;; user's own processes keep their sockets in.
 (allow network-bind
-  (subpath "${escapedDir}")
-  (subpath "${tmpDir}")
-  (subpath "/tmp")
-  (subpath "/private/tmp")
-  (subpath "/private/var/folders"))
+  (subpath "${escapedDir}"))
 
 ;; ------------------------------------------------------------
 ;; MACH/IPC OPERATIONS - Permissive (required by system frameworks)
 ;; ------------------------------------------------------------
 (allow mach*)
+;; ...except the pasteboard. A job has no reason to read what the user copied,
+;; and the clipboard routinely holds passwords and tokens. Denied by name after
+;; the blanket allow, which every system framework still needs.
+(deny mach-lookup
+  (global-name "com.apple.pasteboard.1")
+  (global-name "com.apple.pbs.fetch_services"))
 (allow ipc*)
 
 ;; ------------------------------------------------------------

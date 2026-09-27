@@ -79,7 +79,11 @@ export function expandPath(pattern: string): string {
  * Escape a path for use in sandbox profile.
  */
 function escapePath(pathStr: string): string {
-  return pathStr.replace(/"/g, '\\"');
+  // Backslash first, then quote: a path reaching this DSL must neither escape
+  // out of its string literal nor close it. Policy paths are validated to
+  // carry neither (see validatePathArray), so this is the backstop for paths
+  // from every other source.
+  return pathStr.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
 // Note: macOS sandbox-exec does NOT support hostname-based network filtering.

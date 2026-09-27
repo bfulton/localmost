@@ -316,6 +316,56 @@ describe('Process Sandbox', () => {
       expect(profileWith({})).not.toContain('docker.sock');
     });
 
+    it('lets a job reach unix sockets only inside its own sandbox, not the shared temp dirs', () => {
+      // A unix socket under /tmp or the user's $TMPDIR belongs to one of the
+      // user's own processes - an editor, a daemon, an agent. Connecting to it
+      // reaches outside the sandbox. The job's own TMPDIR is set inside the
+      // sandbox, so well-behaved suites that bind under TMPDIR still work.
+      const profile = profileWith({});
+      const connect = profile.slice(
+        profile.indexOf('(allow network-outbound\n  ;; The system sockets'),
+        profile.indexOf('(allow network-bind (local')
+      );
+      expect(connect).toContain(`(subpath "${instanceDir}")`);
+      expect(connect).not.toContain('(subpath "/tmp")');
+      expect(connect).not.toContain('(subpath "/private/tmp")');
+      expect(connect).not.toContain('(subpath "/private/var/folders")');
+
+      const bind = profile.slice(profile.indexOf('(allow network-bind\n'));
+      expect(bind).toContain(`(subpath "${instanceDir}")`);
+      expect(bind).not.toContain('(subpath "/tmp")');
+      expect(bind).not.toContain('(subpath "/private/var/folders")');
+    });
+
+    it('denies the pasteboard mach service so a job cannot read the clipboard', () => {
+      // (allow mach*) is needed by system frameworks, but the clipboard often
+      // holds passwords and tokens and no job needs it. Denied by name after
+      // the blanket allow, where the last matching rule wins.
+      const profile = profileWith({});
+      const allow = profile.indexOf('(allow mach*)');
+      const deny = profile.indexOf('(global-name "com.apple.pasteboard.1")');
+      expect(allow).toBeGreaterThan(-1);
+      expect(deny).toBeGreaterThan(allow);
+    });
+
+    it('does not open the whole runner directory, and denies the parts that hold secrets', () => {
+      // The runner directory holds every target's proxy credentials, every
+      // instance's registration, the broker's session tokens and the other
+      // workers' sandboxes. Granting it read let any job read all of them and
+      // register as another repository's runner. A job gets its own sandbox
+      // and the shared tool cache, not the directory that contains them.
+      const runnerDir = path.join(os.homedir(), '.localmost', 'runner');
+      const profile = profileWith({ dockerSocket: path.join(instanceDir, 'docker.sock') });
+
+      expect(profile).not.toContain(`(subpath "${runnerDir}")`);
+      const denyRead = profile.slice(profile.indexOf('(deny file-read*'));
+      expect(denyRead).toContain(`(subpath "${runnerDir}/proxies")`);
+      expect(denyRead).toContain(`(subpath "${runnerDir}/config")`);
+      expect(denyRead).toContain(`(subpath "${runnerDir}/sandbox")`);
+      expect(denyRead).toContain(`(subpath "${runnerDir}/sandbox-profiles")`);
+      expect(denyRead).toContain(`(literal "${runnerDir}/broker-sessions.json")`);
+    });
+
     it('escapes quotes in the socket path, as the rest of the profile does', () => {
       // The path is built from the sandbox directory and lands in a security
       // DSL, where an unescaped quote would close the literal early and change
