@@ -357,11 +357,17 @@ describe('Process Sandbox', () => {
       const runnerDir = path.join(os.homedir(), '.localmost', 'runner');
       const profile = profileWith({ dockerSocket: path.join(instanceDir, 'docker.sock') });
 
+      // The runner directory is not opened as a whole. Its node and the
+      // sandbox node are readable so the runner can traverse into its own
+      // sandbox, but not as subtrees - a sibling sandbox is never granted.
       expect(profile).not.toContain(`(subpath "${runnerDir}")`);
+      expect(profile).not.toContain(`(subpath "${runnerDir}/sandbox")`);
+      const allowRead = profile.slice(profile.indexOf('(allow file-read*'), profile.indexOf('(deny file-read*'));
+      expect(allowRead).toContain(`(literal "${runnerDir}")`);
+      expect(allowRead).toContain(`(literal "${runnerDir}/sandbox")`);
       const denyRead = profile.slice(profile.indexOf('(deny file-read*'));
       expect(denyRead).toContain(`(subpath "${runnerDir}/proxies")`);
       expect(denyRead).toContain(`(subpath "${runnerDir}/config")`);
-      expect(denyRead).toContain(`(subpath "${runnerDir}/sandbox")`);
       expect(denyRead).toContain(`(subpath "${runnerDir}/sandbox-profiles")`);
       expect(denyRead).toContain(`(literal "${runnerDir}/broker-sessions.json")`);
     });

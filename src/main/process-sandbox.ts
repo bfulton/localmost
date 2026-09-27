@@ -302,6 +302,12 @@ ${policyWrites ? `(allow file-write*\n${policyWrites})` : ';; No policy-declared
   (literal "/Users")
   (literal "${homeDir}")
   (literal "${appDataDir}")
+  ;; The directory nodes on the way to this job's own sandbox. .NET reads each
+  ;; ancestor directory to open anything beneath it. These are the nodes, not
+  ;; their subtrees: sibling sandboxes and the credential directories below are
+  ;; not granted, and the ones that hold secrets are denied by name below.
+  (literal "${runnerDir}")
+  (literal "${runnerDir}/sandbox")
   (subpath "/bin")
   (subpath "/sbin")
   (subpath "/usr/bin")
@@ -367,11 +373,6 @@ ${policyReads}
   (literal "${homeDir}/.cargo/credentials")
   (literal "${homeDir}/.cargo/credentials.toml")
   (literal "${homeDir}/.nuget/NuGet/NuGet.Config"))
-;; No worker may read another worker's sandbox. The root is denied after every
-;; allow above, and this job's own sandbox re-allowed after that - last match
-;; wins, so a policy that named a sibling sandbox still cannot reach it.
-(deny file-read* (subpath "${runnerDir}/sandbox"))
-(allow file-read* (subpath "${escapedDir}"))
 ${dockerRules}
 
 ;; Device files that need read/write access (git, many tools redirect to /dev/null)
