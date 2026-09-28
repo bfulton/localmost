@@ -89,6 +89,7 @@ jest.mock('fs', () => ({
   existsSync: jest.fn(),
   readFileSync: jest.fn(),
   writeFileSync: jest.fn(),
+  unlinkSync: jest.fn(),
   mkdirSync: jest.fn(),
   promises: {
     mkdir: jest.fn(),
@@ -1586,6 +1587,14 @@ describe('RunnerManager', () => {
       }
       return { manager, helper };
     }
+
+    it('removes the reaped worker\'s pid file so a later sweep cannot act on it', () => {
+      const { helper } = idlePool();
+      const unlinked: string[] = [];
+      (fs.unlinkSync as jest.Mock).mockImplementation((f: unknown) => { unlinked.push(String(f)); });
+      helper.reapUnclaimedWorker(1);
+      expect(unlinked.some((f) => f.endsWith('/pids/1.pid'))).toBe(true);
+    });
 
     it('frees the slot of a worker that never acquired a job', () => {
       // A worker spawned for a job that the broker never routed to it sits in

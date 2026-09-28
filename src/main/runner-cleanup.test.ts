@@ -38,6 +38,12 @@ describe('killOrphanedProcesses', () => {
     expect(signalled.some(([p]) => p === 4242 || p === -4242)).toBe(false);
   });
 
+  it('never signals this process, even if a stale pid file names it', async () => {
+    fs.writeFileSync(path.join(pidDir, '1.pid'), String(process.pid));
+    await killOrphanedProcesses(sandboxBase, () => undefined);
+    expect(signalled).toEqual([]);
+  });
+
   it('refuses to signal pid 1 or lower', async () => {
     fs.writeFileSync(path.join(pidDir, '1.pid'), '-1');
     fs.writeFileSync(path.join(pidDir, '2.pid'), '0');

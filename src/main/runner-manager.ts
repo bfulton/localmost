@@ -1480,9 +1480,15 @@ export class RunnerManager {
     this.abandonJobFor(instanceNum);
     // The exit handler is the other revocation site, but a --once worker that
     // never acquired a job never exits, and releaseInstanceSlot below deletes
-    // the instance so the exit handler would skip it. Revoke here, or the
-    // reaped worker's broker key stays valid until the slot is reused.
+    // the instance so the exit handler would skip it. Revoke the key and drop
+    // the pid file here, or the reaped worker's broker URL stays valid and its
+    // pid file lingers for a later startup sweep, both until the slot is reused.
     this.revokeBrokerUrl?.(instanceNum);
+    try {
+      fs.unlinkSync(path.join(this.pidDir(), `${instanceNum}.pid`));
+    } catch {
+      // Already gone, or never written.
+    }
     this.releaseInstanceSlot(instanceNum);
   }
 

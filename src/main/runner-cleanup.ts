@@ -58,10 +58,10 @@ export async function killOrphanedProcesses(
       try {
         const pidStr = await fs.promises.readFile(pidFile, 'utf-8');
         const pid = parseInt(pidStr.trim(), 10);
-        // Refuse anything that is not a real, single process id. kill(-1)
-        // signals every process the user owns and kill(0) the whole group;
-        // a pid of 1 or less must never reach the kill calls below.
-        if (isNaN(pid) || pid <= 1) continue;
+        // Refuse anything that is not a real, single process id, and never
+        // this process: kill(-1) signals every process the user owns,
+        // kill(0) the whole group, and a reused pid could be the app itself.
+        if (isNaN(pid) || pid <= 1 || pid === process.pid) continue;
 
         // Check if process is running and kill it
         try {
