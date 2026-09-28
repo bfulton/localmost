@@ -762,6 +762,27 @@ describe('message routing', () => {
       expect(internals.acquiredJobDetails.has('req-1')).toBe(false);
     });
 
+    it('clears the acquired payload even when the worker already polled the message', () => {
+      // The deadline/exit path: the worker dequeued its job message, then died
+      // before acquirejob. The queue entry is gone, but the acquired payload
+      // (its secrets) and run-service routing are still resident and must go.
+      const target = addTargetWithRunner('target-a', 'runner-a.1');
+      internals.messageQueues.set(target.id, []); // already polled - nothing queued
+      internals.acquiredJobDetails.set('req-1', JSON.stringify({ secret: 's' }));
+      internals.acquiredJobDetails.set('9', JSON.stringify({ secret: 's' }));
+      (internals as unknown as { jobRunServiceUrls: Map<string, string> }).jobRunServiceUrls.set('req-1', 'https://run/');
+      (internals as unknown as { jobRunServiceUrls: Map<string, string> }).jobRunServiceUrls.set('9', 'https://run/');
+      service.expectWorkerForJob(target.id, 1);
+
+      service.forgetExpectedWorker(target.id, 1, 'req-1');
+
+      expect(internals.acquiredJobDetails.has('req-1')).toBe(false);
+      expect(internals.acquiredJobDetails.has('9')).toBe(false);
+      const urls = (internals as unknown as { jobRunServiceUrls: Map<string, string> }).jobRunServiceUrls;
+      expect(urls.has('req-1')).toBe(false);
+      expect(urls.has('9')).toBe(false);
+    });
+
     it('leaves the other jobs queued for the same repository alone', () => {
       const target = addTargetWithRunner('target-a', 'runner-a.1');
       internals.messageQueues.set(target.id, [jobMessage, secondJob]);

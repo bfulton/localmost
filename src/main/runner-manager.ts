@@ -746,6 +746,11 @@ export class RunnerManager {
       this.onWorkerReservationCancelled?.(context.targetId, instanceNum, context.jobId);
     }
     this.pendingTargetContext.delete(String(instanceNum));
+    // The key was issued when the proxy was created, before the setup that
+    // failed here. Revoke it, or a worker that never started keeps a valid
+    // broker URL until the slot is reused. Idempotent with the exit/reap
+    // revocations.
+    this.revokeBrokerUrl?.(instanceNum);
   }
 
   async spawnWorkerForJob(): Promise<void> {

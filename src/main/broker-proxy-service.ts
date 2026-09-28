@@ -1191,6 +1191,16 @@ export class BrokerProxyService extends EventEmitter {
     }
   }
 
+  /** Delete a map's entry for a key and every alias holding the same value. */
+  private deleteByKeyAndValue<V>(map: Map<string, V>, key: string): void {
+    const value = map.get(key);
+    map.delete(key);
+    if (value === undefined) return;
+    for (const [k, v] of map) {
+      if (v === value) map.delete(k);
+    }
+  }
+
   /**
    * Acknowledge a message to GitHub so it won't be sent again.
    */
@@ -1421,34 +1431,41 @@ export class BrokerProxyService extends EventEmitter {
     const neverBound = agentName !== undefined && this.expectedWorkers.delete(agentName);
     if (!jobId) return;
 
+    // Drop the job from the queue if it is still there. It may already be
+    // gone: the worker polled the message and then died before acquirejob -
+    // the deadline/exit path. The cleanup below must run either way, or the
+    // job's secrets stay resident under both id aliases.
     const queue = this.messageQueues.get(targetId);
     const index = queue?.findIndex(
       message => isJobAssignmentMessage(message) && jobIdFromMessage(message) === jobId
     ) ?? -1;
-    if (!queue || index < 0) return;
-    const [dropped] = queue.splice(index, 1);
-    this.jobAssignments.delete(jobId);
-    this.jobTargets.delete(jobId);
-    // The acquired payload carries the job's secrets, and the run-service URL
-    // and job info are what job operations forward to. None should outlive a
-    // job no worker will run. These are stored under both the runner request
-    // id and the broker message id, so clear the message-id alias too.
-    this.forgetAcquiredJob(jobId);
-    this.jobRunServiceUrls.delete(jobId);
-    this.jobTargets.delete(jobId);
-    try {
-      const messageId = String(JSON.parse(dropped).messageId);
-      this.jobRunServiceUrls.delete(messageId);
-      this.jobInfo.delete(messageId);
-      this.jobTargets.delete(messageId);
-    } catch {
-      // No message-id alias to clear.
+    if (queue && index >= 0) {
+      queue.splice(index, 1);
+      // Binding consumes an assignment. Only a worker that never bound still
+      // has one; taking one otherwise would strand another job's worker.
+      if (neverBound) {
+        const pending = this.pendingTargetAssignments.indexOf(targetId);
+        if (pending >= 0) this.pendingTargetAssignments.splice(pending, 1);
+      }
     }
-    // Binding consumes an assignment. Only a worker that never bound still has
-    // one; taking one otherwise would strand another job's worker.
-    if (neverBound) {
-      const pending = this.pendingTargetAssignments.indexOf(targetId);
-      if (pending >= 0) this.pendingTargetAssignments.splice(pending, 1);
+
+    // Clear every trace of the job, keyed by value so both the runner-request-id
+    // and broker-message-id aliases go without needing the queued message in
+    // hand. The acquired payload holds secrets; the run-service URL and job
+    // info are the upstream routing for job operations.
+    this.jobAssignments.delete(jobId);
+    this.forgetAcquiredJob(jobId);
+    const runServiceUrl = this.jobRunServiceUrls.get(jobId);
+    this.deleteByKeyAndValue(this.jobTargets, jobId);
+    if (runServiceUrl !== undefined) {
+      for (const [key, value] of this.jobRunServiceUrls) {
+        if (value === runServiceUrl) this.jobRunServiceUrls.delete(key);
+      }
+      for (const [key, info] of this.jobInfo) {
+        if (info.runServiceUrl === runServiceUrl) this.jobInfo.delete(key);
+      }
+    } else {
+      this.jobRunServiceUrls.delete(jobId);
     }
     log()?.info(`[BrokerProxy] Dropped job ${jobId} for ${targetId}: its worker ${instanceNum} will never take it`);
   }
