@@ -1426,14 +1426,24 @@ export class BrokerProxyService extends EventEmitter {
       message => isJobAssignmentMessage(message) && jobIdFromMessage(message) === jobId
     ) ?? -1;
     if (!queue || index < 0) return;
-    queue.splice(index, 1);
+    const [dropped] = queue.splice(index, 1);
     this.jobAssignments.delete(jobId);
     this.jobTargets.delete(jobId);
     // The acquired payload carries the job's secrets, and the run-service URL
-    // is what job operations forward to. Neither should outlive a job no
-    // worker will run.
+    // and job info are what job operations forward to. None should outlive a
+    // job no worker will run. These are stored under both the runner request
+    // id and the broker message id, so clear the message-id alias too.
     this.forgetAcquiredJob(jobId);
     this.jobRunServiceUrls.delete(jobId);
+    this.jobTargets.delete(jobId);
+    try {
+      const messageId = String(JSON.parse(dropped).messageId);
+      this.jobRunServiceUrls.delete(messageId);
+      this.jobInfo.delete(messageId);
+      this.jobTargets.delete(messageId);
+    } catch {
+      // No message-id alias to clear.
+    }
     // Binding consumes an assignment. Only a worker that never bound still has
     // one; taking one otherwise would strand another job's worker.
     if (neverBound) {

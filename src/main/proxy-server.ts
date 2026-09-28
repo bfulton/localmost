@@ -119,14 +119,15 @@ export class ProxyServer {
     if (v === 4) return this.isBlockedV4(addr);
     if (v === 6) {
       const lower = addr.toLowerCase();
-      // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible: screen the v4 part.
-      // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d) both embed
-      // a v4 address; screen it.
-      const embedded = lower.match(/^::(?:ffff:)?(\d+\.\d+\.\d+\.\d+)$/);
-      if (embedded) return this.isBlockedV4(embedded[1]);
-      if (lower === '::') return true; // unspecified / wildcard - resolves local
-      // Loopback (::1) is not blocked: the sandbox lets a job reach loopback
-      // directly, so the proxy adds nothing, and the broker rides it.
+      // Loopback stays reachable (the sandbox grants it directly, and the
+      // broker rides it); nothing else in ::/... is a legitimate public AAAA.
+      if (lower === '::1') return false;
+      // Every ::-prefixed form is blocked: unspecified (::), IPv4-mapped in any
+      // notation (::ffff:a.b.c.d and its hex ::ffff:0a00:0001), and
+      // IPv4-compatible (::a.b.c.d). A real host's AAAA record is native IPv6,
+      // never one of these, so refusing them wholesale beats trying to parse
+      // the embedded v4 out of every spelling.
+      if (lower.startsWith('::')) return true;
       if (lower.startsWith('fe8') || lower.startsWith('fe9') || lower.startsWith('fea') || lower.startsWith('feb')) return true; // fe80::/10 link-local
       if (lower.startsWith('fc') || lower.startsWith('fd')) return true; // fc00::/7 unique-local
       return false;
@@ -161,7 +162,7 @@ export class ProxyServer {
    * Node still falls back across a host's IPv4 and IPv6 addresses; pinning a
    * single address broke that fallback and stalled real downloads.
    */
-  private async screenHost(host: string): Promise<boolean> {
+  private async screenAddresses(host: string): Promise<string[] | null> {
     let candidates: string[];
     if (net.isIP(host)) {
       candidates = [host];
@@ -169,11 +170,39 @@ export class ProxyServer {
       try {
         candidates = await this.lookup(host);
       } catch {
-        return false;
+        return null;
       }
     }
-    if (candidates.length === 0) return false;
-    return candidates.every((ip) => !this.isBlockedAddress(ip));
+    if (candidates.length === 0) return null;
+    if (!candidates.every((ip) => !this.isBlockedAddress(ip))) return null;
+    return candidates;
+  }
+
+  /**
+   * A DNS lookup that returns exactly the addresses already screened, so the
+   * connection cannot be sent to something a second resolution turned up.
+   * Keeps every screened address, so Node still falls back across a host's
+   * IPv4 and IPv6 addresses under autoSelectFamily.
+   */
+  private pinnedLookup(addresses: string[]) {
+    return (
+      _hostname: string,
+      options: dns.LookupOptions | ((err: Error | null, address: string, family: number) => void),
+      callback?: (err: Error | null, address: string | dns.LookupAddress[], family?: number) => void
+    ): void => {
+      const cb = (typeof options === 'function' ? options : callback) as (
+        err: Error | null,
+        address: string | dns.LookupAddress[],
+        family?: number
+      ) => void;
+      const all = typeof options === 'object' && options?.all;
+      const entries = addresses.map((address) => ({ address, family: net.isIP(address) || 4 }));
+      if (all) {
+        cb(null, entries);
+      } else {
+        cb(null, entries[0].address, entries[0].family);
+      }
+    };
   }
 
   /**
@@ -331,14 +360,15 @@ export class ProxyServer {
     clientSocket: net.Socket,
     head: Buffer
   ): Promise<void> {
-    if (!(await this.screenHost(host))) {
+    const screened = await this.screenAddresses(host);
+    if (!screened) {
       this.log({ method: 'CONNECT', host, port, blocked: true, reason: undefined });
       clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
       clientSocket.destroy();
       return;
     }
 
-    const serverSocket = net.connect(port, host, () => {
+    const serverSocket = net.connect({ host, port, lookup: this.pinnedLookup(screened), autoSelectFamily: true }, () => {
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       serverSocket.write(head);
       serverSocket.pipe(clientSocket);
@@ -396,8 +426,8 @@ export class ProxyServer {
         return;
       }
 
-      this.screenHost(host).then((safe) => {
-        if (!safe) {
+      this.screenAddresses(host).then((screened) => {
+        if (!screened) {
           this.log({ method: req.method || 'GET', host, port, path, blocked: true, reason: undefined });
           res.writeHead(403, { 'Content-Type': 'text/plain' });
           res.end(`Blocked by sandbox policy (${this.policyLevel}): host '${host}' resolves to a non-routable address`);
@@ -411,6 +441,7 @@ export class ProxyServer {
             path,
             method: req.method,
             headers: stripProxyAuth(req.headers),
+            lookup: this.pinnedLookup(screened),
           },
           (proxyRes) => {
             res.writeHead(proxyRes.statusCode || 500, proxyRes.headers);
