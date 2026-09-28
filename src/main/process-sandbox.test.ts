@@ -337,6 +337,27 @@ describe('Process Sandbox', () => {
       expect(bind).not.toContain('(subpath "/private/var/folders")');
     });
 
+    it('keeps the control plane and runner secrets unwritable even against a policy write path', () => {
+      // seatbelt takes the last matching rule, so the write denials have to
+      // come after the policy-declared write allow - otherwise a policy could
+      // declare a write path into the pid directory or the proxy credentials
+      // and reopen the very holes the read denials close.
+      const profile = profileWith({ dockerSocket: path.join(instanceDir, 'docker.sock') });
+      const runnerDir = path.join(os.homedir(), '.localmost', 'runner');
+      const policyAllow = profile.lastIndexOf('(allow file-write*');
+      const denyWrite = profile.indexOf('(deny file-write*\n  (subpath');
+      // The final re-allow of the job's own sandbox is the true last write rule.
+      const reallowOwn = profile.lastIndexOf(`(allow file-write*\n  (subpath "${instanceDir}"))`);
+      const denyBlock = profile.slice(profile.indexOf('(deny file-write*\n  (subpath'), reallowOwn);
+      expect(denyWrite).toBeGreaterThan(-1);
+      expect(denyBlock).toContain(`(subpath "${runnerDir}/pids")`);
+      expect(denyBlock).toContain(`(subpath "${runnerDir}/proxies")`);
+      expect(denyBlock).toContain(`(subpath "${runnerDir}/config")`);
+      expect(denyBlock).toContain(`(subpath "${runnerDir}/sandbox")`);
+      expect(reallowOwn).toBeGreaterThan(denyWrite);
+      expect(denyWrite).toBeGreaterThan(policyAllow > -1 ? -1 : -2);
+    });
+
     it('denies the pasteboard mach service so a job cannot read the clipboard', () => {
       // (allow mach*) is needed by system frameworks, but the clipboard often
       // holds passwords and tokens and no job needs it. Denied by name after
@@ -360,9 +381,11 @@ describe('Process Sandbox', () => {
       // The runner directory is not opened as a whole. Its node and the
       // sandbox node are readable so the runner can traverse into its own
       // sandbox, but not as subtrees - a sibling sandbox is never granted.
-      expect(profile).not.toContain(`(subpath "${runnerDir}")`);
-      expect(profile).not.toContain(`(subpath "${runnerDir}/sandbox")`);
       const allowRead = profile.slice(profile.indexOf('(allow file-read*'), profile.indexOf('(deny file-read*'));
+      // Reads use the directory nodes as literals for traversal, never the
+      // runner dir or the sandbox root as a readable subtree.
+      expect(allowRead).not.toContain(`(subpath "${runnerDir}")`);
+      expect(allowRead).not.toContain(`(subpath "${runnerDir}/sandbox")`);
       expect(allowRead).toContain(`(literal "${runnerDir}")`);
       expect(allowRead).toContain(`(literal "${runnerDir}/sandbox")`);
       const denyRead = profile.slice(profile.indexOf('(deny file-read*'));

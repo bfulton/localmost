@@ -1310,6 +1310,33 @@ describe('RunnerManager', () => {
       expect(String(write![0])).not.toContain('/sandbox/');
     });
 
+    it('signals the whole process group of an orphan, not just its leader', async () => {
+      // A crashed worker leaves descendants in its detached group. Signalling
+      // only the leader pid strands them; the sweep targets the group.
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      const signals: Array<[number, unknown]> = [];
+      const realKill = process.kill;
+      (process as unknown as { kill: unknown }).kill = ((pid: number, sig?: unknown) => {
+        signals.push([pid, sig]);
+        return true;
+      }) as never;
+      try {
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
+          { name: '1.pid', isFile: () => true, isDirectory: () => false },
+        ] as never);
+        (jest.mocked(fs.promises.readFile) as unknown as jest.Mock).mockResolvedValue('4242' as never);
+        (jest.mocked(fs.promises.unlink) as unknown as jest.Mock).mockResolvedValue(undefined as never);
+
+        await helper.killStaleProcesses();
+      } finally {
+        (process as unknown as { kill: unknown }).kill = realKill;
+      }
+
+      // SIGTERM went to the group (negative pid), not only the leader.
+      expect(signals).toContainEqual([-4242, 'SIGTERM']);
+    });
+
     it('refuses to signal pid 1 or lower, whatever a stale file says', async () => {
       // parseInt('-1') is -1, and process.kill(-1) signals every process the
       // user owns; kill(0) signals the whole group. A pid file naming either

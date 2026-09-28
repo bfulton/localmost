@@ -751,10 +751,15 @@ describe('message routing', () => {
       internals.pendingTargetAssignments.push(target.id);
       service.expectWorkerForJob(target.id, 1);
 
+      internals.acquiredJobDetails.set('req-1', JSON.stringify({ secret: 'in here' }));
+
       service.forgetExpectedWorker(target.id, 1, 'req-1');
 
       expect(internals.messageQueues.get(target.id)).toEqual([]);
       expect(internals.pendingTargetAssignments).toEqual([]);
+      // The acquired payload holds the job's secrets; it must not outlive a
+      // job no worker will run.
+      expect(internals.acquiredJobDetails.has('req-1')).toBe(false);
     });
 
     it('leaves the other jobs queued for the same repository alone', () => {

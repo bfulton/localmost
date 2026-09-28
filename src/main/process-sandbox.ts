@@ -266,12 +266,6 @@ function generateSandboxProfile({
 (allow file-ioctl
   (subpath "${toolCacheDir}"))
 
-;; Belt and braces: never writable, whatever else matches above.
-(deny file-write*
-  (subpath "${policiesDir}")
-  (literal "${configFile}")
-  (literal "${cliSocket}"))
-
 ;; System temp directories (many tools require this)
 ;; Note: /var is a symlink to /private/var on macOS, and sandbox
 ;; checks may use canonical paths, so we need both variants
@@ -288,6 +282,25 @@ ${cacheWriteRules}
 
 ;; Paths the repository's approved policy declares writable.
 ${policyWrites ? `(allow file-write*\n${policyWrites})` : ';; No policy-declared write paths'}
+
+;; Never writable, whatever matched above - including a policy-declared write
+;; path, since this is the last word. The app's control plane (a job that
+;; writes these approves its own policy) and the runner's secrets and bookkeeping
+;; (proxy credentials, registrations, session tokens, the pid files the startup
+;; sweep trusts, and other workers' sandboxes). This job's own sandbox is
+;; re-allowed last so it stays writable.
+(deny file-write*
+  (subpath "${policiesDir}")
+  (literal "${configFile}")
+  (literal "${cliSocket}")
+  (subpath "${runnerDir}/pids")
+  (subpath "${runnerDir}/proxies")
+  (subpath "${runnerDir}/config")
+  (subpath "${runnerDir}/sandbox-profiles")
+  (literal "${runnerDir}/broker-sessions.json")
+  (subpath "${runnerDir}/sandbox"))
+(allow file-write*
+  (subpath "${escapedDir}"))
 
 ;; READ ACCESS - the OS, the toolchains, and this job's own directories.
 ;; Reading everything meant a workflow could read ~/.ssh private keys, AWS

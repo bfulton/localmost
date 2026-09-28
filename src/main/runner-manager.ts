@@ -1183,6 +1183,13 @@ export class RunnerManager {
         // was spawned into the slot, and what is recorded now is that one's.
         if (this.instances.get(instanceNum) === instance) {
           this.revokeBrokerUrl?.(instanceNum);
+          // Drop the pid file so a later startup sweep cannot act on a pid this
+          // slot no longer owns.
+          try {
+            fs.unlinkSync(path.join(this.pidDir(), `${instanceNum}.pid`));
+          } catch {
+            // Already gone, or never written.
+          }
           if (this.acquireDeadlines.has(instanceNum)) {
             this.abandonJobFor(instanceNum);
           }
@@ -2310,6 +2317,23 @@ export class RunnerManager {
     return out;
   }
 
+  /**
+   * Signal a worker's whole process group, falling back to the leader alone if
+   * the group is gone. Workers spawn detached, so the leader pid is the group
+   * id and a negative pid reaches every descendant.
+   */
+  private signalGroupOrLeader(pid: number, signal: NodeJS.Signals): void {
+    try {
+      process.kill(-pid, signal);
+    } catch {
+      try {
+        process.kill(pid, signal);
+      } catch {
+        // Already gone.
+      }
+    }
+  }
+
   private async killStaleProcesses(): Promise<void> {
     // Processes this manager is running right now. A sweep that trusts a pid
     // file alone will kill a runner spawned seconds earlier: seen live, where
@@ -2333,12 +2357,15 @@ export class RunnerManager {
       }
       try {
         process.kill(pid, 0);
-        this.log('info', `Killing stale runner process ${pid}`);
-        process.kill(pid, 'SIGTERM');
+        this.log('info', `Killing stale runner process group ${pid}`);
+        // Negative pid: a worker is spawned detached as its own group leader,
+        // so this reaches its descendants too - a crashed worker's children,
+        // reparented to launchd, are the orphans this sweep exists for.
+        this.signalGroupOrLeader(pid, 'SIGTERM');
         await new Promise((resolve) => setTimeout(resolve, 1000));
         try {
           process.kill(pid, 0);
-          process.kill(pid, 'SIGKILL');
+          this.signalGroupOrLeader(pid, 'SIGKILL');
         } catch {
           // Process exited after SIGTERM - expected success case
         }

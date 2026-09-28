@@ -1429,6 +1429,11 @@ export class BrokerProxyService extends EventEmitter {
     queue.splice(index, 1);
     this.jobAssignments.delete(jobId);
     this.jobTargets.delete(jobId);
+    // The acquired payload carries the job's secrets, and the run-service URL
+    // is what job operations forward to. Neither should outlive a job no
+    // worker will run.
+    this.forgetAcquiredJob(jobId);
+    this.jobRunServiceUrls.delete(jobId);
     // Binding consumes an assignment. Only a worker that never bound still has
     // one; taking one otherwise would strand another job's worker.
     if (neverBound) {
