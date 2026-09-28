@@ -112,24 +112,70 @@ export class ProxyServer {
    * proxy exists to reach declared external hosts; a name that resolves here
    * is either a misconfiguration or an attempt to reach inside from a job.
    */
+  private expandV6ToGroups(addr: string): number[] | null {
+    let s = addr.trim();
+    if (s.startsWith('[') && s.endsWith(']')) s = s.slice(1, -1);
+    const zoneCut = s.indexOf('%');
+    if (zoneCut >= 0) s = s.slice(0, zoneCut);
+    s = s.toLowerCase();
+    if (s === '') return null;
+    const halves = s.split('::');
+    if (halves.length > 2) return null;
+    const toGroups = (part: string): number[] | null => {
+      if (part === '') return [];
+      const out: number[] = [];
+      const pieces = part.split(':');
+      for (let i = 0; i < pieces.length; i++) {
+        const piece = pieces[i];
+        if (piece.includes('.')) {
+          // Embedded dotted IPv4 (only valid as the last piece).
+          if (i !== pieces.length - 1) return null;
+          const octets = piece.split('.').map((o) => parseInt(o, 10));
+          if (octets.length !== 4 || octets.some((o) => isNaN(o) || o < 0 || o > 255)) return null;
+          out.push((octets[0] << 8) | octets[1], (octets[2] << 8) | octets[3]);
+        } else {
+          if (!/^[0-9a-f]{1,4}$/.test(piece)) return null;
+          out.push(parseInt(piece, 16));
+        }
+      }
+      return out;
+    };
+    const head = toGroups(halves[0]);
+    const tail = halves.length === 2 ? toGroups(halves[1]) : [];
+    if (head === null || tail === null) return null;
+    let groups: number[];
+    if (halves.length === 2) {
+      const fill = 8 - head.length - tail.length;
+      if (fill < 1) return null; // :: must stand for at least one zero group
+      groups = [...head, ...new Array(fill).fill(0), ...tail];
+    } else {
+      groups = head;
+    }
+    return groups.length === 8 ? groups : null;
+  }
+
   private isBlockedAddress(ip: string): boolean {
     let addr = ip.trim();
     if (addr.startsWith('[') && addr.endsWith(']')) addr = addr.slice(1, -1);
     const v = net.isIP(addr);
     if (v === 4) return this.isBlockedV4(addr);
     if (v === 6) {
-      const lower = addr.toLowerCase();
-      // Loopback stays reachable (the sandbox grants it directly, and the
-      // broker rides it); nothing else in ::/... is a legitimate public AAAA.
-      if (lower === '::1') return false;
-      // Every ::-prefixed form is blocked: unspecified (::), IPv4-mapped in any
-      // notation (::ffff:a.b.c.d and its hex ::ffff:0a00:0001), and
-      // IPv4-compatible (::a.b.c.d). A real host's AAAA record is native IPv6,
-      // never one of these, so refusing them wholesale beats trying to parse
-      // the embedded v4 out of every spelling.
-      if (lower.startsWith('::')) return true;
-      if (lower.startsWith('fe8') || lower.startsWith('fe9') || lower.startsWith('fea') || lower.startsWith('feb')) return true; // fe80::/10 link-local
-      if (lower.startsWith('fc') || lower.startsWith('fd')) return true; // fc00::/7 unique-local
+      const groups = this.expandV6ToGroups(addr);
+      if (!groups) return true; // unparseable - refuse rather than allow
+      // Loopback (::1) stays reachable, like 127/8: the sandbox grants loopback
+      // directly and the broker rides it.
+      if (groups.every((g, i) => (i === 7 ? g === 1 : g === 0))) return false;
+      // Top 96 bits zero, optionally with 0xffff in the sixth group: the
+      // unspecified address, IPv4-mapped (::ffff:a.b.c.d in any notation,
+      // including the fully-expanded 0:0:0:0:0:ffff:0a00:0001) and
+      // IPv4-compatible (::a.b.c.d). A real host's AAAA is native IPv6, never
+      // one of these, so all are refused.
+      if (groups[0] === 0 && groups[1] === 0 && groups[2] === 0 && groups[3] === 0 &&
+          groups[4] === 0 && (groups[5] === 0 || groups[5] === 0xffff)) {
+        return true;
+      }
+      if ((groups[0] & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
+      if ((groups[0] & 0xfe00) === 0xfc00) return true; // fc00::/7 unique-local
       return false;
     }
     // Not an IP literal: treat as unresolvable, which callers reject.

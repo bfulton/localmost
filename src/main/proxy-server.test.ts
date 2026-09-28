@@ -361,16 +361,17 @@ describe('screening the address a host resolves to', () => {
     '::ffff:10.0.0.1', '::ffff:169.254.169.254',
     '::10.0.0.1', '::169.254.169.254', '0.0.0.0', '::',
     '::ffff:0a00:0001', '::ffff:a9fe:a9fe',
+    '0:0:0:0:0:ffff:0a00:0001', '0:0:0:0:0:0:0:0', '::ffff:192.168.1.1',
   ])('refuses the internal address %s', (ip) => {
     expect(screen(proxy, ip)).toBe(true);
   });
 
   it.each([
     '8.8.8.8', '140.82.112.3', '1.1.1.1',
-    '2606:4700:4700::1111',
+    '2606:4700:4700::1111', '2606:4700:4700:0:0:0:0:1111',
     // Loopback is not screened: the sandbox already grants direct loopback
     // access, and the broker is reached over it.
-    '127.0.0.1', '::1',
+    '127.0.0.1', '::1', '0:0:0:0:0:0:0:1',
   ])('allows the address %s', (ip) => {
     expect(screen(proxy, ip)).toBe(false);
   });

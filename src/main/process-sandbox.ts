@@ -229,9 +229,12 @@ function generateSandboxProfile({
   // the traversal into this job's own sandbox) and a declared write path
   // cannot reach the runner's bookkeeping. The write side is also denied in
   // the profile as a backstop.
-  const runnerRoot = getRunnerDir();
+  const runnerRoot = path.resolve(getRunnerDir());
   const withinRunnerDir = (entry: string): boolean => {
-    const resolved = expandPath(entry);
+    // Resolve `..` and `.` before comparing: a path like
+    // "<x>/runner-parent/../runner/proxies" resolves inside the runner dir,
+    // and seatbelt would canonicalize it, so the check must too.
+    const resolved = path.resolve(expandPath(entry));
     return resolved === runnerRoot || resolved.startsWith(runnerRoot + path.sep);
   };
   const outsideRunner = (entry: string): boolean => {

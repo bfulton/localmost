@@ -367,7 +367,7 @@ describe('Process Sandbox', () => {
       const profile = profileWith({
         filesystemPolicy: {
           level: 'strict',
-          read: [path.join(runnerDir, 'sandbox'), '/tmp/legit-read'],
+          read: [path.join(runnerDir, 'sandbox'), `${runnerDir}/../runner/proxies`, '/tmp/legit-read'],
           write: [path.join(runnerDir, 'pids'), '/tmp/legit-write'],
         },
       });
@@ -379,6 +379,9 @@ describe('Process Sandbox', () => {
         profile.indexOf('Never writable, whatever matched above')
       );
       expect(allowRead).not.toContain(`(subpath "${runnerDir}/sandbox")`);
+      // A traversal spelling that resolves inside the runner dir is also dropped.
+      expect(allowRead).not.toContain('/../runner/proxies');
+      expect(allowRead).not.toContain(`(subpath "${runnerDir}/proxies")`);
       expect(policyWriteAllow).not.toContain(`(subpath "${runnerDir}/pids")`);
       // Legitimate declared paths outside the runner dir are still granted.
       expect(allowRead).toContain('(subpath "/tmp/legit-read")');
@@ -413,6 +416,9 @@ describe('Process Sandbox', () => {
       // runner dir or the sandbox root as a readable subtree.
       expect(allowRead).not.toContain(`(subpath "${runnerDir}")`);
       expect(allowRead).not.toContain(`(subpath "${runnerDir}/sandbox")`);
+      // A traversal spelling that resolves inside the runner dir is also dropped.
+      expect(allowRead).not.toContain('/../runner/proxies');
+      expect(allowRead).not.toContain(`(subpath "${runnerDir}/proxies")`);
       expect(allowRead).toContain(`(literal "${runnerDir}")`);
       expect(allowRead).toContain(`(literal "${runnerDir}/sandbox")`);
       const denyRead = profile.slice(profile.indexOf('(deny file-read*'));
