@@ -22,12 +22,10 @@ jest.mock('./runner-downloader', () => ({
 
 // Mock proxy-server to avoid real HTTP servers in tests
 jest.mock('./proxy-server', () => ({
-  ProxyServer: jest.fn().mockImplementation((options?: { authToken?: string }) => ({
+  ProxyServer: jest.fn().mockImplementation(() => ({
     start: jest.fn().mockResolvedValue(12345),
     stop: jest.fn().mockResolvedValue(undefined),
-    getProxyUrl: jest.fn().mockReturnValue(
-      options?.authToken ? `http://localmost:${options.authToken}@127.0.0.1:12345` : 'http://127.0.0.1:12345'
-    ),
+    getProxyUrl: jest.fn().mockReturnValue('http://127.0.0.1:12345'),
     getPort: jest.fn().mockReturnValue(12345),
     setPolicyAllowedHosts: jest.fn(),
     setPolicyLevel: jest.fn(),
@@ -1400,25 +1398,6 @@ describe('RunnerManager', () => {
 
       expect(reserved).toHaveLength(1);
       expect(cancelled).toHaveLength(1);
-    });
-  });
-
-  describe("a worker's own proxy", () => {
-    it('gives the runner a proxy URL bearing a per-worker token', async () => {
-      // Same setup as the docker-socket test: existsSync true and a spawn stub
-      // bring instance 1 up, which creates its proxy. Every worker's proxy is
-      // on loopback, which the sandbox lets any job reach, so the URL carries a
-      // token as basic-auth credentials: the runner authenticates to its own
-      // proxy and cannot route its traffic through another worker's.
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(9911));
-
-      await runnerManager.start();
-
-      const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
-      expect(env.HTTPS_PROXY).toMatch(/^http:\/\/localmost:[0-9a-f]{48}@127\.0\.0\.1:/);
-      expect(env.http_proxy).toBe(env.HTTPS_PROXY);
-      expect(env.HTTP_PROXY).toBe(env.HTTPS_PROXY);
     });
   });
 

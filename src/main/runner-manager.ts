@@ -1,6 +1,6 @@
 import { ChildProcess } from 'child_process';
 import * as path from 'path';
-import { createHash, randomBytes } from 'crypto';
+import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as yaml from 'js-yaml';
@@ -850,11 +850,6 @@ export class RunnerManager {
       // Closed until a job is claimed. The level belongs to the repository's
       // policy now, and is installed when a worker announces which job it took.
       policyLevel: 'strict',
-      // Per-worker secret. Every worker's proxy is on loopback, which the
-      // sandbox lets any job reach, so without this a job could route its
-      // traffic through another worker's proxy and take that repository's
-      // allowlist. The token rides in the proxy URL this worker is given.
-      authToken: randomBytes(24).toString('hex'),
       onJobAcquired: async (jobId: string) => {
         // The worker behind this proxy just claimed a job. Whichever instance
         // won the queue, this is the one that has to carry its policy.
