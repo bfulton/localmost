@@ -176,6 +176,7 @@ export class ProxyServer {
       }
       if ((groups[0] & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
       if ((groups[0] & 0xfe00) === 0xfc00) return true; // fc00::/7 unique-local
+      if ((groups[0] & 0xff00) === 0xff00) return true; // ff00::/8 multicast
       return false;
     }
     // Not an IP literal: treat as unresolvable, which callers reject.

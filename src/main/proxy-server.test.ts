@@ -362,6 +362,7 @@ describe('screening the address a host resolves to', () => {
     '::10.0.0.1', '::169.254.169.254', '0.0.0.0', '::',
     '::ffff:0a00:0001', '::ffff:a9fe:a9fe',
     '0:0:0:0:0:ffff:0a00:0001', '0:0:0:0:0:0:0:0', '::ffff:192.168.1.1',
+    'ff02::1', 'ff05::1:3',
   ])('refuses the internal address %s', (ip) => {
     expect(screen(proxy, ip)).toBe(true);
   });
