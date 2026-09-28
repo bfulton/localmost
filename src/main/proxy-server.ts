@@ -162,12 +162,14 @@ export class ProxyServer {
   }
 
   /**
-   * Resolve a host and return the single address the proxy will connect to,
-   * or null if it resolves to nothing public. Connecting to this exact
-   * address, rather than to the name again, closes the gap a rebinding DNS
-   * answer would open between the check and the connection.
+   * Whether it is safe to connect to a host: it must resolve, and every
+   * address it resolves to must be routable off this machine. Refusing when
+   * ANY resolved address is internal is stronger against a rebinding answer
+   * than picking the first public one. The connection is then made by name so
+   * Node still falls back across a host's IPv4 and IPv6 addresses; pinning a
+   * single address broke that fallback and stalled real downloads.
    */
-  private async screenTarget(host: string): Promise<string | null> {
+  private async screenHost(host: string): Promise<boolean> {
     let candidates: string[];
     if (net.isIP(host)) {
       candidates = [host];
@@ -175,11 +177,11 @@ export class ProxyServer {
       try {
         candidates = await this.lookup(host);
       } catch {
-        return null;
+        return false;
       }
     }
-    const safe = candidates.find((ip) => !this.isBlockedAddress(ip));
-    return safe ?? null;
+    if (candidates.length === 0) return false;
+    return candidates.every((ip) => !this.isBlockedAddress(ip));
   }
 
   /**
@@ -343,15 +345,14 @@ export class ProxyServer {
     clientSocket: net.Socket,
     head: Buffer
   ): Promise<void> {
-    const address = await this.screenTarget(host);
-    if (!address) {
+    if (!(await this.screenHost(host))) {
       this.log({ method: 'CONNECT', host, port, blocked: true, reason: undefined });
       clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
       clientSocket.destroy();
       return;
     }
 
-    const serverSocket = net.connect(port, address, () => {
+    const serverSocket = net.connect(port, host, () => {
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       serverSocket.write(head);
       serverSocket.pipe(clientSocket);
@@ -415,8 +416,8 @@ export class ProxyServer {
         return;
       }
 
-      this.screenTarget(host).then((address) => {
-        if (!address) {
+      this.screenHost(host).then((safe) => {
+        if (!safe) {
           this.log({ method: req.method || 'GET', host, port, path, blocked: true, reason: undefined });
           res.writeHead(403, { 'Content-Type': 'text/plain' });
           res.end(`Blocked by sandbox policy (${this.policyLevel}): host '${host}' resolves to a non-routable address`);
@@ -425,9 +426,7 @@ export class ProxyServer {
         }
         const proxyReq = http.request(
           {
-            // Connect to the screened address, keeping the Host header the
-            // origin expects, so a rebinding answer cannot redirect this.
-            hostname: address,
+            hostname: host,
             port,
             path,
             method: req.method,
