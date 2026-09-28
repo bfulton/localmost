@@ -133,6 +133,10 @@ export const forceRefreshToken = async (
       if (current?.refreshToken && current.refreshToken !== authState.refreshToken) {
         return current.accessToken ?? null;
       }
+      // The user signed out while this refresh was in flight: there is no
+      // session to mark expired, and reconstructing the old state below would
+      // resurrect and persist it. Same guard as the success path.
+      if (!current) return null;
 
       // Retry a network blip; anything else is not fixed by trying again.
       if (!isNetworkError(lastError)) {

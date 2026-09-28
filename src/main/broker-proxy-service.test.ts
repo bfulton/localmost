@@ -810,6 +810,7 @@ describe('message routing', () => {
       // (its secrets) and run-service routing are still resident and must go.
       const target = addTargetWithRunner('target-a', 'runner-a.1');
       internals.messageQueues.set(target.id, []); // already polled - nothing queued
+      internals.pendingTargetAssignments.push(target.id); // but its assignment lingers
       internals.acquiredJobDetails.set('req-1', JSON.stringify({ secret: 's' }));
       internals.acquiredJobDetails.set('9', JSON.stringify({ secret: 's' }));
       (internals as unknown as { jobRunServiceUrls: Map<string, string> }).jobRunServiceUrls.set('req-1', 'https://run/');
@@ -820,6 +821,8 @@ describe('message routing', () => {
 
       expect(internals.acquiredJobDetails.has('req-1')).toBe(false);
       expect(internals.acquiredJobDetails.has('9')).toBe(false);
+      // The pending assignment goes too, or the next worker binds an abandoned job.
+      expect(internals.pendingTargetAssignments).toEqual([]);
       const urls = (internals as unknown as { jobRunServiceUrls: Map<string, string> }).jobRunServiceUrls;
       expect(urls.has('req-1')).toBe(false);
       expect(urls.has('9')).toBe(false);

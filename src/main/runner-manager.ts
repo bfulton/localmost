@@ -1207,15 +1207,19 @@ export class RunnerManager {
         // ended.
         const workerPid = instance.process?.pid;
         instance.process = null;
-        sweepProcessGroup(workerPid, {
-          onLog: (message) => this.log('warn', `[instance ${instanceNum}] ${message}`),
-        });
 
-        // The job this worker was spawned for is over or was never taken; an
-        // armed deadline means never taken. Only while this is still the
-        // slot's worker: a reaped one's exit can land after the next worker
-        // was spawned into the slot, and what is recorded now is that one's.
+        // Only while this is still the slot's worker: a reaped or completed
+        // worker's exit can land after the next worker was spawned into the
+        // slot, and by then the OS may have reused this pid as the replacement's
+        // group leader - sweeping -pid would kill the new worker. Everything
+        // that acts on the pid or the slot happens under this guard.
         if (this.instances.get(instanceNum) === instance) {
+          // Reap the job's own descendants. A cancelled step can outlive the
+          // worker, reparented, burning CPU; the group sweep in process-group
+          // probes and signals the group, not just the leader.
+          sweepProcessGroup(workerPid, {
+            onLog: (message) => this.log('warn', `[instance ${instanceNum}] ${message}`),
+          });
           this.revokeBrokerUrl?.(instanceNum);
           // Drop the pid file so a later startup sweep cannot act on a pid this
           // slot no longer owns.
@@ -2431,10 +2435,19 @@ export class RunnerManager {
         this.signalGroupOrLeader(pid, 'SIGTERM');
         await new Promise((resolve) => setTimeout(resolve, 1000));
         try {
-          process.kill(pid, 0);
+          // Probe the group, not just the leader: a leader can exit while a
+          // descendant ignores SIGTERM, and kill(pid, 0) on the dead leader
+          // would skip the SIGKILL the descendant still needs.
+          process.kill(-pid, 0);
           this.signalGroupOrLeader(pid, 'SIGKILL');
         } catch {
-          // Process exited after SIGTERM - expected success case
+          try {
+            // Group gone, but the leader itself may linger; escalate to it.
+            process.kill(pid, 0);
+            this.signalGroupOrLeader(pid, 'SIGKILL');
+          } catch {
+            // Everything exited after SIGTERM - the expected success case.
+          }
         }
       } catch {
         // Process doesn't exist (ESRCH) - already dead

@@ -124,6 +124,20 @@ describe('a refresh that can never succeed', () => {
     expect(mockSaveConfig).not.toHaveBeenCalled();
   });
 
+  it('does not resurrect a signed-out session when the refresh then fails', async () => {
+    // Logout clears the session mid-refresh, then the refresh fails with an
+    // auth error. The failure path must not rebuild and persist the old state.
+    mockRefresh.mockImplementation(async () => {
+      authState = null; // signed out while in flight
+      throw new Error('Failed to refresh token: The client_id and/or client_secret passed are incorrect.');
+    });
+
+    expect(await forceRefreshToken()).toBeNull();
+
+    expect(authState).toBeNull();
+    expect(mockSaveConfig).not.toHaveBeenCalled();
+  });
+
   it('leaves a network blip alone, since that session is not expired', async () => {
     mockRefresh.mockRejectedValue(new Error('network timeout: ETIMEDOUT'));
 

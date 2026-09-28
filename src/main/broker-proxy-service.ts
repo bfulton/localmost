@@ -1442,12 +1442,14 @@ export class BrokerProxyService extends EventEmitter {
     ) ?? -1;
     if (queue && index >= 0) {
       queue.splice(index, 1);
-      // Binding consumes an assignment. Only a worker that never bound still
-      // has one; taking one otherwise would strand another job's worker.
-      if (neverBound) {
-        const pending = this.pendingTargetAssignments.indexOf(targetId);
-        if (pending >= 0) this.pendingTargetAssignments.splice(pending, 1);
-      }
+    }
+    // Binding consumes an assignment. A worker that never bound still holds
+    // one, whether or not its message is still queued (it may have polled the
+    // message and then died); drop it, or the next worker takes an assignment
+    // for a job that was abandoned.
+    if (neverBound) {
+      const pending = this.pendingTargetAssignments.indexOf(targetId);
+      if (pending >= 0) this.pendingTargetAssignments.splice(pending, 1);
     }
 
     // Clear every trace of the job, keyed by value so both the runner-request-id
@@ -1979,7 +1981,10 @@ export class BrokerProxyService extends EventEmitter {
           return;
         }
         if (opJobId) {
-          runServiceUrl = this.jobRunServiceUrls.get(opJobId);
+          // Numeric on the wire; the map keys are strings, like the delivered
+          // check above. Without String() a renew/finish with a numeric id
+          // misses and gets sent to the broker instead of the job service.
+          runServiceUrl = this.jobRunServiceUrls.get(String(opJobId));
           log()?.info(`[BrokerProxy] Found run_service_url for ${opJobId}: ${runServiceUrl || 'not found'}`);
         }
       } catch (e) {
