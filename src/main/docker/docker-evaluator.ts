@@ -490,7 +490,8 @@ function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: Dock
     if (isUnset(rawMode) || rawMode === '' || rawMode === 'default') candidate = 'bridge';
     else if (typeof rawMode === 'string') candidate = rawMode;
     else return deny('HostConfig.NetworkMode must be a string');
-    if (candidate === 'host' || candidate.startsWith('container:')) {
+    const candidateMode = candidate.toLowerCase();
+    if (candidateMode === 'host' || candidateMode.startsWith('container:')) {
       return deny(`--network=${candidate} (HostConfig.NetworkMode) reaches the host and cannot be permitted by policy`);
     }
     // The most restrictive reading wins when casings disagree.
@@ -523,7 +524,8 @@ function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: Dock
         // NetworkMode normalises both already; this must too, or every
         // ordinary run is refused.
         const name = key === '' || key === 'default' ? 'bridge' : key;
-        if (name === 'host' || name.startsWith('container:')) {
+        const specialMode = name.toLowerCase();
+        if (specialMode === 'host' || specialMode.startsWith('container:')) {
           return deny(
             `--network=${name} (NetworkingConfig.EndpointsConfig) reaches the host and cannot be permitted by policy`
           );
@@ -748,7 +750,8 @@ function evaluateBuild(req: DockerRequest, policy: DockerPolicy): DockerVerdict 
   // or `docker build --network host` walks through a door create keeps shut.
   const rawMode = req.query.networkmode ?? req.query.NetworkMode;
   if (rawMode !== undefined && rawMode !== '' && rawMode !== 'default') {
-    if (rawMode === 'host' || rawMode.startsWith('container:')) {
+    const rawModeLower = rawMode.toLowerCase();
+    if (rawModeLower === 'host' || rawModeLower.startsWith('container:')) {
       return deny(`--network=${rawMode} on a build reaches the host and cannot be permitted by policy`);
     }
     if (rawMode !== 'none' && rawMode !== policy.run?.network) {

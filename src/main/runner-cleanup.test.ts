@@ -44,6 +44,12 @@ describe('killOrphanedProcesses', () => {
     expect(signalled).toEqual([]);
   });
 
+  it('ignores a pid file with trailing junk, not treating it as a bare number', async () => {
+    fs.writeFileSync(path.join(pidDir, '1.pid'), '4242junk');
+    await killOrphanedProcesses(sandboxBase, () => undefined);
+    expect(signalled).toEqual([]);
+  });
+
   it('refuses to signal pid 1 or lower', async () => {
     fs.writeFileSync(path.join(pidDir, '1.pid'), '-1');
     fs.writeFileSync(path.join(pidDir, '2.pid'), '0');

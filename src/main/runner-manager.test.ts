@@ -1457,6 +1457,25 @@ describe('RunnerManager', () => {
       expect(JSON.parse(String(write![1])).serverUrlV2).toBe(`http://127.0.0.1:8787/w/${'a'.repeat(64)}/`);
     });
 
+    it('revokes the key and drops the pid file when the slot is released on job completion', () => {
+      const revoked: number[] = [];
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        revokeBrokerUrl: (n) => revoked.push(n),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, { name: 'runner-1', status: 'busy' });
+      const unlinked: string[] = [];
+      (fs.unlinkSync as jest.Mock).mockImplementation((f: unknown) => { unlinked.push(String(f)); });
+
+      helper.releaseInstanceSlot(1);
+
+      expect(revoked).toContain(1);
+      expect(unlinked.some((f) => f.endsWith('/pids/1.pid'))).toBe(true);
+    });
+
     it('is revoked when the worker exits', async () => {
       const revoked: number[] = [];
       const manager = new RunnerManager({
@@ -1475,7 +1494,9 @@ describe('RunnerManager', () => {
       proc.emit('exit', 0, null);
       await settle();
 
-      expect(revoked).toEqual([1]);
+      // Clean exit frees the slot, which revokes; the identity-gated exit
+      // cleanup may revoke again. Idempotent, so assert it happened at least once.
+      expect(revoked).toContain(1);
     });
   });
 

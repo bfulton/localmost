@@ -56,12 +56,14 @@ export async function killOrphanedProcesses(
       if (!fs.existsSync(pidFile)) continue;
 
       try {
-        const pidStr = await fs.promises.readFile(pidFile, 'utf-8');
-        const pid = parseInt(pidStr.trim(), 10);
-        // Refuse anything that is not a real, single process id, and never
-        // this process: kill(-1) signals every process the user owns,
-        // kill(0) the whole group, and a reused pid could be the app itself.
-        if (isNaN(pid) || pid <= 1 || pid === process.pid) continue;
+        const pidStr = (await fs.promises.readFile(pidFile, 'utf-8')).trim();
+        // Digits only: parseInt would take '1234junk' as 1234. Refuse anything
+        // that is not a real single process id, and never this process: kill(-1)
+        // signals every process the user owns, kill(0) the whole group, and a
+        // reused pid could be the app itself.
+        if (!/^\d+$/.test(pidStr)) continue;
+        const pid = Number(pidStr);
+        if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) continue;
 
         // Check if process is running and kill it
         try {

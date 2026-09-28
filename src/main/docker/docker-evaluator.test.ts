@@ -887,3 +887,30 @@ describe('networks attached by NetworkingConfig rather than NetworkMode', () => 
     expect(v.allowed).toBe(false);
   });
 });
+
+describe('host networking is refused whatever the case', () => {
+  // The daemon may treat a case variant of a special mode as host; the policy
+  // validator would accept a declared network named "HOST", so the special-mode
+  // check must be case-insensitive or a container could reach the host network.
+  const runPolicy: DockerPolicy = { run: { images: ['postgres:16'], network: 'bridge' }, build: {} };
+  const create = (body: unknown) =>
+    evaluateDockerRequest(mk('POST', '/v1.45/containers/create', body), ctx(runPolicy));
+
+  it('refuses HostConfig.NetworkMode "HOST"', () => {
+    const v = create({ Image: 'postgres:16', HostConfig: { NetworkMode: 'HOST' } });
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/reaches the host/i);
+  });
+
+  it('refuses an EndpointsConfig key "Host"', () => {
+    const v = create({ Image: 'postgres:16', NetworkingConfig: { EndpointsConfig: { Host: {} } } });
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/reaches the host/i);
+  });
+
+  it('refuses the build networkmode query param "Host"', () => {
+    const v = evaluateDockerRequest(mk('POST', '/v1.45/build?networkmode=Host'), ctx(runPolicy));
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/reaches the host/i);
+  });
+});

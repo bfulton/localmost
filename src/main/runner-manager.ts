@@ -1505,6 +1505,17 @@ export class RunnerManager {
     // that records no context of its own would resolve the previous
     // repository's filesystem policy.
     this.pendingTargetContext.delete(String(instanceNum));
+    // Freeing the slot is the one point every finished worker passes through -
+    // job complete calls it directly, before the process even emits exit, so
+    // the exit handler's identity-gated cleanup is skipped. Revoke the broker
+    // key and drop the pid file here, or a completed worker's URL stays usable
+    // and its pid file lingers for a startup sweep until the slot is reused.
+    this.revokeBrokerUrl?.(instanceNum);
+    try {
+      fs.unlinkSync(path.join(this.pidDir(), `${instanceNum}.pid`));
+    } catch {
+      // Already gone, or never written.
+    }
     this.updateAggregateStatus();
   }
 
@@ -2309,8 +2320,12 @@ export class RunnerManager {
    * whole group, so a stale or planted file must never reach them.
    */
   private sweepablePid(raw: string, live: Set<number>): number | null {
-    const pid = parseInt(raw.trim(), 10);
-    if (isNaN(pid) || pid <= 1 || pid === process.pid || live.has(pid)) return null;
+    const trimmed = raw.trim();
+    // Digits only: parseInt would take '1234junk' as 1234, and a pid file that
+    // is not exactly a number is not one this app wrote.
+    if (!/^\d+$/.test(trimmed)) return null;
+    const pid = Number(trimmed);
+    if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid || live.has(pid)) return null;
     return pid;
   }
 
