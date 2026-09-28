@@ -1220,14 +1220,7 @@ export class RunnerManager {
           sweepProcessGroup(workerPid, {
             onLog: (message) => this.log('warn', `[instance ${instanceNum}] ${message}`),
           });
-          this.revokeBrokerUrl?.(instanceNum);
-          // Drop the pid file so a later startup sweep cannot act on a pid this
-          // slot no longer owns.
-          try {
-            fs.unlinkSync(path.join(this.pidDir(), `${instanceNum}.pid`));
-          } catch {
-            // Already gone, or never written.
-          }
+          this.finalizeInstance(instanceNum);
           if (this.acquireDeadlines.has(instanceNum)) {
             this.abandonJobFor(instanceNum);
           }
@@ -1416,6 +1409,12 @@ export class RunnerManager {
     for (const instanceNum of [...this.acquireDeadlines.keys()]) {
       this.disarmAcquireDeadline(instanceNum);
     }
+    // Revoke keys and drop pid files before the map is cleared, or a late exit
+    // event finds its instance already gone and skips this - leaving a stopped
+    // worker's broker credential valid and its pid record stale.
+    for (const instanceNum of this.instances.keys()) {
+      this.finalizeInstance(instanceNum);
+    }
     this.instances.clear();
     this.startingInstances.clear();
     this.startedAt = null;
@@ -1523,6 +1522,21 @@ export class RunnerManager {
       // Already gone, or never written.
     }
     this.releaseInstanceSlot(instanceNum);
+  }
+
+  /**
+   * Release a slot's per-worker resources: its broker key and pid file. Called
+   * whenever an instance is finished with - a worker exit, a reap, or stop()
+   * clearing the pool - so a stopped or gone worker never leaves a usable /w/
+   * credential or a stale pid record behind. Idempotent.
+   */
+  private finalizeInstance(instanceNum: number): void {
+    this.revokeBrokerUrl?.(instanceNum);
+    try {
+      fs.unlinkSync(path.join(this.pidDir(), `${instanceNum}.pid`));
+    } catch {
+      // Already gone, or never written.
+    }
   }
 
   private releaseInstanceSlot(instanceNum: number): void {

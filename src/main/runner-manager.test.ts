@@ -1506,6 +1506,28 @@ describe('RunnerManager', () => {
       expect(unlinked.some((f) => f.endsWith('/pids/1.pid'))).toBe(true);
     });
 
+    it('revokes keys and drops pid files for every instance when stop clears the pool', async () => {
+      const revoked: number[] = [];
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        revokeBrokerUrl: (n) => revoked.push(n),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      // Already-exited processes, so stop() skips the kill loop and reaches the
+      // finalize loop; a late exit would otherwise find the map cleared.
+      helper.setInstance(1, { name: 'runner-1', status: 'listening', process: { exitCode: 0, killed: true } as never });
+      helper.setInstance(2, { name: 'runner-2', status: 'busy', process: { exitCode: 0, killed: true } as never });
+      const unlinked: string[] = [];
+      (fs.unlinkSync as jest.Mock).mockImplementation((f: unknown) => { unlinked.push(String(f)); });
+
+      await manager.stop();
+
+      expect(revoked).toEqual(expect.arrayContaining([1, 2]));
+      expect(unlinked.filter((f) => /\/pids\/[12]\.pid$/.test(f)).length).toBeGreaterThanOrEqual(2);
+    });
+
     it('is revoked when the worker exits', async () => {
       const revoked: number[] = [];
       const manager = new RunnerManager({
