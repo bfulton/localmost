@@ -31,6 +31,7 @@ jest.mock('./proxy-server', () => ({
     getPort: jest.fn().mockReturnValue(12345),
     setPolicyAllowedHosts: jest.fn(),
     setPolicyLevel: jest.fn(),
+    rotateAuthToken: jest.fn(),
   })),
 }));
 

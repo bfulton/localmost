@@ -421,6 +421,17 @@ describe('a worker may use only its own proxy', () => {
     try { expect(await get(p.getPort(), authHeader('secret-b'))).toBe(407); } finally { await p.stop(); }
   });
 
+  it('rejects the old token after rotation, so a reused proxy drops the last job', async () => {
+    const p = new ProxyServer({ policyLevel: 'permissive', authToken: 'old-tok', lookup: async () => ['8.8.8.8'] });
+    await p.start();
+    try {
+      p.rotateAuthToken('new-tok');
+      expect(await get(p.getPort(), authHeader('old-tok'))).toBe(407);
+      const url = new URL(p.getProxyUrl());
+      expect(url.password).toBe('new-tok');
+    } finally { await p.stop(); }
+  });
+
   it('carries the token in the proxy URL it hands the worker', async () => {
     const p = new ProxyServer({ policyLevel: 'strict', authToken: 'secret-a' });
     await p.start();

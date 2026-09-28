@@ -681,6 +681,16 @@ export class ProxyServer {
   }
 
   /**
+   * Replace this proxy's token. Called when a slot's proxy is reused for a new
+   * worker, so a detached orphan of the previous job - still holding the old
+   * token in its HTTP_PROXY - is refused once the slot moves to another
+   * repository's policy.
+   */
+  rotateAuthToken(token: string): void {
+    this.authToken = token;
+  }
+
+  /**
    * Whether a request carries this proxy's token. True when no token is set.
    * The password is compared in constant time; the username is not a secret.
    */

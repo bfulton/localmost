@@ -1049,6 +1049,11 @@ export class RunnerManager {
       // still holds the last job's hosts until this runs.
       proxy.setPolicyAllowedHosts([]);
       proxy.setPolicyLevel('strict');
+      // Rotate the proxy token every start. The proxy is reused across a slot's
+      // jobs, so without this a detached orphan of the previous job would keep a
+      // valid HTTP_PROXY credential and could reach this job's allowlist through
+      // the same proxy after its policy is replaced.
+      proxy.rotateAuthToken(randomBytes(24).toString('hex'));
       const startupContext = this.pendingTargetContext.get(String(instanceNum));
       if (startupContext?.targetDisplayName && startupContext.githubSha) {
         await this.applyPolicyForTarget(
