@@ -1107,14 +1107,22 @@ export class RunnerManager {
       // would describe an endpoint a real `docker build` never calls.
       env.DOCKER_BUILDKIT = '0';
 
-      // Make git hermetic. The sandbox does not grant the user's ~/.gitconfig,
-      // and git treats an unreadable global config as fatal - which sent
-      // actions/checkout down a REST archive fallback whose HTTP client choked
-      // on the proxy's credentials. Pointing global and system config at
-      // /dev/null (already readable) lets checkout use git over the proxy,
-      // which authenticates fine, and makes a run independent of whose machine
-      // it ran on.
-      env.GIT_CONFIG_GLOBAL = '/dev/null';
+      // Make git hermetic and able to authenticate to this worker's proxy.
+      // The sandbox does not grant the user's ~/.gitconfig, and git treats an
+      // unreadable global config as fatal, which sent checkout down a REST
+      // archive fallback. A per-job global config in the sandbox fixes that and
+      // sets http.proxyAuthMethod=basic so git sends the proxy token
+      // preemptively - without it git waits for a 407 challenge the proxy
+      // answers by closing the connection, and the fetch aborts. It also makes
+      // a run independent of whose machine it ran on.
+      const gitConfigPath = path.join(sandboxDir, '.localmost-gitconfig');
+      try {
+        fs.writeFileSync(gitConfigPath, '[http]\n\tproxyAuthMethod = basic\n');
+        env.GIT_CONFIG_GLOBAL = gitConfigPath;
+      } catch (err) {
+        this.log('warn', `Could not write git config for instance ${instanceNum}: ${(err as Error).message}`);
+        env.GIT_CONFIG_GLOBAL = '/dev/null';
+      }
       env.GIT_CONFIG_SYSTEM = '/dev/null';
       env.GIT_CONFIG_NOSYSTEM = '1';
 

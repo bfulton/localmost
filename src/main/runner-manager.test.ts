@@ -1449,8 +1449,13 @@ describe('RunnerManager', () => {
       const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
       expect(env.HTTPS_PROXY).toMatch(/^http:\/\/localmost:[0-9a-f]{48}@127\.0\.0\.1:/);
       expect(env.http_proxy).toBe(env.HTTPS_PROXY);
-      expect(env.GIT_CONFIG_GLOBAL).toBe('/dev/null');
+      // A per-job global config in the sandbox, setting proxyAuthMethod=basic so
+      // git sends the proxy token preemptively; system config is skipped.
+      expect(env.GIT_CONFIG_GLOBAL).toMatch(/sandbox\/1\/\.localmost-gitconfig$/);
       expect(env.GIT_CONFIG_SYSTEM).toBe('/dev/null');
+      const gitCfgWrite = (fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => String(f).endsWith('.localmost-gitconfig'));
+      expect(gitCfgWrite).toBeDefined();
+      expect(String(gitCfgWrite![1])).toContain('proxyAuthMethod = basic');
     });
   });
 
