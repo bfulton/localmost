@@ -1473,6 +1473,11 @@ export class RunnerManager {
       onLog: (message) => this.log('warn', `[instance ${instanceNum}] ${message}`),
     });
     this.abandonJobFor(instanceNum);
+    // The exit handler is the other revocation site, but a --once worker that
+    // never acquired a job never exits, and releaseInstanceSlot below deletes
+    // the instance so the exit handler would skip it. Revoke here, or the
+    // reaped worker's broker key stays valid until the slot is reused.
+    this.revokeBrokerUrl?.(instanceNum);
     this.releaseInstanceSlot(instanceNum);
   }
 

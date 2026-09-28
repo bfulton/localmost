@@ -1602,6 +1602,22 @@ describe('RunnerManager', () => {
       expect(helper.instances.has(1)).toBe(false);
     });
 
+    it("revokes the reaped worker's broker key, since it never exits to trigger the exit handler", () => {
+      const revoked: number[] = [];
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        revokeBrokerUrl: (n) => revoked.push(n),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      helper.setInstance(1, { name: 'runner-1', status: 'listening', currentJob: null });
+
+      helper.reapUnclaimedWorker(1);
+
+      expect(revoked).toContain(1);
+    });
+
     it('reports the job that never started, instead of reclaiming the slot in silence', () => {
       // A consumer watched five runs: two were killed by GitHub at exactly
       // 600s having never run a step, and localmost showed a healthy spawn

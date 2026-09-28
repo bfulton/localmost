@@ -120,11 +120,13 @@ export class ProxyServer {
     if (v === 6) {
       const lower = addr.toLowerCase();
       // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible: screen the v4 part.
-      const mapped = lower.match(/^(?:::ffff:)(\d+\.\d+\.\d+\.\d+)$/);
-      if (mapped) return this.isBlockedV4(mapped[1]);
-      // Loopback (::1) and unspecified (::) are not blocked here: the sandbox
-      // already lets a job reach loopback directly, so the proxy adds nothing,
-      // and the runner's own control traffic to the broker goes over it.
+      // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d) both embed
+      // a v4 address; screen it.
+      const embedded = lower.match(/^::(?:ffff:)?(\d+\.\d+\.\d+\.\d+)$/);
+      if (embedded) return this.isBlockedV4(embedded[1]);
+      if (lower === '::') return true; // unspecified / wildcard - resolves local
+      // Loopback (::1) is not blocked: the sandbox lets a job reach loopback
+      // directly, so the proxy adds nothing, and the broker rides it.
       if (lower.startsWith('fe8') || lower.startsWith('fe9') || lower.startsWith('fea') || lower.startsWith('feb')) return true; // fe80::/10 link-local
       if (lower.startsWith('fc') || lower.startsWith('fd')) return true; // fc00::/7 unique-local
       return false;
@@ -137,10 +139,10 @@ export class ProxyServer {
     const o = addr.split('.').map((n) => parseInt(n, 10));
     if (o.length !== 4 || o.some((n) => isNaN(n) || n < 0 || n > 255)) return true;
     const [a, b] = o;
-    // Loopback (127/8) and this-host (0/8) are intentionally not blocked: the
-    // sandbox grants a job direct loopback access, and the broker (also on
-    // loopback) is reached this way, so screening them here changes nothing
-    // and would break the runner's own control traffic.
+    if (a === 0) return true; // this-network / 0.0.0.0 - resolves to local
+    // Loopback (127/8) is intentionally not blocked: the sandbox grants a job
+    // direct loopback access, and the broker (also on loopback) is reached this
+    // way, so screening it here changes nothing and would break control traffic.
     if (a === 10) return true; // private
     if (a === 172 && b >= 16 && b <= 31) return true; // private
     if (a === 192 && b === 168) return true; // private
