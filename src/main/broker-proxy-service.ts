@@ -1526,8 +1526,19 @@ export class BrokerProxyService extends EventEmitter {
     if (worker.targetId && claimed && claimed !== agentName) {
       log()?.warn(`[BrokerProxy] Worker ${worker.instanceNum} named itself ${claimed}; binding it as ${agentName ?? 'nothing'}`);
     }
+    // One worker key, one bound session. The key rides in the run-service URL
+    // the job holds, so job code could call the session endpoint again; a
+    // second session would reach the arrival-order fallback and could bind
+    // another queued job and receive its payload. A key that already has a
+    // bound session gets none.
+    const keyAlreadyBound = [...this.localSessions.values()].some(
+      (sess) => sess.workerKey === key && sess.targetId !== undefined
+    );
+    if (keyAlreadyBound) {
+      log()?.warn(`[BrokerProxy] Worker ${worker.instanceNum} already has a bound session; leaving this request unbound`);
+    }
     log()?.info(`[BrokerProxy] Session request from ${agentName ?? 'unnamed runner'}`);
-    const targetId = this.resolveSessionTarget(agentName);
+    const targetId = keyAlreadyBound ? undefined : this.resolveSessionTarget(agentName);
     if (!targetId) {
       // getMessageForTarget refuses to hand anything to a session with no
       // target, so this worker cannot receive a queued job however long it

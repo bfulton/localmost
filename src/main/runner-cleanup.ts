@@ -31,28 +31,37 @@ export function validateChildPath(base: string, childName: string): string | nul
 }
 
 /**
- * Kill orphaned runner processes found in sandbox directories.
- * Must be called BEFORE deleting sandbox directories since PID files are inside them.
+ * Kill orphaned runner processes recorded by a previous run.
+ *
+ * Reads the app-owned pid directory (a sibling of the sandbox base), never a
+ * pid file inside a sandbox: the sandbox is writable by the job, so a pid file
+ * there is attacker-controlled and a job could make this signal any process.
+ * The app writes each worker's pid to `<runner>/pids/<instance>.pid`.
  */
 export async function killOrphanedProcesses(
   sandboxBase: string,
   log: CleanupLogger
 ): Promise<boolean> {
   let killedAny = false;
+  const pidDir = path.join(path.dirname(sandboxBase), 'pids');
 
   try {
-    const entries = await fs.promises.readdir(sandboxBase, { withFileTypes: true });
+    if (!fs.existsSync(pidDir)) return false;
+    const entries = await fs.promises.readdir(pidDir, { withFileTypes: true });
 
     for (const entry of entries) {
-      if (!entry.isDirectory() || entry.name.includes('.trash.')) continue;
+      if (entry.isDirectory() || !/^\d+\.pid$/.test(entry.name)) continue;
 
-      const pidFile = path.join(sandboxBase, entry.name, 'runner.pid');
+      const pidFile = path.join(pidDir, entry.name);
       if (!fs.existsSync(pidFile)) continue;
 
       try {
         const pidStr = await fs.promises.readFile(pidFile, 'utf-8');
         const pid = parseInt(pidStr.trim(), 10);
-        if (isNaN(pid)) continue;
+        // Refuse anything that is not a real, single process id. kill(-1)
+        // signals every process the user owns and kill(0) the whole group;
+        // a pid of 1 or less must never reach the kill calls below.
+        if (isNaN(pid) || pid <= 1) continue;
 
         // Check if process is running and kill it
         try {
@@ -83,6 +92,7 @@ export async function killOrphanedProcesses(
         } catch {
           // Process not running (ESRCH) - already dead, nothing to do
         }
+        await fs.promises.unlink(pidFile).catch(() => undefined);
       } catch {
         // Couldn't read PID file - corrupted or permissions issue, skip
       }

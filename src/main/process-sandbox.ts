@@ -368,8 +368,10 @@ ${policyReads}
   (subpath "${userDataDir}")
   (subpath "${policiesDir}")
   ;; The runner directory's own secrets, denied by name so that neither a
-  ;; toolchain grant nor a policy-declared read path can reopen them. The
-  ;; sandbox root is denied and this job's own sandbox re-allowed just below.
+  ;; toolchain grant nor a policy-declared read path can reopen them. Sibling
+  ;; sandboxes are not granted in the first place (reads reach this job's own
+  ;; sandbox by subpath and the parent nodes by literal, never the sandbox
+  ;; root as a subtree), so no read-deny on the sandbox root is needed here.
   (subpath "${runnerDir}/proxies")
   (subpath "${runnerDir}/config")
   (subpath "${runnerDir}/sandbox-profiles")

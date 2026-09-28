@@ -619,6 +619,21 @@ describe('message routing', () => {
     expect(internals.messageQueues.get(target.id)).toHaveLength(1);
   });
 
+  it('binds only one session per worker key, so a job cannot open a second and take another job', async () => {
+    // The key is in the run-service URL the job holds. A second /session with
+    // the same key must not reach the arrival-order fallback and bind another
+    // queued job.
+    const target = addTargetWithRunner('target-a', 'runner-a.1');
+    internals.pendingTargetAssignments.push(target.id, target.id);
+    service.expectWorkerForJob(target.id, 1);
+
+    const first = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }));
+    const second = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }));
+
+    expect(internals.localSessions.get(first)?.targetId).toBe(target.id);
+    expect(internals.localSessions.get(second)?.targetId).toBeUndefined();
+  });
+
   it('expects a worker only once, so a later listener cannot reuse the binding', async () => {
     const target = addTargetWithRunner('target-a', 'runner-a.1');
     service.expectWorkerForJob(target.id, 1);
