@@ -110,6 +110,20 @@ describe('a refresh that can never succeed', () => {
     expect(mockSaveConfig).not.toHaveBeenCalled();
   });
 
+  it('does not resurrect a session the user signed out during the refresh', async () => {
+    // Reconnect and logout can overlap. If the refresh succeeds after logout
+    // cleared the session, installing its token would sign the user back in.
+    mockRefresh.mockImplementation(async () => {
+      authState = null; // the user signs out while this refresh is in flight
+      return { accessToken: 'fresh', refreshToken: 'next', expiresAt: 1, user: { login: 'bfulton' } };
+    });
+
+    expect(await forceRefreshToken()).toBeNull();
+
+    expect(authState).toBeNull();
+    expect(mockSaveConfig).not.toHaveBeenCalled();
+  });
+
   it('leaves a network blip alone, since that session is not expired', async () => {
     mockRefresh.mockRejectedValue(new Error('network timeout: ETIMEDOUT'));
 

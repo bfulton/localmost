@@ -101,6 +101,18 @@ export const forceRefreshToken = async (
         expiresAt: result.expiresAt,
         user: result.user,
       };
+      // The session may have changed while this refresh was in flight. If the
+      // user logged out, there is nothing to install into and resurrecting it
+      // would sign them back in; if another refresh already rotated the token,
+      // that newer state wins and this snapshot would undo it.
+      const currentBeforeInstall = getAuthState();
+      if (!currentBeforeInstall) {
+        logger?.info('Session was signed out during refresh; not installing the new token');
+        return null;
+      }
+      if (currentBeforeInstall.refreshToken !== authState.refreshToken) {
+        return currentBeforeInstall.accessToken ?? null;
+      }
       setAuthState(newAuthState);
 
       // Persist to config

@@ -358,6 +358,33 @@ describe('Process Sandbox', () => {
       expect(denyWrite).toBeGreaterThan(policyAllow > -1 ? -1 : -2);
     });
 
+    it('ignores a policy read or write path that resolves inside the runner directory', () => {
+      // A repo policy has no business reaching the app's own runner dir - proxy
+      // credentials, pids, other sandboxes. A declared read path there cannot be
+      // fenced off by a profile deny without also blocking traversal into this
+      // job's own sandbox, so such paths are dropped before the profile is built.
+      const runnerDir = path.join(os.homedir(), '.localmost', 'runner');
+      const profile = profileWith({
+        filesystemPolicy: {
+          level: 'strict',
+          read: [path.join(runnerDir, 'sandbox'), '/tmp/legit-read'],
+          write: [path.join(runnerDir, 'pids'), '/tmp/legit-write'],
+        },
+      });
+      // The runner-internal paths are dropped from the policy allow blocks (the
+      // write-deny block still names them, so scope the check to the allows).
+      const allowRead = profile.slice(profile.indexOf('(allow file-read*'), profile.indexOf('(deny file-read*'));
+      const policyWriteAllow = profile.slice(
+        profile.indexOf('declares writable'),
+        profile.indexOf('Never writable, whatever matched above')
+      );
+      expect(allowRead).not.toContain(`(subpath "${runnerDir}/sandbox")`);
+      expect(policyWriteAllow).not.toContain(`(subpath "${runnerDir}/pids")`);
+      // Legitimate declared paths outside the runner dir are still granted.
+      expect(allowRead).toContain('(subpath "/tmp/legit-read")');
+      expect(policyWriteAllow).toContain('(subpath "/tmp/legit-write")');
+    });
+
     it('denies the pasteboard mach service so a job cannot read the clipboard', () => {
       // (allow mach*) is needed by system frameworks, but the clipboard often
       // holds passwords and tokens and no job needs it. Denied by name after

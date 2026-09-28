@@ -138,6 +138,8 @@ interface RunnerProfileOptions {
   filesystemPolicy?: SandboxFilesystemPolicy;
   /** The filtering docker socket the app serves this worker, if it has one. */
   dockerSocket?: string;
+  /** Optional log sink for notes such as a policy path being ignored. */
+  onLog?: SandboxLogCallback;
 }
 
 function generateSandboxProfile({
@@ -146,6 +148,7 @@ function generateSandboxProfile({
   allowDirectNetwork = false,
   filesystemPolicy = { level: 'strict', read: [], write: [] },
   dockerSocket,
+  onLog,
 }: RunnerProfileOptions): string {
   // The worker's own docker socket, served by the app: every request on it is
   // checked against the repository policy before it reaches a daemon. Connect
@@ -218,8 +221,28 @@ function generateSandboxProfile({
     paths
       .map((entry) => `  (subpath "${escapeForProfile(expandPath(entry))}")`)
       .join('\n');
-  const policyReads = subpaths(filesystemPolicy.read);
-  const policyWrites = subpaths(filesystemPolicy.write);
+  // A repository policy has no business reading or writing inside the app's
+  // own runner directory - the proxy credentials, registrations, session
+  // tokens, pid files and other workers' sandboxes live there. Drop any policy
+  // path that resolves within it, so a declared read path cannot reopen a
+  // sibling sandbox (which a profile deny cannot cover without also blocking
+  // the traversal into this job's own sandbox) and a declared write path
+  // cannot reach the runner's bookkeeping. The write side is also denied in
+  // the profile as a backstop.
+  const runnerRoot = getRunnerDir();
+  const withinRunnerDir = (entry: string): boolean => {
+    const resolved = expandPath(entry);
+    return resolved === runnerRoot || resolved.startsWith(runnerRoot + path.sep);
+  };
+  const outsideRunner = (entry: string): boolean => {
+    if (withinRunnerDir(entry)) {
+      onLog?.('error', `Ignoring policy path inside the runner directory: ${entry}`);
+      return false;
+    }
+    return true;
+  };
+  const policyReads = subpaths(filesystemPolicy.read.filter(outsideRunner));
+  const policyWrites = subpaths(filesystemPolicy.write.filter(outsideRunner));
   const toolchainRules = subpaths(toolchainPaths);
   const cacheWritePaths =
     filesystemPolicy.level === 'strict'
@@ -577,6 +600,7 @@ export function spawnSandboxed(
       allowDirectNetwork,
       filesystemPolicy,
       dockerSocket,
+      onLog,
     });
 
     // The profile is the thing that confines the job, so it must not live
