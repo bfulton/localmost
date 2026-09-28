@@ -22,10 +22,12 @@ jest.mock('./runner-downloader', () => ({
 
 // Mock proxy-server to avoid real HTTP servers in tests
 jest.mock('./proxy-server', () => ({
-  ProxyServer: jest.fn().mockImplementation(() => ({
+  ProxyServer: jest.fn().mockImplementation((options?: { authToken?: string }) => ({
     start: jest.fn().mockResolvedValue(12345),
     stop: jest.fn().mockResolvedValue(undefined),
-    getProxyUrl: jest.fn().mockReturnValue('http://127.0.0.1:12345'),
+    getProxyUrl: jest.fn().mockReturnValue(
+      options?.authToken ? `http://localmost:${options.authToken}@127.0.0.1:12345` : 'http://127.0.0.1:12345'
+    ),
     getPort: jest.fn().mockReturnValue(12345),
     setPolicyAllowedHosts: jest.fn(),
     setPolicyLevel: jest.fn(),
@@ -1431,6 +1433,24 @@ describe('RunnerManager', () => {
 
       expect(reserved).toHaveLength(1);
       expect(cancelled).toHaveLength(1);
+    });
+  });
+
+  describe("a worker's own proxy and git environment", () => {
+    it('hands the runner a proxy URL with a per-worker token and a hermetic git config', async () => {
+      // The proxy token isolates each worker on shared loopback; the /dev/null
+      // git config keeps checkout from falling back to a client that chokes on
+      // the credentialed proxy URL, and makes the run machine-independent.
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(9911));
+
+      await runnerManager.start();
+
+      const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+      expect(env.HTTPS_PROXY).toMatch(/^http:\/\/localmost:[0-9a-f]{48}@127\.0\.0\.1:/);
+      expect(env.http_proxy).toBe(env.HTTPS_PROXY);
+      expect(env.GIT_CONFIG_GLOBAL).toBe('/dev/null');
+      expect(env.GIT_CONFIG_SYSTEM).toBe('/dev/null');
     });
   });
 

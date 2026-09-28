@@ -1,7 +1,7 @@
 import { ChildProcess } from 'child_process';
 import { processStartTime } from './runner-cleanup';
 import * as path from 'path';
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as yaml from 'js-yaml';
@@ -856,6 +856,11 @@ export class RunnerManager {
       // Closed until a job is claimed. The level belongs to the repository's
       // policy now, and is installed when a worker announces which job it took.
       policyLevel: 'strict',
+      // Per-worker secret. Every worker's proxy is on loopback, which the
+      // sandbox lets any job reach, so without this a job could route its
+      // traffic through another worker's proxy and take that repository's
+      // allowlist. The token rides in the proxy URL this worker is given.
+      authToken: randomBytes(24).toString('hex'),
       onJobAcquired: async (jobId: string) => {
         // The worker behind this proxy just claimed a job. Whichever instance
         // won the queue, this is the one that has to carry its policy.
@@ -1101,6 +1106,17 @@ export class RunnerManager {
       // being a property of any request the filter can see, so `build:` policy
       // would describe an endpoint a real `docker build` never calls.
       env.DOCKER_BUILDKIT = '0';
+
+      // Make git hermetic. The sandbox does not grant the user's ~/.gitconfig,
+      // and git treats an unreadable global config as fatal - which sent
+      // actions/checkout down a REST archive fallback whose HTTP client choked
+      // on the proxy's credentials. Pointing global and system config at
+      // /dev/null (already readable) lets checkout use git over the proxy,
+      // which authenticates fine, and makes a run independent of whose machine
+      // it ran on.
+      env.GIT_CONFIG_GLOBAL = '/dev/null';
+      env.GIT_CONFIG_SYSTEM = '/dev/null';
+      env.GIT_CONFIG_NOSYSTEM = '1';
 
       // Keep the job's temp inside its own sandbox. The default $TMPDIR is a
       // per-user directory shared with every other process the user runs, and

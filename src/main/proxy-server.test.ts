@@ -394,3 +394,40 @@ describe('screening the address a host resolves to', () => {
     }
   });
 });
+
+describe('a worker may use only its own proxy', () => {
+  const authHeader = (token: string) => 'Basic ' + Buffer.from(`localmost:${token}`).toString('base64');
+  const get = (port: number, header?: string) =>
+    new Promise<number>((resolve, reject) => {
+      const headers: Record<string, string> = {};
+      if (header) headers['proxy-authorization'] = header;
+      const req = http.request(
+        { hostname: '127.0.0.1', port, path: 'http://8.8.8.8/', method: 'GET', headers },
+        (res) => { res.resume(); resolve(res.statusCode || 0); }
+      );
+      req.on('error', reject);
+      req.end();
+    });
+
+  it('refuses a request with no proxy credentials', async () => {
+    const p = new ProxyServer({ policyLevel: 'permissive', authToken: 'secret-a', lookup: async () => ['8.8.8.8'] });
+    await p.start();
+    try { expect(await get(p.getPort())).toBe(407); } finally { await p.stop(); }
+  });
+
+  it("refuses another worker's token", async () => {
+    const p = new ProxyServer({ policyLevel: 'permissive', authToken: 'secret-a', lookup: async () => ['8.8.8.8'] });
+    await p.start();
+    try { expect(await get(p.getPort(), authHeader('secret-b'))).toBe(407); } finally { await p.stop(); }
+  });
+
+  it('carries the token in the proxy URL it hands the worker', async () => {
+    const p = new ProxyServer({ policyLevel: 'strict', authToken: 'secret-a' });
+    await p.start();
+    try {
+      const url = new URL(p.getProxyUrl());
+      expect(url.password).toBe('secret-a');
+      expect(url.hostname).toBe('127.0.0.1');
+    } finally { await p.stop(); }
+  });
+});
