@@ -363,7 +363,11 @@ export class BrokerProxyService extends EventEmitter {
    * no entry here, so it cannot bind and win a job its generic sandbox would
    * fail to run.
    */
-  private expectedWorkers: Map<string, { targetId: string; jobId?: string }> = new Map();  // agentName -> the job it was spawned for
+  // Keyed by target+instance, not the runner's agentName: target-manager can
+  // produce the same agentName for two coexisting targets (an org foo-bar and a
+  // repo foo/bar), and keying by name would let one bind the other's job. The
+  // broker key already resolves a session to its (targetId, instanceNum).
+  private expectedWorkers: Map<string, { targetId: string; jobId?: string }> = new Map();
   /**
    * Keys the app issued to the workers it started, one live key per slot.
    *
@@ -1406,16 +1410,13 @@ export class BrokerProxyService extends EventEmitter {
    * Say which worker was spawned for a job, so its session binds to that job's
    * target however the polling races.
    */
+  private static expectKey(targetId: string, instanceNum: number): string {
+    return `${targetId}\u0000${instanceNum}`;
+  }
+
   expectWorkerForJob(targetId: string, instanceNum: number, jobId?: string): void {
-    const agentName = this.targets.get(targetId)?.instances.get(instanceNum)?.runner.agentName;
-    if (!agentName) {
-      log()?.warn(
-        `[BrokerProxy] Cannot expect worker ${instanceNum} for target ${targetId}: no agent name known`
-      );
-      return;
-    }
-    this.expectedWorkers.set(agentName, { targetId, jobId });
-    log()?.info(`[BrokerProxy] Expecting worker ${agentName} for target ${targetId}${jobId ? ` job ${jobId}` : ''}`);
+    this.expectedWorkers.set(BrokerProxyService.expectKey(targetId, instanceNum), { targetId, jobId });
+    log()?.info(`[BrokerProxy] Expecting worker ${instanceNum} for target ${targetId}${jobId ? ` job ${jobId}` : ''}`);
   }
 
   /**
@@ -1428,8 +1429,7 @@ export class BrokerProxyService extends EventEmitter {
    * recorded it as failed, and every later job is off by one.
    */
   forgetExpectedWorker(targetId: string, instanceNum: number, jobId?: string): void {
-    const agentName = this.targets.get(targetId)?.instances.get(instanceNum)?.runner.agentName;
-    const neverBound = agentName !== undefined && this.expectedWorkers.delete(agentName);
+    const neverBound = this.expectedWorkers.delete(BrokerProxyService.expectKey(targetId, instanceNum));
     if (!jobId) return;
 
     // Drop the job from the queue if it is still there. It may already be
@@ -1473,45 +1473,44 @@ export class BrokerProxyService extends EventEmitter {
     log()?.info(`[BrokerProxy] Dropped job ${jobId} for ${targetId}: its worker ${instanceNum} will never take it`);
   }
 
-  private resolveSessionTarget(agentName: string | undefined): { targetId: string; jobId?: string } | undefined {
-    // Every worker is named, by its key if not by its request. An unnamed one
-    // taking whichever assignment is first is how jobs ran on the wrong worker.
-    if (!agentName) return undefined;
-    // A named session binds only if a worker was spawned for a job under that
-    // name. This is the whole decision: no fallback to "some listener on this
-    // target, if an assignment happens to be queued", because that fallback was
-    // the ordering that let an older unbound listener consume the assignment
-    // before the worker the job was meant for. It also keeps the property the
-    // old gate protected - a listener nobody spawned for a job runs in the
-    // generic sandbox, not the repository's policy, and must not win a job.
-    const expected = this.expectedWorkers.get(agentName);
-    if (expected !== undefined) {
-      this.expectedWorkers.delete(agentName);
-      const pending = this.pendingTargetAssignments.indexOf(expected.targetId);
-      if (pending >= 0) this.pendingTargetAssignments.splice(pending, 1);
-      return { targetId: expected.targetId, jobId: expected.jobId };
+  private resolveSessionTarget(
+    worker: { instanceNum: number; targetId?: string },
+    claimedAgentName: string | undefined
+  ): { targetId: string; jobId?: string } | undefined {
+    // A worker spawned for a target is bound by its key's (targetId,
+    // instanceNum) - never by the runner's self-reported name, which can
+    // collide across targets. The expectation, if any, adds the specific job.
+    if (worker.targetId !== undefined) {
+      const k = BrokerProxyService.expectKey(worker.targetId, worker.instanceNum);
+      const expected = this.expectedWorkers.get(k);
+      if (expected !== undefined) {
+        this.expectedWorkers.delete(k);
+        const pending = this.pendingTargetAssignments.indexOf(worker.targetId);
+        if (pending >= 0) this.pendingTargetAssignments.splice(pending, 1);
+        return { targetId: worker.targetId, jobId: expected.jobId };
+      }
+      // No expectation yet: fall back to a queued assignment for this worker's
+      // own target (from its key, so no agentName collision), the same
+      // order-based path as before. Without one, it stays unbound - a worker
+      // nobody assigned a job to must not win one.
+      const pending = this.pendingTargetAssignments.indexOf(worker.targetId);
+      if (pending < 0) return undefined;
+      this.pendingTargetAssignments.splice(pending, 1);
+      return { targetId: worker.targetId };
     }
+    // A keyless-target worker is an idle listener started ahead of any job. It
+    // binds only through the positional assignment, and only under its own
+    // registered name, never taking a job it was not spawned for.
+    if (!claimedAgentName) return undefined;
     for (const state of this.targets.values()) {
       for (const instance of state.instances.values()) {
-        if (instance.runner.agentName !== agentName) continue;
-        // No expectation recorded for this worker. Making that fatal - which it
-        // was, briefly - meant nothing could bind at all when the announcement
-        // did not arrive, and a job that binds late beats a job that never
-        // binds. The pending assignment is the older, order-based path; it is
-        // kept as the fallback it always was, and this says so out loud.
+        if (instance.runner.agentName !== claimedAgentName) continue;
         const pending = this.pendingTargetAssignments.indexOf(state.target.id);
-        log()?.warn(
-          `[BrokerProxy] No expectation for ${agentName}; falling back to arrival order ` +
-            `(pending assignment ${pending >= 0 ? 'present' : 'absent'} for ${state.target.id}). ` +
-            'Expected workers: ' +
-            ([...this.expectedWorkers.keys()].join(', ') || 'none')
-        );
         if (pending < 0) return undefined;
         this.pendingTargetAssignments.splice(pending, 1);
         return { targetId: state.target.id };
       }
     }
-    log()?.warn(`[BrokerProxy] Session request names unknown runner ${agentName}; leaving it unbound`);
     return undefined;
   }
 
@@ -1541,7 +1540,7 @@ export class BrokerProxyService extends EventEmitter {
       log()?.warn(`[BrokerProxy] Worker ${worker.instanceNum} already has a bound session; leaving this request unbound`);
     }
     log()?.info(`[BrokerProxy] Session request from ${agentName ?? 'unnamed runner'}`);
-    const resolved = keyAlreadyBound ? undefined : this.resolveSessionTarget(agentName);
+    const resolved = keyAlreadyBound ? undefined : this.resolveSessionTarget(worker, claimed);
     const targetId = resolved?.targetId;
     const expectedJobId = resolved?.jobId;
     if (!targetId) {

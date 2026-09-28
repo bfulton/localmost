@@ -1286,6 +1286,10 @@ export class RunnerManager {
       this.instances.set(instanceNum, instance);
       this.startingInstances.delete(instanceNum);
       await this.stopDockerProxy(instanceNum);
+      // The broker key was issued before this failure, and its /w/ URL is now
+      // in the (unstarted) runner config. Revoke it, or a valid credential
+      // outlives a worker that never came up.
+      this.revokeBrokerUrl?.(instanceNum);
     }
   }
 

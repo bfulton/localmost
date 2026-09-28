@@ -605,6 +605,30 @@ describe('message routing', () => {
     expect(JSON.parse(res.body).messageType).toBe('RunnerJobRequest');
   });
 
+  it("does not let two targets that share a runner name cross-bind", async () => {
+    // target-manager can produce the same agentName for an org and a repo. The
+    // expectation is keyed by (target, instance) via the broker key, so a worker
+    // for one target cannot bind the other's job even with an identical name.
+    const a = createMockTarget({ id: 'target-a', displayName: 'target-a' });
+    const b = createMockTarget({ id: 'target-b', displayName: 'target-b' });
+    const credA = createMockInstanceCredentials(1);
+    const credB = createMockInstanceCredentials(1);
+    service.addTarget(a, [{ ...credA, runner: { ...credA.runner, agentName: 'dup-name.1' } }]);
+    service.addTarget(b, [{ ...credB, runner: { ...credB.runner, agentName: 'dup-name.1' } }]);
+    internals.targets.get('target-a')!.instances.get(1)!.sessionId = 'up-a';
+    internals.targets.get('target-b')!.instances.get(1)!.sessionId = 'up-b';
+    internals.messageQueues.set('target-b', [jobMessage]);
+    // Only target-b's worker is expected for the job.
+    service.expectWorkerForJob('target-b', 1, 'req-1');
+    const keyA = prefixOf(service.issueWorkerKey(1, 'target-a'));
+
+    // A session from target-a's worker (same name) must not take target-b's job.
+    const sid = await createSession(JSON.stringify({ agent: { name: 'dup-name.1' } }), keyA);
+
+    expect(internals.localSessions.get(sid)?.targetId).not.toBe('target-b');
+    expect(internals.messageQueues.get('target-b')).toHaveLength(1);
+  });
+
   it('gives each same-target worker its own job, never whichever is queued first', async () => {
     // Two jobs for one target. Each worker was spawned for a specific job and
     // built its sandbox from that job's commit; handing worker 1 job 2 would run

@@ -1437,6 +1437,28 @@ describe('RunnerManager', () => {
   });
 
   describe("a worker's own proxy and git environment", () => {
+    it('revokes the broker key when startInstance fails after issuing it', async () => {
+      const revoked: number[] = [];
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        issueBrokerUrl: () => `http://127.0.0.1:8787/w/${'c'.repeat(64)}/`,
+        revokeBrokerUrl: (n) => revoked.push(n),
+      });
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (fs.readFileSync as jest.Mock).mockReturnValue('{}');
+      // startInstance needs a version, and issues the key before spawning.
+      (manager as unknown as { runnerVersion: string }).runnerVersion = '1.0.0';
+      // Spawn throws after the key is issued and written into the config.
+      mockSpawnSandboxed.mockImplementation(() => { throw new Error('spawn failed'); });
+
+      await (manager as unknown as { startInstance(n: number): Promise<void> }).startInstance(1);
+
+      expect(revoked).toContain(1);
+      mockSpawnSandboxed.mockReset();
+    });
+
     it('hands the runner a proxy URL with a per-worker token and a hermetic git config', async () => {
       // The proxy token isolates each worker on shared loopback; the /dev/null
       // git config keeps checkout from falling back to a client that chokes on
