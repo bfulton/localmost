@@ -61,7 +61,8 @@ export function processStartTime(pid: number): string | null {
  */
 export async function killOrphanedProcesses(
   sandboxBase: string,
-  log: CleanupLogger
+  log: CleanupLogger,
+  startTimeOf: (pid: number) => string | null = processStartTime
 ): Promise<boolean> {
   let killedAny = false;
   const pidDir = path.join(path.dirname(sandboxBase), 'pids');
@@ -91,7 +92,7 @@ export async function killOrphanedProcesses(
         // Only signal a process whose start time still matches what was recorded
         // at spawn. A missing record or a mismatch means the pid was reused (or
         // predates this format); either way it is not our worker, so leave it.
-        if (recordedStart === '' || processStartTime(pid) !== recordedStart) {
+        if (recordedStart === '' || startTimeOf(pid) !== recordedStart) {
           await fs.promises.unlink(pidFile).catch(() => undefined);
           continue;
         }
