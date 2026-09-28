@@ -5,6 +5,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { execFileSync } from 'child_process';
 import { shell } from 'electron';
 
 export type CleanupLogger = (message: string) => void;
@@ -28,6 +29,26 @@ export function validateChildPath(base: string, childName: string): string | nul
     return null;
   }
   return normalizedChild;
+}
+
+/**
+ * The OS-reported start time of a process, or null if it is not running.
+ *
+ * A pid alone cannot be trusted after a crash: the OS can reuse it for an
+ * unrelated process before a sweep runs. Recording the start time at spawn and
+ * comparing it here tells a still-living worker from a stranger that inherited
+ * its pid, so a sweep never signals the wrong process.
+ */
+export function processStartTime(pid: number): string | null {
+  try {
+    const out = execFileSync('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf-8',
+      timeout: 5000,
+    }).trim();
+    return out === '' ? null : out;
+  } catch {
+    return null; // no such process
+  }
 }
 
 /**
@@ -56,14 +77,24 @@ export async function killOrphanedProcesses(
       if (!fs.existsSync(pidFile)) continue;
 
       try {
-        const pidStr = (await fs.promises.readFile(pidFile, 'utf-8')).trim();
-        // Digits only: parseInt would take '1234junk' as 1234. Refuse anything
-        // that is not a real single process id, and never this process: kill(-1)
-        // signals every process the user owns, kill(0) the whole group, and a
-        // reused pid could be the app itself.
+        const raw = (await fs.promises.readFile(pidFile, 'utf-8')).trim();
+        // Format is "<pid> <start time>". The pid must be digits only (parseInt
+        // would take '1234junk' as 1234), a safe integer, above 1 (kill(-1)
+        // signals every process the user owns, kill(0) the whole group), and not
+        // this process.
+        const sep = raw.search(/\s/);
+        const pidStr = sep === -1 ? raw : raw.slice(0, sep);
+        const recordedStart = sep === -1 ? '' : raw.slice(sep + 1).trim();
         if (!/^\d+$/.test(pidStr)) continue;
         const pid = Number(pidStr);
         if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) continue;
+        // Only signal a process whose start time still matches what was recorded
+        // at spawn. A missing record or a mismatch means the pid was reused (or
+        // predates this format); either way it is not our worker, so leave it.
+        if (recordedStart === '' || processStartTime(pid) !== recordedStart) {
+          await fs.promises.unlink(pidFile).catch(() => undefined);
+          continue;
+        }
 
         // Check if process is running and kill it
         try {

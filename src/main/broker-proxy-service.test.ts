@@ -605,6 +605,33 @@ describe('message routing', () => {
     expect(JSON.parse(res.body).messageType).toBe('RunnerJobRequest');
   });
 
+  it('gives each same-target worker its own job, never whichever is queued first', async () => {
+    // Two jobs for one target. Each worker was spawned for a specific job and
+    // built its sandbox from that job's commit; handing worker 1 job 2 would run
+    // it under the wrong per-SHA policy. Worker 1 must get req-1, worker 2 req-2,
+    // whatever the queue order or poll order.
+    const target = addTargetWithRunner('target-a', 'runner-a.1');
+    const cred = createMockInstanceCredentials(2);
+    internals.targets.get('target-a')!.instances.set(2, {
+      ...cred, runner: { ...cred.runner, agentName: 'runner-a.2' }, instanceNum: 2, sessionId: 'upstream-a2',
+    } as never);
+    const job2 = JSON.stringify({ messageId: 4, messageType: 'RunnerJobRequest', body: JSON.stringify({ runner_request_id: 'req-2' }) });
+    // Queue job 2 first, then job 1 - poll order must not decide.
+    internals.messageQueues.set(target.id, [job2, jobMessage]);
+    service.expectWorkerForJob(target.id, 1, 'req-1');
+    service.expectWorkerForJob(target.id, 2, 'req-2');
+    const w1 = startWorker(1, 'target-a');
+    const w2 = startWorker(2, 'target-a');
+
+    const s1 = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }), w1);
+    const r1 = await request('GET', `/message?sessionId=${s1}`, undefined, w1);
+    const s2 = await createSession(JSON.stringify({ agent: { name: 'runner-a.2' } }), w2);
+    const r2 = await request('GET', `/message?sessionId=${s2}`, undefined, w2);
+
+    expect(JSON.parse(JSON.parse(r1.body).body).runner_request_id).toBe('req-1');
+    expect(JSON.parse(JSON.parse(r2.body).body).runner_request_id).toBe('req-2');
+  });
+
   it('leaves a listener nobody spawned for a job unbound', async () => {
     // The property that gate protects: a listener spawned ahead of any job runs
     // in the generic sandbox, not the repository's approved policy. Binding it

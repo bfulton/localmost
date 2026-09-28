@@ -1,4 +1,5 @@
 import { ChildProcess } from 'child_process';
+import { processStartTime } from './runner-cleanup';
 import * as path from 'path';
 import { createHash } from 'crypto';
 import * as fs from 'fs';
@@ -125,7 +126,7 @@ interface RunnerManagerOptions {
    * The broker binds that worker's session to the job's target by name, rather
    * than by whichever session happens to poll first.
    */
-  onWorkerReservedForJob?: (targetId: string, instanceNum: number) => void;
+  onWorkerReservedForJob?: (targetId: string, instanceNum: number, jobId?: string) => void;
   /** Withdraw that reservation when the worker never starts. */
   onWorkerReservationCancelled?: (targetId: string, instanceNum: number, jobId?: string) => void;
   /**
@@ -172,7 +173,7 @@ export class RunnerManager {
   private getRepoPolicy?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<RepoPolicyRuntime>;
   private getJobTarget?: (jobId: string) => { targetDisplayName: string; githubSha?: string } | undefined;
   private onJobEvent?: (event: JobEvent) => void;
-  private onWorkerReservedForJob?: (targetId: string, instanceNum: number) => void;
+  private onWorkerReservedForJob?: (targetId: string, instanceNum: number, jobId?: string) => void;
   private onWorkerReservationCancelled?: (targetId: string, instanceNum: number, jobId?: string) => void;
   private issueBrokerUrl?: (instanceNum: number, targetId?: string) => string | undefined;
   private revokeBrokerUrl?: (instanceNum: number) => void;
@@ -795,7 +796,7 @@ export class RunnerManager {
     // request already has a binding waiting and cannot lose a race to another
     // instance polling on the same target.
     if (targetContext.targetId) {
-      this.onWorkerReservedForJob?.(targetContext.targetId, instanceNum);
+      this.onWorkerReservedForJob?.(targetContext.targetId, instanceNum, targetContext.jobId);
     }
 
     this.log('info', `Spawning worker ${instanceNum} for incoming job from ${targetContext.targetDisplayName}...`);
@@ -1139,7 +1140,11 @@ export class RunnerManager {
         try {
           const pidDir = this.pidDir();
           fs.mkdirSync(pidDir, { recursive: true });
-          fs.writeFileSync(path.join(pidDir, `${instanceNum}.pid`), instance.process.pid.toString());
+          // "<pid> <start time>": the start time lets a later sweep tell this
+          // worker from a stranger that inherited its pid after a crash.
+          const started = processStartTime(instance.process.pid);
+          const record = started ? `${instance.process.pid} ${started}` : instance.process.pid.toString();
+          fs.writeFileSync(path.join(pidDir, `${instanceNum}.pid`), record);
         } catch (err) {
           this.log('warn', `Could not write pid file for instance ${instanceNum}: ${(err as Error).message}`);
         }
@@ -2320,12 +2325,19 @@ export class RunnerManager {
    * whole group, so a stale or planted file must never reach them.
    */
   private sweepablePid(raw: string, live: Set<number>): number | null {
+    // Format is "<pid> <start time>".
     const trimmed = raw.trim();
-    // Digits only: parseInt would take '1234junk' as 1234, and a pid file that
-    // is not exactly a number is not one this app wrote.
-    if (!/^\d+$/.test(trimmed)) return null;
-    const pid = Number(trimmed);
+    const sep = trimmed.search(/\s/);
+    const pidStr = sep === -1 ? trimmed : trimmed.slice(0, sep);
+    const recordedStart = sep === -1 ? '' : trimmed.slice(sep + 1).trim();
+    // Digits only: parseInt would take '1234junk' as 1234.
+    if (!/^\d+$/.test(pidStr)) return null;
+    const pid = Number(pidStr);
     if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid || live.has(pid)) return null;
+    // The pid must still belong to the process this app recorded. A missing
+    // record or a start-time mismatch means the pid was reused, so it is not
+    // ours to signal.
+    if (recordedStart === '' || processStartTime(pid) !== recordedStart) return null;
     return pid;
   }
 

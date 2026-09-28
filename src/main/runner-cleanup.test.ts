@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
-import { killOrphanedProcesses } from './runner-cleanup';
+import { spawn } from 'child_process';
+import { killOrphanedProcesses, processStartTime } from './runner-cleanup';
 
 describe('killOrphanedProcesses', () => {
   const runnerDir = path.join(os.tmpdir(), `lm-cleanup-${process.pid}`);
@@ -26,16 +27,45 @@ describe('killOrphanedProcesses', () => {
     fs.rmSync(runnerDir, { recursive: true, force: true });
   });
 
+  it('signals a real orphan whose recorded start time still matches', async () => {
+    // Use a real process so the ps-based identity check actually passes.
+    const child = spawn('/bin/sleep', ['30'], { detached: true });
+    try {
+      const pid = child.pid!;
+      fs.writeFileSync(path.join(pidDir, '1.pid'), `${pid} ${processStartTime(pid)}`);
+
+      await killOrphanedProcesses(sandboxBase, () => undefined);
+
+      expect(signalled.some(([p]) => p === pid || p === -pid)).toBe(true);
+    } finally {
+      try { realKill(-child.pid!, 'SIGKILL'); } catch { /* already gone */ }
+      try { realKill(child.pid!, 'SIGKILL'); } catch { /* already gone */ }
+    }
+  });
+
   it('reads the app-owned pids directory, not the job-writable sandbox pid file', async () => {
     // A job can write its own sandbox; a pid file there must not steer the kill.
+    // (No app-owned file, so nothing to signal - the sandbox file is ignored.)
     fs.writeFileSync(path.join(sandboxBase, '1', 'runner.pid'), '4242');
-    fs.writeFileSync(path.join(pidDir, '1.pid'), '5555');
 
     await killOrphanedProcesses(sandboxBase, () => undefined);
 
-    // Only the app-owned pid was signalled; the planted sandbox pid was not.
-    expect(signalled.some(([p]) => p === 5555 || p === -5555)).toBe(true);
     expect(signalled.some(([p]) => p === 4242 || p === -4242)).toBe(false);
+  });
+
+  it('does not signal a pid whose start time no longer matches (reuse)', async () => {
+    // A live pid, but the recorded start time is stale - the pid was reused.
+    const child = spawn('/bin/sleep', ['30'], { detached: true });
+    try {
+      fs.writeFileSync(path.join(pidDir, '1.pid'), `${child.pid} Thu Jan  1 00:00:00 2000`);
+
+      await killOrphanedProcesses(sandboxBase, () => undefined);
+
+      expect(signalled).toEqual([]);
+    } finally {
+      try { realKill(-child.pid!, 'SIGKILL'); } catch { /* already gone */ }
+      try { realKill(child.pid!, 'SIGKILL'); } catch { /* already gone */ }
+    }
   });
 
   it('never signals this process, even if a stale pid file names it', async () => {

@@ -32,6 +32,11 @@ jest.mock('./proxy-server', () => ({
   })),
 }));
 
+// Mock process-identity verification so tests can supply a matching start time.
+jest.mock('./runner-cleanup', () => ({
+  processStartTime: jest.fn(() => 'START'),
+}));
+
 // Mock the filtering docker socket. A real one binds a unix socket inside the
 // sandbox directory, which does not exist under the mocked fs. The stub keeps
 // the one piece of state the manager reasons about: which repository it is
@@ -1326,7 +1331,7 @@ describe('RunnerManager', () => {
         (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
           { name: '1.pid', isFile: () => true, isDirectory: () => false },
         ] as never);
-        (jest.mocked(fs.promises.readFile) as unknown as jest.Mock).mockResolvedValue('4242' as never);
+        (jest.mocked(fs.promises.readFile) as unknown as jest.Mock).mockResolvedValue('4242 START' as never);
         (jest.mocked(fs.promises.unlink) as unknown as jest.Mock).mockResolvedValue(undefined as never);
 
         await helper.killStaleProcesses();

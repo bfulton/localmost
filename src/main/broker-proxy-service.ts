@@ -91,6 +91,7 @@ interface LocalSession {
   createdAt: Date;
   workerId?: number;
   targetId?: string;  // Which target this session is handling
+  expectedJobId?: string;  // The specific job this worker was spawned for
   currentJobId?: string;  // Job currently being executed
   workerKey: string;  // The key of the worker that created it
 }
@@ -362,7 +363,7 @@ export class BrokerProxyService extends EventEmitter {
    * no entry here, so it cannot bind and win a job its generic sandbox would
    * fail to run.
    */
-  private expectedWorkers: Map<string, string> = new Map();  // agentName -> targetId
+  private expectedWorkers: Map<string, { targetId: string; jobId?: string }> = new Map();  // agentName -> the job it was spawned for
   /**
    * Keys the app issued to the workers it started, one live key per slot.
    *
@@ -1405,7 +1406,7 @@ export class BrokerProxyService extends EventEmitter {
    * Say which worker was spawned for a job, so its session binds to that job's
    * target however the polling races.
    */
-  expectWorkerForJob(targetId: string, instanceNum: number): void {
+  expectWorkerForJob(targetId: string, instanceNum: number, jobId?: string): void {
     const agentName = this.targets.get(targetId)?.instances.get(instanceNum)?.runner.agentName;
     if (!agentName) {
       log()?.warn(
@@ -1413,8 +1414,8 @@ export class BrokerProxyService extends EventEmitter {
       );
       return;
     }
-    this.expectedWorkers.set(agentName, targetId);
-    log()?.info(`[BrokerProxy] Expecting worker ${agentName} for target ${targetId}`);
+    this.expectedWorkers.set(agentName, { targetId, jobId });
+    log()?.info(`[BrokerProxy] Expecting worker ${agentName} for target ${targetId}${jobId ? ` job ${jobId}` : ''}`);
   }
 
   /**
@@ -1470,7 +1471,7 @@ export class BrokerProxyService extends EventEmitter {
     log()?.info(`[BrokerProxy] Dropped job ${jobId} for ${targetId}: its worker ${instanceNum} will never take it`);
   }
 
-  private resolveSessionTarget(agentName: string | undefined): string | undefined {
+  private resolveSessionTarget(agentName: string | undefined): { targetId: string; jobId?: string } | undefined {
     // Every worker is named, by its key if not by its request. An unnamed one
     // taking whichever assignment is first is how jobs ran on the wrong worker.
     if (!agentName) return undefined;
@@ -1484,9 +1485,9 @@ export class BrokerProxyService extends EventEmitter {
     const expected = this.expectedWorkers.get(agentName);
     if (expected !== undefined) {
       this.expectedWorkers.delete(agentName);
-      const pending = this.pendingTargetAssignments.indexOf(expected);
+      const pending = this.pendingTargetAssignments.indexOf(expected.targetId);
       if (pending >= 0) this.pendingTargetAssignments.splice(pending, 1);
-      return expected;
+      return { targetId: expected.targetId, jobId: expected.jobId };
     }
     for (const state of this.targets.values()) {
       for (const instance of state.instances.values()) {
@@ -1505,7 +1506,7 @@ export class BrokerProxyService extends EventEmitter {
         );
         if (pending < 0) return undefined;
         this.pendingTargetAssignments.splice(pending, 1);
-        return state.target.id;
+        return { targetId: state.target.id };
       }
     }
     log()?.warn(`[BrokerProxy] Session request names unknown runner ${agentName}; leaving it unbound`);
@@ -1538,7 +1539,9 @@ export class BrokerProxyService extends EventEmitter {
       log()?.warn(`[BrokerProxy] Worker ${worker.instanceNum} already has a bound session; leaving this request unbound`);
     }
     log()?.info(`[BrokerProxy] Session request from ${agentName ?? 'unnamed runner'}`);
-    const targetId = keyAlreadyBound ? undefined : this.resolveSessionTarget(agentName);
+    const resolved = keyAlreadyBound ? undefined : this.resolveSessionTarget(agentName);
+    const targetId = resolved?.targetId;
+    const expectedJobId = resolved?.jobId;
     if (!targetId) {
       // getMessageForTarget refuses to hand anything to a session with no
       // target, so this worker cannot receive a queued job however long it
@@ -1574,6 +1577,7 @@ export class BrokerProxyService extends EventEmitter {
       id: sessionId,
       createdAt: new Date(),
       targetId,  // Associate session with target
+      expectedJobId,  // and with the specific job it was spawned for
       workerKey: key,
     });
 
@@ -1673,6 +1677,26 @@ export class BrokerProxyService extends EventEmitter {
       }
       const queue = this.messageQueues.get(targetId);
       if (!queue || queue.length === 0) return undefined;
+
+      // A worker spawned for a specific job takes only that job, never
+      // whichever is queued first. Two jobs for the same target build their
+      // sandboxes from different commits before spawn; handing a worker the
+      // other job would run it under the wrong per-SHA policy. It waits for its
+      // own message rather than taking another.
+      if (session.expectedJobId) {
+        const mineJob = queue.findIndex(
+          message => isJobAssignmentMessage(message) && jobIdFromMessage(message) === session.expectedJobId
+        );
+        if (mineJob >= 0) return queue.splice(mineJob, 1)[0];
+        // Its job is not queued yet. Once it holds one, a cancellation naming
+        // that job may follow; anything else waits.
+        const held = session.currentJobId;
+        if (!held) return undefined;
+        const mineCancel = queue.findIndex(message => jobIdFromMessage(message) === held);
+        return mineCancel >= 0 ? queue.splice(mineCancel, 1)[0] : undefined;
+      }
+
+      // No specific job (an idle worker that picked one up without a spawn).
       // The job goes first. A cancellation queued ahead of it is for a job
       // this worker doesn't hold yet; it follows on the next poll.
       const jobIndex = queue.findIndex(isJobAssignmentMessage);
@@ -1680,8 +1704,7 @@ export class BrokerProxyService extends EventEmitter {
 
       // No job queued. Taking the head anyway handed a worker holding no job
       // somebody else's cancellation - stealing it from the worker that runs
-      // that job, and marking this session as holding a job it never had. A
-      // cancellation goes only to the worker whose job it names.
+      // that job. A cancellation goes only to the worker whose job it names.
       const held = session.currentJobId;
       if (!held) return undefined;
       const mine = queue.findIndex(message => jobIdFromMessage(message) === held);
