@@ -17,6 +17,7 @@ const SetupWizard: React.FC<SetupWizardProps> = ({ onComplete }) => {
   // Auth step - Device Flow
   const [deviceCode, setDeviceCode] = useState<DeviceCodeInfo | null>(null);
   const [isWaitingForAuth, setIsWaitingForAuth] = useState(false);
+  const [sessionExpired, setSessionExpired] = useState(false);
 
   // Download step
   const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
@@ -32,7 +33,14 @@ const SetupWizard: React.FC<SetupWizardProps> = ({ onComplete }) => {
     setRunnerName(`localmost-${Math.random().toString(36).substring(2, 8)}`);
 
     // Check if already authenticated
-    window.localmost.github.getAuthStatus().then(async (status: { isAuthenticated: boolean }) => {
+    window.localmost.github.getAuthStatus().then(async (status: { isAuthenticated: boolean; expired?: boolean }) => {
+      // An expired session still reports as authenticated, so the rest of
+      // the app keeps its user, but it yields no token: the later steps
+      // could not list a repository. Sign in again instead.
+      if (status.expired) {
+        setSessionExpired(true);
+        return;
+      }
       if (status.isAuthenticated) {
         // Already logged in - skip to download or configure
         const isDownloaded = await window.localmost.runner.isDownloaded();
@@ -180,6 +188,7 @@ const SetupWizard: React.FC<SetupWizardProps> = ({ onComplete }) => {
             {!isWaitingForAuth && !deviceCode && (
               <>
                 <p className={styles.stepDescription}>
+                  {sessionExpired && 'Your saved GitHub session has expired. '}
                   Click below to authenticate with your GitHub account.
                   A code will appear that you'll enter on GitHub.
                 </p>
