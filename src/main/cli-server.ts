@@ -332,7 +332,11 @@ export class CliServer {
         }
 
         try {
-          await runnerManager.start();
+          // The mode the app starts in: an empty pool, with a worker spawned
+          // for each admitted job. start() also brings up an idle listener,
+          // which cannot bind a job - a session binds only through the
+          // expectation admission sets for it - and would only hold a slot.
+          await runnerManager.initialize();
           // Note: heartbeat resume would require more setup (auth tokens, etc.)
           // For now, CLI resume just starts the runner
           return {

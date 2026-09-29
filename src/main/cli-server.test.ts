@@ -25,6 +25,7 @@ const mockGetJobHistory = jest.fn<() => unknown[]>();
 const mockIsRunning = jest.fn<() => boolean>();
 const mockIsConfigured = jest.fn<() => boolean>();
 const mockStart = jest.fn<() => Promise<void>>();
+const mockInitialize = jest.fn<() => Promise<void>>();
 const mockStop = jest.fn<() => Promise<void>>();
 const mockHeartbeatIsRunning = jest.fn<() => boolean>();
 const mockHeartbeatStop = jest.fn<() => void>();
@@ -37,6 +38,7 @@ jest.mock('./app-state', () => ({
     isRunning: mockIsRunning,
     isConfigured: mockIsConfigured,
     start: mockStart,
+    initialize: mockInitialize,
     stop: mockStop,
   }),
   getHeartbeatManager: () => ({
@@ -110,6 +112,7 @@ describe('CliServer', () => {
     mockIsRunning.mockReset();
     mockIsConfigured.mockReset();
     mockStart.mockReset();
+    mockInitialize.mockReset();
     mockStop.mockReset();
     mockHeartbeatIsRunning.mockReset();
     mockHeartbeatStop.mockReset();
@@ -250,9 +253,13 @@ describe('CliServer', () => {
   });
 
   it('should handle resume command when paused', async () => {
+    // Resume returns to the mode the app starts in: an empty pool that spawns
+    // a worker for each admitted job. start() also spawned an idle listener,
+    // which can never bind a job now that a session binds only through the
+    // expectation admission sets for it - so it only held a slot.
     mockIsRunning.mockReturnValue(false);
     mockIsConfigured.mockReturnValue(true);
-    mockStart.mockResolvedValue(undefined);
+    mockInitialize.mockResolvedValue(undefined);
 
     await server.start();
 
@@ -263,7 +270,8 @@ describe('CliServer', () => {
       command: 'resume',
       message: 'Runner resumed successfully',
     });
-    expect(mockStart).toHaveBeenCalled();
+    expect(mockInitialize).toHaveBeenCalled();
+    expect(mockStart).not.toHaveBeenCalled();
   });
 
   it('should handle resume command when already running', async () => {

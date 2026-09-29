@@ -80,9 +80,14 @@ const MODERATE_WILDCARDS = MODERATE_NETWORK_ALLOWLIST.filter(
 // Mirrors the home-directory toolchain paths process-sandbox makes writable
 // at moderate and permissive. Some hold binaries on the user's PATH, which is
 // why a write there outlives the job. Change both together.
-const HOME_TOOLCHAIN_WRITES =
-  'write access to toolchain directories in your home, some of them on your PATH ' +
-  '(~/.cargo, ~/.rustup, ~/.local, ~/go, ~/.dotnet, ~/.gradle, ~/.m2, ~/Library/Caches and package-manager caches)';
+// Both loosened levels read the toolchains installed in the home directory,
+// and point package managers at a cache of the target's own that stays
+// writable across jobs - so what one job leaves there, the next one runs.
+// The home trees themselves are never writable: some are on the user's PATH.
+const HOME_TOOLCHAIN_ACCESS =
+  'read access to toolchains in your home (~/.cargo, ~/.rustup, ~/.local, ~/go, ~/.dotnet, ~/.gradle, ~/.m2, ' +
+  "~/Library/Caches), and a package-manager cache shared by this target's jobs, pull requests included, " +
+  'when the tool cache is persistent';
 
 /**
  * What a level grants beyond strict. Strict is the baseline and has no entry:
@@ -92,8 +97,8 @@ const LEVEL_GRANTS: Record<Exclude<SandboxPolicyLevel, 'strict'>, string> = {
   moderate:
     `adds package registries, every host under ${MODERATE_WILDCARDS.join(', ')}, and GitHub content hosts ` +
     `(${CONTENT_HOSTS.filter((host) => MODERATE_NETWORK_ALLOWLIST.includes(host)).join(', ')}) - ` +
-    `CDNs and content hosts anyone can publish to - plus ${HOME_TOOLCHAIN_WRITES}`,
-  permissive: `allows every network host, plus ${HOME_TOOLCHAIN_WRITES}`,
+    `CDNs and content hosts anyone can publish to - plus ${HOME_TOOLCHAIN_ACCESS}`,
+  permissive: `allows every network host, plus ${HOME_TOOLCHAIN_ACCESS}`,
 };
 
 export function describePolicy(policy: DescribablePolicy, prefix = ''): PolicyGrant[] {

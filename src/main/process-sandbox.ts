@@ -388,18 +388,18 @@ ${policyWrites ? `(allow file-write*\n${policyWrites})` : ';; No policy-declared
 ;; secrets and bookkeeping (proxy credentials, registrations, session tokens,
 ;; the pid files the startup sweep trusts, other workers' sandboxes) and the
 ;; runner template every worker is copied from, with the record it is checked
-;; against. The runner directory is denied whole and the two places a job does
-;; write there are re-allowed after it, so nothing added there later is
-;; writable by default. The app directory's own node is denied so that it and
-;; the runner directory cannot be renamed away and replaced.
+;; against. The runner directory is denied whole and the places a job does
+;; write there - this target's own caches and its own sandbox - are re-allowed
+;; after it, so nothing added there later is writable by default. The app
+;; directory's own node is denied so that it and the runner directory cannot
+;; be renamed away and replaced.
 (deny file-write*
   (literal "${appDataDir}")
   (subpath "${policiesDir}")
   (literal "${configFile}")
   (literal "${cliSocket}")
   (subpath "${runnerDir}"))
-(allow file-write*
-  (subpath "${toolCacheDir}"))
+${ownCacheRules('file-write*')}
 (allow file-write*
   (subpath "${escapedDir}"))
 

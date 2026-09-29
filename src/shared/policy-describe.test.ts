@@ -70,8 +70,8 @@ describe('describePolicy', () => {
   it('names what a loosened level opens, not just that it is common', () => {
     // "Common package registries" read as a narrow grant. Moderate also opens
     // whole CDN domains and GitHub content hosts anyone can publish to, and
-    // both levels make toolchain trees in the home directory writable, some
-    // of them on the user's PATH.
+    // both levels read the toolchains installed in the home directory and keep
+    // a package-manager cache that later jobs of the same target execute from.
     const [moderate] = describePolicy({ level: 'moderate' });
     const wildcards = MODERATE_NETWORK_ALLOWLIST.filter(
       (host) => host.startsWith('*.') && !RUNNER_INFRASTRUCTURE_ALLOWLIST.includes(host)
@@ -86,7 +86,11 @@ describe('describePolicy', () => {
       for (const dir of ['~/.cargo', '~/.local', '~/go', '~/Library/Caches']) {
         expect(grant.summary).toContain(dir);
       }
-      expect(grant.summary).toMatch(/PATH/);
+      // Read, not write: the home trees hold directories on the user's PATH,
+      // and a job's package managers are pointed at a cache of its own.
+      expect(grant.summary).toMatch(/read access to toolchains/);
+      expect(grant.summary).not.toMatch(/write access to toolchain/);
+      expect(grant.summary).toMatch(/package-manager cache shared by this target's jobs/);
     }
   });
 

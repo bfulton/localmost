@@ -405,9 +405,11 @@ describe('Process Sandbox', () => {
       // not dropped; only the deny that ends the write rules stands in its way.
       const appDir = path.join(os.homedir(), '.localmost');
       const runnerDir = path.join(appDir, 'runner');
+      const ownToolCache = path.join(runnerDir, 'caches', 'aaaa1111', 'tool-cache');
       for (const grant of ['~', '~/.localmost']) {
         const profile = profileWith({
           filesystemPolicy: { level: 'strict', read: [], write: [grant] },
+          toolCacheDir: ownToolCache,
         });
         expect(writable(profile, path.join(appDir, 'some-file'))).toBe(true);
         expect(writable(profile, path.join(runnerDir, 'arc', 'v2.336.0', 'bin', 'Runner.Worker.dll'))).toBe(false);
@@ -418,9 +420,13 @@ describe('Process Sandbox', () => {
         // another in its place, is a write to that directory itself.
         expect(writable(profile, runnerDir)).toBe(false);
         expect(writable(profile, appDir)).toBe(false);
-        // What a job may write in there is still writable.
+        // What a job may write in there is still writable: its own sandbox
+        // and its own target's tool cache. Another target's cache and the old
+        // shared one are not, whatever the policy grants above them.
         expect(writable(profile, path.join(instanceDir, '_work', 'repo', 'out.o'))).toBe(true);
-        expect(writable(profile, path.join(runnerDir, 'tool-cache', 'node', '20', 'bin', 'node'))).toBe(true);
+        expect(writable(profile, path.join(ownToolCache, 'node', '20', 'bin', 'node'))).toBe(true);
+        expect(writable(profile, path.join(runnerDir, 'caches', 'bbbb2222', 'tool-cache', 'node'))).toBe(false);
+        expect(writable(profile, path.join(runnerDir, 'tool-cache', 'node', '20', 'bin', 'node'))).toBe(false);
       }
     });
 

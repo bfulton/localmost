@@ -10,6 +10,9 @@ const retireWorkersForRepository = jest.fn(async () => undefined);
 jest.mock('electron', () => ({
   ipcMain: { handle: (channel: string, handler: (...args: unknown[]) => unknown) => handlers.set(channel, handler) },
 }));
+// The sender check has tests of its own (trusted-ipc.test.ts); here the
+// handlers are called directly, so they are registered on electron's ipcMain.
+jest.mock('./trusted-ipc', () => ({ ipcMain: jest.requireMock<{ ipcMain: unknown }>('electron').ipcMain }));
 jest.mock('../paths', () => ({ getAppDataDir: () => tmpRoot }));
 jest.mock('../app-state', () => ({
   getRunnerManager: () => ({ retireWorkersForRepository }),

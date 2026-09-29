@@ -365,7 +365,7 @@ app.whenReady().then(async () => {
         // the merged policy when the job is claimed, after the workflow is known.
         docker: policy.docker ?? {},
         // Fixed at spawn like the filesystem: see spawnEnvPolicy.
-        env: spawnEnvPolicy(cached.config),
+        env: spawnEnvPolicy(approved),
       };
     },
     onJobEvent: (event: JobEvent) => {
