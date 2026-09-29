@@ -208,6 +208,175 @@ describe('reading job completion from runner output', () => {
   });
 });
 
+describe("reading the runner's status from its output", () => {
+  // The runner's own lines, as the Listener writes them.
+  const REGISTRATION_DELETED =
+    'Failed to create a session. The runner registration has been deleted from the server, please re-configure. ' +
+    'Runner registrations are automatically deleted for runners that have not connected to the service recently.';
+  const SESSION_EXISTS = 'A session for this runner already exists.';
+  const CONNECT_ERROR = '2026-09-29 12:00:01Z: Runner connect error: Connection refused. Retrying until reconnected.';
+
+  function listening(overrides: Partial<ConstructorParameters<typeof RunnerManager>[0]> = {}) {
+    const onReregistrationNeeded = jest.fn(async () => undefined);
+    const ctx = newManager({ onReregistrationNeeded, ...overrides });
+    ctx.helper.runnerCount = 1;
+    ctx.helper.setInstance(1, { name: 'runner-1', status: 'listening' });
+    return { ...ctx, onReregistrationNeeded };
+  }
+
+  it("a job named 'Runner connect error' stays busy and keeps its slot", async () => {
+    // The job's name is the workflow's to choose, and the Listener prints it.
+    const { manager, helper } = listening();
+
+    await helper.parseRunnerOutput(1, '2026-09-29T00:00:00Z: Running job: Runner connect error');
+
+    const instance = helper.instances.get(1)!;
+    expect(instance.status).toBe('busy');
+    expect(instance.currentJob?.name).toBe('Runner connect error');
+    expect(manager.hasAvailableSlot()).toBe(false);
+  });
+
+  it("a job named 'please re-configure' does not re-register", async () => {
+    const { helper, onReregistrationNeeded } = listening();
+
+    await helper.parseRunnerOutput(1, '2026-09-29T00:00:00Z: Running job: please re-configure');
+
+    expect(onReregistrationNeeded).not.toHaveBeenCalled();
+    expect(helper.instances.get(1)!.fatalError).toBe(false);
+    expect(helper.instances.get(1)!.currentJob?.name).toBe('please re-configure');
+  });
+
+  it("records a job whatever its name, even 'Listening for Jobs' or 'session for this runner already exists'", async () => {
+    for (const name of ['Listening for Jobs', 'session for this runner already exists']) {
+      const { helper } = listening();
+      await helper.parseRunnerOutput(1, `2026-09-29T00:00:00Z: Running job: ${name}`);
+      expect(helper.instances.get(1)!.status).toBe('busy');
+      expect(helper.instances.get(1)!.currentJob?.name).toBe(name);
+    }
+  });
+
+  it('takes no status from anything a running job prints, even a line shaped like the runner\'s own', async () => {
+    const { manager, helper, onReregistrationNeeded } = listening();
+    await helper.parseRunnerOutput(1, '2026-09-29 12:00:00Z: Running job: build');
+
+    for (const line of [REGISTRATION_DELETED, SESSION_EXISTS, CONNECT_ERROR, '2026-09-29 12:00:02Z: Listening for Jobs']) {
+      await helper.parseRunnerOutput(1, line);
+    }
+
+    const instance = helper.instances.get(1)!;
+    expect(instance.status).toBe('busy');
+    expect(instance.fatalError).toBe(false);
+    expect(instance.currentJob?.name).toBe('build');
+    expect(onReregistrationNeeded).not.toHaveBeenCalled();
+    expect(manager.hasAvailableSlot()).toBe(false);
+  });
+
+  it('a job that prints a completion line and then a status line keeps its slot and its registration', async () => {
+    // A job that can put a runner-shaped line here can put the completion
+    // first. The worker is --once: having taken its job it is that job's
+    // until it exits, whatever the job says about its end.
+    const cases: Array<[string, Partial<ConstructorParameters<typeof RunnerManager>[0]>]> = [
+      ['no conclusion lookup', {}],
+      ['a conclusion lookup that has none yet', { getJobConclusion: jest.fn(async () => null) }],
+    ];
+    for (const [label, overrides] of cases) {
+      const { manager, helper, events, onReregistrationNeeded } = listening(overrides);
+      helper.setPendingTargetContext('1', {
+        targetId: 't', targetDisplayName: 'owner/repo', githubRepo: 'owner/repo', githubJobId: 7,
+      });
+      await helper.parseRunnerOutput(1, '2026-09-29 12:00:00Z: Running job: build');
+      await helper.parseRunnerOutput(1, 'Job build completed with result: Succeeded');
+
+      for (const line of [CONNECT_ERROR, REGISTRATION_DELETED, SESSION_EXISTS, 'Running job: another']) {
+        await helper.parseRunnerOutput(1, line);
+      }
+
+      const instance = helper.instances.get(1)!;
+      expect({ label, status: instance.status, fatalError: instance.fatalError }).toEqual(
+        { label, status: expect.not.stringMatching(/^error$/), fatalError: false }
+      );
+      expect(manager.hasAvailableSlot()).toBe(false);
+      expect(onReregistrationNeeded).not.toHaveBeenCalled();
+      // One spawn, one job: a second start is not recorded as another.
+      expect(events.filter((e) => e.type === 'started').map((e) => e.jobName)).toEqual(['build']);
+    }
+  });
+
+  it('reads a status only from a line the runner starts with it', async () => {
+    const ready = listening();
+    ready.helper.setInstance(1, { name: 'runner-1', status: 'starting' });
+    await ready.helper.parseRunnerOutput(1, 'echo: Listening for Jobs');
+    expect(ready.helper.instances.get(1)!.status).toBe('starting');
+
+    const { helper, onReregistrationNeeded } = listening();
+
+    for (const line of [
+      'echo: the runner registration has been deleted, please re-configure',
+      'note: a session for this runner already exists',
+      'curl: Runner connect error',
+      'curl: Could not connect to the server',
+    ]) {
+      await helper.parseRunnerOutput(1, line);
+    }
+
+    expect(helper.instances.get(1)!.status).toBe('listening');
+    expect(helper.instances.get(1)!.fatalError).toBe(false);
+    expect(onReregistrationNeeded).not.toHaveBeenCalled();
+  });
+
+  it("still reads the runner's own status lines before a job", async () => {
+    const ready = listening();
+    ready.helper.setInstance(1, { name: 'runner-1', status: 'starting' });
+    await ready.helper.parseRunnerOutput(1, '2026-09-29 12:00:00Z: Listening for Jobs');
+    expect(ready.helper.instances.get(1)!.status).toBe('listening');
+
+    const deleted = listening();
+    await deleted.helper.parseRunnerOutput(1, REGISTRATION_DELETED);
+    expect(deleted.helper.instances.get(1)!.status).toBe('error');
+    expect(deleted.helper.instances.get(1)!.fatalError).toBe(true);
+    expect(deleted.onReregistrationNeeded).toHaveBeenCalledWith(1, 'registration_deleted');
+
+    for (const line of [SESSION_EXISTS, 'The session for this runner already exists.']) {
+      const conflict = listening();
+      await conflict.helper.parseRunnerOutput(1, line);
+      expect(conflict.helper.instances.get(1)!.status).toBe('error');
+      expect(conflict.helper.instances.get(1)!.fatalError).toBe(true);
+    }
+
+    for (const line of [CONNECT_ERROR, 'Could not connect to the server.']) {
+      const unreachable = listening();
+      await unreachable.helper.parseRunnerOutput(1, line);
+      expect(unreachable.helper.instances.get(1)!.status).toBe('error');
+      expect(unreachable.helper.instances.get(1)!.fatalError).toBe(false);
+    }
+  });
+});
+
+describe("recording an organization target's job", () => {
+  it('records the repository GitHub named for the job, not the organization', async () => {
+    const { manager, helper, events } = newManager();
+    helper.setInstance(1, { name: 'runner-1', status: 'listening' });
+    helper.setPendingTargetContext('1', {
+      targetId: 'org-target',
+      targetDisplayName: 'myorg',
+      githubRepo: 'myorg/app',
+      githubRunId: 4242,
+    });
+
+    await helper.parseRunnerOutput(1, '2026-09-29 12:00:00Z: Running job: build');
+
+    const instance = helper.instances.get(1)!;
+    expect(instance.currentJob?.repository).toBe('myorg/app');
+    // The target itself is still named as the target.
+    expect(instance.currentJob?.targetDisplayName).toBe('myorg');
+    // History, and so Cancel, which splits it into owner and repo.
+    const [entry] = manager.getJobHistory();
+    expect(entry).toEqual(expect.objectContaining({ repository: 'myorg/app', targetDisplayName: 'myorg', githubRunId: 4242 }));
+    // The notification.
+    expect(events).toContainEqual(expect.objectContaining({ type: 'started', repository: 'myorg/app' }));
+  });
+});
+
 describe("splitting a worker's output into lines", () => {
   async function spawned() {
     const ctx = newManager();
