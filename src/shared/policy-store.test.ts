@@ -249,6 +249,32 @@ describe('reading the cache', () => {
     expect(readPolicyEntry(dir, 'owner/repo')?.pending?.config).toEqual(NARROW);
   });
 
+  it('keeps one file per repository whatever casing names it, on any volume', () => {
+    // The target's name and the name GitHub reports can differ in case. On a
+    // case-sensitive volume they used to be two files, so an approval
+    // recorded under one was not found under the other.
+    expect(policyFilePath(dir, 'Owner/Repo')).toBe(policyFilePath(dir, 'owner/repo'));
+    expect(policyFilePath(dir, 'Octo_Cat/Repo')).toBe(policyFilePath(dir, 'octo_cat/repo'));
+  });
+
+  it('still reads, and folds in, an entry written under a mixed-case file name', () => {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'Owner_Repo.json'),
+      JSON.stringify({ format: 2, repository: 'Owner/Repo', approved: { config: NARROW, at: '' } })
+    );
+    expect(readPolicyEntry(dir, 'owner/repo')?.approved?.config).toEqual(NARROW);
+
+    // Changing it must neither lose the approved slot nor leave two files -
+    // and on a volume that ignores case, the old name is the new file.
+    recordPending(dir, 'owner/repo', WIDE);
+    const entries = listPolicyEntries(dir);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].approved?.config).toEqual(NARROW);
+    expect(entries[0].pending?.config).toEqual(WIDE);
+    expect(readPolicyEntry(dir, 'OWNER/REPO')?.approved?.config).toEqual(NARROW);
+  });
+
   it('lists valid entries and skips the rest', () => {
     recordPending(dir, REPO, NARROW);
     recordPending(dir, 'my-org/my.repo', WIDE);
