@@ -2759,17 +2759,165 @@ describe('a released slot does not carry the finished job\'s context', () => {
     helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/first', githubSha: 'aaa1111' });
     helper.releaseInstanceSlot(1);
 
-    // The slot is reused for a different repository, by a worker that did not
-    // go through spawnWorkerForJob and so records no context of its own.
+    // With the previous job's context still in the slot, the next worker there
+    // is judged against owner/first and its socket never opens for the job it
+    // is running.
+    expect(helper.pendingTargetContext('1')).toBeUndefined();
+  });
+});
+
+describe('a worker nobody spawned for a job', () => {
+  it('keeps its docker socket closed whatever job it claims', async () => {
+    // Only spawnWorkerForJob records what a worker is for. A worker without
+    // that record - an idle listener - used to be taken as spawned for
+    // whatever repository its claim named, so a job reaching it opened the
+    // socket with that repository's container grants.
+    const docker = { run: { images: ['alpine:3'] } };
+    const manager = new RunnerManager({
+      onLog: jest.fn(), onStatusChange: jest.fn(), onJobHistoryUpdate: jest.fn(),
+      getRepoPolicy: async () => ({ hosts: ['example.com'], level: 'strict' as const, readPaths: [], writePaths: [], docker }),
+    });
+    const helper = new RunnerManagerTestHelper(manager);
     const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn() };
     helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyLevel: jest.fn() });
     helper.setDockerProxy(1, dockerSocket);
-    helper.setInstance(1, { name: 'runner-1', status: 'busy', claimedRepository: 'owner/second' });
+    helper.setInstance(1, { name: 'runner-1', status: 'listening' });
 
-    await helper.applyPolicyOnClaim(1, 'owner/second', 'bbb2222');
+    await helper.applyPolicyOnClaim(1, 'owner/repo', 'abc1234');
 
-    // With the previous job's context still in the slot, this worker is judged
-    // against owner/first and its socket never opens for the job it is running.
-    expect(dockerSocket.bind).toHaveBeenCalledWith('owner/second', docker);
+    expect(dockerSocket.bind).not.toHaveBeenCalled();
+  });
+
+  it('opens it for the repository it was spawned for', async () => {
+    const docker = { run: { images: ['alpine:3'] } };
+    const manager = new RunnerManager({
+      onLog: jest.fn(), onStatusChange: jest.fn(), onJobHistoryUpdate: jest.fn(),
+      getRepoPolicy: async () => ({ hosts: [], level: 'strict' as const, readPaths: [], writePaths: [], docker }),
+    });
+    const helper = new RunnerManagerTestHelper(manager);
+    const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn() };
+    helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyLevel: jest.fn() });
+    helper.setDockerProxy(1, dockerSocket);
+    helper.setInstance(1, { name: 'runner-1', status: 'listening' });
+    helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
+
+    await helper.applyPolicyOnClaim(1, 'owner/repo', 'abc1234');
+
+    expect(dockerSocket.bind).toHaveBeenCalledWith('owner/repo', docker);
+  });
+});
+
+describe('the job a worker claims through its proxy', () => {
+  it("asks the broker about the job as this worker's, not as anyone's", async () => {
+    // The id comes from the acquirejob body, which the job can write. Resolved
+    // globally, naming another repository's job installed that repository's
+    // hosts on this worker's proxy.
+    const getJobTarget = jest.fn((..._args: unknown[]) => undefined);
+    const manager = new RunnerManager({
+      onLog: jest.fn(), onStatusChange: jest.fn(), onJobHistoryUpdate: jest.fn(),
+      getJobTarget: getJobTarget as never,
+    });
+    const helper = new RunnerManagerTestHelper(manager);
+    await helper.startInstanceProxy(3);
+    const options = jest.mocked(ProxyServer).mock.calls.at(-1)![0] as { onJobAcquired: (jobId: string) => Promise<void> };
+    const proxy = jest.mocked(ProxyServer).mock.results.at(-1)!.value as { setPolicyAllowedHosts: jest.Mock };
+
+    await options.onJobAcquired('req-other');
+
+    expect(getJobTarget).toHaveBeenCalledWith(3, 'req-other');
+    expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith([]);
+  });
+});
+
+describe('spawning the worker for an admitted job', () => {
+  function manager() {
+    const m = new RunnerManager({
+      onLog: jest.fn(), onStatusChange: jest.fn(), onJobHistoryUpdate: jest.fn(),
+    });
+    const helper = new RunnerManagerTestHelper(m);
+    helper.startedAt = new Date().toISOString();
+    return { m, helper };
+  }
+
+  it('says when no worker was started, and does not leave the job on offer', async () => {
+    // Only the worker spawned for a job may take it, so a job put back in
+    // 'next' for something else to pick up is a job nothing will ever run -
+    // with its payload held at the broker. The caller drops it instead.
+    jest.useFakeTimers();
+    try {
+      const { m, helper } = manager();
+      helper.runnerCount = 1;
+      helper.setInstance(1, { name: 'runner-1', status: 'busy' });
+      helper.setPendingTargetContext('next', { targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'req-1' });
+
+      const spawned = m.spawnWorkerForJob();
+      await jest.advanceTimersByTimeAsync(61_000);
+
+      await expect(spawned).resolves.toBe(false);
+      expect(helper.pendingTargetContext('next')).toBeUndefined();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('says when it started the worker', async () => {
+    const { m, helper } = manager();
+    helper.setPendingTargetContext('next', { targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'req-1' });
+    helper.stubCopyProxyCredentials(async () => undefined);
+    helper.stubStartInstance(async (n) => {
+      helper.setInstance(n, { name: `runner-${n}`, status: 'starting', process: createMockProcess(4242) });
+    });
+    (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
+
+    await expect(m.spawnWorkerForJob()).resolves.toBe(true);
+  });
+
+  it('says when the worker could not be started', async () => {
+    const { m, helper } = manager();
+    helper.setPendingTargetContext('next', { targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'req-1' });
+    helper.stubCopyProxyCredentials(async () => undefined);
+    helper.stubStartInstance(async () => undefined);
+    (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
+
+    await expect(m.spawnWorkerForJob()).resolves.toBe(false);
+  });
+});
+
+describe('a job that names no actor', () => {
+  function manager(scope: 'everyone' | 'trigger' | 'contributors', cancelWorkflowRun = jest.fn(async () => undefined)) {
+    return new RunnerManager({
+      onLog: jest.fn(), onStatusChange: jest.fn(), onJobHistoryUpdate: jest.fn(),
+      getUserFilter: () => ({ scope, allowedUsers: 'just-me', allowlist: [] }),
+      getCurrentUserLogin: () => 'me',
+      getAllContributors: async () => new Set(['me']),
+      cancelWorkflowRun,
+    });
+  }
+  const evaluate = (m: RunnerManager) =>
+    (m.evaluateJobFilter as (o: string, r: string, actor: string | undefined, sha?: string) => ReturnType<RunnerManager['evaluateJobFilter']>)
+      .call(m, 'o', 'r', undefined, 'abc123');
+
+  it('is refused by any scope that filters', async () => {
+    for (const scope of ['trigger', 'contributors'] as const) {
+      const verdict = await evaluate(manager(scope));
+      expect(verdict.allowed).toBe(false);
+    }
+  });
+
+  it('is admitted when nobody is filtered', async () => {
+    await expect(evaluate(manager('everyone'))).resolves.toEqual({ allowed: true, reason: '' });
+  });
+
+  it('is cancelled by the job-start backstop rather than waved through', async () => {
+    const cancelWorkflowRun = jest.fn(async () => undefined);
+    const helper = new RunnerManagerTestHelper(manager('trigger', cancelWorkflowRun));
+    helper.setInstance(1, {
+      name: 'runner-1',
+      currentJob: { name: 'build', repository: 'owner/repo', startedAt: 'now', id: 'job-1', targetDisplayName: 'owner/repo', githubRunId: 42 },
+    });
+
+    await helper.checkJobUserFilter(1, 'runner-1');
+
+    expect(cancelWorkflowRun).toHaveBeenCalledWith('owner', 'repo', 42);
   });
 });

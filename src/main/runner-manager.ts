@@ -118,8 +118,11 @@ interface RunnerManagerOptions {
   getJobConclusion?: (owner: string, repo: string, jobId: number) => Promise<string | null>;
   /** Get all contributors/authors for a repo at a given commit SHA (for contributor filtering) */
   getAllContributors?: (owner: string, repo: string, sha: string) => Promise<Set<string>>;
-  /** The repository and commit a job belongs to, from the broker. */
-  getJobTarget?: (jobId: string) => { targetDisplayName: string; githubSha?: string } | undefined;
+  /**
+   * The repository and commit of a job the worker in a slot claims, from the
+   * broker - which answers only for a job it delivered to that worker.
+   */
+  getJobTarget?: (instanceNum: number, jobId: string) => { targetDisplayName: string; githubSha?: string } | undefined;
   /** The repository's approved policy, resolved for the job about to run. */
   getRepoPolicy?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<RepoPolicyRuntime>;
   /** Called when a job starts or completes (for notifications) */
@@ -174,7 +177,7 @@ export class RunnerManager {
   private getJobConclusion?: (owner: string, repo: string, jobId: number) => Promise<string | null>;
   private getAllContributors?: (owner: string, repo: string, sha: string) => Promise<Set<string>>;
   private getRepoPolicy?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<RepoPolicyRuntime>;
-  private getJobTarget?: (jobId: string) => { targetDisplayName: string; githubSha?: string } | undefined;
+  private getJobTarget?: (instanceNum: number, jobId: string) => { targetDisplayName: string; githubSha?: string } | undefined;
   private onJobEvent?: (event: JobEvent) => void;
   private onWorkerReservedForJob?: (targetId: string, instanceNum: number, jobId?: string) => void;
   private onWorkerReservationCancelled?: (targetId: string, instanceNum: number, jobId?: string) => void;
@@ -774,7 +777,13 @@ export class RunnerManager {
     this.revokeBrokerUrl?.(instanceNum);
   }
 
-  async spawnWorkerForJob(): Promise<void> {
+  /**
+   * Start the worker for the job admission just put in 'next'. True once a
+   * worker process exists for it; false when none was started, in which case
+   * nothing else will ever run the job - only the worker spawned for a job
+   * may take it - and the caller drops it at the broker.
+   */
+  async spawnWorkerForJob(): Promise<boolean> {
     // Take the context before waiting for a slot. 'next' is a single shared
     // slot, so a job arriving during the wait would otherwise overwrite it and
     // this worker would start with another repository's context.
@@ -795,13 +804,10 @@ export class RunnerManager {
     }
 
     if (instanceNum === null) {
-      // Put it back: this worker never started, so the context still describes
-      // a job that something else may yet pick up.
-      if (claimedContext) {
-        this.pendingTargetContext.set('next', claimedContext);
-      }
+      // Not put back in 'next' for something else to pick up: nothing else
+      // may take the job, so the caller drops it instead.
       this.log('error', 'No worker slot became available; this job will not run');
-      return;
+      return false;
     }
 
     // Get the target context for this job (claimed above, before the wait)
@@ -809,7 +815,7 @@ export class RunnerManager {
     if (!targetContext) {
       this.log('error', 'No target context for spawned worker');
       this.releaseSlotReservation(instanceNum);
-      return;
+      return false;
     }
 
     // Announce the pairing before the worker exists, so its very first session
@@ -838,13 +844,13 @@ export class RunnerManager {
         this.log('error', `Failed to copy proxy credentials: ${(err as Error).message}`);
         this.abandonJobFor(instanceNum);
         this.releaseSlotReservation(instanceNum);
-        return;
+        return false;
       }
     } else {
       this.log('error', `Proxy credentials not found for target ${targetContext.targetId}`);
       this.abandonJobFor(instanceNum);
       this.releaseSlotReservation(instanceNum);
-      return;
+      return false;
     }
 
     // Configure and start the instance
@@ -855,7 +861,9 @@ export class RunnerManager {
       // returning. A worker with no process never started.
       if (!this.instances.get(instanceNum)?.process) {
         this.abandonJobFor(instanceNum);
+        return false;
       }
+      return true;
     } catch (err) {
       // Only on failure. Withdrawing in the finally below took the announcement
       // back on the success path too - the broker recorded the pairing and lost
@@ -882,9 +890,12 @@ export class RunnerManager {
       // allowlist. The token rides in the proxy URL this worker is given.
       authToken: randomBytes(24).toString('hex'),
       onJobAcquired: async (jobId: string) => {
-        // The worker behind this proxy just claimed a job. Whichever instance
-        // won the queue, this is the one that has to carry its policy.
-        const target = this.getJobTarget?.(jobId);
+        // The worker behind this proxy just claimed a job, and this is the
+        // one that has to carry its policy. The id is read from the request
+        // body, which job code can write, so it is resolved only among the
+        // jobs the broker delivered to this slot's worker: naming another
+        // repository's job resolves to nothing and closes the policy below.
+        const target = this.getJobTarget?.(instanceNum, jobId);
         if (!target?.targetDisplayName || !target.githubSha) {
           // Saying the policy is closed is not the same as closing it. This
           // proxy may still hold the last job's hosts, so clear them: an
@@ -2238,18 +2249,20 @@ export class RunnerManager {
    * job with the first repository's container grants; its socket stays
    * closed instead - and stays closed when the job-started line later
    * attributes the job to the spawn repository, which is why the claim is
-   * recorded on the instance rather than checked once.
+   * recorded on the instance rather than checked once. A worker with no
+   * record of what it was spawned for - an idle listener - was spawned for
+   * no repository, and its socket never opens.
    */
   private bindDockerSocket(instanceNum: number, repository: string, docker: DockerPolicy): void {
     const socket = this.dockerProxies.get(instanceNum);
     if (!socket) return;
 
-    const spawnedFor = this.pendingTargetContext.get(String(instanceNum))?.targetDisplayName ?? repository;
+    const spawnedFor = this.pendingTargetContext.get(String(instanceNum))?.targetDisplayName;
     const claimedFor = this.instances.get(instanceNum)?.claimedRepository ?? repository;
     if (spawnedFor !== repository || claimedFor !== repository) {
       this.log(
         'warn',
-        `[instance ${instanceNum}] Docker socket stays closed: spawned for ${spawnedFor}, claimed ${claimedFor}, policy is for ${repository}`
+        `[instance ${instanceNum}] Docker socket stays closed: spawned for ${spawnedFor ?? 'no job'}, claimed ${claimedFor}, policy is for ${repository}`
       );
       return;
     }
@@ -2335,7 +2348,7 @@ export class RunnerManager {
   async evaluateJobFilter(
     owner: string,
     repo: string,
-    githubActor: string,
+    githubActor: string | undefined,
     githubSha?: string
   ): Promise<{ allowed: boolean; reason: string }> {
     const userFilter = this.getUserFilter?.();
@@ -2349,7 +2362,11 @@ export class RunnerManager {
     // Both remaining scopes check who set the run going. 'contributors' adds
     // the authors of the code to that, never replaces it: a run whose commit
     // is the default branch head (issue_comment, pull_request_target) has an
-    // all-trusted history whoever triggered it.
+    // all-trusted history whoever triggered it. A job whose actor could not
+    // be read cannot be shown to be anyone allowed.
+    if (!githubActor) {
+      return { allowed: false, reason: 'cannot identify who triggered this job' };
+    }
     if (!isUserAllowed(githubActor, userFilter, currentUser)) {
       return { allowed: false, reason: `trigger author '${githubActor}' not in allowed users` };
     }
@@ -2444,8 +2461,10 @@ export class RunnerManager {
     const instance = this.instances.get(instanceNum);
     if (!instance?.currentJob) return;
 
+    // No actor is a verdict for evaluateJobFilter, not a reason to skip it;
+    // without a run or a repository there is nothing to cancel.
     const { githubActor, githubRunId, targetDisplayName, githubSha } = instance.currentJob;
-    if (!githubActor || !githubRunId || !targetDisplayName) {
+    if (!githubRunId || !targetDisplayName) {
       this.log('debug', `checkJobUserFilter: missing info (actor=${githubActor}, runId=${githubRunId}, target=${targetDisplayName})`);
       return;
     }
