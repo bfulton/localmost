@@ -42,6 +42,7 @@ import {
   findLocalmostrc,
   parseLocalmostrc,
   getEffectivePolicy,
+  hostPatternProblem,
   LocalmostrcConfig,
   serializeLocalmostrc,
   LOCALMOSTRC_VERSION,
@@ -1331,10 +1332,15 @@ export async function resolveSecrets(
 export async function handleUpdateRc(
   cwd: string,
   workflow: ParsedWorkflow,
-  discovered: DiscoveredAccess,
+  found: DiscoveredAccess,
   socketPaths: string[],
   assumeYes: boolean
 ): Promise<void> {
+  // A host the URL parser accepts can still be one no network entry can
+  // name - an empty label, one over 63 characters. Written in, it would
+  // leave a .localmostrc that no longer parses, so it is reported instead.
+  const unwritableHosts = found.hosts.filter((host) => hostPatternProblem(host) !== null);
+  const discovered: DiscoveredAccess = { ...found, hosts: found.hosts.filter((host) => !unwritableHosts.includes(host)) };
   const { hosts: discoveredHosts, readPaths, writePaths } = discovered;
   const dockerHints = discovered.dockerHints ?? [];
 
@@ -1351,6 +1357,12 @@ export async function handleUpdateRc(
     }
     if (discoveredHosts.length > 5) {
       console.log(`    ${colors.dim}... and ${discoveredHosts.length - 5} more${colors.reset}`);
+    }
+  }
+  if (unwritableHosts.length > 0) {
+    console.log(`  Network: ${unwritableHosts.length} host(s) reached but not written, as no entry can name them`);
+    for (const host of unwritableHosts) {
+      console.log(`    ${colors.yellow}- ${host}${colors.reset} ${colors.dim}${hostPatternProblem(host)}${colors.reset}`);
     }
   }
 

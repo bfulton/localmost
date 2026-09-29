@@ -389,4 +389,37 @@ describe('handleUpdateRc', () => {
     expect(output).toMatch(/Loopback:.*not recorded/);
     expect(output).toMatch(/shared\.network\.loopback/);
   });
+
+  it('writes a discovered host with the port it was reached on, and no host a policy cannot hold', async () => {
+    // A name the URL parser accepts can still fail the entry grammar - an
+    // empty label, one over 63 characters - and written in, it left a
+    // .localmostrc that no longer parsed.
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'updaterc-'));
+    const long = `${'x'.repeat(64)}.example`;
+    const lines: string[] = [];
+    const log = jest.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      lines.push(args.join(' '));
+    });
+    let written = '';
+    try {
+      await handleUpdateRc(
+        cwd,
+        { name: 'CI' } as never,
+        { hosts: ['a..b', 'api.example.com:8443', long, 'github.com'], readPaths: [], writePaths: [] },
+        [],
+        true
+      );
+      written = fs.readFileSync(path.join(cwd, '.localmostrc'), 'utf-8');
+    } finally {
+      log.mockRestore();
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+    const result = parseLocalmostrcContent(written);
+    expect(result.errors).toEqual([]);
+    expect(result.config?.shared?.network?.allow).toEqual(['api.example.com:8443', 'github.com']);
+    const output = lines.join('\n');
+    expect(output).toContain('a..b');
+    expect(output).toContain(long);
+    expect(output).toMatch(/not written/);
+  });
 });

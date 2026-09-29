@@ -97,14 +97,32 @@ export class DiscoveryProxy {
   }
 
   /**
+   * The network entry that allows host:port, reached this way: the bare host
+   * on its scheme's port - 443 through CONNECT, 80 for plain HTTP - and
+   * host:port on any other, an IPv6 address in brackets, as
+   * hostPatternAllows reads an entry.
+   */
+  private static entryFor(host: string, port: number, via: 'connect' | 'http'): string {
+    if (port === (via === 'connect' ? 443 : 80)) return host;
+    return `${net.isIP(host) === 6 ? `[${host}]` : host}:${port}`;
+  }
+
+  /**
    * Record an access once its outcome is known.
    *
    * A host the address screen refused is blocked but not an accessed host:
    * discovery offers the accessed hosts for .localmostrc, and one the screen
-   * refuses would be a grant that can never work.
+   * refuses would be a grant that can never work. An accessed host is kept
+   * as the entry that allows it, port and all, so what discovery writes is
+   * what the next, enforcing run lets through.
    */
-  private recordAccess(host: string, port: number, outcome: 'allowed' | 'denied' | 'not-allowlisted' | 'unroutable'): void {
-    if (outcome !== 'unroutable') this.accessedHosts.add(host);
+  private recordAccess(
+    host: string,
+    port: number,
+    via: 'connect' | 'http',
+    outcome: 'allowed' | 'denied' | 'not-allowlisted' | 'unroutable'
+  ): void {
+    if (outcome !== 'unroutable') this.accessedHosts.add(DiscoveryProxy.entryFor(host, port, via));
     if (outcome === 'allowed') {
       this.allowedHosts.add(host);
     } else {
@@ -183,7 +201,8 @@ export class DiscoveryProxy {
   }
 
   /**
-   * Get all unique hosts that were accessed.
+   * Every host that was accessed, once each, as the network entry that
+   * allows it: host, or host:port for a port its scheme does not use.
    */
   getAccessedHosts(): string[] {
     return Array.from(this.accessedHosts).sort();
@@ -228,7 +247,7 @@ export class DiscoveryProxy {
 
     const verdict = this.checkHost(host, port, 'connect');
     if (verdict !== 'allowed') {
-      this.recordAccess(host, port, verdict);
+      this.recordAccess(host, port, 'connect', verdict);
       clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
       clientSocket.write(`${DiscoveryProxy.refusal(host, port, verdict)}\r\n`);
       clientSocket.destroy();
@@ -242,7 +261,7 @@ export class DiscoveryProxy {
 
   private async connectScreened(host: string, port: number, clientSocket: Duplex, head: Buffer): Promise<void> {
     const screened = await this.screen(host);
-    this.recordAccess(host, port, screened ? 'allowed' : 'unroutable');
+    this.recordAccess(host, port, 'connect', screened ? 'allowed' : 'unroutable');
     if (clientSocket.destroyed) return;
     if (!screened) {
       clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
@@ -304,7 +323,7 @@ export class DiscoveryProxy {
 
       const verdict = this.checkHost(host, port, 'http');
       if (verdict !== 'allowed') {
-        this.recordAccess(host, port, verdict);
+        this.recordAccess(host, port, 'http', verdict);
         res.writeHead(403, { 'Content-Type': 'text/plain' });
         res.end(DiscoveryProxy.refusal(host, port, verdict));
         req.resume();
@@ -312,7 +331,7 @@ export class DiscoveryProxy {
       }
 
       void this.screen(host).then((screened) => {
-        this.recordAccess(host, port, screened ? 'allowed' : 'unroutable');
+        this.recordAccess(host, port, 'http', screened ? 'allowed' : 'unroutable');
         if (!screened) {
           res.writeHead(403, { 'Content-Type': 'text/plain' });
           res.end(`Blocked by sandbox: host '${host}' does not resolve to a routable address`);

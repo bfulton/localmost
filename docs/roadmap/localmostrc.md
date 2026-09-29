@@ -504,10 +504,11 @@ Under `strict` and `moderate` a host is reached on 443 through `CONNECT` and on
 80 for plain HTTP. A network entry that spells a port - `api.example.com:8443`,
 `*.example.com:8080`, `[2001:db8::1]:8443` - allows that port and no other; a
 bare IPv6 address is all address. An entry is a host, an IP address or
-`*.domain`, with an optional port, in the spelling the proxy compares
-(lowercase ASCII, punycode for an international name); a URL, a path or
-surrounding spaces is a validation error rather than an entry that matches
-nothing. An `http://` URL tunnelled through `CONNECT`,
+`*.domain`, with an optional port, in the spelling a request's host arrives in
+(case is ignored; ASCII, punycode for an international name, no trailing dot);
+a URL, a path or surrounding spaces is a validation error rather than an entry
+that matches nothing. `localmost test --updaterc` writes a host it saw reached
+on another port as `host:port`. An `http://` URL tunnelled through `CONNECT`,
 rather than sent as a plain proxied request, needs a `host:80` entry. A literal
 loopback address (`127.0.0.1`, `::1`) is reachable at every level only on the
 broker's port, since the runner reaches the broker through the proxy there,

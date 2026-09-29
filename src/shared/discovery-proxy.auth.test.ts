@@ -13,6 +13,7 @@ import { describe, it, expect, afterEach, jest } from '@jest/globals';
 import * as http from 'http';
 import * as net from 'net';
 import { DiscoveryProxy } from './discovery-proxy';
+import { hostPatternAllows } from './egress-screen';
 
 jest.mock('net', () => {
   const actual = jest.requireActual<typeof import('net')>('net');
@@ -265,6 +266,39 @@ describe('DiscoveryProxy under a policy', () => {
     expect(await get(port, 'http://ok.example.com/', auth)).toBe(502);
     expect(dialled()).toEqual(['svc.example.com:8443', 'ok.example.com:443']);
     expect(forwarded()).toEqual(['ok.example.com:80']);
+  });
+
+  it('records a host reached on another port than its scheme uses as the host:port entry that allows it', async () => {
+    // Discovery wrote the bare name, which allows 443 through CONNECT and 80
+    // for plain HTTP only, so the next, enforcing run refused a step that
+    // reached api.example.com:8443 during discovery.
+    refuseUpstreamDials();
+    const { port, user, token } = await start({ lookup: async () => ['192.0.2.10'] });
+    const auth = basic(user, token);
+    const requests: [string, 'connect' | 'http', string, number][] = [
+      ['ok.example.com:443', 'connect', 'ok.example.com', 443],
+      ['svc.example.com:8443', 'connect', 'svc.example.com', 8443],
+      ['web.example.com:80', 'connect', 'web.example.com', 80],
+      ['[2606:4700::1111]:8443', 'connect', '2606:4700::1111', 8443],
+      ['http://plain.example.com/', 'http', 'plain.example.com', 80],
+      ['http://alt.example.com:8080/', 'http', 'alt.example.com', 8080],
+    ];
+    for (const [target, via] of requests) {
+      expect(await (via === 'connect' ? connect : get)(port, target, auth)).toBe(502);
+    }
+    const recorded = proxy.getAccessedHosts();
+    expect(recorded).toEqual([
+      '[2606:4700::1111]:8443',
+      'alt.example.com:8080',
+      'ok.example.com',
+      'plain.example.com',
+      'svc.example.com:8443',
+      'web.example.com:80',
+    ]);
+    // Each is an entry the enforcing proxy reads as allowing that request.
+    for (const [, via, host, reached] of requests) {
+      expect([host, reached, recorded.some((entry) => hostPatternAllows(entry, host, reached, via))]).toEqual([host, reached, true]);
+    }
   });
 
   it('observes every port under --updaterc, where there is no allow list', async () => {

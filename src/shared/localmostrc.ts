@@ -336,34 +336,43 @@ function validateNetworkPolicy(policy: unknown, path: string, errors: ParseError
 }
 
 /**
- * Network entries, which the proxies read with parseHostPattern: a host name,
- * an IP address or a *.domain wildcard, optionally followed by :port (an IPv6
- * address takes one only in brackets), and nothing else. Read that way,
- * "https://evil.com" is a host "https" with a port that is not one and
- * " evil.com" a name no connection has, so each allowed or denied nothing
- * while reading as though it did. A host must also be in the one spelling
- * the proxies compare - lowercase, ASCII (punycode for an international
- * name), an address written out - since a request's host arrives that way
- * and an entry spelled otherwise never matches it; the message says which.
+ * Why a network entry is not one the proxies can match, or null when it is.
+ * The proxies read an entry with parseHostPattern: a host name, an IP address
+ * or a *.domain wildcard, optionally followed by :port (an IPv6 address takes
+ * one only in brackets), and nothing else. Read that way, "https://evil.com"
+ * is a host "https" with a port that is not one and " evil.com" a name no
+ * connection has, so each allowed or denied nothing while reading as though
+ * it did. Case is ignored.
+ *
+ * A host must also be in the spelling a request's host arrives in - ASCII
+ * (punycode for an international name), an address written out, no trailing
+ * dot - since an allow entry spelled otherwise never matches one. A deny
+ * entry is compared in that spelling whatever it is written in (see
+ * denyForm), and is held to it all the same, so the two lists read alike.
+ * The message gives the entry to write, wildcard and port kept.
  */
+export function hostPatternProblem(entry: string): string | null {
+  const pattern = parseHostPattern(entry);
+  const host = pattern.wildcard ? pattern.host.slice(1) : pattern.host;
+  const canonical = pattern.port === null ? null : canonicalHost(host)?.replace(/\.+$/, '') ?? null;
+  const isAddress = canonical !== null && net.isIP(canonical) !== 0;
+  const isName = canonical !== null && canonical.split('.').every((label) => /^[a-z0-9_-]{1,63}$/.test(label));
+  if (canonical === null || (pattern.wildcard ? !isName || isAddress : !isName && !isAddress)) {
+    return 'must be a host, an IP address or *.domain, optionally with :port, and nothing else';
+  }
+  if (canonical === host) return null;
+  const port = pattern.port === undefined ? '' : `:${pattern.port}`;
+  const spelled = net.isIP(canonical) === 6 && port ? `[${canonical}]` : canonical;
+  return `is not in the spelling a request's host arrives in: write ${JSON.stringify(`${pattern.wildcard ? '*.' : ''}${spelled}${port}`)} instead`;
+}
+
 function validateHostPatternArray(value: unknown, path: string, errors: ParseError[]): void {
   validateStringArray(value, path, errors);
   if (!Array.isArray(value)) return;
-  const shape = 'must be a host, an IP address or *.domain, optionally with :port, and nothing else';
   value.forEach((entry, i) => {
     if (typeof entry !== 'string') return;
-    const pattern = parseHostPattern(entry);
-    const host = pattern.wildcard ? pattern.host.slice(1) : pattern.host;
-    const canonical = pattern.port === null ? null : canonicalHost(host);
-    const isAddress = canonical !== null && net.isIP(canonical) !== 0;
-    const isName = canonical !== null && canonical.replace(/\.$/, '').split('.').every((label) => /^[a-z0-9_-]{1,63}$/.test(label));
-    if (pattern.wildcard ? !isName || isAddress : !isName && !isAddress) {
-      errors.push({ message: `${path}[${i}] ${shape}` });
-    } else if (canonical !== host) {
-      errors.push({
-        message: `${path}[${i}] names ${JSON.stringify(host)}, which the proxy reads as ${JSON.stringify(canonical)}: write that instead`,
-      });
-    }
+    const problem = hostPatternProblem(entry);
+    if (problem) errors.push({ message: `${path}[${i}] ${problem}` });
   });
 }
 

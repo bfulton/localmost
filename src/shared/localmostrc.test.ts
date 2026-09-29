@@ -1247,17 +1247,25 @@ describe('a network entry', () => {
   });
 
   it('refuses a host written in a spelling the proxy never compares, and says which one it does', () => {
-    // A request's host arrives lowercase, in ASCII and with its address
-    // written out; an entry spelled otherwise never matched one.
-    for (const [entry, canonical] of [
+    // A request's host arrives in ASCII, with its address written out and no
+    // trailing dot; an allow entry spelled otherwise never matched one. The
+    // spelling offered keeps the entry's wildcard and port, so writing it in
+    // does not turn a wildcard into one host.
+    for (const [entry, suggestion] of [
       ['bücher.example', 'xn--bcher-kva.example'],
       ['evil.com/path', 'evil.com'],
       ['0x7f.1', '127.0.0.1'],
-      ['*.bücher.example:8443', 'xn--bcher-kva.example'],
+      ['0x7f.1:8080', '127.0.0.1:8080'],
+      ['*.bücher.example:8443', '*.xn--bcher-kva.example:8443'],
+      ['[2001:0db8:0:0:0:0:0:1]:8443', '[2001:db8::1]:8443'],
+      ['example.com.', 'example.com'],
+      ['*.example.com.:8080', '*.example.com:8080'],
     ]) {
-      const r = parsed('deny', entry);
-      expect([entry, r.success]).toEqual([entry, false]);
-      expect(r.errors[0].message).toContain(`"${canonical}"`);
+      for (const list of ['allow', 'deny'] as const) {
+        const r = parsed(list, entry);
+        expect([list, entry, r.success]).toEqual([list, entry, false]);
+        expect(r.errors[0].message).toContain(`write "${suggestion}" instead`);
+      }
     }
   });
 
@@ -1269,7 +1277,6 @@ describe('a network entry', () => {
       'registry.npmjs.org:8443',
       '*.example.com:8080',
       'my_host-1.internal',
-      'example.com.',
       '192.0.2.1',
       '192.0.2.1:8080',
       '2606:4700::1111',

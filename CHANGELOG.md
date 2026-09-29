@@ -124,12 +124,19 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   closed to writes, so a job granted one can no longer rename it and read the
   denied path under the new name.
 - `.localmostrc` refuses a network entry that is not a host pattern - a URL such
-  as `https://evil.com`, a path, surrounding spaces, or a host in a spelling the
-  proxy never compares - and a relative `filesystem.deny` entry. Each was
-  accepted and shown, and allowed or denied nothing.
+  as `https://evil.com`, a path, surrounding spaces - and a relative
+  `filesystem.deny` entry. Each was accepted and shown, and allowed or denied
+  nothing. A network entry must also be in the spelling a request's host
+  arrives in (punycode, an address written out, no trailing dot), which an
+  allow entry spelled otherwise never matched; the error gives the entry to
+  write. An already approved policy with any such entry no longer loads, and
+  its jobs are refused until it is fixed and approved again.
 - `localmost test` applies the checkout's `network.deny` and reaches an allowed
   host only on its scheme's port (or the port an entry spells), as a runner job
   does. Its proxy took the allow list alone and matched a host on any port.
+  `--updaterc` writes a host reached on another port as `host:port`, so the
+  next run allows what discovery saw, and reports rather than writes a host no
+  entry can name.
 - An approved policy is bound to the repository's id as well as its name. A job
   from a different repository that now holds an approved name - the approved one
   deleted or renamed, and the name taken since - is refused until the policy is
