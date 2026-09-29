@@ -313,6 +313,127 @@ describe('ProxyServer host access', () => {
   });
 
   // =========================================================================
+  // Denied hosts
+  //
+  // network.deny in .localmostrc was parsed, shown and approved, and then
+  // never applied: a repository that denied a host still reached it through
+  // its own allow wildcard or the level's defaults.
+  // =========================================================================
+
+  describe('denied hosts', () => {
+    const denying = (level: SandboxPolicyLevel, denied: string[], allowed?: string[]) => {
+      const proxy = makeProxy(level, allowed);
+      proxy.setPolicyDeniedHosts(denied);
+      return proxy;
+    };
+
+    it('refuses a denied host the level would allow', () => {
+      const proxy = denying('moderate', ['*.cloudfront.net']);
+      expect(checkHost(proxy, 'd1.cloudfront.net')).toEqual({ allowed: false, reason: 'denied' });
+      expect(checkHost(proxy, 'registry.npmjs.org').allowed).toBe(true);
+    });
+
+    it("refuses a denied host the policy's own allow wildcard covers", () => {
+      const proxy = denying('strict', ['bad.example.com'], ['*.example.com']);
+      expect(checkHost(proxy, 'bad.example.com')).toEqual({ allowed: false, reason: 'denied' });
+      expect(checkHost(proxy, 'good.example.com').allowed).toBe(true);
+    });
+
+    it('refuses a denied host under permissive too', () => {
+      expect(checkHost(denying('permissive', ['evil.example.com']), 'evil.example.com').allowed).toBe(false);
+    });
+
+    it('matches a denied wildcard like an allowed one', () => {
+      const proxy = denying('permissive', ['*.example.com']);
+      expect(checkHost(proxy, 'a.b.example.com').allowed).toBe(false);
+      expect(checkHost(proxy, 'example.com').allowed).toBe(true);
+      expect(checkHost(proxy, 'badexample.com').allowed).toBe(true);
+    });
+
+    it('leaves the runner infrastructure reachable on its scheme port', () => {
+      // Denying these would leave a runner that cannot report its own job.
+      const proxy = denying('strict', ['github.com', '*.blob.core.windows.net', '127.0.0.1']);
+      expect(checkHost(proxy, 'github.com').reason).toBe('infrastructure');
+      expect(checkHost(proxy, 'x.blob.core.windows.net').reason).toBe('infrastructure');
+      expect(checkHost(proxy, '127.0.0.1', 8787, 'http').reason).toBe('infrastructure');
+    });
+
+    it('wins over an allow entry that spells a port', () => {
+      const proxy = denying('strict', ['github.com'], ['github.com:22']);
+      expect(checkHost(proxy, 'github.com', 22)).toEqual({ allowed: false, reason: 'denied' });
+    });
+
+    it('denies only the port a deny entry spells', () => {
+      const proxy = denying('permissive', ['svc.example.test:8443']);
+      expect(checkHost(proxy, 'svc.example.test', 8443).allowed).toBe(false);
+      expect(checkHost(proxy, 'svc.example.test', 443).allowed).toBe(true);
+    });
+
+    it('denies every port for an entry whose port is not a port', () => {
+      // Allowing nothing is the safe reading of a bad allow entry; for a deny
+      // the safe reading is the host on every port.
+      expect(checkHost(denying('permissive', ['svc.example.test:https']), 'svc.example.test', 443).allowed).toBe(false);
+    });
+
+    it('is not escaped by case, a trailing dot or the other spelling of an IDN', () => {
+      const proxy = denying('permissive', ['Bad.Example.com', 'bücher.example', 'xn--caf-dma.example']);
+      expect(checkHost(proxy, 'bad.example.com.').allowed).toBe(false);
+      expect(checkHost(proxy, 'BAD.EXAMPLE.COM').allowed).toBe(false);
+      expect(checkHost(proxy, 'xn--bcher-kva.example').allowed).toBe(false);
+      expect(checkHost(proxy, 'café.example').allowed).toBe(false);
+    });
+
+    it('replaces the previous job\'s denied hosts rather than accumulating', () => {
+      const proxy = denying('permissive', ['a.example.com']);
+      proxy.setPolicyDeniedHosts(['b.example.com']);
+      expect(checkHost(proxy, 'a.example.com').allowed).toBe(true);
+      expect(checkHost(proxy, 'b.example.com').allowed).toBe(false);
+    });
+
+    const authHeader = (token: string) => 'Basic ' + Buffer.from(`localmost:${token}`).toString('base64');
+
+    it('answers 403 to a CONNECT to a denied host without resolving it', async () => {
+      const p = new ProxyServer({ policyLevel: 'moderate', authToken: 't', lookup: () => new Promise<string[]>(() => undefined) });
+      p.setPolicyDeniedHosts(['*.cloudfront.net']);
+      await p.start();
+      try {
+        const status = await new Promise<string>((resolve) => {
+          const sock = net.connect(p.getPort(), '127.0.0.1', () =>
+            sock.write(`CONNECT d1.cloudfront.net:443 HTTP/1.1\r\nHost: d1.cloudfront.net:443\r\nProxy-Authorization: ${authHeader('t')}\r\n\r\n`)
+          );
+          sock.on('error', () => resolve('closed'));
+          sock.once('data', (d) => { resolve(d.toString().split('\r\n')[0]); sock.destroy(); });
+          setTimeout(() => { resolve('timeout'); sock.destroy(); }, 1000).unref();
+        });
+        expect(status).toBe('HTTP/1.1 403 Forbidden');
+      } finally { await p.stop(); }
+    });
+
+    it('tells a plain request its host is denied', async () => {
+      const p = new ProxyServer({ policyLevel: 'permissive', authToken: 't', lookup: () => new Promise<string[]>(() => undefined) });
+      p.setPolicyDeniedHosts(['evil.example.com']);
+      await p.start();
+      try {
+        const answer = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+          const req = http.request(
+            { hostname: '127.0.0.1', port: p.getPort(), path: 'http://evil.example.com/', method: 'GET', headers: { 'proxy-authorization': authHeader('t') } },
+            (res) => {
+              let body = '';
+              res.on('data', (d) => { body += d; });
+              res.on('end', () => resolve({ status: res.statusCode || 0, body }));
+            }
+          );
+          req.on('error', reject);
+          req.setTimeout(1000, () => req.destroy(new Error('timeout')));
+          req.end();
+        });
+        expect(answer.status).toBe(403);
+        expect(answer.body).toContain('denied');
+      } finally { await p.stop(); }
+    });
+  });
+
+  // =========================================================================
   // Defaults
   // =========================================================================
 

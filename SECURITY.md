@@ -146,6 +146,13 @@ be spelled in a `.localmostrc` network entry as `host:port` (or
 port; the broker behind `127.0.0.1` is guarded by each worker's key, not by
 its port. `permissive` stays unrestricted, ports included.
 
+A `network.deny` entry is read the same way and refuses its host at every
+level, `permissive` included, whatever the allow list says; an entry with a
+port denies that port only. The runner infrastructure hosts on their scheme's
+port cannot be denied. Like the allow list, it matches names, not addresses:
+at `permissive` a job can still reach the same server by its address or another
+name.
+
 Filesystem access is not granted implicitly. A job can read its workspace and
 its own temp directory; everything else — including system paths like `/usr` and the
 Xcode developer directory that most tools need — must be declared in

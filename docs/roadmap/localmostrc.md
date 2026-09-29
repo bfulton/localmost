@@ -431,6 +431,8 @@ Under `strict` and `moderate` a host is reached on 443 through `CONNECT` and on
 80 for plain HTTP. A network entry that spells a port - `api.example.com:8443`,
 `*.example.com:8080`, `[2001:db8::1]:8443` - allows that port and no other; a
 bare IPv6 address is all address. Loopback targets keep any port.
+`network.deny` entries read the same way and win over any allow, at every
+level; only the runner's own hosts on their scheme's port stay reachable.
 
 One thing is granted regardless of the repo's policy: the hosts the Actions
 runner itself needs to register and poll for jobs. That is the runner's own

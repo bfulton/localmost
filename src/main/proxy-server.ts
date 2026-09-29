@@ -9,7 +9,7 @@
 
 import * as http from 'http';
 import * as net from 'net';
-import { URL } from 'url';
+import { URL, domainToASCII } from 'url';
 import { SandboxPolicyLevel } from '../shared/types';
 import {
   HostLookup,
@@ -39,9 +39,10 @@ export interface ProxyLogEntry {
   blocked: boolean;
   /**
    * Why the request was allowed/blocked. 'port' is a refusal of a host that
-   * is allowed, but not on the port asked for.
+   * is allowed, but not on the port asked for; 'denied' of a host the
+   * repository's policy denies.
    */
-  reason?: 'infrastructure' | 'policy' | 'allowlist' | 'moderate-default' | 'permissive' | 'port';
+  reason?: 'infrastructure' | 'policy' | 'allowlist' | 'moderate-default' | 'permissive' | 'port' | 'denied';
 }
 
 export type ProxyLogCallback = (entry: ProxyLogEntry) => void;
@@ -92,11 +93,24 @@ export { MODERATE_NETWORK_ALLOWLIST } from '../shared/network-allowlist';
 // for existing importers.
 export { parseConnectTarget } from '../shared/egress-screen';
 
+/**
+ * A name as a deny entry compares it: lowercased, without trailing dots, and
+ * in its ASCII (punycode) form. Each is another way to write the same host,
+ * and a denied host must not be reachable by writing it differently. Allow
+ * entries are not compared this way - a spelling the allowlist does not name
+ * is refused, which is the safe side for an allow.
+ */
+function denyForm(name: string): string {
+  const trimmed = name.toLowerCase().replace(/\.+$/, '');
+  return domainToASCII(trimmed) || trimmed;
+}
+
 export class ProxyServer {
   private server: http.Server | null = null;
   private port: number;
   private onLog: ProxyLogCallback;
   private policyAllowedHosts: string[];
+  private policyDeniedHosts: string[] = [];
   private static readonly MAX_ACQUIRE_BODY_BYTES = 64 * 1024;
 
   private policyLevel: SandboxPolicyLevel;
@@ -190,6 +204,22 @@ export class ProxyServer {
       return { allowed: true, reason: 'infrastructure' };
     }
 
+    // A host the repository denies is refused whatever its allow list or the
+    // level says. An entry that spells a port denies that port; one that
+    // spells none denies them all, and so does one whose port is not a port,
+    // since denying too much is the safe reading of a deny.
+    const deniedHost = denyForm(normalizedHost);
+    const denies = (entry: string): boolean => {
+      const pattern = parseHostPattern(entry);
+      const named = pattern.wildcard
+        ? deniedHost.endsWith('.' + denyForm(pattern.host.slice(1)))
+        : deniedHost === denyForm(pattern.host);
+      return named && (typeof pattern.port === 'number' ? pattern.port === port : true);
+    };
+    if (this.policyDeniedHosts.some(denies)) {
+      return { allowed: false, reason: 'denied' };
+    }
+
     // Permissive: allow everything, on any port
     if (this.policyLevel === 'permissive') {
       return { allowed: true, reason: 'permissive' };
@@ -219,6 +249,9 @@ export class ProxyServer {
 
   /** The body of a 403 for a host checkHostAccess refused. */
   private refusal(host: string, port: number, reason: ProxyLogEntry['reason']): string {
+    if (reason === 'denied') {
+      return `Blocked by sandbox policy (${this.policyLevel}): host '${host}' is denied by the repository's .localmostrc`;
+    }
     if (reason === 'port') {
       const authority = net.isIP(host) === 6 ? `[${host}]:${port}` : `${host}:${port}`;
       return `Blocked by sandbox policy (${this.policyLevel}): port ${port} is not allowed for host '${host}'; ` +
@@ -285,6 +318,18 @@ export class ProxyServer {
 
   getPolicyAllowedHosts(): string[] {
     return [...this.policyAllowedHosts];
+  }
+
+  /**
+   * Apply the hosts a repository's .localmostrc denies for the current job.
+   *
+   * Entries read like allowed ones. A denied host is refused at every level,
+   * whatever the policy or the level would allow, except the runner
+   * infrastructure on its scheme's port, which the runner itself cannot do
+   * without. Replaces any previous job's list, as setPolicyAllowedHosts does.
+   */
+  setPolicyDeniedHosts(hosts: string[]): void {
+    this.policyDeniedHosts = [...hosts];
   }
 
   /**
