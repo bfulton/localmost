@@ -62,10 +62,13 @@ const ALLOW: DockerVerdict = { allowed: true };
 const deny = (reason: string, policyHint?: string): DockerVerdict =>
   policyHint === undefined ? { allowed: false, reason } : { allowed: false, reason, policyHint };
 
-/** Permitted with no declaration: every client needs them to start, and none reach the host. */
-// Reads that tell a client nothing about the host: every client needs them to
-// start. Container reads are NOT here - the baseline is reads about the job's
-// OWN containers, which is enforced per id below.
+/**
+ * Permitted with no declaration: every client needs them to start. /info in
+ * full describes the operator's machine, down to proxy credentials, so the
+ * filter proxy passes on only the few fields a client reads from it. Container
+ * reads are NOT here - the baseline is reads about the job's OWN containers,
+ * which is enforced per id below.
+ */
 const BASELINE: ReadonlySet<DockerAction> = new Set(['ping', 'version', 'info']);
 
 /**

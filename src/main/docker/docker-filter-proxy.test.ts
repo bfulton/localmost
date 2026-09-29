@@ -12,6 +12,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as http from 'http';
 import * as net from 'net';
+import * as zlib from 'zlib';
 import { DockerFilterProxy, DockerFilterProxyLogEntry } from './docker-filter-proxy';
 import { DockerBackend } from './docker-backend';
 
@@ -944,3 +945,172 @@ const networkDaemon = (dir: string): Promise<{ sock: string; seen: string[]; bod
     servers.push(server);
     server.listen(sock, () => resolve({ sock, seen, bodies }));
   });
+
+// ---------------------------------------------------------------------------
+// /info: a baseline read, cut down to what a client needs to start.
+// ---------------------------------------------------------------------------
+
+/** What a daemon says about itself, including much a job has no business reading. */
+const FULL_INFO = {
+  ID: 'daemon-id',
+  Name: 'operators-macbook',
+  ServerVersion: '28.0.0',
+  OSType: 'linux',
+  Architecture: 'aarch64',
+  OperatingSystem: 'Docker Desktop',
+  KernelVersion: '6.10.14-linuxkit',
+  NCPU: 8,
+  MemTotal: 8_000_000_000,
+  Driver: 'overlay2',
+  CgroupVersion: '2',
+  SecurityOptions: ['name=seccomp,profile=builtin', 'name=cgroupns'],
+  DockerRootDir: '/var/lib/docker',
+  HttpProxy: 'http://user:secret@corp-proxy:3128',
+  HttpsProxy: 'http://user:secret@corp-proxy:3128',
+  NoProxy: 'internal.corp',
+  RegistryConfig: { Mirrors: ['https://mirror.internal.corp'], InsecureRegistryCIDRs: ['10.0.0.0/8'] },
+  Labels: ['com.corp.owner=ops'],
+  Containers: 12,
+  ContainersRunning: 3,
+  Images: 40,
+  Swarm: { NodeID: 'node', LocalNodeState: 'active' },
+  Plugins: { Volume: ['local'], Network: ['bridge'] },
+};
+
+const KEPT_INFO_KEYS = [
+  'Architecture', 'CgroupVersion', 'Driver', 'KernelVersion', 'MemTotal',
+  'NCPU', 'OSType', 'OperatingSystem', 'SecurityOptions', 'ServerVersion',
+];
+
+/** A daemon that answers every request as the test says, and records the headers it was sent. */
+const infoDaemon = (
+  dir: string,
+  answer: (res: http.ServerResponse) => void
+): Promise<{ sock: string; seen: http.IncomingHttpHeaders[] }> =>
+  new Promise((resolve) => {
+    const sock = path.join(dir, 'infod.sock');
+    const seen: http.IncomingHttpHeaders[] = [];
+    const server = http.createServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        seen.push(req.headers);
+        answer(res);
+      });
+    });
+    servers.push(server);
+    server.listen(sock, () => resolve({ sock, seen }));
+  });
+
+describe('/info through the filter', () => {
+  const answerInFull = (res: http.ServerResponse): void => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(FULL_INFO));
+  };
+
+  it('keeps only what a client needs, dropping proxy credentials, registry config and the host name', async () => {
+    const dir = tmp();
+    const daemon = await infoDaemon(dir, answerInFull);
+    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+
+    const reply = await request(sock, 'GET', '/v1.45/info');
+
+    expect(reply.status).toBe(200);
+    const info = JSON.parse(reply.body);
+    expect(Object.keys(info).sort()).toEqual(KEPT_INFO_KEYS);
+    expect(info.HttpProxy).toBeUndefined();
+    expect(info.RegistryConfig).toBeUndefined();
+    expect(info.Name).toBeUndefined();
+    expect(reply.body).not.toContain('secret');
+    expect(info.ServerVersion).toBe('28.0.0');
+    expect(info.SecurityOptions).toEqual(FULL_INFO.SecurityOptions);
+    expect(Number(reply.headers['content-length'])).toBe(Buffer.byteLength(reply.body));
+  });
+
+  it('cuts down an unversioned /info the same way', async () => {
+    const dir = tmp();
+    const daemon = await infoDaemon(dir, answerInFull);
+    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+
+    const reply = await request(sock, 'GET', '/info');
+
+    expect(reply.status).toBe(200);
+    expect(Object.keys(JSON.parse(reply.body)).sort()).toEqual(KEPT_INFO_KEYS);
+  });
+
+  it('cuts down a chunked answer', async () => {
+    const dir = tmp();
+    const daemon = await infoDaemon(dir, (res) => {
+      const body = JSON.stringify(FULL_INFO);
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Transfer-Encoding': 'chunked' });
+      res.write(body.slice(0, 40));
+      res.end(body.slice(40));
+    });
+    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+
+    const reply = await request(sock, 'GET', '/v1.45/info');
+
+    expect(reply.status).toBe(200);
+    expect(reply.headers['transfer-encoding']).toBeUndefined();
+    expect(Object.keys(JSON.parse(reply.body)).sort()).toEqual(KEPT_INFO_KEYS);
+  });
+
+  it('asks the daemon for an uncompressed answer, and still reads a gzip one', async () => {
+    const dir = tmp();
+    const daemon = await infoDaemon(dir, (res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip' });
+      res.end(zlib.gzipSync(JSON.stringify(FULL_INFO)));
+    });
+    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+
+    const reply = await request(sock, 'GET', '/v1.45/info', undefined, { 'Accept-Encoding': 'gzip' });
+
+    expect(daemon.seen[0]['accept-encoding']).toBeUndefined();
+    expect(reply.status).toBe(200);
+    expect(reply.headers['content-encoding']).toBeUndefined();
+    expect(Object.keys(JSON.parse(reply.body)).sort()).toEqual(KEPT_INFO_KEYS);
+    expect(reply.body).not.toContain('secret');
+  });
+
+  it('refuses an answer in an encoding it cannot read, rather than passing it on unread', async () => {
+    const dir = tmp();
+    const daemon = await infoDaemon(dir, (res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Encoding': 'x-unknown' });
+      res.end(JSON.stringify(FULL_INFO));
+    });
+    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+
+    const reply = await request(sock, 'GET', '/v1.45/info');
+
+    expect(reply.status).toBe(502);
+    expect(reply.body).not.toContain('secret');
+    expect(JSON.parse(reply.body).message).toMatch(/info/);
+  });
+
+  it('refuses an answer that is not a JSON object', async () => {
+    const dir = tmp();
+    const daemon = await infoDaemon(dir, (res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('HttpProxy: http://user:secret@corp-proxy:3128');
+    });
+    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+
+    const reply = await request(sock, 'GET', '/v1.45/info');
+
+    expect(reply.status).toBe(502);
+    expect(reply.body).not.toContain('secret');
+  });
+
+  it('passes on only the message of a daemon error', async () => {
+    const dir = tmp();
+    const daemon = await infoDaemon(dir, (res) => {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ message: 'daemon is starting', HttpProxy: 'http://user:secret@corp-proxy:3128' }));
+    });
+    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+
+    const reply = await request(sock, 'GET', '/v1.45/info');
+
+    expect(reply.status).toBe(500);
+    expect(JSON.parse(reply.body)).toEqual({ message: 'daemon is starting' });
+  });
+});
