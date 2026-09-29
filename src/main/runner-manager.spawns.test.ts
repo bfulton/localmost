@@ -202,3 +202,91 @@ describe("a finished worker's sandbox", () => {
     expect(mockRemoveSandbox.mock.calls[0][0]).toMatch(/\/sandbox\/1-[0-9a-f]+$/);
   });
 });
+
+describe("a slot whose last worker's job may still be running", () => {
+  it("is not reserved while the previous worker's process group still answers", async () => {
+    // A step that traps SIGTERM keeps the group alive through the grace
+    // period, with the profile of the job it belongs to.
+    const { calls } = stubKill(new Set([24680]));
+    const { manager, helper } = newManager();
+    const { proc } = await spawnWorker(helper, 24680);
+
+    proc.emit('exit', 0, null);
+    await settle();
+    expect(calls).toContainEqual([-24680, 'SIGTERM']);
+
+    expect(manager.hasAvailableSlot()).toBe(false);
+    expect(helper.reserveSlot()).toBeNull();
+
+    await jest.advanceTimersByTimeAsync(GRACE_MS);
+    expect(calls).toContainEqual([-24680, 'SIGKILL']);
+    expect(manager.hasAvailableSlot()).toBe(true);
+    expect(helper.reserveSlot()).toBe(1);
+  });
+
+  it('is free at once when nothing of the job outlived its worker', async () => {
+    stubKill(new Set());
+    const { manager, helper } = newManager();
+    const { proc } = await spawnWorker(helper, 24680);
+
+    proc.emit('exit', 0, null);
+    await settle();
+
+    expect(manager.hasAvailableSlot()).toBe(true);
+  });
+
+  it('starts the next job only once the previous group has been killed', async () => {
+    const { calls } = stubKill(new Set([24680]));
+    const { helper } = newManager();
+    const { proc } = await spawnWorker(helper, 24680, 'A');
+    proc.emit('exit', 0, null);
+    await settle();
+
+    const next = createMockProcess(24690);
+    let signalsBeforeSpawn: typeof calls = [];
+    mockSpawnSandboxed.mockImplementationOnce(() => {
+      signalsBeforeSpawn = [...calls];
+      return next;
+    });
+    const started = helper.spawnForJob({ targetId: 't2', targetDisplayName: 'other/repo', jobId: 'B' });
+    await settle();
+    expect(mockSpawnSandboxed).toHaveBeenCalledTimes(1);
+
+    await jest.advanceTimersByTimeAsync(GRACE_MS + 1000);
+
+    expect(await started).toBe(true);
+    expect(helper.instances.get(1)!.process).toBe(next);
+    expect(signalsBeforeSpawn).toContainEqual([-24680, 'SIGKILL']);
+  });
+
+  it("is not reserved while a reaped worker's group waits out its grace period", async () => {
+    const { calls } = stubKill(new Set([24680]));
+    const { manager, helper } = newManager();
+    await spawnWorker(helper, 24680);
+
+    helper.reapUnclaimedWorker(1);
+
+    expect(calls).toContainEqual([-24680, 'SIGTERM']);
+    expect(manager.hasAvailableSlot()).toBe(false);
+    expect(helper.reserveSlot()).toBeNull();
+    await jest.advanceTimersByTimeAsync(GRACE_MS);
+    expect(manager.hasAvailableSlot()).toBe(true);
+  });
+
+  it('is not reserved, nor started over, while its worker runs with an error status', async () => {
+    // The status says error; the process has not exited, so its job goes on
+    // in its sandbox with its proxy and broker key.
+    stubKill(new Set([24680]));
+    const { manager, helper } = newManager();
+    const { proc } = await spawnWorker(helper, 24680);
+
+    proc.emit('error', new Error('kill EPERM'));
+    expect(helper.instances.get(1)!.status).toBe('error');
+
+    expect(manager.hasAvailableSlot()).toBe(false);
+    expect(helper.reserveSlot()).toBeNull();
+    await manager.startInstance(1);
+    expect(mockSpawnSandboxed).toHaveBeenCalledTimes(1);
+    expect(helper.instances.get(1)!.process).toBe(proc);
+  });
+});

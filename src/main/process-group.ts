@@ -81,6 +81,14 @@ export function groupHasMembers(pid: number): boolean {
 }
 
 /**
+ * Whether a sweep of `pid`'s group has sent it SIGTERM and not yet SIGKILL:
+ * what it left may still be running, waiting out its grace period.
+ */
+export function sweepInGrace(pid: number): boolean {
+  return pendingEscalations.has(pid);
+}
+
+/**
  * Kill anything still waiting out a grace period, now.
  *
  * Called when the app is quitting: the escalation timers are unref'd so they

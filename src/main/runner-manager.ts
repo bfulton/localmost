@@ -16,7 +16,7 @@ import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RU
 import { SandboxFilesystemPolicy, spawnSandboxed } from './process-sandbox';
 import { inheritedWorkerEnv, packageCacheEnv } from './worker-env';
 import { DEFAULT_BROKER_PORT, type EnvPolicy } from '../shared/sandbox-profile';
-import { groupHasMembers, sweepProcessGroup } from './process-group';
+import { groupHasMembers, sweepInGrace, sweepProcessGroup } from './process-group';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { GitHubClientError } from './github-client';
 import { RunnerDownloader } from './runner-downloader';
@@ -337,6 +337,11 @@ export class RunnerManager {
    * uses as its own re-entry guard.
    */
   private reservedSlots: Set<number> = new Set();
+  /**
+   * The process group each slot's last worker led, once a sweep of it has
+   * had something to signal. See slotDraining.
+   */
+  private drainingGroups: Map<number, number> = new Map();
 
   // Path to job history file
   private readonly jobHistoryPath: string;
@@ -798,12 +803,50 @@ export class RunnerManager {
    */
   hasAvailableSlot(): boolean {
     for (let i = 1; i <= this.runnerCount; i++) {
-      const instance = this.instances.get(i);
-      if (!instance || instance.status === 'offline' || instance.status === 'error') {
+      if (this.slotIsFree(i)) {
         return true;
       }
     }
     return false;
+  }
+
+  /**
+   * Whether a slot can be given to a new worker: nothing is running in it,
+   * whatever its status says, and nothing its last worker left is still
+   * waiting out a grace period.
+   *
+   * A status of 'error' is not an exit. A worker whose status went to error
+   * while it runs keeps its job, sandbox, proxy and broker key; a second one
+   * started in its slot would share the slot's proxy and key with it, and
+   * leave the first one's exit to find the slot taken and skip its sweep.
+   */
+  private slotIsFree(instanceNum: number): boolean {
+    if (this.slotDraining(instanceNum)) return false;
+    const instance = this.instances.get(instanceNum);
+    if (!instance) return true;
+    return (instance.status === 'offline' || instance.status === 'error') && !instance.process;
+  }
+
+  /**
+   * Whether the process group a slot's last worker led was sent SIGTERM and
+   * still has members, and has not yet been sent SIGKILL. What is left there
+   * belongs to the last job and runs under its profile; the slot waits,
+   * a grace period at most, rather than start another job beside it.
+   */
+  private slotDraining(instanceNum: number): boolean {
+    const group = this.drainingGroups.get(instanceNum);
+    if (group === undefined) return false;
+    if (sweepInGrace(group) && groupHasMembers(group)) return true;
+    this.drainingGroups.delete(instanceNum);
+    return false;
+  }
+
+  /** Sweep a finished worker's process group, and hold its slot while the sweep is in its grace period. */
+  private sweepWorkerGroup(instanceNum: number, workerPid: number | undefined): void {
+    const signalled = sweepProcessGroup(workerPid, {
+      onLog: (message) => this.log('warn', `[instance ${instanceNum}] ${message}`),
+    });
+    if (signalled && workerPid) this.drainingGroups.set(instanceNum, workerPid);
   }
 
   /**
@@ -821,8 +864,7 @@ export class RunnerManager {
   private reserveSlot(): number | null {
     for (let i = 1; i <= this.runnerCount; i++) {
       if (this.reservedSlots.has(i) || this.startingInstances.has(i)) continue;
-      const instance = this.instances.get(i);
-      if (!instance || instance.status === 'offline' || instance.status === 'error') {
+      if (this.slotIsFree(i)) {
         this.reservedSlots.add(i);
         return i;
       }
@@ -1099,6 +1141,13 @@ export class RunnerManager {
 
     if (!this.runnerVersion) {
       this.log('error', `Cannot start instance ${instanceNum}: no runner version`);
+      return;
+    }
+
+    // Never over a worker that is still running, whatever its status: its
+    // job keeps the slot's proxy and broker key until it exits.
+    if (this.instances.get(instanceNum)?.process) {
+      this.log('warn', `Instance ${instanceNum} still has a worker running; not starting another in its slot`);
       return;
     }
 
@@ -1492,9 +1541,7 @@ export class RunnerManager {
           // Reap the job's own descendants. A cancelled step can outlive the
           // worker, reparented, burning CPU; the group sweep in process-group
           // probes and signals the group, not just the leader.
-          sweepProcessGroup(workerPid, {
-            onLog: (message) => this.log('warn', `[instance ${instanceNum}] ${message}`),
-          });
+          this.sweepWorkerGroup(instanceNum, workerPid);
           this.finalizeInstance(instanceNum);
           if (this.acquireDeadlines.has(instanceNum)) {
             this.abandonJobFor(instanceNum);
@@ -1807,11 +1854,10 @@ export class RunnerManager {
     // is slow to handle SIGTERM leaves descendants behind, and the slot is
     // released immediately below, so nothing comes back to look for them - the
     // same leak that left a cancelled benchmark running for over an hour.
+    // The slot is not given to another job while they wait out the grace.
     const workerPid = instance.process?.pid;
     instance.process?.kill('SIGTERM');
-    sweepProcessGroup(workerPid, {
-      onLog: (message) => this.log('warn', `[instance ${instanceNum}] ${message}`),
-    });
+    this.sweepWorkerGroup(instanceNum, workerPid);
     this.abandonJobFor(instanceNum);
     // A --once worker that never acquired a job never exits, so the exit
     // handler's cleanup would not run; releaseInstanceSlot finalizes the
