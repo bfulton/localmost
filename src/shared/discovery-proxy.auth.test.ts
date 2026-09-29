@@ -145,6 +145,17 @@ describe('DiscoveryProxy address screen', () => {
     expect(upstreamDials()).toEqual([]);
   });
 
+  it('never offers a host its screen refused as one to allow', async () => {
+    // Discovery writes what it recorded into .localmostrc; a host the screen
+    // will always refuse there would be a grant that can never work.
+    const { port, user, token } = await start({ lookup: async () => ['127.0.0.1'] });
+    expect(await connect(port, 'localhost:3000', basic(user, token))).toBe(403);
+    expect(await connect(port, '127.0.0.1:3000', basic(user, token))).toBe(403);
+    expect(await get(port, 'http://localhost:3000/', basic(user, token))).toBe(403);
+    expect(proxy.getAccessedHosts()).toEqual([]);
+    expect(proxy.getAccessStats().blocked).toEqual(['127.0.0.1', 'localhost']);
+  });
+
   it('dials exactly the addresses it screened, and never forwards its own credentials', async () => {
     // Nothing answers at the screened address; each dial is recorded and then
     // refused locally, so the proxy answers 502 straight away.

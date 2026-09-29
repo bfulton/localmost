@@ -356,10 +356,7 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   const sandboxLogFile = path.join(workspace.path, '.sandbox-trace.log');
 
   const proxyEnv: Record<string, string> = {
-    HTTP_PROXY: proxyUrl,
-    HTTPS_PROXY: proxyUrl,
-    http_proxy: proxyUrl,
-    https_proxy: proxyUrl,
+    ...buildProxyEnv(proxyUrl),
     TMPDIR: tmpDir,
   };
 
@@ -617,6 +614,25 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     reapStepProcesses();
     await discoveryProxy.stop();
   }
+}
+
+/**
+ * The variables that send a step's traffic through the run's proxy.
+ *
+ * Loopback is exempt: steps reach a server they started directly, as their
+ * sandbox allows, and the proxy refuses loopback outright - through it, a
+ * step would reach the ports its sandbox denies.
+ */
+export function buildProxyEnv(proxyUrl: string): Record<string, string> {
+  const noProxy = 'localhost,127.0.0.1,::1';
+  return {
+    HTTP_PROXY: proxyUrl,
+    HTTPS_PROXY: proxyUrl,
+    http_proxy: proxyUrl,
+    https_proxy: proxyUrl,
+    NO_PROXY: noProxy,
+    no_proxy: noProxy,
+  };
 }
 
 /**

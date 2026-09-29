@@ -94,17 +94,21 @@ export class DiscoveryProxy {
     return false;
   }
 
-  /** Record an access and report whether the allowlist permits it. */
-  private recordAccess(host: string, port: number): boolean {
-    this.accessedHosts.add(host);
-    const allowed = this.isHostAllowed(host);
-    if (allowed) {
+  /**
+   * Record an access once its outcome is known.
+   *
+   * A host the address screen refused is blocked but not an accessed host:
+   * discovery offers the accessed hosts for .localmostrc, and one the screen
+   * refuses would be a grant that can never work.
+   */
+  private recordAccess(host: string, port: number, outcome: 'allowed' | 'not-allowlisted' | 'unroutable'): void {
+    if (outcome !== 'unroutable') this.accessedHosts.add(host);
+    if (outcome === 'allowed') {
       this.allowedHosts.add(host);
     } else {
       this.blockedHosts.add(host);
     }
-    this.onAccess(host, port, allowed);
-    return allowed;
+    this.onAccess(host, port, outcome === 'allowed');
   }
 
   /**
@@ -221,7 +225,8 @@ export class DiscoveryProxy {
     const { host, port } = target;
 
     // Block if not allowed
-    if (!this.recordAccess(host, port)) {
+    if (!this.isHostAllowed(host)) {
+      this.recordAccess(host, port, 'not-allowlisted');
       clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
       clientSocket.write(`Blocked by sandbox: host '${host}' not in allowlist\r\n`);
       clientSocket.destroy();
@@ -235,6 +240,7 @@ export class DiscoveryProxy {
 
   private async connectScreened(host: string, port: number, clientSocket: Duplex, head: Buffer): Promise<void> {
     const screened = await this.screen(host);
+    this.recordAccess(host, port, screened ? 'allowed' : 'unroutable');
     if (clientSocket.destroyed) return;
     if (!screened) {
       clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
@@ -295,7 +301,8 @@ export class DiscoveryProxy {
       const port = parseInt(url.port, 10) || 80;
 
       // Block if not allowed
-      if (!this.recordAccess(host, port)) {
+      if (!this.isHostAllowed(host)) {
+        this.recordAccess(host, port, 'not-allowlisted');
         res.writeHead(403, { 'Content-Type': 'text/plain' });
         res.end(`Blocked by sandbox: host '${host}' not in allowlist`);
         req.resume();
@@ -303,6 +310,7 @@ export class DiscoveryProxy {
       }
 
       void this.screen(host).then((screened) => {
+        this.recordAccess(host, port, screened ? 'allowed' : 'unroutable');
         if (!screened) {
           res.writeHead(403, { 'Content-Type': 'text/plain' });
           res.end(`Blocked by sandbox: host '${host}' does not resolve to a routable address`);
