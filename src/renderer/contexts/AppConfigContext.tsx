@@ -23,6 +23,13 @@ import {
   useStore,
 } from '../store';
 
+// Fallback for a store that has no config yet, hoisted so every read returns
+// the same reference: useSyncExternalStore treats a fresh literal per read as
+// a change per read and re-renders until React throws "Maximum update depth
+// exceeded". The store is `{}` until main's first state arrives. (The old
+// inline literal was also the pre-normalization shape.)
+const NO_USER_FILTER: UserFilterConfig = { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] };
+
 export type ThemeSetting = 'light' | 'dark' | 'auto';
 
 interface AppConfigContextValue {
@@ -107,7 +114,7 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
   const storeSleepProtectionConsented = useStore((state) => state?.config?.sleepProtectionConsented ?? false);
   const storePreserveWorkDir = useStore((state) => state?.config?.preserveWorkDir ?? 'never');
   const storeToolCacheLocation = useStore((state) => state?.config?.toolCacheLocation ?? 'persistent');
-  const storeUserFilter = useStore((state) => state?.config?.userFilter ?? { mode: 'just-me' as const, allowlist: [] });
+  const storeUserFilter = useStore((state) => state?.config?.userFilter ?? NO_USER_FILTER);
   const storePower = useStore((state) => state?.config?.power ?? DEFAULT_POWER_CONFIG);
   const storeNotifications = useStore((state) => state?.config?.notifications ?? DEFAULT_NOTIFICATIONS_CONFIG);
   const storeIsOnline = useStore((state) => state?.ui?.isOnline ?? true);

@@ -74,8 +74,21 @@ export async function launchElectron(
   // Wait for the app to be ready
   await page.waitForLoadState('domcontentloaded');
 
-  // Wait for React to render (titlebar is always present once app loads)
-  await page.waitForSelector('[data-testid="titlebar"]', { timeout: 30000 });
+  // Wait for React to render (titlebar is always present once app loads).
+  // When it never does, the page is usually the ErrorBoundary's fallback and
+  // the reason is in the renderer console, which a bare timeout would drop:
+  // the main-process log lives in the temp dir closeElectron removes, and the
+  // next run overwrites the page snapshot.
+  try {
+    await page.waitForSelector('[data-testid="titlebar"]', { timeout: 30000 });
+  } catch (err) {
+    const pageText = await page.locator('body').innerText().catch(() => '(unavailable)');
+    throw new Error(
+      `Titlebar never rendered: ${(err as Error).message}\n` +
+        `Renderer console errors since launch:\n${consoleErrors.length > 0 ? consoleErrors.join('\n') : '(none)'}\n` +
+        `Page text:\n${pageText}`
+    );
+  }
 
   return { app: electronApp, page };
 }

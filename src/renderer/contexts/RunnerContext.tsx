@@ -8,6 +8,24 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
 import { GitHubUser, GitHubRepo, GitHubOrg, RunnerState, JobHistoryEntry, DownloadProgress, DeviceCodeInfo, RunnerRelease, Target, RunnerProxyStatus } from '../../shared/types';
 import { useStore } from '../store';
+import type { AppState } from '../../main/store/types';
+
+// Fallbacks for slices the store does not hold yet, hoisted so each read
+// returns the same reference. The selectors below feed useSyncExternalStore,
+// which compares snapshots by identity: a fresh `[]` on every read is a change
+// on every read, and React re-renders synchronously until it gives up with
+// "Maximum update depth exceeded" and the ErrorBoundary replaces the app. The
+// store is `{}` until main's first state arrives, which is exactly when these
+// are read - so the crash showed only when main was slow enough to lose that
+// race, as a launch whose titlebar never appeared.
+const NO_REPOS: GitHubRepo[] = [];
+const NO_ORGS: GitHubOrg[] = [];
+const NO_VERSIONS: RunnerRelease[] = [];
+const NO_TARGETS: Target[] = [];
+const NO_TARGET_STATUS: RunnerProxyStatus[] = [];
+const NO_HISTORY: JobHistoryEntry[] = [];
+const NO_RUNNER_VERSION: AppState['runner']['runnerVersion'] = { version: null, url: null };
+const OFFLINE: AppState['runner']['runnerState'] = { status: 'offline' };
 
 interface RunnerConfig {
   level: 'repo' | 'org';
@@ -93,21 +111,21 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
   const storeUser = useStore((state) => state?.auth?.user ?? null);
   const storeIsAuthenticating = useStore((state) => state?.auth?.isAuthenticating ?? false);
   const storeDeviceCode = useStore((state) => state?.auth?.deviceCode ?? null);
-  const storeRepos = useStore((state) => state?.github?.repos ?? []);
-  const storeOrgs = useStore((state) => state?.github?.orgs ?? []);
+  const storeRepos = useStore((state) => state?.github?.repos ?? NO_REPOS);
+  const storeOrgs = useStore((state) => state?.github?.orgs ?? NO_ORGS);
   const storeIsDownloaded = useStore((state) => state?.runner?.isDownloaded ?? false);
-  const storeRunnerVersion = useStore((state) => state?.runner?.runnerVersion ?? { version: null, url: null });
-  const storeAvailableVersions = useStore((state) => state?.runner?.availableVersions ?? []);
+  const storeRunnerVersion = useStore((state) => state?.runner?.runnerVersion ?? NO_RUNNER_VERSION);
+  const storeAvailableVersions = useStore((state) => state?.runner?.availableVersions ?? NO_VERSIONS);
   const storeSelectedVersion = useStore((state) => state?.runner?.selectedVersion ?? '');
   const storeDownloadProgress = useStore((state) => state?.runner?.downloadProgress ?? null);
   const storeIsLoadingVersions = useStore((state) => state?.runner?.isLoadingVersions ?? false);
   const storeIsConfigured = useStore((state) => state?.runner?.isConfigured ?? false);
   const storeRunnerConfig = useStore((state) => state?.config?.runnerConfig ?? defaultRunnerConfig);
   const storeRunnerDisplayName = useStore((state) => state?.runner?.runnerDisplayName ?? null);
-  const storeTargets = useStore((state) => state?.config?.targets ?? []);
-  const storeTargetStatus = useStore((state) => state?.runner?.targetStatus ?? []);
-  const storeRunnerState = useStore((state) => state?.runner?.runnerState ?? { status: 'offline' });
-  const storeJobHistory = useStore((state) => state?.jobs?.history ?? []);
+  const storeTargets = useStore((state) => state?.config?.targets ?? NO_TARGETS);
+  const storeTargetStatus = useStore((state) => state?.runner?.targetStatus ?? NO_TARGET_STATUS);
+  const storeRunnerState = useStore((state) => state?.runner?.runnerState ?? OFFLINE);
+  const storeJobHistory = useStore((state) => state?.jobs?.history ?? NO_HISTORY);
   const storeIsLoading = useStore((state) => state?.ui?.isLoading ?? false);
   const storeIsInitialLoading = useStore((state) => state?.ui?.isInitialLoading ?? true);
   const storeError = useStore((state) => state?.ui?.error ?? null);
