@@ -267,15 +267,21 @@ describe('Process Sandbox', () => {
     const instanceDir = path.join(os.homedir(), '.localmost', 'runner-3');
     const homeDir = os.homedir();
 
-    /** Build a runner profile with the given sandbox options, and return its text. */
-    const profileWith = (options: Record<string, unknown>): string => {
+    /**
+     * Build a runner profile with the given sandbox options, and return its
+     * text. `getconf` answers the per-user temp directory lookup, or throws.
+     */
+    const profileWith = (
+      options: Record<string, unknown>,
+      getconf: () => string = () => '/var/folders/zz/zyxw_vut0000gn/T/\n'
+    ): string => {
       let profile = '';
       jest.isolateModules(() => {
         Object.defineProperty(process, 'platform', { value: 'darwin' });
         const mockProcess = createMockProcess(12360);
         const localMockSpawn = jest.fn().mockReturnValue(mockProcess);
         const mockWriteFileSync = jest.fn();
-        jest.doMock('child_process', () => ({ spawn: localMockSpawn }));
+        jest.doMock('child_process', () => ({ spawn: localMockSpawn, execFileSync: jest.fn(getconf) }));
         jest.doMock('fs', () => ({
           existsSync: jest.fn().mockReturnValue(true),
           writeFileSync: mockWriteFileSync,
@@ -335,6 +341,67 @@ describe('Process Sandbox', () => {
       expect(bind).toContain(`(subpath "${instanceDir}")`);
       expect(bind).not.toContain('(subpath "/tmp")');
       expect(bind).not.toContain('(subpath "/private/var/folders")');
+    });
+
+    it.each(['strict', 'moderate', 'permissive'] as const)(
+      'grants no shared temp directory as a whole under %s',
+      (level) => {
+        // /tmp and the per-user /var/folders tree are shared with the user's
+        // own processes and every other worker: writable, a job could plant
+        // files their tools trust (the xcrun cache, clang's module cache);
+        // readable, it could read what they leave there. The job's TMPDIR is
+        // in its own sandbox, which is granted separately.
+        const profile = profileWith({ filesystemPolicy: { level, read: [], write: [] } });
+        for (const shared of ['/tmp', '/private/tmp', '/var/folders', '/private/var/folders', '/var', os.tmpdir()]) {
+          expect(profile).not.toContain(`(subpath "${shared}")`);
+        }
+        expect(profile).not.toContain('/var/folders/zz/zyxw_vut0000gn/T")');
+      }
+    );
+
+    it('lets bare mktemp create its own entries in the per-user temp, by generated name only', () => {
+      // macOS mktemp ignores TMPDIR: with no template it creates
+      // tmp.XXXXXXXXXX in the per-user temp directory that confstr names, and
+      // countless scripts call it that way. Only names of that exact shape
+      // are granted, and not the directory itself, so a job can neither list
+      // the directory nor touch anything else in it.
+      const profile = profileWith({});
+      const rules = [...profile.matchAll(/\(regex #"([^"]+)"\)/g)].map((m) => new RegExp(m[1]));
+      expect(rules.length).toBeGreaterThan(0);
+      const granted = (p: string) => rules.some((rule) => rule.test(p));
+      for (const dir of ['/var/folders/zz/zyxw_vut0000gn/T', '/private/var/folders/zz/zyxw_vut0000gn/T']) {
+        expect(granted(`${dir}/tmp.AbC123xYz9`)).toBe(true);
+        expect(granted(`${dir}/tmp.AbC123xYz9/inside/file`)).toBe(true);
+        expect(granted(dir)).toBe(false);
+        expect(granted(`${dir}/`)).toBe(false);
+        expect(granted(`${dir}/xcrun_db`)).toBe(false);
+        expect(granted(`${dir}/tmp.short`)).toBe(false);
+        expect(granted(`${dir}/foo.AbC123xYz9`)).toBe(false);
+        expect(granted(`${dir}/com.example.ShipIt.AbC123xY`)).toBe(false);
+      }
+      expect(granted('/var/folders/zz/zyxw_vut0000gn/C/tmp.AbC123xYz9')).toBe(false);
+      expect(granted('/var/folders/zz/other_user00gn/T/tmp.AbC123xYz9')).toBe(false);
+    });
+
+    it('grants nothing in the per-user temp when it cannot be looked up', () => {
+      // Failing closed: mktemp without a template fails, nothing else changes.
+      const failed = profileWith({}, () => { throw new Error('getconf: not found'); });
+      expect(failed).not.toContain('(regex');
+      expect(failed).not.toMatch(/\((subpath|literal|regex)[^)]*var\/folders/);
+      // An answer that is not a per-user temp directory is not trusted either.
+      const odd = profileWith({}, () => '/Users/someone\n');
+      expect(odd).not.toContain('(regex');
+    });
+
+    it('reads the OS paths xcrun needs without the whole of /var', () => {
+      // xcrun resolves tools through xcodebuild, which links a framework that
+      // lives under /Library/Apple; with its cache out of the shared temp it
+      // has to be able to do that itself.
+      const allowRead = ((p: string) => p.slice(p.indexOf('(allow file-read*'), p.indexOf('(deny file-read*')))(profileWith({}));
+      expect(allowRead).toContain('(subpath "/Library/Apple")');
+      expect(allowRead).toContain('(subpath "/private/var/db")');
+      expect(allowRead).toContain('(subpath "/private/var/select")');
+      expect(allowRead).not.toContain('(subpath "/var")');
     });
 
     it('keeps the control plane and runner secrets unwritable even against a policy write path', () => {
@@ -689,10 +756,9 @@ describe('Process Sandbox', () => {
         expect(profile).toContain('(allow process*)');
         // Profile should include the runner directory for writes
         expect(profile).toContain('.localmost');
-        // Profile should include both /var/folders and /private/var/folders
-        // because /var is a symlink to /private/var on macOS
-        expect(profile).toContain('/var/folders');
-        expect(profile).toContain('/private/var/folders');
+        // Not the shared temp directories: the job's temp is in its sandbox.
+        expect(profile).not.toContain('(subpath "/private/var/folders")');
+        expect(profile).not.toContain('(subpath "/private/tmp")');
       });
     });
   });

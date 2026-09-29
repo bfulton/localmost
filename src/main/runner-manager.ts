@@ -1167,6 +1167,16 @@ export class RunnerManager {
       env.TMP = jobTmp;
       env.TEMP = jobTmp;
       env.RUNNER_TEMP = jobTmp;
+      // Some tools ignore TMPDIR and keep state in the per-user temp and cache
+      // directories, which the sandbox does not grant: those are shared with
+      // everything the user runs, and the xcrun cache and clang module cache
+      // there are trusted by the user's own compilers. Each of these has a
+      // variable that moves it into the job's temp. xcrun cannot resolve a
+      // tool at all without a cache it can write; zsh puts here-documents
+      // under /tmp.
+      env.xcrun_db = path.join(jobTmp, 'xcrun_db');
+      env.CLANG_MODULE_CACHE_PATH = path.join(jobTmp, 'clang-module-cache');
+      env.TMPPREFIX = path.join(jobTmp, 'zsh');
 
       // A per-spawn marker file, held open by the worker and by what it starts
       // through its bash and .NET layers (run.sh, Listener, Worker, `run:` step

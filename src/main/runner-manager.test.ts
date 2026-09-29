@@ -1773,6 +1773,24 @@ describe('RunnerManager', () => {
       expect(gitCfgWrite).toBeDefined();
       expect(String(gitCfgWrite![1])).toContain('proxyAuthMethod = basic');
     });
+
+    it("points the caches tools keep in the shared per-user temp into the job's own temp", async () => {
+      // The sandbox no longer grants the per-user temp and cache directories.
+      // xcrun keeps its lookup cache there and fails without one it can
+      // write; clang and swiftc keep their module cache there; zsh puts here-
+      // documents in /tmp. Each has a variable that moves it.
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(9912));
+
+      await runnerManager.start();
+
+      const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+      const jobTmp = '/Users/test/.localmost/runner/sandbox/1/_temp';
+      expect(env.TMPDIR).toBe(jobTmp);
+      expect(env.xcrun_db).toBe(`${jobTmp}/xcrun_db`);
+      expect(env.CLANG_MODULE_CACHE_PATH).toBe(`${jobTmp}/clang-module-cache`);
+      expect(env.TMPPREFIX).toBe(`${jobTmp}/zsh`);
+    });
   });
 
   describe("a worker's broker address", () => {

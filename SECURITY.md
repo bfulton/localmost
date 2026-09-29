@@ -60,7 +60,7 @@ localmost is an Electron desktop application that manages GitHub Actions self-ho
 
 ### What localmost protects against
 
-- **Filesystem writes**: Under `strict`, workflows write only to the workspace, temp, and whatever their `.localmostrc` declares. `moderate` and `permissive` additionally allow writes to the standard tool caches (`~/.npm`, `~/.cargo`, `~/.gradle`, `~/Library/Caches` and similar)
+- **Filesystem writes**: Under `strict`, workflows write only to the workspace, their own temp directory inside the job's sandbox, and whatever their `.localmostrc` declares. `moderate` and `permissive` additionally allow writes to the standard tool caches (`~/.npm`, `~/.cargo`, `~/.gradle`, `~/Library/Caches` and similar)
 - **Home directory access**: Workflows cannot read `~/.ssh`, `~/.aws`, `~/.config` or the other credential locations listed above, at any level. `HOME` points inside the workspace, not at your home directory
 - **Filesystem reads**: Under `strict` a job reads the OS, the runner's own directories, its workspace, and whatever its `.localmostrc` declares - nothing else. `moderate` and `permissive` additionally grant the standard toolchain locations (`/opt/homebrew`, `/usr/local`, Xcode) and the package-manager caches. At every level a job is denied `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.config`, `~/Library/Keychains`, `~/.netrc`, `~/.npmrc`, this app's credential store and approval cache, and the credential files kept inside the package-manager caches (`~/.m2/settings.xml`, `~/.gradle/gradle.properties`, cargo credentials, `NuGet.Config`)
 - **Network exfiltration**: A job's sandbox permits no outbound connection except to its own filtering proxy, so the host policy holds even for code that ignores `HTTP_PROXY` and opens a raw socket. Under `strict` the reachable set is runner infrastructure plus what the repository declares — not npm, PyPI or other registries
@@ -109,6 +109,7 @@ loosen its own sandbox without the machine owner agreeing to it.
 - **Container egress**: Traffic from inside a container leaves through the daemon's network, not the job's proxy, so the host allowlist does not apply to it. The Docker filter decides what a container may be created with, not what it connects to once running - see Docker Access below.
 
 - **The runner's own floor**: A job's sandbox also contains the runner process, so the profile must grant what the runner needs to function - the OS, its own installation, the tool cache, the workspace and temp. A repository cannot narrow below that floor, only add to it.
+- **Shared temp directories**: A job gets no access to `/tmp` or to the per-user `/var/folders` directories, at any level. Those are shared with every process you run, and some of what lives there is trusted by your own tools - the xcrun lookup cache and the clang module cache among them. `TMPDIR`, `TMP` and `TEMP` point at the job's own temp directory, and xcrun's cache, the clang and Swift module cache and zsh's here-documents are pointed there too (`xcrun_db`, `CLANG_MODULE_CACHE_PATH`, `TMPPREFIX`). macOS `mktemp` ignores `TMPDIR`, so a bare `mktemp` or `mktemp -d` is allowed to create its entry in the per-user temp directory - by the `tmp.XXXXXXXXXX` name it generates only, without the right to list or read anything else there. The trade-offs: `mktemp -t prefix`, a hard-coded `/tmp` path, and Foundation's `NSTemporaryDirectory()` / `FileManager.temporaryDirectory` fail with "Operation not permitted" inside a job; use `$RUNNER_TEMP` or a template under it (`mktemp -d "$RUNNER_TEMP/x.XXXXXX"`). And an entry of your own named like `tmp.XXXXXXXXXX` is reachable by a job that learns its exact name, for example from the open files of a process of yours it can inspect.
 - **Declared system paths**: A policy that declares OS read paths grants them for the whole job. `localmost policy init` seeds that list with OS subpaths (`/usr/bin`, `/usr/lib`, `/System`, `/Library/Developer` and similar) because nothing runs without them. It deliberately excludes `/usr/local`, `/Library/Application Support` and `/Applications`, which hold third-party software and application data - but a policy is free to add them back, and approving one means accepting that.
 
 ## Network Policy
@@ -134,7 +135,7 @@ cannot distinguish the runner's own requests from a job's, so jobs reach those
 hosts too.
 
 Filesystem access is not granted implicitly. A job can read its workspace and
-temp directories; everything else — including system paths like `/usr` and the
+its own temp directory; everything else — including system paths like `/usr` and the
 Xcode developer directory that most tools need — must be declared in
 `.localmostrc`. Reading a repository's policy therefore tells you everything a
 job may touch. `localmost policy init` starts from a policy that runs, and
@@ -338,7 +339,7 @@ localmost adds isolation layers that the stock GitHub Actions Runner lacks:
 
 | Resource | Access Level |
 |----------|--------------|
-| File system (write) | Runner working directory and temp dirs only |
+| File system (write) | The job's own sandbox directory (workspace and temp) and the tool cache |
 | File system (read) | Essential system paths (`/usr/bin`, `/System/Library`, Xcode) |
 | Network | Allowlisted hosts only (GitHub, npm, PyPI, etc.) via HTTP proxy |
 | Docker daemon | Through a filtering socket; only declared `pull`/`run`/`build` requests are forwarded |
@@ -382,7 +383,7 @@ The sandbox reduces attack surface but does not provide full containment. For un
 | Network isolation | VM boundary | Proxy allowlist |
 | Credential isolation | No access to host | Home directory denied |
 
-The sandbox is rebuilt fresh on each runner start and confines all writes to the runner directory and temp paths. Workflows cannot modify files elsewhere on your system or exfiltrate data to non-allowlisted hosts.
+The sandbox is rebuilt fresh on each runner start and confines all writes to the job's own sandbox directory and the tool cache. Workflows cannot modify files elsewhere on your system or exfiltrate data to non-allowlisted hosts.
 
 ### User Filter
 

@@ -8,7 +8,7 @@
  * - Using Node.js native APIs instead of shell commands where possible
  */
 
-import { spawn, ChildProcess, SpawnOptions } from 'child_process';
+import { spawn, execFileSync, ChildProcess, SpawnOptions } from 'child_process';
 import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
@@ -114,6 +114,33 @@ export const DEFAULT_BROKER_PORT = 8787;
  */
 function getToolCacheDirPath(): string {
   return path.join(getRunnerDir(), 'tool-cache');
+}
+
+/**
+ * The per-user temp directory confstr hands out, looked up once. null once
+ * the lookup has failed or answered something unexpected.
+ */
+let userTempDir: string | null | undefined;
+
+/**
+ * Where macOS `mktemp` puts a file when it is given no template. It ignores
+ * TMPDIR and asks confstr for the per-user temp directory instead, so pointing
+ * TMPDIR into the sandbox does not move it. Only a /var/folders/<a>/<b>/T path
+ * is accepted: the answer lands in a regex in the profile.
+ */
+function darwinUserTempDir(): string | undefined {
+  if (userTempDir === undefined) {
+    try {
+      const answer = String(execFileSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf-8' }))
+        .trim()
+        .replace(/\/+$/, '')
+        .replace(/^\/private/, '');
+      userTempDir = /^\/var\/folders\/[A-Za-z0-9_+-]+\/[A-Za-z0-9_+-]+\/T$/.test(answer) ? answer : null;
+    } catch {
+      userTempDir = null;
+    }
+  }
+  return userTempDir ?? undefined;
 }
 
 /** What a repository's approved policy contributes to the sandbox profile. */
@@ -263,7 +290,23 @@ function generateSandboxProfile({
   const cacheWriteRules = cacheWritePaths.length
     ? `(allow file-write*\n${subpaths(cacheWritePaths)})`
     : ';; strict: caches are not writable unless the policy declares them';
-  const tmpDir = os.tmpdir().replace(/"/g, '\\"');
+  // `mktemp` with no template creates tmp.XXXXXXXXXX in the per-user temp
+  // directory whatever TMPDIR says, and scripts call it that way constantly.
+  // That directory is shared with every process the user runs - the xcrun
+  // cache that their own clang trusts lives there - so it is not granted.
+  // Names of exactly the shape mktemp generates are: ten random characters no
+  // other process can guess, and without read on the directory itself a job
+  // cannot list it to find one. Both spellings, as /var is a symlink.
+  const mktempRules = ((dir?: string): string => {
+    if (!dir) return ';; Per-user temp directory unknown: mktemp without a template is not granted';
+    const escapeForRegex = (value: string) => value.replace(/[.*+?^$()[\]{}|\\]/g, '\\$&');
+    const generated = `/tmp\\.${'[A-Za-z0-9]'.repeat(10)}(/|$)`;
+    return [
+      '(allow file-write* file-read*',
+      `  (regex #"^${escapeForRegex(`/private${dir}`)}${generated}")`,
+      `  (regex #"^${escapeForRegex(dir)}${generated}"))`,
+    ].join('\n');
+  })(darwinUserTempDir());
 
   return `
 (version 1)
@@ -301,15 +344,11 @@ function generateSandboxProfile({
 (allow file-ioctl
   (subpath "${toolCacheDir}"))
 
-;; System temp directories (many tools require this)
-;; Note: /var is a symlink to /private/var on macOS, and sandbox
-;; checks may use canonical paths, so we need both variants
-(allow file-write*
-  (subpath "${tmpDir}")
-  (subpath "/tmp")
-  (subpath "/private/tmp")
-  (subpath "/var/folders")
-  (subpath "/private/var/folders"))
+;; No shared temp directory. /tmp and the per-user /var/folders tree belong to
+;; every process the user runs; the job's TMPDIR is in its own sandbox, and
+;; the caches tools would otherwise keep there are pointed into it too.
+;; Only what mktemp itself creates, by the name it generated:
+${mktempRules}
 
 ;; Package-manager caches. Under strict a repository declares the ones it
 ;; needs; moderate and permissive keep them, matching the read side.
@@ -365,16 +404,18 @@ ${policyWrites ? `(allow file-write*\n${policyWrites})` : ';; No policy-declared
   (subpath "/usr/share")
   (subpath "/System")
   (subpath "/Library/Developer")
+  ;; OS frameworks installed outside /System: xcodebuild links one, and xcrun
+  ;; runs it to find a tool whenever its cache does not already know the way.
+  (subpath "/Library/Apple")
   (subpath "/Library/Preferences")
   (subpath "/Library/Frameworks")
   (subpath "/private/etc")
+  ;; Only the parts of /private/var the toolchain reads (the xcode-select
+  ;; link, the shell selection). Not the rest: it holds logs, other
+  ;; processes' state and the per-user temp and cache directories.
   (subpath "/private/var/db")
   (subpath "/private/var/select")
-  (subpath "/private/var/folders")
   (subpath "/etc")
-  (subpath "/var")
-  (subpath "/tmp")
-  (subpath "/private/tmp")
   ;; This job's own workspace and the shared tool cache. Not the runner
   ;; directory as a whole: it holds every target's proxy credentials, every
   ;; instance's registration, the broker's session tokens and the other
