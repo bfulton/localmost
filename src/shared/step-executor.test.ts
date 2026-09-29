@@ -68,6 +68,18 @@ describe('buildStepEnvironment', () => {
     // Every step gets this HOME, so it has to exist by the time one runs.
     expect(fs.existsSync(env.HOME)).toBe(true);
   });
+
+  it('keeps the tool cache inside the workspace', () => {
+    // A tool cache shared across runs is one a checkout can poison for the
+    // next, and the app's data directory is not writable from a step at all.
+    const env = buildStepEnvironment(
+      { run: 'echo hi' } as never,
+      ctx as never,
+      { 'runs-on': 'self-hosted', steps: [] } as never
+    );
+
+    expect(path.dirname(env.RUNNER_TOOL_CACHE)).toBe(workDir);
+  });
 });
 
 describe('createSecretMasker', () => {

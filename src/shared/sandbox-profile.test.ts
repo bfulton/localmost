@@ -17,7 +17,29 @@ jest.mock('os', () => ({
   totalmem: jest.fn(() => 16 * 1024 * 1024 * 1024),
 }));
 
+/**
+ * A profile's top-level rules, each with its continuation lines, so a test can
+ * ask what one rule grants rather than whether a string appears anywhere.
+ */
+function topLevelForms(profile: string): string[] {
+  const forms: string[] = [];
+  for (const line of profile.split('\n')) {
+    if (line.startsWith('(')) forms.push(line);
+    else if (/^\s+\(/.test(line) && forms.length > 0) forms[forms.length - 1] += `\n${line}`;
+  }
+  return forms;
+}
+
 describe('Sandbox Profile Generator', () => {
+  // The app data directory is named in every profile; pin it to the default
+  // under the mocked home whatever the environment running the tests says.
+  const savedConfigDir = process.env.LOCALMOST_CONFIG_DIR;
+  beforeAll(() => {
+    delete process.env.LOCALMOST_CONFIG_DIR;
+  });
+  afterAll(() => {
+    if (savedConfigDir !== undefined) process.env.LOCALMOST_CONFIG_DIR = savedConfigDir;
+  });
 
   // ===========================================================================
   // generateSandboxProfile - Basic structure
@@ -207,13 +229,53 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).toContain('.cache');
     });
 
-    it('should allow write to localmost directories', () => {
+    it('grants nothing of the app data directory, with or without a policy', () => {
+      // ~/.localmost holds the runner template every worker is copied from and
+      // the approval cache. A test run that could write them would reach every
+      // later real job, and approve its own policy.
+      for (const policy of [undefined, {}]) {
+        const profile = generateSandboxProfile({
+          workDir: '/Users/test/.localmost/workspaces/ws-1',
+          proxyPort: DEFAULT_PROXY_PORT,
+          policy,
+        });
+        const grants = topLevelForms(profile).filter((form) => form.startsWith('(allow'));
+        expect(grants.filter((form) => form.includes('"/Users/test/.localmost"'))).toEqual([]);
+      }
+    });
+
+    it('denies the app data directory after every policy grant, then reopens only the workspace', () => {
+      const workDir = '/Users/test/.localmost/workspaces/ws-1';
       const profile = generateSandboxProfile({
-        workDir: '/path/to/project',
+        workDir,
         proxyPort: DEFAULT_PROXY_PORT,
+        policy: {
+          filesystem: {
+            read: ['~/.localmost', '~'],
+            write: ['~/.localmost/runner', '~/.localmost/policies', '~'],
+          },
+        },
       });
 
-      expect(profile).toContain('.localmost');
+      const deny = profile.indexOf(
+        '(deny file-read* file-write*\n  (subpath "/Users/test/.localmost")\n' +
+          '  (subpath "/Users/test/Library/Application Support/localmost"))'
+      );
+      expect(deny).toBeGreaterThan(profile.indexOf(';; Policy-defined write access'));
+      expect(deny).toBeGreaterThan(profile.indexOf(';; Policy-defined read access'));
+      // Seatbelt takes the last matching rule, so after the deny the only
+      // file grant that may name anything under the app data directory is
+      // this run's own workspace.
+      const reopened = topLevelForms(profile.slice(deny))
+        .filter((form) => form.startsWith('(allow file-') && !form.startsWith('(allow file-read-metadata'))
+        .flatMap((form) => [...form.matchAll(/"([^"]+)"/g)].map((m) => m[1]))
+        .filter((p) => p.startsWith('/Users/test/.localmost') || p.startsWith('/Users/test/Library'));
+      expect(reopened).toEqual([workDir]);
+    });
+
+    it('never lets a step connect to the CLI socket', () => {
+      const profile = generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT });
+      expect(profile).toContain('(deny network-outbound (literal "/Users/test/.localmost/localmost.sock"))');
     });
 
     it('should allow policy-defined write paths', () => {

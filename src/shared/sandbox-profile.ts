@@ -9,6 +9,7 @@
 import * as os from 'os';
 import * as path from 'path';
 import type { DockerPolicy } from './docker-policy';
+import { getAppDataDirWithoutElectron, getCliSocketPath } from './paths';
 
 // =============================================================================
 // Types
@@ -159,6 +160,33 @@ function loopbackNetworkRules(proxyPort: number, escapedWorkDir: string): string
 }
 
 /**
+ * Close the app's own data to a step, then reopen only its workspace.
+ *
+ * The app data directory holds the runner template every worker's sandbox is
+ * copied from, the approval cache, settings, the CLI socket and other runs'
+ * workspaces; the Electron user data directory holds the credential store. A
+ * test run that could write the template would reach every later real job,
+ * and one that could write the approvals would approve its own policy. A
+ * checkout's .localmostrc is applied in test mode without approval, so this
+ * comes after every policy grant: seatbelt takes the last matching rule.
+ *
+ * The workspace lives under the app data directory, so it is reopened last.
+ */
+function appDataDenyRules(escapedWorkDir: string): string[] {
+  const appDataDir = escapePath(getAppDataDirWithoutElectron());
+  const userDataDir = escapePath(path.join(os.homedir(), 'Library', 'Application Support', 'localmost'));
+  return [
+    ';; The app\'s own data - never reachable, whatever a policy declares above',
+    '(deny file-read* file-write*',
+    `  (subpath "${appDataDir}")`,
+    `  (subpath "${userDataDir}"))`,
+    ';; ...except this run\'s workspace, which lives inside it',
+    '(allow file-read* file-write*',
+    `  (subpath "${escapedWorkDir}"))`,
+  ];
+}
+
+/**
  * Generate a macOS sandbox-exec profile from a policy.
  */
 export function generateSandboxProfile(options: SandboxProfileOptions): string {
@@ -302,12 +330,6 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
     lines.push(`  (subpath "${homeDir}/go")`);
     lines.push(`  (subpath "${homeDir}/Library/Caches"))`);
     lines.push('');
-
-    // Localmost directories
-    lines.push(';; Localmost directories');
-    lines.push('(allow file-write*');
-    lines.push(`  (subpath "${homeDir}/.localmost"))`);
-    lines.push('');
   } else {
     lines.push(';; STRICT MODE: User cache directories NOT allowed');
     lines.push('');
@@ -352,6 +374,9 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
     lines.push('');
   }
 
+  lines.push(...appDataDenyRules(escapedWorkDir));
+  lines.push('');
+
   // Device files
   lines.push(';; Device files');
   lines.push('(allow file-write*');
@@ -375,6 +400,7 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push('');
 
   lines.push(...loopbackNetworkRules(options.proxyPort, escapedWorkDir));
+  lines.push(`(deny network-outbound (literal "${escapePath(getCliSocketPath())}"))`);
   lines.push('');
 
   // No daemon socket is opened here. A docker policy is a set of requests the

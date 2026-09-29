@@ -203,7 +203,10 @@ export function buildStepEnvironment(
     RUNNER_OS: 'macOS',
     RUNNER_ARCH: process.arch === 'arm64' ? 'ARM64' : 'X64',
     RUNNER_TEMP: path.join(ctx.workDir, '.runner-temp'),
-    RUNNER_TOOL_CACHE: path.join(os.homedir(), '.localmost', 'tool-cache'),
+    // Per run, like RUNNER_TEMP. A cache shared across runs is one a checkout
+    // can poison for the next, and the app's data directory, where it used to
+    // live, is closed to steps.
+    RUNNER_TOOL_CACHE: path.join(ctx.workDir, '.runner-tool-cache'),
 
     // ImageOS for setup-* actions
     ImageOS: 'macos14',

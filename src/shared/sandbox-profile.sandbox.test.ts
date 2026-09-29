@@ -142,6 +142,65 @@ if (!isMacOS) {
       }
     });
   });
+
+  describe('test-mode app data confinement through a constructed profile', () => {
+    // A stand-in app data directory, laid out as the real one is, with this
+    // run's workspace inside it the way createWorkspace puts it there.
+    let appDir: string;
+    let workDir: string;
+    const savedConfigDir = process.env.LOCALMOST_CONFIG_DIR;
+
+    beforeAll(() => {
+      appDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'localmost-appdata-')));
+      process.env.LOCALMOST_CONFIG_DIR = appDir;
+      workDir = path.join(appDir, 'workspaces', 'ws-1');
+      fs.mkdirSync(workDir, { recursive: true });
+      fs.mkdirSync(path.join(appDir, 'runner', 'arc'), { recursive: true });
+      fs.mkdirSync(path.join(appDir, 'policies'));
+      fs.writeFileSync(path.join(appDir, 'config.yaml'), 'secret: yes\n');
+    });
+
+    afterAll(() => {
+      if (savedConfigDir === undefined) delete process.env.LOCALMOST_CONFIG_DIR;
+      else process.env.LOCALMOST_CONFIG_DIR = savedConfigDir;
+      fs.rmSync(appDir, { recursive: true, force: true });
+    });
+
+    const run = (profile: string, argv: string[]): boolean => {
+      const profilePath = path.join(os.tmpdir(), `localmost-appdata-${process.pid}-${Date.now()}.sb`);
+      fs.writeFileSync(profilePath, profile);
+      try {
+        execFileSync('/usr/bin/sandbox-exec', ['-f', profilePath, ...argv], { timeout: 5000, stdio: 'ignore' });
+        return true;
+      } catch {
+        return false;
+      } finally {
+        fs.unlinkSync(profilePath);
+      }
+    };
+
+    it('writes the workspace but not the runner template, approvals or settings, whatever the policy says', () => {
+      // A checkout's own .localmostrc is applied in test mode without approval,
+      // so it may declare the app data directory writable. That must not reach
+      // the runner template every worker is copied from, or the approvals.
+      const profile = generateSandboxProfile({
+        workDir,
+        proxyPort: 1,
+        policy: {
+          filesystem: {
+            read: [...MACOS_BASELINE_READ_PATHS, appDir],
+            write: [appDir, path.join(appDir, 'runner')],
+          },
+        },
+      });
+
+      expect(run(profile, ['/usr/bin/touch', path.join(workDir, 'built')])).toBe(true);
+      expect(run(profile, ['/usr/bin/touch', path.join(appDir, 'runner', 'arc', 'planted')])).toBe(false);
+      expect(run(profile, ['/usr/bin/touch', path.join(appDir, 'policies', 'owner__repo.json')])).toBe(false);
+      expect(run(profile, ['/bin/cat', path.join(appDir, 'config.yaml')])).toBe(false);
+      expect(fs.existsSync(path.join(appDir, 'runner', 'arc', 'planted'))).toBe(false);
+    });
+  });
 } else {
   describe('test-mode network confinement through the ambient profile', () => {
     it('refuses a direct connection off the machine', async () => {
