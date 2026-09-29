@@ -99,6 +99,20 @@ const fakeProxy = () => ({
 });
 type FakeProxy = ReturnType<typeof fakeProxy>;
 
+/** A reused proxy that holds whatever policy and token it was last given. */
+const holdingProxy = (held: { hosts: string[]; denied: string[]; loopback: unknown; level: string; token: string }) => ({
+  held,
+  proxy: {
+    setPolicyAllowedHosts: jest.fn((hosts: string[]) => { held.hosts = hosts; }),
+    setPolicyDeniedHosts: jest.fn((hosts: string[]) => { held.denied = hosts; }),
+    setLoopbackPolicy: jest.fn((_brokerPort: number, grant: unknown) => { held.loopback = grant; }),
+    setPolicyLevel: jest.fn((level: string) => { held.level = level; }),
+    rotateAuthToken: jest.fn((token: string) => { held.token = token; }),
+    getPort: jest.fn(() => 12345),
+    getProxyUrl: jest.fn(() => 'http://127.0.0.1:12345'),
+  },
+});
+
 const fakeSocket = () => ({ bind: jest.fn(), stop: jest.fn().mockResolvedValue(undefined) });
 
 function managerWith(options: Partial<ConstructorParameters<typeof RunnerManager>[0]> = {}) {
@@ -270,6 +284,48 @@ describe("a spawned worker's profile", () => {
     expect(proxy.setPolicyDeniedHosts).toHaveBeenCalledWith([]);
     expect(proxy.setLoopbackPolicy).toHaveBeenCalledWith(BROKER_PORT, undefined);
     expect(proxy.setLoopbackPolicy.mock.invocationCallOrder[0]).toBeLessThan(mockSpawnSandboxed.mock.invocationCallOrder[0]);
+  });
+
+  it("clears the last job's hosts, denies and loopback from a reused proxy before the runner exists", async () => {
+    // A slot's proxy is reused from job to job. A start with no job context
+    // installs no policy of its own, so the close at the start of the spawn
+    // is all that stands between the new runner and the last job's grants.
+    const { manager } = managerWith({ getRepoPolicy: async () => policy() });
+    const { proxy, held } = holdingProxy({ hosts: ['stale.example'], denied: ['bad.example'], loopback: [5432], level: 'permissive', token: 'last-job' });
+    let atSpawn: typeof held | undefined;
+    (fs.existsSync as jest.Mock).mockReturnValue(true);
+    mockSpawnSandboxed.mockImplementation(() => { atSpawn = { ...held }; return createMockProcess(4242) as never; });
+    await manager.initialize();
+    const helper = new RunnerManagerTestHelper(manager);
+    helper.setProxy(1, proxy);
+
+    await manager.startInstance(1);
+
+    expect(atSpawn).toMatchObject({ hosts: [], denied: [], loopback: undefined, level: 'strict' });
+    expect(atSpawn!.token).not.toBe('last-job');
+  });
+
+  it("closes the job's policy and rotates its token when the runner cannot be started", async () => {
+    // By the spawn the proxy carries the job's grants, on a token handed to a
+    // runner that never came up. Left as they are, both stay live until the
+    // slot is next started, which may be never.
+    const { manager } = managerWith({
+      getRepoPolicy: async () => policy({ hosts: ['ok.example'], deniedHosts: ['bad.example'], loopback: [5432], level: 'permissive' }),
+    });
+    const { proxy, held } = holdingProxy({ hosts: [], denied: [], loopback: undefined, level: 'strict', token: 'last-job' });
+    let atSpawn: typeof held | undefined;
+    (fs.existsSync as jest.Mock).mockReturnValue(true);
+    mockSpawnSandboxed.mockImplementation(() => { atSpawn = { ...held }; throw new Error('sandbox-exec missing'); });
+    await manager.initialize();
+    const helper = new RunnerManagerTestHelper(manager);
+    helper.setProxy(1, proxy);
+    helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
+
+    await manager.startInstance(1);
+
+    expect(atSpawn).toMatchObject({ hosts: ['ok.example'], denied: ['bad.example'], loopback: [5432] });
+    expect(held).toMatchObject({ hosts: [], denied: [], loopback: undefined, level: 'strict' });
+    expect(held.token).not.toBe(atSpawn!.token);
   });
 
   it("resolves an organization target's policy by the repository GitHub named", async () => {

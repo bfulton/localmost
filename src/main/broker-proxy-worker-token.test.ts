@@ -144,6 +144,20 @@ describe('BrokerProxyService worker token endpoint', () => {
     expect((await post(`${second}_apis/oauth2/token`, tokenForm(clientAssertion(current)))).statusCode).toBe(200);
   });
 
+  it("refuses the last start's key at a new start that has not been given one yet", async () => {
+    // Between a slot's new key and its new credential, the credential kept for
+    // the slot is still the last start's. The new address must not honour it:
+    // that key is on disk wherever the last worker's job could reach it.
+    service.issueWorkerKey(1, 'target-a');
+    const old = (await service.issueWorkerCredential(1))!;
+    const second = service.issueWorkerKey(1, 'target-a');
+
+    const res = await post(`${second}_apis/oauth2/token`, tokenForm(clientAssertion(old)));
+
+    expect(res.statusCode).toBe(401);
+    expect(JSON.parse(res.body).error).toBe('unauthorized_client');
+  });
+
   it('refuses a worker that was never given a credential', async () => {
     // A live key alone is not enough: the worker must hold the key made for it.
     const brokerUrl = service.issueWorkerKey(1, 'target-a');

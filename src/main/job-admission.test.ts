@@ -1,4 +1,4 @@
-import { admitJob, checkRepoPolicyApproval, JobAdmissionDeps, PolicyApprovalDeps } from './job-admission';
+import { admitJob, buildAdmissionDeps, checkRepoPolicyApproval, JobAdmissionDeps, PolicyApprovalDeps } from './job-admission';
 import type { GitHubJobInfo } from './broker-proxy-service';
 import type { PolicyDecision } from './policy-cache';
 
@@ -115,6 +115,28 @@ describe('admitJob', () => {
     await admitJob(deps, 't1', 'req-1', { ...info, repositoryId: 4242 });
 
     expect(deps.checkPolicyApproval).toHaveBeenCalledWith('owner', 'repo', 'abc1234def', 4242);
+  });
+
+  it("carries the job's repository id through to the policy decision", async () => {
+    // index.ts builds its admission from here. Written there as its own
+    // lambda, one that forgot the id still compiled, and the approval went
+    // back to whichever repository held the name.
+    const { deps } = setup();
+    const policy = {
+      getAccessToken: jest.fn(async () => 'token'),
+      getFileContent: jest.fn(async () => null),
+      decidePolicyForJob: jest.fn((..._args: unknown[]): PolicyDecision => ({ action: 'allow', reason: 'no-policy' })),
+      recordPendingPolicy: jest.fn(),
+      announce: jest.fn(),
+    } satisfies PolicyApprovalDeps;
+    const admission = buildAdmissionDeps(policy, {
+      findTarget: deps.findTarget, runnerManager: deps.runnerManager, broker: deps.broker, log: deps.log,
+    });
+
+    await admitJob(admission, 't1', 'req-1', { ...info, repositoryId: 4242 });
+
+    expect(policy.decidePolicyForJob).toHaveBeenCalledWith('owner/repo', null, 'abc1234def', 4242);
+    expect(deps.runnerManager.spawnWorkerForJob).toHaveBeenCalled();
   });
 
   it('drops a job for a target it no longer knows', async () => {

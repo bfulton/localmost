@@ -1544,6 +1544,15 @@ export class RunnerManager {
       this.instances.set(instanceNum, instance);
       this.startingInstances.delete(instanceNum);
       await this.stopDockerProxy(instanceNum);
+      // The proxy may already carry this job's policy, on a token given to a
+      // runner that never came up. Close and rotate now, as finalizeInstance
+      // does for one that did, rather than leave both live until the slot is
+      // next started.
+      const proxy = this.proxyServers.get(instanceNum);
+      if (proxy) {
+        this.closeProxyPolicy(proxy);
+        proxy.rotateAuthToken(randomBytes(24).toString('hex'));
+      }
       // The broker key was issued before this failure, and its /w/ URL is now
       // in the (unstarted) runner config. Revoke it, or a valid credential
       // outlives a worker that never came up.
