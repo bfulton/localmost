@@ -9,6 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { getAppDataDirWithoutElectron } from './paths';
 import { resolveWithin } from './contained-path';
+import { isGitHubOwnerName, isGitHubRepoName } from './github-names';
 
 // =============================================================================
 // Types
@@ -87,6 +88,8 @@ function ensureCacheDir(): void {
 
 /**
  * Get the cache index (list of cached actions).
+ *
+ * Only an entry's key and fetch time are ever used from it; see cachedEntry.
  */
 function getCacheIndex(): Record<string, CachedAction> {
   const indexPath = path.join(getActionsCacheDir(), CACHE_INDEX_FILE);
@@ -119,13 +122,49 @@ function getCacheKey(ref: ActionRef): string {
 
 /**
  * Get the local directory path for a cached action.
+ *
+ * The directory is removed before each fetch, and each part of it comes from
+ * the workflow, so the reference is checked here as well as where it is
+ * parsed, and the result must still be inside the cache. The version and
+ * subpath are encoded rather than flattened, so two references never share
+ * a directory: `releases/v1` and `releases_v1` once both became
+ * `releases_v1`.
  */
 function getActionDir(ref: ActionRef): string {
-  const parts = [ref.owner, ref.repo, ref.version.replace(/[^a-zA-Z0-9.-]/g, '_')];
-  if (ref.path) {
-    parts.push(ref.path.replace(/\//g, '_'));
+  if (!isActionRef(ref)) {
+    throw new Error(`Not an action reference: ${JSON.stringify(ref)}`);
   }
-  return path.join(getActionsCacheDir(), ...parts);
+  const parts = [ref.owner, ref.repo, encodeURIComponent(ref.version)];
+  if (ref.path) {
+    parts.push(encodeURIComponent(ref.path));
+  }
+  const cacheDir = path.resolve(getActionsCacheDir());
+  const dir = path.resolve(cacheDir, ...parts);
+  if (!dir.startsWith(cacheDir + path.sep)) {
+    throw new Error(`Action directory is outside the action cache: ${dir}`);
+  }
+  return dir;
+}
+
+/**
+ * An entry of the index, rebuilt from the reference it was asked for.
+ *
+ * The index is a file, and where an entry says its action lives would be
+ * handed to steps to read and removed when it expires. So that is worked out
+ * again from the reference, inside the cache, and only the fetch time is
+ * taken from the file - and not one in the future, which would keep an entry
+ * fresh forever.
+ */
+function cachedEntry(ref: ActionRef, index = getCacheIndex()): CachedAction | null {
+  const cached = index[getCacheKey(ref)];
+  if (!cached || typeof cached.fetchedAt !== 'string') return null;
+  const fetchedAt = Date.parse(cached.fetchedAt);
+  if (!(fetchedAt <= Date.now())) return null;
+  try {
+    return { ref, localPath: resolveActionPath(getActionDir(ref), ref.path), fetchedAt: cached.fetchedAt };
+  } catch {
+    return null;
+  }
 }
 
 // =============================================================================
@@ -159,12 +198,40 @@ export function parseActionRef(uses: string): ActionRef | null {
   }
 
   const [, owner, repo, actionPath, version] = match;
-  return {
+  const ref = {
     owner,
     repo,
     version,
     path: actionPath,
   };
+  return isActionRef(ref) ? ref : null;
+}
+
+/**
+ * A version or subpath: `/`-separated names of letters, digits, `.`, `_`,
+ * `+` and `-`, none of them empty, `.` or `..`. That covers the tags,
+ * branches, SHAs and directories actions are published under, and nothing
+ * that could climb out of the directory it names or change the URL it is
+ * fetched from.
+ */
+const isRefPath = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  value.split('/').every((part) => /^[A-Za-z0-9._+-]+$/.test(part) && part !== '.' && part !== '..');
+
+/**
+ * Whether a reference is one the cache may hold. Each part of it becomes a
+ * directory under the cache that a fetch removes and replaces, so the owner
+ * and repo must be names GitHub would accept, and the version and subpath
+ * must hold no `..`. A version starting with `-` would read as an option.
+ */
+function isActionRef(ref: ActionRef): boolean {
+  return (
+    isGitHubOwnerName(ref.owner) &&
+    isGitHubRepoName(ref.repo) &&
+    isRefPath(ref.version) &&
+    !ref.version.startsWith('-') &&
+    (ref.path === undefined || isRefPath(ref.path))
+  );
 }
 
 /**
@@ -206,7 +273,11 @@ function downloadAndExtract(url: string, destDir: string): Promise<void> {
     // Use curl for download and tar for extraction (simpler than native Node)
     const { spawn } = require('child_process');
 
-    const curl = spawn('curl', ['-sL', url], { stdio: ['ignore', 'pipe', 'pipe'] });
+    // -f so an error page fails the download instead of reaching tar, and
+    // HTTPS for every hop, so a redirect cannot hand the fetch to plain HTTP.
+    const curl = spawn('curl', ['-sSfL', '--proto', '=https', '--proto-redir', '=https', '--', url], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
     const tar = spawn('tar', ['-xz', '--strip-components=1', '-C', destDir], {
       stdio: ['pipe', 'ignore', 'pipe'],
     });
@@ -253,12 +324,9 @@ export async function fetchAction(ref: ActionRef): Promise<CachedAction> {
   const index = getCacheIndex();
 
   // Check cache first
-  if (index[cacheKey]) {
-    const cached = index[cacheKey];
-    const age = Date.now() - new Date(cached.fetchedAt).getTime();
-    if (age < MAX_CACHE_AGE_MS && fs.existsSync(cached.localPath)) {
-      return cached;
-    }
+  const hit = cachedEntry(ref, index);
+  if (hit && Date.now() - Date.parse(hit.fetchedAt) < MAX_CACHE_AGE_MS) {
+    return hit;
   }
 
   // Fetch from GitHub
@@ -269,17 +337,18 @@ export async function fetchAction(ref: ActionRef): Promise<CachedAction> {
     fs.rmSync(actionDir, { recursive: true, force: true });
   }
 
-  // Download tarball
-  const tarballUrl = `https://github.com/${ref.owner}/${ref.repo}/archive/refs/${
-    ref.version.match(/^[0-9a-f]{40}$/) ? '' : 'tags/'
-  }${ref.version}.tar.gz`;
-
-  try {
-    await downloadAndExtract(tarballUrl, actionDir);
-  } catch {
-    // Try as a branch
-    const branchUrl = `https://github.com/${ref.owner}/${ref.repo}/archive/refs/heads/${ref.version}.tar.gz`;
-    await downloadAndExtract(branchUrl, actionDir);
+  // Download tarball. A commit's archive is served at archive/<sha>, not
+  // under refs/; anything else is a tag or, failing that, a branch.
+  const archive = `https://github.com/${ref.owner}/${ref.repo}/archive`;
+  if (/^[0-9a-f]{40}$/.test(ref.version)) {
+    await downloadAndExtract(`${archive}/${ref.version}.tar.gz`, actionDir);
+  } else {
+    try {
+      await downloadAndExtract(`${archive}/refs/tags/${ref.version}.tar.gz`, actionDir);
+    } catch {
+      // Try as a branch
+      await downloadAndExtract(`${archive}/refs/heads/${ref.version}.tar.gz`, actionDir);
+    }
   }
 
   const localPath = resolveActionPath(actionDir, ref.path);
@@ -306,15 +375,24 @@ export async function fetchAction(ref: ActionRef): Promise<CachedAction> {
  * Get a cached action if available.
  */
 export function getCachedAction(ref: ActionRef): CachedAction | null {
-  const cacheKey = getCacheKey(ref);
-  const index = getCacheIndex();
-  const cached = index[cacheKey];
+  return cachedEntry(ref);
+}
 
-  if (cached && fs.existsSync(cached.localPath)) {
-    return cached;
-  }
-
-  return null;
+/**
+ * The index's entries as stored, each with its reference if that is one the
+ * cache could hold and is filed under its own key, and the entry as
+ * cachedEntry rebuilds it. Otherwise both are null: nothing it says is used.
+ */
+function indexEntries(
+  index: Record<string, CachedAction>
+): Array<{ key: string; ref: ActionRef | null; cached: CachedAction | null }> {
+  return Object.entries(index).map(([key, stored]) => {
+    const candidate = (stored as Partial<CachedAction> | null)?.ref;
+    const ref = candidate && typeof candidate === 'object' && isActionRef(candidate) && getCacheKey(candidate) === key
+      ? candidate
+      : null;
+    return { key, ref, cached: ref && cachedEntry(ref, index) };
+  });
 }
 
 /**
@@ -375,13 +453,14 @@ export function cleanActionCache(maxAgeDays = 30): { removed: number; kept: numb
   let removed = 0;
   let kept = 0;
 
-  for (const [key, cached] of Object.entries(index)) {
-    const age = now - new Date(cached.fetchedAt).getTime();
-    if (age > maxAgeMs || !fs.existsSync(cached.localPath)) {
-      // Remove from disk
-      if (fs.existsSync(cached.localPath)) {
+  for (const { key, ref, cached } of indexEntries(index)) {
+    if (!cached || now - Date.parse(cached.fetchedAt) > maxAgeMs) {
+      // Remove from disk: the directory the repository was extracted into,
+      // worked out from a reference that has been checked, never a path the
+      // index names.
+      if (ref) {
         try {
-          fs.rmSync(cached.localPath, { recursive: true, force: true });
+          fs.rmSync(getActionDir(ref), { recursive: true, force: true });
         } catch {
           // Ignore errors
         }
@@ -401,8 +480,7 @@ export function cleanActionCache(maxAgeDays = 30): { removed: number; kept: numb
  * List all cached actions.
  */
 export function listCachedActions(): CachedAction[] {
-  const index = getCacheIndex();
-  return Object.values(index).filter((cached) => fs.existsSync(cached.localPath));
+  return indexEntries(getCacheIndex()).flatMap(({ cached }) => (cached ? [cached] : []));
 }
 
 /**
