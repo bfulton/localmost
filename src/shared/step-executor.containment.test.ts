@@ -113,6 +113,7 @@ const context = (): ExecutionContext => ({
   workDir,
   proxyPort: 1234,
   workflowEnv: {},
+  cacheScope: { sourceDir: '/src/checkout', repository: 'owner/repo', ref: 'refs/heads/main' },
   jobEnv: {},
   matrix: {},
   secrets: {},
@@ -326,28 +327,67 @@ describe('the cache intercept', () => {
     expect(profile).not.toContain(cacheRoot());
   });
 
-  it('keeps one repository\'s and branch\'s caches from another\'s', async () => {
+  describe('scope', () => {
     // A checkout under test could otherwise save a poisoned node_modules
-    // under a key the next repository - or the default branch - restores.
-    fs.mkdirSync(path.join(workDir, 'node_modules'));
-    const as = (repo: string, ref: string, step: WorkflowStep) =>
-      executeStep(step, { ...context(), workflowEnv: { GITHUB_REPOSITORY: repo, GITHUB_REF: ref } }, job());
+    // under a key another checkout - or the same repository's default branch
+    // - restores and runs.
+    const save: WorkflowStep = { uses: 'actions/cache/save@v4', with: { key: 'deps', path: 'node_modules' } };
+    const restore: WorkflowStep = {
+      id: 'c',
+      uses: 'actions/cache@v4',
+      with: { key: 'deps', path: 'node_modules', 'restore-keys': 'de' },
+    };
+    const as = (scope: ExecutionContext['cacheScope'], step: WorkflowStep, workflowEnv: Record<string, string> = {}) =>
+      executeStep(step, { ...context(), cacheScope: scope, workflowEnv }, job());
 
-    await as('evil/fork', 'refs/heads/pr', { uses: 'actions/cache/save@v4', with: { key: 'deps', path: 'node_modules' } });
-    spawn.mockClear();
+    beforeEach(() => {
+      fs.mkdirSync(path.join(workDir, 'node_modules'));
+    });
 
-    for (const [repo, ref] of [['evil/fork', 'refs/heads/main'], ['good/repo', 'refs/heads/pr']]) {
-      const result = await as(repo, ref, {
-        id: 'c',
-        uses: 'actions/cache@v4',
-        with: { key: 'deps', path: 'node_modules', 'restore-keys': 'de' },
-      });
+    it('keeps one repository\'s and branch\'s caches from another\'s', async () => {
+      await as({ sourceDir: '/src/a', repository: 'evil/fork', ref: 'refs/heads/pr' }, save);
+      spawn.mockClear();
+
+      for (const [repository, ref] of [['evil/fork', 'refs/heads/main'], ['good/repo', 'refs/heads/pr']]) {
+        const result = await as({ sourceDir: '/src/a', repository, ref }, restore);
+        expect(result.outputs['cache-hit']).toBe('false');
+      }
+      expect(spawn).not.toHaveBeenCalled();
+
+      const hit = await as({ sourceDir: '/src/a', repository: 'evil/fork', ref: 'refs/heads/pr' }, restore);
+      expect(hit.outputs['cache-hit']).toBe('true');
+    });
+
+    it('keeps two checkouts apart even when both claim the same repository and ref', async () => {
+      // A tarball with no remote is local/repo; a checkout that ships its own
+      // .git names whatever origin it likes. Where it sits on disk is the one
+      // thing it cannot choose.
+      await as({ sourceDir: '/downloads/untrusted', repository: 'local/repo', ref: '' }, save);
+      spawn.mockClear();
+
+      const result = await as({ sourceDir: '/src/mine', repository: 'local/repo', ref: '' }, restore);
       expect(result.outputs['cache-hit']).toBe('false');
-    }
-    expect(spawn).not.toHaveBeenCalled();
+      expect(spawn).not.toHaveBeenCalled();
+    });
 
-    const hit = await as('evil/fork', 'refs/heads/pr', { uses: 'actions/cache@v4', with: { key: 'deps', path: 'node_modules' } });
-    expect(hit.outputs['cache-hit']).toBe('true');
+    it('takes the scope from the checkout, never from what the workflow\'s env claims', async () => {
+      // A workflow's top-level env is the checkout's to write, and it used to
+      // decide the scope: naming another repository and ref reached its cache.
+      const claim = { GITHUB_REPOSITORY: 'victim/repo', GITHUB_REF: 'refs/heads/main' };
+      await as({ sourceDir: '/src/pr', repository: 'evil/fork', ref: 'refs/heads/pr' }, save, claim);
+      spawn.mockClear();
+
+      const result = await as({ sourceDir: '/src/victim', repository: 'victim/repo', ref: 'refs/heads/main' }, restore, claim);
+      expect(result.outputs['cache-hit']).toBe('false');
+      expect(spawn).not.toHaveBeenCalled();
+    });
+
+    it('caches nothing when the run did not say whose cache it is', async () => {
+      const saved = await as(undefined, save);
+      expect(saved.status).toBe('success');
+      expect(spawn).not.toHaveBeenCalled();
+      expect(fs.existsSync(cacheRoot())).toBe(false);
+    });
   });
 });
 

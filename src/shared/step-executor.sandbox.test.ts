@@ -64,6 +64,7 @@ const ctx = (): ExecutionContext => ({
   workDir,
   proxyPort: 1,
   workflowEnv: { GITHUB_REPOSITORY: 'owner/repo', GITHUB_REF: 'refs/heads/main' },
+  cacheScope: { sourceDir: '/src/checkout', repository: 'owner/repo', ref: 'refs/heads/main' },
   jobEnv: {},
   matrix: {},
   secrets: {},

@@ -371,14 +371,19 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   const context: ExecutionContext = {
     workDir: workspace.path,
     proxyPort,
-    workflowEnv: {
-      GITHUB_WORKFLOW: workflow.name,
-      GITHUB_REPOSITORY: repository,
-      GITHUB_SHA: gitInfo?.sha || '',
-      GITHUB_REF: gitInfo?.ref || '',
-      ...(workflow.workflow.env || {}),
-      ...proxyEnv,
-    },
+    workflowEnv: buildWorkflowEnv(
+      workflow.workflow.env,
+      {
+        GITHUB_WORKFLOW: workflow.name,
+        GITHUB_REPOSITORY: repository,
+        GITHUB_SHA: gitInfo?.sha || '',
+        GITHUB_REF: gitInfo?.ref || '',
+      },
+      proxyEnv
+    ),
+    // From the checkout itself, before any of its workflow is read into the
+    // context: the workflow's env is the checkout's to write.
+    cacheScope: { sourceDir: fs.realpathSync(cwd), repository, ref: gitInfo?.ref || '' },
     jobEnv: {},
     matrix: {},
     secrets,
@@ -612,6 +617,22 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     reapStepProcesses();
     await discoveryProxy.stop();
   }
+}
+
+/**
+ * A run's workflow-level environment: what the workflow declares, then the
+ * GITHUB_* defaults over it, then what the run itself needs.
+ *
+ * GitHub does not let a workflow overwrite its default variables, and here
+ * the workflow is the checkout's to write; spreading its env last let it
+ * claim another repository and ref.
+ */
+export function buildWorkflowEnv(
+  declared: Record<string, string> | undefined,
+  defaults: Record<string, string>,
+  runEnv: Record<string, string>
+): Record<string, string> {
+  return { ...(declared || {}), ...defaults, ...runEnv };
 }
 
 // =============================================================================

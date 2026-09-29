@@ -55,6 +55,12 @@ export interface ExecutionContext {
   inputs?: Record<string, string | number | boolean>;
   /** Outputs from jobs this job depends on (needs context) */
   needs?: Record<string, Record<string, string>>;
+  /**
+   * Whose caches actions/cache reaches: the checkout the run was started in,
+   * and the repository and ref read from it, set before any workflow content
+   * is merged in. No scope, no cache.
+   */
+  cacheScope?: { sourceDir: string; repository: string; ref: string };
   /** Sandbox policy to enforce */
   policy?: SandboxPolicy;
   /** Whether running in permissive/discovery mode */
@@ -792,12 +798,17 @@ function executeCheckoutIntercept(
  * checkout under test could save a poisoned node_modules under a key the next
  * repository - or the same repository's main branch - restored and ran. On
  * GitHub a cache is scoped to its repository and branch; here it is scoped to
- * the repository and ref the run was started from. A hash names the
- * directory, so no two (repository, ref) pairs can share one.
+ * the checkout on disk the run was started from, and to the repository and
+ * ref read from it. The repository and ref alone are claims: every checkout
+ * with no remote is local/repo, one that ships its own .git names any origin
+ * it likes, and the workflow's env used to override both. Where the checkout
+ * sits is chosen by the user. A hash names the directory, so no two scopes
+ * can share one. Undefined when the run gave no scope.
  */
-function getLocalCacheDir(ctx: ExecutionContext): string {
-  const scope = JSON.stringify([ctx.workflowEnv.GITHUB_REPOSITORY || 'local/repo', ctx.workflowEnv.GITHUB_REF || '']);
-  const hash = crypto.createHash('sha256').update(scope).digest('hex').slice(0, 32);
+function getLocalCacheDir(ctx: ExecutionContext): string | undefined {
+  if (!ctx.cacheScope) return undefined;
+  const { sourceDir, repository, ref } = ctx.cacheScope;
+  const hash = crypto.createHash('sha256').update(JSON.stringify([sourceDir, repository, ref])).digest('hex').slice(0, 32);
   return path.join(getAppDataDirWithoutElectron(), 'workflow-cache', hash);
 }
 
@@ -913,6 +924,10 @@ async function executeCacheIntercept(
   ctx.onOutput?.(`Cache (local): key=${key}, path=${cachePath}`, 'stdout');
 
   const cacheDir = getLocalCacheDir(ctx);
+  if (!cacheDir) {
+    ctx.onOutput?.('Cache: no scope for this run, not restoring', 'stdout');
+    return miss;
+  }
   const exact = path.join(cacheDir, `${sanitizeCacheKey(key)}.tar`);
   let archive: string | undefined = fs.existsSync(exact) ? exact : undefined;
 
@@ -971,6 +986,12 @@ async function executeCacheSaveIntercept(
 
   ctx.onOutput?.(`Cache save (local): key=${key}, path=${cachePath}`, 'stdout');
 
+  const cacheDir = getLocalCacheDir(ctx);
+  if (!cacheDir) {
+    ctx.onOutput?.('Cache save: no scope for this run, not saving', 'stdout');
+    return done;
+  }
+
   const members = cacheMembers(cachePath, ctx).filter((member) => {
     // Only a hint: tar runs confined to the workspace whatever is here.
     const present = fs.existsSync(path.join(ctx.workDir, member));
@@ -979,7 +1000,6 @@ async function executeCacheSaveIntercept(
   });
   if (members.length === 0) return done;
 
-  const cacheDir = getLocalCacheDir(ctx);
   const archive = path.join(cacheDir, `${sanitizeCacheKey(key)}.tar`);
   // Entries are immutable once saved, as on GitHub.
   if (fs.existsSync(archive)) {
