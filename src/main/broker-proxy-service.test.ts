@@ -1143,6 +1143,14 @@ describe('message routing', () => {
           { jobMessageId: 2, jobId: acquiredIds.jobId },
           { requestId: 'req-9', ...acquiredIds },
           { requestId: 'req-1', jobMessageId: 9, ...acquiredIds },
+          // Upstream decoders match keys whatever their case, so a key this
+          // check does not read by its exact spelling still names a job there.
+          { requestId: 'req-1', PlanId: foreign.planId, JobId: foreign.jobId },
+          { requestId: 'req-1', ...acquiredIds, PlanId: foreign.planId, JobId: foreign.jobId },
+          { requestId: 'req-1', ...acquiredIds, RequestId: 999, JobRequestId: 999 },
+          { jobMessageId: 2, ...acquiredIds, JobMessageId: 9 },
+          { REQUESTID: 'req-9', ...acquiredIds },
+          { requestId: 'req-1', ...acquiredIds, Runner_Request_Id: 'req-9' },
         ]) {
           expect({ ids, status: (await report(ids)).statusCode }).toEqual({ ids, status: 403 });
         }
@@ -1167,6 +1175,31 @@ describe('message routing', () => {
           expect(res.statusCode).toBe(403);
           expect(mockHttpsRequest).not.toHaveBeenCalled();
         });
+
+      it.each([
+        ['GET', '/%6dessage'],
+        ['GET', '/Message'],
+        ['GET', '/message/'],
+        ['GET', '//message'],
+        ['DELETE', '/Session'],
+        ['DELETE', '/%73ession'],
+        ['POST', '/%61cknowledge'],
+        ['POST', '/AcquireJob'],
+        ['POST', '/_apis/OAuth2/Token'],
+        ['PUT', '/session'],
+      ])('refuses another spelling of a locally served endpoint: %s %s', async (method, path) => {
+        // These are answered here and never upstream. Spelled any other way
+        // they missed the local routes and went to the broker on the runner's
+        // token with the target's real session id, so a job could long-poll
+        // the target's session, taking messages from admission, or delete it.
+        const sessionId = await acquiredWorker();
+        mockHttpsRequest.mockClear();
+
+        const res = await request(method, `${path}?sessionId=${sessionId}`, JSON.stringify({ jobMessageId: 2 }));
+
+        expect(res.statusCode).toBe(403);
+        expect(mockHttpsRequest).not.toHaveBeenCalled();
+      });
 
       it('forwards nothing for a job that was delivered but not yet acquired', async () => {
         // Its ids are in the details acquirejob hands out; before that, the
