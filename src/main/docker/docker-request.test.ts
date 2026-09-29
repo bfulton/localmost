@@ -143,6 +143,14 @@ describe('request targets that are not plain origin-form paths', () => {
     expect(parse('http://evil/v1.45/_ping').targetError).toBeTruthy();
   });
 
+  it('refuses a target carrying a fragment, which the filter and the daemon would read differently', () => {
+    // The URL parser here ends the path at '#' and puts the rest, query and
+    // all, in a fragment the filter never sees; the daemon reads a request
+    // target with no notion of a fragment. No client sends one.
+    expect(parse('/v1.45/containers/mine/kill#x?signal=KILL').targetError).toBeTruthy();
+    expect(parse('/v1.45/containers/json?all=1#x').targetError).toBeTruthy();
+  });
+
   it('leaves an ordinary path alone', () => {
     const req = parse('/v1.45/containers/json?all=1');
     expect(req.targetError).toBeUndefined();

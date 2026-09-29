@@ -84,6 +84,15 @@ export function parseDockerRequest(raw: DockerRequest['raw']): DockerRequest {
       targetError: `request target "${raw.url}" is not a plain path; the localmost docker socket accepts origin-form targets only`,
     };
   }
+  // A request target has no fragment. The URL parser here would end the path
+  // at '#' and hide the rest, query included, while the daemon reads it as
+  // part of the target, so what was judged would not be what is forwarded.
+  if (raw.url.includes('#')) {
+    return {
+      method: raw.method, path: raw.url, query: {}, raw,
+      targetError: `request target "${raw.url}" carries a fragment; the localmost docker socket accepts origin-form targets only`,
+    };
+  }
 
   // The base is a placeholder so a path-only URL parses; only pathname and
   // search are read from the result.

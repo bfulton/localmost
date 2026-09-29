@@ -498,7 +498,9 @@ export class DockerFilterProxy {
 
   /**
    * The URL as forwarded: an unversioned request is pinned to the version we
-   * understand, and an owned container or network is named by its id.
+   * understand, and an owned container or network is named by its id. The
+   * query is the one judged: a target with a fragment, where the two could
+   * differ, never gets this far.
    */
   private forwardedUrl(parsed: DockerRequest): string {
     const pinnedPath = this.pinnedPath(parsed);
