@@ -23,10 +23,13 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   with the registries, images, workspace mounts (`ro`/`rw`), network mode and
   build context each covers. The job is never handed the daemon socket: each
   worker gets a socket localmost owns, and only declared requests are forwarded
-  to the daemon. Anything unlisted is denied, host bind mounts and
-  `--privileged`/`--pid=host`/`--network=host`/`--device` are refused, and
-  registry credentials are attached by the proxy so the job never reads
-  `~/.docker/config.json`. Default off. Allowed in `shared` and per workflow.
+  to the daemon. Anything unlisted is denied, host bind mounts,
+  `--privileged`/`--pid=host`/`--network=host`/`--device` and a restart policy
+  other than `no` (`--restart=always`, `unless-stopped`, `on-failure`) are
+  refused, and registry credentials are attached by the proxy so the job never
+  reads `~/.docker/config.json`. The containers and networks a job created are
+  removed when the job ends, the containers with their anonymous volumes.
+  Default off. Allowed in `shared` and per workflow.
   See `docs/superpowers/specs/2026-09-05-docker-isolation-design.md`
 - **Workflow Test Mode**: Run workflows locally before pushing with `localmost test`
   - Intercepts `actions/checkout` to use local working tree
@@ -120,6 +123,21 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   now gets 403 on any other port, and `localhost`, as a name, is refused through
   the proxy on every port. A test suite that binds ephemeral ports declares
   `loopback: true`.
+- A job whose name carries a runner status phrase - `Runner connect error`,
+  `please re-configure` and the like - no longer frees its busy slot or starts
+  re-registration. The runner prints the job's name in its output, which was
+  read for those phrases before the job start, so the worker was marked failed
+  while its job ran on, skipping the user filter and repository policy checks,
+  and the next job, from any repository, was built in the same sandbox.
+- Every job's sandbox is a new directory, `~/.localmost/runner/sandbox/<n>-<id>`
+  with its docker socket inside, and its slot takes no other job until the
+  worker's process group is empty or has been sent SIGKILL. A process a job left
+  behind kept write access to the fixed `sandbox/<n>`, and so to the next job's
+  runner, checkout and docker socket. Anything still running under a finished
+  job's sandbox profile is killed, found by the profile's mark rather than the
+  process group it can leave; that sweep runs a short script with the developer
+  tools' `python3`, and without them only the process group, and the processes
+  holding the marker file descriptor, are swept.
 - A runner job's approved `network.deny` and `filesystem.deny` are enforced, and
   a change to its filesystem deny list or loopback grant retires the workers
   built under the old one.
@@ -131,7 +149,8 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   closed to writes, so a job granted one can no longer rename it and read the
   denied path under the new name.
 - `.localmostrc` refuses a network entry that is not a host pattern - a URL such
-  as `https://evil.com`, a path, surrounding spaces - and a relative
+  as `https://evil.com`, a path, a range such as `10.0.0.0/8`, surrounding
+  spaces - and a relative
   `filesystem.deny` entry. Each was accepted and shown, and allowed or denied
   nothing. A network entry must also be in the spelling a request's host
   arrives in (punycode, an address written out, no trailing dot), which an
@@ -143,7 +162,9 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   does. Its proxy took the allow list alone and matched a host on any port.
   `--updaterc` writes a host reached on another port as `host:port`, so the
   next run allows what discovery saw, and reports rather than writes a host no
-  entry can name.
+  entry can name. A plain request goes upstream with the host that was checked
+  as its `Host`, as a runner job's does, not the header the client wrote, which
+  on a shared front end - a CDN, a cloud load balancer - asks for a denied site.
 - A runner job cannot read or write the app's own data directory
   (`~/.localmost`) or Electron's (`~/Library/Application Support/localmost`),
   whatever its policy grants, beyond its own sandbox and its target's caches,
