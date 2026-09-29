@@ -15,12 +15,13 @@ import {
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
 import { SandboxFilesystemPolicy, spawnSandboxed } from './process-sandbox';
 import { inheritedWorkerEnv, packageCacheEnv } from './worker-env';
-import type { EnvPolicy } from '../shared/sandbox-profile';
+import { DEFAULT_BROKER_PORT, type EnvPolicy } from '../shared/sandbox-profile';
 import { sweepProcessGroup } from './process-group';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { GitHubClientError } from './github-client';
 import { RunnerDownloader } from './runner-downloader';
 import type { WorkerCredentialFiles } from './worker-credentials';
+import type { BrokerJobTarget } from './broker-proxy-service';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
 import { loadConfig } from './config';
 import { normalizeFilterConfig, isUserAllowed, areAllUsersAllowed, parseRepository } from './runner/user-filter';
@@ -107,11 +108,17 @@ interface RunnerInstance {
   /** Set when a claim found the approved policy had moved; the worker stays constrained. */
   policyDrifted?: boolean;
   /**
-   * The repository whose job this worker claimed, as the broker reported it.
-   * The docker socket opens only for this repository, and only when it is
-   * also the one the worker was spawned for.
+   * The job this worker claimed, as the broker reported it: its repository
+   * as GitHub names it, commit and workflow. The docker socket opens only for
+   * this repository, and only when it is also the one the worker was spawned
+   * for; the job-start refresh applies the policy for this job and no other.
    */
-  claimedRepository?: string;
+  claimedJob?: { repository: string; sha: string; workflow: string };
+  /**
+   * Set when the worker is finalized and its proxy closed. A policy lookup
+   * still in flight from before then must not reopen it.
+   */
+  policySealed?: boolean;
   process: ChildProcess | null;
   status: RunnerStatus;
   currentJob: {
@@ -165,7 +172,20 @@ export interface RepoPolicyRuntime {
    * Absent means the policy declares none.
    */
   env?: EnvPolicy;
+  /** Hosts the policy denies, resolved per workflow like hosts; absent means none. */
+  deniedHosts?: string[];
+  /** Paths the policy denies, applied when the worker is spawned; absent means none. */
+  denyPaths?: string[];
+  /**
+   * Loopback the policy opens beyond the worker's own proxy: every port, or
+   * these ones. Applied to the profile at spawn and to the proxy per job;
+   * absent means none.
+   */
+  loopback?: true | number[];
 }
+
+/** The broker's record of a job a worker claimed. */
+export type ClaimedJobTarget = BrokerJobTarget;
 
 interface RunnerManagerOptions {
   onLog: (entry: LogEntry) => void;
@@ -189,7 +209,12 @@ interface RunnerManagerOptions {
    * The repository and commit of a job the worker in a slot claims, from the
    * broker - which answers only for a job it delivered to that worker.
    */
-  getJobTarget?: (instanceNum: number, jobId: string) => { targetDisplayName: string; githubSha?: string } | undefined;
+  getJobTarget?: (instanceNum: number, jobId: string) => ClaimedJobTarget | undefined;
+  /**
+   * The port the broker listens on, the one loopback port every worker's
+   * proxy keeps open. The default broker port when absent.
+   */
+  getBrokerPort?: () => number;
   /** The repository's approved policy, resolved for the job about to run. */
   getRepoPolicy?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<RepoPolicyRuntime>;
   /** Called when a job starts or completes (for notifications) */
@@ -250,7 +275,8 @@ export class RunnerManager {
   private getJobConclusion?: (owner: string, repo: string, jobId: number) => Promise<string | null>;
   private getAllContributors?: (owner: string, repo: string, sha: string) => Promise<Set<string>>;
   private getRepoPolicy?: (owner: string, repo: string, sha: string, workflowName: string) => Promise<RepoPolicyRuntime>;
-  private getJobTarget?: (instanceNum: number, jobId: string) => { targetDisplayName: string; githubSha?: string } | undefined;
+  private getJobTarget?: (instanceNum: number, jobId: string) => ClaimedJobTarget | undefined;
+  private getBrokerPort?: () => number;
   private onJobEvent?: (event: JobEvent) => void;
   private onWorkerReservedForJob?: (targetId: string, instanceNum: number, jobId?: string) => void;
   private onWorkerReservationCancelled?: (targetId: string, instanceNum: number, jobId?: string) => void;
@@ -302,7 +328,10 @@ export class RunnerManager {
 
   // Pending target context for jobs received from broker
   // Keyed by slot number, or 'next' for the job admission is handing to spawnWorkerForJob
-  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string; githubSha?: string; githubRef?: string; githubWorkflow?: string; jobId?: string }> = new Map();
+  // githubRepo is owner/repo as GitHub reports it: the name the policy was
+  // approved and checked under, which for an organization target the display
+  // name is not.
+  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string; githubSha?: string; githubRef?: string; githubWorkflow?: string; jobId?: string; githubRepo?: string }> = new Map();
 
   /**
    * Validate that a child path stays within the expected base directory.
@@ -338,6 +367,7 @@ export class RunnerManager {
     this.getAllContributors = options.getAllContributors;
     this.getRepoPolicy = options.getRepoPolicy;
     this.getJobTarget = options.getJobTarget;
+    this.getBrokerPort = options.getBrokerPort;
     this.onJobEvent = options.onJobEvent;
     this.onWorkerReservedForJob = options.onWorkerReservedForJob;
     this.onWorkerReservationCancelled = options.onWorkerReservationCancelled;
@@ -508,9 +538,10 @@ export class RunnerManager {
    * @param githubRef The branch/tag ref (e.g., refs/heads/main)
    * @param githubWorkflow The workflow name (github.workflow), which keys per-workflow policy
    * @param jobId The broker's id for the job, so a worker that never takes it can give it up
+   * @param githubRepo owner/repo as GitHub reports it, which keys the job's policy
    */
-  setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string, actionsUrl?: string, githubRunId?: number, githubJobId?: number, githubActor?: string, githubSha?: string, githubRef?: string, githubWorkflow?: string, jobId?: string): void {
-    this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName, actionsUrl, githubRunId, githubJobId, githubActor, githubSha, githubRef, githubWorkflow, jobId });
+  setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string, actionsUrl?: string, githubRunId?: number, githubJobId?: number, githubActor?: string, githubSha?: string, githubRef?: string, githubWorkflow?: string, jobId?: string, githubRepo?: string): void {
+    this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName, actionsUrl, githubRunId, githubJobId, githubActor, githubSha, githubRef, githubWorkflow, jobId, githubRepo });
     this.log('debug', `Set pending target context for ${runnerName}: ${targetDisplayName} (runId=${githubRunId}, jobId=${githubJobId}, actor=${githubActor}, sha=${githubSha?.slice(0, 7)})`);
   }
 
@@ -907,10 +938,11 @@ export class RunnerManager {
       // Closed until a job is claimed. The level belongs to the repository's
       // policy now, and is installed when a worker announces which job it took.
       policyLevel: 'strict',
-      // Per-worker secret. Every worker's proxy is on loopback, which the
-      // sandbox lets any job reach, so without this a job could route its
-      // traffic through another worker's proxy and take that repository's
-      // allowlist. The token rides in the proxy URL this worker is given.
+      // Per-worker secret. Every worker's proxy is on loopback, which a job
+      // whose policy opens loopback can reach, so without this a job could
+      // route its traffic through another worker's proxy and take that
+      // repository's allowlist. The token rides in the proxy URL this worker
+      // is given.
       authToken: randomBytes(24).toString('hex'),
       onJobAcquired: async (jobId: string) => {
         // The worker behind this proxy just claimed a job, and this is the
@@ -924,22 +956,29 @@ export class RunnerManager {
           // proxy may still hold the last job's hosts, so clear them: an
           // unidentifiable job gets nothing rather than someone else's grants.
           const staleProxy = this.proxyServers.get(instanceNum);
-          staleProxy?.setPolicyAllowedHosts([]);
-          staleProxy?.setPolicyLevel('strict');
+          if (staleProxy) this.closeProxyPolicy(staleProxy);
           this.log('warn', `[instance ${instanceNum}] No target for acquired job ${jobId}; policy closed`);
           return;
         }
+        // The claimed job's own identity, not the one the worker was spawned
+        // for: its repository as GitHub names it, which the policy was
+        // approved under, and its workflow, which keys workflows.<name>.
         await this.applyPolicyForTarget(
           instanceNum,
-          target.targetDisplayName,
+          target.repository ?? target.targetDisplayName,
           target.githubSha,
-          '',
+          target.githubWorkflow ?? '',
           true
         );
       },
       onLog: (entry: ProxyLogEntry) => {
-        // Skip logging routine localhost message polling (very noisy)
-        if (!entry.blocked && (entry.host === 'localhost' || entry.host === '127.0.0.1')) {
+        // Skip logging routine localhost message polling (very noisy). Only
+        // the broker's: a declared loopback port is a grant worth auditing.
+        if (
+          !entry.blocked &&
+          entry.reason === 'infrastructure' &&
+          (entry.host === 'localhost' || entry.host === '127.0.0.1')
+        ) {
           return;
         }
         const status = entry.blocked ? 'BLOCKED' : 'ALLOWED';
@@ -952,6 +991,33 @@ export class RunnerManager {
     this.log('debug', `Proxy server for instance ${instanceNum} started on port ${port}; policy installed when a job is claimed`);
     this.proxyServers.set(instanceNum, proxy);
     return proxy;
+  }
+
+  /** The broker's port, which every worker's proxy keeps open on loopback. */
+  private brokerPort(): number {
+    return this.getBrokerPort?.() ?? DEFAULT_BROKER_PORT;
+  }
+
+  /**
+   * Close a proxy to runner infrastructure: no policy hosts, no denies,
+   * strict, and on loopback the broker alone. Every place a job's policy is
+   * withdrawn goes through here, so no part of it can be left behind.
+   */
+  private closeProxyPolicy(proxy: ProxyServer): void {
+    proxy.setPolicyAllowedHosts([]);
+    proxy.setPolicyDeniedHosts([]);
+    proxy.setLoopbackPolicy(this.brokerPort(), undefined);
+    proxy.setPolicyLevel('strict');
+  }
+
+  /**
+   * The repository a job context's policy belongs to: owner/repo as GitHub
+   * reported it for the job - the name admission checked and the policy was
+   * approved under - or, for a context recorded without it, the target's
+   * display name.
+   */
+  private policyRepository(context: { targetDisplayName: string; githubRepo?: string }): string {
+    return context.githubRepo ?? context.targetDisplayName;
   }
 
   private async stopInstanceProxy(instanceNum: number): Promise<void> {
@@ -1123,8 +1189,7 @@ export class RunnerManager {
 
       // Install the policy before the runner process exists. A reused proxy
       // still holds the last job's hosts until this runs.
-      proxy.setPolicyAllowedHosts([]);
-      proxy.setPolicyLevel('strict');
+      this.closeProxyPolicy(proxy);
       // Rotate the proxy token every start (finalizeInstance rotates at exit
       // too). The proxy is reused across a slot's jobs, so without this a
       // detached orphan of the previous job would keep a valid HTTP_PROXY
@@ -1135,7 +1200,7 @@ export class RunnerManager {
       if (startupContext?.targetDisplayName && startupContext.githubSha) {
         await this.applyPolicyForTarget(
           instanceNum,
-          startupContext.targetDisplayName,
+          this.policyRepository(startupContext),
           startupContext.githubSha,
           ''
         );
@@ -1308,6 +1373,9 @@ export class RunnerManager {
           // Create a new process group so we can kill all child processes
           detached: true,
           filesystemPolicy,
+          // The one loopback port the profile always opens: without it the
+          // job reaches nothing on loopback, its own proxy included.
+          proxyPort: proxy.getPort(),
           dockerSocket: dockerSocketPath,
           toolCacheDir,
           packageCacheDir,
@@ -1722,13 +1790,15 @@ export class RunnerManager {
     // the job is over. startInstance rotates again for its own worker;
     // nothing legitimate holds this token in between.
     const proxy = this.proxyServers.get(instanceNum);
+    const instance = this.instances.get(instanceNum);
+    // A policy lookup begun before this - a claim, a job start - resolves
+    // after it and must find the worker sealed rather than reopen the proxy.
+    if (instance) instance.policySealed = true;
     if (proxy) {
-      proxy.setPolicyAllowedHosts([]);
-      proxy.setPolicyLevel('strict');
+      this.closeProxyPolicy(proxy);
       proxy.rotateAuthToken(randomBytes(24).toString('hex'));
     }
     const pidFile = path.join(this.pidDir(), `${instanceNum}.pid`);
-    const instance = this.instances.get(instanceNum);
     let markerPath = ownedMarker ?? instance?.markerPath;
     if (!markerPath) {
       try {
@@ -2136,12 +2206,27 @@ export class RunnerManager {
    * were refused. Only what the profile fixed at spawn belongs here.
    */
   private stampFor(
-    policy: Pick<RepoPolicyRuntime, 'level' | 'readPaths' | 'writePaths' | 'docker' | 'env'>
+    policy: Pick<RepoPolicyRuntime, 'level' | 'readPaths' | 'writePaths' | 'env' | 'denyPaths' | 'loopback'>
   ): string {
     // The env policy is fixed at spawn like the profile, so it is part of
-    // what a worker was built under.
+    // what a worker was built under; so are the denied paths and the
+    // loopback ports, which the profile holds too. The denied hosts are not:
+    // like the allowed ones they are resolved per workflow and applied to
+    // the proxy on every claim. Nor is docker, for the same reason: it merges
+    // shared with the claimed workflow's section and the socket is bound to
+    // it per claim. The spawn stamp is taken before the workflow is known, so
+    // stamping it made every claim of a workflow with its own docker section
+    // read as drift.
+    const fixedAtSpawn: unknown[] = [
+      policy.level,
+      policy.readPaths,
+      policy.writePaths,
+      policy.env,
+      policy.denyPaths ?? [],
+      policy.loopback ?? null,
+    ];
     return createHash('sha256')
-      .update(JSON.stringify([policy.level, policy.readPaths, policy.writePaths, policy.docker, policy.env]))
+      .update(JSON.stringify(fixedAtSpawn))
       .digest('hex');
   }
 
@@ -2166,9 +2251,13 @@ export class RunnerManager {
       // GitHub has already handed out, and the run would fail on timeout with
       // no steps recorded. It is --once, so it retires after this job anyway.
       if (instanceNum === exceptInstance) continue;
-      const target = instance.currentJob?.targetDisplayName
-        ?? this.pendingTargetContext.get(String(instanceNum))?.targetDisplayName;
-      if (target !== repository) continue;
+      // By the repository the worker's policy was resolved for, as GitHub
+      // names it - the name approvals are keyed on - and without regard to
+      // case, as GitHub compares them: a policy changed for bfulton/localmost
+      // is the policy of a worker spawned for BFulton/Localmost.
+      const context = this.pendingTargetContext.get(String(instanceNum));
+      const target = context ? this.policyRepository(context) : instance.currentJob?.targetDisplayName;
+      if (target?.toLowerCase() !== repository.toLowerCase()) continue;
 
       if (instance.currentJob) {
         // Leave the stamp alone. Overwriting it made the drift check fire on
@@ -2188,7 +2277,7 @@ export class RunnerManager {
   }
 
   private async resolveFilesystemPolicy(
-    context?: { targetDisplayName?: string; githubSha?: string }
+    context?: { targetDisplayName: string; githubSha?: string; githubRepo?: string }
   ): Promise<SandboxFilesystemPolicy & { env?: EnvPolicy; stamp?: string }> {
     // No stamp rather than a sentinel: a sentinel is truthy, so it would fail
     // the drift check against every real hash and the worker would refuse
@@ -2202,7 +2291,7 @@ export class RunnerManager {
     };
     if (!context?.targetDisplayName || !context.githubSha || !this.getRepoPolicy) return closed;
 
-    const repoInfo = parseRepository(context.targetDisplayName);
+    const repoInfo = parseRepository(this.policyRepository(context));
     if (!repoInfo) return closed;
 
     try {
@@ -2211,6 +2300,8 @@ export class RunnerManager {
         level: policy.level,
         read: policy.readPaths,
         write: policy.writePaths,
+        deny: policy.denyPaths ?? [],
+        ...(policy.loopback !== undefined ? { loopback: policy.loopback } : {}),
         env: policy.env,
         stamp: this.stampFor(policy),
       };
@@ -2221,7 +2312,8 @@ export class RunnerManager {
 
   private async applyPolicyForTarget(
     instanceNum: number,
-    targetDisplayName: string,
+    /** owner/repo as GitHub names it, falling back to the target's display name. */
+    repository: string,
     githubSha: string,
     workflowName: string,
     /**
@@ -2231,17 +2323,31 @@ export class RunnerManager {
      */
     isClaim = false
   ): Promise<void> {
-    const proxy = this.proxyServers.get(instanceNum);
-    if (!proxy || !this.getRepoPolicy) return;
+    const claimProxy = this.proxyServers.get(instanceNum);
+    if (!claimProxy || !this.getRepoPolicy) return;
 
-    const repoInfo = parseRepository(targetDisplayName);
-    if (!repoInfo) return;
+    // The worker this policy is for. The lookup below awaits, and in that
+    // time the worker can exit - its proxy closed by finalizeInstance - and
+    // the slot be given to another job's worker, which reuses the proxy and
+    // the slot number. Whatever the lookup returns belongs to this worker
+    // only, so everything after it is checked against this one.
+    const instance = this.instances.get(instanceNum);
+    const repoInfo = parseRepository(repository);
+    if (!repoInfo || !instance) {
+      // A claim this cannot place gets nothing, as an unidentifiable one
+      // does: returning alone would leave whatever the proxy held before -
+      // the spawn-time policy - on a job nobody has matched it to.
+      if (isClaim) {
+        this.closeProxyPolicy(claimProxy);
+        this.log('warn', `[instance ${instanceNum}] Cannot place claimed job from ${repository}; policy closed`);
+      }
+      return;
+    }
 
     // What the worker claimed, as the broker reported it. Recorded before
     // anything below can bail so the docker socket is judged against it
     // however the rest of the policy fares.
-    const instance = this.instances.get(instanceNum);
-    if (isClaim && instance) instance.claimedRepository = targetDisplayName;
+    if (isClaim) instance.claimedJob = { repository, sha: githubSha, workflow: workflowName };
 
     const policy = await this.getRepoPolicy(
       repoInfo.owner,
@@ -2249,6 +2355,12 @@ export class RunnerManager {
       githubSha,
       workflowName
     );
+    if (this.instances.get(instanceNum) !== instance || instance.policySealed) {
+      this.log('debug', `[instance ${instanceNum}] ${repository} policy resolved after its worker finished; not applied`);
+      return;
+    }
+    const proxy = this.proxyServers.get(instanceNum);
+    if (!proxy) return;
     const { hosts, level } = policy;
 
     // The filesystem half of the policy is baked into the sandbox profile at
@@ -2256,7 +2368,7 @@ export class RunnerManager {
     // this worker would run the job under the old boundary - so it is refused
     // rather than run. Approving through the app retires workers eagerly; this
     // also covers approving through the CLI, which writes the cache directly.
-    if (instance?.policyDrifted) {
+    if (instance.policyDrifted) {
       this.log(
         'debug',
         `[instance ${instanceNum}] Policy drifted for this worker; leaving it constrained rather than reapplying`
@@ -2265,7 +2377,7 @@ export class RunnerManager {
     }
 
     const currentStamp = this.stampFor(policy);
-    if (isClaim && instance?.policyStamp && instance.policyStamp !== currentStamp) {
+    if (isClaim && instance.policyStamp && instance.policyStamp !== currentStamp) {
       // The filesystem half is fixed in this worker's profile and cannot be
       // updated, so the job runs under the boundary that was approved when the
       // worker started. That boundary was approved by the machine owner, just
@@ -2276,23 +2388,26 @@ export class RunnerManager {
       // opens it. Sticky, because the job-start refresh runs without isClaim
       // and so never re-checks drift - without this it fell straight through
       // to the widening below, restoring the hosts and rebinding the socket
-      // this branch had just closed.
-      if (instance) instance.policyDrifted = true;
-      proxy.setPolicyAllowedHosts([]);
-      proxy.setPolicyLevel('strict');
+      // this branch had just closed. The current policy's denied hosts still
+      // apply: a deny only ever narrows what is left.
+      instance.policyDrifted = true;
+      this.closeProxyPolicy(proxy);
+      proxy.setPolicyDeniedHosts(policy.deniedHosts ?? []);
       this.log(
         'warn',
-        `[instance ${instanceNum}] ${targetDisplayName} policy changed since this worker started; running with runner infrastructure only and retiring the worker`
+        `[instance ${instanceNum}] ${repository} policy changed since this worker started; running with runner infrastructure only and retiring the worker`
       );
-      await this.retireWorkersForRepository(targetDisplayName, instanceNum);
+      await this.retireWorkersForRepository(repository, instanceNum);
       return;
     }
 
     proxy.setPolicyAllowedHosts(hosts);
+    proxy.setPolicyDeniedHosts(policy.deniedHosts ?? []);
+    proxy.setLoopbackPolicy(this.brokerPort(), policy.loopback);
     proxy.setPolicyLevel(level);
-    this.bindDockerSocket(instanceNum, targetDisplayName, policy.docker);
+    this.bindDockerSocket(instanceNum, repository, policy.docker);
     if (hosts.length > 0 || level !== 'strict') {
-      this.log('info', `[instance ${instanceNum}] Applied ${level} policy with ${hosts.length} host(s) from ${targetDisplayName} .localmostrc`);
+      this.log('info', `[instance ${instanceNum}] Applied ${level} policy with ${hosts.length} host(s) from ${repository} .localmostrc`);
     }
   }
 
@@ -2313,9 +2428,13 @@ export class RunnerManager {
     const socket = this.dockerProxies.get(instanceNum);
     if (!socket) return;
 
-    const spawnedFor = this.pendingTargetContext.get(String(instanceNum))?.targetDisplayName;
-    const claimedFor = this.instances.get(instanceNum)?.claimedRepository ?? repository;
-    if (spawnedFor !== repository || claimedFor !== repository) {
+    // Repositories by the name GitHub reports, compared as GitHub compares
+    // them, without regard to case.
+    const spawnContext = this.pendingTargetContext.get(String(instanceNum));
+    const spawnedFor = spawnContext ? this.policyRepository(spawnContext) : undefined;
+    const claimedFor = this.instances.get(instanceNum)?.claimedJob?.repository ?? repository;
+    const same = (name: string | undefined): boolean => name?.toLowerCase() === repository.toLowerCase();
+    if (!same(spawnedFor) || !same(claimedFor)) {
       this.log(
         'warn',
         `[instance ${instanceNum}] Docker socket stays closed: spawned for ${spawnedFor ?? 'no job'}, claimed ${claimedFor}, policy is for ${repository}`
@@ -2327,31 +2446,23 @@ export class RunnerManager {
 
   private async applyRepoPolicy(instanceNum: number): Promise<void> {
     const instance = this.instances.get(instanceNum);
-    const proxy = this.proxyServers.get(instanceNum);
-    if (!proxy) return;
+    if (!this.proxyServers.get(instanceNum)) return;
 
     // This refines a policy that acquirejob has already installed for the job
-    // the worker actually claimed, purely to pick up any per-workflow section
-    // now that the job has started. It must never clear: clearing here wiped
+    // the worker actually claimed. It must never clear: clearing here wiped
     // a correct policy whenever this path could not identify the job, and the
     // job then ran with no hosts. Staleness is handled where a job is claimed.
     if (!instance?.currentJob || !this.getRepoPolicy) return;
 
-    const spawnContext = this.pendingTargetContext.get(String(instanceNum));
-    const targetDisplayName = instance.currentJob.targetDisplayName ?? spawnContext?.targetDisplayName;
-    const githubSha = instance.currentJob.githubSha ?? spawnContext?.githubSha;
-    if (!targetDisplayName || !githubSha) return;
+    // Only for the job the broker says this worker claimed - its repository,
+    // commit and workflow, which keys workflows.<name> - never for the one it
+    // was spawned for or the name the runner prints: those are what the
+    // worker was expected to take, not what it took. A worker with no claim
+    // on record keeps the policy it has.
+    const claimed = instance.claimedJob;
+    if (!claimed) return;
 
-    // workflows.<name> keys on the workflow, which the broker read from
-    // github.workflow. The job name the runner prints is a different thing
-    // and only ever matched a section by coincidence; it stays as the fallback
-    // for a job the broker never saw.
-    await this.applyPolicyForTarget(
-      instanceNum,
-      targetDisplayName,
-      githubSha,
-      instance.currentJob.githubWorkflow ?? instance.currentJob.name
-    );
+    await this.applyPolicyForTarget(instanceNum, claimed.repository, claimed.sha, claimed.workflow);
   }
 
   /**
@@ -2587,11 +2698,12 @@ export class RunnerManager {
       return;
     }
 
-    // An org target's name is the org alone. Admission judged such a job by
-    // the job's own repository; this worker only knows the target's.
-    const repoInfo = parseRepository(targetDisplayName);
+    // The job's repository as GitHub reported it: an organization target's
+    // display name is the organization, which names no repository to check.
+    const repository = this.pendingTargetContext.get(String(instanceNum))?.githubRepo ?? targetDisplayName;
+    const repoInfo = parseRepository(repository);
     if (!repoInfo) {
-      this.log('warn', `Cannot parse owner/repo from target: ${targetDisplayName}`);
+      this.log('warn', `Cannot parse owner/repo from target: ${repository}`);
       return;
     }
 

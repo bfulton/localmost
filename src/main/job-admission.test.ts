@@ -1,5 +1,6 @@
-import { admitJob, JobAdmissionDeps } from './job-admission';
+import { admitJob, checkRepoPolicyApproval, JobAdmissionDeps, PolicyApprovalDeps } from './job-admission';
 import type { GitHubJobInfo } from './broker-proxy-service';
+import type { PolicyDecision } from './policy-cache';
 
 describe('admitJob', () => {
   const target = { id: 't1', displayName: 'owner/repo' };
@@ -56,7 +57,7 @@ describe('admitJob', () => {
 
     expect(calls).toEqual(['filter', 'policy', 'context', 'spawn']);
     expect(deps.runnerManager.setPendingTargetContext).toHaveBeenCalledWith(
-      'next', 't1', 'owner/repo', expect.any(String), 42, 7, 'me', 'abc1234def', 'refs/heads/main', 'ci', 'req-1'
+      'next', 't1', 'owner/repo', expect.any(String), 42, 7, 'me', 'abc1234def', 'refs/heads/main', 'ci', 'req-1', 'owner/repo'
     );
     expect(deps.broker.dropJob).not.toHaveBeenCalled();
     expect(deps.broker.refuseJob).not.toHaveBeenCalled();
@@ -93,6 +94,27 @@ describe('admitJob', () => {
     expect(deps.broker.refuseJob).toHaveBeenCalledWith('t1', 'req-1');
     expect(calls.indexOf('refuse')).toBeLessThan(calls.indexOf('cancel'));
     expect(deps.runnerManager.spawnWorkerForJob).not.toHaveBeenCalled();
+  });
+
+  it("hands the worker an organization target's job under the repository GitHub named", async () => {
+    // The display name of an organization target is the organization. The
+    // policy was checked, and approved, under the job's own repository, so
+    // that is the name the worker's policy has to be resolved under.
+    const { deps } = setup({ findTarget: () => ({ id: 't1', displayName: 'myorg' }) });
+
+    await admitJob(deps, 't1', 'req-1', { ...info, githubRepo: 'MyOrg/App' });
+
+    expect(deps.runnerManager.setPendingTargetContext.mock.calls[0]).toEqual([
+      'next', 't1', 'myorg', expect.any(String), 42, 7, 'me', 'abc1234def', 'refs/heads/main', 'ci', 'req-1', 'MyOrg/App',
+    ]);
+  });
+
+  it("asks about the policy with the job's repository id", async () => {
+    const { deps } = setup();
+
+    await admitJob(deps, 't1', 'req-1', { ...info, repositoryId: 4242 });
+
+    expect(deps.checkPolicyApproval).toHaveBeenCalledWith('owner', 'repo', 'abc1234def', 4242);
   });
 
   it('drops a job for a target it no longer knows', async () => {
@@ -190,5 +212,45 @@ describe('admitJob', () => {
 
     expect(deps.broker.refuseJob).toHaveBeenCalledWith('t1', 'req-1');
     expect(deps.broker.dropJob).not.toHaveBeenCalled();
+  });
+});
+
+describe('checkRepoPolicyApproval', () => {
+  const approvalRequest = { repository: 'owner/repo', newConfig: { version: 1 }, diffs: [], isNewRepo: true };
+
+  function deps(decision: PolicyDecision) {
+    return {
+      getAccessToken: jest.fn(async () => 'token'),
+      getFileContent: jest.fn(async () => 'version: 1\n'),
+      decidePolicyForJob: jest.fn((..._args: unknown[]) => decision),
+      recordPendingPolicy: jest.fn(),
+      announce: jest.fn(),
+    } satisfies PolicyApprovalDeps;
+  }
+
+  it("decides and records the pending policy with the job's repository id", async () => {
+    const d = deps({ action: 'needs-approval', request: approvalRequest });
+
+    const reason = await checkRepoPolicyApproval(d, 'owner', 'repo', 'abc1234', 4242);
+
+    expect(d.decidePolicyForJob).toHaveBeenCalledWith('owner/repo', 'version: 1\n', 'abc1234', 4242);
+    expect(d.recordPendingPolicy).toHaveBeenCalledWith('owner/repo', approvalRequest.newConfig, 4242);
+    // A repository that has simply not been approved keeps the plain request.
+    expect(reason).toMatch(/has not been approved/);
+    expect(reason).not.toMatch(/different repository/);
+  });
+
+  it('says so when a different repository now holds the approved name', async () => {
+    // The approval belongs to repository 41. The CLI cannot move it to 4242 -
+    // only the app's approval card, which shows the id changing - so pointing
+    // at `localmost policy approve` sent the operator to a command that
+    // leaves the job refused.
+    const d = deps({ action: 'needs-approval', request: { ...approvalRequest, replacesRepositoryId: 41 } });
+
+    const reason = await checkRepoPolicyApproval(d, 'owner', 'repo', 'abc1234', 4242);
+
+    expect(reason).toMatch(/different repository/);
+    expect(reason).toContain('Settings > Job Security');
+    expect(reason).not.toMatch(/has not been approved|policy approve/);
   });
 });

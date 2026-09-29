@@ -15,8 +15,10 @@ interface RunnerInstance {
   /** Hash of the approved policy this worker's profile was built from. */
   policyStamp?: string;
   markerPath?: string;
-  /** The repository whose job this worker claimed, as the broker reported it. */
-  claimedRepository?: string;
+  /** The job this worker claimed, as the broker reported it. */
+  claimedJob?: { repository: string; sha: string; workflow: string };
+  /** Set once the worker is finalized and its proxy closed. */
+  policySealed?: boolean;
   process: ChildProcess | null;
   status: RunnerStatus;
   currentJob: {
@@ -240,6 +242,7 @@ export class RunnerManagerTestHelper {
       githubSha?: string;
       githubWorkflow?: string;
       jobId?: string;
+      githubRepo?: string;
     }
   ): void {
     (this.manager as never as {

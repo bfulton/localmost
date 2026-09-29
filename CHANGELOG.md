@@ -107,8 +107,28 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
 - The broker no longer logs the head of a job payload, which carries the job's
   secrets, and drops the payload once the worker has taken it instead of holding
   it for the life of the process.
+- A runner job reaches loopback only on the broker's port and the ports its
+  approved `shared.network.loopback` declares, whether it connects directly or
+  through `HTTP_PROXY`: a request for `127.0.0.1:<port>` sent through the proxy
+  now gets 403 on any other port, and `localhost`, as a name, is refused through
+  the proxy on every port. A test suite that binds ephemeral ports declares
+  `loopback: true`.
+- A runner job's approved `network.deny` and `filesystem.deny` are enforced, and
+  a change to its filesystem deny list or loopback grant retires the workers
+  built under the old one.
+- An approved policy is bound to the repository's id as well as its name. A job
+  from a different repository that now holds an approved name - the approved one
+  deleted or renamed, and the name taken since - is refused until the policy is
+  reviewed again in Settings > Job Security.
 
 ### Fixed
+- An organization target's jobs get their repository's approved policy. The
+  policy was looked up under the target's display name, the organization, which
+  names no repository, so they ran with none of their grants.
+- A worker's policy follows the job it claimed - that job's repository and
+  workflow - rather than the one it was spawned for, and a policy lookup still
+  in flight when its worker exits is no longer installed on the slot's next
+  worker.
 - Per-workflow policy sections now match the workflow filename, as documented.
   They were matched against the job name scraped from the runner's output, so a
   `workflows.<name>` section fired only when a job happened to share its

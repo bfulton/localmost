@@ -30,6 +30,7 @@ import {
   STRICT_NETWORK_ALLOWLIST,
   RUNNER_INFRASTRUCTURE_ALLOWLIST,
 } from '../shared/network-allowlist';
+import { DEFAULT_BROKER_PORT } from '../shared/sandbox-profile';
 
 export interface ProxyLogEntry {
   timestamp: string;
@@ -41,9 +42,10 @@ export interface ProxyLogEntry {
   /**
    * Why the request was allowed/blocked. 'port' is a refusal of a host that
    * is allowed, but not on the port asked for; 'denied' of a host the
-   * repository's policy denies.
+   * repository's policy denies; 'loopback' of a port on this machine the
+   * policy does not open.
    */
-  reason?: 'infrastructure' | 'policy' | 'allowlist' | 'moderate-default' | 'permissive' | 'port' | 'denied';
+  reason?: 'infrastructure' | 'policy' | 'allowlist' | 'moderate-default' | 'permissive' | 'port' | 'denied' | 'loopback';
 }
 
 export type ProxyLogCallback = (entry: ProxyLogEntry) => void;
@@ -107,12 +109,26 @@ function denyForm(name: string): string {
   return (canonicalHost(lower) ?? lower).replace(/\.+$/, '');
 }
 
+/**
+ * Whether a target names this machine: localhost or a name under it
+ * (RFC 6761 reserves them all for loopback), or a loopback address in any
+ * spelling isLoopbackAddress reads - 127/8, ::1, and their IPv4-mapped forms.
+ */
+function isLoopbackTarget(host: string): boolean {
+  const name = denyForm(host);
+  return name === 'localhost' || name.endsWith('.localhost') || isLoopbackAddress(name);
+}
+
 export class ProxyServer {
   private server: http.Server | null = null;
   private port: number;
   private onLog: ProxyLogCallback;
   private policyAllowedHosts: string[];
   private policyDeniedHosts: string[] = [];
+  /** The broker's port, the one loopback port open whatever the policy. */
+  private brokerPort = DEFAULT_BROKER_PORT;
+  /** Loopback the policy declares beyond the broker: every port, these ones, or none. */
+  private loopback: true | number[] | undefined;
   private static readonly MAX_ACQUIRE_BODY_BYTES = 64 * 1024;
 
   private policyLevel: SandboxPolicyLevel;
@@ -175,8 +191,8 @@ export class ProxyServer {
    * CONNECT, 80 for plain HTTP - and on any other only when a policy entry
    * spells host:port. Allowing a name used to allow every port on it, so
    * github.com on the infrastructure list opened github.com:22 to every job.
-   * Loopback targets keep any port: the broker is reached at 127.0.0.1 on its
-   * own, and its per-worker key, not the port, is what guards it.
+   * A target on this machine is decided by port alone, at every level: see
+   * setLoopbackPolicy.
    */
   private checkHostAccess(
     host: string,
@@ -184,8 +200,7 @@ export class ProxyServer {
     via: 'connect' | 'http'
   ): { allowed: boolean; reason: ProxyLogEntry['reason'] } {
     const normalizedHost = host.toLowerCase();
-    const onSchemePort =
-      normalizedHost === 'localhost' || isLoopbackAddress(normalizedHost) || port === (via === 'connect' ? 443 : 80);
+    const onSchemePort = port === (via === 'connect' ? 443 : 80);
 
     // Patterns are lowercased as they are read: they come from .localmostrc
     // and are hand-written, so *.GitHub.com must match api.github.com.
@@ -200,12 +215,6 @@ export class ProxyServer {
       return pattern.port === undefined ? onSchemePort : pattern.port === port;
     };
 
-    // Runner infrastructure is allowed at every level - without it the runner
-    // daemon cannot register or poll for jobs.
-    if (RUNNER_INFRASTRUCTURE_ALLOWLIST.some(builtIn)) {
-      return { allowed: true, reason: 'infrastructure' };
-    }
-
     // A host the repository denies is refused whatever its allow list or the
     // level says. An entry that spells a port denies that port; one that
     // spells none denies them all, and so does one whose port is not a port,
@@ -218,6 +227,28 @@ export class ProxyServer {
         : deniedHost === denyForm(pattern.host);
       return named && (typeof pattern.port === 'number' ? pattern.port === port : true);
     };
+
+    // This machine, on the ports the job may reach and no others, whatever
+    // the level: the broker's, which the runner reaches through this proxy
+    // and which its per-worker key rather than the port guards, and the ones
+    // the repository's policy declares. The sandbox closes every other
+    // loopback port to the job's own sockets, and without this the job had
+    // only to ask its proxy instead - localhost and 127.0.0.1 are on the
+    // infrastructure list, and permissive allows anything.
+    if (isLoopbackTarget(normalizedHost)) {
+      if (port === this.brokerPort) return { allowed: true, reason: 'infrastructure' };
+      const declared = this.loopback === true || (this.loopback?.includes(port) ?? false);
+      if (!declared) return { allowed: false, reason: 'loopback' };
+      if (this.policyDeniedHosts.some(denies)) return { allowed: false, reason: 'denied' };
+      return { allowed: true, reason: 'policy' };
+    }
+
+    // Runner infrastructure is allowed at every level - without it the runner
+    // daemon cannot register or poll for jobs.
+    if (RUNNER_INFRASTRUCTURE_ALLOWLIST.some(builtIn)) {
+      return { allowed: true, reason: 'infrastructure' };
+    }
+
     if (this.policyDeniedHosts.some(denies)) {
       return { allowed: false, reason: 'denied' };
     }
@@ -251,6 +282,10 @@ export class ProxyServer {
 
   /** The body of a 403 for a host checkHostAccess refused. */
   private refusal(host: string, port: number, reason: ProxyLogEntry['reason']): string {
+    if (reason === 'loopback') {
+      return `Blocked by sandbox policy (${this.policyLevel}): port ${port} on this machine is not open to this job; ` +
+        `a .localmostrc shared.network.loopback entry opens it`;
+    }
     if (reason === 'denied') {
       return `Blocked by sandbox policy (${this.policyLevel}): host '${host}' is denied by the repository's .localmostrc`;
     }
@@ -332,6 +367,23 @@ export class ProxyServer {
    */
   setPolicyDeniedHosts(hosts: string[]): void {
     this.policyDeniedHosts = [...hosts];
+  }
+
+  /**
+   * Set which loopback ports the job about to run may reach through this
+   * proxy: the broker's, which the runner cannot work without, and those
+   * its repository's approved policy declares - every port for `true`, the
+   * listed ones for a list, none for undefined.
+   *
+   * The sandbox closes a job's direct connections to loopback except to this
+   * proxy and the declared ports; a literal loopback target asked of the
+   * proxy is held to the same ports, or the proxy would be the way round
+   * it. Until this is called only the default broker port is open. Replaces
+   * the previous job's grant, as setPolicyAllowedHosts does.
+   */
+  setLoopbackPolicy(brokerPort: number, loopback: true | number[] | undefined): void {
+    this.brokerPort = brokerPort;
+    this.loopback = loopback === true ? true : Array.isArray(loopback) ? [...loopback] : undefined;
   }
 
   /**
