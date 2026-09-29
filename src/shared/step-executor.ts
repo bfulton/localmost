@@ -141,11 +141,23 @@ export function createSecretMasker(secrets: Record<string, string>): {
  * environment needs the directory to exist - not just `run:` steps.
  */
 export function ensureStepHome(workDir: string): string {
-  const stepHome = path.join(workDir, '.home');
-  if (!fs.existsSync(stepHome)) {
-    fs.mkdirSync(stepHome, { recursive: true });
+  return ensureStepDir(workDir, '.home');
+}
+
+/**
+ * Create a directory the app hands every step, directly in the workspace.
+ *
+ * mkdir without recursion, so a link a step left at the name is never
+ * followed to create a directory somewhere else.
+ */
+function ensureStepDir(workDir: string, name: string): string {
+  const dir = path.join(workDir, name);
+  try {
+    fs.mkdirSync(dir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
   }
-  return stepHome;
+  return dir;
 }
 
 /**
@@ -164,6 +176,18 @@ export function maskSecrets(text: string, secrets: Record<string, string>): stri
     masked = masked.split(value).join('***');
   }
   return masked;
+}
+
+/** The variables that point a step's temp files, and tools' temp caches, at `tmp`. */
+function stepTempEnvironment(tmp: string): Record<string, string> {
+  return {
+    TMPDIR: tmp,
+    TMP: tmp,
+    TEMP: tmp,
+    xcrun_db: path.join(tmp, 'xcrun_db'),
+    CLANG_MODULE_CACHE_PATH: path.join(tmp, 'clang-module-cache'),
+    TMPPREFIX: path.join(tmp, 'zsh'),
+  };
 }
 
 /**
@@ -219,6 +243,15 @@ export function buildStepEnvironment(
     // can poison for the next, and the app's data directory, where it used to
     // live, is closed to steps.
     RUNNER_TOOL_CACHE: path.join(ctx.workDir, '.runner-tool-cache'),
+
+    // Temp, in the workspace: the sandbox grants no shared temp directory, as
+    // the runner grants a job none. Some tools ignore TMPDIR and keep state in
+    // the per-user temp and cache directories instead, each with a variable
+    // that moves it: xcrun cannot resolve a tool at all without a cache it can
+    // write, clang and swiftc keep their module cache there, and zsh puts
+    // here-documents under /tmp. Unix sockets are made here too, which is
+    // where the profile lets a step bind them.
+    ...stepTempEnvironment(ensureStepDir(ctx.workDir, '.tmp')),
 
     // ImageOS for setup-* actions
     ImageOS: 'macos14',

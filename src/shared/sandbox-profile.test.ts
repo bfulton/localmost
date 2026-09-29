@@ -160,7 +160,7 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).not.toContain('(subpath "/")');
     });
 
-    it('reads the workDir and temp, and nothing of the user, by default', () => {
+    it('reads the workDir, and nothing of the user, by default', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
         proxyPort: DEFAULT_PROXY_PORT,
@@ -168,7 +168,6 @@ describe('Sandbox Profile Generator', () => {
 
       expect(profile).toContain('(allow file-read*');
       expect(profile).toContain('(subpath "/path/to/project")');
-      expect(profile).toContain('(subpath "/tmp")');
 
       // A blanket root subpath would grant the whole disk and make every other
       // rule meaningless.
@@ -202,16 +201,21 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).toContain('(subpath "/my/project")');
     });
 
-    it('should allow write to system temp directories', () => {
-      const profile = generateSandboxProfile({
-        workDir: '/path/to/project',
-        proxyPort: DEFAULT_PROXY_PORT,
-      });
-
-      expect(profile).toContain('(subpath "/tmp")');
-      expect(profile).toContain('(subpath "/private/tmp")');
-      expect(profile).toContain('(subpath "/var/folders")');
-      expect(profile).toContain('(subpath "/private/var/folders")');
+    it('grants no shared temp directory, only the entries bare mktemp creates there', () => {
+      // /tmp and the per-user /var/folders tree are shared with everything the
+      // user runs, and hold state their own tools trust: the xcrun cache, the
+      // clang module cache. A step's temp is in its workspace, as a runner
+      // job's is in its sandbox.
+      for (const profile of [
+        generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT }),
+        generateDiscoveryProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, logFile: '' }),
+      ]) {
+        for (const shared of ['/tmp', '/private/tmp', '/var/folders', '/private/var/folders', '/var/folders/test/temp']) {
+          expect(profile).not.toContain(`(subpath "${shared}")`);
+        }
+        const mktemp = topLevelForms(profile).find((f) => f.startsWith('(allow file-write* file-read*') && f.includes('(regex #"'));
+        expect(mktemp).toMatch(/\/T\/tmp\\\.(\[A-Za-z0-9\]){10}/);
+      }
     });
 
     it('grants no home directory cache that the policy has not declared, with or without a policy', () => {
@@ -698,11 +702,6 @@ describe('Sandbox Profile Generator', () => {
         [
           '/Users/test/.localmost/workspaces/ws-1',
           '/Users/test/.localmost/workspaces/ws-1',
-          '/var/folders/test/temp',
-          '/tmp',
-          '/private/tmp',
-          '/var/folders',
-          '/private/var/folders',
           '/dev/null',
           '/dev/random',
           '/dev/urandom',

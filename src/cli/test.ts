@@ -345,20 +345,13 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   // Build proxy environment variables
   const proxyUrl = discoveryProxy.getProxyUrl();
 
-  // Create a tmp directory inside workDir for Unix sockets
-  // This keeps sockets within the sandbox's allowed network paths
-  const tmpDir = path.join(workspace.path, '.tmp');
-  fs.mkdirSync(tmpDir, { recursive: true });
-
   // Create sandbox trace log file
   // In updaterc mode: captures denies for policy generation
   // In enforcement mode: captures denies for error reporting
   const sandboxLogFile = path.join(workspace.path, '.sandbox-trace.log');
 
-  const proxyEnv: Record<string, string> = {
-    ...buildProxyEnv(proxyUrl),
-    TMPDIR: tmpDir,
-  };
+  // Temp is set per step, inside the workspace (see buildStepEnvironment).
+  const proxyEnv = buildProxyEnv(proxyUrl);
 
   // Track PIDs for discovery mode (to filter sandbox logs)
   // Uses kqueue-based pid_tree_watch for real-time process tree tracking

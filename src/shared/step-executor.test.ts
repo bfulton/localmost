@@ -140,6 +140,25 @@ describe('buildStepEnvironment', () => {
 
     expect(path.dirname(env.RUNNER_TOOL_CACHE)).toBe(workDir);
   });
+
+  it('points temp, and the caches tools keep in the shared temp directories, into the workspace', () => {
+    // The sandbox grants no shared temp directory. Each of these moves a tool
+    // that would otherwise need one: xcrun cannot find a tool at all without a
+    // cache it can write, clang and swiftc keep their module cache in the
+    // per-user cache directory, and zsh puts here-documents under /tmp.
+    const env = buildStepEnvironment(
+      { run: 'echo hi' } as never,
+      ctx as never,
+      { 'runs-on': 'self-hosted', steps: [] } as never
+    );
+
+    const tmp = path.join(workDir, '.tmp');
+    expect(env).toMatchObject({ TMPDIR: tmp, TMP: tmp, TEMP: tmp });
+    expect(path.dirname(env.xcrun_db)).toBe(tmp);
+    expect(path.dirname(env.CLANG_MODULE_CACHE_PATH)).toBe(tmp);
+    expect(path.dirname(env.TMPPREFIX)).toBe(tmp);
+    expect(fs.statSync(tmp).isDirectory()).toBe(true);
+  });
 });
 
 describe('createSecretMasker', () => {

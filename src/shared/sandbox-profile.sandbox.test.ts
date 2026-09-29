@@ -270,6 +270,25 @@ if (!isMacOS) {
       expect(run(profile, ['/usr/bin/touch', path.join(home, '.cargo', 'bin', 'cargo')])).toBe(false);
     });
 
+    it('writes no shared temp directory, but lets bare mktemp work', () => {
+      // A planted file in /tmp or the per-user temp outlives the run and is
+      // there for the next one and for the user's own tools.
+      const userTemp = execFileSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf-8' }).trim();
+      const planted = [path.join('/tmp', `localmost-planted-${process.pid}`), path.join(userTemp, `localmost-planted-${process.pid}`)];
+      for (const profile of [
+        generateSandboxProfile({ workDir, proxyPort: 1, policy: readable }),
+        generateDiscoveryProfile({ workDir, proxyPort: 1, logFile: '' }),
+      ]) {
+        for (const target of planted) {
+          expect({ target, ok: run(profile, ['/usr/bin/touch', target]) }).toEqual({ target, ok: false });
+          fs.rmSync(target, { force: true });
+        }
+        // Scripts call mktemp with no template constantly, and it ignores TMPDIR.
+        expect(run(profile, ['/bin/sh', '-c', 'f=$(/usr/bin/mktemp) && echo x > "$f" && rm "$f"'])).toBe(true);
+        expect(run(profile, ['/bin/sh', '-c', 'd=$(/usr/bin/mktemp -d) && touch "$d/f" && rm -r "$d"'])).toBe(true);
+      }
+    });
+
     it('lets --updaterc observe reads and writes without writing the disk', () => {
       const profile = generateDiscoveryProfile({ workDir, proxyPort: 1, logFile: '' });
       expect(run(profile, ['/bin/cat', path.join(home, 'notes.txt')])).toBe(true);

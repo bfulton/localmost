@@ -8,6 +8,7 @@
 
 import * as os from 'os';
 import * as path from 'path';
+import { execFileSync } from 'child_process';
 import type { DockerPolicy } from './docker-policy';
 import { getAppDataDirWithoutElectron, getCliSocketPath } from './paths';
 
@@ -178,6 +179,59 @@ function loopbackNetworkRules(proxyPort: number, escapedWorkDir: string): string
 }
 
 /**
+ * The per-user temp directory confstr hands out, once a lookup has answered.
+ * A failed lookup is tried again at the next profile.
+ */
+let userTempDir: string | undefined;
+
+/**
+ * Where macOS `mktemp` puts a file when it is given no template. It ignores
+ * TMPDIR and asks confstr for the per-user temp directory instead, so pointing
+ * TMPDIR into the workspace does not move it. Only a /var/folders/<a>/<b>/T
+ * path is accepted: the answer lands in a regex in the profile.
+ */
+function darwinUserTempDir(): string | undefined {
+  if (userTempDir !== undefined) return userTempDir;
+  try {
+    const answer = String(execFileSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf-8' }))
+      .trim()
+      .replace(/\/+$/, '')
+      .replace(/^\/private/, '');
+    if (/^\/var\/folders\/[A-Za-z0-9_+-]+\/[A-Za-z0-9_+-]+\/T$/.test(answer)) userTempDir = answer;
+  } catch {
+    // Left unset: bare mktemp is not granted this time.
+  }
+  return userTempDir;
+}
+
+/**
+ * What a step gets of the shared temp directories, as the runner's job does:
+ * only the entries a bare `mktemp` creates.
+ *
+ * /tmp and the per-user /var/folders tree belong to every process the user
+ * runs, and some of what lives there is trusted by their own tools - the
+ * xcrun lookup cache, the clang module cache. A step's TMPDIR is in its
+ * workspace, and the caches tools would otherwise keep there are pointed into
+ * it too (see buildStepEnvironment). But mktemp with no template ignores
+ * TMPDIR, and scripts call it that way constantly, so names of exactly the
+ * shape it generates are granted: ten random characters no other process can
+ * guess, and without read on the directory itself a step cannot list it to
+ * find one. Both spellings, as /var is a symlink.
+ */
+function sharedTempRules(): string[] {
+  const dir = darwinUserTempDir();
+  if (!dir) return [';; Per-user temp directory unknown: mktemp without a template is not granted'];
+  const escapeForRegex = (value: string) => value.replace(/[.*+?^$()[\]{}|\\]/g, '\\$&');
+  const generated = `/tmp\\.${'[A-Za-z0-9]'.repeat(10)}(/|$)`;
+  return [
+    ';; No shared temp directory; only what mktemp itself creates, by the name it generated',
+    '(allow file-write* file-read*',
+    `  (regex #"^${escapeForRegex(`/private${dir}`)}${generated}")`,
+    `  (regex #"^${escapeForRegex(dir)}${generated}"))`,
+  ];
+}
+
+/**
  * The app data directory this process uses, and the installed app's own.
  *
  * LOCALMOST_CONFIG_DIR and the App Sandbox container move the first, but the
@@ -276,7 +330,6 @@ function neverReachableRules(escapedWorkDir: string, readOnlyPaths: string[] = [
  */
 export function generateSandboxProfile(options: SandboxProfileOptions): string {
   const { workDir, policy, permissive = false, logFile } = options;
-  const tmpDir = escapePath(os.tmpdir());
   const escapedWorkDir = escapePath(workDir);
 
   const modeDescription = permissive
@@ -338,16 +391,6 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push(`  (subpath "${escapedWorkDir}"))`);
   lines.push('');
 
-  // Temp directories - read access
-  lines.push(';; Temp directories - read access');
-  lines.push('(allow file-read*');
-  lines.push(`  (subpath "${tmpDir}")`);
-  lines.push('  (subpath "/tmp")');
-  lines.push('  (subpath "/private/tmp")');
-  lines.push('  (subpath "/var/folders")');
-  lines.push('  (subpath "/private/var/folders"))');
-  lines.push('');
-
   // Policy-defined read paths (system paths, user caches, etc.)
   if (policy?.filesystem?.read && policy.filesystem.read.length > 0) {
     lines.push(';; Policy-defined read access');
@@ -383,14 +426,7 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push(`  (subpath "${escapedWorkDir}"))`);
   lines.push('');
 
-  // System temp directories
-  lines.push(';; System temp directories');
-  lines.push('(allow file-write*');
-  lines.push(`  (subpath "${tmpDir}")`);
-  lines.push('  (subpath "/tmp")');
-  lines.push('  (subpath "/private/tmp")');
-  lines.push('  (subpath "/var/folders")');
-  lines.push('  (subpath "/private/var/folders"))');
+  lines.push(...sharedTempRules());
   lines.push('');
 
   // No home directory cache is granted unless the policy declares it. Steps
@@ -548,12 +584,8 @@ export function generateDiscoveryProfile(options: {
     ';; the policy would need.',
     '(allow file-read* (with report))',
     '(allow file-write* (with report)',
-    `  (subpath "${escapedWorkDir}")`,
-    `  (subpath "${escapePath(os.tmpdir())}")`,
-    '  (subpath "/tmp")',
-    '  (subpath "/private/tmp")',
-    '  (subpath "/var/folders")',
-    '  (subpath "/private/var/folders"))',
+    `  (subpath "${escapedWorkDir}"))`,
+    ...sharedTempRules(),
     '(allow file-write*',
     '  (literal "/dev/null")',
     '  (literal "/dev/random")',
