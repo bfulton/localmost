@@ -171,6 +171,24 @@ describe('BrokerProxyService worker token endpoint', () => {
     expect(res.statusCode).toBe(403);
   });
 
+  it('refuses, rather than failing, a request whose worker is stopped while it is being read', async () => {
+    service.issueWorkerKey(1, 'target-a');
+    const files = (await service.issueWorkerCredential(1))!;
+    let release!: () => void;
+    const bodyArrives = new Promise<void>((resolve) => { release = resolve; });
+    const req = fakeRequest('POST', new URL(files.credentials.data.authorizationUrl).pathname);
+    const body = tokenForm(clientAssertion(files));
+    req[Symbol.asyncIterator] = async function* () { await bodyArrives; yield Buffer.from(body); };
+    const res = fakeResponse();
+
+    const handled = (service as unknown as Internals).handleRequest(req, res);
+    service.revokeWorkerKey(1);
+    release();
+    await handled;
+
+    expect(res.statusCode).toBe(403);
+  });
+
   it('has nothing to issue for a slot with no live key', async () => {
     expect(await service.issueWorkerCredential(3)).toBeUndefined();
   });

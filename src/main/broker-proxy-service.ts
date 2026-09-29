@@ -1955,7 +1955,14 @@ export class BrokerProxyService extends EventEmitter {
    */
   private async handleWorkerToken(req: http.IncomingMessage, res: http.ServerResponse, key: string): Promise<void> {
     const form = new URLSearchParams(await readRequestBody(req));
-    const worker = this.workerKeys.get(key)!;
+    // Looked up after the body is read: the worker may have been stopped while
+    // it arrived, and its key is then refused as any revoked key is.
+    const worker = this.workerKeys.get(key);
+    if (!worker) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not a worker of this app' }));
+      return;
+    }
     const refuse = (status: number, error: string, reason: string) => {
       log()?.warn(`[BrokerProxy] Refused a token to worker ${worker.instanceNum}: ${reason}`);
       res.writeHead(status, { 'Content-Type': 'application/json' });
