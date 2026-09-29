@@ -12,7 +12,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import {
   parseWorkflowFile,
   findDefaultWorkflow,
@@ -32,6 +32,7 @@ import {
 } from '../shared/workflow-parser';
 import {
   executeStep,
+  reapStepProcesses,
   ExecutionContext,
   StepResult,
   StepStatus,
@@ -125,43 +126,30 @@ interface JobOutputs {
  * The sandbox (with report) modifier logs to the kernel subsystem:
  *   kernel: (Sandbox) Sandbox: <process>(<pid>) allow <operation> <path>
  */
-function querySandboxLogs(sinceSeconds: number): string {
+export function querySandboxLogs(sinceSeconds: number): string {
   if (process.platform !== 'darwin') {
     return '';
   }
 
-  // Query the unified log for sandbox reports.
-  // Use /bin/bash explicitly and write to a temp file to avoid pipe issues.
-  // Note /usr/bin/log, not `log`: zsh has a `log` builtin that shadows it.
-  const stamp = Date.now();
-  const tmpFile = `/tmp/localmost-sandbox-log-${stamp}.txt`;
-  const scriptFile = `/tmp/localmost-query-log-${stamp}.sh`;
-
+  // /usr/bin/log run directly, its output read from the pipe. This used to go
+  // through a bash script and an output file in /tmp, named from the clock -
+  // a directory every sandboxed step can write, so whatever planted the next
+  // name first had its script run unsandboxed. Filtered to the Sandbox sender
+  // at the source, since everything else the system logged in the window can
+  // run to hundreds of megabytes.
   try {
-    const script = `#!/bin/bash
-/usr/bin/log show --last ${sinceSeconds}s 2>/dev/null | grep "kernel: (Sandbox)" > "${tmpFile}" || true
-`;
-    fs.writeFileSync(scriptFile, script);
-    execSync(`/bin/bash "${scriptFile}"`, { encoding: 'utf-8' });
-
-    let output = '';
-    if (fs.existsSync(tmpFile)) {
-      output = fs.readFileSync(tmpFile, 'utf-8');
-    }
-    return output;
+    const output = execFileSync(
+      '/usr/bin/log',
+      ['show', '--last', `${sinceSeconds}s`, '--predicate', 'sender == "Sandbox"'],
+      { encoding: 'utf-8', maxBuffer: 512 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }
+    );
+    return output
+      .split('\n')
+      .filter((line) => line.includes('kernel: (Sandbox)'))
+      .join('\n');
   } catch {
     // If log command fails, return empty string
     return '';
-  } finally {
-    // Cleanup belongs here: on the previous success-only path a throw left the
-    // script and its output behind in /tmp for good.
-    for (const file of [tmpFile, scriptFile]) {
-      try {
-        if (fs.existsSync(file)) fs.unlinkSync(file);
-      } catch {
-        // Best effort
-      }
-    }
   }
 }
 
@@ -303,6 +291,15 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     },
   });
   const proxyPort = await discoveryProxy.start();
+
+  // Each step leads a process group of its own, so the terminal's Ctrl-C
+  // reaches only this process. End the steps' groups before going.
+  const onInterrupt = (signal: NodeJS.Signals) => {
+    reapStepProcesses();
+    process.exit(signal === 'SIGINT' ? 130 : 143);
+  };
+  process.once('SIGINT', onInterrupt);
+  process.once('SIGTERM', onInterrupt);
 
   // Everything after the proxy starts runs inside try/finally: a throw in
   // workspace setup, parsing or job execution would otherwise leave the proxy
@@ -601,6 +598,9 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     environmentDiffs,
   };
   } finally {
+    process.removeListener('SIGINT', onInterrupt);
+    process.removeListener('SIGTERM', onInterrupt);
+    reapStepProcesses();
     await discoveryProxy.stop();
   }
 }
@@ -630,6 +630,8 @@ async function runJob(
     needs: jobOutputs,
   };
 
+  // Whatever the steps left running ends with the job, as on GitHub.
+  try {
   for (const step of job.steps!) {
     if (options.dryRun) {
       const stepName = step.name || step.id || (step.uses ? `Run ${step.uses}` : 'Run script');
@@ -660,6 +662,9 @@ async function runJob(
         break;
       }
     }
+  }
+  } finally {
+    reapStepProcesses();
   }
 
   // Extract job outputs from step outputs
@@ -760,7 +765,8 @@ async function runReusableWorkflowJob(
       needs: { ...jobOutputs, ...calledJobOutputs },
     };
 
-    // Run steps in the called job
+    // Run steps in the called job, ending what they leave running with it
+    try {
     for (const step of calledJob.steps!) {
       if (options.dryRun) {
         const stepName = step.name || step.id || (step.uses ? `Run ${step.uses}` : 'Run script');
@@ -788,6 +794,9 @@ async function runReusableWorkflowJob(
           break;
         }
       }
+    }
+    } finally {
+      reapStepProcesses();
     }
 
     // Extract outputs from this job

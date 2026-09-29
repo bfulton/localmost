@@ -8,13 +8,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { spawn, SpawnOptions } from 'child_process';
+import { spawn, ChildProcess, SpawnOptions } from 'child_process';
 import { WorkflowStep, WorkflowJob, MatrixCombination } from './workflow-parser';
 import { SandboxPolicy, generateSandboxProfile, generateDiscoveryProfile } from './sandbox-profile';
 import { PidTreeWatcher } from './pid-tree-watch';
 import { parseActionRef, fetchAction, isInterceptedAction, readActionMetadata } from './action-fetcher';
 import { getGitInfo } from './workspace';
 import { resolveWithin } from './contained-path';
+import { getAppDataDirWithoutElectron } from './paths';
 
 // =============================================================================
 // Types
@@ -1073,6 +1074,84 @@ interface SandboxResult {
 }
 
 /**
+ * Write a step's profile where no step can reach it.
+ *
+ * The profile is what confines the step, so it must not live anywhere a step
+ * or a runner job can write. It used to go in os.tmpdir() under a name taken
+ * from the clock, written without O_EXCL and never removed: a sandboxed
+ * process could plant a symlink at the next name and have this write go
+ * through it, or swap a profile before sandbox-exec read it. It goes in the
+ * app's own data directory now, which the profiles deny, in a fresh private
+ * directory, created exclusively. Removed once the step is done unless
+ * LOCALMOST_KEEP_SANDBOX_PROFILES is set, as for the runner's profiles.
+ */
+function writeStepProfile(profile: string): { profilePath: string; remove: () => void } {
+  const base = path.join(getAppDataDirWithoutElectron(), 'test-sandbox-profiles');
+  fs.mkdirSync(base, { recursive: true, mode: 0o700 });
+  const dir = fs.mkdtempSync(path.join(base, 'step-'));
+  const profilePath = path.join(dir, 'profile.sb');
+  fs.writeFileSync(profilePath, profile, { encoding: 'utf-8', mode: 0o600, flag: 'wx' });
+  let removed = false;
+  return {
+    profilePath,
+    remove: () => {
+      if (removed || process.env.LOCALMOST_KEEP_SANDBOX_PROFILES) return;
+      removed = true;
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+/**
+ * The process groups this job's steps lead, by leader pid, and whether the
+ * leader has exited.
+ */
+const stepProcessGroups = new Map<number, boolean>();
+
+/** Remember a step's process group, so reapStepProcesses can end it. */
+export function trackStepProcessGroup(proc: ChildProcess): void {
+  const pid = proc.pid;
+  if (!pid || pid <= 1) return;
+  stepProcessGroups.set(pid, false);
+  proc.once('exit', () => {
+    if (stepProcessGroups.has(pid)) stepProcessGroups.set(pid, true);
+  });
+}
+
+/**
+ * Kill whatever this job's steps left running.
+ *
+ * A step can background a process that outlives it - reparented to launchd,
+ * nothing would ever end it - and one from an untrusted checkout keeps
+ * whatever the sandbox gave it for as long as it lives. Called when a job
+ * ends, as GitHub's runner cleans up orphans at the end of a job and not the
+ * end of a step, so a server one step starts is still there for the next.
+ *
+ * A pid is never reused while it names a live process group, so while the
+ * group has members its leader's pid addresses exactly them. Once the leader
+ * has exited, a live process with that pid means the group emptied and the
+ * pid was reused: that group is someone else's, and is left alone.
+ */
+export function reapStepProcesses(): void {
+  for (const [pgid, leaderExited] of stepProcessGroups) {
+    if (leaderExited) {
+      try {
+        process.kill(pgid, 0);
+        continue;
+      } catch {
+        // No process has the pid, so whatever is left in the group is ours.
+      }
+    }
+    try {
+      process.kill(-pgid, 'SIGKILL');
+    } catch {
+      // Already empty.
+    }
+  }
+  stepProcessGroups.clear();
+}
+
+/**
  * Run a command in the sandbox.
  */
 async function runInSandbox(
@@ -1100,6 +1179,8 @@ async function runInSandbox(
     let spawnArgs: string[];
     let spawnCommand: string;
     let usedSandbox = false;
+    let profilePath = '';
+    let removeProfile = () => {};
 
     if (process.platform === 'darwin') {
       let profile: string;
@@ -1125,22 +1206,9 @@ async function runInSandbox(
         });
       }
 
-      // Write profile to temp file
-      const profilePath = path.join(os.tmpdir(), `localmost-sandbox-${Date.now()}.sb`);
-      fs.writeFileSync(profilePath, profile);
-
-      // Save a copy for inspection, but only when discovering: a normal run
-      // should not write into the workspace, which may be the user's checkout
-      // or an action's own directory. Keyed off discovery mode, not
-      // sandboxLogFile - the CLI sets that on every run, discovery or not.
-      if (isDiscovery) {
-        const debugProfilePath = path.join(options.workDir, '.debug', 'sandbox-profile.sb');
-        const debugDir = path.dirname(debugProfilePath);
-        if (!fs.existsSync(debugDir)) {
-          fs.mkdirSync(debugDir, { recursive: true });
-        }
-        fs.writeFileSync(debugProfilePath, profile);
-      }
+      const written = writeStepProfile(profile);
+      profilePath = written.profilePath;
+      removeProfile = written.remove;
 
       spawnCommand = '/usr/bin/sandbox-exec';
       usedSandbox = true;
@@ -1154,14 +1222,19 @@ async function runInSandbox(
     // it serves; test mode does not serve one yet, and the profile keeps the
     // daemon's own socket closed, so a job under localmost test runs without
     // Docker rather than with an unfiltered daemon.
+    //
+    // Detached, so the step leads a process group of its own and whatever it
+    // leaves running can be reaped when the job ends.
     const spawnOptions: SpawnOptions = {
       cwd: options.cwd,
       env: options.env,
       shell: false,
+      detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     };
 
     const proc = spawn(spawnCommand, spawnArgs, spawnOptions);
+    trackStepProcessGroup(proc);
     const stderrLines: string[] = [];
 
     // Track process tree using kqueue-based PidTreeWatcher for discovery mode
@@ -1209,6 +1282,8 @@ async function runInSandbox(
     proc.stderr?.on('data', (data: Buffer) => stderrSink.write(data.toString()));
 
     proc.on('close', (code) => {
+      removeProfile();
+
       // Release any output still held back for masking or an unterminated line.
       stdoutSink.end();
       stderrSink.end();
@@ -1242,6 +1317,7 @@ async function runInSandbox(
     });
 
     proc.on('error', (err) => {
+      removeProfile();
       if (pidWatcher) {
         pidWatcher.stop();
       }

@@ -36,7 +36,11 @@ interface Spawned {
   command: string;
   args: string[];
   cwd: string;
+  detached?: boolean;
   profile: string;
+  profilePath: string;
+  profileMode: number;
+  profileDirMode: number;
 }
 
 /** Every spawn this test saw, with the profile file read while it still existed. */
@@ -44,9 +48,18 @@ let spawned: Spawned[];
 
 beforeEach(() => {
   spawned = [];
-  spawn.mockImplementation(((command: string, args: string[], options: { cwd: string }) => {
+  spawn.mockImplementation(((command: string, args: string[], options: { cwd: string; detached?: boolean }) => {
     const profilePath = args[args.indexOf('-f') + 1];
-    spawned.push({ command, args, cwd: options.cwd, profile: fs.readFileSync(profilePath, 'utf-8') });
+    spawned.push({
+      command,
+      args,
+      cwd: options.cwd,
+      detached: options.detached,
+      profile: fs.readFileSync(profilePath, 'utf-8'),
+      profilePath,
+      profileMode: fs.statSync(profilePath).mode & 0o777,
+      profileDirMode: fs.statSync(path.dirname(profilePath)).mode & 0o777,
+    });
     const child = new EventEmitter() as childProcess.ChildProcess;
     Object.assign(child, { pid: 999999, stdout: new PassThrough(), stderr: new PassThrough() });
     setImmediate(() => {
@@ -120,6 +133,45 @@ describe('a step\'s working-directory', () => {
     expect(spawned[0].profile).toContain(`(allow file-write*\n  (subpath "${workDir}"))`);
     expect(spawned[0].profile).not.toContain(`(subpath "${path.join(workDir, 'sub')}")`);
     expect(spawned[0].profile).not.toContain('(subpath "/")');
+  });
+});
+
+describe('the profile a step is spawned with', () => {
+  // The app data directory as it is outside tests: not under the temp
+  // directories, which every sandboxed step and runner job may write.
+  let appData: string;
+
+  beforeEach(() => {
+    const build = path.join(process.cwd(), 'build');
+    fs.mkdirSync(build, { recursive: true });
+    appData = fs.realpathSync(fs.mkdtempSync(path.join(build, 'step-appdata-')));
+    process.env.LOCALMOST_CONFIG_DIR = appData;
+  });
+
+  afterEach(() => {
+    fs.rmSync(appData, { recursive: true, force: true });
+  });
+
+  it('is written where no step can reach it, private, and removed once the step is done', async () => {
+    // In os.tmpdir(), under a name taken from the clock, a step could plant a
+    // symlink at the next profile's path or swap a profile before its use.
+    const result = await run({ run: 'true' });
+    expect(result.status).toBe('success');
+    const [{ profilePath, profileMode, profileDirMode }] = spawned;
+
+    for (const tmp of [os.tmpdir(), fs.realpathSync(os.tmpdir()), '/tmp', '/private/tmp']) {
+      expect(profilePath.startsWith(tmp + path.sep)).toBe(false);
+    }
+    expect(profilePath.startsWith(path.join(appData, 'test-sandbox-profiles') + path.sep)).toBe(true);
+    expect(profileMode).toBe(0o600);
+    expect(profileDirMode).toBe(0o700);
+    expect(fs.existsSync(profilePath)).toBe(false);
+    expect(fs.existsSync(path.dirname(profilePath))).toBe(false);
+  });
+
+  it('starts the step in a process group of its own, so what it leaves running can be reaped', async () => {
+    await run({ run: 'true' });
+    expect(spawned[0].detached).toBe(true);
   });
 });
 
