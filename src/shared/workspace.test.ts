@@ -370,7 +370,7 @@ describe('Workspace Management', () => {
         'https://github.com/owner/repo/extra.git',
         'https://github.com.evil.example/owner/repo.git',
         'https://github.com/owner/..',
-        'https://github.com/own_er/repo.git',
+        'https://github.com/-owner/repo.git',
       ]) {
         mockExecSync.mockReturnValue(`${url}\n`);
         expect(getRepositoryFromDir('/repo')).toBeNull();

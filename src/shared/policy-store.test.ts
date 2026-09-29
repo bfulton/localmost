@@ -40,10 +40,30 @@ describe('repository names', () => {
   it('refuses anything that could leave the cache directory or alias another name', () => {
     // The renderer and the CLI hand this module a name; the file it maps to is
     // written. Only the first "/" used to be replaced, and ".." was not refused.
-    for (const name of ['a/../../../escaped', '../x', 'a/b/c', 'a/..', 'a/.', '/abs', 'a/', '/b', 'a_b/c', 'a/b\\c', 'a/b\n', '']) {
+    for (const name of ['a/../../../escaped', '../x', 'a/b/c', 'a/..', 'a/.', '/abs', 'a/', '/b', 'a%5Fb/c', '_a/b', 'a/b\\c', 'a/b\n', '']) {
       expect(isValidRepository(name)).toBe(false);
       expect(() => policyFilePath(dir, name)).toThrow(/repository/);
     }
+  });
+
+  it('accepts an Enterprise Managed User as owner, and keeps its entry apart', () => {
+    // EMU handles are "<user>_<shortcode>", and such a user can own the
+    // repository a runner serves. Refusing "_" in the owner refused every job
+    // from it that carried a .localmostrc, as "could not verify".
+    const emu = 'octocat_acme/repo';
+    const lookalike = 'octocat/acme_repo';
+    expect(isValidRepository(emu)).toBe(true);
+    expect(policyFilePath(dir, emu)).not.toBe(policyFilePath(dir, lookalike));
+
+    recordPending(dir, emu, NARROW);
+    recordPending(dir, lookalike, WIDE);
+    expect(readPolicyEntry(dir, emu)?.pending?.config).toEqual(NARROW);
+    expect(readPolicyEntry(dir, lookalike)?.pending?.config).toEqual(WIDE);
+    expect(listPolicyEntries(dir).map((e) => e.repository).sort()).toEqual([lookalike, emu]);
+  });
+
+  it('keeps the file name of every owner without "_", so existing entries still read', () => {
+    expect(policyFilePath(dir, 'my-org/my_repo.js')).toBe(path.join(dir, 'my-org_my_repo.js.json'));
   });
 
   it('keeps every write inside the cache directory', () => {

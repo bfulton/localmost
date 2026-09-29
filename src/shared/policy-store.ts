@@ -37,11 +37,17 @@ export interface PolicyEntry {
 /** Marks the on-disk shape; an entry without it predates the split. */
 const ENTRY_FORMAT = 2;
 
-// GitHub's own grammar. An owner cannot contain "_", which is what makes
-// "<owner>_<repo>.json" name exactly one repository, and neither part can
-// contain "/" or be "..", which is what keeps the file inside the directory.
-const OWNER = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/;
+// GitHub's own grammar, plus the "_" of an Enterprise Managed User's handle
+// ("<user>_<shortcode>"). Neither part can contain "/" or be "..", which is
+// what keeps the file inside the directory.
+const OWNER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/;
 const REPO = /^[A-Za-z0-9._-]{1,100}$/;
+
+// The file is "<owner>_<repo>.json", with any "_" in the owner written as
+// "%5F", so the first "_" always ends the owner and every name maps to one
+// file. Neither part can contain "%", and an owner without "_" - every owner
+// before managed users were accepted - keeps the file name it always had.
+const OWNER_UNDERSCORE = '%5F';
 
 export function isValidRepository(repository: unknown): repository is string {
   if (typeof repository !== 'string') return false;
@@ -56,7 +62,7 @@ export function policyFilePath(dir: string, repository: string): string {
     throw new Error(`Not a repository name: ${JSON.stringify(String(repository).slice(0, 200))}`);
   }
   const [owner, repo] = repository.split('/');
-  return path.join(dir, `${owner}_${repo}.json`);
+  return path.join(dir, `${owner.split('_').join(OWNER_UNDERSCORE)}_${repo}.json`);
 }
 
 /** GitHub names are case-insensitive, and the app sees both casings. */
@@ -202,12 +208,13 @@ export function listPolicyEntries(dir: string): PolicyEntry[] {
   const entries: PolicyEntry[] = [];
   for (const file of fs.readdirSync(dir)) {
     if (!file.endsWith('.json')) continue;
-    // The owner cannot contain "_", so the first one separates it from the
-    // repository - the inverse of policyFilePath.
+    // The first "_" separates the owner from the repository - the inverse
+    // of policyFilePath.
     const stem = file.slice(0, -'.json'.length);
     const split = stem.indexOf('_');
     if (split < 0) continue;
-    const repository = `${stem.slice(0, split)}/${stem.slice(split + 1)}`;
+    const owner = stem.slice(0, split).split(OWNER_UNDERSCORE).join('_');
+    const repository = `${owner}/${stem.slice(split + 1)}`;
     if (!isValidRepository(repository)) continue;
     try {
       entries.push(parseEntry(JSON.parse(fs.readFileSync(path.join(dir, file), 'utf-8')), repository));
