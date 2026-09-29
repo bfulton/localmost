@@ -610,6 +610,12 @@ export class GitHubAuth {
     let page = 1;
     const perPage = 100;
 
+    // anon=0 leaves out authors with no linked account, so an unattributed
+    // commit already on the default branch when this baseline is taken is not
+    // seen; getCommitAuthors marks only those after it. Counting them here
+    // (anon=1) would refuse every repository with one anywhere in its history,
+    // with no allowlist entry that could admit it - a product decision, not
+    // yet made.
     while (true) {
       const data = await client.get<Array<{ login: string }>>(
         `/repos/${owner}/${repo}/contributors`,
