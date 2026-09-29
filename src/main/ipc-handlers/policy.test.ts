@@ -50,12 +50,27 @@ describe('summarizeGrants', () => {
 
   it('shows docker grants from a per-workflow section too', () => {
     const grants = summarizeGrants({ workflows: { integration: { docker: { run: { images: ['redis:7'] } } } } });
-    expect(grants.join('\n')).toMatch(/integration: docker run image: redis:7/);
+    expect(grants.join('\n')).toMatch(/integration \(any pull request can claim this\): docker run image: redis:7/);
   });
 
   it('still shows the non-docker grants', () => {
     const grants = summarizeGrants({ shared: { network: { allow: ['example.com'] }, filesystem: { write: ['~/.npm'] } } });
     expect(grants).toEqual(['network: example.com', 'write: ~/.npm']);
+  });
+});
+
+describe('per-workflow grants on the approval screen', () => {
+  it('says any pull request can claim a workflow section', () => {
+    // A workflows: key is a file name, and a pull request can add a workflow
+    // file of any name - so a per-workflow grant is not reserved for the
+    // workflow the repository meant it for.
+    const [grant] = summarizeGrants({ workflows: { deploy: { network: { allow: ['x.com'] } } } });
+    expect(grant).toBe('deploy (any pull request can claim this): network: x.com');
+  });
+
+  it('says a per-workflow env allow is not applied', () => {
+    const [grant] = summarizeGrants({ workflows: { deploy: { env: { allow: ['FASTLANE_*'] } } } });
+    expect(grant).toMatch(/^deploy \(any pull request can claim this\): env: FASTLANE_\* \(not applied:/);
   });
 });
 
@@ -83,7 +98,7 @@ describe('the level on the approval screen', () => {
       workflows: { ci: { network: { allow: ['ci.example.com'] } } },
     } as never);
     expect(grants[0]).toMatch(/^level: moderate\b/);
-    expect(grants.slice(1)).toEqual(['network: example.com', 'ci: network: ci.example.com']);
+    expect(grants.slice(1)).toEqual(['network: example.com', 'ci (any pull request can claim this): network: ci.example.com']);
   });
 
   it('shows no level line for strict, which is the baseline', () => {

@@ -13,7 +13,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { DescribablePolicy, describePolicy } from '../shared/policy-describe';
+import { DescribablePolicy, PolicyScope, describePolicy } from '../shared/policy-describe';
 import {
   findLocalmostrc,
   parseLocalmostrc,
@@ -113,8 +113,10 @@ function printConfig(config: LocalmostrcConfig): void {
 
   if (config.workflows) {
     for (const [name, policy] of Object.entries(config.workflows)) {
-      console.log(`${colors.bold}Workflow: ${name}${colors.reset}`);
-      printPolicy(policy);
+      // A workflows: key is only a file name, and a pull request can add a
+      // workflow file of any name.
+      console.log(`${colors.bold}Workflow: ${name}${colors.reset} ${colors.dim}(any pull request can claim this)${colors.reset}`);
+      printPolicy(policy, 'workflow');
       console.log();
     }
   }
@@ -127,8 +129,8 @@ function printConfig(config: LocalmostrcConfig): void {
  * before running `localmost policy approve`, so what it leaves out is approved
  * unseen.
  */
-export function printPolicy(policy: DescribablePolicy): void {
-  const grants = describePolicy(policy);
+export function printPolicy(policy: DescribablePolicy, scope: PolicyScope = 'shared'): void {
+  const grants = describePolicy(policy, '', scope);
   if (grants.length === 0) {
     console.log('  (empty - uses defaults only)');
     return;

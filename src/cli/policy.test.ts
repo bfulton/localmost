@@ -207,6 +207,17 @@ describe('policy approve', () => {
     expect(decisions()).toEqual([]);
   });
 
+  it('says any pull request can claim a workflow section, and what the runner does not apply', () => {
+    writeRc('version: 1\nworkflows:\n  deploy:\n    env:\n      allow: [FASTLANE_TOKEN]\n');
+
+    expect(() => run()).toThrow('exit 1');
+    // Without the CLI's colours, which sit between the words.
+    const ansi = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g');
+    const out = output.join('\n').replace(ansi, '');
+    expect(out).toMatch(/Workflow: deploy \(any pull request can claim this\)/);
+    expect(out).toMatch(/FASTLANE_TOKEN.*not applied/);
+  });
+
   it('approves exactly the policy whose stamp it was given, and records it', () => {
     writeRc(PERMISSIVE);
     run('--stamp', stampOf(PERMISSIVE));

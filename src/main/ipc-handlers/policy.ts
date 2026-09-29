@@ -16,12 +16,12 @@ import {
   approvalStamp,
 } from '../policy-cache';
 import { getRunnerManager, getLogger } from '../app-state';
-import { DescribablePolicy, describePolicy } from '../../shared/policy-describe';
+import { DescribablePolicy, PolicyScope, describePolicy } from '../../shared/policy-describe';
 import { LocalmostrcConfig, diffConfigs, formatPolicyDiff } from '../../shared/localmostrc';
 import { isValidRepository } from '../../shared/policy-store';
 
-function describeSection(section: DescribablePolicy, prefix: string): string[] {
-  return describePolicy(section, prefix).map((grant) => grant.summary);
+function describeSection(section: DescribablePolicy, prefix: string, scope: PolicyScope): string[] {
+  return describePolicy(section, prefix, scope).map((grant) => grant.summary);
 }
 
 /**
@@ -29,16 +29,18 @@ function describeSection(section: DescribablePolicy, prefix: string): string[] {
  *
  * Per-workflow sections are included: a policy can grant access under
  * `workflows:` that appears nowhere in `shared`, and approving what the UI
- * showed would otherwise approve more than was shown.
+ * showed would otherwise approve more than was shown. Each says any pull
+ * request can claim it: a `workflows:` key is only a workflow file's name,
+ * and a pull request can add a workflow file of any name.
  */
 export function summarizeGrants(
   config: Pick<LocalmostrcConfig, 'level' | 'shared' | 'workflows'>
 ): string[] {
   // The level is declared once, at the top, and leads the list: it widens
   // every section below it.
-  const grants = describeSection({ ...config.shared, level: config.level }, '');
+  const grants = describeSection({ ...config.shared, level: config.level }, '', 'shared');
   for (const [workflow, section] of Object.entries(config.workflows || {})) {
-    grants.push(...describeSection(section || {}, `${workflow}: `));
+    grants.push(...describeSection(section || {}, `${workflow} (any pull request can claim this): `, 'workflow'));
   }
   return grants;
 }

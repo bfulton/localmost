@@ -131,6 +131,33 @@ describe('describePolicy', () => {
     expect(grants[1].summary).toMatch(/^denied: ~\/\.aws \(no read or write, even inside a granted path/);
   });
 
+  it('says which workflow-scoped grants the runner cannot apply', () => {
+    // The sandbox profile and the environment are fixed when a worker starts,
+    // before the workflow is known, so a per-workflow filesystem section and
+    // env allow were listed as grants the runner never made.
+    const grants = describePolicy(
+      {
+        network: { allow: ['api.example.com'] },
+        filesystem: { read: ['/opt/x'], write: ['./out'], deny: ['~/.aws'] },
+        env: { allow: ['FASTLANE_*'], deny: ['AWS_*'] },
+      },
+      'deploy: ',
+      'workflow'
+    );
+    const line = (value: string) => grants.find((g) => g.value === value)!.summary;
+    expect(line('api.example.com')).toBe('deploy: network: api.example.com');
+    for (const value of ['/opt/x', './out', '~/.aws']) {
+      expect(line(value)).toMatch(/\(not applied to runner jobs: their filesystem is fixed when the worker starts.*only localmost test applies it\)$/);
+    }
+    expect(line('FASTLANE_*')).toMatch(/\(not applied: the environment is fixed when the worker starts.*declare it under shared:\)$/);
+    expect(line('AWS_*')).toMatch(/\(applied to every job, not only this workflow's/);
+  });
+
+  it('says nothing of scope for the same grants under shared:', () => {
+    const grants = describePolicy({ filesystem: { write: ['./out'] }, env: { allow: ['CI'], deny: ['AWS_*'] } });
+    expect(grants.map((g) => g.summary)).toEqual(['write: ./out', 'env: CI', 'env denied: AWS_*']);
+  });
+
   it('prefixes the flat summary, which is how a workflow scope is shown', () => {
     const [grant] = describePolicy({ network: { allow: ['github.com'] } }, 'ci: ');
     expect(grant.summary).toBe('ci: network: github.com');

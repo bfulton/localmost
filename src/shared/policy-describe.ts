@@ -109,7 +109,25 @@ const LEVEL_GRANTS: Record<Exclude<SandboxPolicyLevel, 'strict'>, string> = {
   permissive: `allows every network host, plus ${HOME_TOOLCHAIN_ACCESS}`,
 };
 
-export function describePolicy(policy: DescribablePolicy, prefix = ''): PolicyGrant[] {
+/**
+ * Where a section sits. A worker's sandbox profile and environment are fixed
+ * when it starts, before the runner knows which workflow it will run, so a
+ * workflow section's filesystem grants and env allow are never applied to a
+ * runner job - and a workflow's env deny is applied to every job, to be safe.
+ * Listing them as plain grants told the reviewer something untrue.
+ */
+export type PolicyScope = 'shared' | 'workflow';
+
+const FILESYSTEM_NOT_APPLIED =
+  'not applied to runner jobs: their filesystem is fixed when the worker starts, before the workflow is known; ' +
+  'only localmost test applies it';
+const ENV_ALLOW_NOT_APPLIED =
+  'not applied: the environment is fixed when the worker starts, before the workflow is known; declare it under shared:';
+const ENV_DENY_EVERYWHERE =
+  "applied to every job, not only this workflow's: the environment is fixed when the worker starts";
+
+export function describePolicy(policy: DescribablePolicy, prefix = '', scope: PolicyScope = 'shared'): PolicyGrant[] {
+  const perWorkflow = scope === 'workflow';
   const grants: PolicyGrant[] = [];
   const add = (
     group: string,
@@ -140,13 +158,17 @@ export function describePolicy(policy: DescribablePolicy, prefix = ''): PolicyGr
   add('Network deny', '-', 'network denied', policy.network?.deny, {
     note: 'refused even where an allow or the level would let it through; runner infrastructure excepted',
   });
-  add('Filesystem read', 'r', 'read', policy.filesystem?.read);
-  add('Filesystem write', 'w', 'write', policy.filesystem?.write, { warn: (value) => sensitiveWriteReason(value) });
-  add('Filesystem deny', '-', 'denied', policy.filesystem?.deny, {
-    note: "no read or write, even inside a granted path; the job's own sandbox excepted",
+  const filesystemNote = perWorkflow ? FILESYSTEM_NOT_APPLIED : undefined;
+  add('Filesystem read', 'r', 'read', policy.filesystem?.read, { note: filesystemNote });
+  add('Filesystem write', 'w', 'write', policy.filesystem?.write, {
+    note: filesystemNote,
+    warn: (value) => sensitiveWriteReason(value),
   });
-  add('Environment allow', '+', 'env', policy.env?.allow);
-  add('Environment deny', '-', 'env denied', policy.env?.deny);
+  add('Filesystem deny', '-', 'denied', policy.filesystem?.deny, {
+    note: filesystemNote ?? "no read or write, even inside a granted path; the job's own sandbox excepted",
+  });
+  add('Environment allow', '+', 'env', policy.env?.allow, { note: perWorkflow ? ENV_ALLOW_NOT_APPLIED : undefined });
+  add('Environment deny', '-', 'env denied', policy.env?.deny, { note: perWorkflow ? ENV_DENY_EVERYWHERE : undefined });
 
   add('Secrets required', '+', 'secret', policy.secrets?.require);
 
