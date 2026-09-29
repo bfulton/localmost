@@ -10,6 +10,8 @@ import { bootLog } from '../log-file';
 // Bridge instance
 let bridge: ReturnType<typeof createZustandBridge> | null = null;
 let unsubscribe: (() => void) | null = null;
+// Said once: a renderer dispatching in a loop would otherwise fill the boot log.
+let warnedRendererAction = false;
 
 /**
  * Initialize the zubridge for a window.
@@ -39,10 +41,15 @@ export function initBridge(mainWindow: BrowserWindow): void {
   // persisted - so a renderer running someone else's script could plant
   // targets or widen the user filter on disk. An empty handler table sends
   // every renderer action to this reducer instead, which changes nothing.
+  // The table has no prototype: zubridge looks a handler up with `in`, which
+  // would otherwise find "constructor" and the rest of Object.prototype.
   bridge = createZustandBridge(store, {
-    handlers: {},
+    handlers: Object.create(null) as Record<string, never>,
     reducer: (state: ReturnType<typeof store.getState>, action: { type: string }) => {
-      bootLog('warn', `Ignored store action "${action.type}" from a renderer; the renderer cannot write the store`);
+      if (!warnedRendererAction) {
+        warnedRendererAction = true;
+        bootLog('warn', `Ignored store action "${action.type}" from a renderer; the renderer cannot write the store`);
+      }
       return state;
     },
   });

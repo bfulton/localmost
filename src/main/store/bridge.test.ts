@@ -29,6 +29,12 @@ jest.mock('electron', () => ({
 let mockNextId = 0;
 jest.mock('uuid', () => ({ v4: () => `id-${++mockNextId}` }));
 
+const mockBootLog = jest.fn();
+jest.mock('../log-file', () => ({
+  ...jest.requireActual<Record<string, unknown>>('../log-file'),
+  bootLog: (...args: unknown[]) => mockBootLog(...args),
+}));
+
 import { store } from './index';
 import { initBridge, destroyBridge, getBridge } from './bridge';
 
@@ -46,6 +52,18 @@ describe('the renderer side of the store bridge', () => {
     // bridge's own destroy clears it.
     await getBridge()?.destroy();
     destroyBridge();
+  });
+
+  it('sends every renderer action to the reducer that ignores it, and says so once', async () => {
+    initBridge(window as never);
+    // A name Object.prototype carries must not resolve to one of its methods.
+    await dispatchFromRenderer({ type: 'constructor', payload: {} });
+    for (let i = 0; i < 5; i++) await dispatchFromRenderer({ type: 'setTheme', payload: 'dark' });
+
+    // A renderer dispatching in a loop must not fill the boot log.
+    const warnings = mockBootLog.mock.calls.filter(([level]) => level === 'warn');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0][1]).toContain('"constructor"');
   });
 
   it('cannot write the store: not by action, not by a raw setState', async () => {
