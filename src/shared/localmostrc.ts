@@ -358,9 +358,10 @@ export function hostPatternProblem(entry: string): string | null {
   const isAddress = canonical !== null && net.isIP(canonical) !== 0;
   const isName = canonical !== null && canonical.split('.').every((label) => /^[a-z0-9_-]{1,63}$/.test(label));
   // canonicalHost reads a host the way a URL does, ending it at the first of
-  // these, so the spelling offered below for "10.0.0.0/8" would be one
-  // address rather than the range, and for "evil.com/path" a whole host.
-  const urlSyntax = /[/?#\\]/.test(host);
+  // these and dropping a tab or line break, so the spelling offered below for
+  // "10.0.0.0/8" would be one address rather than the range, for
+  // "evil.com/path" a whole host, and for "evil.com\tx" another host.
+  const urlSyntax = /[/?#\\\t\n\r]/.test(host);
   if (canonical === null || urlSyntax || (pattern.wildcard ? !isName || isAddress : !isName && !isAddress)) {
     return 'must be a host, an IP address or *.domain, optionally with :port, and nothing else';
   }
