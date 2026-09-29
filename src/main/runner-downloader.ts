@@ -431,7 +431,10 @@ export class RunnerDownloader {
     // Made here, not found: mkdir without recursive refuses a name that
     // already exists, so nothing an earlier start left is built into. The id
     // is short because the docker socket goes inside, and macOS caps a unix
-    // socket path at 104 bytes.
+    // socket path at 104 bytes: <home>/.localmost/runner/sandbox/<n>-<id>/
+    // docker.sock fits a home directory of up to about 49 bytes (/Users/ and
+    // a 42-character user name). Past that the docker socket refuses to
+    // start, and so does the worker.
     const sandboxBase = this.getSandboxBase();
     await fs.promises.mkdir(sandboxBase, { recursive: true });
     const sandboxDir = path.join(sandboxBase, `${instance}-${crypto.randomBytes(6).toString('hex')}`);
