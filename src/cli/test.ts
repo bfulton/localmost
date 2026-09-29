@@ -1145,9 +1145,6 @@ async function confirmPolicyChange(
 }
 
 /**
- * Resolve secrets from environment variables or stub them.
- */
-/**
  * Read secrets from a KEY=value file, in the shape people already keep them.
  */
 function readSecretFile(filePath: string): Record<string, string> {
@@ -1199,14 +1196,23 @@ async function promptForSecret(name: string): Promise<string> {
   return value;
 }
 
+/** The environment variable a secret is read from: never the secret's own name. */
+const secretEnvName = (name: string): string => `LOCALMOST_SECRET_${name}`;
+
 /**
  * Resolve the secrets a workflow references.
  *
- * Order is: a --secret-file entry, then the environment, then whatever the
- * chosen mode does about what is left. Nothing is written to disk, and values
- * are masked out of step output by the executor.
+ * Order is: a --secret-file entry, then LOCALMOST_SECRET_<name> in the
+ * environment, then whatever the chosen mode does about what is left.
+ * Nothing is written to disk, and values are masked out of step output by
+ * the executor.
+ *
+ * The workflow chooses which names it asks for, and the checkout is as
+ * untrusted as its code. Read under their own names, a workflow asking for
+ * AWS_SECRET_ACCESS_KEY or GITHUB_TOKEN got whatever the developer had
+ * exported for other tools; the prefix makes passing one a decision.
  */
-async function resolveSecrets(
+export async function resolveSecrets(
   _repository: string,
   names: string[],
   mode: 'stub' | 'prompt' | 'abort',
@@ -1224,23 +1230,29 @@ async function resolveSecrets(
       continue;
     }
 
-    const envValue = process.env[name];
+    const envValue = process.env[secretEnvName(name)];
     if (envValue !== undefined) {
       result[name] = envValue;
-      console.log(`  ${success(name)} (from environment)`);
+      console.log(`  ${success(name)} (from ${secretEnvName(name)})`);
       continue;
+    }
+
+    if (process.env[name] !== undefined) {
+      console.log(
+        `  ${colors.dim}${name} is set in your environment but not used; set ${secretEnvName(name)} to pass it to the workflow.${colors.reset}`
+      );
     }
 
     switch (mode) {
       case 'abort':
         throw new Error(
-          `Missing secret: ${name}. Set it in the environment or pass --secret-file.`
+          `Missing secret: ${name}. Set ${secretEnvName(name)} or pass --secret-file.`
         );
 
       case 'prompt': {
         if (!process.stdin.isTTY) {
           throw new Error(
-            `Missing secret: ${name}. There is no terminal to prompt on - set it in the environment or pass --secret-file.`
+            `Missing secret: ${name}. There is no terminal to prompt on - set ${secretEnvName(name)} or pass --secret-file.`
           );
         }
         result[name] = await promptForSecret(name);
@@ -1267,7 +1279,7 @@ async function resolveSecrets(
     console.log(
       `  Steps using ${stubbed.length === 1 ? 'it' : 'them'} will run anyway and may behave differently than on GitHub.`
     );
-    console.log('  Use --secret-file, set them in the environment, or --secrets abort to stop instead.');
+    console.log('  Use --secret-file, set LOCALMOST_SECRET_<name>, or --secrets abort to stop instead.');
   }
 
   return result;
@@ -1635,8 +1647,9 @@ ${colors.bold}EXAMPLES:${colors.reset}
   localmost test -v --env           Verbose output with environment diff
 
 ${colors.bold}ENVIRONMENT:${colors.reset}
-  Uses your local machine as the runner. Secrets come from the environment or
-  a --secret-file; they are never written to disk and are masked out of output.
+  Uses your local machine as the runner. Secrets come from a --secret-file or
+  LOCALMOST_SECRET_<name> in the environment, never a variable under the
+  secret's own name; they are never written to disk and are masked out of output.
 
 ${colors.bold}SANDBOX:${colors.reset}
   Workflows run in a sandbox. Configure access in .localmostrc:

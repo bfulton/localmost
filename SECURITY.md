@@ -175,9 +175,13 @@ Under `strict` a repository that uses actions declares the host in its own
 ## Workflow Secrets
 
 `localmost test` runs a workflow locally, where GitHub is not there to supply
-`${{ secrets.X }}`. Values come from a `--secret-file` (`KEY=value` lines) or the
-environment, in that order. `--secrets prompt` asks for anything still missing
-without echoing it.
+`${{ secrets.X }}`. Values come from a `--secret-file` (`KEY=value` lines) or
+`LOCALMOST_SECRET_<name>` in the environment, in that order. `--secrets prompt`
+asks for anything still missing without echoing it.
+
+- **Never taken under their own names.** A workflow chooses which secrets it
+  asks for, so a variable exported for other tools (`AWS_SECRET_ACCESS_KEY`,
+  `GITHUB_TOKEN`) is not handed to it; the CLI says when one is set but unused.
 
 - **Never stored.** localmost has no secret store. Nothing is written to disk,
   and nothing persists between runs.

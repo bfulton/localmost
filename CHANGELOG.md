@@ -88,6 +88,10 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
 - `localmost test` gained `--secret-file`, and `--secrets prompt` now actually
   prompts without echoing. A stubbed secret is announced instead of silently
   becoming an empty string.
+- `localmost test` reads a secret from `LOCALMOST_SECRET_<name>`, no longer from
+  a variable under the secret's own name, so a workflow cannot ask for
+  `AWS_SECRET_ACCESS_KEY` or `GITHUB_TOKEN` and get what you exported for other
+  tools. Re-export secrets under the prefix; the CLI says when one is set but unused.
 - The step script, which contains expanded secrets while a step runs, is written
   0700 rather than 0755.
 - The broker no longer logs the head of a job payload, which carries the job's
