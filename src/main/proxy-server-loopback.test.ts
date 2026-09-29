@@ -170,6 +170,24 @@ describe('loopback refusals on the wire', () => {
     }
   });
 
+  it('rechecks acquirejob against the policy the claim installed, not the one it was buffered under', async () => {
+    // The worker was spawned under a policy that declared this port; the job
+    // it claimed does not. The claim runs while the body is buffered, and the
+    // forward must be judged by what the claim left.
+    const svc = await localService();
+    const p = new ProxyServer({
+      policyLevel: 'strict',
+      authToken: 't',
+      onJobAcquired: async () => { p.setLoopbackPolicy(DEFAULT_BROKER_PORT, undefined); },
+    });
+    p.setLoopbackPolicy(DEFAULT_BROKER_PORT, [svc.port]);
+    await p.start();
+    try {
+      expect(await request(p.getPort(), 'POST', `http://127.0.0.1:${svc.port}/x/acquirejob`, '{"jobMessageId":"m"}')).toBe(403);
+      expect(svc.connections()).toBe(0);
+    } finally { svc.server.close(); await p.stop(); }
+  });
+
   it('reaches a port the policy declares, and not the one beside it', async () => {
     const svc = await localService();
     const other = await localService();

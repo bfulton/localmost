@@ -216,8 +216,9 @@ whatever the policy says.
 The grant appears in the approval card and `localmost policy show` with a note
 that the job can reach local services on those ports, and it is part of the
 approval diff and stamp like every other key. It governs the job's direct
-connections; the job's proxy still reaches `localhost` and `127.0.0.1` as
-runner infrastructure - see SECURITY.md, Network Policy.
+connections and its proxy alike: through the proxy a literal loopback address
+reaches the declared ports and the broker's, and nothing else - see
+SECURITY.md, Network Policy.
 
 ### Per-workflow policies
 
@@ -428,7 +429,8 @@ whatever is declared. The proxy applies the same rule to a request for a
 loopback address, sent through `HTTP_PROXY` or tunnelled with `CONNECT`: it
 answers 403 unless the port is declared, or is the broker's - the runner
 reaches the broker through the proxy, and each worker's key to it, not its
-port, is what guards it.
+port, is what guards it. Only a literal address gets that far: `localhost`, as
+a name, is refused through the proxy on every port.
 
 ## Why Checked Into Git
 

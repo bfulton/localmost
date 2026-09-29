@@ -19,6 +19,7 @@ import { sweepProcessGroup } from './process-group';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { RunnerDownloader } from './runner-downloader';
 import type { WorkerCredentialFiles } from './worker-credentials';
+import type { BrokerJobTarget } from './broker-proxy-service';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
 import { loadConfig } from './config';
 import { normalizeFilterConfig, isUserAllowed, areAllUsersAllowed, parseRepository } from './runner/user-filter';
@@ -125,15 +126,8 @@ export interface RepoPolicyRuntime {
   loopback?: true | number[];
 }
 
-/** The broker's record of a job a worker claimed; see BrokerJobTarget. */
-export interface ClaimedJobTarget {
-  targetDisplayName: string;
-  githubSha?: string;
-  githubWorkflow?: string;
-  /** owner/repo as GitHub reports it, which for an organization target the display name is not. */
-  repository?: string;
-  repositoryId?: number;
-}
+/** The broker's record of a job a worker claimed. */
+export type ClaimedJobTarget = BrokerJobTarget;
 
 interface RunnerManagerOptions {
   onLog: (entry: LogEntry) => void;
@@ -886,8 +880,13 @@ export class RunnerManager {
         );
       },
       onLog: (entry: ProxyLogEntry) => {
-        // Skip logging routine localhost message polling (very noisy)
-        if (!entry.blocked && (entry.host === 'localhost' || entry.host === '127.0.0.1')) {
+        // Skip logging routine localhost message polling (very noisy). Only
+        // the broker's: a declared loopback port is a grant worth auditing.
+        if (
+          !entry.blocked &&
+          entry.reason === 'infrastructure' &&
+          (entry.host === 'localhost' || entry.host === '127.0.0.1')
+        ) {
           return;
         }
         const status = entry.blocked ? 'BLOCKED' : 'ALLOWED';
@@ -2094,18 +2093,25 @@ export class RunnerManager {
    * were refused. Only what the profile fixed at spawn belongs here.
    */
   private stampFor(
-    policy: Pick<RepoPolicyRuntime, 'level' | 'readPaths' | 'writePaths' | 'docker' | 'env' | 'denyPaths' | 'loopback'>
+    policy: Pick<RepoPolicyRuntime, 'level' | 'readPaths' | 'writePaths' | 'env' | 'denyPaths' | 'loopback'>
   ): string {
     // The env policy is fixed at spawn like the profile, so it is part of
     // what a worker was built under; so are the denied paths and the
     // loopback ports, which the profile holds too. The denied hosts are not:
     // like the allowed ones they are resolved per workflow and applied to
-    // the proxy on every claim. A policy that declares neither stamps as it
-    // did before either existed, so upgrading does not read as drift.
-    const fixedAtSpawn: unknown[] = [policy.level, policy.readPaths, policy.writePaths, policy.docker, policy.env];
-    if (policy.denyPaths?.length || policy.loopback !== undefined) {
-      fixedAtSpawn.push(policy.denyPaths ?? [], policy.loopback ?? null);
-    }
+    // the proxy on every claim. Nor is docker, for the same reason: it merges
+    // shared with the claimed workflow's section and the socket is bound to
+    // it per claim. The spawn stamp is taken before the workflow is known, so
+    // stamping it made every claim of a workflow with its own docker section
+    // read as drift.
+    const fixedAtSpawn: unknown[] = [
+      policy.level,
+      policy.readPaths,
+      policy.writePaths,
+      policy.env,
+      policy.denyPaths ?? [],
+      policy.loopback ?? null,
+    ];
     return createHash('sha256')
       .update(JSON.stringify(fixedAtSpawn))
       .digest('hex');
@@ -2204,10 +2210,8 @@ export class RunnerManager {
      */
     isClaim = false
   ): Promise<void> {
-    if (!this.proxyServers.get(instanceNum) || !this.getRepoPolicy) return;
-
-    const repoInfo = parseRepository(repository);
-    if (!repoInfo) return;
+    const claimProxy = this.proxyServers.get(instanceNum);
+    if (!claimProxy || !this.getRepoPolicy) return;
 
     // The worker this policy is for. The lookup below awaits, and in that
     // time the worker can exit - its proxy closed by finalizeInstance - and
@@ -2215,7 +2219,17 @@ export class RunnerManager {
     // the slot number. Whatever the lookup returns belongs to this worker
     // only, so everything after it is checked against this one.
     const instance = this.instances.get(instanceNum);
-    if (!instance) return;
+    const repoInfo = parseRepository(repository);
+    if (!repoInfo || !instance) {
+      // A claim this cannot place gets nothing, as an unidentifiable one
+      // does: returning alone would leave whatever the proxy held before -
+      // the spawn-time policy - on a job nobody has matched it to.
+      if (isClaim) {
+        this.closeProxyPolicy(claimProxy);
+        this.log('warn', `[instance ${instanceNum}] Cannot place claimed job from ${repository}; policy closed`);
+      }
+      return;
+    }
 
     // What the worker claimed, as the broker reported it. Recorded before
     // anything below can bail so the docker socket is judged against it

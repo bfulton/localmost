@@ -2987,7 +2987,7 @@ describe('docker access', () => {
       onJobHistoryUpdate: jest.fn(),
     });
 
-  it('changes the policy stamp when the docker policy changes', () => {
+  it('leaves docker out of the policy stamp, since the socket is bound per claim', () => {
     const manager = makeManager();
     const stamp = (docker: DockerPolicy) =>
       (manager as any).stampFor({
@@ -2997,10 +2997,11 @@ describe('docker access', () => {
         docker,
       });
 
-    // A worker spawned under one docker policy must not claim a job approved
-    // under another.
-    expect(stamp({})).not.toEqual(stamp({ run: { images: ['postgres:16'] } }));
-    expect(stamp({ run: { images: ['postgres:16'] } })).toEqual(stamp({ run: { images: ['postgres:16'] } }));
+    // Docker merges shared with the claimed workflow's section and the socket
+    // is bound to that at every claim; nothing of it is in the profile. The
+    // spawn stamp is taken before the workflow is known, so stamping docker
+    // made every claim of a workflow with its own docker section drift.
+    expect(stamp({})).toEqual(stamp({ run: { images: ['postgres:16'] } }));
   });
 });
 

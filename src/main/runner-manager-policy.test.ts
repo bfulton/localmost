@@ -74,6 +74,8 @@ jest.mock('fs', () => ({
 
 import * as fs from 'fs';
 import { RunnerManager, RepoPolicyRuntime } from './runner-manager';
+import { repoPolicyRuntime } from './repo-policy';
+import type { LocalmostrcConfig } from '../shared/localmostrc';
 import { ProxyServer } from './proxy-server';
 import { spawnSandboxed } from './process-sandbox';
 import { createMockProcess, RunnerManagerTestHelper } from './test-utils';
@@ -190,6 +192,42 @@ describe("a claimed job's denied hosts and loopback on its proxy", () => {
     expect(proxy.setLoopbackPolicy).toHaveBeenLastCalledWith(BROKER_PORT, undefined);
   });
 
+  it('closes them for a claim whose repository it cannot read', async () => {
+    const getRepoPolicy = jest.fn(async () => policy({ hosts: ['ok.example'] }));
+    const { helper } = managerWith({
+      getRepoPolicy: getRepoPolicy as never,
+      getJobTarget: () => ({ targetDisplayName: 'owner/repo', githubSha: 'abc1234', repository: 'not-a-repository' }),
+    });
+    helper.setInstance(3, { name: 'runner-3', status: 'listening' });
+    const { onJobAcquired, proxy } = await realProxyFor(helper, 3);
+
+    await onJobAcquired('req-1');
+
+    expect(getRepoPolicy).not.toHaveBeenCalled();
+    expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith([]);
+    expect(proxy.setPolicyDeniedHosts).toHaveBeenLastCalledWith([]);
+    expect(proxy.setLoopbackPolicy).toHaveBeenLastCalledWith(BROKER_PORT, undefined);
+    expect(proxy.setPolicyLevel).toHaveBeenLastCalledWith('strict');
+  });
+
+  it('logs traffic to a declared loopback port, and not the broker polling', async () => {
+    const onLog = jest.fn();
+    const { helper } = managerWith({ onLog });
+    await helper.startInstanceProxy(1);
+    const proxyLog = (jest.mocked(ProxyServer).mock.calls.at(-1)![0] as { onLog: (entry: object) => void }).onLog;
+    const logged = (): string[] => onLog.mock.calls.map(([entry]) => entry.message as string).filter((m) => m.startsWith('[proxy 1]'));
+    const entry = { timestamp: 'now', method: 'CONNECT', host: '127.0.0.1', blocked: false };
+
+    proxyLog({ ...entry, port: BROKER_PORT, reason: 'infrastructure' });
+    proxyLog({ ...entry, port: 5432, reason: 'policy' });
+    proxyLog({ ...entry, host: 'localhost', port: 5433, reason: 'policy' });
+
+    expect(logged()).toEqual([
+      '[proxy 1] ALLOWED CONNECT 127.0.0.1:5432 (policy)',
+      '[proxy 1] ALLOWED CONNECT localhost:5433 (policy)',
+    ]);
+  });
+
   it('keeps denied hosts when drift cuts a claim back to infrastructure', async () => {
     const { helper } = managerWith({
       getRepoPolicy: async () => policy({ hosts: ['ok.example'], deniedHosts: ['bad.example'], loopback: true }),
@@ -250,7 +288,7 @@ describe('the stamp a worker is built under', () => {
     expect(stampFor(manager, policy({ denyPaths: ['~/secret'] }))).not.toBe(base);
     expect(stampFor(manager, policy({ loopback: true }))).not.toBe(base);
     expect(stampFor(manager, policy({ loopback: [5432] }))).not.toBe(stampFor(manager, policy({ loopback: [5433] })));
-    // A policy that declares neither stamps as before, so an upgrade is not drift.
+    // Declaring an empty deny list is declaring none.
     expect(stampFor(manager, policy({ denyPaths: [] }))).toBe(base);
   });
 
@@ -286,6 +324,36 @@ describe('the job a policy is resolved for', () => {
     await helper.parseRunnerOutput(1, 'Running job: Build and test');
     await new Promise((resolve) => setImmediate(resolve));
     expect(seen).toEqual(['deploy', 'deploy']);
+  });
+
+  it("applies a claimed workflow's own docker section to a worker stamped at spawn, and retires nothing", async () => {
+    // The production shape: the worker was stamped at spawn, before its
+    // workflow was known, from the shared section alone; the claim resolves
+    // the claimed workflow, whose docker section merges with shared. Stamping
+    // the merged docker made every claim of such a workflow look like drift,
+    // and each such job ran with no hosts and a closed socket.
+    const approved: LocalmostrcConfig = {
+      version: 1,
+      shared: { network: { allow: ['ok.example'] } },
+      workflows: { CI: { docker: { run: { images: ['alpine:3'] } } } },
+    };
+    const { manager, helper } = managerWith({
+      getRepoPolicy: async (_o, _r, _s, workflow) => repoPolicyRuntime(approved, workflow),
+      getJobTarget: () => ({ targetDisplayName: 'owner/repo', githubSha: 'abc1234', githubWorkflow: 'CI', repository: 'owner/repo' }),
+    });
+    const stampFor = (manager as unknown as { stampFor(p: RepoPolicyRuntime): string }).stampFor.bind(manager);
+    const socket = fakeSocket();
+    helper.setDockerProxy(1, socket);
+    helper.setInstance(1, { name: 'runner-1', status: 'listening', policyStamp: stampFor(repoPolicyRuntime(approved, '')) });
+    helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234', githubRepo: 'owner/repo' });
+    const { onJobAcquired, proxy } = await realProxyFor(helper, 1);
+    const stopInstance = jest.spyOn(manager, 'stopInstance').mockResolvedValue(undefined as never);
+
+    await onJobAcquired('req-1');
+
+    expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith(['ok.example']);
+    expect(socket.bind).toHaveBeenCalledWith('owner/repo', { run: { images: ['alpine:3'] } });
+    expect(stopInstance).not.toHaveBeenCalled();
   });
 
   it('does not refresh at job start for a worker with no claim on record', async () => {
