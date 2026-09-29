@@ -75,32 +75,42 @@ export function policyFilePath(dir: string, repository: string): string {
 }
 
 /**
- * Files holding this repository's entry under a name in another casing:
- * written before names were lowercased, and on a case-sensitive volume not
- * found by the lowercased name. On a volume that ignores case the entry's
- * own file can be listed under its old name, so that one is recognised by
- * identity, not name, and never counted.
+ * The file an entry is in, if it has one, under whatever casing it was
+ * written. One written before names were lowercased is not found by the
+ * lowercased name on a case-sensitive volume, so the directory is scanned
+ * for it - in sorted order, so that which of several copies is read does
+ * not depend on the directory's.
  */
-function otherCasedFiles(dir: string, filePath: string): string[] {
-  if (!fs.existsSync(dir)) return [];
-  const name = path.basename(filePath);
-  const own = fs.existsSync(filePath) ? fs.statSync(filePath) : null;
-  return fs
-    .readdirSync(dir)
-    .filter((file) => file !== name && file.toLowerCase() === name.toLowerCase())
-    .map((file) => path.join(dir, file))
-    .filter((file) => {
-      const stat = fs.statSync(file);
-      return !own || stat.ino !== own.ino || stat.dev !== own.dev;
-    });
-}
-
-/** The file an entry is in, if it has one, under whatever casing it was written. */
 function existingEntryFile(dir: string, repository: string): string | null {
   const filePath = policyFilePath(dir, repository);
   if (fs.existsSync(filePath)) return filePath;
-  return otherCasedFiles(dir, filePath)[0] ?? null;
+  if (!fs.existsSync(dir)) return null;
+  const name = path.basename(filePath);
+  const match = fs
+    .readdirSync(dir)
+    .filter((file) => file.toLowerCase() === name)
+    .sort()[0];
+  return match ? path.join(dir, match) : null;
 }
+
+/** Whether two paths name one file - as two casings do on a volume that ignores case. */
+function sameFile(a: string, b: string): boolean {
+  try {
+    const x = fs.statSync(a);
+    const y = fs.statSync(b);
+    return x.ino === y.ino && x.dev === y.dev;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The file each entry being changed was read from, when it was read from one
+ * under an older casing: writing it under the lowercased name takes its place,
+ * so the old copy is removed then - that copy, and no other. A copy that was
+ * never read may hold an approval this one does not, and is left alone.
+ */
+const readFrom = new WeakMap<PolicyEntry, string>();
 
 /** GitHub names are case-insensitive, and the app sees both casings. */
 function sameRepository(a: string, b: string): boolean {
@@ -244,17 +254,20 @@ function readEntryToChange(dir: string, repository: string): PolicyEntry {
   const filePath = existingEntryFile(dir, repository);
   if (!filePath) return { repository };
   const text = fs.readFileSync(filePath, 'utf-8');
+  let entry: PolicyEntry;
   try {
-    return parseEntry(JSON.parse(text), repository);
+    entry = parseEntry(JSON.parse(text), repository);
   } catch {
-    return { repository };
+    entry = { repository };
   }
+  readFrom.set(entry, filePath);
+  return entry;
 }
 
 /**
  * Write an entry, or remove it once it holds nothing. Written to a temporary
- * file and renamed, so a reader never sees half an entry. A copy under an
- * older casing goes with it, having been read into this one.
+ * file and renamed, so a reader never sees half an entry. The copy under an
+ * older casing it was read from goes with it, having been read into this one.
  */
 function writePolicyEntry(dir: string, entry: PolicyEntry): void {
   const filePath = policyFilePath(dir, entry.repository);
@@ -267,7 +280,12 @@ function writePolicyEntry(dir: string, entry: PolicyEntry): void {
     fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600, flag: 'wx' });
     fs.renameSync(tmp, filePath);
   }
-  for (const stale of otherCasedFiles(dir, filePath)) fs.rmSync(stale, { force: true });
+  // On a volume that ignores case the rename keeps the old name, so the old
+  // copy is the file just written: it is removed only when it is another.
+  const source = readFrom.get(entry);
+  if (source && source !== filePath && !sameFile(source, filePath)) {
+    fs.rmSync(source, { force: true });
+  }
 }
 
 /** Every entry that reads cleanly. One that does not is left out, not guessed at. */

@@ -374,6 +374,38 @@ describe('reading the cache', () => {
     expect(readPolicyEntry(dir, 'OWNER/REPO')?.approved?.config).toEqual(NARROW);
   });
 
+  describe('on a volume that does not find the old casing by the lowercased name', () => {
+    // This Mac's volume ignores case, so the lowercased name is made to miss
+    // here, as it does on a case-sensitive volume, to reach the scan.
+    // The module object itself: the namespace import is read-only.
+    const nodeFs = jest.requireActual<typeof fs>('fs');
+    let existsSpy: jest.SpiedFunction<typeof fs.existsSync>;
+    beforeEach(() => {
+      const realExists = nodeFs.existsSync.bind(nodeFs);
+      existsSpy = jest.spyOn(nodeFs, 'existsSync').mockImplementation(
+        (p) => String(p) !== policyFilePath(dir, REPO) && realExists(p)
+      );
+    });
+    afterEach(() => existsSpy.mockRestore());
+
+    it('finds the entry by scanning, and removes the file it read only when that is another file', () => {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, 'Owner_Repo.json'),
+        JSON.stringify({ format: 2, repository: 'Owner/Repo', approved: { config: NARROW, at: '' } })
+      );
+      expect(readPolicyEntry(dir, REPO)?.approved?.config).toEqual(NARROW);
+
+      // Written under the lowercased name, which here is the same file as
+      // the one read: removing the old name would delete what was written.
+      recordPending(dir, REPO, WIDE);
+      existsSpy.mockRestore();
+      const entry = readPolicyEntry(dir, REPO);
+      expect(entry?.approved?.config).toEqual(NARROW);
+      expect(entry?.pending?.config).toEqual(WIDE);
+    });
+  });
+
   it('lists valid entries and skips the rest', () => {
     recordPending(dir, REPO, NARROW);
     recordPending(dir, 'my-org/my.repo', WIDE);
