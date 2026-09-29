@@ -87,6 +87,21 @@ function escapePath(pathStr: string): string {
   return pathStr.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
+/**
+ * A policy path with `*` in it, as the body of a seatbelt (regex ...) rule.
+ *
+ * `*` matches anything, as it always has here; everything else is literal.
+ * This used to swap `*` for `.*` and leave the rest as regex syntax, so the
+ * dot in "~/.npm" matched any character and a `+` or `(` in a path changed
+ * what the rule meant. Anchored at both ends, since seatbelt searches rather
+ * than matches. Escaped again for the string literal it lands in, where a
+ * backslash is itself an escape.
+ */
+function globToProfileRegex(expanded: string): string {
+  const literal = (part: string) => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+  return escapePath(`^${expanded.split('*').map(literal).join('.*')}$`);
+}
+
 // Note: macOS sandbox-exec does NOT support hostname-based network filtering.
 // The (remote ...) filter only supports IP addresses and ports, not domain names.
 // Network filtering by hostname is handled by the proxy server, not the sandbox.
@@ -325,8 +340,7 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
         const base = expanded.replace('/**', '').replace('**/', '');
         lines.push(`  (subpath "${escapePath(base)}")`);
       } else if (expanded.includes('*')) {
-        const regex = expanded.replace(/\*/g, '.*').replace(/\//g, '\\/');
-        lines.push(`  (regex "${regex}")`);
+        lines.push(`  (regex "${globToProfileRegex(expanded)}")`);
       } else {
         lines.push(`  (subpath "${escapePath(expanded)}")`);
       }
@@ -373,9 +387,7 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
         const base = expanded.replace('/**', '').replace('**/', '');
         lines.push(`  (subpath "${escapePath(base)}")`);
       } else if (expanded.includes('*')) {
-        // Handle single * wildcards with regex
-        const regex = expanded.replace(/\*/g, '.*').replace(/\//g, '\\/');
-        lines.push(`  (regex "${regex}")`);
+        lines.push(`  (regex "${globToProfileRegex(expanded)}")`);
       } else {
         lines.push(`  (subpath "${escapePath(expanded)}")`);
       }
@@ -390,7 +402,7 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
     for (const pattern of policy.filesystem.deny) {
       const expanded = expandPath(pattern);
       if (expanded.includes('*')) {
-        const regex = expanded.replace(/\*/g, '.*').replace(/\//g, '\\/');
+        const regex = globToProfileRegex(expanded);
         lines.push(`(deny file-read* (regex "${regex}"))`);
         lines.push(`(deny file-write* (regex "${regex}"))`);
       } else {

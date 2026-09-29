@@ -370,6 +370,24 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).toContain('(subpath');
     });
 
+    it('turns a * path into an anchored regex with everything else literal', () => {
+      const profile = generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
+        policy: {
+          filesystem: {
+            read: ['/opt/c++/lib*'],
+            write: ['~/.npm/_cacache/*'],
+            deny: ['~/.ssh/id_*'],
+          },
+        },
+      });
+      // Written into an SBPL string, where a backslash is itself escaped.
+      expect(profile).toContain('(regex "^/opt/c\\\\+\\\\+/lib.*$")');
+      expect(profile).toContain('(regex "^/Users/test/\\\\.npm/_cacache/.*$")');
+      expect(profile).toContain('(deny file-read* (regex "^/Users/test/\\\\.ssh/id_.*$"))');
+    });
+
     it('should deny specified filesystem paths', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',

@@ -264,6 +264,21 @@ if (!isMacOS) {
       expect(fs.existsSync(path.join(home, 'planted'))).toBe(false);
     });
 
+    it('matches a wildcard policy path literally apart from its *', () => {
+      // `*` became `.*` with every other character left as regex syntax, so the
+      // dot in a name like ".npm" matched any character.
+      fs.mkdirSync(path.join(home, 'data'));
+      fs.writeFileSync(path.join(home, 'data', 'a.bc'), 'granted\n');
+      fs.writeFileSync(path.join(home, 'data', 'aXbc'), 'not granted\n');
+      const profile = generateSandboxProfile({
+        workDir,
+        proxyPort: 1,
+        policy: { filesystem: { read: [...MACOS_BASELINE_READ_PATHS, path.join(home, 'data', 'a.b*')] } },
+      });
+      expect(run(profile, ['/bin/cat', path.join(home, 'data', 'a.bc')])).toBe(true);
+      expect(run(profile, ['/bin/cat', path.join(home, 'data', 'aXbc')])).toBe(false);
+    });
+
     it('keeps private keys unreadable even when the policy declares the home directory', () => {
       const profile = generateSandboxProfile({
         workDir,
