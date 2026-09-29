@@ -9,6 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { spawn, execSync } from 'child_process';
 import { getAppDataDirWithoutElectron } from './paths';
+import { isValidRepository } from './policy-store';
 
 // =============================================================================
 // Types
@@ -479,19 +480,14 @@ export function getRepositoryFromDir(dir: string): string | null {
 
     const url = result.trim();
 
-    // SSH format: git@github.com:owner/repo.git
-    const sshMatch = url.match(/git@github\.com:([^/]+\/[^.]+)(?:\.git)?$/);
-    if (sshMatch) {
-      return sshMatch[1];
-    }
-
-    // HTTPS format: https://github.com/owner/repo.git
-    const httpsMatch = url.match(/https:\/\/github\.com\/([^/]+\/[^.]+)(?:\.git)?$/);
-    if (httpsMatch) {
-      return httpsMatch[1];
-    }
-
-    return null;
+    // git@github.com:owner/repo.git, ssh://git@github.com/owner/repo.git or
+    // https://github.com/owner/repo.git, with or without the suffix. A repo
+    // name may itself contain dots - "[^.]+" used to stop at the first one and
+    // then fail to match, so "owner/my.repo" had no repository at all.
+    const match = url.match(/^(?:git@github\.com:|ssh:\/\/git@github\.com\/|https:\/\/github\.com\/)(.+?)(?:\.git)?\/?$/);
+    // Held to GitHub's own name grammar: the policy approval cache is keyed
+    // on this, and anything else is not a repository it could hold.
+    return match && isValidRepository(match[1]) ? match[1] : null;
   } catch {
     return null;
   }
