@@ -31,8 +31,36 @@ import {
   DownloadProgress,
   SetupState,
 } from '../../shared/types';
-import { DEFAULT_RUNNER_COUNT } from '../../shared/constants';
+import { DEFAULT_RUNNER_COUNT, MAX_RUNNER_COUNT, MIN_JOB_HISTORY, MAX_JOB_HISTORY } from '../../shared/constants';
 import { isGitHubOwnerName, isGitHubRepoName } from '../../shared/github-names';
+
+/**
+ * A runner release number. It becomes the arc directory a download creates,
+ * and removes recursively when the download fails, and part of the release
+ * URLs, so nothing that could carry a path is taken.
+ */
+const RUNNER_VERSION = /^\d+\.\d+\.\d+$/;
+
+const isIntegerIn = (value: unknown, min: number, max: number): value is number =>
+  Number.isInteger(value) && (value as number) >= min && (value as number) <= max;
+
+/**
+ * The fields configuration uses other than the owner and repo, which are
+ * checked where they are parsed. The name and labels reach config.sh as
+ * arguments and the count sizes the runner pool.
+ */
+const isConfigureOptions = (options: unknown): options is ConfigureOptions => {
+  if (typeof options !== 'object' || options === null) return false;
+  const { level, runnerName, labels, runnerCount } = options as Record<string, unknown>;
+  return (
+    (level === 'repo' || level === 'org') &&
+    typeof runnerName === 'string' &&
+    runnerName !== '' &&
+    Array.isArray(labels) &&
+    labels.every((label) => typeof label === 'string') &&
+    (runnerCount === undefined || isIntegerIn(runnerCount, 1, MAX_RUNNER_COUNT))
+  );
+};
 
 /**
  * Register runner-related IPC handlers.
@@ -114,7 +142,10 @@ export const registerRunnerHandlers = (): void => {
     }
   });
 
-  ipcMain.handle(IPC_CHANNELS.RUNNER_SET_DOWNLOAD_VERSION, (_event, version: string | null) => {
+  ipcMain.handle(IPC_CHANNELS.RUNNER_SET_DOWNLOAD_VERSION, (_event, version: unknown) => {
+    if (version !== null && !(typeof version === 'string' && RUNNER_VERSION.test(version))) {
+      return { success: false, error: 'Invalid runner version' };
+    }
     const runnerDownloader = getRunnerDownloader();
     runnerDownloader?.setDownloadVersion(version);
     // Update store so zubridge syncs to renderer
@@ -168,7 +199,10 @@ export const registerRunnerHandlers = (): void => {
     return runnerManager?.getStatusDisplayName() ?? '';
   });
 
-  ipcMain.handle(IPC_CHANNELS.RUNNER_CONFIGURE, async (_event, options: ConfigureOptions) => {
+  ipcMain.handle(IPC_CHANNELS.RUNNER_CONFIGURE, async (_event, options: unknown) => {
+    if (!isConfigureOptions(options)) {
+      return { success: false, error: 'Invalid runner configuration' };
+    }
     const accessToken = await getValidAccessToken();
     const githubAuth = getGitHubAuth();
     const runnerDownloader = getRunnerDownloader();
@@ -480,7 +514,10 @@ export const registerRunnerHandlers = (): void => {
     return history;
   });
 
-  ipcMain.handle(IPC_CHANNELS.JOB_HISTORY_SET_MAX, (_event, max: number) => {
+  ipcMain.handle(IPC_CHANNELS.JOB_HISTORY_SET_MAX, (_event, max: unknown) => {
+    if (!isIntegerIn(max, MIN_JOB_HISTORY, MAX_JOB_HISTORY)) {
+      return { success: false, error: `Job history size must be a whole number from ${MIN_JOB_HISTORY} to ${MAX_JOB_HISTORY}` };
+    }
     const runnerManager = getRunnerManager();
     runnerManager?.setMaxJobHistory(max);
     return { success: true };

@@ -13,11 +13,19 @@ const mockGitHubAuth = {
   listOrgRunners: jest.fn<(...args: unknown[]) => Promise<unknown[]>>(),
   cancelWorkflowRun: jest.fn<(...args: unknown[]) => Promise<void>>(),
 };
+const mockRunnerDownloader = {
+  setDownloadVersion: jest.fn<(version: string | null) => void>(),
+};
+const mockRunnerManager = {
+  isRunning: () => false,
+  setMaxJobHistory: jest.fn<(max: number) => void>(),
+};
+const mockSetSelectedVersion = jest.fn<(version: string) => void>();
 jest.mock('../app-state', () => ({
   getMainWindow: () => null,
   getGitHubAuth: () => mockGitHubAuth,
-  getRunnerManager: () => null,
-  getRunnerDownloader: () => null,
+  getRunnerManager: () => mockRunnerManager,
+  getRunnerDownloader: () => mockRunnerDownloader,
   getHeartbeatManager: () => null,
   getAuthState: () => null,
   getLogger: () => null,
@@ -37,7 +45,7 @@ jest.mock('../runner-lifecycle', () => ({ clearStaleRunnerRegistrations: jest.fn
 jest.mock('../runner-proxy-manager', () => ({ getRunnerProxyManager: jest.fn() }));
 jest.mock('../runner-state-service', () => ({ sendRunnerEvent: jest.fn() }));
 jest.mock('../tray-init', () => ({ updateTrayMenu: jest.fn() }));
-jest.mock('../store', () => ({ store: { getState: () => ({}) } }));
+jest.mock('../store', () => ({ store: { getState: () => ({ setSelectedVersion: mockSetSelectedVersion }) } }));
 
 import { registerRunnerHandlers } from './runner';
 import { IPC_CHANNELS } from '../../shared/types';
@@ -57,16 +65,66 @@ describe('runner IPC handlers', () => {
   describe('configure', () => {
     it('refuses an owner, repo or org that is not a GitHub name, before any token is requested', async () => {
       for (const options of [
-        { level: 'repo', repoUrl: 'https://github.com/../orgs', runnerName: 'r' },
-        { level: 'repo', repoUrl: 'https://github.com/a?b/c', runnerName: 'r' },
-        { level: 'org', orgName: 'x/../../user', runnerName: 'r' },
-        { level: 'org', orgName: '..', runnerName: 'r' },
+        { level: 'repo', repoUrl: 'https://github.com/../orgs', runnerName: 'r', labels: [] },
+        { level: 'repo', repoUrl: 'https://github.com/a?b/c', runnerName: 'r', labels: [] },
+        { level: 'org', orgName: 'x/../../user', runnerName: 'r', labels: [] },
+        { level: 'org', orgName: '..', runnerName: 'r', labels: [] },
       ]) {
         const result = await handlers[IPC_CHANNELS.RUNNER_CONFIGURE]({}, options);
         expect({ options, success: result.success }).toEqual({ options, success: false });
       }
       expect(mockGitHubAuth.getRunnerRegistrationToken).not.toHaveBeenCalled();
       expect(mockGitHubAuth.getOrgRunnerRegistrationToken).not.toHaveBeenCalled();
+    });
+
+    it('refuses a runner name, labels or count that are not what configuration takes', async () => {
+      const valid = { level: 'repo', repoUrl: 'https://github.com/o/r', runnerName: 'localmost.host', labels: ['self-hosted'] };
+      for (const options of [
+        null,
+        { ...valid, level: 'enterprise' },
+        { ...valid, runnerName: '' },
+        { ...valid, runnerName: 7 },
+        { ...valid, labels: 'self-hosted' },
+        { ...valid, labels: [{}] },
+        { ...valid, runnerCount: 1e9 },
+        { ...valid, runnerCount: 0 },
+        { ...valid, runnerCount: 2.5 },
+      ]) {
+        const result = await handlers[IPC_CHANNELS.RUNNER_CONFIGURE]({}, options);
+        expect({ options, success: result.success }).toEqual({ options, success: false });
+      }
+      expect(mockGitHubAuth.getRunnerRegistrationToken).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('download version', () => {
+    it('takes only a runner version number, which becomes a directory and a URL', async () => {
+      // The version is joined into the arc directory the download creates and,
+      // on failure, removes recursively; '../' in it would point that anywhere.
+      for (const version of ['../x', '2.330.0/../../x', '/../../../Users/me/Documents', '2.330', 'v2.330.0', 7, {}]) {
+        const result = await handlers[IPC_CHANNELS.RUNNER_SET_DOWNLOAD_VERSION]({}, version);
+        expect({ version, success: result.success }).toEqual({ version, success: false });
+      }
+      expect(mockRunnerDownloader.setDownloadVersion).not.toHaveBeenCalled();
+      expect(mockSetSelectedVersion).not.toHaveBeenCalled();
+
+      expect(await handlers[IPC_CHANNELS.RUNNER_SET_DOWNLOAD_VERSION]({}, '2.330.0')).toEqual({ success: true });
+      expect(mockRunnerDownloader.setDownloadVersion).toHaveBeenCalledWith('2.330.0');
+      expect(await handlers[IPC_CHANNELS.RUNNER_SET_DOWNLOAD_VERSION]({}, null)).toEqual({ success: true });
+      expect(mockRunnerDownloader.setDownloadVersion).toHaveBeenLastCalledWith(null);
+    });
+  });
+
+  describe('job history size', () => {
+    it('takes only a whole number of jobs within the offered range', async () => {
+      for (const max of [1e9, -1, 2.5, '10', null]) {
+        const result = await handlers[IPC_CHANNELS.JOB_HISTORY_SET_MAX]({}, max);
+        expect({ max, success: result.success }).toEqual({ max, success: false });
+      }
+      expect(mockRunnerManager.setMaxJobHistory).not.toHaveBeenCalled();
+
+      expect(await handlers[IPC_CHANNELS.JOB_HISTORY_SET_MAX]({}, 20)).toEqual({ success: true });
+      expect(mockRunnerManager.setMaxJobHistory).toHaveBeenCalledWith(20);
     });
   });
 
