@@ -1433,13 +1433,33 @@ export class BrokerProxyService extends EventEmitter {
    * routing and repository kept for it under every id it goes by.
    *
    * The job was acquired upstream and its payload - the job's secrets - stored
-   * before admission decided anything. Admission calls this for every job it
-   * does not hand to a worker: refused by the user filter or the policy gate,
-   * for a target it no longer knows, or with no worker started for it. The
-   * message may already be gone from the queue (a withdrawn worker polled it
-   * and died before acquirejob); the rest is cleared either way. Idempotent.
+   * before admission decided anything. Admission calls this for a job it
+   * admitted but could not start a worker for, and a withdrawn worker's job
+   * goes the same way. Its dedup entry goes too: nothing decided the job may
+   * not run, so if GitHub offers it again that offer is the retry. The message
+   * may already be gone from the queue (a withdrawn worker polled it and died
+   * before acquirejob); the rest is cleared either way. Idempotent.
    */
   dropJob(targetId: string, jobId: string): void {
+    this.discardJob(targetId, jobId);
+    this.jobAssignments.delete(jobId);
+  }
+
+  /**
+   * Drop a job admission refused - by the user filter, the policy gate, or for
+   * a target it no longer knows - and remember that it was seen.
+   *
+   * Everything dropJob clears goes, but the dedup entry stays. Job messages
+   * are never acknowledged upstream, so GitHub can offer the job again, and
+   * the verdict would be the same: without the entry every such offer was
+   * refused anew, with another history row, notification and cancel. The
+   * entry holds no secrets, only the job's id and where it came from.
+   */
+  refuseJob(targetId: string, jobId: string): void {
+    this.discardJob(targetId, jobId);
+  }
+
+  private discardJob(targetId: string, jobId: string): void {
     const aliases = this.aliasesOf(jobId);
     const queue = this.messageQueues.get(targetId);
     if (queue) {
@@ -1448,7 +1468,6 @@ export class BrokerProxyService extends EventEmitter {
       const kept = queue.filter(message => jobIdFromMessage(message) !== jobId);
       queue.splice(0, queue.length, ...kept);
     }
-    this.jobAssignments.delete(jobId);
     // By alias, not by value: jobs of one target commonly share a run-service
     // URL, so clearing every entry with this job's URL cut the routing of
     // whichever other job was live, and its renew and finish went astray.

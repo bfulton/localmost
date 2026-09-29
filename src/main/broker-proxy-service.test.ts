@@ -1163,8 +1163,61 @@ describe('message routing', () => {
       const sessionId = await createSession();
       const polled = await pollOnce(sessionId, workerPrefix);
 
+      // Not bound at all, not merely handed nothing: a bound session with no
+      // job is what the delivery guard alone would then have to catch.
+      expect(internals.localSessions.get(sessionId)?.targetId).toBeUndefined();
       expect(polled.statusCode).toBe(202);
       expect(internals.messageQueues.get('target-a')).toHaveLength(1);
+    });
+
+    it('hands nothing to a session that has a target but no job of its own', async () => {
+      // Binding always carries a job today, so this session cannot arise; the
+      // delivery guard is what keeps it harmless if one ever does. A job
+      // message without an id would otherwise match its missing job.
+      addTargetWithRunner('target-a', 'runner-a.1');
+      await receive('req-1', 2);
+      internals.messageQueues.get('target-a')!.push(
+        JSON.stringify({ messageId: 5, messageType: 'RunnerJobRequest', body: JSON.stringify({}) })
+      );
+      const keyed = startWorker(2, 'target-a');
+      const sessionId = await createSession(undefined, keyed);
+      internals.localSessions.get(sessionId)!.targetId = 'target-a';
+
+      const polled = await pollOnce(sessionId, keyed);
+
+      expect(polled.statusCode).toBe(202);
+      expect(internals.messageQueues.get('target-a')).toHaveLength(2);
+    });
+
+    it('does not offer a refused job to admission again when GitHub redelivers it', async () => {
+      // Job messages are never acknowledged upstream, so GitHub may offer an
+      // acquired job again, and its acquire may answer again. A refusal that
+      // also forgot the job's dedup entry refused it a second time: another
+      // history row, another notification, another cancel.
+      addTargetWithRunner('target-a', 'runner-a.1');
+      const received = jest.fn((targetId: string, jobId: string) => service.refuseJob(targetId, jobId));
+      service.on('job-received', received);
+
+      await receive('req-1', 2);
+      await receive('req-1', 2);
+
+      expect(received).toHaveBeenCalledTimes(1);
+      expect(internals.messageQueues.get('target-a')).toEqual([]);
+      expect(internals.acquiredJobDetails.size).toBe(0);
+      expect(deep().jobTargets.size).toBe(0);
+    });
+
+    it('offers a dropped job again, since nothing decided it may not run', async () => {
+      // A job dropped because no worker could be started for it was not
+      // judged. Its redelivery is the retry.
+      addTargetWithRunner('target-a', 'runner-a.1');
+      const received = jest.fn((targetId: string, jobId: string) => service.dropJob(targetId, jobId));
+      service.on('job-received', received);
+
+      await receive('req-1', 2);
+      await receive('req-1', 2);
+
+      expect(received).toHaveBeenCalledTimes(2);
     });
 
     it('drops every trace of a refused job, and nothing of another', async () => {

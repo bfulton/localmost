@@ -280,9 +280,9 @@ app.whenReady().then(async () => {
     attachRegistryAuth: (registry: string) => resolveRegistryAuth(registry),
     onStatusChange: sendStatusUpdate,
     onJobHistoryUpdate: sendJobHistoryUpdate,
-    // Bind this job to the worker being spawned for it, by name, so the broker
-    // does not have to infer from arrival order which session belongs to which
-    // job - which is how every job came to be run by the next job's worker.
+    // Bind this job to the worker being spawned for it, by its slot (the
+    // worker key's target and instance). This expectation is the only way a
+    // session binds to a job: a worker nobody announced takes nothing.
     onWorkerReservedForJob: (targetId: string, instanceNum: number, jobId?: string) =>
       getBrokerProxyService()?.expectWorkerForJob(targetId, instanceNum, jobId),
     onWorkerReservationCancelled: (targetId: string, instanceNum: number, jobId?: string) =>
