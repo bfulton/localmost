@@ -545,7 +545,9 @@ The `localmost` CLI talks to the app over a unix socket, mode `0600` inside a `0
 ## Log Sanitization
 
 Log messages are sanitized before being written to disk or displayed:
-- GitHub tokens (`ghp_*`, `gho_*`, etc.) are redacted
+- GitHub tokens (`ghp_*`, `gho_*`, `ghu_*`, `ghs_*`, `ghr_*`, and fine-grained `github_pat_*`) are redacted
+- A worker's broker key in its `/w/<key>` URL is redacted
+- Credentials in a URL (`scheme://user:password@`), including the egress proxy's per-worker token, are redacted
 - JWT tokens are redacted
 - GitHub registration tokens are redacted
 - Encrypted values and bearer tokens are redacted
