@@ -46,6 +46,7 @@ jest.mock('./app-state', () => ({
 }));
 
 import { BrokerProxyService, extractGitHubJobInfo } from './broker-proxy-service';
+import { getLogger } from './app-state';
 import type { Target } from '../shared/types';
 
 // Helper to create mock credentials for a single instance
@@ -1094,6 +1095,58 @@ describe('message routing', () => {
 
       expect(res.statusCode).toBe(200);
       expect(mockHttpsRequest).toHaveBeenCalledTimes(1);
+    });
+
+    describe('in the log', () => {
+      // The log file writes messages verbatim, and a worker's request bodies
+      // are job code's to write: they carry outputs, and whatever lines it
+      // would like the log to show.
+      type Logger = Record<'info' | 'warn' | 'error' | 'debug', jest.Mock>;
+      let logger: Logger;
+      const lines = (...levels: Array<keyof Logger>) =>
+        levels.flatMap(level => logger[level].mock.calls.map(call => String(call[0])));
+      const original = jest.mocked(getLogger).getMockImplementation()!;
+
+      beforeEach(() => {
+        logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
+        jest.mocked(getLogger).mockImplementation(() => logger as unknown as ReturnType<typeof getLogger>);
+      });
+
+      afterEach(() => {
+        jest.mocked(getLogger).mockImplementation(original);
+      });
+
+      it("keeps a job operation's body out of the info log", async () => {
+        const sessionId = await boundWorker();
+
+        await request('POST', `/renewjob?sessionId=${sessionId}`,
+          JSON.stringify({ planId: 'p', jobId: 'j', jobRequestId: 'req-1', note: 'PRIVATE' }));
+
+        expect(lines('info', 'warn', 'error').filter(line => line.includes('PRIVATE'))).toEqual([]);
+        expect(lines('info').some(line => line.includes('/renewjob') && line.includes('req-1'))).toBe(true);
+      });
+
+      it('keeps an acquirejob body out of the info log', async () => {
+        await boundWorker();
+
+        await request('POST', '/acquirejob', JSON.stringify({ jobMessageId: 2, note: 'PRIVATE' }));
+
+        expect(lines('info', 'warn', 'error').filter(line => line.includes('PRIVATE'))).toEqual([]);
+      });
+
+      it('writes no line break a request carries into the log', async () => {
+        const sessionId = await boundWorker();
+        const forged = 'x\n2026-01-01 [INFO] forged';
+
+        await request('POST', `/renewjob?sessionId=${sessionId}`, JSON.stringify({ planId: 'p', jobRequestId: forged }));
+        await request('POST', `/renewjob?sessionId=${sessionId}`, `not json ${forged}`);
+        await request('POST', '/acquirejob', JSON.stringify({ jobMessageId: forged }));
+        await request('POST', '/acquirejob', `not json ${forged}`);
+        await request('POST', '/session', JSON.stringify({ agent: { name: forged } }), startWorker(2));
+        await request('POST', '/session', JSON.stringify({ agent: { name: forged } }), startWorker(1, 'target-a'));
+
+        expect(lines('info', 'warn', 'error', 'debug').filter(line => /[\r\n]/.test(line))).toEqual([]);
+      });
     });
   });
 

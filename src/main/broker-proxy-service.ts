@@ -251,6 +251,15 @@ async function readRequestBody(req: http.IncomingMessage, limit = MAX_REQUEST_BO
   return Buffer.concat(chunks).toString();
 }
 
+/**
+ * A value from a worker's request as a log line may show it. The request is
+ * job code's to write and the log file writes messages verbatim, so the value
+ * is JSON-encoded - a CR/LF in it cannot start a forged line - and cut short.
+ */
+function forLog(value: unknown, max = 100): string {
+  return JSON.stringify(String(value).slice(0, max));
+}
+
 // ============================================================================
 // Broker Proxy Service
 // ============================================================================
@@ -1570,8 +1579,10 @@ export class BrokerProxyService extends EventEmitter {
     const agentName = worker.targetId
       ? this.targets.get(worker.targetId)?.instances.get(worker.instanceNum)?.runner.agentName
       : claimed;
+    // An unbound worker's name is its own claim, so it is logged encoded.
+    const shownName = agentName === undefined ? 'unnamed runner' : forLog(agentName);
     if (worker.targetId && claimed && claimed !== agentName) {
-      log()?.warn(`[BrokerProxy] Worker ${worker.instanceNum} named itself ${claimed}; binding it as ${agentName ?? 'nothing'}`);
+      log()?.warn(`[BrokerProxy] Worker ${worker.instanceNum} named itself ${forLog(claimed)}; binding it as ${shownName}`);
     }
     // One worker key, one bound session. The key rides in the run-service URL
     // the job holds, so job code could call the session endpoint again. The
@@ -1585,7 +1596,7 @@ export class BrokerProxyService extends EventEmitter {
     if (keyAlreadyBound) {
       log()?.warn(`[BrokerProxy] Worker ${worker.instanceNum} already has a bound session; leaving this request unbound`);
     }
-    log()?.info(`[BrokerProxy] Session request from ${agentName ?? 'unnamed runner'}`);
+    log()?.info(`[BrokerProxy] Session request from ${shownName}`);
     const resolved = keyAlreadyBound ? undefined : this.resolveSessionTarget(worker);
     const targetId = resolved?.targetId;
     const expectedJobId = resolved?.jobId;
@@ -1601,7 +1612,7 @@ export class BrokerProxyService extends EventEmitter {
         .filter(([, q]) => q.length > 0)
         .map(([id, q]) => `${id}:${q.length}`);
       log()?.warn(
-        `[BrokerProxy] Session from ${agentName ?? 'unnamed runner'} resolved to no target; ` +
+        `[BrokerProxy] Session from ${shownName} resolved to no target; ` +
           `it can receive no queued job. Queues holding messages: ${waiting.join(', ') || 'none'}`
       );
     }
@@ -1873,13 +1884,13 @@ export class BrokerProxyService extends EventEmitter {
     let jobId: string | undefined;
     try {
       const bodyJson = JSON.parse(reqBody);
-      log()?.info(`[BrokerProxy] acquirejob request body: ${JSON.stringify(bodyJson)}`);
+      log()?.debug(`[BrokerProxy] acquirejob request body: ${forLog(reqBody, 300)}`);
       // Runner uses jobMessageId (which is the message.messageId from the broker)
       const raw = bodyJson.jobMessageId || bodyJson.jobRequestId || bodyJson.requestId;
       // A number on the wire; ids are held as strings everywhere else.
       if (raw !== undefined && raw !== null) jobId = String(raw);
     } catch {
-      log()?.warn(`[BrokerProxy] Could not parse acquirejob body: ${reqBody}`);
+      log()?.warn(`[BrokerProxy] Could not parse acquirejob body (${reqBody.length} bytes)`);
     }
 
     if (!jobId) {
@@ -1892,7 +1903,7 @@ export class BrokerProxyService extends EventEmitter {
     // The payload carries the job's secrets. It goes only to the worker the
     // job was delivered to.
     if (!this.deliveredToWorker.get(key)?.has(jobId)) {
-      log()?.warn(`[BrokerProxy] acquirejob: refused ${jobId}, which was not delivered to this worker`);
+      log()?.warn(`[BrokerProxy] acquirejob: refused ${forLog(jobId)}, which was not delivered to this worker`);
       res.writeHead(403, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Job not delivered to this worker' }));
       return;
@@ -2053,13 +2064,15 @@ export class BrokerProxyService extends EventEmitter {
       let runServiceUrl: string | undefined;
       try {
         const bodyJson = JSON.parse(reqBody);
-        log()?.info(`[BrokerProxy] Job operation ${url.pathname} body: ${JSON.stringify(bodyJson)}`);
         // Try multiple ID fields - runner uses different ones for different operations
         const opJobId = bodyJson.jobRequestId || bodyJson.requestId || bodyJson.runnerRequestId
           || bodyJson.runner_request_id || bodyJson.jobMessageId;
-        log()?.debug(`[BrokerProxy] Looking for run_service_url with jobId: ${opJobId}`);
+        // The id alone at info. The body carries the job's outputs and is job
+        // code's to write, so it goes to debug, encoded and cut short.
+        log()?.info(`[BrokerProxy] Job operation ${url.pathname} for ${opJobId ? forLog(opJobId) : 'no job id'}`);
+        log()?.debug(`[BrokerProxy] Job operation ${url.pathname} body: ${forLog(reqBody, 300)}`);
         if (opJobId && !this.deliveredToWorker.get(key)?.has(String(opJobId))) {
-          log()?.warn(`[BrokerProxy] Refused ${url.pathname} for ${opJobId}, which was not delivered to this worker`);
+          log()?.warn(`[BrokerProxy] Refused ${url.pathname} for ${forLog(opJobId)}, which was not delivered to this worker`);
           res.writeHead(403, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Job not delivered to this worker' }));
           return;
@@ -2069,10 +2082,11 @@ export class BrokerProxyService extends EventEmitter {
           // check above. Without String() a renew/finish with a numeric id
           // misses and gets sent to the broker instead of the job service.
           runServiceUrl = this.jobRunServiceUrls.get(String(opJobId));
-          log()?.info(`[BrokerProxy] Found run_service_url for ${opJobId}: ${runServiceUrl || 'not found'}`);
+          log()?.info(`[BrokerProxy] Found run_service_url for ${forLog(opJobId)}: ${runServiceUrl || 'not found'}`);
         }
-      } catch (e) {
-        log()?.info(`[BrokerProxy] Could not parse job operation body: ${(e as Error).message}, body: ${reqBody?.slice(0, 100)}`);
+      } catch {
+        // Not the parser's message: it quotes the body it could not parse.
+        log()?.info(`[BrokerProxy] Could not parse job operation body (${reqBody.length} bytes)`);
       }
 
       if (runServiceUrl) {
