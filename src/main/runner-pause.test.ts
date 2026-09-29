@@ -19,17 +19,26 @@ import {
   setResourcePaused,
   setRunnerManager,
   setUserPaused,
+  setLogger,
   isUserPaused,
   isResourcePaused,
 } from './app-state';
+import type { Logger } from './logger';
 import {
   getSnapshot,
   initRunnerStateMachine,
   selectEffectivePauseState,
+  selectIsPaused,
   sendRunnerEvent,
   stopRunnerStateMachine,
 } from './runner-state-service';
-import { canAcceptJob, ensureRunnerInitialized, pauseRunner, resumeRunner } from './runner-pause';
+import {
+  canAcceptJob,
+  ensureRunnerInitialized,
+  pauseRunner,
+  resumeRunner,
+  startHeartbeatUnlessPaused,
+} from './runner-pause';
 import { IPC_CHANNELS } from '../shared/types';
 import type { Target } from '../shared/types';
 
@@ -46,6 +55,14 @@ const runner = {
 };
 const resourceMonitor = { shouldPause: jest.fn(() => false) };
 const rendererSend = jest.fn();
+const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
+
+/** A promise and the function that settles it, for holding a call open. */
+const deferred = (): { promise: Promise<void>; release: () => void } => {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => { release = resolve; });
+  return { promise, release };
+};
 
 /** The runner as the app leaves it after starting: listening, nothing paused. */
 const startRunner = (): void => {
@@ -62,6 +79,7 @@ beforeEach(() => {
   setHeartbeatManager(heartbeat as unknown as HeartbeatManager);
   setRunnerManager(runner as unknown as RunnerManager);
   setAuthState({ accessToken: 'token', user: { login: 'someone' } } as never);
+  setLogger(logger as unknown as Logger);
   setMainWindow({
     isDestroyed: () => false,
     webContents: { send: rendererSend },
@@ -73,6 +91,7 @@ afterEach(() => {
   setHeartbeatManager(null);
   setRunnerManager(null);
   setAuthState(null);
+  setLogger(null);
   setMainWindow(null);
 });
 
@@ -245,12 +264,31 @@ describe('pauseRunner', () => {
     expect(isUserPaused()).toBe(true);
   });
 
-  it('says a runner that was never started is not started, and records no pause', async () => {
+  it('says a runner that was never started is not started, records no pause, and logs it', async () => {
     initRunnerStateMachine();
 
     expect(await pauseRunner()).toBe('not-started');
     expect(isUserPaused()).toBe(false);
     expect(heartbeat.stop).not.toHaveBeenCalled();
+    // A tray click that does nothing leaves a trace.
+    expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('not started'));
+  });
+
+  it('pauses a runner that is still starting, and it comes up paused', async () => {
+    // The broker is started, and offered jobs, before the runner reaches
+    // running: the auto-start's delay and sweeps, or a start whose
+    // initialize() failed and left it there. A pause in that window was
+    // dropped.
+    initRunnerStateMachine();
+    sendRunnerEvent({ type: 'START' });
+
+    expect(await pauseRunner()).toBe('paused');
+    expect(canAcceptJob({ resourceMonitor, runnerManager: runner })).toBe(false);
+    expect(heartbeat.stop).toHaveBeenCalled();
+
+    sendRunnerEvent({ type: 'INITIALIZED' });
+    expect(selectIsPaused(getSnapshot()!)).toBe(true);
+    expect(canAcceptJob({ resourceMonitor, runnerManager: runner })).toBe(false);
   });
 });
 
@@ -318,6 +356,95 @@ describe('resumeRunner', () => {
     expect(await resumeRunner()).toBe('not-started');
     expect(runner.initialize).not.toHaveBeenCalled();
   });
+
+  it('lifts a pause made while starting, leaving the pool and heartbeat to the start', async () => {
+    initRunnerStateMachine();
+    sendRunnerEvent({ type: 'START' });
+    runner.isInitialized.mockReturnValue(false);
+    await pauseRunner();
+
+    expect(await resumeRunner()).toBe('resumed');
+    expect(isUserPaused()).toBe(false);
+    expect(runner.initialize).not.toHaveBeenCalled();
+    expect(heartbeat.start).not.toHaveBeenCalled();
+  });
+
+  it('says a starting runner nobody paused is starting', async () => {
+    initRunnerStateMachine();
+    sendRunnerEvent({ type: 'START' });
+    runner.isInitialized.mockReturnValue(false);
+
+    expect(await resumeRunner()).toBe('starting');
+    expect(runner.initialize).not.toHaveBeenCalled();
+  });
+
+  it('lets a pause made while a resume starts the pool win', async () => {
+    // The resume read the pause, then waited on initialize(), then lifted
+    // it. A pause in that wait saw the runner still paused, answered
+    // "already paused" and did nothing, and the resume went on to lift it.
+    startRunner();
+    setUserPaused(true);
+    let initialized = false;
+    runner.isInitialized.mockImplementation(() => initialized);
+    const init = deferred();
+    runner.initialize.mockImplementationOnce(async () => {
+      await init.promise;
+      initialized = true;
+    });
+
+    const resumed = resumeRunner();
+    await Promise.resolve();
+    const paused = pauseRunner();
+    init.release();
+
+    expect(await resumed).toBe('resumed');
+    expect(await paused).toBe('paused');
+    expect(isUserPaused()).toBe(true);
+    expect(canAcceptJob({ resourceMonitor, runnerManager: runner })).toBe(false);
+  });
+
+  it('starts the pool once for two resumes at once', async () => {
+    // initialize() with an empty pool does not notice a second call made
+    // while the first is still sweeping.
+    startRunner();
+    setUserPaused(true);
+    let initialized = false;
+    runner.isInitialized.mockImplementation(() => initialized);
+    const init = deferred();
+    runner.initialize.mockImplementation(async () => {
+      await init.promise;
+      initialized = true;
+    });
+
+    const first = resumeRunner();
+    const second = resumeRunner();
+    init.release();
+
+    expect(await first).toBe('resumed');
+    expect(await second).toBe('already-running');
+    expect(runner.initialize).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('startHeartbeatUnlessPaused', () => {
+  it('leaves the heartbeat stopped for a runner that comes up paused', async () => {
+    // A start routes workflows here by starting the heartbeat once the
+    // runner is up; one paused while starting must not.
+    initRunnerStateMachine();
+    sendRunnerEvent({ type: 'START' });
+    await pauseRunner();
+    sendRunnerEvent({ type: 'INITIALIZED' });
+
+    await startHeartbeatUnlessPaused(heartbeat as unknown as HeartbeatManager);
+    expect(heartbeat.start).not.toHaveBeenCalled();
+  });
+
+  it('starts it for a runner that is not paused', async () => {
+    startRunner();
+
+    await startHeartbeatUnlessPaused(heartbeat as unknown as HeartbeatManager);
+    expect(heartbeat.start).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('ensureRunnerInitialized', () => {
@@ -327,6 +454,26 @@ describe('ensureRunnerInitialized', () => {
 
     await ensureRunnerInitialized();
 
+    expect(runner.initialize).toHaveBeenCalledTimes(1);
+  });
+
+  it('starts the pool once when the resource resume and a user resume race', async () => {
+    startRunner();
+    setUserPaused(true);
+    let initialized = false;
+    runner.isInitialized.mockImplementation(() => initialized);
+    const init = deferred();
+    runner.initialize.mockImplementation(async () => {
+      await init.promise;
+      initialized = true;
+    });
+
+    const fromMonitor = ensureRunnerInitialized();
+    const fromUser = resumeRunner();
+    init.release();
+    await fromMonitor;
+
+    expect(await fromUser).toBe('resumed');
     expect(runner.initialize).toHaveBeenCalledTimes(1);
   });
 

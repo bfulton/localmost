@@ -91,7 +91,7 @@ import { IPC_CHANNELS, SleepProtection, LogLevel, DEFAULT_POWER_CONFIG, DEFAULT_
 
 // Resource monitoring
 import { ResourceMonitor } from './resource-monitor';
-import { canAcceptJob, ensureRunnerInitialized } from './runner-pause';
+import { canAcceptJob, ensureRunnerInitialized, startHeartbeatUnlessPaused } from './runner-pause';
 
 // State machine
 import {
@@ -676,8 +676,8 @@ app.whenReady().then(async () => {
               },
             });
 
-            // Start the heartbeat
-            await heartbeatManager.start();
+            // Start the heartbeat, unless the user paused while it started
+            await startHeartbeatUnlessPaused(heartbeatManager);
           }
         }
       } catch (err) {

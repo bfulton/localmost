@@ -342,6 +342,20 @@ describe('CliServer', () => {
     });
   });
 
+  it('says a runner that is starting and not paused is starting, not resumed', async () => {
+    mockResumeRunner.mockResolvedValue('starting');
+
+    await server.start();
+
+    const response = await sendRequest({ command: 'resume' });
+
+    expect(response).toEqual({
+      success: true,
+      command: 'resume',
+      message: 'Runner is still starting, and is not paused',
+    });
+  });
+
   it('does not claim to resume a runner that was never started', async () => {
     mockResumeRunner.mockResolvedValue('not-started');
 

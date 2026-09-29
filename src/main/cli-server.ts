@@ -328,7 +328,11 @@ export class CliServer {
           if (outcome === 'not-started') {
             return { success: false, error: 'Runner is not started. Start it from the app.' };
           }
-          let message = outcome === 'already-running' ? 'Runner is already running' : 'Runner resumed';
+          let message = outcome === 'already-running'
+            ? 'Runner is already running'
+            : outcome === 'starting'
+              ? 'Runner is still starting, and is not paused'
+              : 'Runner resumed';
           // Resuming lifts the pause, not the condition behind a resource
           // pause, and new jobs wait on the condition.
           const resourceMonitor = getResourceMonitor();

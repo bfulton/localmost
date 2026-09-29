@@ -23,6 +23,7 @@ import {
 } from '../app-state';
 import { getRunnerProxyManager } from '../runner-proxy-manager';
 import { sendRunnerEvent } from '../runner-state-service';
+import { startHeartbeatUnlessPaused } from '../runner-pause';
 import { updateTrayMenu } from '../tray-init';
 import { store } from '../store';
 import {
@@ -463,8 +464,8 @@ export const registerRunnerHandlers = (): void => {
             heartbeatManager.setRunnerName(runnerConfig.runnerName);
           }
 
-          // Start the heartbeat
-          await heartbeatManager.start();
+          // Start the heartbeat, unless the runner is paused
+          await startHeartbeatUnlessPaused(heartbeatManager);
         }
       }
 

@@ -16,6 +16,7 @@
 import { IPC_CHANNELS } from '../shared/types';
 import type { RunnerManager } from './runner-manager';
 import type { ResourceMonitor } from './resource-monitor';
+import type { HeartbeatManager } from './heartbeat-manager';
 import {
   getAuthState,
   getEffectivePauseState,
@@ -28,10 +29,10 @@ import {
   setResourcePaused,
   setUserPaused,
 } from './app-state';
-import { isRunning as isRunnerStarted } from './runner-state-service';
+import { isRunning as isRunnerStarted, isStarting as isRunnerStarting } from './runner-state-service';
 
 export type PauseOutcome = 'paused' | 'already-paused' | 'not-started';
-export type ResumeOutcome = 'resumed' | 'already-running' | 'not-started';
+export type ResumeOutcome = 'resumed' | 'already-running' | 'starting' | 'not-started';
 
 export interface CanAcceptJobDeps {
   resourceMonitor: Pick<ResourceMonitor, 'shouldPause'>;
@@ -67,6 +68,22 @@ const notifyRenderer = (isPaused: boolean): void => {
 };
 
 /**
+ * One pause or resume at a time, in the order asked. A resume can wait on
+ * initialize() between reading the pause and lifting it; a pause made in
+ * that wait read the runner as still paused, did nothing, and was then
+ * lifted by the resume.
+ */
+let pending: Promise<unknown> = Promise.resolve();
+const oneAtATime = <T>(operation: () => Promise<T>): Promise<T> => {
+  const result = pending.then(operation);
+  pending = result.catch(() => {});
+  return result;
+};
+
+/** The initialize() in progress, which every caller waits on. */
+let initializing: Promise<void> | null = null;
+
+/**
  * Start the runner manager's pool if the runner is started and its pool is
  * not.
  *
@@ -74,25 +91,52 @@ const notifyRenderer = (isPaused: boolean): void => {
  * started it again, so the runner read offline once it resumed - while the
  * broker went on acquiring jobs and spawning workers for them. A runner the
  * app never started is left alone: the pool is no use without the broker.
+ *
+ * The resource monitor's resume and the user's can both get here at once,
+ * and initialize() with an empty pool does not notice a second call made
+ * while the first is still sweeping, so they share one.
  */
 export const ensureRunnerInitialized = async (): Promise<void> => {
   if (!isRunnerStarted()) {
     return;
   }
   const runnerManager = getRunnerManager();
-  if (runnerManager && !runnerManager.isInitialized()) {
-    await runnerManager.initialize();
+  if (!runnerManager || runnerManager.isInitialized()) {
+    return;
   }
+  if (!initializing) {
+    initializing = runnerManager.initialize().finally(() => {
+      initializing = null;
+    });
+  }
+  await initializing;
+};
+
+/**
+ * Start the heartbeat that routes workflows here, unless the runner is
+ * paused. For starting the runner: one paused while it started comes up
+ * paused, and its resume starts the heartbeat.
+ */
+export const startHeartbeatUnlessPaused = async (
+  heartbeatManager: Pick<HeartbeatManager, 'start'>
+): Promise<void> => {
+  if (getEffectivePauseState().isPaused) {
+    getLogger()?.info('Runner is paused, so the heartbeat waits for resume');
+    return;
+  }
+  await heartbeatManager.start();
 };
 
 /**
  * Stop taking jobs until the user resumes. Running jobs finish.
  *
- * The runner has to be started: the state machine only holds a pause while
- * it is running, and outside that the flag would not be set at all.
+ * The runner has to be started, or starting: the broker takes jobs from
+ * before the runner is up, and the state machine holds a pause from then.
+ * Outside those the flag would not be set at all.
  */
-export const pauseRunner = async (): Promise<PauseOutcome> => {
-  if (!isRunnerStarted()) {
+export const pauseRunner = (): Promise<PauseOutcome> => oneAtATime(async () => {
+  if (!isRunnerStarted() && !isRunnerStarting()) {
+    getLogger()?.info('Pause ignored: the runner is not started');
     return 'not-started';
   }
   if (isUserPaused()) {
@@ -109,15 +153,27 @@ export const pauseRunner = async (): Promise<PauseOutcome> => {
 
   notifyRenderer(true);
   return 'paused';
-};
+});
 
 /**
  * Take jobs again. Clears the resource pause as well as the user's, as the
  * tray always has. While a resource condition itself still holds, new jobs
  * are refused regardless: canAcceptJob asks the monitor, not the flag.
  */
-export const resumeRunner = async (): Promise<ResumeOutcome> => {
+export const resumeRunner = (): Promise<ResumeOutcome> => oneAtATime(async () => {
+  if (isRunnerStarting()) {
+    if (!isUserPaused()) {
+      return 'starting';
+    }
+    // The start brings up the pool and, with nothing holding it, the
+    // heartbeat.
+    getLogger()?.info('User resumed runner');
+    setUserPaused(false);
+    notifyRenderer(false);
+    return 'resumed';
+  }
   if (!isRunnerStarted()) {
+    getLogger()?.info('Resume ignored: the runner is not started');
     return 'not-started';
   }
   const wasPaused = getEffectivePauseState().isPaused;
@@ -148,4 +204,4 @@ export const resumeRunner = async (): Promise<ResumeOutcome> => {
     notifyRenderer(false);
   }
   return 'resumed';
-};
+});

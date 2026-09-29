@@ -363,11 +363,18 @@ export const runnerMachine = setup({
 
     starting: {
       on: {
-        INITIALIZED: 'running',
-        INSTANCE_LISTENING: {
-          target: 'running',
-          actions: 'updateInstanceListening',
-        },
+        // The broker is up and offered jobs before the runner is, so a user
+        // pause holds from here, and the runner comes up paused.
+        INITIALIZED: [
+          { guard: 'isPaused', target: 'running.paused' },
+          { target: 'running' },
+        ],
+        INSTANCE_LISTENING: [
+          { guard: 'isPaused', target: 'running.paused', actions: 'updateInstanceListening' },
+          { target: 'running', actions: 'updateInstanceListening' },
+        ],
+        USER_PAUSE: { actions: 'setUserPaused' },
+        USER_RESUME: { actions: 'clearUserPaused' },
         INSTANCE_ERROR: {
           target: 'error',
           actions: ['updateInstanceError', 'setError'],

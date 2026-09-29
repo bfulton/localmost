@@ -126,6 +126,36 @@ describe('runnerMachine', () => {
   });
 
   describe('pause state management', () => {
+    it('holds a pause made while starting, and comes up paused', () => {
+      // The broker is up and offered jobs before the runner is initialized,
+      // so a pause in that window has to hold.
+      const actor = createTestActor();
+
+      actor.send({ type: 'START' });
+      actor.send({ type: 'USER_PAUSE' });
+      expect(actor.getSnapshot().context.userPaused).toBe(true);
+
+      actor.send({ type: 'INITIALIZED' });
+      expect(actor.getSnapshot().value).toEqual({ running: 'paused' });
+
+      actor.send({ type: 'USER_RESUME' });
+      expect(actor.getSnapshot().value).toEqual({ running: 'listening' });
+
+      actor.stop();
+    });
+
+    it('comes up paused on a first listening instance too', () => {
+      const actor = createTestActor();
+
+      actor.send({ type: 'START' });
+      actor.send({ type: 'USER_PAUSE' });
+      actor.send({ type: 'INSTANCE_LISTENING', instanceNum: 1 });
+
+      expect(actor.getSnapshot().value).toEqual({ running: 'paused' });
+
+      actor.stop();
+    });
+
     it('should transition to paused on USER_PAUSE', () => {
       const actor = createTestActor();
 
