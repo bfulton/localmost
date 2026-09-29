@@ -222,6 +222,13 @@ function agentNameFromSessionRequest(body: string): string | undefined {
 /** Largest request body the proxy reads; a runner's are a few hundred bytes. */
 const MAX_REQUEST_BODY_BYTES = 64 * 1024;
 
+/**
+ * Largest body forwarded upstream. completejob carries the job's outputs, step
+ * results and annotations, so it can be far larger than anything else the
+ * runner sends; the cap above would fail such a job at its very end.
+ */
+const MAX_FORWARD_BODY_BYTES = 8 * 1024 * 1024;
+
 class RequestBodyTooLargeError extends Error {
   constructor() {
     super('request body too large');
@@ -233,15 +240,56 @@ class RequestBodyTooLargeError extends Error {
  * is drained either way: leaving the loop early destroys the socket, and the
  * 413 would never reach the client.
  */
-async function readRequestBody(req: http.IncomingMessage): Promise<string> {
+async function readRequestBody(req: http.IncomingMessage, limit = MAX_REQUEST_BODY_BYTES): Promise<string> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
     size += (chunk as Buffer).length;
-    if (size <= MAX_REQUEST_BODY_BYTES) chunks.push(chunk as Buffer);
+    if (size <= limit) chunks.push(chunk as Buffer);
   }
-  if (size > MAX_REQUEST_BODY_BYTES) throw new RequestBodyTooLargeError();
+  if (size > limit) throw new RequestBodyTooLargeError();
   return Buffer.concat(chunks).toString();
+}
+
+/** The hosts GitHub's run services live under; a run service is a subdomain. */
+const RUN_SERVICE_HOST_SUFFIXES = ['.actions.githubusercontent.com'];
+
+/**
+ * A job message's run_service_url, if it is one the runner's token may go to.
+ * The broker acquires the job there with the runner's bearer token, and later
+ * forwards there those of the job's operations it can match to the job. The
+ * URL arrives only from GitHub's broker over TLS, so this is defence in depth:
+ * a job offered with any other run service is left unacquired, not handed the
+ * token. The port must be the default because httpsRequest always connects
+ * to 443.
+ *
+ * Returns the URL as parsed, which is what the requests are built from: they
+ * append a path to it as a string, so the checked URL has to end in a
+ * directory with no query or fragment after it, or the appended path would
+ * land somewhere other than where this looked - onto the host name itself,
+ * when a bare host was sent as written.
+ */
+function gitHubRunServiceUrl(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return undefined;
+  }
+  const valid = url.protocol === 'https:' && url.port === '' && !url.username && !url.password &&
+    url.pathname.endsWith('/') && !url.search && !url.hash &&
+    RUN_SERVICE_HOST_SUFFIXES.some(suffix => url.hostname.endsWith(suffix));
+  return valid ? url.href : undefined;
+}
+
+/**
+ * A value from a worker's request as a log line may show it. The request is
+ * job code's to write and the log file writes messages verbatim, so the value
+ * is JSON-encoded - a CR/LF in it cannot start a forged line - and cut short.
+ */
+function forLog(value: unknown, max = 100): string {
+  return JSON.stringify(String(value).slice(0, max));
 }
 
 // ============================================================================
@@ -257,6 +305,21 @@ export interface GitHubJobInfo {
   githubSha?: string;    // Commit SHA that triggered the workflow
   githubRef?: string;    // Branch/tag ref (e.g., refs/heads/main)
   githubWorkflow?: string; // Workflow name from github.workflow (keys workflows.<name> policy)
+  repositoryId?: number;   // github.repository_id: the repository's id, stable across renames and transfers
+}
+
+/**
+ * What the broker keeps about a job for the policy its worker's proxy
+ * installs at acquirejob. The target is the one the job came in on; the rest
+ * is what GitHub's job details name. `repository` is owner/repo as GitHub
+ * reports it, which for an organization target the display name is not.
+ */
+export interface BrokerJobTarget {
+  targetDisplayName: string;
+  githubSha?: string;
+  githubWorkflow?: string;
+  repository?: string;
+  repositoryId?: number;
 }
 
 /** One entry of a GitHub context dict: {"t":2,"d":[{"k":"run_id","v":"123"},...]} */
@@ -279,6 +342,16 @@ function workflowFilename(ref: string | undefined): string | undefined {
   return file.replace(/\.ya?ml$/i, '');
 }
 
+/**
+ * A repository id as GitHub sends it: a positive integer, as a string. Anything
+ * else names no repository, and an id is only worth keeping if it is exact.
+ */
+function repositoryIdFrom(value: string): number | undefined {
+  if (!/^[1-9]\d*$/.test(value)) return undefined;
+  const id = Number(value);
+  return Number.isSafeInteger(id) ? id : undefined;
+}
+
 export function extractGitHubJobInfo(contextData: {
   github?: { d?: ContextDictEntry[] };
   job?: { d?: ContextDictEntry[] };
@@ -296,6 +369,7 @@ export function extractGitHubJobInfo(contextData: {
       if (item.k === 'ref') info.githubRef = item.v;
       if (item.k === 'workflow') info.githubWorkflow = item.v;
       if (item.k === 'workflow_ref') workflowRef = item.v;
+      if (item.k === 'repository_id') info.repositoryId = repositoryIdFrom(item.v);
     }
   }
 
@@ -351,7 +425,6 @@ export class BrokerProxyService extends EventEmitter {
   private pollInterval: NodeJS.Timeout | null = null;
   private isPolling = false;  // Prevent concurrent poll execution
   private messageQueues: Map<string, Array<string>> = new Map();  // Per-target message queues
-  private seenMessageIds: Set<string> = new Set();
   /**
    * Workers spawned for a specific job, and the job each was spawned for.
    *
@@ -393,8 +466,8 @@ export class BrokerProxyService extends EventEmitter {
    * per slot and a previous start's key matches no live address.
    */
   private workerCredentials: Map<number, { key: string; clientId: string; publicKey: crypto.KeyObject }> = new Map();
-  /** Repository and commit for a job, keyed by both jobId and messageId. */
-  private jobTargets: Map<string, { targetDisplayName: string; githubSha?: string }> = new Map();
+  /** What the broker keeps about each job (a BrokerJobTarget), keyed by both jobId and messageId. */
+  private jobTargets: Map<string, BrokerJobTarget> = new Map();
 
   private jobRunServiceUrls: Map<string, string> = new Map();  // jobId -> run_service_url
   private acquiredJobDetails: Map<string, string> = new Map();  // jobId -> job details
@@ -605,17 +678,21 @@ export class BrokerProxyService extends EventEmitter {
         return;
       }
 
-      const runServiceUrl = innerBody?.run_service_url;
+      const offeredRunServiceUrl = innerBody?.run_service_url;
       const billingOwnerId = innerBody?.billing_owner_id;
-      log()?.info(`[BrokerProxy] Job ${jobId} (messageId=${messageId}) received from ${state.target.displayName}, run_service_url=${runServiceUrl ?? 'none'}, billingOwnerId=${billingOwnerId}`);
+      log()?.info(`[BrokerProxy] Job ${jobId} (messageId=${messageId}) received from ${state.target.displayName}, run_service_url=${offeredRunServiceUrl ?? 'none'}, billingOwnerId=${billingOwnerId}`);
 
       // Acquire job from GitHub immediately using target's credentials
       // This claims the job so GitHub won't keep sending it on subsequent polls
       // Note: GitHub uses runner_request_id (UUID) as jobMessageId, not the broker's numeric messageId
+      const runServiceUrl = gitHubRunServiceUrl(offeredRunServiceUrl);
+      if (offeredRunServiceUrl && !runServiceUrl) {
+        log()?.warn(`[BrokerProxy] Job ${jobId}: run_service_url is not a GitHub Actions https URL; not sending the runner's token there`);
+      }
       const jobDetails = runServiceUrl
         ? await this.acquireJobUpstream(state, instance, jobId, runServiceUrl, billingOwnerId)
         : null;
-      if (!jobDetails) {
+      if (!runServiceUrl || !jobDetails) {
         // Not acquired, so not ours to offer. This used to carry on: a worker
         // spawned for it had its acquirejob answered 404, and admission - which
         // refuses a job it cannot identify - would now refuse and record it
@@ -681,7 +758,13 @@ export class BrokerProxyService extends EventEmitter {
       // might present. A worker announces which job it is taking via
       // acquirejob, and its proxy installs that job's policy then - looked up
       // only among the jobs delivered to that worker (getJobTargetForWorker).
-      const jobTarget = { targetDisplayName: state.target.displayName, githubSha: githubInfo.githubSha };
+      const jobTarget: BrokerJobTarget = {
+        targetDisplayName: state.target.displayName,
+        githubSha: githubInfo.githubSha,
+        githubWorkflow: githubInfo.githubWorkflow,
+        repository: githubInfo.githubRepo,
+        repositoryId: githubInfo.repositoryId,
+      };
       this.jobTargets.set(jobId, jobTarget);
       this.jobTargets.set(messageId, jobTarget);
 
@@ -1328,7 +1411,7 @@ export class BrokerProxyService extends EventEmitter {
         // JSON-encoded, so a body containing CR/LF cannot forge log lines: the
         // log file writes messages verbatim. At debug because it is one line
         // per acknowledge, which is one per message the runner receives.
-        log()?.debug(`[BrokerProxy] Runner acknowledge${url.search}: ${JSON.stringify(ackBody.slice(0, 300))}`);
+        log()?.debug(`[BrokerProxy] Runner acknowledge${url.search}: ${forLog(ackBody, 300)}`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end('{}');
       } else if (method === 'POST' && url.pathname === '/acquirejob') {
@@ -1563,8 +1646,10 @@ export class BrokerProxyService extends EventEmitter {
     const agentName = worker.targetId
       ? this.targets.get(worker.targetId)?.instances.get(worker.instanceNum)?.runner.agentName
       : claimed;
+    // An unbound worker's name is its own claim, so it is logged encoded.
+    const shownName = agentName === undefined ? 'unnamed runner' : forLog(agentName);
     if (worker.targetId && claimed && claimed !== agentName) {
-      log()?.warn(`[BrokerProxy] Worker ${worker.instanceNum} named itself ${claimed}; binding it as ${agentName ?? 'nothing'}`);
+      log()?.warn(`[BrokerProxy] Worker ${worker.instanceNum} named itself ${forLog(claimed)}; binding it as ${shownName}`);
     }
     // One worker key, one bound session. The key rides in the run-service URL
     // the job holds, so job code could call the session endpoint again. The
@@ -1578,7 +1663,7 @@ export class BrokerProxyService extends EventEmitter {
     if (keyAlreadyBound) {
       log()?.warn(`[BrokerProxy] Worker ${worker.instanceNum} already has a bound session; leaving this request unbound`);
     }
-    log()?.info(`[BrokerProxy] Session request from ${agentName ?? 'unnamed runner'}`);
+    log()?.info(`[BrokerProxy] Session request from ${shownName}`);
     const resolved = keyAlreadyBound ? undefined : this.resolveSessionTarget(worker);
     const targetId = resolved?.targetId;
     const expectedJobId = resolved?.jobId;
@@ -1594,7 +1679,7 @@ export class BrokerProxyService extends EventEmitter {
         .filter(([, q]) => q.length > 0)
         .map(([id, q]) => `${id}:${q.length}`);
       log()?.warn(
-        `[BrokerProxy] Session from ${agentName ?? 'unnamed runner'} resolved to no target; ` +
+        `[BrokerProxy] Session from ${shownName} resolved to no target; ` +
           `it can receive no queued job. Queues holding messages: ${waiting.join(', ') || 'none'}`
       );
     }
@@ -1836,7 +1921,8 @@ export class BrokerProxyService extends EventEmitter {
   }
 
   /**
-   * The repository and commit of a job, by jobId or messageId - answered only
+   * The BrokerJobTarget of a job - its target, repository, repository id,
+   * commit and workflow - by jobId or messageId, answered only
    * for the worker in the slot the job was delivered to.
    *
    * A worker's proxy asks this when the worker POSTs acquirejob, and installs
@@ -1845,7 +1931,7 @@ export class BrokerProxyService extends EventEmitter {
    * job took that repository's hosts. The proxy is per slot, and a slot has
    * one live key, so the slot names the worker.
    */
-  getJobTargetForWorker(instanceNum: number, jobId: string): { targetDisplayName: string; githubSha?: string } | undefined {
+  getJobTargetForWorker(instanceNum: number, jobId: string): BrokerJobTarget | undefined {
     for (const [key, worker] of this.workerKeys) {
       if (worker.instanceNum !== instanceNum) continue;
       return this.deliveredToWorker.get(key)?.has(jobId) ? this.jobTargets.get(jobId) : undefined;
@@ -1860,23 +1946,19 @@ export class BrokerProxyService extends EventEmitter {
    */
   private async handleAcquireJob(req: http.IncomingMessage, res: http.ServerResponse, key: string): Promise<void> {
     // Read request body to get job ID
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) {
-      chunks.push(chunk as Buffer);
-    }
-    const reqBody = Buffer.concat(chunks).toString();
+    const reqBody = await readRequestBody(req);
 
     // Parse body to find job ID
     let jobId: string | undefined;
     try {
       const bodyJson = JSON.parse(reqBody);
-      log()?.info(`[BrokerProxy] acquirejob request body: ${JSON.stringify(bodyJson)}`);
+      log()?.debug(`[BrokerProxy] acquirejob request body: ${forLog(reqBody, 300)}`);
       // Runner uses jobMessageId (which is the message.messageId from the broker)
       const raw = bodyJson.jobMessageId || bodyJson.jobRequestId || bodyJson.requestId;
       // A number on the wire; ids are held as strings everywhere else.
       if (raw !== undefined && raw !== null) jobId = String(raw);
     } catch {
-      log()?.warn(`[BrokerProxy] Could not parse acquirejob body: ${reqBody}`);
+      log()?.warn(`[BrokerProxy] Could not parse acquirejob body (${reqBody.length} bytes)`);
     }
 
     if (!jobId) {
@@ -1889,7 +1971,7 @@ export class BrokerProxyService extends EventEmitter {
     // The payload carries the job's secrets. It goes only to the worker the
     // job was delivered to.
     if (!this.deliveredToWorker.get(key)?.has(jobId)) {
-      log()?.warn(`[BrokerProxy] acquirejob: refused ${jobId}, which was not delivered to this worker`);
+      log()?.warn(`[BrokerProxy] acquirejob: refused ${forLog(jobId)}, which was not delivered to this worker`);
       res.writeHead(403, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Job not delivered to this worker' }));
       return;
@@ -2029,11 +2111,7 @@ export class BrokerProxyService extends EventEmitter {
     log()?.info(`[BrokerProxy] Forward using ${targetState.target.displayName}/${instance.instanceNum}, upstream sessionId=${instance.sessionId}`);
 
     // Read request body first (needed for routing decisions)
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) {
-      chunks.push(chunk as Buffer);
-    }
-    const reqBody = Buffer.concat(chunks).toString();
+    const reqBody = await readRequestBody(req, MAX_FORWARD_BODY_BYTES);
 
     // Replace local session ID with upstream session ID in query params
     const upstreamParams = new URLSearchParams(url.search);
@@ -2048,19 +2126,33 @@ export class BrokerProxyService extends EventEmitter {
 
     // For job operations, try to use the run_service_url from the job message
     // Note: /acknowledge goes to broker, NOT run_service_url (it's BrokerHttpClient.AcknowledgeRunnerRequestAsync)
+    //
+    // OPEN ITEM, not yet enforced: the delivered-to-this-worker check below
+    // covers only an operation whose body names a request id. The installed
+    // runner's run-service client calls completejob (not finishjob, so it is
+    // not in this list) and renewjob, whose body carries only planId and jobId;
+    // both reach GitHub's broker on the runner's token without being checked,
+    // for whatever planId/jobId the body names, as does any job operation whose
+    // id fields are empty. The fix is to record the plan and job GUIDs from
+    // the acquired details with the ids delivered to the worker, and refuse
+    // these operations for any other, possibly also routing them to the stored
+    // run_service_url. It is left until it can be checked against a live job,
+    // because getting the ids or the route wrong breaks every job's renewal.
     const jobOperations = ['/acquirejob', '/renewjob', '/finishjob', '/jobrequest'];
     if (jobOperations.some(op => url.pathname.startsWith(op))) {
       // Try to find run_service_url from request body or stored job info
       let runServiceUrl: string | undefined;
       try {
         const bodyJson = JSON.parse(reqBody);
-        log()?.info(`[BrokerProxy] Job operation ${url.pathname} body: ${JSON.stringify(bodyJson)}`);
         // Try multiple ID fields - runner uses different ones for different operations
         const opJobId = bodyJson.jobRequestId || bodyJson.requestId || bodyJson.runnerRequestId
           || bodyJson.runner_request_id || bodyJson.jobMessageId;
-        log()?.debug(`[BrokerProxy] Looking for run_service_url with jobId: ${opJobId}`);
+        // The id alone at info. The body carries the job's outputs and is job
+        // code's to write, so it goes to debug, encoded and cut short.
+        log()?.info(`[BrokerProxy] Job operation ${url.pathname} for ${opJobId ? forLog(opJobId) : 'no job id'}`);
+        log()?.debug(`[BrokerProxy] Job operation ${url.pathname} body: ${forLog(reqBody, 300)}`);
         if (opJobId && !this.deliveredToWorker.get(key)?.has(String(opJobId))) {
-          log()?.warn(`[BrokerProxy] Refused ${url.pathname} for ${opJobId}, which was not delivered to this worker`);
+          log()?.warn(`[BrokerProxy] Refused ${url.pathname} for ${forLog(opJobId)}, which was not delivered to this worker`);
           res.writeHead(403, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Job not delivered to this worker' }));
           return;
@@ -2070,10 +2162,11 @@ export class BrokerProxyService extends EventEmitter {
           // check above. Without String() a renew/finish with a numeric id
           // misses and gets sent to the broker instead of the job service.
           runServiceUrl = this.jobRunServiceUrls.get(String(opJobId));
-          log()?.info(`[BrokerProxy] Found run_service_url for ${opJobId}: ${runServiceUrl || 'not found'}`);
+          log()?.info(`[BrokerProxy] Found run_service_url for ${forLog(opJobId)}: ${runServiceUrl || 'not found'}`);
         }
-      } catch (e) {
-        log()?.info(`[BrokerProxy] Could not parse job operation body: ${(e as Error).message}, body: ${reqBody?.slice(0, 100)}`);
+      } catch {
+        // Not the parser's message: it quotes the body it could not parse.
+        log()?.info(`[BrokerProxy] Could not parse job operation body (${reqBody.length} bytes)`);
       }
 
       if (runServiceUrl) {

@@ -46,6 +46,7 @@ jest.mock('./app-state', () => ({
 }));
 
 import { BrokerProxyService, extractGitHubJobInfo } from './broker-proxy-service';
+import { getLogger } from './app-state';
 import type { Target } from '../shared/types';
 
 // Helper to create mock credentials for a single instance
@@ -450,6 +451,24 @@ describe('extractGitHubJobInfo', () => {
     ] } });
 
     expect(info.githubWorkflow).toBe('integration');
+  });
+
+  it("reads github.repository_id, which stays the repository's through renames and transfers", () => {
+    const info = extractGitHubJobInfo({ github: { d: [
+      { k: 'repository', v: 'owner/repo' },
+      { k: 'repository_id', v: '123456789' },
+    ] } });
+
+    expect(info).toEqual({ githubRepo: 'owner/repo', repositoryId: 123456789 });
+  });
+
+  it('takes a repository id only as the positive integer GitHub sends', () => {
+    const idOf = (value: string) => extractGitHubJobInfo({ github: { d: [{ k: 'repository_id', v: value }] } }).repositoryId;
+
+    expect(idOf('42')).toBe(42);
+    for (const value of ['', '0', '-5', '12abc', '1e3', '99999999999999999999']) {
+      expect(idOf(value)).toBeUndefined();
+    }
   });
 });
 
@@ -1050,6 +1069,218 @@ describe('message routing', () => {
     expect(res.statusCode).toBe(413);
   });
 
+  describe('request bodies a worker sends', () => {
+    /** A worker bound to target-a that has been handed job req-1 (message 2). */
+    const boundWorker = async () => {
+      const target = addTargetWithRunner('target-a', 'runner-a.1');
+      const instance = internals.targets.get(target.id)!.instances.get(1)! as Instance & { accessToken?: string; tokenExpiry?: number };
+      instance.accessToken = 'token';
+      instance.tokenExpiry = Date.now() + 3_600_000;
+      internals.messageQueues.set(target.id, [jobMessage]);
+      service.expectWorkerForJob(target.id, 1, 'req-1');
+      const sessionId = await createSession();
+      await request('GET', `/message?sessionId=${sessionId}`);
+      return sessionId;
+    };
+
+    it('rejects an oversized acquirejob instead of buffering it', async () => {
+      await boundWorker();
+
+      const res = await request('POST', '/acquirejob', JSON.stringify({ jobMessageId: 2, pad: 'x'.repeat(65 * 1024) }));
+
+      expect(res.statusCode).toBe(413);
+    });
+
+    it('rejects a forwarded job operation above its cap, and sends nothing upstream', async () => {
+      const sessionId = await boundWorker();
+      mockHttpsRequest.mockClear();
+
+      const res = await request('POST', `/renewjob?sessionId=${sessionId}`, 'x'.repeat(8 * 1024 * 1024 + 1));
+
+      expect(res.statusCode).toBe(413);
+      expect(mockHttpsRequest).not.toHaveBeenCalled();
+    });
+
+    it("still forwards a completejob far larger than the runner's other requests", async () => {
+      // completejob carries the job's outputs, step results and annotations.
+      // The cap on the runner's other requests would fail every job with
+      // sizeable outputs at its very end.
+      const sessionId = await boundWorker();
+      mockHttpsRequest.mockClear();
+      const body = JSON.stringify({ planId: 'p', jobId: 'j', conclusion: 'succeeded', outputs: { big: 'x'.repeat(1024 * 1024) } });
+
+      const res = await request('POST', `/completejob?sessionId=${sessionId}`, body);
+
+      expect(res.statusCode).toBe(200);
+      expect(mockHttpsRequest).toHaveBeenCalledTimes(1);
+    });
+
+    describe('in the log', () => {
+      // The log file writes messages verbatim, and a worker's request bodies
+      // are job code's to write: they carry outputs, and whatever lines it
+      // would like the log to show.
+      type Logger = Record<'info' | 'warn' | 'error' | 'debug', jest.Mock>;
+      let logger: Logger;
+      const lines = (...levels: Array<keyof Logger>) =>
+        levels.flatMap(level => logger[level].mock.calls.map(call => String(call[0])));
+      const original = jest.mocked(getLogger).getMockImplementation()!;
+
+      beforeEach(() => {
+        logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
+        jest.mocked(getLogger).mockImplementation(() => logger as unknown as ReturnType<typeof getLogger>);
+      });
+
+      afterEach(() => {
+        jest.mocked(getLogger).mockImplementation(original);
+      });
+
+      it("keeps a job operation's body out of the info log", async () => {
+        const sessionId = await boundWorker();
+
+        await request('POST', `/renewjob?sessionId=${sessionId}`,
+          JSON.stringify({ planId: 'p', jobId: 'j', jobRequestId: 'req-1', note: 'PRIVATE' }));
+
+        expect(lines('info', 'warn', 'error').filter(line => line.includes('PRIVATE'))).toEqual([]);
+        expect(lines('info').some(line => line.includes('/renewjob') && line.includes('req-1'))).toBe(true);
+      });
+
+      it('keeps an acquirejob body out of the info log', async () => {
+        await boundWorker();
+
+        await request('POST', '/acquirejob', JSON.stringify({ jobMessageId: 2, note: 'PRIVATE' }));
+
+        expect(lines('info', 'warn', 'error').filter(line => line.includes('PRIVATE'))).toEqual([]);
+      });
+
+      it('writes no line break a request carries into the log', async () => {
+        const sessionId = await boundWorker();
+        const forged = 'x\n2026-01-01 [INFO] forged';
+
+        await request('POST', `/renewjob?sessionId=${sessionId}`, JSON.stringify({ planId: 'p', jobRequestId: forged }));
+        await request('POST', `/renewjob?sessionId=${sessionId}`, `not json ${forged}`);
+        await request('POST', '/acquirejob', JSON.stringify({ jobMessageId: forged }));
+        await request('POST', '/acquirejob', `not json ${forged}`);
+        await request('POST', '/session', JSON.stringify({ agent: { name: forged } }), startWorker(2));
+        await request('POST', '/session', JSON.stringify({ agent: { name: forged } }), startWorker(1, 'target-a'));
+
+        expect(lines('info', 'warn', 'error', 'debug').filter(line => /[\r\n]/.test(line))).toEqual([]);
+      });
+    });
+  });
+
+  describe('a job as GitHub delivers it', () => {
+    const runService = 'https://run-actions-1-azure-eastus.actions.githubusercontent.com/';
+    // The job details acquirejob answers with. An organization target's
+    // display name is the organization; the job names its repository.
+    const details = JSON.stringify({
+      jobId: 'plan-job',
+      contextData: { github: { d: [
+        { k: 'repository', v: 'Some-Org/Some-Repo' },
+        { k: 'repository_id', v: '123456789' },
+        { k: 'sha', v: 'abc1234' },
+        { k: 'workflow', v: 'Continuous Integration' },
+        { k: 'workflow_ref', v: 'Some-Org/Some-Repo/.github/workflows/build.yml@refs/heads/main' },
+      ] } },
+    });
+    /** Every host the broker sent a request to. */
+    let upstreamHosts: string[];
+
+    beforeEach(() => {
+      upstreamHosts = [];
+      mockHttpsRequest.mockImplementation((...args: unknown[]) => {
+        const options = args[0] as { hostname?: string; path?: string };
+        upstreamHosts.push(options.hostname ?? '');
+        const callback = args[1] as (res: EventEmitter) => void;
+        const req = new EventEmitter() as EventEmitter & { setTimeout: () => void; write: () => void; end: () => void };
+        req.setTimeout = () => {};
+        req.write = () => {};
+        req.end = () => {
+          const res = new EventEmitter() as EventEmitter & { statusCode: number };
+          res.statusCode = 200;
+          callback(res);
+          if (options.path?.startsWith('/acquirejob')) res.emit('data', details);
+          res.emit('end');
+        };
+        return req;
+      });
+    });
+
+    /** The broker's poll receives job req-1 (message 2) for the organization target. */
+    const receive = async (runServiceUrl: string) => {
+      addTargetWithRunner('some-org', 'runner.1');
+      const state = internals.targets.get('some-org')!;
+      const instance = state.instances.get(1)! as Instance & { accessToken?: string; tokenExpiry?: number };
+      instance.accessToken = 'token';
+      instance.tokenExpiry = Date.now() + 3_600_000;
+      await internals.processMessage(state, instance, JSON.stringify({
+        messageId: 2,
+        messageType: 'RunnerJobRequest',
+        body: JSON.stringify({ runner_request_id: 'req-1', run_service_url: runServiceUrl, billing_owner_id: 'b' }),
+      }));
+    };
+
+    it.each([
+      ['over plain http', 'http://run-actions-1-azure-eastus.actions.githubusercontent.com/'],
+      ['on another host', 'https://run.example/'],
+      ['on a host that only starts like GitHub', 'https://run.actions.githubusercontent.com.example/'],
+      ['on a port of its own', 'https://run-actions-1-azure-eastus.actions.githubusercontent.com:8443/'],
+      ['with a user in it', 'https://user:pass@run-actions-1-azure-eastus.actions.githubusercontent.com/'],
+      // The request paths are appended to the run service's path, so it has
+      // to be a directory, with nothing after it that would swallow them.
+      ['whose path is not a directory', 'https://run-actions-1-azure-eastus.actions.githubusercontent.com/123'],
+      ['with a query', 'https://run-actions-1-azure-eastus.actions.githubusercontent.com/123/?x=1'],
+      ['with a fragment', 'https://run-actions-1-azure-eastus.actions.githubusercontent.com/123/#x'],
+    ])("sends the runner's token to no run service %s", async (_, runServiceUrl) => {
+      // The acquire goes out with the runner's bearer token, and the job's
+      // operations are forwarded to the same place later.
+      const received = jest.fn();
+      service.on('job-received', received);
+
+      await receive(runServiceUrl);
+
+      expect(upstreamHosts).toEqual([]);
+      expect(received).not.toHaveBeenCalled();
+    });
+
+    it("acquires a job from GitHub's own run service", async () => {
+      const received = jest.fn();
+      service.on('job-received', received);
+
+      await receive(runService);
+
+      expect(upstreamHosts).toEqual(['run-actions-1-azure-eastus.actions.githubusercontent.com']);
+      expect(received).toHaveBeenCalledTimes(1);
+    });
+
+    it('acquires from the host that was checked when the run service has no path', async () => {
+      // The request path used to be glued onto the URL as sent, which without
+      // a trailing slash made it part of the host name.
+      await receive('https://run-actions-1-azure-eastus.actions.githubusercontent.com');
+
+      expect(upstreamHosts).toEqual(['run-actions-1-azure-eastus.actions.githubusercontent.com']);
+    });
+
+    it('records the repository, its id and the workflow the job names, for its own worker', async () => {
+      // The policy a worker's proxy installs at acquirejob is keyed on these.
+      // For an organization target the display name names no repository, and
+      // the workflow a spawn guessed may not be the one that was claimed.
+      await receive(runService);
+      service.expectWorkerForJob('some-org', 1, 'req-1');
+      const sessionId = await createSession();
+      await request('GET', `/message?sessionId=${sessionId}`);
+
+      const expected = {
+        targetDisplayName: 'some-org',
+        githubSha: 'abc1234',
+        githubWorkflow: 'build',
+        repository: 'Some-Org/Some-Repo',
+        repositoryId: 123456789,
+      };
+      expect(service.getJobTargetForWorker(1, 'req-1')).toEqual(expected);
+      expect(service.getJobTargetForWorker(1, '2')).toEqual(expected);
+    });
+  });
+
   describe('a job no worker was spawned for', () => {
     // A job message as the broker receives it upstream, with the routing the
     // acquire needs, and the payload acquirejob hands back: the job's secrets.
@@ -1057,7 +1288,11 @@ describe('message routing', () => {
     const upstreamJob = (requestId: string, messageId: number) => JSON.stringify({
       messageId,
       messageType: 'RunnerJobRequest',
-      body: JSON.stringify({ runner_request_id: requestId, run_service_url: 'https://run.example/', billing_owner_id: 'b' }),
+      body: JSON.stringify({
+        runner_request_id: requestId,
+        run_service_url: 'https://run-actions-1-azure-eastus.actions.githubusercontent.com/',
+        billing_owner_id: 'b',
+      }),
     });
     const payloadFor = (requestId: string) => JSON.stringify({
       jobId: requestId,
