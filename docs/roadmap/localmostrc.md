@@ -117,6 +117,8 @@ shared:
       - "registry.npmjs.org"     # Exact match
     deny:                        # Explicit denials (optional, for clarity)
       - "*.analytics.com"
+    loopback: [5432]             # Local ports reachable directly; true for all.
+                                 # shared: only - see "Loopback" below
 
   filesystem:
     read:
@@ -443,6 +445,16 @@ the filesystem, is fixed when a worker starts, before the workflow is known.
 shared or per workflow, applies to every job. Without an allow, a job inherits
 nothing from the app's environment beyond `PATH`, `HOME`, `USER`, `LOGNAME`,
 `SHELL`, `LANG`, `LC_*`, `TERM`, `TZ` and `__CF_USER_TEXT_ENCODING`.
+
+**Loopback.** Without `network: loopback` a job reaches nothing on this Mac's
+loopback interface but its own proxy. `loopback: true` grants every port -
+what a test suite that starts servers on ephemeral ports needs - and a list
+grants those ports alone; the sandbox matches single ports, not ranges.
+Loopback is written into the sandbox profile, so like the filesystem it is
+accepted under `shared:` only, and a per-workflow one is a validation error.
+Local databases, debuggers and dev servers mostly trust whoever connects, so
+the approval screen and `localmost policy show` mark the grant with a warning,
+and a change to it is a policy change like any other.
 
 A repo's policy only takes effect once approved, in Settings > Job Security or
 with `localmost policy approve`, which shows the policy and a stamp, then

@@ -15,7 +15,7 @@ import { MODERATE_NETWORK_ALLOWLIST, RUNNER_INFRASTRUCTURE_ALLOWLIST } from './n
  */
 const everything = {
   level: 'permissive' as const,
-  network: { allow: ['github.com'], deny: ['evil.example'] },
+  network: { allow: ['github.com'], deny: ['evil.example'], loopback: [5432] },
   filesystem: { read: ['/etc'], write: ['~/.npm'], deny: ['~/.ssh'] },
   env: { allow: ['CI'], deny: ['AWS_SECRET_ACCESS_KEY'] },
   docker: {
@@ -30,7 +30,7 @@ describe('describePolicy', () => {
     const text = describePolicy(everything).map((g) => `${g.group} ${g.marker} ${g.value} ${g.summary}`).join('\n');
     for (const value of [
       'github.com', 'evil.example', '/etc', '~/.npm', '~/.ssh',
-      'CI', 'AWS_SECRET_ACCESS_KEY', 'docker.io', 'alpine:3', 'vk-*', 'DEPLOY_KEY', 'permissive',
+      'CI', 'AWS_SECRET_ACCESS_KEY', 'docker.io', 'alpine:3', 'vk-*', 'DEPLOY_KEY', 'permissive', '5432',
     ]) {
       expect(text).toContain(value);
     }
@@ -156,6 +156,18 @@ describe('describePolicy', () => {
   it('says nothing of scope for the same grants under shared:', () => {
     const grants = describePolicy({ filesystem: { write: ['./out'] }, env: { allow: ['CI'], deny: ['AWS_*'] } });
     expect(grants.map((g) => g.summary)).toEqual(['write: ./out', 'env: CI', 'env denied: AWS_*']);
+  });
+
+  it('shows a loopback grant with what it lets the job reach', () => {
+    const [all] = describePolicy({ network: { loopback: true } });
+    expect(all.summary).toMatch(/^loopback: every port \(warning: the job can connect to any service listening on this Mac's loopback/);
+    const [some] = describePolicy({ network: { loopback: [5432, 6379] } });
+    expect(some.summary).toMatch(/^loopback: ports 5432, 6379 \(warning: the job can connect to local services listening on these ports/);
+    expect(describePolicy({ network: { loopback: [5432] } })[0].value).toBe('port 5432');
+  });
+
+  it('says nothing about loopback when none is granted', () => {
+    expect(describePolicy({ network: { loopback: [] } })).toEqual([]);
   });
 
   it('prefixes the flat summary, which is how a workflow scope is shown', () => {

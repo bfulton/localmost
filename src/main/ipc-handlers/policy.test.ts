@@ -74,6 +74,13 @@ describe('per-workflow grants on the approval screen', () => {
   });
 });
 
+describe('loopback on the approval screen', () => {
+  it('shows a loopback grant, and that local services are reachable', () => {
+    const [grant] = summarizeGrants({ shared: { network: { loopback: [5432] } } });
+    expect(grant).toMatch(/^loopback: port 5432 \(warning: the job can connect to local services/);
+  });
+});
+
 describe('sensitive write paths on the approval screen', () => {
   it('marks a write the job could use to run code outside the sandbox', () => {
     const grants = summarizeGrants({ shared: { filesystem: { write: ['~/.zshrc', '~/.npm'] } } });

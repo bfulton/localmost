@@ -138,6 +138,16 @@ describe('the stamp', () => {
     expect(approvalStamp(REPO, NARROW)).toMatch(/^[0-9a-f]{64}$/);
   });
 
+  it('changes with the loopback grant', () => {
+    const withLoopback = (loopback: true | number[]): LocalmostrcConfig => ({
+      version: 1,
+      shared: { network: { allow: ['index.crates.io'], loopback } },
+    });
+    expect(approvalStamp(REPO, withLoopback(true))).not.toBe(approvalStamp(REPO, NARROW));
+    expect(approvalStamp(REPO, withLoopback([5432]))).not.toBe(approvalStamp(REPO, withLoopback(true)));
+    expect(approvalStamp(REPO, withLoopback([5432]))).not.toBe(approvalStamp(REPO, withLoopback([5433])));
+  });
+
   it('does not depend on key order, so the same policy read back matches', () => {
     const reordered = { shared: { network: { allow: ['index.crates.io'] } }, version: 1 } as LocalmostrcConfig;
     expect(approvalStamp(REPO, reordered)).toBe(approvalStamp(REPO, NARROW));

@@ -1098,3 +1098,68 @@ describe('secrets is a workflow-scoped key', () => {
     expect(r.errors.map((e) => e.message).join('\n')).toMatch(/shared\.secrets is not a policy key/);
   });
 });
+
+describe('network.loopback', () => {
+  const shared = (value: string) => parseLocalmostrcContent(`version: 1\nshared:\n  network:\n    loopback: ${value}\n`);
+  const messages = (value: string) => shared(value).errors.map((e) => e.message).join('\n');
+
+  it('accepts every port, or a list of ports, under shared:', () => {
+    expect(shared('true').config?.shared?.network?.loopback).toBe(true);
+    expect(shared('[5432, 6379]').config?.shared?.network?.loopback).toEqual([5432, 6379]);
+    expect(shared('[1, 65535]').success).toBe(true);
+  });
+
+  it('refuses anything but true or a list of distinct ports', () => {
+    for (const value of ['false', '"all"', '5432', '{}', '', '[0]', '[65536]', '[-1]', '[1.5]', '["5432"]', '[true]']) {
+      expect([value, shared(value).success]).toEqual([value, false]);
+      expect(messages(value)).toMatch(/shared\.network\.loopback/);
+    }
+    expect(messages('[5432, 5432]')).toMatch(/shared\.network\.loopback lists port 5432 twice/);
+  });
+
+  it('is refused per workflow, since the sandbox profile is fixed when the worker starts', () => {
+    const r = parseLocalmostrcContent('version: 1\nworkflows:\n  ci:\n    network:\n      loopback: true\n');
+    expect(r.success).toBe(false);
+    expect(r.errors.map((e) => e.message).join('\n')).toMatch(
+      /workflows\.ci\.network\.loopback is only accepted under shared\.network: the sandbox profile is fixed when the worker starts/
+    );
+  });
+
+  it('is a policy change, so a new grant is approved before it applies', () => {
+    const base: LocalmostrcConfig = { version: 1, shared: { network: { allow: ['github.com'] } } };
+    const withLoopback = (loopback: true | number[]): LocalmostrcConfig => ({
+      version: 1,
+      shared: { network: { allow: ['github.com'], loopback } },
+    });
+    expect(diffConfigs(base, withLoopback(true))).toEqual([
+      { path: 'shared.network.loopback', type: 'added', newValue: 'every port' },
+    ]);
+    expect(diffConfigs(withLoopback([5432]), withLoopback([5432, 6379]))).toEqual([
+      { path: 'shared.network.loopback', type: 'added', newValue: '6379' },
+    ]);
+    expect(diffConfigs(withLoopback([5432]), withLoopback(true))).toEqual([
+      { path: 'shared.network.loopback', type: 'added', newValue: 'every port' },
+      { path: 'shared.network.loopback', type: 'removed', oldValue: '5432' },
+    ]);
+    expect(diffConfigs(withLoopback([5432]), withLoopback([5432]))).toEqual([]);
+  });
+
+  it('survives serialization', () => {
+    for (const loopback of [true, [5432, 6379]] as const) {
+      const config: LocalmostrcConfig = { version: 1, shared: { network: { loopback: loopback as true | number[] } } };
+      const reparsed = parseLocalmostrcContent(serializeLocalmostrc(config));
+      expect(reparsed.config?.shared?.network?.loopback).toEqual(loopback);
+    }
+  });
+
+  it('carries into the effective policy of every workflow', () => {
+    const config: LocalmostrcConfig = {
+      version: 1,
+      shared: { network: { loopback: [5432] } },
+      workflows: { ci: { network: { allow: ['x.example'] } } },
+    };
+    expect(getEffectivePolicy(config, 'ci').network).toEqual(
+      expect.objectContaining({ allow: ['x.example'], loopback: [5432] })
+    );
+  });
+});

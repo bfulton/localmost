@@ -4,7 +4,13 @@
  * Handles parsing, validation, and merging of declarative sandbox policies.
  */
 import * as yaml from 'js-yaml';
-import { LOCALMOSTRC_KEYS, POLICY_SECTION_KEYS, WORKFLOW_POLICY_KEYS } from './policy-describe';
+import {
+  LOCALMOSTRC_KEYS,
+  POLICY_SECTION_KEYS,
+  PolicyScope,
+  WORKFLOW_POLICY_KEYS,
+  loopbackValues,
+} from './policy-describe';
 import * as fs from 'fs';
 import * as path from 'path';
 import { SandboxPolicy, NetworkPolicy, FilesystemPolicy, EnvPolicy } from './sandbox-profile';
@@ -31,6 +37,23 @@ export interface WorkflowPolicy extends SandboxPolicy {
   secrets?: SecretsPolicy;
 }
 
+/** The network section as `shared:` may declare it. */
+export interface SharedNetworkPolicy extends NetworkPolicy {
+  /**
+   * Loopback ports a job may connect to directly, not through its proxy:
+   * `true` for every port, or a list (seatbelt has no port ranges). Without
+   * it a job reaches only its own proxy on loopback. Shared only: it is part
+   * of the sandbox profile, fixed when the worker starts, before the
+   * workflow is known.
+   */
+  loopback?: true | number[];
+}
+
+/** What `shared:` may declare: a section, plus what only a whole worker can be given. */
+export interface SharedPolicy extends SandboxPolicy {
+  network?: SharedNetworkPolicy;
+}
+
 export interface LocalmostrcConfig {
   /** Config file version */
   version: number;
@@ -40,7 +63,7 @@ export interface LocalmostrcConfig {
    */
   level?: SandboxPolicyLevel;
   /** Shared policy applied to all workflows */
-  shared?: SandboxPolicy;
+  shared?: SharedPolicy;
   /** Per-workflow policy overrides */
   workflows?: Record<string, WorkflowPolicy>;
 }
@@ -192,7 +215,7 @@ export function validateLocalmostrc(parsed: unknown): ParseResult {
 
   // Validate shared policy
   if (config.shared !== undefined) {
-    validatePolicy(config.shared, 'shared', errors);
+    validatePolicy(config.shared, 'shared', errors, 'shared');
   }
 
   // Validate per-workflow policies
@@ -202,7 +225,7 @@ export function validateLocalmostrc(parsed: unknown): ParseResult {
     } else {
       for (const [workflowName, policy] of Object.entries(config.workflows as Record<string, unknown>)) {
         // A workflow may also require secrets; the shared scope may not.
-        validatePolicy(policy, `workflows.${workflowName}`, errors, WORKFLOW_POLICY_KEYS);
+        validatePolicy(policy, `workflows.${workflowName}`, errors, 'workflow');
         validateSecretsPolicy(policy, `workflows.${workflowName}`, errors);
       }
     }
@@ -216,7 +239,7 @@ export function validateLocalmostrc(parsed: unknown): ParseResult {
   const typedConfig: LocalmostrcConfig = {
     version: typeof config.version === 'number' ? config.version : LOCALMOSTRC_VERSION,
     level: config.level as SandboxPolicyLevel | undefined,
-    shared: config.shared as SandboxPolicy | undefined,
+    shared: config.shared as SharedPolicy | undefined,
     workflows: config.workflows as Record<string, WorkflowPolicy> | undefined,
   };
 
@@ -231,12 +254,8 @@ export function validateLocalmostrc(parsed: unknown): ParseResult {
 /**
  * Validate a sandbox policy object.
  */
-function validatePolicy(
-  policy: unknown,
-  path: string,
-  errors: ParseError[],
-  accepted: readonly string[] = POLICY_SECTION_KEYS
-): void {
+function validatePolicy(policy: unknown, path: string, errors: ParseError[], scope: PolicyScope): void {
+  const accepted: readonly string[] = scope === 'workflow' ? WORKFLOW_POLICY_KEYS : POLICY_SECTION_KEYS;
   if (policy === null || policy === undefined) {
     return; // Empty policy is valid
   }
@@ -262,7 +281,7 @@ function validatePolicy(
 
   // Validate network policy
   if (p.network !== undefined) {
-    validateNetworkPolicy(p.network, `${path}.network`, errors);
+    validateNetworkPolicy(p.network, `${path}.network`, errors, scope);
   }
 
   // Validate filesystem policy
@@ -293,7 +312,7 @@ function validatePolicy(
   }
 }
 
-function validateNetworkPolicy(policy: unknown, path: string, errors: ParseError[]): void {
+function validateNetworkPolicy(policy: unknown, path: string, errors: ParseError[], scope: PolicyScope): void {
   if (typeof policy !== 'object' || policy === null) {
     errors.push({ message: `${path} must be an object` });
     return;
@@ -307,6 +326,42 @@ function validateNetworkPolicy(policy: unknown, path: string, errors: ParseError
   if (p.deny !== undefined) {
     validateStringArray(p.deny, `${path}.deny`, errors);
   }
+  if (p.loopback !== undefined) {
+    validateLoopback(p.loopback, `${path}.loopback`, errors, scope);
+  }
+}
+
+/**
+ * Loopback is written into the sandbox profile, which a worker is spawned
+ * with before anyone knows which workflow it will run - so, like the
+ * filesystem, it can only come from `shared:`. A per-workflow one is refused
+ * rather than shown and not applied. Ports are listed one by one because
+ * seatbelt matches a single port or all of them, never a range.
+ */
+function validateLoopback(value: unknown, path: string, errors: ParseError[], scope: PolicyScope): void {
+  if (scope === 'workflow') {
+    errors.push({
+      message:
+        `${path} is only accepted under shared.network: the sandbox profile is fixed when the worker starts, ` +
+        'before the workflow is known.',
+    });
+    return;
+  }
+  if (value === true) return;
+  if (!Array.isArray(value)) {
+    errors.push({ message: `${path} must be true (every port) or a list of port numbers` });
+    return;
+  }
+  const seen = new Set<number>();
+  value.forEach((port, i) => {
+    if (typeof port !== 'number' || !Number.isInteger(port) || port < 1 || port > 65535) {
+      errors.push({ message: `${path}[${i}] must be a port number from 1 to 65535` });
+    } else if (seen.has(port)) {
+      errors.push({ message: `${path} lists port ${port} twice` });
+    } else {
+      seen.add(port);
+    }
+  });
 }
 
 function validateFilesystemPolicy(policy: unknown, path: string, errors: ParseError[]): void {
@@ -427,7 +482,10 @@ function mergeArrays(base?: string[], override?: string[]): string[] | undefined
 /**
  * Merge network policies.
  */
-function mergeNetworkPolicy(base?: NetworkPolicy, override?: NetworkPolicy): NetworkPolicy | undefined {
+function mergeNetworkPolicy(
+  base?: SharedNetworkPolicy,
+  override?: NetworkPolicy
+): SharedNetworkPolicy | undefined {
   if (!base && !override) {
     return undefined;
   }
@@ -435,6 +493,8 @@ function mergeNetworkPolicy(base?: NetworkPolicy, override?: NetworkPolicy): Net
   return {
     allow: mergeArrays(base?.allow, override?.allow),
     deny: mergeArrays(base?.deny, override?.deny),
+    // Only the shared section can declare it, and it holds for every workflow.
+    ...(base?.loopback !== undefined ? { loopback: base.loopback } : {}),
   };
 }
 
@@ -477,7 +537,7 @@ function mergeEnvPolicy(base?: EnvPolicy, override?: EnvPolicy): EnvPolicy | und
  * Merge two sandbox policies.
  * Override takes precedence, arrays are merged.
  */
-export function mergePolicies(base: SandboxPolicy, override: SandboxPolicy): SandboxPolicy {
+export function mergePolicies(base: SharedPolicy, override: SandboxPolicy): SharedPolicy {
   return {
     network: mergeNetworkPolicy(base.network, override.network),
     filesystem: mergeFilesystemPolicy(base.filesystem, override.filesystem),
@@ -490,7 +550,7 @@ export function mergePolicies(base: SandboxPolicy, override: SandboxPolicy): San
  * Get the effective policy for a specific workflow.
  * Merges shared policy with workflow-specific overrides.
  */
-export function getEffectivePolicy(config: LocalmostrcConfig, workflowName: string): SandboxPolicy {
+export function getEffectivePolicy(config: LocalmostrcConfig, workflowName: string): SharedPolicy {
   const shared = config.shared || {};
   const workflowPolicy = config.workflows?.[workflowName] || {};
 
@@ -546,7 +606,7 @@ export function serializeLocalmostrc(config: LocalmostrcConfig): string {
   return lines.join('\n') + '\n';
 }
 
-function serializePolicy(policy: SandboxPolicy, indent: string): string[] {
+function serializePolicy(policy: SharedPolicy, indent: string): string[] {
   const lines: string[] = [];
 
   if (policy.docker) {
@@ -566,6 +626,10 @@ function serializePolicy(policy: SandboxPolicy, indent: string): string[] {
       for (const domain of policy.network.deny) {
         lines.push(`${indent}    - "${domain}"`);
       }
+    }
+    const loopback = policy.network.loopback;
+    if (loopback !== undefined) {
+      lines.push(`${indent}  loopback: ${loopback === true ? 'true' : `[${loopback.join(', ')}]`}`);
     }
   }
 
@@ -654,14 +718,22 @@ export function diffConfigs(oldConfig: LocalmostrcConfig, newConfig: Localmostrc
 }
 
 function diffPolicies(
-  oldPolicy: SandboxPolicy,
-  newPolicy: SandboxPolicy,
+  oldPolicy: SharedPolicy,
+  newPolicy: SharedPolicy,
   prefix: string,
   diffs: PolicyDiff[]
 ): void {
   // Network
   diffArrays(oldPolicy.network?.allow, newPolicy.network?.allow, `${prefix}.network.allow`, diffs);
   diffArrays(oldPolicy.network?.deny, newPolicy.network?.deny, `${prefix}.network.deny`, diffs);
+  // Each port its own entry, and "every port" one of its own, so widening a
+  // list to all of them reads as exactly that.
+  diffArrays(
+    loopbackValues(oldPolicy.network?.loopback),
+    loopbackValues(newPolicy.network?.loopback),
+    `${prefix}.network.loopback`,
+    diffs
+  );
 
   // Filesystem
   diffArrays(oldPolicy.filesystem?.read, newPolicy.filesystem?.read, `${prefix}.filesystem.read`, diffs);

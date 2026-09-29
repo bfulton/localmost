@@ -47,7 +47,8 @@ export const DESCRIBED_POLICY_KEYS = [...WORKFLOW_POLICY_KEYS, 'level'] as const
 export interface DescribablePolicy {
   /** Top of the file only; a caller describing the whole policy passes it in. */
   level?: SandboxPolicyLevel;
-  network?: { allow?: string[]; deny?: string[] };
+  /** `loopback` is shared-scope only; validation refuses it in a workflow. */
+  network?: { allow?: string[]; deny?: string[]; loopback?: true | number[] };
   filesystem?: { read?: string[]; write?: string[]; deny?: string[] };
   env?: { allow?: string[]; deny?: string[] };
   docker?: DockerPolicy;
@@ -118,6 +119,22 @@ const LEVEL_GRANTS: Record<Exclude<SandboxPolicyLevel, 'strict'>, string> = {
  */
 export type PolicyScope = 'shared' | 'workflow';
 
+/** A loopback grant as the entries a diff compares: each port, or every one. */
+export function loopbackValues(loopback: true | number[] | undefined): string[] | undefined {
+  if (loopback === undefined) return undefined;
+  return loopback === true ? ['every port'] : loopback.map(String);
+}
+
+// A job otherwise reaches nothing on loopback but its own proxy. Services
+// that listen there - a dev database, a debugger on 9229, a browser's remote
+// debugging on 9222, another job's test server - mostly trust whoever can
+// connect, so this is shown as a warning, not a plain grant.
+const LOOPBACK_ALL =
+  "the job can connect to any service listening on this Mac's loopback interface - local databases, " +
+  "debuggers, dev servers, other jobs' test servers - without going through its proxy";
+const LOOPBACK_PORTS =
+  'the job can connect to local services listening on these ports on this Mac, without going through its proxy';
+
 const FILESYSTEM_NOT_APPLIED =
   'not applied to runner jobs: their filesystem is fixed when the worker starts, before the workflow is known; ' +
   'only localmost test applies it';
@@ -159,6 +176,13 @@ export function describePolicy(policy: DescribablePolicy, prefix = '', scope: Po
     note: 'refused even where an allow or the level would let it through; runner infrastructure excepted',
   });
   const filesystemNote = perWorkflow ? FILESYSTEM_NOT_APPLIED : undefined;
+  const loopback = policy.network?.loopback;
+  if (loopback === true) {
+    add('Network loopback', '+', 'loopback', ['every port'], { warn: () => LOOPBACK_ALL });
+  } else if (loopback?.length) {
+    const ports = `${loopback.length === 1 ? 'port' : 'ports'} ${loopback.join(', ')}`;
+    add('Network loopback', '+', 'loopback', [ports], { warn: () => LOOPBACK_PORTS });
+  }
   add('Filesystem read', 'r', 'read', policy.filesystem?.read, { note: filesystemNote });
   add('Filesystem write', 'w', 'write', policy.filesystem?.write, {
     note: filesystemNote,
