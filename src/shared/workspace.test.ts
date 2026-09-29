@@ -3,11 +3,11 @@
  */
 
 import * as fs from 'fs';
+import * as path from 'path';
 import { execSync } from 'child_process';
 import {
   getWorkspacesDir,
   listWorkspaces,
-  removeWorkspace,
   cleanupWorkspaces,
   getWorkspacesTotalSize,
   getGitInfo,
@@ -16,7 +16,9 @@ import {
 } from './workspace';
 
 // Mock fs
-jest.mock('fs');
+// The automock leaves fs.promises out, as it is a getter; it is there to be
+// filled in, so the modules under test see it.
+jest.mock('fs', () => ({ ...jest.createMockFromModule<typeof import('fs')>('fs'), promises: {} }));
 // Mock child_process
 jest.mock('child_process');
 
@@ -111,97 +113,89 @@ describe('Workspace Management', () => {
   });
 
   // ===========================================================================
-  // removeWorkspace
-  // ===========================================================================
-
-  describe('removeWorkspace', () => {
-    it('should return false if workspace does not exist', () => {
-      mockFs.existsSync.mockReturnValue(false);
-
-      const result = removeWorkspace('ws-nonexistent');
-
-      expect(result).toBe(false);
-    });
-
-    it('should remove workspace directory', () => {
-      mockFs.existsSync.mockReturnValue(true);
-      mockFs.rmSync.mockImplementation(() => {});
-
-      const result = removeWorkspace('ws-mumtvjt5-hm4ln8');
-
-      expect(result).toBe(true);
-      expect(mockFs.rmSync).toHaveBeenCalledWith(
-        expect.stringContaining('ws-mumtvjt5-hm4ln8'),
-        { recursive: true, force: true }
-      );
-    });
-  });
-
-  // ===========================================================================
   // cleanupWorkspaces
   // ===========================================================================
 
   describe('cleanupWorkspaces', () => {
-    it('should remove old workspaces', () => {
+    // Which workspaces are chosen: each one is moved aside, the first step
+    // of removing it, by its own path. Removing it is on a real filesystem,
+    // in workspace.cleanup.test.ts. No earlier removal was left part done,
+    // and each one moved aside is gone by the time it is looked at.
+    const removalFs = () => {
+      const rename = jest.fn(async (_from: string, _to: string) => undefined);
+      jest.requireMock<{ promises: unknown }>('fs').promises = {
+        readdir: jest.fn(async () => []),
+        rename,
+        lstat: jest.fn(async () => {
+          throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+        }),
+      };
+      return { movedAside: () => rename.mock.calls.map(([from]) => from) };
+    };
+
+    it('should remove old workspaces', async () => {
       const oldDate = new Date(Date.now() - 48 * 60 * 60 * 1000); // 48 hours ago
       const newDate = new Date();
 
       mockFs.existsSync.mockReturnValue(true);
       (mockFs.readdirSync as jest.Mock).mockReturnValue([
-        { name: 'ws-old', isDirectory: () => true },
-        { name: 'ws-new', isDirectory: () => true },
+        { name: 'ws-old-1', isDirectory: () => true },
+        { name: 'ws-new-1', isDirectory: () => true },
       ]);
       mockFs.readFileSync.mockImplementation((p) => {
         const pathStr = String(p);
-        if (pathStr.includes('ws-old')) {
+        if (pathStr.includes('ws-old-1')) {
           return JSON.stringify({
-            id: 'ws-old',
-            path: '/path/ws-old',
+            id: 'ws-old-1',
+            path: '/path/ws-old-1',
             sourceDir: '/repo',
             createdAt: oldDate.toISOString(),
           });
         }
         return JSON.stringify({
-          id: 'ws-new',
-          path: '/path/ws-new',
+          id: 'ws-new-1',
+          path: '/path/ws-new-1',
           sourceDir: '/repo',
           createdAt: newDate.toISOString(),
         });
       });
-      mockFs.rmSync.mockImplementation(() => {});
+      const { movedAside } = removalFs();
 
-      const result = cleanupWorkspaces({ maxAgeHours: 24 });
+      const result = await cleanupWorkspaces({ maxAgeHours: 24 });
 
       expect(result.removed).toBe(1);
       expect(result.kept).toBe(1);
+      expect(movedAside()).toEqual([path.join(getWorkspacesDir(), 'ws-old-1')]);
     });
 
-    it('should remove workspaces exceeding max count', () => {
+    it('should remove workspaces exceeding max count', async () => {
       const now = Date.now();
       mockFs.existsSync.mockReturnValue(true);
       (mockFs.readdirSync as jest.Mock).mockReturnValue(
         Array.from({ length: 15 }, (_, i) => ({
-          name: `ws-${i}`,
+          name: `ws-${i}-a`,
           isDirectory: () => true,
         }))
       );
       mockFs.readFileSync.mockImplementation((p) => {
         const pathStr = String(p);
-        const match = pathStr.match(/ws-(\d+)/);
+        const match = pathStr.match(/ws-(\d+)-a/);
         const idx = match ? parseInt(match[1]) : 0;
         return JSON.stringify({
-          id: `ws-${idx}`,
-          path: `/path/ws-${idx}`,
+          id: `ws-${idx}-a`,
+          path: `/path/ws-${idx}-a`,
           sourceDir: '/repo',
           createdAt: new Date(now - idx * 1000).toISOString(),
         });
       });
-      mockFs.rmSync.mockImplementation(() => {});
+      const { movedAside } = removalFs();
 
-      const result = cleanupWorkspaces({ maxCount: 10, maxAgeHours: 9999 });
+      const result = await cleanupWorkspaces({ maxCount: 10, maxAgeHours: 9999 });
 
       expect(result.removed).toBe(5);
       expect(result.kept).toBe(10);
+      // The five oldest.
+      expect(movedAside()).toEqual([10, 11, 12, 13, 14].map((i) => path.join(getWorkspacesDir(), `ws-${i}-a`)));
     });
   });
 

@@ -39,6 +39,7 @@ import {
   MACOS_BASELINE_READ_PATHS,
   SandboxProfileOptions,
 } from './sandbox-profile';
+import { getWorkspacesDir, removeWorkspace } from './workspace';
 
 // The real home by default; one block below stands a scratch directory in for
 // it, since os.homedir() is what the profiles are built from.
@@ -328,6 +329,70 @@ if (!isMacOS) {
         expect(run(profile, ['/bin/rmdir', emptyWorkDir])).toBe(false);
         expect(fs.statSync(emptyWorkDir).isDirectory()).toBe(true);
       }
+    });
+
+    it('keeps a step process left running in its workspace from changing the tree once its removal has begun', async () => {
+      // One that outlived the CLI's reap keeps its profile, which grants
+      // write on the workspace's path. Were the tree removed where it is,
+      // the process could swap a directory in it for a link while the
+      // removal walked it.
+      const id = 'ws-aaaa-1111';
+      const workspace = path.join(getWorkspacesDir(), id);
+      fs.mkdirSync(path.join(workspace, 'd0'), { recursive: true });
+      fs.writeFileSync(path.join(workspace, 'd0', 'output'), 'step');
+      const victim = path.join(appDir, 'victim');
+      fs.mkdirSync(victim);
+      fs.writeFileSync(path.join(victim, 'keep'), 'kept');
+      const profilePath = path.join(appDir, 'leftover.sb');
+      fs.writeFileSync(profilePath, generateSandboxProfile({ workDir: workspace, proxyPort: 1, policy: readable }));
+      // While the workspace is where it was, the swap is one its profile
+      // allows: what refuses it below is the workspace being moved aside.
+      fs.mkdirSync(path.join(workspace, 'c0'));
+      const swapInPlace = `cd '${workspace}' && /bin/mv c0 c0.moved && /bin/ln -s '${victim}' c0`;
+      expect(run(fs.readFileSync(profilePath, 'utf-8'), ['/bin/sh', '-c', swapInPlace])).toBe(true);
+      expect(fs.lstatSync(path.join(workspace, 'c0')).isSymbolicLink()).toBe(true);
+      fs.unlinkSync(path.join(workspace, 'c0'));
+      fs.rmdirSync(path.join(workspace, 'c0.moved'));
+      const leftover = spawn(
+        '/usr/bin/sandbox-exec',
+        [
+          '-f', profilePath,
+          '/bin/sh', '-c',
+          `cd '${workspace}' && echo ready && read cue && /bin/mv d0 d0.moved && /bin/ln -s '${victim}' d0`,
+        ],
+        { stdio: ['pipe', 'pipe', 'ignore'], env: { PATH: '/usr/bin:/bin', HOME: realHomedir() } }
+      );
+      const exited = new Promise<number | null>((resolve) => leftover.on('exit', (code) => resolve(code)));
+      // It makes its move once the removal has begun listing the tree, which
+      // a real one would have to win a race to do; here it always does.
+      const realReaddir = fs.promises.readdir.bind(fs.promises) as (...args: unknown[]) => Promise<unknown>;
+      let swapped: boolean | undefined;
+      const readdir = jest.spyOn(fs.promises, 'readdir').mockImplementation((async (...args: unknown[]) => {
+        if (swapped === undefined) {
+          leftover.stdin!.end('go\n');
+          swapped = (await exited) === 0;
+        }
+        return realReaddir(...args);
+      }) as never);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          leftover.stdout!.on('data', (chunk) => {
+            if (String(chunk).includes('ready')) resolve();
+          });
+          exited.then((code) => reject(new Error(`the leftover exited (${code}) before it was in place`)));
+        });
+        expect(await removeWorkspace(id)).toBe(true);
+      } finally {
+        readdir.mockRestore();
+        leftover.kill('SIGKILL');
+      }
+
+      // Its swap is refused: once moved aside, nothing in the tree is a path
+      // its profile grants. That the removal never follows a link, even one
+      // a writer seatbelt does not confine swaps in, is workspace.cleanup.test.ts.
+      expect(swapped).toBe(false);
+      expect(fs.readFileSync(path.join(victim, 'keep'), 'utf-8')).toBe('kept');
+      expect(fs.readdirSync(getWorkspacesDir()).filter((name) => name !== 'ws-1' && name !== 'ws-2')).toEqual([]);
     });
   });
 

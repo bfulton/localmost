@@ -508,7 +508,7 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   }
 
   // Cleanup old workspaces
-  cleanupWorkspaces({ maxAgeHours: 24, maxCount: 10 });
+  await cleanupWorkspaces({ maxAgeHours: 24, maxCount: 10 });
 
   // Calculate overall result
   const duration = Date.now() - startTime;
