@@ -182,7 +182,6 @@ asks for anything still missing without echoing it.
 - **Never taken under their own names.** A workflow chooses which secrets it
   asks for, so a variable exported for other tools (`AWS_SECRET_ACCESS_KEY`,
   `GITHUB_TOKEN`) is not handed to it; the CLI says when one is set but unused.
-
 - **Never stored.** localmost has no secret store. Nothing is written to disk,
   and nothing persists between runs.
 - **Masked in output.** Secret values are replaced with `***` in everything a
@@ -242,7 +241,8 @@ sandbox profile. The checkout is treated as untrusted, and so is its
   broker's port stays closed either way; `NO_PROXY` keeps loopback off the
   proxy. The way out is the run's proxy, which needs a per-run token, refuses
   names that resolve to internal or loopback addresses, and connects only to
-  the addresses it screened. Discovery leaves loopback open, and says so.
+  the addresses it screened. Discovery leaves loopback open, says so, and
+  records none of it: a checkout declares its loopback grant itself.
 - **Discovery is asked about every time.** Under `--updaterc` reads are allowed
   and recorded, and writes outside the workspace are refused and reported.
   Discovery still lets a workflow read everything but the paths above and reach
@@ -261,7 +261,6 @@ sandbox profile. The checkout is treated as untrusted, and so is its
   a short `python3` script; if python3 cannot run, only the process groups are
   killed and the CLI says so. Interrupting the CLI (Ctrl-C, a kill, or the
   terminal closing) runs the same cleanup.
-
 - **Signals stay inside the step.** A step can signal only processes under its
   own sandbox, not your other processes. Each step has a sandbox of its own, so
   a later step cannot signal a server an earlier one left running; the end of

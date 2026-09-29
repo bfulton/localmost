@@ -1,5 +1,15 @@
-import { describe, it, expect } from '@jest/globals';
-import { parseTestArgs, extractJobOutputs, extractWorkflowOutputs, mergeDiscoveredAccess, DiscoveredAccess } from './test';
+import { describe, it, expect, jest } from '@jest/globals';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import {
+  parseTestArgs,
+  extractJobOutputs,
+  extractWorkflowOutputs,
+  mergeDiscoveredAccess,
+  DiscoveredAccess,
+  handleUpdateRc,
+} from './test';
 import { LocalmostrcConfig, LOCALMOSTRC_VERSION } from '../shared/localmostrc';
 
 describe('CLI test command', () => {
@@ -315,5 +325,27 @@ describe('mergeDiscoveredAccess', () => {
 
     expect(config.shared?.docker).toBeUndefined();
     expect(additions).toEqual([]);
+  });
+});
+
+describe('handleUpdateRc', () => {
+  it('says loopback is not recorded, and where a checkout that needs it declares it', async () => {
+    // Discovery leaves every local port open, so a suite that talks to a
+    // local server passes there and is refused the connection on its next,
+    // enforcing run - with nothing in what discovery wrote to say why.
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'updaterc-'));
+    const lines: string[] = [];
+    const log = jest.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      lines.push(args.join(' '));
+    });
+    try {
+      await handleUpdateRc(cwd, { name: 'CI' } as never, { hosts: [], readPaths: [], writePaths: [] }, [], true);
+    } finally {
+      log.mockRestore();
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+    const output = lines.join('\n');
+    expect(output).toMatch(/Loopback:.*not recorded/);
+    expect(output).toMatch(/shared\.network\.loopback/);
   });
 });

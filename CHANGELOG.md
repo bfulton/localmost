@@ -95,7 +95,13 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
 - A `localmost test` step reaches only the run's proxy on loopback, and signals
   only processes under its own sandbox. A test suite that starts local servers
   declares `shared.network.loopback: true` (or its fixed ports) in `.localmostrc`,
-  which is listed and confirmed with the rest of the policy.
+  which is listed and confirmed with the rest of the policy; `--updaterc` cannot
+  discover it. A later step can no longer kill a server an earlier step started;
+  the end of the job reaps it.
+- `localmost test` fetches an action pinned to a commit SHA, and keeps each
+  cached action in a directory of its own. Actions cached under the old layout
+  are fetched again, and their old directories under `actions/` in the app's data
+  directory can be deleted.
 - The step script, which contains expanded secrets while a step runs, is written
   0700 rather than 0755.
 - The broker no longer logs the head of a job payload, which carries the job's

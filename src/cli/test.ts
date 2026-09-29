@@ -1322,9 +1322,10 @@ export async function resolveSecrets(
  *
  * Uses the access discovered during the workflow run to generate a
  * .localmostrc file with only what your workflow actually needs. Socket
- * paths are reported but never written: no policy key declares one.
+ * paths are reported but never written: no policy key declares one, and
+ * neither is loopback, which discovery leaves open and cannot see.
  */
-async function handleUpdateRc(
+export async function handleUpdateRc(
   cwd: string,
   workflow: ParsedWorkflow,
   discovered: DiscoveredAccess,
@@ -1394,6 +1395,14 @@ async function handleUpdateRc(
       );
     }
   }
+
+  // Discovery leaves every loopback port open and sees none of what went
+  // through them, so a suite that talks to a local server passes here and
+  // is refused the connection on its next run. Say so, and where it goes.
+  console.log(`  Loopback: ${colors.dim}not recorded - discovery leaves every local port open${colors.reset}`);
+  console.log(
+    `    ${colors.dim}Steps that reach a local server need shared.network.loopback (true, or its ports)${colors.reset}`
+  );
 
   console.log();
 
@@ -1661,6 +1670,7 @@ ${colors.bold}OPTIONS:${colors.reset}
   -m, --matrix <spec>  Run specific matrix combination (e.g., "os=macos,node=18")
   -f, --full-matrix Run all matrix combinations
   -u, --updaterc    Discovery mode: record access and generate .localmostrc
+                    (not loopback: declare shared.network.loopback yourself)
   -y, --yes         Answer yes to every confirmation: a .localmostrc's grants
                     beyond the workspace, running --updaterc, and its changes
   -n, --dry-run     Show what would run without executing

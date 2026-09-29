@@ -10,11 +10,23 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
+import { EventEmitter } from 'events';
+import { PassThrough } from 'stream';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as childProcess from 'child_process';
 import { checkoutLoopback, confirmCheckoutGrants, grantsBeyondWorkspace, runTest } from './test';
 import { MACOS_BASELINE_READ_PATHS } from '../shared/sandbox-profile';
 import type { LocalmostrcConfig } from '../shared/localmostrc';
+
+// Held so a test can stand in for a step's sandbox-exec and read the profile
+// it was given; everything else a run spawns is the real thing.
+jest.mock('child_process', () => {
+  const actual = jest.requireActual<typeof import('child_process')>('child_process');
+  return { ...actual, spawn: jest.fn(actual.spawn) };
+});
+const spawnMock = jest.mocked(childProcess.spawn);
+const actualSpawn = jest.requireActual<typeof import('child_process')>('child_process').spawn;
 
 let scratch: string;
 let checkout: string;
@@ -163,6 +175,34 @@ describe('runTest on a checkout that grants itself more than its workspace', () 
     fs.writeFileSync(path.join(checkout, '.localmostrc'), 'version: 1\nshared:\n  network:\n    loopback: true\n');
     await expect(runTest({})).rejects.toThrow(/--yes/);
     expect(fs.existsSync(path.join(scratch, 'appdata', 'workspaces'))).toBe(false);
+  });
+
+  it('runs the steps with the loopback grant the user confirmed', async () => {
+    fs.writeFileSync(
+      path.join(checkout, '.localmostrc'),
+      'version: 1\nshared:\n  network:\n    loopback:\n      - 5432\n'
+    );
+    const profiles: string[] = [];
+    spawnMock.mockImplementation(((command: string, args: string[], options: childProcess.SpawnOptions) => {
+      if (command !== '/usr/bin/sandbox-exec') return actualSpawn(command, args, options);
+      profiles.push(fs.readFileSync(args[args.indexOf('-f') + 1], 'utf-8'));
+      const child = new EventEmitter() as childProcess.ChildProcess;
+      Object.assign(child, { pid: 999999, stdout: new PassThrough(), stderr: new PassThrough() });
+      setImmediate(() => {
+        (child.stdout as PassThrough).end();
+        (child.stderr as PassThrough).end();
+        child.emit('exit', 0, null);
+        child.emit('close', 0, null);
+      });
+      return child;
+    }) as never);
+    try {
+      expect((await runTest({ assumeYes: true })).success).toBe(true);
+    } finally {
+      spawnMock.mockImplementation(actualSpawn);
+    }
+    expect(profiles).toHaveLength(1);
+    expect(profiles[0]).toContain('(allow network-outbound (remote ip "localhost:5432"))');
   });
 
   it('does not run discovery, which reads the whole disk, without confirmation', async () => {
