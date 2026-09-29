@@ -404,6 +404,56 @@ describe('CliServer', () => {
     expect(responses.map((r) => r.command)).toEqual(['pause', 'jobs']);
   });
 
+  it('stops reading a connection whose requests are queued faster than they are answered', async () => {
+    // The first request holds the line; everything after it waits its turn.
+    // Reading on regardless kept every waiting request in memory, however
+    // many a client sent.
+    let finishStop: () => void = () => {};
+    mockStop.mockImplementation(() => new Promise<void>((resolve) => { finishStop = resolve; }));
+    await server.start();
+
+    const socket = net.createConnection(testSocketPath);
+    socket.on('error', () => {});
+    await new Promise<void>((resolve) => socket.on('connect', () => resolve()));
+    socket.write(JSON.stringify({ command: 'pause' }) + '\n');
+    const flood = (JSON.stringify({ command: 'jobs' }) + '\n').repeat(50_000);
+    socket.write(flood);
+    await new Promise((r) => setTimeout(r, 300));
+
+    // Most of the flood is still the client's to send: the server stopped
+    // taking it once enough requests were waiting.
+    expect(socket.writableLength).toBeGreaterThan(flood.length / 2);
+
+    finishStop();
+    socket.destroy();
+  });
+
+  it('reads a request whose characters arrive split across writes', async () => {
+    await server.start();
+
+    const reply = await new Promise<string>((resolve, reject) => {
+      const socket = net.createConnection(testSocketPath, async () => {
+        const bytes = Buffer.from(JSON.stringify({ command: 'caf\u00e9' }) + '\n');
+        const split = bytes.indexOf(0xc3) + 1;
+        socket.write(bytes.subarray(0, split));
+        await new Promise((r) => setTimeout(r, 20));
+        socket.write(bytes.subarray(split));
+      });
+      let got = '';
+      socket.setEncoding('utf8');
+      socket.on('data', (data) => {
+        got += data;
+        if (got.includes('\n')) {
+          socket.end();
+          resolve(got);
+        }
+      });
+      socket.on('error', reject);
+    });
+
+    expect(JSON.parse(reply).error).toBe('Unknown command: caf\u00e9');
+  });
+
   it('should clean up socket on stop', async () => {
     await server.start();
     expect(fs.existsSync(testSocketPath)).toBe(true);
