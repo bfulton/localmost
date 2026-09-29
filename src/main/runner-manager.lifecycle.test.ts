@@ -51,6 +51,7 @@ jest.mock('./proxy-server', () => ({
 // The sweep by profile mark runs python; stubbed, as nothing here runs sandboxed.
 jest.mock('../shared/sandbox-reaper', () => ({
   reapMarkedProcessesAsync: jest.fn(async () => []),
+  developerPython: jest.fn(async () => null),
 }));
 
 // Start times: the one recorded at spawn is 'START'. mockLookUpStartTime is

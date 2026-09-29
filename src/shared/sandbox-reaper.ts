@@ -99,8 +99,20 @@ export function reapMarkedProcesses(marker: ProcessMarker): boolean {
  * Not /usr/bin/python3: on a Mac without the developer tools that is a stub
  * that offers to install them, in a dialog the app would raise at the end of
  * every job. xcode-select -p only prints where they are, or fails.
+ *
+ * Looked up once per app run: every finished job is swept, and a startup
+ * sweeps every mark an earlier run left, which without the developer tools
+ * can be thousands. Tools installed while the app runs are found at its
+ * next start.
  */
-function developerPython(): Promise<string | null> {
+export function developerPython(): Promise<string | null> {
+  developerPythonLookup ??= lookUpDeveloperPython();
+  return developerPythonLookup;
+}
+
+let developerPythonLookup: Promise<string | null> | undefined;
+
+function lookUpDeveloperPython(): Promise<string | null> {
   return new Promise((resolve) => {
     execFile('/usr/bin/xcode-select', ['-p'], { encoding: 'utf-8', timeout: 5000 }, (err, stdout) => {
       if (err) return resolve(null);

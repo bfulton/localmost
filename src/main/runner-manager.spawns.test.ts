@@ -61,10 +61,12 @@ jest.mock('./runner-cleanup', () => ({
 }));
 
 // The sweep by profile mark. Resolves to the pids it killed, or null when it
-// could not look.
+// could not look; the developer tools' python3 it runs with, or null.
 const mockReapMarked = jest.fn(async (_marker: { granted: string; withheld: string }): Promise<number[] | null> => []);
+const mockDeveloperPython = jest.fn(async (): Promise<string | null> => '/Library/Developer/CommandLineTools/usr/bin/python3');
 jest.mock('../shared/sandbox-reaper', () => ({
   reapMarkedProcessesAsync: (marker: { granted: string; withheld: string }) => mockReapMarked(marker),
+  developerPython: () => mockDeveloperPython(),
 }));
 
 jest.mock('./docker/docker-filter-proxy', () => ({
@@ -96,6 +98,8 @@ jest.mock('fs', () => ({
 }));
 
 import * as fs from 'fs';
+import * as path from 'path';
+import { DockerFilterProxy } from './docker/docker-filter-proxy';
 import { RunnerManager } from './runner-manager';
 import { GRACE_MS } from './process-group';
 import { spawnSandboxed } from './process-sandbox';
@@ -197,6 +201,30 @@ describe("a finished worker's sandbox", () => {
     expect(mockRemoveSandbox).not.toHaveBeenCalled();
   });
 
+  it("is never the next start's: each start runs, and serves its docker socket, in a directory of its own", async () => {
+    stubKill(new Set());
+    const { helper } = newManager();
+    const startsBefore = mockSpawnSandboxed.mock.calls.length;
+    const first = await spawnWorker(helper, 24680, 'A');
+    first.proc.emit('exit', 0, null);
+    await settle();
+    await spawnWorker(helper, 24690, 'B');
+
+    const starts = mockSpawnSandboxed.mock.calls.slice(startsBefore).map(([, , options]) => options!);
+    const served = (DockerFilterProxy as unknown as jest.Mock).mock.results
+      .slice(-2)
+      .map(({ value }) => (value.start as jest.Mock).mock.calls[0][0]);
+    expect(starts).toHaveLength(2);
+    starts.forEach((options, i) => {
+      const socket = path.join(options.cwd as string, 'docker.sock');
+      expect(options.dockerSocket).toBe(socket);
+      expect((options.env as NodeJS.ProcessEnv).DOCKER_HOST).toBe(`unix://${socket}`);
+      expect(served[i]).toBe(socket);
+    });
+    expect(starts[1].cwd).not.toBe(starts[0].cwd);
+    expect(starts[1].dockerSocket).not.toBe(starts[0].dockerSocket);
+  });
+
   it('is removed at once for a start that never ran its worker', async () => {
     stubKill(new Set());
     const { helper } = newManager({
@@ -210,6 +238,46 @@ describe("a finished worker's sandbox", () => {
     expect(mockSpawnSandboxed).not.toHaveBeenCalled();
     expect(mockRemoveSandbox).toHaveBeenCalledTimes(1);
     expect(mockRemoveSandbox.mock.calls[0][0]).toMatch(/\/sandbox\/1-[0-9a-f]+$/);
+  });
+
+  it('is never run in by a start whose slot was let go while it started', async () => {
+    // stop() finalizes the starting instance, taking its sandbox to be swept;
+    // a worker spawned there afterwards would have it removed as it runs.
+    stubKill(new Set());
+    const { manager, helper } = newManager();
+    let serve!: () => void;
+    (DockerFilterProxy as unknown as jest.Mock).mockImplementationOnce(() => ({
+      start: jest.fn(() => new Promise<void>((resolve) => { serve = resolve; })),
+      stop: jest.fn().mockResolvedValue(undefined),
+      bind: jest.fn(),
+    }));
+
+    const started = helper.spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'A' });
+    await settle();
+    expect(serve).toBeDefined();
+    await manager.stop();
+    serve();
+
+    expect(await started).toBe(false);
+    expect(mockSpawnSandboxed).not.toHaveBeenCalled();
+  });
+
+  it('is removed at once, with its marks, for a start whose spawn threw', async () => {
+    stubKill(new Set());
+    const { helper } = newManager();
+    let started: { cwd?: string; processMarker?: { granted: string; withheld: string } } = {};
+    mockSpawnSandboxed.mockImplementationOnce((_binary, _args, options) => {
+      started = options as typeof started;
+      throw new Error('spawn EACCES');
+    });
+
+    expect(await helper.spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'A' })).toBe(false);
+    await settle();
+
+    expect(started.cwd).toMatch(/\/sandbox\/1-[0-9a-f]+$/);
+    expect(mockRemoveSandbox).toHaveBeenCalledWith(started.cwd);
+    expect(fs.unlinkSync).toHaveBeenCalledWith(started.processMarker!.granted);
+    expect(fs.unlinkSync).toHaveBeenCalledWith(started.processMarker!.withheld);
   });
 });
 
@@ -332,6 +400,29 @@ describe("a slot whose last worker's job may still be running", () => {
     expect(mockSpawnSandboxed).toHaveBeenCalledTimes(1);
     expect(helper.instances.get(1)!.process).toBe(proc);
   });
+
+  it('is free again, and its start discarded, when its worker could not be spawned', async () => {
+    // A spawn that fails - EAGAIN with the process table full, EACCES -
+    // returns a child with no pid that emits 'error' and never 'exit'.
+    stubKill(new Set());
+    const { manager, helper } = newManager();
+    const failed = createMockProcess(undefined as unknown as number);
+    mockSpawnSandboxed.mockReturnValueOnce(failed);
+    expect(await helper.spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'A' })).toBe(true);
+    const [, , options] = mockSpawnSandboxed.mock.calls[0];
+    const marker = (options as { processMarker?: { granted: string; withheld: string } }).processMarker!;
+
+    failed.emit('error', new Error('spawn EAGAIN'));
+    await settle();
+
+    expect(helper.instances.get(1)?.process ?? null).toBeNull();
+    expect(manager.hasAvailableSlot()).toBe(true);
+    expect(helper.reserveSlot()).toBe(1);
+    // Nothing ran in it, so nothing waits on its sandbox or its mark.
+    expect(mockRemoveSandbox).toHaveBeenCalledWith(options!.cwd);
+    expect(fs.unlinkSync).toHaveBeenCalledWith(marker.granted);
+    expect(fs.unlinkSync).toHaveBeenCalledWith(marker.withheld);
+  });
 });
 
 describe('what a finished job left outside its process group', () => {
@@ -386,5 +477,24 @@ describe('what a finished job left outside its process group', () => {
     expect(mockReapMarked).toHaveBeenCalledWith(marker);
     expect(fs.promises.unlink).not.toHaveBeenCalledWith(marker.granted);
     expect(fs.promises.unlink).not.toHaveBeenCalledWith(marker.withheld);
+  });
+
+  it('drops the mark when there are no developer tools to sweep by it, now or at startup', async () => {
+    // Kept, it would only pile up: two files for every job until the next
+    // startup, which cannot sweep by them either.
+    stubKill(new Set());
+    const { helper } = newManager();
+    const { proc } = await spawnWorker(helper, 24680);
+    const marker = lastMarker()!;
+    mockReapMarked.mockResolvedValueOnce(null);
+    mockDeveloperPython.mockResolvedValueOnce(null);
+
+    proc.emit('exit', 0, null);
+    await jest.advanceTimersByTimeAsync(SETTLE_MS);
+    await settle();
+
+    expect(mockReapMarked).toHaveBeenCalledWith(marker);
+    expect(fs.promises.unlink).toHaveBeenCalledWith(marker.granted);
+    expect(fs.promises.unlink).toHaveBeenCalledWith(marker.withheld);
   });
 });

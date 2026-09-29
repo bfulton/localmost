@@ -16,7 +16,7 @@ import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RU
 import { SandboxFilesystemPolicy, spawnSandboxed } from './process-sandbox';
 import { inheritedWorkerEnv, packageCacheEnv } from './worker-env';
 import { DEFAULT_BROKER_PORT, type EnvPolicy, type ProcessMarker } from '../shared/sandbox-profile';
-import { reapMarkedProcessesAsync } from '../shared/sandbox-reaper';
+import { developerPython, reapMarkedProcessesAsync } from '../shared/sandbox-reaper';
 import { groupHasMembers, sweepInGrace, sweepProcessGroup } from './process-group';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { GitHubClientError } from './github-client';
@@ -1129,7 +1129,7 @@ export class RunnerManager {
     try {
       await socket.stop();
     } catch {
-      // Already stopped, or its directory already rebuilt - gone either way.
+      // Already stopped, or its directory already removed - gone either way.
     }
   }
 
@@ -1359,7 +1359,7 @@ export class RunnerManager {
             packageCacheDir = undefined;
           }
         }
-        // The sandbox directory is already writable and rebuilt for each job,
+        // The sandbox directory is already writable, and a new one for each start,
         // so this needs no grant of its own.
         Object.assign(env, packageCacheEnv(packageCacheDir ?? path.join(sandboxDir, '_packages')));
       }
@@ -1370,6 +1370,12 @@ export class RunnerManager {
       // earlier path, cannot connect to it - and it goes with the sandbox.
       const dockerSocketPath = path.join(sandboxDir, DOCKER_SOCKET_NAME);
       const dockerSocket = await this.startDockerProxy(instanceNum, dockerSocketPath);
+      // The last wait before the spawn. A stop() in the meantime finalized
+      // this instance and took its sandbox to be swept, as a finished
+      // spawn's; a worker started there now would lose it as it runs.
+      if (instance.policySealed) {
+        throw new Error('its slot was let go while it started');
+      }
       env.DOCKER_HOST = `unix://${dockerSocketPath}`;
       // Pin the job to the classic builder. BuildKit - the default since
       // Docker 23 - does not use POST /build at all: it negotiates a session
@@ -1536,9 +1542,20 @@ export class RunnerManager {
         this.log('error', `Runner instance ${instanceNum} error: ${error.message}`);
         instance.status = 'error';
         this.updateStatus('error', error.message);
+        // A spawn that failed - EAGAIN with the process table full, EACCES -
+        // leaves a child with no pid that emits 'error' and never 'exit'.
+        // Nothing ran: discard the start and end it as an exit would, or the
+        // slot keeps a worker that does not exist, and takes no job again.
+        if (worker.pid === undefined && instance.process === worker) {
+          this.discardUnstartedSpawn(instanceNum, instance);
+          onExit(null, null);
+        }
       });
 
-      instance.process.on('exit', (code, signal) => {
+      let exited = false;
+      const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+        if (exited) return;
+        exited = true;
         // Captured before the handle is cleared. A worker runs with --once, so
         // by the time it exits its job is over and nothing of that job should
         // still be running - but a cancelled job left its step's own process
@@ -1613,7 +1630,8 @@ export class RunnerManager {
         instance.jobsCompleted++;
         this.log('info', `Runner instance ${instanceNum} completed job #${instance.jobsCompleted}`);
         this.releaseInstanceSlot(instanceNum);
-      });
+      };
+      instance.process.on('exit', onExit);
 
       this.instances.set(instanceNum, instance);
       // Spawned for a specific job: if the broker never routes that job here,
@@ -1635,22 +1653,26 @@ export class RunnerManager {
       // in the (unstarted) runner config. Revoke it, or a valid credential
       // outlives a worker that never came up.
       this.revokeBrokerUrl?.(instanceNum);
-      // Nothing started, so nothing holds the marker or uses the sandbox;
-      // remove them now.
-      if (!instance.process) {
-        if (instance.markerPath) {
-          try { fs.unlinkSync(instance.markerPath); } catch { /* already gone */ }
-          instance.markerPath = undefined;
-        }
-        if (instance.processMarker) {
-          for (const file of [instance.processMarker.granted, instance.processMarker.withheld]) {
-            try { fs.unlinkSync(file); } catch { /* already gone */ }
-          }
-          instance.processMarker = undefined;
-        }
-        this.discardSandbox(instanceNum, instance);
-      }
+      if (!instance.process) this.discardUnstartedSpawn(instanceNum, instance);
     }
+  }
+
+  /**
+   * Nothing started, so nothing holds the marker or the profile mark, or uses
+   * the sandbox; remove them now.
+   */
+  private discardUnstartedSpawn(instanceNum: number, instance: RunnerInstance): void {
+    if (instance.markerPath) {
+      try { fs.unlinkSync(instance.markerPath); } catch { /* already gone */ }
+      instance.markerPath = undefined;
+    }
+    if (instance.processMarker) {
+      for (const file of [instance.processMarker.granted, instance.processMarker.withheld]) {
+        try { fs.unlinkSync(file); } catch { /* already gone */ }
+      }
+      instance.processMarker = undefined;
+    }
+    this.discardSandbox(instanceNum, instance);
   }
 
   /** Remove the sandbox of a start that never ran a worker in it. */
@@ -1977,17 +1999,25 @@ export class RunnerManager {
    * has already reached when it could look, and covers when it could not.
    * Then its sandbox goes, once its process group is empty: a sandbox
    * something of the job still runs in is left to the startup sweep rather
-   * than pulled out from under it.
+   * than pulled out from under it. The group is asked by its leader's pid,
+   * so a group that emptied and whose pid now leads another keeps the
+   * sandbox until then too; that costs only disk.
    */
   private async sweepFinishedSpawn({ markerPath, processMarker, sandboxDir, groupId }: FinishedSpawn): Promise<void> {
     if (processMarker) {
       const killed = await reapMarkedProcessesAsync(processMarker);
+      let keep = false;
       if (killed === null) {
-        this.log('warn', `Could not look for what a finished job left outside its process group; ${path.basename(processMarker.granted)} is kept for the next startup's sweep`);
-      } else {
-        if (killed.length > 0) {
-          this.log('warn', `Killed ${killed.join(', ')}, left running outside its process group by a finished job`);
-        }
+        // Without the developer tools the startup sweep cannot look either;
+        // kept, the mark would only pile up, two files for every job.
+        keep = (await developerPython()) !== null;
+        this.log('warn', keep
+          ? `Could not look for what a finished job left outside its process group; ${path.basename(processMarker.granted)} is kept for the next startup's sweep`
+          : 'Could not look for what a finished job left outside its process group: that needs the developer tools');
+      } else if (killed.length > 0) {
+        this.log('warn', `Killed ${killed.join(', ')}, left running outside its process group by a finished job`);
+      }
+      if (!keep) {
         for (const file of [processMarker.granted, processMarker.withheld]) {
           await fs.promises.unlink(file).catch(() => undefined);
         }
