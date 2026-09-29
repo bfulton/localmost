@@ -1086,6 +1086,35 @@ describe('/info through the filter', () => {
     expect(JSON.parse(reply.body).message).toMatch(/info/);
   });
 
+  it('refuses an answer far larger than any real /info, rather than holding it all in memory', async () => {
+    const dir = tmp();
+    const daemon = await infoDaemon(dir, (res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ...FULL_INFO, Labels: ['x'.repeat(2 * 1024 * 1024)] }));
+    });
+    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+
+    const reply = await request(sock, 'GET', '/v1.45/info');
+
+    expect(reply.status).toBe(502);
+    expect(JSON.parse(reply.body).message).toMatch(/info/);
+  });
+
+  it('refuses a gzip answer that inflates past the same limit', async () => {
+    const dir = tmp();
+    const daemon = await infoDaemon(dir, (res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip' });
+      // A few KB on the wire, megabytes once inflated.
+      res.end(zlib.gzipSync(JSON.stringify({ ...FULL_INFO, Labels: ['x'.repeat(2 * 1024 * 1024)] })));
+    });
+    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+
+    const reply = await request(sock, 'GET', '/v1.45/info');
+
+    expect(reply.status).toBe(502);
+    expect(JSON.parse(reply.body).message).toMatch(/info/);
+  });
+
   it('refuses an answer that is not a JSON object', async () => {
     const dir = tmp();
     const daemon = await infoDaemon(dir, (res) => {

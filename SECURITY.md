@@ -325,9 +325,9 @@ same prominence as a change to `level:`. Default is off: a repository that
 declares nothing under `docker:` has only the baseline of `/_ping`, `/version`,
 `/info` and reads about its own containers, none of which reach the host.
 The filter cuts `/info` down to the daemon's version, platform, kernel, CPU and
-memory, storage driver, cgroup version and security options; the rest of it
-(host name, proxy settings and their credentials, registry mirrors, labels,
-container and image counts) describes the operator's machine. The
+memory, storage driver, cgroup version and security options; the rest (host
+name, proxy settings and their credentials, registry mirrors, labels, container
+and image counts) is withheld because it describes the operator's machine. The
 design is in `docs/superpowers/specs/2026-09-05-docker-isolation-design.md`.
 
 ## Credential Storage

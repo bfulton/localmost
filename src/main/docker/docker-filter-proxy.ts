@@ -79,6 +79,13 @@ const INFO_FIELDS: ReadonlySet<string> = new Set([
   'SecurityOptions',
 ]);
 
+/**
+ * A real /info is a few KB. It is held whole to be rewritten, in the main
+ * process, so a body - or a gzip body once inflated - past this is refused
+ * rather than buffered.
+ */
+const MAX_INFO_BYTES = 1024 * 1024;
+
 const NO_DAEMON_MESSAGE = 'no Docker daemon is available to this job';
 
 const DEFAULT_MIN_API_VERSION = 'v1.24';
@@ -130,12 +137,15 @@ const isJsonContentType = (contentType: string | undefined): boolean =>
 /**
  * A response body as text, undoing the one compression a daemon (or a proxy
  * in front of it) might apply. Throws on any other encoding: a body the filter
- * cannot read is one it cannot rewrite.
+ * cannot read is one it cannot rewrite. Throws too on a gzip body that inflates
+ * past MAX_INFO_BYTES, which a few KB on the wire can.
  */
 function decodeBody(raw: Buffer, contentEncoding: string | undefined): string {
   const encoding = (contentEncoding ?? '').trim().toLowerCase();
   if (encoding === '' || encoding === 'identity') return raw.toString('utf8');
-  if (encoding === 'gzip' || encoding === 'x-gzip') return zlib.gunzipSync(raw).toString('utf8');
+  if (encoding === 'gzip' || encoding === 'x-gzip') {
+    return zlib.gunzipSync(raw, { maxOutputLength: MAX_INFO_BYTES }).toString('utf8');
+  }
   throw new Error(`unsupported content encoding: ${encoding}`);
 }
 
@@ -827,12 +837,20 @@ export class DockerFilterProxy {
    */
   private relayInfo(upstreamRes: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     return new Promise((resolve) => {
-      const chunks: Buffer[] = [];
-      upstreamRes.on('data', (c: Buffer) => chunks.push(c));
+      // Past the limit the rest is read and dropped, so the daemon's answer
+      // still completes and the refusal goes out on a clean connection.
+      let chunks: Buffer[] = [];
+      let size = 0;
+      upstreamRes.on('data', (c: Buffer) => {
+        size += c.length;
+        if (size > MAX_INFO_BYTES) chunks = [];
+        else chunks.push(c);
+      });
       upstreamRes.on('end', () => {
         const status = upstreamRes.statusCode ?? 502;
         let body: Buffer;
         try {
+          if (size > MAX_INFO_BYTES) throw new Error('too large');
           const parsed: unknown = JSON.parse(decodeBody(Buffer.concat(chunks), upstreamRes.headers['content-encoding']));
           if (!isPlainRecord(parsed)) throw new Error('not an object');
           const kept: Record<string, unknown> = {};
