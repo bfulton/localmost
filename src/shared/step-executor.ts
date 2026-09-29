@@ -7,11 +7,15 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import * as crypto from 'crypto';
 import { spawn, ChildProcess, SpawnOptions } from 'child_process';
 import { WorkflowStep, WorkflowJob, MatrixCombination } from './workflow-parser';
-import { SandboxPolicy, generateSandboxProfile, generateDiscoveryProfile } from './sandbox-profile';
+import {
+  SandboxPolicy,
+  generateSandboxProfile,
+  generateDiscoveryProfile,
+  MACOS_BASELINE_READ_PATHS,
+} from './sandbox-profile';
 import { PidTreeWatcher } from './pid-tree-watch';
 import { parseActionRef, fetchAction, isInterceptedAction, readActionMetadata } from './action-fetcher';
 import { resolveWithin } from './contained-path';
@@ -712,13 +716,11 @@ async function executeInterceptedAction(
     return executeCheckoutIntercept(step, ctx, stepName);
   }
 
-  // actions/cache (restore and save variants)
+  // actions/cache/save saves; actions/cache and actions/cache/restore restore
+  if (uses.startsWith('actions/cache/save@')) {
+    return executeCacheSaveIntercept(step, ctx, stepName);
+  }
   if (uses.startsWith('actions/cache')) {
-    // actions/cache/save is for saving only
-    if (uses.includes('/save')) {
-      return executeCacheSaveIntercept(step, ctx, stepName);
-    }
-    // actions/cache/restore is for restore only, regular actions/cache does both
     return executeCacheIntercept(step, ctx, stepName);
   }
 
@@ -784,10 +786,19 @@ function executeCheckoutIntercept(
 }
 
 /**
- * Get the local cache directory for workflow caches.
+ * Where a repository's caches for one ref live.
+ *
+ * Caches were one directory for everything `localmost test` ever ran, so a
+ * checkout under test could save a poisoned node_modules under a key the next
+ * repository - or the same repository's main branch - restored and ran. On
+ * GitHub a cache is scoped to its repository and branch; here it is scoped to
+ * the repository and ref the run was started from. A hash names the
+ * directory, so no two (repository, ref) pairs can share one.
  */
-function getLocalCacheDir(): string {
-  return path.join(os.homedir(), '.localmost', 'workflow-cache');
+function getLocalCacheDir(ctx: ExecutionContext): string {
+  const scope = JSON.stringify([ctx.workflowEnv.GITHUB_REPOSITORY || 'local/repo', ctx.workflowEnv.GITHUB_REF || '']);
+  const hash = crypto.createHash('sha256').update(scope).digest('hex').slice(0, 32);
+  return path.join(getAppDataDirWithoutElectron(), 'workflow-cache', hash);
 }
 
 /**
@@ -799,205 +810,201 @@ function sanitizeCacheKey(key: string): string {
 }
 
 /**
- * Intercept actions/cache - use local cache directory.
+ * The paths a cache step names, relative to the workspace, as tar members.
+ *
+ * A leading ~ is the step's HOME, which is in the workspace. Anything that
+ * lands outside the workspace is dropped with a note: the cache is copied by
+ * this process's own tools, and an absolute path used to have it copy the
+ * user's files into the cache, or write over them on restore.
  */
-function executeCacheIntercept(
+function cacheMembers(pathInput: string, ctx: ExecutionContext): string[] {
+  const home = path.join(ctx.workDir, '.home');
+  const members: string[] = [];
+  for (const raw of pathInput.split('\n').map((p) => p.trim()).filter(Boolean)) {
+    const expanded = raw === '~' || raw.startsWith('~/') ? path.join(home, raw.slice(1)) : raw;
+    const relative = path.relative(ctx.workDir, path.resolve(ctx.workDir, expanded));
+    if (relative === '' || relative.startsWith('..') || path.isAbsolute(relative)) {
+      ctx.onOutput?.(`  Skipped (outside the workspace): ${raw}`, 'stdout');
+      continue;
+    }
+    members.push(`./${relative}`);
+  }
+  return members;
+}
+
+/**
+ * Run tar under a sandbox profile rooted at the workspace.
+ *
+ * The workspace is the steps' to write, so the copy is made by a process the
+ * kernel confines to it rather than by this one: a symlink a step left in
+ * the workspace leads tar nowhere it could not already go. The archive
+ * travels over a pipe, so the cache directory itself is never in the profile.
+ */
+function runSandboxedTar(
+  args: string[],
+  ctx: ExecutionContext,
+  io: { stdinFile?: string; stdoutFile?: string }
+): Promise<{ exitCode: number; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const { profilePath, remove } = writeStepProfile(
+      generateSandboxProfile({
+        workDir: ctx.workDir,
+        proxyPort: ctx.proxyPort,
+        policy: { filesystem: { read: MACOS_BASELINE_READ_PATHS } },
+      })
+    );
+    const proc = spawn('/usr/bin/sandbox-exec', ['-f', profilePath, '/usr/bin/tar', ...args], {
+      cwd: ctx.workDir,
+      env: { PATH: '/usr/bin:/bin', LANG: 'en_US.UTF-8' },
+      shell: false,
+      detached: true,
+      stdio: [io.stdinFile ? 'pipe' : 'ignore', io.stdoutFile ? 'pipe' : 'ignore', 'pipe'],
+    });
+    trackStepProcessGroup(proc);
+
+    let stderr = '';
+    proc.stderr?.on('data', (d: Buffer) => (stderr += d.toString()));
+    const written = io.stdoutFile
+      ? new Promise<void>((done, fail) => {
+          const out = fs.createWriteStream(io.stdoutFile!, { flags: 'wx', mode: 0o600 });
+          out.on('finish', done);
+          out.on('error', fail);
+          proc.stdout?.pipe(out);
+        })
+      : Promise.resolve();
+    if (io.stdinFile && proc.stdin) {
+      // Either end can go first: tar may exit before reading everything, and
+      // a failed read has to end the input rather than leave tar waiting.
+      const input = fs.createReadStream(io.stdinFile);
+      input.on('error', () => proc.stdin?.destroy());
+      proc.stdin.on('error', () => input.destroy());
+      input.pipe(proc.stdin);
+    }
+
+    proc.on('error', (err) => {
+      remove();
+      reject(err);
+    });
+    proc.on('close', (code) => {
+      remove();
+      written.then(() => resolve({ exitCode: code ?? 1, stderr }), reject);
+    });
+  });
+}
+
+/**
+ * Intercept actions/cache and actions/cache/restore - restore from the local cache.
+ */
+async function executeCacheIntercept(
   step: WorkflowStep,
   ctx: ExecutionContext,
   stepName: string
-): StepResult {
+): Promise<StepResult> {
   const key = step.with?.key as string | undefined;
   const cachePath = step.with?.path as string | undefined;
   const restoreKeys = step.with?.['restore-keys'] as string | undefined;
+  const miss: StepResult = { name: stepName, status: 'success', duration: 0, outputs: { 'cache-hit': 'false' } };
 
   if (!key || !cachePath) {
     ctx.onOutput?.('Cache: missing key or path', 'stdout');
-    return {
-      name: stepName,
-      status: 'success',
-      duration: 0,
-      outputs: { 'cache-hit': 'false' },
-    };
+    return miss;
   }
 
   ctx.onOutput?.(`Cache (local): key=${key}, path=${cachePath}`, 'stdout');
 
-  const cacheDir = getLocalCacheDir();
-  const sanitizedKey = sanitizeCacheKey(key);
-  const cacheEntryDir = path.join(cacheDir, sanitizedKey);
+  const cacheDir = getLocalCacheDir(ctx);
+  const exact = path.join(cacheDir, `${sanitizeCacheKey(key)}.tar`);
+  let archive: string | undefined = fs.existsSync(exact) ? exact : undefined;
 
-  // Check for exact match first
-  if (fs.existsSync(cacheEntryDir)) {
-    ctx.onOutput?.(`Cache hit: ${key}`, 'stdout');
-    return restoreCacheEntry(cacheEntryDir, cachePath, ctx, stepName, true);
-  }
-
-  // Check restore keys for prefix match
-  if (restoreKeys) {
-    const prefixes = restoreKeys.split('\n').map(k => k.trim()).filter(Boolean);
-    try {
-      if (!fs.existsSync(cacheDir)) {
-        fs.mkdirSync(cacheDir, { recursive: true });
+  // Restore keys match by prefix, newest first, as on GitHub.
+  if (!archive && restoreKeys && fs.existsSync(cacheDir)) {
+    const entries = fs.readdirSync(cacheDir)
+      .filter((name) => name.endsWith('.tar'))
+      .map((name) => ({ name, mtime: fs.statSync(path.join(cacheDir, name)).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+    for (const prefix of restoreKeys.split('\n').map((k) => k.trim()).filter(Boolean)) {
+      const match = entries.find((entry) => entry.name.startsWith(sanitizeCacheKey(prefix)));
+      if (match) {
+        ctx.onOutput?.(`Cache restored from key prefix: ${prefix}`, 'stdout');
+        archive = path.join(cacheDir, match.name);
+        break;
       }
-      const entries = fs.readdirSync(cacheDir);
-
-      for (const prefix of prefixes) {
-        const sanitizedPrefix = sanitizeCacheKey(prefix);
-        // Find entries that start with this prefix
-        const match = entries.find(entry => entry.startsWith(sanitizedPrefix));
-        if (match) {
-          ctx.onOutput?.(`Cache restored from key prefix: ${prefix}`, 'stdout');
-          return restoreCacheEntry(path.join(cacheDir, match), cachePath, ctx, stepName, false);
-        }
-      }
-    } catch (err) {
-      ctx.onOutput?.(`Cache lookup error: ${(err as Error).message}`, 'stderr');
     }
   }
 
-  ctx.onOutput?.('Cache miss', 'stdout');
-  return {
-    name: stepName,
-    status: 'success',
-    duration: 0,
-    outputs: { 'cache-hit': 'false' },
-  };
-}
+  if (!archive) {
+    ctx.onOutput?.('Cache miss', 'stdout');
+    return miss;
+  }
+  if (archive === exact) ctx.onOutput?.(`Cache hit: ${key}`, 'stdout');
 
-/**
- * Restore a cache entry to the workspace.
- */
-function restoreCacheEntry(
-  cacheEntryDir: string,
-  targetPath: string,
-  ctx: ExecutionContext,
-  stepName: string,
-  exactMatch: boolean
-): StepResult {
   try {
-    // Handle multiple paths separated by newlines
-    const paths = targetPath.split('\n').map(p => p.trim()).filter(Boolean);
-
-    for (const singlePath of paths) {
-      const absoluteTarget = path.isAbsolute(singlePath)
-        ? singlePath
-        : path.join(ctx.workDir, singlePath);
-
-      const cachedPath = path.join(cacheEntryDir, sanitizeCacheKey(singlePath));
-
-      if (fs.existsSync(cachedPath)) {
-        // Ensure parent directory exists
-        const parentDir = path.dirname(absoluteTarget);
-        if (!fs.existsSync(parentDir)) {
-          fs.mkdirSync(parentDir, { recursive: true });
-        }
-
-        // Copy cached files to target
-        copyDirRecursive(cachedPath, absoluteTarget);
-        ctx.onOutput?.(`  Restored: ${singlePath}`, 'stdout');
-      }
+    const result = await runSandboxedTar(['-x', '-f', '-', '-C', ctx.workDir], ctx, { stdinFile: archive });
+    if (result.exitCode !== 0) {
+      ctx.onOutput?.(`Cache restore error: ${result.stderr.trim()}`, 'stderr');
+      return miss;
     }
-
-    return {
-      name: stepName,
-      status: 'success',
-      duration: 0,
-      outputs: { 'cache-hit': exactMatch ? 'true' : 'false' },
-    };
   } catch (err) {
     ctx.onOutput?.(`Cache restore error: ${(err as Error).message}`, 'stderr');
-    return {
-      name: stepName,
-      status: 'success',
-      duration: 0,
-      outputs: { 'cache-hit': 'false' },
-    };
+    return miss;
   }
+  return { name: stepName, status: 'success', duration: 0, outputs: { 'cache-hit': archive === exact ? 'true' : 'false' } };
 }
 
 /**
- * Copy a directory recursively.
+ * Intercept actions/cache/save - save to the local cache.
  */
-function copyDirRecursive(src: string, dest: string): void {
-  const stat = fs.statSync(src);
-
-  if (stat.isDirectory()) {
-    if (!fs.existsSync(dest)) {
-      fs.mkdirSync(dest, { recursive: true });
-    }
-    for (const entry of fs.readdirSync(src)) {
-      copyDirRecursive(path.join(src, entry), path.join(dest, entry));
-    }
-  } else {
-    fs.copyFileSync(src, dest);
-  }
-}
-
-/**
- * Intercept actions/cache/save - save to local cache directory.
- */
-function executeCacheSaveIntercept(
+async function executeCacheSaveIntercept(
   step: WorkflowStep,
   ctx: ExecutionContext,
   stepName: string
-): StepResult {
+): Promise<StepResult> {
   const key = step.with?.key as string | undefined;
   const cachePath = step.with?.path as string | undefined;
+  // Cache save failure shouldn't fail the workflow
+  const done: StepResult = { name: stepName, status: 'success', duration: 0, outputs: {} };
 
   if (!key || !cachePath) {
     ctx.onOutput?.('Cache save: missing key or path', 'stdout');
-    return {
-      name: stepName,
-      status: 'success',
-      duration: 0,
-      outputs: {},
-    };
+    return done;
   }
 
   ctx.onOutput?.(`Cache save (local): key=${key}, path=${cachePath}`, 'stdout');
 
-  const cacheDir = getLocalCacheDir();
-  const sanitizedKey = sanitizeCacheKey(key);
-  const cacheEntryDir = path.join(cacheDir, sanitizedKey);
+  const members = cacheMembers(cachePath, ctx).filter((member) => {
+    // Only a hint: tar runs confined to the workspace whatever is here.
+    const present = fs.existsSync(path.join(ctx.workDir, member));
+    if (!present) ctx.onOutput?.(`  Skipped (not found): ${member}`, 'stdout');
+    return present;
+  });
+  if (members.length === 0) return done;
 
+  const cacheDir = getLocalCacheDir(ctx);
+  const archive = path.join(cacheDir, `${sanitizeCacheKey(key)}.tar`);
+  // Entries are immutable once saved, as on GitHub.
+  if (fs.existsSync(archive)) {
+    ctx.onOutput?.(`Cache already saved for key: ${key}`, 'stdout');
+    return done;
+  }
+
+  fs.mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
+  const partial = path.join(cacheDir, `.partial-${crypto.randomBytes(8).toString('hex')}`);
   try {
-    // Handle multiple paths separated by newlines
-    const paths = cachePath.split('\n').map(p => p.trim()).filter(Boolean);
-
-    // Create cache entry directory
-    if (!fs.existsSync(cacheEntryDir)) {
-      fs.mkdirSync(cacheEntryDir, { recursive: true });
+    const result = await runSandboxedTar(['-c', '-f', '-', '-C', ctx.workDir, '--', ...members], ctx, {
+      stdoutFile: partial,
+    });
+    if (result.exitCode !== 0) {
+      ctx.onOutput?.(`Cache save error: ${result.stderr.trim()}`, 'stderr');
+      return done;
     }
-
-    for (const singlePath of paths) {
-      const absoluteSource = path.isAbsolute(singlePath)
-        ? singlePath
-        : path.join(ctx.workDir, singlePath);
-
-      if (fs.existsSync(absoluteSource)) {
-        const cachedPath = path.join(cacheEntryDir, sanitizeCacheKey(singlePath));
-        copyDirRecursive(absoluteSource, cachedPath);
-        ctx.onOutput?.(`  Saved: ${singlePath}`, 'stdout');
-      } else {
-        ctx.onOutput?.(`  Skipped (not found): ${singlePath}`, 'stdout');
-      }
-    }
-
-    return {
-      name: stepName,
-      status: 'success',
-      duration: 0,
-      outputs: {},
-    };
+    fs.renameSync(partial, archive);
+    for (const member of members) ctx.onOutput?.(`  Saved: ${member}`, 'stdout');
   } catch (err) {
     ctx.onOutput?.(`Cache save error: ${(err as Error).message}`, 'stderr');
-    return {
-      name: stepName,
-      status: 'success', // Cache save failure shouldn't fail the workflow
-      duration: 0,
-      outputs: {},
-    };
+  } finally {
+    fs.rmSync(partial, { force: true });
   }
+  return done;
 }
 
 /**

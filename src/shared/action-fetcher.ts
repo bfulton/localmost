@@ -174,6 +174,8 @@ export function isInterceptedAction(uses: string): boolean {
   const intercepted = [
     'actions/checkout',
     'actions/cache',
+    'actions/cache/save',
+    'actions/cache/restore',
     'actions/upload-artifact',
     'actions/download-artifact',
     'actions/setup-node',
