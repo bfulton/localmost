@@ -1089,8 +1089,11 @@ describe('an upstream request ends with its client', () => {
       sock.on('error', () => undefined);
       sock.once('data', () => resolve(sock));
     });
-  const within = <T>(p: Promise<T>, ms: number) =>
-    Promise.race([p.then(() => 'closed'), new Promise((r) => setTimeout(() => r('still open'), ms))]);
+  const within = <T>(p: Promise<T>, ms: number) => {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise((r) => { timer = setTimeout(() => r('still open'), ms); });
+    return Promise.race([p.then(() => 'closed'), timeout]).finally(() => clearTimeout(timer));
+  };
 
   it('closes the upstream when the token rotates mid-response', async () => {
     const h = await hangingUpstream();
@@ -1126,6 +1129,27 @@ describe('an upstream request ends with its client', () => {
       sock.destroy();
       expect(await within(h.firstClosed(), 500)).toBe('closed');
     } finally { h.up.closeAllConnections(); h.up.close(); await p.stop(); }
+  });
+
+  it('ends the client\'s response when the upstream dies partway through its body', async () => {
+    // pipe() leaves its destination open when the source errors, so the
+    // client sat on a response that would never finish until its own timeout.
+    const up = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { 'content-length': '1000' });
+      res.write('partial;', () => res.socket?.destroy());
+    });
+    await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
+    const upPort = (up.address() as net.AddressInfo).port;
+    const p = new ProxyServer({ policyLevel: 'permissive' });
+    await p.start();
+    try {
+      const sock = await open(p.getPort(), `GET http://127.0.0.1:${upPort}/ HTTP/1.1\r\nHost: 127.0.0.1:${upPort}\r\n\r\n`);
+      const closed = new Promise<void>((r) => sock.once('close', () => r()));
+      try {
+        expect(await within(closed, 500)).toBe('closed');
+      } finally { sock.destroy(); }
+    } finally { up.closeAllConnections(); up.close(); await p.stop(); }
   });
 
   it('does not dial at all when the client left while its name was resolving', async () => {

@@ -645,6 +645,11 @@ export class ProxyServer {
     if (res.destroyed || req.socket.destroyed) return null;
     const proxyReq = http.request(options, (proxyRes) => {
       res.writeHead(proxyRes.statusCode || 500, proxyRes.headers);
+      // pipe() does not end its destination when the source fails, so an
+      // upstream that dies partway through its body would leave the client
+      // waiting on a response that can no longer finish. Cutting the client
+      // off is how it learns the body is short.
+      proxyRes.on('error', () => res.destroy());
       proxyRes.pipe(res);
     });
     proxyReq.on('error', (err) => {
