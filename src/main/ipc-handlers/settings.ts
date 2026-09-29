@@ -2,7 +2,8 @@
  * IPC handlers for settings management.
  */
 
-import { app, ipcMain } from 'electron';
+import { app } from 'electron';
+import { ipcMain } from './trusted-ipc';
 import { loadConfig, saveConfig, SETTABLE_CONFIG_KEYS, AppConfig } from '../config';
 import {
   setSleepProtectionSetting,

@@ -2,7 +2,8 @@
  * IPC handlers for GitHub authentication.
  */
 
-import { ipcMain, shell, clipboard } from 'electron';
+import { shell, clipboard } from 'electron';
+import { ipcMain } from './trusted-ipc';
 import { GitHubAuth, DEFAULT_CLIENT_ID } from '../github-auth';
 import { toUserError } from '../user-error';
 import { loadConfig, saveConfig } from '../config';

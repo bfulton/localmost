@@ -11,6 +11,9 @@ jest.mock('electron', () => ({
     handle: mockHandle,
   },
 }));
+// The sender check has tests of its own (trusted-ipc.test.ts); here the
+// handlers are called directly, so they are registered on electron's ipcMain.
+jest.mock('./trusted-ipc', () => ({ ipcMain: jest.requireMock<{ ipcMain: unknown }>('electron').ipcMain }));
 
 // Mock dependencies
 jest.mock('../config', () => ({

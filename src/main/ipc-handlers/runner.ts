@@ -4,7 +4,7 @@
 
 import * as path from 'path';
 import * as fs from 'fs';
-import { ipcMain } from 'electron';
+import { ipcMain } from './trusted-ipc';
 import { toUserError } from '../user-error';
 import { loadConfig } from '../config';
 import { getValidAccessToken, forceRefreshToken } from '../auth-tokens';

@@ -2,6 +2,9 @@ import { jest, describe, it, expect, beforeEach } from '@jest/globals';
 
 const mockHandle = jest.fn<(channel: string, handler: (...args: any[]) => any) => void>();
 jest.mock('electron', () => ({ ipcMain: { handle: mockHandle } }));
+// The sender check has tests of its own (trusted-ipc.test.ts); here the
+// handlers are called directly, so they are registered on electron's ipcMain.
+jest.mock('./trusted-ipc', () => ({ ipcMain: jest.requireMock<{ ipcMain: unknown }>('electron').ipcMain }));
 
 const mockAddTargetAndAttach = jest.fn<(...args: unknown[]) => Promise<unknown>>();
 jest.mock('../target-manager', () => ({

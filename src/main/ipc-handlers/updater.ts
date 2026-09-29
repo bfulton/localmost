@@ -2,7 +2,7 @@
  * IPC handlers for auto-update operations.
  */
 
-import { ipcMain } from 'electron';
+import { ipcMain } from './trusted-ipc';
 import { IPC_CHANNELS } from '../../shared/types';
 import {
   checkForUpdates,

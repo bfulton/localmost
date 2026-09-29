@@ -2,7 +2,7 @@
  * IPC handlers for resource-aware scheduling.
  */
 
-import { ipcMain } from 'electron';
+import { ipcMain } from './trusted-ipc';
 import { getResourceMonitor } from '../app-state';
 import { IPC_CHANNELS, ResourcePauseState } from '../../shared/types';
 

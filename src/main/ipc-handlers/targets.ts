@@ -2,7 +2,7 @@
  * IPC handlers for target management (multi-target runner support).
  */
 
-import { ipcMain } from 'electron';
+import { ipcMain } from './trusted-ipc';
 import { IPC_CHANNELS, Target, Result, RunnerProxyStatus } from '../../shared/types';
 import { getTargetManager } from '../target-manager';
 import { getLogger, getBrokerProxyService } from '../app-state';
