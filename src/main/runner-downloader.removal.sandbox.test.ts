@@ -124,20 +124,26 @@ if (!isMacOS) {
       const sandbox = await downloader.buildSandbox(1, version);
       write(path.join(sandbox, '_work', 'd0', 'output'), 'job');
       const job = await leftover(sandbox);
-      // The process makes its move once the removal is under way, which a
-      // real one would have to win a race to do; here it always does.
-      const realRm = fs.promises.rm.bind(fs.promises);
+      // The process makes its move once the removal has begun listing the
+      // tree, which a real one would have to win a race to do; here it
+      // always does.
+      const realReaddir = fs.promises.readdir.bind(fs.promises) as (...args: unknown[]) => Promise<unknown>;
       let swapped: boolean | undefined;
-      const rm = jest.spyOn(fs.promises, 'rm').mockImplementation(async (target, options) => {
+      const readdir = jest.spyOn(fs.promises, 'readdir').mockImplementation((async (...args: unknown[]) => {
         if (swapped === undefined) swapped = await job.swap();
-        return realRm(target, options);
-      });
+        return realReaddir(...args);
+      }) as never);
       try {
         await downloader.removeSandbox(sandbox);
       } finally {
-        rm.mockRestore();
+        readdir.mockRestore();
       }
 
+      // What this pins is that the process cannot change the tree at all
+      // once its removal has begun: its swap is refused. The victim would
+      // be safe here even had the swap gone through, as the removal never
+      // follows a link; that half, against a writer seatbelt does not
+      // confine, is the racing writer in runner-cleanup.test.ts.
       expect(swapped).toBe(false);
       expect(fs.readFileSync(path.join(victim, 'keep'), 'utf-8')).toBe('kept');
       expect(fs.readdirSync(downloader.getSandboxBase())).toEqual([]);
