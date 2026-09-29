@@ -397,6 +397,12 @@ describe('DockerFilterProxy forwarding', () => {
         res.end(JSON.stringify({ Id: 'abc', Warnings: [] }));
         return;
       }
+      // And the removal that follows when the socket stops.
+      if (req.method === 'DELETE') {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.flushHeaders();
       new Promise<void>((r) => { releaseBody = r; }).then(() => res.end(JSON.stringify({ StatusCode: 0 })));
@@ -474,12 +480,18 @@ const fakeAttachDaemon = (dir: string): Promise<{ sock: string; heads: string[] 
         const end = buffered.indexOf('\r\n\r\n');
         if (end === -1) return;
         // The socket only attaches to a container it created, so this fake
-        // answers the create that precedes the attach, then upgrades.
+        // answers the create that precedes the attach, then upgrades - and
+        // the removal that follows when the socket stops.
         if (buffered.slice(0, end).includes('/containers/create')) {
           const payload = JSON.stringify({ Id: 'abc123', Warnings: [] });
           socket.write(
             `HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: ${payload.length}\r\nConnection: close\r\n\r\n${payload}`
           );
+          buffered = '';
+          return;
+        }
+        if (buffered.startsWith('DELETE ')) {
+          socket.end('HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n');
           buffered = '';
           return;
         }
@@ -1142,4 +1154,294 @@ describe('/info through the filter', () => {
     expect(reply.status).toBe(500);
     expect(JSON.parse(reply.body)).toEqual({ message: 'daemon is starting' });
   });
+});
+
+// ---------------------------------------------------------------------------
+// What a job leaves behind: containers do not outlive the socket.
+// ---------------------------------------------------------------------------
+
+interface LifetimeDaemonOptions {
+  /** The status every container removal is answered with. */
+  deleteStatus?: number;
+  /** The status for a given container's nth removal attempt, counting from 1; overrides deleteStatus. */
+  deleteStatusFor?: (id: string, attempt: number) => number;
+  /** Keep container removals unanswered until released. */
+  holdDeletes?: boolean;
+  /** How long each container removal takes to answer. */
+  deleteDelayMs?: number;
+  /** The newest API version served; a path naming a newer one gets a 400, as a real daemon answers. */
+  maxApiVersion?: number;
+}
+
+/**
+ * A daemon that hands out a fresh id per create, and notes for each request
+ * whether the job's socket still existed when it arrived. It also counts the
+ * container removals in flight at once, and the ids it removed.
+ */
+const lifetimeDaemon = (
+  dir: string,
+  jobSocket: string,
+  options: LifetimeDaemonOptions = {}
+): Promise<{
+  sock: string;
+  seen: string[];
+  socketPresent: boolean[];
+  removed: Set<string>;
+  maxInFlight: () => number;
+  release: () => void;
+}> =>
+  new Promise((resolve) => {
+    const sock = path.join(dir, 'lifetime.sock');
+    const seen: string[] = [];
+    const socketPresent: boolean[] = [];
+    const removed = new Set<string>();
+    const attempts = new Map<string, number>();
+    const held: Array<() => void> = [];
+    let released = false;
+    let containers = 0;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const server = http.createServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        seen.push(`${req.method} ${req.url}`);
+        socketPresent.push(fs.existsSync(jobSocket));
+        const version = /^\/v(\d+\.\d+)\//.exec(req.url!)?.[1];
+        if (version !== undefined && options.maxApiVersion !== undefined && Number(version) > options.maxApiVersion) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            message: `client version ${version} is too new. Maximum supported API version is ${options.maxApiVersion}`,
+          }));
+          return;
+        }
+        const p = req.url!.replace(/^\/v\d+\.\d+/, '').split('?')[0];
+        if (p === '/containers/create') {
+          containers += 1;
+          res.writeHead(201, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ Id: `c${containers}`, Warnings: [] }));
+        } else if (p === '/networks/create') {
+          res.writeHead(201, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ Id: 'net1', Warning: '' }));
+        } else if (req.method === 'DELETE' && p.startsWith('/containers/')) {
+          const id = p.slice('/containers/'.length);
+          const attempt = (attempts.get(id) ?? 0) + 1;
+          attempts.set(id, attempt);
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          const answer = (): void => {
+            inFlight -= 1;
+            const status = options.deleteStatusFor?.(id, attempt) ?? options.deleteStatus ?? 204;
+            if (status >= 200 && status < 300) removed.add(id);
+            res.writeHead(status, { 'Content-Type': 'application/json' });
+            res.end(status === 204 ? undefined : JSON.stringify({ message: 'removal failed' }));
+          };
+          if (options.holdDeletes && !released) held.push(answer);
+          else if (options.deleteDelayMs) setTimeout(answer, options.deleteDelayMs);
+          else answer();
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        }
+      });
+    });
+    servers.push(server);
+    server.listen(sock, () =>
+      resolve({
+        sock,
+        seen,
+        socketPresent,
+        removed,
+        maxInFlight: () => maxInFlight,
+        release: () => {
+          released = true;
+          for (const answer of held.splice(0)) answer();
+        },
+      })
+    );
+  });
+
+describe('containers a job leaves behind', () => {
+  const policy = {
+    run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] },
+  };
+
+  it('removes the containers it created when it stops, and the networks after them', async () => {
+    // docker run -d returns at once, and the container keeps running after the
+    // job - with egress no proxy filters - unless something removes it.
+    const dir = tmp();
+    const sock = path.join(dir, 'docker.sock');
+    const daemon = await lifetimeDaemon(dir, sock);
+    const { proxy } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', policy);
+
+    expect((await request(sock, 'POST', '/v1.45/containers/create?name=db', { Image: 'alpine:3' })).status).toBe(201);
+    expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
+    expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
+    expect((await request(sock, 'POST', '/v1.45/networks/create', { Name: 'vk-1', Internal: true })).status).toBe(201);
+    // The job removed this one itself; it is not removed a second time.
+    expect((await request(sock, 'DELETE', '/v1.45/containers/c3')).status).toBeLessThan(400);
+    const before = daemon.seen.length;
+
+    await proxy.stop();
+
+    const sweep = daemon.seen.slice(before);
+    // Each container once, by id, however many names it had - forced, since a
+    // running one is the case that matters, with its anonymous volumes.
+    expect(sweep.slice(0, 2).sort()).toEqual([
+      'DELETE /containers/c1?force=1&v=1',
+      'DELETE /containers/c2?force=1&v=1',
+    ]);
+    // A network with a container still attached cannot be removed, so it goes last.
+    expect(sweep.slice(2)).toEqual(['DELETE /networks/net1']);
+    // The socket was already gone, so the job could not start another meanwhile.
+    expect(daemon.socketPresent.slice(before)).toEqual([false, false, false]);
+  });
+
+  it('logs what it could not remove, and still stops', async () => {
+    const dir = tmp();
+    const sock = path.join(dir, 'docker.sock');
+    const daemon = await lifetimeDaemon(dir, sock, { deleteStatus: 500 });
+    const { proxy, logs } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', policy);
+    expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
+
+    await proxy.stop();
+
+    expect(proxy.isRunning()).toBe(false);
+    expect(fs.existsSync(sock)).toBe(false);
+    expect(logs.some((l) => l.level === 'warn' && /c1/.test(l.message) && /500/.test(l.message))).toBe(true);
+  });
+
+  it('logs the containers it could not reach the daemon to remove, and still stops', async () => {
+    const dir = tmp();
+    const sock = path.join(dir, 'docker.sock');
+    const daemon = await lifetimeDaemon(dir, sock);
+    let endpoint: string | null = daemon.sock;
+    const backend: DockerBackend = { ...backendWith(null, dir), resolveEndpoint: () => (endpoint ? { socketPath: endpoint } : null) };
+    const { proxy, logs } = await startProxy(dir, { backend });
+    proxy.bind('owner/repo', policy);
+    expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
+
+    // The daemon went away before the job ended.
+    endpoint = path.join(dir, 'gone.sock');
+    await proxy.stop();
+
+    expect(proxy.isRunning()).toBe(false);
+    expect(logs.some((l) => l.level === 'warn' && /c1/.test(l.message))).toBe(true);
+  });
+
+  it('makes a second stop wait for the first one to finish removing', async () => {
+    // Whoever stops the socket next - the slot's next spawn, or the app
+    // quitting - must not go on while the last job's containers still run.
+    const dir = tmp();
+    const sock = path.join(dir, 'docker.sock');
+    const daemon = await lifetimeDaemon(dir, sock, { holdDeletes: true });
+    const { proxy } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', policy);
+    expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
+
+    const first = proxy.stop();
+    const events: string[] = [];
+    const second = proxy.stop().then(() => events.push('second stop'));
+    for (let waited = 0; !daemon.seen.some((s) => s.startsWith('DELETE')); waited += 5) {
+      expect(waited).toBeLessThan(2000);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    await new Promise((r) => setTimeout(r, 20));
+    events.push('removal answered');
+    daemon.release();
+    await Promise.all([first, second]);
+
+    expect(events).toEqual(['removal answered', 'second stop']);
+  });
+
+  it('removes them on a daemon older than the API version the socket speaks', async () => {
+    // The CLI negotiates down to an older daemon through the clamped ping, so
+    // the job's own requests name a version that daemon serves. The sweep is
+    // the one request the socket words itself, and a daemon refuses a
+    // version newer than its own with a 400 - so it names none.
+    const dir = tmp();
+    const sock = path.join(dir, 'docker.sock');
+    const daemon = await lifetimeDaemon(dir, sock, { maxApiVersion: 1.43 });
+    const { proxy, logs } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', policy);
+    expect((await request(sock, 'POST', '/v1.43/containers/create', { Image: 'alpine:3' })).status).toBe(201);
+    expect((await request(sock, 'POST', '/v1.43/networks/create', { Name: 'vk-1', Internal: true })).status).toBe(201);
+
+    await proxy.stop();
+
+    expect(daemon.removed).toEqual(new Set(['c1']));
+    expect(daemon.seen).toContain('DELETE /networks/net1');
+    expect(logs.filter((l) => l.level === 'warn')).toEqual([]);
+  });
+
+  it('removes many a few at a time, and tries a failed removal again', async () => {
+    // A job can leave as many containers as it likes. They are removed a few
+    // at a time rather than all at once, and one refused the first time is
+    // asked for again, so no one failure decides which of them survive.
+    const dir = tmp();
+    const sock = path.join(dir, 'docker.sock');
+    const daemon = await lifetimeDaemon(dir, sock, {
+      deleteDelayMs: 5,
+      deleteStatusFor: (id, attempt) => (Number(id.slice(1)) % 3 === 0 && attempt === 1 ? 500 : 204),
+    });
+    const { proxy, logs } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', policy);
+    for (let i = 0; i < 50; i += 1) {
+      expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
+    }
+
+    await proxy.stop();
+
+    expect(daemon.removed.size).toBe(50);
+    expect(daemon.maxInFlight()).toBeGreaterThan(1);
+    expect(daemon.maxInFlight()).toBeLessThanOrEqual(8);
+    expect(logs.filter((l) => l.level === 'warn')).toEqual([]);
+  });
+
+  it('counts a container the daemon was already removing as removed once it is gone', async () => {
+    // docker run -d --rm: the daemon removes the container itself when it is
+    // killed, and may answer the forced removal racing it with a 409.
+    const dir = tmp();
+    const sock = path.join(dir, 'docker.sock');
+    const daemon = await lifetimeDaemon(dir, sock, { deleteStatusFor: (_id, attempt) => (attempt === 1 ? 409 : 404) });
+    const { proxy, logs } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', policy);
+    expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
+
+    await proxy.stop();
+
+    expect(daemon.seen.filter((s) => s.startsWith('DELETE'))).toHaveLength(2);
+    expect(logs.filter((l) => l.level === 'warn')).toEqual([]);
+  });
+
+  it('counts a container the daemon no longer has as removed, without a warning', async () => {
+    const dir = tmp();
+    const sock = path.join(dir, 'docker.sock');
+    const daemon = await lifetimeDaemon(dir, sock, { deleteStatus: 404 });
+    const { proxy, logs } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', policy);
+    expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
+
+    await proxy.stop();
+
+    expect(daemon.seen.filter((s) => s.startsWith('DELETE'))).toEqual(['DELETE /containers/c1?force=1&v=1']);
+    expect(logs.filter((l) => l.level === 'warn')).toEqual([]);
+  });
+
+  it('gives up on a removal the daemon never answers, and still stops', async () => {
+    // A hung daemon must not hold the slot's next worker, or the app
+    // quitting, forever.
+    const dir = tmp();
+    const sock = path.join(dir, 'docker.sock');
+    const daemon = await lifetimeDaemon(dir, sock, { holdDeletes: true });
+    const { proxy, logs } = await startProxy(dir, { backend: backendWith(daemon.sock, dir), removeTimeoutMs: 50 });
+    proxy.bind('owner/repo', policy);
+    expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
+
+    await proxy.stop();
+
+    expect(proxy.isRunning()).toBe(false);
+    expect(logs.some((l) => l.level === 'warn' && /container c1/.test(l.message) && /no answer/.test(l.message))).toBe(true);
+  }, 3000);
 });

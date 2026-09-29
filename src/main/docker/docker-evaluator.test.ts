@@ -473,6 +473,27 @@ describe('HostConfig is an allowlist, not a blocklist', () => {
     expect(create({ ContainerIDFile: '' }).allowed).toBe(true);
   });
 
+  it('refuses a restart policy that would outlive the job', () => {
+    // docker run -d --restart=always: the daemon brings the container back
+    // after the job ends, and again after the daemon itself restarts.
+    for (const name of ['always', 'unless-stopped', 'on-failure']) {
+      const verdict = create({ RestartPolicy: { Name: name, MaximumRetryCount: 0 } });
+      expect([name, verdict.allowed]).toEqual([name, false]);
+      expect(verdict.reason).toMatch(/--restart/);
+    }
+    expect(create({ RestartPolicy: { Name: 'on-failure', MaximumRetryCount: 3 } }).allowed).toBe(false);
+    // Any casing of either key, since the daemon decodes both case-insensitively.
+    expect(create({ restartpolicy: { Name: 'always' } }).allowed).toBe(false);
+    expect(create({ RestartPolicy: { name: 'unless-stopped' } }).allowed).toBe(false);
+    // A shape the filter cannot read is not one it can vouch for.
+    expect(create({ RestartPolicy: 'always' }).allowed).toBe(false);
+    expect(create({ RestartPolicy: { Name: 'no', SomeFutureKey: 'always' } }).allowed).toBe(false);
+    // What the CLI sends when no --restart is given: "no", or "" from older ones.
+    expect(create({ RestartPolicy: { Name: 'no', MaximumRetryCount: 0 } }).allowed).toBe(true);
+    expect(create({ RestartPolicy: { Name: '', MaximumRetryCount: 0 } }).allowed).toBe(true);
+    expect(create({ RestartPolicy: {} }).allowed).toBe(true);
+  });
+
   it('still permits the keys a plain docker run actually sends', () => {
     expect(create({}).allowed).toBe(true);
     expect(create({ AutoRemove: true, NetworkMode: 'bridge', Binds: [], RestartPolicy: { Name: '', MaximumRetryCount: 0 }, LogConfig: { Type: '', Config: {} }, ConsoleSize: [0, 0] }).allowed).toBe(true);
