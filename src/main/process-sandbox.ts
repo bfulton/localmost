@@ -159,6 +159,8 @@ interface RunnerProfileOptions {
   dockerSocket?: string;
   /** This worker's target's tool cache, if it keeps one across jobs. */
   toolCacheDir?: string;
+  /** This worker's target's package-manager cache; ignored under strict. */
+  packageCacheDir?: string;
   /** Optional log sink for notes such as a policy path being ignored. */
   onLog?: SandboxLogCallback;
 }
@@ -170,6 +172,7 @@ function generateSandboxProfile({
   filesystemPolicy = { level: 'strict', read: [], write: [] },
   dockerSocket,
   toolCacheDir: toolCache,
+  packageCacheDir: packageCache,
   onLog,
 }: RunnerProfileOptions): string {
   // The worker's own docker socket, served by the app: every request on it is
@@ -209,8 +212,11 @@ function generateSandboxProfile({
 
   // Toolchains and package-manager caches are a convenience for jobs, not
   // something the runner needs. Under strict a repository declares what it
-  // wants; moderate and permissive keep them, which is the same split the
-  // network allowlists already use.
+  // wants; moderate and permissive can read them, which is the same split the
+  // network allowlists already use. Read only: these trees hold directories on
+  // the user's PATH and config their own tools load, so a job that could write
+  // them could plant code the user later runs outside any sandbox. The job's
+  // package managers write to its target's own directory instead.
   const toolchainPaths =
     filesystemPolicy.level === 'strict'
       ? []
@@ -277,13 +283,6 @@ function generateSandboxProfile({
   const policyReads = subpaths(filesystemPolicy.read.filter(outsideRunner));
   const policyWrites = subpaths(filesystemPolicy.write.filter(outsideRunner));
   const toolchainRules = subpaths(toolchainPaths);
-  const cacheWritePaths =
-    filesystemPolicy.level === 'strict'
-      ? []
-      : toolchainPaths.filter((entry) => entry.startsWith(homeDir));
-  const cacheWriteRules = cacheWritePaths.length
-    ? `(allow file-write*\n${subpaths(cacheWritePaths)})`
-    : ';; strict: caches are not writable unless the policy declares them';
   // `mktemp` with no template creates tmp.XXXXXXXXXX in the per-user temp
   // directory whatever TMPDIR says, and scripts call it that way constantly.
   // That directory is shared with every process the user runs - the xcrun
@@ -305,8 +304,10 @@ function generateSandboxProfile({
   // one shared with another target: what a job leaves in a cache, the next
   // job to find it executes. The directories above them are readable as
   // nodes only (.NET reads every ancestor of what it opens), so another
-  // target's caches are not opened along the way.
-  const ownCaches = [toolCache].filter((dir): dir is string => Boolean(dir));
+  // target's caches are not opened along the way. The package cache is a
+  // moderate and permissive convenience; strict keeps what it declares.
+  const ownCaches = [toolCache, filesystemPolicy.level === 'strict' ? undefined : packageCache]
+    .filter((dir): dir is string => Boolean(dir));
   const ownCacheRules = (operation: string) =>
     ownCaches.length
       ? `(allow ${operation}\n${ownCaches.map((dir) => `  (subpath "${dir.replace(/"/g, '\\"')}")`).join('\n')})`
@@ -364,9 +365,9 @@ ${ownCacheRules('file-ioctl')}
 ;; Only what mktemp itself creates, by the name it generated:
 ${mktempRules}
 
-;; Package-manager caches. Under strict a repository declares the ones it
-;; needs; moderate and permissive keep them, matching the read side.
-${cacheWriteRules}
+;; No package-manager cache in the user's home. Under strict a repository
+;; declares what it needs; moderate and permissive get their target's own
+;; package cache above, with the package managers pointed at it.
 
 ;; Paths the repository's approved policy declares writable.
 ${policyWrites ? `(allow file-write*\n${policyWrites})` : ';; No policy-declared write paths'}
@@ -607,6 +608,12 @@ export interface SandboxOptions extends SpawnOptions {
    * Absent means none: the runner keeps its tools in the job's work directory.
    */
   toolCacheDir?: string;
+  /**
+   * The worker's target's own package-manager cache, which the job's package
+   * managers are pointed at under moderate and permissive. Not granted under
+   * strict, whatever is passed.
+   */
+  packageCacheDir?: string;
   /** Log prefix for identifying this process (e.g., runner instance ID) */
   logPrefix?: string;
   /** Optional callback for logging sandbox events */
@@ -654,6 +661,7 @@ export function spawnSandboxed(
     filesystemPolicy,
     dockerSocket,
     toolCacheDir,
+    packageCacheDir,
     logPrefix,
     onLog,
     ...spawnOptions
@@ -674,6 +682,7 @@ export function spawnSandboxed(
       filesystemPolicy,
       dockerSocket,
       toolCacheDir,
+      packageCacheDir,
       onLog,
     });
 

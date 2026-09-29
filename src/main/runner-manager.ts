@@ -13,6 +13,7 @@ import {
   SandboxPolicyLevel, RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
 import { SandboxFilesystemPolicy, spawnSandboxed } from './process-sandbox';
+import { packageCacheEnv } from './worker-env';
 import { sweepProcessGroup } from './process-group';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { RunnerDownloader } from './runner-downloader';
@@ -1131,6 +1132,23 @@ export class RunnerManager {
       const startupContextForPolicy = this.pendingTargetContext.get(String(instanceNum));
       const filesystemPolicy = await this.resolveFilesystemPolicy(startupContextForPolicy);
 
+      // Under moderate and permissive the job's package managers get a
+      // directory of their target's own, in place of the write access to the
+      // user's ~/.cargo, ~/go, ~/.gradle and the like those levels used to
+      // grant - trees that hold the user's PATH directories and tool config.
+      // Strict keeps exactly what the repository declares.
+      let packageCacheDir: string | undefined;
+      if (filesystemPolicy.level !== 'strict' && cacheTargetId) {
+        try {
+          packageCacheDir = path.join(this.downloader.getTargetCacheDir(cacheTargetId), 'packages');
+          fs.mkdirSync(packageCacheDir, { recursive: true, mode: 0o700 });
+          Object.assign(env, packageCacheEnv(packageCacheDir));
+        } catch (err) {
+          this.log('warn', `No package cache for instance ${instanceNum}; package managers write nowhere outside the job: ${(err as Error).message}`);
+          packageCacheDir = undefined;
+        }
+      }
+
       // The job's docker socket is one localmost serves, not the daemon's.
       // It lives in the sandbox directory, which is rebuilt per job, so it
       // is created and destroyed with the job and no cleanup path exists.
@@ -1222,6 +1240,7 @@ export class RunnerManager {
           filesystemPolicy,
           dockerSocket: dockerSocketPath,
           toolCacheDir,
+          packageCacheDir,
         });
       } finally {
         // The child holds its own copy; this process must not, or lsof would

@@ -11,6 +11,7 @@ jest.mock('./runner-downloader', () => ({
     getConfigDir: jest.fn().mockImplementation((instance: number) => `/Users/test/.localmost/runner/config/${instance}`),
     getSandboxDir: jest.fn().mockImplementation((instance: number) => `/Users/test/.localmost/runner/sandbox/${instance}`),
     getToolCacheDir: jest.fn().mockImplementation((targetId: string) => `/Users/test/.localmost/runner/caches/${targetId}/tool-cache`),
+    getTargetCacheDir: jest.fn().mockImplementation((targetId: string) => `/Users/test/.localmost/runner/caches/${targetId}`),
     buildSandbox: jest.fn().mockImplementation((instance: number) => Promise.resolve(`/Users/test/.localmost/runner/sandbox/${instance}`)),
     isDownloaded: jest.fn().mockReturnValue(true),
     isConfigured: jest.fn().mockImplementation((_instance: number) => true),
@@ -1836,6 +1837,55 @@ describe('RunnerManager', () => {
       const options = await spawnFor();
       expect(options.env?.RUNNER_TOOL_CACHE).toBeUndefined();
       expect(options.toolCacheDir).toBeUndefined();
+    });
+  });
+
+  describe("a worker's package caches", () => {
+    const spawnAt = async (level: 'strict' | 'moderate' | 'permissive') => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({ hosts: [], level, readPaths: [], writePaths: [], docker: {} }),
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+      helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
+      await manager.start();
+      return mockSpawnSandboxed.mock.calls.at(-1)![2]!;
+    };
+    const packages = '/Users/test/.localmost/runner/caches/t1/packages';
+
+    it.each(['moderate', 'permissive'] as const)(
+      "point the package managers at the target's own directory under %s, not the user's home",
+      async (level) => {
+        // moderate used to grant write on ~/.cargo, ~/go, ~/.gradle and the
+        // like, which hold the user's PATH directories and tool config. The
+        // tools are moved rather than the grant kept.
+        const options = await spawnAt(level);
+        expect(options).toHaveProperty('packageCacheDir', packages);
+        expect(fs.mkdirSync).toHaveBeenCalledWith(packages, expect.objectContaining({ recursive: true }));
+        const env = options.env!;
+        for (const key of [
+          'npm_config_cache', 'YARN_CACHE_FOLDER', 'YARN_GLOBAL_FOLDER', 'npm_config_store_dir',
+          'XDG_CACHE_HOME', 'XDG_DATA_HOME', 'CARGO_HOME', 'GRADLE_USER_HOME', 'GOPATH', 'GOCACHE',
+          'PIP_CACHE_DIR', 'NUGET_PACKAGES', 'NUGET_HTTP_CACHE_PATH', 'DOTNET_CLI_HOME',
+          'electron_config_cache', 'npm_config_devdir',
+        ]) {
+          expect(env[key]).toMatch(new RegExp(`^${packages}/`));
+        }
+        expect(env.MAVEN_OPTS).toBe(`-Dmaven.repo.local=${packages}/m2/repository`);
+        // The installed toolchains are still found where the user put them.
+        expect(env.RUSTUP_HOME).toBeUndefined();
+      }
+    );
+
+    it('are not given under strict, which keeps what the repository declares', async () => {
+      const options = await spawnAt('strict');
+      expect(options.packageCacheDir).toBeUndefined();
+      expect(options.env?.CARGO_HOME).toBeUndefined();
+      expect(options.env?.GRADLE_USER_HOME).toBeUndefined();
     });
   });
 

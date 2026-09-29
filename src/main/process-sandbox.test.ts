@@ -425,6 +425,43 @@ describe('Process Sandbox', () => {
       expect(allowRead).not.toContain(`(subpath "${runnerDir}/caches")`);
     });
 
+    it.each(['moderate', 'permissive'] as const)(
+      "writes no toolchain tree in the user's home under %s, only the target's own package caches",
+      (level) => {
+        // ~/.cargo, ~/.local, ~/go and the rest are not only caches: they hold
+        // directories on the user's PATH and config their own unsandboxed
+        // tools load. The job's package managers are pointed at a directory of
+        // its target's instead, and the installed toolchains stay readable.
+        const homeDir = os.homedir();
+        const packages = path.join(homeDir, '.localmost', 'runner', 'caches', 'aaaa1111', 'packages');
+        const profile = profileWith({ filesystemPolicy: { level, read: [], write: [] }, packageCacheDir: packages });
+        const writable = [...profile.matchAll(/\(allow file-write\*\n((?:\s*\(subpath "[^"]*"\)\n?)+)\)/g)]
+          .flatMap((m) => [...m[1].matchAll(/\(subpath "([^"]*)"\)/g)].map((s) => s[1]));
+
+        expect(writable).toContain(packages);
+        for (const w of writable) {
+          // Everything writable in the home is this job's own or its target's.
+          if (w.startsWith(homeDir + '/')) {
+            expect(w === packages || w.startsWith(path.join(homeDir, '.localmost') + '/')).toBe(true);
+          }
+        }
+        for (const tree of ['.cargo', '.rustup', '.local', 'go', '.gradle', '.dotnet', '.npm', 'Library/Caches']) {
+          expect(writable).not.toContain(path.join(homeDir, tree));
+        }
+        // Still readable: the job runs the toolchains the user installed.
+        const allowRead = profile.slice(profile.indexOf('(allow file-read*'), profile.indexOf('(deny file-read*'));
+        expect(allowRead).toContain(`(subpath "${path.join(homeDir, '.cargo')}")`);
+        expect(allowRead).toContain(`(subpath "${path.join(homeDir, '.rustup')}")`);
+        expect(allowRead).toContain(`(subpath "${packages}")`);
+      }
+    );
+
+    it('grants strict no package caches, even if handed one', () => {
+      const packages = path.join(os.homedir(), '.localmost', 'runner', 'caches', 'aaaa1111', 'packages');
+      const profile = profileWith({ filesystemPolicy: { level: 'strict', read: [], write: [] }, packageCacheDir: packages });
+      expect(profile).not.toContain(packages);
+    });
+
     it('grants no tool cache at all when the worker has none', () => {
       // Per-sandbox, or a worker with no target: the runner keeps its tools
       // in the job's own work directory, and no shared path is writable.
