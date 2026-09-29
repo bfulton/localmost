@@ -44,6 +44,14 @@ const MAX_OUTPUT_LINE = 64 * 1024;
 /** The name recorded for a job whose start line was over MAX_OUTPUT_LINE. */
 const OVERLONG_JOB_NAME = '(job name too long to read)';
 
+/** A job's history status from the conclusion GitHub gave it. */
+function statusForConclusion(conclusion: string): JobStatus {
+  if (conclusion === 'success') return 'completed';
+  if (conclusion === 'failure') return 'failed';
+  // 'cancelled', and the others (skipped, etc.)
+  return 'cancelled';
+}
+
 /**
  * Split a worker's output stream into whole lines.
  *
@@ -1147,7 +1155,8 @@ export class RunnerManager {
   }
 
   /**
-   * Start a single runner instance. Used for initial start and re-registration.
+   * Start a slot's worker, for the job spawnWorkerForJob placed in the slot.
+   * Every worker it starts gets the acquisition deadline.
    */
   async startInstance(instanceNum: number): Promise<void> {
     // Prevent concurrent sandbox builds for the same instance
@@ -1535,18 +1544,20 @@ export class RunnerManager {
       const worker = instance.process;
       const isCurrent = () => this.instances.get(instanceNum) === instance && instance.process === worker;
       // One reader per stream: a line is only ever continued on its own stream.
-      // The runner never writes a line this long, so one skipped before the
-      // worker has its job is that job's start, with a name too long to read.
-      // Taken as anything else, the start went unread and the next line - the
-      // tail of the name, after a \n in it - was read as the runner's status.
-      const skipped = (stream: string) => () => {
-        if (isCurrent() && !instance.tookJob) this.recordJobStart(instanceNum, OVERLONG_JOB_NAME);
+      const skipped = (stream: string) => () =>
         this.logInstanceOutput(instanceNum, 'debug', `(${stream}: skipped a line over ${MAX_OUTPUT_LINE} characters)`);
-      };
       const stdout = lineReader((line) => {
         if (isCurrent()) this.parseRunnerOutput(instanceNum, line);
         this.logInstanceOutput(instanceNum, 'debug', line);
-      }, skipped('stdout'));
+      }, () => {
+        // The runner never writes a line this long, so one skipped on stdout -
+        // where it writes a job's start - before the worker has its job is
+        // that job's start, with a name too long to read. Taken as anything
+        // else, the start went unread and the next line - the tail of the
+        // name, after a \n in it - was read as the runner's status.
+        if (isCurrent() && !instance.tookJob) this.recordJobStart(instanceNum, OVERLONG_JOB_NAME);
+        skipped('stdout')();
+      });
       instance.process.stdout?.on('data', (data: Buffer) => stdout.write(data));
       instance.process.stdout?.on('end', () => stdout.end());
 
@@ -1596,6 +1607,18 @@ export class RunnerManager {
           // worker, reparented, burning CPU; the group sweep in process-group
           // probes and signals the group, not just the leader.
           this.sweepWorkerGroup(instanceNum, workerPid);
+          // A job still current here is one whose completion line went unread
+          // - split by a \n in its name, skipped as too long, or never written
+          // by a worker that died mid-job. It is over all the same; left
+          // open, its history read 'running', with Cancel offered, until the
+          // app next started.
+          if (instance.currentJob) {
+            const job = instance.currentJob;
+            this.logSandboxSummary(instanceNum, job.name);
+            this.closeJobOnExit(instanceNum, job, code, signal).catch((err) => {
+              this.log('debug', `Closing job ${job.id} on exit failed: ${(err as Error).message}`);
+            });
+          }
           this.finalizeInstance(instanceNum);
           if (this.acquireDeadlines.has(instanceNum)) {
             this.abandonJobFor(instanceNum);
@@ -2277,6 +2300,42 @@ export class RunnerManager {
     });
   }
 
+  /**
+   * Close the history entry of a job whose worker exited before its
+   * completion line was read. GitHub's conclusion when it has one, as for a
+   * completion line; otherwise what the exit says - a signal or a stop is a
+   * cancel, a clean exit a completed job, any other a failed one.
+   */
+  private async closeJobOnExit(
+    instanceNum: number,
+    job: NonNullable<RunnerInstance['currentJob']>,
+    code: number | null,
+    signal: NodeJS.Signals | null
+  ): Promise<void> {
+    let status: JobStatus = signal !== null || this.stopping ? 'cancelled' : code === 0 ? 'completed' : 'failed';
+    const [owner, repo] = job.repository.split('/');
+    if (this.getJobConclusion && job.githubJobId && owner && repo) {
+      try {
+        const conclusion = await this.getJobConclusion(owner, repo, job.githubJobId);
+        if (conclusion !== null) status = statusForConclusion(conclusion);
+      } catch {
+        // Fall back to what the exit says.
+      }
+    }
+    this.log('info', `[instance ${instanceNum}] Job ${job.name} ended with its worker's exit, its completion unread → status=${status}`);
+
+    // The filter backstop may have closed it while the conclusion was looked
+    // up: it stopped the job, and its record of that stands.
+    const entry = this.jobHistory.find((j) => j.id === job.id);
+    if (!entry || entry.status !== 'running') return;
+    const completedAt = new Date().toISOString();
+    this.updateJobInHistory(job.id, {
+      status,
+      completedAt,
+      runTimeSeconds: Math.round((Date.parse(completedAt) - Date.parse(job.startedAt)) / 1000),
+    });
+  }
+
   private async parseRunnerOutput(instanceNum: number, line: string): Promise<void> {
     const instance = this.instances.get(instanceNum);
     if (!instance) return;
@@ -2405,22 +2464,13 @@ export class RunnerManager {
         if (owner && repo) {
           try {
             const conclusion = await this.getJobConclusion(owner, repo, githubJobId);
-            if (conclusion === 'success') {
-              status = 'completed';
-            } else if (conclusion === 'failure') {
-              status = 'failed';
-            } else if (conclusion === 'cancelled') {
-              status = 'cancelled';
-            } else if (conclusion === null) {
+            if (conclusion === null) {
               // Conclusion not yet set - use runner-reported result
               const result = jobCompleteMatch[2].toLowerCase();
               status = result === 'succeeded' ? 'completed' : result === 'failed' ? 'failed' : 'cancelled';
               this.log('info', `[instance ${instanceNum}] Job completed: ${jobName} conclusion=null, using runner result=${result} → status=${status}`);
             } else {
-              // Other conclusions (skipped, etc.) - treat as cancelled
-              status = 'cancelled';
-            }
-            if (conclusion !== null) {
+              status = statusForConclusion(conclusion);
               this.log('info', `[instance ${instanceNum}] Job completed: ${jobName} conclusion=${conclusion} → status=${status}`);
             }
           } catch {

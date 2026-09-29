@@ -377,8 +377,8 @@ describe('reading a job start whatever its name holds', () => {
 
   it.each([
     ['a CR', 'x\rz', 'x\rz'],
-    ['U+2028', 'x z', 'x z'],
-    ['U+2029', 'x z', 'x z'],
+    ['U+2028', 'x\u2028z', 'x\u2028z'],
+    ['U+2029', 'x\u2029z', 'x\u2029z'],
     // Too long to read as a line; the runner never writes one that long, so
     // before its job only the job's own start line can be.
     ['70 KiB', 'x'.repeat(70 * 1024), expect.stringMatching(/too long/)],
@@ -410,6 +410,79 @@ describe('reading a job start whatever its name holds', () => {
     expect(events.filter((e) => e.type === 'completed')).toEqual([
       expect.objectContaining({ jobName: 'x\rz', status: 'completed' }),
     ]);
+  });
+
+  it.each([
+    // The completion line is split at the name's \n, and neither half is one.
+    ['a \\n', 'x\nJob', 'x'],
+    // The completion line is as long as the start was, and skipped the same.
+    ['70 KiB', 'x'.repeat(70 * 1024), expect.stringMatching(/too long/)],
+  ])('closes the job whose name carries %s when its worker exits, though its completion line went unread', async (_label, name, recorded) => {
+    const { manager, proc, events } = await spawned();
+
+    proc.stdout!.emit('data', Buffer.from(`${TS}Running job: ${name}\n`));
+    proc.stdout!.emit('data', Buffer.from(`${TS}Job ${name} completed with result: Succeeded\n`));
+    proc.emit('exit', 0, null);
+    await settle();
+
+    expect(manager.getJobHistory().map((j) => [j.jobName, j.status])).toEqual([[recorded, 'completed']]);
+    expect(events.filter((e) => e.type === 'completed')).toEqual([
+      expect.objectContaining({ jobName: recorded, status: 'completed' }),
+    ]);
+    expect(manager.hasAvailableSlot()).toBe(true);
+  });
+
+  it.each([
+    ['a conclusion GitHub has', { conclusion: 'failure', code: 0, signal: null }, 'failed'],
+    ['no conclusion yet, and a clean exit', { conclusion: null, code: 0, signal: null }, 'completed'],
+    ['no conclusion yet, and an error exit', { conclusion: null, code: 1, signal: null }, 'failed'],
+    ['no conclusion yet, and a signal', { conclusion: null, code: null, signal: 'SIGKILL' }, 'cancelled'],
+  ] as const)('closes a job whose worker exits mid-job by %s', async (_label, { conclusion, code, signal }, status) => {
+    // No completion line at all: the worker crashed, or was killed, with its
+    // job still running. GitHub's conclusion when it has one, as the
+    // completion line's is; otherwise what the exit says.
+    const getJobConclusion = jest.fn(async () => conclusion);
+    const { manager, helper } = newManager({ getJobConclusion });
+    helper.runnerCount = 1;
+    (fs.existsSync as jest.Mock).mockReturnValue(true);
+    const worker = createMockProcess(24690);
+    mockSpawnSandboxed.mockReturnValue(worker);
+    await helper.spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubJobId: 7 });
+    helper.instances.get(1)!.status = 'listening';
+
+    worker.stdout!.emit('data', Buffer.from(`${TS}Running job: build\n`));
+    await settle();
+    worker.emit('exit', code, signal);
+    await settle();
+
+    expect(getJobConclusion).toHaveBeenCalledWith('owner', 'repo', 7);
+    expect(manager.getJobHistory().map((j) => [j.jobName, j.status])).toEqual([['build', status]]);
+  });
+
+  it('closes a job as cancelled when the pool is stopped under it, though its worker exits cleanly', async () => {
+    // The Listener handles SIGTERM and exits 0: a clean exit here is the stop.
+    const { manager, proc } = await spawned();
+    // Still running, as stop() reads it.
+    (proc as unknown as { exitCode: number | null }).exitCode = null;
+    const kill = stubKill();
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] });
+    try {
+      proc.stdout!.emit('data', Buffer.from(`${TS}Running job: build\n`));
+      await settle();
+
+      const stopped = manager.stop();
+      await settle();
+      expect(kill.calls).toContainEqual([-24680, 'SIGTERM']);
+      proc.emit('exit', 0, null);
+      await stopped;
+      await settle();
+
+      expect(manager.getJobHistory().map((j) => [j.jobName, j.status])).toEqual([['build', 'cancelled']]);
+    } finally {
+      jest.clearAllTimers();
+      jest.useRealTimers();
+      kill.restore();
+    }
   });
 });
 
@@ -585,6 +658,42 @@ describe("splitting a worker's output into lines", () => {
 
     // The new worker's own output is read as ever.
     next.stdout!.emit('data', Buffer.from('Running job: build\n'));
+    await settle();
+    expect(started(events)).toEqual(['build']);
+  });
+
+  it("does not take an exited worker's last over-long line as the start of the worker that replaced it", async () => {
+    // Taken there, the new worker would read as having its job: its deadline
+    // disarmed, its status no longer read, and its real start ignored.
+    const { manager, helper, proc, events } = await spawned();
+    proc.emit('exit', 0, null);
+    await settle();
+    const next = createMockProcess(24681);
+    mockSpawnSandboxed.mockReturnValue(next);
+    await helper.spawnForJob();
+    helper.instances.get(1)!.status = 'listening';
+
+    proc.stdout!.emit('data', Buffer.from('x'.repeat(70 * 1024)));
+    proc.stdout!.emit('end');
+    await settle();
+
+    const instance = helper.instances.get(1)!;
+    expect(instance.process).toBe(next);
+    expect(instance.currentJob).toBeNull();
+    expect(instance.status).toBe('listening');
+    expect(started(events)).toEqual([]);
+    expect((manager as never as { acquireDeadlines: Map<number, unknown> }).acquireDeadlines.has(1)).toBe(true);
+  });
+
+  it('takes an over-long line as the job start only on stdout, where the runner writes it', async () => {
+    const { helper, proc, events } = await spawned();
+
+    proc.stderr!.emit('data', Buffer.from(`${'x'.repeat(70 * 1024)}\n`));
+    await settle();
+    expect(helper.instances.get(1)!.currentJob).toBeNull();
+    expect(started(events)).toEqual([]);
+
+    proc.stdout!.emit('data', Buffer.from('Running job: build\n'));
     await settle();
     expect(started(events)).toEqual(['build']);
   });
@@ -785,6 +894,32 @@ describe('the job-start backstop', () => {
       expect(getJobConclusion).toHaveBeenCalled();
       proc.emit('exit', 0, null);
       await settle();
+      expect(entryOf(manager).status).toBe('cancelled');
+
+      conclude('success');
+      await settle();
+
+      expect(entryOf(manager).status).toBe('cancelled');
+      expect(events.filter((e) => e.type === 'completed' && e.jobName === 'build')).toHaveLength(1);
+    } finally {
+      kill.restore();
+    }
+  });
+
+  it('keeps the job cancelled when its worker exits with no completion line and the lookup on exit is still out', async () => {
+    // The exit closes a job whose completion went unread, from GitHub's
+    // conclusion; the backstop's close lands while that is looked up.
+    let conclude: (conclusion: string | null) => void = () => undefined;
+    const getJobConclusion = jest.fn(() => new Promise<string | null>((resolve) => { conclude = resolve; }));
+    const { manager, proc, events } = await claimed(ok, { githubJobId: 7 }, { getJobConclusion });
+    const kill = stubKill();
+    try {
+      proc.stdout!.emit('data', Buffer.from('Running job: build\n'));
+      await settle();
+      expect(kill.calls).toContainEqual([-13579, 'SIGTERM']);
+      proc.emit('exit', 0, null);
+      await settle();
+      expect(getJobConclusion).toHaveBeenCalled();
       expect(entryOf(manager).status).toBe('cancelled');
 
       conclude('success');

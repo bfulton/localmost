@@ -218,7 +218,7 @@ export class RunnerManagerTestHelper {
 
   /**
    * Bring the pool up and start a worker in a slot with no job context, as
-   * restarting an instance after re-registration does.
+   * no production path does any longer.
    */
   async startWorkerWithoutJob(instanceNum = 1): Promise<void> {
     await this.manager.initialize();
