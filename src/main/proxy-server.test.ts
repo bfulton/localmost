@@ -7,20 +7,28 @@
 
 import * as http from 'http';
 import * as net from 'net';
-import { ProxyServer, parseConnectTarget } from './proxy-server';
+import { ProxyLogEntry, ProxyServer, parseConnectTarget } from './proxy-server';
 import { SandboxPolicyLevel } from '../shared/types';
+import { pinnedLookup } from '../shared/egress-screen';
 
 type AccessDecision = { allowed: boolean; reason?: string };
 
 /**
- * Ask a proxy whether a host is allowed.
+ * Ask a proxy whether a host is allowed, by default as a CONNECT to 443.
  * checkHostAccess is private; this mirrors the access pattern used in
  * discovery-proxy.test.ts so we exercise the real decision function.
  */
-function checkHost(proxy: ProxyServer, host: string): AccessDecision {
+function checkHost(
+  proxy: ProxyServer,
+  host: string,
+  port = 443,
+  via: 'connect' | 'http' = 'connect'
+): AccessDecision {
   return (
-    proxy as unknown as { checkHostAccess(host: string): AccessDecision }
-  ).checkHostAccess(host);
+    proxy as unknown as {
+      checkHostAccess(host: string, port: number, via: 'connect' | 'http'): AccessDecision;
+    }
+  ).checkHostAccess(host, port, via);
 }
 
 function makeProxy(
@@ -186,6 +194,273 @@ describe('ProxyServer host access', () => {
       expect(
         checkHost(makeProxy('strict'), 'notgithub.com').allowed
       ).toBe(false);
+    });
+  });
+
+  // =========================================================================
+  // Ports
+  //
+  // A host on the allowlist is reached on the port its scheme uses - 443
+  // through CONNECT, 80 for plain HTTP - and on another port only when the
+  // policy spells host:port. Allowing a name used to allow every port on it:
+  // github.com:22, or any service a CDN or cloud host happens to expose.
+  // =========================================================================
+
+  describe('ports', () => {
+    it('refuses an allowed host on a port its scheme does not use', () => {
+      const proxy = makeProxy('strict');
+      expect(checkHost(proxy, 'github.com', 22)).toEqual({ allowed: false, reason: 'port' });
+      expect(checkHost(proxy, 'github.com', 80, 'connect').allowed).toBe(false);
+      expect(checkHost(proxy, 'github.com', 443, 'http').allowed).toBe(false);
+      expect(checkHost(proxy, 'github.com', 443, 'connect').allowed).toBe(true);
+      expect(checkHost(proxy, 'github.com', 80, 'http').allowed).toBe(true);
+    });
+
+    it('pins the moderate defaults and the policy hosts the same way', () => {
+      expect(checkHost(makeProxy('moderate'), 'registry.npmjs.org', 8443).reason).toBe('port');
+      const proxy = makeProxy('strict', ['svc.example.test', '*.cdn.example.test']);
+      expect(checkHost(proxy, 'svc.example.test', 8443)).toEqual({ allowed: false, reason: 'port' });
+      expect(checkHost(proxy, 'a.cdn.example.test', 8080, 'http').allowed).toBe(false);
+      expect(checkHost(proxy, 'svc.example.test', 443).allowed).toBe(true);
+    });
+
+    it('allows the port a policy entry spells, and only that port', () => {
+      const proxy = makeProxy('strict', ['svc.example.test:8443', '*.cdn.example.test:8080']);
+      expect(checkHost(proxy, 'svc.example.test', 8443)).toEqual({ allowed: true, reason: 'policy' });
+      expect(checkHost(proxy, 'svc.example.test', 8443, 'http').allowed).toBe(true);
+      expect(checkHost(proxy, 'svc.example.test', 443).allowed).toBe(false);
+      expect(checkHost(proxy, 'svc.example.test', 8444).allowed).toBe(false);
+      expect(checkHost(proxy, 'a.cdn.example.test', 8080, 'http').allowed).toBe(true);
+      expect(checkHost(proxy, 'cdn.example.test', 8080, 'http').allowed).toBe(false);
+    });
+
+    it('lets a spelled port reach an infrastructure host on it', () => {
+      expect(checkHost(makeProxy('strict', ['github.com:22']), 'github.com', 22)).toEqual({ allowed: true, reason: 'policy' });
+    });
+
+    it('matches nothing with an entry whose port is not a port', () => {
+      const proxy = makeProxy('strict', ['svc.example.test:https', 'svc.example.test:0', 'svc.example.test:65536']);
+      expect(checkHost(proxy, 'svc.example.test', 443).allowed).toBe(false);
+      expect(checkHost(proxy, 'svc.example.test', 0).allowed).toBe(false);
+    });
+
+    it('reads a bare IPv6 entry as an address, not as an address and a port', () => {
+      const proxy = makeProxy('strict', ['2606:4700::1111', '[2606:4700::64]:8443']);
+      expect(checkHost(proxy, '2606:4700::1111', 443).allowed).toBe(true);
+      expect(checkHost(proxy, '2606:4700::1111', 1111).allowed).toBe(false);
+      expect(checkHost(proxy, '2606:4700::64', 8443).allowed).toBe(true);
+      expect(checkHost(proxy, '2606:4700::64', 443).allowed).toBe(false);
+    });
+
+    it.each(['strict', 'moderate'] as const)('leaves loopback targets on any port under %s', (level) => {
+      // The broker is reached at 127.0.0.1 on its own port, over plain HTTP.
+      const proxy = makeProxy(level);
+      expect(checkHost(proxy, '127.0.0.1', 8787, 'http').allowed).toBe(true);
+      expect(checkHost(proxy, '127.0.0.1', 8787, 'connect').allowed).toBe(true);
+      expect(checkHost(proxy, 'localhost', 9229, 'http').allowed).toBe(true);
+    });
+
+    it('leaves permissive unrestricted, ports included', () => {
+      const proxy = makeProxy('permissive');
+      expect(checkHost(proxy, 'evil.example.com', 22).allowed).toBe(true);
+      expect(checkHost(proxy, '::1', 5432).allowed).toBe(true);
+    });
+
+    const authHeader = (token: string) => 'Basic ' + Buffer.from(`localmost:${token}`).toString('base64');
+    /** A proxy whose resolver never answers: a refusal has to come before the lookup. */
+    const refusingBeforeLookup = async () => {
+      const p = new ProxyServer({ policyLevel: 'strict', authToken: 't', lookup: () => new Promise<string[]>(() => undefined) });
+      await p.start();
+      return p;
+    };
+
+    it('answers 403 to CONNECT github.com:22 without resolving it', async () => {
+      const p = await refusingBeforeLookup();
+      try {
+        const status = await new Promise<string>((resolve) => {
+          const sock = net.connect(p.getPort(), '127.0.0.1', () =>
+            sock.write(`CONNECT github.com:22 HTTP/1.1\r\nHost: github.com:22\r\nProxy-Authorization: ${authHeader('t')}\r\n\r\n`)
+          );
+          sock.on('error', () => resolve('closed'));
+          sock.once('data', (d) => { resolve(d.toString().split('\r\n')[0]); sock.destroy(); });
+          setTimeout(() => { resolve('timeout'); sock.destroy(); }, 1000).unref();
+        });
+        expect(status).toBe('HTTP/1.1 403 Forbidden');
+      } finally { await p.stop(); }
+    });
+
+    it('tells a plain request which port was refused and how to allow it', async () => {
+      const p = await refusingBeforeLookup();
+      try {
+        const answer = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+          const req = http.request(
+            { hostname: '127.0.0.1', port: p.getPort(), path: 'http://github.com:8080/', method: 'GET', headers: { 'proxy-authorization': authHeader('t') } },
+            (res) => {
+              let body = '';
+              res.on('data', (d) => { body += d; });
+              res.on('end', () => resolve({ status: res.statusCode || 0, body }));
+            }
+          );
+          req.on('error', reject);
+          req.setTimeout(1000, () => req.destroy(new Error('timeout')));
+          req.end();
+        });
+        expect(answer.status).toBe(403);
+        expect(answer.body).toContain('port 8080');
+        expect(answer.body).toContain("'github.com:8080'");
+      } finally { await p.stop(); }
+    });
+  });
+
+  // =========================================================================
+  // Denied hosts
+  //
+  // network.deny in .localmostrc was parsed, shown and approved, and then
+  // never applied: a repository that denied a host still reached it through
+  // its own allow wildcard or the level's defaults.
+  // =========================================================================
+
+  describe('denied hosts', () => {
+    const denying = (level: SandboxPolicyLevel, denied: string[], allowed?: string[]) => {
+      const proxy = makeProxy(level, allowed);
+      proxy.setPolicyDeniedHosts(denied);
+      return proxy;
+    };
+
+    it('refuses a denied host the level would allow', () => {
+      const proxy = denying('moderate', ['*.cloudfront.net']);
+      expect(checkHost(proxy, 'd1.cloudfront.net')).toEqual({ allowed: false, reason: 'denied' });
+      expect(checkHost(proxy, 'registry.npmjs.org').allowed).toBe(true);
+    });
+
+    it("refuses a denied host the policy's own allow wildcard covers", () => {
+      const proxy = denying('strict', ['bad.example.com'], ['*.example.com']);
+      expect(checkHost(proxy, 'bad.example.com')).toEqual({ allowed: false, reason: 'denied' });
+      expect(checkHost(proxy, 'good.example.com').allowed).toBe(true);
+    });
+
+    it('refuses a denied host under permissive too', () => {
+      expect(checkHost(denying('permissive', ['evil.example.com']), 'evil.example.com').allowed).toBe(false);
+    });
+
+    it('matches a denied wildcard like an allowed one', () => {
+      const proxy = denying('permissive', ['*.example.com']);
+      expect(checkHost(proxy, 'a.b.example.com').allowed).toBe(false);
+      expect(checkHost(proxy, 'example.com').allowed).toBe(true);
+      expect(checkHost(proxy, 'badexample.com').allowed).toBe(true);
+    });
+
+    it('leaves the runner infrastructure reachable on its scheme port', () => {
+      // Denying these would leave a runner that cannot report its own job.
+      const proxy = denying('strict', ['github.com', '*.blob.core.windows.net', '127.0.0.1']);
+      expect(checkHost(proxy, 'github.com').reason).toBe('infrastructure');
+      expect(checkHost(proxy, 'x.blob.core.windows.net').reason).toBe('infrastructure');
+      expect(checkHost(proxy, '127.0.0.1', 8787, 'http').reason).toBe('infrastructure');
+    });
+
+    it('wins over an allow entry that spells a port', () => {
+      const proxy = denying('strict', ['github.com'], ['github.com:22']);
+      expect(checkHost(proxy, 'github.com', 22)).toEqual({ allowed: false, reason: 'denied' });
+    });
+
+    it('denies only the port a deny entry spells', () => {
+      const proxy = denying('permissive', ['svc.example.test:8443']);
+      expect(checkHost(proxy, 'svc.example.test', 8443).allowed).toBe(false);
+      expect(checkHost(proxy, 'svc.example.test', 443).allowed).toBe(true);
+    });
+
+    it('denies every port for an entry whose port is not a port', () => {
+      // Allowing nothing is the safe reading of a bad allow entry; for a deny
+      // the safe reading is the host on every port.
+      expect(checkHost(denying('permissive', ['svc.example.test:https']), 'svc.example.test', 443).allowed).toBe(false);
+    });
+
+    it('is not escaped by case, a trailing dot or the other spelling of an IDN', () => {
+      const proxy = denying('permissive', ['Bad.Example.com', 'bücher.example', 'xn--caf-dma.example']);
+      expect(checkHost(proxy, 'bad.example.com.').allowed).toBe(false);
+      expect(checkHost(proxy, 'BAD.EXAMPLE.COM').allowed).toBe(false);
+      expect(checkHost(proxy, 'xn--bcher-kva.example').allowed).toBe(false);
+      expect(checkHost(proxy, 'café.example').allowed).toBe(false);
+    });
+
+    it('is not escaped by a non-ASCII full stop or another spelling of an IPv6 address', () => {
+      // The IDNA mapping turns U+3002 and U+FF0E into an ASCII dot, so
+      // 'bad.example.com\u3002' is bad.example.com with a trailing dot; the
+      // resolver dials it as such.
+      const proxy = denying('permissive', ['bad.example.com', '*.evil.test', '2001:db8::1', '[2001:DB8::2]']);
+      expect(checkHost(proxy, 'bad.example.com\u3002').allowed).toBe(false);
+      expect(checkHost(proxy, 'x.evil.test\uff0e').allowed).toBe(false);
+      expect(checkHost(proxy, '2001:0db8:0::1').allowed).toBe(false);
+      expect(checkHost(proxy, '2001:db8:0:0:0:0:0:2').allowed).toBe(false);
+      expect(checkHost(proxy, '2001:db8::3').allowed).toBe(true);
+    });
+
+    it('replaces the previous job\'s denied hosts rather than accumulating', () => {
+      const proxy = denying('permissive', ['a.example.com']);
+      proxy.setPolicyDeniedHosts(['b.example.com']);
+      expect(checkHost(proxy, 'a.example.com').allowed).toBe(true);
+      expect(checkHost(proxy, 'b.example.com').allowed).toBe(false);
+    });
+
+    const authHeader = (token: string) => 'Basic ' + Buffer.from(`localmost:${token}`).toString('base64');
+
+    it('answers 403 to a CONNECT to a denied host without resolving it', async () => {
+      const p = new ProxyServer({ policyLevel: 'moderate', authToken: 't', lookup: () => new Promise<string[]>(() => undefined) });
+      p.setPolicyDeniedHosts(['*.cloudfront.net']);
+      await p.start();
+      try {
+        const status = await new Promise<string>((resolve) => {
+          const sock = net.connect(p.getPort(), '127.0.0.1', () =>
+            sock.write(`CONNECT d1.cloudfront.net:443 HTTP/1.1\r\nHost: d1.cloudfront.net:443\r\nProxy-Authorization: ${authHeader('t')}\r\n\r\n`)
+          );
+          sock.on('error', () => resolve('closed'));
+          sock.once('data', (d) => { resolve(d.toString().split('\r\n')[0]); sock.destroy(); });
+          setTimeout(() => { resolve('timeout'); sock.destroy(); }, 1000).unref();
+        });
+        expect(status).toBe('HTTP/1.1 403 Forbidden');
+      } finally { await p.stop(); }
+    });
+
+    it('answers 403 to a CONNECT that writes a denied IPv6 address the long way', async () => {
+      // A CONNECT target is not a URL, so nothing on the way in compresses
+      // the address; before, [2001:0db8:0::1] went through and was dialled.
+      const p = new ProxyServer({ policyLevel: 'permissive', authToken: 't', lookup: () => new Promise<string[]>(() => undefined) });
+      p.setPolicyDeniedHosts(['2001:db8::1']);
+      await p.start();
+      try {
+        const status = await new Promise<string>((resolve) => {
+          const sock = net.connect(p.getPort(), '127.0.0.1', () =>
+            sock.write(`CONNECT [2001:0db8:0::1]:443 HTTP/1.1\r\nProxy-Authorization: ${authHeader('t')}\r\n\r\n`)
+          );
+          sock.on('error', () => resolve('closed'));
+          sock.once('data', (d) => { resolve(d.toString().split('\r\n')[0]); sock.destroy(); });
+          setTimeout(() => { resolve('timeout'); sock.destroy(); }, 1000).unref();
+        });
+        expect(status).toBe('HTTP/1.1 403 Forbidden');
+      } finally { await p.stop(); }
+    });
+
+    it('tells a plain request its host is denied', async () => {
+      const p = new ProxyServer({ policyLevel: 'permissive', authToken: 't', lookup: () => new Promise<string[]>(() => undefined) });
+      p.setPolicyDeniedHosts(['evil.example.com']);
+      await p.start();
+      try {
+        const answer = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+          const req = http.request(
+            { hostname: '127.0.0.1', port: p.getPort(), path: 'http://evil.example.com/', method: 'GET', headers: { 'proxy-authorization': authHeader('t') } },
+            (res) => {
+              let body = '';
+              res.on('data', (d) => { body += d; });
+              res.on('end', () => resolve({ status: res.statusCode || 0, body }));
+            }
+          );
+          req.on('error', reject);
+          req.setTimeout(1000, () => req.destroy(new Error('timeout')));
+          req.end();
+        });
+        expect(answer.status).toBe(403);
+        expect(answer.body).toContain('denied');
+      } finally { await p.stop(); }
     });
   });
 
@@ -420,6 +695,62 @@ describe('screening the address a host resolves to', () => {
   });
 });
 
+describe('a request the screen refuses', () => {
+  // The name check passes before the address screen runs, and the request
+  // used to be logged as allowed there and then again as blocked: one
+  // request counted twice, once each way, in the job's summary.
+  const logged = async (send: (proxyPort: number) => Promise<unknown>, onJobAcquired?: () => Promise<void>) => {
+    const entries: ProxyLogEntry[] = [];
+    const p = new ProxyServer({
+      policyLevel: 'permissive',
+      lookup: async () => ['10.0.0.1'],
+      onLog: (e) => entries.push(e),
+      onJobAcquired,
+    });
+    await p.start();
+    try {
+      await send(p.getPort());
+      return { entries, stats: p.getStats() };
+    } finally { await p.stop(); }
+  };
+  const plain = (method: string, url: string) => (proxyPort: number) =>
+    new Promise<number>((resolve, reject) => {
+      const req = http.request({ hostname: '127.0.0.1', port: proxyPort, path: url, method, headers: { 'content-length': '2' } },
+        (res) => { res.resume(); resolve(res.statusCode || 0); });
+      req.on('error', reject);
+      req.end('{}');
+    });
+  const tunnel = (target: string) => (proxyPort: number) =>
+    new Promise<string>((resolve) => {
+      const sock = net.connect(proxyPort, '127.0.0.1', () => sock.write(`CONNECT ${target} HTTP/1.1\r\n\r\n`));
+      sock.on('error', () => resolve('closed'));
+      sock.once('data', (d) => { resolve(d.toString().split('\r\n')[0]); sock.destroy(); });
+    });
+
+  it.each([
+    ['a plain request', () => logged(plain('GET', 'http://internal.test/'))],
+    ['a replayed acquirejob', () => logged(plain('POST', 'http://internal.test/_apis/x/acquirejob'), async () => undefined)],
+    ['a CONNECT', () => logged(tunnel('internal.test:443'))],
+  ])('logs %s once, as blocked', async (_name, run) => {
+    const { entries, stats } = await run();
+    expect(entries.map((e) => e.blocked)).toEqual([true]);
+    expect(stats.allowedCount).toBe(0);
+    expect(stats.blockedCount).toBe(1);
+  });
+
+  it('logs an allowed request once, as allowed', async () => {
+    const entries: ProxyLogEntry[] = [];
+    const up = http.createServer((_req, res) => res.end('ok'));
+    await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
+    const p = new ProxyServer({ policyLevel: 'strict', onLog: (e) => entries.push(e) });
+    await p.start();
+    try {
+      expect(await plain('GET', `http://127.0.0.1:${(up.address() as net.AddressInfo).port}/`)(p.getPort())).toBe(200);
+      expect(entries.map((e) => e.blocked)).toEqual([false]);
+    } finally { up.closeAllConnections(); up.close(); await p.stop(); }
+  });
+});
+
 describe('a worker may use only its own proxy', () => {
   const authHeader = (token: string) => 'Basic ' + Buffer.from(`localmost:${token}`).toString('base64');
   const get = (port: number, header?: string) =>
@@ -627,7 +958,13 @@ describe('CONNECT targets', () => {
   it.each([
     ['[::1]:443', { host: '::1', port: 443 }],
     ['[2606:4700:4700::1111]:443', { host: '2606:4700:4700::1111', port: 443 }],
-    ['[::ffff:127.0.0.1]:443', { host: '::ffff:127.0.0.1', port: 443 }],
+    ['[::ffff:127.0.0.1]:443', { host: '::ffff:7f00:1', port: 443 }],
+    // One spelling for every check and for the dial: an IPv6 literal
+    // compressed, a name lowercased and in its ASCII form, with an IDNA full
+    // stop mapped to the '.' the resolver reads it as.
+    ['[2001:0DB8:0::1]:443', { host: '2001:db8::1', port: 443 }],
+    ['Bad.Example.com\u3002:443', { host: 'bad.example.com.', port: 443 }],
+    ['caf\u00e9.example:443', { host: 'xn--caf-dma.example', port: 443 }],
     ['api.github.com:80', { host: 'api.github.com', port: 80 }],
     ['127.0.0.1:8787', { host: '127.0.0.1', port: 8787 }],
     ['api.github.com', { host: 'api.github.com', port: 443 }],
@@ -638,6 +975,7 @@ describe('CONNECT targets', () => {
   it.each([
     '::1:443', 'host:443:extra', 'host:', ':443', '[1.2.3.4]:443', '[host]:443',
     'api.github.com:99999', 'api.github.com:-1', 'api.github.com:0', 'api.github.com:443@10.0.0.1:80', 'a/b:443', '',
+    'a%zz.example:443', 'a\uff1a8080:443', 'xn--i\u00f1valid.example:443', '[fe80::1%en0]:443',
   ])('refuses %s', (target) => {
     expect(parseConnectTarget(target)).toBeNull();
   });
@@ -714,5 +1052,239 @@ describe('CONNECT targets', () => {
     try {
       expect(await getVia(p.getPort(), 'http://[::ffff:127.0.0.1]/')).toBe(403);
     } finally { await p.stop(); }
+  });
+});
+
+describe('an upstream request ends with its client', () => {
+  // A plain request's upstream is a second connection the proxy opened for
+  // the client. Rotation closes the client's socket, and so does the client
+  // going away, but the upstream request lived on: a response that never
+  // finished, or an upload the upstream was still reading, kept a connection
+  // open to a host the last job's policy allowed.
+  /** An upstream that answers headers and then never finishes. */
+  const hangingUpstream = async () => {
+    let connections = 0;
+    const closed: Promise<void>[] = [];
+    const up = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.write('partial;');
+    });
+    up.on('connection', (sock: net.Socket) => {
+      connections++;
+      closed.push(new Promise<void>((r) => sock.once('close', () => r())));
+    });
+    await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
+    return {
+      up,
+      port: (up.address() as net.AddressInfo).port,
+      connections: () => connections,
+      firstClosed: () => closed[0],
+    };
+  };
+  /** Send a raw request and resolve once the first response bytes arrive. */
+  const open = (proxyPort: number, head: string) =>
+    new Promise<net.Socket>((resolve) => {
+      const sock = net.connect(proxyPort, '127.0.0.1', () => sock.write(head));
+      sock.on('error', () => undefined);
+      sock.once('data', () => resolve(sock));
+    });
+  const within = <T>(p: Promise<T>, ms: number) => {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise((r) => { timer = setTimeout(() => r('still open'), ms); });
+    return Promise.race([p.then(() => 'closed'), timeout]).finally(() => clearTimeout(timer));
+  };
+
+  it('closes the upstream when the token rotates mid-response', async () => {
+    const h = await hangingUpstream();
+    const p = new ProxyServer({ policyLevel: 'permissive' });
+    await p.start();
+    try {
+      await open(p.getPort(), `GET http://127.0.0.1:${h.port}/ HTTP/1.1\r\nHost: 127.0.0.1:${h.port}\r\n\r\n`);
+      p.rotateAuthToken('next');
+      expect(await within(h.firstClosed(), 500)).toBe('closed');
+    } finally { h.up.closeAllConnections(); h.up.close(); await p.stop(); }
+  });
+
+  it('closes the upstream when the client goes away mid-response', async () => {
+    const h = await hangingUpstream();
+    const p = new ProxyServer({ policyLevel: 'permissive' });
+    await p.start();
+    try {
+      const sock = await open(p.getPort(), `GET http://127.0.0.1:${h.port}/ HTTP/1.1\r\nHost: 127.0.0.1:${h.port}\r\n\r\n`);
+      sock.destroy();
+      expect(await within(h.firstClosed(), 500)).toBe('closed');
+    } finally { h.up.closeAllConnections(); h.up.close(); await p.stop(); }
+  });
+
+  it('closes a replayed acquirejob upstream when the client goes away', async () => {
+    const h = await hangingUpstream();
+    const p = new ProxyServer({ policyLevel: 'permissive', onJobAcquired: async () => undefined });
+    await p.start();
+    try {
+      const sock = await open(
+        p.getPort(),
+        `POST http://127.0.0.1:${h.port}/_apis/x/acquirejob HTTP/1.1\r\nHost: 127.0.0.1:${h.port}\r\nContent-Length: 2\r\n\r\n{}`
+      );
+      sock.destroy();
+      expect(await within(h.firstClosed(), 500)).toBe('closed');
+    } finally { h.up.closeAllConnections(); h.up.close(); await p.stop(); }
+  });
+
+  it('ends the client\'s response when the upstream dies partway through its body', async () => {
+    // pipe() leaves its destination open when the source errors, so the
+    // client sat on a response that would never finish until its own timeout.
+    const up = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { 'content-length': '1000' });
+      res.write('partial;', () => res.socket?.destroy());
+    });
+    await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
+    const upPort = (up.address() as net.AddressInfo).port;
+    const p = new ProxyServer({ policyLevel: 'permissive' });
+    await p.start();
+    try {
+      const sock = await open(p.getPort(), `GET http://127.0.0.1:${upPort}/ HTTP/1.1\r\nHost: 127.0.0.1:${upPort}\r\n\r\n`);
+      const closed = new Promise<void>((r) => sock.once('close', () => r()));
+      try {
+        expect(await within(closed, 500)).toBe('closed');
+      } finally { sock.destroy(); }
+    } finally { up.closeAllConnections(); up.close(); await p.stop(); }
+  });
+
+  it('does not dial at all when the client left while its name was resolving', async () => {
+    // The pinned lookup is pointed at the local upstream so a connection, if
+    // one were made, would land somewhere this test can see.
+    const h = await hangingUpstream();
+    const p = new ProxyServer({
+      policyLevel: 'permissive',
+      lookup: () => new Promise<string[]>((r) => setTimeout(() => r(['203.0.113.7']), 200)),
+    });
+    (p as unknown as { pinnedLookup: (a: string[]) => unknown }).pinnedLookup = () => pinnedLookup(['127.0.0.1']);
+    await p.start();
+    try {
+      const sock = net.connect(p.getPort(), '127.0.0.1', () =>
+        sock.write(`GET http://slow.test:${h.port}/ HTTP/1.1\r\nHost: slow.test:${h.port}\r\n\r\n`)
+      );
+      sock.on('error', () => undefined);
+      await new Promise((r) => setTimeout(r, 50));
+      sock.destroy();
+      await new Promise((r) => setTimeout(r, 400));
+      expect(h.connections()).toBe(0);
+    } finally { h.up.closeAllConnections(); h.up.close(); await p.stop(); }
+  });
+});
+
+describe('the Host an upstream sees', () => {
+  // The proxy decides by the host in the request line; the Host header is
+  // the client's to write. Forwarded as written, a request the policy allowed
+  // for one host asked a shared front end (a CDN, a cloud load balancer) for
+  // another, which the policy never allowed.
+  const upstreamHosts = async () => {
+    const seen: (string | undefined)[] = [];
+    const up = http.createServer((req, res) => { seen.push(req.headers.host); res.end('ok'); });
+    await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
+    return { up, seen, port: (up.address() as net.AddressInfo).port };
+  };
+  const send = (proxyPort: number, method: string, url: string, body?: string) =>
+    new Promise<number>((resolve, reject) => {
+      const headers: Record<string, string> = { host: 'evil.test' };
+      if (body !== undefined) headers['content-length'] = String(body.length);
+      const req = http.request(
+        { hostname: '127.0.0.1', port: proxyPort, path: url, method, headers },
+        (res) => { res.resume(); resolve(res.statusCode || 0); }
+      );
+      req.on('error', reject);
+      req.end(body);
+    });
+
+  it('is the host the request was checked against, not the Host header sent', async () => {
+    const { up, seen, port } = await upstreamHosts();
+    const p = new ProxyServer({ policyLevel: 'strict' });
+    await p.start();
+    try {
+      expect(await send(p.getPort(), 'GET', `http://127.0.0.1:${port}/`)).toBe(200);
+      expect(seen).toEqual([`127.0.0.1:${port}`]);
+    } finally { up.closeAllConnections(); up.close(); await p.stop(); }
+  });
+
+  it('is the checked host on a replayed acquirejob too', async () => {
+    const { up, seen, port } = await upstreamHosts();
+    const p = new ProxyServer({ policyLevel: 'strict', onJobAcquired: async () => undefined });
+    await p.start();
+    try {
+      expect(await send(p.getPort(), 'POST', `http://127.0.0.1:${port}/_apis/x/acquirejob`, '{}')).toBe(200);
+      expect(seen).toEqual([`127.0.0.1:${port}`]);
+    } finally { up.closeAllConnections(); up.close(); await p.stop(); }
+  });
+});
+
+describe('the acquirejob forward is screened like every other request', () => {
+  // acquirejob is buffered and replayed, so it has its own upstream request.
+  // That request dialled by name through the system resolver, unscreened: a
+  // name on the allowlist that resolves inside - loopback, a private range,
+  // the metadata endpoint - reached it, and a second resolution could differ
+  // from anything a screen had seen.
+  const post = (proxyPort: number, url: string) =>
+    new Promise<number>((resolve, reject) => {
+      const body = JSON.stringify({ jobMessageId: 'msg-1' });
+      const req = http.request(
+        {
+          hostname: '127.0.0.1', port: proxyPort, path: url, method: 'POST',
+          headers: { 'content-type': 'application/json', 'content-length': String(body.length) },
+        },
+        (res) => { res.resume(); resolve(res.statusCode || 0); }
+      );
+      req.on('error', reject);
+      req.end(body);
+    });
+  const acquiring = (options: ConstructorParameters<typeof ProxyServer>[0]) =>
+    new ProxyServer({ onJobAcquired: async () => undefined, ...options });
+
+  it('refuses a name that resolves to loopback and never connects to it', async () => {
+    // 'localhost' is on the infrastructure list, so only the screen stands
+    // between this request and whatever listens on the port. Listening on
+    // '::' takes both 127.0.0.1 and ::1, whichever the name resolves to.
+    let connections = 0;
+    const up = http.createServer((_req, res) => res.end('ok'));
+    up.on('connection', () => { connections++; });
+    await new Promise<void>((r) => up.listen(0, '::', r));
+    const upPort = (up.address() as net.AddressInfo).port;
+    const p = acquiring({ policyLevel: 'permissive' });
+    await p.start();
+    try {
+      expect(await post(p.getPort(), `http://localhost:${upPort}/_apis/x/acquirejob`)).toBe(403);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(connections).toBe(0);
+    } finally { up.close(); await p.stop(); }
+  });
+
+  it('refuses a name that resolves to a private address', async () => {
+    const p = acquiring({ policyLevel: 'permissive', lookup: async () => ['10.0.0.1'] });
+    await p.start();
+    try {
+      expect(await post(p.getPort(), 'http://internal.test/_apis/x/acquirejob')).toBe(403);
+    } finally { await p.stop(); }
+  });
+
+  it('connects to the addresses it screened, not to a second resolution', async () => {
+    // The pinned lookup is swapped for one that records what it was given
+    // and answers with a local upstream, so nothing leaves the machine: the
+    // request arriving there proves the connection used it. The system
+    // resolver has never heard of pinned.test.
+    const up = http.createServer((_req, res) => res.end('ok'));
+    await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
+    const upPort = (up.address() as net.AddressInfo).port;
+    const p = acquiring({ policyLevel: 'permissive', lookup: async () => ['203.0.113.7'] });
+    const pinnedWith: string[][] = [];
+    (p as unknown as { pinnedLookup: (a: string[]) => unknown }).pinnedLookup = (addresses: string[]) => {
+      pinnedWith.push(addresses);
+      return pinnedLookup(['127.0.0.1']);
+    };
+    await p.start();
+    try {
+      expect(await post(p.getPort(), `http://pinned.test:${upPort}/_apis/x/acquirejob`)).toBe(200);
+      expect(pinnedWith).toEqual([['203.0.113.7']]);
+    } finally { up.closeAllConnections(); up.close(); await p.stop(); }
   });
 });

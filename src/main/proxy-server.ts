@@ -13,10 +13,14 @@ import { URL } from 'url';
 import { SandboxPolicyLevel } from '../shared/types';
 import {
   HostLookup,
+  canonicalHost,
   dnsLookup,
+  hostPatternMatches,
   isBlockedAddress,
+  isLoopbackAddress,
   isProxyAuthorized,
   parseConnectTarget,
+  parseHostPattern,
   pinnedLookup,
   screenAddresses,
   stripProxyAuth,
@@ -34,8 +38,12 @@ export interface ProxyLogEntry {
   port: number;
   path?: string;
   blocked: boolean;
-  /** Why the request was allowed/blocked */
-  reason?: 'infrastructure' | 'policy' | 'allowlist' | 'moderate-default' | 'permissive';
+  /**
+   * Why the request was allowed/blocked. 'port' is a refusal of a host that
+   * is allowed, but not on the port asked for; 'denied' of a host the
+   * repository's policy denies.
+   */
+  reason?: 'infrastructure' | 'policy' | 'allowlist' | 'moderate-default' | 'permissive' | 'port' | 'denied';
 }
 
 export type ProxyLogCallback = (entry: ProxyLogEntry) => void;
@@ -86,11 +94,25 @@ export { MODERATE_NETWORK_ALLOWLIST } from '../shared/network-allowlist';
 // for existing importers.
 export { parseConnectTarget } from '../shared/egress-screen';
 
+/**
+ * A name as a deny entry compares it: in canonicalHost's spelling, without
+ * trailing dots. Each is another way to write the same host, and a denied
+ * host must not be reachable by writing it differently. The dots come off
+ * after the mapping, since the mapping is what turns an IDNA full stop into
+ * one. Allow entries are not compared this way - a spelling the allowlist
+ * does not name is refused, which is the safe side for an allow.
+ */
+function denyForm(name: string): string {
+  const lower = name.toLowerCase();
+  return (canonicalHost(lower) ?? lower).replace(/\.+$/, '');
+}
+
 export class ProxyServer {
   private server: http.Server | null = null;
   private port: number;
   private onLog: ProxyLogCallback;
   private policyAllowedHosts: string[];
+  private policyDeniedHosts: string[] = [];
   private static readonly MAX_ACQUIRE_BODY_BYTES = 64 * 1024;
 
   private policyLevel: SandboxPolicyLevel;
@@ -129,7 +151,9 @@ export class ProxyServer {
    *
    * A literal target is trusted as written - the broker is reached at the
    * literal 127.0.0.1, and the sandbox denies the broker port directly so the
-   * proxy is the only path. A name is not: it must resolve entirely to
+   * proxy is the only path. Every job can take that path: what guards the
+   * broker is the per-worker key in its URL, not the proxy or the port. A
+   * name is not trusted as written: it must resolve entirely to
    * routable, off-box addresses, so a repository-controlled hostname cannot
    * rebind to loopback (or any internal range) and reach a local service.
    */
@@ -145,53 +169,97 @@ export class ProxyServer {
   /**
    * Check if a host is allowed through the proxy based on policy level.
    * Returns { allowed: boolean, reason: string } for logging.
+   *
+   * `via` is how the host is asked for: a CONNECT tunnel or a plain HTTP
+   * request. An allowed host is reached on that scheme's port - 443 through
+   * CONNECT, 80 for plain HTTP - and on any other only when a policy entry
+   * spells host:port. Allowing a name used to allow every port on it, so
+   * github.com on the infrastructure list opened github.com:22 to every job.
+   * Loopback targets keep any port: the broker is reached at 127.0.0.1 on its
+   * own, and its per-worker key, not the port, is what guards it.
    */
-  private checkHostAccess(host: string): { allowed: boolean; reason: ProxyLogEntry['reason'] } {
+  private checkHostAccess(
+    host: string,
+    port: number,
+    via: 'connect' | 'http'
+  ): { allowed: boolean; reason: ProxyLogEntry['reason'] } {
     const normalizedHost = host.toLowerCase();
+    const onSchemePort =
+      normalizedHost === 'localhost' || isLoopbackAddress(normalizedHost) || port === (via === 'connect' ? 443 : 80);
 
-    // Permissive: allow everything
-    if (this.policyLevel === 'permissive') {
-      return { allowed: true, reason: 'permissive' };
-    }
-
-    // Helper to check if host matches a pattern
-    const matchesPattern = (pattern: string): boolean => {
-      if (pattern.startsWith('*.')) {
-        // Lowercase the suffix too: patterns come from .localmostrc and are
-        // hand-written, so *.GitHub.com must match api.github.com.
-        const suffix = pattern.slice(1).toLowerCase(); // Remove *
-        return normalizedHost.endsWith(suffix);
-      }
-      return normalizedHost === pattern.toLowerCase();
+    // Patterns are lowercased as they are read: they come from .localmostrc
+    // and are hand-written, so *.GitHub.com must match api.github.com.
+    const names = (entry: string): boolean => hostPatternMatches(parseHostPattern(entry), normalizedHost);
+    // The built-in lists never spell a port.
+    const builtIn = (entry: string): boolean => onSchemePort && names(entry);
+    // A policy entry that spells a port allows that port, and only that one;
+    // one that spells something that is not a port allows nothing.
+    const policyAllows = (entry: string): boolean => {
+      const pattern = parseHostPattern(entry);
+      if (!hostPatternMatches(pattern, normalizedHost)) return false;
+      return pattern.port === undefined ? onSchemePort : pattern.port === port;
     };
 
     // Runner infrastructure is allowed at every level - without it the runner
     // daemon cannot register or poll for jobs.
-    if (RUNNER_INFRASTRUCTURE_ALLOWLIST.some(matchesPattern)) {
+    if (RUNNER_INFRASTRUCTURE_ALLOWLIST.some(builtIn)) {
       return { allowed: true, reason: 'infrastructure' };
     }
 
+    // A host the repository denies is refused whatever its allow list or the
+    // level says. An entry that spells a port denies that port; one that
+    // spells none denies them all, and so does one whose port is not a port,
+    // since denying too much is the safe reading of a deny.
+    const deniedHost = denyForm(normalizedHost);
+    const denies = (entry: string): boolean => {
+      const pattern = parseHostPattern(entry);
+      const named = pattern.wildcard
+        ? deniedHost.endsWith('.' + denyForm(pattern.host.slice(1)))
+        : deniedHost === denyForm(pattern.host);
+      return named && (typeof pattern.port === 'number' ? pattern.port === port : true);
+    };
+    if (this.policyDeniedHosts.some(denies)) {
+      return { allowed: false, reason: 'denied' };
+    }
+
+    // Permissive: allow everything, on any port
+    if (this.policyLevel === 'permissive') {
+      return { allowed: true, reason: 'permissive' };
+    }
+
     // Check policy allowlist (from .localmostrc)
-    if (this.policyAllowedHosts.some(matchesPattern)) {
+    if (this.policyAllowedHosts.some(policyAllows)) {
       return { allowed: true, reason: 'policy' };
     }
 
     // For moderate policy, also check the moderate defaults
-    if (this.policyLevel === 'moderate') {
-      if (MODERATE_NETWORK_ALLOWLIST.some(matchesPattern)) {
-        return { allowed: true, reason: 'moderate-default' };
-      }
+    if (this.policyLevel === 'moderate' && MODERATE_NETWORK_ALLOWLIST.some(builtIn)) {
+      return { allowed: true, reason: 'moderate-default' };
     }
 
     // For strict policy, nothing beyond infrastructure unless declared
-    if (this.policyLevel === 'strict') {
-      if (STRICT_NETWORK_ALLOWLIST.some(matchesPattern)) {
-        return { allowed: true, reason: 'allowlist' };
-      }
+    if (this.policyLevel === 'strict' && STRICT_NETWORK_ALLOWLIST.some(builtIn)) {
+      return { allowed: true, reason: 'allowlist' };
     }
 
-    // Not allowed
-    return { allowed: false, reason: undefined };
+    // Not allowed. A host that would have been allowed on its scheme's port
+    // is logged as refused for the port, so the log points at the fix.
+    const levelList = this.policyLevel === 'moderate' ? MODERATE_NETWORK_ALLOWLIST : STRICT_NETWORK_ALLOWLIST;
+    const named = [RUNNER_INFRASTRUCTURE_ALLOWLIST, this.policyAllowedHosts, levelList].some((list) => list.some(names));
+    return { allowed: false, reason: named ? 'port' : undefined };
+  }
+
+  /** The body of a 403 for a host checkHostAccess refused. */
+  private refusal(host: string, port: number, reason: ProxyLogEntry['reason']): string {
+    if (reason === 'denied') {
+      return `Blocked by sandbox policy (${this.policyLevel}): host '${host}' is denied by the repository's .localmostrc`;
+    }
+    if (reason === 'port') {
+      const authority = net.isIP(host) === 6 ? `[${host}]:${port}` : `${host}:${port}`;
+      return `Blocked by sandbox policy (${this.policyLevel}): port ${port} is not allowed for host '${host}'; ` +
+        `a .localmostrc network entry '${authority}' allows it`;
+    }
+    return `Blocked by sandbox policy (${this.policyLevel}): host '${host}' not in allowlist`;
   }
 
   /**
@@ -255,6 +323,18 @@ export class ProxyServer {
   }
 
   /**
+   * Apply the hosts a repository's .localmostrc denies for the current job.
+   *
+   * Entries read like allowed ones. A denied host is refused at every level,
+   * whatever the policy or the level would allow, except the runner
+   * infrastructure on its scheme's port, which the runner itself cannot do
+   * without. Replaces any previous job's list, as setPolicyAllowedHosts does.
+   */
+  setPolicyDeniedHosts(hosts: string[]): void {
+    this.policyDeniedHosts = [...hosts];
+  }
+
+  /**
    * Set the level for the job about to run.
    *
    * A proxy outlives a single job and serves whichever repository the instance
@@ -291,21 +371,27 @@ export class ProxyServer {
     }
     const { host, port } = target;
 
-    const { allowed, reason } = this.checkHostAccess(host);
-    this.log({ method: 'CONNECT', host, port, blocked: !allowed, reason });
-
+    const { allowed, reason } = this.checkHostAccess(host, port, 'connect');
     if (!allowed) {
+      this.log({ method: 'CONNECT', host, port, blocked: true, reason });
       clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
       clientSocket.destroy();
       return;
     }
 
-    void this.connectScreened(host, port, clientSocket, head);
+    void this.connectScreened(host, port, reason, clientSocket, head);
   }
 
+  /**
+   * Screen what an allowed CONNECT target resolves to and open the tunnel.
+   * The request is logged here, once, when the screen has decided it: an
+   * allowed entry written before the screen refused it counted the one
+   * request as both allowed and blocked.
+   */
   private async connectScreened(
     host: string,
     port: number,
+    reason: ProxyLogEntry['reason'],
     clientSocket: net.Socket,
     head: Buffer
   ): Promise<void> {
@@ -321,6 +407,7 @@ export class ProxyServer {
       clientSocket.destroy();
       return;
     }
+    this.log({ method: 'CONNECT', host, port, blocked: false, reason });
 
     const serverSocket = net.connect({ host, port, lookup: this.pinnedLookup(screened), autoSelectFamily: true }, () => {
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
@@ -351,6 +438,18 @@ export class ProxyServer {
   }
 
   /**
+   * The headers a plain request carries upstream: the client's, without our
+   * credentials, and with Host set to the authority the request line named.
+   * That is the host the policy was checked against; the client's own Host
+   * header is whatever it chose to write, and forwarded as written it asks a
+   * shared front end - a CDN, a cloud load balancer - for a site the policy
+   * never allowed.
+   */
+  private upstreamHeaders(req: http.IncomingMessage, authority: string): http.IncomingHttpHeaders {
+    return { ...stripProxyAuth(req.headers), host: authority };
+  }
+
+  /**
    * Handle regular HTTP requests (proxy them)
    */
   private handleRequest(
@@ -375,16 +474,17 @@ export class ProxyServer {
       // is where this proxy learns which repository it is serving, before the
       // runner fetches a single action for it.
       if (this.onJobAcquired && req.method === 'POST' && url.pathname.endsWith('/acquirejob')) {
-        this.handleAcquireJobRequest(req, res, host, port, path);
+        this.handleAcquireJobRequest(req, res, host, port, path, url.host);
         return;
       }
 
-      const { allowed, reason } = this.checkHostAccess(host);
-      this.log({ method: req.method || 'GET', host, port, path, blocked: !allowed, reason });
-
+      // Logged once, when the decision is final: a refusal here, or the
+      // screen's answer below.
+      const { allowed, reason } = this.checkHostAccess(host, port, 'http');
       if (!allowed) {
+        this.log({ method: req.method || 'GET', host, port, path, blocked: true, reason });
         res.writeHead(403, { 'Content-Type': 'text/plain' });
-        res.end(`Blocked by sandbox policy (${this.policyLevel}): host '${host}' not in allowlist`);
+        res.end(this.refusal(host, port, reason));
         return;
       }
 
@@ -396,27 +496,16 @@ export class ProxyServer {
           req.resume();
           return;
         }
-        const proxyReq = http.request(
-          {
-            hostname: host,
-            port,
-            path,
-            method: req.method,
-            headers: stripProxyAuth(req.headers),
-            lookup: this.pinnedLookup(screened),
-          },
-          (proxyRes) => {
-            res.writeHead(proxyRes.statusCode || 500, proxyRes.headers);
-            proxyRes.pipe(res);
-          }
-        );
-
-        proxyReq.on('error', (err) => {
-          res.writeHead(502, { 'Content-Type': 'text/plain' });
-          res.end(`Proxy error: ${err.message}`);
+        this.log({ method: req.method || 'GET', host, port, path, blocked: false, reason });
+        const proxyReq = this.openUpstream(req, res, {
+          hostname: host,
+          port,
+          path,
+          method: req.method,
+          headers: this.upstreamHeaders(req, url.host),
+          lookup: this.pinnedLookup(screened),
         });
-
-        req.pipe(proxyReq);
+        if (proxyReq) req.pipe(proxyReq);
       });
     } catch (err) {
       res.writeHead(400, { 'Content-Type': 'text/plain' });
@@ -435,16 +524,17 @@ export class ProxyServer {
     res: http.ServerResponse,
     host: string,
     port: number,
-    path: string
+    path: string,
+    authority: string
   ): void {
     // Check the destination before reading anything. Buffering first would let
     // any request to a path ending in /acquirejob consume memory even when the
     // host is blocked outright.
-    const { allowed, reason } = this.checkHostAccess(host);
+    const { allowed, reason } = this.checkHostAccess(host, port, 'http');
     if (!allowed) {
       this.log({ method: req.method || 'POST', host, port, path, blocked: true, reason });
       res.writeHead(403, { 'Content-Type': 'text/plain' });
-      res.end(`Blocked by sandbox policy (${this.policyLevel}): host '${host}' not in allowlist`);
+      res.end(this.refusal(host, port, reason));
       req.resume();
       return;
     }
@@ -491,7 +581,7 @@ export class ProxyServer {
         : Promise.resolve(undefined);
 
       resolved.finally(() => {
-        this.forwardBufferedRequest(req, res, host, port, path, body);
+        this.forwardBufferedRequest(req, res, host, port, path, authority, body);
       });
     });
   }
@@ -502,32 +592,80 @@ export class ProxyServer {
     host: string,
     port: number,
     path: string,
+    authority: string,
     body: Buffer
   ): void {
-    const { allowed, reason } = this.checkHostAccess(host);
-    this.log({ method: req.method || 'POST', host, port, path, blocked: !allowed, reason });
+    const { allowed, reason } = this.checkHostAccess(host, port, 'http');
     if (!allowed) {
+      this.log({ method: req.method || 'POST', host, port, path, blocked: true, reason });
       res.writeHead(403, { 'Content-Type': 'text/plain' });
-      res.end(`Blocked by sandbox policy (${this.policyLevel}): host '${host}' not in allowlist`);
+      res.end(this.refusal(host, port, reason));
       return;
     }
 
-    // The body is replayed whole, so it is no longer chunked. Leaving both
-    // headers on the request makes some servers reject it or frame it wrongly.
-    const headers = { ...stripProxyAuth(req.headers), 'content-length': String(body.length) };
-    delete headers['transfer-encoding'];
-    const proxyReq = http.request(
-      { hostname: host, port, path, method: req.method, headers },
-      (proxyRes) => {
-        res.writeHead(proxyRes.statusCode || 500, proxyRes.headers);
-        proxyRes.pipe(res);
+    // Screened and pinned like any other request. This one has its own
+    // upstream request because the body is replayed, and without the screen a
+    // name on the allowlist that resolves to loopback or a private range
+    // reached it, by whatever the system resolver answered at connect time.
+    this.screenAddresses(host).then((screened) => {
+      if (!screened) {
+        this.log({ method: req.method || 'POST', host, port, path, blocked: true, reason: undefined });
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.end(`Blocked by sandbox policy (${this.policyLevel}): host '${host}' resolves to a non-routable address`);
+        return;
       }
-    );
+      this.log({ method: req.method || 'POST', host, port, path, blocked: false, reason });
+      // The body is replayed whole, so it is no longer chunked. Leaving both
+      // headers on the request makes some servers reject it or frame it wrongly.
+      const headers = { ...this.upstreamHeaders(req, authority), 'content-length': String(body.length) };
+      delete headers['transfer-encoding'];
+      const proxyReq = this.openUpstream(req, res, {
+        hostname: host, port, path, method: req.method, headers, lookup: this.pinnedLookup(screened),
+      });
+      proxyReq?.end(body);
+    });
+  }
+
+  /**
+   * Open the upstream request for a plain request, relaying its response,
+   * and tie it to the client: when the client's side closes before the
+   * response has finished - the client went away, or a rotation dropped its
+   * socket - the upstream request is destroyed with it. Otherwise it outlived
+   * both, holding a connection the last job's policy opened to a host.
+   *
+   * Returns null, having dialled nothing, when the client is already gone:
+   * a request can wait on a name lookup or on the job's policy, and the
+   * client can leave in that time.
+   */
+  private openUpstream(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    options: http.RequestOptions
+  ): http.ClientRequest | null {
+    if (res.destroyed || req.socket.destroyed) return null;
+    const proxyReq = http.request(options, (proxyRes) => {
+      res.writeHead(proxyRes.statusCode || 500, proxyRes.headers);
+      // pipe() does not end its destination when the source fails, so an
+      // upstream that dies partway through its body would leave the client
+      // waiting on a response that can no longer finish. Cutting the client
+      // off is how it learns the body is short.
+      proxyRes.on('error', () => res.destroy());
+      proxyRes.pipe(res);
+    });
     proxyReq.on('error', (err) => {
+      // Once the response has started, or the client has gone, there is no
+      // one to send a 502 to; writing one would throw on the sent headers.
+      if (res.headersSent || res.destroyed) {
+        res.destroy();
+        return;
+      }
       res.writeHead(502, { 'Content-Type': 'text/plain' });
       res.end(`Proxy error: ${err.message}`);
     });
-    proxyReq.end(body);
+    res.on('close', () => {
+      if (!res.writableFinished) proxyReq.destroy();
+    });
+    return proxyReq;
   }
 
   /**
