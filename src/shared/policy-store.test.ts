@@ -125,7 +125,7 @@ describe('a pending policy is kept apart from the approved one', () => {
   it('keeps the repository id with each policy, and approving carries it over', () => {
     recordPending(dir, REPO, NARROW, 41);
     expect(readPolicyEntry(dir, REPO)!.pending?.repositoryId).toBe(41);
-    approvePending(dir, REPO, approvalStamp(REPO, NARROW));
+    approvePending(dir, REPO, approvalStamp(REPO, NARROW, 41));
     expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBe(41);
 
     // A pending policy that names no id leaves the approved one's in place.
@@ -134,15 +134,58 @@ describe('a pending policy is kept apart from the approved one', () => {
     expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBe(41);
   });
 
-  it('approving a config directly keeps the id, or takes the pending one it approves', () => {
+  it('approving a config directly keeps the id the approval is bound to', () => {
     recordPending(dir, REPO, NARROW, 41);
-    approvePending(dir, REPO, approvalStamp(REPO, NARROW));
+    approvePending(dir, REPO, approvalStamp(REPO, NARROW, 41));
     approveConfig(dir, REPO, WIDE);
     expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBe(41);
+  });
 
+  it('approving a config directly never moves the approval to another repository', () => {
+    // The CLI shows the operator's clone, which carries no id, so a pending
+    // policy identical to it from a repository that took the name would be
+    // approved for that repository without its id ever being shown.
+    recordPending(dir, REPO, NARROW, 1);
+    approvePending(dir, REPO, approvalStamp(REPO, NARROW, 1));
+    recordPending(dir, REPO, NARROW, 2);
+
+    approveConfig(dir, REPO, NARROW);
+    const entry = readPolicyEntry(dir, REPO)!;
+    expect(entry.approved?.repositoryId).toBe(1);
+    // Still waiting, for the app's card, which shows the id changing.
+    expect(entry.pending?.repositoryId).toBe(2);
+  });
+
+  it('approving a config directly takes the pending id only when the approval has none', () => {
     recordPending(dir, REPO, NARROW, 42);
     approveConfig(dir, REPO, NARROW);
-    expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBe(42);
+    const entry = readPolicyEntry(dir, REPO)!;
+    expect(entry.approved?.repositoryId).toBe(42);
+    expect(entry.pending).toBeUndefined();
+  });
+
+  it('refuses an approval when the repository behind the pending policy changed since it was shown', () => {
+    recordPending(dir, REPO, NARROW, 1);
+    approvePending(dir, REPO, approvalStamp(REPO, NARROW, 1));
+    recordPending(dir, REPO, NARROW, 2);
+    const shown = approvalStamp(REPO, NARROW, 2);
+    // The same file, from yet another repository under the name.
+    recordPending(dir, REPO, NARROW, 3);
+
+    expect(() => approvePending(dir, REPO, shown)).toThrow(/changed since/);
+    expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBe(1);
+  });
+
+  it('stores no repository id that is not one, and keeps the entry readable', () => {
+    recordPending(dir, REPO, NARROW, 5);
+    approvePending(dir, REPO, approvalStamp(REPO, NARROW, 5));
+    for (const bad of [NaN, 0, -3, 1.5, Infinity]) {
+      recordPending(dir, REPO, WIDE, bad);
+      const entry = readPolicyEntry(dir, REPO)!;
+      expect(entry.pending?.config).toEqual(WIDE);
+      expect(entry.pending?.repositoryId).toBeUndefined();
+      expect(entry.approved?.repositoryId).toBe(5);
+    }
   });
 
   it('binds an approved policy to a repository id only while it has none', () => {
@@ -153,6 +196,15 @@ describe('a pending policy is kept apart from the approved one', () => {
     expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBe(7);
     bindRepositoryId(dir, REPO, 8);
     expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBe(7);
+  });
+
+  it('binds no repository id that is not one', () => {
+    recordPending(dir, REPO, NARROW);
+    approvePending(dir, REPO, approvalStamp(REPO, NARROW));
+    bindRepositoryId(dir, REPO, NaN);
+    bindRepositoryId(dir, REPO, 0);
+    expect(readPolicyEntry(dir, REPO)!.approved?.config).toEqual(NARROW);
+    expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBeUndefined();
   });
 
   it('distrusts an entry whose repository id is not one', () => {
@@ -187,6 +239,12 @@ describe('the stamp', () => {
     expect(approvalStamp(REPO, withLoopback(true))).not.toBe(approvalStamp(REPO, NARROW));
     expect(approvalStamp(REPO, withLoopback([5432]))).not.toBe(approvalStamp(REPO, withLoopback(true)));
     expect(approvalStamp(REPO, withLoopback([5432]))).not.toBe(approvalStamp(REPO, withLoopback([5433])));
+  });
+
+  it('covers the repository id when there is one, and is unchanged when there is none', () => {
+    expect(approvalStamp(REPO, NARROW, 1)).not.toBe(approvalStamp(REPO, NARROW, 2));
+    expect(approvalStamp(REPO, NARROW, 1)).not.toBe(approvalStamp(REPO, NARROW));
+    expect(approvalStamp(REPO, NARROW, undefined)).toBe(approvalStamp(REPO, NARROW));
   });
 
   it('does not depend on key order, so the same policy read back matches', () => {

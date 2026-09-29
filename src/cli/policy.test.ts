@@ -10,7 +10,7 @@ jest.mock('../shared/paths', () => ({ getAppDataDirWithoutElectron: () => dataDi
 jest.mock('../shared/workspace', () => ({ getRepositoryFromDir: () => 'owner/my.repo' }));
 
 import { parsePolicyArgs, printPolicy, runPolicy } from './policy';
-import { approvalStamp, policyFilePath, readPolicyEntry, recordPending } from '../shared/policy-store';
+import { approvalStamp, approvePending, policyFilePath, readPolicyEntry, recordPending } from '../shared/policy-store';
 import { parseLocalmostrcContent } from '../shared/localmostrc';
 
 afterAll(() => {
@@ -247,6 +247,27 @@ describe('policy approve', () => {
     const entry = readPolicyEntry(policiesDir, REPO)!;
     expect(entry.approved?.config.level).toBe('permissive');
     expect(entry.pending?.config).toEqual(other);
+  });
+
+  it('says when the same policy is waiting from a different repository, and keeps the approval where it was', () => {
+    // A repository that took the name copies the approved file byte for
+    // byte. The CLI's diff reads "None", so it has to say whose request
+    // this is - and must not move the approval to it.
+    const config = parseLocalmostrcContent(PERMISSIVE).config!;
+    recordPending(policiesDir, REPO, config, 1);
+    approvePending(policiesDir, REPO, approvalStamp(REPO, config, 1));
+    recordPending(policiesDir, REPO, config, 2);
+    writeRc(PERMISSIVE);
+
+    expect(() => run()).toThrow('exit 1');
+    expect(output.join('\n')).toMatch(/repository id 2[\s\S]*bound to repository id 1[\s\S]*Job Security/);
+
+    output = [];
+    run('--stamp', stampOf(PERMISSIVE));
+    const entry = readPolicyEntry(policiesDir, REPO)!;
+    expect(entry.approved?.repositoryId).toBe(1);
+    expect(entry.pending?.repositoryId).toBe(2);
+    expect(output.join('\n')).toMatch(/repository id 2 is still waiting/);
   });
 
   it('approves over a cache entry that no longer reads', () => {

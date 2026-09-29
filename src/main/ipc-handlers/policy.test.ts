@@ -204,6 +204,21 @@ describe('approving from the app', () => {
     expect(pending.changes).toEqual([expect.stringMatching(/^~ repository id: 1 -> 2 \(.*deleted and recreated/)]);
   });
 
+  it('refuses when the repository behind the pending policy changed after it was listed', async () => {
+    // The same file, recorded again by a job from yet another repository:
+    // approving would bind the approval to an id the card never showed.
+    const config = { version: 1, shared: { network: { allow: ['index.crates.io'] } } };
+    recordPendingPolicy(REPO, config, 1);
+    await approve(REPO, list()[0].stamp);
+    recordPendingPolicy(REPO, config, 2);
+    const shown = list().find((s) => !s.approved)!;
+    recordPendingPolicy(REPO, config, 3);
+
+    const result = await approve(REPO, shown.stamp);
+    expect(result).toEqual({ success: false, error: expect.stringMatching(/changed since it was shown/) });
+    expect(getPolicyEntry(REPO)?.approved?.repositoryId).toBe(1);
+  });
+
   it('rejecting a change leaves the approved policy in force', async () => {
     recordPendingPolicy(REPO, { version: 1, level: 'moderate' });
     await approve(REPO, list()[0].stamp);

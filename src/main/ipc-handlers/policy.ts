@@ -60,7 +60,7 @@ export function listPolicySummaries(): PolicySummary[] {
         approved: false,
         cachedAt: entry.pending.at,
         grants: summarizeGrants(entry.pending.config),
-        stamp: approvalStamp(entry.repository, entry.pending.config),
+        stamp: approvalStamp(entry.repository, entry.pending.config, entry.pending.repositoryId),
       };
       if (entry.approved) {
         const changes: string[] = [];
@@ -110,8 +110,9 @@ export const registerPolicyHandlers = (): void => {
         }
         // Refused unless the pending policy is still the one this stamp was
         // shown with: another refused job may have replaced it since. The
-        // stamp binds the pending policy only, which is what gets approved
-        // and whose full grants the card lists. Its `changes` were computed
+        // stamp binds the pending policy only - with the repository id it
+        // would bind the approval to - which is what gets approved and
+        // whose full grants the card lists. Its `changes` were computed
         // against the approved policy at list time, and are not bound: if
         // that moved in between, the grants list is still exact.
         approvePolicy(repository, stamp);

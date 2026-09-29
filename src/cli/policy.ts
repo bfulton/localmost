@@ -259,11 +259,28 @@ function handleApprove(options: PolicyOptions): void {
     console.log();
     printConfig(config);
 
-    const approved = readCachedPolicy(repository)?.approved;
+    const cached = readCachedPolicy(repository);
+    const approved = cached?.approved;
     if (approved) {
       const diffs = diffConfigs(approved.config, config);
       console.log(`${colors.bold}Changes from the approved policy:${colors.reset}`);
       console.log(diffs.length > 0 ? formatPolicyDiff(diffs) : 'None');
+      console.log();
+    }
+    const otherRepository = pendingFromOtherRepository(repository, cached, stamp);
+    if (otherRepository) {
+      console.log(
+        `${colors.yellow}⚠ A job from repository id ${otherRepository.now} is waiting with this same policy, ` +
+          `but the approval is bound to repository id ${otherRepository.was}.${colors.reset}`
+      );
+      console.log(
+        '  A different repository now holds this name: the approved one was deleted and recreated, or renamed ' +
+          'and its name taken.'
+      );
+      console.log(
+        '  Approving here keeps the approval with repository id ' +
+          `${otherRepository.was}. To move it, review the request in Settings > Job Security.`
+      );
       console.log();
     }
 
@@ -297,6 +314,32 @@ function handleApprove(options: PolicyOptions): void {
 
   console.log(`${colors.green}\u2713${colors.reset} Approved policy for ${repository}`);
   console.log('The runner will apply it to the next job from this repository.');
+  const stillWaiting = pendingFromOtherRepository(repository, readCachedPolicy(repository), stamp);
+  if (stillWaiting) {
+    console.log(
+      `${colors.yellow}The request from repository id ${stillWaiting.now} is still waiting:${colors.reset} ` +
+        'review it in Settings > Job Security.'
+    );
+  }
+}
+
+/**
+ * A pending policy identical to the operator's file but from a different
+ * repository than the approval is bound to - one that took the name. The
+ * clone carries no id and the diff reads "None", so without this the CLI
+ * would show nothing of it. approveConfig leaves the binding and the
+ * request alone; only the app's card, which shows the id, can move it.
+ */
+function pendingFromOtherRepository(
+  repository: string,
+  entry: PolicyEntry | null,
+  stamp: string
+): { was: number; now: number } | null {
+  const was = entry?.approved?.repositoryId;
+  const now = entry?.pending?.repositoryId;
+  if (was === undefined || now === undefined || was === now) return null;
+  if (!entry?.pending || approvalStamp(repository, entry.pending.config) !== stamp) return null;
+  return { was, now };
 }
 
 /**

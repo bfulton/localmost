@@ -20,6 +20,7 @@ import {
   approvalStamp,
   approvePending,
   bindRepositoryId,
+  isRepositoryId,
   listPolicyEntries,
   readPolicyEntry,
   recordPending,
@@ -211,8 +212,9 @@ export function decidePolicyForJob(
   repository: string,
   localmostrcContent: string | null,
   sha: string,
-  repositoryId?: number
+  jobRepositoryId?: number
 ): PolicyDecision {
+  const repositoryId = validRepositoryId(repository, jobRepositoryId);
   const decision = decide(repository, localmostrcContent, repositoryId);
   const covered = decision.action === 'allow' && decision.reason === 'unchanged';
   if (covered && repositoryId !== undefined) {
@@ -224,6 +226,18 @@ export function decidePolicyForJob(
   }
   recordCommitCoverage(repository, sha, covered ? getApprovedPolicy(repository) : null);
   return decision;
+}
+
+/**
+ * The job's repository id, or undefined when it carries none or one that is
+ * not an id. A malformed one is treated as none, as before ids were kept,
+ * rather than compared or stored: stored, it made the entry unreadable, and
+ * the next change replaced the entry, approval and all.
+ */
+function validRepositoryId(repository: string, repositoryId: number | undefined): number | undefined {
+  if (repositoryId === undefined || isRepositoryId(repositoryId)) return repositoryId;
+  log.warn(`Ignoring a malformed repository id for ${repository}: ${String(repositoryId)}`);
+  return undefined;
 }
 
 function decide(repository: string, localmostrcContent: string | null, repositoryId?: number): PolicyDecision {
@@ -276,7 +290,7 @@ function decide(repository: string, localmostrcContent: string | null, repositor
  * is pending. An approved policy is left in force alongside it.
  */
 export function recordPendingPolicy(repository: string, config: LocalmostrcConfig, repositoryId?: number): void {
-  recordPending(getPolicyCacheDir(), repository, config, repositoryId);
+  recordPending(getPolicyCacheDir(), repository, config, validRepositoryId(repository, repositoryId));
   log.debug(`Recorded pending policy for ${repository}`);
 }
 

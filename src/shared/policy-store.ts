@@ -9,8 +9,9 @@
  * which need not be what the reviewer was looking at.
  *
  * Approval is bound to content by a stamp: a sha256 of the repository and the
- * policy, which is what a reviewer is shown alongside it. Approving quotes the
- * stamp, and is refused if the pending policy is no longer the one it names.
+ * policy - and of the repository id a pending policy would be approved for -
+ * which is what a reviewer is shown alongside it. Approving quotes the stamp,
+ * and is refused if the pending policy is no longer the one it names.
  *
  * Shared because the CLI approves too, and it runs outside Electron.
  */
@@ -127,11 +128,19 @@ function canonicalJson(value: unknown): string {
  * - its grants, its level, its changes - is derived from the config, so a
  * stamp over the config binds the approval to all of it, and to anything the
  * rendering might leave out as well.
+ *
+ * A pending policy's stamp also covers the repository id approving it would
+ * bind the approval to, which the card shows when it changes: otherwise the
+ * same file recorded by a job from yet another repository between listing
+ * and approving would move the approval to one the reviewer never saw.
+ * Without an id the stamp is what it always was, which is also what the
+ * CLI, reading a clone that carries none, computes.
  */
-export function approvalStamp(repository: string, config: LocalmostrcConfig): string {
+export function approvalStamp(repository: string, config: LocalmostrcConfig, repositoryId?: number): string {
+  // canonicalJson leaves out an undefined field, so no id hashes as before.
   return crypto
     .createHash('sha256')
-    .update(canonicalJson({ repository: repository.toLowerCase(), config }))
+    .update(canonicalJson({ repository: repository.toLowerCase(), config, repositoryId }))
     .digest('hex');
 }
 
@@ -158,14 +167,19 @@ function parseVersion(raw: unknown, where: string): PolicyVersion | undefined {
   return version;
 }
 
-function isRepositoryId(value: unknown): value is number {
+export function isRepositoryId(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
 }
 
-/** A policy version, with the repository id only when there is one. */
+/**
+ * A policy version, with the repository id only when there is a real one.
+ * An id that is not one is dropped here rather than written: the entry would
+ * then fail to read back, and the next change would replace it, approval and
+ * all. Dropped, the job counts as carrying no id, as before ids were kept.
+ */
 function versionOf(config: LocalmostrcConfig, repositoryId: number | undefined): PolicyVersion {
   const version: PolicyVersion = { config, at: new Date().toISOString() };
-  if (repositoryId !== undefined) version.repositoryId = repositoryId;
+  if (isRepositoryId(repositoryId)) version.repositoryId = repositoryId;
   return version;
 }
 
@@ -302,7 +316,7 @@ export function approvePending(dir: string, repository: string, stamp: string): 
   if (!entry.pending) {
     throw new Error(`There is nothing waiting for approval for ${repository}`);
   }
-  if (approvalStamp(repository, entry.pending.config) !== stamp) {
+  if (approvalStamp(repository, entry.pending.config, entry.pending.repositoryId) !== stamp) {
     throw new Error(`The policy for ${repository} changed since it was shown. Review it again before approving.`);
   }
   // Approving a job's request approves it for the repository that asked. One
@@ -315,19 +329,24 @@ export function approvePending(dir: string, repository: string, stamp: string): 
 
 /**
  * Approve a policy the caller read and showed itself - the CLI, from the
- * operator's own clone. A pending policy is cleared only if it is this one;
- * a different one is still waiting for its own decision.
+ * operator's own clone. A pending policy is cleared only if it is this one,
+ * for the repository the approval is bound to; any other is still waiting
+ * for its own decision.
  */
 export function approveConfig(dir: string, repository: string, config: LocalmostrcConfig): string {
   const stamp = approvalStamp(repository, config);
   const entry = readEntryToChange(dir, repository);
-  // The operator's clone carries no repository id. Approving what a job
-  // asked for takes that job's; otherwise the approval stays bound to the
-  // repository it was bound to, and one with none is bound by the next job.
+  // The operator's clone carries no repository id, and nothing the CLI
+  // shows names one, so an approval bound to a repository stays bound to it.
+  // A pending policy from another repository under the name, however
+  // identical, is left waiting for the app's card, which shows the id
+  // changing: from here an empty binding may be filled, never replaced.
   const pendingIsThis = entry.pending !== undefined && approvalStamp(repository, entry.pending.config) === stamp;
-  const repositoryId = (pendingIsThis ? entry.pending?.repositoryId : undefined) ?? entry.approved?.repositoryId;
-  entry.approved = versionOf(config, repositoryId);
-  if (pendingIsThis) {
+  const boundTo = entry.approved?.repositoryId;
+  const pendingId = pendingIsThis ? entry.pending?.repositoryId : undefined;
+  const pendingMovesIt = boundTo !== undefined && pendingId !== undefined && pendingId !== boundTo;
+  entry.approved = versionOf(config, boundTo ?? pendingId);
+  if (pendingIsThis && !pendingMovesIt) {
     delete entry.pending;
   }
   writePolicyEntry(dir, entry);
@@ -340,6 +359,7 @@ export function approveConfig(dir: string, repository: string, config: Localmost
  * bound, a job from another repository under the same name is asked about.
  */
 export function bindRepositoryId(dir: string, repository: string, repositoryId: number): void {
+  if (!isRepositoryId(repositoryId)) return;
   const entry = readEntryToChange(dir, repository);
   if (!entry.approved || entry.approved.repositoryId !== undefined) return;
   entry.approved.repositoryId = repositoryId;
@@ -353,7 +373,7 @@ export function bindRepositoryId(dir: string, repository: string, repositoryId: 
 export function rejectPending(dir: string, repository: string): string | undefined {
   const entry = readEntryToChange(dir, repository);
   if (!entry.pending) return undefined;
-  const stamp = approvalStamp(repository, entry.pending.config);
+  const stamp = approvalStamp(repository, entry.pending.config, entry.pending.repositoryId);
   delete entry.pending;
   writePolicyEntry(dir, entry);
   return stamp;
