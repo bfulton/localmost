@@ -52,6 +52,12 @@ function statusForConclusion(conclusion: string): JobStatus {
   return 'cancelled';
 }
 
+/** A job's status from the result a runner's completion line gives. */
+function statusForRunnerResult(result: string): JobStatus {
+  const lower = result.toLowerCase();
+  return lower === 'succeeded' ? 'completed' : lower === 'failed' ? 'failed' : 'cancelled';
+}
+
 /**
  * Split a worker's output stream into whole lines.
  *
@@ -157,6 +163,12 @@ interface RunnerInstance {
     githubSha?: string;       // Commit SHA that triggered the workflow
     githubRef?: string;       // Branch/tag ref (e.g., refs/heads/main)
     githubWorkflow?: string;  // Workflow name from github.workflow (keys workflows.<name> policy)
+    /**
+     * The result of the last completion line read for this job. Only a
+     * reading of the job's output, which the job can forge: the job ends
+     * with its worker's exit, and this is weighed only there.
+     */
+    runnerResult?: JobStatus;
   } | null;
   name: string;
   jobsCompleted: number;
@@ -1607,11 +1619,12 @@ export class RunnerManager {
           // worker, reparented, burning CPU; the group sweep in process-group
           // probes and signals the group, not just the leader.
           this.sweepWorkerGroup(instanceNum, workerPid);
-          // A job still current here is one whose completion line went unread
-          // - split by a \n in its name, skipped as too long, or never written
-          // by a worker that died mid-job. It is over all the same; left
-          // open, its history read 'running', with Cancel offered, until the
-          // app next started.
+          // A job still current here is over, and this is where it is
+          // closed: a completion line does not close it, being one the job
+          // can write itself, and one can go unread besides - split by a \n
+          // in the name, skipped as too long, or never written by a worker
+          // that died mid-job. Left open, its history read 'running', with
+          // Cancel offered, until the app next started.
           if (instance.currentJob) {
             const job = instance.currentJob;
             this.logSandboxSummary(instanceNum, job.name);
@@ -2301,10 +2314,17 @@ export class RunnerManager {
   }
 
   /**
-   * Close the history entry of a job whose worker exited before its
-   * completion line was read. GitHub's conclusion when it has one, as for a
-   * completion line; otherwise what the exit says - a signal or a stop is a
-   * cancel, a clean exit a completed job, any other a failed one.
+   * Close the history entry of a job whose worker has exited. A --once
+   * worker exits right after its job, and the exit is the one end a job
+   * cannot forge: its completion line it can (see parseRunnerOutput).
+   *
+   * GitHub's conclusion when it has one. Otherwise what the exit says - a
+   * signal or a stop is a cancel, any exit but a clean one a failed job -
+   * and after a clean exit the result of the last completion line read,
+   * which the runner writes after anything the job put there. That line can
+   * only turn a clean exit's 'completed' into 'failed' or 'cancelled', which
+   * the job could do by failing; it never makes a crash, a signal or a stop
+   * read as a success.
    */
   private async closeJobOnExit(
     instanceNum: number,
@@ -2312,7 +2332,8 @@ export class RunnerManager {
     code: number | null,
     signal: NodeJS.Signals | null
   ): Promise<void> {
-    let status: JobStatus = signal !== null || this.stopping ? 'cancelled' : code === 0 ? 'completed' : 'failed';
+    let status: JobStatus =
+      signal !== null || this.stopping ? 'cancelled' : code === 0 ? (job.runnerResult ?? 'completed') : 'failed';
     const [owner, repo] = job.repository.split('/');
     if (this.getJobConclusion && job.githubJobId && owner && repo) {
       try {
@@ -2322,7 +2343,7 @@ export class RunnerManager {
         // Fall back to what the exit says.
       }
     }
-    this.log('info', `[instance ${instanceNum}] Job ${job.name} ended with its worker's exit, its completion unread → status=${status}`);
+    this.log('info', `[instance ${instanceNum}] Job completed: ${job.name} with its worker's exit (code=${code}, signal=${signal}) → status=${status}`);
 
     // The filter backstop may have closed it while the conclusion was looked
     // up: it stopped the job, and its record of that stands.
@@ -2434,77 +2455,24 @@ export class RunnerManager {
     // an unanchored match ended the job there - its worker shown idle and
     // its history closed while its steps were still running. Its name matches
     // any character, as the start's does.
+    //
+    // Even anchored, it does not end the job. The name is the workflow's,
+    // and what it carries after a \n is a line of its own, which can be
+    // this one to the letter, for the very name the start recorded:
+    // read as the end, it closed the job with the result it named, cleared
+    // it from the worker and marked the worker listening while the job ran
+    // on - its slot held, Cancel gone, the worker shown idle and sleep
+    // protection off - and the real result was never recorded. Nothing
+    // before the worker's exit tells the two apart, and a --once worker
+    // exits right after its job, so the exit ends it (closeJobOnExit). The
+    // result is noted for that, the runner's own line coming last.
     const jobCompleteMatch = line.match(
       /^\s*(?:\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?:?\s*)?Job\s+(.+)\s+completed with result:\s*(\w+)\s*$/is
     );
     if (jobCompleteMatch && instance.currentJob) {
-      // Claim the job synchronously. The conclusion lookup below awaits, and
-      // the runner can emit its completion line more than once; leaving
-      // currentJob set across the await lets a second line re-enter and
-      // report the same job as completed twice.
       const job = instance.currentJob;
-      instance.currentJob = null;
-
-      const completedAt = new Date().toISOString();
-
-      // Compute runtime in seconds
-      const startTime = new Date(job.startedAt).getTime();
-      const endTime = new Date(completedAt).getTime();
-      const runTimeSeconds = Math.round((endTime - startTime) / 1000);
-
-      const jobId = job.id;
-      const githubJobId = job.githubJobId;
-      const repository = job.repository;
-      const jobName = job.name;
-
-      // Query GitHub API for the actual conclusion (authoritative source)
-      let status: JobStatus = 'completed'; // Default fallback
-      if (this.getJobConclusion && githubJobId && repository) {
-        const [owner, repo] = repository.split('/');
-        if (owner && repo) {
-          try {
-            const conclusion = await this.getJobConclusion(owner, repo, githubJobId);
-            if (conclusion === null) {
-              // Conclusion not yet set - use runner-reported result
-              const result = jobCompleteMatch[2].toLowerCase();
-              status = result === 'succeeded' ? 'completed' : result === 'failed' ? 'failed' : 'cancelled';
-              this.log('info', `[instance ${instanceNum}] Job completed: ${jobName} conclusion=null, using runner result=${result} → status=${status}`);
-            } else {
-              status = statusForConclusion(conclusion);
-              this.log('info', `[instance ${instanceNum}] Job completed: ${jobName} conclusion=${conclusion} → status=${status}`);
-            }
-          } catch {
-            // Fall back to runner-reported result
-            const result = jobCompleteMatch[2].toLowerCase();
-            status = result === 'succeeded' ? 'completed' : result === 'failed' ? 'failed' : 'cancelled';
-            this.log('warn', `[instance ${instanceNum}] Could not get job conclusion from GitHub, using runner result: ${result}`);
-          }
-        }
-      } else {
-        // No API available, use runner-reported result
-        const result = jobCompleteMatch[2].toLowerCase();
-        status = result === 'succeeded' ? 'completed' : result === 'failed' ? 'failed' : 'cancelled';
-        this.log('info', `[instance ${instanceNum}] Job completed: ${jobName} result=${result} → status=${status}`);
-      }
-
-      // The filter backstop may have closed the job while the conclusion was
-      // looked up: it stopped the job, and its record of that stands.
-      const closed = this.jobHistory.find((j) => j.id === jobId);
-      if (closed && closed.status !== 'running') {
-        this.log('debug', `[instance ${instanceNum}] Job ${jobName} was already closed as ${closed.status}; keeping that`);
-      } else {
-        this.updateJobInHistory(jobId, {
-          status,
-          completedAt,
-          runTimeSeconds,
-        });
-      }
-
-      // Log sandbox policy summary for the completed job
-      this.logSandboxSummary(instanceNum, jobName);
-
-      instance.status = 'listening';
-      this.updateAggregateStatus();
+      job.runnerResult = statusForRunnerResult(jobCompleteMatch[2]);
+      this.log('debug', `[instance ${instanceNum}] Job ${job.name}: completion line read, result=${jobCompleteMatch[2]}; closed when its worker exits`);
     }
   }
 
