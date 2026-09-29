@@ -10,6 +10,7 @@ import * as path from 'path';
 import { spawn, execSync } from 'child_process';
 import { getAppDataDirWithoutElectron } from './paths';
 import { isValidRepository } from './policy-store';
+import { REMOVAL_PREFIX, moveAsideForRemoval, removeMovedAside } from './tree-removal';
 
 // =============================================================================
 // Types
@@ -378,31 +379,56 @@ export function listWorkspaces(): Workspace[] {
 }
 
 /**
- * Remove a workspace.
+ * Remove a workspace, as a runner job's sandbox is removed.
+ *
+ * Something of the run may still write it: a step process that outlived the
+ * reap keeps a profile granting the workspace's path, and a container a step
+ * started writes it through Docker's file sharing under no profile. A walk
+ * by path loses to either - it finds a directory, the writer swaps it for a
+ * link, and the walk deletes what the link points to. So the workspace is
+ * first moved beside itself under a name no step's profile grants (the
+ * workspaces directory is app data, which every profile denies but for the
+ * run's own workspace), then removed without following a link anywhere in
+ * it (see moveAsideForRemoval and removeMovedAside). Resolves to whether
+ * there was a workspace to remove; rejects when there was, but it could not
+ * all be removed, and cleanupWorkspaces finishes it later.
  */
-export function removeWorkspace(id: string): boolean {
+export async function removeWorkspace(id: string): Promise<boolean> {
   // Only ever a workspace directory itself: an id that is not one could name
   // anything path.join resolves it to.
   if (!WORKSPACE_ID.test(id)) {
     return false;
   }
-  const workspacePath = path.join(getWorkspacesDir(), id);
-  if (!fs.existsSync(workspacePath)) {
+  const aside = await moveAsideForRemoval(path.join(getWorkspacesDir(), id));
+  if (!aside) {
     return false;
   }
-
-  fs.rmSync(workspacePath, { recursive: true, force: true });
+  await removeMovedAside(aside);
   return true;
 }
 
 /**
- * Clean up old workspaces.
+ * Clean up old workspaces, and finish any removal an earlier cleanup left
+ * part done.
  */
-export function cleanupWorkspaces(options: WorkspaceCleanupOptions = {}): {
+export async function cleanupWorkspaces(options: WorkspaceCleanupOptions = {}): Promise<{
   removed: number;
   kept: number;
-} {
+}> {
   const { maxAgeHours = DEFAULT_MAX_AGE_HOURS, maxCount = DEFAULT_MAX_WORKSPACES } = options;
+
+  let leftovers: fs.Dirent[] = [];
+  try {
+    leftovers = await fs.promises.readdir(getWorkspacesDir(), { withFileTypes: true });
+  } catch {
+    // No workspaces directory yet.
+  }
+  for (const entry of leftovers) {
+    if (!entry.name.startsWith(REMOVAL_PREFIX)) continue;
+    await removeMovedAside(path.join(getWorkspacesDir(), entry.name)).catch(() => {
+      // Still being written; the next cleanup tries again.
+    });
+  }
 
   const workspaces = listWorkspaces();
   const now = Date.now();
@@ -417,7 +443,9 @@ export function cleanupWorkspaces(options: WorkspaceCleanupOptions = {}): {
 
     // Remove if too old or exceeds max count
     if (age > maxAgeMs || i >= maxCount) {
-      removeWorkspace(ws.id);
+      await removeWorkspace(ws.id).catch(() => {
+        // What is left is out of every step's reach, and goes next time.
+      });
       removed++;
     } else {
       kept++;

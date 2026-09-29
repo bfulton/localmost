@@ -7,7 +7,6 @@ import { execSync } from 'child_process';
 import {
   getWorkspacesDir,
   listWorkspaces,
-  removeWorkspace,
   cleanupWorkspaces,
   getWorkspacesTotalSize,
   getGitInfo,
@@ -111,38 +110,18 @@ describe('Workspace Management', () => {
   });
 
   // ===========================================================================
-  // removeWorkspace
-  // ===========================================================================
-
-  describe('removeWorkspace', () => {
-    it('should return false if workspace does not exist', () => {
-      mockFs.existsSync.mockReturnValue(false);
-
-      const result = removeWorkspace('ws-nonexistent');
-
-      expect(result).toBe(false);
-    });
-
-    it('should remove workspace directory', () => {
-      mockFs.existsSync.mockReturnValue(true);
-      mockFs.rmSync.mockImplementation(() => {});
-
-      const result = removeWorkspace('ws-mumtvjt5-hm4ln8');
-
-      expect(result).toBe(true);
-      expect(mockFs.rmSync).toHaveBeenCalledWith(
-        expect.stringContaining('ws-mumtvjt5-hm4ln8'),
-        { recursive: true, force: true }
-      );
-    });
-  });
-
-  // ===========================================================================
   // cleanupWorkspaces
   // ===========================================================================
 
   describe('cleanupWorkspaces', () => {
-    it('should remove old workspaces', () => {
+    // Which workspaces are chosen; removing them is on a real filesystem, in
+    // workspace.cleanup.test.ts. No earlier removal was left part done.
+    const noLeftovers = () => {
+      // The automock leaves fs.promises out, as it is a getter.
+      jest.requireMock<{ promises: unknown }>('fs').promises = { readdir: jest.fn(async () => []) };
+    };
+
+    it('should remove old workspaces', async () => {
       const oldDate = new Date(Date.now() - 48 * 60 * 60 * 1000); // 48 hours ago
       const newDate = new Date();
 
@@ -168,15 +147,15 @@ describe('Workspace Management', () => {
           createdAt: newDate.toISOString(),
         });
       });
-      mockFs.rmSync.mockImplementation(() => {});
+      noLeftovers();
 
-      const result = cleanupWorkspaces({ maxAgeHours: 24 });
+      const result = await cleanupWorkspaces({ maxAgeHours: 24 });
 
       expect(result.removed).toBe(1);
       expect(result.kept).toBe(1);
     });
 
-    it('should remove workspaces exceeding max count', () => {
+    it('should remove workspaces exceeding max count', async () => {
       const now = Date.now();
       mockFs.existsSync.mockReturnValue(true);
       (mockFs.readdirSync as jest.Mock).mockReturnValue(
@@ -196,9 +175,9 @@ describe('Workspace Management', () => {
           createdAt: new Date(now - idx * 1000).toISOString(),
         });
       });
-      mockFs.rmSync.mockImplementation(() => {});
+      noLeftovers();
 
-      const result = cleanupWorkspaces({ maxCount: 10, maxAgeHours: 9999 });
+      const result = await cleanupWorkspaces({ maxCount: 10, maxAgeHours: 9999 });
 
       expect(result.removed).toBe(5);
       expect(result.kept).toBe(10);
