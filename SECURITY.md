@@ -170,7 +170,10 @@ to it, or by the plan and job ids of the job details it acquired. That key,
 not the closed port, is what keeps a job from acting as another worker or as
 the runner.
 
-Three levels are available in Settings under Job Security:
+A repository declares one of three levels in its `.localmostrc` (`level:`; see
+Policy levels above), and one that declares none runs `strict`. Settings under
+Job Security describes them but does not choose one; a change of level is a
+policy change, approved like any other:
 
 - **strict** (default): runner infrastructure, plus whatever the repository's
   `.localmostrc` declares
@@ -208,15 +211,30 @@ port can. Like the allow list, it matches names, not addresses:
 at `permissive` a job can still reach the same server by its address or another
 name.
 
-Filesystem access is not granted implicitly. A job can read its workspace and
-its own temp directory; everything else — including system paths like `/usr` and the
-Xcode developer directory that most tools need — must be declared in
-`.localmostrc`. Reading a repository's policy therefore tells you everything a
-job may touch. `localmost policy init` starts from a policy that runs, and
-`localmost test --updaterc` records what a workflow actually needs.
+A runner job's filesystem starts from a fixed floor that its policy does not
+list. Besides its own sandbox directory (workspace and temp), it can read the
+operating system - `/System`, `/bin`, `/sbin`, `/usr/bin`, `/usr/lib`,
+`/usr/libexec`, `/usr/sbin`, `/usr/share`, `/etc`, `/private/etc`,
+`/private/var/db`, `/private/var/select`, `/Library/Apple`,
+`/Library/Preferences`, `/Library/Frameworks` - and the Xcode developer
+directory under `/Library/Developer`, and a few device files (`/dev/null`,
+`/dev/random` and the like); it can read and write its target's own tool cache
+when one is kept, and create files under the names `mktemp` generates in the
+per-user temp directory. Under `moderate` and `permissive` it can also read
+Homebrew, `/usr/local`, Xcode and the package-manager caches in your home, and
+write a package cache of its own. Everything else must be declared in
+`.localmostrc`, and the credential files and app directories listed under What
+localmost protects against stay closed whatever it declares. A repository's
+policy therefore tells you what a job may touch beyond that floor, not
+everything it may touch. A `localmost test` step has no such floor: beyond its
+workspace and the same few device files, its policy lists everything it reads,
+system paths included. `localmost policy init` starts from a policy that runs,
+and `localmost test --updaterc` records what a workflow actually needs.
 
-The single exception is the root directory node, which permits an absolute path
-to resolve at all. It grants no access to anything inside.
+Directory nodes on the way down - `/`, and for a runner job `/Users`, your home
+directory and the app directories above its own sandbox and caches - are
+readable so that an absolute path resolves at all. They grant no access to
+anything inside.
 
 A repository's `.localmostrc` only takes effect once approved. When the runner
 sees a new or changed policy it refuses the job, cancels the run, and records

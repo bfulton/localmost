@@ -46,8 +46,8 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
     grants nothing extra
   - The approved copy is applied, so a change pushed after approval cannot take
     effect until it is reviewed
-- **Sandbox Policy Levels**: Choose enforcement strength in Settings under Job Security
-  - `strict` (default): runner infrastructure plus what `.localmostrc` declares. Filesystem access is never granted implicitly, so a policy states everything a job may touch
+- **Sandbox Policy Levels**: A repository declares its enforcement strength in `.localmostrc` (`level:`), approved like the rest of its policy; one that declares none runs `strict`
+  - `strict` (default): runner infrastructure, a fixed read-only floor of the OS and Xcode's developer directory, plus what `.localmostrc` declares
   - `moderate`: also allows GitHub Actions infrastructure, common registries, and tool caches
   - `permissive`: no restrictions, for trusted repos or debugging
   - Per-job summary of allowed and blocked hosts in the runner log
@@ -77,6 +77,13 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
 ### Removed
 - **`sockets:` policy key**: it was honoured by `localmost test` only, never by the
   runner, and accepted arbitrary socket paths. Declare `docker:` instead
+- **Cache work directory setting** (`preserveWorkDir`): it linked a worker's
+  `_work` to a directory handed to whichever job next took that slot, from any
+  repository, with the previous job's checkout in it, and writes through the
+  link failed anyway. Every job now gets a fresh `_work` inside its own sandbox.
+  A value an earlier build saved is ignored and dropped at the next save, and
+  the directories it kept under `~/.localmost/runner/work` are removed at the
+  next start
 
 ### Security
 - Secret values are masked out of step output. A step that printed one - `set -x`,
@@ -116,6 +123,27 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
 - A runner job's approved `network.deny` and `filesystem.deny` are enforced, and
   a change to its filesystem deny list or loopback grant retires the workers
   built under the old one.
+- A runner job cannot read or write the app's own data directory
+  (`~/.localmost`) or Electron's (`~/Library/Application Support/localmost`),
+  whatever its policy grants, beyond its own sandbox and its target's caches,
+  and cannot rename a directory above them. A grant of `~`, `~/Library` or the
+  like keeps the rest of what it covers.
+- The approval screen and `localmost policy show` mark a write grant that
+  reaches past the job - LaunchAgents and LaunchDaemons, shell rc files,
+  `~/.ssh`, `~/.gitconfig`, `~/.config`, `~/Library/Application Support` and
+  directories on your PATH - with what a write there lets a job do: leave code
+  that runs as you, outside the sandbox, after the job ends. Such grants are
+  still allowed.
+- A job's Docker `/info` shows only the daemon's version, platform, kernel, CPU
+  count, memory, storage driver, cgroup version and security options. In full
+  it described the host: its name, the daemon's proxy URLs with any credentials
+  in them, registry mirrors, labels, and how many containers and images you and
+  other jobs have.
+- The broker sends a job operation upstream on the runner's credentials only
+  when it names the job delivered to that worker: by its request id, or by the
+  plan and job ids of the job details the worker acquired. `completejob` and
+  `renewjob`, which name a job by those ids alone, were forwarded for whatever
+  ids the request carried.
 - An approved policy is bound to the repository's id as well as its name. A job
   from a different repository that now holds an approved name - the approved one
   deleted or renamed, and the name taken since - is refused until the policy is
@@ -129,6 +157,14 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   unattributed commit, email or name.
 
 ### Fixed
+- A run that could not be cancelled says so. When admission refuses a job and
+  GitHub will not cancel its run, the job's history entry records "cancel
+  failed" with the reason and a "Cancel Failed" notification appears; the run's
+  other jobs may still run. The job-start backstop, for a job that reached a
+  worker without passing the user filter, now stops that worker as well as
+  cancelling the run, whether or not the cancel succeeds, so its steps stop
+  without waiting for GitHub. GitHub may show a job stopped this way as lost
+  rather than cancelled.
 - Pausing stops the runner taking jobs. A paused runner went on acquiring every
   job GitHub offered it; a job offered while paused is now left queued with
   GitHub. `localmost pause` and `resume` do what the tray's do: pause no longer
@@ -173,6 +209,16 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   The proxy authenticates on the job's behalf, so the job no longer reads
   `~/.docker/config.json` and nothing under `~/.docker` is opened at any level.
   `localmost test --updaterc` writes the actions from a run's denials
+- **Breaking policy change**: under `strict` and `moderate`, a runner job's proxy
+  reaches an allowed host only on its scheme's port: 443 through `CONNECT` and 80
+  for plain HTTP. A job that reaches a host on any other port - a registry on
+  8443, SSH tunnelled through the proxy - needs a `host:port` entry (or
+  `[v6-address]:port`) in its `network.allow`, which allows that port only.
+  `permissive` is unchanged
+- **Breaking**: a runner job can signal only processes in its own sandbox - its
+  children and the members of its process group that share it. Stopping or
+  killing a process it did not start - a server or app you launched, another
+  worker's job, the app itself - is now refused
 - CLI restructured with standalone commands that don't require the app
 - Improved help text with examples for all commands
 
