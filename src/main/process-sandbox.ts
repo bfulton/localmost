@@ -14,7 +14,7 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import { SandboxPolicyLevel } from '../shared/types';
-import { expandPath, DEFAULT_BROKER_PORT } from '../shared/sandbox-profile';
+import { expandPath, policyDenyFilters, realPath, DEFAULT_BROKER_PORT } from '../shared/sandbox-profile';
 import {
   getAppDataDir,
   getConfigPath,
@@ -277,24 +277,8 @@ export function generateSandboxProfile({
   //
   // seatbelt matches the real path, so a grant of /private/var/... reaches an
   // app directory configured through the /var symlink: each directory is
-  // denied as configured and as it really is. For one that does not exist
-  // yet, that is its nearest existing ancestor's real path with the rest
-  // appended, so a job granted the parent cannot plant it first. Any other
-  // failure leaves the spelling seatbelt matches unknown, so it stops the
-  // spawn rather than leaving the deny under the configured spelling alone.
-  const realPath = (dir: string): string => {
-    const missing: string[] = [];
-    for (let node = path.resolve(dir); ; node = path.dirname(node)) {
-      try {
-        return path.join(fs.realpathSync(node), ...missing);
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
-        if (node === path.dirname(node)) return path.resolve(dir);
-        missing.unshift(path.basename(node));
-      }
-    }
-  };
+  // denied as configured and as it really is (see realPath, which stops the
+  // spawn rather than leave the deny under the configured spelling alone).
   const appDirs = [getRunnerBaseDir(), getUserDataDir()];
   const appDirSpellings = [...new Set(appDirs.flatMap((dir) => [dir, realPath(dir)]))];
   // seatbelt also matches paths as the default APFS volume does, whatever
@@ -338,19 +322,19 @@ export function generateSandboxProfile({
   // A deny only narrows, so none is dropped for what it covers: one over an
   // app directory stays, and the own sandbox and caches are re-allowed after
   // the denies instead. For the same reason a deny list that cannot be read
-  // stops the spawn rather than being skipped. An absolute ".." is resolved,
-  // as seatbelt resolves the path it guards; a relative entry never matches
-  // in seatbelt, so it is dropped and said to have no effect.
+  // stops the spawn rather than being skipped. Each is denied as written and
+  // by its real path, a `*` entry as a pattern (see policyDenyFilters); a
+  // relative entry never matches in seatbelt, so it is dropped and said to
+  // have no effect.
   const declaredDenies = filesystemPolicy.deny ?? [];
   if (!Array.isArray(declaredDenies)) {
     throw new Error("The policy's deny list is not a list, so the job cannot be confined as approved");
   }
-  const policyDenies = subpaths(declaredDenies.flatMap((entry: string) => {
-    const expanded = expandPath(entry);
-    if (path.isAbsolute(expanded)) return [path.resolve(expanded)];
+  const policyDenies = declaredDenies.flatMap((entry: string) => {
+    if (path.isAbsolute(expandPath(entry))) return policyDenyFilters(entry).map((filter) => `  ${filter}`);
     onLog?.('error', `Ignoring relative policy deny path, which would have no effect: ${entry}`);
     return [];
-  }));
+  }).join('\n');
 
   // Loopback reaches every service on this machine, not just the job's own:
   // databases, a debugger listening on 9229, a browser's remote debugging on

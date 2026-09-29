@@ -6,6 +6,7 @@
  * background runner execution.
  */
 
+import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
@@ -140,11 +141,59 @@ function escapePath(pathStr: string): string {
  * dot in "~/.npm" matched any character and a `+` or `(` in a path changed
  * what the rule meant. Anchored at both ends, since seatbelt searches rather
  * than matches. Escaped again for the string literal it lands in, where a
- * backslash is itself an escape.
+ * backslash is itself an escape. With `subtree`, what lies beneath a match
+ * matches too, as it does beneath a (subpath ...).
  */
-function globToProfileRegex(expanded: string): string {
+function globToProfileRegex(expanded: string, subtree = false): string {
   const literal = (part: string) => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
-  return escapePath(`^${expanded.split('*').map(literal).join('.*')}$`);
+  return escapePath(`^${expanded.split('*').map(literal).join('.*')}${subtree ? '(/|$)' : '$'}`);
+}
+
+/**
+ * A path as seatbelt matches it: its real path, every symlink on the way
+ * resolved. For one that does not exist yet, that is its nearest existing
+ * ancestor's real path with the rest appended, so a job granted the parent
+ * cannot plant it first. Any other failure leaves the spelling seatbelt
+ * matches unknown, so it throws rather than guess: a deny under the wrong
+ * spelling would not hold.
+ */
+export function realPath(dir: string): string {
+  const missing: string[] = [];
+  for (let node = path.resolve(dir); ; node = path.dirname(node)) {
+    try {
+      return path.join(fs.realpathSync(node), ...missing);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
+      if (node === path.dirname(node)) return path.resolve(dir);
+      missing.unshift(path.basename(node));
+    }
+  }
+}
+
+/**
+ * The seatbelt filters a policy deny covers: the path and everything beneath
+ * it, both as written and as seatbelt matches it. seatbelt matches the real
+ * path, and /tmp, /etc and /var are symlinks into /private, so a deny of
+ * /etc/ssl/private written alone held nothing against a grant of
+ * /private/etc. A `*` entry is a (regex ...), its real spelling taken from
+ * the directory before the first `*`; written as a subpath it named a file
+ * called "*.pem", which nothing is. An absolute ".." is resolved, as seatbelt
+ * resolves the path it guards. A relative entry is never matched against a
+ * real path, so it covers nothing (validation refuses one).
+ */
+export function policyDenyFilters(entry: string): string[] {
+  const expanded = expandPath(entry);
+  if (!path.isAbsolute(expanded)) return [];
+  const resolved = path.resolve(expanded);
+  const star = resolved.indexOf('*');
+  if (star === -1) {
+    return [...new Set([resolved, realPath(resolved)])].map((spelling) => `(subpath "${escapePath(spelling)}")`);
+  }
+  const cut = resolved.lastIndexOf('/', star);
+  const real = realPath(resolved.slice(0, cut) || '/');
+  const realSpelling = (real === '/' ? '' : real) + resolved.slice(cut);
+  return [...new Set([resolved, realSpelling])].map((spelling) => `(regex "${globToProfileRegex(spelling, true)}")`);
 }
 
 // Note: macOS sandbox-exec does NOT support hostname-based network filtering.
@@ -531,19 +580,13 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
 
   // Policy-defined denies, after the workspace is reopened above so a deny
   // the policy names inside the workspace still holds. A deny only ever
-  // narrows, so it can come last.
+  // narrows, so it can come last. Each is denied as written and by its real
+  // path, as the runner's are (see policyDenyFilters).
   if (policy?.filesystem?.deny) {
     lines.push(';; Policy-defined filesystem deny');
-    for (const pattern of policy.filesystem.deny) {
-      const expanded = expandPath(pattern);
-      if (expanded.includes('*')) {
-        const regex = globToProfileRegex(expanded);
-        lines.push(`(deny file-read* (regex "${regex}"))`);
-        lines.push(`(deny file-write* (regex "${regex}"))`);
-      } else {
-        lines.push(`(deny file-read* (subpath "${escapePath(expanded)}"))`);
-        lines.push(`(deny file-write* (subpath "${escapePath(expanded)}"))`);
-      }
+    for (const filter of policy.filesystem.deny.flatMap((entry) => policyDenyFilters(entry))) {
+      lines.push(`(deny file-read* ${filter})`);
+      lines.push(`(deny file-write* ${filter})`);
     }
     lines.push('');
   }

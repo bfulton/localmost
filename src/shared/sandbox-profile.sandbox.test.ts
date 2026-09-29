@@ -419,6 +419,38 @@ if (!isMacOS) {
       expect(run(profile, ['/bin/cat', path.join(home, 'data', 'aXbc')])).toBe(false);
     });
 
+    it('refuses what a deny names by a spelling that runs through a symlink, and what a glob deny matches', () => {
+      // /tmp is a symlink to /private/tmp, and a link of the user's is one
+      // too; seatbelt matches where they lead.
+      const real = fs.realpathSync(fs.mkdtempSync('/tmp/localmost-deny-'));
+      try {
+        for (const dir of [path.join(real, 'a'), path.join(home, 'kept', 'b')]) {
+          fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(path.join(dir, 'key'), 'key\n');
+        }
+        fs.writeFileSync(path.join(real, 'visible'), 'visible\n');
+        fs.writeFileSync(path.join(home, 'kept', 'server.pem'), 'key\n');
+        fs.symlinkSync(path.join(home, 'kept'), path.join(home, 'link'));
+        const profile = generateSandboxProfile({
+          workDir,
+          proxyPort: 1,
+          policy: {
+            filesystem: {
+              read: [...MACOS_BASELINE_READ_PATHS, real, '~'],
+              deny: [path.join(real.replace(/^\/private/, ''), 'a'), path.join(home, 'link', 'b'), `${home}/kept/*.pem`],
+            },
+          },
+        });
+        expect(run(profile, ['/bin/cat', path.join(real, 'visible')])).toBe(true);
+        expect(run(profile, ['/bin/cat', path.join(real, 'a', 'key')])).toBe(false);
+        expect(run(profile, ['/bin/cat', path.join(home, 'notes.txt')])).toBe(true);
+        expect(run(profile, ['/bin/cat', path.join(home, 'kept', 'b', 'key')])).toBe(false);
+        expect(run(profile, ['/bin/cat', path.join(home, 'kept', 'server.pem')])).toBe(false);
+      } finally {
+        fs.rmSync(real, { recursive: true, force: true });
+      }
+    });
+
     it('keeps private keys unreadable even when the policy declares the home directory', () => {
       const profile = generateSandboxProfile({
         workDir,

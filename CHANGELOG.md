@@ -116,6 +116,10 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
 - A runner job's approved `network.deny` and `filesystem.deny` are enforced, and
   a change to its filesystem deny list or loopback grant retires the workers
   built under the old one.
+- A `filesystem.deny` entry with `*` in it now refuses what it matches in a
+  runner job; it was written as a literal path and matched nothing. Every deny,
+  in a runner job and in `localmost test`, is also applied by its real path, so
+  one written through `/tmp`, `/etc`, `/var` or a symlink of your own holds.
 - An approved policy is bound to the repository's id as well as its name. A job
   from a different repository that now holds an approved name - the approved one
   deleted or renamed, and the name taken since - is refused until the policy is

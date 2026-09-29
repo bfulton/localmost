@@ -462,6 +462,46 @@ if (!isMacOS) {
       expect(run(`/bin/cat '${path.join(secret, 'key')}'`).ok).toBe(false);
     });
 
+    it('refuses a file a glob deny matches', () => {
+      const out = path.join(base, 'globbed');
+      fs.mkdirSync(out, { recursive: true });
+      fs.writeFileSync(path.join(out, 'x.pem'), 'key');
+      fs.writeFileSync(path.join(out, 'x.txt'), 'visible');
+      const run = underProfile({ filesystemPolicy: { level: 'strict', read: [out], write: [out], deny: [`${out}/*.pem`] } });
+      expect(run(`/bin/cat '${path.join(out, 'x.txt')}'`).ok).toBe(true);
+      expect(canCreate(run, path.join(out, probeName()))).toBe(true);
+      expect(run(`/bin/cat '${path.join(out, 'x.pem')}'`).ok).toBe(false);
+      expect(canCreate(run, path.join(out, `${probeName()}.pem`))).toBe(false);
+    });
+
+    it('refuses what a policy denies by a spelling that runs through a symlink', () => {
+      // /tmp is a symlink to /private/tmp, and a link of the user's is one
+      // too; seatbelt matches where they lead.
+      const real = fs.realpathSync(fs.mkdtempSync('/tmp/localmost-deny-'));
+      const viaTmp = real.replace(/^\/private/, '');
+      const link = path.join(base, probeName());
+      try {
+        for (const dir of ['a', 'b']) {
+          fs.mkdirSync(path.join(real, dir));
+          fs.writeFileSync(path.join(real, dir, 'key'), 'key');
+        }
+        fs.writeFileSync(path.join(real, 'visible'), 'visible');
+        fs.symlinkSync(real, link);
+        const run = underProfile({
+          filesystemPolicy: { level: 'strict', read: [real], write: [real], deny: [path.join(viaTmp, 'a'), path.join(link, 'b')] },
+        });
+        expect(viaTmp).toMatch(/^\/tmp\//);
+        expect(run(`/bin/cat '${path.join(real, 'visible')}'`).ok).toBe(true);
+        expect(run(`/bin/cat '${path.join(real, 'a', 'key')}'`).ok).toBe(false);
+        expect(canCreate(run, path.join(real, 'a', probeName()))).toBe(false);
+        expect(run(`/bin/cat '${path.join(real, 'b', 'key')}'`).ok).toBe(false);
+        expect(run(`/bin/cat '${path.join(link, 'b', 'key')}'`).ok).toBe(false);
+      } finally {
+        fs.rmSync(link, { force: true });
+        fs.rmSync(real, { recursive: true, force: true });
+      }
+    });
+
     it('lets a job signal its own children, and no process outside its sandbox', () => {
       const outside = spawn('/bin/sleep', ['60'], { stdio: 'ignore' });
       try {

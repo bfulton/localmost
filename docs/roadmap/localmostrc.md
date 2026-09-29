@@ -189,6 +189,12 @@ workflows:
 | `./build/**` | All files under `build/` recursively |
 | `~/.ssh/id_*` | `~/.ssh/id_rsa`, `~/.ssh/id_ed25519`, etc. |
 
+A `filesystem.deny` entry refuses reads and writes of that path and everything
+beneath it, even inside a granted path, and in a deny `*` matches any run of
+characters, `/` included. It holds however the path is reached: each entry is
+denied as written and by its real path, so a deny of `/tmp/x`, `/etc/...` or a
+path through a symlink of your own covers where it leads.
+
 ### Loopback
 
 A job's sandbox connects directly to one loopback port by default: its own

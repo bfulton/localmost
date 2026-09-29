@@ -443,7 +443,34 @@ describe('Sandbox Profile Generator', () => {
       // Written into an SBPL string, where a backslash is itself escaped.
       expect(profile).toContain('(regex "^/opt/c\\\\+\\\\+/lib.*$")');
       expect(profile).toContain('(regex "^/Users/test/\\\\.npm/_cacache/.*$")');
-      expect(profile).toContain('(deny file-read* (regex "^/Users/test/\\\\.ssh/id_.*$"))');
+      // A deny covers what lies beneath a match too, as a subpath deny does.
+      expect(profile).toContain('(deny file-read* (regex "^/Users/test/\\\\.ssh/id_.*(/|$)"))');
+    });
+
+    it('denies a path reached through a symlink by its real path too', () => {
+      // seatbelt matches the real path, and /tmp and /etc are symlinks into
+      // /private: a deny under the spelling written alone held nothing.
+      const forms = topLevelForms(generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
+        policy: { filesystem: { deny: ['/tmp/localmost-deny/x', '/etc/ssl/private', '/tmp/localmost-deny/*.pem'] } },
+      }));
+      for (const operation of ['file-read*', 'file-write*']) {
+        expect(forms).toContain(`(deny ${operation} (subpath "/tmp/localmost-deny/x"))`);
+        expect(forms).toContain(`(deny ${operation} (subpath "/private/tmp/localmost-deny/x"))`);
+        expect(forms).toContain(`(deny ${operation} (subpath "/private/etc/ssl/private"))`);
+        expect(forms).toContain(`(deny ${operation} (regex "^/private/tmp/localmost-deny/.*\\\\.pem(/|$)"))`);
+      }
+    });
+
+    it('applies no relative deny, which seatbelt would never match', () => {
+      const profile = generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
+        policy: { filesystem: { deny: ['build/secret', '/opt/kept'] } },
+      });
+      expect(profile).not.toContain('build/secret');
+      expect(profile).toContain('(deny file-read* (subpath "/opt/kept"))');
     });
 
     it('keeps a policy deny inside the workspace after the workspace is reopened', () => {
