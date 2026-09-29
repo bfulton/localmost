@@ -153,6 +153,12 @@ export const clearStaleRunnerRegistrations = async (): Promise<void> => {
   }
 
   const config = loadConfig();
+
+  // Every start comes through here before the broker loads the targets'
+  // credentials, so a registration key earlier versions let jobs read is
+  // replaced before anything opens a session with it.
+  await replaceExposedProxyKeys(config);
+
   const runnerConfig = config.runnerConfig;
   if (!runnerConfig?.runnerName) {
     return; // No runner name configured
@@ -263,6 +269,19 @@ export const clearStaleRunnerRegistrations = async (): Promise<void> => {
 
   // Workers are spawned on-demand when jobs arrive via broker proxy
   // No need to pre-register worker runners here
+};
+
+/**
+ * Give a new key to each proxy registration whose key earlier versions copied
+ * into jobs' sandboxes. Disabled targets too: a taken key works whether or not
+ * this app is polling for it.
+ */
+const replaceExposedProxyKeys = async (config: AppConfig): Promise<void> => {
+  const { getRunnerProxyManager } = await import('./runner-proxy-manager');
+  const proxyManager = getRunnerProxyManager();
+  for (const target of config.targets || []) {
+    await proxyManager.replaceExposedKeys(target);
+  }
 };
 
 /**

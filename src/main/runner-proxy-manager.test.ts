@@ -316,6 +316,16 @@ describe('RunnerProxyManager', () => {
       expect(args).toEqual(expect.arrayContaining(['--name', 'localmost.test-host.testowner-testrepo.1', '--replace']));
     });
 
+    it("marks a new registration's key as one no job has held", async () => {
+      await manager.registerInstance(createMockTarget(), 1);
+
+      expect(mockWriteFile).toHaveBeenCalledWith(
+        '/mock/runner/dir/proxies/test-target-id/1/.key-kept-from-jobs',
+        expect.any(String),
+        { mode: 0o600 }
+      );
+    });
+
     it('registers nothing, and leaves no copy behind, when the runner does not match its record', async () => {
       copyVerifiedArc.mockRejectedValue(new Error('Runner v2.336.0 does not match its integrity record (changed: config.sh)'));
 
@@ -324,6 +334,38 @@ describe('RunnerProxyManager', () => {
       expect(mockSpawn).not.toHaveBeenCalled();
       const dest = copyVerifiedArc.mock.calls[0][1];
       expect(mockRm).toHaveBeenCalledWith(dest, { recursive: true, force: true });
+    });
+  });
+
+  describe('replaceExposedKeys', () => {
+    // Earlier versions copied each registration's key into every job's
+    // sandbox. A job that took it could open sessions as that runner whenever
+    // localmost is not polling, so keeping new copies out is not enough.
+    const proxyDir = '/mock/runner/dir/proxies/test-target-id';
+    let registerInstance: jest.SpiedFunction<RunnerProxyManager['registerInstance']>;
+
+    beforeEach(() => {
+      mockReaddirSync.mockReturnValue(['1', '2', '3']);
+      mockReadFileSync.mockReturnValue('{}');
+      registerInstance = jest.spyOn(manager, 'registerInstance').mockResolvedValue({} as never);
+    });
+
+    it('re-registers each registration made before its key was kept from jobs, and only those', async () => {
+      mockExistsSync.mockImplementation((p: string) => p !== `${proxyDir}/2/.key-kept-from-jobs`);
+      const target = createMockTarget();
+
+      await manager.replaceExposedKeys(target);
+
+      expect(registerInstance.mock.calls).toEqual([[target, 2]]);
+    });
+
+    it('goes on to the next registration when one cannot be replaced, to try again at the next start', async () => {
+      mockExistsSync.mockImplementation((p: string) => !p.endsWith('.key-kept-from-jobs'));
+      registerInstance.mockRejectedValueOnce(new Error('Not authenticated'));
+
+      await expect(manager.replaceExposedKeys(createMockTarget())).resolves.toBeUndefined();
+
+      expect(registerInstance.mock.calls.map(([, n]) => n)).toEqual([1, 2, 3]);
     });
   });
 

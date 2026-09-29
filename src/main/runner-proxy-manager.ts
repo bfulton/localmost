@@ -10,6 +10,8 @@
  *   1/.runner, 1/.credentials, 1/.credentials_rsaparams  - Runner instance 1
  *   2/.runner, 2/.credentials, 2/.credentials_rsaparams  - Runner instance 2
  *   ...
+ *   <n>/.key-kept-from-jobs  - the key was made by a version that keeps it
+ *                              out of jobs' sandboxes
  */
 
 import * as fs from 'fs';
@@ -82,6 +84,14 @@ const getProxyBaseDir = (targetId: string): string => {
 const getProxyInstanceDir = (targetId: string, instanceNum: number): string => {
   return path.join(getProxyBaseDir(targetId), String(instanceNum));
 };
+
+/**
+ * Written beside a registration made by a version that never lets its key
+ * into a job's sandbox. Earlier versions copied .credentials_rsaparams into
+ * every job's sandbox, so a registration without this marker may have a key
+ * some job has taken.
+ */
+const KEY_KEPT_MARKER = '.key-kept-from-jobs';
 
 // ============================================================================
 // Runner Proxy Manager
@@ -288,6 +298,12 @@ export class RunnerProxyManager {
         JSON.stringify(runnerConfig, null, 2)
       );
 
+      await fs.promises.writeFile(
+        path.join(instanceDir, KEY_KEPT_MARKER),
+        'This registration\'s key has never been copied into a job\'s sandbox.\n',
+        { mode: 0o600 }
+      );
+
       log()?.info(`[RunnerProxyManager] Registered instance ${instanceNum} for ${target.displayName}`);
 
       // Load and return the credentials
@@ -299,6 +315,28 @@ export class RunnerProxyManager {
     } finally {
       // Clean up temporary sandbox
       await fs.promises.rm(sandboxDir, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * Give a new key to each of a target's registrations that earlier versions
+   * let into jobs' sandboxes. A job that read one could open sessions as that
+   * runner, and be handed its jobs, whenever localmost was not polling - so
+   * keeping new copies out does not help the keys already copied. Registering
+   * again with --replace gives the same runner name a new key, and GitHub
+   * stops honouring the old one. This happens once per registration; one that
+   * cannot be replaced now (offline, signed out) is tried at the next start.
+   */
+  async replaceExposedKeys(target: Target): Promise<void> {
+    const log = () => getLogger();
+    for (const { instanceNum } of this.loadAllCredentials(target.id)) {
+      if (fs.existsSync(path.join(getProxyInstanceDir(target.id, instanceNum), KEY_KEPT_MARKER))) continue;
+      log()?.info(`[RunnerProxyManager] Replacing the key of ${target.displayName} runner ${instanceNum}: earlier versions let jobs read it`);
+      try {
+        await this.registerInstance(target, instanceNum);
+      } catch (err) {
+        log()?.error(`[RunnerProxyManager] Could not replace the key of ${target.displayName} runner ${instanceNum}; trying again at the next start: ${(err as Error).message}`);
+      }
     }
   }
 
