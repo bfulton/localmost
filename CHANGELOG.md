@@ -124,6 +124,9 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   then never run and failed on its own timeout with no steps recorded. Worker
   slots are now claimed in a single step, and a job waits for a slot rather
   than being discarded.
+- `localmost test --updaterc` no longer writes a `.localmostrc` it cannot read
+  back. Env patterns such as `*_TOKEN` and workflow names containing `: ` are
+  quoted, and a section left empty is omitted rather than written as a bare key.
 
 ### Changed
 - **Breaking policy change**: `docker: socket | contexts | credentials`, accepted

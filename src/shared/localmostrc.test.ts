@@ -862,6 +862,76 @@ describe('serializing a declared level', () => {
   });
 });
 
+describe('writing a policy back', () => {
+  // `localmost test --updaterc` parses the file, merges what it discovered
+  // and writes the whole policy back. Whatever the writer drops or garbles,
+  // the repository loses - silently, or on its next parse.
+  const roundTrip = (config: LocalmostrcConfig) => {
+    const reparsed = parseLocalmostrcContent(serializeLocalmostrc(config));
+    expect(reparsed.errors).toEqual([]);
+    return reparsed.config;
+  };
+
+  it.each([
+    ['every port', true],
+    ['a port list', [5432, 6379]],
+  ] as const)('keeps every key the grammar accepts, with loopback as %s', (_label, loopback) => {
+    const config: LocalmostrcConfig = {
+      version: 1,
+      level: 'moderate',
+      shared: {
+        network: { allow: ['github.com'], deny: ['tracker.example'], loopback: loopback as true | number[] },
+        filesystem: { read: ['/usr/local'], write: ['./build'], deny: ['~/.ssh'] },
+        env: { allow: ['NODE_OPTIONS'], deny: ['AWS_SECRET_ACCESS_KEY'] },
+        docker: { pull: { registries: ['docker.io'] } },
+      },
+      workflows: {
+        ci: {
+          network: { allow: ['registry.npmjs.org'], deny: ['ads.example'] },
+          filesystem: { read: ['/opt'], deny: ['./secrets'] },
+          env: { allow: ['CI_FLAG'], deny: ['NPM_TOKEN'] },
+          docker: { build: { context: './' } },
+          secrets: { require: ['DEPLOY_KEY'] },
+        },
+      },
+    };
+
+    expect(roundTrip(config)).toEqual(config);
+  });
+
+  it('quotes env patterns and workflow names that YAML would read as something else', () => {
+    // `*` opens a YAML alias and `: ` a mapping, so unquoted either makes
+    // the rewritten file unparseable; `#` starts a comment.
+    const config: LocalmostrcConfig = {
+      version: 1,
+      shared: { env: { allow: ['LC_*'], deny: ['*_TOKEN', '*'] } },
+      workflows: {
+        'Release: tag #1': { secrets: { require: ['NPM_TOKEN'] } },
+        'CI build': { env: { deny: ['*SECRET*'] } },
+      },
+    };
+
+    expect(roundTrip(config)).toEqual(config);
+  });
+
+  it('writes a section with nothing in it as one that parses back', () => {
+    // mergeDiscoveredAccess leaves `network: { allow: [] }` on a policy
+    // that had no network section and gained only paths, and starts a new
+    // policy with an empty entry for the workflow.
+    const config: LocalmostrcConfig = {
+      version: 1,
+      shared: { network: { allow: [] }, filesystem: { read: ['/usr'], write: [] } },
+      workflows: { ci: {} },
+    };
+
+    expect(roundTrip(config)).toEqual({
+      version: 1,
+      shared: { filesystem: { read: ['/usr'] } },
+      workflows: { ci: {} },
+    });
+  });
+});
+
 describe('docker access', () => {
   const runBlock = [
     'version: 1',

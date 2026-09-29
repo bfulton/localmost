@@ -10,7 +10,12 @@ import {
   DiscoveredAccess,
   handleUpdateRc,
 } from './test';
-import { LocalmostrcConfig, LOCALMOSTRC_VERSION } from '../shared/localmostrc';
+import {
+  LocalmostrcConfig,
+  LOCALMOSTRC_VERSION,
+  parseLocalmostrcContent,
+  serializeLocalmostrc,
+} from '../shared/localmostrc';
 
 describe('CLI test command', () => {
   describe('parseTestArgs', () => {
@@ -325,6 +330,42 @@ describe('mergeDiscoveredAccess', () => {
 
     expect(config.shared?.docker).toBeUndefined();
     expect(additions).toEqual([]);
+  });
+
+  it('writes back what the file already declared, loopback and deny lists included', () => {
+    // --updaterc rewrites the whole file, not just what it adds: a
+    // hand-written grant or protection it drops or garbles is lost.
+    const existing = parseLocalmostrcContent([
+      'version: 1',
+      'shared:',
+      '  network:',
+      '    allow: ["github.com"]',
+      '    deny: ["tracker.example"]',
+      '    loopback: [5432, 6379]',
+      '  filesystem:',
+      '    deny: ["~/.ssh"]',
+      '  env:',
+      '    deny: ["*_TOKEN"]',
+      'workflows:',
+      '  "Release: tag":',
+      '    secrets:',
+      '      require: [NPM_TOKEN]',
+      '',
+    ].join('\n')).config!;
+
+    const { config } = mergeDiscoveredAccess(existing, discovered({ readPaths: ['/opt/homebrew'] }), 'ci');
+    const reparsed = parseLocalmostrcContent(serializeLocalmostrc(config));
+
+    expect(reparsed.errors).toEqual([]);
+    expect(reparsed.config).toEqual({
+      version: 1,
+      shared: {
+        network: { allow: ['github.com'], deny: ['tracker.example'], loopback: [5432, 6379] },
+        filesystem: { read: ['/opt/homebrew'], deny: ['~/.ssh'] },
+        env: { deny: ['*_TOKEN'] },
+      },
+      workflows: { 'Release: tag': { secrets: { require: ['NPM_TOKEN'] } } },
+    });
   });
 });
 
