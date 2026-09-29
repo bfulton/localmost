@@ -142,14 +142,19 @@ hosts too.
 Under `strict` and `moderate`, an allowed host is reached only on its scheme's
 port: 443 through a `CONNECT` tunnel and 80 for plain HTTP. Any other port must
 be spelled in a `.localmostrc` network entry as `host:port` (or
-`[v6-address]:port`), which allows that port only. Loopback targets keep any
-port; the broker behind `127.0.0.1` is guarded by each worker's key, not by
-its port. `permissive` stays unrestricted, ports included.
+`[v6-address]:port`), which allows that port only. An `http://` URL reaches
+port 80 as a plain proxied request; a client that tunnels it through `CONNECT`
+instead needs a `host:80` entry. `permissive` stays unrestricted, ports
+included. A literal loopback address (`127.0.0.1`, `::1`) is reachable through
+the proxy on any port at every level, because the runner reaches the broker
+through it at `127.0.0.1`; the broker is guarded by each worker's key, not by
+its port. A name that resolves to loopback, `localhost` included, is refused.
 
 A `network.deny` entry is read the same way and refuses its host at every
 level, `permissive` included, whatever the allow list says; an entry with a
 port denies that port only. The runner infrastructure hosts on their scheme's
-port cannot be denied. Like the allow list, it matches names, not addresses:
+port, and literal loopback addresses on any port, cannot be denied. Like the
+allow list, it matches names, not addresses:
 at `permissive` a job can still reach the same server by its address or another
 name.
 
