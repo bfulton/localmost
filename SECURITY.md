@@ -324,11 +324,14 @@ sandbox profile. The checkout is treated as untrusted, and so is its
   any change is asked again. Without a terminal, only `--yes` runs it. A policy
   that stays within the workspace and the OS baseline runs without a prompt.
 - **Rooted at the workspace.** Every step's profile is rooted at the run's
-  workspace, a private (`0700`) copy of the checkout. A `working-directory`, a
-  local action's path or an action's entry point that resolves outside it is
-  refused, and fetched action code is readable but not writable. A step can
-  change anything inside the workspace but not remove or replace the workspace
-  directory itself.
+  workspace, a private (`0700`) copy of the checkout. Each file is its own
+  copy - an APFS clone where the volume can make one, never a hard link - so
+  a write to a workspace file never reaches the checkout. `.git`,
+  `node_modules` and whatever git ignores are left out, the ignore rules read
+  by git itself. A `working-directory`, a local action's path or an action's
+  entry point that resolves outside it is refused, and fetched action code is
+  readable but not writable. A step can change anything inside the workspace
+  but not remove or replace the workspace directory itself.
 - **Never reachable.** Whatever the policy declares, a step cannot read or
   write the app's data directory (the runner template every worker is copied
   from, approvals, settings, other runs; `~/.localmost` is closed even when the

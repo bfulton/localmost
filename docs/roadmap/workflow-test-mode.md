@@ -98,15 +98,21 @@ localmost test --staged   # Uses staged changes only
 
 **Implementation:**
 
-```bash
-# Fast copy using rsync, respecting .gitignore
-rsync -a --exclude-from=.gitignore ./ /tmp/localmost-run-xyz/
+The files come from git, which reads the ignore rules as it always does:
+`git ls-files -z --cached --others --exclude-standard` (in a checkout that
+is not a repository, the same against an empty scratch repository), less
+`.git`, `node_modules` and the other default excludes. `--no-ignore` copies
+every file but those. The `.gitignore` is never handed to rsync as filter
+rules, whose syntax reads a lone `!` as "forget every exclude so far",
+`.git` among them.
 
-# Or for speed, use hard-link copy (instant, copy-on-write)
-cp -al ./ /tmp/localmost-run-xyz/
-```
+Each file is copied with `COPYFILE_FICLONE`: an APFS clone, which is
+copy-on-write and near instant, or a byte copy where the volume cannot clone.
+Never a hard link (`cp -al`, `rsync --link-dest`): a hard-linked file is the
+checkout's own file, and every step can write the workspace. Links are copied
+as links, and FIFOs and sockets are left out.
 
-The temp directory becomes the runner's `$GITHUB_WORKSPACE`.
+The copy becomes the runner's `$GITHUB_WORKSPACE`.
 
 ### 2. Intercept `actions/checkout`
 

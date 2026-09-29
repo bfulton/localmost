@@ -28,6 +28,12 @@ const mockExecSync = execSync as jest.MockedFunction<typeof execSync>;
 describe('Workspace Management', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // A workspace's metadata is read through a descriptor, after fstat says
+    // it is a regular file with one name; here the descriptor is its path,
+    // so each test's readFileSync answers by path. The checks themselves are
+    // on a real filesystem, in workspace.cleanup.test.ts.
+    mockFs.openSync.mockImplementation(((p: fs.PathLike) => p) as never);
+    mockFs.fstatSync.mockReturnValue({ isFile: () => true, nlink: 1, size: 100 } as fs.Stats);
   });
 
   // ===========================================================================
