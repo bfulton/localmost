@@ -22,7 +22,7 @@
  * Neither mode skips. macOS only, because seatbelt is.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
+import { describe, it, expect, beforeAll, afterAll, jest } from '@jest/globals';
 import { execFile, execFileSync } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
@@ -35,6 +35,14 @@ import {
   MACOS_BASELINE_READ_PATHS,
   SandboxProfileOptions,
 } from './sandbox-profile';
+
+// The real home by default; one block below stands a scratch directory in for
+// it, since os.homedir() is what the profiles are built from.
+jest.mock('os', () => {
+  const actual = jest.requireActual<typeof import('os')>('os');
+  return { ...actual, homedir: jest.fn(actual.homedir) };
+});
+const realHomedir = jest.requireActual<typeof import('os')>('os').homedir;
 
 const isMacOS = process.platform === 'darwin';
 const execFileAsync = promisify(execFile);
@@ -199,6 +207,61 @@ if (!isMacOS) {
       expect(run(profile, ['/usr/bin/touch', path.join(appDir, 'policies', 'owner__repo.json')])).toBe(false);
       expect(run(profile, ['/bin/cat', path.join(appDir, 'config.yaml')])).toBe(false);
       expect(fs.existsSync(path.join(appDir, 'runner', 'arc', 'planted'))).toBe(false);
+    });
+  });
+
+  describe('test-mode home directory confinement through a constructed profile', () => {
+    // A stand-in home, so the developer's real keys are never in play. Not
+    // under the temp directories, which every test profile may write; the
+    // build output directory is ignored by git and outside every grant.
+    let home: string;
+    let workDir: string;
+
+    beforeAll(() => {
+      const scratch = path.join(process.cwd(), 'build');
+      fs.mkdirSync(scratch, { recursive: true });
+      home = fs.realpathSync(fs.mkdtempSync(path.join(scratch, 'localmost-home-')));
+      jest.mocked(os.homedir).mockReturnValue(home);
+      workDir = path.join(home, 'project');
+      fs.mkdirSync(workDir);
+      fs.mkdirSync(path.join(home, '.ssh'));
+      fs.writeFileSync(path.join(home, '.ssh', 'id_ed25519'), 'PRIVATE KEY\n');
+      fs.mkdirSync(path.join(home, '.cargo', 'bin'), { recursive: true });
+      fs.writeFileSync(path.join(home, 'notes.txt'), 'hello\n');
+    });
+
+    afterAll(() => {
+      jest.mocked(os.homedir).mockImplementation(realHomedir);
+      fs.rmSync(home, { recursive: true, force: true });
+    });
+
+    const run = (profile: string, argv: string[]): boolean => {
+      const profilePath = path.join(os.tmpdir(), `localmost-home-${process.pid}-${Date.now()}.sb`);
+      fs.writeFileSync(profilePath, profile);
+      try {
+        execFileSync('/usr/bin/sandbox-exec', ['-f', profilePath, ...argv], { timeout: 5000, stdio: 'ignore' });
+        return true;
+      } catch {
+        return false;
+      } finally {
+        fs.unlinkSync(profilePath);
+      }
+    };
+
+    it('does not let a checkout with any .localmostrc write where the user\'s own builds execute from', () => {
+      const profile = generateSandboxProfile({ workDir, proxyPort: 1, policy: readable });
+      expect(run(profile, ['/usr/bin/touch', path.join(workDir, 'built')])).toBe(true);
+      expect(run(profile, ['/usr/bin/touch', path.join(home, '.cargo', 'bin', 'cargo')])).toBe(false);
+    });
+
+    it('keeps private keys unreadable even when the policy declares the home directory', () => {
+      const profile = generateSandboxProfile({
+        workDir,
+        proxyPort: 1,
+        policy: { filesystem: { read: [...MACOS_BASELINE_READ_PATHS, '~'] } },
+      });
+      expect(run(profile, ['/bin/cat', path.join(home, 'notes.txt')])).toBe(true);
+      expect(run(profile, ['/bin/cat', path.join(home, '.ssh', 'id_ed25519')])).toBe(false);
     });
   });
 } else {

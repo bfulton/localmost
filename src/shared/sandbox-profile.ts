@@ -50,8 +50,6 @@ export interface SandboxProfileOptions {
   permissive?: boolean;
   /** Log file for sandbox violations */
   logFile?: string;
-  /** Strict mode - only allow write access to workDir, block user caches */
-  strictMode?: boolean;
 }
 
 // =============================================================================
@@ -160,27 +158,46 @@ function loopbackNetworkRules(proxyPort: number, escapedWorkDir: string): string
 }
 
 /**
- * Close the app's own data to a step, then reopen only its workspace.
+ * What a step never reaches, whatever the policy declares, then the workspace.
  *
  * The app data directory holds the runner template every worker's sandbox is
  * copied from, the approval cache, settings, the CLI socket and other runs'
  * workspaces; the Electron user data directory holds the credential store. A
  * test run that could write the template would reach every later real job,
- * and one that could write the approvals would approve its own policy. A
- * checkout's .localmostrc is applied in test mode without approval, so this
- * comes after every policy grant: seatbelt takes the last matching rule.
+ * and one that could write the approvals would approve its own policy. The
+ * developer's own credentials are the same list the runner denies a job at
+ * every level: a policy can never grant them there, so it cannot here either.
  *
- * The workspace lives under the app data directory, so it is reopened last.
+ * A checkout's .localmostrc is applied in test mode without approval, so this
+ * comes after every policy grant: seatbelt takes the last matching rule. The
+ * workspace lives under the app data directory, so it is reopened last.
  */
-function appDataDenyRules(escapedWorkDir: string): string[] {
+function neverReachableRules(escapedWorkDir: string): string[] {
+  const home = escapePath(os.homedir());
   const appDataDir = escapePath(getAppDataDirWithoutElectron());
   const userDataDir = escapePath(path.join(os.homedir(), 'Library', 'Application Support', 'localmost'));
   return [
-    ';; The app\'s own data - never reachable, whatever a policy declares above',
+    ';; Never reachable, whatever a policy declares above: the app\'s own data',
+    ';; and the credentials a developer machine keeps',
     '(deny file-read* file-write*',
     `  (subpath "${appDataDir}")`,
-    `  (subpath "${userDataDir}"))`,
-    ';; ...except this run\'s workspace, which lives inside it',
+    `  (subpath "${userDataDir}")`,
+    `  (subpath "${home}/.ssh")`,
+    `  (subpath "${home}/.aws")`,
+    `  (subpath "${home}/.gnupg")`,
+    `  (subpath "${home}/.kube")`,
+    `  (subpath "${home}/.docker")`,
+    `  (subpath "${home}/.config")`,
+    `  (subpath "${home}/Library/Keychains")`,
+    `  (literal "${home}/.netrc")`,
+    `  (literal "${home}/.npmrc")`,
+    `  (literal "${home}/.m2/settings.xml")`,
+    `  (literal "${home}/.m2/settings-security.xml")`,
+    `  (literal "${home}/.gradle/gradle.properties")`,
+    `  (literal "${home}/.cargo/credentials")`,
+    `  (literal "${home}/.cargo/credentials.toml")`,
+    `  (literal "${home}/.nuget/NuGet/NuGet.Config"))`,
+    ';; ...except this run\'s workspace, which lives inside the app data directory',
     '(allow file-read* file-write*',
     `  (subpath "${escapedWorkDir}"))`,
   ];
@@ -190,16 +207,13 @@ function appDataDenyRules(escapedWorkDir: string): string[] {
  * Generate a macOS sandbox-exec profile from a policy.
  */
 export function generateSandboxProfile(options: SandboxProfileOptions): string {
-  const { workDir, policy, permissive = false, logFile, strictMode = false } = options;
-  const homeDir = escapePath(os.homedir());
+  const { workDir, policy, permissive = false, logFile } = options;
   const tmpDir = escapePath(os.tmpdir());
   const escapedWorkDir = escapePath(workDir);
 
-  const modeDescription = strictMode
-    ? 'STRICT mode - only workDir write access, no user caches'
-    : permissive
-      ? 'PERMISSIVE mode - violations are logged, not blocked'
-      : 'ENFORCEMENT mode - violations are blocked';
+  const modeDescription = permissive
+    ? 'PERMISSIVE mode - violations are logged, not blocked'
+    : 'ENFORCEMENT mode - violations are blocked';
 
   const lines: string[] = [
     '(version 1)',
@@ -312,28 +326,11 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push('  (subpath "/private/var/folders"))');
   lines.push('');
 
-  // User cache directories - only in non-strict mode
-  if (!strictMode) {
-    lines.push(';; User cache directories (npm, cargo, pip, etc.)');
-    lines.push('(allow file-write*');
-    lines.push(`  (subpath "${homeDir}/.npm")`);
-    lines.push(`  (subpath "${homeDir}/.yarn")`);
-    lines.push(`  (subpath "${homeDir}/.pnpm-store")`);
-    lines.push(`  (subpath "${homeDir}/.cache")`);
-    lines.push(`  (subpath "${homeDir}/.cargo")`);
-    lines.push(`  (subpath "${homeDir}/.rustup")`);
-    lines.push(`  (subpath "${homeDir}/.gradle")`);
-    lines.push(`  (subpath "${homeDir}/.m2")`);
-    lines.push(`  (subpath "${homeDir}/.nuget")`);
-    lines.push(`  (subpath "${homeDir}/.dotnet")`);
-    lines.push(`  (subpath "${homeDir}/.local")`);
-    lines.push(`  (subpath "${homeDir}/go")`);
-    lines.push(`  (subpath "${homeDir}/Library/Caches"))`);
-    lines.push('');
-  } else {
-    lines.push(';; STRICT MODE: User cache directories NOT allowed');
-    lines.push('');
-  }
+  // No home directory cache is granted unless the policy declares it. Steps
+  // run with HOME inside the workspace, so these only ever served tools that
+  // bypass it - and each was a store the user's own builds later execute
+  // from (~/.cargo/bin, ~/.local/bin, Gradle init scripts, Maven settings),
+  // handed to any checkout that carried a .localmostrc.
 
   // Policy-defined filesystem access
   if (policy?.filesystem?.write) {
@@ -374,7 +371,7 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
     lines.push('');
   }
 
-  lines.push(...appDataDenyRules(escapedWorkDir));
+  lines.push(...neverReachableRules(escapedWorkDir));
   lines.push('');
 
   // Device files

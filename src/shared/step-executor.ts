@@ -1098,17 +1098,12 @@ async function runInSandbox(
           logFile: options.sandboxLogFile ?? '',
         });
       } else {
-        // Strict mode: no policy provided and not permissive
-        // In strict mode, we block access to user caches (~/.npm, etc.)
-        const strictMode = !policy && !permissive;
-
         // Enforcement mode: apply sandbox with policy restrictions
         profile = generateSandboxProfile({
           workDir: options.cwd,
           proxyPort: options.proxyPort,
           policy: policy || {},  // Empty policy = no network allowlist
           permissive: false,
-          strictMode,
           logFile: options.sandboxLogFile,
         });
       }

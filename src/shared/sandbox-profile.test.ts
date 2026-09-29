@@ -103,7 +103,6 @@ describe('Sandbox Profile Generator', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
         proxyPort: DEFAULT_PROXY_PORT,
-        strictMode: true,
       });
 
       for (const notGranted of ['/bin', '/usr', '/System', '/Library', '/Applications/Xcode.app']) {
@@ -140,7 +139,6 @@ describe('Sandbox Profile Generator', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
         proxyPort: DEFAULT_PROXY_PORT,
-        strictMode: true,
       });
 
       const writeSection = profile.slice(profile.indexOf(';; Write access'));
@@ -156,7 +154,6 @@ describe('Sandbox Profile Generator', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
         proxyPort: DEFAULT_PROXY_PORT,
-        strictMode: true,
       });
 
       expect(profile).toContain('(literal "/")');
@@ -217,16 +214,53 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).toContain('(subpath "/private/var/folders")');
     });
 
-    it('should allow write to package manager caches', () => {
+    it('grants no home directory cache that the policy has not declared, with or without a policy', () => {
+      // Steps run with HOME inside the workspace, so these grants only served
+      // tools that bypass it - and every one is a store the user's own builds
+      // later execute from: ~/.cargo/bin, ~/.local/bin, ~/go/bin, Gradle init
+      // scripts, Maven settings. Any checkout with a .localmostrc used to get
+      // them all.
+      for (const policy of [undefined, {}]) {
+        const profile = generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, policy });
+        const grants = topLevelForms(profile).filter((form) => form.startsWith('(allow'));
+        expect(grants.filter((form) => form.includes('"/Users/test/'))).toEqual([]);
+      }
+    });
+
+    it('still grants a home cache the policy declares', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
         proxyPort: DEFAULT_PROXY_PORT,
+        policy: { filesystem: { write: ['~/.npm'] } },
       });
+      expect(profile).toContain('(subpath "/Users/test/.npm")');
+    });
 
-      expect(profile).toContain('.npm');
-      expect(profile).toContain('.yarn');
-      expect(profile).toContain('.cargo');
-      expect(profile).toContain('.cache');
+    it('denies the credentials the runner never grants, after every policy grant', () => {
+      // A checkout's .localmostrc is applied in test mode without approval; one
+      // that declares ~ readable must still not reach the developer's keys.
+      const profile = generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
+        policy: { filesystem: { read: ['~'], write: ['~'] } },
+      });
+      const forms = topLevelForms(profile);
+      const lastGrant = forms.map((f) => f.includes('"/Users/test"')).lastIndexOf(true);
+      const deny = forms.findIndex((f) => f.startsWith('(deny file-read* file-write*') && f.includes('/Users/test/.ssh'));
+      expect(deny).toBeGreaterThan(lastGrant);
+      for (const secret of [
+        '(subpath "/Users/test/.ssh")',
+        '(subpath "/Users/test/.aws")',
+        '(subpath "/Users/test/.gnupg")',
+        '(subpath "/Users/test/.config")',
+        '(subpath "/Users/test/Library/Keychains")',
+        '(literal "/Users/test/.netrc")',
+        '(literal "/Users/test/.npmrc")',
+      ]) {
+        expect(forms[deny]).toContain(secret);
+      }
+      // Nothing after the deny reopens any of it.
+      expect(forms.slice(deny + 1).filter((f) => f.startsWith('(allow file-') && f.includes('/Users/test/.'))).toEqual([]);
     });
 
     it('grants nothing of the app data directory, with or without a policy', () => {
@@ -257,10 +291,11 @@ describe('Sandbox Profile Generator', () => {
         },
       });
 
-      const deny = profile.indexOf(
-        '(deny file-read* file-write*\n  (subpath "/Users/test/.localmost")\n' +
-          '  (subpath "/Users/test/Library/Application Support/localmost"))'
+      const denyForm = topLevelForms(profile).find(
+        (form) => form.startsWith('(deny file-read* file-write*') && form.includes('(subpath "/Users/test/.localmost")')
       );
+      expect(denyForm).toContain('(subpath "/Users/test/Library/Application Support/localmost")');
+      const deny = profile.indexOf(denyForm!);
       expect(deny).toBeGreaterThan(profile.indexOf(';; Policy-defined write access'));
       expect(deny).toBeGreaterThan(profile.indexOf(';; Policy-defined read access'));
       // Seatbelt takes the last matching rule, so after the deny the only
