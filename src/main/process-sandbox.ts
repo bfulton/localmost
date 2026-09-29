@@ -14,7 +14,7 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import { SandboxPolicyLevel } from '../shared/types';
-import { expandPath, DEFAULT_BROKER_PORT } from '../shared/sandbox-profile';
+import { expandPath, DEFAULT_BROKER_PORT, processMarkerRules, type ProcessMarker } from '../shared/sandbox-profile';
 import {
   getAppDataDir,
   getConfigPath,
@@ -180,6 +180,11 @@ export interface RunnerProfileOptions {
   toolCacheDir?: string;
   /** This worker's target's package-manager cache; ignored under strict. */
   packageCacheDir?: string;
+  /**
+   * The mark every process of this spawn carries, whatever group it is in,
+   * so what its job leaves running can be found when it is done.
+   */
+  processMarker?: ProcessMarker;
   /** Optional log sink for notes such as a policy path being ignored. */
   onLog?: SandboxLogCallback;
 }
@@ -193,6 +198,7 @@ export function generateSandboxProfile({
   dockerSocket,
   toolCacheDir: toolCache,
   packageCacheDir: packageCache,
+  processMarker,
   onLog,
 }: RunnerProfileOptions): string {
   // The worker's own docker socket, served by the app: every request on it is
@@ -734,6 +740,7 @@ ${allowDirectNetwork ? ';; Runner registration talks to GitHub directly: app-dri
 (allow user-preference-read)
 (allow user-preference-write
   (preference-domain "com.apple.dt.Xcode"))
+${processMarkerRules(processMarker).join('\n')}
 `;
 }
 
@@ -777,6 +784,8 @@ export interface SandboxOptions extends SpawnOptions {
    * strict, whatever is passed.
    */
   packageCacheDir?: string;
+  /** This spawn's process marker, the last rules of its profile; see processMarkerRules. */
+  processMarker?: ProcessMarker;
   /** Log prefix for identifying this process (e.g., runner instance ID) */
   logPrefix?: string;
   /** Optional callback for logging sandbox events */
@@ -826,6 +835,7 @@ export function spawnSandboxed(
     dockerSocket,
     toolCacheDir,
     packageCacheDir,
+    processMarker,
     logPrefix,
     onLog,
     ...spawnOptions
@@ -848,6 +858,7 @@ export function spawnSandboxed(
       dockerSocket,
       toolCacheDir,
       packageCacheDir,
+      processMarker,
       onLog,
     });
 

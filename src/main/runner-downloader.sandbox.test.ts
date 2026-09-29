@@ -94,6 +94,72 @@ describe('the sandbox a worker is built from', () => {
       .rejects.toThrow('Missing proxy credential file');
   });
 
+  it('builds every start of a slot in a directory of its own', async () => {
+    // A worker's profile grants its sandbox by path, and a process its job
+    // started can outlive the worker. Built again at the same path, the next
+    // job's runner, checkout and docker socket would be within its reach.
+    await downloader.copyProxyCredentials(1, path.join(runnerDir, 'proxies', 'target-a'));
+    const first = await downloader.buildSandbox(1, version);
+    const second = await downloader.buildSandbox(1, version);
+
+    expect(second).not.toBe(first);
+    expect(second.startsWith(first + path.sep)).toBe(false);
+    for (const sandbox of [first, second]) {
+      expect(path.dirname(sandbox)).toBe(path.join(runnerDir, 'sandbox'));
+      expect(path.basename(sandbox)).toMatch(/^1-/);
+      // Each is the whole runner, checked against its record, with the
+      // slot's settings.
+      expect(fs.readFileSync(path.join(sandbox, 'bin', 'Runner.Listener'), 'utf-8')).toBe('listener');
+      expect(fs.existsSync(path.join(sandbox, '.runner'))).toBe(true);
+    }
+  });
+
+  it('removes a sandbox it built, and refuses anything that is not one', async () => {
+    await downloader.copyProxyCredentials(1, path.join(runnerDir, 'proxies', 'target-a'));
+    const sandbox = await downloader.buildSandbox(1, version);
+    const other = await downloader.buildSandbox(2, version);
+    // Named like a sandbox, but not in the sandbox directory.
+    const lookalike = path.join(runnerDir, 'config', '1-abc');
+    write(path.join(lookalike, 'keep'), 'kept');
+
+    await downloader.removeSandbox(sandbox);
+
+    expect(fs.existsSync(sandbox)).toBe(false);
+    expect(fs.existsSync(path.join(other, 'run.sh'))).toBe(true);
+    for (const notASandbox of [
+      path.join(runnerDir, 'sandbox'),
+      path.join(runnerDir, 'config', '1'),
+      path.join(runnerDir, 'arc', `v${version}`),
+      path.join(other, '_work'),
+      `${other}/../../config`,
+      lookalike,
+    ]) {
+      await expect(downloader.removeSandbox(notASandbox)).rejects.toThrow(/not a sandbox/);
+    }
+    expect(fs.existsSync(path.join(runnerDir, 'config', '1', '.runner'))).toBe(true);
+    expect(fs.existsSync(path.join(runnerDir, 'arc', `v${version}`, 'run.sh'))).toBe(true);
+    expect(fs.existsSync(other)).toBe(true);
+    expect(fs.existsSync(path.join(lookalike, 'keep'))).toBe(true);
+  });
+
+  it('never builds into a directory that is already there', async () => {
+    // Whatever an earlier start left at the name it picks - or anything
+    // put there - is refused, not built into and handed to the next job.
+    await downloader.copyProxyCredentials(1, path.join(runnerDir, 'proxies', 'target-a'));
+    const id = Buffer.from('0123456789ab', 'hex');
+    // The module itself, which the downloader's import reads through.
+    jest.spyOn(jest.requireActual<typeof import('crypto')>('crypto'), 'randomBytes').mockImplementation((() => id) as never);
+    const taken = path.join(runnerDir, 'sandbox', `1-${id.toString('hex')}`);
+    write(path.join(taken, 'left'), 'left');
+
+    try {
+      await expect(downloader.buildSandbox(1, version)).rejects.toThrow(/EEXIST/);
+    } finally {
+      jest.restoreAllMocks();
+    }
+    expect(fs.readdirSync(taken)).toEqual(['left']);
+  });
+
   it("gives every job a _work of its own, never one kept from an earlier job's", async () => {
     // The removed preserveWorkDir setting linked _work to runner/work/<n>,
     // which outlived the sandbox and was handed to whatever job - from
@@ -261,8 +327,10 @@ describe('the runner template a sandbox is copied from', () => {
 
     await expect(build()).rejects.toThrow(/Checksum verification failed/);
     expect(fs.existsSync(path.join(root, 'runner', 'arc-manifests', `v${version}.json`))).toBe(false);
-    // Nothing of the scratch download is left behind.
-    expect(fs.readdirSync(path.join(root, 'runner'))).toEqual(['arc']);
+    // Nothing of the scratch download is left behind, nor the sandbox the
+    // build had started.
+    expect(fs.readdirSync(path.join(root, 'runner')).sort()).toEqual(['arc', 'sandbox']);
+    expect(fs.readdirSync(path.join(root, 'runner', 'sandbox'))).toEqual([]);
   });
 
   it('records what it extracted when it downloads a runner', async () => {

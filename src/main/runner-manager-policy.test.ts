@@ -15,6 +15,7 @@ jest.mock('./runner-downloader', () => ({
     getToolCacheDir: jest.fn().mockImplementation((targetId: string) => `/Users/test/.localmost/runner/caches/${targetId}/tool-cache`),
     getTargetCacheDir: jest.fn().mockImplementation((targetId: string) => `/Users/test/.localmost/runner/caches/${targetId}`),
     buildSandbox: jest.fn().mockImplementation((instance: number) => Promise.resolve(`/Users/test/.localmost/runner/sandbox/${instance}`)),
+    removeSandbox: jest.fn().mockResolvedValue(undefined),
     isDownloaded: jest.fn().mockReturnValue(true),
     isConfigured: jest.fn().mockReturnValue(true),
     hasAnyProxyCredentials: jest.fn().mockReturnValue(true),
@@ -35,6 +36,12 @@ jest.mock('./proxy-server', () => ({
     setPolicyLevel: jest.fn(),
     rotateAuthToken: jest.fn(),
   })),
+}));
+
+// The sweep by profile mark runs python; stubbed, as nothing here runs sandboxed.
+jest.mock('../shared/sandbox-reaper', () => ({
+  reapMarkedProcessesAsync: jest.fn(async () => []),
+  developerPython: jest.fn(async () => null),
 }));
 
 jest.mock('./runner-cleanup', () => ({

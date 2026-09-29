@@ -9,7 +9,7 @@ jest.mock('./runner-downloader', () => ({
     getBaseDir: jest.fn().mockReturnValue('/Users/test/.localmost/runner'),
     getArcDir: jest.fn().mockReturnValue('/Users/test/.localmost/runner/arc/v2.330.0'),
     getConfigDir: jest.fn().mockImplementation((instance: number) => `/Users/test/.localmost/runner/config/${instance}`),
-    getSandboxDir: jest.fn().mockImplementation((instance: number) => `/Users/test/.localmost/runner/sandbox/${instance}`),
+    removeSandbox: jest.fn().mockResolvedValue(undefined),
     getToolCacheDir: jest.fn().mockImplementation((targetId: string) => `/Users/test/.localmost/runner/caches/${targetId}/tool-cache`),
     getTargetCacheDir: jest.fn().mockImplementation((targetId: string) => `/Users/test/.localmost/runner/caches/${targetId}`),
     buildSandbox: jest.fn().mockImplementation((instance: number) => Promise.resolve(`/Users/test/.localmost/runner/sandbox/${instance}`)),
@@ -36,6 +36,12 @@ jest.mock('./proxy-server', () => ({
     setPolicyLevel: jest.fn(),
     rotateAuthToken: jest.fn(),
   })),
+}));
+
+// The sweep by profile mark runs python; stubbed, as nothing here runs sandboxed.
+jest.mock('../shared/sandbox-reaper', () => ({
+  reapMarkedProcessesAsync: jest.fn(async () => []),
+  developerPython: jest.fn(async () => null),
 }));
 
 // Mock process-identity verification so tests can supply a matching start time,

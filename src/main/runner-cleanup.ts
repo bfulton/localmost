@@ -10,6 +10,8 @@ import { execFile, execFileSync, spawn, ChildProcess } from 'child_process';
 import { promisify } from 'util';
 import { randomBytes } from 'crypto';
 import { shell } from 'electron';
+import type { ProcessMarker } from '../shared/sandbox-profile';
+import { reapMarkedProcessesAsync } from '../shared/sandbox-reaper';
 
 const execFileAsync = promisify(execFile);
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -351,7 +353,8 @@ export async function killOrphanedProcesses(
   sandboxBase: string,
   log: CleanupLogger,
   startTimeOf: (pid: number) => StartTime = lookUpStartTime,
-  holdersOf: (markerPath: string) => Promise<number[] | null> | number[] | null = (p) => markerHolders(p, log)
+  holdersOf: (markerPath: string) => Promise<number[] | null> | number[] | null = (p) => markerHolders(p, log),
+  reapMarked: (marker: ProcessMarker) => Promise<number[] | null> = reapMarkedProcessesAsync
 ): Promise<boolean> {
   let killedAny = false;
   const pidDir = path.join(path.dirname(sandboxBase), 'pids');
@@ -448,6 +451,42 @@ export async function killOrphanedProcesses(
       } catch {
         // Couldn't read PID file - corrupted or permissions issue, skip
       }
+    }
+
+    // Profile marks last, for what the sweeps above could not reach. One
+    // left here belongs to a spawn that was never swept by it - the app quit
+    // or crashed first - and what that job left outside its process group
+    // still runs under the profile carrying it, unreachable by pid, group or
+    // marker descriptor. Last, because this sweep stops and kills without
+    // warning, and the worker itself is owed the SIGTERM above. By real
+    // path, as seatbelt answers for those. Every mark goes afterwards, swept
+    // or not: this is its last chance, and one kept because the sweep cannot
+    // run here would be kept for good.
+    let realPidDir = pidDir;
+    try {
+      realPidDir = fs.realpathSync(pidDir);
+    } catch {
+      // Swept as spelled.
+    }
+    for (const entry of entries) {
+      const stem = /^(\d+-[0-9a-f]+)\.granted$/.exec(entry.name)?.[1];
+      if (entry.isDirectory() || !stem) continue;
+      const marker = {
+        granted: path.join(realPidDir, `${stem}.granted`),
+        withheld: path.join(realPidDir, `${stem}.withheld`),
+      };
+      if (!fs.existsSync(marker.withheld)) continue;
+      const killed = await reapMarked(marker);
+      if (killed === null) {
+        log(`Could not look for processes left running under ${stem}'s profile; some may still be running`);
+      } else if (killed.length > 0) {
+        log(`Killed ${killed.join(', ')}, left running under ${stem}'s profile`);
+        killedAny = true;
+      }
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory() || !/^\d+-[0-9a-f]+\.(granted|withheld)$/.test(entry.name)) continue;
+      await fs.promises.unlink(path.join(pidDir, entry.name)).catch(() => undefined);
     }
   } catch {
     // Failed to scan sandbox directories - non-fatal, continue with cleanup
