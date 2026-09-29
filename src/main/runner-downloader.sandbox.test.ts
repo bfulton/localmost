@@ -50,6 +50,7 @@ describe('the sandbox a worker is built from', () => {
   });
 
   afterEach(() => {
+    jest.restoreAllMocks();
     if (savedConfigDir === undefined) delete process.env.LOCALMOST_CONFIG_DIR;
     else process.env.LOCALMOST_CONFIG_DIR = savedConfigDir;
     fs.rmSync(root, { recursive: true, force: true });
@@ -140,6 +141,83 @@ describe('the sandbox a worker is built from', () => {
     expect(fs.existsSync(path.join(runnerDir, 'arc', `v${version}`, 'run.sh'))).toBe(true);
     expect(fs.existsSync(other)).toBe(true);
     expect(fs.existsSync(path.join(lookalike, 'keep'))).toBe(true);
+  });
+
+  it('moves a sandbox out of its path before removing it', async () => {
+    // A process its job left running can still write the sandbox's path, so
+    // it could swap a directory in the tree for a link while a removal walks
+    // it. Removed from a path no job's profile grants, the tree is out of its
+    // reach - and removed without walking it by path, so that a writer no
+    // profile confines cannot steer the removal either.
+    await downloader.copyProxyCredentials(1, path.join(runnerDir, 'proxies', 'target-a'));
+    const sandbox = await downloader.buildSandbox(1, version);
+    write(path.join(sandbox, '_work', 'repo', 'src', 'output'), 'job');
+    const base = downloader.getSandboxBase();
+    const calls: Array<{ op: string; paths: string[] }> = [];
+    for (const op of ['rename', 'rm', 'readdir', 'opendir', 'lstat', 'stat', 'unlink', 'rmdir'] as const) {
+      const real = fs.promises[op].bind(fs.promises) as (...args: unknown[]) => Promise<unknown>;
+      jest.spyOn(fs.promises, op).mockImplementation(((...args: unknown[]) => {
+        calls.push({ op, paths: args.filter((arg): arg is string => typeof arg === 'string') });
+        return real(...args);
+      }) as never);
+    }
+
+    await downloader.removeSandbox(sandbox);
+
+    const [first, ...rest] = calls;
+    expect(first.op).toBe('rename');
+    const [from, to] = first.paths;
+    expect(from).toBe(sandbox);
+    // Beside it, where only the app writes, and under a name no sandbox is
+    // built with, so no job's profile grants it.
+    expect(path.dirname(to)).toBe(base);
+    expect(path.basename(to).startsWith('.removing-')).toBe(true);
+    // From there, no path more than one entry below a directory named for
+    // removal in the base, so no link swapped in anywhere is followed.
+    for (const { op, paths } of rest) {
+      expect(op).not.toBe('rm');
+      for (const p of paths) {
+        const rel = path.relative(base, p).split(path.sep);
+        expect(rel[0].startsWith('.removing-')).toBe(true);
+        expect(rel.length).toBeLessThanOrEqual(2);
+      }
+    }
+    expect(fs.readdirSync(base)).toEqual([]);
+  });
+
+  it('never removes a sandbox where it is when it cannot be moved out of its path', async () => {
+    await downloader.copyProxyCredentials(1, path.join(runnerDir, 'proxies', 'target-a'));
+    const sandbox = await downloader.buildSandbox(1, version);
+    jest.spyOn(fs.promises, 'rename').mockRejectedValue(
+      Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })
+    );
+    const removals = ['rm', 'unlink', 'rmdir'].map((op) => jest.spyOn(fs.promises, op as 'rm'));
+
+    await expect(downloader.removeSandbox(sandbox)).rejects.toThrow(/EACCES/);
+
+    // Left for the next startup's sweep, which moves it first too.
+    for (const removal of removals) expect(removal).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(sandbox, 'run.sh'))).toBe(true);
+  });
+
+  it('removes a sandbox without following a link planted at or in it', async () => {
+    const victim = path.join(root, 'victim');
+    write(path.join(victim, 'keep'), 'kept');
+    await downloader.copyProxyCredentials(1, path.join(runnerDir, 'proxies', 'target-a'));
+    const linkedFrom = await downloader.buildSandbox(1, version);
+    const replaced = await downloader.buildSandbox(2, version);
+    // Its job can write anywhere in its sandbox, and can replace the
+    // sandbox's own directory, since its profile grants that path.
+    fs.mkdirSync(path.join(linkedFrom, '_work'));
+    fs.symlinkSync(victim, path.join(linkedFrom, '_work', 'link'));
+    fs.rmSync(replaced, { recursive: true, force: true });
+    fs.symlinkSync(victim, replaced);
+
+    await downloader.removeSandbox(linkedFrom);
+    await downloader.removeSandbox(replaced);
+
+    expect(fs.readFileSync(path.join(victim, 'keep'), 'utf-8')).toBe('kept');
+    expect(fs.readdirSync(downloader.getSandboxBase())).toEqual([]);
   });
 
   it('never builds into a directory that is already there', async () => {
