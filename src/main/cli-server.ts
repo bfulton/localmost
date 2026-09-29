@@ -48,6 +48,9 @@ export type {
 const asName = (value: unknown): string | null =>
   typeof value === 'string' && value.trim() ? value.trim() : null;
 
+/** Longer than any request the CLI sends, by orders of magnitude. */
+const MAX_REQUEST_LINE_BYTES = 64 * 1024;
+
 /**
  * Describe a target for the CLI, including how many runner proxies are
  * registered for it.
@@ -149,28 +152,52 @@ export class CliServer {
    */
   private handleConnection(socket: net.Socket): void {
     let buffer = '';
+    // Requests on one connection run one at a time, in the order sent. Each
+    // data event used to start its own, so a pause still stopping the runner
+    // could be overtaken by the resume sent after it.
+    let pending: Promise<void> = Promise.resolve();
+    let refused = false;
 
-    socket.on('data', async (data) => {
+    const answer = async (line: string): Promise<void> => {
+      try {
+        const request = JSON.parse(line) as CliRequest;
+        const response = await this.handleCommand(request);
+        socket.write(JSON.stringify(response) + '\n');
+      } catch (parseError) {
+        const errorResponse: ErrorResponse = {
+          success: false,
+          error: `Invalid request: ${(parseError as Error).message}`,
+        };
+        socket.write(JSON.stringify(errorResponse) + '\n');
+      }
+    };
+
+    socket.on('data', (data) => {
+      if (refused) return;
       buffer += data.toString();
 
       // Try to parse complete JSON messages
       const lines = buffer.split('\n');
       buffer = lines.pop() || ''; // Keep incomplete line in buffer
 
+      // A request is a line of JSON a few hundred bytes long. Buffering an
+      // unterminated one without limit let any client grow the app's memory
+      // until it was killed.
+      if (buffer.length > MAX_REQUEST_LINE_BYTES) {
+        refused = true;
+        buffer = '';
+        const errorResponse: ErrorResponse = { success: false, error: 'Invalid request: too large' };
+        // The rest of the upload is read and dropped rather than left unread,
+        // which would reset the connection before the client saw the answer;
+        // a client that keeps sending is cut off shortly after.
+        socket.end(JSON.stringify(errorResponse) + '\n');
+        setTimeout(() => socket.destroy(), 1000).unref();
+        return;
+      }
+
       for (const line of lines) {
         if (!line.trim()) continue;
-
-        try {
-          const request = JSON.parse(line) as CliRequest;
-          const response = await this.handleCommand(request);
-          socket.write(JSON.stringify(response) + '\n');
-        } catch (parseError) {
-          const errorResponse: ErrorResponse = {
-            success: false,
-            error: `Invalid request: ${(parseError as Error).message}`,
-          };
-          socket.write(JSON.stringify(errorResponse) + '\n');
-        }
+        pending = pending.then(() => answer(line));
       }
     });
 

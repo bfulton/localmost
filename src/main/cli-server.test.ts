@@ -346,6 +346,64 @@ describe('CliServer', () => {
     });
   });
 
+  it('refuses a request line too long to be one, and closes the connection instead of buffering it', async () => {
+    await server.start();
+
+    const { received, closed } = await new Promise<{ received: string; closed: boolean }>((resolve, reject) => {
+      const socket = net.createConnection(testSocketPath);
+      let got = '';
+      const timer = setTimeout(() => {
+        socket.destroy();
+        resolve({ received: got, closed: false });
+      }, 2000);
+      socket.on('data', (data) => { got += data.toString(); });
+      socket.on('close', () => {
+        clearTimeout(timer);
+        resolve({ received: got, closed: true });
+      });
+      socket.on('error', (err: NodeJS.ErrnoException) => {
+        // The server may cut the connection while the client is still writing.
+        if (err.code !== 'EPIPE' && err.code !== 'ECONNRESET') reject(err);
+      });
+      // A megabyte with no newline: no CLI request is anywhere near this.
+      socket.write('x'.repeat(1024 * 1024));
+    });
+
+    expect(closed).toBe(true);
+    expect(received).toMatch(/too large/);
+  });
+
+  it('answers the requests on one connection in the order they were sent', async () => {
+    let finishStop: () => void = () => {};
+    mockStop.mockImplementation(() => new Promise<void>((resolve) => { finishStop = resolve; }));
+    await server.start();
+
+    const responses = await new Promise<Array<{ command?: string }>>((resolve, reject) => {
+      const socket = net.createConnection(testSocketPath, async () => {
+        socket.write(JSON.stringify({ command: 'pause' }) + '\n');
+        await new Promise((r) => setTimeout(r, 20));
+        socket.write(JSON.stringify({ command: 'jobs' }) + '\n');
+        await new Promise((r) => setTimeout(r, 20));
+        finishStop();
+      });
+      const seen: Array<{ command?: string }> = [];
+      let buffer = '';
+      socket.on('data', (data) => {
+        buffer += data.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) seen.push(JSON.parse(line));
+        if (seen.length === 2) {
+          socket.end();
+          resolve(seen);
+        }
+      });
+      socket.on('error', reject);
+    });
+
+    expect(responses.map((r) => r.command)).toEqual(['pause', 'jobs']);
+  });
+
   it('should clean up socket on stop', async () => {
     await server.start();
     expect(fs.existsSync(testSocketPath)).toBe(true);
