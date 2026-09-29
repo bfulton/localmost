@@ -1,9 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
+import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
 import { spawn } from 'child_process';
-import { killOrphanedProcesses, markerHolders, parsePidRecord, signalOrphanPids, classifyLsofFailure, classifyPsFailure, lsofCanSeeOtherProcesses } from './runner-cleanup';
+import { cleanupSandboxDirectories, killOrphanedProcesses, markerHolders, parsePidRecord, signalOrphanPids, classifyLsofFailure, classifyPsFailure, lsofCanSeeOtherProcesses } from './runner-cleanup';
 
 describe('killOrphanedProcesses', () => {
   const runnerDir = path.join(os.tmpdir(), `lm-cleanup-${process.pid}`);
@@ -424,4 +424,89 @@ describe('marker-based orphan reaping', () => {
       try { realKill(childPid, 'SIGKILL'); } catch { /* already gone */ }
     }
   }, 20000);
+});
+
+describe('cleanupSandboxDirectories', () => {
+  let root: string;
+  let sandboxBase: string;
+  let victim: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'lm-sweep-'));
+    sandboxBase = path.join(root, 'sandbox');
+    victim = path.join(root, 'victim');
+    fs.mkdirSync(victim, { recursive: true });
+    fs.writeFileSync(path.join(victim, 'keep'), 'kept');
+  });
+  afterEach(() => {
+    jest.restoreAllMocks();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const sandbox = (name: string): string => {
+    const dir = path.join(sandboxBase, name);
+    fs.mkdirSync(path.join(dir, '_work'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '_work', 'output'), 'job');
+    return dir;
+  };
+
+  it('moves each sandbox out of its path before removing it', async () => {
+    // Whatever of an earlier run's jobs outlived the kill before this sweep
+    // still writes its sandbox's path; see removeSandbox.
+    const dirs = [sandbox('1-abc123'), sandbox('2-def456')];
+    const rename = jest.spyOn(fs.promises, 'rename');
+    const rm = jest.spyOn(fs.promises, 'rm');
+
+    await cleanupSandboxDirectories(sandboxBase, () => undefined);
+
+    const removed = rm.mock.calls.map(([target]) => String(target));
+    for (const dir of dirs) {
+      expect(removed).not.toContain(dir);
+      const call = rename.mock.calls.findIndex(([from]) => String(from) === dir);
+      expect(call).not.toBe(-1);
+      const to = String(rename.mock.calls[call][1]);
+      expect(path.dirname(to)).toBe(sandboxBase);
+      expect(path.basename(to)).not.toMatch(/^\d+-[0-9a-f]+$/);
+      const removal = removed.indexOf(to);
+      expect(removal).not.toBe(-1);
+      expect(rename.mock.invocationCallOrder[call]).toBeLessThan(rm.mock.invocationCallOrder[removal]);
+    }
+    expect(fs.readdirSync(sandboxBase)).toEqual([]);
+  });
+
+  it('leaves a sandbox where it is when it cannot be moved out of its path', async () => {
+    const dir = sandbox('1-abc123');
+    jest.spyOn(fs.promises, 'rename').mockRejectedValue(
+      Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })
+    );
+    const rm = jest.spyOn(fs.promises, 'rm');
+    const logged: string[] = [];
+
+    await cleanupSandboxDirectories(sandboxBase, (message) => logged.push(message));
+
+    expect(rm).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(dir, '_work', 'output'), 'utf-8')).toBe('job');
+    expect(logged.some((message) => message.includes('1-abc123') && /retry/.test(message))).toBe(true);
+  });
+
+  it('finishes a removal an earlier run left part done', async () => {
+    const aside = path.join(sandboxBase, '.removing-1-abc123.0a1b2c3d');
+    fs.mkdirSync(path.join(aside, '_work'), { recursive: true });
+    fs.writeFileSync(path.join(aside, '_work', 'output'), 'job');
+
+    await cleanupSandboxDirectories(sandboxBase, () => undefined);
+
+    expect(fs.readdirSync(sandboxBase)).toEqual([]);
+  });
+
+  it('removes sandboxes without following a link planted at or in one', async () => {
+    const linkedFrom = sandbox('1-abc123');
+    fs.symlinkSync(victim, path.join(linkedFrom, '_work', 'link'));
+    fs.symlinkSync(victim, path.join(sandboxBase, '2-def456'));
+
+    await cleanupSandboxDirectories(sandboxBase, () => undefined);
+
+    expect(fs.readFileSync(path.join(victim, 'keep'), 'utf-8')).toBe('kept');
+    expect(fs.existsSync(linkedFrom)).toBe(false);
+  });
 });

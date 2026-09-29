@@ -495,8 +495,40 @@ export async function killOrphanedProcesses(
   return killedAny;
 }
 
+/** The start of the name a sandbox is moved to before it is removed. */
+export const REMOVAL_PREFIX = '.removing-';
+
 /**
- * Clean up sandbox directories (both regular and trash directories).
+ * Move a directory a job could write beside itself, under a name no job's
+ * profile grants, so that it can be removed. A process the job left running -
+ * one that left its process group with setsid() and outlived the sweep by
+ * profile mark - still writes the directory's path, and could swap a
+ * directory in the tree for a link while a recursive removal walked it; the
+ * removal would then delete what the link points to. seatbelt checks a write
+ * against the path the file has at the time of the write, so once moved
+ * nothing in the tree is writable to such a process, whatever it holds open
+ * there - its working directory included. Resolves
+ * to where it went, or null when it was already gone; rejects, leaving it
+ * where it is, when it cannot be moved.
+ */
+export async function moveAsideForRemoval(dir: string): Promise<string | null> {
+  const aside = path.join(
+    path.dirname(dir),
+    `${REMOVAL_PREFIX}${path.basename(dir)}.${randomBytes(4).toString('hex')}`
+  );
+  try {
+    await fs.promises.rename(dir, aside);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
+  return aside;
+}
+
+/**
+ * Clean up sandbox directories: each is moved out of its path and removed
+ * (see moveAsideForRemoval), and what an earlier run left part removed goes
+ * too.
  */
 export async function cleanupSandboxDirectories(
   sandboxBase: string,
@@ -514,7 +546,9 @@ export async function cleanupSandboxDirectories(
         continue;
       }
 
-      if (entry.name.includes('.trash.')) {
+      // Already out of every job's reach: a removal an earlier run began, or
+      // trash an earlier version's sweep moved aside.
+      if (entry.name.startsWith(REMOVAL_PREFIX) || entry.name.includes('.trash.')) {
         // Trash directories: try to remove (may have extended attributes blocking deletion)
         try {
           await fs.promises.rm(dirPath, { recursive: true, force: true });
@@ -530,27 +564,36 @@ export async function cleanupSandboxDirectories(
           }
         }
       } else {
-        // Regular sandbox directories: clean synchronously with timeout
+        // Regular sandbox directories: moved out of their path, never removed
+        // in it, then removed with a timeout
         log(`Removing sandbox: ${entry.name}`);
+        let aside: string | null;
         try {
-          const timeoutMs = 5000; // 5 seconds per directory
-          const rmPromise = fs.promises.rm(dirPath, { recursive: true, force: true });
-          const timeoutPromise = new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error('timeout')), timeoutMs)
-          );
-          await Promise.race([rmPromise, timeoutPromise]);
+          aside = await moveAsideForRemoval(dirPath);
         } catch {
-          // Deletion failed or timed out - rename to trash for background cleanup
-          const trashDir = `${dirPath}.trash.${Date.now()}`;
-          try {
-            await fs.promises.rename(dirPath, trashDir);
-            log(`Moved ${entry.name} to trash for background cleanup`);
-            fs.promises.rm(trashDir, { recursive: true, force: true }).catch(() => {
-              // Background cleanup failure is non-fatal
-            });
-          } catch {
-            log(`Warning: Could not clean ${entry.name}, will retry when runner starts`);
-          }
+          log(`Warning: Could not move ${entry.name} aside to remove it, will retry when runner starts`);
+          continue;
+        }
+        if (!aside) continue;
+        const timeoutMs = 5000; // 5 seconds per directory
+        let timer: NodeJS.Timeout | undefined;
+        const rmPromise = fs.promises.rm(aside, { recursive: true, force: true });
+        try {
+          await Promise.race([
+            rmPromise,
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+            }),
+          ]);
+        } catch {
+          // Deletion failed or timed out: one still going finishes in the
+          // background, and what is left goes at the next startup
+          rmPromise.catch(() => {
+            // Background cleanup failure is non-fatal
+          });
+          log(`Could not finish removing ${entry.name} yet; the rest goes in the background or at the next startup`);
+        } finally {
+          clearTimeout(timer);
         }
       }
     }

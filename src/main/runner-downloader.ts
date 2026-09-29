@@ -11,6 +11,7 @@ import {
   cleanupSandboxDirectories,
   cleanupIncompleteConfigs,
   cleanupWorkDirectories as cleanupWorkDirs,
+  moveAsideForRemoval,
 } from './runner-cleanup';
 
 export interface DownloadProgress {
@@ -484,6 +485,10 @@ export class RunnerDownloader {
    * other path, since this deletes a whole tree. One left behind - the app
    * quit first, or something of its job outlived every sweep - goes at the
    * next startup.
+   *
+   * Moved out of its path first, and never removed in it: something of its
+   * job still running there could otherwise steer the removal outside the
+   * tree (see moveAsideForRemoval).
    */
   async removeSandbox(sandboxDir: string): Promise<void> {
     const base = this.getSandboxBase();
@@ -494,7 +499,8 @@ export class RunnerDownloader {
     ) {
       throw new Error(`Refusing to remove ${sandboxDir}: not a sandbox in ${base}`);
     }
-    await fs.promises.rm(sandboxDir, { recursive: true, force: true });
+    const aside = await moveAsideForRemoval(sandboxDir);
+    if (aside) await fs.promises.rm(aside, { recursive: true, force: true });
   }
 
   /**
