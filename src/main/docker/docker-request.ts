@@ -74,6 +74,17 @@ const headerValue = (headers: Record<string, string>, name: string): string | un
 const isJsonContentType = (contentType: string | undefined): boolean =>
   contentType !== undefined && contentType.split(';')[0].trim().toLowerCase() === 'application/json';
 
+/**
+ * The body's media type as the daemon's Go server takes it
+ * (mime.ParseMediaType): the Content-Type up to its parameters, trimmed and
+ * lowercased, or '' when there is none. Go keeps the type even when the
+ * parameters after it are malformed, so they are not looked at here either.
+ */
+export function mediaTypeOf(req: DockerRequest): string {
+  const value = headerValue(req.raw.headers, 'content-type');
+  return value === undefined ? '' : value.split(';')[0].trim().toLowerCase();
+}
+
 export function parseDockerRequest(raw: DockerRequest['raw']): DockerRequest {
   // Only origin-form is accepted. Anything else either throws here (`//`,
   // `http://[`) or parses to a different path than the daemon will read, and

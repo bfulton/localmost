@@ -216,6 +216,19 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   create carrying `Privileged`, a bind of `/` or a mount propagation under that
   spelling reached the daemon unchecked. A label or container path named
   outside ASCII is refused as well; values are not affected.
+- The Docker filter forwards every permitted JSON body as the object it judged,
+  not the bytes it received. A key repeated exactly is kept once by JSON.parse
+  but decoded every time by the daemon, whose maps keep what an earlier copy
+  added: a network create with host-binding `Options` followed by `"Options":
+  {}` was judged empty and created bound.
+- The Docker filter refuses a body sent as a type the daemon reads parameters
+  from. Go's server takes a form body's parameters over the URL's, and the
+  filter streamed such a body through unread: a pull judged against
+  `fromImage=postgres` pulled the body's image on the operator's docker.io
+  credentials, and a build took `networkmode=host` from it. Each action now
+  accepts only the content types that carry no form.
+- The Docker filter refuses a body nested deeper than any Docker request.
+  Checking its keys overflowed the stack, and the request was never answered.
 - An approved policy is bound to the repository's id as well as its name. A job
   from a different repository that now holds an approved name - the approved one
   deleted or renamed, and the name taken since - is refused until the policy is

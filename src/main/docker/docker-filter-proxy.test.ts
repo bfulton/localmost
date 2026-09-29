@@ -272,6 +272,69 @@ describe('DockerFilterProxy forwarding', () => {
     expect(daemon.seen).toHaveLength(0);
   });
 
+  it('sends the daemon the body it judged, not a repeated key JSON.parse dropped', async () => {
+    // JSON.parse keeps the last copy of a repeated key. Go's decoder decodes
+    // every copy in turn into the same field, and a map keeps the entries an
+    // earlier copy put there, so forwarding these bytes would have the daemon
+    // bind the bridge to a host address the filter never saw.
+    const dir = tmp();
+    const daemon = await fakeDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', { run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] } });
+
+    const body =
+      '{"Name":"vk-1","Internal":true,' +
+      '"Options":{"com.docker.network.bridge.host_binding_ipv4":"0.0.0.0"},"Options":{}}';
+    const reply = await request(sock, 'POST', '/v1.45/networks/create', body, { 'content-type': 'application/json' });
+
+    expect(reply.status).toBe(200);
+    expect(daemon.seen).toHaveLength(1);
+    const forwarded = daemon.seen[0].body.toString();
+    expect(forwarded.match(/"Options"/g)).toHaveLength(1);
+    expect(forwarded).not.toContain('host_binding');
+    expect(JSON.parse(forwarded)).toEqual({ Name: 'vk-1', Internal: true, Options: {} });
+  });
+
+  it('refuses a pull or build whose parameters could come from a form body, without touching the daemon', async () => {
+    // Go's FormValue prefers a form body's parameters to the URL's, and the
+    // proxy streams a non-JSON body through unread: the daemon would pull
+    // from the body's registry on the operator's docker.io credentials, or
+    // build on the host network.
+    const dir = tmp();
+    const daemon = await fakeDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, {
+      backend: backendWith(daemon.sock, dir),
+      attachRegistryAuth: () => 'dG9rZW4=',
+    });
+    proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' }, pull: { registries: ['docker.io'] }, build: { context: './' } });
+
+    const form = { 'content-type': 'application/x-www-form-urlencoded' };
+    const pulled = await request(sock, 'POST', '/v1.45/images/create?fromImage=postgres&tag=16', 'fromImage=evil.example.com%2Fx', form);
+    expect(pulled.status).toBe(403);
+    const built = await request(sock, 'POST', '/v1.45/build?t=app', 'networkmode=host&t=app', form);
+    expect(built.status).toBe(403);
+    expect(daemon.seen).toHaveLength(0);
+
+    // The same pull and build as the CLI sends them still go through.
+    expect((await request(sock, 'POST', '/v1.45/images/create?fromImage=postgres&tag=16')).status).toBe(200);
+    expect((await request(sock, 'POST', '/v1.45/build?t=app', 'tar', { 'content-type': 'application/x-tar' })).status).toBe(200);
+    expect(daemon.seen).toHaveLength(2);
+  });
+
+  it('refuses a body nested deeper than any Docker body, and answers', async () => {
+    const dir = tmp();
+    const daemon = await fakeDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', runPolicy);
+
+    const depth = 100_000;
+    const body = '{"a":'.repeat(depth) + '1' + '}'.repeat(depth);
+    const reply = await request(sock, 'POST', '/v1.45/containers/create', body, { 'content-type': 'application/json' });
+    expect(reply.status).toBe(403);
+    expect(JSON.parse(reply.body).message).toMatch(/nested/);
+    expect(daemon.seen).toHaveLength(0);
+  });
+
   it('pins an unversioned request to the version it understands when forwarding', async () => {
     const dir = tmp();
     const daemon = await fakeDaemon(dir);

@@ -1210,11 +1210,11 @@ describe('message routing', () => {
       });
 
       it.each([
-        ['beside it, in another case', (id: string) => `sessionId=${id}&SessionId=forged`],
-        ['on its own, in another case', () => 'SESSIONID=forged'],
-        ['with a long s, which Go reads as s', (id: string) => `sessionId=${id}&%C5%BFessionId=forged`],
-        ['in any name outside ASCII', (id: string) => `sessionId=${id}&st%C3%A4tus=x`],
-      ])('refuses a query naming a session id %s', async (_, query) => {
+        ['a second session id, in another case', (id: string) => `sessionId=${id}&SessionId=forged`],
+        ['a session id alone, in another case', () => 'SESSIONID=forged'],
+        ['a second session id with a long s, which Go reads as s', (id: string) => `sessionId=${id}&%C5%BFessionId=forged`],
+        ['any parameter named outside ASCII', (id: string) => `sessionId=${id}&st%C3%A4tus=x`],
+      ])('refuses a query upstream could read differently: %s', async (_, query) => {
         // The upstream session id is put in place of the sessionId a request
         // carries, by that exact name. Upstream reads query names whatever
         // their case, and a folding decoder past ASCII, so a second spelling

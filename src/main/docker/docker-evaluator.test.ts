@@ -973,26 +973,52 @@ describe('keys the daemon would read as other keys', () => {
     expect(v.reason).toMatch(/ASCII/);
   });
 
-  it('refuses such a key at any depth', () => {
-    for (const body of [
-      // A second NetworkingConfig the daemon reads, joining the host network.
-      { Image: 'postgres:16', [`Networ${KELVIN}ingConfig`]: { EndpointsConfig: { host: {} } } },
-      { Image: 'postgres:16', HostConfig: { [`Bind${LONG_S}`]: ['/:/host'] } },
-      { Image: 'postgres:16', HostConfig: { [`Privi${LONG_S}eged`]: true } },
-      // A declared read-only mount, with a propagation the filter never reads
-      // and the daemon honours.
-      {
-        Image: 'postgres:16',
-        HostConfig: {
-          Mounts: [{ Type: 'bind', Source: '/ws', Target: '/x', ReadOnly: true, [`BindOption${LONG_S}`]: { Propagation: 'rshared' } }],
-        },
+  // The first three were refused before the ASCII rule too - the NetworkingConfig
+  // case fold (JS lowercases the Kelvin sign to k) and the HostConfig allowlist
+  // caught them - so for those the rows pin only the reason. The last two
+  // reached the daemon.
+  it.each<[string, unknown]>([
+    // A second NetworkingConfig the daemon reads, joining the host network.
+    ['NetworkingConfig with a Kelvin sign', { Image: 'postgres:16', [`Networ${KELVIN}ingConfig`]: { EndpointsConfig: { host: {} } } }],
+    ['HostConfig.Binds with a long s', { Image: 'postgres:16', HostConfig: { [`Bind${LONG_S}`]: ['/:/host'] } }],
+    ['HostConfig.Privileged with a long s', { Image: 'postgres:16', HostConfig: { [`Privi${LONG_S}eged`]: true } }],
+    // A declared read-only mount, with a propagation the filter never reads
+    // and the daemon honours.
+    ['Mounts[].BindOptions with a long s', {
+      Image: 'postgres:16',
+      HostConfig: {
+        Mounts: [{ Type: 'bind', Source: '/ws', Target: '/x', ReadOnly: true, [`BindOption${LONG_S}`]: { Propagation: 'rshared' } }],
       },
-      { Image: 'postgres:16', HostConfig: { Mounts: [{ [`Ty${LONG_S}e`]: 'bind', Type: 'tmpfs', Target: '/x' }] } },
-    ]) {
-      const v = create(body);
-      expect([JSON.stringify(body), v.allowed]).toEqual([JSON.stringify(body), false]);
-      expect(v.reason).toMatch(/ASCII/);
-    }
+    }],
+    // Judged as a tmpfs. Go assigns fields in key order and keeps the last
+    // value, so the daemon reads Type as "bind": a bind of the host's root.
+    ['Mounts[].Type with a long s, after Type', {
+      Image: 'postgres:16',
+      HostConfig: { Mounts: [{ Type: 'tmpfs', Target: '/x', [`Ty${LONG_S}e`]: 'bind', Source: '/' }] },
+    }],
+  ])('refuses such a key at depth: %s', (_name, body) => {
+    const v = create(body);
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/ASCII/);
+  });
+
+  it('names where in the body the key is', () => {
+    const v = create({ Image: 'postgres:16', HostConfig: { Mounts: [{ Type: 'tmpfs', Target: '/x', [`Ty${LONG_S}e`]: 'bind' }] } });
+    expect(v.reason).toMatch(/^the request body at HostConfig\.Mounts\[0\] has a key "Ty\\u017fe"/);
+  });
+
+  it('refuses a body nested deeper than any the daemon takes, rather than overflowing the stack', () => {
+    // JSON.parse takes this in its stride; a recursive walk of it does not.
+    const depth = 100_000;
+    const json = '{"a":'.repeat(depth) + '1' + '}'.repeat(depth);
+    const v = evaluateDockerRequest(raw('POST', '/v1.45/containers/create', json), ctx(runPolicy));
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/nested more than \d+ levels/);
+    // A body as deep as a real one still passes the walk.
+    expect(create({
+      Image: 'postgres:16',
+      HostConfig: { Mounts: [{ Type: 'volume', Target: '/x', VolumeOptions: { DriverConfig: { Options: { a: 'b' } } } }] },
+    }).reason ?? '').not.toMatch(/nested/);
   });
 
   it('refuses such a key in a network create body, including inside IPAM', () => {
@@ -1038,5 +1064,64 @@ describe('keys the daemon would read as other keys', () => {
     }), ctx(p)).allowed).toBe(true);
     const pull: DockerPolicy = { pull: { registries: ['docker.io'] } };
     expect(evaluateDockerRequest(mk('POST', '/v1.45/images/create?fromImage=postgres&tag=16'), ctx(pull)).allowed).toBe(true);
+  });
+});
+
+describe('bodies the daemon reads as a form', () => {
+  // Go's net/http reads parameters from an application/x-www-form-urlencoded
+  // or multipart/form-data body as well as from the URL, and FormValue prefers
+  // the body's. Moby's image-create and build handlers read theirs that way,
+  // from a body the filter streams through unread.
+  const withType = (method: string, url: string, contentType: string | undefined, body = '') =>
+    parseDockerRequest({
+      method, url,
+      headers: contentType === undefined ? {} : { 'content-type': contentType },
+      body: Buffer.from(body),
+    });
+  const p: DockerPolicy = {
+    run: { images: ['postgres:16'], network: 'bridge' }, pull: { registries: ['docker.io'] }, build: { context: './' },
+  };
+
+  it.each([
+    ['application/x-www-form-urlencoded'],
+    ['Application/X-WWW-Form-Urlencoded ; charset=utf-8'],
+    ['multipart/form-data; boundary=x'],
+    ['application/octet-stream'],
+  ])('refuses a pull whose body is sent as %s', (contentType) => {
+    const v = evaluateDockerRequest(
+      withType('POST', '/v1.45/images/create?fromImage=postgres&tag=16', contentType, 'fromImage=evil.example.com%2Fx'),
+      ctx(p)
+    );
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/content type/i);
+  });
+
+  it('refuses a build whose parameters could come from a form body', () => {
+    for (const contentType of ['application/x-www-form-urlencoded', 'multipart/form-data; boundary=x']) {
+      const v = evaluateDockerRequest(withType('POST', '/v1.45/build?t=app', contentType, 'networkmode=host'), ctx(p));
+      expect([contentType, v.allowed]).toEqual([contentType, false]);
+    }
+  });
+
+  it('refuses a create that is not sent as JSON', () => {
+    const v = evaluateDockerRequest(
+      withType('POST', '/v1.45/containers/create', 'application/x-www-form-urlencoded', 'Image=postgres%3A16'),
+      ctx(p)
+    );
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/content type/i);
+  });
+
+  it('permits the types the real clients send', () => {
+    // Captured from docker CLI 29.1.3: a pull, start, wait and stop carry no
+    // type; attach carries text/plain; a build carries application/x-tar.
+    const allowed = (req: DockerRequest, c = ctx(p, ['abc'])) => evaluateDockerRequest(req, c).allowed;
+    expect(allowed(withType('POST', '/v1.45/images/create?fromImage=postgres&tag=16', undefined))).toBe(true);
+    expect(allowed(withType('POST', '/v1.45/images/create?fromImage=postgres&tag=16', 'text/plain'))).toBe(true);
+    expect(allowed(withType('POST', '/v1.45/containers/abc/attach?stream=1', 'text/plain'))).toBe(true);
+    expect(allowed(withType('POST', '/v1.45/containers/abc/start', undefined))).toBe(true);
+    expect(allowed(withType('POST', '/v1.45/build?t=app', 'application/x-tar', 'tar'))).toBe(true);
+    expect(allowed(withType('POST', '/v1.45/build?t=app', 'application/tar', 'tar'))).toBe(true);
+    expect(allowed(withType('POST', '/v1.45/containers/create', 'application/json; charset=utf-8', '{"Image":"postgres:16"}'))).toBe(true);
   });
 });
