@@ -26,8 +26,6 @@ export interface WorkspaceOptions {
   stagedOnly?: boolean;
   /** Additional names to exclude at any depth, with '*' and '?' as wildcards */
   excludePatterns?: string[];
-  /** Additional patterns to include (overrides excludes) */
-  includePatterns?: string[];
 }
 
 export interface Workspace {
@@ -95,15 +93,16 @@ function ensureWorkspacesDir(): void {
 }
 
 /**
- * The shape of a workspace ID, and so of every directory cleanup may remove.
+ * The shape of a workspace ID, and so of every directory cleanup may remove:
+ * the time it was made, in milliseconds, then a random part, both base 36.
  */
-const WORKSPACE_ID = /^ws-[0-9a-z]+-[0-9a-z]+$/;
+const WORKSPACE_ID = /^ws-([0-9a-z]+)-[0-9a-z]+$/;
 
 /**
- * Generate a unique workspace ID.
+ * Generate a unique workspace ID, which dates the workspace.
  */
-function generateWorkspaceId(): string {
-  const timestamp = Date.now().toString(36);
+function generateWorkspaceId(now: number): string {
+  const timestamp = now.toString(36);
   const random = Math.random().toString(36).substring(2, 8);
   return `ws-${timestamp}-${random}`;
 }
@@ -122,12 +121,12 @@ function generateWorkspaceId(): string {
  * handed every step the checkout's own files to write.
  */
 export async function createWorkspace(options: WorkspaceOptions): Promise<Workspace> {
-  const { sourceDir, respectGitignore = true, stagedOnly = false, excludePatterns = [], includePatterns = [] } =
-    options;
+  const { sourceDir, respectGitignore = true, stagedOnly = false, excludePatterns = [] } = options;
 
   ensureWorkspacesDir();
 
-  const id = generateWorkspaceId();
+  const now = Date.now();
+  const id = generateWorkspaceId(now);
   const workspacePath = path.join(getWorkspacesDir(), id);
 
   // Create workspace directory
@@ -146,27 +145,11 @@ export async function createWorkspace(options: WorkspaceOptions): Promise<Worksp
   }
   fs.chmodSync(workspacePath, 0o700);
 
-  // Apply include patterns if specified
-  if (includePatterns.length > 0) {
-    // Re-copy included patterns that may have been excluded
-    for (const pattern of includePatterns) {
-      const srcPath = path.join(sourceDir, pattern);
-      const destPath = path.join(workspacePath, pattern);
-      if (fs.existsSync(srcPath)) {
-        const destDir = path.dirname(destPath);
-        if (!fs.existsSync(destDir)) {
-          fs.mkdirSync(destDir, { recursive: true });
-        }
-        fs.cpSync(srcPath, destPath, { recursive: true });
-      }
-    }
-  }
-
   const workspace: Workspace = {
     id,
     path: workspacePath,
     sourceDir: path.resolve(sourceDir),
-    createdAt: new Date().toISOString(),
+    createdAt: new Date(now).toISOString(),
   };
 
   // Save workspace metadata, as a new file: nothing may be at its name yet.
@@ -180,6 +163,8 @@ export async function createWorkspace(options: WorkspaceOptions): Promise<Worksp
  * other tracked file for context, copied as any workspace is. Each used to
  * be copied by path, which followed a tracked link and put the contents of
  * the file of the user's it named in the workspace, for every step to read.
+ * A submodule is its directory, empty, as a checkout without submodules
+ * leaves it, and no .git is copied from anywhere.
  */
 async function createStagedWorkspace(
   sourceDir: string,
@@ -196,7 +181,12 @@ async function createStagedWorkspace(
     throw new Error('No staged changes found');
   }
 
-  await copyTree(sourceDir, destDir, excluded, new Set([...stagedFiles, ...git(['ls-files', '-z'])]));
+  await copyTree(
+    sourceDir,
+    destDir,
+    (rel) => excluded(rel) || path.posix.basename(rel) === '.git',
+    [...new Set([...stagedFiles, ...git(['ls-files', '-z'])])]
+  );
 }
 
 /**
@@ -214,103 +204,196 @@ function excludeMatcher(patterns: string[]): (rel: string) => boolean {
 
 /**
  * The checkout's files that git would not ignore - tracked, or untracked
- * and not ignored - relative to it.
+ * and not ignored - relative to it, with '/' between names.
  *
  * The ignore rules are read by git, as git reads them. They used to go to
  * rsync as --exclude-from, whose filter syntax gives the checkout's text
  * meanings git never does: a line that is only "!" cleared every rule
- * before it, the default .git exclude among them. A checkout that is not a
- * repository has its .gitignore files read by git against an empty
- * repository of its own. A listing git cannot give is an error rather than
- * a copy of everything, as an ignored file is as often a .env as a build.
+ * before it, the default .git exclude among them. They are the rules of the
+ * repository the checkout is; one that is not a repository, or that lies in
+ * a repository which ignores it (a home directory kept as a dotfiles
+ * repository that ignores everything, say), has its .gitignore files read by
+ * git against an empty repository of its own. A repository within it - a
+ * submodule, or one nested untracked - is listed by its own rules and then
+ * held to the checkout's too, where it used to be copied whole, whatever
+ * either ignored. A listing git cannot give is an error rather than a copy
+ * of everything, as an ignored file is as often a .env as a build.
  */
-function listNotIgnored(sourceDir: string): Set<string> {
-  const git = (args: string[]): string =>
+function listNotIgnored(sourceDir: string): string[] {
+  const run = (args: string[], input?: string): string =>
     execFileSync('git', args, {
       cwd: sourceDir,
       encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'pipe'],
+      input,
+      stdio: ['pipe', 'pipe', 'pipe'],
       maxBuffer: 1024 * 1024 * 1024,
     });
-  let listing: string;
-  try {
-    listing = git(['ls-files', '-z', '--cached', '--others', '--exclude-standard']);
-  } catch {
-    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'localmost-ls-'));
+  const names = (output: string): string[] => output.split('\0').filter(Boolean);
+  // check-ignore exits 1 when it ignores none of the paths it is given.
+  const exitedWith = (err: unknown, status: number): boolean => (err as { status?: unknown }).status === status;
+
+  // Whether git reads sourceDir's rules from a repository: one it is the top
+  // of, or one it is in and not ignored by.
+  const inRepository = (): boolean => {
+    let prefix: string;
     try {
-      git(['init', '--quiet', '--bare', scratch]);
-      listing = git([`--git-dir=${scratch}`, `--work-tree=${sourceDir}`, 'ls-files', '-z', '--others', '--exclude-standard']);
-    } catch (err) {
-      const reason = (err as Error).message.split('\n')[0];
-      throw new Error(`Could not read the .gitignore rules of ${sourceDir} with git (${reason}); --no-ignore copies every file`);
-    } finally {
-      fs.rmSync(scratch, { recursive: true, force: true });
+      prefix = run(['rev-parse', '--show-prefix']).trim();
+    } catch {
+      return false;
     }
+    if (prefix === '') return true;
+    try {
+      run(['check-ignore', '-q', '--no-index', './']);
+      return false;
+    } catch (err) {
+      return exitedWith(err, 1);
+    }
+  };
+
+  // A directory, not a link to one elsewhere, that git would take for a
+  // repository of its own.
+  const isRepository = (dir: string): boolean => {
+    try {
+      return fs.lstatSync(dir).isDirectory() && fs.existsSync(path.join(dir, '.git'));
+    } catch {
+      return false;
+    }
+  };
+
+  let scratch: string | null = null;
+  try {
+    let git = run;
+    if (!inRepository()) {
+      const gitDir = fs.mkdtempSync(path.join(os.tmpdir(), 'localmost-ls-'));
+      scratch = gitDir;
+      run(['init', '--quiet', '--bare', gitDir]);
+      git = (args, input) => run([`--git-dir=${gitDir}`, `--work-tree=${sourceDir}`, ...args], input);
+    }
+
+    const listed: string[] = [];
+    const nested: string[] = [];
+    for (const name of names(git(['ls-files', '-z', '--cached', '--others', '--exclude-standard']))) {
+      // A repository within the checkout is listed as its directory, as
+      // "dir/" when it is untracked. The directory itself is kept, to be
+      // made empty when nothing in it is listed.
+      const rel = name.replace(/\/+$/, '');
+      listed.push(rel);
+      if (isRepository(path.join(sourceDir, rel))) {
+        nested.push(...listNotIgnored(path.join(sourceDir, rel)).map((inner) => `${rel}/${inner}`));
+      }
+    }
+    if (nested.length > 0) {
+      let ignored: Set<string>;
+      try {
+        ignored = new Set(names(git(['check-ignore', '-z', '--stdin', '--no-index'], nested.join('\0'))));
+      } catch (err) {
+        if (!exitedWith(err, 1)) throw err;
+        ignored = new Set();
+      }
+      listed.push(...nested.filter((rel) => !ignored.has(rel)));
+    }
+    return listed;
+  } catch (err) {
+    const reason = (err as Error).message.split('\n')[0];
+    throw new Error(`Could not read the .gitignore rules of ${sourceDir} with git (${reason}); --no-ignore copies every file`);
+  } finally {
+    if (scratch) fs.rmSync(scratch, { recursive: true, force: true });
   }
-  // A repository nested in the checkout is listed as its directory, "dir/".
-  return new Set(listing.split('\0').filter(Boolean).map((p) => p.replace(/\/+$/, '')));
 }
 
 /**
- * Copy a checkout into a workspace, each file its own copy.
+ * Copy a checkout into a workspace, each file its own copy: the paths
+ * listed, or without a listing every path in the checkout, less those
+ * excluded, which take all that is in them out too.
  *
  * A regular file is cloned (COPYFILE_FICLONE: an APFS clone, or a byte copy
  * where the volume or the pair of volumes cannot clone). A link is made
  * again as a link: following it would have this unsandboxed process copy
  * whatever it names into the workspace. Anything else - a FIFO, a socket -
- * is left out, as opening a FIFO waits for a writer. With a listing, only
- * what it names is copied, and a directory it names is copied whole.
+ * is left out, as opening a FIFO waits for a writer. A listed directory is
+ * made, holding only what else is listed in it: a directory git lists is a
+ * submodule, a repository nested untracked, or a tracked file since
+ * replaced by a directory, and was once copied whole, ignored files and all.
+ *
+ * Each listed path is looked up by the name git gives it, as the volume
+ * resolves that name, never matched to the names a walk of the checkout
+ * finds: git gives names precomposed and in the case its index holds, where
+ * the volume can hold them decomposed or renamed in case, and those files
+ * were left out.
  */
 async function copyTree(
   sourceDir: string,
   destDir: string,
   excluded: (rel: string) => boolean,
-  listed: Set<string> | null
+  listed: string[] | null
 ): Promise<void> {
-  // Every directory some listed path is in, which the walk has to enter.
-  const within = new Set<string>();
-  for (const file of listed ?? []) {
-    for (let dir = path.posix.dirname(file); dir !== '.'; dir = path.posix.dirname(dir)) within.add(dir);
-  }
-
-  const files: string[] = [];
-  const dirs: Array<{ rel: string; mode: number }> = [];
-  const walk = async (rel: string, whole: boolean): Promise<void> => {
+  const walk = async (rel: string, into: string[]): Promise<string[]> => {
     for (const entry of await fs.promises.readdir(path.join(sourceDir, rel), { withFileTypes: true })) {
       const child = rel ? `${rel}/${entry.name}` : entry.name;
       if (excluded(child)) continue;
-      const wanted = whole || listed === null || listed.has(child);
-      if (entry.isDirectory()) {
-        if (!wanted && !within.has(child)) continue;
-        const { mode } = await fs.promises.lstat(path.join(sourceDir, child));
-        await fs.promises.mkdir(path.join(destDir, child), { mode: 0o700 });
-        dirs.push({ rel: child, mode });
-        await walk(child, wanted);
-      } else if (wanted && entry.isSymbolicLink()) {
-        await fs.promises.symlink(await fs.promises.readlink(path.join(sourceDir, child)), path.join(destDir, child));
-      } else if (wanted && entry.isFile()) {
-        files.push(child);
+      into.push(child);
+      if (entry.isDirectory()) await walk(child, into);
+    }
+    return into;
+  };
+  const paths = listed ?? (await walk('', []));
+
+  // Each directory, made in the workspace once, if it is a directory in the
+  // checkout, not a link to one, and not excluded, nor in one that is.
+  const modes: Array<{ rel: string; mode: number }> = [];
+  const made = new Map<string, Promise<boolean>>([['.', Promise.resolve(true)]]);
+  const makeDir = (rel: string): Promise<boolean> => {
+    let making = made.get(rel);
+    if (!making) {
+      making = (async () => {
+        if (!(await makeDir(path.posix.dirname(rel))) || excluded(rel)) return false;
+        const stat = await fs.promises.lstat(path.join(sourceDir, rel)).catch(() => null);
+        if (!stat?.isDirectory()) return false;
+        try {
+          await fs.promises.mkdir(path.join(destDir, rel), { mode: 0o700 });
+        } catch (err) {
+          // Two names the checkout's volume tells apart and the workspace's
+          // does not: the first made stands, and only if it is a directory.
+          if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+          return (await fs.promises.lstat(path.join(destDir, rel))).isDirectory();
+        }
+        modes.push({ rel, mode: stat.mode });
+        return true;
+      })();
+      made.set(rel, making);
+    }
+    return making;
+  };
+
+  const place = async (rel: string): Promise<void> => {
+    if (!(await makeDir(path.posix.dirname(rel))) || excluded(rel)) return;
+    const from = path.join(sourceDir, rel);
+    const to = path.join(destDir, rel);
+    // Listed and since removed from the working tree: nothing to copy.
+    const stat = await fs.promises.lstat(from).catch(() => null);
+    try {
+      if (stat?.isDirectory()) {
+        await makeDir(rel);
+      } else if (stat?.isSymbolicLink()) {
+        await fs.promises.symlink(await fs.promises.readlink(from), to);
+      } else if (stat?.isFile()) {
+        await fs.promises.copyFile(from, to, fs.constants.COPYFILE_EXCL | fs.constants.COPYFILE_FICLONE);
       }
+    } catch (err) {
+      // Listed twice, by names the workspace's volume does not tell apart.
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
     }
   };
-  await walk('', false);
 
   let next = 0;
   const copier = async (): Promise<void> => {
-    while (next < files.length) {
-      const rel = files[next++];
-      await fs.promises.copyFile(
-        path.join(sourceDir, rel),
-        path.join(destDir, rel),
-        fs.constants.COPYFILE_EXCL | fs.constants.COPYFILE_FICLONE
-      );
-    }
+    while (next < paths.length) await place(paths[next++]);
   };
   await Promise.all(Array.from({ length: 16 }, copier));
 
   // Each directory takes the checkout's mode once it is filled, always with
   // the owner's bits, which removing the workspace needs.
-  for (const { rel, mode } of dirs.reverse()) {
+  for (const { rel, mode } of modes) {
     await fs.promises.chmod(path.join(destDir, rel), (mode & 0o777) | 0o700);
   }
 }
@@ -319,78 +402,39 @@ async function copyTree(
 // Workspace Cleanup
 // =============================================================================
 
-/** Far more than createWorkspace writes: a metadata file is a few lines. */
-const METADATA_MAX_BYTES = 64 * 1024;
-
 /**
- * Read a workspace's metadata file, or nothing if it is not one
- * createWorkspace could have written.
+ * List all workspaces, newest first.
  *
- * The run's steps can replace the file. A FIFO put there had every later
- * run's cleanup wait in open() for a writer that never came, and a link to
- * one, or to a device, did the same or read without end. Opened without
- * following a symlink or waiting on a FIFO, as readStepOutputs opens a
- * step's output file, and read only if it is a small regular file with no
- * other name.
+ * Each is known by its directory alone, dated by the time in its name. Its
+ * metadata lives in the workspace, which the run's steps can write, and is
+ * not read: a step that rewrote the id in it to "../.." had cleanup delete
+ * whatever that pointed at; one that dated it years ahead, or removed it,
+ * kept its workspace from ever being removed; and one that put a FIFO there
+ * had every later run wait in open() for a writer. A step cannot rename its
+ * workspace, as the directory it is in is app data, which it cannot write.
  */
-function readWorkspaceMetadata(metadataPath: string): Record<string, unknown> | null {
-  let fd: number;
-  try {
-    fd = fs.openSync(metadataPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
-  } catch {
-    return null;
-  }
-  try {
-    const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || stat.nlink !== 1 || stat.size > METADATA_MAX_BYTES) return null;
-    const metadata: unknown = JSON.parse(fs.readFileSync(fd, 'utf-8'));
-    return metadata !== null && typeof metadata === 'object' ? (metadata as Record<string, unknown>) : null;
-  } catch {
-    return null;
-  } finally {
-    fs.closeSync(fd);
-  }
-}
-
-/**
- * List all workspaces.
- */
-export function listWorkspaces(): Workspace[] {
+export function listWorkspaces(): Array<Omit<Workspace, 'sourceDir'>> {
   const dir = getWorkspacesDir();
   if (!fs.existsSync(dir)) {
     return [];
   }
 
-  const workspaces: Workspace[] = [];
-  const entries = fs.readdirSync(dir, { withFileTypes: true });
-
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !entry.name.startsWith('ws-')) {
+  const workspaces: Array<Omit<Workspace, 'sourceDir'>> = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const made = WORKSPACE_ID.exec(entry.name);
+    if (!entry.isDirectory() || !made) {
       continue;
     }
-
-    const workspacePath = path.join(dir, entry.name);
-    // The metadata lives in the workspace, which the run's steps can write,
-    // so it supplies nothing that names a directory: the id and path are the
-    // directory's own. A step that rewrote its id to "../.." had cleanup
-    // delete whatever that pointed at. Without metadata that can be read,
-    // the workspace is dated by its directory.
-    const metadata = readWorkspaceMetadata(path.join(workspacePath, METADATA_FILE));
-    const createdAt = new Date(typeof metadata?.createdAt === 'string' ? metadata.createdAt : NaN);
+    // A name no clock of createWorkspace's gave counts as the oldest.
+    const at = new Date(parseInt(made[1], 36));
     workspaces.push({
       id: entry.name,
-      path: workspacePath,
-      sourceDir: typeof metadata?.sourceDir === 'string' ? metadata.sourceDir : '',
-      createdAt: isNaN(createdAt.getTime())
-        ? fs.statSync(workspacePath).birthtime.toISOString()
-        : createdAt.toISOString(),
+      path: path.join(dir, entry.name),
+      createdAt: (isNaN(at.getTime()) ? new Date(0) : at).toISOString(),
     });
   }
 
-  // Sort by creation time, newest first
-  return workspaces.sort(
-    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-  );
+  return workspaces.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
 }
 
 /**

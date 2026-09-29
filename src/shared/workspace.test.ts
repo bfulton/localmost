@@ -28,13 +28,10 @@ const mockExecSync = execSync as jest.MockedFunction<typeof execSync>;
 describe('Workspace Management', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    // A workspace's metadata is read through a descriptor, after fstat says
-    // it is a regular file with one name; here the descriptor is its path,
-    // so each test's readFileSync answers by path. The checks themselves are
-    // on a real filesystem, in workspace.cleanup.test.ts.
-    mockFs.openSync.mockImplementation(((p: fs.PathLike) => p) as never);
-    mockFs.fstatSync.mockReturnValue({ isFile: () => true, nlink: 1, size: 100 } as fs.Stats);
   });
+
+  /** A workspace directory's entry, named as createWorkspace names one made at the given time. */
+  const madeAt = (ms: number, tail = 'abc123') => ({ name: `ws-${ms.toString(36)}-${tail}`, isDirectory: () => true });
 
   // ===========================================================================
   // getWorkspacesDir
@@ -62,29 +59,25 @@ describe('Workspace Management', () => {
       expect(result).toEqual([]);
     });
 
-    it('should list workspaces with metadata', () => {
-      mockFs.existsSync.mockImplementation((p) => {
-        const pathStr = String(p);
-        return pathStr.includes('workspaces') || pathStr.includes('.localmost-workspace.json');
-      });
+    it('lists each workspace by its name, newest first, and never reads its metadata', () => {
+      mockFs.existsSync.mockReturnValue(true);
+      const older = madeAt(Date.UTC(2024, 0, 1));
+      const newer = madeAt(Date.UTC(2024, 0, 2));
       (mockFs.readdirSync as jest.Mock).mockReturnValue([
+        older,
+        newer,
         { name: 'ws-abc123', isDirectory: () => true },
-        { name: 'ws-def456', isDirectory: () => true },
         { name: 'other-file', isDirectory: () => false },
       ]);
-      mockFs.readFileSync.mockReturnValue(
-        JSON.stringify({
-          id: 'ws-abc123',
-          path: '/path/to/ws-abc123',
-          sourceDir: '/repo',
-          createdAt: '2024-01-01T00:00:00.000Z',
-        })
-      );
 
       const result = listWorkspaces();
 
-      expect(result.length).toBeGreaterThan(0);
-      expect(result[0].id).toContain('ws-');
+      expect(result).toEqual([
+        { id: newer.name, path: path.join(getWorkspacesDir(), newer.name), createdAt: '2024-01-02T00:00:00.000Z' },
+        { id: older.name, path: path.join(getWorkspacesDir(), older.name), createdAt: '2024-01-01T00:00:00.000Z' },
+      ]);
+      expect(mockFs.openSync).not.toHaveBeenCalled();
+      expect(mockFs.readFileSync).not.toHaveBeenCalled();
     });
 
     it('should skip non-workspace directories', () => {
@@ -97,24 +90,6 @@ describe('Workspace Management', () => {
       const result = listWorkspaces();
 
       expect(result).toEqual([]);
-    });
-
-    it('should handle invalid metadata gracefully', () => {
-      mockFs.existsSync.mockReturnValue(true);
-      (mockFs.readdirSync as jest.Mock).mockReturnValue([
-        { name: 'ws-abc123', isDirectory: () => true },
-      ]);
-      mockFs.readFileSync.mockImplementation(() => {
-        throw new Error('Invalid JSON');
-      });
-      mockFs.statSync.mockReturnValue({
-        birthtime: new Date('2024-01-01'),
-      } as fs.Stats);
-
-      const result = listWorkspaces();
-
-      expect(result.length).toBe(1);
-      expect(result[0].id).toBe('ws-abc123');
     });
   });
 
@@ -140,60 +115,25 @@ describe('Workspace Management', () => {
     };
 
     it('should remove old workspaces', async () => {
-      const oldDate = new Date(Date.now() - 48 * 60 * 60 * 1000); // 48 hours ago
-      const newDate = new Date();
+      const oldWs = madeAt(Date.now() - 48 * 60 * 60 * 1000); // 48 hours ago
+      const newWs = madeAt(Date.now());
 
       mockFs.existsSync.mockReturnValue(true);
-      (mockFs.readdirSync as jest.Mock).mockReturnValue([
-        { name: 'ws-old-1', isDirectory: () => true },
-        { name: 'ws-new-1', isDirectory: () => true },
-      ]);
-      mockFs.readFileSync.mockImplementation((p) => {
-        const pathStr = String(p);
-        if (pathStr.includes('ws-old-1')) {
-          return JSON.stringify({
-            id: 'ws-old-1',
-            path: '/path/ws-old-1',
-            sourceDir: '/repo',
-            createdAt: oldDate.toISOString(),
-          });
-        }
-        return JSON.stringify({
-          id: 'ws-new-1',
-          path: '/path/ws-new-1',
-          sourceDir: '/repo',
-          createdAt: newDate.toISOString(),
-        });
-      });
+      (mockFs.readdirSync as jest.Mock).mockReturnValue([oldWs, newWs]);
       const { movedAside } = removalFs();
 
       const result = await cleanupWorkspaces({ maxAgeHours: 24 });
 
       expect(result.removed).toBe(1);
       expect(result.kept).toBe(1);
-      expect(movedAside()).toEqual([path.join(getWorkspacesDir(), 'ws-old-1')]);
+      expect(movedAside()).toEqual([path.join(getWorkspacesDir(), oldWs.name)]);
     });
 
     it('should remove workspaces exceeding max count', async () => {
       const now = Date.now();
+      const entries = Array.from({ length: 15 }, (_, i) => madeAt(now - i * 1000, `a${i}`));
       mockFs.existsSync.mockReturnValue(true);
-      (mockFs.readdirSync as jest.Mock).mockReturnValue(
-        Array.from({ length: 15 }, (_, i) => ({
-          name: `ws-${i}-a`,
-          isDirectory: () => true,
-        }))
-      );
-      mockFs.readFileSync.mockImplementation((p) => {
-        const pathStr = String(p);
-        const match = pathStr.match(/ws-(\d+)-a/);
-        const idx = match ? parseInt(match[1]) : 0;
-        return JSON.stringify({
-          id: `ws-${idx}-a`,
-          path: `/path/ws-${idx}-a`,
-          sourceDir: '/repo',
-          createdAt: new Date(now - idx * 1000).toISOString(),
-        });
-      });
+      (mockFs.readdirSync as jest.Mock).mockReturnValue(entries);
       const { movedAside } = removalFs();
 
       const result = await cleanupWorkspaces({ maxCount: 10, maxAgeHours: 9999 });
@@ -201,7 +141,7 @@ describe('Workspace Management', () => {
       expect(result.removed).toBe(5);
       expect(result.kept).toBe(10);
       // The five oldest.
-      expect(movedAside()).toEqual([10, 11, 12, 13, 14].map((i) => path.join(getWorkspacesDir(), `ws-${i}-a`)));
+      expect(movedAside()).toEqual(entries.slice(10).map(({ name }) => path.join(getWorkspacesDir(), name)));
     });
   });
 

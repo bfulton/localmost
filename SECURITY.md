@@ -328,10 +328,13 @@ sandbox profile. The checkout is treated as untrusted, and so is its
   copy - an APFS clone where the volume can make one, never a hard link - so
   a write to a workspace file never reaches the checkout. `.git`,
   `node_modules` and whatever git ignores are left out, the ignore rules read
-  by git itself. A `working-directory`, a local action's path or an action's
-  entry point that resolves outside it is refused, and fetched action code is
-  readable but not writable. A step can change anything inside the workspace
-  but not remove or replace the workspace directory itself.
+  by git itself; in a submodule or a repository nested in the checkout, what
+  either its own rules or the checkout's ignore. With `--staged` only tracked
+  files are copied, and a submodule's directory is left empty. A
+  `working-directory`, a local action's path or an action's entry point that
+  resolves outside it is refused, and fetched action code is readable but not
+  writable. A step can change anything inside the workspace but not remove or
+  replace the workspace directory itself.
 - **Never reachable.** Whatever the policy declares, a step cannot read or
   write the app's data directory (the runner template every worker is copied
   from, approvals, settings, other runs; `~/.localmost` is closed even when the

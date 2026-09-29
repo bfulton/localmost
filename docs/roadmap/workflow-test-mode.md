@@ -100,11 +100,19 @@ localmost test --staged   # Uses staged changes only
 
 The files come from git, which reads the ignore rules as it always does:
 `git ls-files -z --cached --others --exclude-standard` (in a checkout that
-is not a repository, the same against an empty scratch repository), less
-`.git`, `node_modules` and the other default excludes. `--no-ignore` copies
-every file but those. The `.gitignore` is never handed to rsync as filter
-rules, whose syntax reads a lone `!` as "forget every exclude so far",
-`.git` among them.
+is not a repository, or lies in a repository that ignores it, the same
+against an empty scratch repository), less `.git`, `node_modules` and the
+other default excludes. A submodule or a repository nested in the checkout
+is listed the same way in it, and what the checkout's rules ignore is taken
+out of that too (`git check-ignore --no-index`). `--no-ignore` copies every
+file but the default excludes; `--staged` copies the tracked files and
+leaves a submodule's directory empty. The `.gitignore` is never handed to
+rsync as filter rules, whose syntax reads a lone `!` as "forget every
+exclude so far", `.git` among them.
+
+Each path is looked up by the name git lists, which the volume resolves
+whatever the Unicode form or case the name has on disk, rather than matched
+against a walk of the checkout.
 
 Each file is copied with `COPYFILE_FICLONE`: an APFS clone, which is
 copy-on-write and near instant, or a byte copy where the volume cannot clone.
