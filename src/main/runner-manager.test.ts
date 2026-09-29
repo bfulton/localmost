@@ -727,6 +727,23 @@ describe('RunnerManager', () => {
       const verdict = await m.evaluateJobFilter('o', 'r', 'me');
       expect(verdict.allowed).toBe(false);
     });
+
+    it('blocks a disallowed trigger author even when every contributor is allowed', async () => {
+      // An issue_comment or pull_request_target run checks out the default
+      // branch head, whose history is all trusted, while the person who set it
+      // going is a stranger. 'contributors' is the stricter scope; it must
+      // refuse at least what 'trigger' refuses.
+      const getAllContributors = jest.fn(async () => new Set(['me']));
+      const m = manager({
+        getUserFilter: () => ({ scope: 'contributors', allowedUsers: 'just-me', allowlist: [] }),
+        getCurrentUserLogin: () => 'me',
+        getAllContributors,
+      });
+
+      const verdict = await m.evaluateJobFilter('o', 'r', 'stranger', 'abc123');
+      expect(verdict.allowed).toBe(false);
+      expect(verdict.reason).toMatch(/stranger/);
+    });
   });
 
   describe('repository network policy', () => {

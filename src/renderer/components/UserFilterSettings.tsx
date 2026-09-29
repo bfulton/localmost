@@ -138,7 +138,7 @@ const UserFilterSettings: React.FC<UserFilterSettingsProps> = ({
       case 'trigger':
         return 'Check who triggered the workflow and filter based on that user.';
       case 'contributors':
-        return 'Check all contributors to the repository and ensure all are trusted.';
+        return 'Check who triggered the workflow and all contributors to the repository, and ensure all are trusted.';
       default:
         return '';
     }

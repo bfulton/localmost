@@ -2346,10 +2346,14 @@ export class RunnerManager {
       return { allowed: true, reason: '' };
     }
 
+    // Both remaining scopes check who set the run going. 'contributors' adds
+    // the authors of the code to that, never replaces it: a run whose commit
+    // is the default branch head (issue_comment, pull_request_target) has an
+    // all-trusted history whoever triggered it.
+    if (!isUserAllowed(githubActor, userFilter, currentUser)) {
+      return { allowed: false, reason: `trigger author '${githubActor}' not in allowed users` };
+    }
     if (scope === 'trigger') {
-      if (!isUserAllowed(githubActor, userFilter, currentUser)) {
-        return { allowed: false, reason: `trigger author '${githubActor}' not in allowed users` };
-      }
       return { allowed: true, reason: '' };
     }
 

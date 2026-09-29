@@ -100,7 +100,7 @@ describe('UserFilterSettings', () => {
         />
       );
 
-      expect(screen.getByText(/Check all contributors to the repository/)).toBeInTheDocument();
+      expect(screen.getByText(/who triggered the workflow and all contributors to the repository/)).toBeInTheDocument();
     });
   });
 
