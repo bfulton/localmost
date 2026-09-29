@@ -153,6 +153,22 @@ export function querySandboxLogs(sinceSeconds: number): string {
   }
 }
 
+/**
+ * Save what discovery saw, for --debug, and return where.
+ *
+ * Into a directory created here, not into the workspace's .debug: the
+ * workspace is the steps' to write, and a .debug they had made a symlink
+ * sent these writes, unsandboxed, wherever it pointed.
+ */
+export function saveDebugInfo(workspacePath: string, logContent: string, collectedPids: Set<number>): string {
+  const debugDir = fs.mkdtempSync(path.join(workspacePath, '.debug-'));
+  fs.writeFileSync(path.join(debugDir, 'sandbox-log.txt'), logContent, { flag: 'wx' });
+  fs.writeFileSync(path.join(debugDir, 'collected-pids.json'), JSON.stringify([...collectedPids], null, 2), {
+    flag: 'wx',
+  });
+  return debugDir;
+}
+
 // =============================================================================
 // Output Formatting
 // =============================================================================
@@ -545,17 +561,7 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
 
     // Save debug info if requested
     if (options.debug) {
-      const debugDir = path.join(workspace.path, '.debug');
-      if (!fs.existsSync(debugDir)) {
-        fs.mkdirSync(debugDir, { recursive: true });
-      }
-      // Save raw sandbox log
-      fs.writeFileSync(path.join(debugDir, 'sandbox-log.txt'), logContent);
-      // Save collected PIDs
-      fs.writeFileSync(
-        path.join(debugDir, 'collected-pids.json'),
-        JSON.stringify([...collectedPids], null, 2)
-      );
+      const debugDir = saveDebugInfo(workspace.path, logContent, collectedPids);
       console.log(`${colors.dim}Debug info saved to ${debugDir}${colors.reset}`);
     }
 

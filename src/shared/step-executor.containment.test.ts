@@ -46,9 +46,21 @@ interface Spawned {
 /** Every spawn this test saw, with the profile file read while it still existed. */
 let spawned: Spawned[];
 
+/** What the fake step does while it "runs", given its environment. */
+let duringStep: ((env: Record<string, string>) => void) | undefined;
+
+afterEach(() => {
+  duringStep = undefined;
+});
+
 beforeEach(() => {
   spawned = [];
-  spawn.mockImplementation(((command: string, args: string[], options: { cwd: string; detached?: boolean }) => {
+  spawn.mockImplementation(((
+    command: string,
+    args: string[],
+    options: { cwd: string; detached?: boolean; env: Record<string, string> }
+  ) => {
+    duringStep?.(options.env);
     const profilePath = args[args.indexOf('-f') + 1];
     spawned.push({
       command,
@@ -172,6 +184,54 @@ describe('the profile a step is spawned with', () => {
   it('starts the step in a process group of its own, so what it leaves running can be reaped', async () => {
     await run({ run: 'true' });
     expect(spawned[0].detached).toBe(true);
+  });
+});
+
+describe('the files the app writes and reads in the workspace', () => {
+  // The workspace is the step's to write, so anything the app itself writes
+  // or reads there, outside any sandbox, must not follow what a step put in
+  // its place. A victim outside the workspace stands for the user's files.
+  let victim: string;
+
+  beforeEach(() => {
+    victim = path.join(scratch, 'victim');
+    fs.writeFileSync(victim, 'aws_secret_access_key=hunter2\n');
+  });
+
+  it('does not write the step script through a symlink planted at its name', async () => {
+    // The name was the clock, so something left running by an earlier step
+    // could plant it ahead of time - and the script is the workflow's text.
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1700000000000);
+    try {
+      fs.symlinkSync(victim, path.join(workDir, '.step-1700000000000.sh'));
+      await run({ run: 'echo planted' });
+    } finally {
+      now.mockRestore();
+    }
+    expect(fs.readFileSync(victim, 'utf-8')).toBe('aws_secret_access_key=hunter2\n');
+  });
+
+  it('does not truncate through a symlink planted at the output file', async () => {
+    fs.symlinkSync(victim, path.join(workDir, '.github-output'));
+    await run({ run: 'true' });
+    expect(fs.readFileSync(victim, 'utf-8')).toBe('aws_secret_access_key=hunter2\n');
+  });
+
+  it('does not read a step\'s outputs from a file it swapped for a link to another', async () => {
+    for (const link of [fs.symlinkSync, fs.linkSync]) {
+      duringStep = (env) => {
+        fs.rmSync(env.GITHUB_OUTPUT, { force: true });
+        link(victim, env.GITHUB_OUTPUT);
+      };
+      const result = await run({ id: 'leak', run: 'true' });
+      expect(result.outputs).toEqual({});
+    }
+  });
+
+  it('still reads what a step writes to its output file', async () => {
+    duringStep = (env) => fs.appendFileSync(env.GITHUB_OUTPUT, 'answer=42\n');
+    const result = await run({ id: 'ok', run: 'true' });
+    expect(result.outputs).toEqual({ answer: '42' });
   });
 });
 

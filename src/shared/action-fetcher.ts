@@ -328,6 +328,15 @@ export function readActionMetadata(actionPath: string): ActionMetadata | null {
     return null;
   }
 
+  // Read by the app, outside any sandbox, from a directory a checkout
+  // controls; its input defaults become the step's environment. So it must be
+  // the action's own file, not a link to one elsewhere.
+  try {
+    resolveWithin(actionPath, path.basename(metadataPath), 'Action metadata', 'the action');
+  } catch {
+    return null;
+  }
+
   try {
     const yaml = require('js-yaml');
     return yaml.load(fs.readFileSync(metadataPath, 'utf-8')) as ActionMetadata;

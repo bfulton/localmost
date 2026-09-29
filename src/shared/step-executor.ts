@@ -8,6 +8,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import * as crypto from 'crypto';
 import { spawn, ChildProcess, SpawnOptions } from 'child_process';
 import { WorkflowStep, WorkflowJob, MatrixCombination } from './workflow-parser';
 import { SandboxPolicy, generateSandboxProfile, generateDiscoveryProfile } from './sandbox-profile';
@@ -434,15 +435,11 @@ async function executeRunStep(
   // Expand expressions in the script
   const script = expandExpression(step.run!, env, ctx);
 
-  // Create GITHUB_OUTPUT file
-  const outputFile = env.GITHUB_OUTPUT;
-  fs.writeFileSync(outputFile, '');
-
-  // Create temp script file
-  const scriptFile = path.join(ctx.workDir, `.step-${Date.now()}.sh`);
   // 0700, not 0755: expanding ${{ secrets.X }} puts the value in this file for
   // as long as the step runs, and another account should not be able to read it.
-  fs.writeFileSync(scriptFile, script, { mode: 0o700 });
+  const scriptFile = createStepFile(ctx.workDir, '.step', '.sh', script, 0o700);
+  const outputFile = createStepFile(ctx.workDir, '.github-output', '', '', 0o600);
+  env.GITHUB_OUTPUT = outputFile;
 
   ensureStepHome(ctx.workDir);
 
@@ -464,11 +461,7 @@ async function executeRunStep(
       ctx.permissive
     );
 
-    // Parse outputs from GITHUB_OUTPUT file
-    const outputs = parseGitHubOutputFile(outputFile);
-
-    // Clean up
-    fs.unlinkSync(scriptFile);
+    const outputs = readStepOutputs(outputFile);
 
     return {
       name: stepName,
@@ -479,10 +472,10 @@ async function executeRunStep(
       error: result.exitCode !== 0 && result.stderr ? result.stderr : undefined,
     };
   } finally {
-    // Ensure cleanup
-    if (fs.existsSync(scriptFile)) {
-      fs.unlinkSync(scriptFile);
-    }
+    // rm, not unlink-if-exists: whatever the step left at these names is
+    // removed without being followed.
+    fs.rmSync(scriptFile, { force: true });
+    fs.rmSync(outputFile, { force: true });
   }
 }
 
@@ -567,10 +560,6 @@ async function executeActionFromPath(
     }
   }
 
-  // Create GITHUB_OUTPUT file
-  const outputFile = env.GITHUB_OUTPUT;
-  fs.writeFileSync(outputFile, '');
-
   // Execute based on action type
   const { using, main } = metadata.runs;
 
@@ -589,25 +578,32 @@ async function executeActionFromPath(
     // directory. Its code is readable and nothing more: an action directory
     // fetched into the app's cache is shared by every run that uses it.
     const mainPath = resolveWithin(actionPath, main, 'Action entry point', 'the action');
-    const result = await runInSandbox(
-      'node',
-      [mainPath],
-      {
-        cwd: ctx.workDir,
-        workDir: ctx.workDir,
-        readOnlyPaths: [actionPath],
-        env,
-        proxyPort: ctx.proxyPort,
-        onOutput: ctx.onOutput,
-        sandboxLogFile: ctx.sandboxLogFile,
-        collectedPids: ctx.collectedPids,
-        secrets: ctx.secrets,
-      },
-      ctx.policy,
-      ctx.permissive
-    );
-
-    const outputs = parseGitHubOutputFile(outputFile);
+    const outputFile = createStepFile(ctx.workDir, '.github-output', '', '', 0o600);
+    env.GITHUB_OUTPUT = outputFile;
+    let result: SandboxResult;
+    let outputs: Record<string, string>;
+    try {
+      result = await runInSandbox(
+        'node',
+        [mainPath],
+        {
+          cwd: ctx.workDir,
+          workDir: ctx.workDir,
+          readOnlyPaths: [actionPath],
+          env,
+          proxyPort: ctx.proxyPort,
+          onOutput: ctx.onOutput,
+          sandboxLogFile: ctx.sandboxLogFile,
+          collectedPids: ctx.collectedPids,
+          secrets: ctx.secrets,
+        },
+        ctx.policy,
+        ctx.permissive
+      );
+      outputs = readStepOutputs(outputFile);
+    } finally {
+      fs.rmSync(outputFile, { force: true });
+    }
 
     return {
       name: stepName,
@@ -1331,15 +1327,53 @@ async function runInSandbox(
 // =============================================================================
 
 /**
+ * Create a file the app hands a step, directly in the workspace, under a name
+ * no one could have guessed, and without following anything already there.
+ *
+ * The workspace is the step's to write, and something an earlier step left
+ * running is still there. The script used to go at .step-<ms>.sh and the
+ * output file at .github-output, both written with a plain writeFileSync: a
+ * symlink planted at either name had this unsandboxed process write the
+ * workflow's own script over any file of the user's, or truncate one. A
+ * random name and O_EXCL leave nothing to plant; the workspace directory
+ * itself is not the step's to replace.
+ */
+function createStepFile(workDir: string, prefix: string, suffix: string, content: string, mode: number): string {
+  const file = path.join(workDir, `${prefix}-${crypto.randomBytes(8).toString('hex')}${suffix}`);
+  fs.writeFileSync(file, content, { mode, flag: 'wx' });
+  return file;
+}
+
+/**
+ * Read a step's outputs back, refusing a file the step swapped for a link.
+ *
+ * The step can replace its output file with a symlink or a hard link to any
+ * file it cannot read itself - ~/.aws/credentials is name=value lines already
+ * - and this read happens outside the sandbox, with the result handed to the
+ * next step as ${{ steps.<id>.outputs.* }}. Opened without following a
+ * symlink, and read only if it is a regular file with no other name.
+ */
+function readStepOutputs(filePath: string): Record<string, string> {
+  let fd: number;
+  try {
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  } catch {
+    return {};
+  }
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.nlink !== 1) return {};
+    return parseGitHubOutput(fs.readFileSync(fd, 'utf-8'));
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
  * Parse the GITHUB_OUTPUT file format.
  * Format: name=value or name<<EOF\nvalue\nEOF
  */
-function parseGitHubOutputFile(filePath: string): Record<string, string> {
-  if (!fs.existsSync(filePath)) {
-    return {};
-  }
-
-  const content = fs.readFileSync(filePath, 'utf-8');
+function parseGitHubOutput(content: string): Record<string, string> {
   const outputs: Record<string, string> = {};
 
   const lines = content.split('\n');
