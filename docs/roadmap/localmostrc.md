@@ -459,6 +459,10 @@ and a change to it is a policy change like any other.
 A repo's policy only takes effect once approved, in Settings > Job Security or
 with `localmost policy approve`, which shows the policy and a stamp, then
 `localmost policy approve --stamp <stamp>`, which approves exactly that policy.
+An approval is bound to the repository's GitHub id as well as its name, so a
+different repository that takes the name is asked about again even with the
+same file. Only Settings > Job Security, which shows the id changing, can move
+an approval to it; the CLI, which sees a clone with no id, cannot.
 
 ### CI vs local differences
 
