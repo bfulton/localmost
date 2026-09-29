@@ -185,6 +185,8 @@ export function describePolicy(policy: DescribablePolicy, prefix = '', scope: Po
   // A deny is checked ahead of every grant, so it holds against an allow
   // that would cover it, and against the level. Runner infrastructure is
   // the one exception on the network side: the runner cannot work without it.
+  // On the filesystem side the profile re-allows the job's own sandbox and
+  // its target's caches after the policy's deny, so neither can be denied.
   add('Network deny', '-', 'network denied', policy.network?.deny, {
     note: 'refused even where an allow or the level would let it through; runner infrastructure excepted',
   });
@@ -202,7 +204,7 @@ export function describePolicy(policy: DescribablePolicy, prefix = '', scope: Po
     warn: (value) => sensitiveWriteReason(value),
   });
   add('Filesystem deny', '-', 'denied', policy.filesystem?.deny, {
-    note: filesystemNote ?? "no read or write, even inside a granted path; the job's own sandbox excepted",
+    note: filesystemNote ?? "no read or write, even inside a granted path; the job's own sandbox and caches excepted",
   });
   add('Environment allow', '+', 'env', policy.env?.allow, { note: perWorkflow ? ENV_ALLOW_NOT_APPLIED : undefined });
   add('Environment deny', '-', 'env denied', policy.env?.deny, { note: perWorkflow ? ENV_DENY_EVERYWHERE : undefined });

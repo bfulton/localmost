@@ -24,7 +24,7 @@ interface SensitivePlace {
 }
 
 const LAUNCHD = 'launchd runs what is written here, outside the sandbox';
-const SHELL_RC = 'your shell runs this file when it starts, outside the sandbox';
+const SHELL_RC = 'your shell runs this file as it starts or exits, outside the sandbox';
 const ON_PATH = 'on your PATH: what is written here runs as your own commands, outside the sandbox';
 
 const SENSITIVE_WRITE_PLACES: SensitivePlace[] = [
@@ -32,10 +32,16 @@ const SENSITIVE_WRITE_PLACES: SensitivePlace[] = [
   { path: '~/Library/LaunchDaemons', why: LAUNCHD },
   // LaunchAgents, LaunchDaemons, and whatever launchd reads there next.
   { path: '/Library/Launch', prefix: true, why: LAUNCHD },
+  // zsh reads .zshenv for every invocation, the `zsh -c` of scripts and
+  // editors included - the widest of them all.
+  { path: '~/.zshenv', why: SHELL_RC },
   { path: '~/.zshrc', why: SHELL_RC },
   { path: '~/.zprofile', why: SHELL_RC },
+  { path: '~/.zlogin', why: SHELL_RC },
+  { path: '~/.zlogout', why: SHELL_RC },
   { path: '~/.bashrc', why: SHELL_RC },
   { path: '~/.bash_profile', why: SHELL_RC },
+  { path: '~/.bash_login', why: SHELL_RC },
   { path: '~/.profile', why: SHELL_RC },
   { path: '~/.ssh', why: 'your SSH keys, and the commands your SSH config runs' },
   { path: '~/.gitconfig', why: 'git runs the commands this file names, in every repository you work in' },
@@ -46,7 +52,14 @@ const SENSITIVE_WRITE_PLACES: SensitivePlace[] = [
   },
   { path: '/usr/local/bin', why: ON_PATH },
   { path: '/opt/homebrew/bin', why: ON_PATH },
+  // Where pipx, uv and the like install, and where people keep their own.
+  { path: '~/.local/bin', why: ON_PATH },
+  { path: '~/bin', why: ON_PATH },
 ];
+
+// The data volume is firmlinked at the root, so the home directory and
+// /Library are also reachable under this name.
+const DATA_VOLUME = /^\/system\/volumes\/data(?=\/|$)/i;
 
 /**
  * A path as a set of paths: a directory and everything under it, or - for a
@@ -74,6 +87,10 @@ function regionOf(entry: string, home: string, open = false): Region | null {
   p = p.replace(/\/+/g, '/');
   // "/./" is the directory itself, as the kernel reads it.
   while (p.includes('/./')) p = p.replace('/./', '/');
+  // Read as the path it mirrors, so a grant through the alias is warned
+  // about like one on the place itself. Warning is the safe reading either
+  // way, whether or not the sandbox matches the alias to the place.
+  if (DATA_VOLUME.test(p)) p = p.replace(DATA_VOLUME, '') || '/';
   if (!open) p = p.replace(/\/\.$/, '').replace(/\/+$/, '');
   // The default macOS volume ignores case, and so does the sandbox on it.
   return { literal: p.toLowerCase(), open };
@@ -119,9 +136,12 @@ export function sensitiveWriteReason(entry: string, home: string = os.homedir())
     const placeRegion = regionOf(place.path, home, place.prefix);
     if (!placeRegion || !overlaps(region, placeRegion)) continue;
     // A grant on a parent says which place it takes in; one on the place
-    // itself, or inside it, just says what the place is.
-    const isParent = !placeRegion.open && contains(region, placeRegion.literal) && region.literal !== placeRegion.literal;
-    return isParent ? `includes ${place.path}: ${place.why}` : place.why;
+    // itself, or inside it, just says what the place is. A place matched by
+    // prefix (/Library/Launch*) has a parent in any directory above it.
+    const isParent = placeRegion.open
+      ? !region.open && placeRegion.literal.startsWith(`${region.literal}/`)
+      : contains(region, placeRegion.literal) && region.literal !== placeRegion.literal;
+    return isParent ? `includes ${place.path}${place.prefix ? '*' : ''}: ${place.why}` : place.why;
   }
   return undefined;
 }

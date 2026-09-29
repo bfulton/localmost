@@ -140,6 +140,8 @@ describe('describePolicy', () => {
     const grants = describePolicy({ network: { deny: ['bad.example'] }, filesystem: { deny: ['~/.aws'] } });
     expect(grants[0].summary).toMatch(/^network denied: bad\.example \(refused even where an allow or the level/);
     expect(grants[1].summary).toMatch(/^denied: ~\/\.aws \(no read or write, even inside a granted path/);
+    // The job's own caches are re-allowed after the deny, as its sandbox is.
+    expect(grants[1].summary).toMatch(/the job's own sandbox and caches excepted\)$/);
   });
 
   it('says which workflow-scoped grants the runner cannot apply', () => {

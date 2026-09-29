@@ -16,15 +16,36 @@ describe('isSensitiveWritePath', () => {
       '~/.bashrc',
       '~/.bash_profile',
       '~/.profile',
+      // zsh reads .zshenv for every invocation, scripts' and editors' included.
+      '~/.zshenv',
+      '~/.zlogin',
+      '~/.zlogout',
+      '~/.bash_login',
       '~/.ssh',
       '~/.gitconfig',
       '~/.config',
       '~/Library/Application Support',
       '/usr/local/bin',
       '/opt/homebrew/bin',
+      '~/.local/bin',
+      '~/bin',
     ]) {
       expect([entry, sensitive(entry)]).toEqual([entry, true]);
     }
+  });
+
+  it('sees through the data volume, which mirrors the root under another name', () => {
+    for (const entry of [
+      '/System/Volumes/Data',
+      '/System/Volumes/Data/',
+      '/System/Volumes/Data/Library/LaunchDaemons',
+      `/System/Volumes/Data${HOME}/Library/LaunchAgents`,
+      `/system/volumes/data${HOME}/.zshenv`,
+    ]) {
+      expect([entry, sensitive(entry)]).toEqual([entry, true]);
+    }
+    expect(sensitive('/System/Volumes/Data/tmp/out')).toBe(false);
+    expect(sensitive('/System/Volumes/Database')).toBe(false);
   });
 
   it('flags the home directory and the root themselves, which contain all of them', () => {
@@ -89,6 +110,10 @@ describe('isSensitiveWritePath', () => {
     expect(sensitiveWriteReason('~/.zshrc', HOME)).toMatch(/shell/);
     expect(sensitiveWriteReason('/opt/homebrew/bin', HOME)).toMatch(/PATH/);
     expect(sensitiveWriteReason('~/Library', HOME)).toMatch(/LaunchAgents/);
+    // A parent of a place matched by prefix says it takes that place in,
+    // not that it is the place.
+    expect(sensitiveWriteReason('/Library', HOME)).toMatch(/^includes \/Library\/Launch\*: launchd/);
+    expect(sensitiveWriteReason('/Library/LaunchAgents', HOME)).toMatch(/^launchd/);
     expect(sensitiveWriteReason('~', HOME)).toMatch(/home directory/);
     expect(sensitiveWriteReason('/', HOME)).toMatch(/whole disk/);
     expect(sensitiveWriteReason('./build', HOME)).toBeUndefined();
