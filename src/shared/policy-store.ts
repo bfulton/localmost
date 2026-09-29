@@ -24,6 +24,12 @@ import { LocalmostrcConfig, validateLocalmostrc } from './localmostrc';
 export interface PolicyVersion {
   config: LocalmostrcConfig;
   at: string;
+  /**
+   * GitHub's id for the repository the policy came from. A name can be freed
+   * and taken by another repository; the id cannot. Absent in an entry
+   * written before ids were kept, until a matching job supplies it.
+   */
+  repositoryId?: number;
 }
 
 export interface PolicyEntry {
@@ -144,7 +150,23 @@ function parseVersion(raw: unknown, where: string): PolicyVersion | undefined {
   }
   const record = raw as Record<string, unknown>;
   if (typeof record.at !== 'string') throw new Error(`${where}.at must be a string`);
-  return { config: parseConfig(record.config, `${where}.config`), at: record.at };
+  const version: PolicyVersion = { config: parseConfig(record.config, `${where}.config`), at: record.at };
+  if (record.repositoryId !== undefined) {
+    if (!isRepositoryId(record.repositoryId)) throw new Error(`${where}.repositoryId must be a positive integer`);
+    version.repositoryId = record.repositoryId;
+  }
+  return version;
+}
+
+function isRepositoryId(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
+/** A policy version, with the repository id only when there is one. */
+function versionOf(config: LocalmostrcConfig, repositoryId: number | undefined): PolicyVersion {
+  const version: PolicyVersion = { config, at: new Date().toISOString() };
+  if (repositoryId !== undefined) version.repositoryId = repositoryId;
+  return version;
 }
 
 /**
@@ -261,9 +283,14 @@ export function listPolicyEntries(dir: string): PolicyEntry[] {
  * Record what a refused job asked for. The approved policy, if any, is left
  * exactly as it was: it stays in force until a reviewer approves another.
  */
-export function recordPending(dir: string, repository: string, config: LocalmostrcConfig): void {
+export function recordPending(
+  dir: string,
+  repository: string,
+  config: LocalmostrcConfig,
+  repositoryId?: number
+): void {
   const entry = readEntryToChange(dir, repository);
-  entry.pending = { config, at: new Date().toISOString() };
+  entry.pending = versionOf(config, repositoryId);
   writePolicyEntry(dir, entry);
 }
 
@@ -278,7 +305,9 @@ export function approvePending(dir: string, repository: string, stamp: string): 
   if (approvalStamp(repository, entry.pending.config) !== stamp) {
     throw new Error(`The policy for ${repository} changed since it was shown. Review it again before approving.`);
   }
-  entry.approved = { config: entry.pending.config, at: new Date().toISOString() };
+  // Approving a job's request approves it for the repository that asked. One
+  // that did not say which keeps whatever the approval was bound to before.
+  entry.approved = versionOf(entry.pending.config, entry.pending.repositoryId ?? entry.approved?.repositoryId);
   delete entry.pending;
   writePolicyEntry(dir, entry);
   return entry.approved.config;
@@ -292,12 +321,29 @@ export function approvePending(dir: string, repository: string, stamp: string): 
 export function approveConfig(dir: string, repository: string, config: LocalmostrcConfig): string {
   const stamp = approvalStamp(repository, config);
   const entry = readEntryToChange(dir, repository);
-  entry.approved = { config, at: new Date().toISOString() };
-  if (entry.pending && approvalStamp(repository, entry.pending.config) === stamp) {
+  // The operator's clone carries no repository id. Approving what a job
+  // asked for takes that job's; otherwise the approval stays bound to the
+  // repository it was bound to, and one with none is bound by the next job.
+  const pendingIsThis = entry.pending !== undefined && approvalStamp(repository, entry.pending.config) === stamp;
+  const repositoryId = (pendingIsThis ? entry.pending?.repositoryId : undefined) ?? entry.approved?.repositoryId;
+  entry.approved = versionOf(config, repositoryId);
+  if (pendingIsThis) {
     delete entry.pending;
   }
   writePolicyEntry(dir, entry);
   return stamp;
+}
+
+/**
+ * Bind an approved policy to the repository a matching job came from, if it
+ * is bound to none yet - an approval written before ids were kept. Once
+ * bound, a job from another repository under the same name is asked about.
+ */
+export function bindRepositoryId(dir: string, repository: string, repositoryId: number): void {
+  const entry = readEntryToChange(dir, repository);
+  if (!entry.approved || entry.approved.repositoryId !== undefined) return;
+  entry.approved.repositoryId = repositoryId;
+  writePolicyEntry(dir, entry);
 }
 
 /**

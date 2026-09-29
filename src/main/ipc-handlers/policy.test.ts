@@ -194,6 +194,16 @@ describe('approving from the app', () => {
     expect(approved.grants).toEqual(['network: index.crates.io']);
   });
 
+  it('says when a pending policy is for a different repository under the approved name', async () => {
+    const config = { version: 1, shared: { network: { allow: ['index.crates.io'] } } };
+    recordPendingPolicy(REPO, config, 1);
+    await approve(REPO, list()[0].stamp);
+    recordPendingPolicy(REPO, config, 2);
+
+    const pending = list().find((s) => !s.approved)!;
+    expect(pending.changes).toEqual([expect.stringMatching(/^~ repository id: 1 -> 2 \(.*deleted and recreated/)]);
+  });
+
   it('rejecting a change leaves the approved policy in force', async () => {
     recordPendingPolicy(REPO, { version: 1, level: 'moderate' });
     await approve(REPO, list()[0].stamp);

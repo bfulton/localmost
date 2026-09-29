@@ -63,8 +63,20 @@ export function listPolicySummaries(): PolicySummary[] {
         stamp: approvalStamp(entry.repository, entry.pending.config),
       };
       if (entry.approved) {
+        const changes: string[] = [];
+        // The approval is bound to the repository, not only its name: this
+        // one would move it to another repository that took the name.
+        const was = entry.approved.repositoryId;
+        const now = entry.pending.repositoryId;
+        if (was !== undefined && now !== undefined && was !== now) {
+          changes.push(
+            `~ repository id: ${was} -> ${now} (a different repository under this name: ` +
+              'the approved one was deleted and recreated, or renamed and its name taken)'
+          );
+        }
         const diffs = diffConfigs(entry.approved.config, entry.pending.config);
-        summary.changes = diffs.length > 0 ? formatPolicyDiff(diffs).split('\n') : [];
+        if (diffs.length > 0) changes.push(...formatPolicyDiff(diffs).split('\n'));
+        summary.changes = changes;
       }
       summaries.push(summary);
     }

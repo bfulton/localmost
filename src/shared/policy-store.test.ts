@@ -6,6 +6,7 @@ import {
   approvalStamp,
   approveConfig,
   approvePending,
+  bindRepositoryId,
   isValidRepository,
   listPolicyEntries,
   policyFilePath,
@@ -119,6 +120,46 @@ describe('a pending policy is kept apart from the approved one', () => {
     const entry = readPolicyEntry(dir, REPO)!;
     expect(entry.approved?.config).toEqual(NARROW);
     expect(entry.pending).toBeUndefined();
+  });
+
+  it('keeps the repository id with each policy, and approving carries it over', () => {
+    recordPending(dir, REPO, NARROW, 41);
+    expect(readPolicyEntry(dir, REPO)!.pending?.repositoryId).toBe(41);
+    approvePending(dir, REPO, approvalStamp(REPO, NARROW));
+    expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBe(41);
+
+    // A pending policy that names no id leaves the approved one's in place.
+    recordPending(dir, REPO, WIDE);
+    approvePending(dir, REPO, approvalStamp(REPO, WIDE));
+    expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBe(41);
+  });
+
+  it('approving a config directly keeps the id, or takes the pending one it approves', () => {
+    recordPending(dir, REPO, NARROW, 41);
+    approvePending(dir, REPO, approvalStamp(REPO, NARROW));
+    approveConfig(dir, REPO, WIDE);
+    expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBe(41);
+
+    recordPending(dir, REPO, NARROW, 42);
+    approveConfig(dir, REPO, NARROW);
+    expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBe(42);
+  });
+
+  it('binds an approved policy to a repository id only while it has none', () => {
+    recordPending(dir, REPO, NARROW);
+    approvePending(dir, REPO, approvalStamp(REPO, NARROW));
+
+    bindRepositoryId(dir, REPO, 7);
+    expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBe(7);
+    bindRepositoryId(dir, REPO, 8);
+    expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBe(7);
+  });
+
+  it('distrusts an entry whose repository id is not one', () => {
+    for (const repositoryId of ['7', 0, -1, 1.5, null]) {
+      writeRaw(REPO, { format: 2, repository: REPO, approved: { config: NARROW, at: '', repositoryId } });
+      expect(() => readPolicyEntry(dir, REPO)).toThrow(/repositoryId/);
+    }
   });
 
   it('approving a config directly clears a pending entry only when it is the same policy', () => {
