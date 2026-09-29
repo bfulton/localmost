@@ -19,7 +19,6 @@ import {
   parseLocalmostrc,
   diffConfigs,
   formatPolicyDiff,
-  getEffectivePolicy,
   LocalmostrcConfig,
   serializeLocalmostrc,
   LOCALMOSTRC_VERSION,
@@ -87,13 +86,27 @@ shared:
   console.log(`${colors.bold}Policy: ${colors.reset}${path.relative(cwd, localmostrcPath)}`);
   console.log();
 
-  // Show specific workflow policy if requested
+  // Show specific workflow policy if requested. The two sections are shown
+  // apart rather than merged: the runner applies a workflow's section only in
+  // part, and merged, its env allow and filesystem grants read as grants the
+  // runner makes.
   if (options.workflow) {
-    const effective = getEffectivePolicy(result.config, options.workflow);
-    console.log(`${colors.bold}Effective policy for ${options.workflow}:${colors.reset}`);
+    const workflow = options.workflow;
+    const { level, shared, workflows } = result.config;
+    console.log(`${colors.bold}Policy for ${workflow}:${colors.reset}`);
+    console.log();
     // The level is declared once, at the top of the file, and widens every
-    // section, so it is shown with any effective policy too.
-    printPolicy({ ...effective, level: result.config.level });
+    // section, so it is shown with the shared one.
+    console.log(`${colors.bold}Shared policy${colors.reset} ${colors.dim}(applies to every workflow)${colors.reset}`);
+    printPolicy({ ...shared, level });
+    console.log();
+    const section = workflows?.[workflow];
+    if (section) {
+      console.log(`${colors.bold}Workflow: ${workflow}${colors.reset} ${colors.dim}(any pull request can claim this)${colors.reset}`);
+      printPolicy(section, 'workflow');
+    } else {
+      console.log(`No section for ${workflow}: only the shared policy applies.`);
+    }
     return;
   }
 
@@ -518,7 +531,7 @@ ${colors.bold}SUBCOMMANDS:${colors.reset}
   init              Create a new .localmostrc template
 
 ${colors.bold}OPTIONS:${colors.reset}
-  -w, --workflow <name>  Show effective policy for a specific workflow
+  -w, --workflow <name>  Show the policy that applies to a specific workflow
   -f, --force            Overwrite existing file (for init)
   --stamp <sha256>       Approve only if the policy is still the one shown
 

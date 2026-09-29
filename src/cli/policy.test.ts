@@ -160,6 +160,52 @@ describe('policy show renders the docker grants', () => {
   });
 });
 
+describe('policy show --workflow', () => {
+  const originalLog = console.log;
+  let output: string[];
+  const ansi = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g');
+  const show = (...args: string[]) => {
+    const { subcommand, options } = parsePolicyArgs(['show', ...args]);
+    runPolicy(subcommand, options);
+    return output.join('\n').replace(ansi, '');
+  };
+
+  beforeEach(() => {
+    output = [];
+    console.log = (...args: unknown[]) => void output.push(args.join(' '));
+    jest.spyOn(process, 'cwd').mockReturnValue(repoDir);
+    fs.writeFileSync(
+      path.join(repoDir, '.localmostrc'),
+      'version: 1\nlevel: moderate\nshared:\n  network:\n    allow: [github.com]\n' +
+        'workflows:\n  deploy:\n    env:\n      allow: ["FASTLANE_*"]\n    filesystem:\n      write: ["./out"]\n'
+    );
+  });
+
+  afterEach(() => {
+    console.log = originalLog;
+    jest.restoreAllMocks();
+  });
+
+  it('keeps what the runner does not apply from a workflow marked as not applied', () => {
+    // The merged view listed the workflow's env allow and filesystem grants
+    // as plain effective grants, which the runner never makes.
+    const out = show('--workflow', 'deploy');
+    expect(out).toMatch(/FASTLANE_\*.*not applied/);
+    expect(out).toMatch(/\.\/out.*not applied to runner jobs/);
+    expect(out).toMatch(/deploy \(any pull request can claim this\)/);
+    // The shared section and the level still apply to it, and are shown.
+    expect(out).toMatch(/moderate/);
+    expect(out).toMatch(/github\.com/);
+  });
+
+  it('says when the workflow has no section of its own', () => {
+    const out = show('--workflow', 'build');
+    expect(out).toMatch(/no section for build/i);
+    expect(out).toMatch(/github\.com/);
+    expect(out).not.toMatch(/FASTLANE/);
+  });
+});
+
 describe('policy approve', () => {
   const policiesDir = path.join(dataDir, 'policies');
   const REPO = 'owner/my.repo';
