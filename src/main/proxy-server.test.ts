@@ -718,6 +718,50 @@ describe('CONNECT targets', () => {
   });
 });
 
+describe('the Host an upstream sees', () => {
+  // The proxy decides by the host in the request line; the Host header is
+  // the client's to write. Forwarded as written, a request the policy allowed
+  // for one host asked a shared front end (a CDN, a cloud load balancer) for
+  // another, which the policy never allowed.
+  const upstreamHosts = async () => {
+    const seen: (string | undefined)[] = [];
+    const up = http.createServer((req, res) => { seen.push(req.headers.host); res.end('ok'); });
+    await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
+    return { up, seen, port: (up.address() as net.AddressInfo).port };
+  };
+  const send = (proxyPort: number, method: string, url: string, body?: string) =>
+    new Promise<number>((resolve, reject) => {
+      const headers: Record<string, string> = { host: 'evil.test' };
+      if (body !== undefined) headers['content-length'] = String(body.length);
+      const req = http.request(
+        { hostname: '127.0.0.1', port: proxyPort, path: url, method, headers },
+        (res) => { res.resume(); resolve(res.statusCode || 0); }
+      );
+      req.on('error', reject);
+      req.end(body);
+    });
+
+  it('is the host the request was checked against, not the Host header sent', async () => {
+    const { up, seen, port } = await upstreamHosts();
+    const p = new ProxyServer({ policyLevel: 'strict' });
+    await p.start();
+    try {
+      expect(await send(p.getPort(), 'GET', `http://127.0.0.1:${port}/`)).toBe(200);
+      expect(seen).toEqual([`127.0.0.1:${port}`]);
+    } finally { up.closeAllConnections(); up.close(); await p.stop(); }
+  });
+
+  it('is the checked host on a replayed acquirejob too', async () => {
+    const { up, seen, port } = await upstreamHosts();
+    const p = new ProxyServer({ policyLevel: 'strict', onJobAcquired: async () => undefined });
+    await p.start();
+    try {
+      expect(await send(p.getPort(), 'POST', `http://127.0.0.1:${port}/_apis/x/acquirejob`, '{}')).toBe(200);
+      expect(seen).toEqual([`127.0.0.1:${port}`]);
+    } finally { up.closeAllConnections(); up.close(); await p.stop(); }
+  });
+});
+
 describe('the acquirejob forward is screened like every other request', () => {
   // acquirejob is buffered and replayed, so it has its own upstream request.
   // That request dialled by name through the system resolver, unscreened: a

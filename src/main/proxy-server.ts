@@ -351,6 +351,18 @@ export class ProxyServer {
   }
 
   /**
+   * The headers a plain request carries upstream: the client's, without our
+   * credentials, and with Host set to the authority the request line named.
+   * That is the host the policy was checked against; the client's own Host
+   * header is whatever it chose to write, and forwarded as written it asks a
+   * shared front end - a CDN, a cloud load balancer - for a site the policy
+   * never allowed.
+   */
+  private upstreamHeaders(req: http.IncomingMessage, authority: string): http.IncomingHttpHeaders {
+    return { ...stripProxyAuth(req.headers), host: authority };
+  }
+
+  /**
    * Handle regular HTTP requests (proxy them)
    */
   private handleRequest(
@@ -375,7 +387,7 @@ export class ProxyServer {
       // is where this proxy learns which repository it is serving, before the
       // runner fetches a single action for it.
       if (this.onJobAcquired && req.method === 'POST' && url.pathname.endsWith('/acquirejob')) {
-        this.handleAcquireJobRequest(req, res, host, port, path);
+        this.handleAcquireJobRequest(req, res, host, port, path, url.host);
         return;
       }
 
@@ -402,7 +414,7 @@ export class ProxyServer {
             port,
             path,
             method: req.method,
-            headers: stripProxyAuth(req.headers),
+            headers: this.upstreamHeaders(req, url.host),
             lookup: this.pinnedLookup(screened),
           },
           (proxyRes) => {
@@ -435,7 +447,8 @@ export class ProxyServer {
     res: http.ServerResponse,
     host: string,
     port: number,
-    path: string
+    path: string,
+    authority: string
   ): void {
     // Check the destination before reading anything. Buffering first would let
     // any request to a path ending in /acquirejob consume memory even when the
@@ -491,7 +504,7 @@ export class ProxyServer {
         : Promise.resolve(undefined);
 
       resolved.finally(() => {
-        this.forwardBufferedRequest(req, res, host, port, path, body);
+        this.forwardBufferedRequest(req, res, host, port, path, authority, body);
       });
     });
   }
@@ -502,6 +515,7 @@ export class ProxyServer {
     host: string,
     port: number,
     path: string,
+    authority: string,
     body: Buffer
   ): void {
     const { allowed, reason } = this.checkHostAccess(host);
@@ -525,7 +539,7 @@ export class ProxyServer {
       }
       // The body is replayed whole, so it is no longer chunked. Leaving both
       // headers on the request makes some servers reject it or frame it wrongly.
-      const headers = { ...stripProxyAuth(req.headers), 'content-length': String(body.length) };
+      const headers = { ...this.upstreamHeaders(req, authority), 'content-length': String(body.length) };
       delete headers['transfer-encoding'];
       const proxyReq = http.request(
         { hostname: host, port, path, method: req.method, headers, lookup: this.pinnedLookup(screened) },
