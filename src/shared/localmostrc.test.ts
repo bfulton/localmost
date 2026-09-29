@@ -1246,6 +1246,23 @@ describe('a network entry', () => {
     expect(w.errors[0].message).toMatch(/workflows\.ci\.network\.deny\[0\] must be a host/);
   });
 
+  it('refuses a range or a URL with the grammar, not the host its prefix spells', () => {
+    // The spelling check reads a host the way a URL does, which ends it at the
+    // first of these; "10.0.0.0/8" came back as "write \"10.0.0.0\" instead",
+    // and a deny written that way denies one address rather than the range.
+    // A tab or line break is dropped the same way, so "evil.com\tx" was
+    // offered "evil.comx", a host the entry never named.
+    for (const entry of ['10.0.0.0/8', '2001:db8::/32', 'evil.com/path', 'evil.com?x=1', 'evil.com#top', 'evil.com\\x', 'evil.com\tx', 'evil.com\nx', 'evil.com\rx']) {
+      for (const list of ['allow', 'deny'] as const) {
+        const r = parsed(list, entry);
+        expect([list, entry, r.success]).toEqual([list, entry, false]);
+        expect(r.errors.map((e) => e.message)).toEqual([
+          `shared.network.${list}[0] must be a host, an IP address or *.domain, optionally with :port, and nothing else`,
+        ]);
+      }
+    }
+  });
+
   it('refuses a host written in a spelling the proxy never compares, and says which one it does', () => {
     // A request's host arrives in ASCII, with its address written out and no
     // trailing dot; an allow entry spelled otherwise never matched one. The
@@ -1253,7 +1270,6 @@ describe('a network entry', () => {
     // does not turn a wildcard into one host.
     for (const [entry, suggestion] of [
       ['bücher.example', 'xn--bcher-kva.example'],
-      ['evil.com/path', 'evil.com'],
       ['0x7f.1', '127.0.0.1'],
       ['0x7f.1:8080', '127.0.0.1:8080'],
       ['*.bücher.example:8443', '*.xn--bcher-kva.example:8443'],
