@@ -29,6 +29,10 @@ shared:
       - "github.com"
       - "registry.npmjs.org"
       - "nodejs.org"
+    # A job reaches nothing on loopback but its own proxy unless declared.
+    # The test suites start servers on ephemeral 127.0.0.1 ports and connect
+    # to them, so no fixed list of ports would do.
+    loopback: true
   filesystem:
     # Under strict the sandbox grants the OS, the runner's own directories and
     # the workspace. Anything a build needs beyond that is declared here.

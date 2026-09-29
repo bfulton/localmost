@@ -6,6 +6,7 @@ import {
   approvalStamp,
   approveConfig,
   approvePending,
+  bindRepositoryId,
   isValidRepository,
   listPolicyEntries,
   policyFilePath,
@@ -121,6 +122,98 @@ describe('a pending policy is kept apart from the approved one', () => {
     expect(entry.pending).toBeUndefined();
   });
 
+  it('keeps the repository id with each policy, and approving carries it over', () => {
+    recordPending(dir, REPO, NARROW, 41);
+    expect(readPolicyEntry(dir, REPO)!.pending?.repositoryId).toBe(41);
+    approvePending(dir, REPO, approvalStamp(REPO, NARROW, 41));
+    expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBe(41);
+
+    // A pending policy that names no id leaves the approved one's in place.
+    recordPending(dir, REPO, WIDE);
+    approvePending(dir, REPO, approvalStamp(REPO, WIDE));
+    expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBe(41);
+  });
+
+  it('approving a config directly keeps the id the approval is bound to', () => {
+    recordPending(dir, REPO, NARROW, 41);
+    approvePending(dir, REPO, approvalStamp(REPO, NARROW, 41));
+    approveConfig(dir, REPO, WIDE);
+    expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBe(41);
+  });
+
+  it('approving a config directly never moves the approval to another repository', () => {
+    // The CLI shows the operator's clone, which carries no id, so a pending
+    // policy identical to it from a repository that took the name would be
+    // approved for that repository without its id ever being shown.
+    recordPending(dir, REPO, NARROW, 1);
+    approvePending(dir, REPO, approvalStamp(REPO, NARROW, 1));
+    recordPending(dir, REPO, NARROW, 2);
+
+    approveConfig(dir, REPO, NARROW);
+    const entry = readPolicyEntry(dir, REPO)!;
+    expect(entry.approved?.repositoryId).toBe(1);
+    // Still waiting, for the app's card, which shows the id changing.
+    expect(entry.pending?.repositoryId).toBe(2);
+  });
+
+  it('approving a config directly takes the pending id only when the approval has none', () => {
+    recordPending(dir, REPO, NARROW, 42);
+    approveConfig(dir, REPO, NARROW);
+    const entry = readPolicyEntry(dir, REPO)!;
+    expect(entry.approved?.repositoryId).toBe(42);
+    expect(entry.pending).toBeUndefined();
+  });
+
+  it('refuses an approval when the repository behind the pending policy changed since it was shown', () => {
+    recordPending(dir, REPO, NARROW, 1);
+    approvePending(dir, REPO, approvalStamp(REPO, NARROW, 1));
+    recordPending(dir, REPO, NARROW, 2);
+    const shown = approvalStamp(REPO, NARROW, 2);
+    // The same file, from yet another repository under the name.
+    recordPending(dir, REPO, NARROW, 3);
+
+    expect(() => approvePending(dir, REPO, shown)).toThrow(/changed since/);
+    expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBe(1);
+  });
+
+  it('stores no repository id that is not one, and keeps the entry readable', () => {
+    recordPending(dir, REPO, NARROW, 5);
+    approvePending(dir, REPO, approvalStamp(REPO, NARROW, 5));
+    for (const bad of [NaN, 0, -3, 1.5, Infinity]) {
+      recordPending(dir, REPO, WIDE, bad);
+      const entry = readPolicyEntry(dir, REPO)!;
+      expect(entry.pending?.config).toEqual(WIDE);
+      expect(entry.pending?.repositoryId).toBeUndefined();
+      expect(entry.approved?.repositoryId).toBe(5);
+    }
+  });
+
+  it('binds an approved policy to a repository id only while it has none', () => {
+    recordPending(dir, REPO, NARROW);
+    approvePending(dir, REPO, approvalStamp(REPO, NARROW));
+
+    bindRepositoryId(dir, REPO, 7);
+    expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBe(7);
+    bindRepositoryId(dir, REPO, 8);
+    expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBe(7);
+  });
+
+  it('binds no repository id that is not one', () => {
+    recordPending(dir, REPO, NARROW);
+    approvePending(dir, REPO, approvalStamp(REPO, NARROW));
+    bindRepositoryId(dir, REPO, NaN);
+    bindRepositoryId(dir, REPO, 0);
+    expect(readPolicyEntry(dir, REPO)!.approved?.config).toEqual(NARROW);
+    expect(readPolicyEntry(dir, REPO)!.approved?.repositoryId).toBeUndefined();
+  });
+
+  it('distrusts an entry whose repository id is not one', () => {
+    for (const repositoryId of ['7', 0, -1, 1.5, null]) {
+      writeRaw(REPO, { format: 2, repository: REPO, approved: { config: NARROW, at: '', repositoryId } });
+      expect(() => readPolicyEntry(dir, REPO)).toThrow(/repositoryId/);
+    }
+  });
+
   it('approving a config directly clears a pending entry only when it is the same policy', () => {
     recordPending(dir, REPO, WIDE);
     approveConfig(dir, REPO, NARROW);
@@ -136,6 +229,22 @@ describe('the stamp', () => {
     expect(approvalStamp(REPO, NARROW)).not.toBe(approvalStamp(REPO, { ...NARROW, level: 'moderate' }));
     expect(approvalStamp(REPO, NARROW)).not.toBe(approvalStamp('owner/other', NARROW));
     expect(approvalStamp(REPO, NARROW)).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('changes with the loopback grant', () => {
+    const withLoopback = (loopback: true | number[]): LocalmostrcConfig => ({
+      version: 1,
+      shared: { network: { allow: ['index.crates.io'], loopback } },
+    });
+    expect(approvalStamp(REPO, withLoopback(true))).not.toBe(approvalStamp(REPO, NARROW));
+    expect(approvalStamp(REPO, withLoopback([5432]))).not.toBe(approvalStamp(REPO, withLoopback(true)));
+    expect(approvalStamp(REPO, withLoopback([5432]))).not.toBe(approvalStamp(REPO, withLoopback([5433])));
+  });
+
+  it('covers the repository id when there is one, and is unchanged when there is none', () => {
+    expect(approvalStamp(REPO, NARROW, 1)).not.toBe(approvalStamp(REPO, NARROW, 2));
+    expect(approvalStamp(REPO, NARROW, 1)).not.toBe(approvalStamp(REPO, NARROW));
+    expect(approvalStamp(REPO, NARROW, undefined)).toBe(approvalStamp(REPO, NARROW));
   });
 
   it('does not depend on key order, so the same policy read back matches', () => {
@@ -237,6 +346,64 @@ describe('reading the cache', () => {
   it('matches the repository without regard to case, as GitHub does', () => {
     recordPending(dir, 'Owner/Repo', NARROW);
     expect(readPolicyEntry(dir, 'owner/repo')?.pending?.config).toEqual(NARROW);
+  });
+
+  it('keeps one file per repository whatever casing names it, on any volume', () => {
+    // The target's name and the name GitHub reports can differ in case. On a
+    // case-sensitive volume they used to be two files, so an approval
+    // recorded under one was not found under the other.
+    expect(policyFilePath(dir, 'Owner/Repo')).toBe(policyFilePath(dir, 'owner/repo'));
+    expect(policyFilePath(dir, 'Octo_Cat/Repo')).toBe(policyFilePath(dir, 'octo_cat/repo'));
+  });
+
+  it('still reads, and folds in, an entry written under a mixed-case file name', () => {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'Owner_Repo.json'),
+      JSON.stringify({ format: 2, repository: 'Owner/Repo', approved: { config: NARROW, at: '' } })
+    );
+    expect(readPolicyEntry(dir, 'owner/repo')?.approved?.config).toEqual(NARROW);
+
+    // Changing it must neither lose the approved slot nor leave two files -
+    // and on a volume that ignores case, the old name is the new file.
+    recordPending(dir, 'owner/repo', WIDE);
+    const entries = listPolicyEntries(dir);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].approved?.config).toEqual(NARROW);
+    expect(entries[0].pending?.config).toEqual(WIDE);
+    expect(readPolicyEntry(dir, 'OWNER/REPO')?.approved?.config).toEqual(NARROW);
+  });
+
+  describe('on a volume that does not find the old casing by the lowercased name', () => {
+    // This Mac's volume ignores case, so the lowercased name is made to miss
+    // here, as it does on a case-sensitive volume, to reach the scan.
+    // The module object itself: the namespace import is read-only.
+    const nodeFs = jest.requireActual<typeof fs>('fs');
+    let existsSpy: jest.SpiedFunction<typeof fs.existsSync>;
+    beforeEach(() => {
+      const realExists = nodeFs.existsSync.bind(nodeFs);
+      existsSpy = jest.spyOn(nodeFs, 'existsSync').mockImplementation(
+        (p) => String(p) !== policyFilePath(dir, REPO) && realExists(p)
+      );
+    });
+    afterEach(() => existsSpy.mockRestore());
+
+    it('finds the entry by scanning, and removes the file it read only when that is another file', () => {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, 'Owner_Repo.json'),
+        JSON.stringify({ format: 2, repository: 'Owner/Repo', approved: { config: NARROW, at: '' } })
+      );
+      expect(readPolicyEntry(dir, REPO)?.approved?.config).toEqual(NARROW);
+
+      // Written under the lowercased name, which here is the same file as
+      // the one read: removing the old name would delete what was written.
+      recordPending(dir, REPO, WIDE);
+      existsSpy.mockRestore();
+      const entry = readPolicyEntry(dir, REPO);
+      expect(entry?.approved?.config).toEqual(NARROW);
+      expect(entry?.pending?.config).toEqual(WIDE);
+    });
   });
 
   it('lists valid entries and skips the rest', () => {

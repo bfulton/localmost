@@ -50,12 +50,42 @@ describe('summarizeGrants', () => {
 
   it('shows docker grants from a per-workflow section too', () => {
     const grants = summarizeGrants({ workflows: { integration: { docker: { run: { images: ['redis:7'] } } } } });
-    expect(grants.join('\n')).toMatch(/integration: docker run image: redis:7/);
+    expect(grants.join('\n')).toMatch(/integration \(any pull request can claim this\): docker run image: redis:7/);
   });
 
   it('still shows the non-docker grants', () => {
     const grants = summarizeGrants({ shared: { network: { allow: ['example.com'] }, filesystem: { write: ['~/.npm'] } } });
     expect(grants).toEqual(['network: example.com', 'write: ~/.npm']);
+  });
+});
+
+describe('per-workflow grants on the approval screen', () => {
+  it('says any pull request can claim a workflow section', () => {
+    // A workflows: key is a file name, and a pull request can add a workflow
+    // file of any name - so a per-workflow grant is not reserved for the
+    // workflow the repository meant it for.
+    const [grant] = summarizeGrants({ workflows: { deploy: { network: { allow: ['x.com'] } } } });
+    expect(grant).toBe('deploy (any pull request can claim this): network: x.com');
+  });
+
+  it('says a per-workflow env allow is not applied', () => {
+    const [grant] = summarizeGrants({ workflows: { deploy: { env: { allow: ['FASTLANE_*'] } } } });
+    expect(grant).toMatch(/^deploy \(any pull request can claim this\): env: FASTLANE_\* \(not applied:/);
+  });
+});
+
+describe('loopback on the approval screen', () => {
+  it('shows a loopback grant, and that local services are reachable', () => {
+    const [grant] = summarizeGrants({ shared: { network: { loopback: [5432] } } });
+    expect(grant).toMatch(/^loopback: port 5432 \(warning: the job can connect to local services/);
+  });
+});
+
+describe('sensitive write paths on the approval screen', () => {
+  it('marks a write the job could use to run code outside the sandbox', () => {
+    const grants = summarizeGrants({ shared: { filesystem: { write: ['~/.zshrc', '~/.npm'] } } });
+    expect(grants[0]).toMatch(/^write: ~\/\.zshrc \(warning: your shell runs this file/);
+    expect(grants[1]).toBe('write: ~/.npm');
   });
 });
 
@@ -75,7 +105,7 @@ describe('the level on the approval screen', () => {
       workflows: { ci: { network: { allow: ['ci.example.com'] } } },
     } as never);
     expect(grants[0]).toMatch(/^level: moderate\b/);
-    expect(grants.slice(1)).toEqual(['network: example.com', 'ci: network: ci.example.com']);
+    expect(grants.slice(1)).toEqual(['network: example.com', 'ci (any pull request can claim this): network: ci.example.com']);
   });
 
   it('shows no level line for strict, which is the baseline', () => {
@@ -162,6 +192,31 @@ describe('approving from the app', () => {
     const approved = summaries.find((s) => s.approved)!;
     expect(pending.changes).toEqual(['~ level: strict -> permissive']);
     expect(approved.grants).toEqual(['network: index.crates.io']);
+  });
+
+  it('says when a pending policy is for a different repository under the approved name', async () => {
+    const config = { version: 1, shared: { network: { allow: ['index.crates.io'] } } };
+    recordPendingPolicy(REPO, config, 1);
+    await approve(REPO, list()[0].stamp);
+    recordPendingPolicy(REPO, config, 2);
+
+    const pending = list().find((s) => !s.approved)!;
+    expect(pending.changes).toEqual([expect.stringMatching(/^~ repository id: 1 -> 2 \(.*deleted and recreated/)]);
+  });
+
+  it('refuses when the repository behind the pending policy changed after it was listed', async () => {
+    // The same file, recorded again by a job from yet another repository:
+    // approving would bind the approval to an id the card never showed.
+    const config = { version: 1, shared: { network: { allow: ['index.crates.io'] } } };
+    recordPendingPolicy(REPO, config, 1);
+    await approve(REPO, list()[0].stamp);
+    recordPendingPolicy(REPO, config, 2);
+    const shown = list().find((s) => !s.approved)!;
+    recordPendingPolicy(REPO, config, 3);
+
+    const result = await approve(REPO, shown.stamp);
+    expect(result).toEqual({ success: false, error: expect.stringMatching(/changed since it was shown/) });
+    expect(getPolicyEntry(REPO)?.approved?.repositoryId).toBe(1);
   });
 
   it('rejecting a change leaves the approved policy in force', async () => {

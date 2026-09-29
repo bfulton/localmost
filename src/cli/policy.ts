@@ -13,13 +13,12 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { DescribablePolicy, describePolicy } from '../shared/policy-describe';
+import { DescribablePolicy, PolicyScope, describePolicy } from '../shared/policy-describe';
 import {
   findLocalmostrc,
   parseLocalmostrc,
   diffConfigs,
   formatPolicyDiff,
-  getEffectivePolicy,
   LocalmostrcConfig,
   serializeLocalmostrc,
   LOCALMOSTRC_VERSION,
@@ -87,13 +86,27 @@ shared:
   console.log(`${colors.bold}Policy: ${colors.reset}${path.relative(cwd, localmostrcPath)}`);
   console.log();
 
-  // Show specific workflow policy if requested
+  // Show specific workflow policy if requested. The two sections are shown
+  // apart rather than merged: the runner applies a workflow's section only in
+  // part, and merged, its env allow and filesystem grants read as grants the
+  // runner makes.
   if (options.workflow) {
-    const effective = getEffectivePolicy(result.config, options.workflow);
-    console.log(`${colors.bold}Effective policy for ${options.workflow}:${colors.reset}`);
+    const workflow = options.workflow;
+    const { level, shared, workflows } = result.config;
+    console.log(`${colors.bold}Policy for ${workflow}:${colors.reset}`);
+    console.log();
     // The level is declared once, at the top of the file, and widens every
-    // section, so it is shown with any effective policy too.
-    printPolicy({ ...effective, level: result.config.level });
+    // section, so it is shown with the shared one.
+    console.log(`${colors.bold}Shared policy${colors.reset} ${colors.dim}(applies to every workflow)${colors.reset}`);
+    printPolicy({ ...shared, level });
+    console.log();
+    const section = workflows?.[workflow];
+    if (section) {
+      console.log(`${colors.bold}Workflow: ${workflow}${colors.reset} ${colors.dim}(any pull request can claim this)${colors.reset}`);
+      printPolicy(section, 'workflow');
+    } else {
+      console.log(`No section for ${workflow}: only the shared policy applies.`);
+    }
     return;
   }
 
@@ -113,8 +126,10 @@ function printConfig(config: LocalmostrcConfig): void {
 
   if (config.workflows) {
     for (const [name, policy] of Object.entries(config.workflows)) {
-      console.log(`${colors.bold}Workflow: ${name}${colors.reset}`);
-      printPolicy(policy);
+      // A workflows: key is only a file name, and a pull request can add a
+      // workflow file of any name.
+      console.log(`${colors.bold}Workflow: ${name}${colors.reset} ${colors.dim}(any pull request can claim this)${colors.reset}`);
+      printPolicy(policy, 'workflow');
       console.log();
     }
   }
@@ -127,8 +142,8 @@ function printConfig(config: LocalmostrcConfig): void {
  * before running `localmost policy approve`, so what it leaves out is approved
  * unseen.
  */
-export function printPolicy(policy: DescribablePolicy): void {
-  const grants = describePolicy(policy);
+export function printPolicy(policy: DescribablePolicy, scope: PolicyScope = 'shared'): void {
+  const grants = describePolicy(policy, '', scope);
   if (grants.length === 0) {
     console.log('  (empty - uses defaults only)');
     return;
@@ -142,7 +157,11 @@ export function printPolicy(policy: DescribablePolicy): void {
       console.log(`  ${group}:`);
     }
     const color = colorFor[grant.marker] ?? colors.green;
-    console.log(`    ${color}${grant.marker}${colors.reset} ${grant.value}`);
+    const note = grant.note ? ` ${colors.dim}(${grant.note})${colors.reset}` : '';
+    console.log(`    ${color}${grant.marker}${colors.reset} ${grant.value}${note}`);
+    if (grant.warning) {
+      console.log(`      ${colors.yellow}\u26A0 warning: ${grant.warning}${colors.reset}`);
+    }
   }
 }
 
@@ -253,11 +272,28 @@ function handleApprove(options: PolicyOptions): void {
     console.log();
     printConfig(config);
 
-    const approved = readCachedPolicy(repository)?.approved;
+    const cached = readCachedPolicy(repository);
+    const approved = cached?.approved;
     if (approved) {
       const diffs = diffConfigs(approved.config, config);
       console.log(`${colors.bold}Changes from the approved policy:${colors.reset}`);
       console.log(diffs.length > 0 ? formatPolicyDiff(diffs) : 'None');
+      console.log();
+    }
+    const otherRepository = pendingFromOtherRepository(repository, cached, stamp);
+    if (otherRepository) {
+      console.log(
+        `${colors.yellow}⚠ A job from repository id ${otherRepository.now} is waiting with this same policy, ` +
+          `but the approval is bound to repository id ${otherRepository.was}.${colors.reset}`
+      );
+      console.log(
+        '  A different repository now holds this name: the approved one was deleted and recreated, or renamed ' +
+          'and its name taken.'
+      );
+      console.log(
+        '  Approving here keeps the approval with repository id ' +
+          `${otherRepository.was}. To move it, review the request in Settings > Job Security.`
+      );
       console.log();
     }
 
@@ -291,6 +327,32 @@ function handleApprove(options: PolicyOptions): void {
 
   console.log(`${colors.green}\u2713${colors.reset} Approved policy for ${repository}`);
   console.log('The runner will apply it to the next job from this repository.');
+  const stillWaiting = pendingFromOtherRepository(repository, readCachedPolicy(repository), stamp);
+  if (stillWaiting) {
+    console.log(
+      `${colors.yellow}The request from repository id ${stillWaiting.now} is still waiting:${colors.reset} ` +
+        'review it in Settings > Job Security.'
+    );
+  }
+}
+
+/**
+ * A pending policy identical to the operator's file but from a different
+ * repository than the approval is bound to - one that took the name. The
+ * clone carries no id and the diff reads "None", so without this the CLI
+ * would show nothing of it. approveConfig leaves the binding and the
+ * request alone; only the app's card, which shows the id, can move it.
+ */
+function pendingFromOtherRepository(
+  repository: string,
+  entry: PolicyEntry | null,
+  stamp: string
+): { was: number; now: number } | null {
+  const was = entry?.approved?.repositoryId;
+  const now = entry?.pending?.repositoryId;
+  if (was === undefined || now === undefined || was === now) return null;
+  if (!entry?.pending || approvalStamp(repository, entry.pending.config) !== stamp) return null;
+  return { was, now };
 }
 
 /**
@@ -469,7 +531,7 @@ ${colors.bold}SUBCOMMANDS:${colors.reset}
   init              Create a new .localmostrc template
 
 ${colors.bold}OPTIONS:${colors.reset}
-  -w, --workflow <name>  Show effective policy for a specific workflow
+  -w, --workflow <name>  Show the policy that applies to a specific workflow
   -f, --force            Overwrite existing file (for init)
   --stamp <sha256>       Approve only if the policy is still the one shown
 

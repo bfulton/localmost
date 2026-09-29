@@ -19,6 +19,8 @@ import {
   PolicyEntry,
   approvalStamp,
   approvePending,
+  bindRepositoryId,
+  isRepositoryId,
   listPolicyEntries,
   readPolicyEntry,
   recordPending,
@@ -47,6 +49,11 @@ export interface PolicyApprovalRequest {
   newConfig: LocalmostrcConfig;
   diffs: PolicyDiff[];
   isNewRepo: boolean;
+  /**
+   * The repository id the approved policy was bound to, when the job came
+   * from a different repository under the same name.
+   */
+  replacesRepositoryId?: number;
 }
 
 // =============================================================================
@@ -194,20 +201,48 @@ export function getApprovedPolicyForCommit(repository: string, sha: string): Loc
  * because the job then runs on the baseline: only a commit decided here as
  * carrying the approved policy is given it by getApprovedPolicyForCommit.
  * The commit is required so that a caller cannot decide without recording.
+ *
+ * The repository id, when the job carries one, is held to the one the
+ * approval was bound to: a name can be freed by deleting or renaming a
+ * repository and taken by another, whose .localmostrc need only match the
+ * approved one to inherit its grants. An approval bound to no id yet is
+ * bound to the first job that matches it.
  */
 export function decidePolicyForJob(
   repository: string,
   localmostrcContent: string | null,
-  sha: string
+  sha: string,
+  jobRepositoryId?: number
 ): PolicyDecision {
-  const decision = decide(repository, localmostrcContent);
+  const repositoryId = validRepositoryId(repository, jobRepositoryId);
+  const decision = decide(repository, localmostrcContent, repositoryId);
   const covered = decision.action === 'allow' && decision.reason === 'unchanged';
+  if (covered && repositoryId !== undefined) {
+    try {
+      bindRepositoryId(getPolicyCacheDir(), repository, repositoryId);
+    } catch (err) {
+      log.warn(`Could not bind the approved policy for ${repository} to its repository id: ${(err as Error).message}`);
+    }
+  }
   recordCommitCoverage(repository, sha, covered ? getApprovedPolicy(repository) : null);
   return decision;
 }
 
-function decide(repository: string, localmostrcContent: string | null): PolicyDecision {
-  const approved = getApprovedPolicy(repository);
+/**
+ * The job's repository id, or undefined when it carries none or one that is
+ * not an id. A malformed one is treated as none, as before ids were kept,
+ * rather than compared or stored: stored, it made the entry unreadable, and
+ * the next change replaced the entry, approval and all.
+ */
+function validRepositoryId(repository: string, repositoryId: number | undefined): number | undefined {
+  if (repositoryId === undefined || isRepositoryId(repositoryId)) return repositoryId;
+  log.warn(`Ignoring a malformed repository id for ${repository}: ${String(repositoryId)}`);
+  return undefined;
+}
+
+function decide(repository: string, localmostrcContent: string | null, repositoryId?: number): PolicyDecision {
+  const approvedVersion = getPolicyEntry(repository)?.approved;
+  const approved = approvedVersion?.config ?? null;
 
   if (!localmostrcContent) {
     return { action: 'allow', reason: approved ? 'narrowed' : 'no-policy' };
@@ -226,6 +261,15 @@ function decide(repository: string, localmostrcContent: string | null): PolicyDe
 
   if (approved) {
     const diffs = diffConfigs(approved, newConfig);
+    const boundTo = approvedVersion?.repositoryId;
+    if (repositoryId !== undefined && boundTo !== undefined && repositoryId !== boundTo) {
+      // Another repository under the approved one's name: what was approved
+      // was never asked for by this one.
+      return {
+        action: 'needs-approval',
+        request: { repository, oldConfig: approved, newConfig, diffs, isNewRepo: true, replacesRepositoryId: boundTo },
+      };
+    }
     if (diffs.length === 0) {
       return { action: 'allow', reason: 'unchanged' };
     }
@@ -245,8 +289,8 @@ function decide(repository: string, localmostrcContent: string | null): PolicyDe
  * Record a policy as awaiting approval, so the app and the CLI can show what
  * is pending. An approved policy is left in force alongside it.
  */
-export function recordPendingPolicy(repository: string, config: LocalmostrcConfig): void {
-  recordPending(getPolicyCacheDir(), repository, config);
+export function recordPendingPolicy(repository: string, config: LocalmostrcConfig, repositoryId?: number): void {
+  recordPending(getPolicyCacheDir(), repository, config, validRepositoryId(repository, repositoryId));
   log.debug(`Recorded pending policy for ${repository}`);
 }
 
@@ -256,7 +300,12 @@ export function recordPendingPolicy(repository: string, config: LocalmostrcConfi
 export function formatApprovalRequest(request: PolicyApprovalRequest): string {
   const lines: string[] = [];
 
-  if (request.isNewRepo) {
+  if (request.replacesRepositoryId !== undefined) {
+    lines.push(`New repository under an approved name: ${request.repository}`);
+    lines.push('');
+    lines.push(`Its policy was approved for repository id ${request.replacesRepositoryId}, and this job`);
+    lines.push('comes from a different repository with that name. Review the sandbox policy before approving.');
+  } else if (request.isNewRepo) {
     lines.push(`New repository: ${request.repository}`);
     lines.push('');
     lines.push('This repository wants to run workflows on your machine.');

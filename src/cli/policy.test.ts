@@ -10,7 +10,7 @@ jest.mock('../shared/paths', () => ({ getAppDataDirWithoutElectron: () => dataDi
 jest.mock('../shared/workspace', () => ({ getRepositoryFromDir: () => 'owner/my.repo' }));
 
 import { parsePolicyArgs, printPolicy, runPolicy } from './policy';
-import { approvalStamp, policyFilePath, readPolicyEntry, recordPending } from '../shared/policy-store';
+import { approvalStamp, approvePending, policyFilePath, readPolicyEntry, recordPending } from '../shared/policy-store';
 import { parseLocalmostrcContent } from '../shared/localmostrc';
 
 afterAll(() => {
@@ -149,8 +149,60 @@ describe('policy show renders the docker grants', () => {
     expect(capture({ level: 'moderate' })).toMatch(/moderate/);
   });
 
+  it('warns under a write the job could use to run code outside the sandbox', () => {
+    const out = capture({ filesystem: { write: ['/opt/homebrew/bin', '~/.npm'] } });
+    expect(out).toMatch(/\/opt\/homebrew\/bin[\s\S]*warning: on your PATH/);
+    expect(out.match(/warning/g)).toHaveLength(1);
+  });
+
   it('says nothing about docker when none is declared', () => {
     expect(capture({ network: { allow: ['github.com'] } })).not.toMatch(/docker/i);
+  });
+});
+
+describe('policy show --workflow', () => {
+  const originalLog = console.log;
+  let output: string[];
+  const ansi = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g');
+  const show = (...args: string[]) => {
+    const { subcommand, options } = parsePolicyArgs(['show', ...args]);
+    runPolicy(subcommand, options);
+    return output.join('\n').replace(ansi, '');
+  };
+
+  beforeEach(() => {
+    output = [];
+    console.log = (...args: unknown[]) => void output.push(args.join(' '));
+    jest.spyOn(process, 'cwd').mockReturnValue(repoDir);
+    fs.writeFileSync(
+      path.join(repoDir, '.localmostrc'),
+      'version: 1\nlevel: moderate\nshared:\n  network:\n    allow: [github.com]\n' +
+        'workflows:\n  deploy:\n    env:\n      allow: ["FASTLANE_*"]\n    filesystem:\n      write: ["./out"]\n'
+    );
+  });
+
+  afterEach(() => {
+    console.log = originalLog;
+    jest.restoreAllMocks();
+  });
+
+  it('keeps what the runner does not apply from a workflow marked as not applied', () => {
+    // The merged view listed the workflow's env allow and filesystem grants
+    // as plain effective grants, which the runner never makes.
+    const out = show('--workflow', 'deploy');
+    expect(out).toMatch(/FASTLANE_\*.*not applied/);
+    expect(out).toMatch(/\.\/out.*not applied to runner jobs/);
+    expect(out).toMatch(/deploy \(any pull request can claim this\)/);
+    // The shared section and the level still apply to it, and are shown.
+    expect(out).toMatch(/moderate/);
+    expect(out).toMatch(/github\.com/);
+  });
+
+  it('says when the workflow has no section of its own', () => {
+    const out = show('--workflow', 'build');
+    expect(out).toMatch(/no section for build/i);
+    expect(out).toMatch(/github\.com/);
+    expect(out).not.toMatch(/FASTLANE/);
   });
 });
 
@@ -201,6 +253,17 @@ describe('policy approve', () => {
     expect(decisions()).toEqual([]);
   });
 
+  it('says any pull request can claim a workflow section, and what the runner does not apply', () => {
+    writeRc('version: 1\nworkflows:\n  deploy:\n    env:\n      allow: [FASTLANE_TOKEN]\n');
+
+    expect(() => run()).toThrow('exit 1');
+    // Without the CLI's colours, which sit between the words.
+    const ansi = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g');
+    const out = output.join('\n').replace(ansi, '');
+    expect(out).toMatch(/Workflow: deploy \(any pull request can claim this\)/);
+    expect(out).toMatch(/FASTLANE_TOKEN.*not applied/);
+  });
+
   it('approves exactly the policy whose stamp it was given, and records it', () => {
     writeRc(PERMISSIVE);
     run('--stamp', stampOf(PERMISSIVE));
@@ -230,6 +293,27 @@ describe('policy approve', () => {
     const entry = readPolicyEntry(policiesDir, REPO)!;
     expect(entry.approved?.config.level).toBe('permissive');
     expect(entry.pending?.config).toEqual(other);
+  });
+
+  it('says when the same policy is waiting from a different repository, and keeps the approval where it was', () => {
+    // A repository that took the name copies the approved file byte for
+    // byte. The CLI's diff reads "None", so it has to say whose request
+    // this is - and must not move the approval to it.
+    const config = parseLocalmostrcContent(PERMISSIVE).config!;
+    recordPending(policiesDir, REPO, config, 1);
+    approvePending(policiesDir, REPO, approvalStamp(REPO, config, 1));
+    recordPending(policiesDir, REPO, config, 2);
+    writeRc(PERMISSIVE);
+
+    expect(() => run()).toThrow('exit 1');
+    expect(output.join('\n')).toMatch(/repository id 2[\s\S]*bound to repository id 1[\s\S]*Job Security/);
+
+    output = [];
+    run('--stamp', stampOf(PERMISSIVE));
+    const entry = readPolicyEntry(policiesDir, REPO)!;
+    expect(entry.approved?.repositoryId).toBe(1);
+    expect(entry.pending?.repositoryId).toBe(2);
+    expect(output.join('\n')).toMatch(/repository id 2 is still waiting/);
   });
 
   it('approves over a cache entry that no longer reads', () => {

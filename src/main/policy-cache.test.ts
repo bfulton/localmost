@@ -282,3 +282,84 @@ describe('a commit without a .localmostrc runs on the baseline', () => {
     expect(getApprovedPolicyForCommit(REPO, 'kept-sha')).toBeNull();
   });
 });
+
+describe('the repository behind the name', () => {
+  // An approval is recorded by name, and a name can be freed - by deleting
+  // or renaming the repository - and taken by someone else, whose
+  // .localmostrc need only match the approved one to inherit its grants.
+  const config = { version: 1, shared: { network: { allow: ['index.crates.io'] } } };
+  const approveAs = (repositoryId?: number) => {
+    recordPendingPolicy(REPO, config, repositoryId);
+    approvePolicy(REPO, approvalStamp(REPO, config, repositoryId));
+  };
+
+  it('asks again when a different repository presents the approved one\'s name', () => {
+    approveAs(1);
+
+    const decision = decidePolicyForJob(REPO, POLICY, SHA, 2);
+    expect(decision.action).toBe('needs-approval');
+    if (decision.action === 'needs-approval') {
+      expect(decision.request.isNewRepo).toBe(true);
+      expect(decision.request.replacesRepositoryId).toBe(1);
+    }
+    expect(getApprovedPolicyForCommit(REPO, SHA)).toBeNull();
+  });
+
+  it('allows the repository the policy was approved for', () => {
+    approveAs(1);
+    expect(decidePolicyForJob(REPO, POLICY, SHA, 1)).toEqual({ action: 'allow', reason: 'unchanged' });
+  });
+
+  it('binds an approval that predates ids to the first job that matches it', () => {
+    approveAs(undefined);
+
+    expect(decidePolicyForJob(REPO, POLICY, SHA, 7)).toEqual({ action: 'allow', reason: 'unchanged' });
+    expect(getPolicyEntry(REPO)?.approved?.repositoryId).toBe(7);
+    expect(decidePolicyForJob(REPO, POLICY, SHA, 8).action).toBe('needs-approval');
+  });
+
+  it('does not bind an approval to a job whose policy does not match it', () => {
+    approveAs(undefined);
+    decidePolicyForJob(REPO, POLICY + '      - "evil.example.com"\n', SHA, 7);
+    expect(getPolicyEntry(REPO)?.approved?.repositoryId).toBeUndefined();
+  });
+
+  it('decides as before for a job that carries no id', () => {
+    approveAs(1);
+    expect(decidePolicyForJob(REPO, POLICY, SHA)).toEqual({ action: 'allow', reason: 'unchanged' });
+  });
+
+  it('treats an id that is not one as no id, and never records it', () => {
+    // A malformed id from the job message used to be written into the entry,
+    // which then failed to read back - and the next change dropped the
+    // approval with it.
+    approveAs(undefined);
+    for (const bad of [NaN, 0, 1.5]) {
+      expect(decidePolicyForJob(REPO, POLICY, SHA, bad)).toEqual({ action: 'allow', reason: 'unchanged' });
+      recordPendingPolicy(REPO, config, bad);
+    }
+    const entry = getPolicyEntry(REPO);
+    expect(entry?.approved?.config).toEqual(config);
+    expect(entry?.approved?.repositoryId).toBeUndefined();
+    expect(entry?.pending?.repositoryId).toBeUndefined();
+  });
+
+  it('decides a job with an id that is not one as a job without an id', () => {
+    approveAs(1);
+    for (const bad of [NaN, 0, -1]) {
+      expect(decidePolicyForJob(REPO, POLICY, SHA, bad)).toEqual({ action: 'allow', reason: 'unchanged' });
+    }
+  });
+
+  it('takes the id of the pending policy it approves, so the new repository then runs', () => {
+    approveAs(1);
+    const decision = decidePolicyForJob(REPO, POLICY, SHA, 2);
+    if (decision.action !== 'needs-approval') throw new Error('expected approval request');
+    recordPendingPolicy(REPO, decision.request.newConfig, 2);
+    approvePolicy(REPO, approvalStamp(REPO, decision.request.newConfig, 2));
+
+    expect(getPolicyEntry(REPO)?.approved?.repositoryId).toBe(2);
+    expect(decidePolicyForJob(REPO, POLICY, SHA, 2)).toEqual({ action: 'allow', reason: 'unchanged' });
+    expect(decidePolicyForJob(REPO, POLICY, SHA, 1).action).toBe('needs-approval');
+  });
+});

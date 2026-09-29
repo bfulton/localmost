@@ -16,12 +16,12 @@ import {
   approvalStamp,
 } from '../policy-cache';
 import { getRunnerManager, getLogger } from '../app-state';
-import { DescribablePolicy, describePolicy } from '../../shared/policy-describe';
+import { DescribablePolicy, PolicyScope, describePolicy } from '../../shared/policy-describe';
 import { LocalmostrcConfig, diffConfigs, formatPolicyDiff } from '../../shared/localmostrc';
 import { isValidRepository } from '../../shared/policy-store';
 
-function describeSection(section: DescribablePolicy, prefix: string): string[] {
-  return describePolicy(section, prefix).map((grant) => grant.summary);
+function describeSection(section: DescribablePolicy, prefix: string, scope: PolicyScope): string[] {
+  return describePolicy(section, prefix, scope).map((grant) => grant.summary);
 }
 
 /**
@@ -29,16 +29,18 @@ function describeSection(section: DescribablePolicy, prefix: string): string[] {
  *
  * Per-workflow sections are included: a policy can grant access under
  * `workflows:` that appears nowhere in `shared`, and approving what the UI
- * showed would otherwise approve more than was shown.
+ * showed would otherwise approve more than was shown. Each says any pull
+ * request can claim it: a `workflows:` key is only a workflow file's name,
+ * and a pull request can add a workflow file of any name.
  */
 export function summarizeGrants(
   config: Pick<LocalmostrcConfig, 'level' | 'shared' | 'workflows'>
 ): string[] {
   // The level is declared once, at the top, and leads the list: it widens
   // every section below it.
-  const grants = describeSection({ ...config.shared, level: config.level }, '');
+  const grants = describeSection({ ...config.shared, level: config.level }, '', 'shared');
   for (const [workflow, section] of Object.entries(config.workflows || {})) {
-    grants.push(...describeSection(section || {}, `${workflow}: `));
+    grants.push(...describeSection(section || {}, `${workflow} (any pull request can claim this): `, 'workflow'));
   }
   return grants;
 }
@@ -58,11 +60,23 @@ export function listPolicySummaries(): PolicySummary[] {
         approved: false,
         cachedAt: entry.pending.at,
         grants: summarizeGrants(entry.pending.config),
-        stamp: approvalStamp(entry.repository, entry.pending.config),
+        stamp: approvalStamp(entry.repository, entry.pending.config, entry.pending.repositoryId),
       };
       if (entry.approved) {
+        const changes: string[] = [];
+        // The approval is bound to the repository, not only its name: this
+        // one would move it to another repository that took the name.
+        const was = entry.approved.repositoryId;
+        const now = entry.pending.repositoryId;
+        if (was !== undefined && now !== undefined && was !== now) {
+          changes.push(
+            `~ repository id: ${was} -> ${now} (a different repository under this name: ` +
+              'the approved one was deleted and recreated, or renamed and its name taken)'
+          );
+        }
         const diffs = diffConfigs(entry.approved.config, entry.pending.config);
-        summary.changes = diffs.length > 0 ? formatPolicyDiff(diffs).split('\n') : [];
+        if (diffs.length > 0) changes.push(...formatPolicyDiff(diffs).split('\n'));
+        summary.changes = changes;
       }
       summaries.push(summary);
     }
@@ -96,8 +110,9 @@ export const registerPolicyHandlers = (): void => {
         }
         // Refused unless the pending policy is still the one this stamp was
         // shown with: another refused job may have replaced it since. The
-        // stamp binds the pending policy only, which is what gets approved
-        // and whose full grants the card lists. Its `changes` were computed
+        // stamp binds the pending policy only - with the repository id it
+        // would bind the approval to - which is what gets approved and
+        // whose full grants the card lists. Its `changes` were computed
         // against the approved policy at list time, and are not bound: if
         // that moved in between, the grants list is still exact.
         approvePolicy(repository, stamp);

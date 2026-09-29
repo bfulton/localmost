@@ -9,8 +9,9 @@
  * which need not be what the reviewer was looking at.
  *
  * Approval is bound to content by a stamp: a sha256 of the repository and the
- * policy, which is what a reviewer is shown alongside it. Approving quotes the
- * stamp, and is refused if the pending policy is no longer the one it names.
+ * policy - and of the repository id a pending policy would be approved for -
+ * which is what a reviewer is shown alongside it. Approving quotes the stamp,
+ * and is refused if the pending policy is no longer the one it names.
  *
  * Shared because the CLI approves too, and it runs outside Electron.
  */
@@ -24,6 +25,12 @@ import { LocalmostrcConfig, validateLocalmostrc } from './localmostrc';
 export interface PolicyVersion {
   config: LocalmostrcConfig;
   at: string;
+  /**
+   * GitHub's id for the repository the policy came from. A name can be freed
+   * and taken by another repository; the id cannot. Absent in an entry
+   * written before ids were kept, until a matching job supplies it.
+   */
+  repositoryId?: number;
 }
 
 export interface PolicyEntry {
@@ -47,6 +54,8 @@ const REPO = /^[A-Za-z0-9._-]{1,100}$/;
 // "%5F", so the first "_" always ends the owner and every name maps to one
 // file. Neither part can contain "%", and an owner without "_" - every owner
 // before managed users were accepted - keeps the file name it always had.
+// Both parts are lowercased, as GitHub treats them: the app sees a target's
+// casing and GitHub's, and on a case-sensitive volume those were two files.
 const OWNER_UNDERSCORE = '%5F';
 
 export function isValidRepository(repository: unknown): repository is string {
@@ -61,9 +70,47 @@ export function policyFilePath(dir: string, repository: string): string {
   if (!isValidRepository(repository)) {
     throw new Error(`Not a repository name: ${JSON.stringify(String(repository).slice(0, 200))}`);
   }
-  const [owner, repo] = repository.split('/');
+  const [owner, repo] = repository.toLowerCase().split('/');
   return path.join(dir, `${owner.split('_').join(OWNER_UNDERSCORE)}_${repo}.json`);
 }
+
+/**
+ * The file an entry is in, if it has one, under whatever casing it was
+ * written. One written before names were lowercased is not found by the
+ * lowercased name on a case-sensitive volume, so the directory is scanned
+ * for it - in sorted order, so that which of several copies is read does
+ * not depend on the directory's.
+ */
+function existingEntryFile(dir: string, repository: string): string | null {
+  const filePath = policyFilePath(dir, repository);
+  if (fs.existsSync(filePath)) return filePath;
+  if (!fs.existsSync(dir)) return null;
+  const name = path.basename(filePath);
+  const match = fs
+    .readdirSync(dir)
+    .filter((file) => file.toLowerCase() === name)
+    .sort()[0];
+  return match ? path.join(dir, match) : null;
+}
+
+/** Whether two paths name one file - as two casings do on a volume that ignores case. */
+function sameFile(a: string, b: string): boolean {
+  try {
+    const x = fs.statSync(a);
+    const y = fs.statSync(b);
+    return x.ino === y.ino && x.dev === y.dev;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The file each entry being changed was read from, when it was read from one
+ * under an older casing: writing it under the lowercased name takes its place,
+ * so the old copy is removed then - that copy, and no other. A copy that was
+ * never read may hold an approval this one does not, and is left alone.
+ */
+const readFrom = new WeakMap<PolicyEntry, string>();
 
 /** GitHub names are case-insensitive, and the app sees both casings. */
 function sameRepository(a: string, b: string): boolean {
@@ -91,11 +138,19 @@ function canonicalJson(value: unknown): string {
  * - its grants, its level, its changes - is derived from the config, so a
  * stamp over the config binds the approval to all of it, and to anything the
  * rendering might leave out as well.
+ *
+ * A pending policy's stamp also covers the repository id approving it would
+ * bind the approval to, which the card shows when it changes: otherwise the
+ * same file recorded by a job from yet another repository between listing
+ * and approving would move the approval to one the reviewer never saw.
+ * Without an id the stamp is what it always was, which is also what the
+ * CLI, reading a clone that carries none, computes.
  */
-export function approvalStamp(repository: string, config: LocalmostrcConfig): string {
+export function approvalStamp(repository: string, config: LocalmostrcConfig, repositoryId?: number): string {
+  // canonicalJson leaves out an undefined field, so no id hashes as before.
   return crypto
     .createHash('sha256')
-    .update(canonicalJson({ repository: repository.toLowerCase(), config }))
+    .update(canonicalJson({ repository: repository.toLowerCase(), config, repositoryId }))
     .digest('hex');
 }
 
@@ -114,7 +169,28 @@ function parseVersion(raw: unknown, where: string): PolicyVersion | undefined {
   }
   const record = raw as Record<string, unknown>;
   if (typeof record.at !== 'string') throw new Error(`${where}.at must be a string`);
-  return { config: parseConfig(record.config, `${where}.config`), at: record.at };
+  const version: PolicyVersion = { config: parseConfig(record.config, `${where}.config`), at: record.at };
+  if (record.repositoryId !== undefined) {
+    if (!isRepositoryId(record.repositoryId)) throw new Error(`${where}.repositoryId must be a positive integer`);
+    version.repositoryId = record.repositoryId;
+  }
+  return version;
+}
+
+export function isRepositoryId(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
+/**
+ * A policy version, with the repository id only when there is a real one.
+ * An id that is not one is dropped here rather than written: the entry would
+ * then fail to read back, and the next change would replace it, approval and
+ * all. Dropped, the job counts as carrying no id, as before ids were kept.
+ */
+function versionOf(config: LocalmostrcConfig, repositoryId: number | undefined): PolicyVersion {
+  const version: PolicyVersion = { config, at: new Date().toISOString() };
+  if (isRepositoryId(repositoryId)) version.repositoryId = repositoryId;
+  return version;
 }
 
 /**
@@ -162,8 +238,8 @@ function parseEntry(raw: unknown, repository: string): PolicyEntry {
  * one that cannot be trusted, so the caller decides how to fail closed.
  */
 export function readPolicyEntry(dir: string, repository: string): PolicyEntry | null {
-  const filePath = policyFilePath(dir, repository);
-  if (!fs.existsSync(filePath)) return null;
+  const filePath = existingEntryFile(dir, repository);
+  if (!filePath) return null;
   return parseEntry(JSON.parse(fs.readFileSync(filePath, 'utf-8')), repository);
 }
 
@@ -175,31 +251,41 @@ export function readPolicyEntry(dir: string, repository: string): PolicyEntry | 
  * with it, which fails closed. A name that is not a repository still throws.
  */
 function readEntryToChange(dir: string, repository: string): PolicyEntry {
-  const filePath = policyFilePath(dir, repository);
-  if (!fs.existsSync(filePath)) return { repository };
+  const filePath = existingEntryFile(dir, repository);
+  if (!filePath) return { repository };
   const text = fs.readFileSync(filePath, 'utf-8');
+  let entry: PolicyEntry;
   try {
-    return parseEntry(JSON.parse(text), repository);
+    entry = parseEntry(JSON.parse(text), repository);
   } catch {
-    return { repository };
+    entry = { repository };
   }
+  readFrom.set(entry, filePath);
+  return entry;
 }
 
 /**
  * Write an entry, or remove it once it holds nothing. Written to a temporary
- * file and renamed, so a reader never sees half an entry.
+ * file and renamed, so a reader never sees half an entry. The copy under an
+ * older casing it was read from goes with it, having been read into this one.
  */
 function writePolicyEntry(dir: string, entry: PolicyEntry): void {
   const filePath = policyFilePath(dir, entry.repository);
   if (!entry.approved && !entry.pending) {
     fs.rmSync(filePath, { force: true });
-    return;
+  } else {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const data = { format: ENTRY_FORMAT, ...entry };
+    const tmp = `${filePath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600, flag: 'wx' });
+    fs.renameSync(tmp, filePath);
   }
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const data = { format: ENTRY_FORMAT, ...entry };
-  const tmp = `${filePath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600, flag: 'wx' });
-  fs.renameSync(tmp, filePath);
+  // On a volume that ignores case the rename keeps the old name, so the old
+  // copy is the file just written: it is removed only when it is another.
+  const source = readFrom.get(entry);
+  if (source && source !== filePath && !sameFile(source, filePath)) {
+    fs.rmSync(source, { force: true });
+  }
 }
 
 /** Every entry that reads cleanly. One that does not is left out, not guessed at. */
@@ -229,9 +315,14 @@ export function listPolicyEntries(dir: string): PolicyEntry[] {
  * Record what a refused job asked for. The approved policy, if any, is left
  * exactly as it was: it stays in force until a reviewer approves another.
  */
-export function recordPending(dir: string, repository: string, config: LocalmostrcConfig): void {
+export function recordPending(
+  dir: string,
+  repository: string,
+  config: LocalmostrcConfig,
+  repositoryId?: number
+): void {
   const entry = readEntryToChange(dir, repository);
-  entry.pending = { config, at: new Date().toISOString() };
+  entry.pending = versionOf(config, repositoryId);
   writePolicyEntry(dir, entry);
 }
 
@@ -243,10 +334,12 @@ export function approvePending(dir: string, repository: string, stamp: string): 
   if (!entry.pending) {
     throw new Error(`There is nothing waiting for approval for ${repository}`);
   }
-  if (approvalStamp(repository, entry.pending.config) !== stamp) {
+  if (approvalStamp(repository, entry.pending.config, entry.pending.repositoryId) !== stamp) {
     throw new Error(`The policy for ${repository} changed since it was shown. Review it again before approving.`);
   }
-  entry.approved = { config: entry.pending.config, at: new Date().toISOString() };
+  // Approving a job's request approves it for the repository that asked. One
+  // that did not say which keeps whatever the approval was bound to before.
+  entry.approved = versionOf(entry.pending.config, entry.pending.repositoryId ?? entry.approved?.repositoryId);
   delete entry.pending;
   writePolicyEntry(dir, entry);
   return entry.approved.config;
@@ -254,18 +347,41 @@ export function approvePending(dir: string, repository: string, stamp: string): 
 
 /**
  * Approve a policy the caller read and showed itself - the CLI, from the
- * operator's own clone. A pending policy is cleared only if it is this one;
- * a different one is still waiting for its own decision.
+ * operator's own clone. A pending policy is cleared only if it is this one,
+ * for the repository the approval is bound to; any other is still waiting
+ * for its own decision.
  */
 export function approveConfig(dir: string, repository: string, config: LocalmostrcConfig): string {
   const stamp = approvalStamp(repository, config);
   const entry = readEntryToChange(dir, repository);
-  entry.approved = { config, at: new Date().toISOString() };
-  if (entry.pending && approvalStamp(repository, entry.pending.config) === stamp) {
+  // The operator's clone carries no repository id, and nothing the CLI
+  // shows names one, so an approval bound to a repository stays bound to it.
+  // A pending policy from another repository under the name, however
+  // identical, is left waiting for the app's card, which shows the id
+  // changing: from here an empty binding may be filled, never replaced.
+  const pendingIsThis = entry.pending !== undefined && approvalStamp(repository, entry.pending.config) === stamp;
+  const boundTo = entry.approved?.repositoryId;
+  const pendingId = pendingIsThis ? entry.pending?.repositoryId : undefined;
+  const pendingMovesIt = boundTo !== undefined && pendingId !== undefined && pendingId !== boundTo;
+  entry.approved = versionOf(config, boundTo ?? pendingId);
+  if (pendingIsThis && !pendingMovesIt) {
     delete entry.pending;
   }
   writePolicyEntry(dir, entry);
   return stamp;
+}
+
+/**
+ * Bind an approved policy to the repository a matching job came from, if it
+ * is bound to none yet - an approval written before ids were kept. Once
+ * bound, a job from another repository under the same name is asked about.
+ */
+export function bindRepositoryId(dir: string, repository: string, repositoryId: number): void {
+  if (!isRepositoryId(repositoryId)) return;
+  const entry = readEntryToChange(dir, repository);
+  if (!entry.approved || entry.approved.repositoryId !== undefined) return;
+  entry.approved.repositoryId = repositoryId;
+  writePolicyEntry(dir, entry);
 }
 
 /**
@@ -275,7 +391,7 @@ export function approveConfig(dir: string, repository: string, config: Localmost
 export function rejectPending(dir: string, repository: string): string | undefined {
   const entry = readEntryToChange(dir, repository);
   if (!entry.pending) return undefined;
-  const stamp = approvalStamp(repository, entry.pending.config);
+  const stamp = approvalStamp(repository, entry.pending.config, entry.pending.repositoryId);
   delete entry.pending;
   writePolicyEntry(dir, entry);
   return stamp;
