@@ -13,7 +13,8 @@ import {
   SandboxPolicyLevel, RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
 import { SandboxFilesystemPolicy, spawnSandboxed } from './process-sandbox';
-import { packageCacheEnv } from './worker-env';
+import { inheritedWorkerEnv, packageCacheEnv } from './worker-env';
+import type { EnvPolicy } from '../shared/sandbox-profile';
 import { sweepProcessGroup } from './process-group';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { RunnerDownloader } from './runner-downloader';
@@ -99,6 +100,12 @@ export interface RepoPolicyRuntime {
   writePaths: string[];
   /** The docker actions the policy declares, merged across shared and workflow; empty when it declares none. */
   docker: DockerPolicy;
+  /**
+   * Which of the app's own environment variables a worker may inherit beyond
+   * the baseline, and which it may not; applied when the worker is spawned.
+   * Absent means the policy declares none.
+   */
+  env?: EnvPolicy;
 }
 
 interface RunnerManagerOptions {
@@ -1086,9 +1093,21 @@ export class RunnerManager {
         );
       }
 
+      // A worker is credentialed for one repository and runs a single job, so
+      // the filesystem boundary and the environment can come from that
+      // repository's approved policy. Both are fixed at spawn, which is why a
+      // policy change must retire the workers built under the old one.
+      const startupContextForPolicy = this.pendingTargetContext.get(String(instanceNum));
+      const filesystemPolicy = await this.resolveFilesystemPolicy(startupContextForPolicy);
+
       const proxyUrl = proxy.getProxyUrl();
+      // Not the app's whole environment: launched from a shell, it carries
+      // every token and agent socket that shell had. A worker inherits the
+      // baseline a runner and a shell need, plus what the repository's env
+      // policy allows; everything set below is the app's and comes after, so
+      // no policy can replace it.
       const env: NodeJS.ProcessEnv = {
-        ...process.env,
+        ...inheritedWorkerEnv(process.env, filesystemPolicy.env),
         ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT: 'true',
       };
 
@@ -1124,13 +1143,6 @@ export class RunnerManager {
       env.https_proxy = proxyUrl;
       env.HTTP_PROXY = proxyUrl;
       env.HTTPS_PROXY = proxyUrl;
-
-      // A worker is credentialed for one repository and runs a single job, so
-      // the filesystem boundary can come from that repository's approved
-      // policy. The profile is fixed at spawn, which is why a policy change
-      // must retire the workers built under the old one.
-      const startupContextForPolicy = this.pendingTargetContext.get(String(instanceNum));
-      const filesystemPolicy = await this.resolveFilesystemPolicy(startupContextForPolicy);
 
       // Under moderate and permissive the job's package managers get a
       // directory of their target's own, in place of the write access to the
@@ -2114,10 +2126,12 @@ export class RunnerManager {
    * were refused. Only what the profile fixed at spawn belongs here.
    */
   private stampFor(
-    policy: Pick<RepoPolicyRuntime, 'level' | 'readPaths' | 'writePaths' | 'docker'>
+    policy: Pick<RepoPolicyRuntime, 'level' | 'readPaths' | 'writePaths' | 'docker' | 'env'>
   ): string {
+    // The env policy is fixed at spawn like the profile, so it is part of
+    // what a worker was built under.
     return createHash('sha256')
-      .update(JSON.stringify([policy.level, policy.readPaths, policy.writePaths, policy.docker]))
+      .update(JSON.stringify([policy.level, policy.readPaths, policy.writePaths, policy.docker, policy.env]))
       .digest('hex');
   }
 
@@ -2165,7 +2179,7 @@ export class RunnerManager {
 
   private async resolveFilesystemPolicy(
     context?: { targetDisplayName?: string; githubSha?: string }
-  ): Promise<SandboxFilesystemPolicy & { stamp?: string }> {
+  ): Promise<SandboxFilesystemPolicy & { env?: EnvPolicy; stamp?: string }> {
     // No stamp rather than a sentinel: a sentinel is truthy, so it would fail
     // the drift check against every real hash and the worker would refuse
     // every job. The profile it got is the closed one, which is the safe
@@ -2187,6 +2201,7 @@ export class RunnerManager {
         level: policy.level,
         read: policy.readPaths,
         write: policy.writePaths,
+        env: policy.env,
         stamp: this.stampFor(policy),
       };
     } catch {

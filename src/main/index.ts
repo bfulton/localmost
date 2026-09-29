@@ -103,6 +103,7 @@ import {
 // Zustand store
 import { initStore, connectWindow, cleanupStore, store } from './store/init';
 import { getEffectivePolicy, effectivePolicyLevel } from '../shared/localmostrc';
+import { spawnEnvPolicy } from './worker-env';
 import { resolveRegistryAuth } from './docker/registry-auth';
 import {
   decidePolicyForJob,
@@ -358,6 +359,8 @@ app.whenReady().then(async () => {
         // Docker composes across shared and workflow: the socket is bound to
         // the merged policy when the job is claimed, after the workflow is known.
         docker: policy.docker ?? {},
+        // Fixed at spawn like the filesystem: see spawnEnvPolicy.
+        env: spawnEnvPolicy(cached.config),
       };
     },
     onJobEvent: (event: JobEvent) => {

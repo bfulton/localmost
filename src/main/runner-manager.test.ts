@@ -1889,6 +1889,101 @@ describe('RunnerManager', () => {
     });
   });
 
+  describe("a worker's environment", () => {
+    const withHostEnv = async (vars: Record<string, string>, run: () => Promise<void>) => {
+      const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+      Object.assign(process.env, vars);
+      try {
+        await run();
+      } finally {
+        for (const [k, v] of Object.entries(saved)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
+    };
+
+    it("does not carry the app's own environment into the job", async () => {
+      // Launched from a shell, the app inherits every token and agent socket
+      // that shell had. None of it is the job's.
+      await withHostEnv({ FOO_SECRET: 'hunter2', SSH_AUTH_SOCK: '/tmp/agent.sock', NODE_OPTIONS: '--inspect' }, async () => {
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+
+        await runnerManager.start();
+
+        const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+        expect(env.FOO_SECRET).toBeUndefined();
+        expect(env.SSH_AUTH_SOCK).toBeUndefined();
+        expect(env.NODE_OPTIONS).toBeUndefined();
+        // What the runner and a shell need to know who and where they are.
+        expect(env.PATH).toBe(process.env.PATH);
+        expect(env.HOME).toBe(process.env.HOME);
+        // And what the app sets for the runner itself.
+        expect(env.ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT).toBe('true');
+        expect(env.HTTPS_PROXY).toBeDefined();
+      });
+    });
+
+    it("applies the repository's approved env policy", async () => {
+      await withHostEnv({ DEVELOPER_DIR: '/Applications/Xcode-beta.app', FOO_SECRET: 'hunter2', LANG: 'C' }, async () => {
+        const manager = new RunnerManager({
+          onLog: mockOnLog,
+          onStatusChange: mockOnStatusChange,
+          onJobHistoryUpdate: mockOnJobHistoryUpdate,
+          getRepoPolicy: async () => ({
+            hosts: [], level: 'strict' as const, readPaths: [], writePaths: [], docker: {},
+            env: { allow: ['DEVELOPER_DIR'], deny: ['LANG'] },
+          }),
+        });
+        const helper = new RunnerManagerTestHelper(manager);
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+        helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
+
+        await manager.start();
+
+        const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+        expect(env.DEVELOPER_DIR).toBe('/Applications/Xcode-beta.app');
+        expect(env.LANG).toBeUndefined();
+        expect(env.FOO_SECRET).toBeUndefined();
+      });
+    });
+
+    it('cannot use the env policy to replace what the app sets for the runner', async () => {
+      await withHostEnv({ HTTPS_PROXY: 'http://evil.example:1', TMPDIR: '/tmp' }, async () => {
+        const manager = new RunnerManager({
+          onLog: mockOnLog,
+          onStatusChange: mockOnStatusChange,
+          onJobHistoryUpdate: mockOnJobHistoryUpdate,
+          getRepoPolicy: async () => ({
+            hosts: [], level: 'strict' as const, readPaths: [], writePaths: [], docker: {},
+            env: { allow: ['*'] },
+          }),
+        });
+        const helper = new RunnerManagerTestHelper(manager);
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+        helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
+
+        await manager.start();
+
+        const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+        expect(env.HTTPS_PROXY).toMatch(/^http:\/\/localmost:/);
+        expect(env.TMPDIR).toBe('/Users/test/.localmost/runner/sandbox/1/_temp');
+      });
+    });
+
+    it('counts a change to the env policy as a policy change', () => {
+      // The environment is fixed at spawn like the profile, so a worker built
+      // under the old env policy must be recognised as stale.
+      const stamped = runnerManager as unknown as { stampFor(p: object): string };
+      const base = { level: 'strict', readPaths: [], writePaths: [], docker: {} };
+      expect(stamped.stampFor({ ...base, env: { allow: ['DEVELOPER_DIR'], deny: [] } }))
+        .not.toBe(stamped.stampFor({ ...base, env: { allow: [], deny: [] } }));
+    });
+  });
+
   describe("a worker's broker address", () => {
     it('is issued per start and written into the runner config the worker reads', async () => {
       // The broker serves only workers holding a key it issued. The key goes

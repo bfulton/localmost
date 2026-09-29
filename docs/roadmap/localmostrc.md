@@ -430,6 +430,12 @@ connection to GitHub rather than anything the job asked for, and the runner
 cannot function without it. Because a single proxy serves both, jobs reach those
 hosts too. Filesystem access is never granted implicitly — see SECURITY.md.
 
+The environment, like the filesystem, is fixed when a worker starts, before the
+workflow is known. `env: allow` therefore applies from `shared:` only, and every
+`env: deny`, shared or per workflow, applies to every job. Without an allow, a
+job inherits nothing from the app's environment beyond `PATH`, `HOME`, `USER`,
+`LOGNAME`, `SHELL`, the locale and `TERM`.
+
 A repo's policy only takes effect once approved — see
 `localmost policy approve`.
 
