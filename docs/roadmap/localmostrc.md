@@ -430,8 +430,9 @@ connection to GitHub rather than anything the job asked for, and the runner
 cannot function without it. Because a single proxy serves both, jobs reach those
 hosts too. Filesystem access is never granted implicitly — see SECURITY.md.
 
-A repo's policy only takes effect once approved — see
-`localmost policy approve`.
+A repo's policy only takes effect once approved, in Settings > Job Security or
+with `localmost policy approve`, which shows the policy and a stamp, then
+`localmost policy approve --stamp <stamp>`, which approves exactly that policy.
 
 ### CI vs local differences
 

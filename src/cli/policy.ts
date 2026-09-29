@@ -164,7 +164,7 @@ function readCachedPolicy(repository: string): PolicyEntry | null {
 }
 
 /**
- * Compare local .localmostrc to cached version.
+ * Compare the local .localmostrc to the approved policy.
  */
 function handleDiff(): void {
   const cwd = process.cwd();
@@ -462,7 +462,7 @@ ${colors.bold}USAGE:${colors.reset}
 
 ${colors.bold}SUBCOMMANDS:${colors.reset}
   show              Display current policy (default)
-  diff              Compare local vs cached policy
+  diff              Compare local vs approved policy
   approve           Show this repo's policy and the stamp that approves it
   approve --stamp   Approve exactly the policy that stamp was shown for
   validate          Validate .localmostrc syntax

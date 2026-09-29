@@ -66,9 +66,9 @@ const PolicyApprovals: React.FC = () => {
       {pending.length > 0 && (
         <>
           <p className={shared.formHint}>
-            {pending.length === 1 ? 'A repository is' : `${pending.length} repositories are`} waiting
-            for approval. Jobs from {pending.length === 1 ? 'it' : 'them'} are being refused until
-            you decide.
+            {pending.length === 1 ? 'A policy is' : `${pending.length} policies are`} waiting
+            for approval. Jobs that carry {pending.length === 1 ? 'it are' : 'one are'} refused until
+            you approve it; jobs under an approved policy keep running.
           </p>
           {pending.map(policy => (
             <div key={policy.repository} className={styles.policy} data-testid="pending-policy">
@@ -91,10 +91,10 @@ const PolicyApprovals: React.FC = () => {
                   </button>
                 </div>
               </div>
-              {policy.changes && (
+              {policy.changes && policy.changes.length > 0 && (
                 <div data-testid="policy-changes">
                   <p className={shared.formHint}>
-                    Changes from the approved policy, which stays in force until you decide:
+                    Changes from the approved policy, which stays in force unless you approve this one:
                   </p>
                   <ul className={styles.grants}>
                     {policy.changes.map(change => (

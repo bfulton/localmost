@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
+import { describe, it, expect, beforeEach, afterEach, afterAll } from '@jest/globals';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -12,6 +12,11 @@ jest.mock('../shared/workspace', () => ({ getRepositoryFromDir: () => 'owner/my.
 import { parsePolicyArgs, printPolicy, runPolicy } from './policy';
 import { approvalStamp, policyFilePath, readPolicyEntry, recordPending } from '../shared/policy-store';
 import { parseLocalmostrcContent } from '../shared/localmostrc';
+
+afterAll(() => {
+  fs.rmSync(dataDir, { recursive: true, force: true });
+  fs.rmSync(repoDir, { recursive: true, force: true });
+});
 
 describe('CLI policy command', () => {
   describe('parsePolicyArgs', () => {

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from '@jest/globals';
+import { describe, it, expect, beforeEach, afterAll } from '@jest/globals';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -19,6 +19,10 @@ jest.mock('../app-state', () => ({
 import { summarizeGrants, registerPolicyHandlers } from './policy';
 import { recordPendingPolicy, getPolicyEntry, approvalStamp } from '../policy-cache';
 import { IPC_CHANNELS, PolicySummary, Result } from '../../shared/types';
+
+afterAll(() => {
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+});
 
 describe('summarizeGrants', () => {
   it('shows docker grants, which an operator is consenting to when they approve', () => {

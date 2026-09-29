@@ -95,7 +95,11 @@ export const registerPolicyHandlers = (): void => {
           return { success: false, error: `Approval for ${repository} did not say which policy it approves` };
         }
         // Refused unless the pending policy is still the one this stamp was
-        // shown with: another refused job may have replaced it since.
+        // shown with: another refused job may have replaced it since. The
+        // stamp binds the pending policy only, which is what gets approved
+        // and whose full grants the card lists. Its `changes` were computed
+        // against the approved policy at list time, and are not bound: if
+        // that moved in between, the grants list is still exact.
         approvePolicy(repository, stamp);
         // Workers already running carry a sandbox profile built from the policy
         // that was approved before this one; retire them so the next job for

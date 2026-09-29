@@ -23,6 +23,10 @@ import {
 } from './policy-cache';
 import { LocalmostrcConfig } from '../shared/localmostrc';
 
+afterAll(() => {
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+});
+
 const REPO = 'owner/repo';
 const SHA = 'a'.repeat(40);
 const approvedPolicy = () => getPolicyEntry(REPO)?.approved?.config ?? null;

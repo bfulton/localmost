@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from '@jest/globals';
+import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -23,6 +23,9 @@ const WIDE: LocalmostrcConfig = { version: 1, level: 'permissive' };
 let dir: string;
 beforeEach(() => {
   dir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'policy-store-')), 'policies');
+});
+afterEach(() => {
+  fs.rmSync(path.dirname(dir), { recursive: true, force: true });
 });
 
 const writeRaw = (repository: string, raw: unknown) => {

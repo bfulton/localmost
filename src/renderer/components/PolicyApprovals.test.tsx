@@ -99,9 +99,35 @@ describe('PolicyApprovals', () => {
     render(<PolicyApprovals />);
 
     await waitFor(() => expect(screen.getByText('~ level: strict -> permissive')).toBeInTheDocument());
-    expect(screen.getByTestId('policy-changes')).toHaveTextContent(/stays in force/);
+    // It stays in force after a Reject too, so "until you decide" was wrong.
+    expect(screen.getByTestId('policy-changes')).toHaveTextContent(/stays in force unless you approve this one/);
     expect(screen.getByText('level: permissive (allows every network host)')).toBeInTheDocument();
     expect(screen.getAllByTestId('pending-policy')).toHaveLength(1);
+  });
+
+  it('says only jobs carrying the pending policy are refused', async () => {
+    // Jobs whose file matches the approved policy keep running while a
+    // change waits, so "jobs from it are being refused" overstated it.
+    api().list.mockResolvedValue([
+      { repository: 'owner/repo', approved: false, cachedAt: '', grants: [], stamp: 'a'.repeat(64) },
+    ]);
+
+    render(<PolicyApprovals />);
+
+    await waitFor(() => expect(screen.getByText('owner/repo')).toBeInTheDocument());
+    expect(screen.getByTestId('policy-approvals')).toHaveTextContent(/Jobs that carry it are refused until you approve it/);
+    expect(screen.getByTestId('policy-approvals')).not.toHaveTextContent(/until you decide/);
+  });
+
+  it('shows no empty list of changes', async () => {
+    api().list.mockResolvedValue([
+      { repository: 'owner/repo', approved: false, cachedAt: '', grants: [], changes: [], stamp: 'a'.repeat(64) },
+    ]);
+
+    render(<PolicyApprovals />);
+
+    await waitFor(() => expect(screen.getByText('owner/repo')).toBeInTheDocument());
+    expect(screen.queryByTestId('policy-changes')).not.toBeInTheDocument();
   });
 
   it('shows the error when approval is refused because the policy changed', async () => {
