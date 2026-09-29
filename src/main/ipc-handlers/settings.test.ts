@@ -218,6 +218,44 @@ describe('settings IPC handlers', () => {
       expect(saveConfig).not.toHaveBeenCalledWith(expect.objectContaining({ notifications: expect.anything() }));
     });
 
+    it('takes a runner owner and repository only as GitHub names, or empty', () => {
+      (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({} as any);
+      // With no targets saved, these become the target's owner and repo, and
+      // the repository URL is the job link.
+      for (const runnerConfig of [
+        { level: 'org', orgName: '../x' },
+        { level: 'repo', repoUrl: 'https://github.com/../x' },
+        { level: 'repo', repoUrl: 'https://github.com/o/r/../../x' },
+        { level: 'repo', repoUrl: 'https://evil.example/o/r' },
+      ]) {
+        const result = handlers['settings:set']({}, { runnerConfig });
+        expect({ runnerConfig, success: result.success }).toEqual({ runnerConfig, success: false });
+      }
+      expect(saveConfig).not.toHaveBeenCalledWith(expect.objectContaining({ runnerConfig: expect.anything() }));
+
+      for (const runnerConfig of [
+        { level: 'org', orgName: 'acme', repoUrl: '' },
+        { level: 'repo', orgName: '', repoUrl: 'https://github.com/o/my.repo' },
+      ]) {
+        expect(handlers['settings:set']({}, { runnerConfig })).toEqual({ success: true });
+        expect(saveConfig).toHaveBeenLastCalledWith({ runnerConfig });
+      }
+    });
+
+    it('keeps an allowlist that holds a login only older accounts can have', () => {
+      // GitHub once issued logins such as a trailing hyphen, which a new
+      // account cannot take. The page sends the whole list back on every
+      // change, so refusing one saved entry would refuse every change after.
+      (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({} as any);
+      const userFilter = {
+        scope: 'trigger',
+        allowedUsers: 'allowlist',
+        allowlist: [{ login: 'old-name-', avatar_url: '', name: null }],
+      };
+      expect(handlers['settings:set']({}, { userFilter })).toEqual({ success: true });
+      expect(saveConfig).toHaveBeenCalledWith({ userFilter });
+    });
+
     it('never writes targets, which only the target manager changes', () => {
       (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({} as any);
       const before = store.getState().config.targets;

@@ -17,7 +17,7 @@ import { IPC_CHANNELS, SleepProtection, LogLevel } from '../../shared/types';
 import { store } from '../store';
 import { ThemeSetting } from '../store/types';
 import { MAX_RUNNER_COUNT } from '../../shared/constants';
-import { isGitHubOwnerName } from '../../shared/github-names';
+import { isGitHubLogin, isGitHubOwnerName, parseGitHubRepoUrl } from '../../shared/github-names';
 import { isAllowedUsers, isFilterScope } from '../../shared/user-filter-config';
 
 const log = () => getLogger();
@@ -62,8 +62,10 @@ const SETTING_SHAPES: Record<SettableConfigKey, (value: unknown) => boolean> = {
   runnerConfig: isRecordOf(
     {
       level: oneOf('repo', 'org'),
-      repoUrl: isString,
-      orgName: isString,
+      // With no targets saved these are the runner's owner and repo, and the
+      // URL is the job link, so they are GitHub names or empty.
+      repoUrl: (value) => value === '' || parseGitHubRepoUrl(value) !== null,
+      orgName: (value) => value === '' || isGitHubOwnerName(value),
       runnerName: isString,
       labels: isString,
       runnerCount: isIntegerIn(1, MAX_RUNNER_COUNT),
@@ -83,7 +85,7 @@ const SETTING_SHAPES: Record<SettableConfigKey, (value: unknown) => boolean> = {
       Array.isArray(value) &&
       value.every(
         isRecordOf({
-          login: isGitHubOwnerName,
+          login: isGitHubLogin,
           avatar_url: isString,
           name: (name) => name === null || typeof name === 'string',
         })
