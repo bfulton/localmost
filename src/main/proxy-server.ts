@@ -408,27 +408,15 @@ export class ProxyServer {
           req.resume();
           return;
         }
-        const proxyReq = http.request(
-          {
-            hostname: host,
-            port,
-            path,
-            method: req.method,
-            headers: this.upstreamHeaders(req, url.host),
-            lookup: this.pinnedLookup(screened),
-          },
-          (proxyRes) => {
-            res.writeHead(proxyRes.statusCode || 500, proxyRes.headers);
-            proxyRes.pipe(res);
-          }
-        );
-
-        proxyReq.on('error', (err) => {
-          res.writeHead(502, { 'Content-Type': 'text/plain' });
-          res.end(`Proxy error: ${err.message}`);
+        const proxyReq = this.openUpstream(req, res, {
+          hostname: host,
+          port,
+          path,
+          method: req.method,
+          headers: this.upstreamHeaders(req, url.host),
+          lookup: this.pinnedLookup(screened),
         });
-
-        req.pipe(proxyReq);
+        if (proxyReq) req.pipe(proxyReq);
       });
     } catch (err) {
       res.writeHead(400, { 'Content-Type': 'text/plain' });
@@ -541,19 +529,48 @@ export class ProxyServer {
       // headers on the request makes some servers reject it or frame it wrongly.
       const headers = { ...this.upstreamHeaders(req, authority), 'content-length': String(body.length) };
       delete headers['transfer-encoding'];
-      const proxyReq = http.request(
-        { hostname: host, port, path, method: req.method, headers, lookup: this.pinnedLookup(screened) },
-        (proxyRes) => {
-          res.writeHead(proxyRes.statusCode || 500, proxyRes.headers);
-          proxyRes.pipe(res);
-        }
-      );
-      proxyReq.on('error', (err) => {
-        res.writeHead(502, { 'Content-Type': 'text/plain' });
-        res.end(`Proxy error: ${err.message}`);
+      const proxyReq = this.openUpstream(req, res, {
+        hostname: host, port, path, method: req.method, headers, lookup: this.pinnedLookup(screened),
       });
-      proxyReq.end(body);
+      proxyReq?.end(body);
     });
+  }
+
+  /**
+   * Open the upstream request for a plain request, relaying its response,
+   * and tie it to the client: when the client's side closes before the
+   * response has finished - the client went away, or a rotation dropped its
+   * socket - the upstream request is destroyed with it. Otherwise it outlived
+   * both, holding a connection the last job's policy opened to a host.
+   *
+   * Returns null, having dialled nothing, when the client is already gone:
+   * a request can wait on a name lookup or on the job's policy, and the
+   * client can leave in that time.
+   */
+  private openUpstream(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    options: http.RequestOptions
+  ): http.ClientRequest | null {
+    if (res.destroyed || req.socket.destroyed) return null;
+    const proxyReq = http.request(options, (proxyRes) => {
+      res.writeHead(proxyRes.statusCode || 500, proxyRes.headers);
+      proxyRes.pipe(res);
+    });
+    proxyReq.on('error', (err) => {
+      // Once the response has started, or the client has gone, there is no
+      // one to send a 502 to; writing one would throw on the sent headers.
+      if (res.headersSent || res.destroyed) {
+        res.destroy();
+        return;
+      }
+      res.writeHead(502, { 'Content-Type': 'text/plain' });
+      res.end(`Proxy error: ${err.message}`);
+    });
+    res.on('close', () => {
+      if (!res.writableFinished) proxyReq.destroy();
+    });
+    return proxyReq;
   }
 
   /**

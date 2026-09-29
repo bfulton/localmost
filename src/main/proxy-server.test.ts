@@ -718,6 +718,102 @@ describe('CONNECT targets', () => {
   });
 });
 
+describe('an upstream request ends with its client', () => {
+  // A plain request's upstream is a second connection the proxy opened for
+  // the client. Rotation closes the client's socket, and so does the client
+  // going away, but the upstream request lived on: a response that never
+  // finished, or an upload the upstream was still reading, kept a connection
+  // open to a host the last job's policy allowed.
+  /** An upstream that answers headers and then never finishes. */
+  const hangingUpstream = async () => {
+    let connections = 0;
+    const closed: Promise<void>[] = [];
+    const up = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.write('partial;');
+    });
+    up.on('connection', (sock: net.Socket) => {
+      connections++;
+      closed.push(new Promise<void>((r) => sock.once('close', () => r())));
+    });
+    await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
+    return {
+      up,
+      port: (up.address() as net.AddressInfo).port,
+      connections: () => connections,
+      firstClosed: () => closed[0],
+    };
+  };
+  /** Send a raw request and resolve once the first response bytes arrive. */
+  const open = (proxyPort: number, head: string) =>
+    new Promise<net.Socket>((resolve) => {
+      const sock = net.connect(proxyPort, '127.0.0.1', () => sock.write(head));
+      sock.on('error', () => undefined);
+      sock.once('data', () => resolve(sock));
+    });
+  const within = <T>(p: Promise<T>, ms: number) =>
+    Promise.race([p.then(() => 'closed'), new Promise((r) => setTimeout(() => r('still open'), ms))]);
+
+  it('closes the upstream when the token rotates mid-response', async () => {
+    const h = await hangingUpstream();
+    const p = new ProxyServer({ policyLevel: 'permissive' });
+    await p.start();
+    try {
+      await open(p.getPort(), `GET http://127.0.0.1:${h.port}/ HTTP/1.1\r\nHost: 127.0.0.1:${h.port}\r\n\r\n`);
+      p.rotateAuthToken('next');
+      expect(await within(h.firstClosed(), 500)).toBe('closed');
+    } finally { h.up.closeAllConnections(); h.up.close(); await p.stop(); }
+  });
+
+  it('closes the upstream when the client goes away mid-response', async () => {
+    const h = await hangingUpstream();
+    const p = new ProxyServer({ policyLevel: 'permissive' });
+    await p.start();
+    try {
+      const sock = await open(p.getPort(), `GET http://127.0.0.1:${h.port}/ HTTP/1.1\r\nHost: 127.0.0.1:${h.port}\r\n\r\n`);
+      sock.destroy();
+      expect(await within(h.firstClosed(), 500)).toBe('closed');
+    } finally { h.up.closeAllConnections(); h.up.close(); await p.stop(); }
+  });
+
+  it('closes a replayed acquirejob upstream when the client goes away', async () => {
+    const h = await hangingUpstream();
+    const p = new ProxyServer({ policyLevel: 'permissive', onJobAcquired: async () => undefined });
+    await p.start();
+    try {
+      const sock = await open(
+        p.getPort(),
+        `POST http://127.0.0.1:${h.port}/_apis/x/acquirejob HTTP/1.1\r\nHost: 127.0.0.1:${h.port}\r\nContent-Length: 2\r\n\r\n{}`
+      );
+      sock.destroy();
+      expect(await within(h.firstClosed(), 500)).toBe('closed');
+    } finally { h.up.closeAllConnections(); h.up.close(); await p.stop(); }
+  });
+
+  it('does not dial at all when the client left while its name was resolving', async () => {
+    // The pinned lookup is pointed at the local upstream so a connection, if
+    // one were made, would land somewhere this test can see.
+    const h = await hangingUpstream();
+    const p = new ProxyServer({
+      policyLevel: 'permissive',
+      lookup: () => new Promise<string[]>((r) => setTimeout(() => r(['203.0.113.7']), 200)),
+    });
+    (p as unknown as { pinnedLookup: (a: string[]) => unknown }).pinnedLookup = () => pinnedLookup(['127.0.0.1']);
+    await p.start();
+    try {
+      const sock = net.connect(p.getPort(), '127.0.0.1', () =>
+        sock.write(`GET http://slow.test:${h.port}/ HTTP/1.1\r\nHost: slow.test:${h.port}\r\n\r\n`)
+      );
+      sock.on('error', () => undefined);
+      await new Promise((r) => setTimeout(r, 50));
+      sock.destroy();
+      await new Promise((r) => setTimeout(r, 400));
+      expect(h.connections()).toBe(0);
+    } finally { h.up.closeAllConnections(); h.up.close(); await p.stop(); }
+  });
+});
+
 describe('the Host an upstream sees', () => {
   // The proxy decides by the host in the request line; the Host header is
   // the client's to write. Forwarded as written, a request the policy allowed
