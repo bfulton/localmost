@@ -120,6 +120,13 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   from a different repository that now holds an approved name - the approved one
   deleted or renamed, and the name taken since - is refused until the policy is
   reviewed again in Settings > Job Security.
+- Under the **Repo contributors** scope, a repository with any commit author
+  not linked to a GitHub account (an unattributed commit) is refused, since
+  anyone can write such a commit and no allowlist can admit it. In practice so
+  is one with more than 500 author emails, since GitHub links only the first 500
+  to accounts and lists the rest as anonymous. Repositories
+  this scope admitted before can now be refused; the refusal names the
+  unattributed commit, email or name.
 
 ### Fixed
 - An organization target's jobs get their repository's approved policy. The
@@ -144,6 +151,11 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   then never run and failed on its own timeout with no steps recorded. Worker
   slots are now claimed in a single step, and a job waits for a slot rather
   than being discarded.
+- `localmost test --updaterc` no longer writes a `.localmostrc` it cannot read
+  back. Env patterns such as `*_TOKEN` and workflow names containing `: ` are
+  quoted, as is a workflow name such as `1.0` or `True` that YAML would read
+  back as a different key, and a section left empty is omitted rather than
+  written as a bare key.
 
 ### Changed
 - **Breaking policy change**: `docker: socket | contexts | credentials`, accepted

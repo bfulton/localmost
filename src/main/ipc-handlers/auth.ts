@@ -203,6 +203,8 @@ export const registerAuthHandlers = (): void => {
     // isAuthenticated moves the app into states it has never been in, and two
     // attempts at that ended in a render loop; the badge is worth far less
     // than a working app, so this changes nothing except what it reports.
+    // A caller that needs a token from the session checks `expired` itself
+    // and signs in again, as the (currently unmounted) SetupWizard does.
     return {
       isAuthenticated: !!authState,
       expired: !!authState?.expired,

@@ -103,6 +103,11 @@ describe('UserFilterSettings', () => {
       );
 
       expect(screen.getByText(/who triggered the workflow and all contributors to the repository/)).toBeInTheDocument();
+      // An author GitHub links to no account can be anyone, so the scope
+      // refuses the repository outright - say so before it surprises anyone.
+      expect(
+        screen.getByText(/any commit author not linked to a GitHub account is refused.*no allowlist can admit/)
+      ).toBeInTheDocument();
     });
   });
 

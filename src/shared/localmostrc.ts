@@ -592,6 +592,14 @@ export function getRequiredSecrets(config: LocalmostrcConfig, workflowName: stri
 
 /**
  * Generate a .localmostrc file from a config object.
+ *
+ * `localmost test --updaterc` writes a repository's whole policy back
+ * through this, so it must reproduce every key the parser accepts, each
+ * value exactly. Strings are always quoted - an env pattern such as
+ * `*_TOKEN` would otherwise open a YAML alias - and a section with nothing
+ * in it is left out rather than written as a bare key, which YAML reads as
+ * null and the parser refuses. It writes the parsed config, so comments in
+ * a hand-written file are not kept.
  */
 export function serializeLocalmostrc(config: LocalmostrcConfig): string {
   const lines: string[] = [];
@@ -603,8 +611,7 @@ export function serializeLocalmostrc(config: LocalmostrcConfig): string {
   lines.push('');
 
   if (config.shared) {
-    lines.push('shared:');
-    lines.push(...serializePolicy(config.shared, '  '));
+    lines.push(...serializeBlock('shared', serializePolicy(config.shared, '  ')));
   }
 
   if (config.workflows && Object.keys(config.workflows).length > 0) {
@@ -612,85 +619,76 @@ export function serializeLocalmostrc(config: LocalmostrcConfig): string {
     lines.push('workflows:');
 
     for (const [name, policy] of Object.entries(config.workflows)) {
-      lines.push(`  ${name}:`);
-      lines.push(...serializePolicy(policy, '    '));
-
-      if (policy.secrets?.require?.length) {
-        lines.push('    secrets:');
-        lines.push('      require:');
-        for (const secret of policy.secrets.require) {
-          lines.push(`        - ${secret}`);
-        }
-      }
+      const body = serializePolicy(policy, '    ');
+      body.push(...serializeSection('secrets', serializeList('require', policy.secrets?.require, '      '), '    '));
+      lines.push(...serializeBlock(yamlKey(name), body, '  '));
     }
   }
 
   return lines.join('\n') + '\n';
 }
 
+/** Quote a string for YAML, as serializeDockerPolicy does. */
+const quote = (value: string): string => JSON.stringify(value);
+
+/**
+ * A workflow name as a mapping key: bare only when it is plain characters
+ * and YAML reads it back as the same string, quoted otherwise - a `: ` or
+ * ` #` in a name would end the key early, and a name such as `1.0`, `True`
+ * or `null` would come back as a different key.
+ */
+function yamlKey(name: string): string {
+  return /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(name) && yaml.load(name) === name ? name : quote(name);
+}
+
+/** A policy block: `key:` over its body, or `key: {}` when it has none. */
+function serializeBlock(key: string, body: string[], indent = ''): string[] {
+  return body.length > 0 ? [`${indent}${key}:`, ...body] : [`${indent}${key}: {}`];
+}
+
+/** A section inside a policy: `key:` over its body, or nothing when it has none. */
+function serializeSection(key: string, body: string[], indent: string): string[] {
+  return body.length > 0 ? [`${indent}${key}:`, ...body] : [];
+}
+
+/** A list of strings under `key:`, or nothing when it is empty. */
+function serializeList(key: string, items: readonly string[] | undefined, indent: string): string[] {
+  if (!items?.length) return [];
+  return [`${indent}${key}:`, ...items.map((item) => `${indent}  - ${quote(item)}`)];
+}
+
 function serializePolicy(policy: SharedPolicy, indent: string): string[] {
   const lines: string[] = [];
+  const inner = `${indent}  `;
 
   if (policy.docker) {
     lines.push(...serializeDockerPolicy(policy.docker, indent));
   }
 
   if (policy.network) {
-    lines.push(`${indent}network:`);
-    if (policy.network.allow?.length) {
-      lines.push(`${indent}  allow:`);
-      for (const domain of policy.network.allow) {
-        lines.push(`${indent}    - "${domain}"`);
-      }
-    }
-    if (policy.network.deny?.length) {
-      lines.push(`${indent}  deny:`);
-      for (const domain of policy.network.deny) {
-        lines.push(`${indent}    - "${domain}"`);
-      }
-    }
-    const loopback = policy.network.loopback;
+    const { allow, deny, loopback } = policy.network;
+    const body = [...serializeList('allow', allow, inner), ...serializeList('deny', deny, inner)];
     if (loopback !== undefined) {
-      lines.push(`${indent}  loopback: ${loopback === true ? 'true' : `[${loopback.join(', ')}]`}`);
+      body.push(`${inner}loopback: ${loopback === true ? 'true' : `[${loopback.join(', ')}]`}`);
     }
+    lines.push(...serializeSection('network', body, indent));
   }
 
   if (policy.filesystem) {
-    lines.push(`${indent}filesystem:`);
-    if (policy.filesystem.read?.length) {
-      lines.push(`${indent}  read:`);
-      for (const path of policy.filesystem.read) {
-        lines.push(`${indent}    - "${path}"`);
-      }
-    }
-    if (policy.filesystem.write?.length) {
-      lines.push(`${indent}  write:`);
-      for (const path of policy.filesystem.write) {
-        lines.push(`${indent}    - "${path}"`);
-      }
-    }
-    if (policy.filesystem.deny?.length) {
-      lines.push(`${indent}  deny:`);
-      for (const path of policy.filesystem.deny) {
-        lines.push(`${indent}    - "${path}"`);
-      }
-    }
+    const { read, write, deny } = policy.filesystem;
+    lines.push(...serializeSection('filesystem', [
+      ...serializeList('read', read, inner),
+      ...serializeList('write', write, inner),
+      ...serializeList('deny', deny, inner),
+    ], indent));
   }
 
   if (policy.env) {
-    lines.push(`${indent}env:`);
-    if (policy.env.allow?.length) {
-      lines.push(`${indent}  allow:`);
-      for (const name of policy.env.allow) {
-        lines.push(`${indent}    - ${name}`);
-      }
-    }
-    if (policy.env.deny?.length) {
-      lines.push(`${indent}  deny:`);
-      for (const name of policy.env.deny) {
-        lines.push(`${indent}    - ${name}`);
-      }
-    }
+    const { allow, deny } = policy.env;
+    lines.push(...serializeSection('env', [
+      ...serializeList('allow', allow, inner),
+      ...serializeList('deny', deny, inner),
+    ], indent));
   }
 
   return lines;
