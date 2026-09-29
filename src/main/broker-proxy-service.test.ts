@@ -452,6 +452,24 @@ describe('extractGitHubJobInfo', () => {
 
     expect(info.githubWorkflow).toBe('integration');
   });
+
+  it("reads github.repository_id, which stays the repository's through renames and transfers", () => {
+    const info = extractGitHubJobInfo({ github: { d: [
+      { k: 'repository', v: 'owner/repo' },
+      { k: 'repository_id', v: '123456789' },
+    ] } });
+
+    expect(info).toEqual({ githubRepo: 'owner/repo', repositoryId: 123456789 });
+  });
+
+  it('takes a repository id only as the positive integer GitHub sends', () => {
+    const idOf = (value: string) => extractGitHubJobInfo({ github: { d: [{ k: 'repository_id', v: value }] } }).repositoryId;
+
+    expect(idOf('42')).toBe(42);
+    for (const value of ['', '0', '-5', '12abc', '1e3', '99999999999999999999']) {
+      expect(idOf(value)).toBeUndefined();
+    }
+  });
 });
 
 describe('the workflow a per-workflow policy section keys on', () => {
@@ -1226,6 +1244,26 @@ describe('message routing', () => {
 
       expect(upstreamHosts).toEqual(['run-actions-1-azure-eastus.actions.githubusercontent.com']);
       expect(received).toHaveBeenCalledTimes(1);
+    });
+
+    it('records the repository, its id and the workflow the job names, for its own worker', async () => {
+      // The policy a worker's proxy installs at acquirejob is keyed on these.
+      // For an organization target the display name names no repository, and
+      // the workflow a spawn guessed may not be the one that was claimed.
+      await receive(runService);
+      service.expectWorkerForJob('some-org', 1, 'req-1');
+      const sessionId = await createSession();
+      await request('GET', `/message?sessionId=${sessionId}`);
+
+      const expected = {
+        targetDisplayName: 'some-org',
+        githubSha: 'abc1234',
+        githubWorkflow: 'build',
+        repository: 'Some-Org/Some-Repo',
+        repositoryId: 123456789,
+      };
+      expect(service.getJobTargetForWorker(1, 'req-1')).toEqual(expected);
+      expect(service.getJobTargetForWorker(1, '2')).toEqual(expected);
     });
   });
 

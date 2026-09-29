@@ -296,6 +296,21 @@ export interface GitHubJobInfo {
   githubSha?: string;    // Commit SHA that triggered the workflow
   githubRef?: string;    // Branch/tag ref (e.g., refs/heads/main)
   githubWorkflow?: string; // Workflow name from github.workflow (keys workflows.<name> policy)
+  repositoryId?: number;   // github.repository_id: the repository's across renames and transfers
+}
+
+/**
+ * What the broker keeps about a job for the policy its worker's proxy
+ * installs at acquirejob. The target is the one the job came in on; the rest
+ * is what GitHub's job details name. `repository` is owner/repo as GitHub
+ * reports it, which for an organization target the display name is not.
+ */
+export interface BrokerJobTarget {
+  targetDisplayName: string;
+  githubSha?: string;
+  githubWorkflow?: string;
+  repository?: string;
+  repositoryId?: number;
 }
 
 /** One entry of a GitHub context dict: {"t":2,"d":[{"k":"run_id","v":"123"},...]} */
@@ -318,6 +333,16 @@ function workflowFilename(ref: string | undefined): string | undefined {
   return file.replace(/\.ya?ml$/i, '');
 }
 
+/**
+ * A repository id as GitHub sends it: a positive integer, as a string. Anything
+ * else names no repository, and an id is only worth keeping if it is exact.
+ */
+function repositoryIdFrom(value: string): number | undefined {
+  if (!/^[1-9]\d*$/.test(value)) return undefined;
+  const id = Number(value);
+  return Number.isSafeInteger(id) ? id : undefined;
+}
+
 export function extractGitHubJobInfo(contextData: {
   github?: { d?: ContextDictEntry[] };
   job?: { d?: ContextDictEntry[] };
@@ -335,6 +360,7 @@ export function extractGitHubJobInfo(contextData: {
       if (item.k === 'ref') info.githubRef = item.v;
       if (item.k === 'workflow') info.githubWorkflow = item.v;
       if (item.k === 'workflow_ref') workflowRef = item.v;
+      if (item.k === 'repository_id') info.repositoryId = repositoryIdFrom(item.v);
     }
   }
 
@@ -433,7 +459,7 @@ export class BrokerProxyService extends EventEmitter {
    */
   private workerCredentials: Map<number, { key: string; clientId: string; publicKey: crypto.KeyObject }> = new Map();
   /** Repository and commit for a job, keyed by both jobId and messageId. */
-  private jobTargets: Map<string, { targetDisplayName: string; githubSha?: string }> = new Map();
+  private jobTargets: Map<string, BrokerJobTarget> = new Map();
 
   private jobRunServiceUrls: Map<string, string> = new Map();  // jobId -> run_service_url
   private acquiredJobDetails: Map<string, string> = new Map();  // jobId -> job details
@@ -723,7 +749,13 @@ export class BrokerProxyService extends EventEmitter {
       // might present. A worker announces which job it is taking via
       // acquirejob, and its proxy installs that job's policy then - looked up
       // only among the jobs delivered to that worker (getJobTargetForWorker).
-      const jobTarget = { targetDisplayName: state.target.displayName, githubSha: githubInfo.githubSha };
+      const jobTarget: BrokerJobTarget = {
+        targetDisplayName: state.target.displayName,
+        githubSha: githubInfo.githubSha,
+        githubWorkflow: githubInfo.githubWorkflow,
+        repository: githubInfo.githubRepo,
+        repositoryId: githubInfo.repositoryId,
+      };
       this.jobTargets.set(jobId, jobTarget);
       this.jobTargets.set(messageId, jobTarget);
 
@@ -1889,7 +1921,7 @@ export class BrokerProxyService extends EventEmitter {
    * job took that repository's hosts. The proxy is per slot, and a slot has
    * one live key, so the slot names the worker.
    */
-  getJobTargetForWorker(instanceNum: number, jobId: string): { targetDisplayName: string; githubSha?: string } | undefined {
+  getJobTargetForWorker(instanceNum: number, jobId: string): BrokerJobTarget | undefined {
     for (const [key, worker] of this.workerKeys) {
       if (worker.instanceNum !== instanceNum) continue;
       return this.deliveredToWorker.get(key)?.has(jobId) ? this.jobTargets.get(jobId) : undefined;
