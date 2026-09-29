@@ -764,6 +764,30 @@ workflows: just-a-string
   });
 });
 
+describe('top-level keys', () => {
+  it('rejects a key the grammar does not have, naming the ones it does', () => {
+    // A misspelt key was accepted and ignored, so "levle: strict" read as a
+    // decision about the level while leaving whatever else was declared -
+    // and a key a later version adds would be approved by an older one unseen.
+    const result = parseLocalmostrcContent('version: 1\nlevle: strict\nshared: {}\n');
+
+    expect(result.success).toBe(false);
+    expect(result.errors).toEqual([
+      expect.objectContaining({ message: expect.stringMatching(/"levle" is not a \.localmostrc key.*version, level, shared, workflows/) }),
+    ]);
+  });
+
+  it('rejects every unknown key, not just the first', () => {
+    const result = parseLocalmostrcContent('version: 1\nnetwork: {}\nsecrets: {}\n');
+    expect(result.errors.map((e) => e.message).join('\n')).toMatch(/"network"[\s\S]*"secrets"/);
+  });
+
+  it('accepts every key it does have', () => {
+    const result = parseLocalmostrcContent('version: 1\nlevel: strict\nshared: {}\nworkflows: {}\n');
+    expect(result.success).toBe(true);
+  });
+});
+
 describe('policy level', () => {
   const withLevel = (level: string) => `version: 1\nlevel: ${level}\n`;
 

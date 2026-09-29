@@ -16,6 +16,14 @@
  */
 
 import { DockerPolicy, describeDockerGrants } from './docker-policy';
+import { SandboxPolicyLevel } from './types';
+import { MODERATE_NETWORK_ALLOWLIST, RUNNER_INFRASTRUCTURE_ALLOWLIST } from './network-allowlist';
+
+/**
+ * Every key a .localmostrc may declare at the top of the file. The parser
+ * refuses any other, and every one that is not structure has to be described.
+ */
+export const LOCALMOSTRC_KEYS = ['version', 'level', 'shared', 'workflows'] as const;
 
 /** Every key a policy section may declare at any scope. */
 export const POLICY_SECTION_KEYS = ['network', 'filesystem', 'env', 'docker'] as const;
@@ -28,8 +36,16 @@ export const WORKFLOW_POLICY_KEYS = [...POLICY_SECTION_KEYS, 'secrets'] as const
 
 export type PolicySectionKey = (typeof POLICY_SECTION_KEYS)[number];
 
+/**
+ * Every key describePolicy has to render: the section keys, plus the level,
+ * which is declared once at the top of the file but widens every section.
+ */
+export const DESCRIBED_POLICY_KEYS = [...WORKFLOW_POLICY_KEYS, 'level'] as const;
+
 /** A section of a policy, as the grammar accepts it. */
 export interface DescribablePolicy {
+  /** Top of the file only; a caller describing the whole policy passes it in. */
+  level?: SandboxPolicyLevel;
   network?: { allow?: string[]; deny?: string[] };
   filesystem?: { read?: string[]; write?: string[]; deny?: string[] };
   env?: { allow?: string[]; deny?: string[] };
@@ -43,11 +59,42 @@ export interface PolicyGrant {
   group: string;
   /** Single character marking what the entry does: + grant, - deny, r/w access. */
   marker: string;
-  /** The declared value, as written. */
+  /** The declared value, as written, with what it means when that is not obvious. */
   value: string;
   /** The flat one-line form, already prefixed. */
   summary: string;
 }
+
+/**
+ * Hosts in the moderate allowlist that serve whatever anyone publishes, so a
+ * job can fetch or send nearly anything through them. Named only while the
+ * allowlist still holds them.
+ */
+const CONTENT_HOSTS = ['codeload.github.com', 'objects.githubusercontent.com', 'raw.githubusercontent.com'];
+
+/** Whole domains moderate opens, read from the list the proxy enforces. */
+const MODERATE_WILDCARDS = MODERATE_NETWORK_ALLOWLIST.filter(
+  (host) => host.startsWith('*.') && !RUNNER_INFRASTRUCTURE_ALLOWLIST.includes(host)
+);
+
+// Mirrors the home-directory toolchain paths process-sandbox makes writable
+// at moderate and permissive. Some hold binaries on the user's PATH, which is
+// why a write there outlives the job. Change both together.
+const HOME_TOOLCHAIN_WRITES =
+  'write access to toolchain directories in your home, some of them on your PATH ' +
+  '(~/.cargo, ~/.rustup, ~/.local, ~/go, ~/.dotnet, ~/.gradle, ~/.m2, ~/Library/Caches and package-manager caches)';
+
+/**
+ * What a level grants beyond strict. Strict is the baseline and has no entry:
+ * it grants nothing a policy has to be approved for.
+ */
+const LEVEL_GRANTS: Record<Exclude<SandboxPolicyLevel, 'strict'>, string> = {
+  moderate:
+    `adds package registries, every host under ${MODERATE_WILDCARDS.join(', ')}, and GitHub content hosts ` +
+    `(${CONTENT_HOSTS.filter((host) => MODERATE_NETWORK_ALLOWLIST.includes(host)).join(', ')}) - ` +
+    `CDNs and content hosts anyone can publish to - plus ${HOME_TOOLCHAIN_WRITES}`,
+  permissive: `allows every network host, plus ${HOME_TOOLCHAIN_WRITES}`,
+};
 
 export function describePolicy(policy: DescribablePolicy, prefix = ''): PolicyGrant[] {
   const grants: PolicyGrant[] = [];
@@ -56,6 +103,12 @@ export function describePolicy(policy: DescribablePolicy, prefix = ''): PolicyGr
       grants.push({ group, marker, value, summary: `${prefix}${label}: ${value}` });
     }
   };
+
+  // First, because it widens everything listed after it. It was once left
+  // out entirely, and `level: permissive` described as granting nothing.
+  if (policy.level && policy.level !== 'strict') {
+    add('Level', '+', 'level', [`${policy.level} (${LEVEL_GRANTS[policy.level]})`]);
+  }
 
   add('Network allow', '+', 'network', policy.network?.allow);
   add('Network deny', '-', 'network denied', policy.network?.deny);

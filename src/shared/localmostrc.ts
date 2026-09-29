@@ -4,7 +4,7 @@
  * Handles parsing, validation, and merging of declarative sandbox policies.
  */
 import * as yaml from 'js-yaml';
-import { POLICY_SECTION_KEYS, WORKFLOW_POLICY_KEYS } from './policy-describe';
+import { LOCALMOSTRC_KEYS, POLICY_SECTION_KEYS, WORKFLOW_POLICY_KEYS } from './policy-describe';
 import * as fs from 'fs';
 import * as path from 'path';
 import { SandboxPolicy, NetworkPolicy, FilesystemPolicy, EnvPolicy } from './sandbox-profile';
@@ -119,9 +119,6 @@ export function effectivePolicyLevel(config?: LocalmostrcConfig | null): Sandbox
 }
 
 export function parseLocalmostrcContent(content: string): ParseResult {
-  const errors: ParseError[] = [];
-  const warnings: string[] = [];
-
   let parsed: unknown;
   try {
     parsed = yaml.load(content);
@@ -140,6 +137,20 @@ export function parseLocalmostrcContent(content: string): ParseResult {
     };
   }
 
+  return validateLocalmostrc(parsed);
+}
+
+/**
+ * Validate an already-parsed policy against the grammar.
+ *
+ * Separate from parsing so a policy read back from anywhere else - the
+ * approval cache, which is JSON - is held to exactly the grammar the
+ * repository's file was, rather than trusted for having been written by us.
+ */
+export function validateLocalmostrc(parsed: unknown): ParseResult {
+  const errors: ParseError[] = [];
+  const warnings: string[] = [];
+
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return {
       success: false,
@@ -149,6 +160,17 @@ export function parseLocalmostrcContent(content: string): ParseResult {
   }
 
   const config = parsed as Record<string, unknown>;
+
+  // Closed at the top as each section is: a key nobody parses grants nothing
+  // while reading as though it decides something, and a key a later version
+  // adds would otherwise be approved here without being shown. The list is
+  // shared with what describes a policy, whose guard test covers it.
+  for (const key of Object.keys(config)) {
+    if ((LOCALMOSTRC_KEYS as readonly string[]).includes(key)) continue;
+    errors.push({
+      message: `"${key}" is not a .localmostrc key. Accepted keys: ${LOCALMOSTRC_KEYS.join(', ')}.`,
+    });
+  }
 
   // Validate version
   if (config.version === undefined) {

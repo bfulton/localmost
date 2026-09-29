@@ -348,6 +348,35 @@ describe('Workspace Management', () => {
       expect(result).toBe('owner/repo');
     });
 
+    it('keeps a repository name that contains dots', () => {
+      // `localmost policy approve` keys the approval on this name, and
+      // "owner/my.repo" used to come back as nothing at all.
+      for (const url of [
+        'git@github.com:owner/my.repo.git',
+        'git@github.com:owner/my.repo',
+        'https://github.com/owner/my.repo.git',
+        'https://github.com/owner/my.repo',
+        'ssh://git@github.com/owner/my.repo.git',
+      ]) {
+        mockExecSync.mockReturnValue(`${url}\n`);
+        expect(getRepositoryFromDir('/repo')).toBe('owner/my.repo');
+      }
+      mockExecSync.mockReturnValue('https://github.com/owner/.github.git\n');
+      expect(getRepositoryFromDir('/repo')).toBe('owner/.github');
+    });
+
+    it('returns nothing for a remote that does not name one GitHub repository', () => {
+      for (const url of [
+        'https://github.com/owner/repo/extra.git',
+        'https://github.com.evil.example/owner/repo.git',
+        'https://github.com/owner/..',
+        'https://github.com/-owner/repo.git',
+      ]) {
+        mockExecSync.mockReturnValue(`${url}\n`);
+        expect(getRepositoryFromDir('/repo')).toBeNull();
+      }
+    });
+
     it('should return null for non-GitHub remotes', () => {
       mockExecSync.mockReturnValue('https://gitlab.com/owner/repo.git\n');
 

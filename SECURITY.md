@@ -106,7 +106,7 @@ loosen its own sandbox without the machine owner agreeing to it.
 - **Malware on your machine**: If your system is already compromised, localmost cannot protect you.
 - **A compromised GitHub account**: If an attacker has access to your GitHub account, they can modify workflows that run on your runner.
 - **Allowlisted hosts**: Data can be exfiltrated to any host the active policy allows. Under `strict` that is runner infrastructure plus whatever the repository declares; looser levels allow more.
-- **Approved policies**: Once you approve a repository's `.localmostrc`, everything it declares is granted until the file changes again. Approval is a judgement about that content.
+- **Approved policies**: Once you approve a repository's `.localmostrc`, everything it declares is granted until you approve another. Approval is a judgement about that content, and is bound to it: what you approve is the policy you were shown, level included.
 - **Per-workflow filesystem sections**: A `workflows:` section can narrow or widen *network* access per workflow, because hosts are applied to the proxy when a job is claimed. Filesystem paths are taken from `shared:` only — the sandbox profile is built before the runner knows which workflow it will run, and cannot change afterwards.
 - **Per-workflow env sections**: The environment is fixed when the worker starts, for the same reason. `env: allow` is taken from `shared:` only; a per-workflow allow is not applied. `env: deny` is taken from `shared:` and from every workflow, and applied to every job - a per-workflow deny is honoured more widely than written rather than not at all.
 - **Container egress**: Traffic from inside a container leaves through the daemon's network, not the job's proxy, so the host allowlist does not apply to it. The Docker filter decides what a container may be created with, not what it connects to once running - see Docker Access below.
@@ -150,10 +150,21 @@ The single exception is the root directory node, which permits an absolute path
 to resolve at all. It grants no access to anything inside.
 
 A repository's `.localmostrc` only takes effect once approved. When the runner
-sees a new or changed policy it refuses the job and cancels the run; review it
-with `localmost policy diff` and approve with `localmost policy approve`. A
-repository with no policy is never held for approval — it gets the baseline,
-which grants nothing extra.
+sees a new or changed policy it refuses the job, cancels the run, and records
+the policy as pending; review and approve it in Settings > Job Security, or in
+a clone with `localmost policy approve`, which shows the policy and a stamp,
+and `localmost policy approve --stamp <stamp>`, which approves it. A pending
+policy never replaces the approved one: jobs whose file matches what was
+approved keep running under it until another is approved. Approval is bound to
+the exact policy shown - its sha256 stamp - and is refused if a later job has
+replaced the pending policy since; every decision is appended, with its stamp,
+to `decisions.log` beside the cache. A repository with no policy is never held
+for approval — it gets the baseline, which grants nothing extra. So does a
+commit whose `.localmostrc` was deleted: it is not held, and it runs on the
+baseline rather than under the policy approved for the repository before. The
+approved policy is applied only to a commit the runner checked before spawning
+its worker and found carrying exactly that policy; a job at any other commit,
+or one approved away since the check, runs on the baseline.
 
 `codeload.github.com` is deliberately **not** in that set, even though the
 runner uses it to download actions during job setup. Actions are third-party

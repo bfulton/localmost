@@ -150,7 +150,8 @@ contextBridge.exposeInMainWorld('localmost', {
   // Targets (multi-target runner support)
   policy: {
     list: () => ipcRenderer.invoke(IPC_CHANNELS.POLICY_LIST),
-    approve: (repository: string) => ipcRenderer.invoke(IPC_CHANNELS.POLICY_APPROVE, repository),
+    approve: (repository: string, stamp: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.POLICY_APPROVE, repository, stamp),
     reject: (repository: string) => ipcRenderer.invoke(IPC_CHANNELS.POLICY_REJECT, repository),
   },
 
@@ -250,7 +251,7 @@ export interface LocalmostAPI {
   };
   policy: {
     list: () => Promise<PolicySummary[]>;
-    approve: (repository: string) => Promise<Result>;
+    approve: (repository: string, stamp: string) => Promise<Result>;
     reject: (repository: string) => Promise<Result>;
   };
   targets: {

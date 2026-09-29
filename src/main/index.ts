@@ -109,7 +109,7 @@ import { resolveRegistryAuth } from './docker/registry-auth';
 import {
   decidePolicyForJob,
   recordPendingPolicy,
-  getCachedPolicy,
+  getApprovedPolicyForCommit,
   formatApprovalRequest,
 } from './policy-cache';
 
@@ -186,7 +186,7 @@ async function checkRepoPolicyApproval(
 
     const auth = getGitHubAuth() || new GitHubAuth();
     const content = await auth.getFileContent(accessToken, owner, repo, '.localmostrc', sha);
-    const decision = decidePolicyForJob(repository, content);
+    const decision = decidePolicyForJob(repository, content, sha);
 
     if (decision.action === 'allow') return null;
     if (decision.action === 'invalid') {
@@ -331,14 +331,16 @@ app.whenReady().then(async () => {
     // Stage 1: approved container requests go to the operator's own daemon.
     // The socket the job sees is localmost's; the daemon's is never handed over.
     dockerBackend: new DesktopBackend(),
-    getRepoPolicy: async (owner: string, repo: string, _sha: string, workflowName: string) => {
+    getRepoPolicy: async (owner: string, repo: string, sha: string, workflowName: string) => {
       // Apply the policy that was approved, not whatever is in the repository
       // right now. A job only reaches this point once its policy has been
       // approved, and applying the approved copy means an unreviewed change
       // cannot take effect through a race. That covers the level too: it is
-      // declared in the same file and approved with the rest of it.
-      const cached = getCachedPolicy(`${owner}/${repo}`);
-      if (!cached?.approved) {
+      // declared in the same file and approved with the rest of it. Only a
+      // commit the pre-spawn check found carrying that policy gets it; one
+      // whose .localmostrc was deleted, or that was never checked, gets none.
+      const approved = getApprovedPolicyForCommit(`${owner}/${repo}`, sha);
+      if (!approved) {
         return {
           hosts: [],
           level: 'strict' as const,
@@ -347,18 +349,18 @@ app.whenReady().then(async () => {
           docker: {},
         };
       }
-      const policy = getEffectivePolicy(cached.config, workflowName);
+      const policy = getEffectivePolicy(approved, workflowName);
       return {
         // Network is resolved per workflow and applied to the proxy per job.
         hosts: policy.network?.allow || [],
-        level: effectivePolicyLevel(cached.config),
+        level: effectivePolicyLevel(approved),
         // Filesystem comes from the shared section only. The sandbox profile
         // is built before the workflow is known and cannot change afterwards,
         // so a per-workflow filesystem section could not be applied - and
         // resolving it here would differ between spawn and claim and read as
         // policy drift.
-        readPaths: cached.config.shared?.filesystem?.read || [],
-        writePaths: cached.config.shared?.filesystem?.write || [],
+        readPaths: approved.shared?.filesystem?.read || [],
+        writePaths: approved.shared?.filesystem?.write || [],
         // Docker composes across shared and workflow: the socket is bound to
         // the merged policy when the job is claimed, after the workflow is known.
         docker: policy.docker ?? {},

@@ -1,5 +1,22 @@
-import { describe, it, expect } from '@jest/globals';
-import { parsePolicyArgs, printPolicy } from './policy';
+import { describe, it, expect, beforeEach, afterEach, afterAll } from '@jest/globals';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+
+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-policy-data-'));
+const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-policy-repo-'));
+
+jest.mock('../shared/paths', () => ({ getAppDataDirWithoutElectron: () => dataDir }));
+jest.mock('../shared/workspace', () => ({ getRepositoryFromDir: () => 'owner/my.repo' }));
+
+import { parsePolicyArgs, printPolicy, runPolicy } from './policy';
+import { approvalStamp, policyFilePath, readPolicyEntry, recordPending } from '../shared/policy-store';
+import { parseLocalmostrcContent } from '../shared/localmostrc';
+
+afterAll(() => {
+  fs.rmSync(dataDir, { recursive: true, force: true });
+  fs.rmSync(repoDir, { recursive: true, force: true });
+});
 
 describe('CLI policy command', () => {
   describe('parsePolicyArgs', () => {
@@ -55,6 +72,10 @@ describe('CLI policy command', () => {
       const result = parsePolicyArgs(['-w', 'ci', 'show']);
       expect(result.subcommand).toBe('show');
       expect(result.options.workflow).toBe('ci');
+    });
+
+    it('parses --stamp, which binds an approval to what was shown', () => {
+      expect(parsePolicyArgs(['approve', '--stamp', 'abc']).options.stamp).toBe('abc');
     });
 
     it('handles multiple options', () => {
@@ -118,7 +139,135 @@ describe('policy show renders the docker grants', () => {
     expect(out).toMatch(/docker network create: localmost-e2e-\* \(internal\)/);
   });
 
+  it('shows a loosened level first, which is the largest grant a policy can make', () => {
+    const out = capture({ level: 'permissive', network: { allow: ['github.com'] } });
+    expect(out).toMatch(/Level:[\s\S]*permissive[\s\S]*Network allow/);
+    expect(out).not.toMatch(/empty - uses defaults only/);
+  });
+
+  it('does not call a level-only policy empty', () => {
+    expect(capture({ level: 'moderate' })).toMatch(/moderate/);
+  });
+
   it('says nothing about docker when none is declared', () => {
     expect(capture({ network: { allow: ['github.com'] } })).not.toMatch(/docker/i);
+  });
+});
+
+describe('policy approve', () => {
+  const policiesDir = path.join(dataDir, 'policies');
+  const REPO = 'owner/my.repo';
+  const PERMISSIVE = 'version: 1\nlevel: permissive\n';
+  let output: string[];
+  let exitSpy: jest.SpiedFunction<typeof process.exit>;
+  const originalLog = console.log;
+
+  const writeRc = (content: string) => fs.writeFileSync(path.join(repoDir, '.localmostrc'), content);
+  const stampOf = (content: string) => approvalStamp(REPO, parseLocalmostrcContent(content).config!);
+  const run = (...args: string[]) => {
+    const { subcommand, options } = parsePolicyArgs(['approve', ...args]);
+    runPolicy(subcommand, options);
+  };
+  const decisions = () => {
+    const file = path.join(policiesDir, 'decisions.log');
+    return fs.existsSync(file) ? fs.readFileSync(file, 'utf-8').trim().split('\n').map((l) => JSON.parse(l)) : [];
+  };
+
+  beforeEach(() => {
+    fs.rmSync(policiesDir, { recursive: true, force: true });
+    output = [];
+    console.log = (...args: unknown[]) => void output.push(args.join(' '));
+    jest.spyOn(process, 'cwd').mockReturnValue(repoDir);
+    exitSpy = jest.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`exit ${code}`);
+    }) as never);
+  });
+
+  afterEach(() => {
+    console.log = originalLog;
+    jest.restoreAllMocks();
+  });
+
+  it('shows the whole policy, level first, and approves nothing without its stamp', () => {
+    // Approving used to write whatever the file held and show only a diff
+    // afterwards - or nothing, for a repository the runner had not seen.
+    writeRc(PERMISSIVE);
+
+    expect(() => run()).toThrow('exit 1');
+    const out = output.join('\n');
+    expect(out).toMatch(/permissive/);
+    expect(out).toContain(`localmost policy approve --stamp ${stampOf(PERMISSIVE)}`);
+    expect(readPolicyEntry(policiesDir, REPO)).toBeNull();
+    expect(decisions()).toEqual([]);
+  });
+
+  it('approves exactly the policy whose stamp it was given, and records it', () => {
+    writeRc(PERMISSIVE);
+    run('--stamp', stampOf(PERMISSIVE));
+
+    expect(exitSpy).not.toHaveBeenCalled();
+    expect(readPolicyEntry(policiesDir, REPO)?.approved?.config).toEqual(expect.objectContaining({ level: 'permissive' }));
+    expect(decisions()).toEqual([
+      expect.objectContaining({ repository: REPO, decision: 'approved', stamp: stampOf(PERMISSIVE), via: 'cli' }),
+    ]);
+  });
+
+  it('refuses a stamp for a policy the file no longer holds', () => {
+    const shown = 'version: 1\nshared:\n  network:\n    allow:\n      - "index.crates.io"\n';
+    writeRc(PERMISSIVE);
+
+    expect(() => run('--stamp', stampOf(shown))).toThrow('exit 1');
+    expect(output.join('\n')).toMatch(/changed/);
+    expect(readPolicyEntry(policiesDir, REPO)).toBeNull();
+  });
+
+  it('leaves a different pending policy waiting for its own decision', () => {
+    const other = parseLocalmostrcContent('version: 1\nlevel: moderate\n').config!;
+    recordPending(policiesDir, REPO, other);
+    writeRc(PERMISSIVE);
+    run('--stamp', stampOf(PERMISSIVE));
+
+    const entry = readPolicyEntry(policiesDir, REPO)!;
+    expect(entry.approved?.config.level).toBe('permissive');
+    expect(entry.pending?.config).toEqual(other);
+  });
+
+  it('approves over a cache entry that no longer reads', () => {
+    // An entry from an older grammar used to make approving throw, and the
+    // only way to approve the repository again was deleting it by hand.
+    fs.mkdirSync(policiesDir, { recursive: true });
+    fs.writeFileSync(
+      policyFilePath(policiesDir, REPO),
+      JSON.stringify({ repository: REPO, config: { version: 1, shared: { sockets: {} } }, cachedAt: '', approved: true })
+    );
+    writeRc(PERMISSIVE);
+    run('--stamp', stampOf(PERMISSIVE));
+
+    expect(exitSpy).not.toHaveBeenCalled();
+    expect(readPolicyEntry(policiesDir, REPO)?.approved?.config.level).toBe('permissive');
+  });
+
+  it('says why an approval could not be written, rather than crashing', () => {
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(policiesDir, 'not a directory');
+    writeRc(PERMISSIVE);
+    try {
+      expect(() => run('--stamp', stampOf(PERMISSIVE))).toThrow('exit 1');
+      expect(output.join('\n')).toMatch(/Could not approve/);
+    } finally {
+      fs.rmSync(policiesDir, { force: true });
+    }
+  });
+
+  it('keeps an approval whose decision could not be logged, and says so', () => {
+    // The approval is already written by then; failing the command would say
+    // it had not happened.
+    fs.mkdirSync(path.join(policiesDir, 'decisions.log'), { recursive: true });
+    writeRc(PERMISSIVE);
+    run('--stamp', stampOf(PERMISSIVE));
+
+    expect(exitSpy).not.toHaveBeenCalled();
+    expect(readPolicyEntry(policiesDir, REPO)?.approved?.config.level).toBe('permissive');
+    expect(output.join('\n')).toMatch(/Could not record/);
   });
 });

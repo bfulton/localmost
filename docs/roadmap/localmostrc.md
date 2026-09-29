@@ -441,8 +441,9 @@ shared or per workflow, applies to every job. Without an allow, a job inherits
 nothing from the app's environment beyond `PATH`, `HOME`, `USER`, `LOGNAME`,
 `SHELL`, `LANG`, `LC_*`, `TERM`, `TZ` and `__CF_USER_TEXT_ENCODING`.
 
-A repo's policy only takes effect once approved — see
-`localmost policy approve`.
+A repo's policy only takes effect once approved, in Settings > Job Security or
+with `localmost policy approve`, which shows the policy and a stamp, then
+`localmost policy approve --stamp <stamp>`, which approves exactly that policy.
 
 ### CI vs local differences
 
