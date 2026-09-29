@@ -107,6 +107,22 @@ describe('describePolicy', () => {
     expect(describePolicy({})).toEqual([]);
   });
 
+  it('warns on a write to a place something outside the sandbox acts on', () => {
+    const [grant] = describePolicy({ filesystem: { write: ['~/Library/LaunchAgents'] } });
+    expect(grant.warning).toMatch(/launchd/);
+    expect(grant.summary).toMatch(/^write: ~\/Library\/LaunchAgents \(warning: launchd runs/);
+  });
+
+  it('warns on a write to the home directory itself', () => {
+    expect(describePolicy({ filesystem: { write: ['~'] } })[0].summary).toMatch(/warning: your whole home directory/);
+  });
+
+  it('does not warn on an ordinary write, or on a read of a sensitive place', () => {
+    const grants = describePolicy({ filesystem: { write: ['~/.npm', './build'], read: ['~/Library/LaunchAgents'] } });
+    expect(grants.map((g) => g.warning)).toEqual([undefined, undefined, undefined]);
+    expect(grants.map((g) => g.summary).join('\n')).not.toMatch(/warning/);
+  });
+
   it('prefixes the flat summary, which is how a workflow scope is shown', () => {
     const [grant] = describePolicy({ network: { allow: ['github.com'] } }, 'ci: ');
     expect(grant.summary).toBe('ci: network: github.com');

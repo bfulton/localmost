@@ -149,6 +149,12 @@ describe('policy show renders the docker grants', () => {
     expect(capture({ level: 'moderate' })).toMatch(/moderate/);
   });
 
+  it('warns under a write the job could use to run code outside the sandbox', () => {
+    const out = capture({ filesystem: { write: ['/opt/homebrew/bin', '~/.npm'] } });
+    expect(out).toMatch(/\/opt\/homebrew\/bin[\s\S]*warning: on your PATH/);
+    expect(out.match(/warning/g)).toHaveLength(1);
+  });
+
   it('says nothing about docker when none is declared', () => {
     expect(capture({ network: { allow: ['github.com'] } })).not.toMatch(/docker/i);
   });

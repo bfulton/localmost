@@ -18,6 +18,7 @@
 import { DockerPolicy, describeDockerGrants } from './docker-policy';
 import { SandboxPolicyLevel } from './types';
 import { MODERATE_NETWORK_ALLOWLIST, RUNNER_INFRASTRUCTURE_ALLOWLIST } from './network-allowlist';
+import { sensitiveWriteReason } from './sensitive-paths';
 
 /**
  * Every key a .localmostrc may declare at the top of the file. The parser
@@ -61,7 +62,12 @@ export interface PolicyGrant {
   marker: string;
   /** The declared value, as written, with what it means when that is not obvious. */
   value: string;
-  /** The flat one-line form, already prefixed. */
+  /**
+   * Why this grant reaches past the job, when it does: a write to a place
+   * something outside the sandbox later acts on. Allowed, but called out.
+   */
+  warning?: string;
+  /** The flat one-line form, already prefixed, with the warning if any. */
   summary: string;
 }
 
@@ -103,9 +109,17 @@ const LEVEL_GRANTS: Record<Exclude<SandboxPolicyLevel, 'strict'>, string> = {
 
 export function describePolicy(policy: DescribablePolicy, prefix = ''): PolicyGrant[] {
   const grants: PolicyGrant[] = [];
-  const add = (group: string, marker: string, label: string, values: string[] | undefined) => {
+  const add = (
+    group: string,
+    marker: string,
+    label: string,
+    values: string[] | undefined,
+    warn?: (value: string) => string | undefined
+  ) => {
     for (const value of values ?? []) {
-      grants.push({ group, marker, value, summary: `${prefix}${label}: ${value}` });
+      const warning = warn?.(value);
+      const summary = `${prefix}${label}: ${value}${warning ? ` (warning: ${warning})` : ''}`;
+      grants.push({ group, marker, value, ...(warning ? { warning } : {}), summary });
     }
   };
 
@@ -118,7 +132,7 @@ export function describePolicy(policy: DescribablePolicy, prefix = ''): PolicyGr
   add('Network allow', '+', 'network', policy.network?.allow);
   add('Network deny', '-', 'network denied', policy.network?.deny);
   add('Filesystem read', 'r', 'read', policy.filesystem?.read);
-  add('Filesystem write', 'w', 'write', policy.filesystem?.write);
+  add('Filesystem write', 'w', 'write', policy.filesystem?.write, (value) => sensitiveWriteReason(value));
   add('Filesystem deny', '-', 'denied', policy.filesystem?.deny);
   add('Environment allow', '+', 'env', policy.env?.allow);
   add('Environment deny', '-', 'env denied', policy.env?.deny);

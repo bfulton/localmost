@@ -143,6 +143,9 @@ export function printPolicy(policy: DescribablePolicy): void {
     }
     const color = colorFor[grant.marker] ?? colors.green;
     console.log(`    ${color}${grant.marker}${colors.reset} ${grant.value}`);
+    if (grant.warning) {
+      console.log(`      ${colors.yellow}\u26A0 warning: ${grant.warning}${colors.reset}`);
+    }
   }
 }
 

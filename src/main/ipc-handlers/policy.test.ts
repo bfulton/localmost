@@ -59,6 +59,14 @@ describe('summarizeGrants', () => {
   });
 });
 
+describe('sensitive write paths on the approval screen', () => {
+  it('marks a write the job could use to run code outside the sandbox', () => {
+    const grants = summarizeGrants({ shared: { filesystem: { write: ['~/.zshrc', '~/.npm'] } } });
+    expect(grants[0]).toMatch(/^write: ~\/\.zshrc \(warning: your shell runs this file/);
+    expect(grants[1]).toBe('write: ~/.npm');
+  });
+});
+
 describe('the level on the approval screen', () => {
   it('shows a loosened level, which grants more than any other line', () => {
     // A level-only policy used to summarise as nothing at all, and the card
