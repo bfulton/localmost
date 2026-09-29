@@ -42,6 +42,8 @@ const mockMarkerHolders = jest.fn((_p: string): number[] | null => []);
 const mockSignalOrphanPids = jest.fn(async (..._args: unknown[]): Promise<{ signalled: boolean; remaining: number[] | null }> => ({ signalled: true, remaining: [] }));
 jest.mock('./runner-cleanup', () => ({
   processStartTime: jest.fn(() => 'START'),
+  lookUpStartTime: jest.fn(() => 'START'),
+  mayEscalate: jest.requireActual('./runner-cleanup').mayEscalate,
   markerHolders: (p: string) => mockMarkerHolders(p),
   signalOrphanPids: (...args: unknown[]) => mockSignalOrphanPids(...args),
   parsePidRecord: jest.requireActual('./runner-cleanup').parsePidRecord,

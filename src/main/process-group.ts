@@ -14,16 +14,19 @@
  * still addresses the survivors after the leader itself is gone.
  */
 
-import { processStartTime } from './runner-cleanup';
+import { lookUpStartTime, mayEscalate, StartTime } from './runner-cleanup';
 
 /** How long a process gets to handle SIGTERM before SIGKILL. */
 export const GRACE_MS = 10_000;
 
-type StartTimeOf = (pid: number) => string | null;
+type StartTimeOf = (pid: number) => StartTime;
 
 interface Escalation {
-  /** The leader's start time when the sweep began; null if it had already exited. */
-  leaderStart: string | null;
+  /**
+   * The leader's start time when the sweep began; null if it had already
+   * exited, undefined if the lookup failed.
+   */
+  leaderStart: StartTime;
   startTimeOf: StartTimeOf;
   onLog?: (message: string) => void;
 }
@@ -41,7 +44,9 @@ const pendingEscalations = new Map<number, Escalation & { timer: NodeJS.Timeout 
  * reuses a pid while a group with that id still has members, so a live
  * process at `pid` is either the leader the sweep found (same start time) or
  * a stranger (anything else, including one where the sweep found none), and
- * only the first means the group is still ours to kill.
+ * only the first means the group is still ours to kill. mayEscalate() holds
+ * the rule, shared with the startup sweep, including what a failed lookup
+ * means.
  */
 function escalate(pid: number, { leaderStart, startTimeOf, onLog }: Escalation): void {
   try {
@@ -49,8 +54,7 @@ function escalate(pid: number, { leaderStart, startTimeOf, onLog }: Escalation):
   } catch {
     return; // Gone, which is the point.
   }
-  const now = startTimeOf(pid);
-  if (now !== null && now !== leaderStart) {
+  if (!mayEscalate(leaderStart, startTimeOf(pid))) {
     onLog?.(`process group ${pid} ended and its id was reused; not sending SIGKILL`);
     return;
   }
@@ -93,7 +97,7 @@ export function sweepProcessGroup(
   // is ever a group to sweep.
   if (pid === null || pid === undefined || pid <= 1 || !Number.isInteger(pid)) return false;
 
-  const { graceMs = GRACE_MS, onLog, startTimeOf = processStartTime } = options;
+  const { graceMs = GRACE_MS, onLog, startTimeOf = lookUpStartTime } = options;
 
   try {
     // Signal 0 delivers nothing; it asks whether the group has any members.
