@@ -209,6 +209,16 @@ function jobIdFromMessage(message: string): string | undefined {
   }
 }
 
+/**
+ * A job's plan and job ids as one value, for matching a job operation to the
+ * job details a worker acquired. Both are GUIDs, which the runner may write in
+ * either case. Undefined unless both are non-empty strings.
+ */
+function planJobKey(planId: unknown, jobId: unknown): string | undefined {
+  if (typeof planId !== 'string' || typeof jobId !== 'string' || !planId || !jobId) return undefined;
+  return JSON.stringify([planId.toLowerCase(), jobId.toLowerCase()]);
+}
+
 /** The runner name a session request carries; the runner sends it as `agent.name`. */
 function agentNameFromSessionRequest(body: string): string | undefined {
   try {
@@ -460,6 +470,12 @@ export class BrokerProxyService extends EventEmitter {
   private workerKeys: Map<string, { instanceNum: number; targetId?: string; bound?: boolean }> = new Map();
   /** Job and message ids delivered to each worker key: all it may acquire or report on. */
   private deliveredToWorker: Map<string, Set<string>> = new Map();
+  /**
+   * The plan and job ids (planJobKey) of the job details each worker key
+   * acquired: what completejob and renewjob name a job by, and the only job
+   * they are forwarded for.
+   */
+  private acquiredByWorker: Map<string, Set<string>> = new Map();
   /**
    * The public half of the key each slot's current worker was given, and the
    * worker key it was made for. Replaced on each start, so it holds one entry
@@ -1446,6 +1462,7 @@ export class BrokerProxyService extends EventEmitter {
     const key = crypto.randomBytes(32).toString('hex');
     this.workerKeys.set(key, { instanceNum, targetId });
     this.deliveredToWorker.set(key, new Set());
+    this.acquiredByWorker.set(key, new Set());
     return this.workerUrl(key);
   }
 
@@ -1470,6 +1487,7 @@ export class BrokerProxyService extends EventEmitter {
         this.acquiredJobDetails.delete(id);
       }
       this.deliveredToWorker.delete(key);
+      this.acquiredByWorker.delete(key);
       for (const [id, session] of this.localSessions) {
         if (session.workerKey === key) this.localSessions.delete(id);
       }
@@ -1987,6 +2005,9 @@ export class BrokerProxyService extends EventEmitter {
         log()?.info(`[BrokerProxy] acquirejob response keys: ${Object.keys(parsed).join(', ')}`);
         // Log IDs for debugging
         log()?.info(`[BrokerProxy] jobId=${parsed.jobId}, requestId=${parsed.requestId}, jobName=${parsed.jobName}`);
+        // What the runner's completejob and renewjob will name this job by.
+        const acquired = planJobKey(parsed.plan?.planId, parsed.jobId);
+        if (acquired) this.acquiredByWorker.get(key)?.add(acquired);
         // Check various possible field names
         const urlField = parsed.runServiceUrl || parsed.run_service_url || parsed.runnerServiceUrl;
         if (urlField) {
@@ -2108,6 +2129,20 @@ export class BrokerProxyService extends EventEmitter {
       return;
     }
 
+    // The path's segments as upstream routes them: decoded and case folded.
+    // The job operation gate below matches these, not the spelling sent, so a
+    // /CompleteJob or /%63ompletejob is bound like the operation it names.
+    let routedSegments: string[];
+    try {
+      routedSegments = decodeURIComponent(url.pathname).toLowerCase().split('/').filter(Boolean);
+    } catch {
+      req.resume();
+      log()?.warn(`[BrokerProxy] Refused to forward ${req.method} ${forLog(url.pathname)}: its path does not decode`);
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Path does not decode' }));
+      return;
+    }
+
     log()?.info(`[BrokerProxy] Forward using ${targetState.target.displayName}/${instance.instanceNum}, upstream sessionId=${instance.sessionId}`);
 
     // Read request body first (needed for routing decisions)
@@ -2127,46 +2162,75 @@ export class BrokerProxyService extends EventEmitter {
     // For job operations, try to use the run_service_url from the job message
     // Note: /acknowledge goes to broker, NOT run_service_url (it's BrokerHttpClient.AcknowledgeRunnerRequestAsync)
     //
-    // OPEN ITEM, not yet enforced: the delivered-to-this-worker check below
-    // covers only an operation whose body names a request id. The installed
-    // runner's run-service client calls completejob (not finishjob, so it is
-    // not in this list) and renewjob, whose body carries only planId and jobId;
-    // both reach GitHub's broker on the runner's token without being checked,
-    // for whatever planId/jobId the body names, as does any job operation whose
-    // id fields are empty. The fix is to record the plan and job GUIDs from
-    // the acquired details with the ids delivered to the worker, and refuse
-    // these operations for any other, possibly also routing them to the stored
-    // run_service_url. It is left until it can be checked against a live job,
-    // because getting the ids or the route wrong breaks every job's renewal.
-    const jobOperations = ['/acquirejob', '/renewjob', '/finishjob', '/jobrequest'];
-    if (jobOperations.some(op => url.pathname.startsWith(op))) {
+    // Every job operation goes upstream on the runner's token, so each must
+    // name only a job this worker was given. Every request id its body carries
+    // must have been delivered to it, and a plan or job id - which is how the
+    // runner's run-service client names a job to completejob and renewjob -
+    // must be the pair of the details it acquired. A delivered request id does
+    // not vouch for a pair beside it: the id is a small sequential number. One
+    // that names no job, or whose body cannot be read, is refused.
+    //
+    // OPEN ITEM, routing only: an operation named by plan and job ids still
+    // goes to the broker, not the job's run_service_url, which is keyed by
+    // request id. Live jobs have so far sent neither operation through this
+    // server, so the route is left until it can be checked against one.
+    //
+    // OPEN ITEM, other paths: anything that is not a job operation is still
+    // forwarded on the runner's token as it comes. Forwarding only the paths
+    // the runner uses would close that, but changes what reaches upstream, so
+    // it waits on a decision rather than being made here.
+    const jobOperations = ['acquirejob', 'renewjob', 'finishjob', 'jobrequest', 'completejob'];
+    if (routedSegments.some(segment => jobOperations.some(op => segment.startsWith(op)))) {
+      const refuse = (reason: string) => {
+        log()?.warn(`[BrokerProxy] Refused ${url.pathname}: ${reason}`);
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Job not delivered to this worker' }));
+      };
       // Try to find run_service_url from request body or stored job info
       let runServiceUrl: string | undefined;
+      let bodyJson: Record<string, unknown> | undefined;
       try {
-        const bodyJson = JSON.parse(reqBody);
-        // Try multiple ID fields - runner uses different ones for different operations
-        const opJobId = bodyJson.jobRequestId || bodyJson.requestId || bodyJson.runnerRequestId
-          || bodyJson.runner_request_id || bodyJson.jobMessageId;
-        // The id alone at info. The body carries the job's outputs and is job
-        // code's to write, so it goes to debug, encoded and cut short.
-        log()?.info(`[BrokerProxy] Job operation ${url.pathname} for ${opJobId ? forLog(opJobId) : 'no job id'}`);
-        log()?.debug(`[BrokerProxy] Job operation ${url.pathname} body: ${forLog(reqBody, 300)}`);
-        if (opJobId && !this.deliveredToWorker.get(key)?.has(String(opJobId))) {
-          log()?.warn(`[BrokerProxy] Refused ${url.pathname} for ${forLog(opJobId)}, which was not delivered to this worker`);
-          res.writeHead(403, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Job not delivered to this worker' }));
-          return;
-        }
-        if (opJobId) {
-          // Numeric on the wire; the map keys are strings, like the delivered
-          // check above. Without String() a renew/finish with a numeric id
-          // misses and gets sent to the broker instead of the job service.
-          runServiceUrl = this.jobRunServiceUrls.get(String(opJobId));
-          log()?.info(`[BrokerProxy] Found run_service_url for ${forLog(opJobId)}: ${runServiceUrl || 'not found'}`);
-        }
+        const parsed = JSON.parse(reqBody);
+        if (parsed && typeof parsed === 'object') bodyJson = parsed;
       } catch {
         // Not the parser's message: it quotes the body it could not parse.
         log()?.info(`[BrokerProxy] Could not parse job operation body (${reqBody.length} bytes)`);
+      }
+      if (!bodyJson) {
+        refuse('its body names no job');
+        return;
+      }
+      // Try multiple ID fields - runner uses different ones for different operations
+      const requestIds = [bodyJson.jobRequestId, bodyJson.requestId, bodyJson.runnerRequestId,
+        bodyJson.runner_request_id, bodyJson.jobMessageId].filter(Boolean);
+      const opJobId = requestIds[0];
+      const namesPlanJob = [bodyJson.planId, bodyJson.jobId].some(id => id !== undefined && id !== null && id !== '');
+      // The id alone at info. The body carries the job's outputs and is job
+      // code's to write, so it goes to debug, encoded and cut short.
+      log()?.info(`[BrokerProxy] Job operation ${url.pathname} for ${opJobId ? forLog(opJobId) : 'no job id'}`);
+      log()?.debug(`[BrokerProxy] Job operation ${url.pathname} body: ${forLog(reqBody, 300)}`);
+      if (!opJobId && !namesPlanJob) {
+        refuse('its body names no job');
+        return;
+      }
+      const undelivered = requestIds.find(id => !this.deliveredToWorker.get(key)?.has(String(id)));
+      if (undelivered) {
+        refuse(`${forLog(undelivered)} was not delivered to this worker`);
+        return;
+      }
+      if (namesPlanJob) {
+        const planJob = planJobKey(bodyJson.planId, bodyJson.jobId);
+        if (!planJob || !this.acquiredByWorker.get(key)?.has(planJob)) {
+          refuse(`plan ${forLog(bodyJson.planId)}, job ${forLog(bodyJson.jobId)} is not the job this worker acquired`);
+          return;
+        }
+      }
+      if (opJobId) {
+        // Numeric on the wire; the map keys are strings, like the delivered
+        // check above. Without String() a renew/finish with a numeric id
+        // misses and gets sent to the broker instead of the job service.
+        runServiceUrl = this.jobRunServiceUrls.get(String(opJobId));
+        log()?.info(`[BrokerProxy] Found run_service_url for ${forLog(opJobId)}: ${runServiceUrl || 'not found'}`);
       }
 
       if (runServiceUrl) {

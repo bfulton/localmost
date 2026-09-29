@@ -1083,6 +1083,130 @@ describe('message routing', () => {
       return sessionId;
     };
 
+    // The ids the runner's run-service client reports a job under: the plan
+    // and job GUIDs of the details acquirejob handed it.
+    const acquiredIds = { planId: '0ab9c2d4-6e1f-4a7b-9c3d-5e8f1a2b3c4d', jobId: '81329c47-199d-518c-bd1b-66b2e718ab64' };
+    /** A bound worker that has acquired job req-1, whose details carry acquiredIds. */
+    const acquiredWorker = async () => {
+      const details = JSON.stringify({ plan: { planId: acquiredIds.planId }, jobId: acquiredIds.jobId, requestId: 0 });
+      internals.acquiredJobDetails.set('req-1', details);
+      internals.acquiredJobDetails.set('2', details);
+      const sessionId = await boundWorker();
+      expect((await request('POST', '/acquirejob', JSON.stringify({ jobMessageId: 2 }))).statusCode).toBe(200);
+      return sessionId;
+    };
+
+    describe('reporting on a job', () => {
+      // completejob, and renewjob as the runner's run-service client sends it,
+      // name the job only by its plan and job ids. They go upstream on the
+      // runner's credentials, so they are forwarded only for the job this
+      // worker acquired: a job holding its worker's key could otherwise renew,
+      // or complete with outputs of its choosing, any job it knows the ids of.
+      it.each(['/completejob', '/renewjob'])('forwards %s only for the job this worker acquired', async (op) => {
+        const sessionId = await acquiredWorker();
+        mockHttpsRequest.mockClear();
+        const report = (ids: object) => request('POST', `${op}?sessionId=${sessionId}`, JSON.stringify({ ...ids, conclusion: 'succeeded' }));
+
+        expect((await report(acquiredIds)).statusCode).toBe(200);
+        // GUIDs, which the runner writes in whatever case it likes.
+        expect((await report({ planId: acquiredIds.planId.toUpperCase(), jobId: acquiredIds.jobId.toUpperCase() })).statusCode).toBe(200);
+        expect(mockHttpsRequest).toHaveBeenCalledTimes(2);
+        mockHttpsRequest.mockClear();
+
+        for (const ids of [
+          { planId: acquiredIds.planId, jobId: 'bb1176a1-d7d1-5f81-b037-75e4a947e5f2' },
+          { planId: 'another-plan', jobId: acquiredIds.jobId },
+          { jobId: acquiredIds.jobId },
+          { planId: acquiredIds.planId },
+          {},
+        ]) {
+          expect({ ids, status: (await report(ids)).statusCode }).toEqual({ ids, status: 403 });
+        }
+        expect((await request('POST', `${op}?sessionId=${sessionId}`, 'not json')).statusCode).toBe(403);
+        expect((await request('POST', `${op}?sessionId=${sessionId}`)).statusCode).toBe(403);
+        expect(mockHttpsRequest).not.toHaveBeenCalled();
+      });
+
+      it.each(['/completejob', '/renewjob'])("checks every job %s names, not only the worker's request id", async (op) => {
+        // The request id the worker was delivered is a small sequential
+        // number, easy to guess. Paired with another job's plan and job ids it
+        // vouched for the pair too, which is what the operation acts on.
+        const sessionId = await acquiredWorker();
+        mockHttpsRequest.mockClear();
+        const foreign = { planId: 'victim-plan', jobId: 'victim-job' };
+        const report = (ids: object) => request('POST', `${op}?sessionId=${sessionId}`, JSON.stringify({ ...ids, conclusion: 'succeeded' }));
+
+        for (const ids of [
+          { jobMessageId: 2, ...foreign },
+          { requestId: 'req-1', ...foreign },
+          { requestId: 'req-1', planId: acquiredIds.planId, jobId: foreign.jobId },
+          { jobMessageId: 2, jobId: acquiredIds.jobId },
+          { requestId: 'req-9', ...acquiredIds },
+          { requestId: 'req-1', jobMessageId: 9, ...acquiredIds },
+        ]) {
+          expect({ ids, status: (await report(ids)).statusCode }).toEqual({ ids, status: 403 });
+        }
+        expect(mockHttpsRequest).not.toHaveBeenCalled();
+
+        expect((await report({ requestId: 'req-1', ...acquiredIds })).statusCode).toBe(200);
+        expect(mockHttpsRequest).toHaveBeenCalledTimes(1);
+      });
+
+      it.each(['/CompleteJob', '/RENEWJOB', '/%63ompletejob', '//renewjob', '/_apis/completejob', '/%E0completejob'])(
+        'binds %s like the job operation it names upstream', async (path) => {
+          // Upstream routing ignores case and decodes the path; a gate that
+          // matched only the exact spelling forwarded these on the runner's
+          // token without a look at the job they name. A path that does not
+          // decode is refused rather than guessed at.
+          const sessionId = await acquiredWorker();
+          mockHttpsRequest.mockClear();
+
+          const res = await request('POST', `${path}?sessionId=${sessionId}`,
+            JSON.stringify({ planId: 'victim-plan', jobId: 'victim-job', conclusion: 'succeeded' }));
+
+          expect(res.statusCode).toBe(403);
+          expect(mockHttpsRequest).not.toHaveBeenCalled();
+        });
+
+      it('forwards nothing for a job that was delivered but not yet acquired', async () => {
+        // Its ids are in the details acquirejob hands out; before that, the
+        // worker has no business knowing them.
+        const details = JSON.stringify({ plan: { planId: acquiredIds.planId }, jobId: acquiredIds.jobId });
+        internals.acquiredJobDetails.set('req-1', details);
+        internals.acquiredJobDetails.set('2', details);
+        const sessionId = await boundWorker();
+        mockHttpsRequest.mockClear();
+
+        const res = await request('POST', `/completejob?sessionId=${sessionId}`, JSON.stringify(acquiredIds));
+
+        expect(res.statusCode).toBe(403);
+        expect(mockHttpsRequest).not.toHaveBeenCalled();
+      });
+
+      it("refuses another worker's job, on the same target", async () => {
+        await acquiredWorker();
+        const cred = createMockInstanceCredentials(2);
+        internals.targets.get('target-a')!.instances.set(2, {
+          ...cred, runner: { ...cred.runner, agentName: 'runner-a.2' }, instanceNum: 2, sessionId: 'upstream-a2',
+          accessToken: 'token', tokenExpiry: Date.now() + 3_600_000,
+        } as never);
+        internals.messageQueues.set('target-a', [
+          JSON.stringify({ messageId: 4, messageType: 'RunnerJobRequest', body: JSON.stringify({ runner_request_id: 'req-2' }) }),
+        ]);
+        service.expectWorkerForJob('target-a', 2, 'req-2');
+        const other = startWorker(2, 'target-a');
+        const otherSession = await createSession(JSON.stringify({ agent: { name: 'runner-a.2' } }), other);
+        await request('GET', `/message?sessionId=${otherSession}`, undefined, other);
+        mockHttpsRequest.mockClear();
+
+        for (const op of ['/completejob', '/renewjob']) {
+          const res = await request('POST', `${op}?sessionId=${otherSession}`, JSON.stringify(acquiredIds), other);
+          expect({ op, status: res.statusCode }).toEqual({ op, status: 403 });
+        }
+        expect(mockHttpsRequest).not.toHaveBeenCalled();
+      });
+    });
+
     it('rejects an oversized acquirejob instead of buffering it', async () => {
       await boundWorker();
 
@@ -1105,9 +1229,9 @@ describe('message routing', () => {
       // completejob carries the job's outputs, step results and annotations.
       // The cap on the runner's other requests would fail every job with
       // sizeable outputs at its very end.
-      const sessionId = await boundWorker();
+      const sessionId = await acquiredWorker();
       mockHttpsRequest.mockClear();
-      const body = JSON.stringify({ planId: 'p', jobId: 'j', conclusion: 'succeeded', outputs: { big: 'x'.repeat(1024 * 1024) } });
+      const body = JSON.stringify({ ...acquiredIds, conclusion: 'succeeded', outputs: { big: 'x'.repeat(1024 * 1024) } });
 
       const res = await request('POST', `/completejob?sessionId=${sessionId}`, body);
 

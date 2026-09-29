@@ -247,8 +247,14 @@ escape to the stage that contains it.
 ### An always-on baseline
 
 `/_ping`, `/version`, `/info`, and reads about the job's own containers are
-permitted with no declaration. Every client needs them to start, and none reach
-the host.
+permitted with no declaration. Every client needs them to start. None changes
+anything, but `/info` in full describes the host: its name, the daemon's proxy
+URLs with any credentials in them, registry mirrors, labels, and how many
+containers and images the operator and other jobs have. The filter therefore
+answers `/info` with an allowlist of its fields - the daemon's version,
+platform, kernel, CPU count, memory, storage driver, cgroup version and
+security options, which clients use to decide how to talk to it - and withholds
+the rest, including any field a newer daemon adds.
 
 ### Credentials stop entering the sandbox
 
