@@ -7,7 +7,6 @@ import { FALLBACK_RUNNER_VERSION } from '../shared/constants';
 import { spawnSandboxed } from './process-sandbox';
 import { getRunnerDir } from './paths';
 import {
-  validateChildPath,
   killOrphanedProcesses,
   cleanupSandboxDirectories,
   cleanupIncompleteConfigs,
@@ -21,6 +20,9 @@ export interface DownloadProgress {
 }
 
 export type ProgressCallback = (progress: DownloadProgress) => void;
+
+/** The only files buildSandbox takes from an instance's config directory. */
+const SANDBOX_CONFIG_FILES = ['.runner'];
 
 export interface RunnerRelease {
   version: string;
@@ -43,8 +45,6 @@ export class RunnerDownloader {
   constructor() {
     this.baseDir = getRunnerDir();
   }
-
-  // validateChildPath is now imported from runner-cleanup.ts
 
   /** Get the arc directory for a specific version */
   getArcDir(version: string): string {
@@ -231,21 +231,15 @@ export class RunnerDownloader {
       }
     }
 
-    // Copy config files into sandbox (if config exists)
-    if (fs.existsSync(configDir)) {
-      const configFiles = await fs.promises.readdir(configDir);
-      for (const file of configFiles) {
-        // Security: Validate paths stay within their respective directories
-        const srcPath = validateChildPath(configDir, file);
-        const destPath = validateChildPath(sandboxDir, file);
-        if (!srcPath || !destPath) {
-          log('error', `Skipping suspicious config file name: ${file}`);
-          continue;
-        }
-        const stats = await fs.promises.stat(srcPath);
-        if (stats.isFile()) {
-          await fs.promises.copyFile(srcPath, destPath);
-        }
+    // Copy the runner's settings into the sandbox - and only those. The job
+    // can read its sandbox, so the registration's key (.credentials_rsaparams)
+    // and .credentials never go in, even when a legacy registration or an
+    // earlier version left them in the config dir. The worker is given a key
+    // made for its start by startInstance instead.
+    for (const file of SANDBOX_CONFIG_FILES) {
+      const srcPath = path.join(configDir, file);
+      if (fs.existsSync(srcPath) && (await fs.promises.stat(srcPath)).isFile()) {
+        await fs.promises.copyFile(srcPath, path.join(sandboxDir, file));
       }
     }
 
@@ -321,9 +315,14 @@ export class RunnerDownloader {
   }
 
   /**
-   * Copy proxy credentials to an instance's config directory.
-   * Used for multi-target support where workers use proxy credentials.
-   * The .runner file is modified to point to the local broker proxy.
+   * Take an instance's runner settings from a target's registration.
+   * Used for multi-target support, where every worker runs as one of a
+   * target's registered runners. The .runner file is modified to point to the
+   * local broker proxy.
+   *
+   * Only the .runner is copied. The registration's credentials stay in
+   * proxyBaseDir/<instance>/, where the broker reads them to make every call
+   * upstream; the worker never needs them (see worker-credentials.ts).
    *
    * Directory structure:
    * proxyBaseDir/<instance>/.runner, .credentials, .credentials_rsaparams
@@ -335,24 +334,26 @@ export class RunnerDownloader {
   ): Promise<void> {
     const log = onLog || (() => {});
     const configDir = this.getConfigDir(instance);
-    const configFiles = ['.runner', '.credentials', '.credentials_rsaparams'];
 
     // Credentials are in instance subdirectory (e.g., proxyBaseDir/1/, proxyBaseDir/2/)
     const proxyInstanceDir = path.join(proxyBaseDir, String(instance));
 
+    // The broker cannot serve a worker for a registration it cannot sign for.
+    for (const file of ['.runner', '.credentials', '.credentials_rsaparams']) {
+      if (!fs.existsSync(path.join(proxyInstanceDir, file))) {
+        throw new Error(`Missing proxy credential file: ${file} in ${proxyInstanceDir}`);
+      }
+    }
+
     // Ensure config directory exists
     await fs.promises.mkdir(configDir, { recursive: true });
 
-    // Copy credentials from proxy instance directory
-    for (const file of configFiles) {
-      const srcPath = path.join(proxyInstanceDir, file);
-      const destPath = path.join(configDir, file);
+    await fs.promises.copyFile(path.join(proxyInstanceDir, '.runner'), path.join(configDir, '.runner'));
 
-      if (!fs.existsSync(srcPath)) {
-        throw new Error(`Missing proxy credential file: ${file} in ${proxyInstanceDir}`);
-      }
-
-      await fs.promises.copyFile(srcPath, destPath);
+    // Earlier versions copied the key here too. Nothing reads it from here any
+    // more, so it goes rather than sit in a second place.
+    for (const file of ['.credentials', '.credentials_rsaparams']) {
+      await fs.promises.rm(path.join(configDir, file), { force: true });
     }
 
     // Modify .runner to point to local broker proxy

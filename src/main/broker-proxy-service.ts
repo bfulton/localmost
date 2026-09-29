@@ -22,6 +22,12 @@ import {
   SessionPersistence,
   OAuthTokenManager,
 } from './broker-proxy';
+import {
+  WORKER_TOKEN_PATH,
+  generateWorkerCredential,
+  verifyClientAssertion,
+  type WorkerCredentialFiles,
+} from './worker-credentials';
 
 // Helper to get logger (may be null before initialization)
 const log = () => getLogger();
@@ -380,6 +386,12 @@ export class BrokerProxyService extends EventEmitter {
   private workerKeys: Map<string, { instanceNum: number; targetId?: string; bound?: boolean }> = new Map();
   /** Job and message ids delivered to each worker key: all it may acquire or report on. */
   private deliveredToWorker: Map<string, Set<string>> = new Map();
+  /**
+   * The public half of the key each slot's current worker was given, and the
+   * worker key it was made for. Replaced on each start, so it holds one entry
+   * per slot and a previous start's key matches no live address.
+   */
+  private workerCredentials: Map<number, { key: string; clientId: string; publicKey: crypto.KeyObject }> = new Map();
   /** Repository and commit for a job, keyed by both jobId and messageId. */
   private jobTargets: Map<string, { targetDisplayName: string; githubSha?: string }> = new Map();
 
@@ -1340,6 +1352,8 @@ export class BrokerProxyService extends EventEmitter {
       } else if (method === 'POST' && url.pathname === '/acquirejob') {
         // Return stored job details - we already acquired the job from GitHub
         await this.handleAcquireJob(req, res, key);
+      } else if (method === 'POST' && url.pathname === WORKER_TOKEN_PATH) {
+        await this.handleWorkerToken(req, res, key);
       } else {
         // Forward all other requests (renewjob, finishjob, etc.)
         await this.handleForward(req, res, url, key);
@@ -1394,6 +1408,23 @@ export class BrokerProxyService extends EventEmitter {
 
   private workerUrl(key: string): string {
     return `http://127.0.0.1:${this.port}/w/${key}/`;
+  }
+
+  /**
+   * Make the runner credentials for the worker now holding a slot's key: a key
+   * for this start alone, and a token endpoint on its own broker address. The
+   * registration's key stays app-side; see worker-credentials.ts for why the
+   * runner needs no more than this. Undefined when the slot has no live key,
+   * or was started again while the key was being made.
+   */
+  async issueWorkerCredential(instanceNum: number): Promise<WorkerCredentialFiles | undefined> {
+    const liveKey = () => [...this.workerKeys].find(([, worker]) => worker.instanceNum === instanceNum)?.[0];
+    const key = liveKey();
+    if (!key) return undefined;
+    const credential = await generateWorkerCredential(`${this.workerUrl(key)}${WORKER_TOKEN_PATH.slice(1)}`);
+    if (liveKey() !== key) return undefined;
+    this.workerCredentials.set(instanceNum, { key, clientId: credential.clientId, publicKey: credential.publicKey });
+    return credential.files;
   }
 
   /**
@@ -1909,6 +1940,50 @@ export class BrokerProxyService extends EventEmitter {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Job not found' }));
     }
+  }
+
+  /**
+   * The token endpoint in a worker's .credentials. The runner fetches a token
+   * here before it opens a session, and again when it expires. The token is
+   * opaque and checked by nothing - this server ignores the bearer a worker
+   * sends, and the worker's key already names it - so what matters is that
+   * the endpoint answers only the key made for this worker's start.
+   *
+   * A refusal is never `invalid_client`. The runner reports that as "the
+   * runner registration has been deleted, please re-configure", and the
+   * manager answers that line by re-registering the target with GitHub.
+   */
+  private async handleWorkerToken(req: http.IncomingMessage, res: http.ServerResponse, key: string): Promise<void> {
+    const form = new URLSearchParams(await readRequestBody(req));
+    const worker = this.workerKeys.get(key)!;
+    const refuse = (status: number, error: string, reason: string) => {
+      log()?.warn(`[BrokerProxy] Refused a token to worker ${worker.instanceNum}: ${reason}`);
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error, error_description: reason }));
+    };
+
+    if (form.get('grant_type') !== 'client_credentials' ||
+        form.get('client_assertion_type') !== 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer') {
+      refuse(400, 'unsupported_grant_type', 'only client credentials with a JWT assertion are issued');
+      return;
+    }
+    const credential = this.workerCredentials.get(worker.instanceNum);
+    if (!credential || credential.key !== key) {
+      refuse(401, 'unauthorized_client', 'no key was made for this worker');
+      return;
+    }
+    const reason = verifyClientAssertion(form.get('client_assertion') ?? '', credential);
+    if (reason) {
+      refuse(401, 'unauthorized_client', reason);
+      return;
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      access_token: crypto.randomBytes(32).toString('base64url'),
+      token_type: 'bearer',
+      expires_in: 3600,
+    }));
   }
 
   private async handleForward(

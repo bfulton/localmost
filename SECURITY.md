@@ -260,6 +260,14 @@ design is in `docs/superpowers/specs/2026-09-05-docker-isolation-design.md`.
 - **Non-sensitive data**: Settings like theme, runner count, and repository URLs remain in plaintext for easy user editing
 - **Access Control**: The `~/.localmost` directory and all contents are user-only (700 for directories, 600 for files). The app sets `umask(077)` at startup to ensure no group or world access.
 
+### Runner registrations
+
+Each target's runner registrations live in `~/.localmost/runner/proxies/<target>/<n>/`: the runner's settings and the registration's RSA key. GitHub trusts that key to act as the runner: whoever holds it can open a session under the runner's name and receive the jobs routed to it, with their secrets. It therefore never enters a job's sandbox.
+
+- **The broker signs, not the worker.** The local broker makes every call to GitHub itself, with the registration's key, app-side. A worker only ever talks to the broker, and the broker ignores the token a worker presents.
+- **Each worker start gets its own key.** The runner will not start without a key and a token endpoint, so each worker is given a new RSA key and a token endpoint on its own broker address. That endpoint issues a token only for an assertion signed with that key, and stops answering when the worker exits.
+- **So a copied key is worth nothing.** A job can read its worker's key, but the key works only at its own worker's endpoint, and the token it gets opens nothing. A job cannot use it to act as the runner, including while localmost is paused or quit.
+
 ## Encryption Export Compliance
 
 This app uses encryption **solely** for secure credential storage via OS-provided APIs:

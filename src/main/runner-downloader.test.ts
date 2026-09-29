@@ -243,7 +243,7 @@ describe('RunnerDownloader', () => {
   });
 
   describe('copyProxyCredentials', () => {
-    it('should copy credential files from instance subdirectory and modify .runner serverUrlV2', async () => {
+    it('should copy the .runner from the instance subdirectory and modify its serverUrlV2', async () => {
       // proxyBaseDir is the target directory, credentials are in proxyBaseDir/<instance>/
       const proxyBaseDir = '/path/to/proxy';
       const proxyInstanceDir = path.join(proxyBaseDir, '1');
@@ -269,20 +269,13 @@ describe('RunnerDownloader', () => {
       // Should create config directory
       expect(fs.promises.mkdir).toHaveBeenCalledWith(configDir, { recursive: true });
 
-      // Should copy all three credential files from instance subdirectory
-      expect(mockCopyFile).toHaveBeenCalledTimes(3);
+      // Only the .runner: the registration's key stays with the broker
+      expect(mockCopyFile).toHaveBeenCalledTimes(1);
       expect(mockCopyFile).toHaveBeenCalledWith(
         path.join(proxyInstanceDir, '.runner'),
         path.join(configDir, '.runner')
       );
-      expect(mockCopyFile).toHaveBeenCalledWith(
-        path.join(proxyInstanceDir, '.credentials'),
-        path.join(configDir, '.credentials')
-      );
-      expect(mockCopyFile).toHaveBeenCalledWith(
-        path.join(proxyInstanceDir, '.credentials_rsaparams'),
-        path.join(configDir, '.credentials_rsaparams')
-      );
+      expect(fs.promises.rm).toHaveBeenCalledWith(path.join(configDir, '.credentials_rsaparams'), { force: true });
 
       // Should modify .runner to point to localhost:8787
       expect(mockWriteFile).toHaveBeenCalledWith(

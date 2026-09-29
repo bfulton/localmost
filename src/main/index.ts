@@ -289,6 +289,8 @@ app.whenReady().then(async () => {
     issueBrokerUrl: (instanceNum: number, targetId?: string) =>
       getBrokerProxyService()?.issueWorkerKey(instanceNum, targetId),
     revokeBrokerUrl: (instanceNum: number) => getBrokerProxyService()?.revokeWorkerKey(instanceNum),
+    issueWorkerCredential: async (instanceNum: number) =>
+      getBrokerProxyService()?.issueWorkerCredential(instanceNum),
     onReregistrationNeeded: reRegisterSingleInstance,
     onConfigurationNeeded: configureSingleInstance,
     getRunnerLogLevel: () => getRunnerLogLevelSetting(),

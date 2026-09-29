@@ -16,6 +16,7 @@ import { SandboxFilesystemPolicy, spawnSandboxed } from './process-sandbox';
 import { sweepProcessGroup } from './process-group';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { RunnerDownloader } from './runner-downloader';
+import type { WorkerCredentialFiles } from './worker-credentials';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
 import { loadConfig } from './config';
 import { normalizeFilterConfig, isUserAllowed, areAllUsersAllowed, parseRepository } from './runner/user-filter';
@@ -139,6 +140,12 @@ interface RunnerManagerOptions {
    */
   issueBrokerUrl?: (instanceNum: number, targetId?: string) => string | undefined;
   revokeBrokerUrl?: (instanceNum: number) => void;
+  /**
+   * Runner credentials for the worker just given a broker address: a key made
+   * for this start and a token endpoint at that address. The registration's
+   * own key never goes into a sandbox, which the job can read.
+   */
+  issueWorkerCredential?: (instanceNum: number) => Promise<WorkerCredentialFiles | undefined>;
   /** The daemon a worker's permitted container requests go to. The operator's own by default. */
   dockerBackend?: DockerBackend;
   /** Registry credentials, attached to a pull by the worker's socket so the job never holds them. */
@@ -180,6 +187,7 @@ export class RunnerManager {
   private onWorkerReservationCancelled?: (targetId: string, instanceNum: number, jobId?: string) => void;
   private issueBrokerUrl?: (instanceNum: number, targetId?: string) => string | undefined;
   private revokeBrokerUrl?: (instanceNum: number) => void;
+  private issueWorkerCredential?: (instanceNum: number) => Promise<WorkerCredentialFiles | undefined>;
   private jobHistory: JobHistoryEntry[] = [];
   private jobIdCounter = 0;
   private maxJobHistory = DEFAULT_MAX_JOB_HISTORY;
@@ -269,6 +277,7 @@ export class RunnerManager {
     this.onWorkerReservationCancelled = options.onWorkerReservationCancelled;
     this.issueBrokerUrl = options.issueBrokerUrl;
     this.revokeBrokerUrl = options.revokeBrokerUrl;
+    this.issueWorkerCredential = options.issueWorkerCredential;
     this.dockerBackend = options.dockerBackend ?? new DesktopBackend();
     this.attachRegistryAuth = options.attachRegistryAuth;
 
@@ -1047,7 +1056,30 @@ export class RunnerManager {
           String(fs.readFileSync(runnerConfigFile, 'utf-8')).replace(/^\uFEFF/, '')
         );
         runnerConfig.serverUrlV2 = brokerUrl;
+        // The listener also opens a connection to serverUrl, the pipelines
+        // service, on its own token - unless serverUrl is the broker address
+        // too, when it skips it. GitHub would refuse the token this worker is
+        // given, and the broker is all the listener needs: its sessions,
+        // messages and job acquisition all go there.
+        runnerConfig.serverUrl = brokerUrl;
         fs.writeFileSync(runnerConfigFile, JSON.stringify(runnerConfig, null, 2));
+
+        // The sandbox holds no credentials until now: buildSandbox copies only
+        // the .runner from the config, never the registration's key.
+        const credential = await this.issueWorkerCredential?.(instanceNum);
+        if (!credential) {
+          throw new Error('the broker made no key for it');
+        }
+        fs.writeFileSync(
+          path.join(sandboxDir, '.credentials'),
+          JSON.stringify(credential.credentials, null, 2),
+          { mode: 0o600 }
+        );
+        fs.writeFileSync(
+          path.join(sandboxDir, '.credentials_rsaparams'),
+          JSON.stringify(credential.rsaParams),
+          { mode: 0o600 }
+        );
       } catch (error) {
         this.log('error', `Cannot give instance ${instanceNum} its broker address: ${(error as Error).message}`);
         this.revokeBrokerUrl?.(instanceNum);
