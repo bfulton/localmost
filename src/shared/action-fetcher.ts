@@ -8,6 +8,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { getAppDataDirWithoutElectron } from './paths';
+import { resolveWithin } from './contained-path';
 
 // =============================================================================
 // Types
@@ -173,6 +174,8 @@ export function isInterceptedAction(uses: string): boolean {
   const intercepted = [
     'actions/checkout',
     'actions/cache',
+    'actions/cache/save',
+    'actions/cache/restore',
     'actions/upload-artifact',
     'actions/download-artifact',
     'actions/setup-node',
@@ -230,6 +233,19 @@ function downloadAndExtract(url: string, destDir: string): Promise<void> {
 }
 
 /**
+ * The directory an action runs from: its repository, or a subdirectory of it.
+ *
+ * The subpath is the workflow's to write (`owner/repo/sub@v1`), and the
+ * directory becomes readable to the step, so it is held inside the extracted
+ * repository - neither "../.." nor a symlink the repository ships may lead
+ * out of it.
+ */
+export function resolveActionPath(actionDir: string, subPath?: string): string {
+  if (!subPath) return fs.realpathSync(actionDir);
+  return resolveWithin(actionDir, subPath, 'Action path', 'its repository');
+}
+
+/**
  * Fetch an action from GitHub.
  */
 export async function fetchAction(ref: ActionRef): Promise<CachedAction> {
@@ -266,8 +282,7 @@ export async function fetchAction(ref: ActionRef): Promise<CachedAction> {
     await downloadAndExtract(branchUrl, actionDir);
   }
 
-  // Handle subdirectory actions
-  const localPath = ref.path ? path.join(actionDir, ref.path) : actionDir;
+  const localPath = resolveActionPath(actionDir, ref.path);
 
   // Verify action.yml exists
   if (!fs.existsSync(path.join(localPath, 'action.yml')) &&
@@ -315,11 +330,33 @@ export function readActionMetadata(actionPath: string): ActionMetadata | null {
     return null;
   }
 
+  // Read by the app, outside any sandbox, from a directory a checkout
+  // controls; its input defaults become the step's environment. So it must be
+  // the action's own file, not a link to one elsewhere - and for a local
+  // action, something an earlier step left running can swap it between any
+  // check and the read. So the file is opened first, without following a
+  // link or waiting on a FIFO, and it is the open file that is judged: a
+  // regular file with no other name, the same one the action's path names
+  // once that path has been checked.
+  let fd: number;
   try {
-    const yaml = require('js-yaml');
-    return yaml.load(fs.readFileSync(metadataPath, 'utf-8')) as ActionMetadata;
+    fd = fs.openSync(metadataPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   } catch {
     return null;
+  }
+  try {
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1) return null;
+    const checked = fs.lstatSync(
+      resolveWithin(actionPath, path.basename(metadataPath), 'Action metadata', 'the action')
+    );
+    if (checked.dev !== opened.dev || checked.ino !== opened.ino) return null;
+    const yaml = require('js-yaml');
+    return yaml.load(fs.readFileSync(fd, 'utf-8')) as ActionMetadata;
+  } catch {
+    return null;
+  } finally {
+    fs.closeSync(fd);
   }
 }
 

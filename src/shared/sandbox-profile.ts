@@ -8,7 +8,9 @@
 
 import * as os from 'os';
 import * as path from 'path';
+import { execFileSync } from 'child_process';
 import type { DockerPolicy } from './docker-policy';
+import { getAppDataDirWithoutElectron, getCliSocketPath } from './paths';
 
 // =============================================================================
 // Types
@@ -41,6 +43,8 @@ export interface SandboxPolicy {
 export interface SandboxProfileOptions {
   /** Working directory for the workflow */
   workDir: string;
+  /** Directories readable and never writable, such as a fetched action's code */
+  readOnlyPaths?: string[];
   /** Port of the proxy server - network traffic is restricted to this port */
   proxyPort: number;
   /** Policy to enforce */
@@ -49,8 +53,38 @@ export interface SandboxProfileOptions {
   permissive?: boolean;
   /** Log file for sandbox violations */
   logFile?: string;
-  /** Strict mode - only allow write access to workDir, block user caches */
-  strictMode?: boolean;
+  /** The files that mark a process as running under this run's profiles; see processMarkerRules. */
+  processMarker?: ProcessMarker;
+}
+
+/**
+ * Two files, alike but for their random names, that a step's profile reads
+ * one of and not the other.
+ */
+export interface ProcessMarker {
+  granted: string;
+  withheld: string;
+}
+
+/**
+ * The last rules of a step's profile: how the app finds the step's processes
+ * when the job ends, including one that left its process group.
+ *
+ * A process can leave its group with setsid() and close every descriptor it
+ * inherited, but it cannot leave its sandbox. So the profile carries a mark
+ * the kernel will answer for: it reads one file and not its twin. No other
+ * profile tells the two apart - one that reaches their directory reaches
+ * both - and an unsandboxed process reads both. Last, so no policy rule can
+ * change the answer.
+ */
+function processMarkerRules(marker?: ProcessMarker): string[] {
+  if (!marker) return [];
+  return [
+    ';; How the app finds this run\'s processes when the job ends, even one that',
+    ';; has left its process group: this profile reads one file and not its twin',
+    `(deny file-read* (literal "${escapePath(marker.withheld)}"))`,
+    `(allow file-read* (literal "${escapePath(marker.granted)}"))`,
+  ];
 }
 
 // =============================================================================
@@ -84,6 +118,21 @@ function escapePath(pathStr: string): string {
   // carry neither (see validatePathArray), so this is the backstop for paths
   // from every other source.
   return pathStr.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+/**
+ * A policy path with `*` in it, as the body of a seatbelt (regex ...) rule.
+ *
+ * `*` matches anything, as it always has here; everything else is literal.
+ * This used to swap `*` for `.*` and leave the rest as regex syntax, so the
+ * dot in "~/.npm" matched any character and a `+` or `(` in a path changed
+ * what the rule meant. Anchored at both ends, since seatbelt searches rather
+ * than matches. Escaped again for the string literal it lands in, where a
+ * backslash is itself an escape.
+ */
+function globToProfileRegex(expanded: string): string {
+  const literal = (part: string) => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+  return escapePath(`^${expanded.split('*').map(literal).join('.*')}$`);
 }
 
 // Note: macOS sandbox-exec does NOT support hostname-based network filtering.
@@ -128,19 +177,196 @@ export const MACOS_BASELINE_READ_PATHS = [
 ];
 
 /**
+ * The broker's port, BrokerProxyService's default. Defined here, where the CLI
+ * can reach it, so the runner's profile and the test profiles deny the same one.
+ */
+export const DEFAULT_BROKER_PORT = 8787;
+
+/**
+ * The network rules both test-mode profiles share, mirroring the runner's.
+ *
+ * Hostname filtering happens in the proxy, since seatbelt cannot express it;
+ * the sandbox's job is to make the proxy the only way out. `(local ip)` did
+ * not do that: it names the local end of any IP socket, so as an outbound
+ * filter it matched a connection to anywhere, and a step that ignored
+ * HTTP_PROXY went straight past the allowlist.
+ *
+ * Loopback stays open because test suites start a server and talk to it, and
+ * nothing leaves the machine that way - except the app's broker, which carries
+ * job payloads and which a step has no reason to open.
+ */
+function loopbackNetworkRules(proxyPort: number, escapedWorkDir: string): string[] {
+  return [
+    `;; Network: loopback only; the proxy at port ${proxyPort} is the way out`,
+    '(deny network*)',
+    '(allow network-outbound (remote ip "localhost:*"))',
+    `(deny network-outbound (remote ip "localhost:${DEFAULT_BROKER_PORT}"))`,
+    '(allow network-bind (local ip "localhost:*"))',
+    '(allow network-inbound (local ip "localhost:*"))',
+    ';; Unix sockets: only in the working directory, never a system socket like',
+    ';; Docker\'s or the SSH agent\'s. TMPDIR points there so tools create them there.',
+    `(allow network-bind (subpath "${escapedWorkDir}"))`,
+    `(allow network-outbound (subpath "${escapedWorkDir}"))`,
+  ];
+}
+
+/**
+ * The per-user temp directory confstr hands out, once a lookup has answered.
+ * A failed lookup is tried again at the next profile.
+ */
+let userTempDir: string | undefined;
+
+/**
+ * Where macOS `mktemp` puts a file when it is given no template. It ignores
+ * TMPDIR and asks confstr for the per-user temp directory instead, so pointing
+ * TMPDIR into the workspace does not move it. Only a /var/folders/<a>/<b>/T
+ * path is accepted: the answer lands in a regex in the profile.
+ */
+function darwinUserTempDir(): string | undefined {
+  if (userTempDir !== undefined) return userTempDir;
+  try {
+    const answer = String(execFileSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf-8' }))
+      .trim()
+      .replace(/\/+$/, '')
+      .replace(/^\/private/, '');
+    if (/^\/var\/folders\/[A-Za-z0-9_+-]+\/[A-Za-z0-9_+-]+\/T$/.test(answer)) userTempDir = answer;
+  } catch {
+    // Left unset: bare mktemp is not granted this time.
+  }
+  return userTempDir;
+}
+
+/**
+ * What a step gets of the shared temp directories, as the runner's job does:
+ * only the entries a bare `mktemp` creates.
+ *
+ * /tmp and the per-user /var/folders tree belong to every process the user
+ * runs, and some of what lives there is trusted by their own tools - the
+ * xcrun lookup cache, the clang module cache. A step's TMPDIR is in its
+ * workspace, and the caches tools would otherwise keep there are pointed into
+ * it too (see buildStepEnvironment). But mktemp with no template ignores
+ * TMPDIR, and scripts call it that way constantly, so names of exactly the
+ * shape it generates are granted: ten random characters no other process can
+ * guess, and without read on the directory itself a step cannot list it to
+ * find one. Both spellings, as /var is a symlink.
+ */
+function sharedTempRules(): string[] {
+  const dir = darwinUserTempDir();
+  if (!dir) return [';; Per-user temp directory unknown: mktemp without a template is not granted'];
+  const escapeForRegex = (value: string) => value.replace(/[.*+?^$()[\]{}|\\]/g, '\\$&');
+  const generated = `/tmp\\.${'[A-Za-z0-9]'.repeat(10)}(/|$)`;
+  return [
+    ';; No shared temp directory; only what mktemp itself creates, by the name it generated',
+    '(allow file-write* file-read*',
+    `  (regex #"^${escapeForRegex(`/private${dir}`)}${generated}")`,
+    `  (regex #"^${escapeForRegex(dir)}${generated}"))`,
+  ];
+}
+
+/**
+ * The app data directory this process uses, and the installed app's own.
+ *
+ * LOCALMOST_CONFIG_DIR and the App Sandbox container move the first, but the
+ * app keeps its runner template, approvals and socket in ~/.localmost whatever
+ * this process was started with, so that is denied either way.
+ */
+function appDataDirs(): string[] {
+  return [...new Set([getAppDataDirWithoutElectron(), path.join(os.homedir(), '.localmost')])];
+}
+
+/** Denies for the CLI sockets: this process's, and the installed app's. */
+function cliSocketRules(): string[] {
+  const name = path.basename(getCliSocketPath());
+  return appDataDirs().map((dir) => `(deny network-outbound (literal "${escapePath(path.join(dir, name))}"))`);
+}
+
+/**
+ * What a step never reaches, whatever the policy declares, then the workspace.
+ *
+ * The app data directory holds the runner template every worker's sandbox is
+ * copied from, the approval cache, settings, the CLI socket and other runs'
+ * workspaces; the Electron user data directory holds the credential store. A
+ * test run that could write the template would reach every later real job,
+ * and one that could write the approvals would approve its own policy. The
+ * developer's own credentials are the same list the runner denies a job at
+ * every level: a policy can never grant them there, so it cannot here either.
+ *
+ * A checkout's .localmostrc is applied in test mode without approval, so this
+ * comes after every policy grant: seatbelt takes the last matching rule. The
+ * workspace lives under the app data directory, so it is reopened last.
+ */
+function neverReachablePaths(): { subpaths: string[]; literals: string[] } {
+  const home = os.homedir();
+  return {
+    subpaths: [
+      ...appDataDirs(),
+      path.join(home, 'Library', 'Application Support', 'localmost'),
+      `${home}/.ssh`,
+      `${home}/.aws`,
+      `${home}/.gnupg`,
+      `${home}/.kube`,
+      `${home}/.docker`,
+      `${home}/.config`,
+      `${home}/Library/Keychains`,
+    ],
+    literals: [
+      `${home}/.netrc`,
+      `${home}/.npmrc`,
+      `${home}/.m2/settings.xml`,
+      `${home}/.m2/settings-security.xml`,
+      `${home}/.gradle/gradle.properties`,
+      `${home}/.cargo/credentials`,
+      `${home}/.cargo/credentials.toml`,
+      `${home}/.nuget/NuGet/NuGet.Config`,
+    ],
+  };
+}
+
+/** Whether a path is one no policy can grant, so discovery never suggests it. */
+function isNeverReachable(p: string): boolean {
+  const { subpaths, literals } = neverReachablePaths();
+  return literals.includes(p) || subpaths.some((root) => p === root || p.startsWith(`${root}/`));
+}
+
+function neverReachableRules(escapedWorkDir: string, readOnlyPaths: string[] = []): string[] {
+  const { subpaths, literals } = neverReachablePaths();
+  const entries = [
+    ...subpaths.map((p) => `  (subpath "${escapePath(p)}")`),
+    ...literals.map((p) => `  (literal "${escapePath(p)}")`),
+  ];
+  entries[entries.length - 1] += ')';
+  return [
+    ';; Never reachable, whatever a policy declares above: the app\'s own data',
+    ';; and the credentials a developer machine keeps',
+    '(deny file-read* file-write*',
+    ...entries,
+    ';; ...except this run\'s workspace, which lives inside the app data directory',
+    '(allow file-read* file-write*',
+    `  (subpath "${escapedWorkDir}"))`,
+    ';; ...but not the workspace directory itself: the app writes into it',
+    ';; unsandboxed, and a step that could remove it could leave a link there',
+    `(deny file-write* (literal "${escapedWorkDir}"))`,
+    ...(readOnlyPaths.length > 0
+      ? [
+          ';; ...and the code of the actions this step runs, read-only: a fetched',
+          ';; action is cached in the app data directory for every run',
+          '(allow file-read*',
+          ...readOnlyPaths.map((p, i) => `  (subpath "${escapePath(p)}")${i === readOnlyPaths.length - 1 ? ')' : ''}`),
+        ]
+      : []),
+  ];
+}
+
+/**
  * Generate a macOS sandbox-exec profile from a policy.
  */
 export function generateSandboxProfile(options: SandboxProfileOptions): string {
-  const { workDir, policy, permissive = false, logFile, strictMode = false } = options;
-  const homeDir = escapePath(os.homedir());
-  const tmpDir = escapePath(os.tmpdir());
+  const { workDir, policy, permissive = false, logFile } = options;
   const escapedWorkDir = escapePath(workDir);
 
-  const modeDescription = strictMode
-    ? 'STRICT mode - only workDir write access, no user caches'
-    : permissive
-      ? 'PERMISSIVE mode - violations are logged, not blocked'
-      : 'ENFORCEMENT mode - violations are blocked';
+  const modeDescription = permissive
+    ? 'PERMISSIVE mode - violations are logged, not blocked'
+    : 'ENFORCEMENT mode - violations are blocked';
 
   const lines: string[] = [
     '(version 1)',
@@ -197,16 +423,6 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push(`  (subpath "${escapedWorkDir}"))`);
   lines.push('');
 
-  // Temp directories - read access
-  lines.push(';; Temp directories - read access');
-  lines.push('(allow file-read*');
-  lines.push(`  (subpath "${tmpDir}")`);
-  lines.push('  (subpath "/tmp")');
-  lines.push('  (subpath "/private/tmp")');
-  lines.push('  (subpath "/var/folders")');
-  lines.push('  (subpath "/private/var/folders"))');
-  lines.push('');
-
   // Policy-defined read paths (system paths, user caches, etc.)
   if (policy?.filesystem?.read && policy.filesystem.read.length > 0) {
     lines.push(';; Policy-defined read access');
@@ -222,8 +438,7 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
         const base = expanded.replace('/**', '').replace('**/', '');
         lines.push(`  (subpath "${escapePath(base)}")`);
       } else if (expanded.includes('*')) {
-        const regex = expanded.replace(/\*/g, '.*').replace(/\//g, '\\/');
-        lines.push(`  (regex "${regex}")`);
+        lines.push(`  (regex "${globToProfileRegex(expanded)}")`);
       } else {
         lines.push(`  (subpath "${escapePath(expanded)}")`);
       }
@@ -243,44 +458,14 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push(`  (subpath "${escapedWorkDir}"))`);
   lines.push('');
 
-  // System temp directories
-  lines.push(';; System temp directories');
-  lines.push('(allow file-write*');
-  lines.push(`  (subpath "${tmpDir}")`);
-  lines.push('  (subpath "/tmp")');
-  lines.push('  (subpath "/private/tmp")');
-  lines.push('  (subpath "/var/folders")');
-  lines.push('  (subpath "/private/var/folders"))');
+  lines.push(...sharedTempRules());
   lines.push('');
 
-  // User cache directories - only in non-strict mode
-  if (!strictMode) {
-    lines.push(';; User cache directories (npm, cargo, pip, etc.)');
-    lines.push('(allow file-write*');
-    lines.push(`  (subpath "${homeDir}/.npm")`);
-    lines.push(`  (subpath "${homeDir}/.yarn")`);
-    lines.push(`  (subpath "${homeDir}/.pnpm-store")`);
-    lines.push(`  (subpath "${homeDir}/.cache")`);
-    lines.push(`  (subpath "${homeDir}/.cargo")`);
-    lines.push(`  (subpath "${homeDir}/.rustup")`);
-    lines.push(`  (subpath "${homeDir}/.gradle")`);
-    lines.push(`  (subpath "${homeDir}/.m2")`);
-    lines.push(`  (subpath "${homeDir}/.nuget")`);
-    lines.push(`  (subpath "${homeDir}/.dotnet")`);
-    lines.push(`  (subpath "${homeDir}/.local")`);
-    lines.push(`  (subpath "${homeDir}/go")`);
-    lines.push(`  (subpath "${homeDir}/Library/Caches"))`);
-    lines.push('');
-
-    // Localmost directories
-    lines.push(';; Localmost directories');
-    lines.push('(allow file-write*');
-    lines.push(`  (subpath "${homeDir}/.localmost"))`);
-    lines.push('');
-  } else {
-    lines.push(';; STRICT MODE: User cache directories NOT allowed');
-    lines.push('');
-  }
+  // No home directory cache is granted unless the policy declares it. Steps
+  // run with HOME inside the workspace, so these only ever served tools that
+  // bypass it - and each was a store the user's own builds later execute
+  // from (~/.cargo/bin, ~/.local/bin, Gradle init scripts, Maven settings),
+  // handed to any checkout that carried a .localmostrc.
 
   // Policy-defined filesystem access
   if (policy?.filesystem?.write) {
@@ -293,9 +478,7 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
         const base = expanded.replace('/**', '').replace('**/', '');
         lines.push(`  (subpath "${escapePath(base)}")`);
       } else if (expanded.includes('*')) {
-        // Handle single * wildcards with regex
-        const regex = expanded.replace(/\*/g, '.*').replace(/\//g, '\\/');
-        lines.push(`  (regex "${regex}")`);
+        lines.push(`  (regex "${globToProfileRegex(expanded)}")`);
       } else {
         lines.push(`  (subpath "${escapePath(expanded)}")`);
       }
@@ -304,13 +487,18 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
     lines.push('');
   }
 
-  // Policy-defined read restrictions (if any explicit deny)
+  lines.push(...neverReachableRules(escapedWorkDir, options.readOnlyPaths));
+  lines.push('');
+
+  // Policy-defined denies, after the workspace is reopened above so a deny
+  // the policy names inside the workspace still holds. A deny only ever
+  // narrows, so it can come last.
   if (policy?.filesystem?.deny) {
     lines.push(';; Policy-defined filesystem deny');
     for (const pattern of policy.filesystem.deny) {
       const expanded = expandPath(pattern);
       if (expanded.includes('*')) {
-        const regex = expanded.replace(/\*/g, '.*').replace(/\//g, '\\/');
+        const regex = globToProfileRegex(expanded);
         lines.push(`(deny file-read* (regex "${regex}"))`);
         lines.push(`(deny file-write* (regex "${regex}"))`);
       } else {
@@ -343,19 +531,8 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push(';; ------------------------------------------------------------');
   lines.push('');
 
-  // All network traffic is routed through the proxy server which handles
-  // hostname-based filtering. The sandbox only allows connections to localhost.
-  lines.push(`;; Network: localhost TCP (proxy at port ${options.proxyPort})`);
-  lines.push('(allow network-bind (local ip))');
-  lines.push('(allow network-outbound (local ip))');
-  lines.push('(allow network-inbound (local ip))');
-  lines.push('');
-  // Unix sockets are restricted to the working directory to prevent
-  // connecting to system sockets like Docker or SSH agent.
-  // Caller should set TMPDIR to workDir so tools create sockets there.
-  lines.push(`;; Unix sockets: only in working directory`);
-  lines.push(`(allow network-bind (subpath "${escapedWorkDir}"))`);
-  lines.push(`(allow network-outbound (subpath "${escapedWorkDir}"))`);
+  lines.push(...loopbackNetworkRules(options.proxyPort, escapedWorkDir));
+  lines.push(...cliSocketRules());
   lines.push('');
 
   // No daemon socket is opened here. A docker policy is a set of requests the
@@ -398,6 +575,8 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push('  (preference-domain "com.apple.dt.Xcode"))');
   lines.push('');
 
+  lines.push(...processMarkerRules(options.processMarker));
+
   return lines.join('\n');
 }
 
@@ -412,8 +591,10 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
  */
 export function generateDiscoveryProfile(options: {
   workDir: string;
+  readOnlyPaths?: string[];
   proxyPort: number;
   logFile: string;  // Not used - reports go to system log, not a file
+  processMarker?: ProcessMarker;
 }): string {
   const { workDir, proxyPort } = options;
   const escapedWorkDir = escapePath(workDir);
@@ -429,26 +610,39 @@ export function generateDiscoveryProfile(options: {
     '(deny default)',
     '',
     ';; ------------------------------------------------------------',
-    ';; FILE ACCESS - Allow all with reporting to system log',
+    ';; FILE ACCESS - Reads everywhere and workspace writes, reported',
     ';; ------------------------------------------------------------',
+    ';; Discovery has to see what a workflow reads, so reads are allowed and',
+    ';; reported. Writes are not: the checkout under discovery is no more',
+    ';; trusted than any other, and a write outside the workspace is observed',
+    ';; just as well refused - a denial is logged too, and reported as a path',
+    ';; the policy would need.',
     '(allow file-read* (with report))',
-    '(allow file-write* (with report))',
-    '(allow file-ioctl (with report))',
+    '(allow file-write* (with report)',
+    `  (subpath "${escapedWorkDir}"))`,
+    ...sharedTempRules(),
+    '(allow file-write*',
+    '  (literal "/dev/null")',
+    '  (literal "/dev/random")',
+    '  (literal "/dev/urandom")',
+    '  (literal "/dev/tty")',
+    '  (literal "/dev/dtracehelper"))',
+    '(allow file-ioctl (with report)',
+    `  (subpath "${escapedWorkDir}"))`,
+    '',
+    ...neverReachableRules(escapedWorkDir, options.readOnlyPaths),
+    ';; Metadata stays broad, as in the enforcement profile: tools walk paths',
+    ';; they cannot open, and existence is not the secret.',
+    '(allow file-read-metadata)',
     '',
     ';; ------------------------------------------------------------',
     ';; NETWORK ACCESS - Localhost only (proxy handles filtering)',
     ';; ------------------------------------------------------------',
-    `;; Network: localhost TCP (proxy at port ${proxyPort})`,
-    '(allow network-bind (local ip))',
-    '(allow network-outbound (local ip))',
-    '(allow network-inbound (local ip))',
-    '',
-    `;; Unix sockets: working directory only. Deliberately no blanket
-    ;; (allow network-* (with report)): that would let a tool ignoring
-    ;; HTTP_PROXY reach the internet directly, bypassing the proxy that
-    ;; records which hosts a workflow actually needs.`,
-    `(allow network-bind (subpath "${escapedWorkDir}"))`,
-    `(allow network-outbound (subpath "${escapedWorkDir}"))`,
+    ';; Deliberately no blanket (allow network-* (with report)): that would let',
+    ';; a tool ignoring HTTP_PROXY reach the internet directly, bypassing the',
+    ';; proxy that records which hosts a workflow actually needs.',
+    ...loopbackNetworkRules(proxyPort, escapedWorkDir),
+    ...cliSocketRules(),
     '',
     ';; ------------------------------------------------------------',
     ';; PROCESS/SYSTEM OPERATIONS - Allow all (no reporting needed)',
@@ -461,8 +655,10 @@ export function generateDiscoveryProfile(options: {
     '(allow iokit*)',
     '(allow pseudo-tty)',
     '(allow user-preference-read)',
-    '(allow user-preference-write)',
+    '(allow user-preference-write',
+    '  (preference-domain "com.apple.dt.Xcode"))',
     '',
+    ...processMarkerRules(options.processMarker),
   ];
 
   return lines.join('\n');
@@ -566,7 +762,11 @@ export function parseSandboxTrace(
   // Process names routinely contain hyphens and dots (git-remote-https,
   // com.apple.WebKit), so \w alone silently skips those lines and leaves the
   // discovered policy incomplete.
-  const traceRegex = /Sandbox:\s+([^(\s]+)\((\d+)\)\s+(allow|deny)\s+(\S+)\s+(.+)$/gm;
+  //
+  // A refusal reads `deny(1)`, with a count. The discovery profile refuses
+  // writes outside the workspace, so a refused write is still a write the
+  // workflow wanted, and is reported like an allowed one.
+  const traceRegex = /Sandbox:\s+([^(\s]+)\((\d+)\)\s+(allow|deny)(?:\(\d+\))?\s+(\S+)\s+(.+)$/gm;
 
   let match;
   while ((match = traceRegex.exec(traceContent)) !== null) {
@@ -580,8 +780,13 @@ export function parseSandboxTrace(
       }
     }
 
-    // Only process allow actions in discovery mode
-    if (action !== 'allow') continue;
+    // Refused writes count; a refused read is one of the paths no policy can
+    // grant, and anything else refused is not something discovery asked about.
+    // A refusal counts only from a pid known to be the workflow's: every
+    // sandboxed process on the machine logs its own, and without the pids
+    // any of them could add a write to what --updaterc proposes.
+    const isWrite = operation.includes('write') || operation.includes('create') || operation.includes('unlink');
+    if (action !== 'allow' && !(operation.startsWith('file-') && isWrite && collectedPids?.has(pid))) continue;
 
     // Handle network operations on Unix sockets
     if (operation === 'network-outbound' || operation === 'network-bind') {
@@ -607,6 +812,9 @@ export function parseSandboxTrace(
     // Skip paths inside workDir (already allowed)
     if (filePath.startsWith(workDir)) continue;
 
+    // Never offer what no policy can grant.
+    if (isNeverReachable(filePath)) continue;
+
     // Skip system paths that are always allowed (temp dirs, devices)
     if (
       filePath.startsWith('/tmp') ||
@@ -621,7 +829,7 @@ export function parseSandboxTrace(
     }
 
     // Categorize by operation type
-    if (operation.includes('write') || operation.includes('create') || operation.includes('unlink')) {
+    if (isWrite) {
       // Convert to relative path with ~ if in home directory
       const relativePath = filePath.startsWith(homeDir)
         ? '~' + filePath.slice(homeDir.length)

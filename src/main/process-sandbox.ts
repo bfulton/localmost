@@ -14,7 +14,7 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import { SandboxPolicyLevel } from '../shared/types';
-import { expandPath } from '../shared/sandbox-profile';
+import { expandPath, DEFAULT_BROKER_PORT } from '../shared/sandbox-profile';
 import {
   getAppDataDir,
   getConfigPath,
@@ -105,8 +105,7 @@ function validateExecutablePath(executablePath: string): string {
  * - Sandbox write restrictions (this profile)
  * - Network proxy with domain filtering (separate layer)
  */
-/** The broker's port, mirrored from BrokerProxyService's default. */
-export const DEFAULT_BROKER_PORT = 8787;
+export { DEFAULT_BROKER_PORT };
 
 /**
  * The per-user temp directory confstr hands out, once a lookup has answered.

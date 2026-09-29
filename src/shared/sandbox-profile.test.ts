@@ -17,7 +17,29 @@ jest.mock('os', () => ({
   totalmem: jest.fn(() => 16 * 1024 * 1024 * 1024),
 }));
 
+/**
+ * A profile's top-level rules, each with its continuation lines, so a test can
+ * ask what one rule grants rather than whether a string appears anywhere.
+ */
+function topLevelForms(profile: string): string[] {
+  const forms: string[] = [];
+  for (const line of profile.split('\n')) {
+    if (line.startsWith('(')) forms.push(line);
+    else if (/^\s+\(/.test(line) && forms.length > 0) forms[forms.length - 1] += `\n${line}`;
+  }
+  return forms;
+}
+
 describe('Sandbox Profile Generator', () => {
+  // The app data directory is named in every profile; pin it to the default
+  // under the mocked home whatever the environment running the tests says.
+  const savedConfigDir = process.env.LOCALMOST_CONFIG_DIR;
+  beforeAll(() => {
+    delete process.env.LOCALMOST_CONFIG_DIR;
+  });
+  afterAll(() => {
+    if (savedConfigDir !== undefined) process.env.LOCALMOST_CONFIG_DIR = savedConfigDir;
+  });
 
   // ===========================================================================
   // generateSandboxProfile - Basic structure
@@ -81,7 +103,6 @@ describe('Sandbox Profile Generator', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
         proxyPort: DEFAULT_PROXY_PORT,
-        strictMode: true,
       });
 
       for (const notGranted of ['/bin', '/usr', '/System', '/Library', '/Applications/Xcode.app']) {
@@ -118,7 +139,6 @@ describe('Sandbox Profile Generator', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
         proxyPort: DEFAULT_PROXY_PORT,
-        strictMode: true,
       });
 
       const writeSection = profile.slice(profile.indexOf(';; Write access'));
@@ -134,14 +154,13 @@ describe('Sandbox Profile Generator', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
         proxyPort: DEFAULT_PROXY_PORT,
-        strictMode: true,
       });
 
       expect(profile).toContain('(literal "/")');
       expect(profile).not.toContain('(subpath "/")');
     });
 
-    it('reads the workDir and temp, and nothing of the user, by default', () => {
+    it('reads the workDir, and nothing of the user, by default', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
         proxyPort: DEFAULT_PROXY_PORT,
@@ -149,7 +168,6 @@ describe('Sandbox Profile Generator', () => {
 
       expect(profile).toContain('(allow file-read*');
       expect(profile).toContain('(subpath "/path/to/project")');
-      expect(profile).toContain('(subpath "/tmp")');
 
       // A blanket root subpath would grant the whole disk and make every other
       // rule meaningless.
@@ -183,37 +201,174 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).toContain('(subpath "/my/project")');
     });
 
-    it('should allow write to system temp directories', () => {
-      const profile = generateSandboxProfile({
-        workDir: '/path/to/project',
-        proxyPort: DEFAULT_PROXY_PORT,
-      });
-
-      expect(profile).toContain('(subpath "/tmp")');
-      expect(profile).toContain('(subpath "/private/tmp")');
-      expect(profile).toContain('(subpath "/var/folders")');
-      expect(profile).toContain('(subpath "/private/var/folders")');
+    it('grants no shared temp directory, only the entries bare mktemp creates there', () => {
+      // /tmp and the per-user /var/folders tree are shared with everything the
+      // user runs, and hold state their own tools trust: the xcrun cache, the
+      // clang module cache. A step's temp is in its workspace, as a runner
+      // job's is in its sandbox.
+      for (const profile of [
+        generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT }),
+        generateDiscoveryProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, logFile: '' }),
+      ]) {
+        for (const shared of ['/tmp', '/private/tmp', '/var/folders', '/private/var/folders', '/var/folders/test/temp']) {
+          expect(profile).not.toContain(`(subpath "${shared}")`);
+        }
+        const mktemp = topLevelForms(profile).find((f) => f.startsWith('(allow file-write* file-read*') && f.includes('(regex #"'));
+        expect(mktemp).toMatch(/\/T\/tmp\\\.(\[A-Za-z0-9\]){10}/);
+      }
     });
 
-    it('should allow write to package manager caches', () => {
-      const profile = generateSandboxProfile({
-        workDir: '/path/to/project',
-        proxyPort: DEFAULT_PROXY_PORT,
-      });
-
-      expect(profile).toContain('.npm');
-      expect(profile).toContain('.yarn');
-      expect(profile).toContain('.cargo');
-      expect(profile).toContain('.cache');
+    it('grants no home directory cache that the policy has not declared, with or without a policy', () => {
+      // Steps run with HOME inside the workspace, so these grants only served
+      // tools that bypass it - and every one is a store the user's own builds
+      // later execute from: ~/.cargo/bin, ~/.local/bin, ~/go/bin, Gradle init
+      // scripts, Maven settings. Any checkout with a .localmostrc used to get
+      // them all.
+      for (const policy of [undefined, {}]) {
+        const profile = generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, policy });
+        const grants = topLevelForms(profile).filter((form) => form.startsWith('(allow'));
+        expect(grants.filter((form) => form.includes('"/Users/test/'))).toEqual([]);
+      }
     });
 
-    it('should allow write to localmost directories', () => {
+    it('still grants a home cache the policy declares', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
         proxyPort: DEFAULT_PROXY_PORT,
+        policy: { filesystem: { write: ['~/.npm'] } },
+      });
+      expect(profile).toContain('(subpath "/Users/test/.npm")');
+    });
+
+    it('denies the credentials the runner never grants, after every policy grant', () => {
+      // A checkout's .localmostrc is applied in test mode without approval; one
+      // that declares ~ readable must still not reach the developer's keys.
+      const profile = generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
+        policy: { filesystem: { read: ['~'], write: ['~'] } },
+      });
+      const forms = topLevelForms(profile);
+      const lastGrant = forms.map((f) => f.includes('"/Users/test"')).lastIndexOf(true);
+      const deny = forms.findIndex((f) => f.startsWith('(deny file-read* file-write*') && f.includes('/Users/test/.ssh'));
+      expect(deny).toBeGreaterThan(lastGrant);
+      for (const secret of [
+        '(subpath "/Users/test/.ssh")',
+        '(subpath "/Users/test/.aws")',
+        '(subpath "/Users/test/.gnupg")',
+        '(subpath "/Users/test/.config")',
+        '(subpath "/Users/test/Library/Keychains")',
+        '(literal "/Users/test/.netrc")',
+        '(literal "/Users/test/.npmrc")',
+      ]) {
+        expect(forms[deny]).toContain(secret);
+      }
+      // Nothing after the deny reopens any of it.
+      expect(forms.slice(deny + 1).filter((f) => f.startsWith('(allow file-') && f.includes('/Users/test/.'))).toEqual([]);
+    });
+
+    it('grants nothing of the app data directory, with or without a policy', () => {
+      // ~/.localmost holds the runner template every worker is copied from and
+      // the approval cache. A test run that could write them would reach every
+      // later real job, and approve its own policy.
+      for (const policy of [undefined, {}]) {
+        const profile = generateSandboxProfile({
+          workDir: '/Users/test/.localmost/workspaces/ws-1',
+          proxyPort: DEFAULT_PROXY_PORT,
+          policy,
+        });
+        const grants = topLevelForms(profile).filter((form) => form.startsWith('(allow'));
+        expect(grants.filter((form) => form.includes('"/Users/test/.localmost"'))).toEqual([]);
+      }
+    });
+
+    it('denies the app data directory after every policy grant, then reopens only the workspace', () => {
+      const workDir = '/Users/test/.localmost/workspaces/ws-1';
+      const profile = generateSandboxProfile({
+        workDir,
+        proxyPort: DEFAULT_PROXY_PORT,
+        policy: {
+          filesystem: {
+            read: ['~/.localmost', '~'],
+            write: ['~/.localmost/runner', '~/.localmost/policies', '~'],
+          },
+        },
       });
 
-      expect(profile).toContain('.localmost');
+      const denyForm = topLevelForms(profile).find(
+        (form) => form.startsWith('(deny file-read* file-write*') && form.includes('(subpath "/Users/test/.localmost")')
+      );
+      expect(denyForm).toContain('(subpath "/Users/test/Library/Application Support/localmost")');
+      const deny = profile.indexOf(denyForm!);
+      expect(deny).toBeGreaterThan(profile.indexOf(';; Policy-defined write access'));
+      expect(deny).toBeGreaterThan(profile.indexOf(';; Policy-defined read access'));
+      // Seatbelt takes the last matching rule, so after the deny the only
+      // file grant that may name anything under the app data directory is
+      // this run's own workspace.
+      const reopened = topLevelForms(profile.slice(deny))
+        .filter((form) => form.startsWith('(allow file-') && !form.startsWith('(allow file-read-metadata'))
+        .flatMap((form) => [...form.matchAll(/"([^"]+)"/g)].map((m) => m[1]))
+        .filter((p) => p.startsWith('/Users/test/.localmost') || p.startsWith('/Users/test/Library'));
+      expect(reopened).toEqual([workDir]);
+    });
+
+    it('never lets a step connect to the CLI socket', () => {
+      const profile = generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT });
+      expect(profile).toContain('(deny network-outbound (literal "/Users/test/.localmost/localmost.sock"))');
+    });
+
+    it('denies the real app data directory and socket even when the CLI runs with an override', () => {
+      // LOCALMOST_CONFIG_DIR points the CLI somewhere else, but the installed
+      // app still keeps its runner template, approvals and socket in ~/.localmost.
+      process.env.LOCALMOST_CONFIG_DIR = '/scratch/appdata';
+      try {
+        for (const profile of [
+          generateSandboxProfile({ workDir: '/scratch/appdata/workspaces/ws-1', proxyPort: DEFAULT_PROXY_PORT }),
+          generateDiscoveryProfile({ workDir: '/scratch/appdata/workspaces/ws-1', proxyPort: DEFAULT_PROXY_PORT, logFile: '' }),
+        ]) {
+          const deny = topLevelForms(profile).find((form) => form.startsWith('(deny file-read* file-write*'));
+          expect(deny).toContain('(subpath "/scratch/appdata")');
+          expect(deny).toContain('(subpath "/Users/test/.localmost")');
+          expect(profile).toContain('(deny network-outbound (literal "/scratch/appdata/localmost.sock"))');
+          expect(profile).toContain('(deny network-outbound (literal "/Users/test/.localmost/localmost.sock"))');
+        }
+      } finally {
+        delete process.env.LOCALMOST_CONFIG_DIR;
+      }
+    });
+
+    it('ends with the process marker, so no policy rule can change what it answers', () => {
+      // The app finds a step's processes at the end of the job by asking the
+      // kernel what their profile lets them read. A policy deny or grant after
+      // the marker would make a step's process look like anyone else's.
+      const processMarker = { granted: '/Users/test/.localmost/m/mark-a', withheld: '/Users/test/.localmost/m/mark-b' };
+      const policy = { filesystem: { read: ['/**'], deny: ['/Users/test/**'] } };
+      for (const profile of [
+        generateSandboxProfile({ workDir: '/w', proxyPort: DEFAULT_PROXY_PORT, policy, processMarker }),
+        generateDiscoveryProfile({ workDir: '/w', proxyPort: DEFAULT_PROXY_PORT, logFile: '', processMarker }),
+      ]) {
+        expect(topLevelForms(profile).slice(-2)).toEqual([
+          '(deny file-read* (literal "/Users/test/.localmost/m/mark-b"))',
+          '(allow file-read* (literal "/Users/test/.localmost/m/mark-a"))',
+        ]);
+      }
+    });
+
+    it('lets a step write inside the workspace but never replace the workspace directory itself', () => {
+      // The reopen is a subpath, which covers the directory node too: a step
+      // could rmdir it and leave a symlink in its place, and the app's own
+      // unsandboxed writes into the workspace would follow it.
+      const workDir = '/Users/test/.localmost/workspaces/ws-1';
+      for (const profile of [
+        generateSandboxProfile({ workDir, proxyPort: DEFAULT_PROXY_PORT }),
+        generateDiscoveryProfile({ workDir, proxyPort: DEFAULT_PROXY_PORT, logFile: '' }),
+      ]) {
+        const forms = topLevelForms(profile);
+        const reopen = forms.findIndex((f) => f.startsWith('(allow file-read* file-write*') && f.includes(`(subpath "${workDir}")`));
+        const pinned = forms.indexOf(`(deny file-write* (literal "${workDir}"))`);
+        expect(reopen).toBeGreaterThan(-1);
+        expect(pinned).toBeGreaterThan(reopen);
+      }
     });
 
     it('should allow policy-defined write paths', () => {
@@ -273,6 +428,40 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).toContain('(subpath');
     });
 
+    it('turns a * path into an anchored regex with everything else literal', () => {
+      const profile = generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
+        policy: {
+          filesystem: {
+            read: ['/opt/c++/lib*'],
+            write: ['~/.npm/_cacache/*'],
+            deny: ['~/.ssh/id_*'],
+          },
+        },
+      });
+      // Written into an SBPL string, where a backslash is itself escaped.
+      expect(profile).toContain('(regex "^/opt/c\\\\+\\\\+/lib.*$")');
+      expect(profile).toContain('(regex "^/Users/test/\\\\.npm/_cacache/.*$")');
+      expect(profile).toContain('(deny file-read* (regex "^/Users/test/\\\\.ssh/id_.*$"))');
+    });
+
+    it('keeps a policy deny inside the workspace after the workspace is reopened', () => {
+      // The workspace is reopened after the final deny of the app data
+      // directory it lives in; a deny the policy names inside it must not be
+      // undone by that.
+      const workDir = '/Users/test/.localmost/workspaces/ws-1';
+      const forms = topLevelForms(generateSandboxProfile({
+        workDir,
+        proxyPort: DEFAULT_PROXY_PORT,
+        policy: { filesystem: { deny: [`${workDir}/secrets`] } },
+      }));
+      const reopen = forms.findIndex((f) => f === `(allow file-read* file-write*\n  (subpath "${workDir}"))`);
+      const deny = forms.indexOf(`(deny file-write* (subpath "${workDir}/secrets"))`);
+      expect(reopen).toBeGreaterThan(-1);
+      expect(deny).toBeGreaterThan(reopen);
+    });
+
     it('should deny specified filesystem paths', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
@@ -314,9 +503,30 @@ describe('Sandbox Profile Generator', () => {
       });
 
       // Network should be restricted to localhost (proxy handles filtering)
-      expect(profile).toContain('(local ip)');
+      expect(profile).toContain('(allow network-outbound (remote ip "localhost:*"))');
       expect(profile).toContain('proxy at port 9999');
       expect(profile).not.toContain('(allow network*)');
+    });
+
+    it('never grants an IP rule that matches every address', () => {
+      // (local ip) names the local end of any IP socket, so as an outbound
+      // filter it matches a connection to anywhere: a step could ignore
+      // HTTP_PROXY and reach the internet directly, past the allowlist.
+      for (const profile of [
+        generateSandboxProfile({ workDir: '/path/to/project', proxyPort: 9999 }),
+        generateDiscoveryProfile({ workDir: '/path/to/project', proxyPort: 9999, logFile: '' }),
+      ]) {
+        expect(profile).not.toContain('(local ip)');
+        expect(profile).toContain('(deny network*)');
+        expect(profile).toContain('(allow network-bind (local ip "localhost:*"))');
+        expect(profile).toContain('(allow network-inbound (local ip "localhost:*"))');
+        // The app's broker carries job payloads; a step has no reason to open it.
+        expect(profile).toContain('(deny network-outbound (remote ip "localhost:8787"))');
+        // Nothing after the deny reopens outbound IP beyond loopback.
+        const afterDeny = profile.slice(profile.indexOf('(deny network*)'));
+        const outboundIp = afterDeny.match(/\(allow network-outbound \((?:remote|local) ip[^)]*\)\)/g);
+        expect(outboundIp).toEqual(['(allow network-outbound (remote ip "localhost:*"))']);
+      }
     });
 
     it('should restrict Unix sockets to working directory', () => {
@@ -343,7 +553,7 @@ describe('Sandbox Profile Generator', () => {
         },
       });
 
-      expect(profile).toContain('(local ip)');
+      expect(profile).toContain('(remote ip "localhost:*")');
       expect(profile).not.toContain('github.com');
     });
   });
@@ -444,6 +654,44 @@ describe('Sandbox Profile Generator', () => {
       expect(result.readPaths).toContain('/opt/homebrew');
     });
 
+    it('reports a write the discovery profile refused, so the policy can declare it', () => {
+      const result = parseSandboxTrace(
+        [
+          'kernel: (Sandbox) Sandbox: npm(101) deny(1) file-write-create /opt/cache/x',
+          'kernel: (Sandbox) Sandbox: npm(102) allow file-write-data /work/out',
+        ].join('\n'),
+        '/work',
+        new Set([101, 102])
+      );
+      expect(result.writePaths).toEqual(['/opt/cache/x']);
+    });
+
+    it('takes a refusal only from a process it knows is the workflow\'s', () => {
+      // Every sandboxed process on the machine logs its refusals - other apps,
+      // a runner job - and without the workflow's pids to filter by, any of
+      // them would add write paths to what --updaterc proposes.
+      const log = 'kernel: (Sandbox) Sandbox: evil(555) deny(1) file-write-create /Users/test/Library/LaunchAgents/x.plist';
+      for (const pids of [undefined, new Set<number>()]) {
+        expect(parseSandboxTrace(log, '/work', pids).writePaths).toEqual([]);
+      }
+      expect(parseSandboxTrace(log, '/work', new Set([101])).writePaths).toEqual([]);
+    });
+
+    it('never suggests what no policy can grant', () => {
+      // The app's own data and the developer's credentials are denied at every
+      // level; proposing them for .localmostrc would only mislead.
+      const result = parseSandboxTrace(
+        [
+          'kernel: (Sandbox) Sandbox: sh(101) deny(1) file-read-data /Users/test/.ssh/id_ed25519',
+          'kernel: (Sandbox) Sandbox: sh(102) deny(1) file-write-create /Users/test/.localmost/runner/x',
+          'kernel: (Sandbox) Sandbox: sh(103) allow file-read-data /Users/test/.aws/config',
+        ].join('\n'),
+        '/work'
+      );
+      expect(result.readPaths).toEqual([]);
+      expect(result.writePaths).toEqual([]);
+    });
+
     it('keeps unrelated siblings', () => {
       const result = parseSandboxTrace(trace(['/opt/a', '/opt/b']), '/work');
 
@@ -462,7 +710,43 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).toContain('(deny default)');
       // File operations with (with report) for logging to system log
       expect(profile).toContain('(allow file-read* (with report))');
-      expect(profile).toContain('(allow file-write* (with report))');
+      expect(profile).toContain('(allow file-write* (with report)\n  (subpath "/path/to/project")');
+    });
+
+    it('observes writes outside the workspace without letting them happen', () => {
+      // Discovery exists to see what a workflow touches, not to hand an
+      // untrusted checkout the disk: an unfiltered write allow let a
+      // --updaterc run write anywhere the user can.
+      const profile = generateDiscoveryProfile({
+        workDir: '/Users/test/.localmost/workspaces/ws-1',
+        proxyPort: DEFAULT_PROXY_PORT,
+        logFile: '',
+      });
+      const forms = topLevelForms(profile);
+      expect(forms).not.toContain('(allow file-write* (with report))');
+      expect(forms).not.toContain('(allow file-ioctl (with report))');
+      const writeGrants = forms.filter((f) => f.startsWith('(allow file-write*') || f.startsWith('(allow file-read* file-write*'));
+      const granted = writeGrants.flatMap((f) => [...f.matchAll(/\((?:subpath|literal) "([^"]+)"\)/g)].map((m) => m[1]));
+      expect(granted.sort()).toEqual(
+        [
+          '/Users/test/.localmost/workspaces/ws-1',
+          '/Users/test/.localmost/workspaces/ws-1',
+          '/dev/null',
+          '/dev/random',
+          '/dev/urandom',
+          '/dev/tty',
+          '/dev/dtracehelper',
+        ].sort()
+      );
+      // Reads are still observed everywhere but what is never reachable.
+      expect(forms).toContain('(allow file-read* (with report))');
+      const deny = forms.findIndex((f) => f.startsWith('(deny file-read* file-write*') && f.includes('/Users/test/.ssh'));
+      expect(deny).toBeGreaterThan(forms.indexOf('(allow file-read* (with report))'));
+      expect(forms[deny]).toContain('(subpath "/Users/test/.localmost")');
+      expect(profile).toContain('(deny network-outbound (literal "/Users/test/.localmost/localmost.sock"))');
+      // Preferences are a persistence point too; the Xcode domain is the one
+      // the enforcement profile grants.
+      expect(forms).not.toContain('(allow user-preference-write)');
     });
 
     it('should identify as discovery profile', () => {
@@ -482,7 +766,7 @@ describe('Sandbox Profile Generator', () => {
         logFile: '/tmp/discovery.log',
       });
 
-      expect(profile).toContain('(local ip)');
+      expect(profile).toContain('(remote ip "localhost:*")');
       expect(profile).toContain('proxy at port 9999');
     });
   });
@@ -537,7 +821,7 @@ describe('Sandbox Profile Generator', () => {
       });
 
       expect(profile).toContain('(version 1)');
-      expect(profile).toContain('(local ip)');
+      expect(profile).toContain('(remote ip "localhost:*")');
     });
 
     it('should handle policy with empty arrays', () => {

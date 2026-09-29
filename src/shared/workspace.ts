@@ -81,11 +81,18 @@ export function getWorkspacesDir(): string {
  * Ensure the workspaces directory exists.
  */
 function ensureWorkspacesDir(): void {
+  // Private to the user, whatever the shell's umask or an earlier version
+  // left: a workspace is a copy of the checkout, and holds step scripts that
+  // expanded ${{ secrets.X }}.
   const dir = getWorkspacesDir();
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
 }
+
+/**
+ * The shape of a workspace ID, and so of every directory cleanup may remove.
+ */
+const WORKSPACE_ID = /^ws-[0-9a-z]+-[0-9a-z]+$/;
 
 /**
  * Generate a unique workspace ID.
@@ -116,7 +123,7 @@ export async function createWorkspace(options: WorkspaceOptions): Promise<Worksp
   const workspacePath = path.join(getWorkspacesDir(), id);
 
   // Create workspace directory
-  fs.mkdirSync(workspacePath, { recursive: true });
+  fs.mkdirSync(workspacePath, { recursive: true, mode: 0o700 });
 
   // Build exclude patterns
   const allExcludes = [...DEFAULT_EXCLUDES, ...excludePatterns];
@@ -131,6 +138,8 @@ export async function createWorkspace(options: WorkspaceOptions): Promise<Worksp
       await rsyncCopy(sourceDir, workspacePath, allExcludes, respectGitignore);
     }
   }
+  // rsync -a gives the destination root the source directory's mode.
+  fs.chmodSync(workspacePath, 0o700);
 
   // Apply include patterns if specified
   if (includePatterns.length > 0) {
@@ -335,8 +344,20 @@ export function listWorkspaces(): Workspace[] {
 
     if (fs.existsSync(metadataPath)) {
       try {
+        // The metadata lives in the workspace, which the run's steps can
+        // write, so it supplies nothing that names a directory: the id and
+        // path are the directory's own. A step that rewrote its id to "../.."
+        // had cleanup delete whatever that pointed at.
         const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf-8'));
-        workspaces.push(metadata);
+        const createdAt = new Date(metadata.createdAt);
+        workspaces.push({
+          id: entry.name,
+          path: workspacePath,
+          sourceDir: typeof metadata.sourceDir === 'string' ? metadata.sourceDir : '',
+          createdAt: isNaN(createdAt.getTime())
+            ? fs.statSync(workspacePath).birthtime.toISOString()
+            : createdAt.toISOString(),
+        });
       } catch {
         // Invalid metadata, create from directory info
         const stats = fs.statSync(workspacePath);
@@ -360,6 +381,11 @@ export function listWorkspaces(): Workspace[] {
  * Remove a workspace.
  */
 export function removeWorkspace(id: string): boolean {
+  // Only ever a workspace directory itself: an id that is not one could name
+  // anything path.join resolves it to.
+  if (!WORKSPACE_ID.test(id)) {
+    return false;
+  }
   const workspacePath = path.join(getWorkspacesDir(), id);
   if (!fs.existsSync(workspacePath)) {
     return false;

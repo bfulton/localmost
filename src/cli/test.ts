@@ -12,7 +12,8 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { execSync } from 'child_process';
+import * as crypto from 'crypto';
+import { execFileSync } from 'child_process';
 import {
   parseWorkflowFile,
   findDefaultWorkflow,
@@ -32,6 +33,7 @@ import {
 } from '../shared/workflow-parser';
 import {
   executeStep,
+  reapStepProcesses,
   ExecutionContext,
   StepResult,
   StepStatus,
@@ -44,10 +46,11 @@ import {
   serializeLocalmostrc,
   LOCALMOSTRC_VERSION,
 } from '../shared/localmostrc';
-import { SandboxPolicy, parseSandboxTrace } from '../shared/sandbox-profile';
+import { SandboxPolicy, parseSandboxTrace, MACOS_BASELINE_READ_PATHS } from '../shared/sandbox-profile';
 import { DockerPolicy, diffDockerPolicy, mergeDockerPolicy, parseDockerPolicyHint } from '../shared/docker-policy';
 import { DiscoveryProxy } from '../shared/discovery-proxy';
 import { createWorkspace, cleanupWorkspaces, getGitInfo, getRepositoryFromDir } from '../shared/workspace';
+import { getAppDataDirWithoutElectron } from '../shared/paths';
 import {
   detectLocalEnvironment,
   compareEnvironments,
@@ -66,7 +69,7 @@ export interface TestOptions {
   job?: string;
   /** Run in discovery mode to generate .localmostrc */
   updaterc?: boolean;
-  /** Skip the confirmation prompt when --updaterc rewrites a policy */
+  /** Answer yes to every confirmation: grants beyond the workspace, running discovery, and writing what it found */
   assumeYes?: boolean;
   /** Path to a KEY=value file holding secret values */
   secretFile?: string;
@@ -125,44 +128,49 @@ interface JobOutputs {
  * The sandbox (with report) modifier logs to the kernel subsystem:
  *   kernel: (Sandbox) Sandbox: <process>(<pid>) allow <operation> <path>
  */
-function querySandboxLogs(sinceSeconds: number): string {
+export function querySandboxLogs(sinceSeconds: number): string {
   if (process.platform !== 'darwin') {
     return '';
   }
 
-  // Query the unified log for sandbox reports.
-  // Use /bin/bash explicitly and write to a temp file to avoid pipe issues.
-  // Note /usr/bin/log, not `log`: zsh has a `log` builtin that shadows it.
-  const stamp = Date.now();
-  const tmpFile = `/tmp/localmost-sandbox-log-${stamp}.txt`;
-  const scriptFile = `/tmp/localmost-query-log-${stamp}.sh`;
-
+  // /usr/bin/log run directly, its output read from the pipe. This used to go
+  // through a bash script and an output file in /tmp, named from the clock -
+  // a directory every sandboxed step can write, so whatever planted the next
+  // name first had its script run unsandboxed. Filtered to the Sandbox sender
+  // at the source, since everything else the system logged in the window can
+  // run to hundreds of megabytes.
   try {
-    const script = `#!/bin/bash
-/usr/bin/log show --last ${sinceSeconds}s 2>/dev/null | grep "kernel: (Sandbox)" > "${tmpFile}" || true
-`;
-    fs.writeFileSync(scriptFile, script);
-    execSync(`/bin/bash "${scriptFile}"`, { encoding: 'utf-8' });
-
-    let output = '';
-    if (fs.existsSync(tmpFile)) {
-      output = fs.readFileSync(tmpFile, 'utf-8');
-    }
-    return output;
+    const output = execFileSync(
+      '/usr/bin/log',
+      ['show', '--last', `${sinceSeconds}s`, '--predicate', 'sender == "Sandbox"'],
+      { encoding: 'utf-8', maxBuffer: 512 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }
+    );
+    return output
+      .split('\n')
+      .filter((line) => line.includes('kernel: (Sandbox)'))
+      .join('\n');
   } catch {
     // If log command fails, return empty string
     return '';
-  } finally {
-    // Cleanup belongs here: on the previous success-only path a throw left the
-    // script and its output behind in /tmp for good.
-    for (const file of [tmpFile, scriptFile]) {
-      try {
-        if (fs.existsSync(file)) fs.unlinkSync(file);
-      } catch {
-        // Best effort
-      }
-    }
   }
+}
+
+/**
+ * Save what discovery saw, for --debug, and return where.
+ *
+ * Into a fresh private directory under the app data directory, not the
+ * workspace: the workspace is the steps' to write, and what they left running
+ * could put a link where these writes go. No step can reach the app's data.
+ */
+export function saveDebugInfo(logContent: string, collectedPids: Set<number>): string {
+  const base = path.join(getAppDataDirWithoutElectron(), 'test-debug');
+  fs.mkdirSync(base, { recursive: true, mode: 0o700 });
+  const debugDir = fs.mkdtempSync(path.join(base, 'run-'));
+  fs.writeFileSync(path.join(debugDir, 'sandbox-log.txt'), logContent, { flag: 'wx' });
+  fs.writeFileSync(path.join(debugDir, 'collected-pids.json'), JSON.stringify([...collectedPids], null, 2), {
+    flag: 'wx',
+  });
+  return debugDir;
 }
 
 // =============================================================================
@@ -274,6 +282,22 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   }
   console.log();
 
+  // The checkout is as untrusted as its code: nothing it grants itself
+  // beyond its workspace applies until the user has seen it. Discovery
+  // applies no policy, and is asked about on its own terms. A dry run runs
+  // nothing.
+  if (!options.dryRun) {
+    const confirm = { assumeYes: !!options.assumeYes, isTTY: !!process.stdin.isTTY };
+    const confirmed = options.updaterc
+      ? await confirmDiscovery(confirm)
+      : await confirmCheckoutGrants(cwd, grantsBeyondWorkspace(policy), confirm);
+    if (!confirmed) {
+      throw new Error(
+        'Not running: confirm on a terminal, or pass --yes to run this checkout with what it asks for.'
+      );
+    }
+  }
+
   // Handle secrets
   const secretNames = extractSecretReferences(workflow.workflow);
   let secrets: Record<string, string> = {};
@@ -304,6 +328,8 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   });
   const proxyPort = await discoveryProxy.start();
 
+  const removeInterruptHandlers = installInterruptHandlers(reapStepProcesses);
+
   // Everything after the proxy starts runs inside try/finally: a throw in
   // workspace setup, parsing or job execution would otherwise leave the proxy
   // listening and holding its sockets.
@@ -329,23 +355,13 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   // Build proxy environment variables
   const proxyUrl = discoveryProxy.getProxyUrl();
 
-  // Create a tmp directory inside workDir for Unix sockets
-  // This keeps sockets within the sandbox's allowed network paths
-  const tmpDir = path.join(workspace.path, '.tmp');
-  fs.mkdirSync(tmpDir, { recursive: true });
-
   // Create sandbox trace log file
   // In updaterc mode: captures denies for policy generation
   // In enforcement mode: captures denies for error reporting
   const sandboxLogFile = path.join(workspace.path, '.sandbox-trace.log');
 
-  const proxyEnv: Record<string, string> = {
-    HTTP_PROXY: proxyUrl,
-    HTTPS_PROXY: proxyUrl,
-    http_proxy: proxyUrl,
-    https_proxy: proxyUrl,
-    TMPDIR: tmpDir,
-  };
+  // Temp is set per step, inside the workspace (see buildStepEnvironment).
+  const proxyEnv = buildProxyEnv(proxyUrl);
 
   // Track PIDs for discovery mode (to filter sandbox logs)
   // Uses kqueue-based pid_tree_watch for real-time process tree tracking
@@ -355,14 +371,19 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   const context: ExecutionContext = {
     workDir: workspace.path,
     proxyPort,
-    workflowEnv: {
-      GITHUB_WORKFLOW: workflow.name,
-      GITHUB_REPOSITORY: repository,
-      GITHUB_SHA: gitInfo?.sha || '',
-      GITHUB_REF: gitInfo?.ref || '',
-      ...(workflow.workflow.env || {}),
-      ...proxyEnv,
-    },
+    workflowEnv: buildWorkflowEnv(
+      workflow.workflow.env,
+      {
+        GITHUB_WORKFLOW: workflow.name,
+        GITHUB_REPOSITORY: repository,
+        GITHUB_SHA: gitInfo?.sha || '',
+        GITHUB_REF: gitInfo?.ref || '',
+      },
+      proxyEnv
+    ),
+    // From the checkout itself, before any of its workflow is read into the
+    // context: the workflow's env is the checkout's to write.
+    cacheScope: { sourceDir: fs.realpathSync(cwd), repository, ref: gitInfo?.ref || '' },
     jobEnv: {},
     matrix: {},
     secrets,
@@ -548,17 +569,7 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
 
     // Save debug info if requested
     if (options.debug) {
-      const debugDir = path.join(workspace.path, '.debug');
-      if (!fs.existsSync(debugDir)) {
-        fs.mkdirSync(debugDir, { recursive: true });
-      }
-      // Save raw sandbox log
-      fs.writeFileSync(path.join(debugDir, 'sandbox-log.txt'), logContent);
-      // Save collected PIDs
-      fs.writeFileSync(
-        path.join(debugDir, 'collected-pids.json'),
-        JSON.stringify([...collectedPids], null, 2)
-      );
+      const debugDir = saveDebugInfo(logContent, collectedPids);
       console.log(`${colors.dim}Debug info saved to ${debugDir}${colors.reset}`);
     }
 
@@ -601,8 +612,73 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     environmentDiffs,
   };
   } finally {
+    removeInterruptHandlers();
+    reapStepProcesses();
     await discoveryProxy.stop();
   }
+}
+
+/** The signals that end a run early, and the exit status each ends it with. */
+const INTERRUPT_EXIT_CODES: Partial<Record<NodeJS.Signals, number>> = {
+  SIGINT: 130,
+  SIGTERM: 143,
+  // The terminal closing, or an SSH session dropping.
+  SIGHUP: 129,
+};
+
+/**
+ * End the steps' processes, then exit, when the run is interrupted. Returns
+ * a function that removes the handlers.
+ *
+ * Each step leads a process group of its own, so the terminal's signals reach
+ * only this process; without these, dying of one would leave every step
+ * running.
+ */
+export function installInterruptHandlers(reap: () => void): () => void {
+  const onInterrupt = (signal: NodeJS.Signals) => {
+    reap();
+    process.exit(INTERRUPT_EXIT_CODES[signal] ?? 1);
+  };
+  const signals = Object.keys(INTERRUPT_EXIT_CODES) as NodeJS.Signals[];
+  for (const signal of signals) process.once(signal, onInterrupt);
+  return () => {
+    for (const signal of signals) process.removeListener(signal, onInterrupt);
+  };
+}
+
+/**
+ * The variables that send a step's traffic through the run's proxy.
+ *
+ * Loopback is exempt: steps reach a server they started directly, as their
+ * sandbox allows, and the proxy refuses loopback outright - through it, a
+ * step would reach the ports its sandbox denies.
+ */
+export function buildProxyEnv(proxyUrl: string): Record<string, string> {
+  const noProxy = 'localhost,127.0.0.1,::1';
+  return {
+    HTTP_PROXY: proxyUrl,
+    HTTPS_PROXY: proxyUrl,
+    http_proxy: proxyUrl,
+    https_proxy: proxyUrl,
+    NO_PROXY: noProxy,
+    no_proxy: noProxy,
+  };
+}
+
+/**
+ * A run's workflow-level environment: what the workflow declares, then the
+ * GITHUB_* defaults over it, then what the run itself needs.
+ *
+ * GitHub does not let a workflow overwrite its default variables, and here
+ * the workflow is the checkout's to write; spreading its env last let it
+ * claim another repository and ref.
+ */
+export function buildWorkflowEnv(
+  declared: Record<string, string> | undefined,
+  defaults: Record<string, string>,
+  runEnv: Record<string, string>
+): Record<string, string> {
+  return { ...(declared || {}), ...defaults, ...runEnv };
 }
 
 // =============================================================================
@@ -630,36 +706,41 @@ async function runJob(
     needs: jobOutputs,
   };
 
-  for (const step of job.steps!) {
-    if (options.dryRun) {
-      const stepName = step.name || step.id || (step.uses ? `Run ${step.uses}` : 'Run script');
-      console.log(`  ${pending(stepName)} (dry run)`);
-      continue;
-    }
-
-    const result = await executeStep(step, jobContext, job);
-    stepResults.push(result);
-
-    // Print step result
-    if (!options.verbose) {
-      console.log(`  ${formatStepStatus(result.status, result.name, result.duration)}`);
-    }
-
-    // Handle failure
-    if (result.status === 'failure') {
-      jobStatus = 'failure';
-      if (result.error) {
-        console.log(`    ${colors.red}Error: ${result.error}${colors.reset}`);
-      } else if (result.exitCode !== undefined && result.exitCode !== 0) {
-        console.log(`    ${colors.red}Exit code: ${result.exitCode}${colors.reset}`);
-      } else {
-        console.log(`    ${colors.red}Step failed${colors.reset}`);
+  // Whatever the steps left running ends with the job, as on GitHub.
+  try {
+    for (const step of job.steps!) {
+      if (options.dryRun) {
+        const stepName = step.name || step.id || (step.uses ? `Run ${step.uses}` : 'Run script');
+        console.log(`  ${pending(stepName)} (dry run)`);
+        continue;
       }
-      // Stop on first failure (unless continue-on-error)
-      if (!step['continue-on-error']) {
-        break;
+
+      const result = await executeStep(step, jobContext, job);
+      stepResults.push(result);
+
+      // Print step result
+      if (!options.verbose) {
+        console.log(`  ${formatStepStatus(result.status, result.name, result.duration)}`);
+      }
+
+      // Handle failure
+      if (result.status === 'failure') {
+        jobStatus = 'failure';
+        if (result.error) {
+          console.log(`    ${colors.red}Error: ${result.error}${colors.reset}`);
+        } else if (result.exitCode !== undefined && result.exitCode !== 0) {
+          console.log(`    ${colors.red}Exit code: ${result.exitCode}${colors.reset}`);
+        } else {
+          console.log(`    ${colors.red}Step failed${colors.reset}`);
+        }
+        // Stop on first failure (unless continue-on-error)
+        if (!step['continue-on-error']) {
+          break;
+        }
       }
     }
+  } finally {
+    reapStepProcesses();
   }
 
   // Extract job outputs from step outputs
@@ -760,34 +841,38 @@ async function runReusableWorkflowJob(
       needs: { ...jobOutputs, ...calledJobOutputs },
     };
 
-    // Run steps in the called job
-    for (const step of calledJob.steps!) {
-      if (options.dryRun) {
-        const stepName = step.name || step.id || (step.uses ? `Run ${step.uses}` : 'Run script');
-        console.log(`    ${pending(stepName)} (dry run)`);
-        continue;
-      }
-
-      const result = await executeStep(step, calledContext, calledJob);
-      allStepResults.push(result);
-
-      if (!options.verbose) {
-        console.log(`    ${formatStepStatus(result.status, result.name, result.duration)}`);
-      }
-
-      if (result.status === 'failure') {
-        overallStatus = 'failure';
-        if (result.error) {
-          console.log(`      ${colors.red}Error: ${result.error}${colors.reset}`);
-        } else if (result.exitCode !== undefined && result.exitCode !== 0) {
-          console.log(`      ${colors.red}Exit code: ${result.exitCode}${colors.reset}`);
-        } else {
-          console.log(`      ${colors.red}Step failed${colors.reset}`);
+    // Run steps in the called job, ending what they leave running with it
+    try {
+      for (const step of calledJob.steps!) {
+        if (options.dryRun) {
+          const stepName = step.name || step.id || (step.uses ? `Run ${step.uses}` : 'Run script');
+          console.log(`    ${pending(stepName)} (dry run)`);
+          continue;
         }
-        if (!step['continue-on-error']) {
-          break;
+
+        const result = await executeStep(step, calledContext, calledJob);
+        allStepResults.push(result);
+
+        if (!options.verbose) {
+          console.log(`    ${formatStepStatus(result.status, result.name, result.duration)}`);
+        }
+
+        if (result.status === 'failure') {
+          overallStatus = 'failure';
+          if (result.error) {
+            console.log(`      ${colors.red}Error: ${result.error}${colors.reset}`);
+          } else if (result.exitCode !== undefined && result.exitCode !== 0) {
+            console.log(`      ${colors.red}Exit code: ${result.exitCode}${colors.reset}`);
+          } else {
+            console.log(`      ${colors.red}Step failed${colors.reset}`);
+          }
+          if (!step['continue-on-error']) {
+            break;
+          }
         }
       }
+    } finally {
+      reapStepProcesses();
     }
 
     // Extract outputs from this job
@@ -920,6 +1005,111 @@ function resolveWorkflowPath(input: string | undefined, cwd: string): string {
 }
 
 
+/** Ask a yes/no question on the terminal; a yes is y or yes, anything else no. */
+async function askOnTerminal(question: string): Promise<string> {
+  const readline = await import('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise<string>(resolve => {
+    rl.question(question, a => {
+      rl.close();
+      resolve(a);
+    });
+  });
+}
+
+const isYes = (answer: string): boolean => /^y(es)?$/i.test(answer.trim());
+
+/**
+ * What a policy grants a step beyond its workspace and the OS read paths
+ * every workflow needs: every write, every other read, every host.
+ */
+export function grantsBeyondWorkspace(policy: SandboxPolicy | undefined): PolicyAddition[] {
+  const baseline = new Set(MACOS_BASELINE_READ_PATHS);
+  return nonEmpty([
+    { label: 'filesystem.write', items: policy?.filesystem?.write ?? [] },
+    { label: 'filesystem.read', items: (policy?.filesystem?.read ?? []).filter((p) => !baseline.has(p)) },
+    { label: 'network.allow', items: policy?.network?.allow ?? [] },
+  ]);
+}
+
+/** Where the checkouts' confirmed grants are kept: the app data directory, which no step can reach. */
+const checkoutApprovalsPath = (): string => path.join(getAppDataDirWithoutElectron(), 'test-approvals.json');
+
+function readCheckoutApprovals(): Record<string, string> {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(checkoutApprovalsPath(), 'utf-8'));
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+const grantsDigest = (grants: PolicyAddition[]): string =>
+  crypto.createHash('sha256').update(JSON.stringify(grants)).digest('hex');
+
+/**
+ * Ask before running a checkout whose .localmostrc grants it more than its
+ * workspace, and remember a yes for that checkout and exactly those grants.
+ *
+ * The policy is the checkout's own to write, like the rest of it, and it is
+ * what confines the checkout: applied without asking, it could grant itself
+ * a write to ~/Library/LaunchAgents or a read of the whole home directory.
+ * A yes is remembered by where the checkout sits, which it cannot choose,
+ * never by the repository name it claims; any change to the grants is asked
+ * again. Without a terminal, only --yes runs it.
+ */
+export async function confirmCheckoutGrants(
+  sourceDir: string,
+  grants: PolicyAddition[],
+  options: { assumeYes: boolean; isTTY: boolean; ask?: (question: string) => Promise<string> }
+): Promise<boolean> {
+  if (grants.length === 0) return true;
+  const checkoutKey = fs.realpathSync(sourceDir);
+  const digest = grantsDigest(grants);
+  if (readCheckoutApprovals()[checkoutKey] === digest) return true;
+
+  console.log(`${colors.bold}This checkout's .localmostrc grants its workflow more than its workspace:${colors.reset}`);
+  for (const { label, items } of grants) {
+    console.log(`  ${colors.bold}${label}${colors.reset}`);
+    for (const item of items) console.log(`    ${colors.yellow}+${colors.reset} ${item}`);
+  }
+  console.log('The policy comes from the checkout itself. Run it only if you would grant these to its code.');
+  console.log();
+
+  if (options.assumeYes) return true;
+  if (!options.isTTY) return false;
+
+  if (!isYes(await (options.ask ?? askOnTerminal)('Run with these grants? [y/N] '))) return false;
+  const approvals = { ...readCheckoutApprovals(), [checkoutKey]: digest };
+  fs.mkdirSync(path.dirname(checkoutApprovalsPath()), { recursive: true, mode: 0o700 });
+  const partial = `${checkoutApprovalsPath()}.${crypto.randomBytes(8).toString('hex')}`;
+  fs.writeFileSync(partial, JSON.stringify(approvals, null, 2), { mode: 0o600, flag: 'wx' });
+  fs.renameSync(partial, checkoutApprovalsPath());
+  return true;
+}
+
+/**
+ * Ask before a discovery run, every time.
+ *
+ * Discovery has to see what a workflow reads, so it lets the checkout read
+ * everything but the paths no policy can grant, and reach any host through
+ * the proxy. That is only safe on a checkout you would trust with it, and
+ * nothing about a checkout says whether it is one, so it is not remembered.
+ */
+export async function confirmDiscovery(options: {
+  assumeYes: boolean;
+  isTTY: boolean;
+  ask?: (question: string) => Promise<string>;
+}): Promise<boolean> {
+  console.log(`${colors.yellow}${colors.bold}--updaterc runs this checkout with wide access:${colors.reset}`);
+  console.log('  It can read everything on disk except your credentials and localmost\'s own data,');
+  console.log('  and reach any host on the internet. Use it only on a checkout whose code you trust.');
+  console.log();
+  if (options.assumeYes) return true;
+  if (!options.isTTY) return false;
+  return isYes(await (options.ask ?? askOnTerminal)('Run discovery? [y/N] '));
+}
+
 /**
  * List what a discovery run wants to add, and ask before writing it.
  *
@@ -949,15 +1139,7 @@ async function confirmPolicyChange(
     return false;
   }
 
-  const readline = await import('readline');
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const answer = await new Promise<string>(resolve => {
-    rl.question('Apply these changes? [y/N] ', a => {
-      rl.close();
-      resolve(a);
-    });
-  });
-  const yes = /^y(es)?$/i.test(answer.trim());
+  const yes = isYes(await askOnTerminal('Apply these changes? [y/N] '));
   if (!yes) console.log('Not writing.');
   return yes;
 }
@@ -1435,7 +1617,8 @@ ${colors.bold}OPTIONS:${colors.reset}
   -m, --matrix <spec>  Run specific matrix combination (e.g., "os=macos,node=18")
   -f, --full-matrix Run all matrix combinations
   -u, --updaterc    Discovery mode: record access and generate .localmostrc
-  -y, --yes         Apply --updaterc changes without confirming
+  -y, --yes         Answer yes to every confirmation: a .localmostrc's grants
+                    beyond the workspace, running --updaterc, and its changes
   -n, --dry-run     Show what would run without executing
   -v, --verbose     Show command output
   --staged          Use staged changes only (git diff --staged)
