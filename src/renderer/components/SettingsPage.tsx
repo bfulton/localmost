@@ -684,6 +684,9 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
               <option value="warn">Warning</option>
               <option value="error">Error</option>
             </select>
+            <p className={shared.formHint}>
+              At Debug, with the localmost log level also at Debug, the runner's diagnostic trace (job names, runner URLs) is written to ~/.localmost/logs.
+            </p>
           </div>
         </section>
 

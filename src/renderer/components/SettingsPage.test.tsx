@@ -299,4 +299,13 @@ describe('SettingsPage', () => {
     expect(screen.queryByText('Cache work directory')).not.toBeInTheDocument();
     expect(screen.queryByText(/_work directory/)).not.toBeInTheDocument();
   });
+
+  it('says what debug runner logging writes to disk', async () => {
+    renderWithProviders(<SettingsPage {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Runner log level')).toBeInTheDocument();
+    });
+    expect(screen.getByText(/runner's diagnostic trace/)).toHaveTextContent('~/.localmost/logs');
+  });
 });

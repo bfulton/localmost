@@ -90,7 +90,9 @@ describe('UserFilterSettings', () => {
         />
       );
 
-      expect(screen.getByText(/Check who triggered the workflow/)).toBeInTheDocument();
+      // The trigger is github.actor, not the code's author: a maintainer who
+      // updates a fork's pull request runs its code as themselves.
+      expect(screen.getByText('Checks who triggered the workflow (github.actor), not who wrote the code it runs.')).toBeInTheDocument();
 
       rerender(
         <UserFilterSettings

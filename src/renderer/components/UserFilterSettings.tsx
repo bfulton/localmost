@@ -136,7 +136,7 @@ const UserFilterSettings: React.FC<UserFilterSettingsProps> = ({
       case 'everyone':
         return 'Accept workflow jobs triggered by any user.';
       case 'trigger':
-        return 'Check who triggered the workflow and filter based on that user.';
+        return 'Checks who triggered the workflow (github.actor), not who wrote the code it runs.';
       case 'contributors':
         return 'Check who triggered the workflow and all contributors to the repository, and ensure all are trusted.';
       default:
