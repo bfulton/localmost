@@ -143,8 +143,11 @@ export const MACOS_BASELINE_READ_PATHS = [
   '/Applications/Xcode.app',
 ];
 
-/** The broker's port, mirrored from BrokerProxyService's default. */
-const BROKER_PORT = 8787;
+/**
+ * The broker's port, BrokerProxyService's default. Defined here, where the CLI
+ * can reach it, so the runner's profile and the test profiles deny the same one.
+ */
+export const DEFAULT_BROKER_PORT = 8787;
 
 /**
  * The network rules both test-mode profiles share, mirroring the runner's.
@@ -164,7 +167,7 @@ function loopbackNetworkRules(proxyPort: number, escapedWorkDir: string): string
     `;; Network: loopback only; the proxy at port ${proxyPort} is the way out`,
     '(deny network*)',
     '(allow network-outbound (remote ip "localhost:*"))',
-    `(deny network-outbound (remote ip "localhost:${BROKER_PORT}"))`,
+    `(deny network-outbound (remote ip "localhost:${DEFAULT_BROKER_PORT}"))`,
     '(allow network-bind (local ip "localhost:*"))',
     '(allow network-inbound (local ip "localhost:*"))',
     ';; Unix sockets: only in the working directory, never a system socket like',
@@ -172,6 +175,23 @@ function loopbackNetworkRules(proxyPort: number, escapedWorkDir: string): string
     `(allow network-bind (subpath "${escapedWorkDir}"))`,
     `(allow network-outbound (subpath "${escapedWorkDir}"))`,
   ];
+}
+
+/**
+ * The app data directory this process uses, and the installed app's own.
+ *
+ * LOCALMOST_CONFIG_DIR and the App Sandbox container move the first, but the
+ * app keeps its runner template, approvals and socket in ~/.localmost whatever
+ * this process was started with, so that is denied either way.
+ */
+function appDataDirs(): string[] {
+  return [...new Set([getAppDataDirWithoutElectron(), path.join(os.homedir(), '.localmost')])];
+}
+
+/** Denies for the CLI sockets: this process's, and the installed app's. */
+function cliSocketRules(): string[] {
+  const name = path.basename(getCliSocketPath());
+  return appDataDirs().map((dir) => `(deny network-outbound (literal "${escapePath(path.join(dir, name))}"))`);
 }
 
 /**
@@ -193,7 +213,7 @@ function neverReachablePaths(): { subpaths: string[]; literals: string[] } {
   const home = os.homedir();
   return {
     subpaths: [
-      getAppDataDirWithoutElectron(),
+      ...appDataDirs(),
       path.join(home, 'Library', 'Application Support', 'localmost'),
       `${home}/.ssh`,
       `${home}/.aws`,
@@ -237,6 +257,9 @@ function neverReachableRules(escapedWorkDir: string, readOnlyPaths: string[] = [
     ';; ...except this run\'s workspace, which lives inside the app data directory',
     '(allow file-read* file-write*',
     `  (subpath "${escapedWorkDir}"))`,
+    ';; ...but not the workspace directory itself: the app writes into it',
+    ';; unsandboxed, and a step that could remove it could leave a link there',
+    `(deny file-write* (literal "${escapedWorkDir}"))`,
     ...(readOnlyPaths.length > 0
       ? [
           ';; ...and the code of the actions this step runs, read-only: a fetched',
@@ -441,7 +464,7 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push('');
 
   lines.push(...loopbackNetworkRules(options.proxyPort, escapedWorkDir));
-  lines.push(`(deny network-outbound (literal "${escapePath(getCliSocketPath())}"))`);
+  lines.push(...cliSocketRules());
   lines.push('');
 
   // No daemon socket is opened here. A docker policy is a set of requests the
@@ -552,7 +575,7 @@ export function generateDiscoveryProfile(options: {
     ';; a tool ignoring HTTP_PROXY reach the internet directly, bypassing the',
     ';; proxy that records which hosts a workflow actually needs.',
     ...loopbackNetworkRules(proxyPort, escapedWorkDir),
-    `(deny network-outbound (literal "${escapePath(getCliSocketPath())}"))`,
+    ...cliSocketRules(),
     '',
     ';; ------------------------------------------------------------',
     ';; PROCESS/SYSTEM OPERATIONS - Allow all (no reporting needed)',

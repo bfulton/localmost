@@ -313,6 +313,43 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).toContain('(deny network-outbound (literal "/Users/test/.localmost/localmost.sock"))');
     });
 
+    it('denies the real app data directory and socket even when the CLI runs with an override', () => {
+      // LOCALMOST_CONFIG_DIR points the CLI somewhere else, but the installed
+      // app still keeps its runner template, approvals and socket in ~/.localmost.
+      process.env.LOCALMOST_CONFIG_DIR = '/scratch/appdata';
+      try {
+        for (const profile of [
+          generateSandboxProfile({ workDir: '/scratch/appdata/workspaces/ws-1', proxyPort: DEFAULT_PROXY_PORT }),
+          generateDiscoveryProfile({ workDir: '/scratch/appdata/workspaces/ws-1', proxyPort: DEFAULT_PROXY_PORT, logFile: '' }),
+        ]) {
+          const deny = topLevelForms(profile).find((form) => form.startsWith('(deny file-read* file-write*'));
+          expect(deny).toContain('(subpath "/scratch/appdata")');
+          expect(deny).toContain('(subpath "/Users/test/.localmost")');
+          expect(profile).toContain('(deny network-outbound (literal "/scratch/appdata/localmost.sock"))');
+          expect(profile).toContain('(deny network-outbound (literal "/Users/test/.localmost/localmost.sock"))');
+        }
+      } finally {
+        delete process.env.LOCALMOST_CONFIG_DIR;
+      }
+    });
+
+    it('lets a step write inside the workspace but never replace the workspace directory itself', () => {
+      // The reopen is a subpath, which covers the directory node too: a step
+      // could rmdir it and leave a symlink in its place, and the app's own
+      // unsandboxed writes into the workspace would follow it.
+      const workDir = '/Users/test/.localmost/workspaces/ws-1';
+      for (const profile of [
+        generateSandboxProfile({ workDir, proxyPort: DEFAULT_PROXY_PORT }),
+        generateDiscoveryProfile({ workDir, proxyPort: DEFAULT_PROXY_PORT, logFile: '' }),
+      ]) {
+        const forms = topLevelForms(profile);
+        const reopen = forms.findIndex((f) => f.startsWith('(allow file-read* file-write*') && f.includes(`(subpath "${workDir}")`));
+        const pinned = forms.indexOf(`(deny file-write* (literal "${workDir}"))`);
+        expect(reopen).toBeGreaterThan(-1);
+        expect(pinned).toBeGreaterThan(reopen);
+      }
+    });
+
     it('should allow policy-defined write paths', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',

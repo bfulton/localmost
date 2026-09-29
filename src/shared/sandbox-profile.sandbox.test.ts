@@ -208,6 +208,22 @@ if (!isMacOS) {
       expect(run(profile, ['/bin/cat', path.join(appDir, 'config.yaml')])).toBe(false);
       expect(fs.existsSync(path.join(appDir, 'runner', 'arc', 'planted'))).toBe(false);
     });
+
+    it('lets a step make and remove what it likes in the workspace, but not remove the workspace itself', () => {
+      // An empty workspace a step could rmdir, then put a link in its place for
+      // the app's unsandboxed writes to follow.
+      const emptyWorkDir = path.join(appDir, 'workspaces', 'ws-2');
+      fs.mkdirSync(emptyWorkDir);
+      for (const profile of [
+        generateSandboxProfile({ workDir: emptyWorkDir, proxyPort: 1, policy: readable }),
+        generateDiscoveryProfile({ workDir: emptyWorkDir, proxyPort: 1, logFile: '' }),
+      ]) {
+        expect(run(profile, ['/bin/mkdir', path.join(emptyWorkDir, 'sub')])).toBe(true);
+        expect(run(profile, ['/bin/rmdir', path.join(emptyWorkDir, 'sub')])).toBe(true);
+        expect(run(profile, ['/bin/rmdir', emptyWorkDir])).toBe(false);
+        expect(fs.statSync(emptyWorkDir).isDirectory()).toBe(true);
+      }
+    });
   });
 
   describe('test-mode home directory confinement through a constructed profile', () => {
