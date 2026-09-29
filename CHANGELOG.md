@@ -205,7 +205,17 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   before admission saw them, or delete it. Any other path that is not a job
   operation is still forwarded upstream as it comes, on the runner's
   credentials, with the target's session id in place of any session id it
-  carries.
+  carries. A query that also names the session id another way (`SessionId`,
+  `ſessionId`), or has any parameter name that is not plain ASCII, is refused
+  instead, since upstream could read that name beside or instead of the id put
+  in its place.
+- The Docker filter refuses a request whose body has a key, at any depth, that
+  is not plain ASCII, or whose query has such a parameter name. The daemon's Go
+  decoder reads some other letters as ASCII ones: it took `HoſtConfig` (long s)
+  as `HostConfig`, which the filter read as an unknown key and passed, so a
+  create carrying `Privileged`, a bind of `/` or a mount propagation under that
+  spelling reached the daemon unchecked. A label or container path named
+  outside ASCII is refused as well; values are not affected.
 - An approved policy is bound to the repository's id as well as its name. A job
   from a different repository that now holds an approved name - the approved one
   deleted or renamed, and the name taken since - is refused until the policy is

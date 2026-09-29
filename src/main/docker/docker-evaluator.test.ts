@@ -935,3 +935,108 @@ describe('host networking is refused whatever the case', () => {
     expect(v.reason).toMatch(/reaches the host/i);
   });
 });
+
+describe('keys the daemon would read as other keys', () => {
+  // Go's encoding/json matches a key to a struct field under Unicode simple
+  // folding, not just ASCII case: U+017F (long s) reads as s and U+212A
+  // (Kelvin sign) as k, escaped or not (checked against go1.25.1). A key the
+  // filter reads as some unknown key, the daemon can read as HostConfig. Every
+  // key the CLI sends is plain ASCII, so any other key is refused.
+  const LONG_S = '\u017f';
+  const KELVIN = '\u212a';
+  const runPolicy: DockerPolicy = { run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'ro' }], network: 'bridge' } };
+  const create = (body: unknown) => evaluateDockerRequest(mk('POST', '/v1.45/containers/create', body), ctx(runPolicy));
+  const raw = (method: string, url: string, json: string) =>
+    parseDockerRequest({ method, url, headers: { 'content-type': 'application/json' }, body: Buffer.from(json) });
+
+  it('refuses a HostConfig spelled with a long s, whatever it carries', () => {
+    const hostConfig = `Ho${LONG_S}tConfig`;
+    for (const carried of [
+      { Privileged: true },
+      { Binds: ['/:/host'] },
+      { Mounts: [{ Type: 'bind', Source: '/', Target: '/host' }] },
+    ]) {
+      const v = create({ Image: 'postgres:16', [hostConfig]: carried });
+      expect([JSON.stringify(carried), v.allowed]).toEqual([JSON.stringify(carried), false]);
+      expect(v.reason).toMatch(/ASCII/);
+      // Named escaped, so the refusal does not show a key that passes for HostConfig.
+      expect(v.reason).toContain('"Ho\\u017ftConfig"');
+    }
+  });
+
+  it('refuses the same key when the long s arrives as a JSON escape', () => {
+    const v = evaluateDockerRequest(
+      raw('POST', '/v1.45/containers/create', '{"Image":"postgres:16","Ho\\u017ftConfig":{"Privileged":true}}'),
+      ctx(runPolicy)
+    );
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/ASCII/);
+  });
+
+  it('refuses such a key at any depth', () => {
+    for (const body of [
+      // A second NetworkingConfig the daemon reads, joining the host network.
+      { Image: 'postgres:16', [`Networ${KELVIN}ingConfig`]: { EndpointsConfig: { host: {} } } },
+      { Image: 'postgres:16', HostConfig: { [`Bind${LONG_S}`]: ['/:/host'] } },
+      { Image: 'postgres:16', HostConfig: { [`Privi${LONG_S}eged`]: true } },
+      // A declared read-only mount, with a propagation the filter never reads
+      // and the daemon honours.
+      {
+        Image: 'postgres:16',
+        HostConfig: {
+          Mounts: [{ Type: 'bind', Source: '/ws', Target: '/x', ReadOnly: true, [`BindOption${LONG_S}`]: { Propagation: 'rshared' } }],
+        },
+      },
+      { Image: 'postgres:16', HostConfig: { Mounts: [{ [`Ty${LONG_S}e`]: 'bind', Type: 'tmpfs', Target: '/x' }] } },
+    ]) {
+      const v = create(body);
+      expect([JSON.stringify(body), v.allowed]).toEqual([JSON.stringify(body), false]);
+      expect(v.reason).toMatch(/ASCII/);
+    }
+  });
+
+  it('refuses such a key in a network create body, including inside IPAM', () => {
+    const p: DockerPolicy = { run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] } };
+    const v = evaluateDockerRequest(
+      mk('POST', '/v1.45/networks/create', {
+        Name: 'vk-1', Internal: true,
+        IPAM: { Driver: 'default', Config: [], [`Option${LONG_S}`]: { 'com.example': 'x' } },
+      }),
+      ctx(p)
+    );
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/ASCII/);
+  });
+
+  it('refuses a query parameter whose name is not plain ASCII', () => {
+    const p: DockerPolicy = { run: { images: ['postgres:16'], network: 'bridge' }, pull: { registries: ['docker.io'] } };
+    const v = evaluateDockerRequest(mk('POST', `/v1.45/images/create?fromImage=postgres&tag=16&from${LONG_S}rc=x`), ctx(p));
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/ASCII/);
+  });
+
+  it('still permits what the real CLI sends, whatever the values say', () => {
+    // The plain `docker run` keys, and NetworkingConfig as the CLI fills it.
+    // Values are not keys: an accented label value or env var passes.
+    expect(create({
+      Image: 'postgres:16',
+      Env: ['K=v\u00e9'],
+      Labels: { purpose: 'caf\u00e9' },
+      HostConfig: {
+        AutoRemove: true, NetworkMode: 'bridge', Binds: [],
+        RestartPolicy: { Name: '', MaximumRetryCount: 0 }, LogConfig: { Type: '', Config: {} }, ConsoleSize: [0, 0],
+      },
+      NetworkingConfig: { EndpointsConfig: { default: {} } },
+    }).allowed).toBe(true);
+    // Captured from docker CLI 29.3.1 `docker network create --internal`.
+    const p: DockerPolicy = { run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] } };
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/networks/create', {
+      Name: 'vk-probe-net', Driver: 'bridge', Scope: '',
+      IPAM: { Driver: 'default', Options: {}, Config: [] },
+      Internal: true, Attachable: false, Ingress: false, ConfigOnly: false,
+      ConfigFrom: null, Options: {}, Labels: {},
+    }), ctx(p)).allowed).toBe(true);
+    const pull: DockerPolicy = { pull: { registries: ['docker.io'] } };
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/images/create?fromImage=postgres&tag=16'), ctx(pull)).allowed).toBe(true);
+  });
+});

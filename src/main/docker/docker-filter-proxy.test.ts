@@ -253,6 +253,25 @@ describe('DockerFilterProxy forwarding', () => {
     expect(daemon.seen).toHaveLength(0);
   });
 
+  it('refuses a key the daemon would fold to HostConfig, without touching the daemon', async () => {
+    // Go's encoding/json reads U+017F (long s) as s, so the daemon takes
+    // "HoſtConfig" for HostConfig: privileged, with the host's root mounted.
+    const dir = tmp();
+    const daemon = await fakeDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', runPolicy);
+
+    for (const body of [
+      '{"Image":"postgres:16","Ho\u017ftConfig":{"Privileged":true}}',
+      '{"Image":"postgres:16","Ho\\u017ftConfig":{"Binds":["/:/host"]}}',
+    ]) {
+      const reply = await request(sock, 'POST', '/v1.45/containers/create', body, { 'content-type': 'application/json' });
+      expect([body, reply.status]).toEqual([body, 403]);
+      expect(JSON.parse(reply.body).message).toMatch(/ASCII/);
+    }
+    expect(daemon.seen).toHaveLength(0);
+  });
+
   it('pins an unversioned request to the version it understands when forwarding', async () => {
     const dir = tmp();
     const daemon = await fakeDaemon(dir);

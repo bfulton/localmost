@@ -18,6 +18,7 @@ import { EventEmitter } from 'events';
 import { getLogger } from './app-state';
 import type { Target, RunnerProxyStatus } from '../shared/types';
 import { FALLBACK_RUNNER_VERSION } from '../shared/constants';
+import { isPlainAscii } from '../shared/json-keys';
 import {
   SessionPersistence,
   OAuthTokenManager,
@@ -230,27 +231,18 @@ const JOB_PAIR_KEYS = ['planId', 'jobId'];
 const JOB_KEYS_BY_LOWERCASE = new Map([...JOB_REQUEST_ID_KEYS, ...JOB_PAIR_KEYS].map(key => [key.toLowerCase(), key]));
 
 /**
- * Printable ASCII: all the runner writes in a job body's keys or in a path it
- * sends. Beyond ASCII, decoders and routers fold case each their own way (Go's
- * JSON decoder reads U+017F long s as s and U+212A Kelvin sign as k; .NET's
- * reads neither), so a check here cannot match every one of them, and anything
- * else is refused.
- */
-const PLAIN_ASCII = /^[\x20-\x7e]*$/;
-
-/**
  * The first key of a job operation's body that upstream could read as a job
  * key the gate does not. The JSON decoders of .NET and Go match keys whatever
  * their ASCII case (Go keeping the last), and Go's folds some other letters to
  * ASCII too, so upstream a `PlanId`, `RequestId` or `requeſtId` beside the
  * checked key could be the one that counts, and one on its own names a job the
- * gate never looked at. As in the docker filter's caseAmbiguity, the ambiguity
+ * gate never looked at. As in the docker filter's keyAmbiguity, the ambiguity
  * is refused rather than modelled: the runner writes each key once, in ASCII,
  * as spelled here.
  */
 function ambiguousJobKey(body: object): string | undefined {
   return Object.keys(body).find(key => {
-    if (!PLAIN_ASCII.test(key)) return true;
+    if (!isPlainAscii(key)) return true;
     const gated = JOB_KEYS_BY_LOWERCASE.get(key.toLowerCase());
     return gated !== undefined && gated !== key;
   });
@@ -2188,7 +2180,7 @@ export class BrokerProxyService extends EventEmitter {
     let routedSegments: string[] | undefined;
     try {
       const decoded = decodeURIComponent(url.pathname);
-      if (PLAIN_ASCII.test(decoded)) routedSegments = decoded.toLowerCase().split('/').filter(Boolean);
+      if (isPlainAscii(decoded)) routedSegments = decoded.toLowerCase().split('/').filter(Boolean);
     } catch {
       // Refused below, like a path that decodes to more than ASCII.
     }
@@ -2204,6 +2196,22 @@ export class BrokerProxyService extends EventEmitter {
       log()?.warn(`[BrokerProxy] Refused to forward ${req.method} ${forLog(url.pathname)}: it is a path served here, not upstream`);
       res.writeHead(403, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Path is served here, not upstream' }));
+      return;
+    }
+
+    // The upstream session id goes in place of the query's sessionId, found by
+    // that exact name. Upstream reads query names whatever their case, and a
+    // decoder folding past ASCII reads more (Go takes U+017F as s), so a
+    // second spelling would reach it beside or instead of the id put there.
+    // The runner writes each name once, in ASCII, as spelled here.
+    const oddParam = [...url.searchParams.keys()].find(
+      name => !isPlainAscii(name) || (name !== 'sessionId' && name.toLowerCase() === 'sessionid')
+    );
+    if (oddParam !== undefined) {
+      req.resume();
+      log()?.warn(`[BrokerProxy] Refused to forward ${req.method} ${forLog(url.pathname)}: its query names ${forLog(oddParam)}, which upstream may read as another parameter`);
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Query parameter name upstream may read as another' }));
       return;
     }
 

@@ -180,7 +180,11 @@ the worker's token endpoint) never go upstream: another spelling of one
 (`/Message`, `/message/`, `/%6dessage`), or another method on it, is refused.
 Any other path is not yet restricted: it is forwarded to GitHub's broker on
 the runner's credentials as it comes, with the target's upstream session id in
-place of any session id it carries.
+place of any session id it carries. That id is put in under `sessionId`, so a
+query that also spells it another way (`SessionId`, or with a letter Go reads
+as an ASCII one), or has any parameter name that is not plain ASCII, is refused
+rather than forwarded: upstream could read that spelling beside or instead of
+the id put there.
 Forwarding only the paths the runner uses would close that; it is an open
 item. That key, not the closed port, is what keeps a job from acting as
 another worker, and from acting as the runner through the operations above.
@@ -432,6 +436,12 @@ What the filter refuses, each of which is an executable test against the proxy:
   and after the daemon itself restarts, outliving the job;
 - an image, registry, mount, network mode or build context the policy did not
   declare;
+- a request body with a key the daemon may read as another: two keys that
+  differ only in case, which the daemon's Go decoder merges, or any key, at any
+  depth, that is not plain ASCII, since that decoder also reads some other
+  letters as ASCII ones (`HoſtConfig` is `HostConfig` to it, so such a key
+  carried `--privileged` or a root bind past every check); and a query
+  parameter named outside plain ASCII;
 - any endpoint, API version or request body the proxy does not fully
   understand. The filter fails closed: a request it cannot evaluate is refused,
   not passed through.

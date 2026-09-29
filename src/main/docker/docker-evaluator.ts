@@ -14,6 +14,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { DockerPolicy, DockerMount, DockerNetworkPolicy, MountMode } from '../../shared/docker-policy';
+import { asciiEscaped, isPlainAscii } from '../../shared/json-keys';
 import { DockerRequest, DockerAction, classifyDockerRequest, containerIdFrom, imageRefFrom, networkIdFrom } from './docker-request';
 
 export interface DockerEvalContext {
@@ -808,7 +809,22 @@ function evaluateOwnContainer(req: DockerRequest, ctx: DockerEvalContext): Docke
 // -----------------------------------------------------------------------------
 
 /**
- * The first key in `value` that has a case-variant twin, named with its path.
+ * The first key in `value` the daemon could read as a key this filter does
+ * not, named with its path: one that is not printable ASCII, or one that has
+ * a case-variant twin.
+ *
+ * Beyond ASCII case, Go's decoder folds some other letters to ASCII ones: it
+ * reads U+017F (long s) as `s`, escaped or not, so `HoſtConfig` is HostConfig
+ * to the daemon and an unknown key to every lookup here. Top-level keys are
+ * not an allowlist, and most nested objects are read only by name, so such a
+ * key carried privileged, a root bind or a mount propagation past every gate.
+ * Rather than copy Go's fold, which would have to be right for every letter
+ * and every future version, any key outside printable ASCII is refused, at
+ * every depth. The CLI writes its own keys in ASCII, and values - an
+ * environment variable, a label's value - are not checked. A key the job names
+ * itself, such as a label or a container path under Volumes, is refused too
+ * when it is not ASCII: the price of not modelling which objects are structs
+ * the daemon folds and which are maps it does not.
  *
  * Measured against a real daemon rather than reasoned about: a create body
  * carrying `HostConfig`, `hostconfig` and `HOSTCONFIG` came back with fields
@@ -823,10 +839,10 @@ function evaluateOwnContainer(req: DockerRequest, ctx: DockerEvalContext): Docke
  * that does is either a client the filter does not model or an attempt to be
  * judged on one value and served another.
  */
-function caseAmbiguity(value: unknown, at = 'the request body'): string | undefined {
+function keyAmbiguity(value: unknown, at = 'the request body'): string | undefined {
   if (Array.isArray(value)) {
     for (const [i, item] of value.entries()) {
-      const found = caseAmbiguity(item, `${at}[${i}]`);
+      const found = keyAmbiguity(item, `${at}[${i}]`);
       if (found) return found;
     }
     return undefined;
@@ -834,6 +850,11 @@ function caseAmbiguity(value: unknown, at = 'the request body'): string | undefi
   if (!isPlainObject(value)) return undefined;
   const seen = new Map<string, string>();
   for (const key of Object.keys(value)) {
+    // Every key is checked before any is used in a path below, so `at` only
+    // ever names keys that passed.
+    if (!isPlainAscii(key)) {
+      return `${at} has a key "${asciiEscaped(key)}" that is not plain ASCII, which the daemon may read as another key: its decoder folds some other letters to ASCII ones, so the value it would use is not one this filter can read. Spell every key in ASCII.`;
+    }
     const folded = key.toLowerCase();
     const first = seen.get(folded);
     if (first !== undefined) {
@@ -842,10 +863,22 @@ function caseAmbiguity(value: unknown, at = 'the request body'): string | undefi
     seen.set(folded, key);
   }
   for (const [key, child] of Object.entries(value)) {
-    const found = caseAmbiguity(child, `${at}.${key}`);
+    const found = keyAmbiguity(child, `${at}.${key}`);
     if (found) return found;
   }
   return undefined;
+}
+
+/**
+ * The first query parameter named outside printable ASCII. The daemon reads
+ * its parameters by exact name, so none of these is one it knows; like a
+ * body key, it is refused rather than forwarded unexamined.
+ */
+function nonAsciiParam(query: Record<string, string>): string | undefined {
+  const key = Object.keys(query).find((name) => !isPlainAscii(name));
+  return key === undefined
+    ? undefined
+    : `query parameter "${asciiEscaped(key)}" is not plain ASCII; the localmost docker socket reads parameters by their ASCII names only`;
 }
 
 export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext): DockerVerdict {
@@ -859,8 +892,9 @@ export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext
   if (req.bodyError) return deny(req.bodyError);
 
   // Nor can it judge a body whose keys the daemon would read differently than
-  // it does. Checked once, here, so every action with a body is covered.
-  const ambiguous = caseAmbiguity(req.body);
+  // it does, or a parameter it does not know. Checked once, here, so every
+  // action with a body or a query string is covered.
+  const ambiguous = keyAmbiguity(req.body) ?? nonAsciiParam(req.query);
   if (ambiguous) return deny(ambiguous);
 
   switch (action) {
