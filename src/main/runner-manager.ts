@@ -608,72 +608,13 @@ export class RunnerManager {
     return this.toolCacheLocation;
   }
 
-  async start(): Promise<void> {
-    if (this.isRunning()) {
-      this.log('warn', 'Runner is already running');
-      return;
-    }
-
-    // Show 'starting' status immediately while we do setup
-    this.startedAt = new Date().toISOString();
-    this.updateStatus('starting');
-    // As in initialize(): the previous pool's records go before the sweep,
-    // so a worker the broker spawns during it is not dropped with them.
-    this.instances.clear();
-    this.startingInstances.clear();
-
-    if (!this.downloader.isDownloaded()) {
-      this.startedAt = null;
-      this.updateStatus('offline');
-      throw new Error('Runner is not downloaded. Please download first.');
-    }
-
-    if (!this.isConfigured()) {
-      this.startedAt = null;
-      this.updateStatus('offline');
-      throw new Error('Runner is not configured. Please complete setup first.');
-    }
-
-    this.loadRunnerConfig();
-
-    // Get the installed version
-    this.runnerVersion = this.downloader.getInstalledVersion();
-    if (!this.runnerVersion) {
-      this.startedAt = null;
-      this.updateStatus('offline');
-      throw new Error('Could not determine runner version.');
-    }
-
-    // Kill any stale runner processes
-    await this.killStaleProcesses();
-    await this.detectStaleRunnerProcesses();
-
-    const displayName = this.getStatusDisplayName();
-    this.log('info', `Starting runner pool (max ${this.runnerCount}, ${displayName})...`);
-
-    this.stopping = false;
-
-    // Start one listener in slot 1. It takes no job - the broker binds only a
-    // worker admission spawned and announced for one - so until the pool stops
-    // it only holds the slot; the app's own start path (initialize) starts
-    // none. Unless a job already brought one up during the sweep: spawning
-    // over it would orphan that worker, whose exit is gated on it still being
-    // the slot's.
-    if (!this.instances.has(1) && !this.startingInstances.has(1)) {
-      await this.startInstance(1);
-    }
-
-    this.updateStatus('listening');
-  }
-
   /**
    * Initialize the runner manager without starting any workers.
    * Used for on-demand worker spawning where broker proxy triggers worker starts.
    */
   async initialize(): Promise<void> {
-    // Mirrors start(): a second initialize while workers are live (a Start
-    // click overlapping auto-start) would re-run the stale-process sweep
-    // against them.
+    // A second initialize while workers are live (a Start click overlapping
+    // auto-start) would re-run the stale-process sweep against them.
     if (this.isRunning()) {
       this.log('info', 'Runner is already running');
       return;

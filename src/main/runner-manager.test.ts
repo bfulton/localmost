@@ -230,9 +230,17 @@ describe('RunnerManager', () => {
     });
   });
 
-  describe('start', () => {
-    it('should throw error if not downloaded', async () => {
-      // Create a new manager with downloader that returns false for isDownloaded
+  describe('starting the pool', () => {
+    it('has no way to start a worker that is not for a job', () => {
+      // start() used to bring up a listener in slot 1 with no job. A session
+      // binds only through the expectation admission sets for a worker it
+      // spawned, so that listener could never take a job; it only held a slot
+      // and a live broker key. initialize() is the one way to start the pool.
+      expect((RunnerManager.prototype as unknown as Record<string, unknown>).start).toBeUndefined();
+    });
+
+    it('refuses to start the pool with no runner installed', async () => {
+      // Create a new manager with a downloader that has no runner version
       jest.resetModules();
       jest.doMock('./runner-downloader', () => ({
         RunnerDownloader: jest.fn().mockImplementation(() => ({
@@ -246,13 +254,15 @@ describe('RunnerManager', () => {
       }));
 
       const { RunnerManager: RM } = require('./runner-manager');
+      const onStatusChange = jest.fn();
       const manager = new RM({
         onLog: mockOnLog,
-        onStatusChange: mockOnStatusChange,
+        onStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
       });
 
-      await expect(manager.start()).rejects.toThrow('Runner is not downloaded');
+      await expect(manager.initialize()).rejects.toThrow('Could not determine runner version');
+      expect(onStatusChange).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'offline' }));
     });
 
     it('should warn if binary not found in sandbox', async () => {
@@ -260,13 +270,15 @@ describe('RunnerManager', () => {
       (fs.existsSync as jest.Mock).mockImplementation((p: string) => {
         if (p.includes('run.sh')) return false;
         if (p.includes('.runner')) return true;
+        if (p.includes('/proxies/')) return true;
         if (p === mockConfigPath) return true;
         return false;
       });
 
-      await runnerManager.start();
+      const started = await new RunnerManagerTestHelper(runnerManager).spawnForJob();
 
-      // Should log a warning about missing binary
+      // Should log a warning about missing binary, and report no worker
+      expect(started).toBe(false);
       expect(mockOnLog).toHaveBeenCalledWith(
         expect.objectContaining({
           level: 'warn',
@@ -283,12 +295,13 @@ describe('RunnerManager', () => {
       const mockProcess = createMockProcess(12345);
       mockSpawnSandboxed.mockReturnValue(mockProcess);
 
-      await runnerManager.start();
+      const started = await new RunnerManagerTestHelper(runnerManager).spawnForJob();
 
+      expect(started).toBe(true);
       expect(mockOnLog).toHaveBeenCalledWith(
         expect.objectContaining({
           level: 'info',
-          message: expect.stringContaining('Starting'),
+          message: expect.stringContaining('Spawning worker 1'),
         })
       );
 
@@ -296,24 +309,24 @@ describe('RunnerManager', () => {
       expect(mockSpawnSandboxed).toHaveBeenCalled();
     });
 
-    it('should warn if already running', async () => {
-      // Setup running state by mocking internal status
+    it('does nothing when initialized again while a worker is running', async () => {
       (fs.existsSync as jest.Mock).mockReturnValue(true);
 
       const mockProcess = createMockProcess(12346);
       mockSpawnSandboxed.mockReturnValue(mockProcess);
 
-      await runnerManager.start();
+      await new RunnerManagerTestHelper(runnerManager).spawnForJob();
 
       // Try to start again
-      await runnerManager.start();
+      await runnerManager.initialize();
 
       expect(mockOnLog).toHaveBeenCalledWith(
         expect.objectContaining({
-          level: 'warn',
           message: expect.stringContaining('already running'),
         })
       );
+      expect(mockSpawnSandboxed).toHaveBeenCalledTimes(1);
+      expect(runnerManager.isRunning()).toBe(true);
     });
   });
 
@@ -1402,7 +1415,7 @@ describe('RunnerManager', () => {
       mockSpawnSandboxed.mockReturnValue(createMockProcess(7777));
       (fs.writeFileSync as jest.Mock).mockClear();
 
-      await runnerManager.start();
+      await new RunnerManagerTestHelper(runnerManager).spawnForJob();
 
       const opts = mockSpawnSandboxed.mock.calls.at(-1)![2]!;
       expect(opts.stdio).toEqual(['ignore', 'pipe', 'pipe', 42]);
@@ -1427,7 +1440,7 @@ describe('RunnerManager', () => {
         if (String(f).endsWith('.mark')) throw new Error('EACCES: permission denied');
       });
       try {
-        await runnerManager.start();
+        await new RunnerManagerTestHelper(runnerManager).spawnForJob();
 
         const opts = mockSpawnSandboxed.mock.calls.at(-1)![2]!;
         expect(opts.stdio).toEqual(['ignore', 'pipe', 'pipe']);
@@ -1596,9 +1609,8 @@ describe('RunnerManager', () => {
     });
 
     it('does not re-run the stale sweep when initialize is called while workers are live', async () => {
-      // start() already refuses this; initialize() is the other entry point
-      // that runs the sweep, and a Start click overlapping auto-start must not
-      // sweep the workers auto-start just brought up.
+      // initialize() runs the sweep, and a Start click overlapping auto-start
+      // must not sweep the workers auto-start just brought up.
       const helper = new RunnerManagerTestHelper(runnerManager);
       helper.setInstance(1, { name: 'runner-1', status: 'busy', process: { pid: 5001, kill: jest.fn() } as never });
       (fs.existsSync as jest.Mock).mockReturnValue(true);
@@ -1623,7 +1635,7 @@ describe('RunnerManager', () => {
       (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([] as never);
       (fs.writeFileSync as jest.Mock).mockClear();
 
-      await runnerManager.start();
+      await new RunnerManagerTestHelper(runnerManager).spawnForJob();
 
       const write = (fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => String(f).endsWith('.pid'));
       expect(write).toBeDefined();
@@ -1788,7 +1800,7 @@ describe('RunnerManager', () => {
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       mockSpawnSandboxed.mockReturnValue(createMockProcess(9911));
 
-      await runnerManager.start();
+      await new RunnerManagerTestHelper(runnerManager).spawnForJob();
 
       const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
       expect(env.HTTPS_PROXY).toMatch(/^http:\/\/localmost:[0-9a-f]{48}@127\.0\.0\.1:/);
@@ -1810,7 +1822,7 @@ describe('RunnerManager', () => {
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       mockSpawnSandboxed.mockReturnValue(createMockProcess(9912));
 
-      await runnerManager.start();
+      await new RunnerManagerTestHelper(runnerManager).spawnForJob();
 
       const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
       const jobTmp = '/Users/test/.localmost/runner/sandbox/1/_temp';
@@ -1826,8 +1838,10 @@ describe('RunnerManager', () => {
       const helper = new RunnerManagerTestHelper(runnerManager);
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
-      if (targetId) helper.setPendingTargetContext('1', { targetId, targetDisplayName: 'owner/repo' });
-      await runnerManager.start();
+      // A worker is only ever spawned for a job, so the no-target case is the
+      // bare start a re-registration restart makes.
+      if (targetId) await helper.spawnForJob({ targetId, targetDisplayName: 'owner/repo' });
+      else await helper.startWorkerWithoutJob();
       return mockSpawnSandboxed.mock.calls.at(-1)![2]!;
     };
 
@@ -1882,8 +1896,7 @@ describe('RunnerManager', () => {
       const helper = new RunnerManagerTestHelper(manager);
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
-      helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
-      await manager.start();
+      await helper.spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
       return mockSpawnSandboxed.mock.calls.at(-1)![2]!;
     };
     const packages = '/Users/test/.localmost/runner/caches/t1/packages';
@@ -1965,7 +1978,7 @@ describe('RunnerManager', () => {
         (fs.existsSync as jest.Mock).mockReturnValue(true);
         mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
 
-        await runnerManager.start();
+        await new RunnerManagerTestHelper(runnerManager).spawnForJob();
 
         const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
         expect(env.FOO_SECRET).toBeUndefined();
@@ -1994,9 +2007,8 @@ describe('RunnerManager', () => {
         const helper = new RunnerManagerTestHelper(manager);
         (fs.existsSync as jest.Mock).mockReturnValue(true);
         mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
-        helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
 
-        await manager.start();
+        await helper.spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
 
         const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
         expect(env.DEVELOPER_DIR).toBe('/Applications/Xcode-beta.app');
@@ -2019,9 +2031,8 @@ describe('RunnerManager', () => {
         const helper = new RunnerManagerTestHelper(manager);
         (fs.existsSync as jest.Mock).mockReturnValue(true);
         mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
-        helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
 
-        await manager.start();
+        await helper.spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
 
         const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
         expect(env.HTTPS_PROXY).toMatch(/^http:\/\/localmost:/);
@@ -2058,9 +2069,8 @@ describe('RunnerManager', () => {
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       (fs.readFileSync as jest.Mock).mockReturnValue(JSON.stringify({ agentName: 'r1', serverUrlV2: 'http://localhost:8787/' }));
       mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
-      helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo' });
 
-      await manager.start();
+      await helper.spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo' });
 
       expect(issued).toEqual([[1, 't1']]);
       const write = (fs.writeFileSync as jest.Mock).mock.calls.find(([file]) => String(file).endsWith('sandbox/1/.runner'));
@@ -2099,7 +2109,7 @@ describe('RunnerManager', () => {
       }));
       mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
 
-      await manager.start();
+      await new RunnerManagerTestHelper(manager).spawnForJob();
 
       expect(asked).toEqual([1]);
       const written = (name: string) => (fs.writeFileSync as jest.Mock).mock.calls.find(([file]) => String(file).endsWith(`sandbox/1/${name}`));
@@ -2339,7 +2349,7 @@ describe('RunnerManager', () => {
         unlink.mockClear();
         mockMarkerHolders.mockClear();
         mockMarkerHolders.mockReturnValue([]);
-        await runnerManager.start();
+        await new RunnerManagerTestHelper(runnerManager).spawnForJob();
         const marker = String((fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => /\/pids\/1-[0-9a-f]+\.mark$/.test(String(f)))![0]);
 
         proc.emit('exit', 1, null);
@@ -2353,13 +2363,10 @@ describe('RunnerManager', () => {
       }
     });
 
-    it.each([
-      ['initialize', (m: RunnerManager) => m.initialize()],
-      ['start', (m: RunnerManager) => m.start()],
-    ])('keeps a worker that spawns while %s() is still sweeping', async (_name, run) => {
+    it('keeps a worker that spawns while initialize() is still sweeping', async () => {
       // The broker is already handing out jobs during the sweep. The previous
       // pool's records are dropped before it, so this worker is not dropped
-      // with them - and start() does not spawn a second worker over it.
+      // with them.
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
         { name: '9-deadbeef.mark', isFile: () => true, isDirectory: () => false },
@@ -2368,7 +2375,7 @@ describe('RunnerManager', () => {
       mockMarkerHolders.mockImplementationOnce((() => new Promise<number[]>((resolve) => { answer = resolve; })) as unknown as () => number[]);
       mockSpawnSandboxed.mockReturnValue(createMockProcess(6001));
 
-      const running = run(runnerManager);
+      const running = runnerManager.initialize();
       await settle();
       await (runnerManager as unknown as { startInstance(n: number): Promise<void> }).startInstance(1);
       answer([]);
@@ -2435,7 +2442,7 @@ describe('RunnerManager', () => {
       mockSpawnSandboxed.mockReturnValue(proc);
       jest.useFakeTimers();
       try {
-        await manager.start();
+        await new RunnerManagerTestHelper(manager).spawnForJob();
         const proxy = (ProxyServer as unknown as jest.Mock).mock.results.at(-1)!.value;
         const rotationsAtStart = proxy.rotateAuthToken.mock.calls.length;
         expect(rotationsAtStart).toBeGreaterThan(0);
@@ -2463,7 +2470,7 @@ describe('RunnerManager', () => {
       mockSpawnSandboxed.mockReturnValue(proc);
       jest.useFakeTimers();
       try {
-        await manager.start();
+        await helper.spawnForJob();
         const proxy = (ProxyServer as unknown as jest.Mock).mock.results.at(-1)!.value;
         helper.releaseInstanceSlot(1); // the reap
         helper.setInstance(1, { name: 'runner-1', status: 'busy', process: { pid: 6002, kill: jest.fn() } as never });
@@ -2497,7 +2504,7 @@ describe('RunnerManager', () => {
       // The exit arms a marker settle timer; keep it from firing in a later test.
       jest.useFakeTimers();
       try {
-        await manager.start();
+        await new RunnerManagerTestHelper(manager).spawnForJob();
         expect(mockSpawnSandboxed).toHaveBeenCalled();
 
         proc.emit('exit', 0, null);
@@ -2572,12 +2579,11 @@ describe('RunnerManager', () => {
     });
 
     it('forgets the job when the worker exits before taking it', async () => {
-      const { manager, helper, cancelled } = recordingManager();
+      const { helper, cancelled } = recordingManager();
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       const proc = createMockProcess(12345);
       mockSpawnSandboxed.mockReturnValue(proc);
-      helper.setPendingTargetContext('1', context);
-      await manager.start();
+      await helper.spawnForJob(context);
 
       proc.emit('exit', 1, null);
       await settle();
@@ -2589,12 +2595,11 @@ describe('RunnerManager', () => {
     it("leaves the slot's next worker alone when an old worker's exit arrives late", async () => {
       // A reaped worker is signalled and its slot handed out at once, so its
       // exit can land after the next worker has been spawned into the slot.
-      const { manager, helper, cancelled } = recordingManager();
+      const { helper, cancelled } = recordingManager();
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       const proc = createMockProcess(12345);
       mockSpawnSandboxed.mockReturnValue(proc);
-      helper.setPendingTargetContext('1', context);
-      await manager.start();
+      await helper.spawnForJob(context);
       const next = { targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'req-2' };
       helper.setInstance(1, { name: 'runner-1', status: 'starting', process: createMockProcess(777) });
       helper.setPendingTargetContext('1', next);
@@ -2761,7 +2766,7 @@ describe('RunnerManager', () => {
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
 
-      await runnerManager.start();
+      await new RunnerManagerTestHelper(runnerManager).spawnForJob();
 
       const socket = dockerSocketOf(new RunnerManagerTestHelper(runnerManager), 1);
       expect(socket).toBeDefined();
@@ -2806,7 +2811,7 @@ describe('RunnerManager', () => {
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
 
-      await manager.start();
+      await new RunnerManagerTestHelper(manager).spawnForJob();
 
       const socket = dockerSocketOf(new RunnerManagerTestHelper(manager), 1);
       expect(socket.options.backend).toBe(dockerBackend);
@@ -2818,7 +2823,7 @@ describe('RunnerManager', () => {
       // with its policy hint; neither is any use unless it reaches the log.
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
-      await runnerManager.start();
+      await new RunnerManagerTestHelper(runnerManager).spawnForJob();
       const socket = dockerSocketOf(new RunnerManagerTestHelper(runnerManager), 1);
 
       socket.options.onLog?.({ level: 'warn', message: 'no Docker daemon resolved; the job runs without Docker' });
@@ -2921,8 +2926,8 @@ describe('RunnerManager', () => {
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       const proc = createMockProcess(12345);
       mockSpawnSandboxed.mockReturnValue(proc);
-      await runnerManager.start();
       const helper = new RunnerManagerTestHelper(runnerManager);
+      await helper.spawnForJob();
       const socket = dockerSocketOf(helper, 1);
 
       proc.emit('exit', 0, null);

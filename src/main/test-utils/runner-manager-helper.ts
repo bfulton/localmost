@@ -198,6 +198,31 @@ export class RunnerManagerTestHelper {
     manager.downloader = { ...(manager.downloader ?? {}), copyProxyCredentials: impl };
   }
 
+  /**
+   * Bring the pool up and start the worker for one admitted job, as the app
+   * does: initialize, then admission's hand-off through 'next' to
+   * spawnWorkerForJob. Resolves to whether a worker process was started.
+   */
+  async spawnForJob(
+    context: Parameters<RunnerManagerTestHelper['setPendingTargetContext']>[1] = {
+      targetId: 't1',
+      targetDisplayName: 'owner/repo',
+    }
+  ): Promise<boolean> {
+    await this.manager.initialize();
+    this.setPendingTargetContext('next', context);
+    return this.manager.spawnWorkerForJob();
+  }
+
+  /**
+   * Bring the pool up and start a worker in a slot with no job context, as
+   * restarting an instance after re-registration does.
+   */
+  async startWorkerWithoutJob(instanceNum = 1): Promise<void> {
+    await this.manager.initialize();
+    await this.manager.startInstance(instanceNum);
+  }
+
   /** Run the stale-process sweep that startup performs. */
   async killStaleProcesses(): Promise<void> {
     await (this.manager as never as { killStaleProcesses(): Promise<void> }).killStaleProcesses();
