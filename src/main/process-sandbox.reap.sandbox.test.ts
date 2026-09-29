@@ -158,6 +158,6 @@ if (!isMacOS) {
         other.kill('SIGKILL');
         fs.rmSync(dir, { recursive: true, force: true });
       }
-    });
+    }, 30000);
   });
 }
