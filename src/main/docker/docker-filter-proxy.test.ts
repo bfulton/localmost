@@ -534,6 +534,19 @@ describe('DockerFilterProxy attach', () => {
     socket.destroy();
   });
 
+  it('attaches to the id a name was created with, not whatever holds the name now', async () => {
+    const dir = tmp();
+    const daemon = await fakeAttachDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
+    expect((await request(sock, 'POST', '/v1.45/containers/create?name=mine', { Image: 'postgres:16' })).status).toBe(201);
+
+    const { head, socket } = await attach(sock, '/v1.45/containers/mine/attach?stream=1&stdout=1');
+    socket.destroy();
+    expect(head).toMatch(/^HTTP\/1\.1 101/);
+    expect(daemon.heads[0]).toMatch(/^POST \/v1\.45\/containers\/abc123\/attach\?stream=1&stdout=1 HTTP\/1\.1/);
+  });
+
   it('refuses an attach the policy does not permit on the raw connection, before the daemon sees it', async () => {
     const dir = tmp();
     const daemon = await fakeAttachDaemon(dir);
@@ -754,6 +767,23 @@ describe('which containers a job may address', () => {
     expect((await request(sock, 'GET', '/v1.45/containers/abc123/json')).status).toBe(403);
   });
 
+  it('sends the daemon the id a name was created with, so a name freed by --rm cannot reach its next holder', async () => {
+    const { sock, daemon } = await setup();
+    // docker run --rm --name mine: the daemon frees the name the moment the
+    // container exits, and another job, or the operator, may take it. The
+    // name is still owned here, so what the daemon receives must be the id
+    // it was created with - a removed container is then a 404, not whichever
+    // container holds the name now.
+    await request(sock, 'POST', '/v1.45/containers/create?name=mine', { Image: 'postgres:16' });
+    expect((await request(sock, 'POST', '/v1.45/containers/mine/kill?signal=KILL')).status).toBeLessThan(400);
+    expect(daemon.seen[daemon.seen.length - 1].url).toBe('/v1.45/containers/abc123/kill?signal=KILL');
+    // Unversioned, and on a bare container path, the same.
+    expect((await request(sock, 'POST', '/containers/mine/wait?condition=removed')).status).toBeLessThan(400);
+    expect(daemon.seen[daemon.seen.length - 1].url).toBe('/v1.45/containers/abc123/wait?condition=removed');
+    expect((await request(sock, 'DELETE', '/v1.45/containers/mine?force=1')).status).toBeLessThan(400);
+    expect(daemon.seen[daemon.seen.length - 1].url).toBe('/v1.45/containers/abc123?force=1');
+  });
+
   it('does not accept a bare prefix of an owned id', async () => {
     const { sock } = await setup();
     // The fake daemon answers create with Id abc123. A prefix could resolve on
@@ -788,6 +818,23 @@ describe('networks a job creates', () => {
     expect((await request(sock, 'GET', '/v1.45/networks/net123')).status).toBe(403);
   });
 
+  it('are addressed at the daemon by the id they were created with', async () => {
+    // A network name is freed when anyone removes it, and the next network
+    // with that name is not this job's. The daemon is sent the id.
+    const dir = tmp();
+    const daemon = await networkDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', {
+      run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] },
+    });
+    expect((await request(sock, 'POST', '/v1.45/networks/create', { Name: 'vk-1', Internal: true })).status).toBe(201);
+
+    expect((await request(sock, 'GET', '/v1.45/networks/vk-1?verbose=true')).status).toBeLessThan(400);
+    expect(daemon.seen[daemon.seen.length - 1]).toBe('GET /v1.45/networks/net123?verbose=true');
+    expect((await request(sock, 'DELETE', '/networks/vk-1')).status).toBeLessThan(400);
+    expect(daemon.seen[daemon.seen.length - 1]).toBe('DELETE /v1.45/networks/net123');
+  });
+
   it('are recorded under the name whatever casing the client spelled the key with', async () => {
     // The daemon decodes `name` into the same field as `Name`, so it creates
     // the network either way, and the evaluator already judges either way.
@@ -808,13 +855,15 @@ describe('networks a job creates', () => {
 });
 
 /** A fake daemon that also answers network create. */
-const networkDaemon = (dir: string): Promise<{ sock: string }> =>
+const networkDaemon = (dir: string): Promise<{ sock: string; seen: string[] }> =>
   new Promise((resolve) => {
     const sock = path.join(dir, 'netd.sock');
+    const seen: string[] = [];
     const server = http.createServer((req, res) => {
       const chunks: Buffer[] = [];
       req.on('data', (c: Buffer) => chunks.push(c));
       req.on('end', () => {
+        seen.push(`${req.method} ${req.url}`);
         const p = req.url!.replace(/^\/v\d+\.\d+/, '').split('?')[0];
         if (p === '/networks/create') {
           res.writeHead(201, { 'Content-Type': 'application/json' });
@@ -829,5 +878,5 @@ const networkDaemon = (dir: string): Promise<{ sock: string }> =>
       });
     });
     servers.push(server);
-    server.listen(sock, () => resolve({ sock }));
+    server.listen(sock, () => resolve({ sock, seen }));
   });

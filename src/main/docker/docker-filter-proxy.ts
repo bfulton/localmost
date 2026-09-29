@@ -438,10 +438,43 @@ export class DockerFilterProxy {
     this.forward(parsed, req, res, body, endpoint.socketPath);
   }
 
-  /** The URL as forwarded: an unversioned request is pinned to the version we understand. */
+  /**
+   * The URL as forwarded: an unversioned request is pinned to the version we
+   * understand, and an owned container or network is named by its id.
+   */
   private forwardedUrl(parsed: DockerRequest): string {
+    const pinnedPath = this.pinnedPath(parsed);
+    if (pinnedPath !== undefined) {
+      const queryStart = parsed.raw.url.indexOf('?');
+      const query = queryStart === -1 ? '' : parsed.raw.url.slice(queryStart);
+      return `/${parsed.apiVersion ?? `v${bareVersion(this.maxApiVersion)}`}${pinnedPath}${query}`;
+    }
     if (parsed.apiVersion) return parsed.raw.url;
     return `/v${bareVersion(this.maxApiVersion)}${parsed.raw.url}`;
+  }
+
+  /**
+   * The request's path with an owned alias replaced by the id it was created
+   * with, or undefined when it addresses nothing by alias.
+   *
+   * Ownership is recorded when a name is created and forgotten only when the
+   * job removes it through this socket. The daemon frees a name sooner than
+   * that - an AutoRemove container the moment it exits, a network whenever
+   * anyone deletes it - and hands it to whoever asks next. Forwarding the name
+   * would then reach that next holder. The id is never reused, so a removed
+   * container or network answers 404 instead.
+   */
+  private pinnedPath(parsed: DockerRequest): string | undefined {
+    const pin = (prefix: string, alias: string | undefined, owned: Map<string, string>): string | undefined => {
+      if (alias === undefined) return undefined;
+      const id = owned.get(alias);
+      if (id === undefined || id === alias) return undefined;
+      return `${prefix}${encodeURIComponent(id)}${parsed.path.slice(prefix.length + alias.length)}`;
+    };
+    return (
+      pin('/containers/', containerIdFrom(parsed), this.ownContainerAliases) ??
+      pin('/networks/', networkIdFrom(parsed), this.ownNetworkAliases)
+    );
   }
 
   /** The headers as forwarded: credentials the job may have set are replaced with ours. */
