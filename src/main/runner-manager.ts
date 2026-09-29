@@ -1,5 +1,5 @@
 import { ChildProcess } from 'child_process';
-import { processStartTime, markerHolders, signalOrphanPids, parsePidRecord } from './runner-cleanup';
+import { processStartTime, lookUpStartTime, mayEscalate, markerHolders, signalOrphanPids, parsePidRecord } from './runner-cleanup';
 import { GRACE_MS } from './process-group';
 import * as path from 'path';
 import { createHash, randomBytes } from 'crypto';
@@ -2747,6 +2747,9 @@ export class RunnerManager {
         }
         continue;
       }
+      // sweepablePid matched it against the record, so this is the start
+      // time the SIGTERM below goes to.
+      const { recordedStart } = parsePidRecord(contents);
       try {
         process.kill(pid, 0);
         this.log('info', `Killing stale runner process group ${pid}`);
@@ -2755,19 +2758,27 @@ export class RunnerManager {
         // reparented to launchd, are the orphans this sweep exists for.
         this.signalGroupOrLeader(pid, 'SIGTERM');
         await new Promise((resolve) => setTimeout(resolve, 1000));
-        try {
-          // Probe the group, not just the leader: a leader can exit while a
-          // descendant ignores SIGTERM, and kill(pid, 0) on the dead leader
-          // would skip the SIGKILL the descendant still needs.
-          process.kill(-pid, 0);
-          this.signalGroupOrLeader(pid, 'SIGKILL');
-        } catch {
+        // Liveness alone cannot tell the worker from a process that took its
+        // pid after it exited on the SIGTERM; the start time can, as it did
+        // before the SIGTERM. A leader gone with descendants left in its
+        // group is still escalated (mayEscalate, as in runner-cleanup).
+        if (!mayEscalate(recordedStart, lookUpStartTime(pid))) {
+          this.log('info', `Stale runner ${pid} exited; its pid now belongs to another process, which is left alone`);
+        } else {
           try {
-            // Group gone, but the leader itself may linger; escalate to it.
-            process.kill(pid, 0);
+            // Probe the group, not just the leader: a leader can exit while a
+            // descendant ignores SIGTERM, and kill(pid, 0) on the dead leader
+            // would skip the SIGKILL the descendant still needs.
+            process.kill(-pid, 0);
             this.signalGroupOrLeader(pid, 'SIGKILL');
           } catch {
-            // Everything exited after SIGTERM - the expected success case.
+            try {
+              // Group gone, but the leader itself may linger; escalate to it.
+              process.kill(pid, 0);
+              this.signalGroupOrLeader(pid, 'SIGKILL');
+            } catch {
+              // Everything exited after SIGTERM - the expected success case.
+            }
           }
         }
       } catch {
@@ -2779,6 +2790,7 @@ export class RunnerManager {
 
   private async detectStaleRunnerProcesses(): Promise<void> {
     const orphanedPids: number[] = [];
+    const recordedStarts = new Map<number, string>();
     try {
       for (const [pidFile, contents] of await this.readPidFiles()) {
         // Liveness is read now, not from a snapshot taken before the await.
@@ -2793,6 +2805,7 @@ export class RunnerManager {
         try {
           process.kill(pid, 0);
           orphanedPids.push(pid);
+          recordedStarts.set(pid, parsePidRecord(contents).recordedStart);
         } catch {
           await fs.promises.unlink(pidFile).catch(() => undefined);
         }
@@ -2810,6 +2823,9 @@ export class RunnerManager {
             process.kill(pid, 'SIGTERM');
 
             await new Promise((resolve) => setTimeout(resolve, 1000));
+            // Only the process that was sent SIGTERM: one that took its pid
+            // since has another start time.
+            if (!mayEscalate(recordedStarts.get(pid), lookUpStartTime(pid))) continue;
             try {
               process.kill(pid, 0);
               process.kill(pid, 'SIGKILL');

@@ -442,3 +442,65 @@ describe('saving the job history', () => {
     }));
   });
 });
+
+describe("sweeping a previous session's workers", () => {
+  function pidRecord(contents: string) {
+    (fs.existsSync as jest.Mock).mockReturnValue(true);
+    (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
+      { name: '1.pid', isFile: () => true, isDirectory: () => false },
+    ] as never);
+    (jest.mocked(fs.promises.readFile) as unknown as jest.Mock).mockResolvedValue(contents as never);
+  }
+  const killsOf = (calls: Array<[number, string | number | undefined]>) =>
+    calls.filter(([, sig]) => sig !== 0);
+
+  it('escalates to SIGKILL only while the pid still names the group it signalled', async () => {
+    // The start time seen at escalation, whether the leader is gone by then,
+    // and whether SIGKILL may go out.
+    const cases: Array<[string, string | null | undefined, boolean, boolean]> = [
+      // The worker exited on SIGTERM and its pid went to a new process: bare
+      // liveness says "still there", the start time says it is someone else.
+      ['the pid changed hands', 'LATER', false, false],
+      // Nobody at the pid, but the group it led still has members.
+      ['the leader exited, leaving its group', null, true, true],
+      ['the same leader ignored SIGTERM', 'START', false, true],
+      // Unknown is not a difference: as before the re-check existed.
+      ['the lookup failed', undefined, false, true],
+    ];
+    for (const [name, now, leaderGone, escalates] of cases) {
+      const { helper } = newManager();
+      pidRecord('4242 START\n');
+      mockLookUpStartTime.mockImplementation(() => now);
+      let termed = false;
+      const kill = stubKill((pid, sig) => {
+        if (sig === 'SIGTERM') termed = true;
+        if (termed && leaderGone && pid === 4242) throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
+        return true;
+      });
+      try {
+        await helper.killStaleProcesses();
+      } finally {
+        kill.restore();
+      }
+
+      expect([name, killsOf(kill.calls)]).toEqual([
+        name,
+        escalates ? [[-4242, 'SIGTERM'], [-4242, 'SIGKILL']] : [[-4242, 'SIGTERM']],
+      ]);
+    }
+  });
+
+  it('applies the same rule to orphans found at startup', async () => {
+    const { manager } = newManager();
+    pidRecord('4242 START\n');
+    mockLookUpStartTime.mockImplementation(() => 'LATER');
+    const kill = stubKill();
+    try {
+      await (manager as unknown as { detectStaleRunnerProcesses(): Promise<void> }).detectStaleRunnerProcesses();
+    } finally {
+      kill.restore();
+    }
+
+    expect(killsOf(kill.calls)).toEqual([[4242, 'SIGTERM']]);
+  });
+});
