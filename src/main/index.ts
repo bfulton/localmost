@@ -13,7 +13,7 @@ import { HeartbeatManager, toHeartbeatTarget } from './heartbeat-manager';
 import { BrokerProxyService } from './broker-proxy-service';
 import { TargetManager } from './target-manager';
 import { ContributorCache } from './contributor-cache';
-import { admitJob, checkRepoPolicyApproval, JobAdmissionDeps, PolicyApprovalDeps } from './job-admission';
+import { admitJob, buildAdmissionDeps, PolicyApprovalDeps } from './job-admission';
 import { repoPolicyRuntime } from './repo-policy';
 
 // State management
@@ -403,14 +403,12 @@ app.whenReady().then(async () => {
 
   // Wire up broker proxy to runner manager: when a job is received, decide
   // whether it may run and spawn the worker for it.
-  const admission: JobAdmissionDeps = {
+  const admission = buildAdmissionDeps(repoPolicyApproval, {
     findTarget: (targetId: string) => targetManager.getTargets().find(t => t.id === targetId),
     runnerManager,
     broker: brokerProxyService,
-    checkPolicyApproval: (owner, repo, sha, repositoryId) =>
-      checkRepoPolicyApproval(repoPolicyApproval, owner, repo, sha, repositoryId),
     log: (level, message) => getLogger()?.[level](message),
-  };
+  });
   brokerProxyService.on('job-received', (targetId: string, jobId: string, _registeredRunnerName: string, githubInfo) => {
     admitJob(admission, targetId, jobId, githubInfo).catch((err) => {
       getLogger()?.error(`Admission of job ${jobId} failed: ${(err as Error).message}`);

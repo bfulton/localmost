@@ -149,6 +149,23 @@ export interface PolicyApprovalDeps {
 }
 
 /**
+ * The admission's dependencies, its policy check made by
+ * checkRepoPolicyApproval. Built here rather than by each caller, so the
+ * job's repository id - the approval's binding to the repository it was given
+ * to - cannot be dropped between the two.
+ */
+export function buildAdmissionDeps(
+  policyApproval: PolicyApprovalDeps,
+  deps: Omit<JobAdmissionDeps, 'checkPolicyApproval'>
+): JobAdmissionDeps {
+  return {
+    ...deps,
+    checkPolicyApproval: (owner, repo, sha, repositoryId) =>
+      checkRepoPolicyApproval(policyApproval, owner, repo, sha, repositoryId),
+  };
+}
+
+/**
  * Check whether a repository's .localmostrc has been approved for use.
  *
  * Returns a reason to refuse the job, or null to proceed. A repository with no
