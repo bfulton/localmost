@@ -50,10 +50,39 @@ describe('parseDockerRequest', () => {
     expect(empty.bodyError).toBeUndefined();
   });
 
-  it('reads the first value of a repeated query key, as the daemon does', () => {
-    const req = mk('POST', '/v1.45/images/create?fromImage=postgres&fromImage=evil&tag=16');
+  it('refuses a query that repeats a key, which decoders read differently', () => {
+    // moby reads the first value of a repeated key; Podman's gorilla/schema
+    // keeps the last, and matches names case-insensitively. No one value is
+    // the one every daemon would use.
+    for (const url of [
+      '/v1.45/images/create?fromImage=postgres&fromImage=evil&tag=16',
+      '/v1.45/images/create?fromImage=postgres&FROMIMAGE=evil&tag=16',
+      '/v1.45/images/create?fromImage=postgres&from%49mage=evil&tag=16',
+    ]) {
+      expect(mk('POST', url).targetError).toMatch(/more than once/);
+    }
+    const req = mk('POST', '/v1.45/images/create?fromImage=postgres&tag=16');
+    expect(req.targetError).toBeUndefined();
+    // A build's tags are the one list a client repeats (`docker build -t a -t
+    // b`), and every daemon reads all of them. Only that spelling, and only there.
+    expect(mk('POST', '/v1.45/build?t=a%3A1&t=b%3A2&q=1').targetError).toBeUndefined();
+    expect(mk('POST', '/v1.45/build?t=a&T=b').targetError).toMatch(/more than once/);
+    expect(mk('POST', '/v1.45/build?T=a&t=b').targetError).toMatch(/more than once/);
+    expect(mk('POST', '/v1.45/build?q=1&q=0').targetError).toMatch(/more than once/);
+    expect(mk('POST', '/v1.45/images/create?fromImage=postgres&t=a&t=b').targetError).toMatch(/more than once/);
     expect(req.query.fromImage).toBe('postgres');
     expect(req.query.tag).toBe('16');
+  });
+
+  it('refuses a query with a ";" or a "%" that does not start an escape', () => {
+    // moby answers 400 to both; Podman's decoder reads past them. Neither is
+    // something a client's encoder produces.
+    expect(mk('POST', '/v1.45/images/create?fromImage=postgres;&tag=16').targetError).toMatch(/";"/);
+    expect(mk('POST', '/v1.45/images/create?fromImage=postgres%zz&tag=16').targetError).toMatch(/escape/);
+    expect(mk('POST', '/v1.45/images/create?fromImage=postgres%2&tag=16').targetError).toMatch(/escape/);
+    expect(mk('POST', '/v1.45/images/create?fromImage=postgres%').targetError).toMatch(/escape/);
+    // Well-formed escapes, in either case, are what encoders send.
+    expect(mk('POST', '/v1.45/images/create?fromImage=ghcr.io%2fowner%2Fapp&tag=1').targetError).toBeUndefined();
   });
 });
 

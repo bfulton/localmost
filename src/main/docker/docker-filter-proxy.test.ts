@@ -14,7 +14,7 @@ import * as http from 'http';
 import * as net from 'net';
 import * as zlib from 'zlib';
 import { DockerFilterProxy, DockerFilterProxyLogEntry } from './docker-filter-proxy';
-import { DockerBackend } from './docker-backend';
+import { DockerBackend, DesktopBackend } from './docker-backend';
 
 interface Reply { status: number; headers: http.IncomingHttpHeaders; body: string }
 
@@ -53,11 +53,12 @@ const request = (
     req.end();
   });
 
-const backendWith = (endpoint: string | null, sandboxDir: string, supportsPrivileged = false): DockerBackend => ({
+/** A backend whose workspace is the whole sandbox directory the socket is served in. */
+const backendWith = (endpoint: string | null, supportsPrivileged = false): DockerBackend => ({
   name: 'test',
   supportsPrivileged,
   resolveEndpoint: () => (endpoint ? { socketPath: endpoint } : null),
-  workspaceMountRoot: () => sandboxDir,
+  workspaceMountRoot: (sandboxDir) => sandboxDir,
 });
 
 const proxies: DockerFilterProxy[] = [];
@@ -85,7 +86,7 @@ const startProxy = async (
   const logs: DockerFilterProxyLogEntry[] = [];
   const sock = path.join(dir, 'docker.sock');
   const proxy = new DockerFilterProxy({
-    backend: opts.backend ?? backendWith(null, dir),
+    backend: opts.backend ?? backendWith(null),
     onLog: (entry) => logs.push(entry),
     ...opts,
   });
@@ -147,7 +148,7 @@ describe('DockerFilterProxy', () => {
 
   it('answers with a clean Docker error when no daemon is behind the backend, rather than hanging', async () => {
     const dir = tmp();
-    const { proxy, sock, logs } = await startProxy(dir, { backend: backendWith(null, dir) });
+    const { proxy, sock, logs } = await startProxy(dir, { backend: backendWith(null) });
     proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
 
     const ping = await request(sock, 'GET', '/v1.45/_ping');
@@ -160,7 +161,7 @@ describe('DockerFilterProxy', () => {
 
   it('refuses a socket path the kernel would truncate', async () => {
     const dir = tmp();
-    const proxy = new DockerFilterProxy({ backend: backendWith(null, dir) });
+    const proxy = new DockerFilterProxy({ backend: backendWith(null) });
     const tooLong = path.join(dir, 'x'.repeat(120), 'docker.sock');
     await expect(proxy.start(tooLong)).rejects.toThrow(/104/);
   });
@@ -224,7 +225,7 @@ describe('DockerFilterProxy forwarding', () => {
   it('forwards an approved request to the backend endpoint', async () => {
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', runPolicy);
 
     const reply = await request(sock, 'POST', '/v1.45/containers/create?name=db', { Image: 'postgres:16' }, { Connection: 'keep-alive' });
@@ -244,7 +245,7 @@ describe('DockerFilterProxy forwarding', () => {
   it('still refuses what the policy does not declare, without touching the daemon', async () => {
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', runPolicy);
 
     const reply = await request(sock, 'POST', '/v1.45/containers/create', { Image: 'postgres:16', HostConfig: { Binds: ['/etc:/x'] } });
@@ -258,7 +259,7 @@ describe('DockerFilterProxy forwarding', () => {
     // "HoſtConfig" for HostConfig: privileged, with the host's root mounted.
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', runPolicy);
 
     for (const body of [
@@ -279,7 +280,7 @@ describe('DockerFilterProxy forwarding', () => {
     // bind the bridge to a host address the filter never saw.
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', { run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] } });
 
     const body =
@@ -303,7 +304,7 @@ describe('DockerFilterProxy forwarding', () => {
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
     const { proxy, sock } = await startProxy(dir, {
-      backend: backendWith(daemon.sock, dir),
+      backend: backendWith(daemon.sock),
       attachRegistryAuth: () => 'dG9rZW4=',
     });
     proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' }, pull: { registries: ['docker.io'] }, build: { context: './' } });
@@ -324,7 +325,7 @@ describe('DockerFilterProxy forwarding', () => {
   it('refuses a body nested deeper than any Docker body, and answers', async () => {
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', runPolicy);
 
     const depth = 100_000;
@@ -338,7 +339,7 @@ describe('DockerFilterProxy forwarding', () => {
   it('pins an unversioned request to the version it understands when forwarding', async () => {
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', runPolicy);
 
     await request(sock, 'POST', '/containers/create', { Image: 'postgres:16' });
@@ -350,7 +351,7 @@ describe('DockerFilterProxy forwarding', () => {
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
     const { proxy, sock } = await startProxy(dir, {
-      backend: backendWith(daemon.sock, dir),
+      backend: backendWith(daemon.sock),
       attachRegistryAuth: (registry) => (registry === 'docker.io' ? 'dG9rZW4=' : undefined),
     });
     proxy.bind('owner/repo', { pull: { registries: ['docker.io', 'ghcr.io'] } });
@@ -366,10 +367,67 @@ describe('DockerFilterProxy forwarding', () => {
     expect(daemon.seen[1].headers['x-registry-auth']).toBeUndefined();
   });
 
+  it('refuses a pull whose query another daemon could read as a different image, before it reaches the daemon', async () => {
+    // On Podman each of these pulls evil.example.com/x, while a filter that
+    // reads the first value judged postgres and attached the docker.io
+    // credential to it.
+    const dir = tmp();
+    const daemon = await fakeDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, {
+      backend: backendWith(daemon.sock),
+      attachRegistryAuth: (registry) => (registry === 'docker.io' ? 'dG9rZW4=' : undefined),
+    });
+    proxy.bind('owner/repo', { pull: { registries: ['docker.io'] } });
+
+    for (const query of [
+      'fromImage=postgres&fromImage=evil.example.com%2Fx',
+      'fromImage=postgres;&fromImage=evil.example.com%2Fx',
+      'fromImage=postgres%zz&fromImage=evil.example.com%2Fx',
+      'fromImage=postgres&FROMIMAGE=evil.example.com%2Fx',
+    ]) {
+      const reply = await request(sock, 'POST', `/v1.45/images/create?${query}`);
+      expect(reply.status).toBe(400);
+    }
+    // Nothing reached the daemon, so no credential was offered for any of them.
+    expect(daemon.seen).toHaveLength(0);
+
+    // The one list a client repeats, a build's tags, still goes through.
+    proxy.bind('owner/repo', { build: { context: './' } });
+    const built = await request(sock, 'POST', '/v1.45/build?t=app%3A1&t=app%3Alatest', 'tar', { 'content-type': 'application/x-tar' });
+    expect(built.status).toBe(200);
+    expect(daemon.seen).toHaveLength(1);
+  });
+
+  it('never offers the docker.io credential to a registry the daemon reads from an uppercase first component', async () => {
+    // The daemon's reference parser reads `LOCALHOST/x` and `Evil/x` as
+    // registry hosts. Read as Docker Hub namespaces, they were approved under
+    // docker.io and sent the operator's Docker Hub credential.
+    const dir = tmp();
+    const daemon = await fakeDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, {
+      backend: backendWith(daemon.sock),
+      attachRegistryAuth: (registry) => (registry === 'docker.io' ? 'dG9rZW4=' : undefined),
+    });
+    proxy.bind('owner/repo', { pull: { registries: ['docker.io'] } });
+
+    for (const image of ['Evil/x', 'LOCALHOST/x']) {
+      const reply = await request(sock, 'POST', `/v1.45/images/create?fromImage=${encodeURIComponent(image)}&tag=1`);
+      expect(reply.status).toBe(403);
+    }
+    expect(daemon.seen).toHaveLength(0);
+
+    // Declared as the registry it is, it is pulled, with no Docker Hub credential.
+    proxy.bind('owner/repo', { pull: { registries: ['LOCALHOST'] } });
+    const declared = await request(sock, 'POST', '/v1.45/images/create?fromImage=LOCALHOST%2Fx&tag=1');
+    expect(declared.status).toBe(200);
+    expect(daemon.seen).toHaveLength(1);
+    expect(daemon.seen[0].headers['x-registry-auth']).toBeUndefined();
+  });
+
   it('clamps the API version the daemon advertises, so the client negotiates down to ours', async () => {
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
-    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
 
     const ping = await request(sock, 'HEAD', '/_ping');
     expect(ping.status).toBe(200);
@@ -385,7 +443,7 @@ describe('DockerFilterProxy forwarding', () => {
   it('streams a non-JSON body through without buffering it, once the request line is approved', async () => {
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', { build: { context: './' } });
 
     const tar = 'x'.repeat(3 * 1024 * 1024); // well over the JSON cap
@@ -423,7 +481,7 @@ describe('DockerFilterProxy forwarding', () => {
     });
     servers.push(daemon);
     await new Promise<void>((r) => daemon.listen(sock, () => r()));
-    const { proxy, sock: proxySock } = await startProxy(dir, { backend: backendWith(sock, dir) });
+    const { proxy, sock: proxySock } = await startProxy(dir, { backend: backendWith(sock) });
     proxy.bind('owner/repo', { build: { context: './' } });
 
     const tar = 'x'.repeat(6 * 1024 * 1024);
@@ -449,7 +507,7 @@ describe('DockerFilterProxy forwarding', () => {
     });
     servers.push(daemon);
     await new Promise<void>((r) => daemon.listen(sock, () => r()));
-    const { proxy, sock: proxySock } = await startProxy(dir, { backend: backendWith(sock, dir) });
+    const { proxy, sock: proxySock } = await startProxy(dir, { backend: backendWith(sock) });
     proxy.bind('owner/repo', { build: { context: './' } });
 
     const tar = 'x'.repeat(6 * 1024 * 1024);
@@ -491,7 +549,7 @@ describe('DockerFilterProxy forwarding', () => {
     });
     servers.push(daemon);
     await new Promise<void>((r) => daemon.listen(sock, () => r()));
-    const { proxy, sock: proxySock } = await startProxy(dir, { backend: backendWith(sock, dir) });
+    const { proxy, sock: proxySock } = await startProxy(dir, { backend: backendWith(sock) });
     proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
     // Own the container first, as `docker run` does.
     expect((await request(proxySock, 'POST', '/v1.45/containers/create', { Image: 'postgres:16' })).status).toBe(201);
@@ -516,7 +574,7 @@ describe('DockerFilterProxy forwarding', () => {
     const daemon = await fakeDaemon(dir);
     fs.mkdirSync(path.join(dir, 'fixtures'));
     fs.symlinkSync('/etc', path.join(dir, 'escape'));
-    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir), realpath: undefined });
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock), realpath: undefined });
     proxy.bind('owner/repo', { run: { images: ['postgres:16'], mounts: [{ path: './fixtures', mode: 'rw' }], network: 'bridge' } });
 
     const ok = await request(sock, 'POST', '/v1.45/containers/create', { Image: 'postgres:16', HostConfig: { Binds: [`${dir}/fixtures:/f`] } });
@@ -613,7 +671,7 @@ describe('DockerFilterProxy attach', () => {
   it('relays an approved attach in both directions after the daemon upgrades', async () => {
     const dir = tmp();
     const daemon = await fakeAttachDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
     // Own the container first, as `docker run` does before attaching.
     expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'postgres:16' })).status).toBe(201);
@@ -632,7 +690,7 @@ describe('DockerFilterProxy attach', () => {
   it('attaches to the id a name was created with, not whatever holds the name now', async () => {
     const dir = tmp();
     const daemon = await fakeAttachDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
     expect((await request(sock, 'POST', '/v1.45/containers/create?name=mine', { Image: 'postgres:16' })).status).toBe(201);
 
@@ -645,7 +703,7 @@ describe('DockerFilterProxy attach', () => {
   it('refuses an attach the policy does not permit on the raw connection, before the daemon sees it', async () => {
     const dir = tmp();
     const daemon = await fakeAttachDaemon(dir);
-    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
 
     const { head, socket } = await attach(sock, '/v1.45/containers/abc123/attach?stream=1');
     expect(head).toMatch(/^HTTP\/1\.1 403/);
@@ -659,7 +717,7 @@ describe('an HTTP/1.0 client of the served socket', () => {
   it('receives the relayed response and sees the connection close, rather than hanging', async () => {
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', { run: { images: ['postgres:16'] } });
 
     // What `printf ... | nc -U` does: send the request, half-close, then wait
@@ -690,7 +748,7 @@ describe('container ownership tracking', () => {
   it('permits the run verbs on a container it created, and refuses one it did not', async () => {
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
 
     // Before any create, the socket owns nothing: the whole `docker run`
@@ -741,7 +799,7 @@ describe('upgrade requests', () => {
   it('does not turn a permitted baseline read into a raw daemon tunnel', async () => {
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
 
     // GET /_ping is in the always-on baseline, so the policy permits it. If an
@@ -765,7 +823,7 @@ describe('upgrade requests', () => {
   it('refuses an upgrade on a container the socket does not own', async () => {
     const dir = tmp();
     const daemon = await fakeAttachDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
 
     const { head, socket } = await attach(sock, '/v1.45/containers/theirs999/attach?stream=1');
@@ -775,7 +833,7 @@ describe('upgrade requests', () => {
 });
 
 describe('mount sources are pinned before forwarding', () => {
-  it('sends the daemon the resolved path, so a swapped symlink cannot change what is mounted', async () => {
+  it('sends the daemon the resolved path, not the spelling the client sent through a symlink', async () => {
     const dir = tmp();
     const workspace = fs.realpathSync.native(dir);
     const real = path.join(workspace, 'inside');
@@ -795,12 +853,68 @@ describe('mount sources are pinned before forwarding', () => {
     });
     expect(reply.status).toBe(201);
 
-    // The filter resolved `link` to decide. If it forwards the spelling it was
-    // given, the daemon resolves it again at mount time and the job can swap
-    // the symlink in between.
+    // The filter resolved `link` to decide. If it forwarded the spelling it
+    // was given, the daemon would resolve the link again, wherever the job had
+    // pointed it by then. This pins the create only: the daemon resolves the
+    // pinned path once more at start, and a link swapped onto it after it is
+    // checked and before the container starts is still followed.
     const create = daemon.seen.find((s) => s.url.includes('/containers/create'))!;
     const binds = (JSON.parse(create.body.toString()) as { HostConfig: { Binds: string[] } }).HostConfig.Binds;
     expect(binds[0]).toBe(`${real}:/ws`);
+  });
+});
+
+describe('the mount boundary is the sandbox the app created, not what the job makes of it', () => {
+  // The job's profile writes its whole sandbox directory, so it can replace
+  // _work, or its own checkout, with a link to anywhere. Resolving the root
+  // through those links on every request moved the boundary with them: with
+  // `./` declared, everything under the link's target became "the workspace".
+  it.each([
+    ['its checkout (_work/repo/repo)', 'checkout'],
+    ['_work', 'work'],
+  ])('refuses a mount outside the sandbox after the job links %s elsewhere', async (_label, which) => {
+    const dir = tmp();
+    const sandbox = path.join(dir, 's');
+    const victim = path.join(dir, 'victim');
+    const checkout = path.join(sandbox, '_work', 'repo', 'repo');
+    fs.mkdirSync(path.join(checkout, 'data', 'sub'), { recursive: true });
+    fs.mkdirSync(path.join(victim, '.ssh'), { recursive: true });
+    fs.writeFileSync(path.join(victim, '.ssh', 'id_ed25519'), 'SECRET');
+    const daemon = await fakeDaemon(dir);
+    // The real backend and the real realpath: os.tmpdir() is itself a
+    // symlink on macOS, which a legitimate mount must still get past.
+    const { proxy, sock } = await startProxy(sandbox, {
+      backend: new DesktopBackend({ resolve: () => ({ socketPath: daemon.sock }) }),
+    });
+    const create = (bind: string) => request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3', HostConfig: { Binds: [bind] } });
+
+    // Before: a narrower declared mount judges against the literal root as it
+    // did against the resolved one, and so does `./`; the victim does not mount.
+    proxy.bind('owner/repo', { run: { images: ['alpine:3'], mounts: [{ path: './data', mode: 'rw' }], network: 'bridge' } });
+    expect((await create(`${checkout}/data/sub:/d`)).status).toBe(201);
+    expect((await create(`${checkout}:/d`)).status).toBe(403);
+    proxy.bind('owner/repo', { run: { images: ['alpine:3'], mounts: [{ path: './', mode: 'rw' }], network: 'bridge' } });
+    expect((await create(`${checkout}/data:/d`)).status).toBe(201);
+    expect((await create(`${victim}/.ssh:/x`)).status).toBe(403);
+    expect(daemon.seen).toHaveLength(2);
+
+    if (which === 'checkout') {
+      fs.renameSync(checkout, `${checkout}.x`);
+      fs.symlinkSync(victim, checkout);
+    } else {
+      const staged = path.join(dir, 'staged');
+      fs.mkdirSync(path.join(staged, 'repo'), { recursive: true });
+      fs.symlinkSync(victim, path.join(staged, 'repo', 'repo'));
+      fs.renameSync(path.join(sandbox, '_work'), path.join(sandbox, '_work.x'));
+      fs.symlinkSync(staged, path.join(sandbox, '_work'));
+    }
+
+    // After: neither the victim's path nor the link's spelling of it gets through.
+    for (const bind of [`${victim}/.ssh:/x`, `${checkout}/.ssh:/x`, `${checkout}:/x`]) {
+      const reply = await create(bind);
+      expect(reply.status).toBe(403);
+    }
+    expect(daemon.seen).toHaveLength(2);
   });
 });
 
@@ -808,7 +922,7 @@ describe('a request target the filter cannot read', () => {
   it('is refused, and the connection does not hang', async () => {
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
 
     // Resolve on the response head, not on close: HTTP/1.1 keep-alive means a
@@ -839,7 +953,7 @@ describe('which containers a job may address', () => {
   const setup = async () => {
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' } });
     return { sock, daemon };
   };
@@ -893,7 +1007,7 @@ describe('networks a job creates', () => {
   it('may be read, joined and deleted, and are forgotten once removed', async () => {
     const dir = tmp();
     const daemon = await networkDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', {
       run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] },
     });
@@ -918,7 +1032,7 @@ describe('networks a job creates', () => {
     // with that name is not this job's. The daemon is sent the id.
     const dir = tmp();
     const daemon = await networkDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', {
       run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] },
     });
@@ -937,7 +1051,7 @@ describe('networks a job creates', () => {
     // job's network. The daemon is sent the id, which it resolves or refuses.
     const dir = tmp();
     const daemon = await networkDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', {
       run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] },
     });
@@ -998,7 +1112,7 @@ describe('networks a job creates', () => {
     // job could not join, inspect or delete what it had just made.
     const dir = tmp();
     const daemon = await networkDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', {
       run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] },
     });
@@ -1104,7 +1218,7 @@ describe('/info through the filter', () => {
   it('keeps only what a client needs, dropping proxy credentials, registry config and the host name', async () => {
     const dir = tmp();
     const daemon = await infoDaemon(dir, answerInFull);
-    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
 
     const reply = await request(sock, 'GET', '/v1.45/info');
 
@@ -1123,7 +1237,7 @@ describe('/info through the filter', () => {
   it('cuts down an unversioned /info the same way', async () => {
     const dir = tmp();
     const daemon = await infoDaemon(dir, answerInFull);
-    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
 
     const reply = await request(sock, 'GET', '/info');
 
@@ -1139,7 +1253,7 @@ describe('/info through the filter', () => {
       res.write(body.slice(0, 40));
       res.end(body.slice(40));
     });
-    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
 
     const reply = await request(sock, 'GET', '/v1.45/info');
 
@@ -1154,7 +1268,7 @@ describe('/info through the filter', () => {
       res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip' });
       res.end(zlib.gzipSync(JSON.stringify(FULL_INFO)));
     });
-    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
 
     const reply = await request(sock, 'GET', '/v1.45/info', undefined, { 'Accept-Encoding': 'gzip' });
 
@@ -1171,7 +1285,7 @@ describe('/info through the filter', () => {
       res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Encoding': 'x-unknown' });
       res.end(JSON.stringify(FULL_INFO));
     });
-    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
 
     const reply = await request(sock, 'GET', '/v1.45/info');
 
@@ -1186,7 +1300,7 @@ describe('/info through the filter', () => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ...FULL_INFO, Labels: ['x'.repeat(2 * 1024 * 1024)] }));
     });
-    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
 
     const reply = await request(sock, 'GET', '/v1.45/info');
 
@@ -1201,7 +1315,7 @@ describe('/info through the filter', () => {
       // A few KB on the wire, megabytes once inflated.
       res.end(zlib.gzipSync(JSON.stringify({ ...FULL_INFO, Labels: ['x'.repeat(2 * 1024 * 1024)] })));
     });
-    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
 
     const reply = await request(sock, 'GET', '/v1.45/info');
 
@@ -1215,7 +1329,7 @@ describe('/info through the filter', () => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end('HttpProxy: http://user:secret@corp-proxy:3128');
     });
-    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
 
     const reply = await request(sock, 'GET', '/v1.45/info');
 
@@ -1229,7 +1343,7 @@ describe('/info through the filter', () => {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ message: 'daemon is starting', HttpProxy: 'http://user:secret@corp-proxy:3128' }));
     });
-    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
 
     const reply = await request(sock, 'GET', '/v1.45/info');
 
@@ -1353,7 +1467,7 @@ describe('containers a job leaves behind', () => {
     const dir = tmp();
     const sock = path.join(dir, 'docker.sock');
     const daemon = await lifetimeDaemon(dir, sock);
-    const { proxy } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', policy);
 
     expect((await request(sock, 'POST', '/v1.45/containers/create?name=db', { Image: 'alpine:3' })).status).toBe(201);
@@ -1383,7 +1497,7 @@ describe('containers a job leaves behind', () => {
     const dir = tmp();
     const sock = path.join(dir, 'docker.sock');
     const daemon = await lifetimeDaemon(dir, sock, { deleteStatus: 500 });
-    const { proxy, logs } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, logs } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', policy);
     expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
 
@@ -1399,7 +1513,7 @@ describe('containers a job leaves behind', () => {
     const sock = path.join(dir, 'docker.sock');
     const daemon = await lifetimeDaemon(dir, sock);
     let endpoint: string | null = daemon.sock;
-    const backend: DockerBackend = { ...backendWith(null, dir), resolveEndpoint: () => (endpoint ? { socketPath: endpoint } : null) };
+    const backend: DockerBackend = { ...backendWith(null), resolveEndpoint: () => (endpoint ? { socketPath: endpoint } : null) };
     const { proxy, logs } = await startProxy(dir, { backend });
     proxy.bind('owner/repo', policy);
     expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
@@ -1418,7 +1532,7 @@ describe('containers a job leaves behind', () => {
     const dir = tmp();
     const sock = path.join(dir, 'docker.sock');
     const daemon = await lifetimeDaemon(dir, sock, { holdDeletes: true });
-    const { proxy } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', policy);
     expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
 
@@ -1444,7 +1558,7 @@ describe('containers a job leaves behind', () => {
     const dir = tmp();
     const sock = path.join(dir, 'docker.sock');
     const daemon = await lifetimeDaemon(dir, sock, { holdDeletes: true });
-    const { proxy } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', policy);
     expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
 
@@ -1471,7 +1585,7 @@ describe('containers a job leaves behind', () => {
     const dir = tmp();
     const sock = path.join(dir, 'docker.sock');
     const daemon = await lifetimeDaemon(dir, sock, { maxApiVersion: 1.43 });
-    const { proxy, logs } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, logs } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', policy);
     expect((await request(sock, 'POST', '/v1.43/containers/create', { Image: 'alpine:3' })).status).toBe(201);
     expect((await request(sock, 'POST', '/v1.43/networks/create', { Name: 'vk-1', Internal: true })).status).toBe(201);
@@ -1493,7 +1607,7 @@ describe('containers a job leaves behind', () => {
       deleteDelayMs: 5,
       deleteStatusFor: (id, attempt) => (Number(id.slice(1)) % 3 === 0 && attempt === 1 ? 500 : 204),
     });
-    const { proxy, logs } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, logs } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', policy);
     for (let i = 0; i < 50; i += 1) {
       expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
@@ -1513,7 +1627,7 @@ describe('containers a job leaves behind', () => {
     const dir = tmp();
     const sock = path.join(dir, 'docker.sock');
     const daemon = await lifetimeDaemon(dir, sock, { deleteStatusFor: (_id, attempt) => (attempt === 1 ? 409 : 404) });
-    const { proxy, logs } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, logs } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', policy);
     expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
 
@@ -1527,7 +1641,7 @@ describe('containers a job leaves behind', () => {
     const dir = tmp();
     const sock = path.join(dir, 'docker.sock');
     const daemon = await lifetimeDaemon(dir, sock, { deleteStatus: 404 });
-    const { proxy, logs } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    const { proxy, logs } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', policy);
     expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
 
@@ -1543,7 +1657,7 @@ describe('containers a job leaves behind', () => {
     const dir = tmp();
     const sock = path.join(dir, 'docker.sock');
     const daemon = await lifetimeDaemon(dir, sock, { holdDeletes: true });
-    const { proxy, logs } = await startProxy(dir, { backend: backendWith(daemon.sock, dir), removeTimeoutMs: 50 });
+    const { proxy, logs } = await startProxy(dir, { backend: backendWith(daemon.sock), removeTimeoutMs: 50 });
     proxy.bind('owner/repo', policy);
     expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
 

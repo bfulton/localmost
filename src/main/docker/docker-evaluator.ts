@@ -23,9 +23,17 @@ export interface DockerEvalContext {
   /** The bound policy; null until the worker claims a job, which denies all. */
   policy: DockerPolicy | null;
   /**
-   * The job workspace, absolute and already resolved through symlinks. Mount
-   * sources must resolve inside it; the evaluator does not resolve the root
-   * itself, so that a stubbed realpath in tests cannot move the boundary.
+   * The job's sandbox directory, resolved through symlinks once, when the
+   * socket started: the app made it, before the job existed. Every component
+   * of a mount source from here down is checked with lstat after the source is
+   * resolved, and a symlink among them is refused.
+   */
+  sandboxDir: string;
+  /**
+   * The job workspace: a directory below sandboxDir, joined to it literally
+   * and never resolved, since the job can replace any directory below
+   * sandboxDir with a link to anywhere and so move a root resolved through it.
+   * Mount sources must resolve inside it.
    */
   workspaceRoot: string;
   /** Whether the backend may honour `privileged`. Stage 1: false. */
@@ -44,6 +52,8 @@ export interface DockerEvalContext {
   ownNetworkIds?: ReadonlySet<string>;
   /** Injected for tests; defaults to fs.realpathSync. Must throw when the path does not exist. */
   realpath?: (p: string) => string;
+  /** Injected for tests; defaults to fs.lstatSync. Must throw when the path does not exist. */
+  lstat?: (p: string) => { isSymbolicLink(): boolean };
 }
 
 export interface DockerVerdict {
@@ -61,8 +71,12 @@ export interface DockerVerdict {
    * key repeated exactly, which JSON.parse keeps only the last copy of, while
    * Go decodes every copy in turn and a map or struct keeps what the earlier
    * ones put there. And forwarding a mount source as the client spelled it
-   * would let the daemon resolve it a second time, after the job swapped a
-   * symlink in the gap between the two resolutions.
+   * would have the daemon resolve that spelling again, through whatever link
+   * the job had put on it since it was judged. The resolved path narrows that
+   * without closing it: the daemon resolves it once more when the container
+   * starts, so a directory on it the job replaces with a symlink after it is
+   * checked and before the container starts is followed. That gap is still
+   * open.
    */
   rewrittenBody?: unknown;
 }
@@ -138,8 +152,11 @@ function splitRegistry(reference: string): { registry: string; remainder: string
   const slash = reference.indexOf('/');
   if (slash === -1) return { registry: DEFAULT_REGISTRY, remainder: reference };
   const first = reference.slice(0, slash);
-  // A first component is a registry only when it looks like a host.
-  if (!first.includes('.') && !first.includes(':') && first !== 'localhost') {
+  // A first component is a registry only when it looks like a host, which to
+  // distribution/reference (splitDockerDomain) includes one with an uppercase
+  // letter: no Docker Hub namespace has one, so `LOCALHOST/x` and `Evil/x` are
+  // pulled from those hosts, not from docker.io.
+  if (!first.includes('.') && !first.includes(':') && first !== 'localhost' && first === first.toLowerCase()) {
     return { registry: DEFAULT_REGISTRY, remainder: reference };
   }
   const registry = first === 'index.docker.io' ? DEFAULT_REGISTRY : first;
@@ -366,6 +383,22 @@ function collectMounts(hostConfig: Record<string, unknown>): MountRequest[] | st
   return requests;
 }
 
+/**
+ * The first of `anchor` and each directory from it down to `target` that is a
+ * symlink, or undefined when none is. Throws when one does not exist.
+ */
+function symlinkOnPath(
+  anchor: string,
+  target: string,
+  lstat: (p: string) => { isSymbolicLink(): boolean }
+): string | undefined {
+  const dirs = [anchor];
+  for (const component of path.relative(anchor, target).split(path.sep)) {
+    if (component !== '') dirs.push(path.join(dirs[dirs.length - 1], component));
+  }
+  return dirs.find((dir) => lstat(dir).isSymbolicLink());
+}
+
 /** A declared mount permits a source at or below its path, at or below its mode. */
 function declaredMountPermits(declared: DockerMount, root: string, resolved: string, mode: MountMode): boolean {
   const declaredPath = path.resolve(root, declared.path);
@@ -382,6 +415,7 @@ function checkMounts(
   const requests = collectMounts(hostConfig);
   if (typeof requests === 'string') return deny(requests);
   const realpath = ctx.realpath ?? ((p: string) => fs.realpathSync(p));
+  const lstat = ctx.lstat ?? ((p: string) => fs.lstatSync(p));
   const root = ctx.workspaceRoot;
 
   for (const { source, mode } of requests) {
@@ -394,8 +428,20 @@ function checkMounts(
     } catch {
       return deny(`mount source "${source}" could not be resolved; create it inside the workspace first`);
     }
-    if (!inside(root, resolved)) {
+    if (!inside(root, resolved) || !inside(ctx.sandboxDir, resolved)) {
       return deny(`mount source "${source}" is outside the job workspace and cannot be permitted by policy`);
+    }
+    // What realpath answered held when it answered. Check it still does, one
+    // component at a time from the sandbox directory down, without following
+    // any: a link among them now is one the job put there since.
+    let link: string | undefined;
+    try {
+      link = symlinkOnPath(ctx.sandboxDir, resolved, lstat);
+    } catch {
+      return deny(`mount source "${source}" could not be resolved; create it inside the workspace first`);
+    }
+    if (link !== undefined) {
+      return deny(`mount source "${source}" passes through "${link}", a symlink; the job workspace changed while the mount was judged`);
     }
     if (!declared.some((m) => declaredMountPermits(m, root, resolved, mode))) {
       const relative = relativeTo(root, resolved);
@@ -588,17 +634,33 @@ function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: Dock
   }
 
   // Pin every mount source to the path that was actually checked, so the
-  // daemon mounts what the filter judged rather than re-resolving a name the
-  // job can point somewhere else in between.
+  // daemon is sent what the filter judged rather than a name the job can
+  // point somewhere else in between. The daemon still resolves that path
+  // again when the container starts (see rewrittenBody).
   const resolutions = new Map<string, string>();
   const verdict = checkMounts(hostConfig, ctx, policy.run.mounts ?? [], resolutions);
   if (!verdict.allowed || resolutions.size === 0) return verdict;
   return { allowed: true, rewrittenBody: pinMountSources(body, resolutions) };
 }
 
+/**
+ * The value of the query parameter whose name case-insensitively equals
+ * `name`. Podman decodes the query with gorilla/schema, which matches a name
+ * in any case, so a parameter the filter refuses on must be read in every
+ * casing, not the one moby reads. There is at most one such key: the parser
+ * refuses a query that repeats a name in any case.
+ */
+function queryValue(query: Record<string, string>, name: string): string | undefined {
+  const wanted = name.toLowerCase();
+  const key = Object.keys(query).find((k) => k.toLowerCase() === wanted);
+  return key === undefined ? undefined : query[key];
+}
+
 function evaluatePull(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
+  // fromImage is read in moby's spelling only: moby ignores any other, so a
+  // lone differently-cased one leaves this undefined and the pull is refused.
   const fromImage = req.query.fromImage;
-  if (req.query.fromSrc !== undefined) {
+  if (queryValue(req.query, 'fromSrc') !== undefined) {
     return deny('importing an image (fromSrc) is not permitted; only pulls from a declared registry are');
   }
   if (!fromImage) return deny('image pull requires fromImage');
@@ -776,7 +838,7 @@ function evaluateBuild(req: DockerRequest, policy: DockerPolicy): DockerVerdict 
   // A build runs containers, and its network is chosen here rather than in a
   // HostConfig - so the same rule the run path applies has to apply here too,
   // or `docker build --network host` walks through a door create keeps shut.
-  const rawMode = req.query.networkmode ?? req.query.NetworkMode;
+  const rawMode = queryValue(req.query, 'networkmode');
   if (rawMode !== undefined && rawMode !== '' && rawMode !== 'default') {
     const rawModeLower = rawMode.toLowerCase();
     if (rawModeLower === 'host' || rawModeLower.startsWith('container:')) {
@@ -934,6 +996,11 @@ function nonAsciiParam(query: Record<string, string>): string | undefined {
 }
 
 export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext): DockerVerdict {
+  // A target the parser could not read one way - an authority, a fragment, a
+  // query another daemon decodes differently - is a request the filter cannot
+  // judge, whatever it would otherwise be. The proxy answers these with a 400
+  // before asking; refusing here too keeps the evaluator whole on its own.
+  if (req.targetError) return deny(req.targetError);
   const action = classifyDockerRequest(req);
   if (BASELINE.has(action)) return ALLOW;
 

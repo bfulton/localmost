@@ -24,6 +24,10 @@ export interface DockerBackend {
    * checkout when the socket is bound to one, since that is what `./` means to
    * whoever wrote the policy. Without a repository - a socket not yet bound -
    * the work folder is the widest honest answer.
+   *
+   * A path below `sandboxDir`, joined to it as written. The caller resolves
+   * `sandboxDir` once and never resolves this: every directory below the
+   * sandbox is the job's to replace with a link.
    */
   workspaceMountRoot(sandboxDir: string, repository?: string): string;
 }

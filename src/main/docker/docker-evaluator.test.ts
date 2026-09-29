@@ -6,6 +6,9 @@
  */
 
 import { describe, it, expect } from '@jest/globals';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { evaluateDockerRequest, DockerEvalContext } from './docker-evaluator';
 import { parseDockerRequest, DockerRequest } from './docker-request';
 import { DockerPolicy, mergeDockerPolicy, parseDockerPolicyHint } from '../../shared/docker-policy';
@@ -19,7 +22,12 @@ const ctx = (
   extraOrIds: Partial<DockerEvalContext> | string[] = {}
 ): DockerEvalContext => {
   const extra = Array.isArray(extraOrIds) ? { ownContainerIds: new Set(extraOrIds) } : extraOrIds;
-  return { policy, workspaceRoot: '/ws', supportsPrivileged: false, realpath: (p: string) => p, ...extra };
+  // Paths here are made up, so nothing on them is a symlink; the test that
+  // walks a real tree passes lstat: undefined for the filesystem's own.
+  return {
+    policy, sandboxDir: '/ws', workspaceRoot: '/ws', supportsPrivileged: false,
+    realpath: (p: string) => p, lstat: () => ({ isSymbolicLink: () => false }), ...extra,
+  };
 };
 
 describe('evaluateDockerRequest', () => {
@@ -156,6 +164,39 @@ describe('the SECURITY.md escapes', () => {
     expect(v.reason).toMatch(/could not be resolved/i);
   });
 
+  it('refuses a mount that passes through a symlink below the sandbox directory, whatever resolved it', () => {
+    // A realpath answer is only as good as the moment it was taken: the job
+    // can swap a link in on the way to the source right after. Each component
+    // from the sandbox directory down is checked with lstat, on the real
+    // filesystem, after resolving.
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'deval-')));
+    try {
+      const sandbox = path.join(base, 's');
+      const checkout = path.join(sandbox, '_work', 'repo', 'repo');
+      fs.mkdirSync(path.join(checkout, 'data'), { recursive: true });
+      const staged = path.join(base, 'staged', 'repo', 'repo');
+      fs.mkdirSync(path.join(staged, 'data'), { recursive: true });
+      const real = { sandboxDir: sandbox, workspaceRoot: checkout, realpath: (p: string) => p, lstat: undefined };
+      const policy: DockerPolicy = { run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'rw' }], network: 'bridge' } };
+      const bind = { Image: 'postgres:16', HostConfig: { Binds: [`${checkout}/data:/d`] } };
+
+      expect(create(bind, ctx(policy, real)).allowed).toBe(true);
+      // A workspace outside the sandbox directory leaves nothing to walk down
+      // from, so nothing in it is permitted.
+      const elsewhere = path.join(base, 'elsewhere');
+      fs.mkdirSync(elsewhere);
+      expect(create(bind, ctx(policy, { ...real, sandboxDir: elsewhere })).allowed).toBe(false);
+
+      fs.renameSync(path.join(sandbox, '_work'), path.join(sandbox, '_work.x'));
+      fs.symlinkSync(path.join(base, 'staged'), path.join(sandbox, '_work'));
+      const v = create(bind, ctx(policy, real));
+      expect(v.allowed).toBe(false);
+      expect(v.reason).toMatch(/symlink/);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it('refuses undeclared image and registry; permits declared ones', () => {
     expect(create({ Image: 'redis:7' }).allowed).toBe(false);
     expect(create({ Image: 'postgres:16' }).allowed).toBe(true);
@@ -225,6 +266,34 @@ describe('the SECURITY.md escapes', () => {
     expect(pull('localhost:5000/app', ['localhost:5000']).allowed).toBe(true);
     expect(pull('ghcr.io/owner/app:1', ['ghcr.io']).allowed).toBe(true);
     expect(pull('myregistry:5000/postgres:16', ['docker.io']).allowed).toBe(false);
+    // distribution/reference reads a first component with an uppercase letter
+    // as a registry host, never a Docker Hub namespace: `LOCALHOST/x` pulls
+    // from the daemon's loopback, and `Evil/x` from a host named Evil.
+    expect(pull('Evil/x', ['docker.io']).allowed).toBe(false);
+    expect(pull('LOCALHOST/x', ['docker.io']).allowed).toBe(false);
+    expect(pull('0X7F000001/x', ['docker.io']).allowed).toBe(false);
+    expect(pull('LOCALHOST/x', ['LOCALHOST']).allowed).toBe(true);
+    // Lowercase namespaces are still Docker Hub's.
+    expect(pull('owner/app', ['docker.io']).allowed).toBe(true);
+  });
+
+  it('refuses a query another daemon\'s decoder could read differently', () => {
+    // Podman decodes the query with gorilla/schema, which keeps the last value
+    // of a repeated key and reads past a ";" or a bad escape: each of these is
+    // a pull of evil.example.com/x there, judged here as postgres.
+    const c = ctx({ pull: { registries: ['docker.io'] } });
+    for (const url of [
+      '/v1.45/images/create?fromImage=postgres&fromImage=evil.example.com%2Fx',
+      '/v1.45/images/create?fromImage=postgres;&fromImage=evil.example.com%2Fx',
+      '/v1.45/images/create?fromImage=postgres%zz&fromImage=evil.example.com%2Fx',
+      '/v1.45/images/create?fromImage=postgres&FROMIMAGE=evil.example.com%2Fx',
+    ]) {
+      const v = evaluateDockerRequest(mk('POST', url), c);
+      expect(v.allowed).toBe(false);
+    }
+    // Refused whatever the action: the baseline is no exception.
+    expect(evaluateDockerRequest(mk('GET', '/v1.45/version?a=1&a=2'), c).allowed).toBe(false);
+    expect(evaluateDockerRequest(mk('POST', '/v1.45/images/create?fromImage=postgres&tag=16'), c).allowed).toBe(true);
   });
 
   it('refuses a pull that is an import, or names no image', () => {
@@ -234,16 +303,24 @@ describe('the SECURITY.md escapes', () => {
     expect(evaluateDockerRequest(mk('POST', '/v1.45/images/create'), c).allowed).toBe(false);
   });
 
+  it('refuses an import however fromSrc is cased, since Podman matches the name in any case', () => {
+    const c = ctx({ pull: { registries: ['docker.io'] } });
+    for (const key of ['FROMSRC', 'fromsrc', 'FromSrc']) {
+      const url = `/v1.45/images/create?fromImage=postgres&${key}=-`;
+      expect([url, evaluateDockerRequest(mk('POST', url), c).allowed]).toEqual([url, false]);
+    }
+  });
+
   it('rejects privileged even when declared, unless the backend supports it', () => {
     const v = create({ Image: 'postgres:16', HostConfig: { Privileged: true } },
-      { policy: { run: { images: ['postgres:16'], network: 'bridge' }, privileged: true }, workspaceRoot: '/ws', supportsPrivileged: false, realpath: (p) => p });
+      { policy: { run: { images: ['postgres:16'], network: 'bridge' }, privileged: true }, sandboxDir: '/ws', workspaceRoot: '/ws', supportsPrivileged: false, realpath: (p) => p });
     expect(v.allowed).toBe(false);
     expect(v.reason).toMatch(/managed VM/i);
     const vm = create({ Image: 'postgres:16', HostConfig: { Privileged: true } },
-      { policy: { run: { images: ['postgres:16'], network: 'bridge' }, privileged: true }, workspaceRoot: '/ws', supportsPrivileged: true, realpath: (p) => p });
+      { policy: { run: { images: ['postgres:16'], network: 'bridge' }, privileged: true }, sandboxDir: '/ws', workspaceRoot: '/ws', supportsPrivileged: true, realpath: (p) => p });
     expect(vm.allowed).toBe(true);
     const undeclared = create({ Image: 'postgres:16', HostConfig: { Privileged: true } },
-      { policy: { run: { images: ['postgres:16'], network: 'bridge' } }, workspaceRoot: '/ws', supportsPrivileged: true, realpath: (p) => p });
+      { policy: { run: { images: ['postgres:16'], network: 'bridge' } }, sandboxDir: '/ws', workspaceRoot: '/ws', supportsPrivileged: true, realpath: (p) => p });
     expect(undeclared.allowed).toBe(false);
     expect(undeclared.policyHint).toMatch(/privileged: true/);
   });
@@ -508,6 +585,13 @@ describe('build query parameters', () => {
   it('refuses host and container networking, which the run path already forbids', () => {
     expect(build('?networkmode=host').allowed).toBe(false);
     expect(build('?networkmode=container%3Aabc').allowed).toBe(false);
+  });
+
+  it('judges the build network however its name is cased, since Podman matches it in any case', () => {
+    for (const qs of ['?NETWORKMODE=host', '?networkMode=host', '?Networkmode=host', '?NetworkMode=container%3Aabc', '?NETWORKMODE=some-other-net']) {
+      expect([qs, build(qs).allowed]).toEqual([qs, false]);
+    }
+    expect(build('?NETWORKMODE=bridge').allowed).toBe(true);
   });
 
   it('refuses an undeclared build network, and permits the declared one', () => {
