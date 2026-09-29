@@ -194,8 +194,8 @@ workflows:
 A job's sandbox connects directly to one loopback port by default: its own
 egress proxy. Anything else listening on the Mac's loopback - a debugger on
 9229, a browser's remote-debugging port, a development database, another job's
-server - is closed to the job's own sockets, though not to requests it sends
-through its proxy (below). A repository whose jobs need loopback opts in under
+server - is closed to the job's own sockets, and its proxy will not forward
+to it either (below). A repository whose jobs need loopback opts in under
 `shared.network`:
 
 ```yaml
@@ -424,9 +424,11 @@ ports, or `true` for all of them (a test suite that binds an ephemeral port and
 talks to it needs `true`, since seatbelt matches single ports, never ranges). A
 direct connect to anything else on loopback - a database, a debugger on 9229 -
 fails with `EPERM` on the connect, not on the bind; the broker's port fails
-whatever is declared. The proxy does not yet apply the same rule: a request
-sent through `HTTP_PROXY` for a literal `127.0.0.1` or `localhost` reaches any
-port, so this is not yet a boundary around local services.
+whatever is declared. The proxy applies the same rule to a request for a
+loopback address, sent through `HTTP_PROXY` or tunnelled with `CONNECT`: it
+answers 403 unless the port is declared, or is the broker's - the runner
+reaches the broker through the proxy, and each worker's key to it, not its
+port, is what guards it.
 
 ## Why Checked Into Git
 
@@ -485,10 +487,11 @@ Under `strict` and `moderate` a host is reached on 443 through `CONNECT` and on
 `*.example.com:8080`, `[2001:db8::1]:8443` - allows that port and no other; a
 bare IPv6 address is all address. An `http://` URL tunnelled through `CONNECT`,
 rather than sent as a plain proxied request, needs a `host:80` entry. A literal
-loopback address (`127.0.0.1`, `::1`) is reachable on any port, since the
-runner reaches the broker through the proxy at one. `network.deny` entries read
-the same way and win over any allow, at every level; only the runner's own
-hosts on their scheme's port and literal loopback addresses stay reachable.
+loopback address (`127.0.0.1`, `::1`) is reachable at every level only on the
+broker's port, since the runner reaches the broker through the proxy there,
+and on the ports `network.loopback` declares. `network.deny` entries read the
+same way and win over any allow, at every level; only the runner's own hosts on
+their scheme's port and the broker's port stay reachable.
 
 One thing is granted regardless of the repo's policy: the hosts the Actions
 runner itself needs to register and poll for jobs. That is the runner's own
@@ -508,7 +511,8 @@ nothing from the app's environment beyond `PATH`, `HOME`, `USER`, `LOGNAME`,
 `SHELL`, `LANG`, `LC_*`, `TERM`, `TZ` and `__CF_USER_TEXT_ENCODING`.
 
 **Loopback.** Without `network: loopback` a job reaches nothing on this Mac's
-loopback interface but its own proxy. `loopback: true` grants every port -
+loopback interface but its own proxy and, through it, the broker.
+`loopback: true` grants every port -
 what a test suite that starts servers on ephemeral ports needs - and a list
 grants those ports alone; the sandbox matches single ports, not ranges.
 Loopback is written into the sandbox profile, so like the filesystem it is

@@ -64,7 +64,7 @@ localmost is an Electron desktop application that manages GitHub Actions self-ho
 - **Home directory access**: Workflows cannot read `~/.ssh`, `~/.aws`, `~/.config` or the other credential locations listed above, at any level. `HOME` is your real home directory, because the runner and the toolchains installed there look themselves up through it; the sandbox, not `HOME`, is what keeps a job out: within your home a job reads only what its level and policy grant, and writes only its own sandbox and caches under `~/.localmost` and whatever write paths its approved policy declares. A declared path that is, contains or lies inside `~/.localmost` or the app's Electron data directory (`~/Library/Application Support/localmost`) is ignored whole, in any capitalization: a grant of `~`, `/Users`, `~/Library` or `~/Library/Application Support` grants nothing
 - **Environment**: A job does not inherit the app's environment. Launched from a shell, the app carries every token and agent socket that shell had; a worker gets only `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TERM`, `TZ` and `__CF_USER_TEXT_ENCODING` from it, plus whatever the repository's approved `env: allow` names (`*` matches any run of characters), less whatever `env: deny` names. The variables localmost sets for the runner - the proxy, `TMPDIR`, `DOCKER_HOST`, the per-job configuration and the caches - are set after the policy is applied, so no policy can replace them. Secrets from GitHub reach steps through the job payload as usual; this is about what the host contributes
 - **Filesystem reads**: Under `strict` a job reads the OS, the runner's own directories, its workspace, and whatever its `.localmostrc` declares - nothing else. `moderate` and `permissive` additionally grant the standard toolchain locations (`/opt/homebrew`, `/usr/local`, Xcode) and the package-manager caches. At every level a job is denied `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.config`, `~/Library/Keychains`, `~/.netrc`, `~/.npmrc`, this app's credential store and approval cache, and the credential files kept inside the package-manager caches (`~/.m2/settings.xml`, `~/.gradle/gradle.properties`, cargo credentials, `NuGet.Config`)
-- **Network exfiltration**: A job's sandbox permits no outbound connection except to its own filtering proxy, so the host policy holds even for code that ignores `HTTP_PROXY` and opens a raw socket. A direct connection to any other loopback port is refused too, unless its approved policy declares that port with `network.loopback`; the proxy itself does not yet apply that rule, and forwards a request for a literal `127.0.0.1` or `localhost` to any port, so a job that goes through `HTTP_PROXY` can still reach a local service. Under `strict` the reachable set is runner infrastructure plus what the repository declares — not npm, PyPI or other registries
+- **Network exfiltration**: A job's sandbox permits no outbound connection except to its own filtering proxy, so the host policy holds even for code that ignores `HTTP_PROXY` and opens a raw socket. A direct connection to any other loopback port is refused too, unless its approved policy declares that port with `network.loopback`, and the proxy holds a request for a loopback address to the same ports, so going through `HTTP_PROXY` does not reach a local service either. Under `strict` the reachable set is runner infrastructure plus what the repository declares — not npm, PyPI or other registries
 - **Other processes**: A job can signal only processes in its own sandbox - its children and the members of its process group that share its sandbox - not the app, another worker's job or anything else you run. It cannot look up the app's own Chromium port rendezvous service either
 - **Container work**: A job is never handed the Docker daemon socket. It talks to a filtering socket localmost owns, which forwards only the `pull`, `run` and `build` requests the repository's approved `.localmostrc` declares - see Docker Access below
 - **Credential exposure**: OAuth tokens are encrypted at rest using macOS Keychain
@@ -111,7 +111,7 @@ loosen its own sandbox without the machine owner agreeing to it.
 - **Per-workflow filesystem sections**: A `workflows:` section can narrow or widen *network* access per workflow, because hosts are applied to the proxy when a job is claimed. Filesystem paths are taken from `shared:` only — the sandbox profile is built before the runner knows which workflow it will run, and cannot change afterwards.
 - **Per-workflow env sections**: The environment is fixed when the worker starts, for the same reason. `env: allow` is taken from `shared:` only; a per-workflow allow is not applied. `env: deny` is taken from `shared:` and from every workflow, and applied to every job - a per-workflow deny is honoured more widely than written rather than not at all.
 - **Per-workflow sections are not a boundary between contributors**: A `workflows.<name>` section is available to any commit that can run a workflow file with that name, including pull requests; approving a per-workflow grant approves it for anyone who can open a PR. The key matches a file name, and a pull request can add or change a workflow file like any other. Per-workflow sections keep a compromised dependency of one workflow from using another's grants, not a commit author.
-- **Loopback services, through the proxy**: A job's sandbox closes loopback ports other than its own proxy's unless the repository declares `network.loopback`, but the proxy itself reaches `localhost` and `127.0.0.1` - see Network Policy below. A service listening on loopback is protected from jobs only by its own authentication, as the broker is by its per-worker key. Containers are not under the sandbox's loopback rule at all: a container on a routable network reaches the host's loopback services, the broker included, through the daemon's address for the host (`host.docker.internal`) - see Docker Access below.
+- **Loopback services on declared ports, and the broker**: A job reaches loopback ports other than its own proxy's only when the repository declares them with `network.loopback`, directly or through its proxy, and through its proxy it always reaches the broker's port - see Network Policy below. A service on a declared port is protected from jobs only by its own authentication, as the broker is by its per-worker key. Containers are not under the sandbox's loopback rule at all: a container on a routable network reaches the host's loopback services, the broker included, through the daemon's address for the host (`host.docker.internal`) - see Docker Access below.
 - **Processes running as you**: The CLI control socket is guarded only by file permissions (`0600` in a `0700` directory) and the job sandbox's deny of it. Any process running as your user can control the app through it - pause, resume, add or remove targets - as it could by editing `~/.localmost` directly.
 - **Container egress**: Traffic from inside a container leaves through the daemon's network, not the job's proxy, so the host allowlist does not apply to it. The Docker filter decides what a container may be created with, not what it connects to once running - see Docker Access below.
 
@@ -131,8 +131,8 @@ destination, the job's own proxy on loopback, and the proxy makes the decision.
 Other loopback ports are closed to a job's direct connections by default: a
 debugger listening on 9229, a browser's remote-debugging port, a local database
 or another tool's proxy is not the job's to open a socket to, and neither is a
-port a concurrent job opened. Its proxy still reaches them, though (see
-below), so this narrows the ways to a local service rather than closing them.
+port a concurrent job opened, and its proxy will not forward to one for it
+either (see below).
 A repository whose jobs need loopback - a test suite that starts a server on an
 ephemeral `127.0.0.1` port and connects to it, or a service container published
 on a fixed port - declares it in `.localmostrc`, under `shared:` only, since the
@@ -153,12 +153,13 @@ granted a port reaches whatever listens there, a concurrent job's server
 included, whichever repository it belongs to, and two jobs that bind the same
 fixed port collide.
 
-This closes direct connections only. The proxy treats `localhost` and
-`127.0.0.1` as runner infrastructure (below), because the runner reaches the
-local broker through it, so a job that sends a request or opens a tunnel
-through its own proxy can still reach a service on loopback. A local service
-that jobs must not use needs its own authentication, as the broker has: each
-worker talks to it at an address carrying a key of its own
+The proxy holds a request for a loopback address to the same ports, at every
+level, `permissive` included: a plain request or a `CONNECT` tunnel to
+`127.0.0.1`, `::1`, any other `127/8` address or `localhost` is refused with
+403 unless its port is declared or is the broker's. The broker's port stays
+open through the proxy because the runner reaches the local broker through
+it. What keeps a job from using that port is the broker's own
+authentication: each worker talks to it at an address carrying a key of its own
 (`http://127.0.0.1:<port>/w/<key>/`), and the broker answers each key only
 with its own worker's session and the jobs delivered to that worker. That key,
 not the closed port, is what keeps a job from acting as another worker or as
@@ -174,8 +175,8 @@ Three levels are available in Settings under Job Security:
 
 A small set of hosts is allowed at every level, because the Actions runner is
 launched with `HTTP_PROXY` pointed at this proxy and cannot register or poll for
-jobs without them: `localhost`, `127.0.0.1`, `github.com`, `api.github.com`,
-`*.actions.githubusercontent.com` and `*.blob.core.windows.net`. A single proxy
+jobs without them: the local broker on its own port, `github.com`,
+`api.github.com`, `*.actions.githubusercontent.com` and `*.blob.core.windows.net`. A single proxy
 cannot distinguish the runner's own requests from a job's, so jobs reach those
 hosts too - and those hosts accept writes from any account (a gist, a push
 to another repository, an upload to anyone's storage container), so even
@@ -187,16 +188,18 @@ be spelled in a `.localmostrc` network entry as `host:port` (or
 `[v6-address]:port`), which allows that port only. An `http://` URL reaches
 port 80 as a plain proxied request; a client that tunnels it through `CONNECT`
 instead needs a `host:80` entry. `permissive` stays unrestricted, ports
-included. A literal loopback address (`127.0.0.1`, `::1`) is reachable through
-the proxy on any port at every level, because the runner reaches the broker
-through it at `127.0.0.1`; the broker is guarded by each worker's key, not by
-its port. A name that resolves to loopback, `localhost` included, is refused.
+included, except on this machine: a literal loopback address (`127.0.0.1`,
+`::1`) is reachable through the proxy at every level on the broker's port,
+because the runner reaches the broker through it at `127.0.0.1`, and on the
+ports `shared.network.loopback` declares - no others. The broker is guarded by
+each worker's key, not by its port. A name that resolves to loopback,
+`localhost` included, is refused.
 
 A `network.deny` entry is read the same way and refuses its host at every
 level, `permissive` included, whatever the allow list says; an entry with a
 port denies that port only. The runner infrastructure hosts on their scheme's
-port, and literal loopback addresses on any port, cannot be denied. Like the
-allow list, it matches names, not addresses:
+port, and the broker's port on loopback, cannot be denied; a declared loopback
+port can. Like the allow list, it matches names, not addresses:
 at `permissive` a job can still reach the same server by its address or another
 name.
 

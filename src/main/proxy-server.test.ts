@@ -10,6 +10,7 @@ import * as net from 'net';
 import { ProxyLogEntry, ProxyServer, parseConnectTarget } from './proxy-server';
 import { SandboxPolicyLevel } from '../shared/types';
 import { pinnedLookup } from '../shared/egress-screen';
+import { DEFAULT_BROKER_PORT } from '../shared/sandbox-profile';
 
 type AccessDecision = { allowed: boolean; reason?: string };
 
@@ -31,6 +32,25 @@ function checkHost(
   ).checkHostAccess(host, port, via);
 }
 
+/**
+ * A proxy whose job's policy declares all of loopback. Tests that stand a
+ * local server in for an upstream need it: a job reaches a port on this
+ * machine only when its policy opens it (proxy-server-loopback.test.ts).
+ */
+function openLoopback(proxy: ProxyServer): ProxyServer {
+  proxy.setLoopbackPolicy(DEFAULT_BROKER_PORT, true);
+  return proxy;
+}
+
+/**
+ * A proxy that reaches the broker at 127.0.0.1:1, where nothing listens: a
+ * request that gets a 502 was forwarded rather than refused.
+ */
+function brokerAtPortOne(proxy: ProxyServer): ProxyServer {
+  proxy.setLoopbackPolicy(1, undefined);
+  return proxy;
+}
+
 function makeProxy(
   policyLevel: SandboxPolicyLevel,
   allowedHosts?: string[]
@@ -49,8 +69,6 @@ describe('ProxyServer host access', () => {
 
   describe('runner infrastructure', () => {
     const infrastructureHosts = [
-      'localhost',
-      '127.0.0.1',
       'github.com',
       'api.github.com',
       'pipelines.actions.githubusercontent.com',
@@ -66,6 +84,10 @@ describe('ProxyServer host access', () => {
         });
       }
     );
+
+    it.each(['strict', 'moderate', 'permissive'] as const)('allows the broker on 127.0.0.1 under %s', (level) => {
+      expect(checkHost(makeProxy(level), '127.0.0.1', DEFAULT_BROKER_PORT, 'http')).toEqual({ allowed: true, reason: 'infrastructure' });
+    });
 
     it('allows blob storage for log and artifact upload under strict policy', () => {
       expect(
@@ -252,18 +274,18 @@ describe('ProxyServer host access', () => {
       expect(checkHost(proxy, '2606:4700::64', 443).allowed).toBe(false);
     });
 
-    it.each(['strict', 'moderate'] as const)('leaves loopback targets on any port under %s', (level) => {
+    it.each(['strict', 'moderate'] as const)('reaches the broker on its own port, and no other loopback port, under %s', (level) => {
       // The broker is reached at 127.0.0.1 on its own port, over plain HTTP.
       const proxy = makeProxy(level);
       expect(checkHost(proxy, '127.0.0.1', 8787, 'http').allowed).toBe(true);
       expect(checkHost(proxy, '127.0.0.1', 8787, 'connect').allowed).toBe(true);
-      expect(checkHost(proxy, 'localhost', 9229, 'http').allowed).toBe(true);
+      expect(checkHost(proxy, 'localhost', 9229, 'http')).toEqual({ allowed: false, reason: 'loopback' });
     });
 
-    it('leaves permissive unrestricted, ports included', () => {
+    it('leaves permissive unrestricted off this machine, ports included', () => {
       const proxy = makeProxy('permissive');
       expect(checkHost(proxy, 'evil.example.com', 22).allowed).toBe(true);
-      expect(checkHost(proxy, '::1', 5432).allowed).toBe(true);
+      expect(checkHost(proxy, '::1', 5432)).toEqual({ allowed: false, reason: 'loopback' });
     });
 
     const authHeader = (token: string) => 'Basic ' + Buffer.from(`localmost:${token}`).toString('base64');
@@ -484,7 +506,7 @@ describe('ProxyServer host access', () => {
 
 describe('resolving policy when a worker claims a job', () => {
   const startProxy = async (onJobAcquired: (jobId: string) => Promise<void>) => {
-    const proxy = new ProxyServer({ policyLevel: 'strict', onJobAcquired });
+    const proxy = brokerAtPortOne(new ProxyServer({ policyLevel: 'strict', onJobAcquired }));
     await proxy.start();
     return proxy;
   };
@@ -544,12 +566,12 @@ describe('acquirejob forwarding is resilient', () => {
   it('still forwards when policy resolution rejects', async () => {
     // A rejecting resolver must not become an unhandled rejection or strand
     // the runner's acquirejob request.
-    const proxy = new ProxyServer({
+    const proxy = brokerAtPortOne(new ProxyServer({
       policyLevel: 'strict',
       onJobAcquired: async () => {
         throw new Error('resolution failed');
       },
-    });
+    }));
     await proxy.start();
 
     const body = JSON.stringify({ jobMessageId: 'msg-1' });
@@ -584,12 +606,12 @@ describe('acquirejob body limits', () => {
     // Any request to a path ending in /acquirejob reaches this code, so an
     // unbounded buffer is memory a workflow gets to choose the size of.
     let resolverCalled = false;
-    const proxy = new ProxyServer({
+    const proxy = brokerAtPortOne(new ProxyServer({
       policyLevel: 'strict',
       onJobAcquired: async () => {
         resolverCalled = true;
       },
-    });
+    }));
     await proxy.start();
 
     const body = 'x'.repeat(200 * 1024);
@@ -660,6 +682,7 @@ describe('screening the address a host resolves to', () => {
     const rebind = new ProxyServer({ policyLevel: 'permissive', lookup: async () => ['127.0.0.1'] });
     await rebind.start();
     const literal = new ProxyServer({ policyLevel: 'permissive', lookup: async () => ['8.8.8.8'] });
+    literal.setLoopbackPolicy(9, undefined);
     await literal.start();
     const req = (port: number, path: string) => new Promise<number>((resolve, reject) => {
       const r = http.request({ hostname: '127.0.0.1', port, path, method: 'GET' }, (res) => { res.resume(); resolve(res.statusCode || 0); });
@@ -668,8 +691,9 @@ describe('screening the address a host resolves to', () => {
     try {
       // hostname that resolves to loopback -> refused
       expect(await req(rebind.getPort(), 'http://rebind.example/')).toBe(403);
-      // literal loopback target reaches an upstream that is not listening ->
-      // 502 proves it was NOT screened out (a 403 would mean blocked).
+      // literal loopback target - the broker, here on port 9 - reaches an
+      // upstream that is not listening -> 502 proves it was NOT screened out
+      // (a 403 would mean blocked).
       expect(await req(literal.getPort(), 'http://127.0.0.1:9/')).toBe(502);
     } finally {
       await rebind.stop();
@@ -742,7 +766,7 @@ describe('a request the screen refuses', () => {
     const entries: ProxyLogEntry[] = [];
     const up = http.createServer((_req, res) => res.end('ok'));
     await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
-    const p = new ProxyServer({ policyLevel: 'strict', onLog: (e) => entries.push(e) });
+    const p = openLoopback(new ProxyServer({ policyLevel: 'strict', onLog: (e) => entries.push(e) }));
     await p.start();
     try {
       expect(await plain('GET', `http://127.0.0.1:${(up.address() as net.AddressInfo).port}/`)(p.getPort())).toBe(200);
@@ -834,7 +858,7 @@ describe('a worker may use only its own proxy', () => {
 
   it('drops a tunnel the old token opened when the token rotates', async () => {
     const up = await upstream();
-    const p = new ProxyServer({ ...local, authToken: 'old-tok' });
+    const p = openLoopback(new ProxyServer({ ...local, authToken: 'old-tok' }));
     await p.start();
     try {
       const sock = await tunnel(p.getPort(), `127.0.0.1:${up.port}`, 'old-tok');
@@ -863,7 +887,7 @@ describe('a worker may use only its own proxy', () => {
     });
     await new Promise<void>((r) => upHttp.listen(0, '127.0.0.1', r));
     const upPort = (upHttp.address() as net.AddressInfo).port;
-    const p = new ProxyServer({ ...local, authToken: 'old-tok' });
+    const p = openLoopback(new ProxyServer({ ...local, authToken: 'old-tok' }));
     await p.start();
     try {
       const sock = net.connect(p.getPort(), '127.0.0.1');
@@ -886,7 +910,7 @@ describe('a worker may use only its own proxy', () => {
 
   it('serves a tunnel opened with the new token after rotation', async () => {
     const up = await upstream();
-    const p = new ProxyServer({ ...local, authToken: 'old-tok' });
+    const p = openLoopback(new ProxyServer({ ...local, authToken: 'old-tok' }));
     await p.start();
     try {
       p.rotateAuthToken('new-tok');
@@ -983,7 +1007,7 @@ describe('CONNECT targets', () => {
   it('tunnels to a bracketed IPv6 literal under a permissive policy', async () => {
     const up = net.createServer((s) => s.end());
     const port = await listenV6(up);
-    const p = new ProxyServer({ policyLevel: 'permissive', authToken: 't' });
+    const p = openLoopback(new ProxyServer({ policyLevel: 'permissive', authToken: 't' }));
     await p.start();
     try {
       expect(await connectStatus(p.getPort(), `[::1]:${port}`, 't')).toBe('HTTP/1.1 200 Connection Established');
@@ -1039,7 +1063,7 @@ describe('CONNECT targets', () => {
   it('serves a plain request to a bracketed IPv6 host', async () => {
     const up = http.createServer((_req, res) => res.end('ok'));
     const port = await listenV6(up);
-    const p = new ProxyServer({ policyLevel: 'permissive', authToken: 't' });
+    const p = openLoopback(new ProxyServer({ policyLevel: 'permissive', authToken: 't' }));
     await p.start();
     try {
       expect(await getVia(p.getPort(), `http://[::1]:${port}/`)).toBe(200);
@@ -1097,7 +1121,7 @@ describe('an upstream request ends with its client', () => {
 
   it('closes the upstream when the token rotates mid-response', async () => {
     const h = await hangingUpstream();
-    const p = new ProxyServer({ policyLevel: 'permissive' });
+    const p = openLoopback(new ProxyServer({ policyLevel: 'permissive' }));
     await p.start();
     try {
       await open(p.getPort(), `GET http://127.0.0.1:${h.port}/ HTTP/1.1\r\nHost: 127.0.0.1:${h.port}\r\n\r\n`);
@@ -1108,7 +1132,7 @@ describe('an upstream request ends with its client', () => {
 
   it('closes the upstream when the client goes away mid-response', async () => {
     const h = await hangingUpstream();
-    const p = new ProxyServer({ policyLevel: 'permissive' });
+    const p = openLoopback(new ProxyServer({ policyLevel: 'permissive' }));
     await p.start();
     try {
       const sock = await open(p.getPort(), `GET http://127.0.0.1:${h.port}/ HTTP/1.1\r\nHost: 127.0.0.1:${h.port}\r\n\r\n`);
@@ -1119,7 +1143,7 @@ describe('an upstream request ends with its client', () => {
 
   it('closes a replayed acquirejob upstream when the client goes away', async () => {
     const h = await hangingUpstream();
-    const p = new ProxyServer({ policyLevel: 'permissive', onJobAcquired: async () => undefined });
+    const p = openLoopback(new ProxyServer({ policyLevel: 'permissive', onJobAcquired: async () => undefined }));
     await p.start();
     try {
       const sock = await open(
@@ -1141,7 +1165,7 @@ describe('an upstream request ends with its client', () => {
     });
     await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
     const upPort = (up.address() as net.AddressInfo).port;
-    const p = new ProxyServer({ policyLevel: 'permissive' });
+    const p = openLoopback(new ProxyServer({ policyLevel: 'permissive' }));
     await p.start();
     try {
       const sock = await open(p.getPort(), `GET http://127.0.0.1:${upPort}/ HTTP/1.1\r\nHost: 127.0.0.1:${upPort}\r\n\r\n`);
@@ -1200,7 +1224,7 @@ describe('the Host an upstream sees', () => {
 
   it('is the host the request was checked against, not the Host header sent', async () => {
     const { up, seen, port } = await upstreamHosts();
-    const p = new ProxyServer({ policyLevel: 'strict' });
+    const p = openLoopback(new ProxyServer({ policyLevel: 'strict' }));
     await p.start();
     try {
       expect(await send(p.getPort(), 'GET', `http://127.0.0.1:${port}/`)).toBe(200);
@@ -1210,7 +1234,7 @@ describe('the Host an upstream sees', () => {
 
   it('is the checked host on a replayed acquirejob too', async () => {
     const { up, seen, port } = await upstreamHosts();
-    const p = new ProxyServer({ policyLevel: 'strict', onJobAcquired: async () => undefined });
+    const p = openLoopback(new ProxyServer({ policyLevel: 'strict', onJobAcquired: async () => undefined }));
     await p.start();
     try {
       expect(await send(p.getPort(), 'POST', `http://127.0.0.1:${port}/_apis/x/acquirejob`, '{}')).toBe(200);
