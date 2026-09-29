@@ -230,7 +230,7 @@ export class RunnerManager {
   private readonly jobHistoryPath: string;
 
   // Pending target context for jobs received from broker
-  // Maps runner name (or 'next') to target context
+  // Keyed by slot number, or 'next' for the job admission is handing to spawnWorkerForJob
   private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string; githubSha?: string; githubRef?: string; githubWorkflow?: string; jobId?: string }> = new Map();
 
   /**
@@ -389,9 +389,9 @@ export class RunnerManager {
   }
 
   /**
-   * Set pending target context for the next job received by a runner.
-   * Called by broker-proxy-service when a job is received from a target.
-   * @param runnerName The runner name or 'next' to apply to next job on any runner
+   * Set pending target context for a job admission has accepted.
+   * Called by admission (job-admission.ts) just before spawnWorkerForJob, which takes it.
+   * @param runnerName 'next' for the worker about to be spawned, or a slot number
    * @param targetId The target ID from which the job was received
    * @param targetDisplayName Human-readable target name
    * @param actionsUrl The GitHub Actions URL for this job
@@ -406,25 +406,6 @@ export class RunnerManager {
   setPendingTargetContext(runnerName: string, targetId: string, targetDisplayName: string, actionsUrl?: string, githubRunId?: number, githubJobId?: number, githubActor?: string, githubSha?: string, githubRef?: string, githubWorkflow?: string, jobId?: string): void {
     this.pendingTargetContext.set(runnerName, { targetId, targetDisplayName, actionsUrl, githubRunId, githubJobId, githubActor, githubSha, githubRef, githubWorkflow, jobId });
     this.log('debug', `Set pending target context for ${runnerName}: ${targetDisplayName} (runId=${githubRunId}, jobId=${githubJobId}, actor=${githubActor}, sha=${githubSha?.slice(0, 7)})`);
-  }
-
-  /**
-   * Consume pending target context for a runner.
-   * Returns and removes the context if found.
-   */
-  private consumePendingTargetContext(runnerName: string): { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string; githubSha?: string; githubRef?: string; githubWorkflow?: string; jobId?: string } | undefined {
-    // Try exact match first, then fall back to 'next'
-    let context = this.pendingTargetContext.get(runnerName);
-    if (context) {
-      this.pendingTargetContext.delete(runnerName);
-      return context;
-    }
-    context = this.pendingTargetContext.get('next');
-    if (context) {
-      this.pendingTargetContext.delete('next');
-      return context;
-    }
-    return undefined;
   }
 
   private loadRunnerConfig(): void {
@@ -655,9 +636,12 @@ export class RunnerManager {
 
     this.stopping = false;
 
-    // Start with just 1 runner - will scale up dynamically. Unless a job
-    // already brought one up during the sweep: spawning over it would orphan
-    // that worker, whose exit is gated on it still being the slot's.
+    // Start one listener in slot 1. It takes no job - the broker binds only a
+    // worker admission spawned and announced for one - so until the pool stops
+    // it only holds the slot; the app's own start path (initialize) starts
+    // none. Unless a job already brought one up during the sweep: spawning
+    // over it would orphan that worker, whose exit is gated on it still being
+    // the slot's.
     if (!this.instances.has(1) && !this.startingInstances.has(1)) {
       await this.startInstance(1);
     }
@@ -828,7 +812,7 @@ export class RunnerManager {
     this.log('info', `Spawning worker ${instanceNum} for incoming job from ${targetContext.targetDisplayName}...`);
 
     // Keyed by instance so startInstance can install the policy for this job
-    // before the runner starts; 'next' is consumed by whichever worker registers.
+    // before the runner starts, and the job start reads it from here.
     this.pendingTargetContext.set(String(instanceNum), targetContext);
 
     // Copy proxy credentials to this instance's config before building sandbox
@@ -1763,16 +1747,6 @@ export class RunnerManager {
     this.updateAggregateStatus();
   }
 
-  private countIdleRunners(): number {
-    let count = 0;
-    for (const [, instance] of this.instances) {
-      if (instance.status === 'listening' && !instance.currentJob) {
-        count++;
-      }
-    }
-    return count;
-  }
-
   private countBusyRunners(): number {
     let count = 0;
     for (const [, instance] of this.instances) {
@@ -1781,50 +1755,6 @@ export class RunnerManager {
       }
     }
     return count;
-  }
-
-  private async scaleUp(): Promise<void> {
-    // Find the first available instance number (not in use and not starting)
-    let nextInstance: number | null = null;
-    for (let i = 2; i <= this.runnerCount; i++) {
-      const existing = this.instances.get(i);
-      const isStarting = this.startingInstances.has(i);
-      const isActive = existing && existing.status !== 'offline' && existing.status !== 'error';
-
-      if (!isStarting && !isActive) {
-        nextInstance = i;
-        break;
-      }
-    }
-
-    if (nextInstance === null) {
-      this.log('debug', 'No available instance slots for scale-up');
-      return;
-    }
-
-    // Configure instance on-demand if not yet configured (lazy configuration)
-    if (!this.downloader.isConfigured(nextInstance)) {
-      if (this.onConfigurationNeeded) {
-        this.log('info', `Instance ${nextInstance} not configured, configuring on-demand...`);
-        try {
-          await this.onConfigurationNeeded(nextInstance);
-          // Verify configuration succeeded
-          if (!this.downloader.isConfigured(nextInstance)) {
-            this.log('error', `Instance ${nextInstance} still not configured after callback`);
-            return;
-          }
-        } catch (err) {
-          this.log('error', `Failed to configure instance ${nextInstance}: ${(err as Error).message}`);
-          return;
-        }
-      } else {
-        this.log('warn', `Instance ${nextInstance} not configured and no configuration callback available`);
-        return;
-      }
-    }
-
-    this.log('info', `Scaling up: starting instance ${nextInstance}`);
-    await this.startInstance(nextInstance);
   }
 
   private async parseRunnerOutput(instanceNum: number, line: string): Promise<void> {
@@ -1910,20 +1840,13 @@ export class RunnerManager {
 
       instance.status = 'busy';
 
-      // Get target context if available. spawnWorkerForJob stores it under the
-      // numeric instance id, so look there first; consume also falls back to
-      // 'next' for an idle worker that picked the job up without a spawn. (The
-      // full runner name is never a storage key, so looking it up always missed
-      // and left every job reporting its repository as 'unknown'.)
-      const targetContext = this.consumePendingTargetContext(String(instanceNum));
-
-      // Keep it against this instance. An idle worker that picks a job up
-      // never went through spawnWorkerForJob, so this is the only record of
-      // which repository the job belongs to - and the policy cannot be
-      // resolved without it.
-      if (targetContext) {
-        this.pendingTargetContext.set(String(instanceNum), targetContext);
-      }
+      // The job's context is the one spawnWorkerForJob stored under this slot's
+      // number before the worker started: only a worker spawned and announced
+      // for a job can take one, so its own slot is the only place to look.
+      // It stays there, since the policy and the filter backstop read it from
+      // there too. 'next' is admission's hand-off to spawnWorkerForJob, never
+      // a worker's.
+      const targetContext = this.pendingTargetContext.get(String(instanceNum));
 
       // Use target display name (owner/repo format) for repository if available
       const repository = targetContext?.targetDisplayName || this.config?.url || 'unknown';
@@ -1973,14 +1896,6 @@ export class RunnerManager {
       this.applyRepoPolicy(instanceNum).catch((err) => {
         this.log('debug', `Repo policy load failed: ${(err as Error).message}`);
       });
-
-      // Scale up if all runners are busy
-      const idleCount = this.countIdleRunners();
-      if (idleCount === 0 && this.instances.size < this.runnerCount) {
-        this.scaleUp().catch((err) => {
-          this.log('warn', `Failed to scale up: ${err.message}`);
-        });
-      }
     }
 
     // Detect job completion
@@ -2343,7 +2258,9 @@ export class RunnerManager {
    * Supports three scopes:
    * - 'everyone': No filtering, all jobs allowed
    * - 'trigger': Check the workflow trigger author only
-   * - 'contributors': Check all repository contributors/commit authors
+   * - 'contributors': Check the trigger author, the repository's contributors,
+   *   and the author of every commit since those were fetched - one with no
+   *   linked account is allowed by no filter
    */
   async evaluateJobFilter(
     owner: string,

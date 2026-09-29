@@ -2746,11 +2746,9 @@ describe('a worker constrained by policy drift stays constrained', () => {
 });
 
 describe('a released slot does not carry the finished job\'s context', () => {
-  it('does not judge the next worker in that slot against the previous repository', async () => {
-    const docker = { run: { images: ['alpine:3'] } };
+  it('does not judge the next worker in that slot against the previous repository', () => {
     const manager = new RunnerManager({
       onLog: jest.fn(), onStatusChange: jest.fn(), onJobHistoryUpdate: jest.fn(),
-      getRepoPolicy: async () => ({ hosts: [], level: 'strict' as const, readPaths: [], writePaths: [], docker }),
     });
     const helper = new RunnerManagerTestHelper(manager);
 
@@ -2880,6 +2878,54 @@ describe('spawning the worker for an admitted job', () => {
     (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
 
     await expect(m.spawnWorkerForJob()).resolves.toBe(false);
+  });
+
+  // The stub above is module-wide; later describes in this file have no
+  // beforeEach of their own to reset it.
+  afterEach(() => {
+    (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReset();
+  });
+});
+
+describe('a job start on a worker', () => {
+  function manager() {
+    const m = new RunnerManager({
+      onLog: jest.fn(), onStatusChange: jest.fn(), onJobHistoryUpdate: jest.fn(),
+    });
+    const helper = new RunnerManagerTestHelper(m);
+    helper.startedAt = new Date().toISOString();
+    return { m, helper };
+  }
+
+  it("takes its context only from its own slot, never from admission's 'next'", async () => {
+    // 'next' is admission's hand-off to spawnWorkerForJob, which takes it in
+    // the same tick. A worker with no context of its own was not spawned for
+    // a job, and whatever lingered in 'next' is not its job.
+    const { helper } = manager();
+    helper.setInstance(1, { name: 'runner-1', status: 'listening' });
+    helper.setPendingTargetContext('next', { targetId: 't2', targetDisplayName: 'owner/other', jobId: 'req-2' });
+
+    await helper.parseRunnerOutput(1, 'Running job: build');
+
+    expect(helper.instances.get(1)!.currentJob?.targetDisplayName).toBeUndefined();
+    expect(helper.pendingTargetContext('next')).toBeDefined();
+  });
+
+  it('does not start a listener in another slot when every worker is busy', async () => {
+    // Only a worker spawned and announced for a job can take one, so a
+    // listener started ahead of any job never binds; it would hold a slot
+    // until the pool stops and take a job from nobody.
+    const { helper } = manager();
+    helper.runnerCount = 2;
+    helper.setInstance(1, { name: 'runner-1', status: 'listening' });
+    helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'req-1' });
+    const startInstance = jest.fn(async (_n: number) => undefined);
+    helper.stubStartInstance(startInstance);
+
+    await helper.parseRunnerOutput(1, 'Running job: build');
+    await settle();
+
+    expect(startInstance).not.toHaveBeenCalled();
   });
 });
 

@@ -31,7 +31,8 @@ export function normalizeFilterConfig(
 
 /**
  * Check if a single user is allowed based on filter configuration.
- * Used for 'trigger' scope to check the workflow trigger.
+ * Both filtering scopes check the workflow trigger author with it; 'contributors'
+ * then checks the code's authors with areAllUsersAllowed.
  */
 export function isUserAllowed(
   login: string,

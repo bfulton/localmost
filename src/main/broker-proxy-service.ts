@@ -360,9 +360,9 @@ export class BrokerProxyService extends EventEmitter {
    * unbound, so every job was run by the NEXT job's worker. And an idle
    * listener - one started by a scale-up or a CLI resume, with no job of its
    * own and a generic sandbox - could bind any leftover assignment by naming
-   * the target's runner, including one for a job admission had refused. Such
-   * a listener still starts, but it never binds and so never takes a job; it
-   * holds its slot until the pool stops.
+   * the target's runner, including one for a job admission had refused.
+   * Scale-up no longer starts one. The CLI's resume still does; it never binds
+   * and so never takes a job, and holds its slot until the pool stops.
    */
   // Keyed by target+instance, not the runner's agentName: target-manager can
   // produce the same agentName for two coexisting targets (an org foo-bar and a
