@@ -19,7 +19,7 @@ jest.mock('./encryption', () => ({
   decryptValue: (v: string) => v.replace(/^enc:/, ''),
 }));
 
-import { saveConfig, loadConfig } from './config';
+import { saveConfig, loadConfig, SETTABLE_CONFIG_KEYS } from './config';
 
 beforeEach(() => {
   if (fs.existsSync(configPath)) fs.rmSync(configPath);
@@ -82,5 +82,13 @@ describe('saveConfig', () => {
     saveConfig({ theme: 'light' });
 
     expect(fs.readFileSync(configPath, 'utf-8')).toContain('configVersion: 999999');
+  });
+});
+
+describe('SETTABLE_CONFIG_KEYS', () => {
+  it('leaves out what only the main process writes: the session, and the targets', () => {
+    expect(SETTABLE_CONFIG_KEYS).not.toContain('auth');
+    expect(SETTABLE_CONFIG_KEYS).not.toContain('githubClientId');
+    expect(SETTABLE_CONFIG_KEYS).not.toContain('targets');
   });
 });

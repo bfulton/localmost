@@ -367,6 +367,28 @@ describe('TargetManager', () => {
         targets: [{ ...target, enabled: false }],
       });
     });
+
+    it('changes nothing but enabled, whatever else the update object carries', async () => {
+      const target: Target = {
+        id: 'test-1',
+        type: 'repo',
+        owner: 'testowner',
+        repo: 'testrepo',
+        displayName: 'testowner/testrepo',
+        url: 'https://github.com/testowner/testrepo',
+        proxyRunnerName: 'localmost.test-host.testowner-testrepo',
+        enabled: true,
+        addedAt: '2024-01-01T00:00:00.000Z',
+      };
+      mockLoadConfig.mockReturnValue({ targets: [target] });
+
+      const updates = { enabled: false, url: 'https://evil.example/o/r', owner: '../x', id: '../..' };
+      await manager.updateTarget('test-1', updates as { enabled: boolean });
+
+      expect(mockSaveConfig).toHaveBeenCalledWith({
+        targets: [{ ...target, enabled: false }],
+      });
+    });
   });
 
   describe('getMaxConcurrentJobs', () => {

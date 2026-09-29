@@ -19,6 +19,26 @@ function isValidGitHubUrl(url: string): boolean {
 }
 
 /**
+ * One segment of a REST path, encoded.
+ *
+ * Owner, repo and the rest reach this file from the CLI socket, IPC and job
+ * payloads, and every request carries the user's token. Interpolated raw, a
+ * "/" or "?" in a name would steer that request to another endpoint; encoded,
+ * it stays one segment. A dot segment is refused outright, because the URL
+ * parser collapses "." and ".." before the request is sent, encoded or not.
+ */
+function segment(value: string | number): string {
+  const text = String(value);
+  if (text === '' || text === '.' || text === '..') {
+    throw new Error(`"${text}" is not a valid GitHub API path segment`);
+  }
+  return encodeURIComponent(text);
+}
+
+/** A value whose slashes are part of the path - a file path, a branch name - with each part encoded. */
+const segments = (value: string): string => value.split('/').map(segment).join('/');
+
+/**
  * Rate limiting configuration for OAuth device flow polling.
  * These limits prevent abuse and ensure compliance with GitHub's API guidelines.
  */
@@ -314,25 +334,25 @@ export class GitHubAuth {
 
   async getRunnerRegistrationToken(accessToken: string, owner: string, repo: string): Promise<string> {
     const client = new GitHubClient(accessToken);
-    const data = await client.post<{ token: string }>(`/repos/${owner}/${repo}/actions/runners/registration-token`);
+    const data = await client.post<{ token: string }>(`/repos/${segment(owner)}/${segment(repo)}/actions/runners/registration-token`);
     return data.token;
   }
 
   async getOrgRunnerRegistrationToken(accessToken: string, org: string): Promise<string> {
     const client = new GitHubClient(accessToken);
-    const data = await client.post<{ token: string }>(`/orgs/${org}/actions/runners/registration-token`);
+    const data = await client.post<{ token: string }>(`/orgs/${segment(org)}/actions/runners/registration-token`);
     return data.token;
   }
 
   async getRunnerRemoveToken(accessToken: string, owner: string, repo: string): Promise<string> {
     const client = new GitHubClient(accessToken);
-    const data = await client.post<{ token: string }>(`/repos/${owner}/${repo}/actions/runners/remove-token`);
+    const data = await client.post<{ token: string }>(`/repos/${segment(owner)}/${segment(repo)}/actions/runners/remove-token`);
     return data.token;
   }
 
   async getOrgRunnerRemoveToken(accessToken: string, org: string): Promise<string> {
     const client = new GitHubClient(accessToken);
-    const data = await client.post<{ token: string }>(`/orgs/${org}/actions/runners/remove-token`);
+    const data = await client.post<{ token: string }>(`/orgs/${segment(org)}/actions/runners/remove-token`);
     return data.token;
   }
 
@@ -341,7 +361,7 @@ export class GitHubAuth {
    */
   async listRunners(accessToken: string, owner: string, repo: string): Promise<Array<{ id: number; name: string; status: string }>> {
     const client = new GitHubClient(accessToken);
-    const data = await client.get<{ runners: Array<{ id: number; name: string; status: string }> }>(`/repos/${owner}/${repo}/actions/runners`);
+    const data = await client.get<{ runners: Array<{ id: number; name: string; status: string }> }>(`/repos/${segment(owner)}/${segment(repo)}/actions/runners`);
     return data.runners || [];
   }
 
@@ -350,7 +370,7 @@ export class GitHubAuth {
    */
   async listOrgRunners(accessToken: string, org: string): Promise<Array<{ id: number; name: string; status: string }>> {
     const client = new GitHubClient(accessToken);
-    const data = await client.get<{ runners: Array<{ id: number; name: string; status: string }> }>(`/orgs/${org}/actions/runners`);
+    const data = await client.get<{ runners: Array<{ id: number; name: string; status: string }> }>(`/orgs/${segment(org)}/actions/runners`);
     return data.runners || [];
   }
 
@@ -359,7 +379,7 @@ export class GitHubAuth {
    */
   async deleteRunner(accessToken: string, owner: string, repo: string, runnerId: number): Promise<void> {
     const client = new GitHubClient(accessToken);
-    await client.delete(`/repos/${owner}/${repo}/actions/runners/${runnerId}`);
+    await client.delete(`/repos/${segment(owner)}/${segment(repo)}/actions/runners/${segment(runnerId)}`);
   }
 
   /**
@@ -367,7 +387,7 @@ export class GitHubAuth {
    */
   async deleteOrgRunner(accessToken: string, org: string, runnerId: number): Promise<void> {
     const client = new GitHubClient(accessToken);
-    await client.delete(`/orgs/${org}/actions/runners/${runnerId}`);
+    await client.delete(`/orgs/${segment(org)}/actions/runners/${segment(runnerId)}`);
   }
 
   /**
@@ -380,7 +400,7 @@ export class GitHubAuth {
     runId: number
   ): Promise<void> {
     const client = new GitHubClient(accessToken);
-    await client.post(`/repos/${owner}/${repo}/actions/runs/${runId}/cancel`, {});
+    await client.post(`/repos/${segment(owner)}/${segment(repo)}/actions/runs/${segment(runId)}/cancel`, {});
   }
 
   /**
@@ -394,7 +414,7 @@ export class GitHubAuth {
   ): Promise<string | null> {
     const client = new GitHubClient(accessToken);
     const data = await client.get<{ conclusion: string | null }>(
-      `/repos/${owner}/${repo}/actions/jobs/${jobId}`
+      `/repos/${segment(owner)}/${segment(repo)}/actions/jobs/${segment(jobId)}`
     );
     return data.conclusion;
   }
@@ -472,7 +492,7 @@ export class GitHubAuth {
             private: boolean;
             html_url: string;
           }>;
-        }>(`/user/installations/${installation.id}/repositories?per_page=100`);
+        }>(`/user/installations/${segment(installation.id)}/repositories?per_page=100`);
 
         if (data.repositories) {
           allRepos.push(...data.repositories);
@@ -500,14 +520,14 @@ export class GitHubAuth {
     const client = new GitHubClient(accessToken);
     try {
       // Try to update existing variable
-      await client.patch(`/repos/${owner}/${repo}/actions/variables/${name}`, {
+      await client.patch(`/repos/${segment(owner)}/${segment(repo)}/actions/variables/${segment(name)}`, {
         name,
         value,
       });
     } catch (error) {
       // If variable doesn't exist (404), create it
       if ((error as { status?: number }).status === 404) {
-        await client.post(`/repos/${owner}/${repo}/actions/variables`, {
+        await client.post(`/repos/${segment(owner)}/${segment(repo)}/actions/variables`, {
           name,
           value,
         });
@@ -531,7 +551,7 @@ export class GitHubAuth {
     const client = new GitHubClient(accessToken);
     try {
       // Try to update existing variable
-      await client.patch(`/orgs/${org}/actions/variables/${name}`, {
+      await client.patch(`/orgs/${segment(org)}/actions/variables/${segment(name)}`, {
         name,
         value,
         visibility,
@@ -539,7 +559,7 @@ export class GitHubAuth {
     } catch (error) {
       // If variable doesn't exist (404), create it
       if ((error as { status?: number }).status === 404) {
-        await client.post(`/orgs/${org}/actions/variables`, {
+        await client.post(`/orgs/${segment(org)}/actions/variables`, {
           name,
           value,
           visibility,
@@ -577,7 +597,7 @@ export class GitHubAuth {
     const usersWithNames = await Promise.all(
       (data.items || []).slice(0, 5).map(async (user) => {
         try {
-          const userDetails = await client.get<{ name: string | null }>(`/users/${user.login}`);
+          const userDetails = await client.get<{ name: string | null }>(`/users/${segment(user.login)}`);
           return {
             login: user.login,
             avatar_url: user.avatar_url,
@@ -618,7 +638,7 @@ export class GitHubAuth {
     // yet made.
     while (true) {
       const data = await client.get<Array<{ login: string }>>(
-        `/repos/${owner}/${repo}/contributors`,
+        `/repos/${segment(owner)}/${segment(repo)}/contributors`,
         { params: { per_page: String(perPage), page: String(page), anon: '0' } }
       );
 
@@ -664,7 +684,7 @@ export class GitHubAuth {
           author: { login: string } | null;
           commit: { author: { name: string } | null };
         }>;
-      }>(`/repos/${owner}/${repo}/compare/${baseSha}...${headSha}`);
+      }>(`/repos/${segment(owner)}/${segment(repo)}/compare/${segment(baseSha)}...${segment(headSha)}`);
 
       // The compare API caps the commits it returns (250) while still
       // reporting the true total. A truncated response would silently omit
@@ -718,7 +738,7 @@ export class GitHubAuth {
 
     try {
       const data = await client.get<{ content?: string; encoding?: string }>(
-        `/repos/${owner}/${repo}/contents/${filePath}`,
+        `/repos/${segment(owner)}/${segment(repo)}/contents/${segments(filePath)}`,
         { params: { ref } }
       );
 
@@ -750,12 +770,12 @@ export class GitHubAuth {
 
     // Get repo info to find default branch name
     const repoData = await client.get<{ default_branch: string }>(
-      `/repos/${owner}/${repo}`
+      `/repos/${segment(owner)}/${segment(repo)}`
     );
 
     // Get the branch to find HEAD SHA
     const branchData = await client.get<{ commit: { sha: string } }>(
-      `/repos/${owner}/${repo}/branches/${repoData.default_branch}`
+      `/repos/${segment(owner)}/${segment(repo)}/branches/${segments(repoData.default_branch)}`
     );
 
     return {

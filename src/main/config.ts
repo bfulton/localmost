@@ -32,7 +32,9 @@ export const isConfigFromNewerBuild = (version: unknown): boolean =>
 /**
  * Keys that can be set via the SETTINGS_SET IPC handler.
  * This is the source of truth - TypeScript derives the type from this array.
- * Note: 'auth' and 'githubClientId' are intentionally excluded (set via auth flow).
+ * Note: 'auth' and 'githubClientId' are intentionally excluded (set via auth flow),
+ * and so is 'targets': only the target manager writes them, after checking
+ * each name, and the renderer only ever echoed back what it had read.
  */
 export const SETTABLE_CONFIG_KEYS = [
   'runnerConfig',
@@ -43,7 +45,6 @@ export const SETTABLE_CONFIG_KEYS = [
   'logLevel',
   'runnerLogLevel',
   'userFilter',
-  'targets',
   'maxConcurrentJobs',
   'power',  // Power settings (battery/video call pausing)
   'notifications',

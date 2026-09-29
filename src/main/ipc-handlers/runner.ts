@@ -4,7 +4,7 @@
 
 import * as path from 'path';
 import * as fs from 'fs';
-import { ipcMain } from 'electron';
+import { ipcMain } from './trusted-ipc';
 import { toUserError } from '../user-error';
 import { loadConfig } from '../config';
 import { getValidAccessToken, forceRefreshToken } from '../auth-tokens';
@@ -31,7 +31,36 @@ import {
   DownloadProgress,
   SetupState,
 } from '../../shared/types';
-import { DEFAULT_RUNNER_COUNT } from '../../shared/constants';
+import { DEFAULT_RUNNER_COUNT, MAX_RUNNER_COUNT, MIN_JOB_HISTORY, MAX_JOB_HISTORY } from '../../shared/constants';
+import { isGitHubOwnerName, isGitHubRepoName } from '../../shared/github-names';
+
+/**
+ * A runner release number. It becomes the arc directory a download creates,
+ * and removes recursively when the download fails, and part of the release
+ * URLs, so nothing that could carry a path is taken.
+ */
+const RUNNER_VERSION = /^\d+\.\d+\.\d+$/;
+
+const isIntegerIn = (value: unknown, min: number, max: number): value is number =>
+  Number.isInteger(value) && (value as number) >= min && (value as number) <= max;
+
+/**
+ * The fields configuration uses other than the owner and repo, which are
+ * checked where they are parsed. The name and labels reach config.sh as
+ * arguments and the count sizes the runner pool.
+ */
+const isConfigureOptions = (options: unknown): options is ConfigureOptions => {
+  if (typeof options !== 'object' || options === null) return false;
+  const { level, runnerName, labels, runnerCount } = options as Record<string, unknown>;
+  return (
+    (level === 'repo' || level === 'org') &&
+    typeof runnerName === 'string' &&
+    runnerName !== '' &&
+    Array.isArray(labels) &&
+    labels.every((label) => typeof label === 'string') &&
+    (runnerCount === undefined || isIntegerIn(runnerCount, 1, MAX_RUNNER_COUNT))
+  );
+};
 
 /**
  * Register runner-related IPC handlers.
@@ -113,7 +142,10 @@ export const registerRunnerHandlers = (): void => {
     }
   });
 
-  ipcMain.handle(IPC_CHANNELS.RUNNER_SET_DOWNLOAD_VERSION, (_event, version: string | null) => {
+  ipcMain.handle(IPC_CHANNELS.RUNNER_SET_DOWNLOAD_VERSION, (_event, version: unknown) => {
+    if (version !== null && !(typeof version === 'string' && RUNNER_VERSION.test(version))) {
+      return { success: false, error: 'Invalid runner version' };
+    }
     const runnerDownloader = getRunnerDownloader();
     runnerDownloader?.setDownloadVersion(version);
     // Update store so zubridge syncs to renderer
@@ -167,7 +199,10 @@ export const registerRunnerHandlers = (): void => {
     return runnerManager?.getStatusDisplayName() ?? '';
   });
 
-  ipcMain.handle(IPC_CHANNELS.RUNNER_CONFIGURE, async (_event, options: ConfigureOptions) => {
+  ipcMain.handle(IPC_CHANNELS.RUNNER_CONFIGURE, async (_event, options: unknown) => {
+    if (!isConfigureOptions(options)) {
+      return { success: false, error: 'Invalid runner configuration' };
+    }
     const accessToken = await getValidAccessToken();
     const githubAuth = getGitHubAuth();
     const runnerDownloader = getRunnerDownloader();
@@ -194,6 +229,10 @@ export const registerRunnerHandlers = (): void => {
         if (!options.orgName) {
           throw new Error('Organization name is required');
         }
+        // The name becomes GitHub API paths requested with the user's token.
+        if (!isGitHubOwnerName(options.orgName)) {
+          throw new Error('Invalid organization name');
+        }
         logger()?.info(`Getting registration token for org ${options.orgName}...`);
         registrationToken = await githubAuth.getOrgRunnerRegistrationToken(accessToken, options.orgName);
         configUrl = `https://github.com/${options.orgName}`;
@@ -207,6 +246,9 @@ export const registerRunnerHandlers = (): void => {
           throw new Error('Invalid repository URL');
         }
         [, owner, repo] = match;
+        if (!isGitHubOwnerName(owner) || !isGitHubRepoName(repo)) {
+          throw new Error('Invalid repository URL');
+        }
         logger()?.info(`Getting registration token for ${owner}/${repo}...`);
         registrationToken = await githubAuth.getRunnerRegistrationToken(accessToken, owner, repo);
         configUrl = `https://github.com/${owner}/${repo}`;
@@ -472,14 +514,21 @@ export const registerRunnerHandlers = (): void => {
     return history;
   });
 
-  ipcMain.handle(IPC_CHANNELS.JOB_HISTORY_SET_MAX, (_event, max: number) => {
+  ipcMain.handle(IPC_CHANNELS.JOB_HISTORY_SET_MAX, (_event, max: unknown) => {
+    if (!isIntegerIn(max, MIN_JOB_HISTORY, MAX_JOB_HISTORY)) {
+      return { success: false, error: `Job history size must be a whole number from ${MIN_JOB_HISTORY} to ${MAX_JOB_HISTORY}` };
+    }
     const runnerManager = getRunnerManager();
     runnerManager?.setMaxJobHistory(max);
     return { success: true };
   });
 
   // Cancel a running job
-  ipcMain.handle(IPC_CHANNELS.JOB_CANCEL, async (_event, owner: string, repo: string, runId: number) => {
+  ipcMain.handle(IPC_CHANNELS.JOB_CANCEL, async (_event, owner: unknown, repo: unknown, runId: unknown) => {
+    // These become the path of a POST made with the user's token.
+    if (!isGitHubOwnerName(owner) || !isGitHubRepoName(repo) || !Number.isSafeInteger(runId) || (runId as number) <= 0) {
+      return { success: false, error: 'Invalid workflow run' };
+    }
     const logger = getLogger();
     const auth = getGitHubAuth();
     const accessToken = await getValidAccessToken();
@@ -490,7 +539,7 @@ export const registerRunnerHandlers = (): void => {
 
     try {
       logger?.info(`Cancelling workflow run ${runId} in ${owner}/${repo}`);
-      await auth.cancelWorkflowRun(accessToken, owner, repo, runId);
+      await auth.cancelWorkflowRun(accessToken, owner, repo, runId as number);
       return { success: true };
     } catch (err) {
       const message = (err as Error).message;

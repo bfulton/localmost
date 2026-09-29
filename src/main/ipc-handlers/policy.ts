@@ -7,7 +7,7 @@
  * happens without leaving the app.
  */
 
-import { ipcMain } from 'electron';
+import { ipcMain } from './trusted-ipc';
 import { IPC_CHANNELS, PolicySummary, Result } from '../../shared/types';
 import {
   listCachedPolicies,

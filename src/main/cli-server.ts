@@ -14,6 +14,7 @@ import { getSnapshot, selectEffectivePauseState } from './runner-state-service';
 import { getTargetManager } from './target-manager';
 import { getRunnerProxyManager } from './runner-proxy-manager';
 import type { Target } from '../shared/types';
+import { isGitHubOwnerName, isGitHubRepoName } from '../shared/github-names';
 import type {
   CliRequest,
   CliResponse,
@@ -46,6 +47,15 @@ export type {
  */
 const asName = (value: unknown): string | null =>
   typeof value === 'string' && value.trim() ? value.trim() : null;
+
+/** Longer than any request the CLI sends, by orders of magnitude. */
+const MAX_REQUEST_LINE_CHARS = 64 * 1024;
+
+/**
+ * Requests one connection may have waiting before the server stops reading
+ * it. The CLI sends one at a time; this is room for a script that pipelines.
+ */
+const MAX_QUEUED_REQUESTS = 32;
 
 /**
  * Describe a target for the CLI, including how many runner proxies are
@@ -148,29 +158,77 @@ export class CliServer {
    */
   private handleConnection(socket: net.Socket): void {
     let buffer = '';
+    // Requests on one connection run one at a time, in the order sent. Each
+    // data event used to start its own, so a pause still stopping the runner
+    // could be overtaken by the resume sent after it. While the queue is full
+    // the socket is not read, so a client sending faster than it is answered
+    // waits in its own buffers rather than growing ours.
+    const queue: string[] = [];
+    let draining = false;
+    let paused = false;
+    let refused = false;
+    // Decoded as one stream, so a character split across two reads survives.
+    socket.setEncoding('utf8');
 
-    socket.on('data', async (data) => {
-      buffer += data.toString();
+    const answer = async (line: string): Promise<void> => {
+      try {
+        const request = JSON.parse(line) as CliRequest;
+        const response = await this.handleCommand(request);
+        socket.write(JSON.stringify(response) + '\n');
+      } catch (parseError) {
+        const errorResponse: ErrorResponse = {
+          success: false,
+          error: `Invalid request: ${(parseError as Error).message}`,
+        };
+        socket.write(JSON.stringify(errorResponse) + '\n');
+      }
+    };
+
+    const drain = async (): Promise<void> => {
+      if (draining) return;
+      draining = true;
+      while (queue.length > 0 && !socket.destroyed) {
+        await answer(queue.shift()!);
+        if (paused && queue.length < MAX_QUEUED_REQUESTS) {
+          paused = false;
+          socket.resume();
+        }
+      }
+      queue.length = 0;
+      draining = false;
+    };
+
+    socket.on('data', (data: string) => {
+      if (refused) return;
+      buffer += data;
 
       // Try to parse complete JSON messages
       const lines = buffer.split('\n');
       buffer = lines.pop() || ''; // Keep incomplete line in buffer
 
-      for (const line of lines) {
-        if (!line.trim()) continue;
-
-        try {
-          const request = JSON.parse(line) as CliRequest;
-          const response = await this.handleCommand(request);
-          socket.write(JSON.stringify(response) + '\n');
-        } catch (parseError) {
-          const errorResponse: ErrorResponse = {
-            success: false,
-            error: `Invalid request: ${(parseError as Error).message}`,
-          };
-          socket.write(JSON.stringify(errorResponse) + '\n');
-        }
+      // A request is a line of JSON a few hundred bytes long. Buffering an
+      // unterminated one without limit let any client grow the app's memory
+      // until it was killed.
+      if (buffer.length > MAX_REQUEST_LINE_CHARS) {
+        refused = true;
+        buffer = '';
+        const errorResponse: ErrorResponse = { success: false, error: 'Invalid request: too large' };
+        // The rest of the upload is read and dropped rather than left unread,
+        // which would reset the connection before the client saw the answer;
+        // a client that keeps sending is cut off shortly after.
+        socket.end(JSON.stringify(errorResponse) + '\n');
+        setTimeout(() => socket.destroy(), 1000).unref();
+        return;
       }
+
+      for (const line of lines) {
+        if (line.trim()) queue.push(line);
+      }
+      if (queue.length >= MAX_QUEUED_REQUESTS && !paused) {
+        paused = true;
+        socket.pause();
+      }
+      void drain();
     });
 
     socket.on('error', (err) => {
@@ -307,10 +365,18 @@ export class CliServer {
         if (!ownerName) {
           return { success: false, error: 'Missing or invalid target owner' };
         }
+        // The names become GitHub API paths requested with the user's token;
+        // anything GitHub would not accept as a name is refused here.
+        if (!isGitHubOwnerName(ownerName)) {
+          return { success: false, error: `"${ownerName}" is not a valid GitHub user or organization name` };
+        }
 
         const repoName = asName(repo);
         if (type === 'repo' && !repoName) {
           return { success: false, error: 'Missing or invalid repo name for a repo target' };
+        }
+        if (type === 'repo' && !isGitHubRepoName(repoName)) {
+          return { success: false, error: `"${repoName}" is not a valid GitHub repository name` };
         }
 
         const result = await getTargetManager().addTargetAndAttach(

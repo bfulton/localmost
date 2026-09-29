@@ -33,6 +33,13 @@ import type {
   ActionResponse,
 } from '../shared/cli-protocol';
 
+// Everything the CLI writes - approved policies, workspace copies, the
+// action cache - is the user's alone, as it is for the app, which sets the
+// same mask. A shell's usual 022 would leave it readable by every account on
+// the machine. Workflow steps run by `localmost test` inherit this, as a real
+// job does from the app.
+process.umask(0o077);
+
 const HELP_TEXT = `
 localmost - Run GitHub Actions locally
 
