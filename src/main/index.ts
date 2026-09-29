@@ -388,6 +388,11 @@ app.whenReady().then(async () => {
           // pressing cancel on GitHub.
           title = 'Job Refused';
           body = `${repoShort}: ${event.reason ?? 'blocked by policy'}`;
+        } else if (event.type === 'cancel-failed') {
+          // The run is still going on GitHub; say so rather than let a
+          // refusal read as the end of it.
+          title = 'Cancel Failed';
+          body = `${repoShort}: ${event.reason ?? 'the workflow run could not be cancelled'}`;
         } else if (event.type === 'started') {
           title = 'Job Started';
           body = `${event.jobName} on ${repoShort}`;
