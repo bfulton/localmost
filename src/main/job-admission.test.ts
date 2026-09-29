@@ -28,7 +28,7 @@ describe('admitJob', () => {
           calls.push('filter');
           return overrides.verdict ?? { allowed: true, reason: '' };
         }),
-        recordRefusedJob: jest.fn(() => { calls.push('record'); }),
+        recordRefusedJob: jest.fn(() => { calls.push('record'); return 'refused-42-1'; }),
         cancelRun: jest.fn(async () => { calls.push('cancel'); }),
         setPendingTargetContext: jest.fn(() => { calls.push('context'); }),
         spawnWorkerForJob: jest.fn(async () => {
@@ -73,6 +73,16 @@ describe('admitJob', () => {
     expect(deps.broker.refuseJob).toHaveBeenCalledWith('t1', 'req-1');
     expect(calls.indexOf('refuse')).toBeLessThan(calls.indexOf('cancel'));
     expect(deps.runnerManager.spawnWorkerForJob).not.toHaveBeenCalled();
+  });
+
+  it('has a failed cancel noted on the entry it recorded for this job', async () => {
+    // Two jobs of one run can be refused at once; "the latest entry for the
+    // run" can be the other one's by the time a cancel fails.
+    const { deps } = setup({ verdict: { allowed: false, reason: 'stranger' } });
+
+    await admitJob(deps, 't1', 'req-1', info);
+
+    expect(deps.runnerManager.cancelRun).toHaveBeenCalledWith('owner', 'repo', 42, 'stranger', 'refused-42-1');
   });
 
   it('drops a job whose policy is not approved', async () => {

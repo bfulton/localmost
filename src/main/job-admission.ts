@@ -69,7 +69,7 @@ export async function admitJob(
       // broker acquired and queued, payload and all.
       broker.refuseJob(targetId, jobId);
       told = true;
-      runnerManager.recordRefusedJob({
+      const historyId = runnerManager.recordRefusedJob({
         repository: target.displayName,
         jobName: githubInfo.githubJobId ? `job ${githubInfo.githubJobId}` : jobId,
         reason,
@@ -77,7 +77,7 @@ export async function admitJob(
         githubRunId: githubInfo.githubRunId,
       });
       if (owner && repo && githubInfo.githubRunId) {
-        await runnerManager.cancelRun(owner, repo, githubInfo.githubRunId, reason);
+        await runnerManager.cancelRun(owner, repo, githubInfo.githubRunId, reason, historyId);
       }
     };
 

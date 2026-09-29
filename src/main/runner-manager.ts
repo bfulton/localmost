@@ -18,6 +18,7 @@ import { inheritedWorkerEnv, packageCacheEnv } from './worker-env';
 import type { EnvPolicy } from '../shared/sandbox-profile';
 import { sweepProcessGroup } from './process-group';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
+import { GitHubClientError } from './github-client';
 import { RunnerDownloader } from './runner-downloader';
 import type { WorkerCredentialFiles } from './worker-credentials';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
@@ -32,8 +33,9 @@ import { normalizeFilterConfig, isUserAllowed, areAllUsersAllowed, parseReposito
 const DOCKER_SOCKET_NAME = 'docker.sock';
 
 /**
- * The longest line of worker output that is read as a line. The runner's own
- * status lines are far shorter; anything longer is a job's output.
+ * The longest line of worker output that is read as a line, in characters
+ * (UTF-16 code units, as string length counts them). The runner's own status
+ * lines are far shorter; anything longer is a job's output.
  */
 const MAX_OUTPUT_LINE = 64 * 1024;
 
@@ -360,6 +362,7 @@ export class RunnerManager {
    * Load job history from disk.
    */
   private loadJobHistory(): void {
+    this.removeLeftoverHistoryTemps();
     try {
       if (fs.existsSync(this.jobHistoryPath)) {
         const content = fs.readFileSync(this.jobHistoryPath, 'utf-8');
@@ -381,9 +384,10 @@ export class RunnerManager {
             this.saveJobHistory();
           }
 
-          // Get the highest job ID to continue the counter
+          // Get the highest job ID to continue the counter. Refused entries
+          // draw on it too (refused-<run>-<n>), and must not repeat an id.
           for (const job of this.jobHistory) {
-            const match = job.id.match(/job-(\d+)/);
+            const match = job.id.match(/^(?:job|refused-\d+)-(\d+)$/);
             if (match) {
               const id = parseInt(match[1], 10);
               if (id > this.jobIdCounter) {
@@ -396,6 +400,27 @@ export class RunnerManager {
       }
     } catch (err) {
       this.log('warn', `Failed to load job history: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * Remove the temporary files of saves that never reached their rename.
+   *
+   * A crash between a save's write and its rename leaves one behind, and no
+   * later save uses its random name again. Only names saveJobHistory makes
+   * are removed; this runs before any save of this process.
+   */
+  private removeLeftoverHistoryTemps(): void {
+    const dir = path.dirname(this.jobHistoryPath);
+    const prefix = `${path.basename(this.jobHistoryPath)}.`;
+    try {
+      for (const name of fs.readdirSync(dir)) {
+        if (name.startsWith(prefix) && /^[0-9a-f]{12}\.tmp$/.test(name.slice(prefix.length))) {
+          fs.unlinkSync(path.join(dir, name));
+        }
+      }
+    } catch {
+      // No directory yet, or unreadable: nothing to clean, and saving reports its own failures.
     }
   }
 
@@ -1322,15 +1347,21 @@ export class RunnerManager {
       // One reader per stream: a line is only ever continued on its own stream.
       const skipped = (stream: string) => () =>
         this.logInstanceOutput(instanceNum, 'debug', `(${stream}: skipped a line over ${MAX_OUTPUT_LINE} characters)`);
+      // Parsed only while this is the slot's worker. A pipe's last data and
+      // its end can come after the exit, when a new spawn may hold the slot;
+      // parseRunnerOutput reads the slot, and a dead worker's line read there
+      // could start a job on the new one. Still logged.
+      const worker = instance.process;
+      const isCurrent = () => this.instances.get(instanceNum) === instance && instance.process === worker;
       const stdout = lineReader((line) => {
-        this.parseRunnerOutput(instanceNum, line);
+        if (isCurrent()) this.parseRunnerOutput(instanceNum, line);
         this.logInstanceOutput(instanceNum, 'debug', line);
       }, skipped('stdout'));
       instance.process.stdout?.on('data', (data: Buffer) => stdout.write(data));
       instance.process.stdout?.on('end', () => stdout.end());
 
       const stderr = lineReader((line) => {
-        this.parseRunnerOutput(instanceNum, line); // Also parse stderr for status
+        if (isCurrent()) this.parseRunnerOutput(instanceNum, line); // Also parse stderr for status
         this.logInstanceOutput(instanceNum, 'error', line);
       }, skipped('stderr'));
       instance.process.stderr?.on('data', (data: Buffer) => stderr.write(data));
@@ -2059,11 +2090,18 @@ export class RunnerManager {
         this.log('info', `[instance ${instanceNum}] Job completed: ${jobName} result=${result} → status=${status}`);
       }
 
-      this.updateJobInHistory(jobId, {
-        status,
-        completedAt,
-        runTimeSeconds,
-      });
+      // The filter backstop may have closed the job while the conclusion was
+      // looked up: it stopped the job, and its record of that stands.
+      const closed = this.jobHistory.find((j) => j.id === jobId);
+      if (closed && closed.status !== 'running') {
+        this.log('debug', `[instance ${instanceNum}] Job ${jobName} was already closed as ${closed.status}; keeping that`);
+      } else {
+        this.updateJobInHistory(jobId, {
+          status,
+          completedAt,
+          runTimeSeconds,
+        });
+      }
 
       // Log sandbox policy summary for the completed job
       this.logSandboxSummary(instanceNum, jobName);
@@ -2422,7 +2460,8 @@ export class RunnerManager {
    *
    * A refused job never reaches a worker, so without this it appears on GitHub
    * as a plain cancellation and does not show up in the app at all - leaving no
-   * way to tell a policy refusal from someone pressing cancel.
+   * way to tell a policy refusal from someone pressing cancel. Returns the
+   * entry's id, for the cancel that follows to note a failure on.
    */
   recordRefusedJob(details: {
     repository: string;
@@ -2432,11 +2471,14 @@ export class RunnerManager {
     githubRunId?: number;
     /** 'cancelled' for a policy refusal; 'failed' for a job that never started. */
     status?: 'cancelled' | 'failed';
-  }): void {
+  }): string {
     const status = details.status ?? 'cancelled';
     const now = new Date().toISOString();
+    // Unique per entry: one run can have several jobs refused, and a later
+    // note (a failed cancel) must land on its own job's entry.
+    const id = `refused-${details.githubRunId ?? Date.now()}-${++this.jobIdCounter}`;
     this.addJobToHistory({
-      id: `refused-${details.githubRunId ?? Date.now()}`,
+      id,
       jobName: details.jobName,
       repository: details.repository,
       status,
@@ -2456,6 +2498,7 @@ export class RunnerManager {
       status,
       reason: details.reason,
     });
+    return id;
   }
 
   /**
@@ -2466,17 +2509,24 @@ export class RunnerManager {
    * logged: a run meant to be cancelled that was not goes on running its
    * other jobs, while the history said it was refused and nothing said
    * otherwise. The entry is `historyId` when the caller knows it, else the
-   * latest one for the run.
+   * latest one for the run. A job with no run id has no run to cancel, which
+   * is a failure like any other.
+   *
+   * A run that has already finished is not a failure: GitHub answers 409
+   * when, say, several of a run's jobs are refused one after another and
+   * the first cancel has ended it, or someone cancelled it on GitHub.
    */
   async cancelRun(
     owner: string,
     repo: string,
-    githubRunId: number,
+    githubRunId: number | undefined,
     reason: string,
     historyId?: string
   ): Promise<boolean> {
     let failure: string;
-    if (!this.cancelWorkflowRun) {
+    if (githubRunId === undefined) {
+      failure = 'no workflow run id';
+    } else if (!this.cancelWorkflowRun) {
       failure = 'cancelWorkflowRun not available';
     } else {
       try {
@@ -2484,23 +2534,33 @@ export class RunnerManager {
         this.log('info', `Cancelled workflow run ${githubRunId}: ${reason}`);
         return true;
       } catch (cancelErr) {
+        if (cancelErr instanceof GitHubClientError && cancelErr.status === 409) {
+          this.log('info', `Workflow run ${githubRunId} has already finished; nothing to cancel (${reason})`);
+          return true;
+        }
         failure = (cancelErr as Error).message;
       }
     }
-    this.log('warn', `Failed to cancel workflow run ${githubRunId}: ${failure}`);
+    this.log('warn', `Failed to cancel workflow run ${githubRunId ?? '(none)'}: ${failure}`);
 
     const note = `cancel failed: ${failure}`;
     let entry: JobHistoryEntry | undefined;
     for (let i = this.jobHistory.length - 1; i >= 0 && !entry; i--) {
       const candidate = this.jobHistory[i];
-      if (historyId ? candidate.id === historyId : candidate.githubRunId === githubRunId) entry = candidate;
+      if (historyId ? candidate.id === historyId : githubRunId !== undefined && candidate.githubRunId === githubRunId) {
+        entry = candidate;
+      }
     }
     if (entry) {
-      this.updateJobInHistory(entry.id, { error: entry.error ? `${entry.error}; ${note}` : note });
+      // Onto the entry found, not looked up again by id.
+      this.log('debug', `Updating job ${entry.id}: ${note}`);
+      entry.error = entry.error ? `${entry.error}; ${note}` : note;
+      this.saveJobHistory();
+      this.onJobHistoryUpdate([...this.jobHistory]);
     }
     this.onJobEvent?.({
       type: 'cancel-failed',
-      jobName: entry?.jobName ?? `run ${githubRunId}`,
+      jobName: entry?.jobName ?? `run ${githubRunId ?? '(none)'}`,
       repository: entry?.repository ?? `${owner}/${repo}`,
       reason: note,
     });
@@ -2518,14 +2578,17 @@ export class RunnerManager {
     const worker = instance.process;
     const job = instance.currentJob;
 
-    // No actor is a verdict for evaluateJobFilter, not a reason to skip it;
-    // without a run or a repository there is nothing to cancel.
+    // No actor is a verdict for evaluateJobFilter, not a reason to skip it,
+    // and no run id is only a cancel that cannot be made: the worker is
+    // stopped all the same. The filter needs the repository.
     const { githubActor, githubRunId, targetDisplayName, githubSha } = instance.currentJob;
-    if (!githubRunId || !targetDisplayName) {
+    if (!targetDisplayName) {
       this.log('debug', `checkJobUserFilter: missing info (actor=${githubActor}, runId=${githubRunId}, target=${targetDisplayName})`);
       return;
     }
 
+    // An org target's name is the org alone. Admission judged such a job by
+    // the job's own repository; this worker only knows the target's.
     const repoInfo = parseRepository(targetDisplayName);
     if (!repoInfo) {
       this.log('warn', `Cannot parse owner/repo from target: ${targetDisplayName}`);
@@ -2556,8 +2619,11 @@ export class RunnerManager {
       stop,
     ]);
     // The runner may never report a stopped job's end; don't leave it running.
+    // Nor 'completed': a step can print a whole completion line of its own
+    // before the check is done. A completion the runner reports from here on
+    // finds the entry closed and leaves it.
     const entry = this.jobHistory.find((j) => j.id === job.id);
-    if (entry?.status === 'running') {
+    if (entry && entry.status !== 'cancelled') {
       const completedAt = new Date().toISOString();
       this.updateJobInHistory(job.id, {
         status: 'cancelled',
