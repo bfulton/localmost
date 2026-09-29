@@ -39,6 +39,21 @@ function segment(value: string | number): string {
 const segments = (value: string): string => value.split('/').map(segment).join('/');
 
 /**
+ * The name an author with no linked GitHub account goes by in an author set.
+ *
+ * Such an author is whoever wrote the email into a commit - anyone who can
+ * get one merged or pushed - so no allowlist may admit it. Logins are
+ * alphanumerics and hyphens, so a parenthesised name with spaces can never
+ * equal one, and since the admission refusal lists the authors it refused,
+ * the name itself says why. `detail` (a commit, an email, a name) comes from
+ * commit metadata, so control characters are dropped and it is kept short.
+ */
+export function unattributedAuthor(detail: string): string {
+  const shown = detail.replace(/\p{Cc}/gu, '?').slice(0, 100);
+  return `(unattributed ${shown}: no linked GitHub account, so no allowlist can admit it)`;
+}
+
+/**
  * Rate limiting configuration for OAuth device flow polling.
  * These limits prevent abuse and ensure compliance with GitHub's API guidelines.
  */
@@ -630,16 +645,16 @@ export class GitHubAuth {
     let page = 1;
     const perPage = 100;
 
-    // anon=0 leaves out authors with no linked account, so an unattributed
-    // commit already on the default branch when this baseline is taken is not
-    // seen; getCommitAuthors marks only those after it. Counting them here
-    // (anon=1) would refuse every repository with one anywhere in its history,
-    // with no allowlist entry that could admit it - a product decision, not
-    // yet made.
+    // anon=1, so authors with no linked account are listed too. anon=0 left
+    // them out - and GitHub links only the first 500 author emails, so past
+    // that it left out everyone - and the baseline read as trusted while code
+    // nobody vouched for was already on the default branch. Each one stands in
+    // the set as unattributed, which no allowlist admits: a repository with
+    // such an author anywhere in its history is refused under 'contributors'.
     while (true) {
-      const data = await client.get<Array<{ login: string }>>(
+      const data = await client.get<Array<{ login?: string; email?: string; name?: string }>>(
         `/repos/${segment(owner)}/${segment(repo)}/contributors`,
-        { params: { per_page: String(perPage), page: String(page), anon: '0' } }
+        { params: { per_page: String(perPage), page: String(page), anon: '1' } }
       );
 
       if (!data || data.length === 0) {
@@ -649,6 +664,8 @@ export class GitHubAuth {
       for (const contributor of data) {
         if (contributor.login) {
           contributors.push(contributor.login.toLowerCase());
+        } else {
+          contributors.push(unattributedAuthor(contributor.email || contributor.name || 'contributor'));
         }
       }
 
@@ -702,10 +719,10 @@ export class GitHubAuth {
         } else {
           // No linked account: the commit's email belongs to nobody GitHub
           // knows, which is anyone who can get a commit merged or pushed.
-          // Skipping it read as "no new authors". It stands in the set under
-          // a name no login can equal (logins are alphanumerics and hyphens),
-          // so no allowlist admits it and the refusal says which commit.
-          authors.add(`(unattributed ${commit.sha ? commit.sha.slice(0, 7) : 'commit'})`);
+          // Skipping it read as "no new authors". It stands in the set as
+          // unattributed, so no allowlist admits it and the refusal says
+          // which commit.
+          authors.add(unattributedAuthor(commit.sha ? `commit ${commit.sha.slice(0, 7)}` : 'commit'));
         }
       }
     } catch (error) {

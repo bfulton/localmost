@@ -118,11 +118,13 @@ export class ContributorCache {
   ): Promise<RepoCacheEntry> {
     const cacheKey = this.getCacheKey(owner, repo);
 
-    // Fetch contributors and default branch info in parallel
-    const [contributors, branchInfo] = await Promise.all([
-      this.githubAuth.getContributors(accessToken, owner, repo),
-      this.githubAuth.getDefaultBranch(accessToken, owner, repo),
-    ]);
+    // The head first, then the contributors. Later commits reach this set
+    // through the compare from this head, so the list must cover at least
+    // the history up to it: read the other way round (or together), a commit
+    // landing between the two reads would be in neither. One landing after
+    // the head is read may also appear in the list, which only adds authors.
+    const branchInfo = await this.githubAuth.getDefaultBranch(accessToken, owner, repo);
+    const contributors = await this.githubAuth.getContributors(accessToken, owner, repo);
 
     const entry: RepoCacheEntry = {
       contributors: new Set(contributors),

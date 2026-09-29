@@ -29,6 +29,31 @@ describe('ContributorCache', () => {
     expect(authors).toEqual(new Set(['trusted', 'stranger']));
   });
 
+  it('reads the default branch head before the contributor list', async () => {
+    // Fetched the other way round (or together), a commit that lands between
+    // the two reads is in neither: the contributor list predates it and the
+    // compare starts after it.
+    const order: string[] = [];
+    let branchDone = false;
+    const auth = makeAuth({
+      getDefaultBranch: jest.fn(async () => {
+        order.push('branch:start');
+        await new Promise((r) => setTimeout(r, 10));
+        branchDone = true;
+        order.push('branch:done');
+        return { name: 'main', sha: 'base000' };
+      }),
+      getContributors: jest.fn(async () => {
+        order.push(branchDone ? 'contributors:after-branch' : 'contributors:before-branch');
+        return ['trusted'];
+      }),
+    });
+
+    await makeCache(auth).getAllAuthors('token', 'owner', 'repo', 'base000');
+
+    expect(order).toEqual(['branch:start', 'branch:done', 'contributors:after-branch']);
+  });
+
   it('propagates a compare failure instead of returning a partial author set', async () => {
     // Contributor filtering is only as good as the author set it checks. If the
     // commit range cannot be resolved, returning the cached contributors looks
