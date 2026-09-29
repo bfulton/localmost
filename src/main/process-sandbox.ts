@@ -227,11 +227,6 @@ export function generateSandboxProfile({
   const configFile = getConfigPath().replace(/"/g, '\\"');
   const runnerDir = getRunnerDir().replace(/"/g, '\\"');
   const userDataDir = getUserDataDir().replace(/"/g, '\\"');
-  // Both spellings of the app's own data, once each: under the App Sandbox
-  // they are the same directory.
-  const appDirsDenied = [...new Set([appDataDir, userDataDir])]
-    .map((dir) => `  (subpath "${dir}")`)
-    .join('\n');
 
   // Toolchains and package-manager caches are a convenience for jobs, not
   // something the runner needs. Under strict a repository declares what it
@@ -274,33 +269,40 @@ export function generateSandboxProfile({
   // A repository policy has no business reading or writing the app's own
   // directories - the runner's credentials, registrations, session tokens and
   // pid files, other workers' sandboxes, the logs, the job history, the
-  // browser profile and the credential store. Drop any policy path that is
-  // one of them, lies inside one, or contains one (a grant of ~ contains
-  // ~/.localmost), so a declared read path cannot reopen a sibling sandbox
-  // (which a profile deny cannot cover without also blocking the traversal
-  // into this job's own sandbox) and a declared write path cannot reach the
-  // app's bookkeeping. The write side is also denied in the profile as a
-  // backstop.
-  const runnerRoot = path.resolve(getRunnerDir());
-  // seatbelt matches paths as the default APFS volume does, whatever their
-  // case or Unicode normalization, so ~/.LOCALMOST grants what ~/.localmost
-  // would. Both sides are folded before comparing; on a case-sensitive volume
-  // that only drops more than it had to.
-  const fold = (dir: string): string => path.resolve(dir).normalize('NFD').toLowerCase();
-  // And it matches the real path, so a grant of /private/var/... reaches an
+  // browser profile and the credential store. A policy path that reaches
+  // them is still granted, since a grant of ~ or ~/Library means everything
+  // else in there too; the app's directories are then denied, read and write,
+  // after every grant, and only what the job itself uses in them is given
+  // back (see the deny below).
+  //
+  // seatbelt matches the real path, so a grant of /private/var/... reaches an
   // app directory configured through the /var symlink: each directory is
-  // compared as configured and as it really is. One that does not exist yet
-  // has no real path to reach.
-  const realPath = (dir: string): string[] => {
-    try {
-      return [fs.realpathSync(dir)];
-    } catch {
-      return [];
+  // denied as configured and as it really is. For one that does not exist
+  // yet, that is its nearest existing ancestor's real path with the rest
+  // appended, so a job granted the parent cannot plant it first. Any other
+  // failure leaves the spelling seatbelt matches unknown, so it stops the
+  // spawn rather than leaving the deny under the configured spelling alone.
+  const realPath = (dir: string): string => {
+    const missing: string[] = [];
+    for (let node = path.resolve(dir); ; node = path.dirname(node)) {
+      try {
+        return path.join(fs.realpathSync(node), ...missing);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
+        if (node === path.dirname(node)) return path.resolve(dir);
+        missing.unshift(path.basename(node));
+      }
     }
   };
-  const appRoots = [getRunnerBaseDir(), getUserDataDir()]
-    .flatMap((dir) => [dir, ...realPath(dir)])
-    .map(fold);
+  const appDirs = [getRunnerBaseDir(), getUserDataDir()];
+  const appDirSpellings = [...new Set(appDirs.flatMap((dir) => [dir, realPath(dir)]))];
+  // seatbelt also matches paths as the default APFS volume does, whatever
+  // their case or Unicode normalization, so ~/.LOCALMOST reaches what
+  // ~/.localmost would. The deny needs neither folded; the note below compares
+  // both sides folded.
+  const fold = (dir: string): string => path.resolve(dir).normalize('NFD').toLowerCase();
+  const appRoots = appDirSpellings.map(fold);
   const within = (inner: string, outer: string): boolean =>
     inner === outer || inner.startsWith(outer.endsWith(path.sep) ? outer : outer + path.sep);
   const touchesAppDirs = (entry: string): boolean => {
@@ -319,31 +321,26 @@ export function generateSandboxProfile({
     onLog?.('error', `Ignoring traversing policy path: ${entry}`);
     return true;
   };
-  const outsideRunner = (entry: string): boolean => {
+  const grantable = (entry: string): boolean => {
     if (traversing(entry)) return false;
     // A relative path is kept as written: seatbelt accepts a relative subpath
     // but never matches it against a real path, so it grants nothing and
     // cannot widen anything. Resolving it here would resolve it against this
     // process's directory instead - "/" for an app launched from the Finder,
     // which contains everything.
-    if (!path.isAbsolute(expandPath(entry))) return true;
-    if (touchesAppDirs(entry)) {
-      onLog?.('error', `Ignoring policy path that reaches the app's own directories: ${entry}`);
-      return false;
+    if (path.isAbsolute(expandPath(entry)) && touchesAppDirs(entry)) {
+      onLog?.('debug', `Policy path reaches the app's own directories, which stay closed to the job: ${entry}`);
     }
     return true;
   };
-  const policyReads = subpaths(filesystemPolicy.read.filter(outsideRunner));
-  const policyWrites = subpaths(filesystemPolicy.write.filter(outsideRunner));
+  const policyReads = subpaths(filesystemPolicy.read.filter(grantable));
+  const policyWrites = subpaths(filesystemPolicy.write.filter(grantable));
   // A deny only narrows, so none is dropped for what it covers: one over an
-  // app directory stays, since dropping it, as a grant there is dropped,
-  // would quietly widen what the approved policy says. (Frozen contract C2
-  // says denies are filtered like grants; this is a deliberate departure, so
-  // the own sandbox and caches are re-allowed after the denies instead.) For
-  // the same reason a deny list that cannot be read stops the spawn rather
-  // than being skipped. An absolute ".." is resolved, as seatbelt resolves the
-  // path it guards; a relative entry never matches in seatbelt, so it is
-  // dropped and said to have no effect.
+  // app directory stays, and the own sandbox and caches are re-allowed after
+  // the denies instead. For the same reason a deny list that cannot be read
+  // stops the spawn rather than being skipped. An absolute ".." is resolved,
+  // as seatbelt resolves the path it guards; a relative entry never matches
+  // in seatbelt, so it is dropped and said to have no effect.
   const declaredDenies = filesystemPolicy.deny ?? [];
   if (!Array.isArray(declaredDenies)) {
     throw new Error("The policy's deny list is not a list, so the job cannot be confined as approved");
@@ -411,27 +408,50 @@ export function generateSandboxProfile({
   })(darwinUserTempDir(onLog));
   // This worker's target's own caches, when it keeps any across jobs. Never
   // one shared with another target: what a job leaves in a cache, the next
-  // job to find it executes. The directories above them are readable as
-  // nodes only (.NET reads every ancestor of what it opens), so another
-  // target's caches are not opened along the way. The package cache is a
-  // moderate and permissive convenience; strict keeps what it declares.
+  // job to find it executes. The package cache is a moderate and permissive
+  // convenience; strict keeps what it declares.
   const ownCaches = [toolCache, filesystemPolicy.level === 'strict' ? undefined : packageCache]
     .filter((dir): dir is string => Boolean(dir));
   const ownCacheRules = (operation: string) =>
     ownCaches.length
       ? `(allow ${operation}\n${ownCaches.map((dir) => `  (subpath "${dir.replace(/"/g, '\\"')}")`).join('\n')})`
       : `;; No cache kept across jobs: nothing outside the sandbox for ${operation}`;
-  const ownCacheNodes = [...new Set(ownCaches.flatMap((dir) => {
+  const ownCacheReads = ownCaches.map((dir) => `  (subpath "${dir.replace(/"/g, '\\"')}")`).join('\n');
+  // The app's own data directory and Electron's, in every spelling seatbelt
+  // could match, once each: under the App Sandbox they are the same directory.
+  const appDirsDenied = appDirSpellings
+    .map((dir) => `  (subpath "${dir.replace(/"/g, '\\"')}")`)
+    .join('\n');
+  // Every directory above them, in each of those spellings, up to but not
+  // including /: the deny matches paths, so renaming one of these would move
+  // an app directory out from under it. Those not created yet too, where a
+  // link planted now would carry the app's directory wherever it points.
+  const appDirAncestors = [...new Set(appDirSpellings.flatMap((dir) => {
     const nodes: string[] = [];
-    for (let node = path.dirname(dir); node.startsWith(runnerRoot + path.sep); node = path.dirname(node)) {
+    for (let node = path.dirname(dir); node !== path.dirname(node); node = path.dirname(node)) nodes.push(node);
+    return nodes;
+  }))];
+  const appDirAncestorsDenied = appDirAncestors.length
+    ? `(deny file-write*\n${appDirAncestors.map((node) => `  (literal "${node.replace(/"/g, '\\"')}")`).join('\n')})`
+    : ';; Both app directories sit at the root: nothing above them to rename';
+  // The directory nodes in there on the way down to the job's own sandbox and
+  // its target's caches - the app directory, runner/, runner/sandbox,
+  // runner/caches and the like. .NET reads every ancestor of what it opens.
+  // Nodes, not subtrees, so a sibling sandbox or another target's caches are
+  // not opened along the way.
+  const insideAppDirs = (node: string): boolean =>
+    appDirs.some((dir) => within(node, path.resolve(dir)));
+  const ownNodes = [...new Set([instanceDir, ...ownCaches].flatMap((dir) => {
+    const nodes: string[] = [];
+    for (let node = path.dirname(path.resolve(dir)); insideAppDirs(node); node = path.dirname(node)) {
       nodes.push(node);
+      if (node === path.dirname(node)) break;
     }
     return nodes;
   }))];
-  const ownCacheReads = [
-    ...ownCacheNodes.map((node) => `  (literal "${node.replace(/"/g, '\\"')}")`),
-    ...ownCaches.map((dir) => `  (subpath "${dir.replace(/"/g, '\\"')}")`),
-  ].join('\n');
+  const ownNodeReads = ownNodes.length
+    ? `(allow file-read*\n${ownNodes.map((node) => `  (literal "${node.replace(/"/g, '\\"')}")`).join('\n')})`
+    : ';; Neither the sandbox nor a cache lies in the app\'s directories: no nodes to give back';
 
   return `
 (version 1)
@@ -493,13 +513,7 @@ ${policyWrites ? `(allow file-write*\n${policyWrites})` : ';; No policy-declared
   (literal "/")
   (literal "/Users")
   (literal "${homeDir}")
-  (literal "${appDataDir}")
-  ;; The directory nodes on the way to this job's own sandbox. .NET reads each
-  ;; ancestor directory to open anything beneath it. These are the nodes, not
-  ;; their subtrees: sibling sandboxes and the credential directories below are
-  ;; not granted, and the ones that hold secrets are denied by name below.
-  (literal "${runnerDir}")
-  (literal "${runnerDir}/sandbox")
+  ;; The nodes inside the app's own directories come after their deny, below.
   (subpath "/bin")
   (subpath "/sbin")
   (subpath "/usr/bin")
@@ -549,14 +563,15 @@ ${policyReads}
   (subpath "${userDataDir}")
   (subpath "${policiesDir}")
   ;; The runner directory's own secrets, denied by name so that neither a
-  ;; toolchain grant nor a policy-declared read path can reopen them. Sibling
-  ;; sandboxes are not granted in the first place (reads reach this job's own
-  ;; sandbox by subpath and the parent nodes by literal, never the sandbox
-  ;; root as a subtree), so no read-deny on the sandbox root is needed here.
+  ;; toolchain grant nor a policy-declared read path can reopen them, even
+  ;; apart from the deny of the app's directories below, which also closes
+  ;; the sibling sandboxes.
   (subpath "${runnerDir}/proxies")
   (subpath "${runnerDir}/config")
   (subpath "${runnerDir}/sandbox-profiles")
-  (literal "${runnerDir}/broker-sessions.json")
+  ;; The broker's session file and the temporary sibling it is written
+  ;; through, whatever that one's name.
+  (prefix "${runnerDir}/broker-sessions.json")
   (literal "${configFile}")
   (literal "${homeDir}/.netrc")
   (literal "${homeDir}/.npmrc")
@@ -570,26 +585,37 @@ ${policyReads}
   (literal "${homeDir}/.cargo/credentials.toml")
   (literal "${homeDir}/.nuget/NuGet/NuGet.Config"))
 
+;; Never readable or writable, whatever was granted above - a policy path of
+;; ~, /Users or ~/Library included, which keeps the rest of what it grants:
+;; the app's own data directory and Electron's. They hold the app's control
+;; plane (a job that writes it approves its own policy), the runner's secrets
+;; and bookkeeping (proxy credentials, registrations, session tokens, the pid
+;; files the startup sweep trusts, other workers' sandboxes and other targets'
+;; caches), the runner template every worker is copied from with the record
+;; it is checked against, the logs, the job history, the CLI the user runs,
+;; the browser profile and the credential store. Denied whole, so nothing
+;; added there later is open by default, and the directories' own nodes with
+;; them so neither can be renamed away and replaced.
+(deny file-read* file-write*
+${appDirsDenied})
+;; Nor the directories above them, as nodes: renaming one would move an app
+;; directory out from under the deny above, to be read and written under the
+;; new name. What is inside them stays as granted; nothing given back below
+;; lies above an app directory, so this is never reopened.
+${appDirAncestorsDenied}
+;; Given back as nodes: the directories on the way down to the job's own
+;; sandbox and caches. Before the policy's denies, so one over them still
+;; stops the job rather than being quietly overridden.
+${ownNodeReads}
+
 ;; Paths the repository's approved policy denies, read and write. After every
 ;; grant above - the policy's own and the toolchains a level brings - so the
 ;; deny is what matches last.
 ${policyDenies ? `(deny file-read* file-write*\n${policyDenies})` : ';; No policy-declared deny paths'}
 
-;; Never writable, whatever matched above - including a policy-declared write
-;; path, since this is the last word: the app's own data directory and
-;; Electron's. They hold the app's control plane (a job that writes it
-;; approves its own policy), the runner's secrets and bookkeeping (proxy
-;; credentials, registrations, session tokens, the pid files the startup sweep
-;; trusts, other workers' sandboxes), the runner template every worker is
-;; copied from with the record it is checked against, the logs, the job
-;; history, the CLI the user runs and the credential store. Denied whole, so
-;; nothing added there later is writable by default, and the directories'
-;; own nodes with them so neither can be renamed away and replaced.
-(deny file-write*
-${appDirsDenied})
-;; The places a job does write in there, re-allowed after both denies: its
-;; target's own caches and its own sandbox, which a policy deny covering them
-;; would only stop the runner from using.
+;; The places a job does use in the app's directories, re-allowed after every
+;; deny: its target's own caches and its own sandbox, which a deny covering
+;; them would only stop the runner from using.
 ${ownCacheRules('file-read* file-write*')}
 (allow file-read* file-write*
   (subpath "${escapedDir}"))

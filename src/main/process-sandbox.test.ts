@@ -9,6 +9,7 @@ jest.mock('fs', () => ({
   writeFileSync: jest.fn(),
   unlinkSync: jest.fn(),
   mkdirSync: jest.fn(),
+  realpathSync: jest.fn((p: string) => p),
 }));
 
 // Mock child_process
@@ -61,6 +62,7 @@ describe('Process Sandbox', () => {
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -87,6 +89,7 @@ describe('Process Sandbox', () => {
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -112,6 +115,7 @@ describe('Process Sandbox', () => {
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -134,6 +138,7 @@ describe('Process Sandbox', () => {
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -153,6 +158,7 @@ describe('Process Sandbox', () => {
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -173,6 +179,7 @@ describe('Process Sandbox', () => {
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -193,6 +200,7 @@ describe('Process Sandbox', () => {
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -238,6 +246,7 @@ describe('Process Sandbox', () => {
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -263,7 +272,9 @@ describe('Process Sandbox', () => {
       jest.resetModules();
     });
 
-  const instanceDir = path.join(os.homedir(), '.localmost', 'runner-3');
+  // Where a worker's sandbox is: its nodes on the way down are what the
+  // profile gives back inside the app's directories.
+  const instanceDir = path.join(os.homedir(), '.localmost', 'runner', 'sandbox', '3');
   const homeDir = os.homedir();
 
   /**
@@ -287,6 +298,7 @@ describe('Process Sandbox', () => {
         writeFileSync: mockWriteFileSync,
         unlinkSync: jest.fn(),
         mkdirSync: jest.fn(),
+        realpathSync: jest.fn((p: string) => p),
       }));
 
       const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -321,11 +333,14 @@ describe('Process Sandbox', () => {
         else if (profile[end] === ')' && --depth === 0) break;
       }
       const body = profile.slice(match.index, end).replace(/;;.*$/gm, '');
-      const filters = [...body.matchAll(/\((subpath|literal|regex) #?"([^"]*)"\)/g)];
+      const filters = [...body.matchAll(/\((subpath|literal|prefix|regex) #?"([^"]*)"\)/g)];
       const matches = filters.length === 0 || filters.some(([, kind, value]) =>
         kind === 'regex'
           ? new RegExp(value).test(target)
-          : target === value || (kind === 'subpath' && target.startsWith(`${value}/`)));
+          : kind === 'prefix'
+            ? target.startsWith(value)
+            : target === value ||
+              (kind === 'subpath' && target.startsWith(value.endsWith('/') ? value : `${value}/`)));
       if (matches) verdict = match[1] === 'allow';
     }
     return verdict;
@@ -440,34 +455,28 @@ describe('Process Sandbox', () => {
       }
     });
 
-    it('ignores a policy read or write path that resolves inside the runner directory', () => {
+    it('reaches nothing in the runner directory through a policy path that names it', () => {
       // A repo policy has no business reaching the app's own runner dir - proxy
-      // credentials, pids, other sandboxes. A declared read path there cannot be
-      // fenced off by a profile deny without also blocking traversal into this
-      // job's own sandbox, so such paths are dropped before the profile is built.
+      // credentials, pids, other sandboxes. A path there is granted as written,
+      // and the deny of the app's directories that follows every grant takes
+      // it back, all but the job's own sandbox.
       const runnerDir = path.join(os.homedir(), '.localmost', 'runner');
       const profile = profileWith({
         filesystemPolicy: {
           level: 'strict',
-          read: [path.join(runnerDir, 'sandbox'), `${runnerDir}/../runner/proxies`, '/tmp/legit-read'],
-          write: [path.join(runnerDir, 'pids'), '/tmp/legit-write'],
+          read: [path.join(runnerDir, 'sandbox'), path.join(runnerDir, 'proxies'), '/tmp/legit-read'],
+          write: [path.join(runnerDir, 'pids'), path.join(runnerDir, 'sandbox'), '/tmp/legit-write'],
         },
       });
-      // The runner-internal paths are dropped from the policy allow blocks (the
-      // write-deny block still names them, so scope the check to the allows).
-      const allowRead = profile.slice(profile.indexOf('(allow file-read*'), profile.indexOf('(deny file-read*'));
-      const policyWriteAllow = profile.slice(
-        profile.indexOf('declares writable'),
-        profile.indexOf('Never writable, whatever matched above')
-      );
-      expect(allowRead).not.toContain(`(subpath "${runnerDir}/sandbox")`);
-      // A traversal spelling that resolves inside the runner dir is also dropped.
-      expect(allowRead).not.toContain('/../runner/proxies');
-      expect(allowRead).not.toContain(`(subpath "${runnerDir}/proxies")`);
-      expect(policyWriteAllow).not.toContain(`(subpath "${runnerDir}/pids")`);
-      // Legitimate declared paths outside the runner dir are still granted.
-      expect(allowRead).toContain('(subpath "/tmp/legit-read")');
-      expect(policyWriteAllow).toContain('(subpath "/tmp/legit-write")');
+      expect(readable(profile, path.join(runnerDir, 'sandbox', '2', 'token'))).toBe(false);
+      expect(writable(profile, path.join(runnerDir, 'sandbox', '2', 'run.sh'))).toBe(false);
+      expect(readable(profile, path.join(runnerDir, 'proxies', 'target-a', '1', '.credentials_rsaparams'))).toBe(false);
+      expect(writable(profile, path.join(runnerDir, 'pids', 'worker-1.pid'))).toBe(false);
+      expect(readable(profile, path.join(instanceDir, '_work', 'main.c'))).toBe(true);
+      expect(writable(profile, path.join(instanceDir, '_work', 'out.o'))).toBe(true);
+      // Declared paths outside the runner dir are granted as ever.
+      expect(readable(profile, '/tmp/legit-read/file')).toBe(true);
+      expect(writable(profile, '/tmp/legit-write/file')).toBe(true);
     });
 
     it('denies the pasteboard mach service so a job cannot read the clipboard', () => {
@@ -493,21 +502,26 @@ describe('Process Sandbox', () => {
       // The runner directory is not opened as a whole. Its node and the
       // sandbox node are readable so the runner can traverse into its own
       // sandbox, but not as subtrees - a sibling sandbox is never granted.
-      const allowRead = profile.slice(profile.indexOf('(allow file-read*'), profile.indexOf('(deny file-read*'));
-      // Reads use the directory nodes as literals for traversal, never the
-      // runner dir or the sandbox root as a readable subtree.
-      expect(allowRead).not.toContain(`(subpath "${runnerDir}")`);
-      expect(allowRead).not.toContain(`(subpath "${runnerDir}/sandbox")`);
-      // A traversal spelling that resolves inside the runner dir is also dropped.
-      expect(allowRead).not.toContain('/../runner/proxies');
-      expect(allowRead).not.toContain(`(subpath "${runnerDir}/proxies")`);
-      expect(allowRead).toContain(`(literal "${runnerDir}")`);
-      expect(allowRead).toContain(`(literal "${runnerDir}/sandbox")`);
+      expect(readable(profile, runnerDir)).toBe(true);
+      expect(readable(profile, path.join(runnerDir, 'sandbox'))).toBe(true);
+      expect(readable(profile, path.join(runnerDir, 'sandbox', '2'))).toBe(false);
+      expect(readable(profile, path.join(runnerDir, 'sandbox', '2', 'token'))).toBe(false);
+      expect(readable(profile, path.join(runnerDir, 'arc', 'v2.336.0', 'run.sh'))).toBe(false);
+      expect(readable(profile, path.join(instanceDir, 'run.sh'))).toBe(true);
+      // The secrets are denied by name as well, whatever overlaps them: the
+      // first read deny is the one that names them.
       const denyRead = profile.slice(profile.indexOf('(deny file-read*'));
-      expect(denyRead).toContain(`(subpath "${runnerDir}/proxies")`);
-      expect(denyRead).toContain(`(subpath "${runnerDir}/config")`);
-      expect(denyRead).toContain(`(subpath "${runnerDir}/sandbox-profiles")`);
-      expect(denyRead).toContain(`(literal "${runnerDir}/broker-sessions.json")`);
+      const secrets = denyRead.slice(0, denyRead.indexOf('\n\n'));
+      expect(secrets).toContain(`(subpath "${runnerDir}/proxies")`);
+      expect(secrets).toContain(`(subpath "${runnerDir}/config")`);
+      expect(secrets).toContain(`(subpath "${runnerDir}/sandbox-profiles")`);
+      // The broker's session file, and the temporary file it is written
+      // through before the rename, under any name the writer gives it.
+      const named = `(allow file-read* (subpath "${runnerDir}"))\n${secrets}`;
+      for (const name of ['broker-sessions.json', 'broker-sessions.json.tmp', 'broker-sessions.json.4242.tmp']) {
+        expect(readable(named, path.join(runnerDir, name))).toBe(false);
+      }
+      expect(readable(named, path.join(runnerDir, 'other.json'))).toBe(true);
     });
 
     it('escapes quotes in the socket path, as the rest of the profile does', () => {
@@ -598,11 +612,13 @@ describe('Process Sandbox', () => {
         }
         expect(profile).not.toContain(`(subpath "${runnerDir}/tool-cache")`);
       }
-      // Readable, and the directory nodes above it can be traversed.
-      const allowRead = a.slice(a.indexOf('(allow file-read*'), a.indexOf('(deny file-read*'));
-      expect(allowRead).toContain(`(subpath "${cacheA}")`);
-      expect(allowRead).toContain(`(literal "${runnerDir}/caches")`);
-      expect(allowRead).not.toContain(`(subpath "${runnerDir}/caches")`);
+      // Readable, and the directory nodes above it can be traversed, but not
+      // opened as subtrees on the way.
+      expect(readable(a, path.join(cacheA, 'node', '20', 'bin', 'node'))).toBe(true);
+      expect(readable(a, path.join(runnerDir, 'caches'))).toBe(true);
+      expect(readable(a, path.join(runnerDir, 'caches', 'aaaa1111'))).toBe(true);
+      expect(readable(a, path.join(runnerDir, 'caches', 'bbbb2222'))).toBe(false);
+      expect(readable(a, path.join(cacheB, 'node', '20', 'bin', 'node'))).toBe(false);
     });
 
     it.each(['moderate', 'permissive'] as const)(
@@ -716,66 +732,137 @@ describe('Process Sandbox', () => {
     const ownToolCache = path.join(runnerDir, 'caches', 'aaaa1111', 'tool-cache');
     const ownPackages = path.join(runnerDir, 'caches', 'aaaa1111', 'packages');
 
-    it('never lets a job write them, apart from its own sandbox and caches', () => {
-      // Logs, job history, the CLI binary the user runs and whatever is added
-      // there later: none of it is the job's, and a job that can write the
-      // app's directories can plant what the app or the user later trusts.
-      // The grants of both directories are dropped before the profile is
-      // built; the deny that ends the write rules is the backstop behind that.
+    it('never lets a job read or write them, apart from its own sandbox and caches', () => {
+      // Logs, job history, the CLI binary the user runs, other workers'
+      // sandboxes and whatever is added there later: none of it is the job's,
+      // and a job that can write the app's directories can plant what the app
+      // or the user later trusts. Denied after every grant, so a policy that
+      // names them outright reaches nothing in them.
       const dockerSocket = path.join(instanceDir, 'docker.sock');
       const profile = profileWith({
-        filesystemPolicy: { level: 'moderate', read: [], write: ['/opt/out', '~/.localmost', userDataDir] },
+        filesystemPolicy: {
+          level: 'moderate',
+          read: ['~/.localmost', userDataDir],
+          write: ['/opt/out', '~/.localmost', userDataDir],
+        },
         dockerSocket,
         toolCacheDir: ownToolCache,
         packageCacheDir: ownPackages,
       });
-      expect(profile).toContain(`(deny file-write*\n  (subpath "${appDir}")\n  (subpath "${userDataDir}"))`);
+      expect(profile).toContain(`(deny file-read* file-write*\n  (subpath "${appDir}")\n  (subpath "${userDataDir}"))`);
       for (const target of [
         path.join(appDir, 'logs', 'main.log'),
         path.join(appDir, 'job-history.json'),
         path.join(appDir, 'bin', 'localmost'),
         path.join(appDir, 'something-added-later'),
+        path.join(runnerDir, 'sandbox', '2', 'token'),
+        path.join(runnerDir, 'caches', 'bbbb2222', 'tool-cache', 'node'),
         path.join(userDataDir, 'Local State'),
         path.join(userDataDir, 'credentials'),
       ]) {
         expect(writable(profile, target)).toBe(false);
+        expect(readable(profile, target)).toBe(false);
       }
       expect(writable(profile, path.join(instanceDir, '_work', 'out'))).toBe(true);
+      expect(readable(profile, path.join(instanceDir, '_work', 'main.c'))).toBe(true);
       expect(writable(profile, path.join(ownToolCache, 'node'))).toBe(true);
+      expect(readable(profile, path.join(ownToolCache, 'node'))).toBe(true);
       expect(writable(profile, path.join(ownPackages, 'cargo', 'registry'))).toBe(true);
       expect(writable(profile, '/opt/out/artifact')).toBe(true);
       expect(writable(profile, dockerSocket)).toBe(false);
+      expect(readable(profile, dockerSocket)).toBe(true);
     });
 
-    it('drops a policy path that is, contains, or lies inside either of them', () => {
-      // A grant of ~ contains ~/.localmost: other workers' sandboxes, the
-      // logs and the job history. It cannot be granted and then fenced off
-      // without also cutting the way into the job's own sandbox, so it is
-      // not granted. Relative workspace paths resolve inside the job's own
-      // sandbox and are kept.
+    it('keeps a policy path that is, contains, or lies inside either of them, less the directories themselves', () => {
+      // A grant of ~ contains ~/.localmost, and one of ~/Library contains
+      // Electron's directory (here /tmp contains the mock's). What such a
+      // grant covers beyond them is what was approved, so it is granted; the
+      // app's directories are denied after it, and only the job's own sandbox
+      // and caches given back.
       const onLog = jest.fn();
-      const dropped = ['~', '/', '~/.localmost', '~/.localmost/logs', userDataDir, `${userDataDir}/Cookies`, '/tmp'];
+      const covering = ['~', '/', '/Users', '/tmp', '~/.localmost', '~/.localmost/logs', userDataDir, `${userDataDir}/Cookies`];
       const profile = profileWith({
-        filesystemPolicy: { level: 'strict', read: [...dropped, '/opt/keep', './build'], write: [...dropped, '/opt/out'] },
+        filesystemPolicy: { level: 'strict', read: covering, write: covering },
+        toolCacheDir: ownToolCache,
+        proxyPort: 45678,
         onLog,
       });
-      const allowRead = profile.slice(profile.indexOf('(allow file-read*'), profile.indexOf('(deny file-read*'));
-      const policyWriteAllow = profile.slice(profile.indexOf('declares writable'), profile.indexOf('(allow file-read*'));
-      for (const entry of dropped) {
-        const expanded = entry.startsWith('~') ? path.join(os.homedir(), entry.slice(1)) : entry;
-        expect(allowRead).not.toContain(`(subpath "${expanded}")`);
-        expect(policyWriteAllow).not.toContain(`(subpath "${expanded}")`);
-        expect(onLog).toHaveBeenCalledWith('error', expect.stringContaining(entry));
+      for (const target of [
+        path.join(os.homedir(), 'project', 'README'),
+        path.join(os.homedir(), 'Library', 'Application Support', 'another-app', 'state'),
+        '/tmp/elsewhere/file',
+        '/opt/file',
+      ]) {
+        expect(readable(profile, target)).toBe(true);
+        expect(writable(profile, target)).toBe(true);
       }
-      expect(readable(profile, path.join(os.homedir(), 'project', 'README'))).toBe(false);
-      expect(allowRead).toContain('(subpath "/opt/keep")');
-      expect(allowRead).toContain('(subpath "./build")');
-      expect(policyWriteAllow).toContain('(subpath "/opt/out")');
+      for (const target of [
+        path.join(appDir, 'logs', 'main.log'),
+        path.join(appDir, 'config.yaml'),
+        path.join(runnerDir, 'sandbox', '2', 'token'),
+        path.join(runnerDir, 'caches', 'bbbb2222', 'tool-cache', 'node'),
+        path.join(userDataDir, 'Cookies'),
+        userDataDir,
+        appDir,
+      ]) {
+        expect(writable(profile, target)).toBe(false);
+      }
+      for (const target of [
+        path.join(appDir, 'logs', 'main.log'),
+        path.join(runnerDir, 'sandbox', '2', 'token'),
+        path.join(runnerDir, 'sandbox', '2'),
+        path.join(userDataDir, 'Cookies'),
+        userDataDir,
+      ]) {
+        expect(readable(profile, target)).toBe(false);
+      }
+      // The credentials a developer machine keeps stay closed as ever.
+      expect(readable(profile, path.join(os.homedir(), '.ssh', 'id_ed25519'))).toBe(false);
+      // The job's own, and the way down to it.
+      expect(writable(profile, path.join(instanceDir, '_work', 'out'))).toBe(true);
+      expect(writable(profile, path.join(ownToolCache, 'node'))).toBe(true);
+      for (const node of [appDir, runnerDir, path.join(runnerDir, 'sandbox'), path.join(runnerDir, 'caches')]) {
+        expect(readable(profile, node)).toBe(true);
+      }
+      // Kept, and said to be narrowed, not refused.
+      for (const entry of covering) {
+        expect(onLog).toHaveBeenCalledWith('debug', expect.stringContaining(`app's own directories, which stay closed to the job: ${entry}`));
+      }
+      expect(onLog).not.toHaveBeenCalledWith('error', expect.anything());
     });
 
-    it('drops them whatever their case or Unicode form, since seatbelt matches both loosely', () => {
-      // On the default APFS volume seatbelt matches a path whatever its case
-      // and normalization, so ~/.LOCALMOST grants what ~/.localmost would.
+    it('never lets a job rename a directory above them, whatever the policy grants', () => {
+      // The deny of the app's directories matches paths. Renaming the
+      // directory above one moves it out from under the deny, where the job
+      // reads and writes it under the new name before moving it back - or
+      // leaves a link in its place for the app to write through. So the
+      // directories above them are closed to writes as nodes, after every
+      // grant; what is inside them stays as granted.
+      const covering = ['~', '/', '/Users', '/tmp'];
+      const profile = profileWith({
+        filesystemPolicy: { level: 'strict', read: covering, write: covering },
+        toolCacheDir: ownToolCache,
+      });
+      for (const node of [os.homedir(), path.dirname(os.homedir()), '/tmp']) {
+        expect(writable(profile, node)).toBe(false);
+      }
+      for (const target of [
+        path.join(os.homedir(), 'project'),
+        path.join(os.homedir(), 'Library', 'Application Support', 'another-app'),
+        path.join(path.dirname(os.homedir()), 'Shared', 'file'),
+        '/tmp/elsewhere',
+      ]) {
+        expect(writable(profile, target)).toBe(true);
+      }
+      // Nodes, not subtrees: the job's own sandbox and caches are as before.
+      expect(writable(profile, path.join(instanceDir, '_work', 'out'))).toBe(true);
+      expect(writable(profile, path.join(ownToolCache, 'node'))).toBe(true);
+    });
+
+    it('notes a grant that reaches them in another case, since seatbelt matches it all the same', () => {
+      // On the default APFS volume seatbelt matches a path whatever its case,
+      // so ~/.LOCALMOST grants what ~/.localmost would, and the deny of the
+      // app's directories takes it back the same way.
       const onLog = jest.fn();
       const spellings = [
         '~/.LOCALMOST',
@@ -790,30 +877,96 @@ describe('Process Sandbox', () => {
       });
       for (const entry of spellings) {
         const expanded = entry.startsWith('~') ? path.join(os.homedir(), entry.slice(1)) : entry;
-        expect(profile).not.toContain(`(subpath "${expanded}")`);
-        expect(onLog).toHaveBeenCalledWith('error', expect.stringContaining(entry));
+        expect(profile).toContain(`(subpath "${expanded}")`);
+        expect(onLog).toHaveBeenCalledWith('debug', expect.stringContaining(entry));
       }
+      // Granted before the deny, so the deny is what matches last.
+      expect(profile.indexOf('(deny file-read* file-write*')).toBeGreaterThan(profile.lastIndexOf('(subpath "/Tmp")'));
     });
 
-    it('drops a grant of the app directory spelled in another Unicode form', () => {
+    it('notes a grant of the app directory spelled in another Unicode form, and denies the directory after it', () => {
       const previous = process.env.LOCALMOST_CONFIG_DIR;
       process.env.LOCALMOST_CONFIG_DIR = '/opt/café';
       try {
-        const decomposed = '/opt/café/runner/sandbox';
+        // The same directory, its é decomposed into e and a combining accent.
+        const decomposed = '/opt/cafe\u0301/runner/sandbox';
+        const onLog = jest.fn();
         let profile = '';
         jest.isolateModules(() => {
           const { generateSandboxProfile } = require('./process-sandbox');
           profile = generateSandboxProfile({
             instanceDir: '/opt/café/runner/sandbox/1',
             filesystemPolicy: { level: 'strict', read: [decomposed, '/opt/other'], write: [] },
+            onLog,
           });
         });
-        expect(profile).not.toContain(`(subpath "${decomposed}")`);
-        expect(profile).toContain('(subpath "/opt/other")');
+        expect(onLog).toHaveBeenCalledWith('debug', expect.stringContaining(decomposed));
+        expect(onLog).not.toHaveBeenCalledWith('debug', expect.stringContaining('/opt/other'));
+        const deny = profile.indexOf('(deny file-read* file-write*\n  (subpath "/opt/café")');
+        expect(deny).toBeGreaterThan(profile.indexOf(`(subpath "${decomposed}")`));
+        expect(readable(profile, '/opt/café/runner/sandbox/2/token')).toBe(false);
+        expect(readable(profile, '/opt/café/runner/sandbox/1/run.sh')).toBe(true);
       } finally {
         if (previous === undefined) delete process.env.LOCALMOST_CONFIG_DIR;
         else process.env.LOCALMOST_CONFIG_DIR = previous;
       }
+    });
+
+    it('denies each directory by its real path too, even one not created yet', () => {
+      // seatbelt matches the real path: /tmp is a symlink to /private/tmp, so
+      // a deny of /tmp/... alone would not stop a grant of /private/tmp. And a
+      // directory the app has yet to create is where a job granted its parent
+      // could plant what the app would then trust.
+      const previous = process.env.LOCALMOST_CONFIG_DIR;
+      const unborn = `/tmp/localmost-unborn-${process.pid}/app`;
+      process.env.LOCALMOST_CONFIG_DIR = unborn;
+      try {
+        let profile = '';
+        jest.isolateModules(() => {
+          jest.doMock('fs', () => jest.requireActual('fs'));
+          const { generateSandboxProfile } = require('./process-sandbox');
+          profile = generateSandboxProfile({
+            instanceDir: `${unborn}/runner/sandbox/1`,
+            filesystemPolicy: { level: 'strict', read: ['/private/tmp'], write: ['/private/tmp'] },
+          });
+        });
+        const deny = profile.slice(profile.indexOf('(deny file-read* file-write*'));
+        const denied = deny.slice(0, deny.indexOf('))\n') + 2);
+        expect(denied).toContain(`(subpath "${unborn}")`);
+        expect(denied).toContain(`(subpath "/private${unborn}")`);
+        // Electron's directory, which the mock puts at /tmp/test.
+        expect(denied).toContain(`(subpath "${userDataDir}")`);
+        expect(denied).toContain(`(subpath "/private${userDataDir}")`);
+        expect(writable(profile, `/private${unborn}/runner/arc/run.sh`)).toBe(false);
+        expect(readable(profile, `/private${userDataDir}/Cookies`)).toBe(false);
+        expect(writable(profile, '/private/tmp/elsewhere')).toBe(true);
+        // Nor the directory on the way to it that is not there yet either,
+        // where a link planted now would carry the app's directory elsewhere.
+        expect(writable(profile, path.dirname(unborn))).toBe(false);
+        expect(writable(profile, `/private${path.dirname(unborn)}`)).toBe(false);
+        expect(writable(profile, `/private${path.dirname(unborn)}-sibling`)).toBe(true);
+      } finally {
+        if (previous === undefined) delete process.env.LOCALMOST_CONFIG_DIR;
+        else process.env.LOCALMOST_CONFIG_DIR = previous;
+      }
+    });
+
+    it("refuses to build a profile when an app directory's real path cannot be looked up", () => {
+      // Only a directory that is not there yet is walked up from; any other
+      // failure leaves the spelling seatbelt matches unknown, and a deny
+      // under the wrong one would not hold.
+      let build: () => string = () => '';
+      jest.isolateModules(() => {
+        jest.doMock('fs', () => ({
+          ...jest.requireActual('fs'),
+          realpathSync: jest.fn(() => {
+            throw Object.assign(new Error('EACCES: permission denied, realpath'), { code: 'EACCES' });
+          }),
+        }));
+        const { generateSandboxProfile } = require('./process-sandbox');
+        build = () => generateSandboxProfile({ instanceDir });
+      });
+      expect(build).toThrow(/EACCES/);
     });
   });
 
@@ -856,9 +1009,22 @@ describe('Process Sandbox', () => {
       expect(readable(profile, path.join(instanceDir, '_work', 'repo', 'main.c'))).toBe(true);
     });
 
+    it('is not overridden by the directory nodes given back in the app directory', () => {
+      // The nodes on the way down to the job's sandbox are given back before
+      // the policy's denies, so a deny over them stands: the job may then
+      // fail to start, but it does not get what its policy refused.
+      const runnerDir = path.join(os.homedir(), '.localmost', 'runner');
+      const profile = profileWith({
+        filesystemPolicy: { level: 'strict', read: [], write: [], deny: [runnerDir] },
+      });
+      expect(readable(profile, runnerDir)).toBe(false);
+      expect(readable(profile, path.join(runnerDir, 'sandbox'))).toBe(false);
+      expect(readable(profile, path.join(instanceDir, 'run.sh'))).toBe(true);
+    });
+
     it('keeps a deny that covers the app directories, since a deny only narrows', () => {
-      // Dropping it, as a grant there is dropped, would quietly widen what
-      // the approved policy says: /tmp contains the mock's userData directory.
+      // Dropping it would quietly widen what the approved policy says: /tmp
+      // contains the mock's userData directory.
       const profile = profileWith({
         filesystemPolicy: { level: 'strict', read: [], write: [], deny: ['/tmp', '~/.localmost/logs'] },
       });
@@ -878,7 +1044,7 @@ describe('Process Sandbox', () => {
       expect(denyRule).toContain('(subpath "/opt/etc")');
       expect(profile).not.toContain('/opt/data/../etc');
       // And none at all when the policy denies nothing.
-      expect(profileWith({})).not.toContain('(deny file-read* file-write*');
+      expect(profileWith({})).toContain(';; No policy-declared deny paths');
     });
 
     it('says a relative deny has no effect, since seatbelt never matches a relative path', () => {
@@ -1014,6 +1180,7 @@ describe('Process Sandbox', () => {
           writeFileSync: mockWriteFileSync,
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
         sandboxedSpawn(path.join(instanceDir, 'run.sh'), [], { cwd: instanceDir, proxyPort });
@@ -1036,6 +1203,7 @@ describe('Process Sandbox', () => {
           writeFileSync: mockWriteFileSync,
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -1065,6 +1233,7 @@ describe('Process Sandbox', () => {
           writeFileSync: mockWriteFileSync,
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -1093,7 +1262,7 @@ describe('Process Sandbox', () => {
 
         // The app's own control plane is never writable by a job: a job that
         // can write the approval cache can approve its own policy.
-        expect(profile).toContain('(deny file-write*');
+        expect(profile).toContain('(deny file-read* file-write*');
         expect(writable(profile, path.join(os.homedir(), '.localmost', 'policies', 'owner-repo.json'))).toBe(false);
       });
     });
@@ -1112,6 +1281,7 @@ describe('Process Sandbox', () => {
           writeFileSync: jest.fn(),
           unlinkSync: mockUnlinkSync,
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -1139,6 +1309,7 @@ describe('Process Sandbox', () => {
           writeFileSync: mockWriteFileSync,
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -1168,6 +1339,7 @@ describe('Process Sandbox', () => {
           writeFileSync: mockWriteFileSync,
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -1200,6 +1372,7 @@ describe('Process Sandbox', () => {
           writeFileSync: mockWriteFileSync,
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -1227,6 +1400,7 @@ describe('Process Sandbox', () => {
           writeFileSync: mockWriteFileSync,
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -1255,6 +1429,7 @@ describe('Process Sandbox', () => {
           writeFileSync: mockWriteFileSync,
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
