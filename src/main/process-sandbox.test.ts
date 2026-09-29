@@ -393,6 +393,46 @@ describe('Process Sandbox', () => {
       expect(odd).not.toContain('(regex');
     });
 
+    it("grants only the tool cache it is given, so two targets' profiles share none", () => {
+      // setup-* actions execute the highest matching toolchain they find in
+      // the tool cache. A cache every job can write lets one repository's job
+      // plant a binary another repository's job runs with its own secrets.
+      const runnerDir = path.join(os.homedir(), '.localmost', 'runner');
+      const cacheA = path.join(runnerDir, 'caches', 'aaaa1111', 'tool-cache');
+      const cacheB = path.join(runnerDir, 'caches', 'bbbb2222', 'tool-cache');
+      const writable = (profile: string) =>
+        [...profile.matchAll(/\(allow file-write\*\n((?:\s*\(subpath "[^"]*"\)\n?)+)\)/g)]
+          .flatMap((m) => [...m[1].matchAll(/\(subpath "([^"]*)"\)/g)].map((s) => s[1]));
+      const a = profileWith({ toolCacheDir: cacheA });
+      const b = profileWith({ toolCacheDir: cacheB });
+
+      expect(writable(a)).toContain(cacheA);
+      expect(writable(b)).toContain(cacheB);
+      expect(a).not.toContain(cacheB);
+      expect(b).not.toContain(cacheA);
+      // Nothing either can write lies inside, or contains, the other's cache,
+      // and neither names the old shared cache.
+      for (const [profile, other] of [[a, cacheB], [b, cacheA]]) {
+        for (const w of writable(profile)) {
+          expect(other.startsWith(w + '/') || other === w || w.startsWith(other + '/')).toBe(false);
+        }
+        expect(profile).not.toContain(`(subpath "${runnerDir}/tool-cache")`);
+      }
+      // Readable, and the directory nodes above it can be traversed.
+      const allowRead = a.slice(a.indexOf('(allow file-read*'), a.indexOf('(deny file-read*'));
+      expect(allowRead).toContain(`(subpath "${cacheA}")`);
+      expect(allowRead).toContain(`(literal "${runnerDir}/caches")`);
+      expect(allowRead).not.toContain(`(subpath "${runnerDir}/caches")`);
+    });
+
+    it('grants no tool cache at all when the worker has none', () => {
+      // Per-sandbox, or a worker with no target: the runner keeps its tools
+      // in the job's own work directory, and no shared path is writable.
+      const profile = profileWith({});
+      expect(profile).not.toContain('tool-cache');
+      expect(profile).not.toContain('/caches');
+    });
+
     it('reads the OS paths xcrun needs without the whole of /var', () => {
       // xcrun resolves tools through xcodebuild, which links a framework that
       // lives under /Library/Apple; with its cache out of the shared temp it

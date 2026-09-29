@@ -10,7 +10,7 @@ jest.mock('./runner-downloader', () => ({
     getArcDir: jest.fn().mockReturnValue('/Users/test/.localmost/runner/arc/v2.330.0'),
     getConfigDir: jest.fn().mockImplementation((instance: number) => `/Users/test/.localmost/runner/config/${instance}`),
     getSandboxDir: jest.fn().mockImplementation((instance: number) => `/Users/test/.localmost/runner/sandbox/${instance}`),
-    getToolCacheDir: jest.fn().mockReturnValue('/Users/test/.localmost/runner/tool-cache'),
+    getToolCacheDir: jest.fn().mockImplementation((targetId: string) => `/Users/test/.localmost/runner/caches/${targetId}/tool-cache`),
     buildSandbox: jest.fn().mockImplementation((instance: number) => Promise.resolve(`/Users/test/.localmost/runner/sandbox/${instance}`)),
     isDownloaded: jest.fn().mockReturnValue(true),
     isConfigured: jest.fn().mockImplementation((_instance: number) => true),
@@ -1790,6 +1790,52 @@ describe('RunnerManager', () => {
       expect(env.xcrun_db).toBe(`${jobTmp}/xcrun_db`);
       expect(env.CLANG_MODULE_CACHE_PATH).toBe(`${jobTmp}/clang-module-cache`);
       expect(env.TMPPREFIX).toBe(`${jobTmp}/zsh`);
+    });
+  });
+
+  describe("a worker's tool cache", () => {
+    const spawnFor = async (targetId?: string): Promise<NonNullable<Parameters<typeof spawnSandboxed>[2]>> => {
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+      if (targetId) helper.setPendingTargetContext('1', { targetId, targetDisplayName: 'owner/repo' });
+      await runnerManager.start();
+      return mockSpawnSandboxed.mock.calls.at(-1)![2]!;
+    };
+
+    it("is the worker's own target's, in the env and in the profile", async () => {
+      // setup-* actions execute what they find in the tool cache. One cache
+      // per target means a job can only ever find tools its own repository's
+      // jobs put there.
+      const options = await spawnFor('t1');
+      const cache = '/Users/test/.localmost/runner/caches/t1/tool-cache';
+      expect(options.env?.RUNNER_TOOL_CACHE).toBe(cache);
+      expect(options.env?.AGENT_TOOLSDIRECTORY).toBe(cache);
+      expect(options).toHaveProperty('toolCacheDir', cache);
+      expect(fs.mkdirSync).toHaveBeenCalledWith(cache, expect.objectContaining({ recursive: true }));
+    });
+
+    it('is not shared between targets', async () => {
+      const first = await spawnFor('t1');
+      await runnerManager.stop();
+      const second = await spawnFor('t2');
+      expect(second.toolCacheDir).toBe('/Users/test/.localmost/runner/caches/t2/tool-cache');
+      expect(second.toolCacheDir).not.toBe(first.toolCacheDir);
+    });
+
+    it('is absent with per-sandbox selected, leaving the runner its own work directory', async () => {
+      (runnerManager as unknown as { toolCacheLocation: string }).toolCacheLocation = 'per-sandbox';
+      const options = await spawnFor('t1');
+      expect(options.env?.RUNNER_TOOL_CACHE).toBeUndefined();
+      expect(options.env?.AGENT_TOOLSDIRECTORY).toBeUndefined();
+      expect(options.toolCacheDir).toBeUndefined();
+    });
+
+    it('is absent for a worker spawned without a target', async () => {
+      // No target, no cache to give it: nothing shared is writable instead.
+      const options = await spawnFor();
+      expect(options.env?.RUNNER_TOOL_CACHE).toBeUndefined();
+      expect(options.toolCacheDir).toBeUndefined();
     });
   });
 

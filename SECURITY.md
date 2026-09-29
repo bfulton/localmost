@@ -109,6 +109,7 @@ loosen its own sandbox without the machine owner agreeing to it.
 - **Container egress**: Traffic from inside a container leaves through the daemon's network, not the job's proxy, so the host allowlist does not apply to it. The Docker filter decides what a container may be created with, not what it connects to once running - see Docker Access below.
 
 - **The runner's own floor**: A job's sandbox also contains the runner process, so the profile must grant what the runner needs to function - the OS, its own installation, the tool cache, the workspace and temp. A repository cannot narrow below that floor, only add to it.
+- **Tool cache**: With the persistent tool cache selected, each repository or organization target has its own (`~/.localmost/runner/caches/<target>/tool-cache`), readable and writable by that target's jobs and no other's. `setup-node` and the other setup actions execute the highest matching version they find there, so a cache shared across targets would let one repository's job plant a toolchain another repository's job runs with its own secrets. Within one target the cache is still shared between jobs, including a pull request's and the default branch's; choose per-sandbox to keep every job's tools to itself. A worker with no target, or per-sandbox, gets no cache outside its sandbox at all. The single shared `tool-cache` directory earlier versions used is left on disk untouched and is no longer granted to any job; delete it when convenient.
 - **Shared temp directories**: A job gets no access to `/tmp` or to the per-user `/var/folders` directories, at any level. Those are shared with every process you run, and some of what lives there is trusted by your own tools - the xcrun lookup cache and the clang module cache among them. `TMPDIR`, `TMP` and `TEMP` point at the job's own temp directory, and xcrun's cache, the clang and Swift module cache and zsh's here-documents are pointed there too (`xcrun_db`, `CLANG_MODULE_CACHE_PATH`, `TMPPREFIX`). macOS `mktemp` ignores `TMPDIR`, so a bare `mktemp` or `mktemp -d` is allowed to create its entry in the per-user temp directory - by the `tmp.XXXXXXXXXX` name it generates only, without the right to list or read anything else there. The trade-offs: `mktemp -t prefix`, a hard-coded `/tmp` path, and Foundation's `NSTemporaryDirectory()` / `FileManager.temporaryDirectory` fail with "Operation not permitted" inside a job; use `$RUNNER_TEMP` or a template under it (`mktemp -d "$RUNNER_TEMP/x.XXXXXX"`). And an entry of your own named like `tmp.XXXXXXXXXX` is reachable by a job that learns its exact name, for example from the open files of a process of yours it can inspect.
 - **Declared system paths**: A policy that declares OS read paths grants them for the whole job. `localmost policy init` seeds that list with OS subpaths (`/usr/bin`, `/usr/lib`, `/System`, `/Library/Developer` and similar) because nothing runs without them. It deliberately excludes `/usr/local`, `/Library/Application Support` and `/Applications`, which hold third-party software and application data - but a policy is free to add them back, and approving one means accepting that.
 
@@ -339,7 +340,7 @@ localmost adds isolation layers that the stock GitHub Actions Runner lacks:
 
 | Resource | Access Level |
 |----------|--------------|
-| File system (write) | The job's own sandbox directory (workspace and temp) and the tool cache |
+| File system (write) | The job's own sandbox directory (workspace and temp) and its target's own tool cache |
 | File system (read) | Essential system paths (`/usr/bin`, `/System/Library`, Xcode) |
 | Network | Allowlisted hosts only (GitHub, npm, PyPI, etc.) via HTTP proxy |
 | Docker daemon | Through a filtering socket; only declared `pull`/`run`/`build` requests are forwarded |
@@ -383,7 +384,7 @@ The sandbox reduces attack surface but does not provide full containment. For un
 | Network isolation | VM boundary | Proxy allowlist |
 | Credential isolation | No access to host | Home directory denied |
 
-The sandbox is rebuilt fresh on each runner start and confines all writes to the job's own sandbox directory and the tool cache. Workflows cannot modify files elsewhere on your system or exfiltrate data to non-allowlisted hosts.
+The sandbox is rebuilt fresh on each runner start and confines all writes to the job's own sandbox directory and its target's own caches. Workflows cannot modify files elsewhere on your system or exfiltrate data to non-allowlisted hosts.
 
 ### User Filter
 

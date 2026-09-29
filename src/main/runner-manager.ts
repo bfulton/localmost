@@ -1092,12 +1092,24 @@ export class RunnerManager {
       };
 
       // Set tool cache location based on setting
-      // 'persistent' = shared directory that survives restarts (fast subsequent jobs)
-      // 'per-sandbox' = inside sandbox, rebuilt each time (clean but slow)
-      if (this.toolCacheLocation === 'persistent') {
-        const toolCacheDir = this.downloader.getToolCacheDir();
-        env.RUNNER_TOOL_CACHE = toolCacheDir;
-        env.AGENT_TOOLSDIRECTORY = toolCacheDir; // Some actions check this instead
+      // 'persistent' = the worker's target's own directory, kept across that
+      //   target's jobs (fast subsequent jobs). Never shared between targets:
+      //   setup-* actions execute what they find there, so a shared cache let
+      //   one repository's job plant a toolchain another's would run.
+      // 'per-sandbox' = inside sandbox, rebuilt each time (clean but slow).
+      // A worker with no target gets none, and so no shared path either.
+      const cacheTargetId = this.pendingTargetContext.get(String(instanceNum))?.targetId;
+      let toolCacheDir: string | undefined;
+      if (this.toolCacheLocation === 'persistent' && cacheTargetId) {
+        try {
+          toolCacheDir = this.downloader.getToolCacheDir(cacheTargetId);
+          fs.mkdirSync(toolCacheDir, { recursive: true, mode: 0o700 });
+          env.RUNNER_TOOL_CACHE = toolCacheDir;
+          env.AGENT_TOOLSDIRECTORY = toolCacheDir; // Some actions check this instead
+        } catch (err) {
+          this.log('warn', `No tool cache for instance ${instanceNum}; its tools stay in the job: ${(err as Error).message}`);
+          toolCacheDir = undefined;
+        }
       }
 
       // The sandbox confines the runner to this proxy, and that rule only
@@ -1209,6 +1221,7 @@ export class RunnerManager {
           detached: true,
           filesystemPolicy,
           dockerSocket: dockerSocketPath,
+          toolCacheDir,
         });
       } finally {
         // The child holds its own copy; this process must not, or lsof would

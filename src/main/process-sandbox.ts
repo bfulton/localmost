@@ -109,14 +109,6 @@ function validateExecutablePath(executablePath: string): string {
 export const DEFAULT_BROKER_PORT = 8787;
 
 /**
- * Where the runner keeps downloaded toolchains, shared across jobs.
- * Mirrors RunnerDownloader.getToolCacheDir.
- */
-function getToolCacheDirPath(): string {
-  return path.join(getRunnerDir(), 'tool-cache');
-}
-
-/**
  * The per-user temp directory confstr hands out, looked up once. null once
  * the lookup has failed or answered something unexpected.
  */
@@ -165,6 +157,8 @@ interface RunnerProfileOptions {
   filesystemPolicy?: SandboxFilesystemPolicy;
   /** The filtering docker socket the app serves this worker, if it has one. */
   dockerSocket?: string;
+  /** This worker's target's tool cache, if it keeps one across jobs. */
+  toolCacheDir?: string;
   /** Optional log sink for notes such as a policy path being ignored. */
   onLog?: SandboxLogCallback;
 }
@@ -175,6 +169,7 @@ function generateSandboxProfile({
   allowDirectNetwork = false,
   filesystemPolicy = { level: 'strict', read: [], write: [] },
   dockerSocket,
+  toolCacheDir: toolCache,
   onLog,
 }: RunnerProfileOptions): string {
   // The worker's own docker socket, served by the app: every request on it is
@@ -206,7 +201,6 @@ function generateSandboxProfile({
   // The app's own control plane: approvals, settings and the CLI socket. A job
   // that can write these can approve its own policy, so it is carved out of
   // the app data directory rather than trusted to leave it alone.
-  const toolCacheDir = getToolCacheDirPath().replace(/"/g, '\\"');
   const policiesDir = `${appDataDir}/policies`;
   const configFile = getConfigPath().replace(/"/g, '\\"');
   const runnerDir = getRunnerDir().replace(/"/g, '\\"');
@@ -307,6 +301,27 @@ function generateSandboxProfile({
       `  (regex #"^${escapeForRegex(dir)}${generated}"))`,
     ].join('\n');
   })(darwinUserTempDir());
+  // This worker's target's own caches, when it keeps any across jobs. Never
+  // one shared with another target: what a job leaves in a cache, the next
+  // job to find it executes. The directories above them are readable as
+  // nodes only (.NET reads every ancestor of what it opens), so another
+  // target's caches are not opened along the way.
+  const ownCaches = [toolCache].filter((dir): dir is string => Boolean(dir));
+  const ownCacheRules = (operation: string) =>
+    ownCaches.length
+      ? `(allow ${operation}\n${ownCaches.map((dir) => `  (subpath "${dir.replace(/"/g, '\\"')}")`).join('\n')})`
+      : `;; No cache kept across jobs: nothing outside the sandbox for ${operation}`;
+  const ownCacheNodes = [...new Set(ownCaches.flatMap((dir) => {
+    const nodes: string[] = [];
+    for (let node = path.dirname(dir); node.startsWith(runnerRoot + path.sep); node = path.dirname(node)) {
+      nodes.push(node);
+    }
+    return nodes;
+  }))];
+  const ownCacheReads = [
+    ...ownCacheNodes.map((node) => `  (literal "${node.replace(/"/g, '\\"')}")`),
+    ...ownCaches.map((dir) => `  (subpath "${dir.replace(/"/g, '\\"')}")`),
+  ].join('\n');
 
   return `
 (version 1)
@@ -334,15 +349,14 @@ function generateSandboxProfile({
 (allow file-ioctl
   (subpath "${escapedDir}"))
 
-;; Tool cache only. The rest of the app data directory holds the approval
-;; cache, settings and the CLI socket - a job that can write those can approve
-;; its own policy, so it does not get the directory wholesale.
-(allow file-write*
-  (subpath "${toolCacheDir}"))
+;; This target's own caches only. The rest of the app data directory holds the
+;; approval cache, settings and the CLI socket - a job that can write those can
+;; approve its own policy - and every other target's caches, which a job that
+;; could write would poison for that target's next job.
+${ownCacheRules('file-write*')}
 
-;; File ioctl for git file locking in the tool cache
-(allow file-ioctl
-  (subpath "${toolCacheDir}"))
+;; File ioctl for git file locking in those caches
+${ownCacheRules('file-ioctl')}
 
 ;; No shared temp directory. /tmp and the per-user /var/folders tree belong to
 ;; every process the user runs; the job's TMPDIR is in its own sandbox, and
@@ -416,13 +430,13 @@ ${policyWrites ? `(allow file-write*\n${policyWrites})` : ';; No policy-declared
   (subpath "/private/var/db")
   (subpath "/private/var/select")
   (subpath "/etc")
-  ;; This job's own workspace and the shared tool cache. Not the runner
+  ;; This job's own workspace and its target's own caches. Not the runner
   ;; directory as a whole: it holds every target's proxy credentials, every
-  ;; instance's registration, the broker's session tokens and the other
-  ;; workers' sandboxes. The job's own sandbox already carries the runner it
-  ;; runs, so it needs nothing else from there.
+  ;; instance's registration, the broker's session tokens, the other workers'
+  ;; sandboxes and the other targets' caches. The job's own sandbox already
+  ;; carries the runner it runs, so it needs nothing else from there.
   (subpath "${escapedDir}")
-  (subpath "${toolCacheDir}")
+${ownCacheReads}
 ${toolchainRules}
 ${policyReads}
   (literal "/dev/null")
@@ -588,6 +602,11 @@ export interface SandboxOptions extends SpawnOptions {
    * to it and nothing else; the daemon's own socket stays denied.
    */
   dockerSocket?: string;
+  /**
+   * The worker's target's own tool cache, kept across that target's jobs.
+   * Absent means none: the runner keeps its tools in the job's work directory.
+   */
+  toolCacheDir?: string;
   /** Log prefix for identifying this process (e.g., runner instance ID) */
   logPrefix?: string;
   /** Optional callback for logging sandbox events */
@@ -634,6 +653,7 @@ export function spawnSandboxed(
     allowDirectNetwork,
     filesystemPolicy,
     dockerSocket,
+    toolCacheDir,
     logPrefix,
     onLog,
     ...spawnOptions
@@ -653,6 +673,7 @@ export function spawnSandboxed(
       allowDirectNetwork,
       filesystemPolicy,
       dockerSocket,
+      toolCacheDir,
       onLog,
     });
 

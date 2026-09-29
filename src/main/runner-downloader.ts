@@ -34,6 +34,7 @@ export interface RunnerRelease {
  *   arc/v2.330.0/     - downloaded binaries (versioned, persistent)
  *   config/1/         - config files for instance 1 (persistent)
  *   sandbox/1/        - ephemeral sandbox for instance 1 (rebuilt on each start)
+ *   caches/<target>/  - one target's caches, kept across its jobs (persistent)
  */
 export class RunnerDownloader {
   private readonly baseDir: string;
@@ -66,9 +67,26 @@ export class RunnerDownloader {
     return this.baseDir;
   }
 
-  /** Get the persistent tool cache directory (shared across all instances) */
-  getToolCacheDir(): string {
-    return path.join(this.baseDir, 'tool-cache');
+  /**
+   * A target's own cache directory, kept across that target's jobs and never
+   * shared with another target's. A job can write its caches, and what it
+   * leaves there - a toolchain in the tool cache - the next job to find it
+   * executes. Target IDs are app-generated; checked anyway, since this
+   * becomes a path the sandbox grants write to.
+   */
+  getTargetCacheDir(targetId: string): string {
+    if (!/^[A-Za-z0-9-]+$/.test(targetId)) {
+      throw new Error(`Not a target id for a cache directory: ${JSON.stringify(targetId)}`);
+    }
+    return path.join(this.baseDir, 'caches', targetId);
+  }
+
+  /**
+   * The persistent tool cache for one target's jobs. The shared tool-cache
+   * directory earlier versions used is left in place and no longer granted.
+   */
+  getToolCacheDir(targetId: string): string {
+    return path.join(this.getTargetCacheDir(targetId), 'tool-cache');
   }
 
   /**
