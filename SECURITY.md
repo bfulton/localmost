@@ -177,7 +177,45 @@ without echoing it.
   deploys or publishes.
 
 For jobs run by the background runner, secrets come from GitHub in the job
-payload as they would on any self-hosted runner. They pass through the local
+payload as they would on any self-hosted runner.
+
+## Local Test Mode
+
+`localmost test` runs a checkout's workflow on the Mac, each step under its own
+sandbox profile. The checkout is treated as untrusted:
+
+- **Rooted at the workspace.** Every step's profile is rooted at the run's
+  workspace, a private (`0700`) copy of the checkout. A `working-directory`, a
+  local action's path or an action's entry point that resolves outside it is
+  refused, and fetched action code is readable but not writable.
+- **Never reachable.** Whatever the checkout's `.localmostrc` declares, a step
+  cannot read or write the app's data directory (the runner template every
+  worker is copied from, approvals, settings, other runs) or the credentials the
+  runner denies a job at every level (`~/.ssh`, `~/.aws`, `~/.gnupg`,
+  `~/.config`, the keychains, `.netrc`, `.npmrc` and the package-manager
+  credential files). The CLI socket is closed too.
+- **Nothing in home granted implicitly.** Steps run with `HOME` and the tool
+  cache inside the workspace; a home cache is writable only if the policy
+  declares it.
+- **Loopback-only network.** A step can reach loopback, except the broker's
+  port, and nothing else directly. The way out is the run's proxy, which needs
+  a per-run token, refuses names that resolve to internal or loopback
+  addresses, and connects only to the addresses it screened.
+- **Discovery does not write the disk.** Under `--updaterc` reads are allowed
+  and recorded; writes outside the workspace and temp are refused and reported.
+  Discovery still lets a workflow read everything but the paths above and reach
+  any host, since that is what it exists to observe - so it is for checkouts
+  whose workflow you are willing to run with that much.
+- **No unsandboxed code in the workspace.** The app's own work in the
+  workspace - step scripts, output files, the cache intercept (which copies with
+  tar under the step's profile, scoped per repository and ref) and the checkout
+  intercept (which runs no git) - never follows what a step left there.
+  Whatever a job's steps leave running is killed when the job ends.
+
+The checkout's own `.localmostrc` is applied without approval, as it is the
+developer's to test. It can still grant reads, hosts and writes outside the
+workspace beyond the paths above, so review one you did not write before
+testing with it. They pass through the local
 proxy in transit, are handed to the runner binary, and are not parsed, logged
 or stored by localmost.
 

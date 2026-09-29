@@ -48,7 +48,10 @@ workflows:                       # Per-workflow additions
 localmost test --updaterc
 ```
 
-Runs the workflow permissively but logs all access:
+Runs the workflow with reads allowed and every access logged. Writes outside
+the workspace and temp are refused rather than made - a denial is logged too,
+so the path is still offered - and the app's own data and the developer's
+credentials stay closed, since no policy can grant them:
 
 ```
 Discovered access:
@@ -58,7 +61,7 @@ Discovered access:
     + api.cocoapods.org (pod install)    ← new
 
   filesystem:
-    + read: ~/.netrc (git credential)
+    + read: /opt/homebrew/bin
     + write: ./Pods/                      ← new
 
 Write to .localmostrc? [y/n]
@@ -399,7 +402,7 @@ network:
 | Command | Behavior |
 |---------|----------|
 | `localmost test` | Enforce `.localmostrc`, fail on violations |
-| `localmost test --updaterc` | Permissive, record access, prompt to update |
+| `localmost test --updaterc` | Record reads and writes (writes outside the workspace refused), prompt to update |
 | `localmost test --dry-run` | Show what *would* be accessed without running |
 | `localmost policy show` | Display current policy for this repo |
 | `localmost policy diff` | Compare local vs cached policy |
