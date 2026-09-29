@@ -55,7 +55,7 @@ APP COMMANDS (requires running app):
   start     Start the localmost app
   stop      Stop the localmost app
   status    Show current runner status
-  pause     Pause the runner (stops accepting jobs)
+  pause     Pause the runner (takes no new jobs; running jobs finish)
   resume    Resume the runner (start accepting jobs)
   jobs      Show recent job history
   targets   Manage the repos/orgs this machine runs jobs for

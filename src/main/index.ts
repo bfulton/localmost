@@ -91,6 +91,7 @@ import { IPC_CHANNELS, SleepProtection, LogLevel, DEFAULT_POWER_CONFIG, DEFAULT_
 
 // Resource monitoring
 import { ResourceMonitor } from './resource-monitor';
+import { canAcceptJob, ensureRunnerInitialized, startHeartbeatUnlessPaused } from './runner-pause';
 
 // State machine
 import {
@@ -398,13 +399,7 @@ app.whenReady().then(async () => {
   }
 
   // Set capacity check callback - broker proxy will only acquire jobs when we have capacity AND not paused
-  brokerProxyService.setCanAcceptJobCallback(() => {
-    // Don't accept jobs if resource monitor says we should be paused
-    if (resourceMonitor.shouldPause()) {
-      return false;
-    }
-    return runnerManager.hasAvailableSlot();
-  });
+  brokerProxyService.setCanAcceptJobCallback(() => canAcceptJob({ resourceMonitor, runnerManager }));
 
   // Wire up broker proxy to runner manager: when a job is received, decide
   // whether it may run and spawn the worker for it.
@@ -481,15 +476,19 @@ app.whenReady().then(async () => {
     // Send event to state machine - it will update tray and renderer via subscription
     sendRunnerEvent({ type: 'RESOURCE_PAUSE', reason });
 
-    const runnerManager = getRunnerManager();
     const heartbeatManager = getHeartbeatManager();
 
     // Stop heartbeat to signal unavailability
     heartbeatManager?.stop();
     await heartbeatManager?.clear();
 
-    // Stop any running workers (gracefully - in-progress jobs will complete)
-    // The broker proxy will reject new jobs via the canAcceptJob callback
+    // New jobs are held back by canAcceptJob, which asks the monitor. Unlike
+    // a user pause, this also stops the workers, and with them any job they
+    // are running: stop() signals each worker's process group, and a job cut
+    // off that way fails on GitHub. isRunning() is whether there are workers;
+    // an idle pool has none, and is left started. A stopped pool is started
+    // again on resume.
+    const runnerManager = getRunnerManager();
     if (runnerManager?.isRunning()) {
       await runnerManager.stop();
     }
@@ -504,8 +503,16 @@ app.whenReady().then(async () => {
     // Send event to state machine - it will update tray and renderer via subscription
     sendRunnerEvent({ type: 'RESOURCE_RESUME' });
 
+    // The broker proxy will start accepting jobs via the canAcceptJob callback.
+    // Start the pool again if the pause stopped it, or the runner reads
+    // offline while it takes them.
+    try {
+      await ensureRunnerInitialized();
+    } catch (err) {
+      logger?.error(`Failed to restart runner: ${(err as Error).message}`);
+    }
+
     // Restart heartbeat to signal availability
-    // The broker proxy will start accepting jobs via the canAcceptJob callback
     const heartbeatManager = getHeartbeatManager();
     const authState = getAuthState();
     if (heartbeatManager && authState?.accessToken) {
@@ -669,8 +676,8 @@ app.whenReady().then(async () => {
               },
             });
 
-            // Start the heartbeat
-            await heartbeatManager.start();
+            // Start the heartbeat, unless the user paused while it started
+            await startHeartbeatUnlessPaused(heartbeatManager);
           }
         }
       } catch (err) {

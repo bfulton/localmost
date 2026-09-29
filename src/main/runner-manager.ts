@@ -711,6 +711,14 @@ export class RunnerManager {
     return false;
   }
 
+  /**
+   * Whether the pool is started: initialize() has run and stop() has not
+   * since. Not isRunning(), which counts workers, and an idle pool has none.
+   */
+  isInitialized(): boolean {
+    return this.startedAt !== null;
+  }
+
   isConfigured(): boolean {
     // In proxy-only mode, check for proxy credentials instead of individual worker configs
     return this.downloader.hasAnyProxyCredentials();

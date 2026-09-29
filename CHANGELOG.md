@@ -129,6 +129,12 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   unattributed commit, email or name.
 
 ### Fixed
+- Pausing stops the runner taking jobs. A paused runner went on acquiring every
+  job GitHub offered it; a job offered while paused is now left queued with
+  GitHub. `localmost pause` and `resume` do what the tray's do: pause no longer
+  answers "already paused" for an idle runner or kills a running job, and
+  `localmost status` shows the pause. A pause made while the runner is still
+  starting holds, and it comes up paused.
 - An organization target's jobs get their repository's approved policy. The
   policy was looked up under the target's display name, the organization, which
   names no repository, so they ran with none of their grants.

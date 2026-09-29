@@ -13,15 +13,11 @@ import {
   getPowerSaveBlockerId,
   getBrokerProxyService,
   getEffectivePauseState,
-  setUserPaused,
-  setResourcePaused,
   getLogger,
-  getHeartbeatManager,
-  getIsQuitting,
 } from './app-state';
-import { IPC_CHANNELS } from '../shared/types';
 import { findAsset } from './log-file';
 import { confirmQuitIfBusy } from './window';
+import { pauseRunner, resumeRunner } from './runner-pause';
 
 /**
  * Initialize the system tray using TrayManager.
@@ -59,49 +55,15 @@ export const initTray = (): void => {
         updateTrayMenu();
       },
       onPause: async () => {
-        getLogger()?.info('User paused runner');
-        setUserPaused(true);
-
-        // Stop heartbeat timer first, then clear variables
-        const heartbeatManager = getHeartbeatManager();
-        heartbeatManager?.stop();
-        await heartbeatManager?.clear();
-
-        // Notify renderer of pause state change
-        const mainWindow = getMainWindow();
-        if (mainWindow && !mainWindow.isDestroyed() && !getIsQuitting()) {
-          mainWindow.webContents.send(IPC_CHANNELS.RESOURCE_STATE_CHANGED, {
-            isPaused: true,
-            reason: 'Paused by user',
-            conditions: [],
-          });
-        }
-
+        await pauseRunner();
         updateTrayMenu();
       },
       onResume: async () => {
-        getLogger()?.info('User resumed runner');
-        // Clear both user and resource pause - user override takes precedence
-        setUserPaused(false);
-        setResourcePaused(false);
-
-        // Restart heartbeat to signal availability
-        const heartbeatManager = getHeartbeatManager();
-        const authState = getAuthState();
-        if (heartbeatManager && authState?.accessToken) {
-          await heartbeatManager.start();
+        try {
+          await resumeRunner();
+        } catch (err) {
+          getLogger()?.error(`Failed to resume runner: ${(err as Error).message}`);
         }
-
-        // Notify renderer of pause state change
-        const mainWindow = getMainWindow();
-        if (mainWindow && !mainWindow.isDestroyed() && !getIsQuitting()) {
-          mainWindow.webContents.send(IPC_CHANNELS.RESOURCE_STATE_CHANGED, {
-            isPaused: false,
-            reason: null,
-            conditions: [],
-          });
-        }
-
         updateTrayMenu();
       },
       onQuit: async () => {
