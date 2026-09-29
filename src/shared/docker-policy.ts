@@ -525,10 +525,12 @@ export function describeDockerGrants(docker: DockerPolicy | undefined, prefix: s
         : `${prefix}docker network: ${network} (${UNFILTERED_EGRESS})`);
     }
   }
+  // A build needs no run.network to be routable: the filter lets one through
+  // with no network mode, and the classic builder then runs each RUN step on
+  // the daemon's default bridge. The egress is implicit, so it is spelled out.
   if (docker.build) {
-    grants.push(docker.build.context === undefined
-      ? `${prefix}docker build`
-      : `${prefix}docker build: ${docker.build.context}`);
+    const build = docker.build.context === undefined ? 'docker build' : `docker build: ${docker.build.context}`;
+    grants.push(`${prefix}${build} (RUN steps: ${UNFILTERED_EGRESS})`);
   }
   if (docker.privileged) grants.push(`${prefix}docker privileged`);
   return grants;

@@ -463,4 +463,17 @@ describe('describeDockerGrants on container networks', () => {
     expect(grants[0]).toMatch(unfiltered);
     expect(grants[1]).toBe('docker network create: vk-* (internal)');
   });
+
+  it('says a build is unfiltered egress too, since its RUN steps default to the daemon bridge', () => {
+    // The filter lets a build through with no network mode at all, whatever
+    // run.network says, and the classic builder then runs each step routable.
+    const withContext = describeDockerGrants({ build: { context: './' } }, '');
+    expect(withContext).toHaveLength(1);
+    expect(withContext[0]).toMatch(/^docker build: \.\/ \(RUN steps: /);
+    expect(withContext[0]).toMatch(unfiltered);
+    const bare = describeDockerGrants({ build: {} }, '');
+    expect(bare).toHaveLength(1);
+    expect(bare[0]).toMatch(/^docker build \(RUN steps: /);
+    expect(bare[0]).toMatch(unfiltered);
+  });
 });
