@@ -73,7 +73,38 @@ describe('trusted ipcMain', () => {
   });
 });
 
+/**
+ * Whether a module could reach electron's own ipcMain. Rather than listing
+ * the ways to spell that, only one form of electron import passes: named
+ * imports that do not include ipcMain. A namespace or default import, a
+ * require() or a dynamic import() of electron could reach it, so each fails.
+ */
+const reachesElectronIpc = (source: string): boolean => {
+  if (/\b(?:require|import)\s*\(\s*['"`]electron['"`]\s*\)/.test(source)) return true;
+  for (const [, clause] of source.matchAll(/import\s+([^;]*?)\s*from\s*['"]electron['"]/g)) {
+    const named = /^(?:type\s+)?\{([^}]*)\}$/.exec(clause.trim());
+    if (!named) return true;
+    if (named[1].split(',').some((name) => name.trim().split(/\s+/)[0] === 'ipcMain')) return true;
+  }
+  return false;
+};
+
 describe('handler modules', () => {
+  it('can tell every way of reaching electron\'s ipcMain from a named import of something else', () => {
+    for (const source of [
+      "import { ipcMain } from 'electron';",
+      'import { app, ipcMain } from "electron";',
+      "import { ipcMain as main } from 'electron';",
+      "import * as electron from 'electron';",
+      "import electron from 'electron';",
+      "const { ipcMain } = require('electron');",
+      "const electron = await import('electron');",
+    ]) {
+      expect({ source, reaches: reachesElectronIpc(source) }).toEqual({ source, reaches: true });
+    }
+    expect(reachesElectronIpc("import { app, shell } from 'electron';\nimport { ipcMain } from './trusted-ipc';")).toBe(false);
+  });
+
   it('all register through the trusted ipcMain, never electron\'s directly', () => {
     const modules = fs
       .readdirSync(__dirname)
@@ -81,8 +112,7 @@ describe('handler modules', () => {
     expect(modules.length).toBeGreaterThan(5);
     for (const file of modules) {
       const source = fs.readFileSync(path.join(__dirname, file), 'utf8');
-      const importsElectronIpc = /import\s*\{[^}]*\bipcMain\b[^}]*\}\s*from\s*'electron'/.test(source);
-      expect({ file, importsElectronIpc }).toEqual({ file, importsElectronIpc: false });
+      expect({ file, reaches: reachesElectronIpc(source) }).toEqual({ file, reaches: false });
     }
   });
 });
