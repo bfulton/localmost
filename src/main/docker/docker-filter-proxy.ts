@@ -354,7 +354,65 @@ export class DockerFilterProxy {
       });
       return { refusal: { status: 403, message } };
     }
+    if (classifyDockerRequest(req) === 'create') {
+      return { refusal: null, rewrittenBody: this.pinnedNetworks(verdict.rewrittenBody ?? req.body) };
+    }
     return { refusal: null, rewrittenBody: verdict.rewrittenBody };
+  }
+
+  /**
+   * An approved create body with each owned network named by the id it was
+   * created with, for the same reason pinnedPath pins a URL: the name is freed
+   * when anyone removes the network, and the next network of that name is not
+   * this job's. NetworkMode is replaced outright; an EndpointsConfig entry
+   * keeps its key and gains the id as its NetworkID, which the daemon prefers
+   * over the key. The evaluator has already required any NetworkID there to
+   * be empty or the key itself, so this only narrows what the key meant.
+   */
+  private pinnedNetworks(body: unknown): unknown {
+    if (!isPlainRecord(body)) return body;
+    const idFor = (name: unknown): string | undefined => {
+      if (typeof name !== 'string') return undefined;
+      const id = this.ownNetworkAliases.get(name);
+      return id !== undefined && id !== name ? id : undefined;
+    };
+    // Spread copies keep every key the client sent, and only the keys found
+    // below are assigned, so nothing else in the body changes.
+    const pinned: Record<string, unknown> = { ...body };
+    for (const key of Object.keys(pinned)) {
+      const section = pinned[key];
+      if (!isPlainRecord(section)) continue;
+      if (key.toLowerCase() === 'hostconfig') {
+        const hostConfig: Record<string, unknown> = { ...section };
+        for (const field of Object.keys(hostConfig)) {
+          if (field.toLowerCase() !== 'networkmode') continue;
+          const id = idFor(hostConfig[field]);
+          if (id !== undefined) hostConfig[field] = id;
+        }
+        pinned[key] = hostConfig;
+      } else if (key.toLowerCase() === 'networkingconfig') {
+        const networkingConfig: Record<string, unknown> = { ...section };
+        for (const field of Object.keys(networkingConfig)) {
+          const endpoints = networkingConfig[field];
+          if (field.toLowerCase() !== 'endpointsconfig' || !isPlainRecord(endpoints)) continue;
+          const pinnedEndpoints: Record<string, unknown> = { ...endpoints };
+          for (const name of Object.keys(pinnedEndpoints)) {
+            const id = idFor(name);
+            if (id === undefined) continue;
+            const endpoint = pinnedEndpoints[name];
+            const entry: Record<string, unknown> = isPlainRecord(endpoint) ? { ...endpoint } : {};
+            for (const endpointField of Object.keys(entry)) {
+              if (endpointField.toLowerCase() === 'networkid') delete entry[endpointField];
+            }
+            entry.NetworkID = id;
+            pinnedEndpoints[name] = entry;
+          }
+          networkingConfig[field] = pinnedEndpoints;
+        }
+        pinned[key] = networkingConfig;
+      }
+    }
+    return pinned;
   }
 
   /** Said once per socket: a declaration is a permission, not a requirement. */

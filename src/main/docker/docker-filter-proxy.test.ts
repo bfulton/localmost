@@ -835,6 +835,67 @@ describe('networks a job creates', () => {
     expect(daemon.seen[daemon.seen.length - 1]).toBe('DELETE /v1.45/networks/net123');
   });
 
+  it('are joined at create by the id they were created with, not by a name anyone may take next', async () => {
+    // `docker run --network vk-1` names the network in the create body, twice:
+    // HostConfig.NetworkMode and an EndpointsConfig key. If vk-1 was removed
+    // and another job made a network of that name, the name would join that
+    // job's network. The daemon is sent the id, which it resolves or refuses.
+    const dir = tmp();
+    const daemon = await networkDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', {
+      run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] },
+    });
+    expect((await request(sock, 'POST', '/v1.45/networks/create', { Name: 'vk-1', Internal: true })).status).toBe(201);
+
+    expect(
+      (
+        await request(sock, 'POST', '/v1.45/containers/create', {
+          Image: 'alpine:3',
+          HostConfig: { NetworkMode: 'vk-1' },
+          NetworkingConfig: { EndpointsConfig: { 'vk-1': { Aliases: ['db'], NetworkID: 'vk-1' } } },
+        })
+      ).status
+    ).toBe(201);
+    expect(daemon.bodies[daemon.bodies.length - 1]).toEqual({
+      Image: 'alpine:3',
+      HostConfig: { NetworkMode: 'net123' },
+      NetworkingConfig: { EndpointsConfig: { 'vk-1': { Aliases: ['db'], NetworkID: 'net123' } } },
+    });
+
+    // The daemon reads these keys in any casing, so the pin does too.
+    expect(
+      (
+        await request(sock, 'POST', '/v1.45/containers/create', {
+          Image: 'alpine:3',
+          HostConfig: { networkmode: 'vk-1' },
+          NetworkingConfig: { endpointsconfig: { 'vk-1': { networkid: '' } } },
+        })
+      ).status
+    ).toBe(201);
+    expect(daemon.bodies[daemon.bodies.length - 1]).toEqual({
+      Image: 'alpine:3',
+      HostConfig: { networkmode: 'net123' },
+      NetworkingConfig: { endpointsconfig: { 'vk-1': { NetworkID: 'net123' } } },
+    });
+
+    // The declared network is not the job's to pin, and is sent as named.
+    expect(
+      (
+        await request(sock, 'POST', '/v1.45/containers/create', {
+          Image: 'alpine:3',
+          HostConfig: { NetworkMode: 'bridge' },
+          NetworkingConfig: { EndpointsConfig: { bridge: {} } },
+        })
+      ).status
+    ).toBe(201);
+    expect(daemon.bodies[daemon.bodies.length - 1]).toEqual({
+      Image: 'alpine:3',
+      HostConfig: { NetworkMode: 'bridge' },
+      NetworkingConfig: { EndpointsConfig: { bridge: {} } },
+    });
+  });
+
   it('are recorded under the name whatever casing the client spelled the key with', async () => {
     // The daemon decodes `name` into the same field as `Name`, so it creates
     // the network either way, and the evaluator already judges either way.
@@ -855,15 +916,18 @@ describe('networks a job creates', () => {
 });
 
 /** A fake daemon that also answers network create. */
-const networkDaemon = (dir: string): Promise<{ sock: string; seen: string[] }> =>
+const networkDaemon = (dir: string): Promise<{ sock: string; seen: string[]; bodies: unknown[] }> =>
   new Promise((resolve) => {
     const sock = path.join(dir, 'netd.sock');
     const seen: string[] = [];
+    const bodies: unknown[] = [];
     const server = http.createServer((req, res) => {
       const chunks: Buffer[] = [];
       req.on('data', (c: Buffer) => chunks.push(c));
       req.on('end', () => {
         seen.push(`${req.method} ${req.url}`);
+        const body = Buffer.concat(chunks).toString();
+        bodies.push(body === '' ? undefined : JSON.parse(body));
         const p = req.url!.replace(/^\/v\d+\.\d+/, '').split('?')[0];
         if (p === '/networks/create') {
           res.writeHead(201, { 'Content-Type': 'application/json' });
@@ -878,5 +942,5 @@ const networkDaemon = (dir: string): Promise<{ sock: string; seen: string[] }> =
       });
     });
     servers.push(server);
-    server.listen(sock, () => resolve({ sock, seen }));
+    server.listen(sock, () => resolve({ sock, seen, bodies }));
   });
