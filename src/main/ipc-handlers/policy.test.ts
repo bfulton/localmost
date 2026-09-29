@@ -119,7 +119,7 @@ describe('network grants on the approval screen', () => {
       shared: { docker: { run: { networks: [{ name: 'vk-*', internal: true }, { name: 'build', internal: false }] } } },
     });
     expect(grants.join('\n')).toMatch(/docker network create: vk-\* \(internal\)/);
-    expect(grants.join('\n')).toMatch(/docker network create: build \(routable\)/);
+    expect(grants.join('\n')).toMatch(/docker network create: build \(routable: unfiltered egress/);
   });
 });
 

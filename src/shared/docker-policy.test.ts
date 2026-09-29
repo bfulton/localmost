@@ -7,6 +7,7 @@ import {
   diffDockerPolicy,
   serializeDockerPolicy,
   parseDockerPolicyHint,
+  describeDockerGrants,
   DockerPolicy,
 } from './docker-policy';
 
@@ -436,5 +437,43 @@ describe('a glob in run.images must say what tag it covers', () => {
 
   it('leaves exact references alone, tagless or not', () => {
     expect(collect({ run: { images: ['alpine', 'alpine:3', 'ghcr.io/o/app:1'] } })).toEqual([]);
+  });
+});
+
+describe('describeDockerGrants on container networks', () => {
+  // What an operator approving a routable network needs to read: the job's
+  // allowlist stops at the job's own proxy, and a container is not behind it.
+  const unfiltered = /unfiltered egress.*bypasses the network allowlist.*loopback services on the host/;
+
+  it('says a declared run.network is unfiltered egress that reaches the host, unless it is none', () => {
+    const grants = describeDockerGrants({ run: { network: 'bridge' } }, '');
+    expect(grants).toHaveLength(1);
+    expect(grants[0]).toMatch(/^docker network: bridge \(/);
+    expect(grants[0]).toMatch(unfiltered);
+    // none has no network at all, so there is nothing to warn about.
+    expect(describeDockerGrants({ run: { network: 'none' } }, '')).toEqual(['docker network: none']);
+  });
+
+  it('says the same of a routable network the job may create, and not of an internal one', () => {
+    const grants = describeDockerGrants({
+      run: { networks: [{ name: 'open-*', internal: false }, { name: 'vk-*', internal: true }] },
+    }, '');
+    expect(grants).toHaveLength(2);
+    expect(grants[0]).toMatch(/^docker network create: open-\* \(routable/);
+    expect(grants[0]).toMatch(unfiltered);
+    expect(grants[1]).toBe('docker network create: vk-* (internal)');
+  });
+
+  it('says a build is unfiltered egress too, since its RUN steps default to the daemon bridge', () => {
+    // The filter lets a build through with no network mode at all, whatever
+    // run.network says, and the classic builder then runs each step routable.
+    const withContext = describeDockerGrants({ build: { context: './' } }, '');
+    expect(withContext).toHaveLength(1);
+    expect(withContext[0]).toMatch(/^docker build: \.\/ \(RUN steps: /);
+    expect(withContext[0]).toMatch(unfiltered);
+    const bare = describeDockerGrants({ build: {} }, '');
+    expect(bare).toHaveLength(1);
+    expect(bare[0]).toMatch(/^docker build \(RUN steps: /);
+    expect(bare[0]).toMatch(unfiltered);
   });
 });

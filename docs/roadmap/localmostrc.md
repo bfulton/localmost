@@ -313,7 +313,10 @@ mode, and every endpoint the proxy does not understand.
 
 A small baseline needs no declaration: `/_ping`, `/version`, `/info`, and reads
 about the job's own containers. Every client needs them to start, and none reach
-the host.
+the host. `/info` keeps only the fields a client reads to start (version,
+platform, kernel, CPU and memory, storage driver, cgroup version, security
+options); the host name, proxy settings, registry mirrors, labels and counts of
+other containers are removed.
 
 There is no key at any level for `--pid=host`, `--network=host`, `--device`,
 mounting the daemon socket into a container, or the other host-reaching

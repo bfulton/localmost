@@ -15,9 +15,10 @@ import * as fs from 'fs';
 import * as http from 'http';
 import * as net from 'net';
 import * as path from 'path';
+import * as zlib from 'zlib';
 import { DockerPolicy } from '../../shared/docker-policy';
 import { DockerBackend } from './docker-backend';
-import { DockerRequest, classifyDockerRequest, containerIdFrom, networkIdFrom, parseDockerRequest } from './docker-request';
+import { DockerAction, DockerRequest, classifyDockerRequest, containerIdFrom, networkIdFrom, parseDockerRequest } from './docker-request';
 import { evaluateDockerRequest, registryOf } from './docker-evaluator';
 
 export interface DockerFilterProxyLogEntry {
@@ -54,6 +55,36 @@ const MAX_UPGRADE_HEAD_BYTES = 64 * 1024;
 
 /** Hop-by-hop headers: each leg of the relay decides these for itself. */
 const HOP_BY_HOP = ['connection', 'keep-alive', 'proxy-connection'];
+
+/**
+ * The fields of /info a job is shown. Clients read these to decide how to talk
+ * to the daemon (version, platform, storage driver, cgroup and seccomp
+ * support) and to size what they start. The rest describes the operator's
+ * machine and setup rather than the daemon: the host name, the proxy URLs
+ * with any credentials in them, registry mirrors and insecure ranges, labels,
+ * how many containers and images other jobs and the operator have, swarm
+ * membership. An allowlist, so a field a newer daemon adds is withheld until
+ * someone decides it is harmless.
+ */
+const INFO_FIELDS: ReadonlySet<string> = new Set([
+  'ServerVersion',
+  'OSType',
+  'Architecture',
+  'OperatingSystem',
+  'KernelVersion',
+  'NCPU',
+  'MemTotal',
+  'Driver',
+  'CgroupVersion',
+  'SecurityOptions',
+]);
+
+/**
+ * A real /info is a few KB. It is held whole to be rewritten, in the main
+ * process, so a body - or a gzip body once inflated - past this is refused
+ * rather than buffered.
+ */
+const MAX_INFO_BYTES = 1024 * 1024;
 
 const NO_DAEMON_MESSAGE = 'no Docker daemon is available to this job';
 
@@ -102,6 +133,21 @@ const isPlainRecord = (v: unknown): v is Record<string, unknown> =>
 
 const isJsonContentType = (contentType: string | undefined): boolean =>
   contentType !== undefined && contentType.split(';')[0].trim().toLowerCase() === 'application/json';
+
+/**
+ * A response body as text, undoing the one compression a daemon (or a proxy
+ * in front of it) might apply. Throws on any other encoding: a body the filter
+ * cannot read is one it cannot rewrite. Throws too on a gzip body that inflates
+ * past MAX_INFO_BYTES, which a few KB on the wire can.
+ */
+function decodeBody(raw: Buffer, contentEncoding: string | undefined): string {
+  const encoding = (contentEncoding ?? '').trim().toLowerCase();
+  if (encoding === '' || encoding === 'identity') return raw.toString('utf8');
+  if (encoding === 'gzip' || encoding === 'x-gzip') {
+    return zlib.gunzipSync(raw, { maxOutputLength: MAX_INFO_BYTES }).toString('utf8');
+  }
+  throw new Error(`unsupported content encoding: ${encoding}`);
+}
 
 export class DockerFilterProxy {
   private server: http.Server | null = null;
@@ -547,6 +593,9 @@ export class DockerFilterProxy {
     // The job never holds registry credentials; whatever it sent is not ours.
     delete headers['x-registry-auth'];
     delete headers['x-registry-config'];
+    // /info is rewritten on the way back, so it is asked for in a form that
+    // can be read; relayInfo still copes with a daemon that compresses anyway.
+    if (classifyDockerRequest(parsed) === 'info') delete headers['accept-encoding'];
     if (classifyDockerRequest(parsed) === 'pull' && this.attachRegistryAuth && parsed.query.fromImage) {
       const auth = this.attachRegistryAuth(registryOf(parsed.query.fromImage));
       if (auth) headers['x-registry-auth'] = auth;
@@ -590,17 +639,7 @@ export class DockerFilterProxy {
           const addressed = networkIdFrom(parsed);
           if (addressed) this.disownNetwork(addressed);
         }
-        const relayed =
-          action === 'ping'
-            ? this.relayPing(upstreamRes, res)
-            : action === 'version'
-              ? this.relayVersion(upstreamRes, res)
-              : action === 'create'
-                ? this.relayCreate(upstreamRes, res, parsed)
-                : action === 'network-create'
-                  ? this.relayNetworkCreate(upstreamRes, res, parsed)
-                  : this.relay(upstreamRes, res);
-        relayed.then(() => {
+        this.relayFor(action, upstreamRes, res, parsed).then(() => {
           answered = true;
           if (bufferedBody !== null) {
             res.end();
@@ -638,6 +677,29 @@ export class DockerFilterProxy {
 
     if (bufferedBody !== null) upstream.end(bufferedBody);
     else req.pipe(upstream);
+  }
+
+  /** Relay the daemon's answer, rewritten where the action calls for it. */
+  private relayFor(
+    action: DockerAction,
+    upstreamRes: http.IncomingMessage,
+    res: http.ServerResponse,
+    parsed: DockerRequest
+  ): Promise<void> {
+    switch (action) {
+      case 'ping':
+        return this.relayPing(upstreamRes, res);
+      case 'version':
+        return this.relayVersion(upstreamRes, res);
+      case 'info':
+        return this.relayInfo(upstreamRes, res);
+      case 'create':
+        return this.relayCreate(upstreamRes, res, parsed);
+      case 'network-create':
+        return this.relayNetworkCreate(upstreamRes, res, parsed);
+      default:
+        return this.relay(upstreamRes, res);
+    }
   }
 
   /** The daemon's response headers as relayed to the job. */
@@ -760,6 +822,54 @@ export class DockerFilterProxy {
         const headers = { ...this.relayedHeaders(upstreamRes), 'content-length': String(body.length) };
         delete headers['transfer-encoding'];
         res.writeHead(upstreamRes.statusCode ?? 502, headers);
+        res.write(body);
+        resolve();
+      });
+    });
+  }
+
+  /**
+   * The daemon's /info, cut down to INFO_FIELDS. It is a baseline read, so
+   * any job can make it with no policy at all, and in full it tells the job
+   * about the machine it runs on - down to proxy credentials. An error keeps
+   * only its message. Anything that cannot be read as a JSON object, in an
+   * encoding this understands, is refused rather than passed on unread.
+   */
+  private relayInfo(upstreamRes: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    return new Promise((resolve) => {
+      // Past the limit the rest is read and dropped, so the daemon's answer
+      // still completes and the refusal goes out on a clean connection.
+      let chunks: Buffer[] = [];
+      let size = 0;
+      upstreamRes.on('data', (c: Buffer) => {
+        size += c.length;
+        if (size > MAX_INFO_BYTES) chunks = [];
+        else chunks.push(c);
+      });
+      upstreamRes.on('end', () => {
+        const status = upstreamRes.statusCode ?? 502;
+        let body: Buffer;
+        try {
+          if (size > MAX_INFO_BYTES) throw new Error('too large');
+          const parsed: unknown = JSON.parse(decodeBody(Buffer.concat(chunks), upstreamRes.headers['content-encoding']));
+          if (!isPlainRecord(parsed)) throw new Error('not an object');
+          const kept: Record<string, unknown> = {};
+          if (status >= 200 && status < 300) {
+            for (const [key, value] of Object.entries(parsed)) if (INFO_FIELDS.has(key)) kept[key] = value;
+          } else if (typeof parsed.message === 'string') {
+            kept.message = parsed.message;
+          }
+          body = Buffer.from(JSON.stringify(kept));
+        } catch {
+          this.refuse(res, 502, 'docker daemon returned an unreadable info response');
+          resolve();
+          return;
+        }
+        // The rewritten body is sent plain and whole, whatever the daemon's was.
+        const headers = { ...this.relayedHeaders(upstreamRes), 'content-length': String(body.length) };
+        delete headers['transfer-encoding'];
+        delete headers['content-encoding'];
+        res.writeHead(status, headers);
         res.write(body);
         resolve();
       });

@@ -482,6 +482,16 @@ export function parseDockerPolicyHint(hint: string): DockerPolicy | undefined {
 }
 
 /**
+ * What a container on a routable network can reach, said wherever one is
+ * granted. Its traffic leaves through the daemon's network rather than the
+ * job's proxy, so the policy's host allowlist never sees it, and the daemon
+ * forwards to the host's own loopback (host.docker.internal) - local
+ * databases, debuggers and the app's broker among them.
+ */
+const UNFILTERED_EGRESS =
+  'unfiltered egress: bypasses the network allowlist and reaches loopback services on the host';
+
+/**
  * The container grants a docker policy makes, one line each, for anything that
  * asks an operator to approve them. Shared so the CLI and the app describe the
  * same policy the same way: `localmost policy show` once rendered network,
@@ -505,14 +515,22 @@ export function describeDockerGrants(docker: DockerPolicy | undefined, prefix: s
     // Creating a network is a grant, and whether it is routable is the part an
     // operator most needs to see.
     for (const n of networks) {
-      grants.push(`${prefix}docker network create: ${n.name} (${n.internal ? 'internal' : 'routable'})`);
+      grants.push(`${prefix}docker network create: ${n.name} (${n.internal ? 'internal' : `routable: ${UNFILTERED_EGRESS}`})`);
     }
-    if (network !== undefined) grants.push(`${prefix}docker network: ${network}`);
+    // A named network may be one the operator made internal, but nothing in
+    // the policy says so, and only none is known to have no route at all.
+    if (network !== undefined) {
+      grants.push(network === 'none'
+        ? `${prefix}docker network: ${network}`
+        : `${prefix}docker network: ${network} (${UNFILTERED_EGRESS})`);
+    }
   }
+  // A build needs no run.network to be routable: the filter lets one through
+  // with no network mode, and the classic builder then runs each RUN step on
+  // the daemon's default bridge. The egress is implicit, so it is spelled out.
   if (docker.build) {
-    grants.push(docker.build.context === undefined
-      ? `${prefix}docker build`
-      : `${prefix}docker build: ${docker.build.context}`);
+    const build = docker.build.context === undefined ? 'docker build' : `docker build: ${docker.build.context}`;
+    grants.push(`${prefix}${build} (RUN steps: ${UNFILTERED_EGRESS})`);
   }
   if (docker.privileged) grants.push(`${prefix}docker privileged`);
   return grants;
