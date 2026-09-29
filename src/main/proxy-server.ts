@@ -512,22 +512,34 @@ export class ProxyServer {
       return;
     }
 
-    // The body is replayed whole, so it is no longer chunked. Leaving both
-    // headers on the request makes some servers reject it or frame it wrongly.
-    const headers = { ...stripProxyAuth(req.headers), 'content-length': String(body.length) };
-    delete headers['transfer-encoding'];
-    const proxyReq = http.request(
-      { hostname: host, port, path, method: req.method, headers },
-      (proxyRes) => {
-        res.writeHead(proxyRes.statusCode || 500, proxyRes.headers);
-        proxyRes.pipe(res);
+    // Screened and pinned like any other request. This one has its own
+    // upstream request because the body is replayed, and without the screen a
+    // name on the allowlist that resolves to loopback or a private range
+    // reached it, by whatever the system resolver answered at connect time.
+    this.screenAddresses(host).then((screened) => {
+      if (!screened) {
+        this.log({ method: req.method || 'POST', host, port, path, blocked: true, reason: undefined });
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.end(`Blocked by sandbox policy (${this.policyLevel}): host '${host}' resolves to a non-routable address`);
+        return;
       }
-    );
-    proxyReq.on('error', (err) => {
-      res.writeHead(502, { 'Content-Type': 'text/plain' });
-      res.end(`Proxy error: ${err.message}`);
+      // The body is replayed whole, so it is no longer chunked. Leaving both
+      // headers on the request makes some servers reject it or frame it wrongly.
+      const headers = { ...stripProxyAuth(req.headers), 'content-length': String(body.length) };
+      delete headers['transfer-encoding'];
+      const proxyReq = http.request(
+        { hostname: host, port, path, method: req.method, headers, lookup: this.pinnedLookup(screened) },
+        (proxyRes) => {
+          res.writeHead(proxyRes.statusCode || 500, proxyRes.headers);
+          proxyRes.pipe(res);
+        }
+      );
+      proxyReq.on('error', (err) => {
+        res.writeHead(502, { 'Content-Type': 'text/plain' });
+        res.end(`Proxy error: ${err.message}`);
+      });
+      proxyReq.end(body);
     });
-    proxyReq.end(body);
   }
 
   /**

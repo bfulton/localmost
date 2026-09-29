@@ -9,6 +9,7 @@ import * as http from 'http';
 import * as net from 'net';
 import { ProxyServer, parseConnectTarget } from './proxy-server';
 import { SandboxPolicyLevel } from '../shared/types';
+import { pinnedLookup } from '../shared/egress-screen';
 
 type AccessDecision = { allowed: boolean; reason?: string };
 
@@ -714,5 +715,75 @@ describe('CONNECT targets', () => {
     try {
       expect(await getVia(p.getPort(), 'http://[::ffff:127.0.0.1]/')).toBe(403);
     } finally { await p.stop(); }
+  });
+});
+
+describe('the acquirejob forward is screened like every other request', () => {
+  // acquirejob is buffered and replayed, so it has its own upstream request.
+  // That request dialled by name through the system resolver, unscreened: a
+  // name on the allowlist that resolves inside - loopback, a private range,
+  // the metadata endpoint - reached it, and a second resolution could differ
+  // from anything a screen had seen.
+  const post = (proxyPort: number, url: string) =>
+    new Promise<number>((resolve, reject) => {
+      const body = JSON.stringify({ jobMessageId: 'msg-1' });
+      const req = http.request(
+        {
+          hostname: '127.0.0.1', port: proxyPort, path: url, method: 'POST',
+          headers: { 'content-type': 'application/json', 'content-length': String(body.length) },
+        },
+        (res) => { res.resume(); resolve(res.statusCode || 0); }
+      );
+      req.on('error', reject);
+      req.end(body);
+    });
+  const acquiring = (options: ConstructorParameters<typeof ProxyServer>[0]) =>
+    new ProxyServer({ onJobAcquired: async () => undefined, ...options });
+
+  it('refuses a name that resolves to loopback and never connects to it', async () => {
+    // 'localhost' is on the infrastructure list, so only the screen stands
+    // between this request and whatever listens on the port. Listening on
+    // '::' takes both 127.0.0.1 and ::1, whichever the name resolves to.
+    let connections = 0;
+    const up = http.createServer((_req, res) => res.end('ok'));
+    up.on('connection', () => { connections++; });
+    await new Promise<void>((r) => up.listen(0, '::', r));
+    const upPort = (up.address() as net.AddressInfo).port;
+    const p = acquiring({ policyLevel: 'permissive' });
+    await p.start();
+    try {
+      expect(await post(p.getPort(), `http://localhost:${upPort}/_apis/x/acquirejob`)).toBe(403);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(connections).toBe(0);
+    } finally { up.close(); await p.stop(); }
+  });
+
+  it('refuses a name that resolves to a private address', async () => {
+    const p = acquiring({ policyLevel: 'permissive', lookup: async () => ['10.0.0.1'] });
+    await p.start();
+    try {
+      expect(await post(p.getPort(), 'http://internal.test/_apis/x/acquirejob')).toBe(403);
+    } finally { await p.stop(); }
+  });
+
+  it('connects to the addresses it screened, not to a second resolution', async () => {
+    // The pinned lookup is swapped for one that records what it was given
+    // and answers with a local upstream, so nothing leaves the machine: the
+    // request arriving there proves the connection used it. The system
+    // resolver has never heard of pinned.test.
+    const up = http.createServer((_req, res) => res.end('ok'));
+    await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
+    const upPort = (up.address() as net.AddressInfo).port;
+    const p = acquiring({ policyLevel: 'permissive', lookup: async () => ['203.0.113.7'] });
+    const pinnedWith: string[][] = [];
+    (p as unknown as { pinnedLookup: (a: string[]) => unknown }).pinnedLookup = (addresses: string[]) => {
+      pinnedWith.push(addresses);
+      return pinnedLookup(['127.0.0.1']);
+    };
+    await p.start();
+    try {
+      expect(await post(p.getPort(), `http://pinned.test:${upPort}/_apis/x/acquirejob`)).toBe(200);
+      expect(pinnedWith).toEqual([['203.0.113.7']]);
+    } finally { up.closeAllConnections(); up.close(); await p.stop(); }
   });
 });
