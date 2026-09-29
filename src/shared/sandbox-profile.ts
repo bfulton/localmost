@@ -211,6 +211,19 @@ function loopbackNetworkRules(proxyPort: number, escapedWorkDir: string): string
 }
 
 /**
+ * Which processes a step may signal: those under its own sandbox.
+ *
+ * An unfiltered (allow signal) let a step stop or kill any process of the
+ * user's - the app, a runner, an editor with unsaved work. Each step runs
+ * under a sandbox of its own, so this also means a step cannot signal a
+ * server an earlier step left running; the job's end reaps that instead
+ * (see reapStepProcesses).
+ */
+function signalRules(): string[] {
+  return ['(allow signal (target same-sandbox))'];
+}
+
+/**
  * The per-user temp directory confstr hands out, once a lookup has answered.
  * A failed lookup is tried again at the next profile.
  */
@@ -548,7 +561,7 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push(';; PROCESS OPERATIONS - Permissive (runner spawns build tools)');
   lines.push(';; ------------------------------------------------------------');
   lines.push('(allow process*)');
-  lines.push('(allow signal)');
+  lines.push(...signalRules());
   lines.push('');
 
   // ------------------------------------------------------------
@@ -648,7 +661,7 @@ export function generateDiscoveryProfile(options: {
     ';; PROCESS/SYSTEM OPERATIONS - Allow all (no reporting needed)',
     ';; ------------------------------------------------------------',
     '(allow process*)',
-    '(allow signal)',
+    ...signalRules(),
     '(allow mach*)',
     '(allow ipc*)',
     '(allow sysctl*)',

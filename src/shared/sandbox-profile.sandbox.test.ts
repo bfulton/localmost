@@ -27,7 +27,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, jest } from '@jest/globals';
-import { execFile, execFileSync } from 'child_process';
+import { ChildProcess, execFile, execFileSync, spawn } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as net from 'net';
@@ -152,6 +152,62 @@ if (!isMacOS) {
         expect({ mode, ok: result.ok }).toEqual({ mode, ok: false });
         expect(result.output).toContain('Operation not permitted');
       }
+    });
+  });
+
+  describe('test-mode signals through a constructed profile', () => {
+    // A process of the user's that no step started; only processes this test
+    // spawns are ever signalled.
+    let outsider: ChildProcess;
+    let workDir: string;
+
+    beforeAll(() => {
+      workDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'localmost-signal-')));
+      outsider = spawn('/bin/sleep', ['30'], { stdio: 'ignore' });
+    });
+
+    afterAll(() => {
+      outsider.kill('SIGKILL');
+      fs.rmSync(workDir, { recursive: true, force: true });
+    });
+
+    const run = async (profile: string, argv: string[]): Promise<{ ok: boolean; output: string }> => {
+      const profilePath = path.join(workDir, `signal-${Date.now()}.sb`);
+      fs.writeFileSync(profilePath, profile);
+      try {
+        const { stdout, stderr } = await execFileAsync('/usr/bin/sandbox-exec', ['-f', profilePath, ...argv], {
+          timeout: 15000,
+        });
+        return { ok: true, output: stdout + stderr };
+      } catch (err) {
+        const e = err as { stdout?: string; stderr?: string; message: string };
+        return { ok: false, output: `${e.stdout ?? ''}${e.stderr ?? ''}${e.message}` };
+      } finally {
+        fs.rmSync(profilePath, { force: true });
+      }
+    };
+
+    const profiles = (): [string, string][] => [
+      ['enforcement', generateSandboxProfile({ workDir, proxyPort: 1, policy: readable })],
+      ['discovery', generateDiscoveryProfile({ workDir, proxyPort: 1, logFile: '' })],
+    ];
+
+    it('signals what the step itself started, so the refusal below is specific', async () => {
+      for (const [mode, profile] of profiles()) {
+        const result = await run(profile, ['/bin/sh', '-c', '/bin/sleep 30 & p=$!; /bin/kill -TERM "$p" && wait "$p"; [ $? -eq 143 ]']);
+        expect({ mode, ...result }).toMatchObject({ mode, ok: true });
+      }
+    });
+
+    it('cannot signal a process of the user\'s that it did not start', async () => {
+      // Unsandboxed the same probe succeeds; the profile has to refuse it.
+      expect((await execFileAsync('/bin/kill', ['-0', String(outsider.pid)])).stderr).toBe('');
+      for (const [mode, profile] of profiles()) {
+        const result = await run(profile, ['/bin/kill', '-0', String(outsider.pid)]);
+        expect({ mode, ok: result.ok }).toEqual({ mode, ok: false });
+        expect(result.output).toContain('Operation not permitted');
+      }
+      expect(outsider.exitCode).toBeNull();
     });
   });
 
@@ -349,6 +405,8 @@ if (!isMacOS) {
         expect(profile).toContain('(allow network-outbound (remote ip "localhost:*"))');
         expect(profile).toContain(`(deny file-write* (literal "${workDir}"))`);
         expect(profile).not.toContain('(subpath "/private/tmp")');
+        expect(profile).toContain('(allow signal (target same-sandbox))');
+        expect(profile).not.toContain('(allow signal)');
       }
     });
   });

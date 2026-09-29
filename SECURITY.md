@@ -258,9 +258,13 @@ sandbox profile. The checkout is treated as untrusted, and so is its
   killed and the CLI says so. Interrupting the CLI (Ctrl-C, a kill, or the
   terminal closing) runs the same cleanup.
 
-What test mode still trusts: signals are not filtered, as in the runner's
-profile, so a step can signal your other processes; and loopback is shared, so
-a step can reach any local service that listens on it.
+- **Signals stay inside the step.** A step can signal only processes under its
+  own sandbox, not your other processes. Each step has a sandbox of its own, so
+  a later step cannot signal a server an earlier one left running; the end of
+  the job reaps it.
+
+What test mode still trusts: loopback is shared, so a step can reach any local
+service that listens on it.
 
 ## Authentication
 

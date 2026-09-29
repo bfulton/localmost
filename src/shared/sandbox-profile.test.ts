@@ -572,13 +572,15 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).toContain('(allow process*)');
     });
 
-    it('should allow signal operations', () => {
-      const profile = generateSandboxProfile({
-        workDir: '/path/to/project',
-        proxyPort: DEFAULT_PROXY_PORT,
-      });
-
-      expect(profile).toContain('(allow signal)');
+    it('lets a step signal only processes under its own profile', () => {
+      // An unfiltered (allow signal) let a step stop or kill any process the
+      // user runs: the app, the runner, an editor with unsaved work.
+      for (const profile of [
+        generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT }),
+        generateDiscoveryProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, logFile: '' }),
+      ]) {
+        expect(profile.match(/\(allow signal[^\n]*/g)).toEqual(['(allow signal (target same-sandbox))']);
+      }
     });
 
     it('should allow mach and ipc operations', () => {
