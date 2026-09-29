@@ -1150,6 +1150,85 @@ describe('message routing', () => {
     });
   });
 
+  describe('a job as GitHub delivers it', () => {
+    const runService = 'https://run-actions-1-azure-eastus.actions.githubusercontent.com/';
+    // The job details acquirejob answers with. An organization target's
+    // display name is the organization; the job names its repository.
+    const details = JSON.stringify({
+      jobId: 'plan-job',
+      contextData: { github: { d: [
+        { k: 'repository', v: 'Some-Org/Some-Repo' },
+        { k: 'repository_id', v: '123456789' },
+        { k: 'sha', v: 'abc1234' },
+        { k: 'workflow', v: 'Continuous Integration' },
+        { k: 'workflow_ref', v: 'Some-Org/Some-Repo/.github/workflows/build.yml@refs/heads/main' },
+      ] } },
+    });
+    /** Every host the broker sent a request to. */
+    let upstreamHosts: string[];
+
+    beforeEach(() => {
+      upstreamHosts = [];
+      mockHttpsRequest.mockImplementation((...args: unknown[]) => {
+        const options = args[0] as { hostname?: string; path?: string };
+        upstreamHosts.push(options.hostname ?? '');
+        const callback = args[1] as (res: EventEmitter) => void;
+        const req = new EventEmitter() as EventEmitter & { setTimeout: () => void; write: () => void; end: () => void };
+        req.setTimeout = () => {};
+        req.write = () => {};
+        req.end = () => {
+          const res = new EventEmitter() as EventEmitter & { statusCode: number };
+          res.statusCode = 200;
+          callback(res);
+          if (options.path?.startsWith('/acquirejob')) res.emit('data', details);
+          res.emit('end');
+        };
+        return req;
+      });
+    });
+
+    /** The broker's poll receives job req-1 (message 2) for the organization target. */
+    const receive = async (runServiceUrl: string) => {
+      addTargetWithRunner('some-org', 'runner.1');
+      const state = internals.targets.get('some-org')!;
+      const instance = state.instances.get(1)! as Instance & { accessToken?: string; tokenExpiry?: number };
+      instance.accessToken = 'token';
+      instance.tokenExpiry = Date.now() + 3_600_000;
+      await internals.processMessage(state, instance, JSON.stringify({
+        messageId: 2,
+        messageType: 'RunnerJobRequest',
+        body: JSON.stringify({ runner_request_id: 'req-1', run_service_url: runServiceUrl, billing_owner_id: 'b' }),
+      }));
+    };
+
+    it.each([
+      ['over plain http', 'http://run-actions-1-azure-eastus.actions.githubusercontent.com/'],
+      ['on another host', 'https://run.example/'],
+      ['on a host that only starts like GitHub', 'https://run.actions.githubusercontent.com.example/'],
+      ['on a port of its own', 'https://run-actions-1-azure-eastus.actions.githubusercontent.com:8443/'],
+    ])("sends the runner's token to no run service %s", async (_, runServiceUrl) => {
+      // The acquire goes out with the runner's bearer token, and the job's
+      // operations are forwarded to the same place later.
+      const received = jest.fn();
+      service.on('job-received', received);
+
+      await receive(runServiceUrl);
+
+      expect(upstreamHosts).toEqual([]);
+      expect(received).not.toHaveBeenCalled();
+    });
+
+    it("acquires a job from GitHub's own run service", async () => {
+      const received = jest.fn();
+      service.on('job-received', received);
+
+      await receive(runService);
+
+      expect(upstreamHosts).toEqual(['run-actions-1-azure-eastus.actions.githubusercontent.com']);
+      expect(received).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('a job no worker was spawned for', () => {
     // A job message as the broker receives it upstream, with the routing the
     // acquire needs, and the payload acquirejob hands back: the job's secrets.
@@ -1157,7 +1236,11 @@ describe('message routing', () => {
     const upstreamJob = (requestId: string, messageId: number) => JSON.stringify({
       messageId,
       messageType: 'RunnerJobRequest',
-      body: JSON.stringify({ runner_request_id: requestId, run_service_url: 'https://run.example/', billing_owner_id: 'b' }),
+      body: JSON.stringify({
+        runner_request_id: requestId,
+        run_service_url: 'https://run-actions-1-azure-eastus.actions.githubusercontent.com/',
+        billing_owner_id: 'b',
+      }),
     });
     const payloadFor = (requestId: string) => JSON.stringify({
       jobId: requestId,

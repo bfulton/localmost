@@ -251,6 +251,29 @@ async function readRequestBody(req: http.IncomingMessage, limit = MAX_REQUEST_BO
   return Buffer.concat(chunks).toString();
 }
 
+/** The hosts GitHub's run services live under; a run service is a subdomain. */
+const RUN_SERVICE_HOST_SUFFIXES = ['.actions.githubusercontent.com'];
+
+/**
+ * Whether a job message's run_service_url is one the runner's token may go
+ * to. The broker acquires the job there with the runner's bearer token, and
+ * later forwards the job's operations there. The URL arrives only from
+ * GitHub's broker over TLS, so this is defence in depth: a job offered with
+ * any other run service is left unacquired, not handed the token. The port
+ * must be the default because httpsRequest always connects to 443.
+ */
+function isGitHubRunServiceUrl(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  return url.protocol === 'https:' && url.port === '' && !url.username && !url.password &&
+    RUN_SERVICE_HOST_SUFFIXES.some(suffix => url.hostname.endsWith(suffix));
+}
+
 /**
  * A value from a worker's request as a log line may show it. The request is
  * job code's to write and the log file writes messages verbatim, so the value
@@ -628,7 +651,10 @@ export class BrokerProxyService extends EventEmitter {
       // Acquire job from GitHub immediately using target's credentials
       // This claims the job so GitHub won't keep sending it on subsequent polls
       // Note: GitHub uses runner_request_id (UUID) as jobMessageId, not the broker's numeric messageId
-      const jobDetails = runServiceUrl
+      if (runServiceUrl && !isGitHubRunServiceUrl(runServiceUrl)) {
+        log()?.warn(`[BrokerProxy] Job ${jobId}: run_service_url is not a GitHub Actions https host; not sending the runner's token there`);
+      }
+      const jobDetails = isGitHubRunServiceUrl(runServiceUrl)
         ? await this.acquireJobUpstream(state, instance, jobId, runServiceUrl, billingOwnerId)
         : null;
       if (!jobDetails) {
