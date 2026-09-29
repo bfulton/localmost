@@ -782,8 +782,11 @@ export function parseSandboxTrace(
 
     // Refused writes count; a refused read is one of the paths no policy can
     // grant, and anything else refused is not something discovery asked about.
+    // A refusal counts only from a pid known to be the workflow's: every
+    // sandboxed process on the machine logs its own, and without the pids
+    // any of them could add a write to what --updaterc proposes.
     const isWrite = operation.includes('write') || operation.includes('create') || operation.includes('unlink');
-    if (action !== 'allow' && !(operation.startsWith('file-') && isWrite)) continue;
+    if (action !== 'allow' && !(operation.startsWith('file-') && isWrite && collectedPids?.has(pid))) continue;
 
     // Handle network operations on Unix sockets
     if (operation === 'network-outbound' || operation === 'network-bind') {

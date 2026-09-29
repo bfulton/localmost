@@ -660,9 +660,21 @@ describe('Sandbox Profile Generator', () => {
           'kernel: (Sandbox) Sandbox: npm(101) deny(1) file-write-create /opt/cache/x',
           'kernel: (Sandbox) Sandbox: npm(102) allow file-write-data /work/out',
         ].join('\n'),
-        '/work'
+        '/work',
+        new Set([101, 102])
       );
       expect(result.writePaths).toEqual(['/opt/cache/x']);
+    });
+
+    it('takes a refusal only from a process it knows is the workflow\'s', () => {
+      // Every sandboxed process on the machine logs its refusals - other apps,
+      // a runner job - and without the workflow's pids to filter by, any of
+      // them would add write paths to what --updaterc proposes.
+      const log = 'kernel: (Sandbox) Sandbox: evil(555) deny(1) file-write-create /Users/test/Library/LaunchAgents/x.plist';
+      for (const pids of [undefined, new Set<number>()]) {
+        expect(parseSandboxTrace(log, '/work', pids).writePaths).toEqual([]);
+      }
+      expect(parseSandboxTrace(log, '/work', new Set([101])).writePaths).toEqual([]);
     });
 
     it('never suggests what no policy can grant', () => {
