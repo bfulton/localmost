@@ -94,13 +94,20 @@ export function packageCacheEnv(dir: string): Record<string, string> {
     YARN_GLOBAL_FOLDER: at('yarn', 'global'),
     npm_config_store_dir: at('pnpm-store'),
     // ~/.cache and ~/.local/share, for the tools that follow XDG (uv, pnpm's
-    // metadata, pipx, pre-commit and others)
+    // metadata, pipx, pre-commit and others). The data home also hides what
+    // the user installed there - mise's tools, uv's Pythons - so a job
+    // installs its own copy here instead of failing to write ~/.local.
     XDG_CACHE_HOME: at('cache'),
     XDG_DATA_HOME: at('local', 'share'),
     // ~/.cargo, ~/.gradle, ~/.m2, ~/go
     CARGO_HOME: at('cargo'),
     GRADLE_USER_HOME: at('gradle'),
+    // Maven has no variable for its repository, only a property. MAVEN_OPTS
+    // carries it for every version, but a workflow that sets MAVEN_OPTS for
+    // its JVM flags replaces it; Maven 3.9 and later also read MAVEN_ARGS,
+    // which workflows rarely set.
     MAVEN_OPTS: `-Dmaven.repo.local=${at('m2', 'repository')}`,
+    MAVEN_ARGS: `-Dmaven.repo.local=${at('m2', 'repository')}`,
     GOPATH: at('go'),
     // ~/.nuget, ~/.dotnet
     NUGET_PACKAGES: at('nuget', 'packages'),

@@ -1117,8 +1117,10 @@ export class RunnerManager {
       //   setup-* actions execute what they find there, so a shared cache let
       //   one repository's job plant a toolchain another's would run.
       // 'per-sandbox' = inside sandbox, rebuilt each time (clean but slow).
-      // A worker with no target gets none, and so no shared path either.
-      const cacheTargetId = this.pendingTargetContext.get(String(instanceNum))?.targetId;
+      // A worker with no target gets none, and so no shared path either. The
+      // target is the one the policy above was resolved for, so the caches
+      // and the policy they are granted under always belong together.
+      const cacheTargetId = startupContextForPolicy?.targetId;
       let toolCacheDir: string | undefined;
       if (this.toolCacheLocation === 'persistent' && cacheTargetId) {
         try {
@@ -1145,20 +1147,28 @@ export class RunnerManager {
       env.HTTPS_PROXY = proxyUrl;
 
       // Under moderate and permissive the job's package managers get a
-      // directory of their target's own, in place of the write access to the
-      // user's ~/.cargo, ~/go, ~/.gradle and the like those levels used to
-      // grant - trees that hold the user's PATH directories and tool config.
-      // Strict keeps exactly what the repository declares.
+      // directory of their own, in place of the write access to the user's
+      // ~/.cargo, ~/go, ~/.gradle and the like those levels used to grant -
+      // trees that hold the user's PATH directories and tool config. Strict
+      // keeps exactly what the repository declares.
+      // Kept across jobs only where the tool cache is: the package cache holds
+      // what the target's next job executes (gradle init scripts, cargo's
+      // config and bin, GOPATH/bin), so with per-sandbox selected, or no
+      // target, it lives in the job's own sandbox and goes with it.
       let packageCacheDir: string | undefined;
-      if (filesystemPolicy.level !== 'strict' && cacheTargetId) {
-        try {
-          packageCacheDir = path.join(this.downloader.getTargetCacheDir(cacheTargetId), 'packages');
-          fs.mkdirSync(packageCacheDir, { recursive: true, mode: 0o700 });
-          Object.assign(env, packageCacheEnv(packageCacheDir));
-        } catch (err) {
-          this.log('warn', `No package cache for instance ${instanceNum}; package managers write nowhere outside the job: ${(err as Error).message}`);
-          packageCacheDir = undefined;
+      if (filesystemPolicy.level !== 'strict') {
+        if (this.toolCacheLocation === 'persistent' && cacheTargetId) {
+          try {
+            packageCacheDir = path.join(this.downloader.getTargetCacheDir(cacheTargetId), 'packages');
+            fs.mkdirSync(packageCacheDir, { recursive: true, mode: 0o700 });
+          } catch (err) {
+            this.log('warn', `No package cache for instance ${instanceNum}; its packages stay in the job: ${(err as Error).message}`);
+            packageCacheDir = undefined;
+          }
         }
+        // The sandbox directory is already writable and rebuilt for each job,
+        // so this needs no grant of its own.
+        Object.assign(env, packageCacheEnv(packageCacheDir ?? path.join(sandboxDir, '_packages')));
       }
 
       // The job's docker socket is one localmost serves, not the daemon's.

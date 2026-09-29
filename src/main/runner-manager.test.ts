@@ -1841,13 +1841,17 @@ describe('RunnerManager', () => {
   });
 
   describe("a worker's package caches", () => {
-    const spawnAt = async (level: 'strict' | 'moderate' | 'permissive') => {
+    const spawnAt = async (
+      level: 'strict' | 'moderate' | 'permissive',
+      toolCacheLocation: 'persistent' | 'per-sandbox' = 'persistent'
+    ) => {
       const manager = new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
         getRepoPolicy: async () => ({ hosts: [], level, readPaths: [], writePaths: [], docker: {} }),
       });
+      (manager as unknown as { toolCacheLocation: string }).toolCacheLocation = toolCacheLocation;
       const helper = new RunnerManagerTestHelper(manager);
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
@@ -1876,6 +1880,9 @@ describe('RunnerManager', () => {
           expect(env[key]).toMatch(new RegExp(`^${packages}/`));
         }
         expect(env.MAVEN_OPTS).toBe(`-Dmaven.repo.local=${packages}/m2/repository`);
+        // Maven 3.9 and later also read MAVEN_ARGS, which a workflow setting
+        // MAVEN_OPTS for its JVM flags (-Xmx and the like) leaves alone.
+        expect(env.MAVEN_ARGS).toBe(`-Dmaven.repo.local=${packages}/m2/repository`);
         // The installed toolchains are still found where the user put them.
         expect(env.RUSTUP_HOME).toBeUndefined();
       }
@@ -1887,6 +1894,27 @@ describe('RunnerManager', () => {
       expect(options.env?.CARGO_HOME).toBeUndefined();
       expect(options.env?.GRADLE_USER_HOME).toBeUndefined();
     });
+
+    it.each(['moderate', 'permissive'] as const)(
+      "stay inside the job's own sandbox under %s with per-sandbox selected",
+      async (level) => {
+        // The package cache holds what the target's next job executes -
+        // gradle init scripts, cargo's config and bin, GOPATH/bin - so one
+        // kept across jobs would let a pull request's job plant code its
+        // default branch's next job runs with that branch's secrets.
+        // per-sandbox promises no cache outside the job at all.
+        const options = await spawnAt(level, 'per-sandbox');
+        expect(options.packageCacheDir).toBeUndefined();
+        const inSandbox = '/Users/test/.localmost/runner/sandbox/1/_packages';
+        const env = options.env!;
+        for (const key of ['CARGO_HOME', 'GRADLE_USER_HOME', 'GOPATH', 'npm_config_cache', 'XDG_CACHE_HOME']) {
+          expect(env[key]).toMatch(new RegExp(`^${inSandbox}/`));
+        }
+        expect(env.MAVEN_OPTS).toBe(`-Dmaven.repo.local=${inSandbox}/m2/repository`);
+        const created = (fs.mkdirSync as jest.Mock).mock.calls.map(([dir]) => String(dir));
+        expect(created.filter((dir) => dir.includes('/runner/caches/'))).toEqual([]);
+      }
+    );
   });
 
   describe("a worker's environment", () => {

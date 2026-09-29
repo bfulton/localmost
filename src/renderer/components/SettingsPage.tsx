@@ -459,7 +459,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
                 <option value="per-sandbox">Per-sandbox</option>
               </select>
               <p className={shared.formHint}>
-                Persistent caches tools like Node.js across restarts, separately for each repository or organization. Per-sandbox rebuilds each time (slower but cleaner).
+                Persistent caches tools like Node.js across restarts, separately for each repository or organization, shared by all of its jobs (pull requests and, for an organization, all of its repositories). Per-sandbox rebuilds each time (slower, but no job can leave anything for the next).
               </p>
             </div>
 
