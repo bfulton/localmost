@@ -13,6 +13,7 @@ import { HeartbeatManager, toHeartbeatTarget } from './heartbeat-manager';
 import { BrokerProxyService } from './broker-proxy-service';
 import { TargetManager } from './target-manager';
 import { ContributorCache } from './contributor-cache';
+import { admitJob, JobAdmissionDeps } from './job-admission';
 
 // State management
 import {
@@ -279,9 +280,9 @@ app.whenReady().then(async () => {
     attachRegistryAuth: (registry: string) => resolveRegistryAuth(registry),
     onStatusChange: sendStatusUpdate,
     onJobHistoryUpdate: sendJobHistoryUpdate,
-    // Bind this job to the worker being spawned for it, by name, so the broker
-    // does not have to infer from arrival order which session belongs to which
-    // job - which is how every job came to be run by the next job's worker.
+    // Bind this job to the worker being spawned for it, by its slot (the
+    // worker key's target and instance). This expectation is the only way a
+    // session binds to a job: a worker nobody announced takes nothing.
     onWorkerReservedForJob: (targetId: string, instanceNum: number, jobId?: string) =>
       getBrokerProxyService()?.expectWorkerForJob(targetId, instanceNum, jobId),
     onWorkerReservationCancelled: (targetId: string, instanceNum: number, jobId?: string) =>
@@ -323,7 +324,7 @@ app.whenReady().then(async () => {
       }
       return contributorCache.getAllAuthors(accessToken, owner, repo, sha);
     },
-    getJobTarget: (jobId: string) => brokerProxyService.getJobTarget(jobId),
+    getJobTarget: (instanceNum: number, jobId: string) => brokerProxyService.getJobTargetForWorker(instanceNum, jobId),
     // Stage 1: approved container requests go to the operator's own daemon.
     // The socket the job sees is localmost's; the daemon's is never handed over.
     dockerBackend: new DesktopBackend(),
@@ -451,72 +452,19 @@ app.whenReady().then(async () => {
     return runnerManager.hasAvailableSlot();
   });
 
-  // Wire up broker proxy to runner manager: when a job is received, spawn a worker
-  brokerProxyService.on('job-received', async (targetId: string, jobId: string, _registeredRunnerName: string, githubInfo) => {
-    getLogger()?.info(`[job-received event] targetId=${targetId}, jobId=${jobId}, runId=${githubInfo.githubRunId}, actor=${githubInfo.githubActor}, sha=${githubInfo.githubSha?.slice(0, 7)}`);
-    const target = targetManager.getTargets().find(t => t.id === targetId);
-    if (target) {
-      getLogger()?.info(`Spawning worker for job ${jobId} from ${target.displayName}...`);
-      // Construct actions URL directly from GitHub IDs
-      let actionsUrl: string | undefined;
-      if (githubInfo.githubRunId && githubInfo.githubJobId && githubInfo.githubRepo) {
-        actionsUrl = `https://github.com/${githubInfo.githubRepo}/actions/runs/${githubInfo.githubRunId}/job/${githubInfo.githubJobId}`;
-        getLogger()?.info(`Constructed actions URL: ${actionsUrl}`);
-      }
-      // Decide whether this job may run before any worker exists. Cancelling
-      // after a worker has started leaves untrusted steps executing for as long
-      // as the check takes.
-      const [owner, repo] = (githubInfo.githubRepo || target.displayName).split('/');
-      if (owner && repo && githubInfo.githubActor) {
-        const verdict = await runnerManager.evaluateJobFilter(
-          owner,
-          repo,
-          githubInfo.githubActor,
-          githubInfo.githubSha
-        );
-        if (!verdict.allowed) {
-          runnerManager.recordRefusedJob({
-            repository: target.displayName,
-            jobName: githubInfo.githubJobId ? `job ${githubInfo.githubJobId}` : jobId,
-            reason: verdict.reason,
-            actionsUrl,
-            githubRunId: githubInfo.githubRunId,
-          });
-          if (githubInfo.githubRunId) {
-            await runnerManager.cancelRun(owner, repo, githubInfo.githubRunId, verdict.reason);
-          }
-          return;
-        }
-
-        // A .localmostrc grants access beyond the baseline, so a new or
-        // changed one needs the machine owner's consent before it takes effect.
-        const policyReason = await checkRepoPolicyApproval(owner, repo, githubInfo.githubSha);
-        if (policyReason) {
-          runnerManager.recordRefusedJob({
-            repository: target.displayName,
-            jobName: githubInfo.githubJobId ? `job ${githubInfo.githubJobId}` : jobId,
-            reason: policyReason,
-            actionsUrl,
-            githubRunId: githubInfo.githubRunId,
-          });
-          if (githubInfo.githubRunId) {
-            await runnerManager.cancelRun(owner, repo, githubInfo.githubRunId, policyReason);
-          }
-          return;
-        }
-      }
-
-      runnerManager.setPendingTargetContext('next', targetId, target.displayName, actionsUrl, githubInfo.githubRunId, githubInfo.githubJobId, githubInfo.githubActor, githubInfo.githubSha, githubInfo.githubRef, githubInfo.githubWorkflow, jobId);
-
-      // Spawn a worker to handle this job
-      try {
-        await runnerManager.spawnWorkerForJob();
-      } catch (err) {
-        getLogger()?.error(`Failed to spawn worker for job ${jobId}: ${(err as Error).message}`);
-      }
-    } else {
-      getLogger()?.warn(`[job-received] Target not found for id: ${targetId}`);
-    }
+  // Wire up broker proxy to runner manager: when a job is received, decide
+  // whether it may run and spawn the worker for it.
+  const admission: JobAdmissionDeps = {
+    findTarget: (targetId: string) => targetManager.getTargets().find(t => t.id === targetId),
+    runnerManager,
+    broker: brokerProxyService,
+    checkPolicyApproval: checkRepoPolicyApproval,
+    log: (level, message) => getLogger()?.[level](message),
+  };
+  brokerProxyService.on('job-received', (targetId: string, jobId: string, _registeredRunnerName: string, githubInfo) => {
+    admitJob(admission, targetId, jobId, githubInfo).catch((err) => {
+      getLogger()?.error(`Admission of job ${jobId} failed: ${(err as Error).message}`);
+    });
   });
 
   // Wire up broker proxy status updates to renderer

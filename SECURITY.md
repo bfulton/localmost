@@ -386,15 +386,26 @@ The sandbox is rebuilt fresh on each runner start and confines all writes to the
 
 ### User Filter
 
-localmost includes a user filter that restricts which GitHub users' jobs are accepted:
+localmost includes a user filter that restricts which GitHub users' jobs are accepted. Its scope says whose involvement is checked:
 
-| Mode | Description |
-|------|-------------|
-| **Everyone** | Accept jobs triggered by any user (default) |
-| **Just me** | Only accept jobs triggered by the authenticated user |
-| **Allowlist** | Only accept jobs from specific GitHub usernames |
+| Scope | What is checked |
+|-------|-----------------|
+| **Everyone** | Nothing: jobs from any user are accepted (default) |
+| **Trigger author** | The user who triggered the run (`github.actor`) |
+| **Repo contributors** | The trigger author, and every contributor to the repository and author of the commits since |
 
-When a job is triggered by a user not matching the filter, localmost automatically cancels the workflow run.
+and who is allowed:
+
+| Allowed users | Description |
+|---------------|-------------|
+| **Just me** | Only the authenticated user |
+| **Allowlist** | Only specific GitHub usernames |
+
+The trigger author is the person who set the run going, not necessarily the author of the code it runs; a comment or a re-run by an allowed user runs whatever the commit contains. **Repo contributors** covers the code as well, and checks the trigger author too, so it refuses at least what **Trigger author** refuses.
+
+Under either filtering scope, a job whose trigger author cannot be read is refused, since it cannot be shown to be anyone allowed. Under **Repo contributors**, a commit whose email is linked to no GitHub account counts as an author no filter allows (it appears as `(unattributed <sha>)` in the refusal), since anyone can write such a commit. This applies to the commits between the default branch head at which the contributor list was fetched and the job's commit; GitHub's contributor list itself leaves such authors out, so one already on the default branch when the list was fetched is not seen.
+
+The check runs before any worker is started. A refused job never runs: it is dropped, recorded in the job history, and its workflow run is cancelled.
 
 ### Recommendations
 

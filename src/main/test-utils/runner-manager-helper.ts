@@ -175,6 +175,13 @@ export class RunnerManagerTestHelper {
     }).applyPolicyForTarget(instanceNum, targetDisplayName, githubSha, '', true);
   }
 
+  /** Start an instance's egress proxy, as spawning does. */
+  async startInstanceProxy(instanceNum: number): Promise<void> {
+    await (this.manager as never as {
+      startInstanceProxy(n: number): Promise<unknown>;
+    }).startInstanceProxy(instanceNum);
+  }
+
   /** Watch the job events the manager emits, as the app does for notifications. */
   setOnJobEvent(handler: (event: unknown) => void): void {
     (this.manager as never as { onJobEvent?: (event: unknown) => void }).onJobEvent = handler;

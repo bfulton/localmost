@@ -480,7 +480,6 @@ describe('message routing', () => {
   interface RoutingInternals {
     targets: Map<string, { target: Target; instances: Map<number, Instance> }>;
     messageQueues: Map<string, string[]>;
-    pendingTargetAssignments: string[];
     localSessions: Map<string, { targetId?: string; currentJobId?: string }>;
     acquiredJobDetails: Map<string, string>;
     handleRequest(req: unknown, res: unknown): Promise<void>;
@@ -588,15 +587,16 @@ describe('message routing', () => {
     // the NEXT job's worker, ~10s after that job was assigned, and any job with
     // no successor inside 600s was killed by GitHub having never run a step.
     //
-    // pendingTargetAssignments is a list of target ids, so with several
-    // instances on one target arrival order is the only thing telling them
-    // apart. Whichever session polled first consumed the assignment and the
-    // worker actually spawned for the job came back unbound - permanently, and
-    // since queues are per-target every later worker then drained the oldest
-    // message. Naming the worker removes ordering from the decision.
+    // The positional assignments this replaced were a list of target ids, so
+    // with several instances on one target arrival order was the only thing
+    // telling them apart. Whichever session polled first consumed the
+    // assignment and the worker actually spawned for the job came back unbound
+    // - permanently, and since queues are per-target every later worker then
+    // drained the oldest message. Naming the worker removes ordering from the
+    // decision.
     const target = addTargetWithRunner('target-a', 'runner-a.1');
     internals.messageQueues.set(target.id, [jobMessage]);
-    service.expectWorkerForJob(target.id, 1);
+    service.expectWorkerForJob(target.id, 1, 'req-1');
 
     const sessionId = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }));
     const res = await request('GET', `/message?sessionId=${sessionId}`);
@@ -680,7 +680,6 @@ describe('message routing', () => {
     const target = addTargetWithRunner('target-a', 'runner-a.1');
     const job2 = JSON.stringify({ messageId: 4, messageType: 'RunnerJobRequest', body: JSON.stringify({ runner_request_id: 'req-2' }) });
     internals.messageQueues.set(target.id, [jobMessage, job2]);
-    internals.pendingTargetAssignments.push(target.id, target.id);
     internals.acquiredJobDetails.set('req-2', '{"secret":"job2"}');
     internals.acquiredJobDetails.set('4', '{"secret":"job2"}');
     service.expectWorkerForJob(target.id, 1, 'req-1');
@@ -694,7 +693,6 @@ describe('message routing', () => {
 
     expect(internals.localSessions.get(second)?.targetId).toBeUndefined();
     expect(internals.messageQueues.get(target.id)).toEqual([job2]);
-    expect(internals.pendingTargetAssignments).toEqual([target.id]);
     const steal = await request('POST', '/acquirejob', JSON.stringify({ jobMessageId: 4 }));
     expect(steal.statusCode).toBe(403);
   });
@@ -704,8 +702,7 @@ describe('message routing', () => {
     // the same key must not reach the arrival-order fallback and bind another
     // queued job.
     const target = addTargetWithRunner('target-a', 'runner-a.1');
-    internals.pendingTargetAssignments.push(target.id, target.id);
-    service.expectWorkerForJob(target.id, 1);
+    service.expectWorkerForJob(target.id, 1, 'req-1');
 
     const first = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }));
     const second = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }));
@@ -716,7 +713,7 @@ describe('message routing', () => {
 
   it('expects a worker only once, so a later listener cannot reuse the binding', async () => {
     const target = addTargetWithRunner('target-a', 'runner-a.1');
-    service.expectWorkerForJob(target.id, 1);
+    service.expectWorkerForJob(target.id, 1, 'req-1');
 
     const first = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }));
     const second = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }));
@@ -763,7 +760,7 @@ describe('message routing', () => {
       ]);
       internals.targets.get('target-b')!.instances.get(2)!.sessionId = 'upstream-b';
       internals.messageQueues.set(targetA.id, [jobMessage]);
-      service.expectWorkerForJob(targetA.id, 1);
+      service.expectWorkerForJob(targetA.id, 1, 'req-1');
       const intruder = startWorker(2, 'target-b');
 
       const sessionId = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }), intruder);
@@ -777,7 +774,7 @@ describe('message routing', () => {
       internals.acquiredJobDetails.set('req-1', JSON.stringify({ jobId: 'req-1' }));
       internals.acquiredJobDetails.set('2', JSON.stringify({ jobId: 'req-1' }));
       internals.messageQueues.set(target.id, [jobWithRunService]);
-      service.expectWorkerForJob(target.id, 1);
+      service.expectWorkerForJob(target.id, 1, 'req-1');
 
       const early = await request('POST', '/acquirejob', JSON.stringify({ jobMessageId: 2 }));
       expect(early.statusCode).toBe(403);
@@ -795,7 +792,7 @@ describe('message routing', () => {
       // Without its key there, every one of them would be refused.
       const target = addTargetWithRunner('target-a', 'runner-a.1');
       internals.messageQueues.set(target.id, [jobWithRunService]);
-      service.expectWorkerForJob(target.id, 1);
+      service.expectWorkerForJob(target.id, 1, 'req-1');
 
       const sessionId = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }));
       const res = await request('GET', `/message?sessionId=${sessionId}`);
@@ -843,15 +840,13 @@ describe('message routing', () => {
       // recorded that job as failed.
       const target = addTargetWithRunner('target-a', 'runner-a.1');
       internals.messageQueues.set(target.id, [jobMessage]);
-      internals.pendingTargetAssignments.push(target.id);
-      service.expectWorkerForJob(target.id, 1);
+      service.expectWorkerForJob(target.id, 1, 'req-1');
 
       internals.acquiredJobDetails.set('req-1', JSON.stringify({ secret: 'in here' }));
 
       service.forgetExpectedWorker(target.id, 1, 'req-1');
 
       expect(internals.messageQueues.get(target.id)).toEqual([]);
-      expect(internals.pendingTargetAssignments).toEqual([]);
       // The acquired payload holds the job's secrets; it must not outlive a
       // job no worker will run.
       expect(internals.acquiredJobDetails.has('req-1')).toBe(false);
@@ -863,19 +858,21 @@ describe('message routing', () => {
       // (its secrets) and run-service routing are still resident and must go.
       const target = addTargetWithRunner('target-a', 'runner-a.1');
       internals.messageQueues.set(target.id, []); // already polled - nothing queued
-      internals.pendingTargetAssignments.push(target.id); // but its assignment lingers
-      internals.acquiredJobDetails.set('req-1', JSON.stringify({ secret: 's' }));
-      internals.acquiredJobDetails.set('9', JSON.stringify({ secret: 's' }));
+      // As processMessage stores them: each alias set from one value.
+      const payload = JSON.stringify({ secret: 's' });
+      internals.acquiredJobDetails.set('req-1', payload);
+      internals.acquiredJobDetails.set('9', payload);
+      const jobTarget = { targetDisplayName: 'target-a' };
+      (internals as unknown as { jobTargets: Map<string, unknown> }).jobTargets.set('req-1', jobTarget);
+      (internals as unknown as { jobTargets: Map<string, unknown> }).jobTargets.set('9', jobTarget);
       (internals as unknown as { jobRunServiceUrls: Map<string, string> }).jobRunServiceUrls.set('req-1', 'https://run/');
       (internals as unknown as { jobRunServiceUrls: Map<string, string> }).jobRunServiceUrls.set('9', 'https://run/');
-      service.expectWorkerForJob(target.id, 1);
+      service.expectWorkerForJob(target.id, 1, 'req-1');
 
       service.forgetExpectedWorker(target.id, 1, 'req-1');
 
       expect(internals.acquiredJobDetails.has('req-1')).toBe(false);
       expect(internals.acquiredJobDetails.has('9')).toBe(false);
-      // The pending assignment goes too, or the next worker binds an abandoned job.
-      expect(internals.pendingTargetAssignments).toEqual([]);
       const urls = (internals as unknown as { jobRunServiceUrls: Map<string, string> }).jobRunServiceUrls;
       expect(urls.has('req-1')).toBe(false);
       expect(urls.has('9')).toBe(false);
@@ -887,44 +884,42 @@ describe('message routing', () => {
       // are set from one object, as the single insertion site does.
       const target = addTargetWithRunner('target-a', 'runner-a.1');
       internals.messageQueues.set(target.id, []);
-      internals.pendingTargetAssignments.push(target.id);
       const jobTargets = (internals as unknown as { jobTargets: Map<string, unknown> }).jobTargets;
       const jobTarget = { targetDisplayName: 'o/r', githubSha: 'abc' };
       jobTargets.set('req-1', jobTarget);
       jobTargets.set('9', jobTarget);
-      service.expectWorkerForJob(target.id, 1);
+      service.expectWorkerForJob(target.id, 1, 'req-1');
 
       service.forgetExpectedWorker(target.id, 1, 'req-1');
 
-      expect(service.getJobTarget('req-1')).toBeUndefined();
-      expect(service.getJobTarget('9')).toBeUndefined();
+      expect(jobTargets.has('req-1')).toBe(false);
+      expect(jobTargets.has('9')).toBe(false);
     });
 
     it('leaves the other jobs queued for the same repository alone', () => {
       const target = addTargetWithRunner('target-a', 'runner-a.1');
       internals.messageQueues.set(target.id, [jobMessage, secondJob]);
-      internals.pendingTargetAssignments.push(target.id, target.id);
-      service.expectWorkerForJob(target.id, 1);
+      service.expectWorkerForJob(target.id, 1, 'req-1');
 
       service.forgetExpectedWorker(target.id, 1, 'req-1');
 
       expect(internals.messageQueues.get(target.id)).toEqual([secondJob]);
-      expect(internals.pendingTargetAssignments).toEqual([target.id]);
     });
 
-    it('does not take an assignment its own session already used', async () => {
-      // Binding consumed this worker's assignment. The one still queued
-      // belongs to another job's worker, which would come back unbound.
+    it("leaves another worker's announcement for the same repository in place", async () => {
+      // Withdrawing worker 1 must not cost worker 2 its binding: it would come
+      // back unbound and its job would be stranded.
       const target = addTargetWithRunner('target-a', 'runner-a.1');
       internals.messageQueues.set(target.id, [jobMessage, secondJob]);
-      internals.pendingTargetAssignments.push(target.id, target.id);
-      service.expectWorkerForJob(target.id, 1);
-      await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }));
+      service.expectWorkerForJob(target.id, 1, 'req-1');
+      service.expectWorkerForJob(target.id, 2, 'req-2');
+      const second = startWorker(2, target.id);
 
       service.forgetExpectedWorker(target.id, 1, 'req-1');
+      const sessionId = await createSession(undefined, second);
+      const res = await request('GET', `/message?sessionId=${sessionId}`, undefined, second);
 
-      expect(internals.pendingTargetAssignments).toEqual([target.id]);
-      expect(internals.messageQueues.get(target.id)).toEqual([secondJob]);
+      expect(JSON.parse(JSON.parse(res.body).body).runner_request_id).toBe('req-2');
     });
   });
 
@@ -934,7 +929,7 @@ describe('message routing', () => {
     // restarts its session, and the job is never delivered.
     const target = addTargetWithRunner('target-a', 'runner-a.1');
     internals.messageQueues.set(target.id, [refreshMessage, jobMessage]);
-    internals.pendingTargetAssignments.push(target.id);
+    service.expectWorkerForJob(target.id, 1, 'req-1');
 
     const sessionId = await createSession();
     const res = await request('GET', `/message?sessionId=${sessionId}`);
@@ -965,7 +960,7 @@ describe('message routing', () => {
   it('queues a JobCancellation for a job a worker is running', async () => {
     const target = addTargetWithRunner('target-a', 'runner-a.1');
     internals.messageQueues.set(target.id, [jobMessage]);
-    internals.pendingTargetAssignments.push(target.id);
+    service.expectWorkerForJob(target.id, 1, 'req-1');
     const sessionId = await createSession();
     await request('GET', `/message?sessionId=${sessionId}`);
     const state = internals.targets.get(target.id)!;
@@ -981,7 +976,7 @@ describe('message routing', () => {
     // holding a job it never had.
     const target = addTargetWithRunner('target-a', 'runner-a.1');
     internals.messageQueues.set(target.id, [cancelMessage]);
-    internals.pendingTargetAssignments.push(target.id);
+    service.expectWorkerForJob(target.id, 1, 'req-1');
     const sessionId = await createSession();
 
     // Nothing is deliverable, so the handler long-polls rather than answering -
@@ -1004,7 +999,7 @@ describe('message routing', () => {
   it('does hand the cancellation to the worker actually running that job', async () => {
     const target = addTargetWithRunner('target-a', 'runner-a.1');
     internals.messageQueues.set(target.id, [jobMessage]);
-    internals.pendingTargetAssignments.push(target.id);
+    service.expectWorkerForJob(target.id, 1, 'req-1');
     const sessionId = await createSession();
     await request('GET', `/message?sessionId=${sessionId}`); // takes the job
     internals.messageQueues.set(target.id, [cancelMessage]);
@@ -1055,6 +1050,300 @@ describe('message routing', () => {
     expect(res.statusCode).toBe(413);
   });
 
+  describe('a job no worker was spawned for', () => {
+    // A job message as the broker receives it upstream, with the routing the
+    // acquire needs, and the payload acquirejob hands back: the job's secrets.
+    // Jobs of one target share a run service, as they commonly do upstream.
+    const upstreamJob = (requestId: string, messageId: number) => JSON.stringify({
+      messageId,
+      messageType: 'RunnerJobRequest',
+      body: JSON.stringify({ runner_request_id: requestId, run_service_url: 'https://run.example/', billing_owner_id: 'b' }),
+    });
+    const payloadFor = (requestId: string) => JSON.stringify({
+      jobId: requestId,
+      secret: `secret-of-${requestId}`,
+      contextData: { github: { d: [{ k: 'repository', v: 'target-a' }, { k: 'actor', v: 'stranger' }, { k: 'sha', v: 'abc1234' }] } },
+    });
+
+    type Internals = RoutingInternals & {
+      isShuttingDown: boolean;
+      jobTargets: Map<string, unknown>;
+      jobRunServiceUrls: Map<string, string>;
+      jobInfo: Map<string, unknown>;
+      jobAssignments: Map<string, unknown>;
+    };
+    const deep = () => internals as unknown as Internals;
+
+    /** Acquire upstream answers with the job's payload; anything else succeeds empty. */
+    const upstreamAcquires = () => {
+      mockHttpsRequest.mockImplementation((...args: unknown[]) => {
+        const options = args[0] as { path?: string };
+        const callback = args[1] as (res: EventEmitter) => void;
+        let sent = '';
+        const req = new EventEmitter() as EventEmitter & { setTimeout: () => void; write: (b: string) => void; end: () => void };
+        req.setTimeout = () => {};
+        req.write = (b: string) => { sent += b; };
+        req.end = () => {
+          const res = new EventEmitter() as EventEmitter & { statusCode: number };
+          res.statusCode = 200;
+          callback(res);
+          if (options.path?.startsWith('/acquirejob')) res.emit('data', payloadFor(JSON.parse(sent).jobMessageId));
+          res.emit('end');
+        };
+        return req;
+      });
+    };
+
+    /** The broker receives and acquires a job for target-a, as its poll loop does. */
+    const receive = async (requestId: string, messageId: number) => {
+      const state = internals.targets.get('target-a')!;
+      const instance = state.instances.get(1)! as Instance & { accessToken?: string; tokenExpiry?: number };
+      instance.accessToken = 'token';
+      instance.tokenExpiry = Date.now() + 3_600_000;
+      await internals.processMessage(state, instance, upstreamJob(requestId, messageId));
+    };
+
+    /** Poll once and give up when nothing is deliverable, the way a shutdown ends a long poll. */
+    const pollOnce = async (sessionId: string, prefix: string) => {
+      const pending = request('GET', `/message?sessionId=${sessionId}`, undefined, prefix);
+      await new Promise((r) => setTimeout(r, 30));
+      deep().isShuttingDown = true;
+      const res = await pending;
+      deep().isShuttingDown = false;
+      return res;
+    };
+
+    beforeEach(() => {
+      upstreamAcquires();
+    });
+
+    it('never hands a refused job to an idle listener that names the runner it was meant for', async () => {
+      // The admission refused the job and returned, touching nothing here. The
+      // job stayed queued, acquired, with its assignment pending. A listener
+      // started later with no job of its own - a scale-up, or a CLI resume -
+      // named the target's runner, bound the leftover assignment, polled the
+      // refused job and acquired its payload.
+      addTargetWithRunner('target-a', 'runner-a.1');
+      service.on('job-received', () => { /* refused: nothing is spawned */ });
+      await receive('req-1', 2);
+      const listener = startWorker(2);
+
+      const sessionId = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }), listener);
+      const polled = await pollOnce(sessionId, listener);
+      const acquired = await request('POST', '/acquirejob', JSON.stringify({ jobMessageId: 2 }), listener);
+
+      expect(internals.localSessions.get(sessionId)?.targetId).toBeUndefined();
+      expect(polled.statusCode).toBe(202);
+      expect(acquired.statusCode).not.toBe(200);
+      expect(acquired.body ?? '').not.toContain('secret-of-req-1');
+    });
+
+    it("does not bind a target's worker that no job was announced for", async () => {
+      // A worker keyed to the target but with no expectation - a re-registration
+      // restart of a slot - used to fall back to the target's oldest pending
+      // assignment and take whichever job was queued first.
+      addTargetWithRunner('target-a', 'runner-a.1');
+      await receive('req-1', 2);
+      const unannounced = startWorker(2, 'target-a');
+
+      const sessionId = await createSession(undefined, unannounced);
+      const polled = await pollOnce(sessionId, unannounced);
+
+      expect(internals.localSessions.get(sessionId)?.targetId).toBeUndefined();
+      expect(polled.statusCode).toBe(202);
+    });
+
+    it('takes no job on an announcement that names none', async () => {
+      // A session takes the job it was spawned for and nothing else; an
+      // announcement without a job gives it nothing to take.
+      addTargetWithRunner('target-a', 'runner-a.1');
+      await receive('req-1', 2);
+      service.expectWorkerForJob('target-a', 1);
+
+      const sessionId = await createSession();
+      const polled = await pollOnce(sessionId, workerPrefix);
+
+      // Not bound at all, not merely handed nothing: a bound session with no
+      // job is what the delivery guard alone would then have to catch.
+      expect(internals.localSessions.get(sessionId)?.targetId).toBeUndefined();
+      expect(polled.statusCode).toBe(202);
+      expect(internals.messageQueues.get('target-a')).toHaveLength(1);
+    });
+
+    it('hands nothing to a session that has a target but no job of its own', async () => {
+      // Binding always carries a job today, so this session cannot arise; the
+      // delivery guard is what keeps it harmless if one ever does. A job
+      // message without an id would otherwise match its missing job.
+      addTargetWithRunner('target-a', 'runner-a.1');
+      await receive('req-1', 2);
+      internals.messageQueues.get('target-a')!.push(
+        JSON.stringify({ messageId: 5, messageType: 'RunnerJobRequest', body: JSON.stringify({}) })
+      );
+      const keyed = startWorker(2, 'target-a');
+      const sessionId = await createSession(undefined, keyed);
+      internals.localSessions.get(sessionId)!.targetId = 'target-a';
+
+      const polled = await pollOnce(sessionId, keyed);
+
+      expect(polled.statusCode).toBe(202);
+      expect(internals.messageQueues.get('target-a')).toHaveLength(2);
+    });
+
+    it('does not offer a refused job to admission again when GitHub redelivers it', async () => {
+      // Job messages are never acknowledged upstream, so GitHub may offer an
+      // acquired job again, and its acquire may answer again. A refusal that
+      // also forgot the job's dedup entry refused it a second time: another
+      // history row, another notification, another cancel.
+      addTargetWithRunner('target-a', 'runner-a.1');
+      const received = jest.fn((targetId: string, jobId: string) => service.refuseJob(targetId, jobId));
+      service.on('job-received', received);
+
+      await receive('req-1', 2);
+      await receive('req-1', 2);
+
+      expect(received).toHaveBeenCalledTimes(1);
+      expect(internals.messageQueues.get('target-a')).toEqual([]);
+      expect(internals.acquiredJobDetails.size).toBe(0);
+      expect(deep().jobTargets.size).toBe(0);
+    });
+
+    it('offers a dropped job again, since nothing decided it may not run', async () => {
+      // A job dropped because no worker could be started for it was not
+      // judged. Its redelivery is the retry.
+      addTargetWithRunner('target-a', 'runner-a.1');
+      const received = jest.fn((targetId: string, jobId: string) => service.dropJob(targetId, jobId));
+      service.on('job-received', received);
+
+      await receive('req-1', 2);
+      await receive('req-1', 2);
+
+      expect(received).toHaveBeenCalledTimes(2);
+    });
+
+    it('drops every trace of a refused job, and nothing of another', async () => {
+      addTargetWithRunner('target-a', 'runner-a.1');
+      await receive('req-1', 2);
+      await receive('req-2', 4);
+      const drop = (service as unknown as { dropJob: (targetId: string, jobId: string) => void }).dropJob;
+
+      drop.call(service, 'target-a', 'req-1');
+
+      const i = deep();
+      expect(i.messageQueues.get('target-a')!.map((m) => JSON.parse(JSON.parse(m).body).runner_request_id)).toEqual(['req-2']);
+      for (const id of ['req-1', '2']) {
+        expect(i.acquiredJobDetails.has(id)).toBe(false);
+        expect(i.jobTargets.has(id)).toBe(false);
+        expect(i.jobRunServiceUrls.has(id)).toBe(false);
+        expect(i.jobInfo.has(id)).toBe(false);
+      }
+      expect(i.jobAssignments.has('req-1')).toBe(false);
+      // The other job is untouched: its worker can still bind and take it.
+      for (const id of ['req-2', '4']) {
+        expect(i.acquiredJobDetails.has(id)).toBe(true);
+        expect(i.jobTargets.has(id)).toBe(true);
+        expect(i.jobRunServiceUrls.has(id)).toBe(true);
+      }
+      expect(i.jobInfo.has('4')).toBe(true);
+      expect(i.jobAssignments.has('req-2')).toBe(true);
+      service.expectWorkerForJob('target-a', 1, 'req-2');
+      const sessionId = await createSession();
+      const polled = await request('GET', `/message?sessionId=${sessionId}`);
+      expect(JSON.parse(JSON.parse(polled.body).body).runner_request_id).toBe('req-2');
+    });
+
+    it('drops a queued cancellation for the dropped job with it', async () => {
+      addTargetWithRunner('target-a', 'runner-a.1');
+      await receive('req-1', 2);
+      internals.messageQueues.get('target-a')!.push(
+        JSON.stringify({ messageId: 3, messageType: 'JobCancellation', body: JSON.stringify({ jobId: 'req-1' }) })
+      );
+
+      (service as unknown as { dropJob: (t: string, j: string) => void }).dropJob('target-a', 'req-1');
+
+      expect(internals.messageQueues.get('target-a')).toEqual([]);
+    });
+
+    it('offers nothing to admission for a job it could not acquire', async () => {
+      // With no stored payload the worker's acquirejob is answered 404, so a
+      // worker spawned for it could never run it; and admission now refuses a
+      // job it cannot identify. Offered anyway, every redelivery - GitHub keeps
+      // offering a job nobody claimed - would be refused and recorded again.
+      // Left alone, the next redelivery is acquired and admitted properly.
+      addTargetWithRunner('target-a', 'runner-a.1');
+      mockHttpsRequest.mockImplementation((...args: unknown[]) => {
+        const callback = args[1] as (res: EventEmitter) => void;
+        const req = new EventEmitter() as EventEmitter & { setTimeout: () => void; write: () => void; end: () => void };
+        req.setTimeout = () => {};
+        req.write = () => {};
+        req.end = () => {
+          const res = new EventEmitter() as EventEmitter & { statusCode: number };
+          res.statusCode = 503;
+          callback(res);
+          res.emit('end');
+        };
+        return req;
+      });
+      const received = jest.fn();
+      service.on('job-received', received);
+
+      await receive('req-1', 2);
+
+      expect(received).not.toHaveBeenCalled();
+      expect(internals.messageQueues.get('target-a') ?? []).toEqual([]);
+      expect(deep().jobAssignments.has('req-1')).toBe(false);
+      expect(deep().jobRunServiceUrls.size).toBe(0);
+      expect(deep().jobInfo.size).toBe(0);
+    });
+  });
+
+  describe("which job's repository a worker may claim", () => {
+    const deliver = async (instanceNum: number, requestId: string, messageId: number) => {
+      const prefix = startWorker(instanceNum, 'target-a');
+      internals.messageQueues.get('target-a')!.push(JSON.stringify({
+        messageId, messageType: 'RunnerJobRequest', body: JSON.stringify({ runner_request_id: requestId }),
+      }));
+      const jobTarget = { targetDisplayName: `repo-of-${requestId}`, githubSha: 'abc' };
+      const jobTargets = (internals as unknown as { jobTargets: Map<string, unknown> }).jobTargets;
+      jobTargets.set(requestId, jobTarget);
+      jobTargets.set(String(messageId), jobTarget);
+      service.expectWorkerForJob('target-a', instanceNum, requestId);
+      const sessionId = await createSession(undefined, prefix);
+      await request('GET', `/message?sessionId=${sessionId}`, undefined, prefix);
+    };
+    type ForWorker = { getJobTargetForWorker: (instanceNum: number, jobId: string) => unknown };
+
+    it('names a job only to the worker it was delivered to', async () => {
+      // The proxy's acquirejob hook installs the policy of whatever job id the
+      // request body names. A job could name another repository's job and take
+      // its hosts; only the job this worker was actually handed is its own.
+      addTargetWithRunner('target-a', 'runner-a.1');
+      internals.messageQueues.set('target-a', []);
+      await deliver(1, 'req-1', 2);
+      await deliver(2, 'req-7', 9);
+      const lookup = (service as unknown as ForWorker).getJobTargetForWorker.bind(service);
+
+      expect(lookup(1, 'req-1')).toEqual({ targetDisplayName: 'repo-of-req-1', githubSha: 'abc' });
+      expect(lookup(1, '2')).toEqual({ targetDisplayName: 'repo-of-req-1', githubSha: 'abc' });
+      expect(lookup(1, 'req-7')).toBeUndefined();
+      expect(lookup(1, '9')).toBeUndefined();
+      expect(lookup(3, 'req-1')).toBeUndefined();
+    });
+
+    it("forgets a job's repository once its worker is finished", async () => {
+      // jobTargets was pruned only for a withdrawn worker, so every job ever run
+      // stayed resolvable by id for the life of the process.
+      addTargetWithRunner('target-a', 'runner-a.1');
+      internals.messageQueues.set('target-a', []);
+      await deliver(1, 'req-1', 2);
+      const jobTargets = (internals as unknown as { jobTargets: Map<string, unknown> }).jobTargets;
+
+      service.revokeWorkerKey(1);
+
+      expect(jobTargets.has('req-1')).toBe(false);
+      expect(jobTargets.has('2')).toBe(false);
+    });
+  });
+
   describe('session to target binding', () => {
     it('leaves a session unbound when its target has no job waiting', async () => {
       // A listener spawned ahead of any job runs in the generic sandbox, not
@@ -1068,34 +1357,26 @@ describe('message routing', () => {
       expect(internals.localSessions.get(sessionId)?.targetId).toBeUndefined();
     });
 
-    it("never hands a named session another target's pending assignment", async () => {
+    it("never binds a session to another target's announced job, whatever it is called", async () => {
+      // The property this has always protected: a session must not take a
+      // different target's job. Target B's worker names target A's runner.
       const targetA = addTargetWithRunner('target-a', 'runner-a.1');
       addTargetWithRunner('target-b', 'runner-b.1');
-      internals.pendingTargetAssignments.push(targetA.id);
+      service.expectWorkerForJob(targetA.id, 1, 'req-1');
 
-      const sessionId = await createSession(JSON.stringify({ agent: { name: 'runner-b.1' } }));
+      const sessionId = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }));
 
       expect(internals.localSessions.get(sessionId)?.targetId).toBeUndefined();
-      expect(internals.pendingTargetAssignments).toEqual([targetA.id]);
+      // Target A's own worker still finds its announcement.
+      const own = await createSession(undefined, startWorker(1, targetA.id));
+      expect(internals.localSessions.get(own)?.targetId).toBe(targetA.id);
     });
 
-    it('consumes its own target assignment, never another target one', async () => {
-      // The property this has always protected: a session must not take a
-      // different target's assignment. It is now expressed through the
-      // expectation - binding is by name, so ordering cannot get it wrong.
+    it('binds an unnamed request by its key alone', async () => {
+      // The name in the request never decided anything for a keyed worker, so
+      // its absence does not either.
       const targetA = addTargetWithRunner('target-a', 'runner-a.1');
-      const targetB = addTargetWithRunner('target-b', 'runner-b.1');
-      internals.pendingTargetAssignments.push(targetA.id, targetB.id);
-      service.expectWorkerForJob(targetB.id, 1);
-
-      await createSession(JSON.stringify({ agent: { name: 'runner-b.1' } }));
-
-      expect(internals.pendingTargetAssignments).toEqual([targetA.id]);
-    });
-
-    it('falls back to the pending assignment when the request names no runner', async () => {
-      const targetA = addTargetWithRunner('target-a', 'runner-a.1');
-      internals.pendingTargetAssignments.push(targetA.id);
+      service.expectWorkerForJob(targetA.id, 1, 'req-1');
 
       const sessionId = await createSession();
 

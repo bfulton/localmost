@@ -346,22 +346,23 @@ export class BrokerProxyService extends EventEmitter {
   private isPolling = false;  // Prevent concurrent poll execution
   private messageQueues: Map<string, Array<string>> = new Map();  // Per-target message queues
   private seenMessageIds: Set<string> = new Set();
-  private pendingTargetAssignments: string[] = [];  // Queue of target IDs for upcoming sessions
   /**
-   * Workers spawned for a specific job, by the agent name they will present.
+   * Workers spawned for a specific job, and the job each was spawned for.
    *
-   * pendingTargetAssignments distinguishes workers only by target and arrival
-   * order, so with several instances on one target whichever session polls
-   * first consumes the assignment and the worker actually spawned for the job
-   * comes back unbound - and stays unbound, because a session binds once. Since
-   * queues are per-target, every later worker then drains the oldest message: a
-   * consumer measured every job being run by the NEXT job's worker, with the
-   * last job of any burst killed by GitHub at 600s having never started.
+   * This is the only way a session binds to a target and so the only way a
+   * job reaches a worker: admission spawns one worker per admitted job, and
+   * announces it here before the worker exists. A job that admission refused
+   * or dropped has no entry, so nothing can take it.
    *
-   * Naming the worker takes ordering out of the decision, while keeping what
-   * the ordering was there to protect: a listener nobody spawned for a job has
-   * no entry here, so it cannot bind and win a job its generic sandbox would
-   * fail to run.
+   * There used to be a positional queue of target ids beside this. With
+   * several instances on one target whichever session polled first consumed
+   * the assignment and the worker actually spawned for the job came back
+   * unbound, so every job was run by the NEXT job's worker. And an idle
+   * listener - one started by a scale-up or a CLI resume, with no job of its
+   * own and a generic sandbox - could bind any leftover assignment by naming
+   * the target's runner, including one for a job admission had refused.
+   * Scale-up no longer starts one. The CLI's resume still does; it never binds
+   * and so never takes a job, and holds its slot until the pool stops.
    */
   // Keyed by target+instance, not the runner's agentName: target-manager can
   // produce the same agentName for two coexisting targets (an org foo-bar and a
@@ -592,44 +593,45 @@ export class BrokerProxyService extends EventEmitter {
         return;
       }
 
-      // Store real run_service_url for forwarding job operations
-      // Store by multiple keys since runner may use different IDs
       const runServiceUrl = innerBody?.run_service_url;
       const billingOwnerId = innerBody?.billing_owner_id;
-      if (runServiceUrl) {
-        this.jobRunServiceUrls.set(jobId, runServiceUrl);
-        // Also store by messageId (used as jobMessageId in acquirejob)
-        // messageId was extracted as string to avoid precision loss
-        this.jobRunServiceUrls.set(messageId, runServiceUrl);
-        // Store job info for acquireJobUpstream
-        this.jobInfo.set(messageId, { billingOwnerId, runServiceUrl });
-        log()?.info(`[BrokerProxy] Job ${jobId} (messageId=${messageId}) received from ${state.target.displayName}, run_service_url=${runServiceUrl}, billingOwnerId=${billingOwnerId}`);
-      } else {
-        log()?.info(`[BrokerProxy] Job ${jobId} received from ${state.target.displayName} (no run_service_url)`);
-      }
+      log()?.info(`[BrokerProxy] Job ${jobId} (messageId=${messageId}) received from ${state.target.displayName}, run_service_url=${runServiceUrl ?? 'none'}, billingOwnerId=${billingOwnerId}`);
 
       // Acquire job from GitHub immediately using target's credentials
       // This claims the job so GitHub won't keep sending it on subsequent polls
       // Note: GitHub uses runner_request_id (UUID) as jobMessageId, not the broker's numeric messageId
-      let githubInfo: GitHubJobInfo = {};
-      if (runServiceUrl) {
-        const jobDetails = await this.acquireJobUpstream(state, instance, jobId, runServiceUrl, billingOwnerId);
-        if (jobDetails) {
-          this.acquiredJobDetails.set(jobId, jobDetails);
-          this.acquiredJobDetails.set(messageId, jobDetails);
-          log()?.info(`[BrokerProxy] Acquired job ${jobId} (messageId=${messageId}) upstream, stored details`);
+      const jobDetails = runServiceUrl
+        ? await this.acquireJobUpstream(state, instance, jobId, runServiceUrl, billingOwnerId)
+        : null;
+      if (!jobDetails) {
+        // Not acquired, so not ours to offer. This used to carry on: a worker
+        // spawned for it had its acquirejob answered 404, and admission - which
+        // refuses a job it cannot identify - would now refuse and record it
+        // again on every redelivery. GitHub keeps offering a job nobody has
+        // claimed, and the next offer is acquired afresh.
+        log()?.warn(`[BrokerProxy] Could not acquire job ${jobId} upstream; leaving it for GitHub to offer again`);
+        return;
+      }
 
-          // Extract run_id, job ID, actor, sha, ref from job details
-          try {
-            const parsed = JSON.parse(jobDetails);
-            githubInfo = extractGitHubJobInfo(parsed.contextData);
-            log()?.info(`[BrokerProxy] Extracted: run_id=${githubInfo.githubRunId}, job_id=${githubInfo.githubJobId}, repo=${githubInfo.githubRepo}, actor=${githubInfo.githubActor}, sha=${githubInfo.githubSha?.slice(0, 7)}, workflow=${githubInfo.githubWorkflow}`);
-          } catch (e) {
-            log()?.warn(`[BrokerProxy] Failed to parse job details for IDs: ${(e as Error).message}`);
-          }
-        } else {
-          log()?.warn(`[BrokerProxy] Failed to acquire job ${jobId} upstream, continuing anyway`);
-        }
+      // Store real run_service_url for forwarding job operations
+      // Store by multiple keys since runner may use different IDs
+      this.jobRunServiceUrls.set(jobId, runServiceUrl);
+      // Also store by messageId (used as jobMessageId in acquirejob)
+      // messageId was extracted as string to avoid precision loss
+      this.jobRunServiceUrls.set(messageId, runServiceUrl);
+      this.jobInfo.set(messageId, { billingOwnerId, runServiceUrl });
+      this.acquiredJobDetails.set(jobId, jobDetails);
+      this.acquiredJobDetails.set(messageId, jobDetails);
+      log()?.info(`[BrokerProxy] Acquired job ${jobId} (messageId=${messageId}) upstream, stored details`);
+
+      // Extract run_id, job ID, actor, sha, ref from job details
+      let githubInfo: GitHubJobInfo = {};
+      try {
+        const parsed = JSON.parse(jobDetails);
+        githubInfo = extractGitHubJobInfo(parsed.contextData);
+        log()?.info(`[BrokerProxy] Extracted: run_id=${githubInfo.githubRunId}, job_id=${githubInfo.githubJobId}, repo=${githubInfo.githubRepo}, actor=${githubInfo.githubActor}, sha=${githubInfo.githubSha?.slice(0, 7)}, workflow=${githubInfo.githubWorkflow}`);
+      } catch (e) {
+        log()?.warn(`[BrokerProxy] Failed to parse job details for IDs: ${(e as Error).message}`);
       }
 
       // Rewrite run_service_url to point to our proxy
@@ -663,19 +665,17 @@ export class BrokerProxyService extends EventEmitter {
         assignedAt: new Date(),
       });
 
-      // Queue target assignment for the worker that will be spawned
-      this.pendingTargetAssignments.push(targetId);
-
       // Record the repository this job belongs to under every id the runner
       // might present. A worker announces which job it is taking via
-      // acquirejob, and that is the only binding of job to worker that does
-      // not race: the queue decides which worker wins, not the spawn.
+      // acquirejob, and its proxy installs that job's policy then - looked up
+      // only among the jobs delivered to that worker (getJobTargetForWorker).
       const jobTarget = { targetDisplayName: state.target.displayName, githubSha: githubInfo.githubSha };
       this.jobTargets.set(jobId, jobTarget);
       this.jobTargets.set(messageId, jobTarget);
 
-      // Emit event to spawn worker for job messages only
-      // Include IDs so we can construct the job URL and check user filter directly
+      // Admission decides from here: it announces the worker it spawns for
+      // the job (expectWorkerForJob), or drops the job (dropJob). Until one of
+      // those happens no session can take it.
       this.emit('job-received', state.target.id, jobId, instance.runner.agentName, githubInfo);
       this.emitStatusUpdate();
     } else {
@@ -1197,24 +1197,6 @@ export class BrokerProxyService extends EventEmitter {
   }
 
   /**
-   * Delete a map's entry for a key and every alias key whose value is the
-   * same object. Aliases are found by identity (===), not by shape, so every
-   * alias of an entry must be set from the one object the primary key holds -
-   * as jobTargets does at its single insertion site, setting the request id
-   * and the message id from one literal. A copy stored under an alias would
-   * not be found. (The string-valued maps cleared alongside compare by ===
-   * too, which for strings is value equality.)
-   */
-  private deleteByKeyAndValue<V>(map: Map<string, V>, key: string): void {
-    const value = map.get(key);
-    map.delete(key);
-    if (value === undefined) return;
-    for (const [k, v] of map) {
-      if (v === value) map.delete(k);
-    }
-  }
-
-  /**
    * Acknowledge a message to GitHub so it won't be sent again.
    */
   private async acknowledgeMessageUpstream(state: TargetState, instance: RunnerInstanceState, messageId: string): Promise<void> {
@@ -1357,16 +1339,6 @@ export class BrokerProxyService extends EventEmitter {
   }
 
   /**
-   * The target a new worker session belongs to, or none.
-   *
-   * A worker spawned for a job carries the repository's approved sandbox
-   * policy; a listener spawned ahead of any job runs in the generic sandbox
-   * and must not be handed one. The runner names itself in the request, so a
-   * session is bound only when the target it is registered under has a job
-   * waiting, and it takes that entry rather than whichever is first. An
-   * unnamed request falls back to the positional queue.
-   */
-  /**
    * Issue the broker URL for a worker being started in a slot, revoking the
    * key of whatever ran there before. The target is the one the worker was
    * spawned for, if any; the worker is then that target's runner in the slot,
@@ -1380,11 +1352,26 @@ export class BrokerProxyService extends EventEmitter {
     return this.workerUrl(key);
   }
 
-  /** Revoke the key of the worker in a slot, and the sessions it opened. */
+  /**
+   * Revoke the key of the worker in a slot, and the sessions it opened.
+   *
+   * A worker is --once, so its key is revoked when its job is over: the
+   * worker exited, was reaped, or its slot is being started again. What was
+   * kept for the jobs delivered to it - repository, routing, any payload it
+   * never acquired - goes with it. jobTargets was otherwise pruned only for a
+   * withdrawn worker, so every job ever run stayed resolvable by id for the
+   * life of the process.
+   */
   revokeWorkerKey(instanceNum: number): void {
     for (const [key, worker] of this.workerKeys) {
       if (worker.instanceNum !== instanceNum) continue;
       this.workerKeys.delete(key);
+      for (const id of this.deliveredToWorker.get(key) ?? []) {
+        this.jobTargets.delete(id);
+        this.jobRunServiceUrls.delete(id);
+        this.jobInfo.delete(id);
+        this.acquiredJobDetails.delete(id);
+      }
       this.deliveredToWorker.delete(key);
       for (const [id, session] of this.localSessions) {
         if (session.workerKey === key) this.localSessions.delete(id);
@@ -1429,97 +1416,109 @@ export class BrokerProxyService extends EventEmitter {
 
   /**
    * Withdraw a worker that will never take the job it was spawned for, so its
-   * name cannot later bind a session to a job it was not spawned for.
+   * key cannot later bind a session to a job it was not spawned for.
    *
-   * With the job's id, the job goes too. Queues are per target and drained in
-   * order, so a job left behind is handed to the next worker spawned for the
-   * repository, which runs it in place of its own - the job history has by then
-   * recorded it as failed, and every later job is off by one.
+   * With the job's id, the job goes too. A job left behind holds its payload
+   * here for the life of the process, with nothing that will ever run it.
    */
   forgetExpectedWorker(targetId: string, instanceNum: number, jobId?: string): void {
-    const neverBound = this.expectedWorkers.delete(BrokerProxyService.expectKey(targetId, instanceNum));
+    this.expectedWorkers.delete(BrokerProxyService.expectKey(targetId, instanceNum));
     if (!jobId) return;
-
-    // Drop the job from the queue if it is still there. It may already be
-    // gone: the worker polled the message and then died before acquirejob -
-    // the deadline/exit path. The cleanup below must run either way, or the
-    // job's secrets stay resident under both id aliases.
-    const queue = this.messageQueues.get(targetId);
-    const index = queue?.findIndex(
-      message => isJobAssignmentMessage(message) && jobIdFromMessage(message) === jobId
-    ) ?? -1;
-    if (queue && index >= 0) {
-      queue.splice(index, 1);
-    }
-    // Binding consumes an assignment. A worker that never bound still holds
-    // one, whether or not its message is still queued (it may have polled the
-    // message and then died); drop it, or the next worker takes an assignment
-    // for a job that was abandoned.
-    if (neverBound) {
-      const pending = this.pendingTargetAssignments.indexOf(targetId);
-      if (pending >= 0) this.pendingTargetAssignments.splice(pending, 1);
-    }
-
-    // Clear every trace of the job, keyed by value so both the runner-request-id
-    // and broker-message-id aliases go without needing the queued message in
-    // hand. The acquired payload holds secrets; the run-service URL and job
-    // info are the upstream routing for job operations.
-    this.jobAssignments.delete(jobId);
-    this.forgetAcquiredJob(jobId);
-    const runServiceUrl = this.jobRunServiceUrls.get(jobId);
-    this.deleteByKeyAndValue(this.jobTargets, jobId);
-    if (runServiceUrl !== undefined) {
-      for (const [key, value] of this.jobRunServiceUrls) {
-        if (value === runServiceUrl) this.jobRunServiceUrls.delete(key);
-      }
-      for (const [key, info] of this.jobInfo) {
-        if (info.runServiceUrl === runServiceUrl) this.jobInfo.delete(key);
-      }
-    } else {
-      this.jobRunServiceUrls.delete(jobId);
-    }
+    this.dropJob(targetId, jobId);
     log()?.info(`[BrokerProxy] Dropped job ${jobId} for ${targetId}: its worker ${instanceNum} will never take it`);
   }
 
+  /**
+   * Forget a job entirely: its queued messages, its acquired payload, and the
+   * routing and repository kept for it under every id it goes by.
+   *
+   * The job was acquired upstream and its payload - the job's secrets - stored
+   * before admission decided anything. Admission calls this for a job it
+   * admitted but could not start a worker for, and a withdrawn worker's job
+   * goes the same way. Its dedup entry goes too: nothing decided the job may
+   * not run, so if GitHub offers it again that offer is the retry. The message
+   * may already be gone from the queue (a withdrawn worker polled it and died
+   * before acquirejob); the rest is cleared either way. Idempotent.
+   */
+  dropJob(targetId: string, jobId: string): void {
+    this.discardJob(targetId, jobId);
+    this.jobAssignments.delete(jobId);
+  }
+
+  /**
+   * Drop a job admission refused - by the user filter, the policy gate, or for
+   * a target it no longer knows - and remember that it was seen.
+   *
+   * Everything dropJob clears goes, but the dedup entry stays. Job messages
+   * are never acknowledged upstream, so GitHub can offer the job again, and
+   * the verdict would be the same: without the entry every such offer was
+   * refused anew, with another history row, notification and cancel. The
+   * entry holds no secrets, only the job's id and where it came from.
+   */
+  refuseJob(targetId: string, jobId: string): void {
+    this.discardJob(targetId, jobId);
+  }
+
+  private discardJob(targetId: string, jobId: string): void {
+    const aliases = this.aliasesOf(jobId);
+    const queue = this.messageQueues.get(targetId);
+    if (queue) {
+      // The assignment, and any cancellation queued for it: with the job gone
+      // no worker will hold it, so a cancellation has nobody to go to.
+      const kept = queue.filter(message => jobIdFromMessage(message) !== jobId);
+      queue.splice(0, queue.length, ...kept);
+    }
+    // By alias, not by value: jobs of one target commonly share a run-service
+    // URL, so clearing every entry with this job's URL cut the routing of
+    // whichever other job was live, and its renew and finish went astray.
+    for (const id of aliases) {
+      this.acquiredJobDetails.delete(id);
+      this.jobTargets.delete(id);
+      this.jobRunServiceUrls.delete(id);
+      this.jobInfo.delete(id);
+    }
+  }
+
+  /**
+   * Every id a job is stored under: its runner request id and its broker
+   * message id. Both keys of jobTargets are set from one object at its single
+   * insertion site, and both keys of acquiredJobDetails from one string, so an
+   * alias is found by identity with the primary key's entry.
+   */
+  private aliasesOf(jobId: string): string[] {
+    const aliases = new Set([jobId]);
+    const target = this.jobTargets.get(jobId);
+    if (target !== undefined) {
+      for (const [id, value] of this.jobTargets) if (value === target) aliases.add(id);
+    }
+    const details = this.acquiredJobDetails.get(jobId);
+    if (details !== undefined) {
+      for (const [id, value] of this.acquiredJobDetails) if (value === details) aliases.add(id);
+    }
+    return [...aliases];
+  }
+
+  /**
+   * The target a new worker session belongs to, and the job it is for - or
+   * none.
+   *
+   * Only through the expectation admission set when it spawned this worker for
+   * a job, looked up by the key's (targetId, instanceNum): never by the name
+   * in the request, which is the caller's to write and can collide across
+   * targets. A worker with no expectation - an idle listener, or a slot
+   * restarted after its expectation was used - stays unbound and can take
+   * nothing, and so can a worker whose expectation names no job.
+   */
   private resolveSessionTarget(
-    worker: { instanceNum: number; targetId?: string },
-    claimedAgentName: string | undefined
-  ): { targetId: string; jobId?: string } | undefined {
-    // A worker spawned for a target is bound by its key's (targetId,
-    // instanceNum) - never by the runner's self-reported name, which can
-    // collide across targets. The expectation, if any, adds the specific job.
-    if (worker.targetId !== undefined) {
-      const k = BrokerProxyService.expectKey(worker.targetId, worker.instanceNum);
-      const expected = this.expectedWorkers.get(k);
-      if (expected !== undefined) {
-        this.expectedWorkers.delete(k);
-        const pending = this.pendingTargetAssignments.indexOf(worker.targetId);
-        if (pending >= 0) this.pendingTargetAssignments.splice(pending, 1);
-        return { targetId: worker.targetId, jobId: expected.jobId };
-      }
-      // No expectation yet: fall back to a queued assignment for this worker's
-      // own target (from its key, so no agentName collision), the same
-      // order-based path as before. Without one, it stays unbound - a worker
-      // nobody assigned a job to must not win one.
-      const pending = this.pendingTargetAssignments.indexOf(worker.targetId);
-      if (pending < 0) return undefined;
-      this.pendingTargetAssignments.splice(pending, 1);
-      return { targetId: worker.targetId };
-    }
-    // A keyless-target worker is an idle listener started ahead of any job. It
-    // binds only through the positional assignment, and only under its own
-    // registered name, never taking a job it was not spawned for.
-    if (!claimedAgentName) return undefined;
-    for (const state of this.targets.values()) {
-      for (const instance of state.instances.values()) {
-        if (instance.runner.agentName !== claimedAgentName) continue;
-        const pending = this.pendingTargetAssignments.indexOf(state.target.id);
-        if (pending < 0) return undefined;
-        this.pendingTargetAssignments.splice(pending, 1);
-        return { targetId: state.target.id };
-      }
-    }
-    return undefined;
+    worker: { instanceNum: number; targetId?: string }
+  ): { targetId: string; jobId: string } | undefined {
+    if (worker.targetId === undefined) return undefined;
+    const k = BrokerProxyService.expectKey(worker.targetId, worker.instanceNum);
+    const expected = this.expectedWorkers.get(k);
+    if (expected === undefined) return undefined;
+    this.expectedWorkers.delete(k);
+    if (expected.jobId === undefined) return undefined;
+    return { targetId: worker.targetId, jobId: expected.jobId };
   }
 
   private async handleSessionCreate(req: http.IncomingMessage, res: http.ServerResponse, key: string): Promise<void> {
@@ -1537,9 +1536,9 @@ export class BrokerProxyService extends EventEmitter {
       log()?.warn(`[BrokerProxy] Worker ${worker.instanceNum} named itself ${claimed}; binding it as ${agentName ?? 'nothing'}`);
     }
     // One worker key, one bound session. The key rides in the run-service URL
-    // the job holds, so job code could call the session endpoint again; a
-    // second session would reach the arrival-order fallback and could bind
-    // another queued job and receive its payload. The state lives on the key,
+    // the job holds, so job code could call the session endpoint again. The
+    // first bind consumes the key's expectation, so a second finds none; this
+    // holds even if one were set again for the slot. The state lives on the key,
     // not on the session: a job can DELETE its session and ask again, and the
     // guard must survive that. A --once worker deletes its session only at
     // exit, and the broker never forwards the refresh message that makes a
@@ -1549,16 +1548,17 @@ export class BrokerProxyService extends EventEmitter {
       log()?.warn(`[BrokerProxy] Worker ${worker.instanceNum} already has a bound session; leaving this request unbound`);
     }
     log()?.info(`[BrokerProxy] Session request from ${agentName ?? 'unnamed runner'}`);
-    const resolved = keyAlreadyBound ? undefined : this.resolveSessionTarget(worker, claimed);
+    const resolved = keyAlreadyBound ? undefined : this.resolveSessionTarget(worker);
     const targetId = resolved?.targetId;
     const expectedJobId = resolved?.jobId;
     if (targetId) worker.bound = true;
     if (!targetId) {
       // getMessageForTarget refuses to hand anything to a session with no
       // target, so this worker cannot receive a queued job however long it
-      // polls. If a job was queued for the target this worker was spawned for,
-      // it waits for some later worker instead - which is what a job sitting
-      // 451s before its first step looks like from outside.
+      // polls. For an idle listener that is the point. For a worker spawned
+      // for a job it means its job is stranded until the acquire deadline
+      // reaps the worker and drops the job - which, logged here, is what a
+      // job sitting minutes before its first step looks like from outside.
       const waiting = [...this.messageQueues.entries()]
         .filter(([, q]) => q.length > 0)
         .map(([id, q]) => `${id}:${q.length}`);
@@ -1680,12 +1680,11 @@ export class BrokerProxyService extends EventEmitter {
 
     // Helper to get a message for this session's target
     const getMessageForTarget = (): string | undefined => {
-      if (!targetId) {
-        // No target assigned - this worker was scaled up preemptively or recycled
-        // without a job. It should NOT steal messages from target-specific queues.
-        // Only workers spawned for specific jobs should receive messages.
-        return undefined;
-      }
+      // A session with no job of its own takes nothing: not a job, which is
+      // how a refused job's leftovers reached an idle listener, and not a
+      // cancellation, which belongs to the worker running that job. Binding
+      // always carries a job, so this is a session that never bound.
+      if (!targetId || !session.expectedJobId) return undefined;
       const queue = this.messageQueues.get(targetId);
       if (!queue || queue.length === 0) return undefined;
 
@@ -1694,32 +1693,16 @@ export class BrokerProxyService extends EventEmitter {
       // sandboxes from different commits before spawn; handing a worker the
       // other job would run it under the wrong per-SHA policy. It waits for its
       // own message rather than taking another.
-      if (session.expectedJobId) {
-        const mineJob = queue.findIndex(
-          message => isJobAssignmentMessage(message) && jobIdFromMessage(message) === session.expectedJobId
-        );
-        if (mineJob >= 0) return queue.splice(mineJob, 1)[0];
-        // Its job is not queued yet. Once it holds one, a cancellation naming
-        // that job may follow; anything else waits.
-        const held = session.currentJobId;
-        if (!held) return undefined;
-        const mineCancel = queue.findIndex(message => jobIdFromMessage(message) === held);
-        return mineCancel >= 0 ? queue.splice(mineCancel, 1)[0] : undefined;
-      }
-
-      // No specific job (an idle worker that picked one up without a spawn).
-      // The job goes first. A cancellation queued ahead of it is for a job
-      // this worker doesn't hold yet; it follows on the next poll.
-      const jobIndex = queue.findIndex(isJobAssignmentMessage);
-      if (jobIndex >= 0) return queue.splice(jobIndex, 1)[0];
-
-      // No job queued. Taking the head anyway handed a worker holding no job
-      // somebody else's cancellation - stealing it from the worker that runs
-      // that job. A cancellation goes only to the worker whose job it names.
+      const mineJob = queue.findIndex(
+        message => isJobAssignmentMessage(message) && jobIdFromMessage(message) === session.expectedJobId
+      );
+      if (mineJob >= 0) return queue.splice(mineJob, 1)[0];
+      // Its job is not queued yet. Once it holds one, a cancellation naming
+      // that job may follow; anything else waits.
       const held = session.currentJobId;
       if (!held) return undefined;
-      const mine = queue.findIndex(message => jobIdFromMessage(message) === held);
-      return mine >= 0 ? queue.splice(mine, 1)[0] : undefined;
+      const mineCancel = queue.findIndex(message => jobIdFromMessage(message) === held);
+      return mineCancel >= 0 ? queue.splice(mineCancel, 1)[0] : undefined;
     };
 
     // Helper to extract job ID from message and mark session
@@ -1822,10 +1805,21 @@ export class BrokerProxyService extends EventEmitter {
   }
 
   /**
-   * The repository and commit a job belongs to, by jobId or messageId.
+   * The repository and commit of a job, by jobId or messageId - answered only
+   * for the worker in the slot the job was delivered to.
+   *
+   * A worker's proxy asks this when the worker POSTs acquirejob, and installs
+   * that repository's policy. The id comes from the request body, which job
+   * code can write: answered for any id, a job naming another repository's
+   * job took that repository's hosts. The proxy is per slot, and a slot has
+   * one live key, so the slot names the worker.
    */
-  getJobTarget(jobId: string): { targetDisplayName: string; githubSha?: string } | undefined {
-    return this.jobTargets.get(jobId);
+  getJobTargetForWorker(instanceNum: number, jobId: string): { targetDisplayName: string; githubSha?: string } | undefined {
+    for (const [key, worker] of this.workerKeys) {
+      if (worker.instanceNum !== instanceNum) continue;
+      return this.deliveredToWorker.get(key)?.has(jobId) ? this.jobTargets.get(jobId) : undefined;
+    }
+    return undefined;
   }
 
   /**

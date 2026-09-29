@@ -610,6 +610,12 @@ export class GitHubAuth {
     let page = 1;
     const perPage = 100;
 
+    // anon=0 leaves out authors with no linked account, so an unattributed
+    // commit already on the default branch when this baseline is taken is not
+    // seen; getCommitAuthors marks only those after it. Counting them here
+    // (anon=1) would refuse every repository with one anywhere in its history,
+    // with no allowlist entry that could admit it - a product decision, not
+    // yet made.
     while (true) {
       const data = await client.get<Array<{ login: string }>>(
         `/repos/${owner}/${repo}/contributors`,
@@ -654,6 +660,7 @@ export class GitHubAuth {
       const data = await client.get<{
         total_commits: number;
         commits: Array<{
+          sha: string;
           author: { login: string } | null;
           commit: { author: { name: string } | null };
         }>;
@@ -670,9 +677,15 @@ export class GitHubAuth {
       }
 
       for (const commit of data.commits || []) {
-        // Prefer the GitHub user login if available
         if (commit.author?.login) {
           authors.add(commit.author.login.toLowerCase());
+        } else {
+          // No linked account: the commit's email belongs to nobody GitHub
+          // knows, which is anyone who can get a commit merged or pushed.
+          // Skipping it read as "no new authors". It stands in the set under
+          // a name no login can equal (logins are alphanumerics and hyphens),
+          // so no allowlist admits it and the refusal says which commit.
+          authors.add(`(unattributed ${commit.sha ? commit.sha.slice(0, 7) : 'commit'})`);
         }
       }
     } catch (error) {
