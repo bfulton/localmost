@@ -9,6 +9,7 @@ jest.mock('fs', () => ({
   writeFileSync: jest.fn(),
   unlinkSync: jest.fn(),
   mkdirSync: jest.fn(),
+  realpathSync: jest.fn((p: string) => p),
 }));
 
 // Mock child_process
@@ -61,6 +62,7 @@ describe('Process Sandbox', () => {
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -87,6 +89,7 @@ describe('Process Sandbox', () => {
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -112,6 +115,7 @@ describe('Process Sandbox', () => {
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -134,6 +138,7 @@ describe('Process Sandbox', () => {
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -153,6 +158,7 @@ describe('Process Sandbox', () => {
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -173,6 +179,7 @@ describe('Process Sandbox', () => {
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -193,6 +200,7 @@ describe('Process Sandbox', () => {
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -238,6 +246,7 @@ describe('Process Sandbox', () => {
           writeFileSync: jest.fn(),
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -289,6 +298,7 @@ describe('Process Sandbox', () => {
         writeFileSync: mockWriteFileSync,
         unlinkSync: jest.fn(),
         mkdirSync: jest.fn(),
+        realpathSync: jest.fn((p: string) => p),
       }));
 
       const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -821,6 +831,34 @@ describe('Process Sandbox', () => {
       expect(onLog).not.toHaveBeenCalledWith('error', expect.anything());
     });
 
+    it('never lets a job rename a directory above them, whatever the policy grants', () => {
+      // The deny of the app's directories matches paths. Renaming the
+      // directory above one moves it out from under the deny, where the job
+      // reads and writes it under the new name before moving it back - or
+      // leaves a link in its place for the app to write through. So the
+      // directories above them are closed to writes as nodes, after every
+      // grant; what is inside them stays as granted.
+      const covering = ['~', '/', '/Users', '/tmp'];
+      const profile = profileWith({
+        filesystemPolicy: { level: 'strict', read: covering, write: covering },
+        toolCacheDir: ownToolCache,
+      });
+      for (const node of [os.homedir(), path.dirname(os.homedir()), '/tmp']) {
+        expect(writable(profile, node)).toBe(false);
+      }
+      for (const target of [
+        path.join(os.homedir(), 'project'),
+        path.join(os.homedir(), 'Library', 'Application Support', 'another-app'),
+        path.join(path.dirname(os.homedir()), 'Shared', 'file'),
+        '/tmp/elsewhere',
+      ]) {
+        expect(writable(profile, target)).toBe(true);
+      }
+      // Nodes, not subtrees: the job's own sandbox and caches are as before.
+      expect(writable(profile, path.join(instanceDir, '_work', 'out'))).toBe(true);
+      expect(writable(profile, path.join(ownToolCache, 'node'))).toBe(true);
+    });
+
     it('notes a grant that reaches them in another case, since seatbelt matches it all the same', () => {
       // On the default APFS volume seatbelt matches a path whatever its case,
       // so ~/.LOCALMOST grants what ~/.localmost would, and the deny of the
@@ -902,10 +940,33 @@ describe('Process Sandbox', () => {
         expect(writable(profile, `/private${unborn}/runner/arc/run.sh`)).toBe(false);
         expect(readable(profile, `/private${userDataDir}/Cookies`)).toBe(false);
         expect(writable(profile, '/private/tmp/elsewhere')).toBe(true);
+        // Nor the directory on the way to it that is not there yet either,
+        // where a link planted now would carry the app's directory elsewhere.
+        expect(writable(profile, path.dirname(unborn))).toBe(false);
+        expect(writable(profile, `/private${path.dirname(unborn)}`)).toBe(false);
+        expect(writable(profile, `/private${path.dirname(unborn)}-sibling`)).toBe(true);
       } finally {
         if (previous === undefined) delete process.env.LOCALMOST_CONFIG_DIR;
         else process.env.LOCALMOST_CONFIG_DIR = previous;
       }
+    });
+
+    it("refuses to build a profile when an app directory's real path cannot be looked up", () => {
+      // Only a directory that is not there yet is walked up from; any other
+      // failure leaves the spelling seatbelt matches unknown, and a deny
+      // under the wrong one would not hold.
+      let build: () => string = () => '';
+      jest.isolateModules(() => {
+        jest.doMock('fs', () => ({
+          ...jest.requireActual('fs'),
+          realpathSync: jest.fn(() => {
+            throw Object.assign(new Error('EACCES: permission denied, realpath'), { code: 'EACCES' });
+          }),
+        }));
+        const { generateSandboxProfile } = require('./process-sandbox');
+        build = () => generateSandboxProfile({ instanceDir });
+      });
+      expect(build).toThrow(/EACCES/);
     });
   });
 
@@ -962,8 +1023,8 @@ describe('Process Sandbox', () => {
     });
 
     it('keeps a deny that covers the app directories, since a deny only narrows', () => {
-      // Dropping it, as a grant there is dropped, would quietly widen what
-      // the approved policy says: /tmp contains the mock's userData directory.
+      // Dropping it would quietly widen what the approved policy says: /tmp
+      // contains the mock's userData directory.
       const profile = profileWith({
         filesystemPolicy: { level: 'strict', read: [], write: [], deny: ['/tmp', '~/.localmost/logs'] },
       });
@@ -1119,6 +1180,7 @@ describe('Process Sandbox', () => {
           writeFileSync: mockWriteFileSync,
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
         sandboxedSpawn(path.join(instanceDir, 'run.sh'), [], { cwd: instanceDir, proxyPort });
@@ -1141,6 +1203,7 @@ describe('Process Sandbox', () => {
           writeFileSync: mockWriteFileSync,
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -1170,6 +1233,7 @@ describe('Process Sandbox', () => {
           writeFileSync: mockWriteFileSync,
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -1217,6 +1281,7 @@ describe('Process Sandbox', () => {
           writeFileSync: jest.fn(),
           unlinkSync: mockUnlinkSync,
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -1244,6 +1309,7 @@ describe('Process Sandbox', () => {
           writeFileSync: mockWriteFileSync,
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -1273,6 +1339,7 @@ describe('Process Sandbox', () => {
           writeFileSync: mockWriteFileSync,
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -1305,6 +1372,7 @@ describe('Process Sandbox', () => {
           writeFileSync: mockWriteFileSync,
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -1332,6 +1400,7 @@ describe('Process Sandbox', () => {
           writeFileSync: mockWriteFileSync,
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -1360,6 +1429,7 @@ describe('Process Sandbox', () => {
           writeFileSync: mockWriteFileSync,
           unlinkSync: jest.fn(),
           mkdirSync: jest.fn(),
+          realpathSync: jest.fn((p: string) => p),
         }));
 
         const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');

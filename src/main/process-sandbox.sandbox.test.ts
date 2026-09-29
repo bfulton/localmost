@@ -268,6 +268,26 @@ if (!isMacOS) {
       expect(canCreateUnder(run, path.join(parent, 'app'))).toBe(false);
     });
 
+    it("refuses the directories on the way to the app's data directory before they exist", () => {
+      // A job granted the directory above could otherwise put a link where
+      // the app will later create the rest of the way down, and have the
+      // app's directory made wherever the link points.
+      const parent = path.join(base, 'unborn-above');
+      const elsewhere = path.join(base, 'unborn-elsewhere');
+      fs.mkdirSync(parent, { recursive: true });
+      fs.mkdirSync(elsewhere, { recursive: true });
+      const middle = path.join(parent, 'middle');
+      const run = underProfileText(profileWithAppDir(path.join(middle, 'app'), {
+        filesystemPolicy: { level: 'strict', read: [], write: [parent, elsewhere] },
+      }));
+      expect(canCreate(run, path.join(parent, probeName()))).toBe(true);
+      const linked = run(`/bin/ln -s '${elsewhere}' '${middle}'`);
+      const made = run(`/bin/mkdir '${middle}'`);
+      fs.rmSync(middle, { recursive: true, force: true });
+      expect(linked.ok).toBe(false);
+      expect(made.ok).toBe(false);
+    });
+
     it("refuses reads of the app's data directory granted in another case", () => {
       // seatbelt matches paths case-insensitively on the default APFS volume,
       // so a grant spelled in capitals reaches what the lower-case one would:
@@ -395,11 +415,31 @@ if (!isMacOS) {
         for (const file of [
           path.join(appDir, 'logs', 'app.log'),
           path.join(otherCache, 'node'),
+          // Refused here by the deny of the app's directories as much as by
+          // name; the unit test that evaluates the named deny on its own is
+          // what shows the name covers it.
           path.join(appDir, 'runner', 'broker-sessions.json.tmp'),
           path.join(userData, 'Cookies'),
         ]) {
           expect(cat(run, file)).toBe(false);
         }
+      });
+
+      it("cannot move the app's directories out from under the deny by renaming a directory above them", () => {
+        // Renamed, the directory would sit outside the path the deny names,
+        // readable and writable under ~ until moved back. Each rename is
+        // undone from outside the sandbox should the sandbox let it through.
+        const run = underHomeGrant();
+        const cookies = path.join(userData, 'Cookies');
+        for (const above of [path.dirname(userData), path.join(home, 'Library'), home]) {
+          const moved = `${above}-moved`;
+          const result = run(`/bin/mv '${above}' '${moved}' && /bin/cat '${path.join(moved, path.relative(above, cookies))}'`);
+          if (fs.existsSync(moved)) fs.renameSync(moved, above);
+          expect(result.stdout).not.toContain('cookies');
+          expect(result.ok).toBe(false);
+          expect(result.stderr).toContain('Operation not permitted');
+        }
+        expect(fs.readFileSync(cookies, 'utf-8')).toBe('cookies');
       });
 
       it("cannot read another worker's sandbox", () => {
@@ -571,6 +611,18 @@ if (!isMacOS) {
       const target = path.join(appDir, probeName());
       const result = run(`/usr/bin/touch '${target}'`);
       fs.rmSync(target, { force: true });
+      expect(result.ok).toBe(false);
+      expect(result.stderr).toContain('Operation not permitted');
+    });
+
+    it("refuses reads in the app's own data directory outside the job's own sandbox", () => {
+      // The runner template every worker is copied from, which is certainly
+      // there while a job runs; listing it is a read of the directory itself.
+      const sandboxDir = path.dirname(fs.realpathSync(os.tmpdir()));
+      const runnerDir = path.dirname(path.dirname(sandboxDir));
+      expect(path.basename(runnerDir)).toBe('runner');
+      expect(fs.existsSync(path.join(runnerDir, 'arc'))).toBe(true);
+      const result = run(`/bin/ls '${path.join(runnerDir, 'arc')}'`);
       expect(result.ok).toBe(false);
       expect(result.stderr).toContain('Operation not permitted');
     });

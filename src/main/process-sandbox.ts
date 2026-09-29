@@ -279,13 +279,17 @@ export function generateSandboxProfile({
   // app directory configured through the /var symlink: each directory is
   // denied as configured and as it really is. For one that does not exist
   // yet, that is its nearest existing ancestor's real path with the rest
-  // appended, so a job granted the parent cannot plant it first.
+  // appended, so a job granted the parent cannot plant it first. Any other
+  // failure leaves the spelling seatbelt matches unknown, so it stops the
+  // spawn rather than leaving the deny under the configured spelling alone.
   const realPath = (dir: string): string => {
     const missing: string[] = [];
     for (let node = path.resolve(dir); ; node = path.dirname(node)) {
       try {
         return path.join(fs.realpathSync(node), ...missing);
-      } catch {
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
         if (node === path.dirname(node)) return path.resolve(dir);
         missing.unshift(path.basename(node));
       }
@@ -418,6 +422,18 @@ export function generateSandboxProfile({
   const appDirsDenied = appDirSpellings
     .map((dir) => `  (subpath "${dir.replace(/"/g, '\\"')}")`)
     .join('\n');
+  // Every directory above them, in each of those spellings, up to but not
+  // including /: the deny matches paths, so renaming one of these would move
+  // an app directory out from under it. Those not created yet too, where a
+  // link planted now would carry the app's directory wherever it points.
+  const appDirAncestors = [...new Set(appDirSpellings.flatMap((dir) => {
+    const nodes: string[] = [];
+    for (let node = path.dirname(dir); node !== path.dirname(node); node = path.dirname(node)) nodes.push(node);
+    return nodes;
+  }))];
+  const appDirAncestorsDenied = appDirAncestors.length
+    ? `(deny file-write*\n${appDirAncestors.map((node) => `  (literal "${node.replace(/"/g, '\\"')}")`).join('\n')})`
+    : ';; Both app directories sit at the root: nothing above them to rename';
   // The directory nodes in there on the way down to the job's own sandbox and
   // its target's caches - the app directory, runner/, runner/sandbox,
   // runner/caches and the like. .NET reads every ancestor of what it opens.
@@ -582,6 +598,11 @@ ${policyReads}
 ;; them so neither can be renamed away and replaced.
 (deny file-read* file-write*
 ${appDirsDenied})
+;; Nor the directories above them, as nodes: renaming one would move an app
+;; directory out from under the deny above, to be read and written under the
+;; new name. What is inside them stays as granted; nothing given back below
+;; lies above an app directory, so this is never reopened.
+${appDirAncestorsDenied}
 ;; Given back as nodes: the directories on the way down to the job's own
 ;; sandbox and caches. Before the policy's denies, so one over them still
 ;; stops the job rather than being quietly overridden.
