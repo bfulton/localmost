@@ -1905,7 +1905,7 @@ export class RunnerManager {
     );
     if (context) {
       this.recordRefusedJob({
-        repository: context.targetDisplayName,
+        repository: this.policyRepository(context),
         jobName: context.githubWorkflow ?? 'job',
         reason:
           'accepted but never started: a runner was spawned for this job and the job was never ' +

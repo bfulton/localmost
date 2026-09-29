@@ -76,6 +76,21 @@ describe('admitJob', () => {
     expect(deps.runnerManager.spawnWorkerForJob).not.toHaveBeenCalled();
   });
 
+  it("records an organization target's refused job under the job's repository", async () => {
+    // An org target's name is the organization alone. A refusal recorded
+    // under it named no repository, so history showed the org and Cancel
+    // from the status page found no run to cancel.
+    const orgTarget = { id: 't2', displayName: 'myorg' };
+    const { deps } = setup({
+      verdict: { allowed: false, reason: 'stranger' },
+      findTarget: (id: string) => (id === orgTarget.id ? orgTarget : undefined),
+    });
+
+    await admitJob(deps, 't2', 'req-1', { ...info, githubRepo: 'myorg/app' });
+
+    expect(deps.runnerManager.recordRefusedJob).toHaveBeenCalledWith(expect.objectContaining({ repository: 'myorg/app' }));
+  });
+
   it('has a failed cancel noted on the entry it recorded for this job', async () => {
     // Two jobs of one run can be refused at once; "the latest entry for the
     // run" can be the other one's by the time a cancel fails.

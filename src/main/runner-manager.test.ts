@@ -2727,6 +2727,27 @@ describe('RunnerManager', () => {
       expect(recorded.at(-1)?.actionsUrl).toContain('/job/2');
     });
 
+    it("reports an organization target's unstarted job under the job's repository", () => {
+      // An org target's name is the organization alone; recorded under it,
+      // the failure named no repository and could not be cancelled from the
+      // status page.
+      const { helper } = idlePool();
+      const events: JobEvent[] = [];
+      helper.setOnJobEvent((e) => events.push(e as JobEvent));
+      helper.setPendingTargetContext('1', {
+        targetId: 't2',
+        targetDisplayName: 'myorg',
+        githubRepo: 'myorg/app',
+        githubRunId: 1,
+        githubJobId: 2,
+        githubWorkflow: 'macos',
+      });
+
+      helper.reapUnclaimedWorker(1);
+
+      expect(events[0].repository).toBe('myorg/app');
+    });
+
     it('reclaims a worker that is still unclaimed when the deadline passes', () => {
       jest.useFakeTimers();
       try {

@@ -76,7 +76,9 @@ export async function admitJob(
       broker.refuseJob(targetId, jobId);
       told = true;
       const historyId = runnerManager.recordRefusedJob({
-        repository: target.displayName,
+        // The job's own repository: an organization target's name is the
+        // organization alone, which history and Cancel cannot act on.
+        repository: githubInfo.githubRepo ?? target.displayName,
         jobName: githubInfo.githubJobId ? `job ${githubInfo.githubJobId}` : jobId,
         reason,
         actionsUrl,
