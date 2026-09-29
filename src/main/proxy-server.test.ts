@@ -14,14 +14,21 @@ import { pinnedLookup } from '../shared/egress-screen';
 type AccessDecision = { allowed: boolean; reason?: string };
 
 /**
- * Ask a proxy whether a host is allowed.
+ * Ask a proxy whether a host is allowed, by default as a CONNECT to 443.
  * checkHostAccess is private; this mirrors the access pattern used in
  * discovery-proxy.test.ts so we exercise the real decision function.
  */
-function checkHost(proxy: ProxyServer, host: string): AccessDecision {
+function checkHost(
+  proxy: ProxyServer,
+  host: string,
+  port = 443,
+  via: 'connect' | 'http' = 'connect'
+): AccessDecision {
   return (
-    proxy as unknown as { checkHostAccess(host: string): AccessDecision }
-  ).checkHostAccess(host);
+    proxy as unknown as {
+      checkHostAccess(host: string, port: number, via: 'connect' | 'http'): AccessDecision;
+    }
+  ).checkHostAccess(host, port, via);
 }
 
 function makeProxy(
@@ -187,6 +194,121 @@ describe('ProxyServer host access', () => {
       expect(
         checkHost(makeProxy('strict'), 'notgithub.com').allowed
       ).toBe(false);
+    });
+  });
+
+  // =========================================================================
+  // Ports
+  //
+  // A host on the allowlist is reached on the port its scheme uses - 443
+  // through CONNECT, 80 for plain HTTP - and on another port only when the
+  // policy spells host:port. Allowing a name used to allow every port on it:
+  // github.com:22, or any service a CDN or cloud host happens to expose.
+  // =========================================================================
+
+  describe('ports', () => {
+    it('refuses an allowed host on a port its scheme does not use', () => {
+      const proxy = makeProxy('strict');
+      expect(checkHost(proxy, 'github.com', 22)).toEqual({ allowed: false, reason: 'port' });
+      expect(checkHost(proxy, 'github.com', 80, 'connect').allowed).toBe(false);
+      expect(checkHost(proxy, 'github.com', 443, 'http').allowed).toBe(false);
+      expect(checkHost(proxy, 'github.com', 443, 'connect').allowed).toBe(true);
+      expect(checkHost(proxy, 'github.com', 80, 'http').allowed).toBe(true);
+    });
+
+    it('pins the moderate defaults and the policy hosts the same way', () => {
+      expect(checkHost(makeProxy('moderate'), 'registry.npmjs.org', 8443).reason).toBe('port');
+      const proxy = makeProxy('strict', ['svc.example.test', '*.cdn.example.test']);
+      expect(checkHost(proxy, 'svc.example.test', 8443)).toEqual({ allowed: false, reason: 'port' });
+      expect(checkHost(proxy, 'a.cdn.example.test', 8080, 'http').allowed).toBe(false);
+      expect(checkHost(proxy, 'svc.example.test', 443).allowed).toBe(true);
+    });
+
+    it('allows the port a policy entry spells, and only that port', () => {
+      const proxy = makeProxy('strict', ['svc.example.test:8443', '*.cdn.example.test:8080']);
+      expect(checkHost(proxy, 'svc.example.test', 8443)).toEqual({ allowed: true, reason: 'policy' });
+      expect(checkHost(proxy, 'svc.example.test', 8443, 'http').allowed).toBe(true);
+      expect(checkHost(proxy, 'svc.example.test', 443).allowed).toBe(false);
+      expect(checkHost(proxy, 'svc.example.test', 8444).allowed).toBe(false);
+      expect(checkHost(proxy, 'a.cdn.example.test', 8080, 'http').allowed).toBe(true);
+      expect(checkHost(proxy, 'cdn.example.test', 8080, 'http').allowed).toBe(false);
+    });
+
+    it('lets a spelled port reach an infrastructure host on it', () => {
+      expect(checkHost(makeProxy('strict', ['github.com:22']), 'github.com', 22)).toEqual({ allowed: true, reason: 'policy' });
+    });
+
+    it('matches nothing with an entry whose port is not a port', () => {
+      const proxy = makeProxy('strict', ['svc.example.test:https', 'svc.example.test:0', 'svc.example.test:65536']);
+      expect(checkHost(proxy, 'svc.example.test', 443).allowed).toBe(false);
+      expect(checkHost(proxy, 'svc.example.test', 0).allowed).toBe(false);
+    });
+
+    it('reads a bare IPv6 entry as an address, not as an address and a port', () => {
+      const proxy = makeProxy('strict', ['2606:4700::1111', '[2606:4700::64]:8443']);
+      expect(checkHost(proxy, '2606:4700::1111', 443).allowed).toBe(true);
+      expect(checkHost(proxy, '2606:4700::1111', 1111).allowed).toBe(false);
+      expect(checkHost(proxy, '2606:4700::64', 8443).allowed).toBe(true);
+      expect(checkHost(proxy, '2606:4700::64', 443).allowed).toBe(false);
+    });
+
+    it.each(['strict', 'moderate'] as const)('leaves loopback targets on any port under %s', (level) => {
+      // The broker is reached at 127.0.0.1 on its own port, over plain HTTP.
+      const proxy = makeProxy(level);
+      expect(checkHost(proxy, '127.0.0.1', 8787, 'http').allowed).toBe(true);
+      expect(checkHost(proxy, '127.0.0.1', 8787, 'connect').allowed).toBe(true);
+      expect(checkHost(proxy, 'localhost', 9229, 'http').allowed).toBe(true);
+    });
+
+    it('leaves permissive unrestricted, ports included', () => {
+      const proxy = makeProxy('permissive');
+      expect(checkHost(proxy, 'evil.example.com', 22).allowed).toBe(true);
+      expect(checkHost(proxy, '::1', 5432).allowed).toBe(true);
+    });
+
+    const authHeader = (token: string) => 'Basic ' + Buffer.from(`localmost:${token}`).toString('base64');
+    /** A proxy whose resolver never answers: a refusal has to come before the lookup. */
+    const refusingBeforeLookup = async () => {
+      const p = new ProxyServer({ policyLevel: 'strict', authToken: 't', lookup: () => new Promise<string[]>(() => undefined) });
+      await p.start();
+      return p;
+    };
+
+    it('answers 403 to CONNECT github.com:22 without resolving it', async () => {
+      const p = await refusingBeforeLookup();
+      try {
+        const status = await new Promise<string>((resolve) => {
+          const sock = net.connect(p.getPort(), '127.0.0.1', () =>
+            sock.write(`CONNECT github.com:22 HTTP/1.1\r\nHost: github.com:22\r\nProxy-Authorization: ${authHeader('t')}\r\n\r\n`)
+          );
+          sock.on('error', () => resolve('closed'));
+          sock.once('data', (d) => { resolve(d.toString().split('\r\n')[0]); sock.destroy(); });
+          setTimeout(() => { resolve('timeout'); sock.destroy(); }, 1000).unref();
+        });
+        expect(status).toBe('HTTP/1.1 403 Forbidden');
+      } finally { await p.stop(); }
+    });
+
+    it('tells a plain request which port was refused and how to allow it', async () => {
+      const p = await refusingBeforeLookup();
+      try {
+        const answer = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+          const req = http.request(
+            { hostname: '127.0.0.1', port: p.getPort(), path: 'http://github.com:8080/', method: 'GET', headers: { 'proxy-authorization': authHeader('t') } },
+            (res) => {
+              let body = '';
+              res.on('data', (d) => { body += d; });
+              res.on('end', () => resolve({ status: res.statusCode || 0, body }));
+            }
+          );
+          req.on('error', reject);
+          req.setTimeout(1000, () => req.destroy(new Error('timeout')));
+          req.end();
+        });
+        expect(answer.status).toBe(403);
+        expect(answer.body).toContain('port 8080');
+        expect(answer.body).toContain("'github.com:8080'");
+      } finally { await p.stop(); }
     });
   });
 

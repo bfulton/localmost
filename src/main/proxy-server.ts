@@ -14,9 +14,12 @@ import { SandboxPolicyLevel } from '../shared/types';
 import {
   HostLookup,
   dnsLookup,
+  hostPatternMatches,
   isBlockedAddress,
+  isLoopbackAddress,
   isProxyAuthorized,
   parseConnectTarget,
+  parseHostPattern,
   pinnedLookup,
   screenAddresses,
   stripProxyAuth,
@@ -34,8 +37,11 @@ export interface ProxyLogEntry {
   port: number;
   path?: string;
   blocked: boolean;
-  /** Why the request was allowed/blocked */
-  reason?: 'infrastructure' | 'policy' | 'allowlist' | 'moderate-default' | 'permissive';
+  /**
+   * Why the request was allowed/blocked. 'port' is a refusal of a host that
+   * is allowed, but not on the port asked for.
+   */
+  reason?: 'infrastructure' | 'policy' | 'allowlist' | 'moderate-default' | 'permissive' | 'port';
 }
 
 export type ProxyLogCallback = (entry: ProxyLogEntry) => void;
@@ -129,7 +135,9 @@ export class ProxyServer {
    *
    * A literal target is trusted as written - the broker is reached at the
    * literal 127.0.0.1, and the sandbox denies the broker port directly so the
-   * proxy is the only path. A name is not: it must resolve entirely to
+   * proxy is the only path. Every job can take that path: what guards the
+   * broker is the per-worker key in its URL, not the proxy or the port. A
+   * name is not trusted as written: it must resolve entirely to
    * routable, off-box addresses, so a repository-controlled hostname cannot
    * rebind to loopback (or any internal range) and reach a local service.
    */
@@ -145,53 +153,78 @@ export class ProxyServer {
   /**
    * Check if a host is allowed through the proxy based on policy level.
    * Returns { allowed: boolean, reason: string } for logging.
+   *
+   * `via` is how the host is asked for: a CONNECT tunnel or a plain HTTP
+   * request. An allowed host is reached on that scheme's port - 443 through
+   * CONNECT, 80 for plain HTTP - and on any other only when a policy entry
+   * spells host:port. Allowing a name used to allow every port on it, so
+   * github.com on the infrastructure list opened github.com:22 to every job.
+   * Loopback targets keep any port: the broker is reached at 127.0.0.1 on its
+   * own, and its per-worker key, not the port, is what guards it.
    */
-  private checkHostAccess(host: string): { allowed: boolean; reason: ProxyLogEntry['reason'] } {
+  private checkHostAccess(
+    host: string,
+    port: number,
+    via: 'connect' | 'http'
+  ): { allowed: boolean; reason: ProxyLogEntry['reason'] } {
     const normalizedHost = host.toLowerCase();
+    const onSchemePort =
+      normalizedHost === 'localhost' || isLoopbackAddress(normalizedHost) || port === (via === 'connect' ? 443 : 80);
 
-    // Permissive: allow everything
-    if (this.policyLevel === 'permissive') {
-      return { allowed: true, reason: 'permissive' };
-    }
-
-    // Helper to check if host matches a pattern
-    const matchesPattern = (pattern: string): boolean => {
-      if (pattern.startsWith('*.')) {
-        // Lowercase the suffix too: patterns come from .localmostrc and are
-        // hand-written, so *.GitHub.com must match api.github.com.
-        const suffix = pattern.slice(1).toLowerCase(); // Remove *
-        return normalizedHost.endsWith(suffix);
-      }
-      return normalizedHost === pattern.toLowerCase();
+    // Patterns are lowercased as they are read: they come from .localmostrc
+    // and are hand-written, so *.GitHub.com must match api.github.com.
+    const names = (entry: string): boolean => hostPatternMatches(parseHostPattern(entry), normalizedHost);
+    // The built-in lists never spell a port.
+    const builtIn = (entry: string): boolean => onSchemePort && names(entry);
+    // A policy entry that spells a port allows that port, and only that one;
+    // one that spells something that is not a port allows nothing.
+    const policyAllows = (entry: string): boolean => {
+      const pattern = parseHostPattern(entry);
+      if (!hostPatternMatches(pattern, normalizedHost)) return false;
+      return pattern.port === undefined ? onSchemePort : pattern.port === port;
     };
 
     // Runner infrastructure is allowed at every level - without it the runner
     // daemon cannot register or poll for jobs.
-    if (RUNNER_INFRASTRUCTURE_ALLOWLIST.some(matchesPattern)) {
+    if (RUNNER_INFRASTRUCTURE_ALLOWLIST.some(builtIn)) {
       return { allowed: true, reason: 'infrastructure' };
     }
 
+    // Permissive: allow everything, on any port
+    if (this.policyLevel === 'permissive') {
+      return { allowed: true, reason: 'permissive' };
+    }
+
     // Check policy allowlist (from .localmostrc)
-    if (this.policyAllowedHosts.some(matchesPattern)) {
+    if (this.policyAllowedHosts.some(policyAllows)) {
       return { allowed: true, reason: 'policy' };
     }
 
     // For moderate policy, also check the moderate defaults
-    if (this.policyLevel === 'moderate') {
-      if (MODERATE_NETWORK_ALLOWLIST.some(matchesPattern)) {
-        return { allowed: true, reason: 'moderate-default' };
-      }
+    if (this.policyLevel === 'moderate' && MODERATE_NETWORK_ALLOWLIST.some(builtIn)) {
+      return { allowed: true, reason: 'moderate-default' };
     }
 
     // For strict policy, nothing beyond infrastructure unless declared
-    if (this.policyLevel === 'strict') {
-      if (STRICT_NETWORK_ALLOWLIST.some(matchesPattern)) {
-        return { allowed: true, reason: 'allowlist' };
-      }
+    if (this.policyLevel === 'strict' && STRICT_NETWORK_ALLOWLIST.some(builtIn)) {
+      return { allowed: true, reason: 'allowlist' };
     }
 
-    // Not allowed
-    return { allowed: false, reason: undefined };
+    // Not allowed. A host that would have been allowed on its scheme's port
+    // is logged as refused for the port, so the log points at the fix.
+    const levelList = this.policyLevel === 'moderate' ? MODERATE_NETWORK_ALLOWLIST : STRICT_NETWORK_ALLOWLIST;
+    const named = [RUNNER_INFRASTRUCTURE_ALLOWLIST, this.policyAllowedHosts, levelList].some((list) => list.some(names));
+    return { allowed: false, reason: named ? 'port' : undefined };
+  }
+
+  /** The body of a 403 for a host checkHostAccess refused. */
+  private refusal(host: string, port: number, reason: ProxyLogEntry['reason']): string {
+    if (reason === 'port') {
+      const authority = net.isIP(host) === 6 ? `[${host}]:${port}` : `${host}:${port}`;
+      return `Blocked by sandbox policy (${this.policyLevel}): port ${port} is not allowed for host '${host}'; ` +
+        `a .localmostrc network entry '${authority}' allows it`;
+    }
+    return `Blocked by sandbox policy (${this.policyLevel}): host '${host}' not in allowlist`;
   }
 
   /**
@@ -291,7 +324,7 @@ export class ProxyServer {
     }
     const { host, port } = target;
 
-    const { allowed, reason } = this.checkHostAccess(host);
+    const { allowed, reason } = this.checkHostAccess(host, port, 'connect');
     this.log({ method: 'CONNECT', host, port, blocked: !allowed, reason });
 
     if (!allowed) {
@@ -391,12 +424,12 @@ export class ProxyServer {
         return;
       }
 
-      const { allowed, reason } = this.checkHostAccess(host);
+      const { allowed, reason } = this.checkHostAccess(host, port, 'http');
       this.log({ method: req.method || 'GET', host, port, path, blocked: !allowed, reason });
 
       if (!allowed) {
         res.writeHead(403, { 'Content-Type': 'text/plain' });
-        res.end(`Blocked by sandbox policy (${this.policyLevel}): host '${host}' not in allowlist`);
+        res.end(this.refusal(host, port, reason));
         return;
       }
 
@@ -441,11 +474,11 @@ export class ProxyServer {
     // Check the destination before reading anything. Buffering first would let
     // any request to a path ending in /acquirejob consume memory even when the
     // host is blocked outright.
-    const { allowed, reason } = this.checkHostAccess(host);
+    const { allowed, reason } = this.checkHostAccess(host, port, 'http');
     if (!allowed) {
       this.log({ method: req.method || 'POST', host, port, path, blocked: true, reason });
       res.writeHead(403, { 'Content-Type': 'text/plain' });
-      res.end(`Blocked by sandbox policy (${this.policyLevel}): host '${host}' not in allowlist`);
+      res.end(this.refusal(host, port, reason));
       req.resume();
       return;
     }
@@ -506,11 +539,11 @@ export class ProxyServer {
     authority: string,
     body: Buffer
   ): void {
-    const { allowed, reason } = this.checkHostAccess(host);
+    const { allowed, reason } = this.checkHostAccess(host, port, 'http');
     this.log({ method: req.method || 'POST', host, port, path, blocked: !allowed, reason });
     if (!allowed) {
       res.writeHead(403, { 'Content-Type': 'text/plain' });
-      res.end(`Blocked by sandbox policy (${this.policyLevel}): host '${host}' not in allowlist`);
+      res.end(this.refusal(host, port, reason));
       return;
     }
 

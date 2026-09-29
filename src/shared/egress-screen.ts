@@ -64,6 +64,54 @@ export function parseConnectTarget(target: string): { host: string; port: number
   return { host, port };
 }
 
+/** A network entry, as read by parseHostPattern. */
+export interface HostPattern {
+  /** Lowercased; for a wildcard, the suffix with its leading dot. */
+  host: string;
+  wildcard: boolean;
+  /**
+   * The port the entry spells. Undefined when it spells none, and null when
+   * what follows the host is not a port - an entry no connection can match.
+   */
+  port: number | undefined | null;
+}
+
+function readPort(text: string): number | null {
+  if (!/^\d{1,5}$/.test(text)) return null;
+  const port = Number(text);
+  return port >= 1 && port <= 65535 ? port : null;
+}
+
+/**
+ * Read a network entry: an exact host or a *.suffix wildcard, optionally
+ * followed by :port. An IPv6 literal takes a port only in brackets; a bare
+ * one is all address, so 2606:4700::1111 is not read as a host and a port.
+ */
+export function parseHostPattern(entry: string): HostPattern {
+  let host = entry.toLowerCase();
+  let port: number | undefined | null;
+  const bracketed = /^\[([^\]]*)\](?::(.*))?$/.exec(host);
+  if (bracketed) {
+    host = bracketed[1];
+    port = bracketed[2] === undefined ? undefined : readPort(bracketed[2]);
+  } else if (host.indexOf(':') !== -1 && host.indexOf(':') === host.lastIndexOf(':')) {
+    port = readPort(host.slice(host.indexOf(':') + 1));
+    host = host.slice(0, host.indexOf(':'));
+  }
+  const wildcard = host.startsWith('*.');
+  return { host: wildcard ? host.slice(1) : host, wildcard, port };
+}
+
+/**
+ * Whether a host is the one an entry names, ignoring any port it spells:
+ * which ports that allows is the caller's decision. A wildcard matches below
+ * its suffix only, never the bare parent domain.
+ */
+export function hostPatternMatches(pattern: HostPattern, host: string): boolean {
+  const normalizedHost = host.toLowerCase();
+  return pattern.wildcard ? normalizedHost.endsWith(pattern.host) : normalizedHost === pattern.host;
+}
+
 function expandV6ToGroups(addr: string): number[] | null {
   let s = addr.trim();
   if (s.startsWith('[') && s.endsWith(']')) s = s.slice(1, -1);

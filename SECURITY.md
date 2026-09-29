@@ -139,6 +139,13 @@ jobs without them: `localhost`, `127.0.0.1`, `github.com`, `api.github.com`,
 cannot distinguish the runner's own requests from a job's, so jobs reach those
 hosts too.
 
+Under `strict` and `moderate`, an allowed host is reached only on its scheme's
+port: 443 through a `CONNECT` tunnel and 80 for plain HTTP. Any other port must
+be spelled in a `.localmostrc` network entry as `host:port` (or
+`[v6-address]:port`), which allows that port only. Loopback targets keep any
+port; the broker behind `127.0.0.1` is guarded by each worker's key, not by
+its port. `permissive` stays unrestricted, ports included.
+
 Filesystem access is not granted implicitly. A job can read its workspace and
 its own temp directory; everything else — including system paths like `/usr` and the
 Xcode developer directory that most tools need — must be declared in
