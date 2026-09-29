@@ -332,18 +332,31 @@ export function readActionMetadata(actionPath: string): ActionMetadata | null {
 
   // Read by the app, outside any sandbox, from a directory a checkout
   // controls; its input defaults become the step's environment. So it must be
-  // the action's own file, not a link to one elsewhere.
+  // the action's own file, not a link to one elsewhere - and for a local
+  // action, something an earlier step left running can swap it between any
+  // check and the read. So the file is opened first, without following a
+  // link or waiting on a FIFO, and it is the open file that is judged: a
+  // regular file with no other name, the same one the action's path names
+  // once that path has been checked.
+  let fd: number;
   try {
-    resolveWithin(actionPath, path.basename(metadataPath), 'Action metadata', 'the action');
+    fd = fs.openSync(metadataPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   } catch {
     return null;
   }
-
   try {
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1) return null;
+    const checked = fs.lstatSync(
+      resolveWithin(actionPath, path.basename(metadataPath), 'Action metadata', 'the action')
+    );
+    if (checked.dev !== opened.dev || checked.ino !== opened.ino) return null;
     const yaml = require('js-yaml');
-    return yaml.load(fs.readFileSync(metadataPath, 'utf-8')) as ActionMetadata;
+    return yaml.load(fs.readFileSync(fd, 'utf-8')) as ActionMetadata;
   } catch {
     return null;
+  } finally {
+    fs.closeSync(fd);
   }
 }
 

@@ -1,8 +1,19 @@
-import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
+import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { execFileSync, spawn } from 'child_process';
+import * as containedPath from './contained-path';
 import { parseActionRef, readActionMetadata, resolveActionPath } from './action-fetcher';
+
+// Held so a test can act between the containment check and the read, as a
+// process a step left running could.
+jest.mock('./contained-path', () => {
+  const actual = jest.requireActual<typeof import('./contained-path')>('./contained-path');
+  return { ...actual, resolveWithin: jest.fn(actual.resolveWithin) };
+});
+const resolveWithin = jest.mocked(containedPath.resolveWithin);
+const actualResolveWithin = jest.requireActual<typeof import('./contained-path')>('./contained-path').resolveWithin;
 
 describe('readActionMetadata', () => {
   let scratch: string;
@@ -30,6 +41,72 @@ describe('readActionMetadata', () => {
     fs.rmSync(path.join(action, 'action.yml'));
     fs.copyFileSync(outside, path.join(action, 'action.yml'));
     expect(readActionMetadata(action)?.runs.using).toBe('node20');
+  });
+
+  it('reads the file it checked, not one swapped in after the check', () => {
+    // A local action is in the workspace, where something an earlier step
+    // left running can replace action.yml between the check and the read.
+    const outside = path.join(scratch, 'credentials');
+    fs.writeFileSync(outside, 'name: x\ninputs:\n  token:\n    default: secret\nruns:\n  using: node20\n  main: i.js\n');
+    const action = path.join(scratch, 'action');
+    fs.mkdirSync(action);
+    const metadata = path.join(action, 'action.yml');
+    const swaps: Array<[string, () => void]> = [
+      ['symlink', () => fs.symlinkSync(outside, metadata)],
+      ['hard link', () => fs.linkSync(outside, metadata)],
+      ['directory link', () => {
+        // The action directory itself becomes a link to a copy elsewhere.
+        const decoy = path.join(scratch, 'decoy');
+        fs.mkdirSync(decoy);
+        fs.copyFileSync(outside, path.join(decoy, 'action.yml'));
+        fs.renameSync(action, path.join(scratch, 'parked'));
+        fs.symlinkSync(decoy, action);
+      }],
+    ];
+    for (const [name, swap] of swaps) {
+      fs.writeFileSync(metadata, 'name: mine\nruns:\n  using: composite\n  steps: []\n');
+      let swapped = false;
+      resolveWithin.mockImplementation((root, target, what, rootName) => {
+        const real = actualResolveWithin(root, target, what, rootName);
+        if (!swapped) {
+          swapped = true;
+          fs.rmSync(metadata);
+          swap();
+        }
+        return real;
+      });
+      try {
+        expect({ name, inputs: readActionMetadata(action)?.inputs }).toEqual({ name, inputs: undefined });
+      } finally {
+        resolveWithin.mockImplementation(actualResolveWithin);
+        if (fs.lstatSync(action).isSymbolicLink()) {
+          fs.rmSync(action);
+          fs.rmSync(path.join(scratch, 'decoy'), { recursive: true });
+          fs.renameSync(path.join(scratch, 'parked'), action);
+        }
+        fs.rmSync(metadata, { force: true });
+      }
+    }
+  });
+
+  it('does not hang on a FIFO swapped in for the metadata', () => {
+    // Opening a FIFO for reading blocks until a writer appears, and this read
+    // is synchronous: the whole run would stop, Ctrl-C included.
+    const action = path.join(scratch, 'action');
+    fs.mkdirSync(action);
+    const metadata = path.join(action, 'action.yml');
+    fs.writeFileSync(metadata, 'name: mine\nruns:\n  using: composite\n');
+    resolveWithin.mockImplementationOnce((root, target, what, rootName) => {
+      const real = actualResolveWithin(root, target, what, rootName);
+      fs.rmSync(metadata);
+      execFileSync('/usr/bin/mkfifo', [metadata]);
+      // A writer, late, so the unfixed read returns rather than hanging forever.
+      spawn('/bin/sh', ['-c', `sleep 3; echo 'name: late' > '${metadata}'`], { detached: true, stdio: 'ignore' }).unref();
+      return real;
+    });
+    const started = Date.now();
+    expect(readActionMetadata(action)).toBeNull();
+    expect(Date.now() - started).toBeLessThan(1500);
   });
 });
 

@@ -1346,12 +1346,13 @@ function createStepFile(workDir: string, prefix: string, suffix: string, content
  * file it cannot read itself - ~/.aws/credentials is name=value lines already
  * - and this read happens outside the sandbox, with the result handed to the
  * next step as ${{ steps.<id>.outputs.* }}. Opened without following a
- * symlink, and read only if it is a regular file with no other name.
+ * symlink or waiting on a FIFO, which would stop the run until a writer came,
+ * and read only if it is a regular file with no other name.
  */
 function readStepOutputs(filePath: string): Record<string, string> {
   let fd: number;
   try {
-    fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   } catch {
     return {};
   }

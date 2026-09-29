@@ -238,6 +238,24 @@ describe('the files the app writes and reads in the workspace', () => {
     }
   });
 
+  it('does not hang on a FIFO a step swapped in for its output file', async () => {
+    // Opening a FIFO for reading blocks until a writer appears, and the read
+    // is synchronous: the whole run would stop, Ctrl-C included.
+    duringStep = (env) => {
+      fs.rmSync(env.GITHUB_OUTPUT, { force: true });
+      childProcess.execFileSync('/usr/bin/mkfifo', [env.GITHUB_OUTPUT]);
+      // A writer, late, so the unfixed read returns rather than hanging forever.
+      const actual = jest.requireActual<typeof import('child_process')>('child_process');
+      actual
+        .spawn('/bin/sh', ['-c', `sleep 3; echo 'leak=1' > '${env.GITHUB_OUTPUT}'`], { detached: true, stdio: 'ignore' })
+        .unref();
+    };
+    const started = Date.now();
+    const result = await run({ id: 'fifo', run: 'true' });
+    expect(result.outputs).toEqual({});
+    expect(Date.now() - started).toBeLessThan(1500);
+  });
+
   it('still reads what a step writes to its output file', async () => {
     duringStep = (env) => fs.appendFileSync(env.GITHUB_OUTPUT, 'answer=42\n');
     const result = await run({ id: 'ok', run: 'true' });

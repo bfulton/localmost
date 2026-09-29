@@ -49,6 +49,7 @@ import { SandboxPolicy, parseSandboxTrace } from '../shared/sandbox-profile';
 import { DockerPolicy, diffDockerPolicy, mergeDockerPolicy, parseDockerPolicyHint } from '../shared/docker-policy';
 import { DiscoveryProxy } from '../shared/discovery-proxy';
 import { createWorkspace, cleanupWorkspaces, getGitInfo, getRepositoryFromDir } from '../shared/workspace';
+import { getAppDataDirWithoutElectron } from '../shared/paths';
 import {
   detectLocalEnvironment,
   compareEnvironments,
@@ -156,12 +157,14 @@ export function querySandboxLogs(sinceSeconds: number): string {
 /**
  * Save what discovery saw, for --debug, and return where.
  *
- * Into a directory created here, not into the workspace's .debug: the
- * workspace is the steps' to write, and a .debug they had made a symlink
- * sent these writes, unsandboxed, wherever it pointed.
+ * Into a fresh private directory under the app data directory, not the
+ * workspace: the workspace is the steps' to write, and what they left running
+ * could put a link where these writes go. No step can reach the app's data.
  */
-export function saveDebugInfo(workspacePath: string, logContent: string, collectedPids: Set<number>): string {
-  const debugDir = fs.mkdtempSync(path.join(workspacePath, '.debug-'));
+export function saveDebugInfo(logContent: string, collectedPids: Set<number>): string {
+  const base = path.join(getAppDataDirWithoutElectron(), 'test-debug');
+  fs.mkdirSync(base, { recursive: true, mode: 0o700 });
+  const debugDir = fs.mkdtempSync(path.join(base, 'run-'));
   fs.writeFileSync(path.join(debugDir, 'sandbox-log.txt'), logContent, { flag: 'wx' });
   fs.writeFileSync(path.join(debugDir, 'collected-pids.json'), JSON.stringify([...collectedPids], null, 2), {
     flag: 'wx',
@@ -561,7 +564,7 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
 
     // Save debug info if requested
     if (options.debug) {
-      const debugDir = saveDebugInfo(workspace.path, logContent, collectedPids);
+      const debugDir = saveDebugInfo(logContent, collectedPids);
       console.log(`${colors.dim}Debug info saved to ${debugDir}${colors.reset}`);
     }
 
