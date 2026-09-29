@@ -13,8 +13,10 @@ import { URL } from 'url';
 import { SandboxPolicyLevel } from '../shared/types';
 import {
   HostLookup,
-  canonicalHost,
+  denyForm,
   dnsLookup,
+  hostPatternAllows,
+  hostPatternDenies,
   hostPatternMatches,
   isBlockedAddress,
   isLoopbackAddress,
@@ -97,22 +99,10 @@ export { MODERATE_NETWORK_ALLOWLIST } from '../shared/network-allowlist';
 export { parseConnectTarget } from '../shared/egress-screen';
 
 /**
- * A name as a deny entry compares it: in canonicalHost's spelling, without
- * trailing dots. Each is another way to write the same host, and a denied
- * host must not be reachable by writing it differently. The dots come off
- * after the mapping, since the mapping is what turns an IDNA full stop into
- * one. Allow entries are not compared this way - a spelling the allowlist
- * does not name is refused, which is the safe side for an allow.
- */
-function denyForm(name: string): string {
-  const lower = name.toLowerCase();
-  return (canonicalHost(lower) ?? lower).replace(/\.+$/, '');
-}
-
-/**
  * Whether a target names this machine: localhost or a name under it
  * (RFC 6761 reserves them all for loopback), or a loopback address in any
- * spelling isLoopbackAddress reads - 127/8, ::1, and their IPv4-mapped forms.
+ * spelling isLoopbackAddress reads - 127/8, ::1, and their IPv4-mapped forms,
+ * each compared as a deny compares it (see denyForm).
  */
 function isLoopbackTarget(host: string): boolean {
   const name = denyForm(host);
@@ -207,26 +197,13 @@ export class ProxyServer {
     const names = (entry: string): boolean => hostPatternMatches(parseHostPattern(entry), normalizedHost);
     // The built-in lists never spell a port.
     const builtIn = (entry: string): boolean => onSchemePort && names(entry);
-    // A policy entry that spells a port allows that port, and only that one;
-    // one that spells something that is not a port allows nothing.
-    const policyAllows = (entry: string): boolean => {
-      const pattern = parseHostPattern(entry);
-      if (!hostPatternMatches(pattern, normalizedHost)) return false;
-      return pattern.port === undefined ? onSchemePort : pattern.port === port;
-    };
+    // A policy entry that spells a port allows that port, and only that one
+    // (see hostPatternAllows).
+    const policyAllows = (entry: string): boolean => hostPatternAllows(entry, normalizedHost, port, via);
 
     // A host the repository denies is refused whatever its allow list or the
-    // level says. An entry that spells a port denies that port; one that
-    // spells none denies them all, and so does one whose port is not a port,
-    // since denying too much is the safe reading of a deny.
-    const deniedHost = denyForm(normalizedHost);
-    const denies = (entry: string): boolean => {
-      const pattern = parseHostPattern(entry);
-      const named = pattern.wildcard
-        ? deniedHost.endsWith('.' + denyForm(pattern.host.slice(1)))
-        : deniedHost === denyForm(pattern.host);
-      return named && (typeof pattern.port === 'number' ? pattern.port === port : true);
-    };
+    // level says (see hostPatternDenies).
+    const denies = (entry: string): boolean => hostPatternDenies(entry, normalizedHost, port);
 
     // This machine, on the ports the job may reach and no others, whatever
     // the level: the broker's, which the runner reaches through this proxy

@@ -42,6 +42,7 @@ import {
   findLocalmostrc,
   parseLocalmostrc,
   getEffectivePolicy,
+  hostPatternProblem,
   LocalmostrcConfig,
   serializeLocalmostrc,
   LOCALMOSTRC_VERSION,
@@ -317,9 +318,12 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     ? undefined  // Discovery mode: allow all traffic through
     : (policy?.network?.allow || []);  // Enforcement mode: use policy or empty
 
-  // Start proxy for network isolation (sandbox restricts traffic to proxy only)
+  // Start proxy for network isolation (sandbox restricts traffic to proxy only).
+  // Enforcement reads the policy as the runner's proxy does: the deny list
+  // first, then the allow list on each scheme's port. Discovery applies none.
   const discoveryProxy = new DiscoveryProxy({
     allowlist: networkAllowlist,
+    denylist: options.updaterc ? undefined : policy?.network?.deny,
     onAccess: (host, port, allowed) => {
       if (options.verbose) {
         const status = allowed ? colors.dim : colors.red;
@@ -1328,10 +1332,15 @@ export async function resolveSecrets(
 export async function handleUpdateRc(
   cwd: string,
   workflow: ParsedWorkflow,
-  discovered: DiscoveredAccess,
+  found: DiscoveredAccess,
   socketPaths: string[],
   assumeYes: boolean
 ): Promise<void> {
+  // A host the URL parser accepts can still be one no network entry can
+  // name - an empty label, one over 63 characters. Written in, it would
+  // leave a .localmostrc that no longer parses, so it is reported instead.
+  const unwritableHosts = found.hosts.filter((host) => hostPatternProblem(host) !== null);
+  const discovered: DiscoveredAccess = { ...found, hosts: found.hosts.filter((host) => !unwritableHosts.includes(host)) };
   const { hosts: discoveredHosts, readPaths, writePaths } = discovered;
   const dockerHints = discovered.dockerHints ?? [];
 
@@ -1348,6 +1357,12 @@ export async function handleUpdateRc(
     }
     if (discoveredHosts.length > 5) {
       console.log(`    ${colors.dim}... and ${discoveredHosts.length - 5} more${colors.reset}`);
+    }
+  }
+  if (unwritableHosts.length > 0) {
+    console.log(`  Network: ${unwritableHosts.length} host(s) reached but not written, as no entry can name them`);
+    for (const host of unwritableHosts) {
+      console.log(`    ${colors.yellow}- ${host}${colors.reset} ${colors.dim}${hostPatternProblem(host)}${colors.reset}`);
     }
   }
 

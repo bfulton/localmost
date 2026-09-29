@@ -189,6 +189,22 @@ workflows:
 | `./build/**` | All files under `build/` recursively |
 | `~/.ssh/id_*` | `~/.ssh/id_rsa`, `~/.ssh/id_ed25519`, etc. |
 
+A `filesystem.deny` entry refuses reads and writes of that path and everything
+beneath it, even inside a granted path, and in a deny `*` matches any run of
+characters, `/` included. Each entry is denied as written and by its real path,
+so a deny of `/tmp/x`, `/etc/...` or a path through a symlink of your own covers
+where it leads. For a `*` entry the real path is taken up to the directory
+before the first `*`; a symlink past it, or a matched file that is itself a
+symlink, is not followed. The directories above a deny cannot be created,
+renamed or removed by the job, since renaming one would carry the denied path
+out from under it; for a `*` entry that means the directory before the first `*`
+and those above it, so a directory the `*` itself stands for can still be moved.
+The real path is looked up as far as it can be: a directory the app cannot look
+into, a symlink loop, or a folder macOS asks permission for (Desktop, Documents,
+Downloads, `~/Library`, `/Volumes`) ends the lookup there, and the rest is
+denied as written. A deny is absolute, `~`, or starts with `~/`; a relative one
+is a validation error, since the sandbox never matches it.
+
 ### Loopback
 
 A job's sandbox connects directly to one loopback port by default: its own
@@ -487,7 +503,12 @@ anything; it adds to whatever the configured policy level already allows:
 Under `strict` and `moderate` a host is reached on 443 through `CONNECT` and on
 80 for plain HTTP. A network entry that spells a port - `api.example.com:8443`,
 `*.example.com:8080`, `[2001:db8::1]:8443` - allows that port and no other; a
-bare IPv6 address is all address. An `http://` URL tunnelled through `CONNECT`,
+bare IPv6 address is all address. An entry is a host, an IP address or
+`*.domain`, with an optional port, in the spelling a request's host arrives in
+(case is ignored; ASCII, punycode for an international name, no trailing dot);
+a URL, a path or surrounding spaces is a validation error rather than an entry
+that matches nothing. `localmost test --updaterc` writes a host it saw reached
+on another port as `host:port`. An `http://` URL tunnelled through `CONNECT`,
 rather than sent as a plain proxied request, needs a `host:80` entry. A literal
 loopback address (`127.0.0.1`, `::1`) is reachable at every level only on the
 broker's port, since the runner reaches the broker through the proxy there,

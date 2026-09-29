@@ -462,6 +462,102 @@ if (!isMacOS) {
       expect(run(`/bin/cat '${path.join(secret, 'key')}'`).ok).toBe(false);
     });
 
+    it('refuses a file a glob deny matches', () => {
+      const out = path.join(base, 'globbed');
+      fs.mkdirSync(out, { recursive: true });
+      fs.writeFileSync(path.join(out, 'x.pem'), 'key');
+      fs.writeFileSync(path.join(out, 'x.txt'), 'visible');
+      const run = underProfile({ filesystemPolicy: { level: 'strict', read: [out], write: [out], deny: [`${out}/*.pem`] } });
+      expect(run(`/bin/cat '${path.join(out, 'x.txt')}'`).ok).toBe(true);
+      expect(canCreate(run, path.join(out, probeName()))).toBe(true);
+      expect(run(`/bin/cat '${path.join(out, 'x.pem')}'`).ok).toBe(false);
+      expect(canCreate(run, path.join(out, `${probeName()}.pem`))).toBe(false);
+    });
+
+    it('cannot move what a policy denies out from under the deny by renaming a directory above it', () => {
+      // The deny matches paths, so renamed, the secret would sit under a name
+      // the write grant covers and the deny does not. Each rename is undone
+      // from outside the sandbox should the sandbox let it through.
+      const out = path.join(base, 'renamed');
+      for (const dir of [path.join(out, 'a', 'secret'), path.join(out, 'g')]) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(out, 'a', 'secret', 'key'), 'key');
+      fs.writeFileSync(path.join(out, 'g', 'x.pem'), 'key');
+      const run = underProfile({
+        filesystemPolicy: {
+          level: 'strict', read: [out], write: [out], deny: [path.join(out, 'a', 'secret'), `${out}/g/*.pem`],
+        },
+      });
+      for (const [above, file] of [['a', path.join('secret', 'key')], ['g', 'x.pem']]) {
+        const from = path.join(out, above);
+        const moved = `${from}-moved`;
+        const result = run(`/bin/mv '${from}' '${moved}' && /bin/cat '${path.join(moved, file)}'`);
+        if (fs.existsSync(moved)) fs.renameSync(moved, from);
+        expect(result.stdout).not.toContain('key');
+        expect(result.ok).toBe(false);
+      }
+      const whole = run(`/bin/mv '${out}' '${out}-moved' && /bin/cat '${out}-moved/a/secret/key'`);
+      if (fs.existsSync(`${out}-moved`)) fs.renameSync(`${out}-moved`, out);
+      expect(whole.ok).toBe(false);
+      // What the grant gives stays given: a new file beside the secret.
+      expect(canCreate(run, path.join(out, 'a', probeName()))).toBe(true);
+      expect(canCreate(run, path.join(out, 'g', probeName()))).toBe(true);
+    });
+
+    it('refuses what a policy denies by a spelling that runs through a symlink', () => {
+      // /tmp is a symlink to /private/tmp, and a link of the user's is one
+      // too; seatbelt matches where they lead.
+      const real = fs.realpathSync(fs.mkdtempSync('/tmp/localmost-deny-'));
+      const viaTmp = real.replace(/^\/private/, '');
+      const link = path.join(base, probeName());
+      try {
+        for (const dir of ['a', 'b']) {
+          fs.mkdirSync(path.join(real, dir));
+          fs.writeFileSync(path.join(real, dir, 'key'), 'key');
+        }
+        fs.writeFileSync(path.join(real, 'visible'), 'visible');
+        fs.writeFileSync(path.join(real, 'x.pem'), 'key');
+        fs.symlinkSync(real, link);
+        const run = underProfile({
+          filesystemPolicy: {
+            level: 'strict', read: [real], write: [real], deny: [path.join(viaTmp, 'a'), path.join(link, 'b'), `${viaTmp}/*.pem`],
+          },
+        });
+        expect(viaTmp).toMatch(/^\/tmp\//);
+        expect(run(`/bin/cat '${path.join(real, 'visible')}'`).ok).toBe(true);
+        // A glob through the link too: the directory before its * is resolved.
+        expect(run(`/bin/cat '${path.join(real, 'x.pem')}'`).ok).toBe(false);
+        expect(run(`/bin/cat '${path.join(real, 'a', 'key')}'`).ok).toBe(false);
+        expect(canCreate(run, path.join(real, 'a', probeName()))).toBe(false);
+        expect(run(`/bin/cat '${path.join(real, 'b', 'key')}'`).ok).toBe(false);
+        expect(run(`/bin/cat '${path.join(link, 'b', 'key')}'`).ok).toBe(false);
+      } finally {
+        fs.rmSync(link, { force: true });
+        fs.rmSync(real, { recursive: true, force: true });
+      }
+    });
+
+    it('builds and applies a deny beneath what it cannot look up: an unsearchable directory, a symlink loop', () => {
+      // The job cannot pass through either, so the deny holds as written;
+      // stopping every spawn for the repository over it helped no one.
+      const out = path.join(base, 'unresolvable');
+      fs.mkdirSync(path.join(out, 'locked', 'inner'), { recursive: true });
+      fs.writeFileSync(path.join(out, 'visible'), 'visible');
+      fs.symlinkSync('loop', path.join(out, 'loop'));
+      fs.chmodSync(path.join(out, 'locked'), 0o000);
+      try {
+        const run = underProfile({
+          filesystemPolicy: {
+            level: 'strict', read: [out], write: [out], deny: [path.join(out, 'locked', 'inner', 'secret'), path.join(out, 'loop', 'secret')],
+          },
+        });
+        expect(run(`/bin/cat '${path.join(out, 'visible')}'`).ok).toBe(true);
+        expect(canCreate(run, path.join(out, probeName()))).toBe(true);
+      } finally {
+        fs.chmodSync(path.join(out, 'locked'), 0o755);
+        fs.rmSync(out, { recursive: true, force: true });
+      }
+    });
+
     it('lets a job signal its own children, and no process outside its sandbox', () => {
       const outside = spawn('/bin/sleep', ['60'], { stdio: 'ignore' });
       try {

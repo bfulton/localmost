@@ -116,6 +116,27 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
 - A runner job's approved `network.deny` and `filesystem.deny` are enforced, and
   a change to its filesystem deny list or loopback grant retires the workers
   built under the old one.
+- A `filesystem.deny` entry with `*` in it now refuses what it matches in a
+  runner job; it was written as a literal path and matched nothing. Every deny,
+  in a runner job and in `localmost test`, is also applied by its real path, so
+  one written through `/tmp`, `/etc`, `/var` or a symlink of your own holds
+  (for a `*` entry, up to the first `*`). The directories above a deny are
+  closed to writes, so a job granted one can no longer rename it and read the
+  denied path under the new name.
+- `.localmostrc` refuses a network entry that is not a host pattern - a URL such
+  as `https://evil.com`, a path, surrounding spaces - and a relative
+  `filesystem.deny` entry. Each was accepted and shown, and allowed or denied
+  nothing. A network entry must also be in the spelling a request's host
+  arrives in (punycode, an address written out, no trailing dot), which an
+  allow entry spelled otherwise never matched; the error gives the entry to
+  write. An already approved policy with any such entry no longer loads, and
+  its jobs are refused until it is fixed and approved again.
+- `localmost test` applies the checkout's `network.deny` and reaches an allowed
+  host only on its scheme's port (or the port an entry spells), as a runner job
+  does. Its proxy took the allow list alone and matched a host on any port.
+  `--updaterc` writes a host reached on another port as `host:port`, so the
+  next run allows what discovery saw, and reports rather than writes a host no
+  entry can name.
 - An approved policy is bound to the repository's id as well as its name. A job
   from a different repository that now holds an approved name - the approved one
   deleted or renamed, and the name taken since - is refused until the policy is

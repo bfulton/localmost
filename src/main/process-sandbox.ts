@@ -14,7 +14,15 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import { SandboxPolicyLevel } from '../shared/types';
-import { expandPath, DEFAULT_BROKER_PORT, processMarkerRules, type ProcessMarker } from '../shared/sandbox-profile';
+import {
+  expandPath,
+  policyDenyAncestors,
+  policyDenyFilters,
+  realPath,
+  DEFAULT_BROKER_PORT,
+  processMarkerRules,
+  type ProcessMarker,
+} from '../shared/sandbox-profile';
 import {
   getAppDataDir,
   getConfigPath,
@@ -283,24 +291,8 @@ export function generateSandboxProfile({
   //
   // seatbelt matches the real path, so a grant of /private/var/... reaches an
   // app directory configured through the /var symlink: each directory is
-  // denied as configured and as it really is. For one that does not exist
-  // yet, that is its nearest existing ancestor's real path with the rest
-  // appended, so a job granted the parent cannot plant it first. Any other
-  // failure leaves the spelling seatbelt matches unknown, so it stops the
-  // spawn rather than leaving the deny under the configured spelling alone.
-  const realPath = (dir: string): string => {
-    const missing: string[] = [];
-    for (let node = path.resolve(dir); ; node = path.dirname(node)) {
-      try {
-        return path.join(fs.realpathSync(node), ...missing);
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
-        if (node === path.dirname(node)) return path.resolve(dir);
-        missing.unshift(path.basename(node));
-      }
-    }
-  };
+  // denied as configured and as it really is (see realPath, which stops the
+  // spawn rather than leave the deny under the configured spelling alone).
   const appDirs = [getRunnerBaseDir(), getUserDataDir()];
   const appDirSpellings = [...new Set(appDirs.flatMap((dir) => [dir, realPath(dir)]))];
   // seatbelt also matches paths as the default APFS volume does, whatever
@@ -344,19 +336,24 @@ export function generateSandboxProfile({
   // A deny only narrows, so none is dropped for what it covers: one over an
   // app directory stays, and the own sandbox and caches are re-allowed after
   // the denies instead. For the same reason a deny list that cannot be read
-  // stops the spawn rather than being skipped. An absolute ".." is resolved,
-  // as seatbelt resolves the path it guards; a relative entry never matches
-  // in seatbelt, so it is dropped and said to have no effect.
+  // stops the spawn rather than being skipped. Each is denied as written and
+  // by its real path, a `*` entry as a pattern (see policyDenyFilters), and
+  // the directories above it are closed to writes as nodes, so none can be
+  // renamed to carry it away (see policyDenyAncestors); a relative entry
+  // never matches in seatbelt, so it is dropped and said to have no effect.
   const declaredDenies = filesystemPolicy.deny ?? [];
   if (!Array.isArray(declaredDenies)) {
     throw new Error("The policy's deny list is not a list, so the job cannot be confined as approved");
   }
-  const policyDenies = subpaths(declaredDenies.flatMap((entry: string) => {
-    const expanded = expandPath(entry);
-    if (path.isAbsolute(expanded)) return [path.resolve(expanded)];
+  const absoluteDenies = declaredDenies.filter((entry: string) => {
+    if (path.isAbsolute(expandPath(entry))) return true;
     onLog?.('error', `Ignoring relative policy deny path, which would have no effect: ${entry}`);
-    return [];
-  }));
+    return false;
+  });
+  const policyDenies = absoluteDenies.flatMap((entry: string) => policyDenyFilters(entry).map((filter) => `  ${filter}`)).join('\n');
+  const policyDenyNodes = [...new Set(absoluteDenies.flatMap((entry: string) => policyDenyAncestors(entry)))]
+    .map((node) => `  ${node}`)
+    .join('\n');
 
   // Loopback reaches every service on this machine, not just the job's own:
   // databases, a debugger listening on 9229, a browser's remote debugging on
@@ -618,6 +615,10 @@ ${ownNodeReads}
 ;; grant above - the policy's own and the toolchains a level brings - so the
 ;; deny is what matches last.
 ${policyDenies ? `(deny file-read* file-write*\n${policyDenies})` : ';; No policy-declared deny paths'}
+;; Nor the directories above them, as nodes: renaming one would carry a
+;; denied path out from under the deny, to be read and written under the new
+;; name. What is inside them stays as granted.
+${policyDenyNodes ? `(deny file-write*\n${policyDenyNodes})` : ';; No directories above a policy deny to close'}
 
 ;; The places a job does use in the app's directories, re-allowed after every
 ;; deny: its target's own caches and its own sandbox, which a deny covering

@@ -419,6 +419,92 @@ if (!isMacOS) {
       expect(run(profile, ['/bin/cat', path.join(home, 'data', 'aXbc')])).toBe(false);
     });
 
+    it('refuses what a deny names by a spelling that runs through a symlink, and what a glob deny matches', () => {
+      // /tmp is a symlink to /private/tmp, and a link of the user's is one
+      // too; seatbelt matches where they lead.
+      const real = fs.realpathSync(fs.mkdtempSync('/tmp/localmost-deny-'));
+      try {
+        for (const dir of [path.join(real, 'a'), path.join(home, 'kept', 'b')]) {
+          fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(path.join(dir, 'key'), 'key\n');
+        }
+        fs.writeFileSync(path.join(real, 'visible'), 'visible\n');
+        fs.writeFileSync(path.join(home, 'kept', 'server.pem'), 'key\n');
+        fs.symlinkSync(path.join(home, 'kept'), path.join(home, 'link'));
+        const profile = generateSandboxProfile({
+          workDir,
+          proxyPort: 1,
+          policy: {
+            filesystem: {
+              read: [...MACOS_BASELINE_READ_PATHS, real, '~'],
+              deny: [path.join(real.replace(/^\/private/, ''), 'a'), path.join(home, 'link', 'b'), `${home}/link/*.pem`],
+            },
+          },
+        });
+        expect(run(profile, ['/bin/cat', path.join(real, 'visible')])).toBe(true);
+        expect(run(profile, ['/bin/cat', path.join(real, 'a', 'key')])).toBe(false);
+        expect(run(profile, ['/bin/cat', path.join(home, 'notes.txt')])).toBe(true);
+        expect(run(profile, ['/bin/cat', path.join(home, 'kept', 'b', 'key')])).toBe(false);
+        expect(run(profile, ['/bin/cat', path.join(home, 'kept', 'server.pem')])).toBe(false);
+      } finally {
+        fs.rmSync(real, { recursive: true, force: true });
+      }
+    });
+
+    it('cannot move what a deny names out from under it by renaming a directory above it', () => {
+      // The deny matches paths, so renamed, the secret would sit under a name
+      // the write grant covers and the deny does not. Each rename is undone
+      // from outside the sandbox should the sandbox let it through.
+      const out = path.join(home, 'renamed');
+      for (const dir of [path.join(out, 'a', 'secret'), path.join(out, 'g')]) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(out, 'a', 'secret', 'key'), 'key\n');
+      fs.writeFileSync(path.join(out, 'g', 'x.pem'), 'key\n');
+      const profile = generateSandboxProfile({
+        workDir,
+        proxyPort: 1,
+        policy: {
+          filesystem: {
+            read: [...MACOS_BASELINE_READ_PATHS, out],
+            write: [out],
+            deny: [path.join(out, 'a', 'secret'), `${out}/g/*.pem`],
+          },
+        },
+      });
+      for (const [above, file] of [['a', path.join('secret', 'key')], ['g', 'x.pem']]) {
+        const from = path.join(out, above);
+        const moved = `${from}-moved`;
+        const ok = run(profile, ['/bin/sh', '-c', `/bin/mv '${from}' '${moved}' && /bin/cat '${path.join(moved, file)}'`]);
+        if (fs.existsSync(moved)) fs.renameSync(moved, from);
+        expect(ok).toBe(false);
+      }
+      // What the grant gives stays given: a new file beside the secret.
+      expect(run(profile, ['/usr/bin/touch', path.join(out, 'a', 'built')])).toBe(true);
+      expect(run(profile, ['/usr/bin/touch', path.join(out, 'g', 'built')])).toBe(true);
+    });
+
+    it('builds and applies a deny beneath what it cannot look up: an unsearchable directory, a symlink loop', () => {
+      const out = path.join(home, 'unresolvable');
+      fs.mkdirSync(path.join(out, 'locked', 'inner'), { recursive: true });
+      fs.writeFileSync(path.join(out, 'visible'), 'visible\n');
+      fs.symlinkSync('loop', path.join(out, 'loop'));
+      fs.chmodSync(path.join(out, 'locked'), 0o000);
+      try {
+        const profile = generateSandboxProfile({
+          workDir,
+          proxyPort: 1,
+          policy: {
+            filesystem: {
+              read: [...MACOS_BASELINE_READ_PATHS, out],
+              deny: [path.join(out, 'locked', 'inner', 'secret'), path.join(out, 'loop', 'secret')],
+            },
+          },
+        });
+        expect(run(profile, ['/bin/cat', path.join(out, 'visible')])).toBe(true);
+      } finally {
+        fs.chmodSync(path.join(out, 'locked'), 0o755);
+      }
+    });
+
     it('keeps private keys unreadable even when the policy declares the home directory', () => {
       const profile = generateSandboxProfile({
         workDir,

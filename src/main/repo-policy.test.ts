@@ -37,6 +37,14 @@ describe('repoPolicyRuntime', () => {
     expect(repoPolicyRuntime(all, '').loopback).toBe(true);
   });
 
+  it('treats an empty loopback list as none', () => {
+    // Both open nothing beyond the proxy, and the spawn stamp hashes the
+    // value: [] read as a change, retiring every worker spawned without it.
+    const empty: LocalmostrcConfig = { version: 1, shared: { network: { loopback: [] } } };
+    expect(repoPolicyRuntime(empty, '')).toEqual(repoPolicyRuntime({ version: 1, shared: {} }, ''));
+    expect('loopback' in repoPolicyRuntime(empty, '')).toBe(false);
+  });
+
   it('declares nothing denied for a policy that denies nothing', () => {
     const runtime = repoPolicyRuntime({ version: 1, shared: { network: { allow: ['ok.example'] } } }, '');
     expect(runtime.deniedHosts).toEqual([]);

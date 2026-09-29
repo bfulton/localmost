@@ -13,6 +13,7 @@ import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals
 import { EventEmitter } from 'events';
 import { PassThrough } from 'stream';
 import * as fs from 'fs';
+import * as net from 'net';
 import * as path from 'path';
 import * as childProcess from 'child_process';
 import { checkoutLoopback, confirmCheckoutGrants, grantsBeyondWorkspace, runTest } from './test';
@@ -203,6 +204,70 @@ describe('runTest on a checkout that grants itself more than its workspace', () 
     }
     expect(profiles).toHaveLength(1);
     expect(profiles[0]).toContain('(allow network-outbound (remote ip "localhost:5432"))');
+  });
+
+  /**
+   * Run the checkout's workflow with a step that asks the run's proxy for
+   * each target in turn through CONNECT, and return what it answered each.
+   */
+  const proxyAnswers = async (targets: string[], options: Parameters<typeof runTest>[0]): Promise<string[]> => {
+    const answers: string[] = [];
+    spawnMock.mockImplementation(((command: string, args: string[], spawnOptions: childProcess.SpawnOptions) => {
+      if (command !== '/usr/bin/sandbox-exec') return actualSpawn(command, args, spawnOptions);
+      const proxyUrl = new URL(String(spawnOptions.env?.HTTPS_PROXY));
+      const auth = `Basic ${Buffer.from(`${proxyUrl.username}:${proxyUrl.password}`).toString('base64')}`;
+      const child = new EventEmitter() as childProcess.ChildProcess;
+      Object.assign(child, { pid: 999999, stdout: new PassThrough(), stderr: new PassThrough() });
+      const answerFor = (target: string) =>
+        new Promise<string>((resolve) => {
+          const socket = net.connect(Number(proxyUrl.port), proxyUrl.hostname, () =>
+            socket.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\nProxy-Authorization: ${auth}\r\n\r\n`));
+          let data = '';
+          socket.on('data', (chunk) => { data += chunk.toString(); });
+          socket.on('close', () => resolve(data));
+          socket.on('error', () => resolve(data));
+        });
+      void (async () => {
+        for (const target of targets) answers.push(await answerFor(target));
+        (child.stdout as PassThrough).end();
+        (child.stderr as PassThrough).end();
+        child.emit('exit', 0, null);
+        child.emit('close', 0, null);
+      })();
+      return child;
+    }) as never);
+    try {
+      expect((await runTest(options)).success).toBe(true);
+    } finally {
+      spawnMock.mockImplementation(actualSpawn);
+    }
+    return answers;
+  };
+
+  it("holds a step to the checkout's network deny list and ports, as a runner job is held", async () => {
+    // The run's proxy was given the allow list alone and matched hosts on
+    // any port: a deny the checkout declared, and the port a runner job is
+    // held to, were never applied here.
+    fs.writeFileSync(
+      path.join(checkout, '.localmostrc'),
+      'version: 1\nshared:\n  network:\n    allow:\n      - "*.example.com"\n    deny:\n      - bad.example.com\n'
+    );
+    const refusals = await proxyAnswers(['bad.example.com:443', 'ok.example.com:22'], { assumeYes: true });
+    // Refused by the policy itself, before any lookup: not a name that failed to resolve.
+    expect(refusals).toHaveLength(2);
+    expect(refusals[0]).toMatch(/^HTTP\/1\.1 403[\s\S]*'bad\.example\.com' is denied by the policy/);
+    expect(refusals[1]).toMatch(/^HTTP\/1\.1 403[\s\S]*'ok\.example\.com' on port 22 is not in the allowlist/);
+  });
+
+  it('applies no deny list under --updaterc, which observes every host', async () => {
+    // Discovery records what a workflow reaches so it can be declared, and a
+    // deny applied there would keep a host out of what it records. The
+    // address is one the screen refuses, so nothing is looked up or dialled.
+    fs.writeFileSync(path.join(checkout, '.localmostrc'), 'version: 1\nshared:\n  network:\n    deny:\n      - 10.0.0.1\n');
+    const answers = await proxyAnswers(['10.0.0.1:22'], { updaterc: true, assumeYes: true });
+    expect(answers).toHaveLength(1);
+    expect(answers[0]).toMatch(/^HTTP\/1\.1 403[\s\S]*does not resolve to a routable address/);
+    expect(answers[0]).not.toMatch(/denied by the policy/);
   });
 
   it('does not run discovery, which reads the whole disk, without confirmation', async () => {

@@ -333,10 +333,11 @@ describe('Process Sandbox', () => {
         else if (profile[end] === ')' && --depth === 0) break;
       }
       const body = profile.slice(match.index, end).replace(/;;.*$/gm, '');
-      const filters = [...body.matchAll(/\((subpath|literal|prefix|regex) #?"([^"]*)"\)/g)];
-      const matches = filters.length === 0 || filters.some(([, kind, value]) =>
+      const filters = [...body.matchAll(/\((subpath|literal|prefix|regex) (#?)"([^"]*)"\)/g)];
+      const matches = filters.length === 0 || filters.some(([, kind, raw, value]) =>
         kind === 'regex'
-          ? new RegExp(value).test(target)
+          // In a plain string a backslash is itself escaped; #"..." is raw.
+          ? new RegExp(raw ? value : value.replace(/\\(.)/g, '$1')).test(target)
           : kind === 'prefix'
             ? target.startsWith(value)
             : target === value ||
@@ -1045,15 +1046,120 @@ describe('Process Sandbox', () => {
       expect(readable(profile, path.join(instanceDir, 'run.sh'))).toBe(true);
     });
 
+    /** Build a runner profile with every path's real spelling looked up on this machine. */
+    const profileWithRealPaths = (options: Record<string, unknown>): string => {
+      let profile = '';
+      jest.isolateModules(() => {
+        jest.doMock('fs', () => jest.requireActual('fs'));
+        const { generateSandboxProfile } = require('./process-sandbox');
+        profile = generateSandboxProfile({ instanceDir, ...options });
+      });
+      return profile;
+    };
+
     it('keeps a deny that covers the app directories, since a deny only narrows', () => {
       // Dropping it would quietly widen what the approved policy says: /tmp
-      // contains the mock's userData directory.
-      const profile = profileWith({
+      // contains the mock's userData directory. Denied by its real path too,
+      // the one seatbelt matches.
+      const profile = profileWithRealPaths({
         filesystemPolicy: { level: 'strict', read: [], write: [], deny: ['/tmp', '~/.localmost/logs'] },
       });
-      const denyRule = profile.slice(profile.indexOf('(deny file-read* file-write*'));
-      expect(denyRule).toContain('(subpath "/tmp")');
+      const denyRule = profile.slice(profile.lastIndexOf('(deny file-read* file-write*'));
+      expect(denyRule).toContain('(subpath "/private/tmp")');
       expect(denyRule).toContain(`(subpath "${path.join(os.homedir(), '.localmost', 'logs')}")`);
+    });
+
+    it('refuses what a glob deny matches, and only that', () => {
+      // A * entry written as a subpath named a file called "*.pem", which
+      // nothing is: every .pem stayed readable and writable.
+      const profile = profileWith({
+        filesystemPolicy: {
+          level: 'strict',
+          read: ['/opt/out'],
+          write: ['/opt/out'],
+          deny: ['/opt/out/*.pem', '/opt/out/keys-*'],
+        },
+      });
+      expect(readable(profile, '/opt/out/server.pem')).toBe(false);
+      expect(writable(profile, '/opt/out/server.pem')).toBe(false);
+      expect(readable(profile, '/opt/out/nested/client.pem')).toBe(false);
+      expect(readable(profile, '/opt/out/keys-prod/id')).toBe(false);
+      // What lies beneath a match too, as beneath a deny with no *.
+      expect(readable(profile, '/opt/out/bundle.pem/key')).toBe(false);
+      // Everything but the * is literal: the dot is a dot.
+      expect(readable(profile, '/opt/out/serverXpem')).toBe(true);
+      expect(writable(profile, '/opt/out/server.pem.txt')).toBe(true);
+      expect(readable(profile, '/opt/out/keys')).toBe(true);
+      expect(profile).not.toContain('(subpath "/opt/out/*.pem")');
+    });
+
+    it('denies a path reached through a symlink by its real path too', () => {
+      // seatbelt matches the real path: /tmp, /etc and /var are symlinks into
+      // /private, and the profile grants /private/etc, so a deny under the
+      // spelling written alone matched nothing the job opened.
+      const profile = profileWithRealPaths({
+        filesystemPolicy: {
+          level: 'strict',
+          read: ['/private/tmp'],
+          write: ['/private/tmp'],
+          deny: ['/tmp/localmost-deny/x', '/etc/ssl/private', '/tmp/localmost-deny/*.pem'],
+        },
+      });
+      const denyRule = profile.slice(profile.lastIndexOf('(deny file-read* file-write*'));
+      expect(denyRule).toContain('(subpath "/tmp/localmost-deny/x")');
+      expect(denyRule).toContain('(subpath "/private/tmp/localmost-deny/x")');
+      expect(readable(profile, '/private/tmp/localmost-deny/x/key')).toBe(false);
+      expect(writable(profile, '/private/tmp/localmost-deny/x/key')).toBe(false);
+      expect(readable(profile, '/private/etc/ssl/private/key.pem')).toBe(false);
+      expect(readable(profile, '/private/etc/ssl/cert.pem')).toBe(true);
+      expect(readable(profile, '/private/tmp/localmost-deny/server.pem')).toBe(false);
+      expect(writable(profile, '/private/tmp/localmost-deny/other')).toBe(true);
+    });
+
+    it('denies writing the directories above a deny, so renaming one cannot carry it away', () => {
+      // A deny matches paths: granted /opt/out, a job could rename out/a to
+      // out/b and read out/b/secret, or out/g to out/h and read every .pem.
+      const profile = profileWith({
+        filesystemPolicy: {
+          level: 'strict', read: ['/opt/out'], write: ['/opt/out'], deny: ['/opt/out/a/secret', '/opt/out/g/*.pem'],
+        },
+      });
+      for (const node of ['/opt/out/a', '/opt/out/g', '/opt/out', '/opt']) {
+        expect(writable(profile, node)).toBe(false);
+      }
+      // Nodes, not what is in them: the grant still writes beside the secret.
+      expect(writable(profile, '/opt/out/a/built')).toBe(true);
+      expect(writable(profile, '/opt/out/g/built.txt')).toBe(true);
+      expect(writable(profile, '/opt/out/other/built')).toBe(true);
+      expect(readable(profile, '/opt/out/a')).toBe(true);
+    });
+
+    it('builds a deny it cannot look up beneath, denied as written and by the real path of what it can', () => {
+      // A component the app cannot look up - unsearchable, or a symlink loop
+      // anyone could plant above a deny - is one the job cannot pass through
+      // either. Throwing there stopped every spawn for the repository.
+      const actualFs = jest.requireActual<typeof import('fs')>('fs');
+      const real = actualFs.realpathSync(actualFs.mkdtempSync('/tmp/localmost-unresolvable-'));
+      const viaTmp = real.replace(/^\/private/, '');
+      actualFs.mkdirSync(path.join(real, 'locked', 'inner'), { recursive: true });
+      actualFs.symlinkSync('loop', path.join(real, 'loop'));
+      actualFs.chmodSync(path.join(real, 'locked'), 0o000);
+      try {
+        const profile = profileWithRealPaths({
+          filesystemPolicy: {
+            level: 'strict', read: [], write: [], deny: [`${viaTmp}/locked/inner/secret`, `${viaTmp}/loop/secret`],
+          },
+        });
+        const denyRule = profile.slice(profile.lastIndexOf('(deny file-read* file-write*'));
+        for (const spelling of [viaTmp, real]) {
+          expect(denyRule).toContain(`(subpath "${spelling}/locked/inner/secret")`);
+          expect(denyRule).toContain(`(subpath "${spelling}/loop/secret")`);
+          expect(writable(profile, `${spelling}/locked/inner`)).toBe(false);
+        }
+      } finally {
+        actualFs.chmodSync(path.join(real, 'locked'), 0o755);
+        actualFs.rmSync(real, { recursive: true, force: true });
+      }
     });
 
     it('escapes deny paths, and resolves a traversing one rather than dropping it', () => {

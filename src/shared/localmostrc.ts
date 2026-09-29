@@ -13,7 +13,9 @@ import {
   loopbackValues,
 } from './policy-describe';
 import * as fs from 'fs';
+import * as net from 'net';
 import * as path from 'path';
+import { canonicalHost, parseHostPattern } from './egress-screen';
 import { SandboxPolicy, NetworkPolicy, FilesystemPolicy, EnvPolicy } from './sandbox-profile';
 import { SandboxPolicyLevel } from './types';
 import {
@@ -323,14 +325,55 @@ function validateNetworkPolicy(policy: unknown, path: string, errors: ParseError
   refuseUnknownKeys(p, path, POLICY_SECTION_SUBKEYS.network, errors);
 
   if (p.allow !== undefined) {
-    validateStringArray(p.allow, `${path}.allow`, errors);
+    validateHostPatternArray(p.allow, `${path}.allow`, errors);
   }
   if (p.deny !== undefined) {
-    validateStringArray(p.deny, `${path}.deny`, errors);
+    validateHostPatternArray(p.deny, `${path}.deny`, errors);
   }
   if (p.loopback !== undefined) {
     validateLoopback(p.loopback, `${path}.loopback`, errors, scope);
   }
+}
+
+/**
+ * Why a network entry is not one the proxies can match, or null when it is.
+ * The proxies read an entry with parseHostPattern: a host name, an IP address
+ * or a *.domain wildcard, optionally followed by :port (an IPv6 address takes
+ * one only in brackets), and nothing else. Read that way, "https://evil.com"
+ * is a host "https" with a port that is not one and " evil.com" a name no
+ * connection has, so each allowed or denied nothing while reading as though
+ * it did. Case is ignored.
+ *
+ * A host must also be in the spelling a request's host arrives in - ASCII
+ * (punycode for an international name), an address written out, no trailing
+ * dot - since an allow entry spelled otherwise never matches one. A deny
+ * entry is compared in that spelling whatever it is written in (see
+ * denyForm), and is held to it all the same, so the two lists read alike.
+ * The message gives the entry to write, wildcard and port kept.
+ */
+export function hostPatternProblem(entry: string): string | null {
+  const pattern = parseHostPattern(entry);
+  const host = pattern.wildcard ? pattern.host.slice(1) : pattern.host;
+  const canonical = pattern.port === null ? null : canonicalHost(host)?.replace(/\.+$/, '') ?? null;
+  const isAddress = canonical !== null && net.isIP(canonical) !== 0;
+  const isName = canonical !== null && canonical.split('.').every((label) => /^[a-z0-9_-]{1,63}$/.test(label));
+  if (canonical === null || (pattern.wildcard ? !isName || isAddress : !isName && !isAddress)) {
+    return 'must be a host, an IP address or *.domain, optionally with :port, and nothing else';
+  }
+  if (canonical === host) return null;
+  const port = pattern.port === undefined ? '' : `:${pattern.port}`;
+  const spelled = net.isIP(canonical) === 6 && port ? `[${canonical}]` : canonical;
+  return `is not in the spelling a request's host arrives in: write ${JSON.stringify(`${pattern.wildcard ? '*.' : ''}${spelled}${port}`)} instead`;
+}
+
+function validateHostPatternArray(value: unknown, path: string, errors: ParseError[]): void {
+  validateStringArray(value, path, errors);
+  if (!Array.isArray(value)) return;
+  value.forEach((entry, i) => {
+    if (typeof entry !== 'string') return;
+    const problem = hostPatternProblem(entry);
+    if (problem) errors.push({ message: `${path}[${i}] ${problem}` });
+  });
 }
 
 /**
@@ -383,6 +426,15 @@ function validateFilesystemPolicy(policy: unknown, path: string, errors: ParseEr
   }
   if (p.deny !== undefined) {
     validatePathArray(p.deny, `${path}.deny`, errors);
+    // seatbelt never matches a relative path against a real one, so a
+    // relative deny would be shown as denying something and deny nothing.
+    // Unlike a grant, which is no worse for granting nothing.
+    if (Array.isArray(p.deny)) {
+      p.deny.forEach((entry, i) => {
+        if (typeof entry !== 'string' || entry === '~' || entry.startsWith('~/') || entry.startsWith('/')) return;
+        errors.push({ message: `${path}.deny[${i}] must be an absolute path or start with ~/: a relative deny is never applied` });
+      });
+    }
   }
 }
 

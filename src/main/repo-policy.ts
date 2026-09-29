@@ -28,6 +28,7 @@ export function repoPolicyRuntime(approved: LocalmostrcConfig | null, workflowNa
     };
   }
   const policy = getEffectivePolicy(approved, workflowName);
+  const loopback = approved.shared?.network?.loopback;
   return {
     // Network is resolved per workflow and applied to the proxy per job.
     hosts: policy.network?.allow || [],
@@ -43,7 +44,10 @@ export function repoPolicyRuntime(approved: LocalmostrcConfig | null, workflowNa
     writePaths: approved.shared?.filesystem?.write || [],
     denyPaths: approved.shared?.filesystem?.deny || [],
     // Loopback is part of the profile too, and only shared: may declare it.
-    ...(approved.shared?.network?.loopback !== undefined ? { loopback: approved.shared.network.loopback } : {}),
+    // An empty list opens nothing, so it is no declaration, as an empty list
+    // is none above; kept, it would change the spawn stamp and retire workers
+    // for a policy that grants the same.
+    ...(loopback === true || (Array.isArray(loopback) && loopback.length > 0) ? { loopback } : {}),
     // Docker composes across shared and workflow: the socket is bound to
     // the merged policy when the job is claimed, after the workflow is known.
     docker: policy.docker ?? {},

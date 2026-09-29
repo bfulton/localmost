@@ -79,18 +79,21 @@ describe('DiscoveryProxy', () => {
   });
 
   // ===========================================================================
-  // isHostAllowed Function Tests
+  // checkHost Function Tests
   // ===========================================================================
 
-  describe('isHostAllowed', () => {
-    // We test the private isHostAllowed method by invoking it via the class
+  describe('checkHost', () => {
+    // We test the private checkHost method by invoking it via the class, for
+    // a CONNECT on 443; ports and denies are covered through the proxy itself
+    // in discovery-proxy.auth.test.ts.
     const testIsHostAllowed = (
       allowlist: string[] | undefined,
       host: string
     ): boolean => {
       const proxy = new DiscoveryProxy({ allowlist });
       // Access private method for testing
-      return (proxy as unknown as { isHostAllowed(host: string): boolean }).isHostAllowed(host);
+      type Check = { checkHost(host: string, port: number, via: 'connect'): string };
+      return (proxy as unknown as Check).checkHost(host, 443, 'connect') === 'allowed';
     };
 
     describe('Discovery Mode (allowlist undefined)', () => {

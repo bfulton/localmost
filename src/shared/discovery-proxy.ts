@@ -15,6 +15,8 @@ import { Duplex } from 'stream';
 import {
   HostLookup,
   dnsLookup,
+  hostPatternAllows,
+  hostPatternDenies,
   isProxyAuthorized,
   parseConnectTarget,
   pinnedLookup,
@@ -29,6 +31,8 @@ export interface DiscoveryProxyOptions {
   onAccess?: (host: string, port: number, allowed: boolean) => void;
   /** Optional allowlist for filtering mode (if not provided, all traffic is allowed) */
   allowlist?: string[];
+  /** Hosts refused whatever the allowlist says, read as the runner's proxy reads network.deny. */
+  denylist?: string[];
   /** Resolve a host to its addresses. Injectable for tests; defaults to DNS. */
   lookup?: HostLookup;
 }
@@ -50,6 +54,7 @@ export class DiscoveryProxy {
   private allowedHosts: Set<string> = new Set();
   private blockedHosts: Set<string> = new Set();
   private allowlist: string[] | null;
+  private denylist: string[];
   private lookup: HostLookup;
   /**
    * Required in Proxy-Authorization, and handed to steps in the proxy URL.
@@ -65,34 +70,41 @@ export class DiscoveryProxy {
     this.port = options.port || 0;
     this.onAccess = options.onAccess || (() => {});
     this.allowlist = options.allowlist ?? null;  // null = discovery mode (allow all)
+    this.denylist = options.denylist ?? [];
     this.lookup = options.lookup ?? dnsLookup;
   }
 
   /**
-   * Check if a host is allowed by the allowlist.
-   * Returns true if allowed, false if blocked.
+   * Whether the policy lets a step reach host:port, asked for through a
+   * CONNECT tunnel or as a plain HTTP request: 'allowed', 'denied' or
+   * 'not-allowlisted'. As the runner's proxy reads a policy, so a run here
+   * holds what a runner job would: a denied host is refused first, whatever
+   * an allow entry covers, and an allowed host is reached on its scheme's
+   * port and on another only when an entry spells host:port. Discovery, with
+   * no allowlist, observes every host on every port.
    */
-  private isHostAllowed(host: string): boolean {
-    // If no allowlist, we're in discovery mode - allow everything
-    if (this.allowlist === null) {
-      return true;
-    }
+  private checkHost(host: string, port: number, via: 'connect' | 'http'): 'allowed' | 'denied' | 'not-allowlisted' {
+    if (this.denylist.some((entry) => hostPatternDenies(entry, host, port))) return 'denied';
+    if (this.allowlist === null) return 'allowed';
+    return this.allowlist.some((entry) => hostPatternAllows(entry, host, port, via)) ? 'allowed' : 'not-allowlisted';
+  }
 
-    const normalizedHost = host.toLowerCase();
+  /** The body of a refusal the policy made, naming which part of it. */
+  private static refusal(host: string, port: number, verdict: 'denied' | 'not-allowlisted'): string {
+    return verdict === 'denied'
+      ? `Blocked by sandbox: host '${host}' is denied by the policy`
+      : `Blocked by sandbox: '${host}' on port ${port} is not in the allowlist`;
+  }
 
-    // Check against allowlist patterns
-    for (const pattern of this.allowlist) {
-      if (pattern.startsWith('*.')) {
-        const suffix = pattern.slice(1).toLowerCase(); // Remove *, keep the dot
-        if (normalizedHost.endsWith(suffix)) {
-          return true;
-        }
-      } else if (normalizedHost === pattern.toLowerCase()) {
-        return true;
-      }
-    }
-
-    return false;
+  /**
+   * The network entry that allows host:port, reached this way: the bare host
+   * on its scheme's port - 443 through CONNECT, 80 for plain HTTP - and
+   * host:port on any other, an IPv6 address in brackets, as
+   * hostPatternAllows reads an entry.
+   */
+  private static entryFor(host: string, port: number, via: 'connect' | 'http'): string {
+    if (port === (via === 'connect' ? 443 : 80)) return host;
+    return `${net.isIP(host) === 6 ? `[${host}]` : host}:${port}`;
   }
 
   /**
@@ -100,10 +112,17 @@ export class DiscoveryProxy {
    *
    * A host the address screen refused is blocked but not an accessed host:
    * discovery offers the accessed hosts for .localmostrc, and one the screen
-   * refuses would be a grant that can never work.
+   * refuses would be a grant that can never work. An accessed host is kept
+   * as the entry that allows it, port and all, so what discovery writes is
+   * what the next, enforcing run lets through.
    */
-  private recordAccess(host: string, port: number, outcome: 'allowed' | 'not-allowlisted' | 'unroutable'): void {
-    if (outcome !== 'unroutable') this.accessedHosts.add(host);
+  private recordAccess(
+    host: string,
+    port: number,
+    via: 'connect' | 'http',
+    outcome: 'allowed' | 'denied' | 'not-allowlisted' | 'unroutable'
+  ): void {
+    if (outcome !== 'unroutable') this.accessedHosts.add(DiscoveryProxy.entryFor(host, port, via));
     if (outcome === 'allowed') {
       this.allowedHosts.add(host);
     } else {
@@ -182,7 +201,8 @@ export class DiscoveryProxy {
   }
 
   /**
-   * Get all unique hosts that were accessed.
+   * Every host that was accessed, once each, as the network entry that
+   * allows it: host, or host:port for a port its scheme does not use.
    */
   getAccessedHosts(): string[] {
     return Array.from(this.accessedHosts).sort();
@@ -225,11 +245,11 @@ export class DiscoveryProxy {
     }
     const { host, port } = target;
 
-    // Block if not allowed
-    if (!this.isHostAllowed(host)) {
-      this.recordAccess(host, port, 'not-allowlisted');
+    const verdict = this.checkHost(host, port, 'connect');
+    if (verdict !== 'allowed') {
+      this.recordAccess(host, port, 'connect', verdict);
       clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-      clientSocket.write(`Blocked by sandbox: host '${host}' not in allowlist\r\n`);
+      clientSocket.write(`${DiscoveryProxy.refusal(host, port, verdict)}\r\n`);
       clientSocket.destroy();
       return;
     }
@@ -241,7 +261,7 @@ export class DiscoveryProxy {
 
   private async connectScreened(host: string, port: number, clientSocket: Duplex, head: Buffer): Promise<void> {
     const screened = await this.screen(host);
-    this.recordAccess(host, port, screened ? 'allowed' : 'unroutable');
+    this.recordAccess(host, port, 'connect', screened ? 'allowed' : 'unroutable');
     if (clientSocket.destroyed) return;
     if (!screened) {
       clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
@@ -301,17 +321,17 @@ export class DiscoveryProxy {
       const host = url.hostname.replace(/^\[(.*)\]$/, '$1');
       const port = parseInt(url.port, 10) || 80;
 
-      // Block if not allowed
-      if (!this.isHostAllowed(host)) {
-        this.recordAccess(host, port, 'not-allowlisted');
+      const verdict = this.checkHost(host, port, 'http');
+      if (verdict !== 'allowed') {
+        this.recordAccess(host, port, 'http', verdict);
         res.writeHead(403, { 'Content-Type': 'text/plain' });
-        res.end(`Blocked by sandbox: host '${host}' not in allowlist`);
+        res.end(DiscoveryProxy.refusal(host, port, verdict));
         req.resume();
         return;
       }
 
       void this.screen(host).then((screened) => {
-        this.recordAccess(host, port, screened ? 'allowed' : 'unroutable');
+        this.recordAccess(host, port, 'http', screened ? 'allowed' : 'unroutable');
         if (!screened) {
           res.writeHead(403, { 'Content-Type': 'text/plain' });
           res.end(`Blocked by sandbox: host '${host}' does not resolve to a routable address`);

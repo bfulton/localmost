@@ -13,6 +13,7 @@ import { describe, it, expect, afterEach, jest } from '@jest/globals';
 import * as http from 'http';
 import * as net from 'net';
 import { DiscoveryProxy } from './discovery-proxy';
+import { hostPatternAllows } from './egress-screen';
 
 jest.mock('net', () => {
   const actual = jest.requireActual<typeof import('net')>('net');
@@ -194,5 +195,116 @@ describe('DiscoveryProxy address screen', () => {
     expect(forwarded).toBeDefined();
     expect(Object.keys(forwarded!.headers ?? {}).map((h) => h.toLowerCase())).not.toContain('proxy-authorization');
     expect(forwarded!.lookup).toBeDefined();
+  });
+});
+
+describe('DiscoveryProxy under a policy', () => {
+  /** Upstream dials fail at once, so a request the policy lets through answers 502 and is recorded. */
+  const refuseUpstreamDials = () => {
+    const actualNet = jest.requireActual<typeof import('net')>('net');
+    const actualHttp = jest.requireActual<typeof import('http')>('http');
+    netConnect.mockClear();
+    httpRequest.mockClear();
+    netConnect.mockImplementation(((...args: unknown[]) => {
+      const opts = args[0];
+      if (typeof opts === 'object' && opts !== null && 'lookup' in opts) {
+        const socket = new actualNet.Socket();
+        process.nextTick(() => socket.destroy(new Error('refused in test')));
+        return socket;
+      }
+      return (actualNet.connect as (...a: unknown[]) => net.Socket)(...args);
+    }) as never);
+    httpRequest.mockImplementation(((opts: http.RequestOptions, cb: (res: http.IncomingMessage) => void) =>
+      actualHttp.request(
+        opts.hostname?.endsWith('.example.com') ? { hostname: '127.0.0.1', port: 1, method: opts.method } : opts,
+        cb
+      )) as never);
+  };
+  const dialled = () => upstreamDials().map((dial) => {
+    const { host, port } = dial as net.TcpNetConnectOpts;
+    return `${host}:${port}`;
+  });
+  const forwarded = () =>
+    httpRequest.mock.calls
+      .map((call) => call[0] as http.RequestOptions)
+      .filter((opts) => opts.hostname?.endsWith('.example.com'))
+      .map((opts) => `${opts.hostname}:${opts.port}`);
+
+  it('refuses a denied host an allow wildcard covers', async () => {
+    refuseUpstreamDials();
+    const { port, user, token } = await start({
+      allowlist: ['*.example.com'],
+      denylist: ['bad.example.com', 'BAD2.example.com.', 'svc.example.com:8443'],
+      lookup: async () => ['192.0.2.10'],
+    });
+    const auth = basic(user, token);
+    expect(await connect(port, 'bad.example.com:443', auth)).toBe(403);
+    expect(await get(port, 'http://bad.example.com/', auth)).toBe(403);
+    // A deny compares the host however it is spelled.
+    expect(await connect(port, 'bad2.example.com:443', auth)).toBe(403);
+    expect(await connect(port, 'ok.example.com:443', auth)).toBe(502);
+    // An entry with a port denies that port only.
+    expect(await connect(port, 'svc.example.com:443', auth)).toBe(502);
+    expect(dialled()).toEqual(['ok.example.com:443', 'svc.example.com:443']);
+    expect(forwarded()).toEqual([]);
+    expect(proxy.getAccessStats().blocked).toEqual(['bad.example.com', 'bad2.example.com']);
+  });
+
+  it('refuses an allowed host on a port its scheme does not use', async () => {
+    refuseUpstreamDials();
+    const { port, user, token } = await start({
+      allowlist: ['*.example.com', 'svc.example.com:8443'],
+      lookup: async () => ['192.0.2.10'],
+    });
+    const auth = basic(user, token);
+    expect(await connect(port, 'ok.example.com:22', auth)).toBe(403);
+    expect(await connect(port, 'ok.example.com:80', auth)).toBe(403);
+    expect(await get(port, 'http://ok.example.com:8080/', auth)).toBe(403);
+    // A port an entry spells is allowed, and only that one.
+    expect(await connect(port, 'svc.example.com:8443', auth)).toBe(502);
+    expect(await connect(port, 'ok.example.com:443', auth)).toBe(502);
+    expect(await get(port, 'http://ok.example.com/', auth)).toBe(502);
+    expect(dialled()).toEqual(['svc.example.com:8443', 'ok.example.com:443']);
+    expect(forwarded()).toEqual(['ok.example.com:80']);
+  });
+
+  it('records a host reached on another port than its scheme uses as the host:port entry that allows it', async () => {
+    // Discovery wrote the bare name, which allows 443 through CONNECT and 80
+    // for plain HTTP only, so the next, enforcing run refused a step that
+    // reached api.example.com:8443 during discovery.
+    refuseUpstreamDials();
+    const { port, user, token } = await start({ lookup: async () => ['192.0.2.10'] });
+    const auth = basic(user, token);
+    const requests: [string, 'connect' | 'http', string, number][] = [
+      ['ok.example.com:443', 'connect', 'ok.example.com', 443],
+      ['svc.example.com:8443', 'connect', 'svc.example.com', 8443],
+      ['web.example.com:80', 'connect', 'web.example.com', 80],
+      ['[2606:4700::1111]:8443', 'connect', '2606:4700::1111', 8443],
+      ['http://plain.example.com/', 'http', 'plain.example.com', 80],
+      ['http://alt.example.com:8080/', 'http', 'alt.example.com', 8080],
+    ];
+    for (const [target, via] of requests) {
+      expect(await (via === 'connect' ? connect : get)(port, target, auth)).toBe(502);
+    }
+    const recorded = proxy.getAccessedHosts();
+    expect(recorded).toEqual([
+      '[2606:4700::1111]:8443',
+      'alt.example.com:8080',
+      'ok.example.com',
+      'plain.example.com',
+      'svc.example.com:8443',
+      'web.example.com:80',
+    ]);
+    // Each is an entry the enforcing proxy reads as allowing that request.
+    for (const [, via, host, reached] of requests) {
+      expect([host, reached, recorded.some((entry) => hostPatternAllows(entry, host, reached, via))]).toEqual([host, reached, true]);
+    }
+  });
+
+  it('observes every port under --updaterc, where there is no allow list', async () => {
+    refuseUpstreamDials();
+    const { port, user, token } = await start({ lookup: async () => ['192.0.2.10'] });
+    expect(await connect(port, 'ok.example.com:22', basic(user, token))).toBe(502);
+    expect(dialled()).toEqual(['ok.example.com:22']);
   });
 });
