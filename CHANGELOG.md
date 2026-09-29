@@ -47,7 +47,7 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   - The approved copy is applied, so a change pushed after approval cannot take
     effect until it is reviewed
 - **Sandbox Policy Levels**: A repository declares its enforcement strength in `.localmostrc` (`level:`), approved like the rest of its policy; one that declares none runs `strict`
-  - `strict` (default): runner infrastructure, a fixed read-only floor of the OS and Xcode's developer directory, plus what `.localmostrc` declares
+  - `strict` (default): runner infrastructure, a fixed floor - mostly read-only - of the OS and `/Library/Developer` (the Command Line Tools), plus what `.localmostrc` declares. Xcode itself is read under `moderate` and `permissive`, or when declared
   - `moderate`: also allows GitHub Actions infrastructure, common registries, and tool caches
   - `permissive`: no restrictions, for trusted repos or debugging
   - Per-job summary of allowed and blocked hosts in the runner log
@@ -131,7 +131,8 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
 - The approval screen and `localmost policy show` mark a write grant that
   reaches past the job - LaunchAgents and LaunchDaemons, shell rc files,
   `~/.ssh`, `~/.gitconfig`, `~/.config`, `~/Library/Application Support` and
-  directories on your PATH - with what a write there lets a job do: leave code
+  the common PATH directories (`/usr/local/bin`, `/opt/homebrew/bin`,
+  `~/.local/bin`, `~/bin`) - with what a write there lets a job do: leave code
   that runs as you, outside the sandbox, after the job ends. Such grants are
   still allowed.
 - A job's Docker `/info` shows only the daemon's version, platform, kernel, CPU
@@ -140,10 +141,12 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   in them, registry mirrors, labels, and how many containers and images you and
   other jobs have.
 - The broker sends a job operation upstream on the runner's credentials only
-  when it names the job delivered to that worker: by its request id, or by the
-  plan and job ids of the job details the worker acquired. `completejob` and
+  when it names the job delivered to that worker and no other: any request id
+  it carries must have been delivered to that worker, and any plan and job ids
+  must be those of the job details the worker acquired. `completejob` and
   `renewjob`, which name a job by those ids alone, were forwarded for whatever
-  ids the request carried.
+  ids the request carried, as was any operation whose path was spelled in
+  another case.
 - An approved policy is bound to the repository's id as well as its name. A job
   from a different repository that now holds an approved name - the approved one
   deleted or renamed, and the name taken since - is refused until the policy is
@@ -159,8 +162,9 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
 ### Fixed
 - A run that could not be cancelled says so. When admission refuses a job and
   GitHub will not cancel its run, the job's history entry records "cancel
-  failed" with the reason and a "Cancel Failed" notification appears; the run's
-  other jobs may still run. The job-start backstop, for a job that reached a
+  failed" with the reason and, when job notifications are on, a "Cancel Failed"
+  notification appears; the run's other jobs may still run. The job-start
+  backstop, for a job that reached a
   worker without passing the user filter, now stops that worker as well as
   cancelling the run, whether or not the cancel succeeds, so its steps stop
   without waiting for GitHub. GitHub may show a job stopped this way as lost

@@ -1127,6 +1127,47 @@ describe('message routing', () => {
         expect(mockHttpsRequest).not.toHaveBeenCalled();
       });
 
+      it.each(['/completejob', '/renewjob'])("checks every job %s names, not only the worker's request id", async (op) => {
+        // The request id the worker was delivered is a small sequential
+        // number, easy to guess. Paired with another job's plan and job ids it
+        // vouched for the pair too, which is what the operation acts on.
+        const sessionId = await acquiredWorker();
+        mockHttpsRequest.mockClear();
+        const foreign = { planId: 'victim-plan', jobId: 'victim-job' };
+        const report = (ids: object) => request('POST', `${op}?sessionId=${sessionId}`, JSON.stringify({ ...ids, conclusion: 'succeeded' }));
+
+        for (const ids of [
+          { jobMessageId: 2, ...foreign },
+          { requestId: 'req-1', ...foreign },
+          { requestId: 'req-1', planId: acquiredIds.planId, jobId: foreign.jobId },
+          { jobMessageId: 2, jobId: acquiredIds.jobId },
+          { requestId: 'req-9', ...acquiredIds },
+          { requestId: 'req-1', jobMessageId: 9, ...acquiredIds },
+        ]) {
+          expect({ ids, status: (await report(ids)).statusCode }).toEqual({ ids, status: 403 });
+        }
+        expect(mockHttpsRequest).not.toHaveBeenCalled();
+
+        expect((await report({ requestId: 'req-1', ...acquiredIds })).statusCode).toBe(200);
+        expect(mockHttpsRequest).toHaveBeenCalledTimes(1);
+      });
+
+      it.each(['/CompleteJob', '/RENEWJOB', '/%63ompletejob', '//renewjob', '/_apis/completejob', '/%E0completejob'])(
+        'binds %s like the job operation it names upstream', async (path) => {
+          // Upstream routing ignores case and decodes the path; a gate that
+          // matched only the exact spelling forwarded these on the runner's
+          // token without a look at the job they name. A path that does not
+          // decode is refused rather than guessed at.
+          const sessionId = await acquiredWorker();
+          mockHttpsRequest.mockClear();
+
+          const res = await request('POST', `${path}?sessionId=${sessionId}`,
+            JSON.stringify({ planId: 'victim-plan', jobId: 'victim-job', conclusion: 'succeeded' }));
+
+          expect(res.statusCode).toBe(403);
+          expect(mockHttpsRequest).not.toHaveBeenCalled();
+        });
+
       it('forwards nothing for a job that was delivered but not yet acquired', async () => {
         // Its ids are in the details acquirejob hands out; before that, the
         // worker has no business knowing them.

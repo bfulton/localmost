@@ -115,8 +115,8 @@ shared:
     allow:
       - "*.github.com"           # Wildcard subdomain
       - "registry.npmjs.org"     # Exact match
-    deny:                        # Wins over allow and the level; the
-      - "*.analytics.com"        # runner's own hosts excepted. See
+    deny:                        # For runner jobs, wins over allow and the
+      - "*.analytics.com"        # level; the runner's own hosts excepted. See
                                  # "Relationship to the policy level" below.
     loopback: [5432]             # Loopback ports the job may connect to; true
                                  # for all. shared: only. See "Loopback" below.
@@ -505,8 +505,8 @@ runner itself needs to register and poll for jobs. That is the runner's own
 connection to GitHub rather than anything the job asked for, and the runner
 cannot function without it. Because a single proxy serves both, jobs reach those
 hosts too. A runner job's filesystem likewise starts from a fixed floor the
-policy does not list - the operating system, Xcode's developer directory and
-its own caches - see SECURITY.md.
+policy does not list - the operating system, `/Library/Developer` (the Command
+Line Tools, not Xcode) and its own caches - see SECURITY.md.
 
 `env:` governs what a job inherits from the environment localmost itself was
 launched with, and nothing else. It never affects the variables the runner or

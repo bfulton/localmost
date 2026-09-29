@@ -165,8 +165,10 @@ authentication: each worker talks to it at an address carrying a key of its own
 (`http://127.0.0.1:<port>/w/<key>/`), and the broker answers each key only
 with its own worker's session and the jobs delivered to that worker. A job
 operation it sends upstream on the runner's credentials (renewing, finishing
-or completing a job) must name that worker's job: by the request id delivered
-to it, or by the plan and job ids of the job details it acquired. That key,
+or completing a job) must name that worker's job and no other: any request id
+it carries must be one delivered to that worker, and any plan and job ids
+those of the job details it acquired. The operation is recognised however its
+path is spelled, in any case or percent-encoded. That key,
 not the closed port, is what keeps a job from acting as another worker or as
 the runner.
 
@@ -216,19 +218,23 @@ list. Besides its own sandbox directory (workspace and temp), it can read the
 operating system - `/System`, `/bin`, `/sbin`, `/usr/bin`, `/usr/lib`,
 `/usr/libexec`, `/usr/sbin`, `/usr/share`, `/etc`, `/private/etc`,
 `/private/var/db`, `/private/var/select`, `/Library/Apple`,
-`/Library/Preferences`, `/Library/Frameworks` - and the Xcode developer
-directory under `/Library/Developer`, and a few device files (`/dev/null`,
-`/dev/random` and the like); it can read and write its target's own tool cache
-when one is kept, and create files under the names `mktemp` generates in the
-per-user temp directory. Under `moderate` and `permissive` it can also read
-Homebrew, `/usr/local`, Xcode and the package-manager caches in your home, and
-write a package cache of its own. Everything else must be declared in
+`/Library/Preferences`, `/Library/Frameworks` - and `/Library/Developer`
+(the Command Line Tools and simulator support), and a few device files
+(`/dev/null`, `/dev/random` and the like); it can read and write its target's
+own tool cache when one is kept, and create files under the names `mktemp`
+generates in the per-user temp directory. Xcode itself
+(`/Applications/Xcode.app`, usually the active developer directory) is not on
+the floor: under `strict` a job that runs `xcodebuild` from it declares it.
+Under `moderate` and `permissive` it can also read Homebrew, `/usr/local`,
+Xcode and the package-manager caches in your home, and write a package cache
+of its own. Everything else must be declared in
 `.localmostrc`, and the credential files and app directories listed under What
 localmost protects against stay closed whatever it declares. A repository's
 policy therefore tells you what a job may touch beyond that floor, not
 everything it may touch. A `localmost test` step has no such floor: beyond its
-workspace and the same few device files, its policy lists everything it reads,
-system paths included. `localmost policy init` starts from a policy that runs,
+workspace, the same few device files, the names `mktemp` generates in the
+per-user temp directory and, read-only, the code of the actions it runs, its
+policy lists everything it reads, system paths included. `localmost policy init` starts from a policy that runs,
 and `localmost test --updaterc` records what a workflow actually needs.
 
 Directory nodes on the way down - `/`, and for a runner job `/Users`, your home
