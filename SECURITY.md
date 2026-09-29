@@ -163,7 +163,10 @@ open through the proxy because the runner reaches the local broker through
 it. What keeps a job from using that port is the broker's own
 authentication: each worker talks to it at an address carrying a key of its own
 (`http://127.0.0.1:<port>/w/<key>/`), and the broker answers each key only
-with its own worker's session and the jobs delivered to that worker. That key,
+with its own worker's session and the jobs delivered to that worker. A job
+operation it sends upstream on the runner's credentials (renewing, finishing
+or completing a job) must name that worker's job: by the request id delivered
+to it, or by the plan and job ids of the job details it acquired. That key,
 not the closed port, is what keeps a job from acting as another worker or as
 the runner.
 
