@@ -401,8 +401,8 @@ network:
 
 | Command | Behavior |
 |---------|----------|
-| `localmost test` | Enforce `.localmostrc`, fail on violations |
-| `localmost test --updaterc` | Record reads and writes (writes outside the workspace refused), prompt to update |
+| `localmost test` | Enforce `.localmostrc`, fail on violations; ask first if it grants more than the workspace |
+| `localmost test --updaterc` | Ask first (it reads widely and reaches any host), record reads and writes (writes outside the workspace refused), prompt to update |
 | `localmost test --dry-run` | Show what *would* be accessed without running |
 | `localmost policy show` | Display current policy for this repo |
 | `localmost policy diff` | Compare local vs cached policy |

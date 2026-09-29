@@ -12,6 +12,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import { execFileSync } from 'child_process';
 import {
   parseWorkflowFile,
@@ -45,7 +46,7 @@ import {
   serializeLocalmostrc,
   LOCALMOSTRC_VERSION,
 } from '../shared/localmostrc';
-import { SandboxPolicy, parseSandboxTrace } from '../shared/sandbox-profile';
+import { SandboxPolicy, parseSandboxTrace, MACOS_BASELINE_READ_PATHS } from '../shared/sandbox-profile';
 import { DockerPolicy, diffDockerPolicy, mergeDockerPolicy, parseDockerPolicyHint } from '../shared/docker-policy';
 import { DiscoveryProxy } from '../shared/discovery-proxy';
 import { createWorkspace, cleanupWorkspaces, getGitInfo, getRepositoryFromDir } from '../shared/workspace';
@@ -68,7 +69,7 @@ export interface TestOptions {
   job?: string;
   /** Run in discovery mode to generate .localmostrc */
   updaterc?: boolean;
-  /** Skip the confirmation prompt when --updaterc rewrites a policy */
+  /** Answer yes to every confirmation: grants beyond the workspace, running discovery, and writing what it found */
   assumeYes?: boolean;
   /** Path to a KEY=value file holding secret values */
   secretFile?: string;
@@ -280,6 +281,22 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     // policy stays undefined = empty allowlist
   }
   console.log();
+
+  // The checkout is as untrusted as its code: nothing it grants itself
+  // beyond its workspace applies until the user has seen it. Discovery
+  // applies no policy, and is asked about on its own terms. A dry run runs
+  // nothing.
+  if (!options.dryRun) {
+    const confirm = { assumeYes: !!options.assumeYes, isTTY: !!process.stdin.isTTY };
+    const confirmed = options.updaterc
+      ? await confirmDiscovery(confirm)
+      : await confirmCheckoutGrants(cwd, grantsBeyondWorkspace(policy), confirm);
+    if (!confirmed) {
+      throw new Error(
+        'Not running: confirm on a terminal, or pass --yes to run this checkout with what it asks for.'
+      );
+    }
+  }
 
   // Handle secrets
   const secretNames = extractSecretReferences(workflow.workflow);
@@ -988,6 +1005,111 @@ function resolveWorkflowPath(input: string | undefined, cwd: string): string {
 }
 
 
+/** Ask a yes/no question on the terminal; a yes is y or yes, anything else no. */
+async function askOnTerminal(question: string): Promise<string> {
+  const readline = await import('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise<string>(resolve => {
+    rl.question(question, a => {
+      rl.close();
+      resolve(a);
+    });
+  });
+}
+
+const isYes = (answer: string): boolean => /^y(es)?$/i.test(answer.trim());
+
+/**
+ * What a policy grants a step beyond its workspace and the OS read paths
+ * every workflow needs: every write, every other read, every host.
+ */
+export function grantsBeyondWorkspace(policy: SandboxPolicy | undefined): PolicyAddition[] {
+  const baseline = new Set(MACOS_BASELINE_READ_PATHS);
+  return nonEmpty([
+    { label: 'filesystem.write', items: policy?.filesystem?.write ?? [] },
+    { label: 'filesystem.read', items: (policy?.filesystem?.read ?? []).filter((p) => !baseline.has(p)) },
+    { label: 'network.allow', items: policy?.network?.allow ?? [] },
+  ]);
+}
+
+/** Where the checkouts' confirmed grants are kept: the app data directory, which no step can reach. */
+const checkoutApprovalsPath = (): string => path.join(getAppDataDirWithoutElectron(), 'test-approvals.json');
+
+function readCheckoutApprovals(): Record<string, string> {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(checkoutApprovalsPath(), 'utf-8'));
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+const grantsDigest = (grants: PolicyAddition[]): string =>
+  crypto.createHash('sha256').update(JSON.stringify(grants)).digest('hex');
+
+/**
+ * Ask before running a checkout whose .localmostrc grants it more than its
+ * workspace, and remember a yes for that checkout and exactly those grants.
+ *
+ * The policy is the checkout's own to write, like the rest of it, and it is
+ * what confines the checkout: applied without asking, it could grant itself
+ * a write to ~/Library/LaunchAgents or a read of the whole home directory.
+ * A yes is remembered by where the checkout sits, which it cannot choose,
+ * never by the repository name it claims; any change to the grants is asked
+ * again. Without a terminal, only --yes runs it.
+ */
+export async function confirmCheckoutGrants(
+  sourceDir: string,
+  grants: PolicyAddition[],
+  options: { assumeYes: boolean; isTTY: boolean; ask?: (question: string) => Promise<string> }
+): Promise<boolean> {
+  if (grants.length === 0) return true;
+  const checkoutKey = fs.realpathSync(sourceDir);
+  const digest = grantsDigest(grants);
+  if (readCheckoutApprovals()[checkoutKey] === digest) return true;
+
+  console.log(`${colors.bold}This checkout's .localmostrc grants its workflow more than its workspace:${colors.reset}`);
+  for (const { label, items } of grants) {
+    console.log(`  ${colors.bold}${label}${colors.reset}`);
+    for (const item of items) console.log(`    ${colors.yellow}+${colors.reset} ${item}`);
+  }
+  console.log('The policy comes from the checkout itself. Run it only if you would grant these to its code.');
+  console.log();
+
+  if (options.assumeYes) return true;
+  if (!options.isTTY) return false;
+
+  if (!isYes(await (options.ask ?? askOnTerminal)('Run with these grants? [y/N] '))) return false;
+  const approvals = { ...readCheckoutApprovals(), [checkoutKey]: digest };
+  fs.mkdirSync(path.dirname(checkoutApprovalsPath()), { recursive: true, mode: 0o700 });
+  const partial = `${checkoutApprovalsPath()}.${crypto.randomBytes(8).toString('hex')}`;
+  fs.writeFileSync(partial, JSON.stringify(approvals, null, 2), { mode: 0o600, flag: 'wx' });
+  fs.renameSync(partial, checkoutApprovalsPath());
+  return true;
+}
+
+/**
+ * Ask before a discovery run, every time.
+ *
+ * Discovery has to see what a workflow reads, so it lets the checkout read
+ * everything but the paths no policy can grant, and reach any host through
+ * the proxy. That is only safe on a checkout you would trust with it, and
+ * nothing about a checkout says whether it is one, so it is not remembered.
+ */
+export async function confirmDiscovery(options: {
+  assumeYes: boolean;
+  isTTY: boolean;
+  ask?: (question: string) => Promise<string>;
+}): Promise<boolean> {
+  console.log(`${colors.yellow}${colors.bold}--updaterc runs this checkout with wide access:${colors.reset}`);
+  console.log('  It can read everything on disk except your credentials and localmost\'s own data,');
+  console.log('  and reach any host on the internet. Use it only on a checkout whose code you trust.');
+  console.log();
+  if (options.assumeYes) return true;
+  if (!options.isTTY) return false;
+  return isYes(await (options.ask ?? askOnTerminal)('Run discovery? [y/N] '));
+}
+
 /**
  * List what a discovery run wants to add, and ask before writing it.
  *
@@ -1017,15 +1139,7 @@ async function confirmPolicyChange(
     return false;
   }
 
-  const readline = await import('readline');
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const answer = await new Promise<string>(resolve => {
-    rl.question('Apply these changes? [y/N] ', a => {
-      rl.close();
-      resolve(a);
-    });
-  });
-  const yes = /^y(es)?$/i.test(answer.trim());
+  const yes = isYes(await askOnTerminal('Apply these changes? [y/N] '));
   if (!yes) console.log('Not writing.');
   return yes;
 }
@@ -1503,7 +1617,8 @@ ${colors.bold}OPTIONS:${colors.reset}
   -m, --matrix <spec>  Run specific matrix combination (e.g., "os=macos,node=18")
   -f, --full-matrix Run all matrix combinations
   -u, --updaterc    Discovery mode: record access and generate .localmostrc
-  -y, --yes         Apply --updaterc changes without confirming
+  -y, --yes         Answer yes to every confirmation: a .localmostrc's grants
+                    beyond the workspace, running --updaterc, and its changes
   -n, --dry-run     Show what would run without executing
   -v, --verbose     Show command output
   --staged          Use staged changes only (git diff --staged)
