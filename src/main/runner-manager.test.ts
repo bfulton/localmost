@@ -10,7 +10,8 @@ jest.mock('./runner-downloader', () => ({
     getArcDir: jest.fn().mockReturnValue('/Users/test/.localmost/runner/arc/v2.330.0'),
     getConfigDir: jest.fn().mockImplementation((instance: number) => `/Users/test/.localmost/runner/config/${instance}`),
     getSandboxDir: jest.fn().mockImplementation((instance: number) => `/Users/test/.localmost/runner/sandbox/${instance}`),
-    getToolCacheDir: jest.fn().mockReturnValue('/Users/test/.localmost/runner/tool-cache'),
+    getToolCacheDir: jest.fn().mockImplementation((targetId: string) => `/Users/test/.localmost/runner/caches/${targetId}/tool-cache`),
+    getTargetCacheDir: jest.fn().mockImplementation((targetId: string) => `/Users/test/.localmost/runner/caches/${targetId}`),
     buildSandbox: jest.fn().mockImplementation((instance: number) => Promise.resolve(`/Users/test/.localmost/runner/sandbox/${instance}`)),
     isDownloaded: jest.fn().mockReturnValue(true),
     isConfigured: jest.fn().mockImplementation((_instance: number) => true),
@@ -1789,6 +1790,242 @@ describe('RunnerManager', () => {
       const gitCfgWrite = (fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => String(f).endsWith('.localmost-gitconfig'));
       expect(gitCfgWrite).toBeDefined();
       expect(String(gitCfgWrite![1])).toContain('proxyAuthMethod = basic');
+    });
+
+    it("points the caches tools keep in the shared per-user temp into the job's own temp", async () => {
+      // The sandbox no longer grants the per-user temp and cache directories.
+      // xcrun keeps its lookup cache there and fails without one it can
+      // write; clang and swiftc keep their module cache there; zsh puts here-
+      // documents in /tmp. Each has a variable that moves it.
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(9912));
+
+      await runnerManager.start();
+
+      const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+      const jobTmp = '/Users/test/.localmost/runner/sandbox/1/_temp';
+      expect(env.TMPDIR).toBe(jobTmp);
+      expect(env.xcrun_db).toBe(`${jobTmp}/xcrun_db`);
+      expect(env.CLANG_MODULE_CACHE_PATH).toBe(`${jobTmp}/clang-module-cache`);
+      expect(env.TMPPREFIX).toBe(`${jobTmp}/zsh`);
+    });
+  });
+
+  describe("a worker's tool cache", () => {
+    const spawnFor = async (targetId?: string): Promise<NonNullable<Parameters<typeof spawnSandboxed>[2]>> => {
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+      if (targetId) helper.setPendingTargetContext('1', { targetId, targetDisplayName: 'owner/repo' });
+      await runnerManager.start();
+      return mockSpawnSandboxed.mock.calls.at(-1)![2]!;
+    };
+
+    it("is the worker's own target's, in the env and in the profile", async () => {
+      // setup-* actions execute what they find in the tool cache. One cache
+      // per target means a job can only ever find tools its own repository's
+      // jobs put there.
+      const options = await spawnFor('t1');
+      const cache = '/Users/test/.localmost/runner/caches/t1/tool-cache';
+      expect(options.env?.RUNNER_TOOL_CACHE).toBe(cache);
+      expect(options.env?.AGENT_TOOLSDIRECTORY).toBe(cache);
+      expect(options).toHaveProperty('toolCacheDir', cache);
+      expect(fs.mkdirSync).toHaveBeenCalledWith(cache, expect.objectContaining({ recursive: true }));
+    });
+
+    it('is not shared between targets', async () => {
+      const first = await spawnFor('t1');
+      await runnerManager.stop();
+      const second = await spawnFor('t2');
+      expect(second.toolCacheDir).toBe('/Users/test/.localmost/runner/caches/t2/tool-cache');
+      expect(second.toolCacheDir).not.toBe(first.toolCacheDir);
+    });
+
+    it('is absent with per-sandbox selected, leaving the runner its own work directory', async () => {
+      (runnerManager as unknown as { toolCacheLocation: string }).toolCacheLocation = 'per-sandbox';
+      const options = await spawnFor('t1');
+      expect(options.env?.RUNNER_TOOL_CACHE).toBeUndefined();
+      expect(options.env?.AGENT_TOOLSDIRECTORY).toBeUndefined();
+      expect(options.toolCacheDir).toBeUndefined();
+    });
+
+    it('is absent for a worker spawned without a target', async () => {
+      // No target, no cache to give it: nothing shared is writable instead.
+      const options = await spawnFor();
+      expect(options.env?.RUNNER_TOOL_CACHE).toBeUndefined();
+      expect(options.toolCacheDir).toBeUndefined();
+    });
+  });
+
+  describe("a worker's package caches", () => {
+    const spawnAt = async (
+      level: 'strict' | 'moderate' | 'permissive',
+      toolCacheLocation: 'persistent' | 'per-sandbox' = 'persistent'
+    ) => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({ hosts: [], level, readPaths: [], writePaths: [], docker: {} }),
+      });
+      (manager as unknown as { toolCacheLocation: string }).toolCacheLocation = toolCacheLocation;
+      const helper = new RunnerManagerTestHelper(manager);
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+      helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
+      await manager.start();
+      return mockSpawnSandboxed.mock.calls.at(-1)![2]!;
+    };
+    const packages = '/Users/test/.localmost/runner/caches/t1/packages';
+
+    it.each(['moderate', 'permissive'] as const)(
+      "point the package managers at the target's own directory under %s, not the user's home",
+      async (level) => {
+        // moderate used to grant write on ~/.cargo, ~/go, ~/.gradle and the
+        // like, which hold the user's PATH directories and tool config. The
+        // tools are moved rather than the grant kept.
+        const options = await spawnAt(level);
+        expect(options).toHaveProperty('packageCacheDir', packages);
+        expect(fs.mkdirSync).toHaveBeenCalledWith(packages, expect.objectContaining({ recursive: true }));
+        const env = options.env!;
+        for (const key of [
+          'npm_config_cache', 'YARN_CACHE_FOLDER', 'YARN_GLOBAL_FOLDER', 'npm_config_store_dir',
+          'XDG_CACHE_HOME', 'XDG_DATA_HOME', 'CARGO_HOME', 'GRADLE_USER_HOME', 'GOPATH', 'GOCACHE',
+          'PIP_CACHE_DIR', 'NUGET_PACKAGES', 'NUGET_HTTP_CACHE_PATH', 'DOTNET_CLI_HOME',
+          'electron_config_cache', 'npm_config_devdir',
+        ]) {
+          expect(env[key]).toMatch(new RegExp(`^${packages}/`));
+        }
+        expect(env.MAVEN_OPTS).toBe(`-Dmaven.repo.local=${packages}/m2/repository`);
+        // Maven 3.9 and later also read MAVEN_ARGS, which a workflow setting
+        // MAVEN_OPTS for its JVM flags (-Xmx and the like) leaves alone.
+        expect(env.MAVEN_ARGS).toBe(`-Dmaven.repo.local=${packages}/m2/repository`);
+        // The installed toolchains are still found where the user put them.
+        expect(env.RUSTUP_HOME).toBeUndefined();
+      }
+    );
+
+    it('are not given under strict, which keeps what the repository declares', async () => {
+      const options = await spawnAt('strict');
+      expect(options.packageCacheDir).toBeUndefined();
+      expect(options.env?.CARGO_HOME).toBeUndefined();
+      expect(options.env?.GRADLE_USER_HOME).toBeUndefined();
+    });
+
+    it.each(['moderate', 'permissive'] as const)(
+      "stay inside the job's own sandbox under %s with per-sandbox selected",
+      async (level) => {
+        // The package cache holds what the target's next job executes -
+        // gradle init scripts, cargo's config and bin, GOPATH/bin - so one
+        // kept across jobs would let a pull request's job plant code its
+        // default branch's next job runs with that branch's secrets.
+        // per-sandbox promises no cache outside the job at all.
+        const options = await spawnAt(level, 'per-sandbox');
+        expect(options.packageCacheDir).toBeUndefined();
+        const inSandbox = '/Users/test/.localmost/runner/sandbox/1/_packages';
+        const env = options.env!;
+        for (const key of ['CARGO_HOME', 'GRADLE_USER_HOME', 'GOPATH', 'npm_config_cache', 'XDG_CACHE_HOME']) {
+          expect(env[key]).toMatch(new RegExp(`^${inSandbox}/`));
+        }
+        expect(env.MAVEN_OPTS).toBe(`-Dmaven.repo.local=${inSandbox}/m2/repository`);
+        const created = (fs.mkdirSync as jest.Mock).mock.calls.map(([dir]) => String(dir));
+        expect(created.filter((dir) => dir.includes('/runner/caches/'))).toEqual([]);
+      }
+    );
+  });
+
+  describe("a worker's environment", () => {
+    const withHostEnv = async (vars: Record<string, string>, run: () => Promise<void>) => {
+      const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+      Object.assign(process.env, vars);
+      try {
+        await run();
+      } finally {
+        for (const [k, v] of Object.entries(saved)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
+    };
+
+    it("does not carry the app's own environment into the job", async () => {
+      // Launched from a shell, the app inherits every token and agent socket
+      // that shell had. None of it is the job's.
+      await withHostEnv({ FOO_SECRET: 'hunter2', SSH_AUTH_SOCK: '/tmp/agent.sock', NODE_OPTIONS: '--inspect' }, async () => {
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+
+        await runnerManager.start();
+
+        const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+        expect(env.FOO_SECRET).toBeUndefined();
+        expect(env.SSH_AUTH_SOCK).toBeUndefined();
+        expect(env.NODE_OPTIONS).toBeUndefined();
+        // What the runner and a shell need to know who and where they are.
+        expect(env.PATH).toBe(process.env.PATH);
+        expect(env.HOME).toBe(process.env.HOME);
+        // And what the app sets for the runner itself.
+        expect(env.ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT).toBe('true');
+        expect(env.HTTPS_PROXY).toBeDefined();
+      });
+    });
+
+    it("applies the repository's approved env policy", async () => {
+      await withHostEnv({ DEVELOPER_DIR: '/Applications/Xcode-beta.app', FOO_SECRET: 'hunter2', LANG: 'C' }, async () => {
+        const manager = new RunnerManager({
+          onLog: mockOnLog,
+          onStatusChange: mockOnStatusChange,
+          onJobHistoryUpdate: mockOnJobHistoryUpdate,
+          getRepoPolicy: async () => ({
+            hosts: [], level: 'strict' as const, readPaths: [], writePaths: [], docker: {},
+            env: { allow: ['DEVELOPER_DIR'], deny: ['LANG'] },
+          }),
+        });
+        const helper = new RunnerManagerTestHelper(manager);
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+        helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
+
+        await manager.start();
+
+        const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+        expect(env.DEVELOPER_DIR).toBe('/Applications/Xcode-beta.app');
+        expect(env.LANG).toBeUndefined();
+        expect(env.FOO_SECRET).toBeUndefined();
+      });
+    });
+
+    it('cannot use the env policy to replace what the app sets for the runner', async () => {
+      await withHostEnv({ HTTPS_PROXY: 'http://evil.example:1', TMPDIR: '/tmp' }, async () => {
+        const manager = new RunnerManager({
+          onLog: mockOnLog,
+          onStatusChange: mockOnStatusChange,
+          onJobHistoryUpdate: mockOnJobHistoryUpdate,
+          getRepoPolicy: async () => ({
+            hosts: [], level: 'strict' as const, readPaths: [], writePaths: [], docker: {},
+            env: { allow: ['*'] },
+          }),
+        });
+        const helper = new RunnerManagerTestHelper(manager);
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+        helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
+
+        await manager.start();
+
+        const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+        expect(env.HTTPS_PROXY).toMatch(/^http:\/\/localmost:/);
+        expect(env.TMPDIR).toBe('/Users/test/.localmost/runner/sandbox/1/_temp');
+      });
+    });
+
+    it('counts a change to the env policy as a policy change', () => {
+      // The environment is fixed at spawn like the profile, so a worker built
+      // under the old env policy must be recognised as stale.
+      const stamped = runnerManager as unknown as { stampFor(p: object): string };
+      const base = { level: 'strict', readPaths: [], writePaths: [], docker: {} };
+      expect(stamped.stampFor({ ...base, env: { allow: ['DEVELOPER_DIR'], deny: [] } }))
+        .not.toBe(stamped.stampFor({ ...base, env: { allow: [], deny: [] } }));
     });
   });
 

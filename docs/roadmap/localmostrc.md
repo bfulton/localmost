@@ -150,7 +150,7 @@ shared:
       - PATH
     deny:
       - AWS_*
-      - GITHUB_TOKEN             # Don't leak to subprocesses
+      - GITHUB_TOKEN             # Not inherited from localmost's own environment
 
 # Per-workflow policies — merged with shared
 workflows:
@@ -429,6 +429,17 @@ runner itself needs to register and poll for jobs. That is the runner's own
 connection to GitHub rather than anything the job asked for, and the runner
 cannot function without it. Because a single proxy serves both, jobs reach those
 hosts too. Filesystem access is never granted implicitly — see SECURITY.md.
+
+`env:` governs what a job inherits from the environment localmost itself was
+launched with, and nothing else. It never affects the variables the runner or
+the workflow sets: `GITHUB_TOKEN`, secrets and a step's `env:` reach the job as
+usual whatever it says, and neither does it touch what localmost sets for the
+runner (the proxy, `TMPDIR`, `DOCKER_HOST`, the caches). The environment, like
+the filesystem, is fixed when a worker starts, before the workflow is known.
+`env: allow` therefore applies from `shared:` only, and every `env: deny`,
+shared or per workflow, applies to every job. Without an allow, a job inherits
+nothing from the app's environment beyond `PATH`, `HOME`, `USER`, `LOGNAME`,
+`SHELL`, `LANG`, `LC_*`, `TERM`, `TZ` and `__CF_USER_TEXT_ENCODING`.
 
 A repo's policy only takes effect once approved — see
 `localmost policy approve`.

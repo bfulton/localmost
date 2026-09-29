@@ -49,6 +49,29 @@ describe('RunnerDownloader', () => {
     });
   });
 
+  describe('getToolCacheDir', () => {
+    it("is one per target, so one repository's job never finds another's tools", () => {
+      // A job can write its tool cache, and setup-* actions execute the
+      // highest matching version they find there. Shared, a job in one
+      // repository could plant a "node" another repository's job then runs.
+      const a = downloader.getToolCacheDir('26c43c63');
+      const b = downloader.getToolCacheDir('27ef7257');
+      expect(a).toBe(path.join(mockRunnerDir, 'caches', '26c43c63', 'tool-cache'));
+      expect(b).not.toBe(a);
+      expect(b.startsWith(a)).toBe(false);
+      expect(a.startsWith(b)).toBe(false);
+      // Not the old shared directory, which is left where it is.
+      expect(a).not.toBe(path.join(mockRunnerDir, 'tool-cache'));
+    });
+
+    it('refuses a target id that is not a plain name', () => {
+      // It becomes a path the sandbox grants write to.
+      for (const bad of ['', '..', '../proxies', 'a/b', 'x"y', '.']) {
+        expect(() => downloader.getToolCacheDir(bad)).toThrow();
+      }
+    });
+  });
+
   describe('setDownloadVersion / getDownloadVersion', () => {
     it('should return fallback version when no version set', () => {
       expect(downloader.getDownloadVersion()).toBe(FALLBACK_RUNNER_VERSION);

@@ -59,7 +59,7 @@ localmost is a macOS app that manages GitHub's official [actions-runner](https:/
 - **Runner proxy** — maintains long-poll sessions with GitHub's broker to receive job assignments
 - **Runner pool** — 1-8 worker instances that execute jobs in sandboxed environments
 - **HTTP proxy** — allowlist-based network isolation for runner traffic (GitHub, npm, PyPI, etc.)
-- **Build cache** — persistent tool cache shared across job runs (Node.js, Python, etc.)
+- **Build cache** — persistent tool cache shared across job runs (Node.js, Python, etc.), one per repository or organization
 
 ## Workflow Integration
 

@@ -13,6 +13,8 @@ import {
   SandboxPolicyLevel, RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
 import { SandboxFilesystemPolicy, spawnSandboxed } from './process-sandbox';
+import { inheritedWorkerEnv, packageCacheEnv } from './worker-env';
+import type { EnvPolicy } from '../shared/sandbox-profile';
 import { sweepProcessGroup } from './process-group';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { RunnerDownloader } from './runner-downloader';
@@ -98,6 +100,12 @@ export interface RepoPolicyRuntime {
   writePaths: string[];
   /** The docker actions the policy declares, merged across shared and workflow; empty when it declares none. */
   docker: DockerPolicy;
+  /**
+   * Which of the app's own environment variables a worker may inherit beyond
+   * the baseline, and which it may not; applied when the worker is spawned.
+   * Absent means the policy declares none.
+   */
+  env?: EnvPolicy;
 }
 
 interface RunnerManagerOptions {
@@ -1080,19 +1088,45 @@ export class RunnerManager {
         );
       }
 
+      // A worker is credentialed for one repository and runs a single job, so
+      // the filesystem boundary and the environment can come from that
+      // repository's approved policy. Both are fixed at spawn, which is why a
+      // policy change must retire the workers built under the old one.
+      const startupContextForPolicy = this.pendingTargetContext.get(String(instanceNum));
+      const filesystemPolicy = await this.resolveFilesystemPolicy(startupContextForPolicy);
+
       const proxyUrl = proxy.getProxyUrl();
+      // Not the app's whole environment: launched from a shell, it carries
+      // every token and agent socket that shell had. A worker inherits the
+      // baseline a runner and a shell need, plus what the repository's env
+      // policy allows; everything set below is the app's and comes after, so
+      // no policy can replace it.
       const env: NodeJS.ProcessEnv = {
-        ...process.env,
+        ...inheritedWorkerEnv(process.env, filesystemPolicy.env),
         ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT: 'true',
       };
 
       // Set tool cache location based on setting
-      // 'persistent' = shared directory that survives restarts (fast subsequent jobs)
-      // 'per-sandbox' = inside sandbox, rebuilt each time (clean but slow)
-      if (this.toolCacheLocation === 'persistent') {
-        const toolCacheDir = this.downloader.getToolCacheDir();
-        env.RUNNER_TOOL_CACHE = toolCacheDir;
-        env.AGENT_TOOLSDIRECTORY = toolCacheDir; // Some actions check this instead
+      // 'persistent' = the worker's target's own directory, kept across that
+      //   target's jobs (fast subsequent jobs). Never shared between targets:
+      //   setup-* actions execute what they find there, so a shared cache let
+      //   one repository's job plant a toolchain another's would run.
+      // 'per-sandbox' = inside sandbox, rebuilt each time (clean but slow).
+      // A worker with no target gets none, and so no shared path either. The
+      // target is the one the policy above was resolved for, so the caches
+      // and the policy they are granted under always belong together.
+      const cacheTargetId = startupContextForPolicy?.targetId;
+      let toolCacheDir: string | undefined;
+      if (this.toolCacheLocation === 'persistent' && cacheTargetId) {
+        try {
+          toolCacheDir = this.downloader.getToolCacheDir(cacheTargetId);
+          fs.mkdirSync(toolCacheDir, { recursive: true, mode: 0o700 });
+          env.RUNNER_TOOL_CACHE = toolCacheDir;
+          env.AGENT_TOOLSDIRECTORY = toolCacheDir; // Some actions check this instead
+        } catch (err) {
+          this.log('warn', `No tool cache for instance ${instanceNum}; its tools stay in the job: ${(err as Error).message}`);
+          toolCacheDir = undefined;
+        }
       }
 
       // The sandbox confines the runner to this proxy, and that rule only
@@ -1107,12 +1141,30 @@ export class RunnerManager {
       env.HTTP_PROXY = proxyUrl;
       env.HTTPS_PROXY = proxyUrl;
 
-      // A worker is credentialed for one repository and runs a single job, so
-      // the filesystem boundary can come from that repository's approved
-      // policy. The profile is fixed at spawn, which is why a policy change
-      // must retire the workers built under the old one.
-      const startupContextForPolicy = this.pendingTargetContext.get(String(instanceNum));
-      const filesystemPolicy = await this.resolveFilesystemPolicy(startupContextForPolicy);
+      // Under moderate and permissive the job's package managers get a
+      // directory of their own, in place of the write access to the user's
+      // ~/.cargo, ~/go, ~/.gradle and the like those levels used to grant -
+      // trees that hold the user's PATH directories and tool config. Strict
+      // keeps exactly what the repository declares.
+      // Kept across jobs only where the tool cache is: the package cache holds
+      // what the target's next job executes (gradle init scripts, cargo's
+      // config and bin, GOPATH/bin), so with per-sandbox selected, or no
+      // target, it lives in the job's own sandbox and goes with it.
+      let packageCacheDir: string | undefined;
+      if (filesystemPolicy.level !== 'strict') {
+        if (this.toolCacheLocation === 'persistent' && cacheTargetId) {
+          try {
+            packageCacheDir = path.join(this.downloader.getTargetCacheDir(cacheTargetId), 'packages');
+            fs.mkdirSync(packageCacheDir, { recursive: true, mode: 0o700 });
+          } catch (err) {
+            this.log('warn', `No package cache for instance ${instanceNum}; its packages stay in the job: ${(err as Error).message}`);
+            packageCacheDir = undefined;
+          }
+        }
+        // The sandbox directory is already writable and rebuilt for each job,
+        // so this needs no grant of its own.
+        Object.assign(env, packageCacheEnv(packageCacheDir ?? path.join(sandboxDir, '_packages')));
+      }
 
       // The job's docker socket is one localmost serves, not the daemon's.
       // It lives in the sandbox directory, which is rebuilt per job, so it
@@ -1162,6 +1214,16 @@ export class RunnerManager {
       env.TMP = jobTmp;
       env.TEMP = jobTmp;
       env.RUNNER_TEMP = jobTmp;
+      // Some tools ignore TMPDIR and keep state in the per-user temp and cache
+      // directories, which the sandbox does not grant: those are shared with
+      // everything the user runs, and the xcrun cache and clang module cache
+      // there are trusted by the user's own compilers. Each of these has a
+      // variable that moves it into the job's temp. xcrun cannot resolve a
+      // tool at all without a cache it can write; zsh puts here-documents
+      // under /tmp.
+      env.xcrun_db = path.join(jobTmp, 'xcrun_db');
+      env.CLANG_MODULE_CACHE_PATH = path.join(jobTmp, 'clang-module-cache');
+      env.TMPPREFIX = path.join(jobTmp, 'zsh');
 
       // A per-spawn marker file, held open by the worker and by what it starts
       // through its bash and .NET layers (run.sh, Listener, Worker, `run:` step
@@ -1194,6 +1256,8 @@ export class RunnerManager {
           detached: true,
           filesystemPolicy,
           dockerSocket: dockerSocketPath,
+          toolCacheDir,
+          packageCacheDir,
         });
       } finally {
         // The child holds its own copy; this process must not, or lsof would
@@ -1998,10 +2062,12 @@ export class RunnerManager {
    * were refused. Only what the profile fixed at spawn belongs here.
    */
   private stampFor(
-    policy: Pick<RepoPolicyRuntime, 'level' | 'readPaths' | 'writePaths' | 'docker'>
+    policy: Pick<RepoPolicyRuntime, 'level' | 'readPaths' | 'writePaths' | 'docker' | 'env'>
   ): string {
+    // The env policy is fixed at spawn like the profile, so it is part of
+    // what a worker was built under.
     return createHash('sha256')
-      .update(JSON.stringify([policy.level, policy.readPaths, policy.writePaths, policy.docker]))
+      .update(JSON.stringify([policy.level, policy.readPaths, policy.writePaths, policy.docker, policy.env]))
       .digest('hex');
   }
 
@@ -2049,7 +2115,7 @@ export class RunnerManager {
 
   private async resolveFilesystemPolicy(
     context?: { targetDisplayName?: string; githubSha?: string }
-  ): Promise<SandboxFilesystemPolicy & { stamp?: string }> {
+  ): Promise<SandboxFilesystemPolicy & { env?: EnvPolicy; stamp?: string }> {
     // No stamp rather than a sentinel: a sentinel is truthy, so it would fail
     // the drift check against every real hash and the worker would refuse
     // every job. The profile it got is the closed one, which is the safe
@@ -2071,6 +2137,7 @@ export class RunnerManager {
         level: policy.level,
         read: policy.readPaths,
         write: policy.writePaths,
+        env: policy.env,
         stamp: this.stampFor(policy),
       };
     } catch {

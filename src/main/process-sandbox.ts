@@ -8,7 +8,7 @@
  * - Using Node.js native APIs instead of shell commands where possible
  */
 
-import { spawn, ChildProcess, SpawnOptions } from 'child_process';
+import { spawn, execFileSync, ChildProcess, SpawnOptions } from 'child_process';
 import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
@@ -109,11 +109,41 @@ function validateExecutablePath(executablePath: string): string {
 export const DEFAULT_BROKER_PORT = 8787;
 
 /**
- * Where the runner keeps downloaded toolchains, shared across jobs.
- * Mirrors RunnerDownloader.getToolCacheDir.
+ * The per-user temp directory confstr hands out, once a lookup has answered.
+ * A failed lookup is not remembered: it is tried again at the next spawn, so
+ * one transient failure does not cost every later job its bare mktemp.
  */
-function getToolCacheDirPath(): string {
-  return path.join(getRunnerDir(), 'tool-cache');
+let userTempDir: string | undefined;
+/** Whether a failed lookup has been logged, so a lasting failure logs once. */
+let userTempDirFailureLogged = false;
+
+/**
+ * Where macOS `mktemp` puts a file when it is given no template. It ignores
+ * TMPDIR and asks confstr for the per-user temp directory instead, so pointing
+ * TMPDIR into the sandbox does not move it. Only a /var/folders/<a>/<b>/T path
+ * is accepted: the answer lands in a regex in the profile.
+ */
+function darwinUserTempDir(onLog?: SandboxLogCallback): string | undefined {
+  if (userTempDir !== undefined) return userTempDir;
+  let failure: string;
+  try {
+    const answer = String(execFileSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf-8' }))
+      .trim()
+      .replace(/\/+$/, '')
+      .replace(/^\/private/, '');
+    if (/^\/var\/folders\/[A-Za-z0-9_+-]+\/[A-Za-z0-9_+-]+\/T$/.test(answer)) {
+      userTempDir = answer;
+      return userTempDir;
+    }
+    failure = `unexpected answer ${JSON.stringify(answer)}`;
+  } catch (err) {
+    failure = (err as Error).message;
+  }
+  if (!userTempDirFailureLogged && onLog) {
+    userTempDirFailureLogged = true;
+    onLog('error', `Per-user temp directory lookup failed, so jobs cannot use mktemp without a template: ${failure}`);
+  }
+  return undefined;
 }
 
 /** What a repository's approved policy contributes to the sandbox profile. */
@@ -127,7 +157,7 @@ export interface SandboxFilesystemPolicy {
 }
 
 /** Everything the runner profile is built from. */
-interface RunnerProfileOptions {
+export interface RunnerProfileOptions {
   /** The instance directory this worker runs in. */
   instanceDir: string;
   /** The broker's port, denied to jobs because it carries job payloads. */
@@ -138,16 +168,22 @@ interface RunnerProfileOptions {
   filesystemPolicy?: SandboxFilesystemPolicy;
   /** The filtering docker socket the app serves this worker, if it has one. */
   dockerSocket?: string;
+  /** This worker's target's tool cache, if it keeps one across jobs. */
+  toolCacheDir?: string;
+  /** This worker's target's package-manager cache; ignored under strict. */
+  packageCacheDir?: string;
   /** Optional log sink for notes such as a policy path being ignored. */
   onLog?: SandboxLogCallback;
 }
 
-function generateSandboxProfile({
+export function generateSandboxProfile({
   instanceDir,
   brokerPort = DEFAULT_BROKER_PORT,
   allowDirectNetwork = false,
   filesystemPolicy = { level: 'strict', read: [], write: [] },
   dockerSocket,
+  toolCacheDir: toolCache,
+  packageCacheDir: packageCache,
   onLog,
 }: RunnerProfileOptions): string {
   // The worker's own docker socket, served by the app: every request on it is
@@ -179,7 +215,6 @@ function generateSandboxProfile({
   // The app's own control plane: approvals, settings and the CLI socket. A job
   // that can write these can approve its own policy, so it is carved out of
   // the app data directory rather than trusted to leave it alone.
-  const toolCacheDir = getToolCacheDirPath().replace(/"/g, '\\"');
   const policiesDir = `${appDataDir}/policies`;
   const configFile = getConfigPath().replace(/"/g, '\\"');
   const runnerDir = getRunnerDir().replace(/"/g, '\\"');
@@ -188,8 +223,11 @@ function generateSandboxProfile({
 
   // Toolchains and package-manager caches are a convenience for jobs, not
   // something the runner needs. Under strict a repository declares what it
-  // wants; moderate and permissive keep them, which is the same split the
-  // network allowlists already use.
+  // wants; moderate and permissive can read them, which is the same split the
+  // network allowlists already use. Read only: these trees hold directories on
+  // the user's PATH and config their own tools load, so a job that could write
+  // them could plant code the user later runs outside any sandbox. The job's
+  // package managers write to its target's own directory instead.
   const toolchainPaths =
     filesystemPolicy.level === 'strict'
       ? []
@@ -256,14 +294,46 @@ function generateSandboxProfile({
   const policyReads = subpaths(filesystemPolicy.read.filter(outsideRunner));
   const policyWrites = subpaths(filesystemPolicy.write.filter(outsideRunner));
   const toolchainRules = subpaths(toolchainPaths);
-  const cacheWritePaths =
-    filesystemPolicy.level === 'strict'
-      ? []
-      : toolchainPaths.filter((entry) => entry.startsWith(homeDir));
-  const cacheWriteRules = cacheWritePaths.length
-    ? `(allow file-write*\n${subpaths(cacheWritePaths)})`
-    : ';; strict: caches are not writable unless the policy declares them';
-  const tmpDir = os.tmpdir().replace(/"/g, '\\"');
+  // `mktemp` with no template creates tmp.XXXXXXXXXX in the per-user temp
+  // directory whatever TMPDIR says, and scripts call it that way constantly.
+  // That directory is shared with every process the user runs - the xcrun
+  // cache that their own clang trusts lives there - so it is not granted.
+  // Names of exactly the shape mktemp generates are: ten random characters no
+  // other process can guess, and without read on the directory itself a job
+  // cannot list it to find one. Both spellings, as /var is a symlink.
+  const mktempRules = ((dir?: string): string => {
+    if (!dir) return ';; Per-user temp directory unknown: mktemp without a template is not granted';
+    const escapeForRegex = (value: string) => value.replace(/[.*+?^$()[\]{}|\\]/g, '\\$&');
+    const generated = `/tmp\\.${'[A-Za-z0-9]'.repeat(10)}(/|$)`;
+    return [
+      '(allow file-write* file-read*',
+      `  (regex #"^${escapeForRegex(`/private${dir}`)}${generated}")`,
+      `  (regex #"^${escapeForRegex(dir)}${generated}"))`,
+    ].join('\n');
+  })(darwinUserTempDir(onLog));
+  // This worker's target's own caches, when it keeps any across jobs. Never
+  // one shared with another target: what a job leaves in a cache, the next
+  // job to find it executes. The directories above them are readable as
+  // nodes only (.NET reads every ancestor of what it opens), so another
+  // target's caches are not opened along the way. The package cache is a
+  // moderate and permissive convenience; strict keeps what it declares.
+  const ownCaches = [toolCache, filesystemPolicy.level === 'strict' ? undefined : packageCache]
+    .filter((dir): dir is string => Boolean(dir));
+  const ownCacheRules = (operation: string) =>
+    ownCaches.length
+      ? `(allow ${operation}\n${ownCaches.map((dir) => `  (subpath "${dir.replace(/"/g, '\\"')}")`).join('\n')})`
+      : `;; No cache kept across jobs: nothing outside the sandbox for ${operation}`;
+  const ownCacheNodes = [...new Set(ownCaches.flatMap((dir) => {
+    const nodes: string[] = [];
+    for (let node = path.dirname(dir); node.startsWith(runnerRoot + path.sep); node = path.dirname(node)) {
+      nodes.push(node);
+    }
+    return nodes;
+  }))];
+  const ownCacheReads = [
+    ...ownCacheNodes.map((node) => `  (literal "${node.replace(/"/g, '\\"')}")`),
+    ...ownCaches.map((dir) => `  (subpath "${dir.replace(/"/g, '\\"')}")`),
+  ].join('\n');
 
   return `
 (version 1)
@@ -291,29 +361,24 @@ function generateSandboxProfile({
 (allow file-ioctl
   (subpath "${escapedDir}"))
 
-;; Tool cache only. The rest of the app data directory holds the approval
-;; cache, settings and the CLI socket - a job that can write those can approve
-;; its own policy, so it does not get the directory wholesale.
-(allow file-write*
-  (subpath "${toolCacheDir}"))
+;; This target's own caches only. The rest of the app data directory holds the
+;; approval cache, settings and the CLI socket - a job that can write those can
+;; approve its own policy - and every other target's caches, which a job that
+;; could write would poison for that target's next job.
+${ownCacheRules('file-write*')}
 
-;; File ioctl for git file locking in the tool cache
-(allow file-ioctl
-  (subpath "${toolCacheDir}"))
+;; File ioctl for git file locking in those caches
+${ownCacheRules('file-ioctl')}
 
-;; System temp directories (many tools require this)
-;; Note: /var is a symlink to /private/var on macOS, and sandbox
-;; checks may use canonical paths, so we need both variants
-(allow file-write*
-  (subpath "${tmpDir}")
-  (subpath "/tmp")
-  (subpath "/private/tmp")
-  (subpath "/var/folders")
-  (subpath "/private/var/folders"))
+;; No shared temp directory. /tmp and the per-user /var/folders tree belong to
+;; every process the user runs; the job's TMPDIR is in its own sandbox, and
+;; the caches tools would otherwise keep there are pointed into it too.
+;; Only what mktemp itself creates, by the name it generated:
+${mktempRules}
 
-;; Package-manager caches. Under strict a repository declares the ones it
-;; needs; moderate and permissive keep them, matching the read side.
-${cacheWriteRules}
+;; No package-manager cache in the user's home. Under strict a repository
+;; declares what it needs; moderate and permissive get their target's own
+;; package cache above, with the package managers pointed at it.
 
 ;; Paths the repository's approved policy declares writable.
 ${policyWrites ? `(allow file-write*\n${policyWrites})` : ';; No policy-declared write paths'}
@@ -365,23 +430,25 @@ ${policyWrites ? `(allow file-write*\n${policyWrites})` : ';; No policy-declared
   (subpath "/usr/share")
   (subpath "/System")
   (subpath "/Library/Developer")
+  ;; OS frameworks installed outside /System: xcodebuild links one, and xcrun
+  ;; runs it to find a tool whenever its cache does not already know the way.
+  (subpath "/Library/Apple")
   (subpath "/Library/Preferences")
   (subpath "/Library/Frameworks")
   (subpath "/private/etc")
+  ;; Only the parts of /private/var the toolchain reads (the xcode-select
+  ;; link, the shell selection). Not the rest: it holds logs, other
+  ;; processes' state and the per-user temp and cache directories.
   (subpath "/private/var/db")
   (subpath "/private/var/select")
-  (subpath "/private/var/folders")
   (subpath "/etc")
-  (subpath "/var")
-  (subpath "/tmp")
-  (subpath "/private/tmp")
-  ;; This job's own workspace and the shared tool cache. Not the runner
+  ;; This job's own workspace and its target's own caches. Not the runner
   ;; directory as a whole: it holds every target's proxy credentials, every
-  ;; instance's registration, the broker's session tokens and the other
-  ;; workers' sandboxes. The job's own sandbox already carries the runner it
-  ;; runs, so it needs nothing else from there.
+  ;; instance's registration, the broker's session tokens, the other workers'
+  ;; sandboxes and the other targets' caches. The job's own sandbox already
+  ;; carries the runner it runs, so it needs nothing else from there.
   (subpath "${escapedDir}")
-  (subpath "${toolCacheDir}")
+${ownCacheReads}
 ${toolchainRules}
 ${policyReads}
   (literal "/dev/null")
@@ -547,6 +614,17 @@ export interface SandboxOptions extends SpawnOptions {
    * to it and nothing else; the daemon's own socket stays denied.
    */
   dockerSocket?: string;
+  /**
+   * The worker's target's own tool cache, kept across that target's jobs.
+   * Absent means none: the runner keeps its tools in the job's work directory.
+   */
+  toolCacheDir?: string;
+  /**
+   * The worker's target's own package-manager cache, which the job's package
+   * managers are pointed at under moderate and permissive. Not granted under
+   * strict, whatever is passed.
+   */
+  packageCacheDir?: string;
   /** Log prefix for identifying this process (e.g., runner instance ID) */
   logPrefix?: string;
   /** Optional callback for logging sandbox events */
@@ -593,6 +671,8 @@ export function spawnSandboxed(
     allowDirectNetwork,
     filesystemPolicy,
     dockerSocket,
+    toolCacheDir,
+    packageCacheDir,
     logPrefix,
     onLog,
     ...spawnOptions
@@ -612,15 +692,18 @@ export function spawnSandboxed(
       allowDirectNetwork,
       filesystemPolicy,
       dockerSocket,
+      toolCacheDir,
+      packageCacheDir,
       onLog,
     });
 
     // The profile is the thing that confines the job, so it must not live
-    // anywhere a job can write. os.tmpdir() is granted to every sandbox, and
-    // the name was predictable from the clock: a job could plant a symlink at
-    // the next path and have the app write through it, or swap the profile
-    // used by the next spawn. It goes in the app's own directory instead,
-    // created exclusively so an existing entry is never followed.
+    // anywhere a job can write. It used to go in os.tmpdir(), which every
+    // sandbox could then write, under a name predictable from the clock: a job
+    // could plant a symlink at the next path and have the app write through
+    // it, or swap the profile used by the next spawn. It goes in the app's own
+    // directory instead, created exclusively so an existing entry is never
+    // followed.
     const profileDir = path.join(getRunnerDir(), 'sandbox-profiles');
     fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
     const profilePath = path.join(
