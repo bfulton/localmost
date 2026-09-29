@@ -303,6 +303,14 @@ describe('the SECURITY.md escapes', () => {
     expect(evaluateDockerRequest(mk('POST', '/v1.45/images/create'), c).allowed).toBe(false);
   });
 
+  it('refuses an import however fromSrc is cased, since Podman matches the name in any case', () => {
+    const c = ctx({ pull: { registries: ['docker.io'] } });
+    for (const key of ['FROMSRC', 'fromsrc', 'FromSrc']) {
+      const url = `/v1.45/images/create?fromImage=postgres&${key}=-`;
+      expect([url, evaluateDockerRequest(mk('POST', url), c).allowed]).toEqual([url, false]);
+    }
+  });
+
   it('rejects privileged even when declared, unless the backend supports it', () => {
     const v = create({ Image: 'postgres:16', HostConfig: { Privileged: true } },
       { policy: { run: { images: ['postgres:16'], network: 'bridge' }, privileged: true }, sandboxDir: '/ws', workspaceRoot: '/ws', supportsPrivileged: false, realpath: (p) => p });
@@ -577,6 +585,13 @@ describe('build query parameters', () => {
   it('refuses host and container networking, which the run path already forbids', () => {
     expect(build('?networkmode=host').allowed).toBe(false);
     expect(build('?networkmode=container%3Aabc').allowed).toBe(false);
+  });
+
+  it('judges the build network however its name is cased, since Podman matches it in any case', () => {
+    for (const qs of ['?NETWORKMODE=host', '?networkMode=host', '?Networkmode=host', '?NetworkMode=container%3Aabc', '?NETWORKMODE=some-other-net']) {
+      expect([qs, build(qs).allowed]).toEqual([qs, false]);
+    }
+    expect(build('?NETWORKMODE=bridge').allowed).toBe(true);
   });
 
   it('refuses an undeclared build network, and permits the declared one', () => {

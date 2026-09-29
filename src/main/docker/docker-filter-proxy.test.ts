@@ -388,8 +388,8 @@ describe('DockerFilterProxy forwarding', () => {
       const reply = await request(sock, 'POST', `/v1.45/images/create?${query}`);
       expect(reply.status).toBe(400);
     }
+    // Nothing reached the daemon, so no credential was offered for any of them.
     expect(daemon.seen).toHaveLength(0);
-    expect(daemon.seen.some((s) => s.headers['x-registry-auth'] !== undefined)).toBe(false);
 
     // The one list a client repeats, a build's tags, still goes through.
     proxy.bind('owner/repo', { build: { context: './' } });
@@ -856,8 +856,8 @@ describe('mount sources are pinned before forwarding', () => {
     // The filter resolved `link` to decide. If it forwarded the spelling it
     // was given, the daemon would resolve the link again, wherever the job had
     // pointed it by then. This pins the create only: the daemon resolves the
-    // pinned path once more at start, and a link swapped onto it between
-    // create and start is still followed.
+    // pinned path once more at start, and a link swapped onto it after it is
+    // checked and before the container starts is still followed.
     const create = daemon.seen.find((s) => s.url.includes('/containers/create'))!;
     const binds = (JSON.parse(create.body.toString()) as { HostConfig: { Binds: string[] } }).HostConfig.Binds;
     expect(binds[0]).toBe(`${real}:/ws`);
@@ -877,7 +877,7 @@ describe('the mount boundary is the sandbox the app created, not what the job ma
     const sandbox = path.join(dir, 's');
     const victim = path.join(dir, 'victim');
     const checkout = path.join(sandbox, '_work', 'repo', 'repo');
-    fs.mkdirSync(path.join(checkout, 'data'), { recursive: true });
+    fs.mkdirSync(path.join(checkout, 'data', 'sub'), { recursive: true });
     fs.mkdirSync(path.join(victim, '.ssh'), { recursive: true });
     fs.writeFileSync(path.join(victim, '.ssh', 'id_ed25519'), 'SECRET');
     const daemon = await fakeDaemon(dir);
@@ -886,13 +886,17 @@ describe('the mount boundary is the sandbox the app created, not what the job ma
     const { proxy, sock } = await startProxy(sandbox, {
       backend: new DesktopBackend({ resolve: () => ({ socketPath: daemon.sock }) }),
     });
-    proxy.bind('owner/repo', { run: { images: ['alpine:3'], mounts: [{ path: './', mode: 'rw' }], network: 'bridge' } });
     const create = (bind: string) => request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3', HostConfig: { Binds: [bind] } });
 
-    // Before: the checkout mounts, the victim does not.
+    // Before: a narrower declared mount judges against the literal root as it
+    // did against the resolved one, and so does `./`; the victim does not mount.
+    proxy.bind('owner/repo', { run: { images: ['alpine:3'], mounts: [{ path: './data', mode: 'rw' }], network: 'bridge' } });
+    expect((await create(`${checkout}/data/sub:/d`)).status).toBe(201);
+    expect((await create(`${checkout}:/d`)).status).toBe(403);
+    proxy.bind('owner/repo', { run: { images: ['alpine:3'], mounts: [{ path: './', mode: 'rw' }], network: 'bridge' } });
     expect((await create(`${checkout}/data:/d`)).status).toBe(201);
     expect((await create(`${victim}/.ssh:/x`)).status).toBe(403);
-    expect(daemon.seen).toHaveLength(1);
+    expect(daemon.seen).toHaveLength(2);
 
     if (which === 'checkout') {
       fs.renameSync(checkout, `${checkout}.x`);
@@ -910,7 +914,7 @@ describe('the mount boundary is the sandbox the app created, not what the job ma
       const reply = await create(bind);
       expect(reply.status).toBe(403);
     }
-    expect(daemon.seen).toHaveLength(1);
+    expect(daemon.seen).toHaveLength(2);
   });
 });
 

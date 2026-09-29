@@ -430,10 +430,11 @@ What the filter refuses, each of which is an executable test against the proxy:
   to it as written, so a job that replaces its checkout or `_work` with a link
   moves nothing. After resolving, each directory from the sandbox directory
   down to the source is checked, and a symlink among them is refused. The
-  daemon is sent the resolved path, not the spelling it was given. That holds
-  when the container is created, not when it starts: the daemon resolves the
-  path again at start, and a job that swaps a symlink onto it in between
-  mounts what the link names. Closing that is an open item;
+  daemon is sent the resolved path, not the spelling it was given. That does
+  not hold through to the mount: the daemon resolves the path again when the
+  container starts, and a job that swaps a symlink onto it after it is checked
+  and before the container starts mounts what the link names. Closing that is
+  an open item;
 - mounting the daemon socket into a container;
 - `--privileged`, `--pid=host`, `--network=host`, `--device`, and the other
   host-reaching container settings (`IpcMode`, `UtsMode`, `UsernsMode`,

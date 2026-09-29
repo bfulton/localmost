@@ -229,6 +229,21 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   accepts only the content types that carry no form.
 - The Docker filter refuses a body nested deeper than any Docker request.
   Checking its keys overflowed the stack, and the request was never answered.
+- The Docker filter keeps the mount boundary where the app put it. It resolved
+  the job's checkout through symlinks on every request, so with `./` declared a
+  job that replaced its checkout or `_work` with a link to `~` could mount
+  `~/.ssh`. The sandbox directory is now resolved once, when the socket starts,
+  and a mount source reached through a symlink below it is refused.
+- The Docker filter reads a pull's registry the way the daemon does: a first
+  component with an uppercase letter (`LOCALHOST/x`, `Evil/x`) names a registry
+  host, not a Docker Hub namespace. Such a pull was approved under `docker.io`
+  and sent the operator's Docker Hub credential.
+- The Docker filter answers 400 to a query that repeats a parameter in any case
+  or spelling, or has a `;` or a `%` that starts no escape. Podman reads such a
+  query differently from the filter, so a pull judged as `postgres` pulled
+  another image on the `docker.io` credential. A build's `t` tags may still
+  repeat. `networkmode` on a build and `fromSrc` on a pull are judged in any
+  case, as Podman reads them.
 - An approved policy is bound to the repository's id as well as its name. A job
   from a different repository that now holds an approved name - the approved one
   deleted or renamed, and the name taken since - is refused until the policy is

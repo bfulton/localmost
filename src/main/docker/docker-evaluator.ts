@@ -74,8 +74,9 @@ export interface DockerVerdict {
    * would have the daemon resolve that spelling again, through whatever link
    * the job had put on it since it was judged. The resolved path narrows that
    * without closing it: the daemon resolves it once more when the container
-   * starts, so a directory on it the job replaces with a symlink between
-   * create and start is followed. That gap is still open.
+   * starts, so a directory on it the job replaces with a symlink after it is
+   * checked and before the container starts is followed. That gap is still
+   * open.
    */
   rewrittenBody?: unknown;
 }
@@ -642,9 +643,24 @@ function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: Dock
   return { allowed: true, rewrittenBody: pinMountSources(body, resolutions) };
 }
 
+/**
+ * The value of the query parameter whose name case-insensitively equals
+ * `name`. Podman decodes the query with gorilla/schema, which matches a name
+ * in any case, so a parameter the filter refuses on must be read in every
+ * casing, not the one moby reads. There is at most one such key: the parser
+ * refuses a query that repeats a name in any case.
+ */
+function queryValue(query: Record<string, string>, name: string): string | undefined {
+  const wanted = name.toLowerCase();
+  const key = Object.keys(query).find((k) => k.toLowerCase() === wanted);
+  return key === undefined ? undefined : query[key];
+}
+
 function evaluatePull(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
+  // fromImage is read in moby's spelling only: moby ignores any other, so a
+  // lone differently-cased one leaves this undefined and the pull is refused.
   const fromImage = req.query.fromImage;
-  if (req.query.fromSrc !== undefined) {
+  if (queryValue(req.query, 'fromSrc') !== undefined) {
     return deny('importing an image (fromSrc) is not permitted; only pulls from a declared registry are');
   }
   if (!fromImage) return deny('image pull requires fromImage');
@@ -822,7 +838,7 @@ function evaluateBuild(req: DockerRequest, policy: DockerPolicy): DockerVerdict 
   // A build runs containers, and its network is chosen here rather than in a
   // HostConfig - so the same rule the run path applies has to apply here too,
   // or `docker build --network host` walks through a door create keeps shut.
-  const rawMode = req.query.networkmode ?? req.query.NetworkMode;
+  const rawMode = queryValue(req.query, 'networkmode');
   if (rawMode !== undefined && rawMode !== '' && rawMode !== 'default') {
     const rawModeLower = rawMode.toLowerCase();
     if (rawModeLower === 'host' || rawModeLower.startsWith('container:')) {
