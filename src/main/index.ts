@@ -13,7 +13,8 @@ import { HeartbeatManager, toHeartbeatTarget } from './heartbeat-manager';
 import { BrokerProxyService } from './broker-proxy-service';
 import { TargetManager } from './target-manager';
 import { ContributorCache } from './contributor-cache';
-import { admitJob, JobAdmissionDeps } from './job-admission';
+import { admitJob, checkRepoPolicyApproval, JobAdmissionDeps, PolicyApprovalDeps } from './job-admission';
+import { repoPolicyRuntime } from './repo-policy';
 
 // State management
 import {
@@ -102,8 +103,6 @@ import {
 
 // Zustand store
 import { initStore, connectWindow, cleanupStore, store } from './store/init';
-import { getEffectivePolicy, effectivePolicyLevel } from '../shared/localmostrc';
-import { spawnEnvPolicy } from './worker-env';
 import { resolveRegistryAuth } from './docker/registry-auth';
 import {
   decidePolicyForJob,
@@ -161,47 +160,17 @@ if (!gotTheLock) {
 
 
 /**
- * Check whether a repository's .localmostrc has been approved for use.
- *
- * Returns a reason to refuse the job, or null to proceed. A repository with no
- * policy is never refused: it runs on the built-in baseline, which grants
- * nothing beyond what every job already gets.
+ * Check whether a repository's .localmostrc has been approved for use: see
+ * checkRepoPolicyApproval in job-admission.
  */
-async function checkRepoPolicyApproval(
-  owner: string,
-  repo: string,
-  sha?: string
-): Promise<string | null> {
-  const repository = `${owner}/${repo}`;
-  try {
-    const accessToken = await getValidAccessToken();
-    if (!accessToken) {
-      return `cannot check ${repository} policy: not authenticated`;
-    }
-    if (!sha) {
-      // Without a commit there is no way to know which policy would apply.
-      return `cannot check ${repository} policy: no commit SHA for this job`;
-    }
-
-    const auth = getGitHubAuth() || new GitHubAuth();
-    const content = await auth.getFileContent(accessToken, owner, repo, '.localmostrc', sha);
-    const decision = decidePolicyForJob(repository, content, sha);
-
-    if (decision.action === 'allow') return null;
-    if (decision.action === 'invalid') {
-      return `${repository} has a .localmostrc that could not be parsed: ${decision.reason}`;
-    }
-
-    recordPendingPolicy(repository, decision.request.newConfig);
-    getLogger()?.warn(formatApprovalRequest(decision.request));
-    return decision.request.isNewRepo
-      ? `${repository} has a .localmostrc that has not been approved. Review and approve it in Settings > Job Security, or run "localmost policy approve" in a clone of the repository.`
-      : `${repository} .localmostrc changed since it was approved. Review and approve it in Settings > Job Security, or run "localmost policy approve" in a clone of the repository.`;
-  } catch (err) {
-    // Fail closed: an unverifiable policy must not be applied silently.
-    return `could not verify ${repository} policy: ${(err as Error).message}`;
-  }
-}
+const repoPolicyApproval: PolicyApprovalDeps = {
+  getAccessToken: getValidAccessToken,
+  getFileContent: (accessToken, owner, repo, filePath, ref) =>
+    (getGitHubAuth() || new GitHubAuth()).getFileContent(accessToken, owner, repo, filePath, ref),
+  decidePolicyForJob,
+  recordPendingPolicy,
+  announce: (request) => getLogger()?.warn(formatApprovalRequest(request)),
+};
 
 app.whenReady().then(async () => {
   // Set restrictive umask so all files/directories are user-only (no group/world access)
@@ -327,46 +296,20 @@ app.whenReady().then(async () => {
       return contributorCache.getAllAuthors(accessToken, owner, repo, sha);
     },
     getJobTarget: (instanceNum: number, jobId: string) => brokerProxyService.getJobTargetForWorker(instanceNum, jobId),
+    // The one loopback port every worker's proxy keeps open.
+    getBrokerPort: () => brokerProxyService.getPort(),
     // Stage 1: approved container requests go to the operator's own daemon.
     // The socket the job sees is localmost's; the daemon's is never handed over.
     dockerBackend: new DesktopBackend(),
-    getRepoPolicy: async (owner: string, repo: string, sha: string, workflowName: string) => {
-      // Apply the policy that was approved, not whatever is in the repository
-      // right now. A job only reaches this point once its policy has been
-      // approved, and applying the approved copy means an unreviewed change
-      // cannot take effect through a race. That covers the level too: it is
-      // declared in the same file and approved with the rest of it. Only a
-      // commit the pre-spawn check found carrying that policy gets it; one
-      // whose .localmostrc was deleted, or that was never checked, gets none.
-      const approved = getApprovedPolicyForCommit(`${owner}/${repo}`, sha);
-      if (!approved) {
-        return {
-          hosts: [],
-          level: 'strict' as const,
-          readPaths: [],
-          writePaths: [],
-          docker: {},
-        };
-      }
-      const policy = getEffectivePolicy(approved, workflowName);
-      return {
-        // Network is resolved per workflow and applied to the proxy per job.
-        hosts: policy.network?.allow || [],
-        level: effectivePolicyLevel(approved),
-        // Filesystem comes from the shared section only. The sandbox profile
-        // is built before the workflow is known and cannot change afterwards,
-        // so a per-workflow filesystem section could not be applied - and
-        // resolving it here would differ between spawn and claim and read as
-        // policy drift.
-        readPaths: approved.shared?.filesystem?.read || [],
-        writePaths: approved.shared?.filesystem?.write || [],
-        // Docker composes across shared and workflow: the socket is bound to
-        // the merged policy when the job is claimed, after the workflow is known.
-        docker: policy.docker ?? {},
-        // Fixed at spawn like the filesystem: see spawnEnvPolicy.
-        env: spawnEnvPolicy(approved),
-      };
-    },
+    // Apply the policy that was approved, not whatever is in the repository
+    // right now. A job only reaches this point once its policy has been
+    // approved, and applying the approved copy means an unreviewed change
+    // cannot take effect through a race. That covers the level too: it is
+    // declared in the same file and approved with the rest of it. Only a
+    // commit the pre-spawn check found carrying that policy gets it; one
+    // whose .localmostrc was deleted, or that was never checked, gets none.
+    getRepoPolicy: async (owner: string, repo: string, sha: string, workflowName: string) =>
+      repoPolicyRuntime(getApprovedPolicyForCommit(`${owner}/${repo}`, sha), workflowName),
     onJobEvent: (event: JobEvent) => {
       logger?.info(`Job event: ${event.type} ${event.jobName}`);
 
@@ -464,7 +407,8 @@ app.whenReady().then(async () => {
     findTarget: (targetId: string) => targetManager.getTargets().find(t => t.id === targetId),
     runnerManager,
     broker: brokerProxyService,
-    checkPolicyApproval: checkRepoPolicyApproval,
+    checkPolicyApproval: (owner, repo, sha, repositoryId) =>
+      checkRepoPolicyApproval(repoPolicyApproval, owner, repo, sha, repositoryId),
     log: (level, message) => getLogger()?.[level](message),
   };
   brokerProxyService.on('job-received', (targetId: string, jobId: string, _registeredRunnerName: string, githubInfo) => {
