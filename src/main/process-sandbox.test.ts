@@ -263,40 +263,47 @@ describe('Process Sandbox', () => {
       jest.resetModules();
     });
 
-  describe("the worker's docker socket in the runner profile", () => {
-    const instanceDir = path.join(os.homedir(), '.localmost', 'runner-3');
-    const homeDir = os.homedir();
+  const instanceDir = path.join(os.homedir(), '.localmost', 'runner-3');
+  const homeDir = os.homedir();
 
-    /**
-     * Build a runner profile with the given sandbox options, and return its
-     * text. `getconf` answers the per-user temp directory lookup, or throws.
-     */
-    const profileWith = (
-      options: Record<string, unknown>,
-      getconf: () => string = () => '/var/folders/zz/zyxw_vut0000gn/T/\n'
-    ): string => {
-      let profile = '';
-      jest.isolateModules(() => {
-        Object.defineProperty(process, 'platform', { value: 'darwin' });
-        const mockProcess = createMockProcess(12360);
-        const localMockSpawn = jest.fn().mockReturnValue(mockProcess);
-        const mockWriteFileSync = jest.fn();
-        jest.doMock('child_process', () => ({ spawn: localMockSpawn, execFileSync: jest.fn(getconf) }));
-        jest.doMock('fs', () => ({
-          existsSync: jest.fn().mockReturnValue(true),
-          writeFileSync: mockWriteFileSync,
-          unlinkSync: jest.fn(),
-          mkdirSync: jest.fn(),
-        }));
+  /**
+   * Build runner profiles for each set of sandbox options in turn, within one
+   * load of the module, and return their text. `getconf` answers the per-user
+   * temp directory lookup, or throws.
+   */
+  const profilesWith = (
+    optionSets: Record<string, unknown>[],
+    getconf: () => string = () => '/var/folders/zz/zyxw_vut0000gn/T/\n'
+  ): string[] => {
+    let profiles: string[] = [];
+    jest.isolateModules(() => {
+      Object.defineProperty(process, 'platform', { value: 'darwin' });
+      const mockProcess = createMockProcess(12360);
+      const localMockSpawn = jest.fn().mockReturnValue(mockProcess);
+      const mockWriteFileSync = jest.fn();
+      jest.doMock('child_process', () => ({ spawn: localMockSpawn, execFileSync: jest.fn(getconf) }));
+      jest.doMock('fs', () => ({
+        existsSync: jest.fn().mockReturnValue(true),
+        writeFileSync: mockWriteFileSync,
+        unlinkSync: jest.fn(),
+        mkdirSync: jest.fn(),
+      }));
 
-        const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
+      const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
+      for (const options of optionSets) {
         sandboxedSpawn(path.join(instanceDir, 'run.sh'), [], { cwd: instanceDir, ...options });
+      }
 
-        profile = mockWriteFileSync.mock.calls[0][1];
-      });
-      return profile;
-    };
+      profiles = mockWriteFileSync.mock.calls.map((call) => call[1]);
+    });
+    return profiles;
+  };
 
+  /** Build one runner profile with the given sandbox options. */
+  const profileWith = (options: Record<string, unknown>, getconf?: () => string): string =>
+    profilesWith([options], getconf)[0];
+
+  describe("the worker's docker socket in the runner profile", () => {
     it('grants the worker docker socket read+connect but not write, and keeps ~/.docker fully denied', () => {
       const dockerSocket = path.join(instanceDir, 'docker.sock');
       const profile = profileWith({ dockerSocket });
@@ -343,6 +350,110 @@ describe('Process Sandbox', () => {
       expect(bind).not.toContain('(subpath "/private/var/folders")');
     });
 
+    it('keeps the control plane and runner secrets unwritable even against a policy write path', () => {
+      // seatbelt takes the last matching rule, so the write denials have to
+      // come after the policy-declared write allow - otherwise a policy could
+      // declare a write path into the pid directory or the proxy credentials
+      // and reopen the very holes the read denials close.
+      const profile = profileWith({ dockerSocket: path.join(instanceDir, 'docker.sock') });
+      const runnerDir = path.join(os.homedir(), '.localmost', 'runner');
+      const policyAllow = profile.lastIndexOf('(allow file-write*');
+      const denyWrite = profile.indexOf('(deny file-write*\n  (subpath');
+      // The final re-allow of the job's own sandbox is the true last write rule.
+      const reallowOwn = profile.lastIndexOf(`(allow file-write*\n  (subpath "${instanceDir}"))`);
+      const denyBlock = profile.slice(profile.indexOf('(deny file-write*\n  (subpath'), reallowOwn);
+      expect(denyWrite).toBeGreaterThan(-1);
+      expect(denyBlock).toContain(`(subpath "${runnerDir}/pids")`);
+      expect(denyBlock).toContain(`(subpath "${runnerDir}/proxies")`);
+      expect(denyBlock).toContain(`(subpath "${runnerDir}/config")`);
+      expect(denyBlock).toContain(`(subpath "${runnerDir}/sandbox")`);
+      expect(reallowOwn).toBeGreaterThan(denyWrite);
+      expect(denyWrite).toBeGreaterThan(policyAllow > -1 ? -1 : -2);
+    });
+
+    it('ignores a policy read or write path that resolves inside the runner directory', () => {
+      // A repo policy has no business reaching the app's own runner dir - proxy
+      // credentials, pids, other sandboxes. A declared read path there cannot be
+      // fenced off by a profile deny without also blocking traversal into this
+      // job's own sandbox, so such paths are dropped before the profile is built.
+      const runnerDir = path.join(os.homedir(), '.localmost', 'runner');
+      const profile = profileWith({
+        filesystemPolicy: {
+          level: 'strict',
+          read: [path.join(runnerDir, 'sandbox'), `${runnerDir}/../runner/proxies`, '/tmp/legit-read'],
+          write: [path.join(runnerDir, 'pids'), '/tmp/legit-write'],
+        },
+      });
+      // The runner-internal paths are dropped from the policy allow blocks (the
+      // write-deny block still names them, so scope the check to the allows).
+      const allowRead = profile.slice(profile.indexOf('(allow file-read*'), profile.indexOf('(deny file-read*'));
+      const policyWriteAllow = profile.slice(
+        profile.indexOf('declares writable'),
+        profile.indexOf('Never writable, whatever matched above')
+      );
+      expect(allowRead).not.toContain(`(subpath "${runnerDir}/sandbox")`);
+      // A traversal spelling that resolves inside the runner dir is also dropped.
+      expect(allowRead).not.toContain('/../runner/proxies');
+      expect(allowRead).not.toContain(`(subpath "${runnerDir}/proxies")`);
+      expect(policyWriteAllow).not.toContain(`(subpath "${runnerDir}/pids")`);
+      // Legitimate declared paths outside the runner dir are still granted.
+      expect(allowRead).toContain('(subpath "/tmp/legit-read")');
+      expect(policyWriteAllow).toContain('(subpath "/tmp/legit-write")');
+    });
+
+    it('denies the pasteboard mach service so a job cannot read the clipboard', () => {
+      // (allow mach*) is needed by system frameworks, but the clipboard often
+      // holds passwords and tokens and no job needs it. Denied by name after
+      // the blanket allow, where the last matching rule wins.
+      const profile = profileWith({});
+      const allow = profile.indexOf('(allow mach*)');
+      const deny = profile.indexOf('(global-name "com.apple.pasteboard.1")');
+      expect(allow).toBeGreaterThan(-1);
+      expect(deny).toBeGreaterThan(allow);
+    });
+
+    it('does not open the whole runner directory, and denies the parts that hold secrets', () => {
+      // The runner directory holds every target's proxy credentials, every
+      // instance's registration, the broker's session tokens and the other
+      // workers' sandboxes. Granting it read let any job read all of them and
+      // register as another repository's runner. A job gets its own sandbox
+      // and the shared tool cache, not the directory that contains them.
+      const runnerDir = path.join(os.homedir(), '.localmost', 'runner');
+      const profile = profileWith({ dockerSocket: path.join(instanceDir, 'docker.sock') });
+
+      // The runner directory is not opened as a whole. Its node and the
+      // sandbox node are readable so the runner can traverse into its own
+      // sandbox, but not as subtrees - a sibling sandbox is never granted.
+      const allowRead = profile.slice(profile.indexOf('(allow file-read*'), profile.indexOf('(deny file-read*'));
+      // Reads use the directory nodes as literals for traversal, never the
+      // runner dir or the sandbox root as a readable subtree.
+      expect(allowRead).not.toContain(`(subpath "${runnerDir}")`);
+      expect(allowRead).not.toContain(`(subpath "${runnerDir}/sandbox")`);
+      // A traversal spelling that resolves inside the runner dir is also dropped.
+      expect(allowRead).not.toContain('/../runner/proxies');
+      expect(allowRead).not.toContain(`(subpath "${runnerDir}/proxies")`);
+      expect(allowRead).toContain(`(literal "${runnerDir}")`);
+      expect(allowRead).toContain(`(literal "${runnerDir}/sandbox")`);
+      const denyRead = profile.slice(profile.indexOf('(deny file-read*'));
+      expect(denyRead).toContain(`(subpath "${runnerDir}/proxies")`);
+      expect(denyRead).toContain(`(subpath "${runnerDir}/config")`);
+      expect(denyRead).toContain(`(subpath "${runnerDir}/sandbox-profiles")`);
+      expect(denyRead).toContain(`(literal "${runnerDir}/broker-sessions.json")`);
+    });
+
+    it('escapes quotes in the socket path, as the rest of the profile does', () => {
+      // The path is built from the sandbox directory and lands in a security
+      // DSL, where an unescaped quote would close the literal early and change
+      // what the rule means.
+      const profile = profileWith({ dockerSocket: '/tmp/od"d/docker.sock' });
+
+      expect(profile).toContain('(allow network-outbound (literal "/tmp/od\\"d/docker.sock"))');
+      expect(profile).toContain('(deny file-write* (literal "/tmp/od\\"d/docker.sock"))');
+      expect(profile).not.toContain('(allow network-outbound (literal "/tmp/od"d/docker.sock"))');
+    });
+  });
+
+  describe("the runner profile's filesystem floor", () => {
     it.each(['strict', 'moderate', 'permissive'] as const)(
       'grants no shared temp directory as a whole under %s',
       (level) => {
@@ -481,106 +592,20 @@ describe('Process Sandbox', () => {
       expect(allowRead).not.toContain('(subpath "/var")');
     });
 
-    it('keeps the control plane and runner secrets unwritable even against a policy write path', () => {
-      // seatbelt takes the last matching rule, so the write denials have to
-      // come after the policy-declared write allow - otherwise a policy could
-      // declare a write path into the pid directory or the proxy credentials
-      // and reopen the very holes the read denials close.
-      const profile = profileWith({ dockerSocket: path.join(instanceDir, 'docker.sock') });
-      const runnerDir = path.join(os.homedir(), '.localmost', 'runner');
-      const policyAllow = profile.lastIndexOf('(allow file-write*');
-      const denyWrite = profile.indexOf('(deny file-write*\n  (subpath');
-      // The final re-allow of the job's own sandbox is the true last write rule.
-      const reallowOwn = profile.lastIndexOf(`(allow file-write*\n  (subpath "${instanceDir}"))`);
-      const denyBlock = profile.slice(profile.indexOf('(deny file-write*\n  (subpath'), reallowOwn);
-      expect(denyWrite).toBeGreaterThan(-1);
-      expect(denyBlock).toContain(`(subpath "${runnerDir}/pids")`);
-      expect(denyBlock).toContain(`(subpath "${runnerDir}/proxies")`);
-      expect(denyBlock).toContain(`(subpath "${runnerDir}/config")`);
-      expect(denyBlock).toContain(`(subpath "${runnerDir}/sandbox")`);
-      expect(reallowOwn).toBeGreaterThan(denyWrite);
-      expect(denyWrite).toBeGreaterThan(policyAllow > -1 ? -1 : -2);
-    });
-
-    it('ignores a policy read or write path that resolves inside the runner directory', () => {
-      // A repo policy has no business reaching the app's own runner dir - proxy
-      // credentials, pids, other sandboxes. A declared read path there cannot be
-      // fenced off by a profile deny without also blocking traversal into this
-      // job's own sandbox, so such paths are dropped before the profile is built.
-      const runnerDir = path.join(os.homedir(), '.localmost', 'runner');
-      const profile = profileWith({
-        filesystemPolicy: {
-          level: 'strict',
-          read: [path.join(runnerDir, 'sandbox'), `${runnerDir}/../runner/proxies`, '/tmp/legit-read'],
-          write: [path.join(runnerDir, 'pids'), '/tmp/legit-write'],
-        },
+    it('looks the per-user temp up again after a failed lookup, and says why it has none', () => {
+      // A transient getconf failure must not leave every later job without
+      // bare mktemp until the app restarts, and the missing grant must be
+      // explained somewhere.
+      let calls = 0;
+      const onLog = jest.fn();
+      const [first, second] = profilesWith([{ onLog }, { onLog }], () => {
+        calls += 1;
+        if (calls === 1) throw new Error('getconf: interrupted');
+        return '/var/folders/zz/zyxw_vut0000gn/T/\n';
       });
-      // The runner-internal paths are dropped from the policy allow blocks (the
-      // write-deny block still names them, so scope the check to the allows).
-      const allowRead = profile.slice(profile.indexOf('(allow file-read*'), profile.indexOf('(deny file-read*'));
-      const policyWriteAllow = profile.slice(
-        profile.indexOf('declares writable'),
-        profile.indexOf('Never writable, whatever matched above')
-      );
-      expect(allowRead).not.toContain(`(subpath "${runnerDir}/sandbox")`);
-      // A traversal spelling that resolves inside the runner dir is also dropped.
-      expect(allowRead).not.toContain('/../runner/proxies');
-      expect(allowRead).not.toContain(`(subpath "${runnerDir}/proxies")`);
-      expect(policyWriteAllow).not.toContain(`(subpath "${runnerDir}/pids")`);
-      // Legitimate declared paths outside the runner dir are still granted.
-      expect(allowRead).toContain('(subpath "/tmp/legit-read")');
-      expect(policyWriteAllow).toContain('(subpath "/tmp/legit-write")');
-    });
-
-    it('denies the pasteboard mach service so a job cannot read the clipboard', () => {
-      // (allow mach*) is needed by system frameworks, but the clipboard often
-      // holds passwords and tokens and no job needs it. Denied by name after
-      // the blanket allow, where the last matching rule wins.
-      const profile = profileWith({});
-      const allow = profile.indexOf('(allow mach*)');
-      const deny = profile.indexOf('(global-name "com.apple.pasteboard.1")');
-      expect(allow).toBeGreaterThan(-1);
-      expect(deny).toBeGreaterThan(allow);
-    });
-
-    it('does not open the whole runner directory, and denies the parts that hold secrets', () => {
-      // The runner directory holds every target's proxy credentials, every
-      // instance's registration, the broker's session tokens and the other
-      // workers' sandboxes. Granting it read let any job read all of them and
-      // register as another repository's runner. A job gets its own sandbox
-      // and the shared tool cache, not the directory that contains them.
-      const runnerDir = path.join(os.homedir(), '.localmost', 'runner');
-      const profile = profileWith({ dockerSocket: path.join(instanceDir, 'docker.sock') });
-
-      // The runner directory is not opened as a whole. Its node and the
-      // sandbox node are readable so the runner can traverse into its own
-      // sandbox, but not as subtrees - a sibling sandbox is never granted.
-      const allowRead = profile.slice(profile.indexOf('(allow file-read*'), profile.indexOf('(deny file-read*'));
-      // Reads use the directory nodes as literals for traversal, never the
-      // runner dir or the sandbox root as a readable subtree.
-      expect(allowRead).not.toContain(`(subpath "${runnerDir}")`);
-      expect(allowRead).not.toContain(`(subpath "${runnerDir}/sandbox")`);
-      // A traversal spelling that resolves inside the runner dir is also dropped.
-      expect(allowRead).not.toContain('/../runner/proxies');
-      expect(allowRead).not.toContain(`(subpath "${runnerDir}/proxies")`);
-      expect(allowRead).toContain(`(literal "${runnerDir}")`);
-      expect(allowRead).toContain(`(literal "${runnerDir}/sandbox")`);
-      const denyRead = profile.slice(profile.indexOf('(deny file-read*'));
-      expect(denyRead).toContain(`(subpath "${runnerDir}/proxies")`);
-      expect(denyRead).toContain(`(subpath "${runnerDir}/config")`);
-      expect(denyRead).toContain(`(subpath "${runnerDir}/sandbox-profiles")`);
-      expect(denyRead).toContain(`(literal "${runnerDir}/broker-sessions.json")`);
-    });
-
-    it('escapes quotes in the socket path, as the rest of the profile does', () => {
-      // The path is built from the sandbox directory and lands in a security
-      // DSL, where an unescaped quote would close the literal early and change
-      // what the rule means.
-      const profile = profileWith({ dockerSocket: '/tmp/od"d/docker.sock' });
-
-      expect(profile).toContain('(allow network-outbound (literal "/tmp/od\\"d/docker.sock"))');
-      expect(profile).toContain('(deny file-write* (literal "/tmp/od\\"d/docker.sock"))');
-      expect(profile).not.toContain('(allow network-outbound (literal "/tmp/od"d/docker.sock"))');
+      expect(first).not.toContain('(regex');
+      expect(onLog).toHaveBeenCalledWith('error', expect.stringContaining('getconf: interrupted'));
+      expect(second).toContain('(regex');
     });
   });
 

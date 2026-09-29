@@ -109,10 +109,13 @@ function validateExecutablePath(executablePath: string): string {
 export const DEFAULT_BROKER_PORT = 8787;
 
 /**
- * The per-user temp directory confstr hands out, looked up once. null once
- * the lookup has failed or answered something unexpected.
+ * The per-user temp directory confstr hands out, once a lookup has answered.
+ * A failed lookup is not remembered: it is tried again at the next spawn, so
+ * one transient failure does not cost every later job its bare mktemp.
  */
-let userTempDir: string | null | undefined;
+let userTempDir: string | undefined;
+/** Whether a failed lookup has been logged, so a lasting failure logs once. */
+let userTempDirFailureLogged = false;
 
 /**
  * Where macOS `mktemp` puts a file when it is given no template. It ignores
@@ -120,19 +123,27 @@ let userTempDir: string | null | undefined;
  * TMPDIR into the sandbox does not move it. Only a /var/folders/<a>/<b>/T path
  * is accepted: the answer lands in a regex in the profile.
  */
-function darwinUserTempDir(): string | undefined {
-  if (userTempDir === undefined) {
-    try {
-      const answer = String(execFileSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf-8' }))
-        .trim()
-        .replace(/\/+$/, '')
-        .replace(/^\/private/, '');
-      userTempDir = /^\/var\/folders\/[A-Za-z0-9_+-]+\/[A-Za-z0-9_+-]+\/T$/.test(answer) ? answer : null;
-    } catch {
-      userTempDir = null;
+function darwinUserTempDir(onLog?: SandboxLogCallback): string | undefined {
+  if (userTempDir !== undefined) return userTempDir;
+  let failure: string;
+  try {
+    const answer = String(execFileSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf-8' }))
+      .trim()
+      .replace(/\/+$/, '')
+      .replace(/^\/private/, '');
+    if (/^\/var\/folders\/[A-Za-z0-9_+-]+\/[A-Za-z0-9_+-]+\/T$/.test(answer)) {
+      userTempDir = answer;
+      return userTempDir;
     }
+    failure = `unexpected answer ${JSON.stringify(answer)}`;
+  } catch (err) {
+    failure = (err as Error).message;
   }
-  return userTempDir ?? undefined;
+  if (!userTempDirFailureLogged && onLog) {
+    userTempDirFailureLogged = true;
+    onLog('error', `Per-user temp directory lookup failed, so jobs cannot use mktemp without a template: ${failure}`);
+  }
+  return undefined;
 }
 
 /** What a repository's approved policy contributes to the sandbox profile. */
@@ -146,7 +157,7 @@ export interface SandboxFilesystemPolicy {
 }
 
 /** Everything the runner profile is built from. */
-interface RunnerProfileOptions {
+export interface RunnerProfileOptions {
   /** The instance directory this worker runs in. */
   instanceDir: string;
   /** The broker's port, denied to jobs because it carries job payloads. */
@@ -165,7 +176,7 @@ interface RunnerProfileOptions {
   onLog?: SandboxLogCallback;
 }
 
-function generateSandboxProfile({
+export function generateSandboxProfile({
   instanceDir,
   brokerPort = DEFAULT_BROKER_PORT,
   allowDirectNetwork = false,
@@ -299,7 +310,7 @@ function generateSandboxProfile({
       `  (regex #"^${escapeForRegex(`/private${dir}`)}${generated}")`,
       `  (regex #"^${escapeForRegex(dir)}${generated}"))`,
     ].join('\n');
-  })(darwinUserTempDir());
+  })(darwinUserTempDir(onLog));
   // This worker's target's own caches, when it keeps any across jobs. Never
   // one shared with another target: what a job leaves in a cache, the next
   // job to find it executes. The directories above them are readable as
@@ -687,11 +698,12 @@ export function spawnSandboxed(
     });
 
     // The profile is the thing that confines the job, so it must not live
-    // anywhere a job can write. os.tmpdir() is granted to every sandbox, and
-    // the name was predictable from the clock: a job could plant a symlink at
-    // the next path and have the app write through it, or swap the profile
-    // used by the next spawn. It goes in the app's own directory instead,
-    // created exclusively so an existing entry is never followed.
+    // anywhere a job can write. It used to go in os.tmpdir(), which every
+    // sandbox could then write, under a name predictable from the clock: a job
+    // could plant a symlink at the next path and have the app write through
+    // it, or swap the profile used by the next spawn. It goes in the app's own
+    // directory instead, created exclusively so an existing entry is never
+    // followed.
     const profileDir = path.join(getRunnerDir(), 'sandbox-profiles');
     fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
     const profilePath = path.join(
