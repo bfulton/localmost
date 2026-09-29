@@ -235,6 +235,34 @@ describe('the files the app writes and reads in the workspace', () => {
   });
 });
 
+describe('the checkout intercept', () => {
+  it('runs no git in the workspace, whatever a step left there', () => {
+    // A step can create .git in the workspace with core.fsmonitor set to its
+    // own script; git runs that on status, and the intercept ran git here
+    // unsandboxed.
+    const marker = path.join(scratch, 'fsmonitor-ran');
+    const hook = path.join(workDir, 'hook.sh');
+    fs.writeFileSync(hook, `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
+    const git = (args: string) =>
+      jest.requireActual<typeof import('child_process')>('child_process').execSync(`git ${args}`, {
+        cwd: workDir,
+        stdio: 'ignore',
+        env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+      });
+    git('init -q');
+    git('-c user.name=t -c user.email=t@t commit -q --allow-empty -m init');
+    git(`config core.fsmonitor '${hook}'`);
+
+    return Promise.all([
+      run({ uses: 'actions/checkout@v4' }),
+      run({ uses: 'actions/checkout@v4', with: { submodules: true } }),
+    ]).then((results) => {
+      expect(results.map((r) => r.status)).toEqual(['success', 'success']);
+      expect(fs.existsSync(marker)).toBe(false);
+    });
+  });
+});
+
 describe('a local action', () => {
   const writeAction = (dir: string) => {
     fs.mkdirSync(dir, { recursive: true });

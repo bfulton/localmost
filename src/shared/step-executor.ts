@@ -14,7 +14,6 @@ import { WorkflowStep, WorkflowJob, MatrixCombination } from './workflow-parser'
 import { SandboxPolicy, generateSandboxProfile, generateDiscoveryProfile } from './sandbox-profile';
 import { PidTreeWatcher } from './pid-tree-watch';
 import { parseActionRef, fetchAction, isInterceptedAction, readActionMetadata } from './action-fetcher';
-import { getGitInfo } from './workspace';
 import { resolveWithin } from './contained-path';
 import { getAppDataDirWithoutElectron } from './paths';
 
@@ -764,27 +763,16 @@ function executeCheckoutIntercept(
     };
   }
 
-  // Use local working tree
-  const gitInfo = getGitInfo(ctx.workDir);
-  if (gitInfo) {
-    ctx.workflowEnv.GITHUB_SHA = gitInfo.sha;
-    ctx.workflowEnv.GITHUB_REF = gitInfo.ref;
-  }
-
+  // Use the local working tree. GITHUB_SHA and GITHUB_REF were read from the
+  // checkout the run was started in, before any step ran. No git runs here:
+  // this is the workspace, outside any sandbox, and an earlier step can have
+  // left a .git whose config names a command - core.fsmonitor runs on status.
   ctx.onOutput?.('Using local working tree (checkout intercepted)', 'stdout');
 
-  // Handle submodules
+  // Submodules come with the working tree: the workspace is a copy of the
+  // checkout, initialized submodules included.
   if (step.with?.submodules === 'true' || step.with?.submodules === true) {
-    ctx.onOutput?.('Updating submodules...', 'stdout');
-    try {
-      const { execSync } = require('child_process');
-      execSync('git submodule update --init --recursive', {
-        cwd: ctx.workDir,
-        stdio: 'pipe',
-      });
-    } catch (err) {
-      ctx.onOutput?.(`Warning: Failed to update submodules: ${(err as Error).message}`, 'stderr');
-    }
+    ctx.onOutput?.('Submodules: using those already checked out in the working tree', 'stdout');
   }
 
   return {
