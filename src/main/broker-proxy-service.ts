@@ -222,6 +222,13 @@ function agentNameFromSessionRequest(body: string): string | undefined {
 /** Largest request body the proxy reads; a runner's are a few hundred bytes. */
 const MAX_REQUEST_BODY_BYTES = 64 * 1024;
 
+/**
+ * Largest body forwarded upstream. completejob carries the job's outputs, step
+ * results and annotations, so it can be far larger than anything else the
+ * runner sends; the cap above would fail such a job at its very end.
+ */
+const MAX_FORWARD_BODY_BYTES = 8 * 1024 * 1024;
+
 class RequestBodyTooLargeError extends Error {
   constructor() {
     super('request body too large');
@@ -233,14 +240,14 @@ class RequestBodyTooLargeError extends Error {
  * is drained either way: leaving the loop early destroys the socket, and the
  * 413 would never reach the client.
  */
-async function readRequestBody(req: http.IncomingMessage): Promise<string> {
+async function readRequestBody(req: http.IncomingMessage, limit = MAX_REQUEST_BODY_BYTES): Promise<string> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
     size += (chunk as Buffer).length;
-    if (size <= MAX_REQUEST_BODY_BYTES) chunks.push(chunk as Buffer);
+    if (size <= limit) chunks.push(chunk as Buffer);
   }
-  if (size > MAX_REQUEST_BODY_BYTES) throw new RequestBodyTooLargeError();
+  if (size > limit) throw new RequestBodyTooLargeError();
   return Buffer.concat(chunks).toString();
 }
 
@@ -1860,11 +1867,7 @@ export class BrokerProxyService extends EventEmitter {
    */
   private async handleAcquireJob(req: http.IncomingMessage, res: http.ServerResponse, key: string): Promise<void> {
     // Read request body to get job ID
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) {
-      chunks.push(chunk as Buffer);
-    }
-    const reqBody = Buffer.concat(chunks).toString();
+    const reqBody = await readRequestBody(req);
 
     // Parse body to find job ID
     let jobId: string | undefined;
@@ -2029,11 +2032,7 @@ export class BrokerProxyService extends EventEmitter {
     log()?.info(`[BrokerProxy] Forward using ${targetState.target.displayName}/${instance.instanceNum}, upstream sessionId=${instance.sessionId}`);
 
     // Read request body first (needed for routing decisions)
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) {
-      chunks.push(chunk as Buffer);
-    }
-    const reqBody = Buffer.concat(chunks).toString();
+    const reqBody = await readRequestBody(req, MAX_FORWARD_BODY_BYTES);
 
     // Replace local session ID with upstream session ID in query params
     const upstreamParams = new URLSearchParams(url.search);

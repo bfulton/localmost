@@ -1050,6 +1050,53 @@ describe('message routing', () => {
     expect(res.statusCode).toBe(413);
   });
 
+  describe('request bodies a worker sends', () => {
+    /** A worker bound to target-a that has been handed job req-1 (message 2). */
+    const boundWorker = async () => {
+      const target = addTargetWithRunner('target-a', 'runner-a.1');
+      const instance = internals.targets.get(target.id)!.instances.get(1)! as Instance & { accessToken?: string; tokenExpiry?: number };
+      instance.accessToken = 'token';
+      instance.tokenExpiry = Date.now() + 3_600_000;
+      internals.messageQueues.set(target.id, [jobMessage]);
+      service.expectWorkerForJob(target.id, 1, 'req-1');
+      const sessionId = await createSession();
+      await request('GET', `/message?sessionId=${sessionId}`);
+      return sessionId;
+    };
+
+    it('rejects an oversized acquirejob instead of buffering it', async () => {
+      await boundWorker();
+
+      const res = await request('POST', '/acquirejob', JSON.stringify({ jobMessageId: 2, pad: 'x'.repeat(65 * 1024) }));
+
+      expect(res.statusCode).toBe(413);
+    });
+
+    it('rejects a forwarded job operation above its cap, and sends nothing upstream', async () => {
+      const sessionId = await boundWorker();
+      mockHttpsRequest.mockClear();
+
+      const res = await request('POST', `/renewjob?sessionId=${sessionId}`, 'x'.repeat(8 * 1024 * 1024 + 1));
+
+      expect(res.statusCode).toBe(413);
+      expect(mockHttpsRequest).not.toHaveBeenCalled();
+    });
+
+    it("still forwards a completejob far larger than the runner's other requests", async () => {
+      // completejob carries the job's outputs, step results and annotations.
+      // The cap on the runner's other requests would fail every job with
+      // sizeable outputs at its very end.
+      const sessionId = await boundWorker();
+      mockHttpsRequest.mockClear();
+      const body = JSON.stringify({ planId: 'p', jobId: 'j', conclusion: 'succeeded', outputs: { big: 'x'.repeat(1024 * 1024) } });
+
+      const res = await request('POST', `/completejob?sessionId=${sessionId}`, body);
+
+      expect(res.statusCode).toBe(200);
+      expect(mockHttpsRequest).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('a job no worker was spawned for', () => {
     // A job message as the broker receives it upstream, with the routing the
     // acquire needs, and the payload acquirejob hands back: the job's secrets.
