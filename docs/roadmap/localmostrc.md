@@ -376,12 +376,15 @@ cannot join a container network there. The portable arrangement is a container
 with a foot in both networks - see `run.networks` above.
 
 **Connecting to loopback is refused unless declared.** A job may bind
-localhost, but it connects only to its worker's own proxy there, and to the
-loopback ports `shared.network.loopback` declares: a list of fixed ports, or
-`true` for all of them (a test suite that binds an ephemeral port and talks to
-it needs `true`, since seatbelt matches single ports, never ranges). Anything
-else on loopback - a database, a debugger on 9229 - fails with `EPERM` on the
-connect, not on the bind; the broker's port fails whatever is declared.
+localhost, but it connects directly only to its worker's own proxy there, and
+to the loopback ports `shared.network.loopback` declares: a list of fixed
+ports, or `true` for all of them (a test suite that binds an ephemeral port and
+talks to it needs `true`, since seatbelt matches single ports, never ranges). A
+direct connect to anything else on loopback - a database, a debugger on 9229 -
+fails with `EPERM` on the connect, not on the bind; the broker's port fails
+whatever is declared. The proxy does not yet apply the same rule: a request
+sent through `HTTP_PROXY` for a literal `127.0.0.1` or `localhost` reaches any
+port, so this is not yet a boundary around local services.
 
 ## Why Checked Into Git
 

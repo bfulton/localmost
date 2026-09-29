@@ -772,6 +772,49 @@ describe('Process Sandbox', () => {
       expect(allowRead).toContain('(subpath "./build")');
       expect(policyWriteAllow).toContain('(subpath "/opt/out")');
     });
+
+    it('drops them whatever their case or Unicode form, since seatbelt matches both loosely', () => {
+      // On the default APFS volume seatbelt matches a path whatever its case
+      // and normalization, so ~/.LOCALMOST grants what ~/.localmost would.
+      const onLog = jest.fn();
+      const spellings = [
+        '~/.LOCALMOST',
+        '~/.LocalMost/runner/sandbox',
+        os.homedir().toUpperCase(),
+        '/TMP/TEST/Cookies',
+        '/Tmp',
+      ];
+      const profile = profileWith({
+        filesystemPolicy: { level: 'strict', read: spellings, write: spellings },
+        onLog,
+      });
+      for (const entry of spellings) {
+        const expanded = entry.startsWith('~') ? path.join(os.homedir(), entry.slice(1)) : entry;
+        expect(profile).not.toContain(`(subpath "${expanded}")`);
+        expect(onLog).toHaveBeenCalledWith('error', expect.stringContaining(entry));
+      }
+    });
+
+    it('drops a grant of the app directory spelled in another Unicode form', () => {
+      const previous = process.env.LOCALMOST_CONFIG_DIR;
+      process.env.LOCALMOST_CONFIG_DIR = '/opt/café';
+      try {
+        const decomposed = '/opt/café/runner/sandbox';
+        let profile = '';
+        jest.isolateModules(() => {
+          const { generateSandboxProfile } = require('./process-sandbox');
+          profile = generateSandboxProfile({
+            instanceDir: '/opt/café/runner/sandbox/1',
+            filesystemPolicy: { level: 'strict', read: [decomposed, '/opt/other'], write: [] },
+          });
+        });
+        expect(profile).not.toContain(`(subpath "${decomposed}")`);
+        expect(profile).toContain('(subpath "/opt/other")');
+      } finally {
+        if (previous === undefined) delete process.env.LOCALMOST_CONFIG_DIR;
+        else process.env.LOCALMOST_CONFIG_DIR = previous;
+      }
+    });
   });
 
   describe('policy deny paths', () => {
@@ -824,17 +867,39 @@ describe('Process Sandbox', () => {
       expect(denyRule).toContain(`(subpath "${path.join(os.homedir(), '.localmost', 'logs')}")`);
     });
 
-    it('escapes deny paths and drops a traversing one', () => {
-      const onLog = jest.fn();
+    it('escapes deny paths, and resolves a traversing one rather than dropping it', () => {
+      // Dropping a deny widens the approved policy, so an absolute one with
+      // ".." is kept, resolved as seatbelt would resolve the path it guards.
       const profile = profileWith({
-        filesystemPolicy: { level: 'strict', read: [], write: [], deny: ['/opt/a"b', '/opt/../etc'] },
-        onLog,
+        filesystemPolicy: { level: 'strict', read: [], write: [], deny: ['/opt/a"b', '/opt/data/../etc'] },
       });
-      expect(profile).toContain('(subpath "/opt/a\\"b")');
-      expect(profile).not.toContain('/opt/../etc');
-      expect(onLog).toHaveBeenCalledWith('error', expect.stringContaining('/opt/../etc'));
+      const denyRule = profile.slice(profile.indexOf('(deny file-read* file-write*'));
+      expect(denyRule).toContain('(subpath "/opt/a\\"b")');
+      expect(denyRule).toContain('(subpath "/opt/etc")');
+      expect(profile).not.toContain('/opt/data/../etc');
       // And none at all when the policy denies nothing.
       expect(profileWith({})).not.toContain('(deny file-read* file-write*');
+    });
+
+    it('says a relative deny has no effect, since seatbelt never matches a relative path', () => {
+      const onLog = jest.fn();
+      const profile = profileWith({
+        filesystemPolicy: { level: 'strict', read: [], write: [], deny: ['build/secret', '../up', '/opt/kept'] },
+        onLog,
+      });
+      expect(profile).not.toContain('(subpath "build/secret")');
+      expect(profile).not.toContain('../up');
+      expect(profile).toContain('(subpath "/opt/kept")');
+      expect(onLog).toHaveBeenCalledWith('error', expect.stringContaining('build/secret'));
+      expect(onLog).toHaveBeenCalledWith('error', expect.stringContaining('../up'));
+    });
+
+    it('refuses to build a profile from a deny list that is not a list', () => {
+      // Dropping it would widen the approved policy, so the spawn fails with
+      // a message saying why rather than running the job without its denies.
+      expect(() => profileWith({
+        filesystemPolicy: { level: 'strict', read: [], write: [], deny: '/opt/secret' },
+      })).toThrow(/deny list is not a list/);
     });
   });
 
@@ -914,6 +979,28 @@ describe('Process Sandbox', () => {
       });
       const ports = [...profile.matchAll(/\(remote ip "localhost:([^"]+)"\)/g)].map((m) => m[1]).sort();
       expect(ports).toEqual([String(proxyPort), '5432', '8787'].sort());
+    });
+
+    it('drops a loopback declaration that is neither true nor a list, and says so', () => {
+      // Narrowing is the safe direction: the job keeps its proxy and nothing
+      // else, rather than the spawn failing on the value.
+      for (const loopback of ['true', '5432', { 5432: true }, false]) {
+        const onLog = jest.fn();
+        const profile = profileWith({
+          proxyPort,
+          filesystemPolicy: { level: 'strict', read: [], write: [], loopback },
+          onLog,
+        });
+        const ports = [...profile.matchAll(/\(remote ip "localhost:([^"]+)"\)/g)].map((m) => m[1]).sort();
+        expect(ports).toEqual([String(proxyPort), '8787'].sort());
+        expect(onLog).toHaveBeenCalledWith('error', expect.stringMatching(/loopback/));
+      }
+    });
+
+    it('says, in a registration profile, that the network is direct rather than closed', () => {
+      const profile = profileWith({ allowDirectNetwork: true });
+      expect(profile).not.toContain('nothing on loopback is reachable');
+      expect(profile).toContain('(allow network-outbound)');
     });
 
     it('passes the proxy port to the profile, not to the spawned process', () => {

@@ -282,14 +282,32 @@ export function generateSandboxProfile({
   // app's bookkeeping. The write side is also denied in the profile as a
   // backstop.
   const runnerRoot = path.resolve(getRunnerDir());
-  const appRoots = [getRunnerBaseDir(), getUserDataDir()].map((dir) => path.resolve(dir));
+  // seatbelt matches paths as the default APFS volume does, whatever their
+  // case or Unicode normalization, so ~/.LOCALMOST grants what ~/.localmost
+  // would. Both sides are folded before comparing; on a case-sensitive volume
+  // that only drops more than it had to.
+  const fold = (dir: string): string => path.resolve(dir).normalize('NFD').toLowerCase();
+  // And it matches the real path, so a grant of /private/var/... reaches an
+  // app directory configured through the /var symlink: each directory is
+  // compared as configured and as it really is. One that does not exist yet
+  // has no real path to reach.
+  const realPath = (dir: string): string[] => {
+    try {
+      return [fs.realpathSync(dir)];
+    } catch {
+      return [];
+    }
+  };
+  const appRoots = [getRunnerBaseDir(), getUserDataDir()]
+    .flatMap((dir) => [dir, ...realPath(dir)])
+    .map(fold);
   const within = (inner: string, outer: string): boolean =>
     inner === outer || inner.startsWith(outer.endsWith(path.sep) ? outer : outer + path.sep);
   const touchesAppDirs = (entry: string): boolean => {
     // Resolve `..` and `.` before comparing: a path like
     // "<x>/runner-parent/../runner/proxies" resolves inside the runner dir,
     // and seatbelt would canonicalize it, so the check must too.
-    const resolved = path.resolve(expandPath(entry));
+    const resolved = fold(expandPath(entry));
     return appRoots.some((root) => within(resolved, root) || within(root, resolved));
   };
   const traversing = (entry: string): boolean => {
@@ -303,10 +321,11 @@ export function generateSandboxProfile({
   };
   const outsideRunner = (entry: string): boolean => {
     if (traversing(entry)) return false;
-    // A relative workspace path without ".." resolves inside the job's own
-    // sandbox, which is its already, so it is kept. Resolving it here would
-    // resolve it against this process's directory instead - "/" for an app
-    // launched from the Finder, which contains everything.
+    // A relative path is kept as written: seatbelt accepts a relative subpath
+    // but never matches it against a real path, so it grants nothing and
+    // cannot widen anything. Resolving it here would resolve it against this
+    // process's directory instead - "/" for an app launched from the Finder,
+    // which contains everything.
     if (!path.isAbsolute(expandPath(entry))) return true;
     if (touchesAppDirs(entry)) {
       onLog?.('error', `Ignoring policy path that reaches the app's own directories: ${entry}`);
@@ -316,10 +335,25 @@ export function generateSandboxProfile({
   };
   const policyReads = subpaths(filesystemPolicy.read.filter(outsideRunner));
   const policyWrites = subpaths(filesystemPolicy.write.filter(outsideRunner));
-  // A deny only narrows, so only a traversing one is dropped. One that covers
-  // an app directory stays: dropping it, as a grant there is dropped, would
-  // quietly widen what the approved policy says.
-  const policyDenies = subpaths((filesystemPolicy.deny ?? []).filter((entry) => !traversing(entry)));
+  // A deny only narrows, so none is dropped for what it covers: one over an
+  // app directory stays, since dropping it, as a grant there is dropped,
+  // would quietly widen what the approved policy says. (Frozen contract C2
+  // says denies are filtered like grants; this is a deliberate departure, so
+  // the own sandbox and caches are re-allowed after the denies instead.) For
+  // the same reason a deny list that cannot be read stops the spawn rather
+  // than being skipped. An absolute ".." is resolved, as seatbelt resolves the
+  // path it guards; a relative entry never matches in seatbelt, so it is
+  // dropped and said to have no effect.
+  const declaredDenies = filesystemPolicy.deny ?? [];
+  if (!Array.isArray(declaredDenies)) {
+    throw new Error("The policy's deny list is not a list, so the job cannot be confined as approved");
+  }
+  const policyDenies = subpaths(declaredDenies.flatMap((entry: string) => {
+    const expanded = expandPath(entry);
+    if (path.isAbsolute(expanded)) return [path.resolve(expanded)];
+    onLog?.('error', `Ignoring relative policy deny path, which would have no effect: ${entry}`);
+    return [];
+  }));
 
   // Loopback reaches every service on this machine, not just the job's own:
   // databases, a debugger listening on 9229, a browser's remote debugging on
@@ -327,27 +361,30 @@ export function generateSandboxProfile({
   // beyond it only what its repository's approved policy declares. seatbelt
   // takes a single port or "*", never a range. The ports are validated where
   // the policy is parsed; this drops anything else as the backstop, since the
-  // value lands in the profile.
+  // value lands in the profile. Dropping narrows, so it is safe here.
   const isPort = (port: unknown): port is number =>
     typeof port === 'number' && Number.isInteger(port) && port >= 1 && port <= 65535;
   const loopbackRule = (port: number | '*') => `(allow network-outbound (remote ip "localhost:${port}"))`;
   const loopbackRules = ((): string => {
-    const declared = filesystemPolicy.loopback;
+    const declared: unknown = filesystemPolicy.loopback;
     if (declared === true) {
       return [';; The repository declares all of loopback.', loopbackRule('*')].join('\n');
     }
+    if (declared !== undefined && !Array.isArray(declared)) {
+      onLog?.('error', `Ignoring a loopback declaration that is neither true nor a list of ports: ${JSON.stringify(declared)}`);
+    }
+    const listed: unknown[] = Array.isArray(declared) ? declared : [];
     if (!isPort(proxyPort)) {
+      if (allowDirectNetwork) return ';; Registration: no proxy, and direct network below';
       // Nothing to confine the job to, so it gets nothing: a worker that
       // cannot reach its proxy fails, one that could reach all of loopback
       // would not.
-      if (!allowDirectNetwork) {
-        onLog?.('error', 'No egress proxy port for this worker, so its job can reach nothing on loopback');
-      }
+      onLog?.('error', 'No egress proxy port for this worker, so its job can reach nothing on loopback');
       return ';; No proxy port known: nothing on loopback is reachable';
     }
-    const notPorts = (declared ?? []).filter((port) => !isPort(port));
+    const notPorts = listed.filter((port) => !isPort(port));
     if (notPorts.length) onLog?.('error', `Ignoring loopback entries that are not ports: ${notPorts.join(', ')}`);
-    const ports = [...new Set((declared ?? []).filter(isPort))].filter((port) => port !== proxyPort);
+    const ports = [...new Set(listed.filter(isPort))].filter((port) => port !== proxyPort);
     return [
       ';; This worker\'s own egress proxy.',
       loopbackRule(proxyPort),
@@ -596,7 +633,9 @@ ${dockerRules}
 ;; browser's remote debugging (9222), local proxies. The job reaches this
 ;; worker's own proxy, and the loopback ports its repository's approved policy
 ;; declares - all of them if it declares true, for test suites that bind
-;; ephemeral ports and talk to themselves.
+;; ephemeral ports and talk to themselves. This confines direct connections
+;; only: what the proxy forwards to a literal loopback address is the proxy's
+;; to decide.
 ${loopbackRules}
 ${allowDirectNetwork ? ';; Runner registration talks to GitHub directly: app-driven, no workflow\n;; code involved, and there is no instance proxy at configuration time.\n(allow network-outbound)' : ''}
 

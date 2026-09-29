@@ -180,29 +180,105 @@ if (!isMacOS) {
       }
     });
 
-    it("refuses writes to the app's own data directory, whatever the policy grants", () => {
-      // Logs, job history and the runner template live beside the job's
-      // sandbox; a grant of the whole directory is dropped, and the deny that
-      // ends the write rules closes it behind that. The app's directory is
-      // read when the profile is built, so it is pointed here only for that.
-      const configDir = path.join(base, 'config');
-      const granted = path.join(base, 'granted');
-      fs.mkdirSync(path.join(configDir, 'logs'), { recursive: true });
-      fs.mkdirSync(path.join(configDir, 'runner', 'arc'), { recursive: true });
-      fs.mkdirSync(granted, { recursive: true });
+    /**
+     * The runner profile built from `options` with the app's directory at
+     * `appDir`, which is read when the profile is built and only then.
+     */
+    const profileWithAppDir = (appDir: string, options: Omit<RunnerProfileOptions, 'instanceDir'>): string => {
       const previous = process.env.LOCALMOST_CONFIG_DIR;
-      process.env.LOCALMOST_CONFIG_DIR = configDir;
-      let run: ReturnType<typeof underProfile>;
+      process.env.LOCALMOST_CONFIG_DIR = appDir;
       try {
-        run = underProfile({ filesystemPolicy: { level: 'strict', read: [], write: [configDir, granted] } });
+        return generateSandboxProfile({ instanceDir, ...options });
       } finally {
         if (previous === undefined) delete process.env.LOCALMOST_CONFIG_DIR;
         else process.env.LOCALMOST_CONFIG_DIR = previous;
       }
+    };
+
+    /** A runner for shell commands under the given profile text. */
+    const underProfileText = (profile: string) => {
+      const profilePath = path.join(base, `${probeName()}.sb`);
+      fs.writeFileSync(profilePath, profile);
+      return (command: string) => shell(command, profilePath, jobEnv());
+    };
+
+    /** An app directory with another worker's sandbox, the logs and the runner template in it. */
+    const makeAppDir = (name: string): string => {
+      const appDir = path.join(base, name);
+      fs.mkdirSync(path.join(appDir, 'logs'), { recursive: true });
+      fs.mkdirSync(path.join(appDir, 'runner', 'arc'), { recursive: true });
+      fs.mkdirSync(path.join(appDir, 'runner', 'sandbox', '2'), { recursive: true });
+      fs.writeFileSync(path.join(appDir, 'runner', 'sandbox', '2', 'token'), 'token');
+      fs.writeFileSync(path.join(appDir, 'logs', 'app.log'), 'log');
+      return appDir;
+    };
+
+    it("refuses writes to the app's own data directory, whatever the policy grants", () => {
+      // Logs, job history and the runner template live beside the job's
+      // sandbox; a grant of the whole directory is dropped before the profile
+      // is built.
+      const configDir = makeAppDir('config');
+      const granted = path.join(base, 'granted');
+      fs.mkdirSync(granted, { recursive: true });
+      const run = underProfileText(profileWithAppDir(configDir, {
+        filesystemPolicy: { level: 'strict', read: [], write: [configDir, granted] },
+      }));
       expect(canCreate(run, path.join(granted, probeName()))).toBe(true);
       expect(canCreate(run, path.join(configDir, 'logs', probeName()))).toBe(false);
       expect(canCreate(run, path.join(configDir, 'job-history.json'))).toBe(false);
       expect(canCreate(run, path.join(configDir, 'runner', 'arc', probeName()))).toBe(false);
+    });
+
+    it("keeps the app's data directory unwritable even past a grant the filter missed", () => {
+      // The deny that ends the write rules is the backstop behind the filter,
+      // so it is proven on its own: a grant of the whole directory is put
+      // where the policy's write grants go, as if the filter had let it by.
+      // The job's own sandbox and its target's caches, inside that directory
+      // as a worker's are, stay writable.
+      const appDir = base;
+      makeAppDir('.');
+      const profile = profileWithAppDir(appDir, {
+        filesystemPolicy: { level: 'moderate', read: [], write: [] },
+        packageCacheDir,
+      });
+      const placeholder = ';; No policy-declared write paths';
+      expect(profile).toContain(placeholder);
+      const run = underProfileText(profile.replace(placeholder, `(allow file-write* (subpath "${appDir}"))`));
+      expect(canCreate(run, path.join(appDir, 'logs', probeName()))).toBe(false);
+      expect(canCreate(run, path.join(appDir, 'job-history.json'))).toBe(false);
+      expect(canCreate(run, path.join(appDir, 'runner', 'arc', probeName()))).toBe(false);
+      expect(canCreate(run, path.join(appDir, 'runner', 'sandbox', '2', probeName()))).toBe(false);
+      expect(canCreate(run, path.join(jobTmp, probeName()))).toBe(true);
+      expect(canCreateUnder(run, packageCacheDir)).toBe(true);
+    });
+
+    it("refuses reads of the app's data directory granted in another case", () => {
+      // seatbelt matches paths case-insensitively on the default APFS volume,
+      // so a grant spelled in capitals reaches what the lower-case one would:
+      // other workers' sandboxes and the logs.
+      const appDir = makeAppDir('cased');
+      const run = underProfileText(profileWithAppDir(appDir, {
+        filesystemPolicy: { level: 'strict', read: [appDir.toUpperCase()], write: [] },
+      }));
+      const own = path.join(jobTmp, probeName());
+      fs.writeFileSync(own, 'own');
+      expect(run(`/bin/cat '${own}'`).ok).toBe(true);
+      expect(run(`/bin/cat '${path.join(appDir, 'runner', 'sandbox', '2', 'token')}'`).ok).toBe(false);
+      expect(run(`/bin/cat '${path.join(appDir, 'logs', 'app.log')}'`).ok).toBe(false);
+    });
+
+    it("refuses reads of the app's data directory granted by its real path", () => {
+      // os.tmpdir() is under /var, a symlink to /private/var. seatbelt matches
+      // the real path, so a grant of /private/var/... reaches an app directory
+      // configured as /var/...
+      const appDir = makeAppDir('linked');
+      const spelled = appDir.replace(/^\/private\//, '/');
+      expect(spelled).not.toBe(appDir);
+      const run = underProfileText(profileWithAppDir(spelled, {
+        filesystemPolicy: { level: 'strict', read: [appDir], write: [] },
+      }));
+      expect(run(`/bin/cat '${path.join(appDir, 'runner', 'sandbox', '2', 'token')}'`).ok).toBe(false);
+      expect(run(`/bin/cat '${path.join(appDir, 'logs', 'app.log')}'`).ok).toBe(false);
     });
 
     it('refuses what a policy denies, read and write, inside what it grants', () => {
@@ -356,9 +432,19 @@ if (!isMacOS) {
       }
     });
 
-    it("refuses writes to the app's own logs", () => {
-      const appDir = process.env.LOCALMOST_CONFIG_DIR ?? path.join(homeDir, '.localmost');
-      expect(canCreate(run, path.join(appDir, 'logs', probeName()))).toBe(false);
+    it("refuses writes to the app's own data directory", () => {
+      // Found from where the job runs, <app dir>/runner/sandbox/<n>/_temp, so
+      // the directory is certainly there and a refusal is the sandbox's EPERM,
+      // not a missing parent's ENOENT.
+      const sandboxDir = path.dirname(fs.realpathSync(os.tmpdir()));
+      expect(path.basename(path.dirname(sandboxDir))).toBe('sandbox');
+      expect(path.basename(path.dirname(path.dirname(sandboxDir)))).toBe('runner');
+      const appDir = path.dirname(path.dirname(path.dirname(sandboxDir)));
+      const target = path.join(appDir, probeName());
+      const result = run(`/usr/bin/touch '${target}'`);
+      fs.rmSync(target, { force: true });
+      expect(result.ok).toBe(false);
+      expect(result.stderr).toContain('Operation not permitted');
     });
 
     it('signals its own children', () => {
