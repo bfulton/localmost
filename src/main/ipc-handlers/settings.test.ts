@@ -19,7 +19,11 @@ jest.mock('./trusted-ipc', () => ({ ipcMain: jest.requireMock<{ ipcMain: unknown
 jest.mock('../config', () => ({
   loadConfig: jest.fn(),
   saveConfig: jest.fn(),
-  SETTABLE_CONFIG_KEYS: ['theme', 'sleepProtection', 'logLevel', 'runnerLogLevel', 'launchAtLogin'],
+  // As in config.ts.
+  SETTABLE_CONFIG_KEYS: [
+    'runnerConfig', 'theme', 'launchAtLogin', 'hideOnStart', 'sleepProtection', 'logLevel',
+    'runnerLogLevel', 'userFilter', 'maxConcurrentJobs', 'power', 'notifications',
+  ],
 }));
 
 jest.mock('../app-state', () => ({
@@ -38,6 +42,7 @@ jest.mock('../app-state', () => ({
 
 import { app } from 'electron';
 import { registerSettingsHandlers } from './settings';
+import { store } from '../store';
 import { loadConfig, saveConfig } from '../config';
 import {
   setSleepProtectionSetting,
@@ -68,6 +73,15 @@ describe('settings IPC handlers', () => {
   describe('settings:get', () => {
     it('should register handler', () => {
       expect(handlers['settings:get']).toBeDefined();
+    });
+
+    it('never hands the renderer the stored session', () => {
+      (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({
+        theme: 'dark',
+        auth: { refreshToken: 'ghr_secret', user: { login: 'octocat' } },
+      } as any);
+
+      expect(handlers['settings:get']()).toEqual({ theme: 'dark' });
     });
 
     it('should return current config', () => {
@@ -145,6 +159,76 @@ describe('settings IPC handlers', () => {
         openAtLogin: true,
         openAsHidden: false,
       });
+    });
+
+    it('saves only values of the shape each setting has, and refuses the rest', () => {
+      (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({ theme: 'light', logLevel: 'info' } as any);
+      const valid = {
+        runnerConfig: { level: 'repo', repoUrl: 'https://github.com/o/r', runnerName: 'mac', labels: 'a,b', runnerCount: 4 },
+        hideOnStart: false,
+        userFilter: { scope: 'trigger', allowedUsers: 'allowlist', allowlist: [{ login: 'octocat', avatar_url: 'https://x', name: null }] },
+        maxConcurrentJobs: 2,
+        power: { pauseOnBattery: '<25%', pauseOnVideoCall: true, videoCallGracePeriod: 60 },
+        notifications: { notifyOnPause: true, notifyOnJobEvents: false },
+      };
+
+      const result = handlers['settings:set']({}, {
+        ...valid,
+        theme: 'neon',
+        logLevel: { level: 'debug' },
+        runnerLogLevel: 'trace',
+        sleepProtection: 42,
+        launchAtLogin: 'yes',
+      });
+
+      expect(saveConfig).toHaveBeenCalledWith({ theme: 'light', logLevel: 'info', ...valid });
+      expect(result).toEqual({
+        success: false,
+        error: 'Refused settings of the wrong shape: theme, launchAtLogin, sleepProtection, logLevel, runnerLogLevel',
+      });
+      expect(setLogLevelSetting).not.toHaveBeenCalled();
+      expect(setRunnerLogLevelSetting).not.toHaveBeenCalled();
+      expect(setSleepProtectionSetting).not.toHaveBeenCalled();
+      expect(app.setLoginItemSettings).not.toHaveBeenCalled();
+      expect(store.getState().config.maxConcurrentJobs).toBe(2);
+    });
+
+    it('refuses nested values that are not what the setting holds', () => {
+      (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({} as any);
+
+      for (const settings of [
+        { runnerConfig: { level: 'enterprise' } },
+        { runnerConfig: { level: 'repo', runnerCount: 1e9 } },
+        { runnerConfig: { level: 'repo', repoUrl: 'https://github.com/o/r', extra: true } },
+        { userFilter: { scope: 'trigger', allowedUsers: 'allowlist', allowlist: [{ login: '../x', avatar_url: '', name: null }] } },
+        { userFilter: { scope: 'everyone', allowedUsers: 'just-me', allowlist: 'octocat' } },
+        { maxConcurrentJobs: 1e9 },
+        { maxConcurrentJobs: 2.5 },
+        { power: { pauseOnBattery: 'sometimes', pauseOnVideoCall: false, videoCallGracePeriod: 60 } },
+        { power: { pauseOnBattery: 'never', pauseOnVideoCall: false, videoCallGracePeriod: -1 } },
+        { notifications: { notifyOnPause: 'true', notifyOnJobEvents: false } },
+      ]) {
+        const result = handlers['settings:set']({}, settings);
+        expect({ settings, success: result.success }).toEqual({ settings, success: false });
+      }
+      expect(saveConfig).not.toHaveBeenCalledWith(expect.objectContaining({ runnerConfig: expect.anything() }));
+      expect(saveConfig).not.toHaveBeenCalledWith(expect.objectContaining({ userFilter: expect.anything() }));
+      expect(saveConfig).not.toHaveBeenCalledWith(expect.objectContaining({ maxConcurrentJobs: expect.anything() }));
+      expect(saveConfig).not.toHaveBeenCalledWith(expect.objectContaining({ power: expect.anything() }));
+      expect(saveConfig).not.toHaveBeenCalledWith(expect.objectContaining({ notifications: expect.anything() }));
+    });
+
+    it('never writes targets, which only the target manager changes', () => {
+      (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({} as any);
+      const before = store.getState().config.targets;
+
+      handlers['settings:set']({}, {
+        theme: 'dark',
+        targets: [{ id: 'x', type: 'repo', owner: '../x', repo: 'y', displayName: 'x', url: 'https://evil.example' }],
+      });
+
+      expect(saveConfig).toHaveBeenCalledWith({ theme: 'dark' });
+      expect(store.getState().config.targets).toBe(before);
     });
 
     it('should merge with existing config', () => {

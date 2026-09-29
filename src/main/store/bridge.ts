@@ -5,6 +5,7 @@
 import { BrowserWindow } from 'electron';
 import { createZustandBridge } from '@zubridge/electron/main';
 import { store } from './index';
+import { bootLog } from '../log-file';
 
 // Bridge instance
 let bridge: ReturnType<typeof createZustandBridge> | null = null;
@@ -31,8 +32,20 @@ export function initBridge(mainWindow: BrowserWindow): void {
     return;
   }
 
-  // Create the bridge
-  bridge = createZustandBridge(store);
+  // Create the bridge. The renderer reads this store and never writes it:
+  // every change goes through an IPC handler that checks it first. By
+  // default zubridge lets a renderer dispatch call any store action by name,
+  // or replace state outright with a "setState" action, and the store is
+  // persisted - so a renderer running someone else's script could plant
+  // targets or widen the user filter on disk. An empty handler table sends
+  // every renderer action to this reducer instead, which changes nothing.
+  bridge = createZustandBridge(store, {
+    handlers: {},
+    reducer: (state: ReturnType<typeof store.getState>, action: { type: string }) => {
+      bootLog('warn', `Ignored store action "${action.type}" from a renderer; the renderer cannot write the store`);
+      return state;
+    },
+  });
 
   // Subscribe the window
   const sub = bridge.subscribe([mainWindow]);
