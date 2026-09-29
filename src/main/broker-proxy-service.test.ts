@@ -1224,6 +1224,12 @@ describe('message routing', () => {
       ['on another host', 'https://run.example/'],
       ['on a host that only starts like GitHub', 'https://run.actions.githubusercontent.com.example/'],
       ['on a port of its own', 'https://run-actions-1-azure-eastus.actions.githubusercontent.com:8443/'],
+      ['with a user in it', 'https://user:pass@run-actions-1-azure-eastus.actions.githubusercontent.com/'],
+      // The request paths are appended to the run service's path, so it has
+      // to be a directory, with nothing after it that would swallow them.
+      ['whose path is not a directory', 'https://run-actions-1-azure-eastus.actions.githubusercontent.com/123'],
+      ['with a query', 'https://run-actions-1-azure-eastus.actions.githubusercontent.com/123/?x=1'],
+      ['with a fragment', 'https://run-actions-1-azure-eastus.actions.githubusercontent.com/123/#x'],
     ])("sends the runner's token to no run service %s", async (_, runServiceUrl) => {
       // The acquire goes out with the runner's bearer token, and the job's
       // operations are forwarded to the same place later.
@@ -1244,6 +1250,14 @@ describe('message routing', () => {
 
       expect(upstreamHosts).toEqual(['run-actions-1-azure-eastus.actions.githubusercontent.com']);
       expect(received).toHaveBeenCalledTimes(1);
+    });
+
+    it('acquires from the host that was checked when the run service has no path', async () => {
+      // The request path used to be glued onto the URL as sent, which without
+      // a trailing slash made it part of the host name.
+      await receive('https://run-actions-1-azure-eastus.actions.githubusercontent.com');
+
+      expect(upstreamHosts).toEqual(['run-actions-1-azure-eastus.actions.githubusercontent.com']);
     });
 
     it('records the repository, its id and the workflow the job names, for its own worker', async () => {
