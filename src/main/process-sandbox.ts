@@ -18,7 +18,6 @@ import { expandPath, DEFAULT_BROKER_PORT } from '../shared/sandbox-profile';
 import {
   getAppDataDir,
   getConfigPath,
-  getCliSocketPath,
   getRunnerDir,
   getUserDataDir,
   isAppSandboxed,
@@ -90,9 +89,10 @@ function validateExecutablePath(executablePath: string): string {
  * Generate a macOS sandbox profile for the runner process.
  *
  * SECURITY MODEL:
- * The profile restricts file WRITES to known-safe directories while allowing
- * broad READ access. Network, process, and IPC access remain permissive
- * because CI runners genuinely require these capabilities.
+ * The profile restricts file writes and reads to allowlists, confines network
+ * access to this worker's own proxy and the loopback ports its policy
+ * declares, and lets a job signal only its own processes. Process spawning and
+ * IPC remain permissive because CI runners genuinely require them.
  *
  * File write restrictions prevent:
  * - Malicious workflows from modifying system files
@@ -153,6 +153,13 @@ export interface SandboxFilesystemPolicy {
   read: string[];
   /** Paths the policy declares writable, beyond the workspace. */
   write: string[];
+  /** Paths the policy denies, read and write, over every grant. */
+  deny?: string[];
+  /**
+   * Loopback the job may connect to beyond its own proxy: every port, or
+   * these ones. Absent means only the proxy.
+   */
+  loopback?: true | number[];
 }
 
 /** Everything the runner profile is built from. */
@@ -161,6 +168,8 @@ export interface RunnerProfileOptions {
   instanceDir: string;
   /** The broker's port, denied to jobs because it carries job payloads. */
   brokerPort?: number;
+  /** This worker's own egress proxy port, the one loopback port always open. */
+  proxyPort?: number;
   /** Registration only: reach the network without going through a proxy. */
   allowDirectNetwork?: boolean;
   /** The repository's approved policy; strict with nothing declared by default. */
@@ -178,6 +187,7 @@ export interface RunnerProfileOptions {
 export function generateSandboxProfile({
   instanceDir,
   brokerPort = DEFAULT_BROKER_PORT,
+  proxyPort,
   allowDirectNetwork = false,
   filesystemPolicy = { level: 'strict', read: [], write: [] },
   dockerSocket,
@@ -211,14 +221,17 @@ export function generateSandboxProfile({
   const escapedDir = instanceDir.replace(/"/g, '\\"');
   const homeDir = os.homedir().replace(/"/g, '\\"');
   const appDataDir = getRunnerBaseDir().replace(/"/g, '\\"');
-  // The app's own control plane: approvals, settings and the CLI socket. A job
-  // that can write these can approve its own policy, so it is carved out of
-  // the app data directory rather than trusted to leave it alone.
+  // The app's own control plane: approvals and settings. Named for the read
+  // denies below; for writes the whole app data directory is closed.
   const policiesDir = `${appDataDir}/policies`;
   const configFile = getConfigPath().replace(/"/g, '\\"');
   const runnerDir = getRunnerDir().replace(/"/g, '\\"');
   const userDataDir = getUserDataDir().replace(/"/g, '\\"');
-  const cliSocket = getCliSocketPath().replace(/"/g, '\\"');
+  // Both spellings of the app's own data, once each: under the App Sandbox
+  // they are the same directory.
+  const appDirsDenied = [...new Set([appDataDir, userDataDir])]
+    .map((dir) => `  (subpath "${dir}")`)
+    .join('\n');
 
   // Toolchains and package-manager caches are a convenience for jobs, not
   // something the runner needs. Under strict a repository declares what it
@@ -258,40 +271,126 @@ export function generateSandboxProfile({
     paths
       .map((entry) => `  (subpath "${escapeForProfile(expandPath(entry))}")`)
       .join('\n');
-  // A repository policy has no business reading or writing inside the app's
-  // own runner directory - the proxy credentials, registrations, session
-  // tokens, pid files and other workers' sandboxes live there. Drop any policy
-  // path that resolves within it, so a declared read path cannot reopen a
-  // sibling sandbox (which a profile deny cannot cover without also blocking
-  // the traversal into this job's own sandbox) and a declared write path
-  // cannot reach the runner's bookkeeping. The write side is also denied in
-  // the profile as a backstop.
+  // A repository policy has no business reading or writing the app's own
+  // directories - the runner's credentials, registrations, session tokens and
+  // pid files, other workers' sandboxes, the logs, the job history, the
+  // browser profile and the credential store. Drop any policy path that is
+  // one of them, lies inside one, or contains one (a grant of ~ contains
+  // ~/.localmost), so a declared read path cannot reopen a sibling sandbox
+  // (which a profile deny cannot cover without also blocking the traversal
+  // into this job's own sandbox) and a declared write path cannot reach the
+  // app's bookkeeping. The write side is also denied in the profile as a
+  // backstop.
   const runnerRoot = path.resolve(getRunnerDir());
-  const withinRunnerDir = (entry: string): boolean => {
+  // seatbelt matches paths as the default APFS volume does, whatever their
+  // case or Unicode normalization, so ~/.LOCALMOST grants what ~/.localmost
+  // would. Both sides are folded before comparing; on a case-sensitive volume
+  // that only drops more than it had to.
+  const fold = (dir: string): string => path.resolve(dir).normalize('NFD').toLowerCase();
+  // And it matches the real path, so a grant of /private/var/... reaches an
+  // app directory configured through the /var symlink: each directory is
+  // compared as configured and as it really is. One that does not exist yet
+  // has no real path to reach.
+  const realPath = (dir: string): string[] => {
+    try {
+      return [fs.realpathSync(dir)];
+    } catch {
+      return [];
+    }
+  };
+  const appRoots = [getRunnerBaseDir(), getUserDataDir()]
+    .flatMap((dir) => [dir, ...realPath(dir)])
+    .map(fold);
+  const within = (inner: string, outer: string): boolean =>
+    inner === outer || inner.startsWith(outer.endsWith(path.sep) ? outer : outer + path.sep);
+  const touchesAppDirs = (entry: string): boolean => {
     // Resolve `..` and `.` before comparing: a path like
     // "<x>/runner-parent/../runner/proxies" resolves inside the runner dir,
     // and seatbelt would canonicalize it, so the check must too.
-    const resolved = path.resolve(expandPath(entry));
-    return resolved === runnerRoot || resolved.startsWith(runnerRoot + path.sep);
+    const resolved = fold(expandPath(entry));
+    return appRoots.some((root) => within(resolved, root) || within(root, resolved));
+  };
+  const traversing = (entry: string): boolean => {
+    // A ".." segment could climb out of the workspace into the runner
+    // directory, and the profile resolves a relative one from the worker's
+    // directory, not from wherever this process runs. Validation already
+    // rejects these; this is the backstop.
+    if (!expandPath(entry).split('/').includes('..')) return false;
+    onLog?.('error', `Ignoring traversing policy path: ${entry}`);
+    return true;
   };
   const outsideRunner = (entry: string): boolean => {
-    // A ".." segment could climb out of the workspace into the runner
-    // directory; the resolved-against-main-cwd check below would miss a
-    // relative one, since the profile resolves it from the worker's directory.
-    // Validation already rejects these; this is the backstop. Relative
-    // workspace paths without ".." are legitimate and kept.
-    if (expandPath(entry).split('/').includes('..')) {
-      onLog?.('error', `Ignoring traversing policy path: ${entry}`);
-      return false;
-    }
-    if (withinRunnerDir(entry)) {
-      onLog?.('error', `Ignoring policy path inside the runner directory: ${entry}`);
+    if (traversing(entry)) return false;
+    // A relative path is kept as written: seatbelt accepts a relative subpath
+    // but never matches it against a real path, so it grants nothing and
+    // cannot widen anything. Resolving it here would resolve it against this
+    // process's directory instead - "/" for an app launched from the Finder,
+    // which contains everything.
+    if (!path.isAbsolute(expandPath(entry))) return true;
+    if (touchesAppDirs(entry)) {
+      onLog?.('error', `Ignoring policy path that reaches the app's own directories: ${entry}`);
       return false;
     }
     return true;
   };
   const policyReads = subpaths(filesystemPolicy.read.filter(outsideRunner));
   const policyWrites = subpaths(filesystemPolicy.write.filter(outsideRunner));
+  // A deny only narrows, so none is dropped for what it covers: one over an
+  // app directory stays, since dropping it, as a grant there is dropped,
+  // would quietly widen what the approved policy says. (Frozen contract C2
+  // says denies are filtered like grants; this is a deliberate departure, so
+  // the own sandbox and caches are re-allowed after the denies instead.) For
+  // the same reason a deny list that cannot be read stops the spawn rather
+  // than being skipped. An absolute ".." is resolved, as seatbelt resolves the
+  // path it guards; a relative entry never matches in seatbelt, so it is
+  // dropped and said to have no effect.
+  const declaredDenies = filesystemPolicy.deny ?? [];
+  if (!Array.isArray(declaredDenies)) {
+    throw new Error("The policy's deny list is not a list, so the job cannot be confined as approved");
+  }
+  const policyDenies = subpaths(declaredDenies.flatMap((entry: string) => {
+    const expanded = expandPath(entry);
+    if (path.isAbsolute(expanded)) return [path.resolve(expanded)];
+    onLog?.('error', `Ignoring relative policy deny path, which would have no effect: ${entry}`);
+    return [];
+  }));
+
+  // Loopback reaches every service on this machine, not just the job's own:
+  // databases, a debugger listening on 9229, a browser's remote debugging on
+  // 9222, local proxies. So a job gets this worker's own egress proxy, and
+  // beyond it only what its repository's approved policy declares. seatbelt
+  // takes a single port or "*", never a range. The ports are validated where
+  // the policy is parsed; this drops anything else as the backstop, since the
+  // value lands in the profile. Dropping narrows, so it is safe here.
+  const isPort = (port: unknown): port is number =>
+    typeof port === 'number' && Number.isInteger(port) && port >= 1 && port <= 65535;
+  const loopbackRule = (port: number | '*') => `(allow network-outbound (remote ip "localhost:${port}"))`;
+  const loopbackRules = ((): string => {
+    const declared: unknown = filesystemPolicy.loopback;
+    if (declared === true) {
+      return [';; The repository declares all of loopback.', loopbackRule('*')].join('\n');
+    }
+    if (declared !== undefined && !Array.isArray(declared)) {
+      onLog?.('error', `Ignoring a loopback declaration that is neither true nor a list of ports: ${JSON.stringify(declared)}`);
+    }
+    const listed: unknown[] = Array.isArray(declared) ? declared : [];
+    if (!isPort(proxyPort)) {
+      if (allowDirectNetwork) return ';; Registration: no proxy, and direct network below';
+      // Nothing to confine the job to, so it gets nothing: a worker that
+      // cannot reach its proxy fails, one that could reach all of loopback
+      // would not.
+      onLog?.('error', 'No egress proxy port for this worker, so its job can reach nothing on loopback');
+      return ';; No proxy port known: nothing on loopback is reachable';
+    }
+    const notPorts = listed.filter((port) => !isPort(port));
+    if (notPorts.length) onLog?.('error', `Ignoring loopback entries that are not ports: ${notPorts.join(', ')}`);
+    const ports = [...new Set(listed.filter(isPort))].filter((port) => port !== proxyPort);
+    return [
+      ';; This worker\'s own egress proxy.',
+      loopbackRule(proxyPort),
+      ...(ports.length ? [';; Ports the repository declares.', ...ports.map(loopbackRule)] : []),
+    ].join('\n');
+  })();
   const toolchainRules = subpaths(toolchainPaths);
   // `mktemp` with no template creates tmp.XXXXXXXXXX in the per-user temp
   // directory whatever TMPDIR says, and scripts call it that way constantly.
@@ -382,27 +481,6 @@ ${mktempRules}
 ;; Paths the repository's approved policy declares writable.
 ${policyWrites ? `(allow file-write*\n${policyWrites})` : ';; No policy-declared write paths'}
 
-;; Never writable, whatever matched above - including a policy-declared write
-;; path, since this is the last word. The app's control plane (a job that
-;; writes these approves its own policy) and the whole runner directory: its
-;; secrets and bookkeeping (proxy credentials, registrations, session tokens,
-;; the pid files the startup sweep trusts, other workers' sandboxes) and the
-;; runner template every worker is copied from, with the record it is checked
-;; against. The runner directory is denied whole and the places a job does
-;; write there - this target's own caches and its own sandbox - are re-allowed
-;; after it, so nothing added there later is writable by default. The app
-;; directory's own node is denied so that it and the runner directory cannot
-;; be renamed away and replaced.
-(deny file-write*
-  (literal "${appDataDir}")
-  (subpath "${policiesDir}")
-  (literal "${configFile}")
-  (literal "${cliSocket}")
-  (subpath "${runnerDir}"))
-${ownCacheRules('file-write*')}
-(allow file-write*
-  (subpath "${escapedDir}"))
-
 ;; READ ACCESS - the OS, the toolchains, and this job's own directories.
 ;; Reading everything meant a workflow could read ~/.ssh private keys, AWS
 ;; credentials and this app's own credential store, which is the opposite of
@@ -491,6 +569,30 @@ ${policyReads}
   (literal "${homeDir}/.cargo/credentials")
   (literal "${homeDir}/.cargo/credentials.toml")
   (literal "${homeDir}/.nuget/NuGet/NuGet.Config"))
+
+;; Paths the repository's approved policy denies, read and write. After every
+;; grant above - the policy's own and the toolchains a level brings - so the
+;; deny is what matches last.
+${policyDenies ? `(deny file-read* file-write*\n${policyDenies})` : ';; No policy-declared deny paths'}
+
+;; Never writable, whatever matched above - including a policy-declared write
+;; path, since this is the last word: the app's own data directory and
+;; Electron's. They hold the app's control plane (a job that writes it
+;; approves its own policy), the runner's secrets and bookkeeping (proxy
+;; credentials, registrations, session tokens, the pid files the startup sweep
+;; trusts, other workers' sandboxes), the runner template every worker is
+;; copied from with the record it is checked against, the logs, the job
+;; history, the CLI the user runs and the credential store. Denied whole, so
+;; nothing added there later is writable by default, and the directories'
+;; own nodes with them so neither can be renamed away and replaced.
+(deny file-write*
+${appDirsDenied})
+;; The places a job does write in there, re-allowed after both denies: its
+;; target's own caches and its own sandbox, which a policy deny covering them
+;; would only stop the runner from using.
+${ownCacheRules('file-read* file-write*')}
+(allow file-read* file-write*
+  (subpath "${escapedDir}"))
 ${dockerRules}
 
 ;; Device files that need read/write access (git, many tools redirect to /dev/null)
@@ -509,10 +611,13 @@ ${dockerRules}
 ;; PROCESS OPERATIONS - Permissive (runner spawns build tools)
 ;; ------------------------------------------------------------
 (allow process*)
-(allow signal)
+;; Signals only to processes in this sandbox: the job's own children and its
+;; own process group, which inherit it. Not the app, another worker's job or
+;; anything else the user runs, which a bare (allow signal) let it kill.
+(allow signal (target same-sandbox))
 
 ;; ------------------------------------------------------------
-;; NETWORK ACCESS - Permissive (runner contacts many services)
+;; NETWORK ACCESS - Through this worker's proxy (runner contacts many services)
 ;; Hostname filtering is done at the proxy layer - sandbox-exec cannot express
 ;; it - so the sandbox's job is to make the proxy the only way out.
 ;; ------------------------------------------------------------
@@ -523,16 +628,16 @@ ${dockerRules}
 ;; exists - but it can make the proxy the only way out.
 (deny network*)
 
-;; Loopback is allowed: build and test suites routinely start a server and talk
-;; to it, and nothing leaves the machine this way. Everything else must go
-;; through the proxy, which is itself on loopback.
-(allow network-outbound (remote ip "localhost:*"))
+;; Loopback is not open as a whole. It reaches every service on this machine,
+;; not only the job's own: databases, debuggers (node --inspect on 9229), a
+;; browser's remote debugging (9222), local proxies. The job reaches this
+;; worker's own proxy, and the loopback ports its repository's approved policy
+;; declares - all of them if it declares true, for test suites that bind
+;; ephemeral ports and talk to themselves. This confines direct connections
+;; only: what the proxy forwards to a literal loopback address is the proxy's
+;; to decide.
+${loopbackRules}
 ${allowDirectNetwork ? ';; Runner registration talks to GitHub directly: app-driven, no workflow\n;; code involved, and there is no instance proxy at configuration time.\n(allow network-outbound)' : ''}
-
-;; ...except this app's own control channels. The broker carries job payloads
-;; including secrets, and the runner reaches it through the proxy rather than
-;; directly, so a job has no reason to open it.
-(deny network-outbound (remote ip "localhost:${brokerPort}"))
 
 ;; .NET asks the kernel about network availability over AF_SYSTEM before it
 ;; will open a connection; denying it surfaces as "Permission denied" on the
@@ -569,6 +674,12 @@ ${allowDirectNetwork ? ';; Runner registration talks to GitHub directly: app-dri
 (allow network-bind
   (subpath "${escapedDir}"))
 
+;; The broker's port, whatever loopback allows above, so this is the last
+;; network rule. It carries job payloads including secrets; the runner reaches
+;; it through the proxy, where the per-worker session key is what guards it,
+;; so a job has no reason to open it directly.
+(deny network-outbound (remote ip "localhost:${brokerPort}"))
+
 ;; ------------------------------------------------------------
 ;; MACH/IPC OPERATIONS - Permissive (required by system frameworks)
 ;; ------------------------------------------------------------
@@ -579,6 +690,13 @@ ${allowDirectNetwork ? ';; Runner registration talks to GitHub directly: app-dri
 (deny mach-lookup
   (global-name "com.apple.pasteboard.1")
   (global-name "com.apple.pbs.fetch_services"))
+;; ...and this app's own MachPortRendezvousServer, through which Chromium hands
+;; the app's helper processes their ports. Named by this process's pid, which
+;; no other process holds while the app runs, rather than by bundle id: a
+;; development build runs as Electron's bundle, and a signed one may carry a
+;; team prefix. Other processes' servers - a browser the job's tests drive -
+;; stay reachable.
+(deny mach-lookup (global-name-regex #"\\.MachPortRendezvousServer\\.${process.pid}$"))
 (allow ipc*)
 
 ;; ------------------------------------------------------------
@@ -606,8 +724,15 @@ export interface SandboxOptions extends SpawnOptions {
    */
   allowDirectNetwork?: boolean;
   /**
+   * This worker's own egress proxy port: the loopback port its job can always
+   * reach. Absent means none on loopback at all, unless the policy declares
+   * all of it.
+   */
+  proxyPort?: number;
+  /**
    * The repository's approved policy, which decides how much filesystem the
-   * job gets. Absent means strict with nothing declared.
+   * job gets, what it denies, and which loopback ports it opens. Absent means
+   * strict with nothing declared.
    */
   filesystemPolicy?: SandboxFilesystemPolicy;
   /**
@@ -670,6 +795,7 @@ export function spawnSandboxed(
   // Extract custom options (don't pass to spawn)
   const {
     allowDirectNetwork,
+    proxyPort,
     filesystemPolicy,
     dockerSocket,
     toolCacheDir,
@@ -690,6 +816,7 @@ export function spawnSandboxed(
   if (process.platform === 'darwin') {
     const profile = generateSandboxProfile({
       instanceDir,
+      proxyPort,
       allowDirectNetwork,
       filesystemPolicy,
       dockerSocket,

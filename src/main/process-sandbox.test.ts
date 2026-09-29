@@ -303,6 +303,40 @@ describe('Process Sandbox', () => {
   const profileWith = (options: Record<string, unknown>, getconf?: () => string): string =>
     profilesWith([options], getconf)[0];
 
+  /**
+   * Whether a profile lets a job perform a file operation on a path: seatbelt
+   * applies the last rule for that operation whose filters match it. A rule
+   * may name several operations, as the policy deny does.
+   */
+  const permits = (profile: string, operation: 'file-read*' | 'file-write*', target: string): boolean => {
+    let verdict = false;
+    const rule = /\((allow|deny) ((?:file-[a-z*-]+[ \t]*)+)/g;
+    for (let match = rule.exec(profile); match; match = rule.exec(profile)) {
+      if (!match[2].trim().split(/\s+/).includes(operation)) continue;
+      // The rule runs to the parenthesis that closes it.
+      let depth = 0;
+      let end = match.index;
+      for (; end < profile.length; end++) {
+        if (profile[end] === '(') depth++;
+        else if (profile[end] === ')' && --depth === 0) break;
+      }
+      const body = profile.slice(match.index, end).replace(/;;.*$/gm, '');
+      const filters = [...body.matchAll(/\((subpath|literal|regex) #?"([^"]*)"\)/g)];
+      const matches = filters.length === 0 || filters.some(([, kind, value]) =>
+        kind === 'regex'
+          ? new RegExp(value).test(target)
+          : target === value || (kind === 'subpath' && target.startsWith(`${value}/`)));
+      if (matches) verdict = match[1] === 'allow';
+    }
+    return verdict;
+  };
+
+  /** Whether a profile lets a job write a path. */
+  const writable = (profile: string, target: string): boolean => permits(profile, 'file-write*', target);
+
+  /** Whether a profile lets a job read a path. */
+  const readable = (profile: string, target: string): boolean => permits(profile, 'file-read*', target);
+
   describe("the worker's docker socket in the runner profile", () => {
     it('grants the worker docker socket read+connect but not write, and keeps ~/.docker fully denied', () => {
       const dockerSocket = path.join(instanceDir, 'docker.sock');
@@ -373,36 +407,12 @@ describe('Process Sandbox', () => {
       expect(writable(profile, path.join(instanceDir, 'docker.sock'))).toBe(false);
     });
 
-    /**
-     * Whether a profile lets a job write a path: seatbelt applies the last
-     * file-write rule whose filters match it.
-     */
-    const writable = (profile: string, target: string): boolean => {
-      let verdict = false;
-      const rule = /\((allow|deny) file-write\*/g;
-      for (let match = rule.exec(profile); match; match = rule.exec(profile)) {
-        // The rule runs to the parenthesis that closes it.
-        let depth = 0;
-        let end = match.index;
-        for (; end < profile.length; end++) {
-          if (profile[end] === '(') depth++;
-          else if (profile[end] === ')' && --depth === 0) break;
-        }
-        const body = profile.slice(match.index, end).replace(/;;.*$/gm, '');
-        const filters = [...body.matchAll(/\((subpath|literal) "([^"]*)"\)/g)];
-        const matches = filters.length === 0 || filters.some(([, kind, value]) =>
-          target === value || (kind === 'subpath' && target.startsWith(`${value}/`)));
-        if (matches) verdict = match[1] === 'allow';
-      }
-      return verdict;
-    };
-
     it("keeps the runner template and its integrity record unwritable, even under a policy that grants the app's directory", () => {
       // Every worker runs a copy of runner/arc, checked against the record in
       // runner/arc-manifests. A job that could write both could change the
       // runner every later job runs, and the check would pass. A policy write
-      // path of ~ or ~/.localmost lies outside the runner directory, so it is
-      // not dropped; only the deny that ends the write rules stands in its way.
+      // path of ~ or ~/.localmost is dropped, and the deny that ends the write
+      // rules would stand in its way if it were not.
       const appDir = path.join(os.homedir(), '.localmost');
       const runnerDir = path.join(appDir, 'runner');
       const ownToolCache = path.join(runnerDir, 'caches', 'aaaa1111', 'tool-cache');
@@ -411,7 +421,7 @@ describe('Process Sandbox', () => {
           filesystemPolicy: { level: 'strict', read: [], write: [grant] },
           toolCacheDir: ownToolCache,
         });
-        expect(writable(profile, path.join(appDir, 'some-file'))).toBe(true);
+        expect(writable(profile, path.join(appDir, 'some-file'))).toBe(false);
         expect(writable(profile, path.join(runnerDir, 'arc', 'v2.336.0', 'bin', 'Runner.Worker.dll'))).toBe(false);
         expect(writable(profile, path.join(runnerDir, 'arc', 'v9.9.9', '.env'))).toBe(false);
         expect(writable(profile, path.join(runnerDir, 'arc-manifests', 'v2.336.0.json'))).toBe(false);
@@ -668,6 +678,351 @@ describe('Process Sandbox', () => {
     });
   });
 
+  describe("the runner profile's reach into other processes", () => {
+    it('lets a job signal only the processes in its own sandbox', () => {
+      // A bare (allow signal) let a job kill or stop any process the user
+      // runs - the app, an editor, another worker's job. Its own children
+      // and its own process group inherit its sandbox, so they stay in reach.
+      const profile = profileWith({});
+      expect(profile).toContain('(allow signal (target same-sandbox))');
+      expect(profile).not.toMatch(/^\(allow signal\)$/m);
+    });
+
+    it("denies this app's own MachPortRendezvousServer, by this process's pid", () => {
+      // Chromium's browser process serves its child processes their ports
+      // under <bundle id>.MachPortRendezvousServer.<pid>. A job has no
+      // business with it, and (allow mach*) would otherwise reach it. Matched
+      // on the pid rather than a hardcoded bundle id: a development build runs
+      // as Electron's own bundle, and a signed one may carry a team prefix.
+      const profile = profileWith({});
+      const rule = `(deny mach-lookup (global-name-regex #"\\.MachPortRendezvousServer\\.${process.pid}$"))`;
+      expect(profile).toContain(rule);
+      expect(profile.indexOf(rule)).toBeGreaterThan(profile.indexOf('(allow mach*)'));
+      const pattern = new RegExp(`\\.MachPortRendezvousServer\\.${process.pid}$`);
+      expect(pattern.test(`com.localmost.app.MachPortRendezvousServer.${process.pid}`)).toBe(true);
+      expect(pattern.test(`com.github.Electron.MachPortRendezvousServer.${process.pid}`)).toBe(true);
+      // Nobody else's: another process's server, or a pid that merely starts
+      // with this one, stays reachable for the job's own browsers.
+      expect(pattern.test(`com.google.Chrome.MachPortRendezvousServer.${process.pid}1`)).toBe(false);
+      expect(pattern.test(`com.localmost.app.MachPortRendezvousServer.${process.pid + 1}`)).toBe(false);
+    });
+  });
+
+  describe("the app's own data directories", () => {
+    const appDir = path.join(os.homedir(), '.localmost');
+    const runnerDir = path.join(appDir, 'runner');
+    // Where the electron mock puts Electron's userData directory.
+    const userDataDir = '/tmp/test';
+    const ownToolCache = path.join(runnerDir, 'caches', 'aaaa1111', 'tool-cache');
+    const ownPackages = path.join(runnerDir, 'caches', 'aaaa1111', 'packages');
+
+    it('never lets a job write them, apart from its own sandbox and caches', () => {
+      // Logs, job history, the CLI binary the user runs and whatever is added
+      // there later: none of it is the job's, and a job that can write the
+      // app's directories can plant what the app or the user later trusts.
+      // The grants of both directories are dropped before the profile is
+      // built; the deny that ends the write rules is the backstop behind that.
+      const dockerSocket = path.join(instanceDir, 'docker.sock');
+      const profile = profileWith({
+        filesystemPolicy: { level: 'moderate', read: [], write: ['/opt/out', '~/.localmost', userDataDir] },
+        dockerSocket,
+        toolCacheDir: ownToolCache,
+        packageCacheDir: ownPackages,
+      });
+      expect(profile).toContain(`(deny file-write*\n  (subpath "${appDir}")\n  (subpath "${userDataDir}"))`);
+      for (const target of [
+        path.join(appDir, 'logs', 'main.log'),
+        path.join(appDir, 'job-history.json'),
+        path.join(appDir, 'bin', 'localmost'),
+        path.join(appDir, 'something-added-later'),
+        path.join(userDataDir, 'Local State'),
+        path.join(userDataDir, 'credentials'),
+      ]) {
+        expect(writable(profile, target)).toBe(false);
+      }
+      expect(writable(profile, path.join(instanceDir, '_work', 'out'))).toBe(true);
+      expect(writable(profile, path.join(ownToolCache, 'node'))).toBe(true);
+      expect(writable(profile, path.join(ownPackages, 'cargo', 'registry'))).toBe(true);
+      expect(writable(profile, '/opt/out/artifact')).toBe(true);
+      expect(writable(profile, dockerSocket)).toBe(false);
+    });
+
+    it('drops a policy path that is, contains, or lies inside either of them', () => {
+      // A grant of ~ contains ~/.localmost: other workers' sandboxes, the
+      // logs and the job history. It cannot be granted and then fenced off
+      // without also cutting the way into the job's own sandbox, so it is
+      // not granted. Relative workspace paths resolve inside the job's own
+      // sandbox and are kept.
+      const onLog = jest.fn();
+      const dropped = ['~', '/', '~/.localmost', '~/.localmost/logs', userDataDir, `${userDataDir}/Cookies`, '/tmp'];
+      const profile = profileWith({
+        filesystemPolicy: { level: 'strict', read: [...dropped, '/opt/keep', './build'], write: [...dropped, '/opt/out'] },
+        onLog,
+      });
+      const allowRead = profile.slice(profile.indexOf('(allow file-read*'), profile.indexOf('(deny file-read*'));
+      const policyWriteAllow = profile.slice(profile.indexOf('declares writable'), profile.indexOf('(allow file-read*'));
+      for (const entry of dropped) {
+        const expanded = entry.startsWith('~') ? path.join(os.homedir(), entry.slice(1)) : entry;
+        expect(allowRead).not.toContain(`(subpath "${expanded}")`);
+        expect(policyWriteAllow).not.toContain(`(subpath "${expanded}")`);
+        expect(onLog).toHaveBeenCalledWith('error', expect.stringContaining(entry));
+      }
+      expect(readable(profile, path.join(os.homedir(), 'project', 'README'))).toBe(false);
+      expect(allowRead).toContain('(subpath "/opt/keep")');
+      expect(allowRead).toContain('(subpath "./build")');
+      expect(policyWriteAllow).toContain('(subpath "/opt/out")');
+    });
+
+    it('drops them whatever their case or Unicode form, since seatbelt matches both loosely', () => {
+      // On the default APFS volume seatbelt matches a path whatever its case
+      // and normalization, so ~/.LOCALMOST grants what ~/.localmost would.
+      const onLog = jest.fn();
+      const spellings = [
+        '~/.LOCALMOST',
+        '~/.LocalMost/runner/sandbox',
+        os.homedir().toUpperCase(),
+        '/TMP/TEST/Cookies',
+        '/Tmp',
+      ];
+      const profile = profileWith({
+        filesystemPolicy: { level: 'strict', read: spellings, write: spellings },
+        onLog,
+      });
+      for (const entry of spellings) {
+        const expanded = entry.startsWith('~') ? path.join(os.homedir(), entry.slice(1)) : entry;
+        expect(profile).not.toContain(`(subpath "${expanded}")`);
+        expect(onLog).toHaveBeenCalledWith('error', expect.stringContaining(entry));
+      }
+    });
+
+    it('drops a grant of the app directory spelled in another Unicode form', () => {
+      const previous = process.env.LOCALMOST_CONFIG_DIR;
+      process.env.LOCALMOST_CONFIG_DIR = '/opt/café';
+      try {
+        const decomposed = '/opt/café/runner/sandbox';
+        let profile = '';
+        jest.isolateModules(() => {
+          const { generateSandboxProfile } = require('./process-sandbox');
+          profile = generateSandboxProfile({
+            instanceDir: '/opt/café/runner/sandbox/1',
+            filesystemPolicy: { level: 'strict', read: [decomposed, '/opt/other'], write: [] },
+          });
+        });
+        expect(profile).not.toContain(`(subpath "${decomposed}")`);
+        expect(profile).toContain('(subpath "/opt/other")');
+      } finally {
+        if (previous === undefined) delete process.env.LOCALMOST_CONFIG_DIR;
+        else process.env.LOCALMOST_CONFIG_DIR = previous;
+      }
+    });
+  });
+
+  describe('policy deny paths', () => {
+    it('refuses reading and writing what a deny names, over every grant', () => {
+      const cargoBin = path.join(os.homedir(), '.cargo', 'bin');
+      const profile = profileWith({
+        filesystemPolicy: {
+          level: 'moderate',
+          read: ['/opt/data'],
+          write: ['/opt/out'],
+          deny: ['/opt/out/secret', '/opt/data/private', '~/.cargo/bin'],
+        },
+      });
+      expect(writable(profile, '/opt/out/artifact')).toBe(true);
+      expect(writable(profile, '/opt/out/secret/key')).toBe(false);
+      expect(readable(profile, '/opt/out/secret/key')).toBe(false);
+      expect(readable(profile, '/opt/data/table')).toBe(true);
+      expect(readable(profile, '/opt/data/private/table')).toBe(false);
+      // A toolchain grant is narrowed too, with ~ expanded as grants are.
+      expect(readable(profile, path.join(os.homedir(), '.cargo', 'registry', 'index'))).toBe(true);
+      expect(readable(profile, path.join(cargoBin, 'cargo'))).toBe(false);
+      // After the grants it narrows, so the last matching rule is the deny.
+      const deny = profile.indexOf('(deny file-read* file-write*');
+      expect(deny).toBeGreaterThan(profile.indexOf('(subpath "/opt/data")'));
+      expect(deny).toBeGreaterThan(profile.indexOf('(subpath "/opt/out")'));
+    });
+
+    it("cannot take the job's own sandbox from it", () => {
+      // The job's own sandbox is re-allowed after the deny: a deny that
+      // covered it would only stop the runner from starting.
+      const profile = profileWith({
+        filesystemPolicy: { level: 'strict', read: [], write: [], deny: [path.join(instanceDir, '_work')] },
+      });
+      const deny = profile.indexOf('(deny file-read* file-write*');
+      const reallow = profile.indexOf(`(allow file-read* file-write*\n  (subpath "${instanceDir}"))`);
+      expect(deny).toBeGreaterThan(-1);
+      expect(reallow).toBeGreaterThan(deny);
+      expect(writable(profile, path.join(instanceDir, '_work', 'repo', 'out.o'))).toBe(true);
+      expect(readable(profile, path.join(instanceDir, '_work', 'repo', 'main.c'))).toBe(true);
+    });
+
+    it('keeps a deny that covers the app directories, since a deny only narrows', () => {
+      // Dropping it, as a grant there is dropped, would quietly widen what
+      // the approved policy says: /tmp contains the mock's userData directory.
+      const profile = profileWith({
+        filesystemPolicy: { level: 'strict', read: [], write: [], deny: ['/tmp', '~/.localmost/logs'] },
+      });
+      const denyRule = profile.slice(profile.indexOf('(deny file-read* file-write*'));
+      expect(denyRule).toContain('(subpath "/tmp")');
+      expect(denyRule).toContain(`(subpath "${path.join(os.homedir(), '.localmost', 'logs')}")`);
+    });
+
+    it('escapes deny paths, and resolves a traversing one rather than dropping it', () => {
+      // Dropping a deny widens the approved policy, so an absolute one with
+      // ".." is kept, resolved as seatbelt would resolve the path it guards.
+      const profile = profileWith({
+        filesystemPolicy: { level: 'strict', read: [], write: [], deny: ['/opt/a"b', '/opt/data/../etc'] },
+      });
+      const denyRule = profile.slice(profile.indexOf('(deny file-read* file-write*'));
+      expect(denyRule).toContain('(subpath "/opt/a\\"b")');
+      expect(denyRule).toContain('(subpath "/opt/etc")');
+      expect(profile).not.toContain('/opt/data/../etc');
+      // And none at all when the policy denies nothing.
+      expect(profileWith({})).not.toContain('(deny file-read* file-write*');
+    });
+
+    it('says a relative deny has no effect, since seatbelt never matches a relative path', () => {
+      const onLog = jest.fn();
+      const profile = profileWith({
+        filesystemPolicy: { level: 'strict', read: [], write: [], deny: ['build/secret', '../up', '/opt/kept'] },
+        onLog,
+      });
+      expect(profile).not.toContain('(subpath "build/secret")');
+      expect(profile).not.toContain('../up');
+      expect(profile).toContain('(subpath "/opt/kept")');
+      expect(onLog).toHaveBeenCalledWith('error', expect.stringContaining('build/secret'));
+      expect(onLog).toHaveBeenCalledWith('error', expect.stringContaining('../up'));
+    });
+
+    it('refuses to build a profile from a deny list that is not a list', () => {
+      // Dropping it would widen the approved policy, so the spawn fails with
+      // a message saying why rather than running the job without its denies.
+      expect(() => profileWith({
+        filesystemPolicy: { level: 'strict', read: [], write: [], deny: '/opt/secret' },
+      })).toThrow(/deny list is not a list/);
+    });
+  });
+
+  describe('loopback', () => {
+    const proxyPort = 45678;
+    const allowsRemote = (profile: string, spec: string) =>
+      profile.includes(`(allow network-outbound (remote ip "localhost:${spec}"))`);
+
+    it("reaches only this worker's own proxy by default", () => {
+      // Loopback reaches every service on the machine: databases, a debugger
+      // on 9229, a browser's remote debugging on 9222, local proxies. The
+      // proxy is the one a job always needs.
+      const profile = profileWith({ proxyPort });
+      expect(allowsRemote(profile, String(proxyPort))).toBe(true);
+      expect(profile).not.toContain('(remote ip "localhost:*")');
+      expect(profile.match(/\(remote ip "localhost:\d+"\)/g)?.sort()).toEqual(
+        [`(remote ip "localhost:${proxyPort}")`, '(remote ip "localhost:8787")'].sort()
+      );
+    });
+
+    it('opens the ports a repository declares, or all of loopback when it declares true', () => {
+      const listed = profileWith({
+        proxyPort,
+        filesystemPolicy: { level: 'strict', read: [], write: [], loopback: [5432, 6379] },
+      });
+      expect(allowsRemote(listed, String(proxyPort))).toBe(true);
+      expect(allowsRemote(listed, '5432')).toBe(true);
+      expect(allowsRemote(listed, '6379')).toBe(true);
+      expect(listed).not.toContain('(remote ip "localhost:*")');
+
+      const all = profileWith({
+        proxyPort,
+        filesystemPolicy: { level: 'strict', read: [], write: [], loopback: true },
+      });
+      expect(allowsRemote(all, '*')).toBe(true);
+    });
+
+    it('keeps the broker denied as the last network rule, whatever loopback allows', () => {
+      for (const loopback of [true, [8787, 5432]] as const) {
+        const profile = profileWith({
+          proxyPort,
+          filesystemPolicy: { level: 'strict', read: [], write: [], loopback },
+        });
+        const brokerDeny = profile.indexOf('(deny network-outbound (remote ip "localhost:8787"))');
+        expect(brokerDeny).toBeGreaterThan(-1);
+        const networkRules = [...profile.matchAll(/^\((?:allow|deny) (?:network|system-socket)[^\n]*/gm)];
+        expect(networkRules[networkRules.length - 1].index).toBe(brokerDeny);
+      }
+    });
+
+    it('opens no loopback at all without the proxy port, and says so', () => {
+      // Failing closed: a worker spawned without its proxy port cannot reach
+      // anything, rather than reaching everything on loopback.
+      for (const loopback of [undefined, [5432]]) {
+        const onLog = jest.fn();
+        const profile = profileWith({
+          filesystemPolicy: { level: 'strict', read: [], write: [], ...(loopback ? { loopback } : {}) },
+          onLog,
+        });
+        expect(profile).not.toMatch(/\(allow network-outbound \(remote ip/);
+        expect(onLog).toHaveBeenCalledWith('error', expect.stringMatching(/proxy port/));
+      }
+      // Declaring all of loopback covers the proxy wherever it is.
+      const all = profileWith({ filesystemPolicy: { level: 'strict', read: [], write: [], loopback: true } });
+      expect(allowsRemote(all, '*')).toBe(true);
+      // Registration has no proxy and is open to every destination anyway,
+      // so the missing port is not worth an error there.
+      const onLog = jest.fn();
+      profileWith({ allowDirectNetwork: true, onLog });
+      expect(onLog).not.toHaveBeenCalledWith('error', expect.stringMatching(/proxy port/));
+    });
+
+    it('drops a declared loopback port that is not a port', () => {
+      const profile = profileWith({
+        proxyPort,
+        filesystemPolicy: { level: 'strict', read: [], write: [], loopback: [0, 70000, 1.5, -1, 5432] },
+      });
+      const ports = [...profile.matchAll(/\(remote ip "localhost:([^"]+)"\)/g)].map((m) => m[1]).sort();
+      expect(ports).toEqual([String(proxyPort), '5432', '8787'].sort());
+    });
+
+    it('drops a loopback declaration that is neither true nor a list, and says so', () => {
+      // Narrowing is the safe direction: the job keeps its proxy and nothing
+      // else, rather than the spawn failing on the value.
+      for (const loopback of ['true', '5432', { 5432: true }, false]) {
+        const onLog = jest.fn();
+        const profile = profileWith({
+          proxyPort,
+          filesystemPolicy: { level: 'strict', read: [], write: [], loopback },
+          onLog,
+        });
+        const ports = [...profile.matchAll(/\(remote ip "localhost:([^"]+)"\)/g)].map((m) => m[1]).sort();
+        expect(ports).toEqual([String(proxyPort), '8787'].sort());
+        expect(onLog).toHaveBeenCalledWith('error', expect.stringMatching(/loopback/));
+      }
+    });
+
+    it('says, in a registration profile, that the network is direct rather than closed', () => {
+      const profile = profileWith({ allowDirectNetwork: true });
+      expect(profile).not.toContain('nothing on loopback is reachable');
+      expect(profile).toContain('(allow network-outbound)');
+    });
+
+    it('passes the proxy port to the profile, not to the spawned process', () => {
+      jest.isolateModules(() => {
+        Object.defineProperty(process, 'platform', { value: 'darwin' });
+        const localMockSpawn = jest.fn().mockReturnValue(createMockProcess(12361));
+        const mockWriteFileSync = jest.fn();
+        jest.doMock('child_process', () => ({ spawn: localMockSpawn, execFileSync: jest.fn(() => '') }));
+        jest.doMock('fs', () => ({
+          existsSync: jest.fn().mockReturnValue(true),
+          writeFileSync: mockWriteFileSync,
+          unlinkSync: jest.fn(),
+          mkdirSync: jest.fn(),
+        }));
+        const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
+        sandboxedSpawn(path.join(instanceDir, 'run.sh'), [], { cwd: instanceDir, proxyPort });
+        expect(mockWriteFileSync.mock.calls[0][1]).toContain(`(remote ip "localhost:${proxyPort}")`);
+        expect(localMockSpawn.mock.calls[0][2]).not.toHaveProperty('proxyPort');
+      });
+    });
+  });
+
     it('should use sandbox-exec on macOS', () => {
       // Re-require after platform change
       jest.isolateModules(() => {
@@ -716,7 +1071,7 @@ describe('Process Sandbox', () => {
 
         const instanceDir = path.join(os.homedir(), '.localmost', 'runner-2');
         const runnerPath = path.join(instanceDir, 'run.sh');
-        sandboxedSpawn(runnerPath, [], { cwd: instanceDir });
+        sandboxedSpawn(runnerPath, [], { cwd: instanceDir, proxyPort: 45678 });
 
         // Get the profile from the writeFileSync call
         const profile = mockWriteFileSync.mock.calls[0][1];
@@ -729,16 +1084,17 @@ describe('Process Sandbox', () => {
         // connect straight out, which is exactly what the policy forbids.
         expect(profile).toContain('(deny network*)');
         expect(profile).not.toContain('(allow network*)');
-        // Loopback only: the proxy lives there, and nothing leaves the machine
-        // this way. A job that ignores HTTP_PROXY reaches nothing.
-        expect(profile).toContain('(allow network-outbound (remote ip "localhost:*"))');
+        // This worker's proxy only, on loopback. A job that ignores
+        // HTTP_PROXY reaches nothing, not even the rest of loopback.
+        expect(profile).toContain('(allow network-outbound (remote ip "localhost:45678"))');
+        expect(profile).not.toContain('(remote ip "localhost:*")');
         // The escape hatch for runner registration stays off unless asked for.
         expect(profile).not.toMatch(/\(allow network-outbound\)\s*$/m);
 
         // The app's own control plane is never writable by a job: a job that
         // can write the approval cache can approve its own policy.
         expect(profile).toContain('(deny file-write*');
-        expect(profile).toMatch(/deny file-write\*[\s\S]*policies/);
+        expect(writable(profile, path.join(os.homedir(), '.localmost', 'policies', 'owner-repo.json'))).toBe(false);
       });
     });
 
@@ -796,7 +1152,7 @@ describe('Process Sandbox', () => {
         expect(profile).toMatch(/^\(allow network-outbound\)$/m);
         // Still denies by default and still keeps the control plane closed.
         expect(profile).toContain('(deny network*)');
-        expect(profile).toMatch(/deny file-write\*[\s\S]*policies/);
+        expect(writable(profile, path.join(os.homedir(), '.localmost', 'policies', 'owner-repo.json'))).toBe(false);
       });
     });
 

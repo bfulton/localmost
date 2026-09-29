@@ -1,12 +1,13 @@
 /**
- * Integration coverage for the runner profile's filesystem floor at the
- * seatbelt layer.
+ * Integration coverage for the runner profile's filesystem floor, signals and
+ * loopback at the seatbelt layer.
  *
  * The unit tests assert which rules the runner profile contains. They cannot
  * show that seatbelt accepts them - a rule the engine rejects fails every
  * worker spawn - or that a process under them is kept out of the shared temp
- * directories and the user's toolchain trees, whatever spelling a future rule
- * takes. So the same two modes as the docker isolation test:
+ * directories, the user's toolchain trees, the app's own data, other
+ * processes and loopback services it was not granted, whatever spelling a
+ * future rule takes. So the same two modes as the docker isolation test:
  *
  *   constructed  On an unsandboxed machine, build the runner profile and
  *                apply it with sandbox-exec. Tests both directions: what the
@@ -21,9 +22,10 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
-import { execFileSync, spawnSync } from 'child_process';
+import { execFileSync, spawn, spawnSync } from 'child_process';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { generateSandboxProfile, RunnerProfileOptions } from './process-sandbox';
@@ -127,13 +129,20 @@ if (!isMacOS) {
       fs.rmSync(base, { recursive: true, force: true });
     });
 
-    /** A runner for shell commands under the runner profile built from `options`. */
-    const underProfile = (options: Omit<RunnerProfileOptions, 'instanceDir'> = {}) => {
+    // The job's TMPDIR, as the worker's is: inside its own sandbox.
+    const jobEnv = () => ({ PATH: '/usr/bin:/bin', HOME: homeDir, TMPDIR: jobTmp });
+
+    /** Write the runner profile built from `options`, and return its path. */
+    const writeProfile = (options: Omit<RunnerProfileOptions, 'instanceDir'> = {}): string => {
       const profilePath = path.join(base, `${probeName()}.sb`);
       fs.writeFileSync(profilePath, generateSandboxProfile({ instanceDir, ...options }));
-      // The job's TMPDIR, as the worker's is: inside its own sandbox.
-      const env = { PATH: '/usr/bin:/bin', HOME: homeDir, TMPDIR: jobTmp };
-      return (command: string) => shell(command, profilePath, env);
+      return profilePath;
+    };
+
+    /** A runner for shell commands under the runner profile built from `options`. */
+    const underProfile = (options: Omit<RunnerProfileOptions, 'instanceDir'> = {}) => {
+      const profilePath = writeProfile(options);
+      return (command: string) => shell(command, profilePath, jobEnv());
     };
 
     it('compiles, and writes the job its own sandbox', () => {
@@ -170,6 +179,221 @@ if (!isMacOS) {
         expect(canCreateUnder(run, path.join(homeDir, tree))).toBe(false);
       }
     });
+
+    /**
+     * The runner profile built from `options` with the app's directory at
+     * `appDir`, which is read when the profile is built and only then.
+     */
+    const profileWithAppDir = (appDir: string, options: Omit<RunnerProfileOptions, 'instanceDir'>): string => {
+      const previous = process.env.LOCALMOST_CONFIG_DIR;
+      process.env.LOCALMOST_CONFIG_DIR = appDir;
+      try {
+        return generateSandboxProfile({ instanceDir, ...options });
+      } finally {
+        if (previous === undefined) delete process.env.LOCALMOST_CONFIG_DIR;
+        else process.env.LOCALMOST_CONFIG_DIR = previous;
+      }
+    };
+
+    /** A runner for shell commands under the given profile text. */
+    const underProfileText = (profile: string) => {
+      const profilePath = path.join(base, `${probeName()}.sb`);
+      fs.writeFileSync(profilePath, profile);
+      return (command: string) => shell(command, profilePath, jobEnv());
+    };
+
+    /** An app directory with another worker's sandbox, the logs and the runner template in it. */
+    const makeAppDir = (name: string): string => {
+      const appDir = path.join(base, name);
+      fs.mkdirSync(path.join(appDir, 'logs'), { recursive: true });
+      fs.mkdirSync(path.join(appDir, 'runner', 'arc'), { recursive: true });
+      fs.mkdirSync(path.join(appDir, 'runner', 'sandbox', '2'), { recursive: true });
+      fs.writeFileSync(path.join(appDir, 'runner', 'sandbox', '2', 'token'), 'token');
+      fs.writeFileSync(path.join(appDir, 'logs', 'app.log'), 'log');
+      return appDir;
+    };
+
+    it("refuses writes to the app's own data directory, whatever the policy grants", () => {
+      // Logs, job history and the runner template live beside the job's
+      // sandbox; a grant of the whole directory is dropped before the profile
+      // is built.
+      const configDir = makeAppDir('config');
+      const granted = path.join(base, 'granted');
+      fs.mkdirSync(granted, { recursive: true });
+      const run = underProfileText(profileWithAppDir(configDir, {
+        filesystemPolicy: { level: 'strict', read: [], write: [configDir, granted] },
+      }));
+      expect(canCreate(run, path.join(granted, probeName()))).toBe(true);
+      expect(canCreate(run, path.join(configDir, 'logs', probeName()))).toBe(false);
+      expect(canCreate(run, path.join(configDir, 'job-history.json'))).toBe(false);
+      expect(canCreate(run, path.join(configDir, 'runner', 'arc', probeName()))).toBe(false);
+    });
+
+    it("keeps the app's data directory unwritable even past a grant the filter missed", () => {
+      // The deny that ends the write rules is the backstop behind the filter,
+      // so it is proven on its own: a grant of the whole directory is put
+      // where the policy's write grants go, as if the filter had let it by.
+      // The job's own sandbox and its target's caches, inside that directory
+      // as a worker's are, stay writable.
+      const appDir = base;
+      makeAppDir('.');
+      const profile = profileWithAppDir(appDir, {
+        filesystemPolicy: { level: 'moderate', read: [], write: [] },
+        packageCacheDir,
+      });
+      const placeholder = ';; No policy-declared write paths';
+      expect(profile).toContain(placeholder);
+      const run = underProfileText(profile.replace(placeholder, `(allow file-write* (subpath "${appDir}"))`));
+      expect(canCreate(run, path.join(appDir, 'logs', probeName()))).toBe(false);
+      expect(canCreate(run, path.join(appDir, 'job-history.json'))).toBe(false);
+      expect(canCreate(run, path.join(appDir, 'runner', 'arc', probeName()))).toBe(false);
+      expect(canCreate(run, path.join(appDir, 'runner', 'sandbox', '2', probeName()))).toBe(false);
+      expect(canCreate(run, path.join(jobTmp, probeName()))).toBe(true);
+      expect(canCreateUnder(run, packageCacheDir)).toBe(true);
+    });
+
+    it("refuses reads of the app's data directory granted in another case", () => {
+      // seatbelt matches paths case-insensitively on the default APFS volume,
+      // so a grant spelled in capitals reaches what the lower-case one would:
+      // other workers' sandboxes and the logs.
+      const appDir = makeAppDir('cased');
+      const run = underProfileText(profileWithAppDir(appDir, {
+        filesystemPolicy: { level: 'strict', read: [appDir.toUpperCase()], write: [] },
+      }));
+      const own = path.join(jobTmp, probeName());
+      fs.writeFileSync(own, 'own');
+      expect(run(`/bin/cat '${own}'`).ok).toBe(true);
+      expect(run(`/bin/cat '${path.join(appDir, 'runner', 'sandbox', '2', 'token')}'`).ok).toBe(false);
+      expect(run(`/bin/cat '${path.join(appDir, 'logs', 'app.log')}'`).ok).toBe(false);
+    });
+
+    it("refuses reads of the app's data directory granted by its real path", () => {
+      // os.tmpdir() is under /var, a symlink to /private/var. seatbelt matches
+      // the real path, so a grant of /private/var/... reaches an app directory
+      // configured as /var/...
+      const appDir = makeAppDir('linked');
+      const spelled = appDir.replace(/^\/private\//, '/');
+      expect(spelled).not.toBe(appDir);
+      const run = underProfileText(profileWithAppDir(spelled, {
+        filesystemPolicy: { level: 'strict', read: [appDir], write: [] },
+      }));
+      expect(run(`/bin/cat '${path.join(appDir, 'runner', 'sandbox', '2', 'token')}'`).ok).toBe(false);
+      expect(run(`/bin/cat '${path.join(appDir, 'logs', 'app.log')}'`).ok).toBe(false);
+    });
+
+    it('refuses what a policy denies, read and write, inside what it grants', () => {
+      const out = path.join(base, 'out');
+      const secret = path.join(out, 'secret');
+      fs.mkdirSync(secret, { recursive: true });
+      fs.writeFileSync(path.join(out, 'visible'), 'visible');
+      fs.writeFileSync(path.join(secret, 'key'), 'key');
+      const run = underProfile({ filesystemPolicy: { level: 'strict', read: [out], write: [out], deny: [secret] } });
+      expect(canCreate(run, path.join(out, probeName()))).toBe(true);
+      expect(run(`/bin/cat '${path.join(out, 'visible')}'`).ok).toBe(true);
+      expect(canCreate(run, path.join(secret, probeName()))).toBe(false);
+      expect(run(`/bin/cat '${path.join(secret, 'key')}'`).ok).toBe(false);
+    });
+
+    it('lets a job signal its own children, and no process outside its sandbox', () => {
+      const outside = spawn('/bin/sleep', ['60'], { stdio: 'ignore' });
+      try {
+        const run = underProfile();
+        expect(run(`/bin/kill -0 ${outside.pid}`).ok).toBe(false);
+        expect(run('/bin/sleep 60 & C=$!; /bin/kill -0 $C && /bin/kill -TERM $C').ok).toBe(true);
+      } finally {
+        outside.kill('SIGKILL');
+      }
+    });
+
+    it('signals the members of its process group that share its sandbox, and no others', async () => {
+      // An unsandboxed shell leads a fresh process group - never this test's
+      // own - and starts one process outside the sandbox and then the job in
+      // the same group. The job signals the whole group: its own child gets
+      // it; the shell and the outside process must not.
+      const profilePath = writeProfile();
+      const job = '/bin/sleep 60 & C=$!; trap "" TERM; kill -TERM 0; wait $C; echo child=$?';
+      const script = [
+        '/bin/sleep 60 & OUTSIDE=$!',
+        `/usr/bin/sandbox-exec -f '${profilePath}' /bin/sh -c '${job}'`,
+        '/bin/kill -0 $OUTSIDE && echo outside=alive',
+        '/bin/kill -KILL $OUTSIDE',
+      ].join('\n');
+      const shellProcess = spawn('/bin/sh', ['-c', script], {
+        detached: true,
+        stdio: ['ignore', 'pipe', 'ignore'],
+        env: jobEnv(),
+      });
+      let stdout = '';
+      shellProcess.stdout.setEncoding('utf-8').on('data', (chunk: string) => { stdout += chunk; });
+      const timer = setTimeout(() => shellProcess.kill('SIGKILL'), 15000);
+      await new Promise((resolve) => shellProcess.on('close', resolve));
+      clearTimeout(timer);
+      expect(stdout).toContain('child=143');
+      expect(stdout).toContain('outside=alive');
+    });
+
+    describe('loopback', () => {
+      // Listeners outside the sandbox: one stands in for the worker's proxy,
+      // the others for services on this machine. A connect under seatbelt is
+      // refused before it leaves the process, and one it allows completes
+      // against the listen backlog while this process waits.
+      let proxy: net.Server;
+      let service: net.Server;
+      let other: net.Server;
+      const portOf = (server: net.Server) => (server.address() as net.AddressInfo).port;
+      const listen = () =>
+        new Promise<net.Server>((resolve, reject) => {
+          const server = net.createServer((socket) => socket.destroy());
+          server.once('error', reject);
+          server.listen(0, '127.0.0.1', () => resolve(server));
+        });
+      const reaches = (run: (command: string) => { ok: boolean }, server: net.Server) =>
+        run(`/usr/bin/nc -z -G 2 127.0.0.1 ${portOf(server)}`).ok;
+
+      beforeAll(async () => {
+        proxy = await listen();
+        service = await listen();
+        other = await listen();
+      });
+
+      afterAll(async () => {
+        await Promise.all([proxy, service, other].map((server) => new Promise((resolve) => server.close(resolve))));
+      });
+
+      it('reaches its own proxy and nothing else on loopback by default', () => {
+        const run = underProfile({ proxyPort: portOf(proxy) });
+        expect(reaches(run, proxy)).toBe(true);
+        expect(reaches(run, service)).toBe(false);
+      });
+
+      it('reaches a service whose port the policy declares, and not one whose port it does not', () => {
+        const run = underProfile({
+          proxyPort: portOf(proxy),
+          filesystemPolicy: { level: 'strict', read: [], write: [], loopback: [portOf(service)] },
+        });
+        expect(reaches(run, proxy)).toBe(true);
+        expect(reaches(run, service)).toBe(true);
+        expect(reaches(run, other)).toBe(false);
+      });
+
+      it('reaches every loopback port only when the policy declares all of loopback', () => {
+        const declared = underProfile({
+          proxyPort: portOf(proxy),
+          filesystemPolicy: { level: 'strict', read: [], write: [], loopback: true },
+        });
+        expect(reaches(declared, service)).toBe(true);
+        expect(reaches(declared, other)).toBe(true);
+        const undeclared = underProfile({ proxyPort: portOf(proxy) });
+        expect(reaches(undeclared, service)).toBe(false);
+        expect(reaches(undeclared, other)).toBe(false);
+      });
+
+      it('reaches nothing on loopback when it was given no proxy port', () => {
+        const run = underProfile();
+        expect(reaches(run, proxy)).toBe(false);
+        expect(reaches(run, service)).toBe(false);
+      });
+    });
   });
 } else {
   describe("the runner profile's filesystem floor through the ambient seatbelt profile", () => {
@@ -205,6 +429,38 @@ if (!isMacOS) {
       }
       for (const tree of ['.cargo', '.gradle', 'go', '.local']) {
         expect(canCreateUnder(run, path.join(homeDir, tree))).toBe(false);
+      }
+    });
+
+    it("refuses writes to the app's own data directory", () => {
+      // Found from where the job runs, <app dir>/runner/sandbox/<n>/_temp, so
+      // the directory is certainly there and a refusal is the sandbox's EPERM,
+      // not a missing parent's ENOENT.
+      const sandboxDir = path.dirname(fs.realpathSync(os.tmpdir()));
+      expect(path.basename(path.dirname(sandboxDir))).toBe('sandbox');
+      expect(path.basename(path.dirname(path.dirname(sandboxDir)))).toBe('runner');
+      const appDir = path.dirname(path.dirname(path.dirname(sandboxDir)));
+      const target = path.join(appDir, probeName());
+      const result = run(`/usr/bin/touch '${target}'`);
+      fs.rmSync(target, { force: true });
+      expect(result.ok).toBe(false);
+      expect(result.stderr).toContain('Operation not permitted');
+    });
+
+    it('signals its own children', () => {
+      expect(run('/bin/sleep 60 & C=$!; /bin/kill -0 $C && /bin/kill -TERM $C').ok).toBe(true);
+    });
+
+    it('reaches a listener it starts on loopback, which this repository declares', async () => {
+      // This repository's policy declares all of loopback: its test suites
+      // bind ephemeral 127.0.0.1 ports and talk to themselves.
+      const server = net.createServer((socket) => socket.destroy());
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      try {
+        const { port } = server.address() as net.AddressInfo;
+        expect(run(`/usr/bin/nc -z -G 2 127.0.0.1 ${port}`).ok).toBe(true);
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
       }
     });
   });
