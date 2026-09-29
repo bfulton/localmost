@@ -1064,12 +1064,16 @@ export class RunnerManager {
   private async stopDockerProxy(instanceNum: number): Promise<void> {
     const socket = this.dockerProxies.get(instanceNum);
     if (!socket) return;
-    this.dockerProxies.delete(instanceNum);
     try {
+      // Stopping removes the containers the job left, which takes a moment.
+      // The socket stays in the map until that is done, so the next spawn in
+      // this slot and a full stop both wait for it: a second stop() joins the
+      // first.
       await socket.stop();
     } catch {
       // Already stopped, or its directory already rebuilt - gone either way.
     }
+    if (this.dockerProxies.get(instanceNum) === socket) this.dockerProxies.delete(instanceNum);
   }
 
   /**

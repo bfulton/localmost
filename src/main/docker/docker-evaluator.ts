@@ -181,7 +181,7 @@ const oneOf = (...allowed: string[]) => (v: unknown): boolean => isUnset(v) || a
  * the grammar applies to itself: what cannot be named cannot be requested.
  *
  * These are the keys an ordinary `docker run` sends. Each is either inert
- * (resource limits, logging, restart behaviour) or gated below.
+ * (resource limits, logging, removal on exit) or gated below.
  */
 const HOST_CONFIG_KNOWN: ReadonlySet<string> = new Set([
   // Gated below by value, or checked by the mount and network logic.
@@ -189,10 +189,10 @@ const HOST_CONFIG_KNOWN: ReadonlySet<string> = new Set([
   'pidmode', 'ipcmode', 'utsmode', 'usernsmode', 'cgroupnsmode', 'cgroupparent', 'cgroup',
   'devices', 'devicerequests', 'devicecgrouprules', 'securityopt', 'capadd', 'sysctls', 'runtime',
   'isolation', 'maskedpaths', 'readonlypaths', 'volumesfrom', 'extrahosts', 'groupadd', 'links',
-  'volumedriver',
+  'volumedriver', 'restartpolicy',
   // Inert: they bound the container, they do not widen it. Dropping capabilities
   // and setting resource limits or DNS search only ever restricts.
-  'capdrop', 'autoremove', 'restartpolicy', 'logconfig', 'consolesize', 'readonlyrootfs', 'init',
+  'capdrop', 'autoremove', 'logconfig', 'consolesize', 'readonlyrootfs', 'init',
   'oomscoreadj', 'oomkilldisable', 'shmsize', 'memory', 'memoryswap', 'memoryreservation',
   'memoryswappiness', 'kernelmemory', 'nanocpus', 'cpushares', 'cpuperiod', 'cpuquota',
   'cpurealtimeperiod', 'cpurealtimeruntime', 'cpusetcpus', 'cpusetmems', 'cpucount', 'cpupercent',
@@ -200,6 +200,17 @@ const HOST_CONFIG_KNOWN: ReadonlySet<string> = new Set([
   'blkiodevicereadiops', 'blkiodevicewriteiops', 'pidslimit', 'dns', 'dnsoptions', 'dnssearch',
   'annotations', 'tmpfs', 'ulimits', 'iomaximumbandwidth', 'iomaximumiops',
 ]);
+
+/** The fields of a RestartPolicy; anything else is a shape the filter cannot read. */
+const RESTART_POLICY_KNOWN: ReadonlySet<string> = new Set(['name', 'maximumretrycount']);
+
+/** Is a RestartPolicy one that never brings the container back? */
+const isNoRestart = (v: unknown): boolean => {
+  if (isUnset(v)) return true;
+  if (!isPlainObject(v)) return false;
+  if (Object.keys(v).some((key) => !RESTART_POLICY_KNOWN.has(key.toLowerCase()))) return false;
+  return valuesFor(v, 'Name').every((name) => isEmptyString(name) || name === 'no');
+};
 
 const HOST_CONFIG_GATES: ReadonlyArray<{ key: string; permitted: (v: unknown) => boolean; flag: string }> = [
   // The daemon writes the new container's id to this HOST path, so a non-empty
@@ -236,6 +247,11 @@ const HOST_CONFIG_GATES: ReadonlyArray<{ key: string; permitted: (v: unknown) =>
   { key: 'MaskedPaths', permitted: isUnset, flag: 'MaskedPaths' },
   { key: 'ReadonlyPaths', permitted: isUnset, flag: 'ReadonlyPaths' },
   { key: 'VolumesFrom', permitted: isEmptyArray, flag: '--volumes-from' },
+  // A restart policy is the daemon's promise to bring the container back:
+  // after it exits, and after the daemon itself restarts. With one, a
+  // container outlives the job and the removal that runs when it ends. The
+  // CLI sends "no", or "" from older versions, when --restart is not given.
+  { key: 'RestartPolicy', permitted: isNoRestart, flag: '--restart' },
 ];
 
 /** Bind options that do not change what the mount reaches. */

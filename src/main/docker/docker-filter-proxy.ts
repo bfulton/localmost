@@ -88,6 +88,13 @@ const MAX_INFO_BYTES = 1024 * 1024;
 
 const NO_DAEMON_MESSAGE = 'no Docker daemon is available to this job';
 
+/**
+ * How long one removal may take when the socket stops. A forced remove kills
+ * the container first, which a daemon does in well under this; one that has
+ * not answered by then is logged rather than waited on.
+ */
+const REMOVE_TIMEOUT_MS = 10_000;
+
 const DEFAULT_MIN_API_VERSION = 'v1.24';
 const DEFAULT_MAX_API_VERSION = 'v1.45';
 
@@ -182,6 +189,8 @@ export class DockerFilterProxy {
    */
   private readonly upstreamAgent = new http.Agent({ keepAlive: false });
   private warnedNoDaemon = false;
+  /** The stop in progress, so a second caller waits for the same removals. */
+  private stopping: Promise<void> | null = null;
 
   constructor(options: DockerFilterProxyOptions) {
     this.backend = options.backend;
@@ -282,21 +291,102 @@ export class DockerFilterProxy {
     });
   }
 
-  async stop(): Promise<void> {
+  /**
+   * Stop serving, then remove what the job created through this socket.
+   *
+   * A container outlives the process that started it: `docker run -d` returns
+   * at once, and the container keeps its unfiltered egress and its route to
+   * the host long after the job has ended. So the containers go with the
+   * socket - forced, since a running one is the case that matters, and with
+   * their anonymous volumes - and then the networks the job created. The
+   * socket closes first, so the job cannot create another during the sweep. A
+   * create still in flight then may reach the daemon, but its start, which
+   * needs this socket too, cannot: that container is created and never runs.
+   *
+   * A removal that fails is logged and the stop still completes. A second call
+   * while one is in progress waits for the same removals.
+   */
+  stop(): Promise<void> {
+    this.stopping ??= this.teardown().finally(() => {
+      this.stopping = null;
+    });
+    return this.stopping;
+  }
+
+  private async teardown(): Promise<void> {
     for (const socket of this.connections) socket.destroy();
     this.connections.clear();
     const server = this.server;
     this.server = null;
-    if (!server) return;
-    await new Promise<void>((resolve) => {
-      const force = setTimeout(resolve, 1000);
-      server.close(() => {
-        clearTimeout(force);
-        resolve();
+    if (server) {
+      await new Promise<void>((resolve) => {
+        const force = setTimeout(resolve, 1000);
+        server.close(() => {
+          clearTimeout(force);
+          resolve();
+        });
       });
-    });
-    if (this.socketPath) fs.rmSync(this.socketPath, { force: true });
+      if (this.socketPath) fs.rmSync(this.socketPath, { force: true });
+    }
+    await this.removeOwned();
     this.upstreamAgent.destroy();
+  }
+
+  /** Force-remove every container, then every network, this socket created. */
+  private async removeOwned(): Promise<void> {
+    const containers = [...new Set(this.ownContainerAliases.values())];
+    const networks = [...new Set(this.ownNetworkAliases.values())];
+    this.ownContainerAliases.clear();
+    this.ownContainerIds.clear();
+    this.ownNetworkAliases.clear();
+    this.ownNetworkIds.clear();
+    if (containers.length === 0 && networks.length === 0) return;
+
+    const endpoint = this.backend.resolveEndpoint();
+    if (!endpoint) {
+      const what = [...containers.map((id) => `container ${id}`), ...networks.map((id) => `network ${id}`)];
+      this.onLog({ level: 'warn', message: `could not remove ${what.join(', ')} the job created: ${NO_DAEMON_MESSAGE}` });
+      return;
+    }
+    const version = `v${bareVersion(this.maxApiVersion)}`;
+    // A network with a container still attached cannot be removed, so the
+    // containers go first.
+    await Promise.all(
+      containers.map((id) =>
+        this.removeFromDaemon(endpoint.socketPath, `container ${id}`, `/${version}/containers/${encodeURIComponent(id)}?force=1&v=1`)
+      )
+    );
+    await Promise.all(
+      networks.map((id) =>
+        this.removeFromDaemon(endpoint.socketPath, `network ${id}`, `/${version}/networks/${encodeURIComponent(id)}`)
+      )
+    );
+  }
+
+  /** One DELETE against the daemon; resolves whatever happens, logging a failure. */
+  private removeFromDaemon(socketPath: string, what: string, url: string): Promise<void> {
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (problem?: string): void => {
+        if (settled) return;
+        settled = true;
+        if (problem) this.onLog({ level: 'warn', message: `could not remove ${what} the job created: ${problem}` });
+        resolve();
+      };
+      const req = http.request(
+        { socketPath, path: url, method: 'DELETE', agent: this.upstreamAgent, timeout: REMOVE_TIMEOUT_MS },
+        (res) => {
+          const status = res.statusCode ?? 502;
+          res.resume();
+          res.on('error', (err) => done(err.message));
+          // Already gone - an AutoRemove container that exited, say - is removed.
+          res.on('end', () => done((status >= 200 && status < 300) || status === 404 ? undefined : `the daemon answered ${status}`));
+        }
+      );
+      req.on('timeout', () => req.destroy(new Error(`no answer in ${REMOVE_TIMEOUT_MS / 1000}s`)));
+      req.on('error', (err) => done(err.message));
+      req.end();
+    });
   }
 
   isRunning(): boolean {

@@ -203,6 +203,10 @@ Per family, and in the same executable-escape style as the original spec:
   duplicate - the real CLI's bodies are clean, which the e2e exercises - so the
   ambiguity is refused recursively at the evaluator's entry, once, for every
   action with a body.
-- Whether an owned network should be deleted automatically when the job's worker
-  exits, as the socket itself is. Leaning yes, for the same reason: nothing
-  should outlive the job that created it.
+- ~~Whether an owned network should be deleted automatically when the job's
+  worker exits, as the socket itself is.~~ **Decided: yes, and its containers
+  first.** A container started with `docker run -d` outlived the job, and one
+  with `--restart=always` outlived the daemon restarting too. Stopping the
+  socket now force-removes every container the job created, then every network
+  it created, and `RestartPolicy` is gated to `no` or empty. See "Containers end
+  with the socket" in the docker isolation design.

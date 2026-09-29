@@ -2962,6 +2962,30 @@ describe('RunnerManager', () => {
       expect(socket.stop).toHaveBeenCalled();
       expect(helper.dockerProxy(1)).toBeUndefined();
     });
+
+    it('starts the next socket in the slot only once the last one has removed its containers', async () => {
+      // Stopping removes the containers the job left, which takes a moment.
+      // The next worker's socket binds the same path, so it waits; the app
+      // quitting waits the same way, rather than leaving them running.
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValueOnce(createMockProcess(12345)).mockReturnValueOnce(createMockProcess(12346));
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      await helper.startWorkerWithoutJob(1);
+      const first = dockerSocketOf(helper, 1);
+      let finishRemoval: () => void = () => {};
+      first.stop.mockReturnValue(new Promise<void>((resolve) => { finishRemoval = resolve; }));
+
+      (mockSpawnSandboxed.mock.results[0].value as ReturnType<typeof createMockProcess>).emit('exit', 0, null);
+      await settle();
+      const respawn = runnerManager.startInstance(1);
+      await settle();
+      expect(mockSpawnSandboxed).toHaveBeenCalledTimes(1);
+
+      finishRemoval();
+      await respawn;
+      expect(mockSpawnSandboxed).toHaveBeenCalledTimes(2);
+      expect(dockerSocketOf(helper, 1)).not.toBe(first);
+    });
   });
 
   describe('status aggregation with listening', () => {

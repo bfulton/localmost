@@ -358,9 +358,14 @@ the worker's sandbox directory and points `DOCKER_HOST` at it; a filtering proxy
 behind that socket parses every Docker API request, checks it against the policy
 bound to that worker, and forwards only what passes to the daemon. The socket is
 created denying everything, is bound to the repository's policy when the job is
-claimed, and is destroyed with the job. A worker that claims a job for a
-repository other than the one its socket is bound to gets no docker access at
-all. The profile denies `~/.docker` in full; the only socket a job can reach is
+claimed, and is destroyed with the job. The containers the job created through
+it go too: when the socket stops, each one still on the daemon is force-removed
+with its anonymous volumes, then each network the job created. The socket
+closes before that sweep, so the job cannot start another during it. A removal
+the daemon refuses or never answers is logged, not retried, and if localmost
+itself is killed before the job's worker exits, nothing runs the sweep. A
+worker that claims a job for a repository other than the one its socket is
+bound to gets no docker access at all. The profile denies `~/.docker` in full; the only socket a job can reach is
 the one localmost serves, and it cannot unlink or replace it.
 
 What the filter refuses, each of which is an executable test against the proxy:
@@ -374,6 +379,9 @@ What the filter refuses, each of which is an executable test against the proxy:
   host-reaching container settings (`IpcMode`, `UtsMode`, `UsernsMode`,
   `CgroupParent`, `SecurityOpt`), none of which has a spelling in the policy
   grammar;
+- a restart policy other than `no` (`--restart=always`, `unless-stopped`,
+  `on-failure`), with which the daemon brings a container back after it exits
+  and after the daemon itself restarts, outliving the job;
 - an image, registry, mount, network mode or build context the policy did not
   declare;
 - any endpoint, API version or request body the proxy does not fully
