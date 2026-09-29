@@ -62,12 +62,14 @@ export interface PolicyGrant {
   marker: string;
   /** The declared value, as written, with what it means when that is not obvious. */
   value: string;
+  /** What the entry does that its bare value would not say. */
+  note?: string;
   /**
    * Why this grant reaches past the job, when it does: a write to a place
    * something outside the sandbox later acts on. Allowed, but called out.
    */
   warning?: string;
-  /** The flat one-line form, already prefixed, with the warning if any. */
+  /** The flat one-line form, already prefixed, with the note and warning. */
   summary: string;
 }
 
@@ -114,12 +116,14 @@ export function describePolicy(policy: DescribablePolicy, prefix = ''): PolicyGr
     marker: string,
     label: string,
     values: string[] | undefined,
-    warn?: (value: string) => string | undefined
+    how: { note?: string; warn?: (value: string) => string | undefined } = {}
   ) => {
+    const { note } = how;
     for (const value of values ?? []) {
-      const warning = warn?.(value);
-      const summary = `${prefix}${label}: ${value}${warning ? ` (warning: ${warning})` : ''}`;
-      grants.push({ group, marker, value, ...(warning ? { warning } : {}), summary });
+      const warning = how.warn?.(value);
+      const summary =
+        `${prefix}${label}: ${value}` + (note ? ` (${note})` : '') + (warning ? ` (warning: ${warning})` : '');
+      grants.push({ group, marker, value, ...(note ? { note } : {}), ...(warning ? { warning } : {}), summary });
     }
   };
 
@@ -130,10 +134,17 @@ export function describePolicy(policy: DescribablePolicy, prefix = ''): PolicyGr
   }
 
   add('Network allow', '+', 'network', policy.network?.allow);
-  add('Network deny', '-', 'network denied', policy.network?.deny);
+  // A deny is checked ahead of every grant, so it holds against an allow
+  // that would cover it, and against the level. Runner infrastructure is
+  // the one exception on the network side: the runner cannot work without it.
+  add('Network deny', '-', 'network denied', policy.network?.deny, {
+    note: 'refused even where an allow or the level would let it through; runner infrastructure excepted',
+  });
   add('Filesystem read', 'r', 'read', policy.filesystem?.read);
-  add('Filesystem write', 'w', 'write', policy.filesystem?.write, (value) => sensitiveWriteReason(value));
-  add('Filesystem deny', '-', 'denied', policy.filesystem?.deny);
+  add('Filesystem write', 'w', 'write', policy.filesystem?.write, { warn: (value) => sensitiveWriteReason(value) });
+  add('Filesystem deny', '-', 'denied', policy.filesystem?.deny, {
+    note: "no read or write, even inside a granted path; the job's own sandbox excepted",
+  });
   add('Environment allow', '+', 'env', policy.env?.allow);
   add('Environment deny', '-', 'env denied', policy.env?.deny);
 

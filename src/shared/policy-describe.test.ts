@@ -123,6 +123,14 @@ describe('describePolicy', () => {
     expect(grants.map((g) => g.summary).join('\n')).not.toMatch(/warning/);
   });
 
+  it('says a deny is enforced, even where an allow or the level would let it through', () => {
+    // Deny lists used to be merged and shown but never applied, so a
+    // reviewer read a denial that did not exist. Both are enforced now.
+    const grants = describePolicy({ network: { deny: ['bad.example'] }, filesystem: { deny: ['~/.aws'] } });
+    expect(grants[0].summary).toMatch(/^network denied: bad\.example \(refused even where an allow or the level/);
+    expect(grants[1].summary).toMatch(/^denied: ~\/\.aws \(no read or write, even inside a granted path/);
+  });
+
   it('prefixes the flat summary, which is how a workflow scope is shown', () => {
     const [grant] = describePolicy({ network: { allow: ['github.com'] } }, 'ci: ');
     expect(grant.summary).toBe('ci: network: github.com');
