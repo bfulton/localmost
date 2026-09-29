@@ -13,7 +13,9 @@ import {
   loopbackValues,
 } from './policy-describe';
 import * as fs from 'fs';
+import * as net from 'net';
 import * as path from 'path';
+import { canonicalHost, parseHostPattern } from './egress-screen';
 import { SandboxPolicy, NetworkPolicy, FilesystemPolicy, EnvPolicy } from './sandbox-profile';
 import { SandboxPolicyLevel } from './types';
 import {
@@ -323,14 +325,46 @@ function validateNetworkPolicy(policy: unknown, path: string, errors: ParseError
   refuseUnknownKeys(p, path, POLICY_SECTION_SUBKEYS.network, errors);
 
   if (p.allow !== undefined) {
-    validateStringArray(p.allow, `${path}.allow`, errors);
+    validateHostPatternArray(p.allow, `${path}.allow`, errors);
   }
   if (p.deny !== undefined) {
-    validateStringArray(p.deny, `${path}.deny`, errors);
+    validateHostPatternArray(p.deny, `${path}.deny`, errors);
   }
   if (p.loopback !== undefined) {
     validateLoopback(p.loopback, `${path}.loopback`, errors, scope);
   }
+}
+
+/**
+ * Network entries, which the proxies read with parseHostPattern: a host name,
+ * an IP address or a *.domain wildcard, optionally followed by :port (an IPv6
+ * address takes one only in brackets), and nothing else. Read that way,
+ * "https://evil.com" is a host "https" with a port that is not one and
+ * " evil.com" a name no connection has, so each allowed or denied nothing
+ * while reading as though it did. A host must also be in the one spelling
+ * the proxies compare - lowercase, ASCII (punycode for an international
+ * name), an address written out - since a request's host arrives that way
+ * and an entry spelled otherwise never matches it; the message says which.
+ */
+function validateHostPatternArray(value: unknown, path: string, errors: ParseError[]): void {
+  validateStringArray(value, path, errors);
+  if (!Array.isArray(value)) return;
+  const shape = 'must be a host, an IP address or *.domain, optionally with :port, and nothing else';
+  value.forEach((entry, i) => {
+    if (typeof entry !== 'string') return;
+    const pattern = parseHostPattern(entry);
+    const host = pattern.wildcard ? pattern.host.slice(1) : pattern.host;
+    const canonical = pattern.port === null ? null : canonicalHost(host);
+    const isAddress = canonical !== null && net.isIP(canonical) !== 0;
+    const isName = canonical !== null && canonical.replace(/\.$/, '').split('.').every((label) => /^[a-z0-9_-]{1,63}$/.test(label));
+    if (pattern.wildcard ? !isName || isAddress : !isName && !isAddress) {
+      errors.push({ message: `${path}[${i}] ${shape}` });
+    } else if (canonical !== host) {
+      errors.push({
+        message: `${path}[${i}] names ${JSON.stringify(host)}, which the proxy reads as ${JSON.stringify(canonical)}: write that instead`,
+      });
+    }
+  });
 }
 
 /**
@@ -383,6 +417,15 @@ function validateFilesystemPolicy(policy: unknown, path: string, errors: ParseEr
   }
   if (p.deny !== undefined) {
     validatePathArray(p.deny, `${path}.deny`, errors);
+    // seatbelt never matches a relative path against a real one, so a
+    // relative deny would be shown as denying something and deny nothing.
+    // Unlike a grant, which is no worse for granting nothing.
+    if (Array.isArray(p.deny)) {
+      p.deny.forEach((entry, i) => {
+        if (typeof entry !== 'string' || entry === '~' || entry.startsWith('~/') || entry.startsWith('/')) return;
+        errors.push({ message: `${path}.deny[${i}] must be an absolute path or start with ~/: a relative deny is never applied` });
+      });
+    }
   }
 }
 

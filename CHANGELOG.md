@@ -120,6 +120,10 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   runner job; it was written as a literal path and matched nothing. Every deny,
   in a runner job and in `localmost test`, is also applied by its real path, so
   one written through `/tmp`, `/etc`, `/var` or a symlink of your own holds.
+- `.localmostrc` refuses a network entry that is not a host pattern - a URL such
+  as `https://evil.com`, a path, surrounding spaces, or a host in a spelling the
+  proxy never compares - and a relative `filesystem.deny` entry. Each was
+  accepted and shown, and allowed or denied nothing.
 - An approved policy is bound to the repository's id as well as its name. A job
   from a different repository that now holds an approved name - the approved one
   deleted or renamed, and the name taken since - is refused until the policy is

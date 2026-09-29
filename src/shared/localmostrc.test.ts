@@ -328,6 +328,23 @@ shared:
       expect(result.success).toBe(true);
     });
 
+    it('refuses a relative filesystem deny, which the sandbox never applies', () => {
+      // seatbelt never matches a relative path against a real one, so the
+      // runner drops it and test mode matched nothing: the policy said a
+      // path was denied and nothing was.
+      for (const entry of ['./build/secret', 'secrets', '~other/x']) {
+        const r = parseLocalmostrcContent(`version: 1\nshared:\n  filesystem:\n    deny:\n      - '${entry}'`);
+        expect([entry, r.success]).toEqual([entry, false]);
+        expect(r.errors[0].message).toMatch(/shared\.filesystem\.deny\[0\] must be an absolute path or start with ~\//);
+      }
+      const w = parseLocalmostrcContent('version: 1\nworkflows:\n  ci:\n    filesystem:\n      deny:\n        - build');
+      expect(w.errors[0].message).toMatch(/workflows\.ci\.filesystem\.deny\[0\] must be an absolute path/);
+      for (const entry of ['/opt/secret', '~/.ssh/id_*', '~']) {
+        const r = parseLocalmostrcContent(`version: 1\nshared:\n  filesystem:\n    deny:\n      - '${entry}'`);
+        expect([entry, r.success]).toEqual([entry, true]);
+      }
+    });
+
     it('rejects a backslash in a filesystem path', () => {
       const content = 'version: 1\nshared:\n  filesystem:\n    write:\n      - \'/tmp/a\\\\b\'';
       const result = parseLocalmostrcContent(content);
@@ -888,7 +905,7 @@ describe('writing a policy back', () => {
       workflows: {
         ci: {
           network: { allow: ['registry.npmjs.org'], deny: ['ads.example'] },
-          filesystem: { read: ['/opt'], deny: ['./secrets'] },
+          filesystem: { read: ['/opt'], deny: ['/opt/secrets'] },
           env: { allow: ['CI_FLAG'], deny: ['NPM_TOKEN'] },
           docker: { build: { context: './' } },
           secrets: { require: ['DEPLOY_KEY'] },
@@ -1211,8 +1228,63 @@ describe('secrets is a workflow-scoped key', () => {
   });
 });
 
+describe('a network entry', () => {
+  const parsed = (list: 'allow' | 'deny', entry: string) =>
+    parseLocalmostrcContent(`version: 1\nshared:\n  network:\n    ${list}:\n      - ${JSON.stringify(entry)}\n`);
+
+  it('refuses a network entry that is not a host pattern', () => {
+    // Each read as some host no connection has - "https" with a port that is
+    // not one, a name with a space in it - so it allowed or denied nothing.
+    for (const entry of ['https://evil.com', ' evil.com', 'evil.com ', 'evil.com:ssh', '*', '*.', '.evil.com', '*.1.2.3.4', 'a b.com', 'evil..com', ':443', '']) {
+      for (const list of ['allow', 'deny'] as const) {
+        const r = parsed(list, entry);
+        expect([list, entry, r.success]).toEqual([list, entry, false]);
+        expect(r.errors[0].message).toMatch(new RegExp(`shared\\.network\\.${list}\\[0\\] must be a host`));
+      }
+    }
+    const w = parseLocalmostrcContent('version: 1\nworkflows:\n  ci:\n    network:\n      deny:\n        - "http://x.example"\n');
+    expect(w.errors[0].message).toMatch(/workflows\.ci\.network\.deny\[0\] must be a host/);
+  });
+
+  it('refuses a host written in a spelling the proxy never compares, and says which one it does', () => {
+    // A request's host arrives lowercase, in ASCII and with its address
+    // written out; an entry spelled otherwise never matched one.
+    for (const [entry, canonical] of [
+      ['bücher.example', 'xn--bcher-kva.example'],
+      ['evil.com/path', 'evil.com'],
+      ['0x7f.1', '127.0.0.1'],
+      ['*.bücher.example:8443', 'xn--bcher-kva.example'],
+    ]) {
+      const r = parsed('deny', entry);
+      expect([entry, r.success]).toEqual([entry, false]);
+      expect(r.errors[0].message).toContain(`"${canonical}"`);
+    }
+  });
+
+  it('accepts a host, an address or a wildcard, with or without a port', () => {
+    for (const entry of [
+      'github.com',
+      'API.GitHub.com',
+      '*.github.com',
+      'registry.npmjs.org:8443',
+      '*.example.com:8080',
+      'my_host-1.internal',
+      'example.com.',
+      '192.0.2.1',
+      '192.0.2.1:8080',
+      '2606:4700::1111',
+      '[2001:db8::1]:8443',
+      'localhost',
+    ]) {
+      for (const list of ['allow', 'deny'] as const) {
+        expect([list, entry, parsed(list, entry).success]).toEqual([list, entry, true]);
+      }
+    }
+  });
+});
+
 describe('network.loopback', () => {
-  const shared = (value: string) => parseLocalmostrcContent(`version: 1\nshared:\n  network:\n    loopback: ${value}\n`);
+  const shared =(value: string) => parseLocalmostrcContent(`version: 1\nshared:\n  network:\n    loopback: ${value}\n`);
   const messages = (value: string) => shared(value).errors.map((e) => e.message).join('\n');
 
   it('accepts every port, or a list of ports, under shared:', () => {
