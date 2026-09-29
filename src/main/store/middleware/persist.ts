@@ -283,6 +283,11 @@ export function savePersistedConfig(): void {
           configToSave.auth = {
             refreshToken: existingAuth.refreshToken,
             user: existingAuth.user,
+            // Whether the session is spent is written by the auth module
+            // (saveConfig). This writer runs on every config change and on
+            // quit; rebuilding auth without it made every launch forget the
+            // session was dead and refresh a token that can never work.
+            ...(existingAuth.expired ? { expired: true } : {}),
           };
         }
       } catch (readErr) {

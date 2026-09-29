@@ -69,6 +69,7 @@ import { RunnerManager, UNCLAIMED_WORKER_TIMEOUT_MS, JobEvent } from './runner-m
 import * as fs from 'fs';
 import * as path from 'path';
 import { GRACE_MS } from './process-group';
+import { ProxyServer } from './proxy-server';
 import * as os from 'os';
 import { LogEntry, RunnerState, JobHistoryEntry } from '../shared/types';
 import { DockerPolicy } from '../shared/docker-policy';
@@ -2082,6 +2083,62 @@ describe('RunnerManager', () => {
         jest.useRealTimers();
         mockMarkerHolders.mockReset();
         mockMarkerHolders.mockImplementation(() => []);
+      }
+    });
+
+    it('seals the proxy when the worker exits, not only when the slot restarts', async () => {
+      // A finished worker's proxy token and allowed hosts otherwise stay live
+      // until the slot is next started, which may be never - an orphan that
+      // escaped reaping would keep the job's network for as long as it liked.
+      const manager = new RunnerManager({ onLog: mockOnLog, onStatusChange: mockOnStatusChange, onJobHistoryUpdate: mockOnJobHistoryUpdate });
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (fs.readFileSync as jest.Mock).mockReturnValue('{}');
+      const proc = createMockProcess(12345);
+      mockSpawnSandboxed.mockReturnValue(proc);
+      jest.useFakeTimers();
+      try {
+        await manager.start();
+        const proxy = (ProxyServer as unknown as jest.Mock).mock.results.at(-1)!.value;
+        const rotationsAtStart = proxy.rotateAuthToken.mock.calls.length;
+        expect(rotationsAtStart).toBeGreaterThan(0);
+
+        proc.emit('exit', 0, null);
+        await jest.advanceTimersByTimeAsync(0);
+
+        expect(proxy.rotateAuthToken.mock.calls.length).toBeGreaterThan(rotationsAtStart);
+        expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith([]);
+        expect(proxy.setPolicyLevel).toHaveBeenLastCalledWith('strict');
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('ignores a clean exit from a worker that no longer holds its slot', async () => {
+      // A reaped worker handles SIGTERM gracefully and reports code 0 - after
+      // the reap freed its slot, and possibly after a job refilled it. That
+      // exit must not free the replacement's slot or seal its proxy.
+      const manager = new RunnerManager({ onLog: mockOnLog, onStatusChange: mockOnStatusChange, onJobHistoryUpdate: mockOnJobHistoryUpdate });
+      const helper = new RunnerManagerTestHelper(manager);
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (fs.readFileSync as jest.Mock).mockReturnValue('{}');
+      const proc = createMockProcess(12345);
+      mockSpawnSandboxed.mockReturnValue(proc);
+      jest.useFakeTimers();
+      try {
+        await manager.start();
+        const proxy = (ProxyServer as unknown as jest.Mock).mock.results.at(-1)!.value;
+        helper.releaseInstanceSlot(1); // the reap
+        helper.setInstance(1, { name: 'runner-1', status: 'busy', process: { pid: 6002, kill: jest.fn() } as never });
+        const rotations = proxy.rotateAuthToken.mock.calls.length;
+
+        proc.emit('exit', 0, null);
+        await jest.advanceTimersByTimeAsync(0);
+
+        const pool = (manager as unknown as { instances: Map<number, { process: { pid: number } | null }> }).instances;
+        expect(pool.get(1)?.process?.pid).toBe(6002);
+        expect(proxy.rotateAuthToken.mock.calls.length).toBe(rotations);
+      } finally {
+        jest.useRealTimers();
       }
     });
 

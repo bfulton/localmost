@@ -1069,10 +1069,11 @@ export class RunnerManager {
       // still holds the last job's hosts until this runs.
       proxy.setPolicyAllowedHosts([]);
       proxy.setPolicyLevel('strict');
-      // Rotate the proxy token every start. The proxy is reused across a slot's
-      // jobs, so without this a detached orphan of the previous job would keep a
-      // valid HTTP_PROXY credential and could reach this job's allowlist through
-      // the same proxy after its policy is replaced.
+      // Rotate the proxy token every start (finalizeInstance rotates at exit
+      // too). The proxy is reused across a slot's jobs, so without this a
+      // detached orphan of the previous job would keep a valid HTTP_PROXY
+      // credential and could reach this job's allowlist through the same
+      // proxy after its policy is replaced.
       proxy.rotateAuthToken(randomBytes(24).toString('hex'));
       const startupContext = this.pendingTargetContext.get(String(instanceNum));
       if (startupContext?.targetDisplayName && startupContext.githubSha) {
@@ -1321,6 +1322,11 @@ export class RunnerManager {
           this.updateAggregateStatus();
           return;
         }
+
+        // A reaped worker handles SIGTERM gracefully and reports code 0 -
+        // after the reap freed its slot, and possibly after a job refilled it.
+        // Freeing the slot again would drop the replacement and seal its proxy.
+        if (this.instances.get(instanceNum) !== instance) return;
 
         instance.jobsCompleted++;
         this.log('info', `Runner instance ${instanceNum} completed job #${instance.jobsCompleted}`);
@@ -1590,6 +1596,18 @@ export class RunnerManager {
    */
   private finalizeInstance(instanceNum: number, ownedMarker?: string): void {
     this.revokeBrokerUrl?.(instanceNum);
+    // The proxy is the other credential a finished worker leaves behind: its
+    // token and the job's hosts would stay live until the slot is next
+    // started, which may be never. Close the policy, drop every connection
+    // and rotate now, so a survivor of this job has no network the moment
+    // the job is over. startInstance rotates again for its own worker;
+    // nothing legitimate holds this token in between.
+    const proxy = this.proxyServers.get(instanceNum);
+    if (proxy) {
+      proxy.setPolicyAllowedHosts([]);
+      proxy.setPolicyLevel('strict');
+      proxy.rotateAuthToken(randomBytes(24).toString('hex'));
+    }
     const pidFile = path.join(this.pidDir(), `${instanceNum}.pid`);
     const instance = this.instances.get(instanceNum);
     let markerPath = ownedMarker ?? instance?.markerPath;

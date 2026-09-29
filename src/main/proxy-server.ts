@@ -81,6 +81,26 @@ function stripProxyAuth(headers: http.IncomingHttpHeaders): http.IncomingHttpHea
   return copy;
 }
 
+/**
+ * Parse a CONNECT request-target: authority-form host[:port] (RFC 9112
+ * s3.2.3) - a bracketed IPv6 literal or a colon-free name/IPv4 literal. A
+ * bare IPv6, userinfo, a path, an empty or out-of-range port are refused
+ * rather than guessed at, so the host that is screened is exactly the host
+ * dialled. Brackets come off here: net.isIP, the address screen and
+ * net.connect all take the bare literal. (Not new URL('http://' + target):
+ * that drops port 80 as the scheme default and accepts userinfo.)
+ */
+const CONNECT_TARGET = /^(?:\[([0-9a-fA-F:.%a-zA-Z0-9]+)\]|([^[\]:/?#@\s]+))(?::(\d{1,5}))?$/;
+export function parseConnectTarget(target: string): { host: string; port: number } | null {
+  const m = CONNECT_TARGET.exec(target);
+  if (!m) return null;
+  const host = m[1] ?? m[2];
+  if (m[1] !== undefined && net.isIP(host) !== 6) return null; // brackets hold only an IPv6 literal
+  const port = m[3] === undefined ? 443 : Number(m[3]);
+  if (port < 1 || port > 65535) return null;
+  return { host, port };
+}
+
 export class ProxyServer {
   private server: http.Server | null = null;
   private port: number;
@@ -425,14 +445,20 @@ export class ProxyServer {
     clientSocket: net.Socket,
     head: Buffer
   ): void {
-    const [host, portStr] = (req.url || '').split(':');
-    const port = parseInt(portStr, 10) || 443;
-
     if (!this.isProxyAuthorized(req)) {
       clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="localmost"\r\n\r\n');
       clientSocket.destroy();
       return;
     }
+
+    const target = parseConnectTarget(req.url || '');
+    if (!target) {
+      this.log({ method: 'CONNECT', host: req.url || '', port: 0, blocked: true, reason: undefined });
+      clientSocket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+      clientSocket.destroy();
+      return;
+    }
+    const { host, port } = target;
 
     const { allowed, reason } = this.checkHostAccess(host);
     this.log({ method: 'CONNECT', host, port, blocked: !allowed, reason });
@@ -452,7 +478,12 @@ export class ProxyServer {
     clientSocket: net.Socket,
     head: Buffer
   ): Promise<void> {
+    // Tracked from here, not from when the upstream exists: a rotation that
+    // lands while the name resolves must take this tunnel with it.
+    this.connections.add(clientSocket);
+    clientSocket.once('close', () => this.connections.delete(clientSocket));
     const screened = await this.screenAddresses(host);
+    if (clientSocket.destroyed) return;
     if (!screened) {
       this.log({ method: 'CONNECT', host, port, blocked: true, reason: undefined });
       clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
@@ -503,7 +534,9 @@ export class ProxyServer {
     }
     try {
       const url = new URL(req.url || '', `http://${req.headers.host}`);
-      const host = url.hostname;
+      // WHATWG URL keeps the brackets on an IPv6 hostname; net.isIP, the
+      // address screen and http.request all want the bare literal.
+      const host = url.hostname.replace(/^\[(.*)\]$/, '$1');
       const port = parseInt(url.port, 10) || 80;
       const path = url.pathname + url.search;
 
@@ -710,13 +743,35 @@ export class ProxyServer {
   }
 
   /**
-   * Replace this proxy's token. Called when a slot's proxy is reused for a new
-   * worker, so a detached orphan of the previous job - still holding the old
-   * token in its HTTP_PROXY - is refused once the slot moves to another
-   * repository's policy.
+   * Replace this proxy's token. Called when a worker finishes and again when
+   * a slot's proxy is reused for a new worker, so a detached orphan of the
+   * previous job - still holding the old token in its HTTP_PROXY - is refused
+   * once the slot moves to another repository's policy.
+   *
+   * Live connections are dropped first. Auth is checked when a tunnel or
+   * request is opened and never again, so a tunnel (or a request still
+   * streaming) the old token opened would otherwise keep carrying bytes
+   * under the new token and policy.
    */
   rotateAuthToken(token: string): void {
+    this.closeConnections();
     this.authToken = token;
+  }
+
+  /**
+   * Drop every live connection: CONNECT tunnels (both ends, tracked in
+   * `connections`) and plain-HTTP sockets, including a request mid-stream.
+   * Nothing legitimate is connected when this runs - the worker that opened
+   * them has exited, or the next one has not been spawned yet.
+   */
+  private closeConnections(): void {
+    for (const socket of this.connections) {
+      socket.destroy();
+    }
+    this.connections.clear();
+    // A CONNECT-upgraded socket is detached from the http server, so this
+    // reaches only plain-HTTP connections; the loop above covers the tunnels.
+    this.server?.closeAllConnections();
   }
 
   /**
@@ -749,11 +804,7 @@ export class ProxyServer {
    * Stop the proxy server
    */
   async stop(): Promise<void> {
-    // Close all active connections
-    for (const socket of this.connections) {
-      socket.destroy();
-    }
-    this.connections.clear();
+    this.closeConnections();
 
     return new Promise((resolve) => {
       if (this.server) {

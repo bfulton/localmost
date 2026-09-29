@@ -6,7 +6,8 @@
  */
 
 import * as http from 'http';
-import { ProxyServer } from './proxy-server';
+import * as net from 'net';
+import { ProxyServer, parseConnectTarget } from './proxy-server';
 import { SandboxPolicyLevel } from '../shared/types';
 
 type AccessDecision = { allowed: boolean; reason?: string };
@@ -463,6 +464,255 @@ describe('a worker may use only its own proxy', () => {
       const url = new URL(p.getProxyUrl());
       expect(url.password).toBe('secret-a');
       expect(url.hostname).toBe('127.0.0.1');
+    } finally { await p.stop(); }
+  });
+
+  // Rotation must end what the old token already opened, not only refuse what
+  // it opens next: auth is checked when a tunnel or request starts and never
+  // again, so an orphan of the last job could otherwise keep streaming through
+  // a tunnel to a host that job allowed, under the next job's policy.
+  /** A TCP upstream that records what reaches it. */
+  const upstream = () =>
+    new Promise<{ port: number; received: () => string; close: () => void }>((resolve) => {
+      let received = '';
+      const server = net.createServer((sock) => sock.on('data', (d) => { received += d.toString(); }));
+      server.listen(0, '127.0.0.1', () => resolve({
+        port: (server.address() as net.AddressInfo).port,
+        received: () => received,
+        close: () => server.close(),
+      }));
+    });
+  /** Open a CONNECT tunnel through the proxy; resolves once established. */
+  const tunnel = (proxyPort: number, target: string, token: string) =>
+    new Promise<net.Socket>((resolve, reject) => {
+      const sock = net.connect(proxyPort, '127.0.0.1', () => {
+        sock.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\nProxy-Authorization: ${authHeader(token)}\r\n\r\n`);
+      });
+      sock.on('error', () => undefined);
+      sock.once('data', (d) => {
+        const status = d.toString().split('\r\n')[0];
+        if (status.startsWith('HTTP/1.1 200')) resolve(sock); else reject(new Error(status));
+      });
+    });
+  const until = async (cond: () => boolean) => {
+    for (let i = 0; i < 40 && !cond(); i++) await new Promise((r) => setTimeout(r, 25));
+  };
+  const settle = () => new Promise((r) => setTimeout(r, 100));
+  const tracked = (p: ProxyServer) => (p as unknown as { connections: Set<net.Socket> }).connections;
+  const local = { policyLevel: 'permissive' as const, lookup: async () => ['127.0.0.1'] };
+
+  it('drops a tunnel the old token opened when the token rotates', async () => {
+    const up = await upstream();
+    const p = new ProxyServer({ ...local, authToken: 'old-tok' });
+    await p.start();
+    try {
+      const sock = await tunnel(p.getPort(), `127.0.0.1:${up.port}`, 'old-tok');
+      const closed = new Promise<void>((r) => sock.once('close', () => r()));
+      sock.write('before;');
+      await until(() => up.received() === 'before;');
+
+      p.rotateAuthToken('new-tok');
+      await closed;
+      sock.write('after;');
+      await settle();
+      expect(up.received()).toBe('before;');
+      expect(tracked(p).size).toBe(0);
+    } finally { up.close(); await p.stop(); }
+  });
+
+  it('cuts a request that was still streaming when the token rotated', async () => {
+    // A chunked body is piped upstream as it arrives, so an open POST is a
+    // tunnel by another name, authenticated only at its headers - and it is
+    // not a tracked tunnel socket, so the http server itself must close it.
+    let body = '';
+    const upHttp = http.createServer((req, res) => {
+      req.on('data', (d) => { body += d.toString(); });
+      req.on('error', () => undefined);
+      req.on('end', () => res.end());
+    });
+    await new Promise<void>((r) => upHttp.listen(0, '127.0.0.1', r));
+    const upPort = (upHttp.address() as net.AddressInfo).port;
+    const p = new ProxyServer({ ...local, authToken: 'old-tok' });
+    await p.start();
+    try {
+      const sock = net.connect(p.getPort(), '127.0.0.1');
+      sock.on('error', () => undefined);
+      await new Promise<void>((r) => sock.once('connect', r));
+      const closed = new Promise<void>((r) => sock.once('close', () => r()));
+      sock.write(
+        `POST http://127.0.0.1:${upPort}/ HTTP/1.1\r\nHost: 127.0.0.1:${upPort}\r\n` +
+        `Proxy-Authorization: ${authHeader('old-tok')}\r\nTransfer-Encoding: chunked\r\n\r\n7\r\nbefore;\r\n`
+      );
+      await until(() => body === 'before;');
+
+      p.rotateAuthToken('new-tok');
+      await closed;
+      sock.write('6\r\nafter;\r\n');
+      await settle();
+      expect(body).toBe('before;');
+    } finally { upHttp.closeAllConnections(); upHttp.close(); await p.stop(); }
+  });
+
+  it('serves a tunnel opened with the new token after rotation', async () => {
+    const up = await upstream();
+    const p = new ProxyServer({ ...local, authToken: 'old-tok' });
+    await p.start();
+    try {
+      p.rotateAuthToken('new-tok');
+      const sock = await tunnel(p.getPort(), `127.0.0.1:${up.port}`, 'new-tok');
+      sock.write('hello;');
+      await until(() => up.received() === 'hello;');
+      expect(up.received()).toBe('hello;');
+      sock.destroy();
+    } finally { up.close(); await p.stop(); }
+  });
+
+  it('takes a tunnel still resolving its name down with a rotation', async () => {
+    // Authorised before the rotation, established after it: tracked from the
+    // moment it is accepted, so the rotation reaches it too.
+    const up = await upstream();
+    const p = new ProxyServer({
+      policyLevel: 'permissive',
+      authToken: 'old-tok',
+      lookup: () => new Promise<string[]>((r) => setTimeout(() => r(['127.0.0.1']), 200)),
+    });
+    await p.start();
+    try {
+      // A name, not a literal: literals are never looked up, so only a name
+      // has a resolution window for the rotation to land in.
+      const outcome = new Promise<string>((resolve) => {
+        const sock = net.connect(p.getPort(), '127.0.0.1', () => {
+          sock.write(`CONNECT upstream.test:${up.port} HTTP/1.1\r\nHost: upstream.test:${up.port}\r\nProxy-Authorization: ${authHeader('old-tok')}\r\n\r\n`);
+        });
+        sock.on('error', () => undefined);
+        sock.once('data', (d) => resolve(d.toString().split('\r\n')[0]));
+        sock.once('close', () => resolve('closed'));
+      });
+      await new Promise((r) => setTimeout(r, 50));
+      p.rotateAuthToken('new-tok');
+
+      expect(await outcome).toBe('closed');
+      await settle();
+      expect(tracked(p).size).toBe(0);
+    } finally { up.close(); await p.stop(); }
+  });
+});
+
+describe('CONNECT targets', () => {
+  // Authority-form host[:port]: a bracketed IPv6 literal or a colon-free name.
+  // Splitting on ':' turned '[2606:4700::1111]:443' into host '[2606' port 4700
+  // - refused, so no reach, but every IPv6 literal was 403 at every policy
+  // level - and let an out-of-range port through to a net.connect throw that
+  // left the client hanging with no response.
+  const authHeader = (token: string) => 'Basic ' + Buffer.from(`localmost:${token}`).toString('base64');
+  /** Send a raw CONNECT; resolves with the status line, or 'closed' / 'timeout'. */
+  const connectStatus = (proxyPort: number, target: string, token?: string) =>
+    new Promise<string>((resolve) => {
+      let settled = false;
+      const done = (s: string) => { if (!settled) { settled = true; resolve(s); sock.destroy(); } };
+      const sock = net.connect(proxyPort, '127.0.0.1', () => {
+        sock.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n${token ? `Proxy-Authorization: ${authHeader(token)}\r\n` : ''}\r\n`);
+      });
+      sock.on('error', () => done('closed'));
+      sock.once('data', (d) => done(d.toString().split('\r\n')[0]));
+      sock.once('close', () => done('closed'));
+      setTimeout(() => done('timeout'), 2000).unref();
+    });
+  const listenV6 = (server: net.Server | http.Server) =>
+    new Promise<number>((resolve, reject) => {
+      server.on('error', reject);
+      server.listen(0, '::1', () => resolve((server.address() as net.AddressInfo).port));
+    });
+
+  it.each([
+    ['[::1]:443', { host: '::1', port: 443 }],
+    ['[2606:4700:4700::1111]:443', { host: '2606:4700:4700::1111', port: 443 }],
+    ['[::ffff:127.0.0.1]:443', { host: '::ffff:127.0.0.1', port: 443 }],
+    ['api.github.com:80', { host: 'api.github.com', port: 80 }],
+    ['127.0.0.1:8787', { host: '127.0.0.1', port: 8787 }],
+    ['api.github.com', { host: 'api.github.com', port: 443 }],
+  ])('parses %s', (target, expected) => {
+    expect(parseConnectTarget(target)).toEqual(expected);
+  });
+
+  it.each([
+    '::1:443', 'host:443:extra', 'host:', ':443', '[1.2.3.4]:443', '[host]:443',
+    'api.github.com:99999', 'api.github.com:-1', 'api.github.com:0', 'api.github.com:443@10.0.0.1:80', 'a/b:443', '',
+  ])('refuses %s', (target) => {
+    expect(parseConnectTarget(target)).toBeNull();
+  });
+
+  it('tunnels to a bracketed IPv6 literal under a permissive policy', async () => {
+    const up = net.createServer((s) => s.end());
+    const port = await listenV6(up);
+    const p = new ProxyServer({ policyLevel: 'permissive', authToken: 't' });
+    await p.start();
+    try {
+      expect(await connectStatus(p.getPort(), `[::1]:${port}`, 't')).toBe('HTTP/1.1 200 Connection Established');
+    } finally { up.close(); await p.stop(); }
+  });
+
+  it('refuses a bracketed IPv6 literal the allowlist does not name', async () => {
+    const p = new ProxyServer({ policyLevel: 'strict', authToken: 't' });
+    await p.start();
+    try {
+      expect(await connectStatus(p.getPort(), '[::1]:443', 't')).toBe('HTTP/1.1 403 Forbidden');
+    } finally { await p.stop(); }
+  });
+
+  it.each(['[::ffff:127.0.0.1]:443', '[::]:443', '[::ffff:10.0.0.1]:443', '[fe80::1]:443'])(
+    'screens %s with the brackets off', async (target) => {
+      const p = new ProxyServer({ policyLevel: 'permissive', authToken: 't' });
+      await p.start();
+      try {
+        expect(await connectStatus(p.getPort(), target, 't')).toBe('HTTP/1.1 403 Forbidden');
+      } finally { await p.stop(); }
+    }
+  );
+
+  it.each(['api.github.com:99999', 'api.github.com:-1', '::1:443', 'host:443:extra'])(
+    'answers 400 to the malformed target %s instead of hanging', async (target) => {
+      const p = new ProxyServer({ policyLevel: 'permissive', authToken: 't', lookup: async () => ['8.8.8.8'] });
+      await p.start();
+      try {
+        expect(await connectStatus(p.getPort(), target, 't')).toBe('HTTP/1.1 400 Bad Request');
+      } finally { await p.stop(); }
+    }
+  );
+
+  it('checks the token before it looks at the target', async () => {
+    const p = new ProxyServer({ policyLevel: 'permissive', authToken: 't' });
+    await p.start();
+    try {
+      expect(await connectStatus(p.getPort(), 'host:443:extra')).toBe('HTTP/1.1 407 Proxy Authentication Required');
+    } finally { await p.stop(); }
+  });
+
+  const getVia = (proxyPort: number, url: string) =>
+    new Promise<number>((resolve, reject) => {
+      const req = http.request(
+        { hostname: '127.0.0.1', port: proxyPort, path: url, method: 'GET', headers: { 'proxy-authorization': authHeader('t') } },
+        (res) => { res.resume(); resolve(res.statusCode || 0); }
+      );
+      req.on('error', reject);
+      req.end();
+    });
+
+  it('serves a plain request to a bracketed IPv6 host', async () => {
+    const up = http.createServer((_req, res) => res.end('ok'));
+    const port = await listenV6(up);
+    const p = new ProxyServer({ policyLevel: 'permissive', authToken: 't' });
+    await p.start();
+    try {
+      expect(await getVia(p.getPort(), `http://[::1]:${port}/`)).toBe(200);
+    } finally { up.close(); await p.stop(); }
+  });
+
+  it('screens a plain request to a bracketed IPv4-mapped loopback', async () => {
+    const p = new ProxyServer({ policyLevel: 'permissive', authToken: 't' });
+    await p.start();
+    try {
+      expect(await getVia(p.getPort(), 'http://[::ffff:127.0.0.1]/')).toBe(403);
     } finally { await p.stop(); }
   });
 });

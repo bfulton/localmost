@@ -377,7 +377,7 @@ export class BrokerProxyService extends EventEmitter {
    * worker is asking, which the name in a session request cannot: that name is
    * whatever the caller writes.
    */
-  private workerKeys: Map<string, { instanceNum: number; targetId?: string }> = new Map();
+  private workerKeys: Map<string, { instanceNum: number; targetId?: string; bound?: boolean }> = new Map();
   /** Job and message ids delivered to each worker key: all it may acquire or report on. */
   private deliveredToWorker: Map<string, Set<string>> = new Map();
   /** Repository and commit for a job, keyed by both jobId and messageId. */
@@ -1196,7 +1196,15 @@ export class BrokerProxyService extends EventEmitter {
     }
   }
 
-  /** Delete a map's entry for a key and every alias holding the same value. */
+  /**
+   * Delete a map's entry for a key and every alias key whose value is the
+   * same object. Aliases are found by identity (===), not by shape, so every
+   * alias of an entry must be set from the one object the primary key holds -
+   * as jobTargets does at its single insertion site, setting the request id
+   * and the message id from one literal. A copy stored under an alias would
+   * not be found. (The string-valued maps cleared alongside compare by ===
+   * too, which for strings is value equality.)
+   */
   private deleteByKeyAndValue<V>(map: Map<string, V>, key: string): void {
     const value = map.get(key);
     map.delete(key);
@@ -1531,11 +1539,12 @@ export class BrokerProxyService extends EventEmitter {
     // One worker key, one bound session. The key rides in the run-service URL
     // the job holds, so job code could call the session endpoint again; a
     // second session would reach the arrival-order fallback and could bind
-    // another queued job and receive its payload. A key that already has a
-    // bound session gets none.
-    const keyAlreadyBound = [...this.localSessions.values()].some(
-      (sess) => sess.workerKey === key && sess.targetId !== undefined
-    );
+    // another queued job and receive its payload. The state lives on the key,
+    // not on the session: a job can DELETE its session and ask again, and the
+    // guard must survive that. A --once worker deletes its session only at
+    // exit, and the broker never forwards the refresh message that makes a
+    // runner restart its session, so no legitimate create follows a delete.
+    const keyAlreadyBound = worker.bound === true;
     if (keyAlreadyBound) {
       log()?.warn(`[BrokerProxy] Worker ${worker.instanceNum} already has a bound session; leaving this request unbound`);
     }
@@ -1543,6 +1552,7 @@ export class BrokerProxyService extends EventEmitter {
     const resolved = keyAlreadyBound ? undefined : this.resolveSessionTarget(worker, claimed);
     const targetId = resolved?.targetId;
     const expectedJobId = resolved?.jobId;
+    if (targetId) worker.bound = true;
     if (!targetId) {
       // getMessageForTarget refuses to hand anything to a session with no
       // target, so this worker cannot receive a queued job however long it

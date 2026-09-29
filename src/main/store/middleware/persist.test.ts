@@ -14,9 +14,11 @@ jest.mock('../../log-file', () => ({
   bootLog: jest.fn(),
 }));
 
+import * as yaml from 'js-yaml';
 import { loadPersistedConfig, savePersistedConfig } from './persist';
 import { store } from '../index';
 import { defaultConfigState } from '../types';
+import type { AppConfig } from '../../config';
 
 const GOOD_CONFIG = `theme: auto
 hideOnStart: true
@@ -38,6 +40,45 @@ beforeEach(() => {
   if (fs.existsSync(configPath)) fs.rmSync(configPath);
   const tmp = `${configPath}.tmp`;
   if (fs.existsSync(tmp)) fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+const SPENT_SESSION_CONFIG = `configVersion: 1
+theme: auto
+auth:
+  refreshToken: enc:spent
+  user:
+    login: bfulton
+  expired: true
+`;
+
+describe('savePersistedConfig auth preservation', () => {
+  it('carries a spent session forward when an unrelated setting is persisted', () => {
+    // saveConfig records `expired`. This writer runs on every config change,
+    // on the startup targets write and on quit, and rebuilt auth from the
+    // refresh token and user alone - so the next launch forgot the session
+    // was spent and went back to refreshing a token that can never work.
+    fs.writeFileSync(configPath, SPENT_SESSION_CONFIG);
+    loadPersistedConfig();
+
+    store.setState({ config: { ...store.getState().config, theme: 'dark' } });
+    savePersistedConfig();
+
+    const saved = yaml.load(fs.readFileSync(configPath, 'utf-8')) as AppConfig;
+    expect(saved.theme).toBe('dark');
+    expect(saved.auth).toEqual({ refreshToken: 'enc:spent', user: { login: 'bfulton' }, expired: true });
+  });
+
+  it('does not invent the flag for a healthy session', () => {
+    fs.writeFileSync(configPath, SPENT_SESSION_CONFIG.replace('  expired: true\n', ''));
+    loadPersistedConfig();
+
+    store.setState({ config: { ...store.getState().config, theme: 'dark' } });
+    savePersistedConfig();
+
+    const saved = yaml.load(fs.readFileSync(configPath, 'utf-8')) as AppConfig;
+    // Still an allowlist: a legacy access token on disk is not revived either.
+    expect(saved.auth).toEqual({ refreshToken: 'enc:spent', user: { login: 'bfulton' } });
+  });
 });
 
 describe('savePersistedConfig hydration guard', () => {

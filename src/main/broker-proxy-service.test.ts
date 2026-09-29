@@ -670,6 +670,35 @@ describe('message routing', () => {
     expect(internals.messageQueues.get(target.id)).toHaveLength(1);
   });
 
+  it('keeps a key bound after its session is deleted, so a job cannot delete and re-create to take a second job', async () => {
+    // The one-session guard used to be derived from live sessions. A job
+    // holds its worker key (it rides in the run-service URL), so it could
+    // DELETE its session and POST a new one: the key's expectation was
+    // already consumed, the arrival-order fallback took another pending
+    // assignment for the same repository, and the new session could poll a
+    // second queued job and acquire its payload.
+    const target = addTargetWithRunner('target-a', 'runner-a.1');
+    const job2 = JSON.stringify({ messageId: 4, messageType: 'RunnerJobRequest', body: JSON.stringify({ runner_request_id: 'req-2' }) });
+    internals.messageQueues.set(target.id, [jobMessage, job2]);
+    internals.pendingTargetAssignments.push(target.id, target.id);
+    internals.acquiredJobDetails.set('req-2', '{"secret":"job2"}');
+    internals.acquiredJobDetails.set('4', '{"secret":"job2"}');
+    service.expectWorkerForJob(target.id, 1, 'req-1');
+
+    const first = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }));
+    const taken = await request('GET', `/message?sessionId=${first}`);
+    expect(JSON.parse(JSON.parse(taken.body).body).runner_request_id).toBe('req-1');
+
+    expect((await request('DELETE', `/session?sessionId=${first}`)).statusCode).toBe(200);
+    const second = await createSession(JSON.stringify({ agent: { name: 'runner-a.1' } }));
+
+    expect(internals.localSessions.get(second)?.targetId).toBeUndefined();
+    expect(internals.messageQueues.get(target.id)).toEqual([job2]);
+    expect(internals.pendingTargetAssignments).toEqual([target.id]);
+    const steal = await request('POST', '/acquirejob', JSON.stringify({ jobMessageId: 4 }));
+    expect(steal.statusCode).toBe(403);
+  });
+
   it('binds only one session per worker key, so a job cannot open a second and take another job', async () => {
     // The key is in the run-service URL the job holds. A second /session with
     // the same key must not reach the arrival-order fallback and bind another
@@ -850,6 +879,25 @@ describe('message routing', () => {
       const urls = (internals as unknown as { jobRunServiceUrls: Map<string, string> }).jobRunServiceUrls;
       expect(urls.has('req-1')).toBe(false);
       expect(urls.has('9')).toBe(false);
+    });
+
+    it('clears the job target under both of its id aliases', () => {
+      // jobTargets holds one object under the request id and the message id,
+      // and the cleanup finds aliases by identity - exact only while both keys
+      // are set from one object, as the single insertion site does.
+      const target = addTargetWithRunner('target-a', 'runner-a.1');
+      internals.messageQueues.set(target.id, []);
+      internals.pendingTargetAssignments.push(target.id);
+      const jobTargets = (internals as unknown as { jobTargets: Map<string, unknown> }).jobTargets;
+      const jobTarget = { targetDisplayName: 'o/r', githubSha: 'abc' };
+      jobTargets.set('req-1', jobTarget);
+      jobTargets.set('9', jobTarget);
+      service.expectWorkerForJob(target.id, 1);
+
+      service.forgetExpectedWorker(target.id, 1, 'req-1');
+
+      expect(service.getJobTarget('req-1')).toBeUndefined();
+      expect(service.getJobTarget('9')).toBeUndefined();
     });
 
     it('leaves the other jobs queued for the same repository alone', () => {
