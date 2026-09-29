@@ -372,20 +372,26 @@ export class ProxyServer {
     const { host, port } = target;
 
     const { allowed, reason } = this.checkHostAccess(host, port, 'connect');
-    this.log({ method: 'CONNECT', host, port, blocked: !allowed, reason });
-
     if (!allowed) {
+      this.log({ method: 'CONNECT', host, port, blocked: true, reason });
       clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
       clientSocket.destroy();
       return;
     }
 
-    void this.connectScreened(host, port, clientSocket, head);
+    void this.connectScreened(host, port, reason, clientSocket, head);
   }
 
+  /**
+   * Screen what an allowed CONNECT target resolves to and open the tunnel.
+   * The request is logged here, once, when the screen has decided it: an
+   * allowed entry written before the screen refused it counted the one
+   * request as both allowed and blocked.
+   */
   private async connectScreened(
     host: string,
     port: number,
+    reason: ProxyLogEntry['reason'],
     clientSocket: net.Socket,
     head: Buffer
   ): Promise<void> {
@@ -401,6 +407,7 @@ export class ProxyServer {
       clientSocket.destroy();
       return;
     }
+    this.log({ method: 'CONNECT', host, port, blocked: false, reason });
 
     const serverSocket = net.connect({ host, port, lookup: this.pinnedLookup(screened), autoSelectFamily: true }, () => {
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
@@ -471,10 +478,11 @@ export class ProxyServer {
         return;
       }
 
+      // Logged once, when the decision is final: a refusal here, or the
+      // screen's answer below.
       const { allowed, reason } = this.checkHostAccess(host, port, 'http');
-      this.log({ method: req.method || 'GET', host, port, path, blocked: !allowed, reason });
-
       if (!allowed) {
+        this.log({ method: req.method || 'GET', host, port, path, blocked: true, reason });
         res.writeHead(403, { 'Content-Type': 'text/plain' });
         res.end(this.refusal(host, port, reason));
         return;
@@ -488,6 +496,7 @@ export class ProxyServer {
           req.resume();
           return;
         }
+        this.log({ method: req.method || 'GET', host, port, path, blocked: false, reason });
         const proxyReq = this.openUpstream(req, res, {
           hostname: host,
           port,
@@ -587,8 +596,8 @@ export class ProxyServer {
     body: Buffer
   ): void {
     const { allowed, reason } = this.checkHostAccess(host, port, 'http');
-    this.log({ method: req.method || 'POST', host, port, path, blocked: !allowed, reason });
     if (!allowed) {
+      this.log({ method: req.method || 'POST', host, port, path, blocked: true, reason });
       res.writeHead(403, { 'Content-Type': 'text/plain' });
       res.end(this.refusal(host, port, reason));
       return;
@@ -605,6 +614,7 @@ export class ProxyServer {
         res.end(`Blocked by sandbox policy (${this.policyLevel}): host '${host}' resolves to a non-routable address`);
         return;
       }
+      this.log({ method: req.method || 'POST', host, port, path, blocked: false, reason });
       // The body is replayed whole, so it is no longer chunked. Leaving both
       // headers on the request makes some servers reject it or frame it wrongly.
       const headers = { ...this.upstreamHeaders(req, authority), 'content-length': String(body.length) };

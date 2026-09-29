@@ -7,7 +7,7 @@
 
 import * as http from 'http';
 import * as net from 'net';
-import { ProxyServer, parseConnectTarget } from './proxy-server';
+import { ProxyLogEntry, ProxyServer, parseConnectTarget } from './proxy-server';
 import { SandboxPolicyLevel } from '../shared/types';
 import { pinnedLookup } from '../shared/egress-screen';
 
@@ -692,6 +692,62 @@ describe('screening the address a host resolves to', () => {
     } finally {
       await p.stop();
     }
+  });
+});
+
+describe('a request the screen refuses', () => {
+  // The name check passes before the address screen runs, and the request
+  // used to be logged as allowed there and then again as blocked: one
+  // request counted twice, once each way, in the job's summary.
+  const logged = async (send: (proxyPort: number) => Promise<unknown>, onJobAcquired?: () => Promise<void>) => {
+    const entries: ProxyLogEntry[] = [];
+    const p = new ProxyServer({
+      policyLevel: 'permissive',
+      lookup: async () => ['10.0.0.1'],
+      onLog: (e) => entries.push(e),
+      onJobAcquired,
+    });
+    await p.start();
+    try {
+      await send(p.getPort());
+      return { entries, stats: p.getStats() };
+    } finally { await p.stop(); }
+  };
+  const plain = (method: string, url: string) => (proxyPort: number) =>
+    new Promise<number>((resolve, reject) => {
+      const req = http.request({ hostname: '127.0.0.1', port: proxyPort, path: url, method, headers: { 'content-length': '2' } },
+        (res) => { res.resume(); resolve(res.statusCode || 0); });
+      req.on('error', reject);
+      req.end('{}');
+    });
+  const tunnel = (target: string) => (proxyPort: number) =>
+    new Promise<string>((resolve) => {
+      const sock = net.connect(proxyPort, '127.0.0.1', () => sock.write(`CONNECT ${target} HTTP/1.1\r\n\r\n`));
+      sock.on('error', () => resolve('closed'));
+      sock.once('data', (d) => { resolve(d.toString().split('\r\n')[0]); sock.destroy(); });
+    });
+
+  it.each([
+    ['a plain request', () => logged(plain('GET', 'http://internal.test/'))],
+    ['a replayed acquirejob', () => logged(plain('POST', 'http://internal.test/_apis/x/acquirejob'), async () => undefined)],
+    ['a CONNECT', () => logged(tunnel('internal.test:443'))],
+  ])('logs %s once, as blocked', async (_name, run) => {
+    const { entries, stats } = await run();
+    expect(entries.map((e) => e.blocked)).toEqual([true]);
+    expect(stats.allowedCount).toBe(0);
+    expect(stats.blockedCount).toBe(1);
+  });
+
+  it('logs an allowed request once, as allowed', async () => {
+    const entries: ProxyLogEntry[] = [];
+    const up = http.createServer((_req, res) => res.end('ok'));
+    await new Promise<void>((r) => up.listen(0, '127.0.0.1', r));
+    const p = new ProxyServer({ policyLevel: 'strict', onLog: (e) => entries.push(e) });
+    await p.start();
+    try {
+      expect(await plain('GET', `http://127.0.0.1:${(up.address() as net.AddressInfo).port}/`)(p.getPort())).toBe(200);
+      expect(entries.map((e) => e.blocked)).toEqual([false]);
+    } finally { up.closeAllConnections(); up.close(); await p.stop(); }
   });
 });
 
