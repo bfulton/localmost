@@ -24,7 +24,6 @@ const mockGetStatus = jest.fn<() => { status: string; jobName?: string; reposito
 const mockGetJobHistory = jest.fn<() => unknown[]>();
 const mockIsRunning = jest.fn<() => boolean>();
 const mockIsConfigured = jest.fn<() => boolean>();
-const mockStart = jest.fn<() => Promise<void>>();
 const mockInitialize = jest.fn<() => Promise<void>>();
 const mockStop = jest.fn<() => Promise<void>>();
 const mockHeartbeatIsRunning = jest.fn<() => boolean>();
@@ -37,7 +36,6 @@ jest.mock('./app-state', () => ({
     getJobHistory: mockGetJobHistory,
     isRunning: mockIsRunning,
     isConfigured: mockIsConfigured,
-    start: mockStart,
     initialize: mockInitialize,
     stop: mockStop,
   }),
@@ -111,7 +109,6 @@ describe('CliServer', () => {
     mockGetJobHistory.mockReset();
     mockIsRunning.mockReset();
     mockIsConfigured.mockReset();
-    mockStart.mockReset();
     mockInitialize.mockReset();
     mockStop.mockReset();
     mockHeartbeatIsRunning.mockReset();
@@ -254,9 +251,7 @@ describe('CliServer', () => {
 
   it('should handle resume command when paused', async () => {
     // Resume returns to the mode the app starts in: an empty pool that spawns
-    // a worker for each admitted job. start() also spawned an idle listener,
-    // which can never bind a job now that a session binds only through the
-    // expectation admission sets for it - so it only held a slot.
+    // a worker for each admitted job.
     mockIsRunning.mockReturnValue(false);
     mockIsConfigured.mockReturnValue(true);
     mockInitialize.mockResolvedValue(undefined);
@@ -271,7 +266,6 @@ describe('CliServer', () => {
       message: 'Runner resumed successfully',
     });
     expect(mockInitialize).toHaveBeenCalled();
-    expect(mockStart).not.toHaveBeenCalled();
   });
 
   it('should handle resume command when already running', async () => {
@@ -286,7 +280,7 @@ describe('CliServer', () => {
       command: 'resume',
       message: 'Runner is already running',
     });
-    expect(mockStart).not.toHaveBeenCalled();
+    expect(mockInitialize).not.toHaveBeenCalled();
   });
 
   it('should handle resume command when not configured', async () => {
