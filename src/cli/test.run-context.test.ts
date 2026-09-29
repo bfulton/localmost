@@ -28,7 +28,7 @@ describe('installInterruptHandlers', () => {
 describe('buildProxyEnv', () => {
   it('sends traffic through the proxy but leaves loopback direct', () => {
     // The proxy refuses loopback, so a test that talks to a server it started
-    // on localhost has to reach it directly, as its sandbox allows.
+    // on localhost has to reach it directly, where its policy grants that.
     const env = buildProxyEnv('http://localmost:t@127.0.0.1:1234');
     expect(env.HTTPS_PROXY).toBe('http://localmost:t@127.0.0.1:1234');
     expect(env.http_proxy).toBe('http://localmost:t@127.0.0.1:1234');

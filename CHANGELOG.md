@@ -92,6 +92,10 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   a variable under the secret's own name, so a workflow cannot ask for
   `AWS_SECRET_ACCESS_KEY` or `GITHUB_TOKEN` and get what you exported for other
   tools. Re-export secrets under the prefix; the CLI says when one is set but unused.
+- A `localmost test` step reaches only the run's proxy on loopback, and signals
+  only processes under its own sandbox. A test suite that starts local servers
+  declares `shared.network.loopback: true` (or its fixed ports) in `.localmostrc`,
+  which is listed and confirmed with the rest of the policy.
 - The step script, which contains expanded secrets while a step runs, is written
   0700 rather than 0755.
 - The broker no longer logs the head of a job payload, which carries the job's

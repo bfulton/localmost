@@ -40,6 +40,12 @@ export interface SandboxPolicy {
   docker?: DockerPolicy;
 }
 
+/**
+ * A `network.loopback` grant: every loopback port, or a list of them.
+ * Seatbelt matches one port or all of them, so there are no ranges.
+ */
+export type LoopbackGrant = true | number[];
+
 export interface SandboxProfileOptions {
   /** Working directory for the workflow */
   workDir: string;
@@ -47,6 +53,12 @@ export interface SandboxProfileOptions {
   readOnlyPaths?: string[];
   /** Port of the proxy server - network traffic is restricted to this port */
   proxyPort: number;
+  /**
+   * Loopback ports a step may connect to besides the proxy's: all of them
+   * (true) or these. The checkout's shared network.loopback, once the user
+   * has confirmed it; absent, loopback is the proxy only.
+   */
+  loopback?: LoopbackGrant;
   /** Policy to enforce */
   policy?: SandboxPolicy;
   /** Whether to run in permissive mode (log violations but don't block) */
@@ -191,15 +203,29 @@ export const DEFAULT_BROKER_PORT = 8787;
  * filter it matched a connection to anywhere, and a step that ignored
  * HTTP_PROXY went straight past the allowlist.
  *
- * Loopback stays open because test suites start a server and talk to it, and
- * nothing leaves the machine that way - except the app's broker, which carries
- * job payloads and which a step has no reason to open.
+ * Loopback is the proxy's port and no other, unless the checkout's policy
+ * grants more and the user has confirmed it: loopback is not only the step's
+ * own test servers but everything else the machine runs there - a database,
+ * a debugger port, another app's control port - none of which checks who is
+ * calling. A test suite that starts a server and talks to it needs
+ * `network.loopback: true` in its shared policy, or the fixed ports it uses.
+ * The app's broker, which carries job payloads, is denied last whatever is
+ * granted, as seatbelt takes the last matching rule.
+ *
+ * Only whole port numbers from the grant reach the profile; anything else in
+ * it is dropped, never read as every port.
  */
-function loopbackNetworkRules(proxyPort: number, escapedWorkDir: string): string[] {
+function loopbackNetworkRules(proxyPort: number, escapedWorkDir: string, loopback?: LoopbackGrant): string[] {
+  const isPort = (port: unknown): port is number =>
+    typeof port === 'number' && Number.isInteger(port) && port >= 1 && port <= 65535;
+  const granted =
+    loopback === true ? ['*'] : Array.isArray(loopback) ? [...new Set(loopback.filter(isPort))].map(String) : [];
   return [
     `;; Network: loopback only; the proxy at port ${proxyPort} is the way out`,
     '(deny network*)',
-    '(allow network-outbound (remote ip "localhost:*"))',
+    ...(isPort(proxyPort) ? [`(allow network-outbound (remote ip "localhost:${proxyPort}"))`] : []),
+    ...(granted.length > 0 ? [';; Loopback the policy grants beyond the proxy'] : []),
+    ...granted.map((port) => `(allow network-outbound (remote ip "localhost:${port}"))`),
     `(deny network-outbound (remote ip "localhost:${DEFAULT_BROKER_PORT}"))`,
     '(allow network-bind (local ip "localhost:*"))',
     '(allow network-inbound (local ip "localhost:*"))',
@@ -544,7 +570,7 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push(';; ------------------------------------------------------------');
   lines.push('');
 
-  lines.push(...loopbackNetworkRules(options.proxyPort, escapedWorkDir));
+  lines.push(...loopbackNetworkRules(options.proxyPort, escapedWorkDir, options.loopback));
   lines.push(...cliSocketRules());
   lines.push('');
 
@@ -653,8 +679,10 @@ export function generateDiscoveryProfile(options: {
     ';; ------------------------------------------------------------',
     ';; Deliberately no blanket (allow network-* (with report)): that would let',
     ';; a tool ignoring HTTP_PROXY reach the internet directly, bypassing the',
-    ';; proxy that records which hosts a workflow actually needs.',
-    ...loopbackNetworkRules(proxyPort, escapedWorkDir),
+    ';; proxy that records which hosts a workflow actually needs. Loopback is',
+    ';; open: discovery applies no policy, runs the workflow to see what it',
+    ';; needs, test servers included, and is confirmed on every run.',
+    ...loopbackNetworkRules(proxyPort, escapedWorkDir, true),
     ...cliSocketRules(),
     '',
     ';; ------------------------------------------------------------',

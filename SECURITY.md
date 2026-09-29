@@ -234,11 +234,15 @@ sandbox profile. The checkout is treated as untrusted, and so is its
   creates - and xcrun's cache, the clang and Swift module cache and zsh's
   here-documents are pointed into the workspace. A hard-coded `/tmp` path fails
   here as it does in a job.
-- **Loopback-only network.** A step can reach loopback, except the broker's
-  port, and nothing else directly; `NO_PROXY` keeps loopback off the proxy. The
-  way out is the run's proxy, which needs a per-run token, refuses names that
-  resolve to internal or loopback addresses, and connects only to the addresses
-  it screened.
+- **Proxy-only network.** A step can reach the run's proxy on loopback and
+  nothing else directly. Other loopback ports - a local database, a debugger,
+  another app's control port - are reached only when the checkout's
+  `shared.network.loopback` grants them (`true` for every port, or a list), and
+  that grant is listed and asked about with the rest of the policy. The
+  broker's port stays closed either way; `NO_PROXY` keeps loopback off the
+  proxy. The way out is the run's proxy, which needs a per-run token, refuses
+  names that resolve to internal or loopback addresses, and connects only to
+  the addresses it screened. Discovery leaves loopback open, and says so.
 - **Discovery is asked about every time.** Under `--updaterc` reads are allowed
   and recorded, and writes outside the workspace are refused and reported.
   Discovery still lets a workflow read everything but the paths above and reach
@@ -263,8 +267,8 @@ sandbox profile. The checkout is treated as untrusted, and so is its
   a later step cannot signal a server an earlier one left running; the end of
   the job reaps it.
 
-What test mode still trusts: loopback is shared, so a step can reach any local
-service that listens on it.
+What test mode still trusts: a loopback grant is shared, so a step granted a
+port reaches whatever listens on it, not only what the step started.
 
 ## Authentication
 

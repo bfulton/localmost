@@ -12,6 +12,7 @@ import { spawn, execFileSync, ChildProcess, SpawnOptions } from 'child_process';
 import { WorkflowStep, WorkflowJob, MatrixCombination } from './workflow-parser';
 import {
   SandboxPolicy,
+  LoopbackGrant,
   generateSandboxProfile,
   generateDiscoveryProfile,
   MACOS_BASELINE_READ_PATHS,
@@ -64,6 +65,12 @@ export interface ExecutionContext {
   cacheScope?: { sourceDir: string; repository: string; ref: string };
   /** Sandbox policy to enforce */
   policy?: SandboxPolicy;
+  /**
+   * Loopback ports a step may reach besides the proxy's: the checkout's
+   * shared network.loopback, once the user has confirmed it. Absent, only
+   * the proxy.
+   */
+  loopback?: LoopbackGrant;
   /** Whether running in permissive/discovery mode */
   permissive?: boolean;
   /** Log file for sandbox trace output (for discovery mode) */
@@ -495,6 +502,7 @@ async function executeRunStep(
         workDir: ctx.workDir,
         env,
         proxyPort: ctx.proxyPort,
+        loopback: ctx.loopback,
         onOutput: ctx.onOutput,
         sandboxLogFile: ctx.sandboxLogFile,
         collectedPids: ctx.collectedPids,
@@ -635,6 +643,7 @@ async function executeActionFromPath(
           readOnlyPaths: [actionPath],
           env,
           proxyPort: ctx.proxyPort,
+          loopback: ctx.loopback,
           onOutput: ctx.onOutput,
           sandboxLogFile: ctx.sandboxLogFile,
           collectedPids: ctx.collectedPids,
@@ -1330,6 +1339,8 @@ async function runInSandbox(
     readOnlyPaths?: string[];
     env: Record<string, string>;
     proxyPort: number;
+    /** Loopback ports beyond the proxy's; see ExecutionContext.loopback. */
+    loopback?: LoopbackGrant;
     onOutput?: (line: string, stream: 'stdout' | 'stderr') => void;
     sandboxLogFile?: string;
     collectedPids?: Set<number>;
@@ -1365,6 +1376,7 @@ async function runInSandbox(
           workDir: options.workDir,
           readOnlyPaths: options.readOnlyPaths,
           proxyPort: options.proxyPort,
+          loopback: options.loopback,
           policy: policy || {},  // Empty policy = no network allowlist
           permissive: false,
           logFile: options.sandboxLogFile,

@@ -12,8 +12,9 @@
 import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
 import * as fs from 'fs';
 import * as path from 'path';
-import { confirmCheckoutGrants, grantsBeyondWorkspace, runTest } from './test';
+import { checkoutLoopback, confirmCheckoutGrants, grantsBeyondWorkspace, runTest } from './test';
 import { MACOS_BASELINE_READ_PATHS } from '../shared/sandbox-profile';
+import type { LocalmostrcConfig } from '../shared/localmostrc';
 
 let scratch: string;
 let checkout: string;
@@ -53,6 +54,44 @@ describe('grantsBeyondWorkspace', () => {
   it('is empty for a policy that stays in the workspace and the OS', () => {
     expect(grantsBeyondWorkspace({ filesystem: { read: MACOS_BASELINE_READ_PATHS } })).toEqual([]);
     expect(grantsBeyondWorkspace(undefined)).toEqual([]);
+  });
+
+  it('lists loopback beyond the proxy, which reaches the services this machine runs', () => {
+    expect(grantsBeyondWorkspace(undefined, [5432, 6379])).toEqual([
+      { label: 'network.loopback', items: ['port 5432 on this machine', 'port 6379 on this machine'] },
+    ]);
+    expect(grantsBeyondWorkspace(undefined, true)).toEqual([
+      { label: 'network.loopback', items: ['every port on this machine: any local service'] },
+    ]);
+  });
+});
+
+describe('checkoutLoopback', () => {
+  // As a parsed .localmostrc holds it; the schema types network.loopback.
+  const withNetwork = (where: 'shared' | 'workflow', network: Record<string, unknown>) =>
+    (where === 'shared'
+      ? { version: 1, shared: { network } }
+      : { version: 1, workflows: { CI: { network } } }) as unknown as LocalmostrcConfig;
+
+  it('is the shared grant: every port, or whole port numbers', () => {
+    expect(checkoutLoopback(withNetwork('shared', { loopback: true }))).toBe(true);
+    expect(checkoutLoopback(withNetwork('shared', { loopback: [5432, 6379] }))).toEqual([5432, 6379]);
+    expect(checkoutLoopback(withNetwork('shared', { allow: ['github.com'] }))).toBeUndefined();
+    expect(checkoutLoopback(undefined)).toBeUndefined();
+  });
+
+  it('grants nothing from a value that is not a grant', () => {
+    // The schema refuses these; this is what runs if one reaches it anyway.
+    for (const loopback of [false, 'yes', '*', [5432, 0], [65536], [1.5], ['5432'], [5432, 5432], []]) {
+      expect({ loopback, grant: checkoutLoopback(withNetwork('shared', { loopback })) }).toEqual({
+        loopback,
+        grant: undefined,
+      });
+    }
+  });
+
+  it('never takes a per-workflow grant', () => {
+    expect(checkoutLoopback(withNetwork('workflow', { loopback: true }))).toBeUndefined();
   });
 });
 
@@ -116,6 +155,12 @@ describe('runTest on a checkout that grants itself more than its workspace', () 
       'version: 1\nshared:\n  filesystem:\n    write:\n      - ~/Library/LaunchAgents\n'
     );
     // Jest's stdin is not a terminal, and --yes was not passed.
+    await expect(runTest({})).rejects.toThrow(/--yes/);
+    expect(fs.existsSync(path.join(scratch, 'appdata', 'workspaces'))).toBe(false);
+  });
+
+  it('does not open loopback to a checkout without confirmation', async () => {
+    fs.writeFileSync(path.join(checkout, '.localmostrc'), 'version: 1\nshared:\n  network:\n    loopback: true\n');
     await expect(runTest({})).rejects.toThrow(/--yes/);
     expect(fs.existsSync(path.join(scratch, 'appdata', 'workspaces'))).toBe(false);
   });

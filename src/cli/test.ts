@@ -46,7 +46,7 @@ import {
   serializeLocalmostrc,
   LOCALMOSTRC_VERSION,
 } from '../shared/localmostrc';
-import { SandboxPolicy, parseSandboxTrace, MACOS_BASELINE_READ_PATHS } from '../shared/sandbox-profile';
+import { SandboxPolicy, LoopbackGrant, parseSandboxTrace, MACOS_BASELINE_READ_PATHS } from '../shared/sandbox-profile';
 import { DockerPolicy, diffDockerPolicy, mergeDockerPolicy, parseDockerPolicyHint } from '../shared/docker-policy';
 import { DiscoveryProxy } from '../shared/discovery-proxy';
 import { createWorkspace, cleanupWorkspaces, getGitInfo, getRepositoryFromDir } from '../shared/workspace';
@@ -265,6 +265,7 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   const localmostrcPath = findLocalmostrc(cwd);
   let config: LocalmostrcConfig | undefined;
   let policy: SandboxPolicy | undefined;
+  let loopback: LoopbackGrant | undefined;
 
   if (localmostrcPath) {
     console.log(`Using policy: ${path.relative(cwd, localmostrcPath)}`);
@@ -272,6 +273,7 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     if (result.success && result.config) {
       config = result.config;
       policy = getEffectivePolicy(config, workflow.name);
+      loopback = checkoutLoopback(config);
     } else {
       console.log(`${colors.yellow}Warning:${colors.reset} Invalid .localmostrc: ${result.errors[0]?.message}`);
     }
@@ -290,7 +292,7 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     const confirm = { assumeYes: !!options.assumeYes, isTTY: !!process.stdin.isTTY };
     const confirmed = options.updaterc
       ? await confirmDiscovery(confirm)
-      : await confirmCheckoutGrants(cwd, grantsBeyondWorkspace(policy), confirm);
+      : await confirmCheckoutGrants(cwd, grantsBeyondWorkspace(policy, loopback), confirm);
     if (!confirmed) {
       throw new Error(
         'Not running: confirm on a terminal, or pass --yes to run this checkout with what it asks for.'
@@ -389,6 +391,9 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     secrets,
     stepOutputs: {},
     policy,
+    // Confirmed above with the rest of the policy. Discovery applies no
+    // policy; its profile leaves loopback open.
+    loopback: options.updaterc ? undefined : loopback,
     permissive: options.updaterc,
     sandboxLogFile,
     collectedPids: options.updaterc ? collectedPids : undefined,
@@ -649,9 +654,9 @@ export function installInterruptHandlers(reap: () => void): () => void {
 /**
  * The variables that send a step's traffic through the run's proxy.
  *
- * Loopback is exempt: steps reach a server they started directly, as their
- * sandbox allows, and the proxy refuses loopback outright - through it, a
- * step would reach the ports its sandbox denies.
+ * Loopback is exempt: steps reach a server they started directly, where the
+ * checkout's network.loopback grants it, and the proxy refuses loopback
+ * outright - through it, a step would reach the ports its sandbox denies.
  */
 export function buildProxyEnv(proxyUrl: string): Record<string, string> {
   const noProxy = 'localhost,127.0.0.1,::1';
@@ -1021,15 +1026,41 @@ const isYes = (answer: string): boolean => /^y(es)?$/i.test(answer.trim());
 
 /**
  * What a policy grants a step beyond its workspace and the OS read paths
- * every workflow needs: every write, every other read, every host.
+ * every workflow needs: every write, every other read, every host, and any
+ * loopback port besides the proxy's - which reaches whatever this machine
+ * runs there, not only the step's own test servers.
  */
-export function grantsBeyondWorkspace(policy: SandboxPolicy | undefined): PolicyAddition[] {
+export function grantsBeyondWorkspace(policy: SandboxPolicy | undefined, loopback?: LoopbackGrant): PolicyAddition[] {
   const baseline = new Set(MACOS_BASELINE_READ_PATHS);
   return nonEmpty([
     { label: 'filesystem.write', items: policy?.filesystem?.write ?? [] },
     { label: 'filesystem.read', items: (policy?.filesystem?.read ?? []).filter((p) => !baseline.has(p)) },
     { label: 'network.allow', items: policy?.network?.allow ?? [] },
+    {
+      label: 'network.loopback',
+      items:
+        loopback === true
+          ? ['every port on this machine: any local service']
+          : (loopback ?? []).map((port) => `port ${port} on this machine`),
+    },
   ]);
+}
+
+/**
+ * The loopback ports a checkout's policy grants its steps besides the
+ * proxy's: its shared network.loopback, `true` for every port or a list of
+ * them. Shared only, as for the runner, whose profile is fixed before the
+ * job's workflow is known.
+ *
+ * The value is the checkout's to write, so anything but `true` or a list of
+ * distinct whole port numbers grants nothing, rather than something.
+ */
+export function checkoutLoopback(config: LocalmostrcConfig | undefined): LoopbackGrant | undefined {
+  const value = (config?.shared?.network as { loopback?: unknown } | undefined)?.loopback;
+  if (value === true) return true;
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const ports = value.filter((port): port is number => Number.isInteger(port) && port >= 1 && port <= 65535);
+  return ports.length === value.length && new Set(ports).size === ports.length ? ports : undefined;
 }
 
 /** Where the checkouts' confirmed grants are kept: the app data directory, which no step can reach. */
@@ -1103,7 +1134,8 @@ export async function confirmDiscovery(options: {
 }): Promise<boolean> {
   console.log(`${colors.yellow}${colors.bold}--updaterc runs this checkout with wide access:${colors.reset}`);
   console.log('  It can read everything on disk except your credentials and localmost\'s own data,');
-  console.log('  and reach any host on the internet. Use it only on a checkout whose code you trust.');
+  console.log('  reach any host on the internet, and reach any service listening on this machine\'s');
+  console.log('  loopback. Use it only on a checkout whose code you trust.');
   console.log();
   if (options.assumeYes) return true;
   if (!options.isTTY) return false;
@@ -1658,5 +1690,6 @@ ${colors.bold}SANDBOX:${colors.reset}
       network:
         allow:
           - registry.npmjs.org
+        loopback: true    # or [5432]: local ports steps may reach
 `);
 }

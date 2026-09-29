@@ -153,6 +153,51 @@ if (!isMacOS) {
         expect(result.output).toContain('Operation not permitted');
       }
     });
+
+    describe('a service of the user\'s on loopback', () => {
+      // Two listeners standing in for what a developer machine runs on
+      // loopback: a database, a debugger port.
+      let services: net.Server[];
+      let ports: number[];
+
+      beforeAll(async () => {
+        services = [net.createServer((socket) => socket.end()), net.createServer((socket) => socket.end())];
+        await Promise.all(services.map((s) => new Promise<void>((resolve) => s.listen(0, '127.0.0.1', resolve))));
+        ports = services.map((s) => (s.address() as net.AddressInfo).port);
+      });
+
+      afterAll(async () => {
+        await Promise.all(services.map((s) => new Promise<void>((resolve) => s.close(() => resolve()))));
+      });
+
+      const enforcing = (loopback?: true | number[]) =>
+        generateSandboxProfile({ workDir, proxyPort, policy: readable, loopback });
+
+      it('is refused to a step unless the checkout was granted it', async () => {
+        expect(await tryConnect(null, '127.0.0.1', ports[0])).toMatchObject({ ok: true });
+        const refused = await tryConnect(enforcing(), '127.0.0.1', ports[0]);
+        expect(refused.ok).toBe(false);
+        expect(refused.output).toContain('Operation not permitted');
+        // The proxy, on the same interface, is still reached.
+        expect(await tryConnect(enforcing(), '127.0.0.1', proxyPort)).toMatchObject({ ok: true });
+      });
+
+      it('is reached on exactly the ports granted, or all of them under true', async () => {
+        const one = enforcing([ports[0]]);
+        expect(await tryConnect(one, '127.0.0.1', ports[0])).toMatchObject({ ok: true });
+        const other = await tryConnect(one, '127.0.0.1', ports[1]);
+        expect(other.ok).toBe(false);
+        expect(other.output).toContain('Operation not permitted');
+        for (const port of ports) {
+          expect(await tryConnect(enforcing(true), '127.0.0.1', port)).toMatchObject({ ok: true });
+        }
+      });
+
+      it('is reached under discovery, which observes the whole workflow', async () => {
+        const discovery = generateDiscoveryProfile({ workDir, proxyPort, logFile: '' });
+        expect(await tryConnect(discovery, '127.0.0.1', ports[1])).toMatchObject({ ok: true });
+      });
+    });
   });
 
   describe('test-mode signals through a constructed profile', () => {
@@ -396,13 +441,19 @@ if (!isMacOS) {
       // Not a substitute for applying them - that needs a machine outside a
       // job - but it holds the rules this file is about in place here too.
       const workDir = '/Users/test/.localmost/workspaces/ws-1';
-      for (const profile of [
-        generateSandboxProfile({ workDir, proxyPort: 1, policy: readable }),
-        generateDiscoveryProfile({ workDir, proxyPort: 1, logFile: '' }),
-      ]) {
+      const enforcement = generateSandboxProfile({ workDir, proxyPort: 1, policy: readable });
+      const discovery = generateDiscoveryProfile({ workDir, proxyPort: 1, logFile: '' });
+      // Loopback: only the proxy under enforcement, the granted ports on
+      // request, everything under discovery.
+      expect(enforcement).toContain('(allow network-outbound (remote ip "localhost:1"))');
+      expect(enforcement).not.toContain('"localhost:*"))');
+      expect(
+        generateSandboxProfile({ workDir, proxyPort: 1, policy: readable, loopback: [5432] })
+      ).toContain('(allow network-outbound (remote ip "localhost:5432"))');
+      expect(discovery).toContain('(allow network-outbound (remote ip "localhost:*"))');
+      for (const profile of [enforcement, discovery]) {
         expect(profile).not.toContain('(local ip)');
         expect(profile).toContain('(deny network*)');
-        expect(profile).toContain('(allow network-outbound (remote ip "localhost:*"))');
         expect(profile).toContain(`(deny file-write* (literal "${workDir}"))`);
         expect(profile).not.toContain('(subpath "/private/tmp")');
         expect(profile).toContain('(allow signal (target same-sandbox))');

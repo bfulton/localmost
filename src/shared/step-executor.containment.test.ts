@@ -476,6 +476,21 @@ describe('a fetched action', () => {
     expect(writeGrants.filter((form) => form.includes(actionDir))).toEqual([]);
   });
 
+  it('reaches the loopback ports the run was granted, as a run: step does', async () => {
+    // Only the proxy, until the user confirms the checkout's grant.
+    expect((await run({ run: 'true' })).status).toBe('success');
+    expect(spawned[0].profile).toContain('(allow network-outbound (remote ip "localhost:1234"))');
+    expect(spawned[0].profile).not.toContain('(remote ip "localhost:*")');
+    expect(spawned[0].profile).not.toContain('"localhost:5432"');
+    await executeStep({ run: 'true' }, { ...context(), loopback: [5432] }, job());
+    expect(spawned[1].profile).toContain('(allow network-outbound (remote ip "localhost:5432"))');
+    spawned = [];
+
+    const result = await executeStep({ uses: 'owner/repo@v1' }, { ...context(), loopback: [5432] }, job());
+    expect(result.status).toBe('success');
+    expect(spawned[0].profile).toContain('(allow network-outbound (remote ip "localhost:5432"))');
+  });
+
   it('refuses an entry point that climbs out of the action', async () => {
     fs.writeFileSync(path.join(actionDir, 'action.yml'), 'name: t\nruns:\n  using: node20\n  main: ../../../../x.js\n');
     fs.writeFileSync(path.join(scratch, 'appdata', 'x.js'), '');
