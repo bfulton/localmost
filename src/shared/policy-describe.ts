@@ -35,6 +35,19 @@ export const POLICY_SECTION_KEYS = ['network', 'filesystem', 'env', 'docker'] as
  */
 export const WORKFLOW_POLICY_KEYS = [...POLICY_SECTION_KEYS, 'secrets'] as const;
 
+/**
+ * Every key each section may declare inside it. The parser refuses any other,
+ * as it does at the levels above: a misspelled `lookback:` or `denny:` would
+ * otherwise read as a grant or a protection and be neither. Docker has a
+ * grammar of its own, closed in docker-policy.
+ */
+export const POLICY_SECTION_SUBKEYS = {
+  network: ['allow', 'deny', 'loopback'],
+  filesystem: ['read', 'write', 'deny'],
+  env: ['allow', 'deny'],
+  secrets: ['require'],
+} as const;
+
 export type PolicySectionKey = (typeof POLICY_SECTION_KEYS)[number];
 
 /**

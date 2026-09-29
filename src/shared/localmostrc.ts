@@ -7,6 +7,7 @@ import * as yaml from 'js-yaml';
 import {
   LOCALMOSTRC_KEYS,
   POLICY_SECTION_KEYS,
+  POLICY_SECTION_SUBKEYS,
   PolicyScope,
   WORKFLOW_POLICY_KEYS,
   loopbackValues,
@@ -319,6 +320,7 @@ function validateNetworkPolicy(policy: unknown, path: string, errors: ParseError
   }
 
   const p = policy as Record<string, unknown>;
+  refuseUnknownKeys(p, path, POLICY_SECTION_SUBKEYS.network, errors);
 
   if (p.allow !== undefined) {
     validateStringArray(p.allow, `${path}.allow`, errors);
@@ -371,6 +373,7 @@ function validateFilesystemPolicy(policy: unknown, path: string, errors: ParseEr
   }
 
   const p = policy as Record<string, unknown>;
+  refuseUnknownKeys(p, path, POLICY_SECTION_SUBKEYS.filesystem, errors);
 
   if (p.read !== undefined) {
     validatePathArray(p.read, `${path}.read`, errors);
@@ -390,12 +393,30 @@ function validateEnvPolicy(policy: unknown, path: string, errors: ParseError[]):
   }
 
   const p = policy as Record<string, unknown>;
+  refuseUnknownKeys(p, path, POLICY_SECTION_SUBKEYS.env, errors);
 
   if (p.allow !== undefined) {
     validateStringArray(p.allow, `${path}.allow`, errors);
   }
   if (p.deny !== undefined) {
     validateStringArray(p.deny, `${path}.deny`, errors);
+  }
+}
+
+/**
+ * Refuse a key inside a section that the grammar does not define, for the
+ * same reason validatePolicy refuses one at the section level: nothing
+ * parses it, so it grants or protects nothing while reading as though it did.
+ */
+function refuseUnknownKeys(
+  section: Record<string, unknown>,
+  path: string,
+  accepted: readonly string[],
+  errors: ParseError[]
+): void {
+  for (const key of Object.keys(section)) {
+    if (accepted.includes(key)) continue;
+    errors.push({ message: `${path}.${key} is not a policy key. Accepted keys: ${accepted.join(', ')}.` });
   }
 }
 
@@ -415,6 +436,7 @@ function validateSecretsPolicy(policy: unknown, path: string, errors: ParseError
   }
 
   const s = p.secrets as Record<string, unknown>;
+  refuseUnknownKeys(s, `${path}.secrets`, POLICY_SECTION_SUBKEYS.secrets, errors);
   if (s.require !== undefined) {
     validateStringArray(s.require, `${path}.secrets.require`, errors);
   }

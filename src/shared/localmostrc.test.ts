@@ -1082,6 +1082,38 @@ describe('a policy key the grammar does not know', () => {
     expect(ok.errors).toEqual([]);
     expect(ok.success).toBe(true);
   });
+
+  it('is refused inside a section too, and the message names the keys that section accepts', () => {
+    // `lookback: true` read as a loopback grant and did nothing; `denny:`
+    // read as a protection that did not exist. Both validated clean.
+    const cases: Array<[string, string, string[]]> = [
+      ['  network:\n    lookback: true\n', 'shared.network.lookback', ['allow', 'deny', 'loopback']],
+      ['  filesystem:\n    denny: ["~/.ssh"]\n', 'shared.filesystem.denny', ['read', 'write', 'deny']],
+      ['  env:\n    alow: ["CI"]\n', 'shared.env.alow', ['allow', 'deny']],
+    ];
+    for (const [body, where, accepted] of cases) {
+      const result = parse(body);
+      expect(result.success).toBe(false);
+      const message = result.errors.map((e) => e.message).join('\n');
+      expect(message).toContain(`${where} is not a policy key`);
+      expect(message).toContain(`Accepted keys: ${accepted.join(', ')}.`);
+    }
+  });
+
+  it('is refused under a workflow\'s secrets', () => {
+    const r = parseLocalmostrcContent('version: 1\nworkflows:\n  deploy:\n    secrets:\n      requires: ["KEY"]\n');
+    expect(r.success).toBe(false);
+    expect(r.errors.map((e) => e.message).join('\n')).toContain('workflows.deploy.secrets.requires is not a policy key');
+  });
+
+  it('still accepts every key a section knows', () => {
+    const ok = parse(
+      '  network:\n    allow: ["github.com"]\n    deny: ["evil.example"]\n    loopback: [5432]\n' +
+      '  filesystem:\n    read: ["/etc"]\n    write: ["~/.npm"]\n    deny: ["~/.ssh"]\n' +
+      '  env:\n    allow: ["CI"]\n    deny: ["AWS_*"]\n'
+    );
+    expect(ok.errors).toEqual([]);
+  });
 });
 
 describe('secrets is a workflow-scoped key', () => {

@@ -4,6 +4,7 @@ import {
   DESCRIBED_POLICY_KEYS,
   LOCALMOSTRC_KEYS,
   POLICY_SECTION_KEYS,
+  POLICY_SECTION_SUBKEYS,
   WORKFLOW_POLICY_KEYS,
 } from './policy-describe';
 import { MODERATE_NETWORK_ALLOWLIST, RUNNER_INFRASTRUCTURE_ALLOWLIST } from './network-allowlist';
@@ -48,6 +49,16 @@ describe('describePolicy', () => {
     // the file rather than in a section, which is how it came to be enforced
     // and never shown - `level: permissive` alone described as nothing.
     expect(DESCRIBED_POLICY_KEYS).toContain('level');
+  });
+
+  it('covers every key a section accepts, so a new one cannot be enforced unseen', () => {
+    for (const [section, keys] of Object.entries(POLICY_SECTION_SUBKEYS)) {
+      const declared = (everything as Record<string, unknown>)[section] as Record<string, unknown>;
+      for (const key of keys) {
+        expect(declared).toHaveProperty(key);
+        expect(describePolicy({ [section]: { [key]: declared[key] } }).length).toBeGreaterThan(0);
+      }
+    }
   });
 
   it('describes every top-level key that is not structure, so a new one cannot grant unseen', () => {
