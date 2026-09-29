@@ -314,9 +314,30 @@ describe('Sandbox Profile Generator', () => {
       });
 
       // Network should be restricted to localhost (proxy handles filtering)
-      expect(profile).toContain('(local ip)');
+      expect(profile).toContain('(allow network-outbound (remote ip "localhost:*"))');
       expect(profile).toContain('proxy at port 9999');
       expect(profile).not.toContain('(allow network*)');
+    });
+
+    it('never grants an IP rule that matches every address', () => {
+      // (local ip) names the local end of any IP socket, so as an outbound
+      // filter it matches a connection to anywhere: a step could ignore
+      // HTTP_PROXY and reach the internet directly, past the allowlist.
+      for (const profile of [
+        generateSandboxProfile({ workDir: '/path/to/project', proxyPort: 9999 }),
+        generateDiscoveryProfile({ workDir: '/path/to/project', proxyPort: 9999, logFile: '' }),
+      ]) {
+        expect(profile).not.toContain('(local ip)');
+        expect(profile).toContain('(deny network*)');
+        expect(profile).toContain('(allow network-bind (local ip "localhost:*"))');
+        expect(profile).toContain('(allow network-inbound (local ip "localhost:*"))');
+        // The app's broker carries job payloads; a step has no reason to open it.
+        expect(profile).toContain('(deny network-outbound (remote ip "localhost:8787"))');
+        // Nothing after the deny reopens outbound IP beyond loopback.
+        const afterDeny = profile.slice(profile.indexOf('(deny network*)'));
+        const outboundIp = afterDeny.match(/\(allow network-outbound \((?:remote|local) ip[^)]*\)\)/g);
+        expect(outboundIp).toEqual(['(allow network-outbound (remote ip "localhost:*"))']);
+      }
     });
 
     it('should restrict Unix sockets to working directory', () => {
@@ -343,7 +364,7 @@ describe('Sandbox Profile Generator', () => {
         },
       });
 
-      expect(profile).toContain('(local ip)');
+      expect(profile).toContain('(remote ip "localhost:*")');
       expect(profile).not.toContain('github.com');
     });
   });
@@ -482,7 +503,7 @@ describe('Sandbox Profile Generator', () => {
         logFile: '/tmp/discovery.log',
       });
 
-      expect(profile).toContain('(local ip)');
+      expect(profile).toContain('(remote ip "localhost:*")');
       expect(profile).toContain('proxy at port 9999');
     });
   });
@@ -537,7 +558,7 @@ describe('Sandbox Profile Generator', () => {
       });
 
       expect(profile).toContain('(version 1)');
-      expect(profile).toContain('(local ip)');
+      expect(profile).toContain('(remote ip "localhost:*")');
     });
 
     it('should handle policy with empty arrays', () => {

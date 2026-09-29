@@ -127,6 +127,37 @@ export const MACOS_BASELINE_READ_PATHS = [
   '/Applications/Xcode.app',
 ];
 
+/** The broker's port, mirrored from BrokerProxyService's default. */
+const BROKER_PORT = 8787;
+
+/**
+ * The network rules both test-mode profiles share, mirroring the runner's.
+ *
+ * Hostname filtering happens in the proxy, since seatbelt cannot express it;
+ * the sandbox's job is to make the proxy the only way out. `(local ip)` did
+ * not do that: it names the local end of any IP socket, so as an outbound
+ * filter it matched a connection to anywhere, and a step that ignored
+ * HTTP_PROXY went straight past the allowlist.
+ *
+ * Loopback stays open because test suites start a server and talk to it, and
+ * nothing leaves the machine that way - except the app's broker, which carries
+ * job payloads and which a step has no reason to open.
+ */
+function loopbackNetworkRules(proxyPort: number, escapedWorkDir: string): string[] {
+  return [
+    `;; Network: loopback only; the proxy at port ${proxyPort} is the way out`,
+    '(deny network*)',
+    '(allow network-outbound (remote ip "localhost:*"))',
+    `(deny network-outbound (remote ip "localhost:${BROKER_PORT}"))`,
+    '(allow network-bind (local ip "localhost:*"))',
+    '(allow network-inbound (local ip "localhost:*"))',
+    ';; Unix sockets: only in the working directory, never a system socket like',
+    ';; Docker\'s or the SSH agent\'s. TMPDIR points there so tools create them there.',
+    `(allow network-bind (subpath "${escapedWorkDir}"))`,
+    `(allow network-outbound (subpath "${escapedWorkDir}"))`,
+  ];
+}
+
 /**
  * Generate a macOS sandbox-exec profile from a policy.
  */
@@ -343,19 +374,7 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push(';; ------------------------------------------------------------');
   lines.push('');
 
-  // All network traffic is routed through the proxy server which handles
-  // hostname-based filtering. The sandbox only allows connections to localhost.
-  lines.push(`;; Network: localhost TCP (proxy at port ${options.proxyPort})`);
-  lines.push('(allow network-bind (local ip))');
-  lines.push('(allow network-outbound (local ip))');
-  lines.push('(allow network-inbound (local ip))');
-  lines.push('');
-  // Unix sockets are restricted to the working directory to prevent
-  // connecting to system sockets like Docker or SSH agent.
-  // Caller should set TMPDIR to workDir so tools create sockets there.
-  lines.push(`;; Unix sockets: only in working directory`);
-  lines.push(`(allow network-bind (subpath "${escapedWorkDir}"))`);
-  lines.push(`(allow network-outbound (subpath "${escapedWorkDir}"))`);
+  lines.push(...loopbackNetworkRules(options.proxyPort, escapedWorkDir));
   lines.push('');
 
   // No daemon socket is opened here. A docker policy is a set of requests the
@@ -438,17 +457,10 @@ export function generateDiscoveryProfile(options: {
     ';; ------------------------------------------------------------',
     ';; NETWORK ACCESS - Localhost only (proxy handles filtering)',
     ';; ------------------------------------------------------------',
-    `;; Network: localhost TCP (proxy at port ${proxyPort})`,
-    '(allow network-bind (local ip))',
-    '(allow network-outbound (local ip))',
-    '(allow network-inbound (local ip))',
-    '',
-    `;; Unix sockets: working directory only. Deliberately no blanket
-    ;; (allow network-* (with report)): that would let a tool ignoring
-    ;; HTTP_PROXY reach the internet directly, bypassing the proxy that
-    ;; records which hosts a workflow actually needs.`,
-    `(allow network-bind (subpath "${escapedWorkDir}"))`,
-    `(allow network-outbound (subpath "${escapedWorkDir}"))`,
+    ';; Deliberately no blanket (allow network-* (with report)): that would let',
+    ';; a tool ignoring HTTP_PROXY reach the internet directly, bypassing the',
+    ';; proxy that records which hosts a workflow actually needs.',
+    ...loopbackNetworkRules(proxyPort, escapedWorkDir),
     '',
     ';; ------------------------------------------------------------',
     ';; PROCESS/SYSTEM OPERATIONS - Allow all (no reporting needed)',

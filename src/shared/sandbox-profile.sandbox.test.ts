@@ -1,0 +1,153 @@
+/**
+ * Integration coverage for the `localmost test` profiles at the seatbelt layer.
+ *
+ * The unit tests assert which rules a profile contains. They cannot show what
+ * those rules let a process do: `(allow network-outbound (local ip))` reads
+ * like "loopback only" and matches a connection to anywhere. So the profiles
+ * are applied with sandbox-exec and a real process tries what a step would.
+ *
+ * As in docker-access.sandbox.test.ts, which mode applies depends on whether
+ * this process is already inside a sandbox:
+ *
+ *   constructed  On an unsandboxed machine, build a profile and apply it with
+ *                sandbox-exec. Each refusal is paired with an allowed case, so
+ *                the refusal is specific rather than a profile that runs
+ *                nothing.
+ *
+ *   ambient      Inside a localmost job, seatbelt refuses any nested profile
+ *                that deviates from the one in force, so constructing one is
+ *                impossible. What can still be shown is that the profile this
+ *                process runs under refuses the same connection.
+ *
+ * Neither mode skips. macOS only, because seatbelt is.
+ */
+
+import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
+import { execFile, execFileSync } from 'child_process';
+import { promisify } from 'util';
+import * as fs from 'fs';
+import * as net from 'net';
+import * as os from 'os';
+import * as path from 'path';
+import {
+  generateSandboxProfile,
+  generateDiscoveryProfile,
+  MACOS_BASELINE_READ_PATHS,
+  SandboxProfileOptions,
+} from './sandbox-profile';
+
+const isMacOS = process.platform === 'darwin';
+const execFileAsync = promisify(execFile);
+
+/**
+ * An address no machine answers on (TEST-NET-1, RFC 5737). Unsandboxed, a
+ * connect to it times out or is unreachable; only the sandbox refuses it with
+ * EPERM, which is what makes the error text a finding about the profile.
+ */
+const OFF_BOX = '192.0.2.1';
+
+/** Connect with nc and report how it ended: its exit status and what it said. */
+const tryConnect = async (
+  profile: string | null,
+  host: string,
+  port: number
+): Promise<{ ok: boolean; output: string }> => {
+  const nc = ['/usr/bin/nc', '-v', '-z', '-G', '2', '-w', '2', host, String(port)];
+  let command = nc;
+  let profileDir: string | undefined;
+  if (profile !== null) {
+    profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'localmost-net-'));
+    const profilePath = path.join(profileDir, 'profile.sb');
+    fs.writeFileSync(profilePath, profile);
+    command = ['/usr/bin/sandbox-exec', '-f', profilePath, ...nc];
+  }
+  try {
+    const { stdout, stderr } = await execFileAsync(command[0], command.slice(1), { timeout: 15000 });
+    return { ok: true, output: stdout + stderr };
+  } catch (err) {
+    const e = err as { stdout?: string; stderr?: string; message: string };
+    return { ok: false, output: `${e.stdout ?? ''}${e.stderr ?? ''}${e.message}` };
+  } finally {
+    if (profileDir) fs.rmSync(profileDir, { recursive: true, force: true });
+  }
+};
+
+const readable = { filesystem: { read: MACOS_BASELINE_READ_PATHS } };
+
+const canConstruct = (): boolean => {
+  if (!isMacOS) return false;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'localmost-probe-'));
+  const probePath = path.join(dir, 'probe.sb');
+  fs.writeFileSync(
+    probePath,
+    generateSandboxProfile({ workDir: fs.realpathSync(dir), proxyPort: 1, policy: readable })
+  );
+  try {
+    execFileSync('/usr/bin/sandbox-exec', ['-f', probePath, '/usr/bin/true'], { timeout: 5000, stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+};
+
+if (!isMacOS) {
+  describe('test-mode profiles through seatbelt', () => {
+    it('has nothing to assert off macOS, where seatbelt does not exist', () => {
+      expect(process.platform).not.toBe('darwin');
+    });
+  });
+} else if (canConstruct()) {
+  describe('test-mode network confinement through a constructed profile', () => {
+    // Stands in for the proxy: the one loopback port a step must reach.
+    let proxy: net.Server;
+    let proxyPort: number;
+    let workDir: string;
+
+    beforeAll(async () => {
+      workDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'localmost-net-work-')));
+      proxy = net.createServer((socket) => socket.end());
+      await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+      proxyPort = (proxy.address() as net.AddressInfo).port;
+    });
+
+    afterAll(async () => {
+      await new Promise<void>((resolve) => proxy.close(() => resolve()));
+      fs.rmSync(workDir, { recursive: true, force: true });
+    });
+
+    const profiles = (): [string, string][] => {
+      const options: SandboxProfileOptions = { workDir, proxyPort, policy: readable };
+      return [
+        ['enforcement', generateSandboxProfile(options)],
+        ['discovery', generateDiscoveryProfile({ workDir, proxyPort, logFile: '' })],
+      ];
+    };
+
+    it('reaches the proxy on loopback, so the refusal below is specific', async () => {
+      for (const [, profile] of profiles()) {
+        expect(await tryConnect(profile, '127.0.0.1', proxyPort)).toMatchObject({ ok: true });
+      }
+    });
+
+    it('refuses a direct connection off the machine', async () => {
+      // Unsandboxed the same connect is attempted and fails on the route; the
+      // sandbox has to refuse it before it leaves.
+      expect((await tryConnect(null, OFF_BOX, 9)).output).not.toContain('Operation not permitted');
+      for (const [mode, profile] of profiles()) {
+        const result = await tryConnect(profile, OFF_BOX, 9);
+        expect({ mode, ok: result.ok }).toEqual({ mode, ok: false });
+        expect(result.output).toContain('Operation not permitted');
+      }
+    });
+  });
+} else {
+  describe('test-mode network confinement through the ambient profile', () => {
+    it('refuses a direct connection off the machine', async () => {
+      const result = await tryConnect(null, OFF_BOX, 9);
+      expect(result.ok).toBe(false);
+      expect(result.output).toContain('Operation not permitted');
+    });
+  });
+}
