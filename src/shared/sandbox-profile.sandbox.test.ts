@@ -27,7 +27,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, jest } from '@jest/globals';
-import { execFile, execFileSync } from 'child_process';
+import { ChildProcess, execFile, execFileSync, spawn } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as net from 'net';
@@ -152,6 +152,107 @@ if (!isMacOS) {
         expect({ mode, ok: result.ok }).toEqual({ mode, ok: false });
         expect(result.output).toContain('Operation not permitted');
       }
+    });
+
+    describe('a service of the user\'s on loopback', () => {
+      // Two listeners standing in for what a developer machine runs on
+      // loopback: a database, a debugger port.
+      let services: net.Server[];
+      let ports: number[];
+
+      beforeAll(async () => {
+        services = [net.createServer((socket) => socket.end()), net.createServer((socket) => socket.end())];
+        await Promise.all(services.map((s) => new Promise<void>((resolve) => s.listen(0, '127.0.0.1', resolve))));
+        ports = services.map((s) => (s.address() as net.AddressInfo).port);
+      });
+
+      afterAll(async () => {
+        await Promise.all(services.map((s) => new Promise<void>((resolve) => s.close(() => resolve()))));
+      });
+
+      const enforcing = (loopback?: true | number[]) =>
+        generateSandboxProfile({ workDir, proxyPort, policy: readable, loopback });
+
+      it('is refused to a step unless the checkout was granted it', async () => {
+        expect(await tryConnect(null, '127.0.0.1', ports[0])).toMatchObject({ ok: true });
+        const refused = await tryConnect(enforcing(), '127.0.0.1', ports[0]);
+        expect(refused.ok).toBe(false);
+        expect(refused.output).toContain('Operation not permitted');
+        // The proxy, on the same interface, is still reached.
+        expect(await tryConnect(enforcing(), '127.0.0.1', proxyPort)).toMatchObject({ ok: true });
+      });
+
+      it('is reached on exactly the ports granted, or all of them under true', async () => {
+        const one = enforcing([ports[0]]);
+        expect(await tryConnect(one, '127.0.0.1', ports[0])).toMatchObject({ ok: true });
+        const other = await tryConnect(one, '127.0.0.1', ports[1]);
+        expect(other.ok).toBe(false);
+        expect(other.output).toContain('Operation not permitted');
+        for (const port of ports) {
+          expect(await tryConnect(enforcing(true), '127.0.0.1', port)).toMatchObject({ ok: true });
+        }
+      });
+
+      it('is reached under discovery, which observes the whole workflow', async () => {
+        const discovery = generateDiscoveryProfile({ workDir, proxyPort, logFile: '' });
+        expect(await tryConnect(discovery, '127.0.0.1', ports[1])).toMatchObject({ ok: true });
+      });
+    });
+  });
+
+  describe('test-mode signals through a constructed profile', () => {
+    // A process of the user's that no step started; only processes this test
+    // spawns are ever signalled.
+    let outsider: ChildProcess;
+    let workDir: string;
+
+    beforeAll(() => {
+      workDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'localmost-signal-')));
+      outsider = spawn('/bin/sleep', ['30'], { stdio: 'ignore' });
+    });
+
+    afterAll(() => {
+      outsider.kill('SIGKILL');
+      fs.rmSync(workDir, { recursive: true, force: true });
+    });
+
+    const run = async (profile: string, argv: string[]): Promise<{ ok: boolean; output: string }> => {
+      const profilePath = path.join(workDir, `signal-${Date.now()}.sb`);
+      fs.writeFileSync(profilePath, profile);
+      try {
+        const { stdout, stderr } = await execFileAsync('/usr/bin/sandbox-exec', ['-f', profilePath, ...argv], {
+          timeout: 15000,
+        });
+        return { ok: true, output: stdout + stderr };
+      } catch (err) {
+        const e = err as { stdout?: string; stderr?: string; message: string };
+        return { ok: false, output: `${e.stdout ?? ''}${e.stderr ?? ''}${e.message}` };
+      } finally {
+        fs.rmSync(profilePath, { force: true });
+      }
+    };
+
+    const profiles = (): [string, string][] => [
+      ['enforcement', generateSandboxProfile({ workDir, proxyPort: 1, policy: readable })],
+      ['discovery', generateDiscoveryProfile({ workDir, proxyPort: 1, logFile: '' })],
+    ];
+
+    it('signals what the step itself started, so the refusal below is specific', async () => {
+      for (const [mode, profile] of profiles()) {
+        const result = await run(profile, ['/bin/sh', '-c', '/bin/sleep 30 & p=$!; /bin/kill -TERM "$p" && wait "$p"; [ $? -eq 143 ]']);
+        expect({ mode, ...result }).toMatchObject({ mode, ok: true });
+      }
+    });
+
+    it('cannot signal a process of the user\'s that it did not start', async () => {
+      // Unsandboxed the same probe succeeds; the profile has to refuse it.
+      expect((await execFileAsync('/bin/kill', ['-0', String(outsider.pid)])).stderr).toBe('');
+      for (const [mode, profile] of profiles()) {
+        const result = await run(profile, ['/bin/kill', '-0', String(outsider.pid)]);
+        expect({ mode, ok: result.ok }).toEqual({ mode, ok: false });
+        expect(result.output).toContain('Operation not permitted');
+      }
+      expect(outsider.exitCode).toBeNull();
     });
   });
 
@@ -340,15 +441,23 @@ if (!isMacOS) {
       // Not a substitute for applying them - that needs a machine outside a
       // job - but it holds the rules this file is about in place here too.
       const workDir = '/Users/test/.localmost/workspaces/ws-1';
-      for (const profile of [
-        generateSandboxProfile({ workDir, proxyPort: 1, policy: readable }),
-        generateDiscoveryProfile({ workDir, proxyPort: 1, logFile: '' }),
-      ]) {
+      const enforcement = generateSandboxProfile({ workDir, proxyPort: 1, policy: readable });
+      const discovery = generateDiscoveryProfile({ workDir, proxyPort: 1, logFile: '' });
+      // Loopback: only the proxy under enforcement, the granted ports on
+      // request, everything under discovery.
+      expect(enforcement).toContain('(allow network-outbound (remote ip "localhost:1"))');
+      expect(enforcement).not.toContain('"localhost:*"))');
+      expect(
+        generateSandboxProfile({ workDir, proxyPort: 1, policy: readable, loopback: [5432] })
+      ).toContain('(allow network-outbound (remote ip "localhost:5432"))');
+      expect(discovery).toContain('(allow network-outbound (remote ip "localhost:*"))');
+      for (const profile of [enforcement, discovery]) {
         expect(profile).not.toContain('(local ip)');
         expect(profile).toContain('(deny network*)');
-        expect(profile).toContain('(allow network-outbound (remote ip "localhost:*"))');
         expect(profile).toContain(`(deny file-write* (literal "${workDir}"))`);
         expect(profile).not.toContain('(subpath "/private/tmp")');
+        expect(profile).toContain('(allow signal (target same-sandbox))');
+        expect(profile).not.toContain('(allow signal)');
       }
     });
   });

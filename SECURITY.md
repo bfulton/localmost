@@ -196,10 +196,13 @@ Under `strict` a repository that uses actions declares the host in its own
 ## Workflow Secrets
 
 `localmost test` runs a workflow locally, where GitHub is not there to supply
-`${{ secrets.X }}`. Values come from a `--secret-file` (`KEY=value` lines) or the
-environment, in that order. `--secrets prompt` asks for anything still missing
-without echoing it.
+`${{ secrets.X }}`. Values come from a `--secret-file` (`KEY=value` lines) or
+`LOCALMOST_SECRET_<name>` in the environment, in that order. `--secrets prompt`
+asks for anything still missing without echoing it.
 
+- **Never taken under their own names.** A workflow chooses which secrets it
+  asks for, so a variable exported for other tools (`AWS_SECRET_ACCESS_KEY`,
+  `GITHUB_TOKEN`) is not handed to it; the CLI says when one is set but unused.
 - **Never stored.** localmost has no secret store. Nothing is written to disk,
   and nothing persists between runs.
 - **Masked in output.** Secret values are replaced with `***` in everything a
@@ -251,11 +254,16 @@ sandbox profile. The checkout is treated as untrusted, and so is its
   creates - and xcrun's cache, the clang and Swift module cache and zsh's
   here-documents are pointed into the workspace. A hard-coded `/tmp` path fails
   here as it does in a job.
-- **Loopback-only network.** A step can reach loopback, except the broker's
-  port, and nothing else directly; `NO_PROXY` keeps loopback off the proxy. The
-  way out is the run's proxy, which needs a per-run token, refuses names that
-  resolve to internal or loopback addresses, and connects only to the addresses
-  it screened.
+- **Proxy-only network.** A step can reach the run's proxy on loopback and
+  nothing else directly. Other loopback ports - a local database, a debugger,
+  another app's control port - are reached only when the checkout's
+  `shared.network.loopback` grants them (`true` for every port, or a list), and
+  that grant is listed and asked about with the rest of the policy. The
+  broker's port stays closed either way; `NO_PROXY` keeps loopback off the
+  proxy. The way out is the run's proxy, which needs a per-run token, refuses
+  names that resolve to internal or loopback addresses, and connects only to
+  the addresses it screened. Discovery leaves loopback open, says so, and
+  records none of it: a checkout declares its loopback grant itself.
 - **Discovery is asked about every time.** Under `--updaterc` reads are allowed
   and recorded, and writes outside the workspace are refused and reported.
   Discovery still lets a workflow read everything but the paths above and reach
@@ -274,10 +282,13 @@ sandbox profile. The checkout is treated as untrusted, and so is its
   a short `python3` script; if python3 cannot run, only the process groups are
   killed and the CLI says so. Interrupting the CLI (Ctrl-C, a kill, or the
   terminal closing) runs the same cleanup.
+- **Signals stay inside the step.** A step can signal only processes under its
+  own sandbox, not your other processes. Each step has a sandbox of its own, so
+  a later step cannot signal a server an earlier one left running; the end of
+  the job reaps it.
 
-What test mode still trusts: signals are not filtered, so a step can signal
-your other processes; and loopback is shared, so a step can reach any local
-service that listens on it.
+What test mode still trusts: a loopback grant is shared, so a step granted a
+port reaches whatever listens on it, not only what the step started.
 
 ## Authentication
 

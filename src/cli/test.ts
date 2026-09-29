@@ -46,7 +46,7 @@ import {
   serializeLocalmostrc,
   LOCALMOSTRC_VERSION,
 } from '../shared/localmostrc';
-import { SandboxPolicy, parseSandboxTrace, MACOS_BASELINE_READ_PATHS } from '../shared/sandbox-profile';
+import { SandboxPolicy, LoopbackGrant, parseSandboxTrace, MACOS_BASELINE_READ_PATHS } from '../shared/sandbox-profile';
 import { DockerPolicy, diffDockerPolicy, mergeDockerPolicy, parseDockerPolicyHint } from '../shared/docker-policy';
 import { DiscoveryProxy } from '../shared/discovery-proxy';
 import { createWorkspace, cleanupWorkspaces, getGitInfo, getRepositoryFromDir } from '../shared/workspace';
@@ -265,6 +265,7 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   const localmostrcPath = findLocalmostrc(cwd);
   let config: LocalmostrcConfig | undefined;
   let policy: SandboxPolicy | undefined;
+  let loopback: LoopbackGrant | undefined;
 
   if (localmostrcPath) {
     console.log(`Using policy: ${path.relative(cwd, localmostrcPath)}`);
@@ -272,6 +273,7 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     if (result.success && result.config) {
       config = result.config;
       policy = getEffectivePolicy(config, workflow.name);
+      loopback = checkoutLoopback(config);
     } else {
       console.log(`${colors.yellow}Warning:${colors.reset} Invalid .localmostrc: ${result.errors[0]?.message}`);
     }
@@ -290,7 +292,7 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     const confirm = { assumeYes: !!options.assumeYes, isTTY: !!process.stdin.isTTY };
     const confirmed = options.updaterc
       ? await confirmDiscovery(confirm)
-      : await confirmCheckoutGrants(cwd, grantsBeyondWorkspace(policy), confirm);
+      : await confirmCheckoutGrants(cwd, grantsBeyondWorkspace(policy, loopback), confirm);
     if (!confirmed) {
       throw new Error(
         'Not running: confirm on a terminal, or pass --yes to run this checkout with what it asks for.'
@@ -389,6 +391,9 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     secrets,
     stepOutputs: {},
     policy,
+    // Confirmed above with the rest of the policy. Discovery applies no
+    // policy; its profile leaves loopback open.
+    loopback: options.updaterc ? undefined : loopback,
     permissive: options.updaterc,
     sandboxLogFile,
     collectedPids: options.updaterc ? collectedPids : undefined,
@@ -649,9 +654,9 @@ export function installInterruptHandlers(reap: () => void): () => void {
 /**
  * The variables that send a step's traffic through the run's proxy.
  *
- * Loopback is exempt: steps reach a server they started directly, as their
- * sandbox allows, and the proxy refuses loopback outright - through it, a
- * step would reach the ports its sandbox denies.
+ * Loopback is exempt: steps reach a server they started directly, where the
+ * checkout's network.loopback grants it, and the proxy refuses loopback
+ * outright - through it, a step would reach the ports its sandbox denies.
  */
 export function buildProxyEnv(proxyUrl: string): Record<string, string> {
   const noProxy = 'localhost,127.0.0.1,::1';
@@ -1021,15 +1026,41 @@ const isYes = (answer: string): boolean => /^y(es)?$/i.test(answer.trim());
 
 /**
  * What a policy grants a step beyond its workspace and the OS read paths
- * every workflow needs: every write, every other read, every host.
+ * every workflow needs: every write, every other read, every host, and any
+ * loopback port besides the proxy's - which reaches whatever this machine
+ * runs there, not only the step's own test servers.
  */
-export function grantsBeyondWorkspace(policy: SandboxPolicy | undefined): PolicyAddition[] {
+export function grantsBeyondWorkspace(policy: SandboxPolicy | undefined, loopback?: LoopbackGrant): PolicyAddition[] {
   const baseline = new Set(MACOS_BASELINE_READ_PATHS);
   return nonEmpty([
     { label: 'filesystem.write', items: policy?.filesystem?.write ?? [] },
     { label: 'filesystem.read', items: (policy?.filesystem?.read ?? []).filter((p) => !baseline.has(p)) },
     { label: 'network.allow', items: policy?.network?.allow ?? [] },
+    {
+      label: 'network.loopback',
+      items:
+        loopback === true
+          ? ['every port on this machine: any local service']
+          : (loopback ?? []).map((port) => `port ${port} on this machine`),
+    },
   ]);
+}
+
+/**
+ * The loopback ports a checkout's policy grants its steps besides the
+ * proxy's: its shared network.loopback, `true` for every port or a list of
+ * them. Shared only, as for the runner, whose profile is fixed before the
+ * job's workflow is known.
+ *
+ * The value is the checkout's to write, so anything but `true` or a list of
+ * distinct whole port numbers grants nothing, rather than something.
+ */
+export function checkoutLoopback(config: LocalmostrcConfig | undefined): LoopbackGrant | undefined {
+  const value = (config?.shared?.network as { loopback?: unknown } | undefined)?.loopback;
+  if (value === true) return true;
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const ports = value.filter((port): port is number => Number.isInteger(port) && port >= 1 && port <= 65535);
+  return ports.length === value.length && new Set(ports).size === ports.length ? ports : undefined;
 }
 
 /** Where the checkouts' confirmed grants are kept: the app data directory, which no step can reach. */
@@ -1103,7 +1134,8 @@ export async function confirmDiscovery(options: {
 }): Promise<boolean> {
   console.log(`${colors.yellow}${colors.bold}--updaterc runs this checkout with wide access:${colors.reset}`);
   console.log('  It can read everything on disk except your credentials and localmost\'s own data,');
-  console.log('  and reach any host on the internet. Use it only on a checkout whose code you trust.');
+  console.log('  reach any host on the internet, and reach any service listening on this machine\'s');
+  console.log('  loopback. Use it only on a checkout whose code you trust.');
   console.log();
   if (options.assumeYes) return true;
   if (!options.isTTY) return false;
@@ -1144,9 +1176,6 @@ async function confirmPolicyChange(
   return yes;
 }
 
-/**
- * Resolve secrets from environment variables or stub them.
- */
 /**
  * Read secrets from a KEY=value file, in the shape people already keep them.
  */
@@ -1199,14 +1228,23 @@ async function promptForSecret(name: string): Promise<string> {
   return value;
 }
 
+/** The environment variable a secret is read from: never the secret's own name. */
+const secretEnvName = (name: string): string => `LOCALMOST_SECRET_${name}`;
+
 /**
  * Resolve the secrets a workflow references.
  *
- * Order is: a --secret-file entry, then the environment, then whatever the
- * chosen mode does about what is left. Nothing is written to disk, and values
- * are masked out of step output by the executor.
+ * Order is: a --secret-file entry, then LOCALMOST_SECRET_<name> in the
+ * environment, then whatever the chosen mode does about what is left.
+ * Nothing is written to disk, and values are masked out of step output by
+ * the executor.
+ *
+ * The workflow chooses which names it asks for, and the checkout is as
+ * untrusted as its code. Read under their own names, a workflow asking for
+ * AWS_SECRET_ACCESS_KEY or GITHUB_TOKEN got whatever the developer had
+ * exported for other tools; the prefix makes passing one a decision.
  */
-async function resolveSecrets(
+export async function resolveSecrets(
   _repository: string,
   names: string[],
   mode: 'stub' | 'prompt' | 'abort',
@@ -1224,23 +1262,29 @@ async function resolveSecrets(
       continue;
     }
 
-    const envValue = process.env[name];
+    const envValue = process.env[secretEnvName(name)];
     if (envValue !== undefined) {
       result[name] = envValue;
-      console.log(`  ${success(name)} (from environment)`);
+      console.log(`  ${success(name)} (from ${secretEnvName(name)})`);
       continue;
+    }
+
+    if (process.env[name] !== undefined) {
+      console.log(
+        `  ${colors.dim}${name} is set in your environment but not used; set ${secretEnvName(name)} to pass it to the workflow.${colors.reset}`
+      );
     }
 
     switch (mode) {
       case 'abort':
         throw new Error(
-          `Missing secret: ${name}. Set it in the environment or pass --secret-file.`
+          `Missing secret: ${name}. Set ${secretEnvName(name)} or pass --secret-file.`
         );
 
       case 'prompt': {
         if (!process.stdin.isTTY) {
           throw new Error(
-            `Missing secret: ${name}. There is no terminal to prompt on - set it in the environment or pass --secret-file.`
+            `Missing secret: ${name}. There is no terminal to prompt on - set ${secretEnvName(name)} or pass --secret-file.`
           );
         }
         result[name] = await promptForSecret(name);
@@ -1267,7 +1311,7 @@ async function resolveSecrets(
     console.log(
       `  Steps using ${stubbed.length === 1 ? 'it' : 'them'} will run anyway and may behave differently than on GitHub.`
     );
-    console.log('  Use --secret-file, set them in the environment, or --secrets abort to stop instead.');
+    console.log('  Use --secret-file, set LOCALMOST_SECRET_<name>, or --secrets abort to stop instead.');
   }
 
   return result;
@@ -1278,9 +1322,10 @@ async function resolveSecrets(
  *
  * Uses the access discovered during the workflow run to generate a
  * .localmostrc file with only what your workflow actually needs. Socket
- * paths are reported but never written: no policy key declares one.
+ * paths are reported but never written: no policy key declares one, and
+ * neither is loopback, which discovery leaves open and cannot see.
  */
-async function handleUpdateRc(
+export async function handleUpdateRc(
   cwd: string,
   workflow: ParsedWorkflow,
   discovered: DiscoveredAccess,
@@ -1350,6 +1395,14 @@ async function handleUpdateRc(
       );
     }
   }
+
+  // Discovery leaves every loopback port open and sees none of what went
+  // through them, so a suite that talks to a local server passes here and
+  // is refused the connection on its next run. Say so, and where it goes.
+  console.log(`  Loopback: ${colors.dim}not recorded - discovery leaves every local port open${colors.reset}`);
+  console.log(
+    `    ${colors.dim}Steps that reach a local server need shared.network.loopback (true, or its ports)${colors.reset}`
+  );
 
   console.log();
 
@@ -1617,6 +1670,7 @@ ${colors.bold}OPTIONS:${colors.reset}
   -m, --matrix <spec>  Run specific matrix combination (e.g., "os=macos,node=18")
   -f, --full-matrix Run all matrix combinations
   -u, --updaterc    Discovery mode: record access and generate .localmostrc
+                    (not loopback: declare shared.network.loopback yourself)
   -y, --yes         Answer yes to every confirmation: a .localmostrc's grants
                     beyond the workspace, running --updaterc, and its changes
   -n, --dry-run     Show what would run without executing
@@ -1635,8 +1689,9 @@ ${colors.bold}EXAMPLES:${colors.reset}
   localmost test -v --env           Verbose output with environment diff
 
 ${colors.bold}ENVIRONMENT:${colors.reset}
-  Uses your local machine as the runner. Secrets come from the environment or
-  a --secret-file; they are never written to disk and are masked out of output.
+  Uses your local machine as the runner. Secrets come from a --secret-file or
+  LOCALMOST_SECRET_<name> in the environment, never a variable under the
+  secret's own name; they are never written to disk and are masked out of output.
 
 ${colors.bold}SANDBOX:${colors.reset}
   Workflows run in a sandbox. Configure access in .localmostrc:
@@ -1645,5 +1700,6 @@ ${colors.bold}SANDBOX:${colors.reset}
       network:
         allow:
           - registry.npmjs.org
+        loopback: true    # or [5432]: local ports steps may reach
 `);
 }

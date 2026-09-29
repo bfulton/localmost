@@ -496,16 +496,61 @@ describe('Sandbox Profile Generator', () => {
   // ===========================================================================
 
   describe('generateSandboxProfile - Network access', () => {
-    it('should restrict network to localhost', () => {
-      const profile = generateSandboxProfile({
-        workDir: '/path/to/project',
-        proxyPort: 9999,
-      });
+    /** The outbound IP rules after the network deny, in order. */
+    const outboundIpRules = (profile: string): string[] =>
+      profile
+        .slice(profile.indexOf('(deny network*)'))
+        .match(/\((?:allow|deny) network-outbound \((?:remote|local) ip[^)]*\)\)/g) ?? [];
 
-      // Network should be restricted to localhost (proxy handles filtering)
-      expect(profile).toContain('(allow network-outbound (remote ip "localhost:*"))');
+    it('reaches only the proxy on loopback unless the checkout grants more', () => {
+      // A service on loopback - a debugger port, a local database, another
+      // app's control port - is not the proxy, and a step has no reason to
+      // reach it that the user has not agreed to.
+      const profile = generateSandboxProfile({ workDir: '/path/to/project', proxyPort: 9999 });
+      expect(outboundIpRules(profile)).toEqual([
+        '(allow network-outbound (remote ip "localhost:9999"))',
+        '(deny network-outbound (remote ip "localhost:8787"))',
+      ]);
       expect(profile).toContain('proxy at port 9999');
       expect(profile).not.toContain('(allow network*)');
+    });
+
+    it('opens the loopback ports a confirmed grant names, and the broker never', () => {
+      expect(
+        outboundIpRules(generateSandboxProfile({ workDir: '/p', proxyPort: 9999, loopback: [5432, 6379] }))
+      ).toEqual([
+        '(allow network-outbound (remote ip "localhost:9999"))',
+        '(allow network-outbound (remote ip "localhost:5432"))',
+        '(allow network-outbound (remote ip "localhost:6379"))',
+        '(deny network-outbound (remote ip "localhost:8787"))',
+      ]);
+      // Seatbelt takes the last match, so the broker stays closed even under
+      // every port, and even when a grant names it.
+      for (const loopback of [true, [8787]] as Array<true | number[]>) {
+        const rules = outboundIpRules(generateSandboxProfile({ workDir: '/p', proxyPort: 9999, loopback }));
+        expect(rules[rules.length - 1]).toBe('(deny network-outbound (remote ip "localhost:8787"))');
+      }
+      expect(outboundIpRules(generateSandboxProfile({ workDir: '/p', proxyPort: 9999, loopback: true }))).toEqual([
+        '(allow network-outbound (remote ip "localhost:9999"))',
+        '(allow network-outbound (remote ip "localhost:*"))',
+        '(deny network-outbound (remote ip "localhost:8787"))',
+      ]);
+    });
+
+    it('drops a loopback port that is not one, rather than widening to it', () => {
+      // The grant comes from the checkout; only whole port numbers reach the
+      // profile, where anything else could change what a rule matches.
+      const loopback = [0, 65536, 1.5, -1, '22' as unknown as number, '*' as unknown as number, 443];
+      expect(outboundIpRules(generateSandboxProfile({ workDir: '/p', proxyPort: 9999, loopback }))).toEqual([
+        '(allow network-outbound (remote ip "localhost:9999"))',
+        '(allow network-outbound (remote ip "localhost:443"))',
+        '(deny network-outbound (remote ip "localhost:8787"))',
+      ]);
+      const notAGrant = 'yes' as unknown as true;
+      expect(outboundIpRules(generateSandboxProfile({ workDir: '/p', proxyPort: 9999, loopback: notAGrant }))).toEqual([
+        '(allow network-outbound (remote ip "localhost:9999"))',
+        '(deny network-outbound (remote ip "localhost:8787"))',
+      ]);
     });
 
     it('never grants an IP rule that matches every address', () => {
@@ -513,7 +558,7 @@ describe('Sandbox Profile Generator', () => {
       // filter it matches a connection to anywhere: a step could ignore
       // HTTP_PROXY and reach the internet directly, past the allowlist.
       for (const profile of [
-        generateSandboxProfile({ workDir: '/path/to/project', proxyPort: 9999 }),
+        generateSandboxProfile({ workDir: '/path/to/project', proxyPort: 9999, loopback: true }),
         generateDiscoveryProfile({ workDir: '/path/to/project', proxyPort: 9999, logFile: '' }),
       ]) {
         expect(profile).not.toContain('(local ip)');
@@ -523,9 +568,7 @@ describe('Sandbox Profile Generator', () => {
         // The app's broker carries job payloads; a step has no reason to open it.
         expect(profile).toContain('(deny network-outbound (remote ip "localhost:8787"))');
         // Nothing after the deny reopens outbound IP beyond loopback.
-        const afterDeny = profile.slice(profile.indexOf('(deny network*)'));
-        const outboundIp = afterDeny.match(/\(allow network-outbound \((?:remote|local) ip[^)]*\)\)/g);
-        expect(outboundIp).toEqual(['(allow network-outbound (remote ip "localhost:*"))']);
+        expect(outboundIpRules(profile).every((rule) => rule.includes('"localhost:'))).toBe(true);
       }
     });
 
@@ -541,8 +584,8 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).not.toContain('(local unix-socket)');
     });
 
-    it('should allow traffic to localhost regardless of policy', () => {
-      // Policy is for proxy-level filtering, sandbox just restricts to localhost
+    it('should allow traffic to the proxy regardless of policy', () => {
+      // Policy is for proxy-level filtering, sandbox just restricts to the proxy
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',
         proxyPort: 8080,
@@ -553,7 +596,7 @@ describe('Sandbox Profile Generator', () => {
         },
       });
 
-      expect(profile).toContain('(remote ip "localhost:*")');
+      expect(profile).toContain('(remote ip "localhost:8080")');
       expect(profile).not.toContain('github.com');
     });
   });
@@ -572,13 +615,15 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).toContain('(allow process*)');
     });
 
-    it('should allow signal operations', () => {
-      const profile = generateSandboxProfile({
-        workDir: '/path/to/project',
-        proxyPort: DEFAULT_PROXY_PORT,
-      });
-
-      expect(profile).toContain('(allow signal)');
+    it('lets a step signal only processes under its own profile', () => {
+      // An unfiltered (allow signal) let a step stop or kill any process the
+      // user runs: the app, the runner, an editor with unsaved work.
+      for (const profile of [
+        generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT }),
+        generateDiscoveryProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, logFile: '' }),
+      ]) {
+        expect(profile.match(/\(allow signal[^\n]*/g)).toEqual(['(allow signal (target same-sandbox))']);
+      }
     });
 
     it('should allow mach and ipc operations', () => {
@@ -760,6 +805,9 @@ describe('Sandbox Profile Generator', () => {
     });
 
     it('should still restrict network to localhost', () => {
+      // Discovery applies no policy and is confirmed on every run as the
+      // wide mode it is, so loopback stays open there: it runs the workflow
+      // to see what it needs, test servers included.
       const profile = generateDiscoveryProfile({
         workDir: '/path/to/project',
         proxyPort: 9999,
@@ -821,7 +869,7 @@ describe('Sandbox Profile Generator', () => {
       });
 
       expect(profile).toContain('(version 1)');
-      expect(profile).toContain('(remote ip "localhost:*")');
+      expect(profile).toContain(`(remote ip "localhost:${DEFAULT_PROXY_PORT}")`);
     });
 
     it('should handle policy with empty arrays', () => {
