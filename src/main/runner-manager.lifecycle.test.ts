@@ -103,7 +103,7 @@ jest.mock('fs', () => ({
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { RunnerManager, JobEvent, lineReader } from './runner-manager';
+import { RunnerManager, JobEvent, lineReader, UNCLAIMED_WORKER_TIMEOUT_MS } from './runner-manager';
 import { ProxyServer } from './proxy-server';
 import { spawnSandboxed } from './process-sandbox';
 import { getJobHistoryPath } from './paths';
@@ -318,6 +318,7 @@ describe("reading the runner's status from its output", () => {
 
     for (const line of [
       'echo: the runner registration has been deleted, please re-configure',
+      'echo: The runner registration has been deleted from the server, please re-configure.',
       'note: a session for this runner already exists',
       'curl: Runner connect error',
       'curl: Could not connect to the server',
@@ -354,6 +355,91 @@ describe("reading the runner's status from its output", () => {
       await unreachable.helper.parseRunnerOutput(1, line);
       expect(unreachable.helper.instances.get(1)!.status).toBe('error');
       expect(unreachable.helper.instances.get(1)!.fatalError).toBe(false);
+    }
+  });
+});
+
+describe('reading a job start whatever its name holds', () => {
+  const TS = '2026-09-29 12:00:00Z: ';
+  const REREGISTER = 'The runner registration has been deleted from the server, please re-configure.';
+
+  async function spawned() {
+    const onReregistrationNeeded = jest.fn(async () => undefined);
+    const ctx = newManager({ onReregistrationNeeded });
+    ctx.helper.runnerCount = 1;
+    (fs.existsSync as jest.Mock).mockReturnValue(true);
+    const proc = createMockProcess(24680);
+    mockSpawnSandboxed.mockReturnValue(proc);
+    await ctx.helper.spawnForJob();
+    ctx.helper.instances.get(1)!.status = 'listening';
+    return { ...ctx, proc, onReregistrationNeeded };
+  }
+
+  it.each([
+    ['a CR', 'x\rz', 'x\rz'],
+    ['U+2028', 'x z', 'x z'],
+    ['U+2029', 'x z', 'x z'],
+    // Too long to read as a line; the runner never writes one that long, so
+    // before its job only the job's own start line can be.
+    ['70 KiB', 'x'.repeat(70 * 1024), expect.stringMatching(/too long/)],
+  ])('a job whose name carries %s before a re-configure line is recorded and does not re-register', async (_label, name, recorded) => {
+    // Only \n ends a line; any other separator the name holds is part of
+    // the start line, and what follows the name's own \n is the job's.
+    const { manager, helper, proc, events, onReregistrationNeeded } = await spawned();
+
+    proc.stdout!.emit('data', Buffer.from(`${TS}Running job: ${name}\n${REREGISTER}\n${TS}Runner connect error: y\n`));
+    await settle();
+
+    const instance = helper.instances.get(1)!;
+    expect(instance.status).toBe('busy');
+    expect(instance.fatalError).toBe(false);
+    expect(instance.currentJob?.name).toEqual(recorded);
+    expect(events.filter((e) => e.type === 'started')).toHaveLength(1);
+    expect(onReregistrationNeeded).not.toHaveBeenCalled();
+    expect(manager.hasAvailableSlot()).toBe(false);
+  });
+
+  it("ends a job whose name carries a CR on the runner's completion line", async () => {
+    const { helper, events } = newManager();
+    helper.setInstance(1, { name: 'runner-1', status: 'listening' });
+    await helper.parseRunnerOutput(1, `${TS}Running job: x\rz`);
+
+    await helper.parseRunnerOutput(1, `${TS}Job x\rz completed with result: Succeeded`);
+
+    expect(helper.instances.get(1)!.currentJob).toBeNull();
+    expect(events.filter((e) => e.type === 'completed')).toEqual([
+      expect.objectContaining({ jobName: 'x\rz', status: 'completed' }),
+    ]);
+  });
+});
+
+describe('a worker started with no job', () => {
+  fakeTimersFor();
+
+  it('gives its slot back when no job reaches it, as one spawned for a job does', async () => {
+    // Restarting a slot after re-registration started one this way. Only the
+    // worker spawned for a job may take it, so this one never gets one: with
+    // no deadline it long-polled and held the slot until the app restarted.
+    const { manager, helper } = newManager();
+    helper.runnerCount = 1;
+    (fs.existsSync as jest.Mock).mockReturnValue(true);
+    const proc = createMockProcess(24700);
+    mockSpawnSandboxed.mockReturnValue(proc);
+    const kill = stubKill(() => {
+      throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
+    });
+    try {
+      await helper.startWorkerWithoutJob(1);
+      proc.stdout!.emit('data', Buffer.from('2026-09-29 12:00:00Z: Listening for Jobs\n'));
+      await settle();
+      expect(manager.hasAvailableSlot()).toBe(false);
+
+      await jest.advanceTimersByTimeAsync(UNCLAIMED_WORKER_TIMEOUT_MS);
+
+      expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
+      expect(manager.hasAvailableSlot()).toBe(true);
+    } finally {
+      kill.restore();
     }
   });
 });
@@ -440,16 +526,22 @@ describe("splitting a worker's output into lines", () => {
   it('does not parse a line too long to be the runner\'s, nor its tail', async () => {
     // Buffering to the next newline without bound would let a job that never
     // prints one grow the app's memory for as long as it likes.
-    const { proc, events } = await spawned();
-
-    proc.stdout!.emit('data', Buffer.from('x'.repeat(70 * 1024)));
-    proc.stdout!.emit('data', Buffer.from('Running job: evil\n'));
-    await settle();
-    expect(started(events)).toEqual([]);
-
-    // The next line is read normally.
+    // (Before the job, a line this long is taken as its start: see "a job
+    // whose name carries 70 KiB".)
+    const { helper, proc, events } = await spawned();
     proc.stdout!.emit('data', Buffer.from('Running job: build\n'));
     await settle();
+
+    proc.stdout!.emit('data', Buffer.from('x'.repeat(70 * 1024)));
+    proc.stdout!.emit('data', Buffer.from('Job build completed with result: Succeeded\n'));
+    await settle();
+    expect(helper.instances.get(1)!.currentJob).not.toBeNull();
+    expect(events.filter((e) => e.type === 'completed')).toEqual([]);
+
+    // The next line is read normally.
+    proc.stdout!.emit('data', Buffer.from('Job build completed with result: Succeeded\n'));
+    await settle();
+    expect(helper.instances.get(1)!.currentJob).toBeNull();
     expect(started(events)).toEqual(['build']);
   });
 

@@ -337,7 +337,7 @@ const ensureProxyRegistrations = async (
 
 /**
  * Re-register a single runner instance after detecting session conflict or registration deletion.
- * This stops the instance, deletes the GitHub registration, clears config, re-registers, and restarts.
+ * This stops the instance, deletes the GitHub registration, clears config and re-registers.
  */
 export const reRegisterSingleInstance = async (
   instanceNum: number,
@@ -464,10 +464,10 @@ const doReRegisterInstance = async (
     },
   });
 
-  logger?.info(`Re-registration of instance ${instanceNum} complete, restarting...`);
-
-  // Restart the instance
-  await runnerManager.startInstance(instanceNum);
+  // Not restarted here. Only the worker spawned for a job may take it, so one
+  // started now would have no job and never get one; the slot is started
+  // again by the next job spawned into it.
+  logger?.info(`Re-registration of instance ${instanceNum} complete; the next job for it starts its worker`);
 };
 
 /**
