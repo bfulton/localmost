@@ -3014,6 +3014,88 @@ describe('RunnerManager', () => {
       expect(dockerSocketOf(helper, 1)).not.toBe(first);
     });
 
+    describe("stopping waits for the socket to remove the job's containers", () => {
+      // Quitting the app goes through stop(). Were it to finish first, a job's
+      // `--restart` or detached containers would be left on the daemon with
+      // nothing left to remove them.
+      const realKill = process.kill;
+      afterEach(() => {
+        (process as unknown as { kill: unknown }).kill = realKill;
+      });
+
+      /** Start a worker whose socket's removal stays pending until the returned function is called. */
+      const workerWithSlowRemoval = async (): Promise<{ proc: ReturnType<typeof createMockProcess>; socket: DockerSocketStub; finishRemoval: () => void }> => {
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        const proc = createMockProcess(12345);
+        mockSpawnSandboxed.mockReturnValue(proc);
+        const helper = new RunnerManagerTestHelper(runnerManager);
+        await helper.spawnForJob();
+        const socket = dockerSocketOf(helper, 1);
+        let finishRemoval: () => void = () => {};
+        socket.stop.mockReturnValue(new Promise<void>((resolve) => { finishRemoval = resolve; }));
+        return { proc, socket, finishRemoval };
+      };
+
+      const expectStopToWaitFor = async (socket: DockerSocketStub, finishRemoval: () => void): Promise<void> => {
+        let stopped = false;
+        const stopping = runnerManager.stop().then(() => { stopped = true; });
+        for (let i = 0; i < 5; i++) await settle();
+        expect(socket.stop).toHaveBeenCalled();
+        expect(stopped).toBe(false);
+
+        finishRemoval();
+        await stopping;
+        expect(stopped).toBe(true);
+      };
+
+      it('when the worker exits on the stop', async () => {
+        const { proc, socket, finishRemoval } = await workerWithSlowRemoval();
+        // A live worker, which exits on the group's SIGTERM; its group is then
+        // empty, so the sweep that follows sends nothing more.
+        Object.defineProperty(proc, 'exitCode', { value: null, writable: true });
+        let exited = false;
+        proc.once('exit', () => { exited = true; });
+        (process as unknown as { kill: unknown }).kill = ((pid: number, sig?: unknown) => {
+          if (pid === -12345 && sig === 'SIGTERM') {
+            process.nextTick(() => proc.emit('exit', null, 'SIGTERM'));
+            return true;
+          }
+          throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
+        }) as never;
+
+        await expectStopToWaitFor(socket, finishRemoval);
+        expect(exited).toBe(true);
+      });
+
+      it("when the worker's exit never reached the manager", async () => {
+        const { socket, finishRemoval } = await workerWithSlowRemoval();
+        await expectStopToWaitFor(socket, finishRemoval);
+      });
+
+      it('when the worker could not be spawned', async () => {
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        const helper = new RunnerManagerTestHelper(runnerManager);
+        let socket: DockerSocketStub | undefined;
+        let finishRemoval: () => void = () => {};
+        mockSpawnSandboxed.mockImplementationOnce(() => {
+          socket = dockerSocketOf(helper, 1);
+          socket.stop.mockReturnValue(new Promise<void>((resolve) => { finishRemoval = resolve; }));
+          throw new Error('spawn EAGAIN');
+        });
+        await runnerManager.initialize();
+
+        let started = false;
+        const starting = runnerManager.startInstance(1).then(() => { started = true; });
+        for (let i = 0; i < 5; i++) await settle();
+        expect(socket?.stop).toHaveBeenCalled();
+        expect(started).toBe(false);
+
+        finishRemoval();
+        await starting;
+        expect(helper.dockerProxy(1)).toBeUndefined();
+      });
+    });
+
     it('leaves a socket that took the slot while the last one was removing its containers', async () => {
       // The finished stop forgets only its own socket, never whichever one
       // holds the slot by the time it is done.

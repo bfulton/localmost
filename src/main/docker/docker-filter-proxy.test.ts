@@ -1355,6 +1355,32 @@ describe('containers a job leaves behind', () => {
     expect(events).toEqual(['removal answered', 'second stop']);
   });
 
+  it('makes a stop that comes once removals are under way wait for them too', async () => {
+    // As it happens in the manager: the worker's exit starts the removals, and
+    // the slot's next spawn stops the socket again later, by which time the
+    // socket has closed and its record of the job's containers is spent.
+    const dir = tmp();
+    const sock = path.join(dir, 'docker.sock');
+    const daemon = await lifetimeDaemon(dir, sock, { holdDeletes: true });
+    const { proxy } = await startProxy(dir, { backend: backendWith(daemon.sock, dir) });
+    proxy.bind('owner/repo', policy);
+    expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
+
+    const first = proxy.stop();
+    for (let waited = 0; !daemon.seen.some((s) => s.startsWith('DELETE')); waited += 5) {
+      expect(waited).toBeLessThan(2000);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const events: string[] = [];
+    const second = proxy.stop().then(() => events.push('second stop'));
+    await new Promise((r) => setTimeout(r, 50));
+    events.push('removal answered');
+    daemon.release();
+    await Promise.all([first, second]);
+
+    expect(events).toEqual(['removal answered', 'second stop']);
+  });
+
   it('removes them on a daemon older than the API version the socket speaks', async () => {
     // The CLI negotiates down to an older daemon through the clamped ping, so
     // the job's own requests name a version that daemon serves. The sweep is
