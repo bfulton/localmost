@@ -295,6 +295,43 @@ describe('RunnerDownloader', () => {
       expect(options.env.ACTIONS_RUNNER_INPUT_TOKEN).toBe('REGISTRATION-TOKEN');
       expect(args).toEqual(expect.arrayContaining(['--url', 'https://github.com/owner/repo', '--unattended']));
     });
+
+    it.each([
+      ['succeeds', 0],
+      ['fails', 1],
+    ])('registers in a sandbox of its own, saves from it, and removes it when config.sh %s', async (_outcome, code) => {
+      // Built for this registration alone: a worker's leftover cannot reach
+      // it, and nothing of it is left for a later start of the slot.
+      const { EventEmitter } = jest.requireActual('events') as typeof import('events');
+      const sandboxDir = path.join(mockRunnerDir, 'sandbox', '1-0123456789ab');
+      jest.spyOn(downloader, 'buildSandbox').mockResolvedValue(sandboxDir);
+      const saveConfig = jest.spyOn(downloader, 'saveConfig').mockResolvedValue(undefined);
+      const removeSandbox = jest.spyOn(downloader, 'removeSandbox').mockResolvedValue(undefined);
+      jest.spyOn(downloader, 'configureForBrokerProxy').mockResolvedValue(undefined);
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (spawnSandboxed as jest.Mock).mockImplementation((_script: string, _args: string[], options: { cwd: string }) => {
+        expect(options.cwd).toBe(sandboxDir);
+        const proc = Object.assign(new EventEmitter(), { stdout: new EventEmitter(), stderr: new EventEmitter() });
+        setImmediate(() => proc.emit('close', code));
+        return proc;
+      });
+
+      const configured = downloader.configureInstance(1, '2.336.0', {
+        url: 'https://github.com/owner/repo',
+        token: 'REGISTRATION-TOKEN',
+        name: 'localmost.x.1',
+        labels: ['self-hosted'],
+      });
+
+      if (code === 0) {
+        await configured;
+        expect(saveConfig).toHaveBeenCalledWith(1, sandboxDir);
+      } else {
+        await expect(configured).rejects.toThrow(/Configuration failed/);
+        expect(saveConfig).not.toHaveBeenCalled();
+      }
+      expect(removeSandbox).toHaveBeenCalledWith(sandboxDir);
+    });
   });
 
   describe('copyProxyCredentials', () => {

@@ -61,7 +61,8 @@ export interface RunnerRelease {
  * ~/.localmost/runner/
  *   arc/v2.330.0/     - downloaded binaries (versioned, persistent)
  *   config/1/         - config files for instance 1 (persistent)
- *   sandbox/1/        - ephemeral sandbox for instance 1 (rebuilt on each start)
+ *   sandbox/1-<id>/   - one start of instance 1: a directory of its own for
+ *                       every start, removed once that worker is done
  *   caches/<target>/  - one target's caches, kept across its jobs (persistent)
  */
 export class RunnerDownloader {
@@ -85,9 +86,9 @@ export class RunnerDownloader {
     return path.join(this.baseDir, 'config', `${instance}`);
   }
 
-  /** Get the sandbox directory for a specific instance */
-  getSandboxDir(instance: number): string {
-    return path.join(this.baseDir, 'sandbox', `${instance}`);
+  /** Where every worker's sandbox is built, one directory per start. */
+  getSandboxBase(): string {
+    return path.join(this.baseDir, 'sandbox');
   }
 
   /** Get the base runner directory */
@@ -404,8 +405,15 @@ export class RunnerDownloader {
   }
 
   /**
-   * Build a sandbox for the given instance by copying arc + config.
-   * This should be called before starting each runner instance.
+   * Build a sandbox for one start of an instance, by copying arc + config
+   * into a directory made for it, and return that directory.
+   *
+   * Never a directory an earlier start used. The profile a worker runs under
+   * grants its sandbox by path, and a process its job started can outlive it -
+   * one that traps SIGTERM, or leaves its process group - keeping that
+   * profile. Built again at the same path, the next job's runner (after its
+   * copy was checked), its checkout and its docker socket would all be within
+   * that process's reach, whatever repository the next job came from.
    */
   async buildSandbox(
     instance: number,
@@ -415,60 +423,51 @@ export class RunnerDownloader {
     const log = onLog || (() => {});
     const arcDir = this.getArcDir(version);
     const configDir = this.getConfigDir(instance);
-    const sandboxDir = this.getSandboxDir(instance);
 
     if (!fs.existsSync(arcDir)) {
       throw new Error(`Runner version ${version} not downloaded. Please download first.`);
     }
 
-    // Remove existing sandbox via rename + background delete (fast and reliable)
-    if (fs.existsSync(sandboxDir)) {
-      const trashDir = `${sandboxDir}.trash.${Date.now()}`;
-      try {
-        fs.renameSync(sandboxDir, trashDir);
-        log('info', `Moved sandbox to trash for background cleanup`);
-        // Delete in background (fire and forget)
-        fs.promises.rm(trashDir, { recursive: true, force: true }).catch(() => {
-          // Background cleanup - failures are non-fatal, will retry on next startup
-          // Common causes: file in use, permissions, concurrent access
-        });
-      } catch (renameErr) {
-        log('error', `Could not rename sandbox: ${(renameErr as Error).message}`);
-        throw new Error(`Failed to clean sandbox for instance ${instance}: ${(renameErr as Error).message}`);
+    // Made here, not found: mkdir without recursive refuses a name that
+    // already exists, so nothing an earlier start left is built into. The id
+    // is short because the docker socket goes inside, and macOS caps a unix
+    // socket path at 104 bytes.
+    const sandboxBase = this.getSandboxBase();
+    await fs.promises.mkdir(sandboxBase, { recursive: true });
+    const sandboxDir = path.join(sandboxBase, `${instance}-${crypto.randomBytes(6).toString('hex')}`);
+    await fs.promises.mkdir(sandboxDir);
+
+    try {
+      // Copy arc to sandbox
+      log('info', `Copying arc to sandbox...`);
+      const copyStart = Date.now();
+      await this.copyVerifiedArc(version, sandboxDir, log);
+      log('info', `Arc copy completed in ${Date.now() - copyStart}ms`);
+
+      // Verify critical files exist
+      const criticalFiles = ['run.sh', 'bin/Runner.Listener'];
+      for (const file of criticalFiles) {
+        const filePath = path.join(sandboxDir, file);
+        if (!fs.existsSync(filePath)) {
+          throw new Error(`Critical file missing after copy: ${file}`);
+        }
       }
-    }
 
-    // Verify sandbox directory is gone (should always be true after sync rm or rename)
-    if (fs.existsSync(sandboxDir)) {
-      log('error', `Sandbox still exists after cleanup: ${sandboxDir}`);
-      throw new Error(`Failed to clean sandbox for instance ${instance}: directory still exists`);
-    }
-
-    // Copy arc to sandbox
-    log('info', `Copying arc to sandbox...`);
-    const copyStart = Date.now();
-    await this.copyVerifiedArc(version, sandboxDir, log);
-    log('info', `Arc copy completed in ${Date.now() - copyStart}ms`);
-
-    // Verify critical files exist
-    const criticalFiles = ['run.sh', 'bin/Runner.Listener'];
-    for (const file of criticalFiles) {
-      const filePath = path.join(sandboxDir, file);
-      if (!fs.existsSync(filePath)) {
-        throw new Error(`Critical file missing after copy: ${file}`);
+      // Copy the runner's settings into the sandbox - and only those. The job
+      // can read its sandbox, so the registration's key (.credentials_rsaparams)
+      // and .credentials never go in, even when a legacy registration or an
+      // earlier version left them in the config dir. The worker is given a key
+      // made for its start by startInstance instead.
+      for (const file of SANDBOX_CONFIG_FILES) {
+        const srcPath = path.join(configDir, file);
+        if (fs.existsSync(srcPath) && (await fs.promises.stat(srcPath)).isFile()) {
+          await fs.promises.copyFile(srcPath, path.join(sandboxDir, file));
+        }
       }
-    }
-
-    // Copy the runner's settings into the sandbox - and only those. The job
-    // can read its sandbox, so the registration's key (.credentials_rsaparams)
-    // and .credentials never go in, even when a legacy registration or an
-    // earlier version left them in the config dir. The worker is given a key
-    // made for its start by startInstance instead.
-    for (const file of SANDBOX_CONFIG_FILES) {
-      const srcPath = path.join(configDir, file);
-      if (fs.existsSync(srcPath) && (await fs.promises.stat(srcPath)).isFile()) {
-        await fs.promises.copyFile(srcPath, path.join(sandboxDir, file));
-      }
+    } catch (err) {
+      // Nothing has run in it, so a half-built sandbox is only clutter.
+      await fs.promises.rm(sandboxDir, { recursive: true, force: true }).catch(() => undefined);
+      throw err;
     }
 
     // _work is left for the runner to create inside this fresh sandbox. A
@@ -478,11 +477,28 @@ export class RunnerDownloader {
   }
 
   /**
-   * Save config files from sandbox to persistent config directory.
-   * Should be called after configuration completes.
+   * Remove a sandbox buildSandbox made, once nothing runs in it. Refuses any
+   * other path, since this deletes a whole tree. One left behind - the app
+   * quit first, or something of its job outlived every sweep - goes at the
+   * next startup.
    */
-  async saveConfig(instance: number): Promise<void> {
-    const sandboxDir = this.getSandboxDir(instance);
+  async removeSandbox(sandboxDir: string): Promise<void> {
+    const base = this.getSandboxBase();
+    if (
+      path.resolve(sandboxDir) !== sandboxDir ||
+      path.dirname(sandboxDir) !== base ||
+      !/^\d+-[0-9a-f]+$/.test(path.basename(sandboxDir))
+    ) {
+      throw new Error(`Refusing to remove ${sandboxDir}: not a sandbox in ${base}`);
+    }
+    await fs.promises.rm(sandboxDir, { recursive: true, force: true });
+  }
+
+  /**
+   * Save config files from the sandbox registration ran in to the persistent
+   * config directory. Should be called after configuration completes.
+   */
+  async saveConfig(instance: number, sandboxDir: string): Promise<void> {
     const configDir = this.getConfigDir(instance);
 
     const configFiles = ['.runner', '.credentials', '.credentials_rsaparams'];
@@ -597,8 +613,29 @@ export class RunnerDownloader {
       // Fallback logging when no callback provided - should rarely happen in practice
     });
 
-    // Build fresh sandbox from arc
+    // Build fresh sandbox from arc: this registration's own, removed once its
+    // settings are saved.
     const sandboxDir = await this.buildSandbox(instance, version);
+    try {
+      await this.runConfigScript(instance, sandboxDir, options, log);
+
+      // Save config files to persistent location
+      await this.saveConfig(instance, sandboxDir);
+    } finally {
+      await this.removeSandbox(sandboxDir).catch(() => undefined);
+    }
+
+    // Modify .runner to route through local broker proxy if enabled
+    await this.configureForBrokerProxy(instance, options.onLog);
+  }
+
+  /** Register an instance by running config.sh in the sandbox built for it. */
+  private async runConfigScript(
+    instance: number,
+    sandboxDir: string,
+    options: { url: string; token: string; name: string; labels: string[]; workFolder?: string },
+    log: (level: 'info' | 'error', message: string) => void
+  ): Promise<void> {
     const configScript = path.join(sandboxDir, 'config.sh');
 
     if (!fs.existsSync(configScript)) {
@@ -654,12 +691,6 @@ export class RunnerDownloader {
         reject(err);
       });
     });
-
-    // Save config files to persistent location
-    await this.saveConfig(instance);
-
-    // Modify .runner to route through local broker proxy if enabled
-    await this.configureForBrokerProxy(instance, options.onLog);
   }
 
   /**
@@ -695,13 +726,7 @@ export class RunnerDownloader {
 
       await fs.promises.writeFile(runnerConfigPath, JSON.stringify(runnerConfig, null, 2));
       log('info', `Configured instance ${instance} to use broker proxy`);
-
-      // Also update sandbox copy
-      const sandboxDir = this.getSandboxDir(instance);
-      const sandboxRunnerPath = path.join(sandboxDir, '.runner');
-      if (fs.existsSync(sandboxRunnerPath)) {
-        await fs.promises.writeFile(sandboxRunnerPath, JSON.stringify(runnerConfig, null, 2));
-      }
+      // No sandbox keeps a copy to update: each start copies it from here.
     } catch (err) {
       log('error', `Failed to configure broker proxy for instance ${instance}: ${(err as Error).message}`);
     }
@@ -883,14 +908,14 @@ export class RunnerDownloader {
 
   /**
    * Clean up stale/corrupt runner configuration.
-   * Removes sandbox directories (they're rebuilt fresh on each start).
+   * Removes sandbox directories (each start builds one of its own).
    * Validates config directories have required files.
    * @param onLog - Optional logging callback
    */
   async cleanupStaleConfiguration(onLog?: (message: string) => void): Promise<void> {
     const log = onLog || (() => {});
 
-    const sandboxBase = path.join(this.baseDir, 'sandbox');
+    const sandboxBase = this.getSandboxBase();
     if (fs.existsSync(sandboxBase)) {
       log('Cleaning up stale sandbox directories...');
 

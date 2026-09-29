@@ -554,12 +554,12 @@ The sandbox reduces attack surface but does not provide full containment. For un
 
 | Feature | GitHub-Hosted | localmost |
 |---------|---------------|-----------|
-| Fresh environment | New VM each job | Sandbox rebuilt fresh each start |
+| Fresh environment | New VM each job | New sandbox directory each job |
 | Filesystem isolation | VM boundary | sandbox-exec restricts writes |
 | Network isolation | VM boundary | Proxy allowlist |
 | Credential isolation | No access to host | Home directory denied |
 
-The sandbox is rebuilt fresh on each runner start and confines all writes to the job's own sandbox directory and its target's own caches. Workflows cannot modify files elsewhere on your system or exfiltrate data to non-allowlisted hosts.
+Every job gets a sandbox directory of its own, built fresh at a path no earlier job used, and its writes are confined to that directory and its target's own caches. Workflows cannot modify files elsewhere on your system or exfiltrate data to non-allowlisted hosts.
 
 ### User Filter
 

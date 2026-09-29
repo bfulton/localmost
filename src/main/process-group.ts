@@ -67,6 +67,20 @@ function escalate(pid: number, { leaderStart, startTimeOf, onLog }: Escalation):
 }
 
 /**
+ * Whether `pid`'s process group has any members this process may signal.
+ * Signal 0 delivers nothing; it only asks.
+ */
+export function groupHasMembers(pid: number): boolean {
+  if (pid <= 1 || !Number.isInteger(pid)) return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Kill anything still waiting out a grace period, now.
  *
  * Called when the app is quitting: the escalation timers are unref'd so they
