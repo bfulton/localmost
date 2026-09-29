@@ -166,6 +166,51 @@ describe('reading the cache', () => {
     expect(() => readPolicyEntry(dir, REPO)).toThrow(/repository/);
   });
 
+  describe('an entry that no longer reads is replaced, not a lockout', () => {
+    // The grammar has tightened since entries were first written, and the
+    // writer before this one was not atomic. An entry that fails today's
+    // checks made every writer throw, so a refused job recorded nothing, the
+    // app had nothing to show, and the CLI could not approve over it either:
+    // the repository stayed refused until someone deleted the file by hand.
+    const unreadable: Array<[string, () => void]> = [
+      ['an old entry the grammar no longer accepts', () =>
+        writeRaw(REPO, { repository: REPO, config: { version: 1, shared: { sockets: {} } }, cachedAt: '', approved: true })],
+      ['a truncated entry', () => {
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(policyFilePath(dir, REPO), '{"format": 2, "repository": "owner/re');
+      }],
+      ['an entry for another repository', () =>
+        writeRaw(REPO, { format: 2, repository: 'someone/else', approved: { config: WIDE, at: '' } })],
+    ];
+
+    for (const [what, write] of unreadable) {
+      it(`records a pending policy over ${what}, which can then be approved`, () => {
+        write();
+        recordPending(dir, REPO, NARROW);
+
+        // Nothing of the old entry survives: its approved slot was never
+        // trustworthy, so dropping it grants nothing.
+        const raw = JSON.parse(fs.readFileSync(policyFilePath(dir, REPO), 'utf-8'));
+        expect(raw).toEqual({ format: 2, repository: REPO, pending: { config: NARROW, at: expect.any(String) } });
+        expect(listPolicyEntries(dir).map((e) => e.repository)).toEqual([REPO]);
+
+        approvePending(dir, REPO, approvalStamp(REPO, NARROW));
+        expect(readPolicyEntry(dir, REPO)?.approved?.config).toEqual(NARROW);
+      });
+
+      it(`approves a policy directly over ${what}`, () => {
+        write();
+        approveConfig(dir, REPO, NARROW);
+        expect(readPolicyEntry(dir, REPO)).toEqual({ repository: REPO, approved: { config: NARROW, at: expect.any(String) } });
+      });
+
+      it(`has nothing pending to reject in ${what}`, () => {
+        write();
+        expect(rejectPending(dir, REPO)).toBeUndefined();
+      });
+    }
+  });
+
   it('matches the repository without regard to case, as GitHub does', () => {
     recordPending(dir, 'Owner/Repo', NARROW);
     expect(readPolicyEntry(dir, 'owner/repo')?.pending?.config).toEqual(NARROW);

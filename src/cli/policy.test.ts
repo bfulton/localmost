@@ -10,7 +10,7 @@ jest.mock('../shared/paths', () => ({ getAppDataDirWithoutElectron: () => dataDi
 jest.mock('../shared/workspace', () => ({ getRepositoryFromDir: () => 'owner/my.repo' }));
 
 import { parsePolicyArgs, printPolicy, runPolicy } from './policy';
-import { approvalStamp, readPolicyEntry, recordPending } from '../shared/policy-store';
+import { approvalStamp, policyFilePath, readPolicyEntry, recordPending } from '../shared/policy-store';
 import { parseLocalmostrcContent } from '../shared/localmostrc';
 
 describe('CLI policy command', () => {
@@ -225,5 +225,44 @@ describe('policy approve', () => {
     const entry = readPolicyEntry(policiesDir, REPO)!;
     expect(entry.approved?.config.level).toBe('permissive');
     expect(entry.pending?.config).toEqual(other);
+  });
+
+  it('approves over a cache entry that no longer reads', () => {
+    // An entry from an older grammar used to make approving throw, and the
+    // only way to approve the repository again was deleting it by hand.
+    fs.mkdirSync(policiesDir, { recursive: true });
+    fs.writeFileSync(
+      policyFilePath(policiesDir, REPO),
+      JSON.stringify({ repository: REPO, config: { version: 1, shared: { sockets: {} } }, cachedAt: '', approved: true })
+    );
+    writeRc(PERMISSIVE);
+    run('--stamp', stampOf(PERMISSIVE));
+
+    expect(exitSpy).not.toHaveBeenCalled();
+    expect(readPolicyEntry(policiesDir, REPO)?.approved?.config.level).toBe('permissive');
+  });
+
+  it('says why an approval could not be written, rather than crashing', () => {
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(policiesDir, 'not a directory');
+    writeRc(PERMISSIVE);
+    try {
+      expect(() => run('--stamp', stampOf(PERMISSIVE))).toThrow('exit 1');
+      expect(output.join('\n')).toMatch(/Could not approve/);
+    } finally {
+      fs.rmSync(policiesDir, { force: true });
+    }
+  });
+
+  it('keeps an approval whose decision could not be logged, and says so', () => {
+    // The approval is already written by then; failing the command would say
+    // it had not happened.
+    fs.mkdirSync(path.join(policiesDir, 'decisions.log'), { recursive: true });
+    writeRc(PERMISSIVE);
+    run('--stamp', stampOf(PERMISSIVE));
+
+    expect(exitSpy).not.toHaveBeenCalled();
+    expect(readPolicyEntry(policiesDir, REPO)?.approved?.config.level).toBe('permissive');
+    expect(output.join('\n')).toMatch(/Could not record/);
   });
 });

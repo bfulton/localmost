@@ -275,8 +275,19 @@ function handleApprove(options: PolicyOptions): void {
   }
 
   const dir = getPolicyCacheDir();
-  approveConfig(dir, repository, config);
-  recordPolicyDecision(dir, { repository, decision: 'approved', stamp, via: 'cli' });
+  try {
+    approveConfig(dir, repository, config);
+  } catch (err) {
+    console.log(`${colors.red}Could not approve the policy for ${repository}:${colors.reset} ${(err as Error).message}`);
+    process.exit(1);
+  }
+  // The approval is written by now, so a log that cannot be written is
+  // reported rather than made to look as if the approval failed.
+  try {
+    recordPolicyDecision(dir, { repository, decision: 'approved', stamp, via: 'cli' });
+  } catch (err) {
+    console.log(`${colors.yellow}Could not record the decision in decisions.log: ${(err as Error).message}${colors.reset}`);
+  }
 
   console.log(`${colors.green}\u2713${colors.reset} Approved policy for ${repository}`);
   console.log('The runner will apply it to the next job from this repository.');

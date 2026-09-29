@@ -174,6 +174,31 @@ describe('a pending policy does not displace the approved one', () => {
     expect(decidePolicyForJob(REPO, POLICY, SHA).action).toBe('needs-approval');
   });
 
+  it('records a refused job over an entry that does not validate, so it can be approved', () => {
+    // recordPendingPolicy threw on such an entry, so the job was refused as
+    // "could not verify", nothing was left to approve, and every later job
+    // was refused the same way until someone deleted the file.
+    fs.mkdirSync(path.join(tmpRoot, 'policies'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpRoot, 'policies', 'owner_repo.json'),
+      JSON.stringify({ repository: REPO, config: { version: 1, shared: { sockets: {} } }, approved: true, cachedAt: '' })
+    );
+    const decision = decidePolicyForJob(REPO, POLICY, SHA);
+    if (decision.action !== 'needs-approval') throw new Error('expected approval request');
+
+    recordPendingPolicy(REPO, decision.request.newConfig);
+    approvePolicy(REPO, approvalStamp(REPO, decision.request.newConfig));
+    expect(decidePolicyForJob(REPO, POLICY, SHA)).toEqual({ action: 'allow', reason: 'unchanged' });
+  });
+
+  it('records no decision when there was nothing to reject', () => {
+    approve({ version: 1, level: 'moderate' });
+    expect(() => rejectPolicy(REPO)).toThrow(/nothing waiting/);
+
+    const log = fs.readFileSync(path.join(tmpRoot, 'policies', 'decisions.log'), 'utf-8').trim().split('\n');
+    expect(log.map((line) => JSON.parse(line).decision)).toEqual(['approved']);
+  });
+
   it('still applies an approval written in the format before the split', () => {
     fs.mkdirSync(path.join(tmpRoot, 'policies'), { recursive: true });
     fs.writeFileSync(

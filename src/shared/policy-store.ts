@@ -162,6 +162,24 @@ export function readPolicyEntry(dir: string, repository: string): PolicyEntry | 
 }
 
 /**
+ * Read an entry in order to change it. One that cannot be trusted is replaced
+ * rather than refused: it grants nothing already, and refusing meant nothing
+ * could ever be recorded or approved over it, so the repository stayed locked
+ * out until someone deleted the file by hand. Its approved slot is dropped
+ * with it, which fails closed. A name that is not a repository still throws.
+ */
+function readEntryToChange(dir: string, repository: string): PolicyEntry {
+  const filePath = policyFilePath(dir, repository);
+  if (!fs.existsSync(filePath)) return { repository };
+  const text = fs.readFileSync(filePath, 'utf-8');
+  try {
+    return parseEntry(JSON.parse(text), repository);
+  } catch {
+    return { repository };
+  }
+}
+
+/**
  * Write an entry, or remove it once it holds nothing. Written to a temporary
  * file and renamed, so a reader never sees half an entry.
  */
@@ -205,7 +223,7 @@ export function listPolicyEntries(dir: string): PolicyEntry[] {
  * exactly as it was: it stays in force until a reviewer approves another.
  */
 export function recordPending(dir: string, repository: string, config: LocalmostrcConfig): void {
-  const entry = readPolicyEntry(dir, repository) ?? { repository };
+  const entry = readEntryToChange(dir, repository);
   entry.pending = { config, at: new Date().toISOString() };
   writePolicyEntry(dir, entry);
 }
@@ -214,8 +232,8 @@ export function recordPending(dir: string, repository: string, config: Localmost
  * Approve the pending policy, provided it is still the one the reviewer saw.
  */
 export function approvePending(dir: string, repository: string, stamp: string): LocalmostrcConfig {
-  const entry = readPolicyEntry(dir, repository);
-  if (!entry?.pending) {
+  const entry = readEntryToChange(dir, repository);
+  if (!entry.pending) {
     throw new Error(`There is nothing waiting for approval for ${repository}`);
   }
   if (approvalStamp(repository, entry.pending.config) !== stamp) {
@@ -234,7 +252,7 @@ export function approvePending(dir: string, repository: string, stamp: string): 
  */
 export function approveConfig(dir: string, repository: string, config: LocalmostrcConfig): string {
   const stamp = approvalStamp(repository, config);
-  const entry = readPolicyEntry(dir, repository) ?? { repository };
+  const entry = readEntryToChange(dir, repository);
   entry.approved = { config, at: new Date().toISOString() };
   if (entry.pending && approvalStamp(repository, entry.pending.config) === stamp) {
     delete entry.pending;
@@ -248,8 +266,8 @@ export function approveConfig(dir: string, repository: string, config: Localmost
  * stamp of what was dropped, for the record.
  */
 export function rejectPending(dir: string, repository: string): string | undefined {
-  const entry = readPolicyEntry(dir, repository);
-  if (!entry?.pending) return undefined;
+  const entry = readEntryToChange(dir, repository);
+  if (!entry.pending) return undefined;
   const stamp = approvalStamp(repository, entry.pending.config);
   delete entry.pending;
   writePolicyEntry(dir, entry);

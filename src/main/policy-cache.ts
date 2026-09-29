@@ -99,6 +99,8 @@ export function approvePolicy(repository: string, stamp: string): void {
  */
 export function rejectPolicy(repository: string): void {
   const stamp = rejectPending(getPolicyCacheDir(), repository);
+  // A decision about nothing would be noise in the audit log.
+  if (!stamp) throw new Error(`There is nothing waiting for approval for ${repository}`);
   recordPolicyDecision(repository, 'rejected', stamp);
   log.info(`Rejected pending policy for ${repository}`);
 }
