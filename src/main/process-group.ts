@@ -15,7 +15,7 @@
  */
 
 /** How long a process gets to handle SIGTERM before SIGKILL. */
-const GRACE_MS = 10_000;
+export const GRACE_MS = 10_000;
 
 /** Escalations still waiting out their grace period, by process group. */
 const pendingEscalations = new Map<number, NodeJS.Timeout>();

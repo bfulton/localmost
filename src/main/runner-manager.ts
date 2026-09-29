@@ -1,5 +1,6 @@
 import { ChildProcess } from 'child_process';
-import { processStartTime } from './runner-cleanup';
+import { processStartTime, markerHolders, signalOrphanPids, parsePidRecord } from './runner-cleanup';
+import { GRACE_MS } from './process-group';
 import * as path from 'path';
 import { createHash, randomBytes } from 'crypto';
 import * as fs from 'fs';
@@ -40,6 +41,8 @@ interface RunnerInstance {
    * the approved policy must not serve a job under it.
    */
   policyStamp?: string;
+  /** This spawn's marker file, held open by the worker's tree; see createMarker. */
+  markerPath?: string;
   /** Set when a claim found the approved policy had moved; the worker stays constrained. */
   policyDrifted?: boolean;
   /**
@@ -613,6 +616,10 @@ export class RunnerManager {
     // Show 'starting' status immediately while we do setup
     this.startedAt = new Date().toISOString();
     this.updateStatus('starting');
+    // As in initialize(): the previous pool's records go before the sweep,
+    // so a worker the broker spawns during it is not dropped with them.
+    this.instances.clear();
+    this.startingInstances.clear();
 
     if (!this.downloader.isDownloaded()) {
       this.startedAt = null;
@@ -643,12 +650,14 @@ export class RunnerManager {
     const displayName = this.getStatusDisplayName();
     this.log('info', `Starting runner pool (max ${this.runnerCount}, ${displayName})...`);
 
-    this.instances.clear();
-    this.startingInstances.clear();
     this.stopping = false;
 
-    // Start with just 1 runner - will scale up dynamically
-    await this.startInstance(1);
+    // Start with just 1 runner - will scale up dynamically. Unless a job
+    // already brought one up during the sweep: spawning over it would orphan
+    // that worker, whose exit is gated on it still being the slot's.
+    if (!this.instances.has(1) && !this.startingInstances.has(1)) {
+      await this.startInstance(1);
+    }
 
     this.updateStatus('listening');
   }
@@ -658,8 +667,21 @@ export class RunnerManager {
    * Used for on-demand worker spawning where broker proxy triggers worker starts.
    */
   async initialize(): Promise<void> {
+    // Mirrors start(): a second initialize while workers are live (a Start
+    // click overlapping auto-start) would re-run the stale-process sweep
+    // against them.
+    if (this.isRunning()) {
+      this.log('info', 'Runner is already running');
+      return;
+    }
     this.startedAt = new Date().toISOString();
     this.updateStatus('starting');
+    // The previous pool's records go now, not after the sweep: the broker is
+    // already handing out jobs, and a worker spawned during the sweep must
+    // not be forgotten with them - its exit is identity-gated, so nothing
+    // would ever finalize it.
+    this.instances.clear();
+    this.startingInstances.clear();
 
     if (!this.isConfigured()) {
       this.startedAt = null;
@@ -684,8 +706,6 @@ export class RunnerManager {
     const displayName = this.getStatusDisplayName();
     this.log('info', `Runner manager initialized (max ${this.runnerCount}, ${displayName})`);
 
-    this.instances.clear();
-    this.startingInstances.clear();
     this.stopping = false;
 
     // Don't start any instances - workers will be spawned on demand
@@ -1147,15 +1167,45 @@ export class RunnerManager {
       env.TEMP = jobTmp;
       env.RUNNER_TEMP = jobTmp;
 
-      instance.process = spawnSandboxed(runnerBinary, ['--once'], {
-        cwd: sandboxDir,
-        env,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        // Create a new process group so we can kill all child processes
-        detached: true,
-        filesystemPolicy,
-        dockerSocket: dockerSocketPath,
-      });
+      // A per-spawn marker file, held open by the worker and by what it starts
+      // through its bash and .NET layers (run.sh, Listener, Worker, `run:` step
+      // shells and what they exec): those inherit the descriptor and keep it
+      // for as long as they live, even after the worker leader has exited. A
+      // later sweep can then find exactly this spawn's survivors with lsof -
+      // something a pid or pgid cannot do safely once the leader is gone, since
+      // either may have been reused. Passed as fd 3; the runner never touches
+      // it. Not inherited by children that Node or Python spawn (both close
+      // inherited fds), so those are reached only via the process group while
+      // the leader lives - see markerHolders.
+      let markerPath: string | undefined;
+      let markerFd: number | undefined;
+      try {
+        markerPath = this.createMarker(instanceNum);
+        instance.markerPath = markerPath;
+        markerFd = fs.openSync(markerPath, 'r');
+      } catch (err) {
+        // Bookkeeping, not a prerequisite: without a marker this spawn's
+        // stragglers are reachable only through its process group, as before.
+        this.log('warn', `Could not create marker for instance ${instanceNum}: ${(err as Error).message}`);
+      }
+
+      try {
+        instance.process = spawnSandboxed(runnerBinary, ['--once'], {
+          cwd: sandboxDir,
+          env,
+          stdio: markerFd !== undefined ? ['ignore', 'pipe', 'pipe', markerFd] : ['ignore', 'pipe', 'pipe'],
+          // Create a new process group so we can kill all child processes
+          detached: true,
+          filesystemPolicy,
+          dockerSocket: dockerSocketPath,
+        });
+      } finally {
+        // The child holds its own copy; this process must not, or lsof would
+        // list the app itself as a member of every worker's tree.
+        if (markerFd !== undefined) {
+          try { fs.closeSync(markerFd); } catch { /* already closed */ }
+        }
+      }
       instance.policyStamp = filesystemPolicy.stamp;
 
       // Don't set 'listening' until we see "Listening for Jobs". Until then
@@ -1169,11 +1219,13 @@ export class RunnerManager {
         try {
           const pidDir = this.pidDir();
           fs.mkdirSync(pidDir, { recursive: true });
-          // "<pid> <start time>": the start time lets a later sweep tell this
-          // worker from a stranger that inherited its pid after a crash.
+          // Line one "<pid> <start time>": the start time lets a later sweep
+          // tell this worker from a stranger that inherited its pid after a
+          // crash. Line two: the spawn's marker file, which names the tree's
+          // survivors even once the leader is gone.
           const started = processStartTime(instance.process.pid);
-          const record = started ? `${instance.process.pid} ${started}` : instance.process.pid.toString();
-          fs.writeFileSync(path.join(pidDir, `${instanceNum}.pid`), record);
+          const first = started ? `${instance.process.pid} ${started}` : instance.process.pid.toString();
+          fs.writeFileSync(path.join(pidDir, `${instanceNum}.pid`), markerPath ? `${first}\n${markerPath}\n` : `${first}\n`);
         } catch (err) {
           this.log('warn', `Could not write pid file for instance ${instanceNum}: ${(err as Error).message}`);
         }
@@ -1295,6 +1347,11 @@ export class RunnerManager {
       // in the (unstarted) runner config. Revoke it, or a valid credential
       // outlives a worker that never came up.
       this.revokeBrokerUrl?.(instanceNum);
+      // Nothing started, so nothing holds the marker; remove it now.
+      if (instance.markerPath) {
+        try { fs.unlinkSync(instance.markerPath); } catch { /* already gone */ }
+        instance.markerPath = undefined;
+      }
     }
   }
 
@@ -1519,17 +1576,9 @@ export class RunnerManager {
       onLog: (message) => this.log('warn', `[instance ${instanceNum}] ${message}`),
     });
     this.abandonJobFor(instanceNum);
-    // The exit handler is the other revocation site, but a --once worker that
-    // never acquired a job never exits, and releaseInstanceSlot below deletes
-    // the instance so the exit handler would skip it. Revoke the key and drop
-    // the pid file here, or the reaped worker's broker URL stays valid and its
-    // pid file lingers for a later startup sweep, both until the slot is reused.
-    this.revokeBrokerUrl?.(instanceNum);
-    try {
-      fs.unlinkSync(path.join(this.pidDir(), `${instanceNum}.pid`));
-    } catch {
-      // Already gone, or never written.
-    }
+    // A --once worker that never acquired a job never exits, so the exit
+    // handler's cleanup would not run; releaseInstanceSlot finalizes the
+    // instance (key, pid file, marker) itself.
     this.releaseInstanceSlot(instanceNum);
   }
 
@@ -1539,13 +1588,126 @@ export class RunnerManager {
    * clearing the pool - so a stopped or gone worker never leaves a usable /w/
    * credential or a stale pid record behind. Idempotent.
    */
-  private finalizeInstance(instanceNum: number): void {
+  private finalizeInstance(instanceNum: number, ownedMarker?: string): void {
     this.revokeBrokerUrl?.(instanceNum);
+    const pidFile = path.join(this.pidDir(), `${instanceNum}.pid`);
+    const instance = this.instances.get(instanceNum);
+    let markerPath = ownedMarker ?? instance?.markerPath;
+    if (!markerPath) {
+      try {
+        const recorded = parsePidRecord(fs.readFileSync(pidFile, 'utf-8')).markerPath;
+        // The record is app-owned, but a marker is only ever one of ours.
+        if (recorded && this.isMarkerPath(recorded)) markerPath = recorded;
+      } catch {
+        // No record, or no marker in it.
+      }
+    }
     try {
-      fs.unlinkSync(path.join(this.pidDir(), `${instanceNum}.pid`));
+      fs.unlinkSync(pidFile);
     } catch {
       // Already gone, or never written.
     }
+    // Ownership ends here, whichever path got here first: the exit handler
+    // and releaseInstanceSlot both finalize a clean exit, and a later sweep
+    // must see this marker as a finished spawn's, not a running worker's.
+    if (instance && markerPath && instance.markerPath === markerPath) instance.markerPath = undefined;
+    if (markerPath) this.settleMarker(markerPath);
+  }
+
+  /**
+   * How long after a worker is finalized before its marker is swept: past
+   * the exit sweep's own SIGKILL, so what still holds it then has left the
+   * process group.
+   */
+  private static readonly MARKER_SETTLE_MS = GRACE_MS + 2000;
+  /** Markers with a settle sweep pending, so a second finalize of the same exit does not arm another. */
+  private readonly settlingMarkers = new Set<string>();
+
+  /**
+   * Sweep a finished worker's marker once the exit sweep's escalation has
+   * run. Whatever still holds it then has escaped the process group - the
+   * case the marker exists for - and is signalled by exact pid. Unref'd: it
+   * must not keep the app alive; if the app quits first the marker simply
+   * survives to the startup sweep.
+   */
+  private settleMarker(markerPath: string): void {
+    if (this.settlingMarkers.has(markerPath)) return;
+    this.settlingMarkers.add(markerPath);
+    const timer = setTimeout(() => {
+      this.settlingMarkers.delete(markerPath);
+      this.sweepMarker(markerPath, 2000)
+        .then((outcome) => {
+          if (outcome === 'kept') this.log('info', `${path.basename(markerPath)} kept for the next sweep`);
+        })
+        .catch((err) => this.log('warn', `Sweep of ${path.basename(markerPath)} failed: ${(err as Error).message}`));
+    }, RunnerManager.MARKER_SETTLE_MS);
+    timer.unref();
+  }
+
+  /** Pids of the workers this manager is running now. */
+  private livePids(): Set<number> {
+    const pids = new Set<number>();
+    for (const instance of this.instances.values()) {
+      if (instance.process?.pid) pids.add(instance.process.pid);
+    }
+    return pids;
+  }
+
+  /** Whether a worker this manager is running now owns the marker. */
+  private ownsMarker(markerPath: string): boolean {
+    for (const instance of this.instances.values()) {
+      if (instance.process?.pid && instance.markerPath === markerPath) return true;
+    }
+    return false;
+  }
+
+  /** Whether a path is one of this manager's marker files, by location and name. */
+  private isMarkerPath(p: string): boolean {
+    return path.dirname(p) === this.pidDir() && /^\d+-[0-9a-f]+\.mark$/.test(path.basename(p));
+  }
+
+  /**
+   * Reap whatever still holds a finished spawn's marker, then remove the
+   * marker once nothing does. A marker a running worker owns, or whose
+   * holders include a running worker, is left entirely alone - no signal, no
+   * unlink: its holders are that job's Listener, Worker and steps, and the
+   * marker is how a later sweep would find them if the app died. A marker
+   * whose holders cannot be determined, or that is still held after the
+   * escalation, is kept: it is the one reuse-proof handle a later sweep has
+   * on those survivors.
+   */
+  private async sweepMarker(markerPath: string, graceMs: number): Promise<'released' | 'kept' | 'owned'> {
+    if (this.ownsMarker(markerPath)) return 'owned';
+    const holders = await markerHolders(markerPath, (m) => this.log('warn', m));
+    if (holders === null) return 'kept';
+    // Decided after the wait, not before it: a worker that spawned meanwhile
+    // is live, and a pid it holds is not ours to signal.
+    if (this.ownsMarker(markerPath) || holders.some((pid) => this.livePids().has(pid))) return 'owned';
+    let remaining: number[] | null = holders;
+    if (holders.length > 0) {
+      const result = await signalOrphanPids(holders, (m) => this.log('info', m), graceMs, () => markerHolders(markerPath));
+      remaining = result.remaining;
+    }
+    if (remaining !== null && remaining.length === 0) {
+      await fs.promises.unlink(markerPath).catch(() => undefined);
+      return 'released';
+    }
+    return 'kept';
+  }
+
+  /**
+   * Create this spawn's marker file and return its path. Nothing else is
+   * touched: the nonce makes each marker unique, and deletion belongs to
+   * finalizeInstance (once nothing holds it) and to the startup sweeps, which
+   * are the only ones that can tell a crash leftover with live survivors from
+   * an empty file.
+   */
+  private createMarker(instanceNum: number): string {
+    const pidDir = this.pidDir();
+    fs.mkdirSync(pidDir, { recursive: true });
+    const markerPath = path.join(pidDir, `${instanceNum}-${randomBytes(8).toString('hex')}.mark`);
+    fs.writeFileSync(markerPath, '');
+    return markerPath;
   }
 
   private releaseInstanceSlot(instanceNum: number): void {
@@ -1555,23 +1717,20 @@ export class RunnerManager {
       instance.status = 'offline';
     }
     this.instances.delete(instanceNum);
+    const markerPath = instance?.markerPath;
     // The context describes the job this slot just finished. Left behind, the
     // next worker to take the slot is judged against the previous repository -
     // its docker socket refuses the job it is actually running, and a spawn
     // that records no context of its own would resolve the previous
     // repository's filesystem policy.
     this.pendingTargetContext.delete(String(instanceNum));
-    // Freeing the slot is the one point every finished worker passes through -
-    // job complete calls it directly, before the process even emits exit, so
-    // the exit handler's identity-gated cleanup is skipped. Revoke the broker
-    // key and drop the pid file here, or a completed worker's URL stays usable
-    // and its pid file lingers for a startup sweep until the slot is reused.
-    this.revokeBrokerUrl?.(instanceNum);
-    try {
-      fs.unlinkSync(path.join(this.pidDir(), `${instanceNum}.pid`));
-    } catch {
-      // Already gone, or never written.
-    }
+    // Freeing the slot is the one point every finished worker passes through:
+    // a clean exit and the reap of a worker that never took its job both end
+    // here, and the reaped worker never exits on its own. Finalize here -
+    // revoke the broker key, drop the pid file, settle the marker - or a
+    // finished worker's URL stays usable and its records linger until the
+    // slot is reused. Idempotent with the exit handler's own call.
+    this.finalizeInstance(instanceNum, markerPath);
     this.updateAggregateStatus();
   }
 
@@ -2376,20 +2535,27 @@ export class RunnerManager {
    * whole group, so a stale or planted file must never reach them.
    */
   private sweepablePid(raw: string, live: Set<number>): number | null {
-    // Format is "<pid> <start time>".
-    const trimmed = raw.trim();
-    const sep = trimmed.search(/\s/);
-    const pidStr = sep === -1 ? trimmed : trimmed.slice(0, sep);
-    const recordedStart = sep === -1 ? '' : trimmed.slice(sep + 1).trim();
-    // Digits only: parseInt would take '1234junk' as 1234.
-    if (!/^\d+$/.test(pidStr)) return null;
-    const pid = Number(pidStr);
-    if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid || live.has(pid)) return null;
+    // Line one is "<pid> <start time>"; line two, if present, the marker path,
+    // which the marker sweep handles separately. Digits-only pid: parseInt
+    // would take '1234junk' as 1234.
+    const { pid, recordedStart } = parsePidRecord(raw);
+    if (pid === null || pid <= 1 || pid === process.pid || live.has(pid)) return null;
     // The pid must still belong to the process this app recorded. A missing
     // record or a start-time mismatch means the pid was reused, so it is not
     // ours to signal.
     if (recordedStart === '' || processStartTime(pid) !== recordedStart) return null;
     return pid;
+  }
+
+  /** Marker files left in the pid directory by spawns that were never finalized. */
+  private async readMarkers(): Promise<string[]> {
+    const pidDir = this.pidDir();
+    if (!fs.existsSync(pidDir)) return [];
+    const entries = await fs.promises.readdir(pidDir, { withFileTypes: true });
+    if (!Array.isArray(entries)) return [];
+    return entries
+      .filter((entry) => !entry.isDirectory() && /^\d+-[0-9a-f]+\.mark$/.test(entry.name))
+      .map((entry) => path.join(pidDir, entry.name));
   }
 
   /** The pid files this manager wrote, as [absolute path, pid string]. */
@@ -2434,12 +2600,23 @@ export class RunnerManager {
     // auto-start brought instance 1 up as pid 5748 and this killed it one
     // second later, leaving the pool empty and the runner Offline for eight
     // hours while heartbeats carried on as though nothing were wrong.
-    const live = new Set<number>();
-    for (const instance of this.instances.values()) {
-      if (instance.process?.pid) live.add(instance.process.pid);
+    // Markers first: each names the surviving holders of one spawn's
+    // descriptor, leader alive or not, so a leaderless orphan group - which
+    // the pid/start-time path below cannot verify - is reaped here. Ownership is
+    // decided per marker at the moment it is examined, never from a snapshot
+    // taken before an await: the broker is already accepting jobs while this
+    // runs, so a worker can spawn at any wait.
+    const kept: string[] = [];
+    for (const markerPath of await this.readMarkers()) {
+      if ((await this.sweepMarker(markerPath, 1000)) === 'kept') kept.push(path.basename(markerPath));
+    }
+    if (kept.length > 0) {
+      this.log('warn', `Kept ${kept.length} marker file(s) for the next sweep: ${kept.join(', ')}`);
     }
 
     for (const [pidFile, contents] of await this.readPidFiles()) {
+      // Liveness is read now, for the same reason.
+      const live = this.livePids();
       const pid = this.sweepablePid(contents, live);
       if (pid === null) {
         // Either not ours to kill, or a value we refuse to signal. Drop the
@@ -2480,17 +2657,14 @@ export class RunnerManager {
   }
 
   private async detectStaleRunnerProcesses(): Promise<void> {
-    const trackedPids = new Set<number>();
-    for (const [, instance] of this.instances) {
-      if (instance.process?.pid) trackedPids.add(instance.process.pid);
-    }
-
     const orphanedPids: number[] = [];
     try {
       for (const [pidFile, contents] of await this.readPidFiles()) {
-        const pid = this.sweepablePid(contents, trackedPids);
+        // Liveness is read now, not from a snapshot taken before the await.
+        const live = this.livePids();
+        const pid = this.sweepablePid(contents, live);
         if (pid === null) {
-          if (!trackedPids.has(parseInt(contents.trim(), 10))) {
+          if (!live.has(parseInt(contents.trim(), 10))) {
             await fs.promises.unlink(pidFile).catch(() => undefined);
           }
           continue;
@@ -2507,6 +2681,9 @@ export class RunnerManager {
         this.log('warn', `Found ${orphanedPids.length} orphaned runner process(es): ${orphanedPids.join(', ')}`);
 
         for (const pid of orphanedPids) {
+          // Verified above, but that was before an await; a worker may have
+          // spawned since.
+          if (this.livePids().has(pid)) continue;
           try {
             this.log('info', `Killing orphaned process ${pid}`);
             process.kill(pid, 'SIGTERM');

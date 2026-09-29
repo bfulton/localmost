@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
-import { killOrphanedProcesses } from './runner-cleanup';
+import { spawn } from 'child_process';
+import { killOrphanedProcesses, markerHolders, parsePidRecord, signalOrphanPids, classifyLsofFailure, lsofCanSeeOtherProcesses } from './runner-cleanup';
 
 describe('killOrphanedProcesses', () => {
   const runnerDir = path.join(os.tmpdir(), `lm-cleanup-${process.pid}`);
@@ -75,4 +76,234 @@ describe('killOrphanedProcesses', () => {
 
     expect(signalled).toEqual([]);
   });
+});
+
+describe('marker-based orphan reaping', () => {
+  const runnerDir = path.join(os.tmpdir(), `lm-marker-${process.pid}`);
+  const sandboxBase = path.join(runnerDir, 'sandbox');
+  const pidDir = path.join(runnerDir, 'pids');
+  let realKill: typeof process.kill;
+  let signalled: Array<[number, unknown]>;
+
+  beforeEach(() => {
+    fs.mkdirSync(pidDir, { recursive: true });
+    fs.mkdirSync(sandboxBase, { recursive: true });
+    signalled = [];
+    realKill = process.kill;
+    (process as unknown as { kill: unknown }).kill = ((pid: number, sig?: unknown) => {
+      signalled.push([pid, sig]);
+      return true;
+    }) as never;
+  });
+  afterEach(() => {
+    (process as unknown as { kill: unknown }).kill = realKill;
+    fs.rmSync(runnerDir, { recursive: true, force: true });
+  });
+
+  it('parses a two-line record: pid+start, then the marker path', () => {
+    expect(parsePidRecord('4242 Mon Sep 28 13:50:00 2026\n/x/pids/1-ab.mark\n')).toEqual({
+      pid: 4242, recordedStart: 'Mon Sep 28 13:50:00 2026', markerPath: '/x/pids/1-ab.mark',
+    });
+    expect(parsePidRecord('4242junk\n/x/m')).toMatchObject({ pid: null });
+    expect(parsePidRecord('4242')).toEqual({ pid: 4242, recordedStart: '', markerPath: null });
+  });
+
+  it('signals the pids holding a leftover marker, escalating only to those still holding it', async () => {
+    // Leader gone (no pid record at all) - the marker alone names survivors.
+    // 6001 lets go after SIGTERM; 6002 does not. kill(pid, 0) cannot tell
+    // 6001's exit from a stranger that inherited its pid during the grace
+    // period, so escalation goes by a second look at the marker.
+    const marker = path.join(pidDir, '1-deadbeef.mark');
+    fs.writeFileSync(marker, '');
+    const looks = [[6001, 6002], [6002], []];
+    const holdersOf = (p: string) => (p === marker ? (looks.shift() ?? []) : []);
+
+    // The boolean gates the caller's settle wait; something was signalled.
+    expect(await killOrphanedProcesses(sandboxBase, () => undefined, () => null, holdersOf)).toBe(true);
+
+    expect(signalled.filter(([, sig]) => sig === 'SIGTERM').map(([p]) => p)).toEqual([6001, 6002]);
+    expect(signalled.filter(([, sig]) => sig === 'SIGKILL').map(([p]) => p)).toEqual([6002]);
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it('force-kills a holder that appeared during the grace period', async () => {
+    // 6001 forked 6003 after SIGTERM; the child holds the marker too and goes
+    // with it - the original list would have missed it.
+    const marker = path.join(pidDir, '1-deadbeef.mark');
+    fs.writeFileSync(marker, '');
+    const looks = [[6001], [6001, 6003], []];
+
+    await killOrphanedProcesses(sandboxBase, () => undefined, () => null, (p) => (p === marker ? (looks.shift() ?? []) : []));
+
+    expect(signalled.filter(([, sig]) => sig === 'SIGTERM').map(([p]) => p)).toEqual([6001]);
+    expect(signalled.filter(([, sig]) => sig === 'SIGKILL').map(([p]) => p)).toEqual([6001, 6003]);
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it('keeps the marker, and sends no SIGKILL, when the post-grace re-check is unavailable', async () => {
+    // 6001 ignored SIGTERM and lsof then timed out. Dropping the marker here
+    // would make 6001 unreachable for good: no leader record names it.
+    const marker = path.join(pidDir, '1-deadbeef.mark');
+    fs.writeFileSync(marker, '');
+    const looks: Array<number[] | null> = [[6001], null];
+    const next = (): number[] | null => (looks.length > 0 ? looks.shift()! : []);
+
+    await killOrphanedProcesses(sandboxBase, () => undefined, () => null, (p) => (p === marker ? next() : []));
+
+    expect(signalled).toEqual([[6001, 'SIGTERM']]);
+    expect(fs.existsSync(marker)).toBe(true);
+  });
+
+  it('keeps the marker while a holder survives SIGKILL', async () => {
+    const marker = path.join(pidDir, '1-deadbeef.mark');
+    fs.writeFileSync(marker, '');
+    const looks = [[6001], [6001], [6001]];
+
+    await killOrphanedProcesses(sandboxBase, () => undefined, () => null, (p) => (p === marker ? (looks.shift() ?? []) : []));
+
+    expect(signalled.filter(([, sig]) => sig === 'SIGKILL').map(([p]) => p)).toEqual([6001]);
+    expect(fs.existsSync(marker)).toBe(true);
+  });
+
+  it('keeps a marker, and signals nothing, when it could not learn who holds it', async () => {
+    // "Unknown" is not "nobody": the marker is the only reuse-proof handle on
+    // the survivors, so a failed lsof must not cost it.
+    const marker = path.join(pidDir, '1-deadbeef.mark');
+    fs.writeFileSync(marker, '');
+    const logged: string[] = [];
+
+    await killOrphanedProcesses(sandboxBase, (m) => logged.push(m), () => null, () => null);
+
+    expect(signalled).toEqual([]);
+    expect(fs.existsSync(marker)).toBe(true);
+    expect(logged.some((m) => m.includes('1-deadbeef.mark'))).toBe(true);
+  });
+
+  it('does not force-kill blind when the marker cannot be re-checked after the grace period', async () => {
+    const logged: string[] = [];
+
+    const result = await signalOrphanPids([6001], (m) => logged.push(m), 10, () => null);
+
+    expect(signalled).toEqual([[6001, 'SIGTERM']]);
+    expect(result).toEqual({ signalled: true, remaining: null });
+    expect(logged.some((m) => /next sweep/.test(m))).toBe(true);
+  });
+
+  it('answers "nobody" for a marker that no longer exists', async () => {
+    await expect(markerHolders(path.join(pidDir, 'never-made.mark'))).resolves.toEqual([]);
+  });
+
+  it('does not remember a probe that failed', async () => {
+    // First probe-using test in this file, so the cache is empty here. A
+    // transient failure must not blind every later sweep.
+    await expect(lsofCanSeeOtherProcesses(async () => false)).resolves.toBe(false);
+    await expect(lsofCanSeeOtherProcesses()).resolves.toBe(true);
+  });
+
+  it('answers "nobody" for an existing file nothing holds', async () => {
+    const marker = path.join(pidDir, '1-0000beef.mark');
+    fs.writeFileSync(marker, '');
+    await expect(markerHolders(marker)).resolves.toEqual([]);
+  });
+
+  it('answers "unknown" for everything, and says so once, while lsof is not trusted', async () => {
+    const marker = path.join(pidDir, '1-0000beef.mark');
+    fs.writeFileSync(marker, '');
+    const logged: string[] = [];
+    const blind = async () => false;
+
+    await expect(markerHolders(marker, (m) => logged.push(m), blind)).resolves.toBeNull();
+    await expect(markerHolders(marker, (m) => logged.push(m), blind)).resolves.toBeNull();
+
+    expect(logged).toEqual(["lsof cannot see other processes' open files here; marker files are kept, not swept"]);
+  });
+
+  it('proves lsof can see other processes before trusting an empty answer', async () => {
+    await expect(lsofCanSeeOtherProcesses()).resolves.toBe(true);
+  });
+
+  it('reads a failed lsof run as holders, nobody, or unknown', () => {
+    // execFile's shapes: numeric code for an exit status, string code for a
+    // spawn failure, killed/signal for a timeout.
+    expect(classifyLsofFailure({ code: 1, stdout: '', stderr: '' })).toEqual([]);
+    expect(classifyLsofFailure({ code: 1, stdout: '4242\n4243\n', stderr: '' })).toEqual([4242, 4243]);
+    expect(classifyLsofFailure({ code: 1, stdout: '', stderr: "lsof: can't get PID byte count" })).toBeNull();
+    // Output beside an error is a partial answer, which is no answer.
+    expect(classifyLsofFailure({ code: 1, stdout: '4242\n', stderr: "lsof: can't get PID byte count" })).toBeNull();
+    expect(classifyLsofFailure({})).toBeNull();
+    expect(classifyLsofFailure({ code: 2, stdout: '', stderr: '' })).toBeNull();
+    expect(classifyLsofFailure({ code: 'ENOENT', stdout: '', stderr: '' })).toBeNull();
+    // A run that was cut off cannot vouch for what it did not print.
+    expect(classifyLsofFailure({ killed: true, signal: 'SIGTERM', code: null, stdout: '4242\n' })).toBeNull();
+    // Never itself, never pid 1, no duplicates.
+    expect(classifyLsofFailure({ code: 1, stdout: `1\n${process.pid}\n7\n7\n` })).toEqual([7]);
+  });
+
+  it('finds real survivors of a spawn by an inherited fd after the leader has exited', async () => {
+    // The mechanism itself, end to end: a "leader" opens the marker on an
+    // inherited fd, starts a child that outlives it, and exits. lsof on the
+    // marker must still name the surviving child, and the sweep must signal
+    // it - the case a pid or pgid cannot handle safely once the leader is gone.
+    const marker = path.join(pidDir, '1-0123abcd.mark');
+    fs.writeFileSync(marker, '');
+    const fd = fs.openSync(marker, 'r');
+    // Leader: a shell that starts a detached sleeper (inheriting fd 3) and exits.
+    // The sleeper keeps fd 3 but not the stdout pipe, so 'close' means the
+    // leader is gone and its output is fully read.
+    const leader = spawn('/bin/sh', ['-c', 'sleep 30 >/dev/null 2>&1 & echo $!'], { stdio: ['ignore', 'pipe', 'ignore', fd], detached: true });
+    fs.closeSync(fd);
+    const childPid = await new Promise<number>((resolve) => {
+      let out = '';
+      leader.stdout!.on('data', (d) => { out += d.toString(); });
+      leader.on('close', () => resolve(parseInt(out.trim(), 10)));
+    });
+    try {
+      // Leader is gone; only the sleeper holds the marker.
+      const holders = await markerHolders(marker);
+      expect(holders).toContain(childPid);
+      const logged: string[] = [];
+
+      await killOrphanedProcesses(sandboxBase, (m) => logged.push(m), () => null, markerHolders);
+
+      expect(signalled.some(([p, sig]) => p === childPid && sig === 'SIGTERM')).toBe(true);
+      expect(signalled.some(([p, sig]) => p === childPid && sig === 'SIGKILL')).toBe(true);
+      // The signals are stubbed, so the sleeper never went away; a real lsof
+      // says so at the final look, and the marker stays for the next sweep.
+      // (Which list the SIGKILL came from is pinned by the injected-holders
+      // tests above, not here.)
+      expect(logged.some((m) => new RegExp(`Orphans ${childPid} still hold their marker after SIGKILL`).test(m))).toBe(true);
+      expect(fs.existsSync(marker)).toBe(true);
+    } finally {
+      try { realKill(childPid, 'SIGKILL'); } catch { /* already gone */ }
+    }
+  }, 20000);
+
+  it('releases the marker once a real SIGTERM lands', async () => {
+    // Same spawn shape, with the sleeper's signals forwarded for real: it
+    // ends on SIGTERM, the re-check finds nobody, no SIGKILL is sent, and
+    // the marker goes.
+    const marker = path.join(pidDir, '1-4567abcd.mark');
+    fs.writeFileSync(marker, '');
+    const fd = fs.openSync(marker, 'r');
+    const leader = spawn('/bin/sh', ['-c', 'sleep 30 >/dev/null 2>&1 & echo $!'], { stdio: ['ignore', 'pipe', 'ignore', fd], detached: true });
+    fs.closeSync(fd);
+    const childPid = await new Promise<number>((resolve) => {
+      let out = '';
+      leader.stdout!.on('data', (d) => { out += d.toString(); });
+      leader.on('close', () => resolve(parseInt(out.trim(), 10)));
+    });
+    (process as unknown as { kill: unknown }).kill = ((pid: number, sig?: unknown) => {
+      signalled.push([pid, sig]);
+      return pid === childPid ? realKill(pid, sig as never) : true;
+    }) as never;
+    try {
+      await killOrphanedProcesses(sandboxBase, () => undefined, () => null, markerHolders);
+
+      expect(signalled).toContainEqual([childPid, 'SIGTERM']);
+      expect(signalled.some(([p, sig]) => p === childPid && sig === 'SIGKILL')).toBe(false);
+      expect(fs.existsSync(marker)).toBe(false);
+    } finally {
+      try { realKill(childPid, 'SIGKILL'); } catch { /* already gone */ }
+    }
+  }, 20000);
 });

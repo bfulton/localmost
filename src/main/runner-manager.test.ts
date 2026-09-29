@@ -35,9 +35,15 @@ jest.mock('./proxy-server', () => ({
   })),
 }));
 
-// Mock process-identity verification so tests can supply a matching start time.
+// Mock process-identity verification so tests can supply a matching start time,
+// and the marker helpers so no real lsof runs. parsePidRecord is the real one.
+const mockMarkerHolders = jest.fn((_p: string): number[] | null => []);
+const mockSignalOrphanPids = jest.fn(async (..._args: unknown[]): Promise<{ signalled: boolean; remaining: number[] | null }> => ({ signalled: true, remaining: [] }));
 jest.mock('./runner-cleanup', () => ({
   processStartTime: jest.fn(() => 'START'),
+  markerHolders: (p: string) => mockMarkerHolders(p),
+  signalOrphanPids: (...args: unknown[]) => mockSignalOrphanPids(...args),
+  parsePidRecord: jest.requireActual('./runner-cleanup').parsePidRecord,
 }));
 
 // Mock the filtering docker socket. A real one binds a unix socket inside the
@@ -62,6 +68,7 @@ jest.mock('./docker/docker-filter-proxy', () => ({
 import { RunnerManager, UNCLAIMED_WORKER_TIMEOUT_MS, JobEvent } from './runner-manager';
 import * as fs from 'fs';
 import * as path from 'path';
+import { GRACE_MS } from './process-group';
 import * as os from 'os';
 import { LogEntry, RunnerState, JobHistoryEntry } from '../shared/types';
 import { DockerPolicy } from '../shared/docker-policy';
@@ -99,6 +106,8 @@ jest.mock('fs', () => ({
   writeFileSync: jest.fn(),
   unlinkSync: jest.fn(),
   mkdirSync: jest.fn(),
+  openSync: jest.fn(() => 42),
+  closeSync: jest.fn(),
   promises: {
     mkdir: jest.fn(),
     chmod: jest.fn(),
@@ -119,6 +128,12 @@ describe('RunnerManager', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    // clearAllMocks keeps implementations; a test that failed mid-way must
+    // not leak its marker holders into the next one.
+    mockMarkerHolders.mockReset();
+    mockMarkerHolders.mockImplementation(() => []);
+    mockSignalOrphanPids.mockReset();
+    mockSignalOrphanPids.mockImplementation(async () => ({ signalled: true, remaining: [] }));
 
     mockOnLog = jest.fn();
     mockOnStatusChange = jest.fn();
@@ -1288,14 +1303,285 @@ describe('RunnerManager', () => {
         (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
           { name: '1.pid', isFile: () => true, isDirectory: () => false },
         ] as never);
-        (jest.mocked(fs.promises.readFile) as unknown as jest.Mock).mockResolvedValue('5748' as never);
+        (jest.mocked(fs.promises.readFile) as unknown as jest.Mock).mockResolvedValue('5748 START' as never);
 
         await helper.killStaleProcesses();
       } finally {
         (process as unknown as { kill: unknown }).kill = realKill;
       }
 
-      expect(killed).not.toContain(5748);
+      // The only record is the live worker's; the group signal would show as -5748.
+      expect(killed).toEqual([]);
+    });
+
+    it('decides a pid record is live at signal time, not from a snapshot taken before reading it', async () => {
+      // The worker spawns while the sweep is reading the pid directory, and
+      // its fresh record is what the sweep then examines.
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      const killed: Array<[number, unknown]> = [];
+      const realKill = process.kill;
+      (process as unknown as { kill: unknown }).kill = ((pid: number, sig?: unknown) => {
+        if (sig !== 0) killed.push([pid, sig]);
+        return true;
+      }) as never;
+      try {
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
+          { name: '1.pid', isFile: () => true, isDirectory: () => false },
+        ] as never);
+        (jest.mocked(fs.promises.readFile) as unknown as jest.Mock).mockImplementation(async () => {
+          helper.setInstance(1, { name: 'runner-1', status: 'starting', process: { pid: 5748, kill: jest.fn() } as never });
+          return '5748 START';
+        });
+
+        await helper.killStaleProcesses();
+      } finally {
+        (process as unknown as { kill: unknown }).kill = realKill;
+        (jest.mocked(fs.promises.readFile) as unknown as jest.Mock).mockReset();
+        (jest.mocked(fs.promises.readFile) as unknown as jest.Mock).mockResolvedValue('' as never);
+      }
+
+      expect(killed).toEqual([]);
+    });
+
+    it('decides a marker is owned at signal time, not from a snapshot taken before lsof', async () => {
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
+        { name: '1-cafef00d.mark', isFile: () => true, isDirectory: () => false },
+      ] as never);
+      const unlink = jest.mocked(fs.promises.unlink) as unknown as jest.Mock;
+      unlink.mockResolvedValue(undefined as never);
+      unlink.mockClear();
+      // The worker spawns while lsof is running on its (already listed) marker.
+      mockMarkerHolders.mockImplementation((p: string) => {
+        helper.setInstance(1, { name: 'runner-1', status: 'busy', process: { pid: 5001, kill: jest.fn() } as never, markerPath: p });
+        return [5001, 5002, 5003];
+      });
+
+      await helper.killStaleProcesses();
+
+      expect(mockSignalOrphanPids).not.toHaveBeenCalled();
+      expect(unlink.mock.calls.some(([f]) => String(f).endsWith('1-cafef00d.mark'))).toBe(false);
+    });
+
+    it('hands the worker a per-spawn marker fd and records the marker in its pid file', async () => {
+      // Descendants inherit fd 3 and hold it for life, so a later sweep can
+      // find exactly this spawn's survivors with lsof - even once the leader
+      // (whose pid/pgid may be reused) is gone.
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([] as never);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(7777));
+      (fs.writeFileSync as jest.Mock).mockClear();
+
+      await runnerManager.start();
+
+      const opts = mockSpawnSandboxed.mock.calls.at(-1)![2]!;
+      expect(opts.stdio).toEqual(['ignore', 'pipe', 'pipe', 42]);
+      // The app closes its own copy; only the worker's tree holds the marker.
+      expect(fs.closeSync).toHaveBeenCalledWith(42);
+      const marker = (fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => /\/pids\/1-[0-9a-f]+\.mark$/.test(String(f)));
+      expect(marker).toBeDefined();
+      expect(fs.openSync).toHaveBeenCalledWith(marker![0], 'r');
+      const record = (fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => String(f).endsWith('/pids/1.pid'));
+      expect(String(record![1])).toMatch(/^7777 START\n.*\/pids\/1-[0-9a-f]+\.mark\n$/);
+      // A previous spawn's marker may still be held; nothing removes it here.
+      expect((fs.unlinkSync as jest.Mock).mock.calls.some(([f]) => String(f).endsWith('.mark'))).toBe(false);
+    });
+
+    it('starts the worker without a marker when the marker cannot be created', async () => {
+      // Bookkeeping must not disable the runner: the spawn goes ahead with
+      // process-group coverage only, and says so.
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([] as never);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(7778));
+      (fs.writeFileSync as jest.Mock).mockImplementation((f: unknown) => {
+        if (String(f).endsWith('.mark')) throw new Error('EACCES: permission denied');
+      });
+      try {
+        await runnerManager.start();
+
+        const opts = mockSpawnSandboxed.mock.calls.at(-1)![2]!;
+        expect(opts.stdio).toEqual(['ignore', 'pipe', 'pipe']);
+        const record = (fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => String(f).endsWith('/pids/1.pid'));
+        expect(String(record![1])).toBe('7778 START\n');
+        expect(mockOnLog).toHaveBeenCalledWith(expect.objectContaining({
+          level: 'warn', message: expect.stringContaining('Could not create marker'),
+        }));
+      } finally {
+        (fs.writeFileSync as jest.Mock).mockReset();
+      }
+    });
+
+    it('reaps a leaderless orphan group through its marker, by exact surviving pids', async () => {
+      // The leader is gone (no start time to verify) but two descendants still
+      // hold the marker. The pid/start-time path would leave them; the marker
+      // path signals precisely those pids.
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
+        { name: '1-deadbeef.mark', isFile: () => true, isDirectory: () => false },
+      ] as never);
+      (jest.mocked(fs.promises.unlink) as unknown as jest.Mock).mockResolvedValue(undefined as never);
+      mockMarkerHolders.mockReturnValue([5001, 5002]);
+      mockSignalOrphanPids.mockClear();
+
+      await helper.killStaleProcesses();
+
+      expect(mockSignalOrphanPids).toHaveBeenCalledWith([5001, 5002], expect.any(Function), 1000, expect.any(Function));
+      // Escalation re-checks the marker itself, not bare liveness: the
+      // callback handed over reads this marker's holders afresh.
+      const recheck = mockSignalOrphanPids.mock.calls[0][3] as () => Promise<number[] | null>;
+      mockMarkerHolders.mockClear();
+      mockMarkerHolders.mockReturnValue([5002]);
+      expect(await recheck()).toEqual([5002]);
+      expect(mockMarkerHolders).toHaveBeenCalledWith(expect.stringMatching(/1-deadbeef\.mark$/));
+      // The marker is consumed once nothing holds it.
+      expect((jest.mocked(fs.promises.unlink) as unknown as jest.Mock).mock.calls.some(([f]) => String(f).endsWith('1-deadbeef.mark'))).toBe(true);
+      mockMarkerHolders.mockReturnValue([]);
+    });
+
+    it.each([
+      ['a holder survived', [5002] as number[] | null],
+      ['the re-check was unavailable', null as number[] | null],
+    ])('keeps a swept marker when %s', async (_why, remaining) => {
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
+        { name: '1-deadbeef.mark', isFile: () => true, isDirectory: () => false },
+      ] as never);
+      const unlink = jest.mocked(fs.promises.unlink) as unknown as jest.Mock;
+      unlink.mockResolvedValue(undefined as never);
+      unlink.mockClear();
+      mockMarkerHolders.mockReturnValue([5001, 5002]);
+      mockSignalOrphanPids.mockResolvedValueOnce({ signalled: true, remaining });
+
+      await helper.killStaleProcesses();
+
+      expect(unlink.mock.calls.some(([f]) => String(f).endsWith('1-deadbeef.mark'))).toBe(false);
+      expect(mockOnLog).toHaveBeenCalledWith(expect.objectContaining({
+        level: 'warn', message: expect.stringContaining('1-deadbeef.mark'),
+      }));
+      mockMarkerHolders.mockReturnValue([]);
+    });
+
+    it("sweeps the marker of a worker that has exited but is still in the map", async () => {
+      // A worker that exited with an error stays in the map as 'error' with no
+      // process. Its marker is a finished spawn's: whatever still holds it is
+      // a straggler, and the next Start must not mistake it for live.
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      const marker = path.join((runnerManager as unknown as { pidDir(): string }).pidDir(), '1-0badf00d.mark');
+      helper.setInstance(1, { name: 'runner-1', status: 'error', process: null, markerPath: marker });
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
+        { name: '1-0badf00d.mark', isFile: () => true, isDirectory: () => false },
+      ] as never);
+      (jest.mocked(fs.promises.unlink) as unknown as jest.Mock).mockResolvedValue(undefined as never);
+      mockMarkerHolders.mockReturnValue([7001]);
+      mockSignalOrphanPids.mockClear();
+
+      await helper.killStaleProcesses();
+
+      expect(mockSignalOrphanPids).toHaveBeenCalledTimes(1);
+      expect(mockSignalOrphanPids.mock.calls[0][0]).toEqual([7001]);
+      mockMarkerHolders.mockReturnValue([]);
+    });
+
+    it("leaves a live worker's marker alone: no lsof, no signal, no unlink", async () => {
+      // A marker belongs to a spawn, not a pid. Instance 1 is running now and
+      // its whole tree - Listener, Worker, a step's shell - holds
+      // 1-cafef00d.mark. Reaping "the holders other than the leader" would
+      // kill the live job's steps, and removing the marker would blind the
+      // sweep that runs if the app dies. A marker nobody owns is still swept.
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      const liveMarker = path.join((runnerManager as unknown as { pidDir(): string }).pidDir(), '1-cafef00d.mark');
+      helper.setInstance(1, { name: 'runner-1', status: 'busy', process: { pid: 5001, kill: jest.fn() } as never, markerPath: liveMarker });
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
+        { name: '1-cafef00d.mark', isFile: () => true, isDirectory: () => false },
+        { name: '2-0badf00d.mark', isFile: () => true, isDirectory: () => false },
+      ] as never);
+      const unlink = jest.mocked(fs.promises.unlink) as unknown as jest.Mock;
+      unlink.mockResolvedValue(undefined as never);
+      unlink.mockClear();
+      mockMarkerHolders.mockClear();
+      mockMarkerHolders.mockImplementation((p) => (p === liveMarker ? [5001, 5002, 5003] : [6001]));
+      mockSignalOrphanPids.mockClear();
+
+      await helper.killStaleProcesses();
+
+      expect(mockMarkerHolders).not.toHaveBeenCalledWith(liveMarker);
+      expect(mockMarkerHolders).toHaveBeenCalledWith(expect.stringMatching(/2-0badf00d\.mark$/));
+      expect(mockSignalOrphanPids).toHaveBeenCalledTimes(1);
+      expect(mockSignalOrphanPids.mock.calls[0][0]).toEqual([6001]);
+      const unlinked = unlink.mock.calls.map(([f]) => String(f));
+      expect(unlinked).not.toContain(liveMarker);
+      expect(unlinked.some((f) => f.endsWith('2-0badf00d.mark'))).toBe(true);
+      mockMarkerHolders.mockReset();
+      mockMarkerHolders.mockImplementation(() => []);
+    });
+
+    it('skips a marker it did not record whose holders include a live worker', async () => {
+      // Belt and braces for a worker this manager has but whose marker it never
+      // recorded: its tree is still not ours to touch, and the marker stays.
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      helper.setInstance(1, { name: 'runner-1', status: 'listening', process: { pid: 5001, kill: jest.fn() } as never });
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
+        { name: '2-cafef00d.mark', isFile: () => true, isDirectory: () => false },
+      ] as never);
+      const unlink = jest.mocked(fs.promises.unlink) as unknown as jest.Mock;
+      unlink.mockResolvedValue(undefined as never);
+      unlink.mockClear();
+      mockMarkerHolders.mockReturnValue([5001, 5002]);
+      mockSignalOrphanPids.mockClear();
+
+      await helper.killStaleProcesses();
+
+      expect(mockSignalOrphanPids).not.toHaveBeenCalled();
+      expect(unlink.mock.calls.some(([f]) => String(f).endsWith('2-cafef00d.mark'))).toBe(false);
+      mockMarkerHolders.mockReturnValue([]);
+    });
+
+    it('keeps a marker whose holders it could not determine', async () => {
+      // lsof failing is "unknown", never "nobody": signal nothing, keep the
+      // marker for the next sweep, say so.
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
+        { name: '3-feedface.mark', isFile: () => true, isDirectory: () => false },
+      ] as never);
+      const unlink = jest.mocked(fs.promises.unlink) as unknown as jest.Mock;
+      unlink.mockResolvedValue(undefined as never);
+      unlink.mockClear();
+      mockMarkerHolders.mockReturnValue(null);
+      mockSignalOrphanPids.mockClear();
+
+      await helper.killStaleProcesses();
+
+      expect(mockSignalOrphanPids).not.toHaveBeenCalled();
+      expect(unlink.mock.calls.some(([f]) => String(f).endsWith('3-feedface.mark'))).toBe(false);
+      expect(mockOnLog).toHaveBeenCalledWith(expect.objectContaining({
+        level: 'warn', message: expect.stringContaining('3-feedface.mark'),
+      }));
+      mockMarkerHolders.mockReturnValue([]);
+    });
+
+    it('does not re-run the stale sweep when initialize is called while workers are live', async () => {
+      // start() already refuses this; initialize() is the other entry point
+      // that runs the sweep, and a Start click overlapping auto-start must not
+      // sweep the workers auto-start just brought up.
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      helper.setInstance(1, { name: 'runner-1', status: 'busy', process: { pid: 5001, kill: jest.fn() } as never });
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockClear();
+      mockOnStatusChange.mockClear();
+
+      await runnerManager.initialize();
+
+      expect(mockOnLog).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('already running') }));
+      expect(mockOnStatusChange).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'starting' }));
+      expect(fs.promises.readdir).not.toHaveBeenCalled();
     });
 
     it('reads pids from the app-owned pids directory, never the job-writable sandbox', async () => {
@@ -1454,9 +1740,15 @@ describe('RunnerManager', () => {
       // Spawn throws after the key is issued and written into the config.
       mockSpawnSandboxed.mockImplementation(() => { throw new Error('spawn failed'); });
 
+      const unlinked: string[] = [];
+      (fs.unlinkSync as jest.Mock).mockImplementation((f: unknown) => { unlinked.push(String(f)); });
+
       await (manager as unknown as { startInstance(n: number): Promise<void> }).startInstance(1);
 
       expect(revoked).toContain(1);
+      // Nothing started, so nothing holds the marker; it goes now rather than
+      // lingering for a sweep.
+      expect(unlinked.some((f) => /\/pids\/1-[0-9a-f]+\.mark$/.test(f))).toBe(true);
       mockSpawnSandboxed.mockReset();
     });
 
@@ -1529,6 +1821,226 @@ describe('RunnerManager', () => {
       expect(unlinked.some((f) => f.endsWith('/pids/1.pid'))).toBe(true);
     });
 
+    // Marker settling: the pid record goes at once; the marker is swept only
+    // after the exit sweep's SIGKILL has had its turn, so whatever still holds
+    // it then has escaped the process group and is signalled by exact pid.
+    const SETTLE_MS = GRACE_MS + 2000;
+    const managerWithMarkers = () => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        revokeBrokerUrl: () => undefined,
+      });
+      const helper = new RunnerManagerTestHelper(manager);
+      const pidDir = (manager as unknown as { pidDir(): string }).pidDir();
+      const unlink = jest.mocked(fs.promises.unlink) as unknown as jest.Mock;
+      unlink.mockResolvedValue(undefined as never);
+      unlink.mockClear();
+      const unlinked = () => unlink.mock.calls.map(([f]) => String(f));
+      return { manager, helper, pidDir, unlinked };
+    };
+
+    it("removes a finalized instance's marker once nothing holds it", async () => {
+      jest.useFakeTimers();
+      try {
+        const { helper, pidDir, unlinked } = managerWithMarkers();
+        const marker = path.join(pidDir, '1-abcd.mark');
+        helper.setInstance(1, { name: 'runner-1', status: 'busy', markerPath: marker });
+        (fs.readFileSync as jest.Mock).mockReturnValue('4242 START\n');
+        mockMarkerHolders.mockReturnValue([]);
+        mockSignalOrphanPids.mockClear();
+
+        helper.releaseInstanceSlot(1);
+
+        expect((fs.unlinkSync as jest.Mock).mock.calls.some(([f]) => String(f).endsWith('/pids/1.pid'))).toBe(true);
+        // Never removed with the record: its tree may still hold it.
+        expect((fs.unlinkSync as jest.Mock).mock.calls.some(([f]) => String(f).endsWith('.mark'))).toBe(false);
+        await jest.advanceTimersByTimeAsync(SETTLE_MS - 1);
+        expect(unlinked()).not.toContain(marker);
+        await jest.advanceTimersByTimeAsync(1);
+        expect(unlinked()).toContain(marker);
+        expect(mockSignalOrphanPids).not.toHaveBeenCalled();
+      } finally {
+        jest.useRealTimers();
+        (fs.readFileSync as jest.Mock).mockReturnValue('{}');
+      }
+    });
+
+    it("reaps what still holds a finalized instance's marker, found through its pid record", async () => {
+      jest.useFakeTimers();
+      try {
+        const { helper, pidDir, unlinked } = managerWithMarkers();
+        const marker = path.join(pidDir, '1-abcd.mark');
+        // No instance-recorded marker: the pid record still names it.
+        helper.setInstance(1, { name: 'runner-1', status: 'busy' });
+        (fs.readFileSync as jest.Mock).mockReturnValue(`4242 START\n${marker}\n`);
+        mockMarkerHolders.mockClear();
+        mockMarkerHolders.mockReturnValue([7001]);
+        mockSignalOrphanPids.mockClear();
+
+        helper.releaseInstanceSlot(1);
+        await jest.advanceTimersByTimeAsync(SETTLE_MS);
+
+        expect(mockMarkerHolders).toHaveBeenCalledWith(marker);
+        expect(mockSignalOrphanPids).toHaveBeenCalledTimes(1);
+        expect(mockSignalOrphanPids.mock.calls[0][0]).toEqual([7001]);
+        // The mock reports nothing remaining, so the marker is released.
+        expect(unlinked()).toContain(marker);
+      } finally {
+        jest.useRealTimers();
+        mockMarkerHolders.mockReturnValue([]);
+        (fs.readFileSync as jest.Mock).mockReturnValue('{}');
+      }
+    });
+
+    it("keeps a finalized instance's marker while a straggler survives", async () => {
+      jest.useFakeTimers();
+      try {
+        const { helper, pidDir, unlinked } = managerWithMarkers();
+        const marker = path.join(pidDir, '1-abcd.mark');
+        helper.setInstance(1, { name: 'runner-1', status: 'busy', markerPath: marker });
+        (fs.readFileSync as jest.Mock).mockReturnValue('4242 START\n');
+        mockMarkerHolders.mockReturnValue([7001]);
+        mockSignalOrphanPids.mockResolvedValueOnce({ signalled: true, remaining: [7001] });
+
+        helper.releaseInstanceSlot(1);
+        await jest.advanceTimersByTimeAsync(SETTLE_MS);
+
+        expect(unlinked()).not.toContain(marker);
+        expect(mockOnLog).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('1-abcd.mark kept') }));
+      } finally {
+        jest.useRealTimers();
+        mockMarkerHolders.mockReturnValue([]);
+        (fs.readFileSync as jest.Mock).mockReturnValue('{}');
+      }
+    });
+
+    it('ignores a marker path in a pid record that is not one of its own', async () => {
+      jest.useFakeTimers();
+      try {
+        const { helper } = managerWithMarkers();
+        helper.setInstance(1, { name: 'runner-1', status: 'busy' });
+        (fs.readFileSync as jest.Mock).mockReturnValue('4242 START\n/tmp/somewhere/1-abcd.mark\n');
+        mockMarkerHolders.mockClear();
+
+        helper.releaseInstanceSlot(1);
+        await jest.advanceTimersByTimeAsync(SETTLE_MS);
+
+        expect(mockMarkerHolders).not.toHaveBeenCalled();
+      } finally {
+        jest.useRealTimers();
+        (fs.readFileSync as jest.Mock).mockReturnValue('{}');
+      }
+    });
+
+    it('sweeps a marker once when the same exit is finalized twice', async () => {
+      // A clean exit is finalized by the exit handler and again by
+      // releaseInstanceSlot; ownership ends at the first, and one sweep runs.
+      jest.useFakeTimers();
+      try {
+        const { manager, helper, pidDir } = managerWithMarkers();
+        const marker = path.join(pidDir, '1-abcd.mark');
+        helper.setInstance(1, { name: 'runner-1', status: 'busy', markerPath: marker });
+        // The second finalize no longer has the instance's marker, but the
+        // record still names it; the pending settle is what stops a repeat.
+        (fs.readFileSync as jest.Mock).mockReturnValue(`4242 START\n${marker}\n`);
+        mockMarkerHolders.mockClear();
+        mockMarkerHolders.mockReturnValue([]);
+
+        (manager as unknown as { finalizeInstance(n: number): void }).finalizeInstance(1);
+        helper.releaseInstanceSlot(1);
+        await jest.advanceTimersByTimeAsync(SETTLE_MS);
+
+        expect(mockMarkerHolders).toHaveBeenCalledTimes(1);
+        expect(mockMarkerHolders).toHaveBeenCalledWith(marker);
+      } finally {
+        jest.useRealTimers();
+        (fs.readFileSync as jest.Mock).mockReturnValue('{}');
+      }
+    });
+
+    it('reports a settle sweep that throws instead of dropping it', async () => {
+      jest.useFakeTimers();
+      try {
+        const { helper, pidDir } = managerWithMarkers();
+        const marker = path.join(pidDir, '1-abcd.mark');
+        helper.setInstance(1, { name: 'runner-1', status: 'busy', markerPath: marker });
+        (fs.readFileSync as jest.Mock).mockReturnValue('4242 START\n');
+        mockMarkerHolders.mockImplementationOnce(() => { throw new Error('lsof exploded'); });
+
+        helper.releaseInstanceSlot(1);
+        await jest.advanceTimersByTimeAsync(SETTLE_MS);
+
+        expect(mockOnLog).toHaveBeenCalledWith(expect.objectContaining({
+          level: 'warn', message: expect.stringContaining('Sweep of 1-abcd.mark failed: lsof exploded'),
+        }));
+      } finally {
+        jest.useRealTimers();
+        (fs.readFileSync as jest.Mock).mockReturnValue('{}');
+      }
+    });
+
+    it("settles the marker of a worker that exits with an error", async () => {
+      // The error-exit path finalizes only through the exit handler; the
+      // marker written at spawn is what gets swept. The exit also runs the
+      // real process-group sweep, which must not reach a real pid.
+      jest.useFakeTimers();
+      const realKill = process.kill;
+      (process as unknown as { kill: unknown }).kill = (() => true) as never;
+      try {
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        (fs.readFileSync as jest.Mock).mockReturnValue('{}');
+        (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([] as never);
+        const proc = createMockProcess(12346);
+        mockSpawnSandboxed.mockReturnValue(proc);
+        (fs.writeFileSync as jest.Mock).mockClear();
+        const unlink = jest.mocked(fs.promises.unlink) as unknown as jest.Mock;
+        unlink.mockResolvedValue(undefined as never);
+        unlink.mockClear();
+        mockMarkerHolders.mockClear();
+        mockMarkerHolders.mockReturnValue([]);
+        await runnerManager.start();
+        const marker = String((fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => /\/pids\/1-[0-9a-f]+\.mark$/.test(String(f)))![0]);
+
+        proc.emit('exit', 1, null);
+        await jest.advanceTimersByTimeAsync(SETTLE_MS);
+
+        expect(mockMarkerHolders).toHaveBeenCalledWith(marker);
+        expect(unlink.mock.calls.map(([f]) => String(f))).toContain(marker);
+      } finally {
+        (process as unknown as { kill: unknown }).kill = realKill;
+        jest.useRealTimers();
+      }
+    });
+
+    it.each([
+      ['initialize', (m: RunnerManager) => m.initialize()],
+      ['start', (m: RunnerManager) => m.start()],
+    ])('keeps a worker that spawns while %s() is still sweeping', async (_name, run) => {
+      // The broker is already handing out jobs during the sweep. The previous
+      // pool's records are dropped before it, so this worker is not dropped
+      // with them - and start() does not spawn a second worker over it.
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
+        { name: '9-deadbeef.mark', isFile: () => true, isDirectory: () => false },
+      ] as never);
+      let answer!: (holders: number[]) => void;
+      mockMarkerHolders.mockImplementationOnce((() => new Promise<number[]>((resolve) => { answer = resolve; })) as unknown as () => number[]);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(6001));
+
+      const running = run(runnerManager);
+      await settle();
+      await (runnerManager as unknown as { startInstance(n: number): Promise<void> }).startInstance(1);
+      answer([]);
+      await running;
+
+      expect(runnerManager.isRunning()).toBe(true);
+      expect(mockSpawnSandboxed).toHaveBeenCalledTimes(1);
+      const pool = (runnerManager as unknown as { instances: Map<number, { process: { pid: number } | null }> }).instances;
+      expect(pool.get(1)?.process?.pid).toBe(6001);
+    });
+
     it('revokes keys and drops pid files for every instance when stop clears the pool', async () => {
       const revoked: number[] = [];
       const manager = new RunnerManager({
@@ -1540,15 +2052,37 @@ describe('RunnerManager', () => {
       const helper = new RunnerManagerTestHelper(manager);
       // Already-exited processes, so stop() skips the kill loop and reaches the
       // finalize loop; a late exit would otherwise find the map cleared.
-      helper.setInstance(1, { name: 'runner-1', status: 'listening', process: { exitCode: 0, killed: true } as never });
-      helper.setInstance(2, { name: 'runner-2', status: 'busy', process: { exitCode: 0, killed: true } as never });
+      const pidDir = (manager as unknown as { pidDir(): string }).pidDir();
+      const held = path.join(pidDir, '1-aaaa.mark');
+      const free = path.join(pidDir, '2-bbbb.mark');
+      helper.setInstance(1, { name: 'runner-1', status: 'listening', process: { exitCode: 0, killed: true } as never, markerPath: held });
+      helper.setInstance(2, { name: 'runner-2', status: 'busy', process: { exitCode: 0, killed: true } as never, markerPath: free });
       const unlinked: string[] = [];
       (fs.unlinkSync as jest.Mock).mockImplementation((f: unknown) => { unlinked.push(String(f)); });
+      const unlink = jest.mocked(fs.promises.unlink) as unknown as jest.Mock;
+      unlink.mockResolvedValue(undefined as never);
+      unlink.mockClear();
+      mockMarkerHolders.mockImplementation((p) => (p === held ? [7001] : []));
+      mockSignalOrphanPids.mockResolvedValueOnce({ signalled: true, remaining: [7001] });
+      jest.useFakeTimers();
+      try {
+        await manager.stop();
 
-      await manager.stop();
-
-      expect(revoked).toEqual(expect.arrayContaining([1, 2]));
-      expect(unlinked.filter((f) => /\/pids\/[12]\.pid$/.test(f)).length).toBeGreaterThanOrEqual(2);
+        expect(revoked).toEqual(expect.arrayContaining([1, 2]));
+        expect(unlinked.filter((f) => /\/pids\/[12]\.pid$/.test(f)).length).toBeGreaterThanOrEqual(2);
+        // Markers are not unlinked with the records; each is swept once its
+        // tree has had the exit grace, and a held one stays.
+        expect(unlinked.some((f) => f.endsWith('.mark'))).toBe(false);
+        expect(unlink.mock.calls.map(([f]) => String(f))).not.toContain(free);
+        await jest.advanceTimersByTimeAsync(GRACE_MS + 2000);
+        const swept = unlink.mock.calls.map(([f]) => String(f));
+        expect(swept).toContain(free);
+        expect(swept).not.toContain(held);
+      } finally {
+        jest.useRealTimers();
+        mockMarkerHolders.mockReset();
+        mockMarkerHolders.mockImplementation(() => []);
+      }
     });
 
     it('is revoked when the worker exits', async () => {
@@ -1564,14 +2098,20 @@ describe('RunnerManager', () => {
       (fs.readFileSync as jest.Mock).mockReturnValue('{}');
       const proc = createMockProcess(12345);
       mockSpawnSandboxed.mockReturnValue(proc);
-      await manager.start();
+      // The exit arms a marker settle timer; keep it from firing in a later test.
+      jest.useFakeTimers();
+      try {
+        await manager.start();
 
-      proc.emit('exit', 0, null);
-      await settle();
+        proc.emit('exit', 0, null);
+        await jest.advanceTimersByTimeAsync(0);
 
-      // Clean exit frees the slot, which revokes; the identity-gated exit
-      // cleanup may revoke again. Idempotent, so assert it happened at least once.
-      expect(revoked).toContain(1);
+        // Clean exit frees the slot, which revokes; the identity-gated exit
+        // cleanup may revoke again. Idempotent, so assert it happened at least once.
+        expect(revoked).toContain(1);
+      } finally {
+        jest.useRealTimers();
+      }
     });
   });
 

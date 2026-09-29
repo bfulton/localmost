@@ -14,6 +14,7 @@ import { ChildProcess } from 'child_process';
 interface RunnerInstance {
   /** Hash of the approved policy this worker's profile was built from. */
   policyStamp?: string;
+  markerPath?: string;
   /** The repository whose job this worker claimed, as the broker reported it. */
   claimedRepository?: string;
   process: ChildProcess | null;
