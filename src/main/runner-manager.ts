@@ -403,14 +403,25 @@ export class RunnerManager {
    * Save job history to disk.
    */
   private saveJobHistory(): void {
+    // Written whole beside the file and renamed over it, so a full disk or a
+    // crash mid-write leaves the previous history rather than a truncated
+    // file loadJobHistory cannot parse, which would lose all of it. The
+    // random suffix keeps two writers off one temporary file.
+    const temp = `${this.jobHistoryPath}.${randomBytes(6).toString('hex')}.tmp`;
     try {
       const data = {
         version: 1,
         savedAt: new Date().toISOString(),
         jobs: this.jobHistory,
       };
-      fs.writeFileSync(this.jobHistoryPath, JSON.stringify(data, null, 2));
+      fs.writeFileSync(temp, JSON.stringify(data, null, 2), { flag: 'wx' });
+      fs.renameSync(temp, this.jobHistoryPath);
     } catch (err) {
+      try {
+        fs.unlinkSync(temp);
+      } catch {
+        // Never created, or already renamed into place.
+      }
       this.log('warn', `Failed to save job history: ${(err as Error).message}`);
     }
   }

@@ -91,9 +91,11 @@ jest.mock('fs', () => ({
 }));
 
 import * as fs from 'fs';
+import * as path from 'path';
 import { RunnerManager, JobEvent, lineReader } from './runner-manager';
 import { ProxyServer } from './proxy-server';
 import { spawnSandboxed } from './process-sandbox';
+import { getJobHistoryPath } from './paths';
 import { createMockProcess, RunnerManagerTestHelper } from './test-utils';
 
 const mockSpawnSandboxed = spawnSandboxed as jest.MockedFunction<typeof spawnSandboxed>;
@@ -376,5 +378,67 @@ describe('the job-start backstop', () => {
     } finally {
       kill.restore();
     }
+  });
+});
+
+describe('saving the job history', () => {
+  /** A one-file disk: writes land under their own name, rename moves them. */
+  function disk() {
+    const files = new Map<string, string>();
+    (fs.writeFileSync as jest.Mock).mockImplementation((p: string, data: string, opts?: { flag?: string }) => {
+      if (opts?.flag === 'wx' && files.has(p)) throw Object.assign(new Error('EEXIST'), { code: 'EEXIST' });
+      files.set(p, String(data));
+    });
+    (fs.renameSync as jest.Mock).mockImplementation((from: string, to: string) => {
+      if (!files.has(from)) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+      files.set(to, files.get(from)!);
+      files.delete(from);
+    });
+    (fs.unlinkSync as jest.Mock).mockImplementation((p: string) => { files.delete(p); });
+    return files;
+  }
+
+  const refuse = (manager: RunnerManager, runId: number) =>
+    manager.recordRefusedJob({ repository: 'owner/repo', jobName: `job ${runId}`, reason: 'no', githubRunId: runId });
+
+  it('writes a temporary file beside it and renames it into place, in the same format', () => {
+    const files = disk();
+    const { manager } = newManager();
+    refuse(manager, 1);
+
+    const historyPath = getJobHistoryPath();
+    expect([...files.keys()]).toEqual([historyPath]);
+    const saved = JSON.parse(files.get(historyPath)!);
+    expect(saved).toEqual({ version: 1, savedAt: expect.any(String), jobs: [expect.objectContaining({ githubRunId: 1 })] });
+
+    const [temp] = (fs.renameSync as jest.Mock).mock.calls[0];
+    expect(path.dirname(temp)).toBe(path.dirname(historyPath));
+    expect(temp).not.toBe(historyPath);
+
+    // Each save gets its own temporary name.
+    refuse(manager, 2);
+    const temps = (fs.renameSync as jest.Mock).mock.calls.map(([from]) => from);
+    expect(new Set(temps).size).toBe(2);
+  });
+
+  it('leaves the previous history intact when a write fails part-way', () => {
+    const files = disk();
+    const { manager, onLog } = newManager();
+    refuse(manager, 1);
+    const before = files.get(getJobHistoryPath());
+
+    (fs.writeFileSync as jest.Mock).mockImplementationOnce((p: string) => {
+      // A full disk: part of the file is written, then the write fails.
+      files.set(p, '{"version":1,"jo');
+      throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
+    });
+    refuse(manager, 2);
+
+    expect(files.get(getJobHistoryPath())).toBe(before);
+    // And the partial temporary file is not left behind.
+    expect([...files.keys()]).toEqual([getJobHistoryPath()]);
+    expect(onLog).toHaveBeenCalledWith(expect.objectContaining({
+      level: 'warn', message: expect.stringContaining('Failed to save job history'),
+    }));
   });
 });
