@@ -59,14 +59,38 @@ const REMOVAL_BATCH = 32;
  * found a directory, and each entry in it is unlinked, or, when it is a
  * directory, removed if empty or else moved up there to be listed in turn.
  * None of unlink, rmdir and rename follows a link at the path it is given.
- * Rejects, leaving the rest for the next sweep, when something cannot be
- * removed or keeps being added.
+ * A directory its owner sealed - took write away from - is given it back:
+ * one listed there by path, as nothing can swap it, and one in the tree only
+ * through a descriptor opened without following a link. Rejects, leaving
+ * the rest for the next sweep, when something cannot be removed or keeps
+ * being added.
  */
 export async function removeMovedAside(aside: string): Promise<void> {
   const into = path.dirname(aside);
   const stem = path.join(into, `${REMOVAL_PREFIX}${randomBytes(6).toString('hex')}`);
   const code = (err: unknown) => (err as NodeJS.ErrnoException).code;
   let moved = 0;
+  // Give a directory in the tree its owner's permissions back, when it is
+  // still a directory: resolves to whether it did.
+  const unseal = async (dir: string): Promise<boolean> => {
+    let handle: fs.promises.FileHandle;
+    try {
+      handle = await fs.promises.open(
+        dir,
+        fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW
+      );
+    } catch {
+      return false;
+    }
+    try {
+      await handle.chmod(0o700);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      await handle.close();
+    }
+  };
   // Clear one entry of a directory being listed: unlinked, or, when it is a
   // directory - which the listing only suggests, as it may since have been
   // swapped - moved up beside the tree and returned, to be listed in turn.
@@ -88,8 +112,21 @@ export async function removeMovedAside(aside: string): Promise<void> {
       return up;
     } catch (err) {
       if (code(err) === 'ENOENT') return null;
+      // A directory its owner cannot write - as Go leaves its module cache -
+      // cannot be moved to another parent, which rewrites its `..`. Its
+      // write bit is given back through a descriptor opened without
+      // following a link, so a link swapped in for it is refused.
+      if (code(err) === 'EACCES' && (await unseal(from))) {
+        try {
+          await fs.promises.rename(from, up);
+          return up;
+        } catch (again) {
+          if (code(again) === 'ENOENT') return null;
+        }
+      }
       // An empty directory that cannot be moved - one its owner cannot
-      // write, which rename needs - can still be removed where it is.
+      // write, nor read to give the write bit back - can still be removed
+      // where it is.
       await fs.promises.rmdir(from).catch(() => {
         throw err;
       });
@@ -111,6 +148,13 @@ export async function removeMovedAside(aside: string): Promise<void> {
         if (code(err) !== 'ENOENT') throw err;
       });
       return [];
+    }
+    // Its entries can only be removed while it is writable, and listed while
+    // it is readable. It is an entry of the directory the tree was moved
+    // into, which only the app writes, so it is still the directory lstat
+    // found, and chmod cannot be led through a link.
+    if ((stat.mode & 0o700) !== 0o700) {
+      await fs.promises.chmod(dir, 0o700);
     }
     const found: string[] = [];
     for (let pass = 1; ; pass++) {

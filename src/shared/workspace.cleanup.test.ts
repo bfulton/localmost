@@ -10,6 +10,7 @@ import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { execFileSync } from 'child_process';
 import { cleanupWorkspaces, createWorkspace, getWorkspacesDir, listWorkspaces, removeWorkspace } from './workspace';
 
 let appData: string;
@@ -89,6 +90,35 @@ describe('workspace cleanup', () => {
   });
 });
 
+describe('a workspace cleanup cannot remove', () => {
+  // A file flagged immutable can be neither unlinked nor moved, by the app
+  // or by anyone - a removal that never clears, like the ones that would
+  // otherwise leave a copy of the checkout in app data run after run.
+  const stuck = (dir: string): void => {
+    fs.writeFileSync(path.join(dir, 'stuck'), 'x');
+    execFileSync('chflags', ['uchg', path.join(dir, 'stuck')]);
+  };
+  afterEach(() => {
+    execFileSync('chflags', ['-R', 'nouchg', getWorkspacesDir()]);
+  });
+
+  it('is named in a warning, and not counted as removed', async () => {
+    const dir = makeWorkspace('ws-aaaa-1111', { sourceDir: '/x', createdAt: new Date(0).toISOString() });
+    stuck(dir);
+    const leftover = path.join(getWorkspacesDir(), '.removing-ws-bbbb-2222.0a1b2c3d');
+    fs.mkdirSync(leftover);
+    stuck(leftover);
+    const warned = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    const { removed, kept } = await cleanupWorkspaces({ maxAgeHours: 24, maxCount: 10 });
+
+    expect({ removed, kept }).toEqual({ removed: 0, kept: 0 });
+    const said = warned.mock.calls.map((args) => args.join(' '));
+    expect(said.some((line) => line.includes('ws-aaaa-1111') && line.includes('EPERM'))).toBe(true);
+    expect(said.some((line) => line.includes('.removing-ws-bbbb-2222.0a1b2c3d') && line.includes('EPERM'))).toBe(true);
+  });
+});
+
 describe('removing a workspace something of its run still writes', () => {
   // A step's leftover process - one that outlived the CLI's reap - still
   // writes its workspace's path, and a container a step started writes the
@@ -155,19 +185,20 @@ describe('removing a workspace something of its run still writes', () => {
     const dir = workspace('ws-aaaa-1111');
     fs.symlinkSync(victim, path.join(dir, 'link'));
     fs.symlinkSync(victim, path.join(getWorkspacesDir(), 'ws-bbbb-2222'));
-    // A writer swaps d0 for a link to the user's files once the removal has
-    // begun listing the tree - the race a real one would have to win, won
-    // here every time.
-    const realReaddir = fs.promises.readdir.bind(fs.promises) as (...args: unknown[]) => Promise<unknown>;
+    // A writer swaps d0 for a link to the user's files just after the
+    // removal has listed it as a directory - the race a real one would have
+    // to win, won here every time.
+    const realReaddir = fs.promises.readdir.bind(fs.promises) as (...args: unknown[]) => Promise<fs.Dirent[]>;
     let swapped = false;
     jest.spyOn(fs.promises, 'readdir').mockImplementation((async (...args: unknown[]) => {
+      const listed = await realReaddir(...args);
       const d0 = path.join(String(args[0]), 'd0');
-      if (!swapped && fs.existsSync(d0)) {
+      if (!swapped && listed.some((entry) => entry.name === 'd0' && entry.isDirectory())) {
         fs.renameSync(d0, path.join(appData, 'd0.moved'));
         fs.symlinkSync(victim, d0);
         swapped = true;
       }
-      return realReaddir(...args);
+      return listed;
     }) as never);
 
     expect(await removeWorkspace('ws-aaaa-1111')).toBe(true);

@@ -345,6 +345,14 @@ if (!isMacOS) {
       fs.writeFileSync(path.join(victim, 'keep'), 'kept');
       const profilePath = path.join(appDir, 'leftover.sb');
       fs.writeFileSync(profilePath, generateSandboxProfile({ workDir: workspace, proxyPort: 1, policy: readable }));
+      // While the workspace is where it was, the swap is one its profile
+      // allows: what refuses it below is the workspace being moved aside.
+      fs.mkdirSync(path.join(workspace, 'c0'));
+      const swapInPlace = `cd '${workspace}' && /bin/mv c0 c0.moved && /bin/ln -s '${victim}' c0`;
+      expect(run(fs.readFileSync(profilePath, 'utf-8'), ['/bin/sh', '-c', swapInPlace])).toBe(true);
+      expect(fs.lstatSync(path.join(workspace, 'c0')).isSymbolicLink()).toBe(true);
+      fs.unlinkSync(path.join(workspace, 'c0'));
+      fs.rmdirSync(path.join(workspace, 'c0.moved'));
       const leftover = spawn(
         '/usr/bin/sandbox-exec',
         [

@@ -409,7 +409,8 @@ export async function removeWorkspace(id: string): Promise<boolean> {
 
 /**
  * Clean up old workspaces, and finish any removal an earlier cleanup left
- * part done.
+ * part done. A workspace counts as removed once all of it is gone; each one
+ * that is not is named in a warning on stderr.
  */
 export async function cleanupWorkspaces(options: WorkspaceCleanupOptions = {}): Promise<{
   removed: number;
@@ -425,8 +426,8 @@ export async function cleanupWorkspaces(options: WorkspaceCleanupOptions = {}): 
   }
   for (const entry of leftovers) {
     if (!entry.name.startsWith(REMOVAL_PREFIX)) continue;
-    await removeMovedAside(path.join(getWorkspacesDir(), entry.name)).catch(() => {
-      // Still being written; the next cleanup tries again.
+    await removeMovedAside(path.join(getWorkspacesDir(), entry.name)).catch((err) => {
+      console.error(`Warning: could not finish removing ${entry.name}: ${(err as Error).message}`);
     });
   }
 
@@ -443,10 +444,13 @@ export async function cleanupWorkspaces(options: WorkspaceCleanupOptions = {}): 
 
     // Remove if too old or exceeds max count
     if (age > maxAgeMs || i >= maxCount) {
-      await removeWorkspace(ws.id).catch(() => {
-        // What is left is out of every step's reach, and goes next time.
-      });
-      removed++;
+      // What a failed removal leaves is out of every step's reach, and the
+      // next cleanup tries it again.
+      try {
+        if (await removeWorkspace(ws.id)) removed++;
+      } catch (err) {
+        console.error(`Warning: could not remove old workspace ${ws.id}: ${(err as Error).message}`);
+      }
     } else {
       kept++;
     }
