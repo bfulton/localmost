@@ -361,12 +361,14 @@ created denying everything, is bound to the repository's policy when the job is
 claimed, and is destroyed with the job. The containers the job created through
 it go too: when the socket stops, each one still on the daemon is force-removed
 with its anonymous volumes, then each network the job created. The socket
-closes before that sweep, so the job cannot start another during it. A removal
-the daemon refuses or never answers is logged, not retried, and if localmost
-itself is killed before the job's worker exits, nothing runs the sweep. A
-worker that claims a job for a repository other than the one its socket is
-bound to gets no docker access at all. The profile denies `~/.docker` in full; the only socket a job can reach is
-the one localmost serves, and it cannot unlink or replace it.
+closes before that sweep, so the job cannot start another during it; a create
+already on its way to the daemon when the socket closes can still leave a
+container that is created but never started. A removal the daemon refuses or
+never answers is tried once more, then logged, and if localmost itself is
+killed before the job's worker exits, nothing runs the sweep. A worker that
+claims a job for a repository other than the one its socket is bound to gets no
+docker access at all. The profile denies `~/.docker` in full; the only socket a
+job can reach is the one localmost serves, and it cannot unlink or replace it.
 
 What the filter refuses, each of which is an executable test against the proxy:
 

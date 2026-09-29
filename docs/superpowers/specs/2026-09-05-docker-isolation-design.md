@@ -90,9 +90,18 @@ operator's daemon with egress no proxy filters. So the socket keeps a record of
 what the job created, and stopping it - which the worker's exit does - closes
 the socket first, then force-removes each of those containers with its
 anonymous volumes (`DELETE /containers/<id>?force=1&v=1`), then each network the
-job created. A removal the daemon refuses or does not answer is logged and the
-stop completes anyway. The next worker in the slot, and the app quitting, wait
-for the sweep rather than racing it.
+job created. The removals name no API version, so the daemon serves them at its
+own: the socket's maxApiVersion is newer than some daemons it otherwise works
+with, and a daemon refuses a version newer than its own with a 400. They go a
+few at a time, however many the job left. A create already on its way to the
+daemon when the socket closes can still leave a container that is created but
+never started: its answer, and so its id, is lost with the job's connection. A
+removal the daemon refuses or does not answer is tried once more, then logged,
+and the stop completes anyway. The next worker in the slot, and the app
+quitting, wait for the sweep rather than racing it.
+
+The record is held in memory only. If localmost is killed before the worker
+exits, the job's containers keep running until something else removes them.
 
 A restart policy would undo that from the daemon's side, bringing a container
 back after it exits and after the daemon restarts. `HostConfig.RestartPolicy` is
@@ -333,3 +342,8 @@ remains the whole of the access control.
   `DockerBackend`, and the choice is better made with stage 1 usage in hand.
 - Per-container memory floor under a VM-per-container runtime, which stage 3
   would need in order to feed the existing resource-aware scheduler.
+- Removing a job's containers after localmost itself was killed. The socket's
+  record of what the job created lives in memory, so a crash leaves those
+  containers running. A likely shape: label each approved create with the
+  socket that made it (`dev.localmost.job=<uuid>`), and at startup remove the
+  labelled containers whose socket is gone.

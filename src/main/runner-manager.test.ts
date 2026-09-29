@@ -2986,6 +2986,28 @@ describe('RunnerManager', () => {
       expect(mockSpawnSandboxed).toHaveBeenCalledTimes(2);
       expect(dockerSocketOf(helper, 1)).not.toBe(first);
     });
+
+    it('leaves a socket that took the slot while the last one was removing its containers', async () => {
+      // The finished stop forgets only its own socket, never whichever one
+      // holds the slot by the time it is done.
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      const proc = createMockProcess(12345);
+      mockSpawnSandboxed.mockReturnValue(proc);
+      const helper = new RunnerManagerTestHelper(runnerManager);
+      await helper.startWorkerWithoutJob(1);
+      const first = dockerSocketOf(helper, 1);
+      let finishRemoval: () => void = () => {};
+      first.stop.mockReturnValue(new Promise<void>((resolve) => { finishRemoval = resolve; }));
+
+      proc.emit('exit', 0, null);
+      await settle();
+      const replacement = dockerSocketStub();
+      helper.setDockerProxy(1, replacement);
+      finishRemoval();
+      await settle();
+
+      expect(helper.dockerProxy(1)).toBe(replacement);
+    });
   });
 
   describe('status aggregation with listening', () => {

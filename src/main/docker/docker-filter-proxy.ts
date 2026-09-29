@@ -39,6 +39,8 @@ export interface DockerFilterProxyOptions {
   attachRegistryAuth?: (registry: string) => string | undefined;
   /** Injected for tests; defaults to fs.realpathSync. */
   realpath?: (p: string) => string;
+  /** How long one removal waits for the daemon when the socket stops. Injected for tests; default 10s. */
+  removeTimeoutMs?: number;
 }
 
 /** macOS caps sun_path at 104 bytes including the terminator, and truncates silently. */
@@ -94,6 +96,19 @@ const NO_DAEMON_MESSAGE = 'no Docker daemon is available to this job';
  * not answered by then is logged rather than waited on.
  */
 const REMOVE_TIMEOUT_MS = 10_000;
+
+/**
+ * How many removals are in flight at once. A job can leave as many containers
+ * as it likes, and a removal each at once would open that many connections to
+ * the daemon from the main process.
+ */
+const REMOVE_CONCURRENCY = 8;
+
+/**
+ * The pause before a failed removal is asked for again. Long enough for the
+ * daemon to finish removing a `--rm` container that raced the first attempt.
+ */
+const REMOVE_RETRY_DELAY_MS = 250;
 
 const DEFAULT_MIN_API_VERSION = 'v1.24';
 const DEFAULT_MAX_API_VERSION = 'v1.45';
@@ -156,6 +171,15 @@ function decodeBody(raw: Buffer, contentEncoding: string | undefined): string {
   throw new Error(`unsupported content encoding: ${encoding}`);
 }
 
+/** Run `task` over every item, with at most `limit` in progress at once. */
+async function eachAtMost<T>(limit: number, items: T[], task: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) await task(items[next++]);
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+}
+
 export class DockerFilterProxy {
   private server: http.Server | null = null;
   private socketPath: string | null = null;
@@ -179,6 +203,7 @@ export class DockerFilterProxy {
   private readonly maxApiVersion: ApiVersion;
   private readonly attachRegistryAuth?: (registry: string) => string | undefined;
   private readonly realpath: (p: string) => string;
+  private readonly removeTimeoutMs: number;
   private readonly connections: Set<net.Socket> = new Set();
   /**
    * Never keep-alive. A pooled client socket sheds its http error listener
@@ -202,6 +227,7 @@ export class DockerFilterProxy {
     }
     this.attachRegistryAuth = options.attachRegistryAuth;
     this.realpath = options.realpath ?? ((p) => fs.realpathSync(p));
+    this.removeTimeoutMs = options.removeTimeoutMs ?? REMOVE_TIMEOUT_MS;
   }
 
   /** Record an identifier the job may use for a container it created. */
@@ -300,11 +326,13 @@ export class DockerFilterProxy {
    * socket - forced, since a running one is the case that matters, and with
    * their anonymous volumes - and then the networks the job created. The
    * socket closes first, so the job cannot create another during the sweep. A
-   * create still in flight then may reach the daemon, but its start, which
-   * needs this socket too, cannot: that container is created and never runs.
+   * create still in flight then may reach the daemon, but its answer, and so
+   * its id, is lost with the job's connection, and its start, which needs
+   * this socket too, cannot happen: that container is created and never runs.
    *
-   * A removal that fails is logged and the stop still completes. A second call
-   * while one is in progress waits for the same removals.
+   * A removal that fails is asked for once more, then logged, and the stop
+   * still completes. A second call while one is in progress waits for the
+   * same removals.
    */
   stop(): Promise<void> {
     this.stopping ??= this.teardown().finally(() => {
@@ -348,33 +376,43 @@ export class DockerFilterProxy {
       this.onLog({ level: 'warn', message: `could not remove ${what.join(', ')} the job created: ${NO_DAEMON_MESSAGE}` });
       return;
     }
-    const version = `v${bareVersion(this.maxApiVersion)}`;
+    // Unversioned, so the daemon serves them at its own API version. The job's
+    // requests carry the version it negotiated, but these are the socket's
+    // own, and a daemon older than maxApiVersion refuses that one with a 400;
+    // a fixed older one fails the other way once a daemon's minimum passes it.
+    // Neither endpoint, nor force and v, has changed across versions.
+    const remove = (targets: Array<{ what: string; url: string }>): Promise<void> =>
+      eachAtMost(REMOVE_CONCURRENCY, targets, ({ what, url }) => this.removeWithRetry(endpoint.socketPath, what, url));
     // A network with a container still attached cannot be removed, so the
     // containers go first.
-    await Promise.all(
-      containers.map((id) =>
-        this.removeFromDaemon(endpoint.socketPath, `container ${id}`, `/${version}/containers/${encodeURIComponent(id)}?force=1&v=1`)
-      )
-    );
-    await Promise.all(
-      networks.map((id) =>
-        this.removeFromDaemon(endpoint.socketPath, `network ${id}`, `/${version}/networks/${encodeURIComponent(id)}`)
-      )
-    );
+    await remove(containers.map((id) => ({ what: `container ${id}`, url: `/containers/${encodeURIComponent(id)}?force=1&v=1` })));
+    await remove(networks.map((id) => ({ what: `network ${id}`, url: `/networks/${encodeURIComponent(id)}` })));
   }
 
-  /** One DELETE against the daemon; resolves whatever happens, logging a failure. */
-  private removeFromDaemon(socketPath: string, what: string, url: string): Promise<void> {
+  /**
+   * Remove one thing, asking once more after a pause if the first attempt
+   * fails; resolves whatever happens, logging a removal that failed twice.
+   * The second attempt also settles a `--rm` container the daemon was already
+   * removing, which it answers with a 409 and then, once it is gone, a 404.
+   */
+  private async removeWithRetry(socketPath: string, what: string, url: string): Promise<void> {
+    if ((await this.removeFromDaemon(socketPath, url)) === undefined) return;
+    await new Promise((resolve) => setTimeout(resolve, REMOVE_RETRY_DELAY_MS));
+    const problem = await this.removeFromDaemon(socketPath, url);
+    if (problem !== undefined) this.onLog({ level: 'warn', message: `could not remove ${what} the job created: ${problem}` });
+  }
+
+  /** One DELETE against the daemon; resolves with what went wrong, if anything. */
+  private removeFromDaemon(socketPath: string, url: string): Promise<string | undefined> {
     return new Promise((resolve) => {
       let settled = false;
       const done = (problem?: string): void => {
         if (settled) return;
         settled = true;
-        if (problem) this.onLog({ level: 'warn', message: `could not remove ${what} the job created: ${problem}` });
-        resolve();
+        resolve(problem);
       };
       const req = http.request(
-        { socketPath, path: url, method: 'DELETE', agent: this.upstreamAgent, timeout: REMOVE_TIMEOUT_MS },
+        { socketPath, path: url, method: 'DELETE', agent: this.upstreamAgent, timeout: this.removeTimeoutMs },
         (res) => {
           const status = res.statusCode ?? 502;
           res.resume();
@@ -383,7 +421,7 @@ export class DockerFilterProxy {
           res.on('end', () => done((status >= 200 && status < 300) || status === 404 ? undefined : `the daemon answered ${status}`));
         }
       );
-      req.on('timeout', () => req.destroy(new Error(`no answer in ${REMOVE_TIMEOUT_MS / 1000}s`)));
+      req.on('timeout', () => req.destroy(new Error(`no answer in ${this.removeTimeoutMs / 1000}s`)));
       req.on('error', (err) => done(err.message));
       req.end();
     });
