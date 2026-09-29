@@ -61,13 +61,23 @@ export const registerTargetHandlers = (): void => {
   // Update a target
   ipcMain.handle(
     IPC_CHANNELS.TARGETS_UPDATE,
-    async (
-      _event,
-      targetId: string,
-      updates: Partial<Pick<Target, 'enabled'>>
-    ): Promise<Result<Target>> => {
+    async (_event, targetId: unknown, updates: unknown): Promise<Result<Target>> => {
+      // Enabling or disabling is the one change the renderer makes. The rest
+      // of a target - its url, owner, repo and id - decides where config.sh
+      // sends a registration token and which API paths are requested, so an
+      // update carrying anything else is refused rather than trimmed.
+      if (
+        typeof targetId !== 'string' ||
+        typeof updates !== 'object' ||
+        updates === null ||
+        Object.keys(updates).length !== 1 ||
+        typeof (updates as { enabled?: unknown }).enabled !== 'boolean'
+      ) {
+        return { success: false, error: 'Invalid target update: only enabled may be changed' };
+      }
+      const enabled = (updates as { enabled: boolean }).enabled;
       log()?.info(`[IPC] targets:update ${targetId}`);
-      return getTargetManager().updateTarget(targetId, updates);
+      return getTargetManager().updateTarget(targetId, { enabled });
     }
   );
 
