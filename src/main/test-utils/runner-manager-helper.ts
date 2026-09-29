@@ -34,6 +34,8 @@ interface RunnerInstance {
     githubActor?: string;
     githubSha?: string;
     githubWorkflow?: string;
+    /** The result of the last completion line read, weighed at exit. */
+    runnerResult?: 'completed' | 'failed' | 'cancelled';
   } | null;
   name: string;
   jobsCompleted: number;

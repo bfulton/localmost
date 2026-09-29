@@ -668,21 +668,15 @@ describe('RunnerManager', () => {
   });
 
   describe('job completion', () => {
-    it('handles a repeated completion line only once', async () => {
-      // The runner can emit its completion line more than once. The handler
-      // awaits the GitHub conclusion lookup before clearing currentJob, so a
-      // second line arriving during that await would re-enter and report the
-      // same job as completed twice.
-      let releaseConclusion: (value: string) => void = () => {};
-      const conclusionPending = new Promise<string>((resolve) => {
-        releaseConclusion = resolve;
-      });
-
+    it('neither closes the job nor looks it up on a completion line, however often it comes', async () => {
+      // A completion line is output the job can write itself, as often as it
+      // likes: the job ends with its worker's exit, which looks it up once.
+      const getJobConclusion = jest.fn(async () => 'success');
       const manager = new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getJobConclusion: () => conclusionPending,
+        getJobConclusion,
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setInstance(1, {
@@ -698,15 +692,11 @@ describe('RunnerManager', () => {
       });
 
       const line = 'Job build completed with result: Succeeded';
-      const first = helper.parseRunnerOutput(1, line);
-      const second = helper.parseRunnerOutput(1, line);
-      releaseConclusion('success');
-      await Promise.all([first, second]);
+      await Promise.all([helper.parseRunnerOutput(1, line), helper.parseRunnerOutput(1, line)]);
 
-      const completions = mockOnLog.mock.calls.filter(
-        ([entry]) => typeof entry?.message === 'string' && entry.message.includes('Job completed:')
-      );
-      expect(completions).toHaveLength(1);
+      expect(getJobConclusion).not.toHaveBeenCalled();
+      expect(helper.instances.get(1)!.currentJob?.id).toBe('job-1');
+      expect(helper.instances.get(1)!.status).toBe('busy');
     });
   });
 

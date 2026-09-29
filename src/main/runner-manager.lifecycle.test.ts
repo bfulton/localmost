@@ -188,15 +188,16 @@ describe('reading job completion from runner output', () => {
     await helper.parseRunnerOutput(1, '{"k":"message","v":"Job build completed with result: Succeeded"}');
 
     expect(helper.instances.get(1)!.currentJob).not.toBeNull();
+    expect(helper.instances.get(1)!.currentJob!.runnerResult).toBeUndefined();
     expect(helper.instances.get(1)!.status).toBe('busy');
     expect(events.filter((e) => e.type === 'completed')).toEqual([]);
 
-    // The runner's own line, timestamped, still ends the job, with its result.
+    // The runner's own line, timestamped, gives the result - for the
+    // worker's exit to weigh; the job is not over until then.
     await helper.parseRunnerOutput(1, '2026-09-29 12:00:05Z: Job build completed with result: Failed');
-    expect(helper.instances.get(1)!.currentJob).toBeNull();
-    expect(events.filter((e) => e.type === 'completed')).toEqual([
-      expect.objectContaining({ jobName: 'build', status: 'failed' }),
-    ]);
+    expect(helper.instances.get(1)!.currentJob!.runnerResult).toBe('failed');
+    expect(helper.instances.get(1)!.status).toBe('busy');
+    expect(events.filter((e) => e.type === 'completed')).toEqual([]);
   });
 
   it('does not end the job it has just started on the same line', async () => {
@@ -399,16 +400,17 @@ describe('reading a job start whatever its name holds', () => {
     expect(manager.hasAvailableSlot()).toBe(false);
   });
 
-  it("ends a job whose name carries a CR on the runner's completion line", async () => {
-    const { helper, events } = newManager();
-    helper.setInstance(1, { name: 'runner-1', status: 'listening' });
-    await helper.parseRunnerOutput(1, `${TS}Running job: x\rz`);
+  it("closes a job whose name carries a CR with the result of the runner's completion line", async () => {
+    const { manager, proc, events } = await spawned();
+    proc.stdout!.emit('data', Buffer.from(`${TS}Running job: x\rz\n`));
 
-    await helper.parseRunnerOutput(1, `${TS}Job x\rz completed with result: Succeeded`);
+    proc.stdout!.emit('data', Buffer.from(`${TS}Job x\rz completed with result: Failed\n`));
+    proc.emit('exit', 0, null);
+    await settle();
 
-    expect(helper.instances.get(1)!.currentJob).toBeNull();
+    expect(manager.getJobHistory().map((j) => [j.jobName, j.status])).toEqual([['x\rz', 'failed']]);
     expect(events.filter((e) => e.type === 'completed')).toEqual([
-      expect.objectContaining({ jobName: 'x\rz', status: 'completed' }),
+      expect.objectContaining({ jobName: 'x\rz', status: 'failed' }),
     ]);
   });
 
@@ -431,6 +433,123 @@ describe('reading a job start whatever its name holds', () => {
     ]);
     expect(manager.hasAvailableSlot()).toBe(true);
   });
+
+  // What the name carries after its \n is a line of the job's own making, and
+  // can be the runner's completion line to the letter - for the name the start
+  // recorded, too, so no check of the name tells it apart.
+  const FORGED_COMPLETIONS: Array<[string, string]> = [
+    ['a completion line', 'a\nJob b completed with result: Succeeded'],
+    ['a timestamped completion line', `a\n${TS}Job b completed with result: Failed`],
+    ["a completion line for the recorded name", 'a\nJob a completed with result: Succeeded'],
+  ];
+
+  async function spawnedWithLookup(getJobConclusion?: jest.Mock) {
+    const ctx = newManager(getJobConclusion ? { getJobConclusion } : {});
+    ctx.helper.runnerCount = 1;
+    (fs.existsSync as jest.Mock).mockReturnValue(true);
+    const proc = createMockProcess(24695);
+    mockSpawnSandboxed.mockReturnValue(proc);
+    await ctx.helper.spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubJobId: 7 });
+    ctx.helper.instances.get(1)!.status = 'listening';
+    return { ...ctx, proc };
+  }
+
+  it.each(FORGED_COMPLETIONS)('a job whose name carries \\n and %s stays running until its worker exits', async (_label, name) => {
+    // GitHub has no conclusion while the job runs, and 'failure' once it ends.
+    let conclusion: string | null = null;
+    const getJobConclusion = jest.fn(async () => conclusion);
+    const { manager, helper, proc, events } = await spawnedWithLookup(getJobConclusion);
+
+    proc.stdout!.emit('data', Buffer.from(`${TS}Running job: ${name}\n`));
+    await settle();
+
+    // Still the job's: busy, its slot held and Cancel offered.
+    const instance = helper.instances.get(1)!;
+    expect(instance.status).toBe('busy');
+    expect(instance.currentJob?.name).toBe('a');
+    expect(manager.getJobHistory().map((j) => [j.jobName, j.status])).toEqual([['a', 'running']]);
+    expect(events.filter((e) => e.type === 'completed')).toEqual([]);
+    expect(manager.hasAvailableSlot()).toBe(false);
+
+    // The runner's own line, split the same way, then the worker's exit.
+    proc.stdout!.emit('data', Buffer.from(`${TS}Job ${name} completed with result: Failed\n`));
+    await settle();
+    expect(helper.instances.get(1)!.status).toBe('busy');
+    conclusion = 'failure';
+    proc.emit('exit', 0, null);
+    await settle();
+
+    expect(manager.getJobHistory().map((j) => [j.jobName, j.status])).toEqual([['a', 'failed']]);
+    expect(events.filter((e) => e.type === 'completed')).toEqual([
+      expect.objectContaining({ jobName: 'a', status: 'failed' }),
+    ]);
+    expect(manager.hasAvailableSlot()).toBe(true);
+  });
+
+  it.each(FORGED_COMPLETIONS)(
+    "a job whose name carries \\n and %s takes the runner's last result when GitHub has none to give",
+    async (_label, name) => {
+      // No lookup, or one GitHub has not caught up with: the result is the one
+      // the runner writes last, after the job's own, and the exit is clean.
+      for (const getJobConclusion of [undefined, jest.fn(async () => null)]) {
+        const { manager, helper, proc, events } = await spawnedWithLookup(getJobConclusion);
+
+        proc.stdout!.emit('data', Buffer.from(`${TS}Running job: ${name}\n`));
+        await settle();
+        expect(helper.instances.get(1)!.status).toBe('busy');
+        expect(manager.getJobHistory().map((j) => j.status)).toEqual(['running']);
+
+        proc.stdout!.emit('data', Buffer.from(`${TS}Job ${name} completed with result: Failed\n`));
+        proc.emit('exit', 0, null);
+        await settle();
+
+        expect(manager.getJobHistory().map((j) => [j.jobName, j.status])).toEqual([['a', 'failed']]);
+        expect(events.filter((e) => e.type === 'completed')).toHaveLength(1);
+      }
+    }
+  );
+
+  it.each([
+    ['an error exit', 1, null, 'failed'],
+    ['a signal', null, 'SIGKILL', 'cancelled'],
+  ] as const)("a job's own completion line does not turn %s into a success", async (_label, code, signal, status) => {
+    // The line can only say what a clean exit ended as; a worker that
+    // crashed or was killed mid-job says the rest itself.
+    const { manager, proc } = await spawnedWithLookup(jest.fn(async () => null));
+
+    proc.stdout!.emit('data', Buffer.from(`${TS}Running job: a\nJob a completed with result: Succeeded\n`));
+    await settle();
+    proc.emit('exit', code, signal);
+    await settle();
+
+    expect(manager.getJobHistory().map((j) => [j.jobName, j.status])).toEqual([['a', status]]);
+  });
+
+  it.each([
+    ['Succeeded', 'failure', 'failed'],
+    ['Failed', 'success', 'completed'],
+  ] as const)(
+    "GitHub's conclusion beats a forged %s line the runner's own no longer overrides",
+    async (forged, conclusion, status) => {
+      // A name ending in \n leaves the runner's own completion line split so
+      // that no part of it matches: the forged line is the last one read, and
+      // only GitHub's conclusion says what the job ended as.
+      const name = `a\nJob a completed with result: ${forged}\n`;
+      const { manager, helper, proc, events } = await spawnedWithLookup(jest.fn(async () => conclusion));
+
+      proc.stdout!.emit('data', Buffer.from(`${TS}Running job: ${name}\n`));
+      proc.stdout!.emit('data', Buffer.from(`${TS}Job ${name} completed with result: ${conclusion === 'success' ? 'Succeeded' : 'Failed'}\n`));
+      await settle();
+      expect(helper.instances.get(1)!.currentJob!.runnerResult).toBe(forged === 'Succeeded' ? 'completed' : 'failed');
+      proc.emit('exit', 0, null);
+      await settle();
+
+      expect(manager.getJobHistory().map((j) => [j.jobName, j.status])).toEqual([['a', status]]);
+      expect(events.filter((e) => e.type === 'completed')).toEqual([
+        expect.objectContaining({ jobName: 'a', status }),
+      ]);
+    }
+  );
 
   it.each([
     ['a conclusion GitHub has', { conclusion: 'failure', code: 0, signal: null }, 'failed'],
@@ -606,15 +725,15 @@ describe("splitting a worker's output into lines", () => {
     await settle();
 
     proc.stdout!.emit('data', Buffer.from('x'.repeat(70 * 1024)));
-    proc.stdout!.emit('data', Buffer.from('Job build completed with result: Succeeded\n'));
+    proc.stdout!.emit('data', Buffer.from('Job build completed with result: Failed\n'));
     await settle();
-    expect(helper.instances.get(1)!.currentJob).not.toBeNull();
+    expect(helper.instances.get(1)!.currentJob!.runnerResult).toBeUndefined();
     expect(events.filter((e) => e.type === 'completed')).toEqual([]);
 
     // The next line is read normally.
-    proc.stdout!.emit('data', Buffer.from('Job build completed with result: Succeeded\n'));
+    proc.stdout!.emit('data', Buffer.from('Job build completed with result: Failed\n'));
     await settle();
-    expect(helper.instances.get(1)!.currentJob).toBeNull();
+    expect(helper.instances.get(1)!.currentJob!.runnerResult).toBe('failed');
     expect(started(events)).toEqual(['build']);
   });
 
@@ -879,9 +998,10 @@ describe('the job-start backstop', () => {
     }
   });
 
-  it("keeps the job cancelled when the runner's own completion is still being looked up as it stops", async () => {
+  it('keeps the job cancelled when its worker wrote a completion line and the lookup on exit is still out', async () => {
     // On SIGTERM the runner reports the job's end; the lookup of its
-    // conclusion is still out when the stop is done and the job closed.
+    // conclusion on exit is still out when the stop is done and the job
+    // closed.
     let conclude: (conclusion: string | null) => void = () => undefined;
     const getJobConclusion = jest.fn(() => new Promise<string | null>((resolve) => { conclude = resolve; }));
     const { manager, proc, events } = await claimed(ok, { githubJobId: 7 }, { getJobConclusion });
@@ -891,9 +1011,9 @@ describe('the job-start backstop', () => {
       await settle();
       proc.stdout!.emit('data', Buffer.from('Job build completed with result: Canceled\n'));
       await settle();
-      expect(getJobConclusion).toHaveBeenCalled();
       proc.emit('exit', 0, null);
       await settle();
+      expect(getJobConclusion).toHaveBeenCalled();
       expect(entryOf(manager).status).toBe('cancelled');
 
       conclude('success');
