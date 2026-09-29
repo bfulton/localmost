@@ -1151,6 +1151,11 @@ describe('message routing', () => {
           { jobMessageId: 2, ...acquiredIds, JobMessageId: 9 },
           { REQUESTID: 'req-9', ...acquiredIds },
           { requestId: 'req-1', ...acquiredIds, Runner_Request_Id: 'req-9' },
+          // Go's decoder folds beyond ASCII case: its U+017F long s matches s,
+          // so each of these is read there as the key it resembles.
+          { requestId: 'req-1', ...acquiredIds, 'requeſtId': 'req-9' },
+          { 'requeſtId': 'req-9', ...acquiredIds },
+          { jobMessageId: 2, ...acquiredIds, 'jobMeſſageId': 9 },
         ]) {
           expect({ ids, status: (await report(ids)).statusCode }).toEqual({ ids, status: 403 });
         }
@@ -1160,7 +1165,8 @@ describe('message routing', () => {
         expect(mockHttpsRequest).toHaveBeenCalledTimes(1);
       });
 
-      it.each(['/CompleteJob', '/RENEWJOB', '/%63ompletejob', '//renewjob', '/_apis/completejob', '/%E0completejob'])(
+      it.each(['/CompleteJob', '/RENEWJOB', '/%63ompletejob', '//renewjob', '/_apis/completejob', '/%E0completejob',
+        '/fini%C5%BFhjob', '/f%C4%B1nishjob'])(
         'binds %s like the job operation it names upstream', async (path) => {
           // Upstream routing ignores case and decodes the path; a gate that
           // matched only the exact spelling forwarded these on the runner's
@@ -1183,6 +1189,8 @@ describe('message routing', () => {
         ['GET', '//message'],
         ['DELETE', '/Session'],
         ['DELETE', '/%73ession'],
+        ['DELETE', '/%C5%BFession'],
+        ['GET', '/me%C5%BF%C5%BFage'],
         ['POST', '/%61cknowledge'],
         ['POST', '/AcquireJob'],
         ['POST', '/_apis/OAuth2/Token'],
