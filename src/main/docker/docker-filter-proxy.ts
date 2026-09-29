@@ -183,6 +183,13 @@ async function eachAtMost<T>(limit: number, items: T[], task: (item: T) => Promi
 export class DockerFilterProxy {
   private server: http.Server | null = null;
   private socketPath: string | null = null;
+  /**
+   * The directory the socket is served in - the job's sandbox - resolved
+   * through symlinks when the socket starts. The app made it, before the job
+   * existed, so that answer is the app's; resolved again later, it would be
+   * whatever the job had made of it by then.
+   */
+  private sandboxDir: string | null = null;
   private policy: DockerPolicy | null = null;
   /**
    * Containers created through this socket. The daemon is shared with the
@@ -289,6 +296,7 @@ export class DockerFilterProxy {
     // The sandbox directory is rebuilt per job, so a file here is a leftover
     // of our own, never something else's socket.
     fs.rmSync(socketPath, { force: true });
+    const sandboxDir = this.realpath(path.dirname(path.resolve(socketPath)));
 
     return new Promise((resolve, reject) => {
       const server = http.createServer((req, res) => this.handleRequest(req, res));
@@ -312,6 +320,7 @@ export class DockerFilterProxy {
         server.off('error', reject);
         this.server = server;
         this.socketPath = socketPath;
+        this.sandboxDir = sandboxDir;
         resolve();
       });
     });
@@ -435,18 +444,6 @@ export class DockerFilterProxy {
   // Deciding
   // ---------------------------------------------------------------------------
 
-  /** The workspace the backend roots mounts at, resolved so symlinked sandbox dirs compare equal. */
-  private workspaceRoot(): string {
-    const root = this.backend.workspaceMountRoot(path.dirname(this.socketPath ?? ''), this.repository);
-    try {
-      return this.realpath(root);
-    } catch {
-      // Not created yet: nothing inside it can exist either, so no mount can
-      // resolve into it and the unresolved path is a safe boundary.
-      return path.resolve(root);
-    }
-  }
-
   /** Write a Docker API error the job can act on, leaving the response open. */
   private writeRefusal(res: http.ServerResponse, status: number, message: string): void {
     const body = JSON.stringify({ message });
@@ -511,9 +508,15 @@ export class DockerFilterProxy {
       }
     }
 
+    const sandboxDir = this.sandboxDir;
+    if (sandboxDir === null) return { refusal: { status: 503, message: 'the localmost docker socket is not serving' } };
     const verdict = evaluateDockerRequest(req, {
       policy: this.policy,
-      workspaceRoot: this.workspaceRoot(),
+      sandboxDir,
+      // Joined, never resolved: every directory below the sandbox is the
+      // job's to replace with a link, and a root resolved through one moves
+      // wherever the link points.
+      workspaceRoot: this.backend.workspaceMountRoot(sandboxDir, this.repository),
       supportsPrivileged: this.backend.supportsPrivileged,
       ownContainerIds: this.ownContainerIds,
       ownNetworkIds: this.ownNetworkIds,

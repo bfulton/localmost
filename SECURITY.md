@@ -424,8 +424,16 @@ What the filter refuses, each of which is an executable test against the proxy:
 
 - a bind mount of any host path outside the job workspace - `docker run -v
   ~/.ssh:/host-ssh` is refused - including `../` traversal and a symlink that
-  resolves outside the workspace, since paths are resolved before they are
-  checked;
+  resolves outside the workspace, since a source is resolved before it is
+  checked. The workspace itself is never resolved again: the sandbox directory
+  is resolved once, when the socket starts, and `_work/<repo>/<repo>` is joined
+  to it as written, so a job that replaces its checkout or `_work` with a link
+  moves nothing. After resolving, each directory from the sandbox directory
+  down to the source is checked, and a symlink among them is refused. The
+  daemon is sent the resolved path, not the spelling it was given. That holds
+  when the container is created, not when it starts: the daemon resolves the
+  path again at start, and a job that swaps a symlink onto it in between
+  mounts what the link names. Closing that is an open item;
 - mounting the daemon socket into a container;
 - `--privileged`, `--pid=host`, `--network=host`, `--device`, and the other
   host-reaching container settings (`IpcMode`, `UtsMode`, `UsernsMode`,
