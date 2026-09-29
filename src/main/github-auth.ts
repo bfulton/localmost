@@ -654,6 +654,7 @@ export class GitHubAuth {
       const data = await client.get<{
         total_commits: number;
         commits: Array<{
+          sha: string;
           author: { login: string } | null;
           commit: { author: { name: string } | null };
         }>;
@@ -670,9 +671,15 @@ export class GitHubAuth {
       }
 
       for (const commit of data.commits || []) {
-        // Prefer the GitHub user login if available
         if (commit.author?.login) {
           authors.add(commit.author.login.toLowerCase());
+        } else {
+          // No linked account: the commit's email belongs to nobody GitHub
+          // knows, which is anyone who can get a commit merged or pushed.
+          // Skipping it read as "no new authors". It stands in the set under
+          // a name no login can equal (logins are alphanumerics and hyphens),
+          // so no allowlist admits it and the refusal says which commit.
+          authors.add(`(unattributed ${commit.sha ? commit.sha.slice(0, 7) : 'commit'})`);
         }
       }
     } catch (error) {
