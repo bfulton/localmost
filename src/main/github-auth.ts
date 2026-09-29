@@ -46,10 +46,13 @@ const segments = (value: string): string => value.split('/').map(segment).join('
  * alphanumerics and hyphens, so a parenthesised name with spaces can never
  * equal one, and since the admission refusal lists the authors it refused,
  * the name itself says why. `detail` (a commit, an email, a name) comes from
- * commit metadata, so control characters are dropped and it is kept short.
+ * commit metadata, so control and format characters (a right-to-left
+ * override, a zero-width space) are replaced, lest the reason read as
+ * something else, and it is cut to 100 characters, not UTF-16 units, so the
+ * cut never splits one.
  */
 export function unattributedAuthor(detail: string): string {
-  const shown = detail.replace(/\p{Cc}/gu, '?').slice(0, 100);
+  const shown = Array.from(detail.replace(/[\p{Cc}\p{Cf}]/gu, '?')).slice(0, 100).join('');
   return `(unattributed ${shown}: no linked GitHub account, so no allowlist can admit it)`;
 }
 
@@ -731,6 +734,55 @@ export class GitHubAuth {
       // contributors are involved in a job.
       throw new Error(
         `Failed to compare ${baseSha}...${headSha} for ${owner}/${repo}: ${(error as Error).message}`
+      );
+    }
+
+    return Array.from(authors);
+  }
+
+  /**
+   * Authors of the commits reachable from `headSha` dated after `since`.
+   *
+   * The contributor list is served from a cache GitHub says can be a few
+   * hours old, so it can predate commits already on the branch; this names
+   * their authors. Like getCommitAuthors, a commit with no linked account is
+   * unattributed and any failure throws, since the result gates admission.
+   */
+  async getRecentCommitAuthors(
+    accessToken: string,
+    owner: string,
+    repo: string,
+    headSha: string,
+    since: Date
+  ): Promise<string[]> {
+    const client = new GitHubClient(accessToken);
+    const authors = new Set<string>();
+    let page = 1;
+    const perPage = 100;
+
+    try {
+      while (true) {
+        const data = await client.get<Array<{ sha: string; author: { login?: string } | null }>>(
+          `/repos/${segment(owner)}/${segment(repo)}/commits`,
+          { params: { sha: headSha, since: since.toISOString(), per_page: String(perPage), page: String(page) } }
+        );
+
+        for (const commit of data || []) {
+          if (commit.author?.login) {
+            authors.add(commit.author.login.toLowerCase());
+          } else {
+            authors.add(unattributedAuthor(commit.sha ? `commit ${commit.sha.slice(0, 7)}` : 'commit'));
+          }
+        }
+
+        if (!data || data.length < perPage) {
+          break;
+        }
+        page++;
+      }
+    } catch (error) {
+      throw new Error(
+        `Failed to list commits since ${since.toISOString()} on ${headSha} for ${owner}/${repo}: ${(error as Error).message}`
       );
     }
 

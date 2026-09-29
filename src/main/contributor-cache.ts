@@ -20,6 +20,13 @@ interface RepoCacheEntry {
   fetchedAt: Date;
 }
 
+/**
+ * How far back from the default branch head the baseline also walks commits.
+ * GitHub documents its contributor data as possibly "a few hours old"; a day
+ * is comfortably past that.
+ */
+const RECENT_COMMIT_MARGIN_MS = 24 * 60 * 60 * 1000;
+
 /** Logger function type */
 type LogFn = (message: string) => void;
 
@@ -118,16 +125,27 @@ export class ContributorCache {
   ): Promise<RepoCacheEntry> {
     const cacheKey = this.getCacheKey(owner, repo);
 
-    // The head first, then the contributors. Later commits reach this set
-    // through the compare from this head, so the list must cover at least
-    // the history up to it: read the other way round (or together), a commit
-    // landing between the two reads would be in neither. One landing after
-    // the head is read may also appear in the list, which only adds authors.
+    // The head first. Later commits reach this set through the compare from
+    // it, so everything up to it must be covered here. The contributor list
+    // alone does not: GitHub serves it from a cache that can be a few hours
+    // old, so a commit merged shortly before this read may be missing from
+    // it. The authors of the head's commits from the last day close that gap;
+    // a commit landing after the head is read may also show up, which only
+    // adds authors. The walk selects by commit date, which the committer
+    // sets, so a commit dated back past the margin and merged within the
+    // cache's lag can still be missed.
     const branchInfo = await this.githubAuth.getDefaultBranch(accessToken, owner, repo);
     const contributors = await this.githubAuth.getContributors(accessToken, owner, repo);
+    const recentAuthors = await this.githubAuth.getRecentCommitAuthors(
+      accessToken,
+      owner,
+      repo,
+      branchInfo.sha,
+      new Date(Date.now() - RECENT_COMMIT_MARGIN_MS)
+    );
 
     const entry: RepoCacheEntry = {
-      contributors: new Set(contributors),
+      contributors: new Set([...contributors, ...recentAuthors]),
       defaultBranchSha: branchInfo.sha,
       fetchedAt: new Date(),
     };

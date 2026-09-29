@@ -3,7 +3,7 @@ jest.mock('./github-client', () => ({
   GitHubClient: jest.fn().mockImplementation(() => ({ get: mockGet })),
 }));
 
-import { GitHubAuth } from './github-auth';
+import { GitHubAuth, unattributedAuthor } from './github-auth';
 import { ContributorCache } from './contributor-cache';
 import { areAllUsersAllowed } from './runner/user-filter';
 
@@ -48,6 +48,7 @@ describe('GitHubAuth.getCommitAuthors', () => {
       if (endpoint === '/repos/o/r') return { default_branch: 'main' };
       if (endpoint.includes('/branches/')) return { name: 'main', commit: { sha: 'base' } };
       if (endpoint.includes('/compare/')) return compare([{ sha: 'ccccccc3333333' }]);
+      if (endpoint === '/repos/o/r/commits') return [];
       throw new Error(`unexpected ${endpoint}`);
     });
     const cache = new ContributorCache(new GitHubAuth());
@@ -107,6 +108,7 @@ describe('GitHubAuth.getContributors', () => {
       if (endpoint.endsWith('/contributors')) return anonymousPage.slice(0, 2);
       if (endpoint === '/repos/o/r') return { default_branch: 'main' };
       if (endpoint.includes('/branches/')) return { name: 'main', commit: { sha: 'head' } };
+      if (endpoint === '/repos/o/r/commits') return [];
       throw new Error(`unexpected ${endpoint}`);
     });
     const cache = new ContributorCache(new GitHubAuth());
@@ -120,5 +122,83 @@ describe('GitHubAuth.getContributors', () => {
 
     expect(verdict.allowed).toBe(false);
     expect(verdict.disallowedUsers).toEqual([expect.stringContaining('x@y.example')]);
+  });
+});
+
+describe('GitHubAuth.getRecentCommitAuthors', () => {
+  beforeEach(() => {
+    mockGet.mockReset();
+  });
+
+  const commit = (sha: string, login?: string) => ({ sha, author: login ? { login } : null });
+
+  it('walks the branch from the head since the given time, every page, and names each author', async () => {
+    const since = new Date('2026-09-28T12:00:00Z');
+    const fullPage = Array.from({ length: 100 }, (_, i) => commit(`f${String(i).padStart(13, '0')}`, 'Me'));
+    mockGet
+      .mockResolvedValueOnce(fullPage)
+      .mockResolvedValueOnce([commit('ddddddd4444444', 'Other'), commit('eeeeeee5555555')]);
+
+    const authors = await new GitHubAuth().getRecentCommitAuthors('token', 'o', 'r', 'head', since);
+
+    expect(mockGet).toHaveBeenNthCalledWith(1, '/repos/o/r/commits', {
+      params: expect.objectContaining({ sha: 'head', since: '2026-09-28T12:00:00.000Z', page: '1' }),
+    });
+    expect(mockGet).toHaveBeenNthCalledWith(2, '/repos/o/r/commits', {
+      params: expect.objectContaining({ page: '2' }),
+    });
+    expect(authors).toHaveLength(3);
+    expect(authors).toEqual(expect.arrayContaining(['me', 'other', expect.stringContaining('eeeeeee')]));
+  });
+
+  it('throws rather than returning a partial list', async () => {
+    mockGet.mockRejectedValue(new Error('502 Bad Gateway'));
+
+    await expect(
+      new GitHubAuth().getRecentCommitAuthors('token', 'o', 'r', 'head', new Date())
+    ).rejects.toThrow(/502 Bad Gateway/);
+  });
+
+  it('makes contributors admission refuse an author the stale contributor list leaves out', async () => {
+    // GitHub serves /contributors from a cache that can be hours old, so a
+    // commit merged just before the baseline is read is missing from it, and
+    // the compare starts at the head, after it.
+    mockGet.mockImplementation(async (endpoint: string) => {
+      if (endpoint.endsWith('/contributors')) return [{ login: 'me' }];
+      if (endpoint === '/repos/o/r') return { default_branch: 'main' };
+      if (endpoint.includes('/branches/')) return { name: 'main', commit: { sha: 'head' } };
+      if (endpoint === '/repos/o/r/commits') return [commit('fffffff6666666', 'Me'), commit('ggggggg7777777', 'Newcomer')];
+      throw new Error(`unexpected ${endpoint}`);
+    });
+    const cache = new ContributorCache(new GitHubAuth());
+
+    const authors = await cache.getAllAuthors('token', 'o', 'r', 'head');
+    const verdict = areAllUsersAllowed(
+      authors,
+      { scope: 'contributors', allowedUsers: 'allowlist', allowlist: [{ login: 'me', avatar_url: '', name: null }] },
+      'me'
+    );
+
+    expect(verdict.allowed).toBe(false);
+    expect(verdict.disallowedUsers).toEqual(['newcomer']);
+  });
+});
+
+describe('unattributedAuthor', () => {
+  it('keeps commit metadata from reordering or hiding text in the refusal reason', () => {
+    // An email or name is whatever the committer wrote. A right-to-left
+    // override or a zero-width character in it would make the reason shown
+    // in the UI and job history read as something else.
+    const shown = unattributedAuthor('evil‮gro.elpmaxe@​me');
+    expect(shown).not.toMatch(/[‮​]/);
+    expect(shown).toContain('evil?gro.elpmaxe@?me');
+  });
+
+  it('shortens by characters, never splitting one in half', () => {
+    // 99 ASCII characters and then an emoji, a surrogate pair in UTF-16: a cut
+    // at 100 code units would leave half of it.
+    const shown = unattributedAuthor('a'.repeat(99) + '\u{1F600}' + 'tail');
+    expect(shown).toContain('a'.repeat(99) + '\u{1F600}:');
+    expect(shown).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
   });
 });
