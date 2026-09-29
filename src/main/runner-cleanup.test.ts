@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
 import { spawn } from 'child_process';
-import { killOrphanedProcesses, markerHolders, parsePidRecord, signalOrphanPids, classifyLsofFailure, lsofCanSeeOtherProcesses } from './runner-cleanup';
+import { killOrphanedProcesses, markerHolders, parsePidRecord, signalOrphanPids, classifyLsofFailure, classifyPsFailure, lsofCanSeeOtherProcesses } from './runner-cleanup';
 
 describe('killOrphanedProcesses', () => {
   const runnerDir = path.join(os.tmpdir(), `lm-cleanup-${process.pid}`);
@@ -54,6 +54,52 @@ describe('killOrphanedProcesses', () => {
     await killOrphanedProcesses(sandboxBase, () => undefined, startTimeOf({ 4242: 'NEW-START' }));
 
     expect(signalled).toEqual([]);
+  });
+
+  it('sends no SIGKILL when the pid changed hands during the grace period', async () => {
+    // The worker exited on SIGTERM, and in the two seconds before the
+    // escalation the OS gave its pid to a new process. A liveness probe
+    // cannot tell the two apart; the start time can.
+    fs.writeFileSync(path.join(pidDir, '1.pid'), '4242 STARTED-AT');
+    const looks = ['STARTED-AT', 'LATER-START'];
+    const startTimeOf = (pid: number) => (pid === 4242 ? (looks.length > 1 ? looks.shift()! : looks[0]) : null);
+
+    await killOrphanedProcesses(sandboxBase, () => undefined, startTimeOf);
+
+    expect(signalled.filter(([, sig]) => sig === 'SIGTERM')).toEqual([[-4242, 'SIGTERM']]);
+    expect(signalled.filter(([, sig]) => sig === 'SIGKILL')).toEqual([]);
+  });
+
+  it('force-kills survivors of a worker that exited on SIGTERM', async () => {
+    // The worker is gone after the grace period but its descendants are not.
+    // While they live the group id cannot have been reused, so the group is
+    // still the one verified above - the same rule the per-worker sweep uses.
+    fs.writeFileSync(path.join(pidDir, '1.pid'), '4242 STARTED-AT');
+    const looks: Array<string | null> = ['STARTED-AT', null];
+    const startTimeOf = (pid: number) => (pid === 4242 ? (looks.length > 1 ? looks.shift()! : looks[0]) : null);
+
+    await killOrphanedProcesses(sandboxBase, () => undefined, startTimeOf);
+
+    expect(signalled.filter(([, sig]) => sig === 'SIGKILL')).toEqual([[-4242, 'SIGKILL']]);
+  });
+
+  it('force-kills as before when the second start-time lookup fails', async () => {
+    // ps timing out under load is not evidence the pid changed hands.
+    fs.writeFileSync(path.join(pidDir, '1.pid'), '4242 STARTED-AT');
+    const looks: Array<string | undefined> = ['STARTED-AT', undefined];
+    const startTimeOf = (pid: number) => (pid === 4242 ? (looks.length > 1 ? looks.shift() : looks[0]) : null);
+
+    await killOrphanedProcesses(sandboxBase, () => undefined, startTimeOf);
+
+    expect(signalled.filter(([, sig]) => sig === 'SIGKILL')).toEqual([[-4242, 'SIGKILL']]);
+  });
+
+  it('still force-kills a worker that ignored SIGTERM', async () => {
+    fs.writeFileSync(path.join(pidDir, '1.pid'), '4242 STARTED-AT');
+
+    await killOrphanedProcesses(sandboxBase, () => undefined, startTimeOf({ 4242: 'STARTED-AT' }));
+
+    expect(signalled.filter(([, sig]) => sig === 'SIGKILL')).toEqual([[-4242, 'SIGKILL']]);
   });
 
   it('never signals this process, even if a stale pid file names it', async () => {
@@ -237,6 +283,17 @@ describe('marker-based orphan reaping', () => {
     expect(classifyLsofFailure({ killed: true, signal: 'SIGTERM', code: null, stdout: '4242\n' })).toBeNull();
     // Never itself, never pid 1, no duplicates.
     expect(classifyLsofFailure({ code: 1, stdout: `1\n${process.pid}\n7\n7\n` })).toEqual([7]);
+  });
+
+  it('reads a failed ps run as no such process only when ps said so', () => {
+    // execFileSync's shapes. `ps -p <pid>` for a pid nobody holds exits 1 and
+    // prints nothing; a timeout or a failed spawn says nothing about the pid.
+    expect(classifyPsFailure({ status: 1, signal: null, stdout: '', stderr: '' })).toBeNull();
+    expect(classifyPsFailure({ status: null, signal: 'SIGTERM', code: 'ETIMEDOUT', stdout: '' })).toBeUndefined();
+    expect(classifyPsFailure({ status: null, signal: null, code: 'ENOENT' })).toBeUndefined();
+    expect(classifyPsFailure({ status: 1, signal: null, stdout: '', stderr: 'ps: some error' })).toBeUndefined();
+    expect(classifyPsFailure({ status: 2, signal: null, stdout: '', stderr: '' })).toBeUndefined();
+    expect(classifyPsFailure({})).toBeUndefined();
   });
 
   it('finds real survivors of a spawn by an inherited fd after the leader has exited', async () => {

@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from '@jest/globals';
+import { describe, it, expect, afterEach, beforeEach, jest } from '@jest/globals';
 import { spawn } from 'child_process';
 import { sweepProcessGroup, finishPendingSweeps } from './process-group';
 
@@ -116,5 +116,99 @@ describe('sweepProcessGroup', () => {
     // the user's session, so they are refused rather than passed through.
     expect(sweepProcessGroup(0)).toBe(false);
     expect(sweepProcessGroup(1)).toBe(false);
+  });
+});
+
+describe('sweepProcessGroup escalation', () => {
+  // Signals are recorded, not sent: these tests are about which pid the
+  // SIGKILL would reach, and 4242 is nobody this test owns.
+  let realKill: typeof process.kill;
+  let signalled: Array<[number, unknown]>;
+
+  beforeEach(() => {
+    finishPendingSweeps();
+    jest.useFakeTimers();
+    signalled = [];
+    realKill = process.kill;
+    (process as unknown as { kill: unknown }).kill = ((pid: number, sig?: unknown) => {
+      signalled.push([pid, sig]);
+      return true;
+    }) as never;
+  });
+  afterEach(() => {
+    (process as unknown as { kill: unknown }).kill = realKill;
+    jest.useRealTimers();
+  });
+
+  /**
+   * A start-time lookup that answers from a script, one look at a time: a
+   * start time, null for no such process, undefined for a failed lookup.
+   */
+  const startTimes = (...answers: Array<string | null | undefined>) => {
+    const seen: Array<string | null | undefined> = [...answers];
+    return jest.fn((_pid: number) => (seen.length > 1 ? seen.shift() : seen[0]));
+  };
+  const sigkills = () => signalled.filter(([, sig]) => sig === 'SIGKILL');
+
+  it('sends no SIGKILL once the group id has been taken by an unrelated process', () => {
+    // The leader was gone when the sweep began; during the grace period its
+    // survivors exited and the OS gave pid 4242 to a new process that leads
+    // its own group. kill(-4242) now names that stranger's group.
+    const startTimeOf = startTimes(null, 'Tue Sep 29 10:00:05 2026');
+
+    expect(sweepProcessGroup(4242, { graceMs: 1000, startTimeOf })).toBe(true);
+    jest.advanceTimersByTime(1000);
+
+    expect(sigkills()).toEqual([]);
+    expect(startTimeOf).toHaveBeenCalledTimes(2);
+  });
+
+  it('still escalates on a leaderless group, and on a leader that ignored SIGTERM', () => {
+    // Survivors of a leader that had already exited: nothing holds pid 4242.
+    sweepProcessGroup(4242, { graceMs: 1000, startTimeOf: startTimes(null) });
+    jest.advanceTimersByTime(1000);
+    expect(sigkills()).toEqual([[-4242, 'SIGKILL']]);
+
+    // The same leader, alive through the grace period.
+    signalled = [];
+    sweepProcessGroup(4343, { graceMs: 1000, startTimeOf: startTimes('Tue Sep 29 09:00:00 2026') });
+    jest.advanceTimersByTime(1000);
+    expect(sigkills()).toEqual([[-4343, 'SIGKILL']]);
+  });
+
+  it('still escalates on survivors of a leader that exited during the grace period', () => {
+    // The reclaim path: the leader was alive when the sweep began, took the
+    // SIGTERM and exited, and left its descendants behind - the orphans the
+    // sweep exists for. The pid cannot have been reused while they live.
+    sweepProcessGroup(4242, { graceMs: 1000, startTimeOf: startTimes('Tue Sep 29 09:00:00 2026', null) });
+    jest.advanceTimersByTime(1000);
+    expect(sigkills()).toEqual([[-4242, 'SIGKILL']]);
+
+    signalled = [];
+    sweepProcessGroup(4343, { graceMs: 1000, startTimeOf: startTimes('Tue Sep 29 09:00:00 2026', null) });
+    finishPendingSweeps();
+    expect(sigkills()).toEqual([[-4343, 'SIGKILL']]);
+  });
+
+  it('escalates as it always did when a lookup fails, rather than sparing the group', () => {
+    // ps can time out under load. Unknown is not "someone else": only a start
+    // time actually seen to differ spares the group.
+    sweepProcessGroup(4242, { graceMs: 1000, startTimeOf: startTimes(undefined, 'Tue Sep 29 09:00:00 2026') });
+    jest.advanceTimersByTime(1000);
+    expect(sigkills()).toEqual([[-4242, 'SIGKILL']]);
+
+    signalled = [];
+    sweepProcessGroup(4343, { graceMs: 1000, startTimeOf: startTimes('Tue Sep 29 09:00:00 2026', undefined) });
+    finishPendingSweeps();
+    expect(sigkills()).toEqual([[-4343, 'SIGKILL']]);
+  });
+
+  it('checks the leader again when quit forgoes the grace period', () => {
+    const startTimeOf = startTimes('Tue Sep 29 09:00:00 2026', 'Tue Sep 29 10:00:05 2026');
+    sweepProcessGroup(4242, { graceMs: 1000, startTimeOf });
+
+    finishPendingSweeps();
+
+    expect(sigkills()).toEqual([]);
   });
 });

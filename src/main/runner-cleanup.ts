@@ -44,16 +44,80 @@ export function validateChildPath(base: string, childName: string): string | nul
  * unrelated process before a sweep runs. Recording the start time at spawn and
  * comparing it here tells a still-living worker from a stranger that inherited
  * its pid, so a sweep never signals the wrong process.
+ *
+ * A failed lookup also reads as null here, which suits a caller deciding
+ * whether to signal at all: unknown is not a match.
  */
 export function processStartTime(pid: number): string | null {
+  return lookUpStartTime(pid) ?? null;
+}
+
+/** A process's start time; null for no such process; undefined when the lookup failed. */
+export type StartTime = string | null | undefined;
+
+/**
+ * processStartTime, keeping "no such process" (null) apart from "ps failed"
+ * (undefined: timed out under load, or could not be spawned).
+ *
+ * An escalation to SIGKILL needs the difference. There, a pid seen to be
+ * free, or held by the same process, means the group is still the one that
+ * was sent SIGTERM; a failed lookup proves nothing either way.
+ */
+export function lookUpStartTime(pid: number): StartTime {
   try {
     const out = execFileSync('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], {
       encoding: 'utf-8',
       timeout: 5000,
+      stdio: ['ignore', 'pipe', 'pipe'],
     }).trim();
     return out === '' ? null : out;
+  } catch (err) {
+    return classifyPsFailure(err);
+  }
+}
+
+/**
+ * What a failed `ps -o lstart= -p <pid>` run means. The shapes are
+ * execFileSync's: a numeric `status` for an exit status, a string `code` for
+ * a spawn failure or timeout, `signal` for a run that was killed.
+ *
+ * ps exits 1 with nothing on either stream when no process has the pid;
+ * that is null. Anything else is unknown (undefined).
+ */
+export function classifyPsFailure(err: unknown): null | undefined {
+  const e = err as {
+    status?: number | null; signal?: string | null; code?: string;
+    stdout?: string | Buffer; stderr?: string | Buffer;
+  };
+  if (e.status !== 1 || e.signal || typeof e.code === 'string') return undefined;
+  const quiet = String(e.stdout ?? '').trim() === '' && String(e.stderr ?? '').trim() === '';
+  return quiet ? null : undefined;
+}
+
+/**
+ * Whether the SIGKILL that follows a SIGTERM to `pid`'s group may go out,
+ * given the leader's start time when the SIGTERM was sent and now.
+ *
+ * The OS never reuses a pid while a group with that id has members, so while
+ * the group is non-empty a pid nobody holds (null) still names it, and so
+ * does the same leader. Only a start time actually seen to differ from the
+ * one before - a process at the pid when there was none, or another one -
+ * means the id changed hands during the grace period. A lookup that failed
+ * on either side escalates, as before this check existed: sparing the group
+ * would leave a leader that ignored SIGTERM running with nothing to reap it.
+ */
+export function mayEscalate(before: StartTime, now: StartTime): boolean {
+  if (typeof now !== 'string' || before === undefined) return true;
+  return now === before;
+}
+
+/** Whether a process (pid) or a non-empty group (-pgid) exists to signal. Signal 0 delivers nothing. */
+function canSignal(target: number): boolean {
+  try {
+    process.kill(target, 0);
+    return true;
   } catch {
-    return null; // no such process
+    return false;
   }
 }
 
@@ -286,7 +350,7 @@ export function parsePidRecord(raw: string): { pid: number | null; recordedStart
 export async function killOrphanedProcesses(
   sandboxBase: string,
   log: CleanupLogger,
-  startTimeOf: (pid: number) => string | null = processStartTime,
+  startTimeOf: (pid: number) => StartTime = lookUpStartTime,
   holdersOf: (markerPath: string) => Promise<number[] | null> | number[] | null = (p) => markerHolders(p, log)
 ): Promise<boolean> {
   let killedAny = false;
@@ -359,19 +423,24 @@ export async function killOrphanedProcesses(
           }
           // Give it time to gracefully disconnect from GitHub
           await new Promise(resolve => setTimeout(resolve, 2000));
-          // Force kill if still alive
-          try {
-            process.kill(pid, 0);
+          // Force kill only the group that was verified above. The worker may
+          // have exited on SIGTERM and its pid been handed to a new process
+          // within the grace period, which a liveness probe cannot tell
+          // apart; the start time can, as it did before the SIGTERM. A worker
+          // gone with descendants still in its group is escalated too, by the
+          // same rule as the per-worker sweep (mayEscalate). Nothing left in
+          // the group or at the pid is the expected success case.
+          const now = startTimeOf(pid);
+          if (mayEscalate(recordedStart, now) && (canSignal(-pid) || canSignal(pid))) {
             log(`Force killing orphaned process ${pid}`);
             try {
               process.kill(-pid, 'SIGKILL');
             } catch {
               // Process group kill failed - fall back to single process
-              process.kill(pid, 'SIGKILL');
+              try { process.kill(pid, 'SIGKILL'); } catch { /* exited meanwhile */ }
             }
-          } catch {
-            // Process exited after SIGTERM - this is the expected success case
           }
+          // Otherwise it exited after SIGTERM - the expected success case.
         } catch {
           // Process not running (ESRCH) - already dead, nothing to do
         }

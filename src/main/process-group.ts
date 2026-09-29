@@ -14,11 +14,57 @@
  * still addresses the survivors after the leader itself is gone.
  */
 
+import { lookUpStartTime, mayEscalate, StartTime } from './runner-cleanup';
+
 /** How long a process gets to handle SIGTERM before SIGKILL. */
 export const GRACE_MS = 10_000;
 
+type StartTimeOf = (pid: number) => StartTime;
+
+interface Escalation {
+  /**
+   * The leader's start time when the sweep began; null if it had already
+   * exited, undefined if the lookup failed.
+   */
+  leaderStart: StartTime;
+  startTimeOf: StartTimeOf;
+  onLog?: (message: string) => void;
+}
+
 /** Escalations still waiting out their grace period, by process group. */
-const pendingEscalations = new Map<number, NodeJS.Timeout>();
+const pendingEscalations = new Map<number, Escalation & { timer: NodeJS.Timeout }>();
+
+/**
+ * SIGKILL the group, unless its id no longer names the group that was swept.
+ *
+ * A process group id is its leader's pid, and the OS can hand that pid out
+ * again once every member of the group has exited - which is what SIGTERM
+ * asks of them during the grace period. A new process given that pid that
+ * leads a group of its own is then what kill(-pid) reaches. The OS never
+ * reuses a pid while a group with that id still has members, so a live
+ * process at `pid` is either the leader the sweep found (same start time) or
+ * a stranger (anything else, including one where the sweep found none), and
+ * only the first means the group is still ours to kill. mayEscalate() holds
+ * the rule, shared with the startup sweep, including what a failed lookup
+ * means.
+ */
+function escalate(pid: number, { leaderStart, startTimeOf, onLog }: Escalation): void {
+  try {
+    process.kill(-pid, 0);
+  } catch {
+    return; // Gone, which is the point.
+  }
+  if (!mayEscalate(leaderStart, startTimeOf(pid))) {
+    onLog?.(`process group ${pid} ended and its id was reused; not sending SIGKILL`);
+    return;
+  }
+  try {
+    process.kill(-pid, 'SIGKILL');
+    onLog?.(`process group ${pid} ignored SIGTERM; sent SIGKILL`);
+  } catch {
+    // Exited between the check and the signal.
+  }
+}
 
 /**
  * Kill anything still waiting out a grace period, now.
@@ -29,14 +75,9 @@ const pendingEscalations = new Map<number, NodeJS.Timeout>();
  * reap it.
  */
 export function finishPendingSweeps(): void {
-  for (const [pid, timer] of pendingEscalations) {
-    clearTimeout(timer);
-    try {
-      process.kill(-pid, 0);
-      process.kill(-pid, 'SIGKILL');
-    } catch {
-      // Already gone.
-    }
+  for (const [pid, pending] of pendingEscalations) {
+    clearTimeout(pending.timer);
+    escalate(pid, pending);
   }
   pendingEscalations.clear();
 }
@@ -49,14 +90,14 @@ export function finishPendingSweeps(): void {
  */
 export function sweepProcessGroup(
   pid: number | null | undefined,
-  options: { graceMs?: number; onLog?: (message: string) => void } = {}
+  options: { graceMs?: number; onLog?: (message: string) => void; startTimeOf?: StartTimeOf } = {}
 ): boolean {
   // kill(-0) signals the caller's own process group and kill(-1) signals every
   // process this user may signal. Either would take down the app, so neither
   // is ever a group to sweep.
   if (pid === null || pid === undefined || pid <= 1 || !Number.isInteger(pid)) return false;
 
-  const { graceMs = GRACE_MS, onLog } = options;
+  const { graceMs = GRACE_MS, onLog, startTimeOf = lookUpStartTime } = options;
 
   try {
     // Signal 0 delivers nothing; it asks whether the group has any members.
@@ -64,6 +105,10 @@ export function sweepProcessGroup(
   } catch {
     return false; // Empty group: the job cleaned up after itself.
   }
+
+  // Who holds the pid now, so the escalation can tell this group from one
+  // that takes over its id during the grace period.
+  const leaderStart = startTimeOf(pid);
 
   onLog?.(`job processes outlived their worker; terminating process group ${pid}`);
   try {
@@ -77,13 +122,7 @@ export function sweepProcessGroup(
     // would later signal -pid, a group id the OS may by then have reused for
     // something unrelated.
     pendingEscalations.delete(pid);
-    try {
-      process.kill(-pid, 0);
-      process.kill(-pid, 'SIGKILL');
-      onLog?.(`process group ${pid} ignored SIGTERM; sent SIGKILL`);
-    } catch {
-      // Gone, which is the point.
-    }
+    escalate(pid, { leaderStart, startTimeOf, onLog });
   }, graceMs);
   // Never hold the app open waiting to escalate.
   escalation.unref?.();
@@ -92,7 +131,7 @@ export function sweepProcessGroup(
   // when a surviving descendant matters most: nothing will be left to reap it.
   // finishNow() is the caller's way to say "there is no later" - it forgoes the
   // grace period and kills immediately.
-  pendingEscalations.set(pid, escalation);
+  pendingEscalations.set(pid, { timer: escalation, leaderStart, startTimeOf, onLog });
 
   return true;
 }

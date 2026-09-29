@@ -519,7 +519,7 @@ and who is allowed:
 
 The trigger author is the person who set the run going, not necessarily the author of the code it runs; a comment or a re-run by an allowed user runs whatever the commit contains. **Repo contributors** covers the code as well, and checks the trigger author too, so it refuses at least what **Trigger author** refuses.
 
-Under either filtering scope, a job whose trigger author cannot be read is refused, since it cannot be shown to be anyone allowed. Under **Repo contributors**, a commit whose email is linked to no GitHub account counts as an author no filter allows (it appears as `(unattributed <sha>)` in the refusal), since anyone can write such a commit. This applies to the commits between the default branch head at which the contributor list was fetched and the job's commit; GitHub's contributor list itself leaves such authors out, so one already on the default branch when the list was fetched is not seen.
+Under either filtering scope, a job whose trigger author cannot be read is refused, since it cannot be shown to be anyone allowed. Under **Repo contributors**, an author whose email is linked to no GitHub account counts as one no filter allows, since anyone can write such a commit. That holds for the repository's contributor list, which is read with anonymous contributors included; for the commits on the default branch dated within the day before its head was read, since GitHub serves the contributor list from a cache that can be a few hours old; and for every commit between that head and the job's commit. Each appears in the refusal as `(unattributed <commit, email or name>: no linked GitHub account, ...)`. So a repository with such an author in its history is refused under this scope, and no allowlist entry can admit it; nor, in practice, can one with more than 500 author emails, since GitHub links only the first 500 to accounts and lists the rest as anonymous. One gap remains: the recent-commit walk goes by commit date, which the committer sets, so a commit dated back more than a day and merged within the hours before the baseline was read can be missed, with its author.
 
 The check runs before any worker is started. A refused job never runs: it is dropped, recorded in the job history, and its workflow run is cancelled.
 
@@ -567,7 +567,9 @@ The `localmost` CLI talks to the app over a unix socket, mode `0600` inside a `0
 ## Log Sanitization
 
 Log messages are sanitized before being written to disk or displayed:
-- GitHub tokens (`ghp_*`, `gho_*`, etc.) are redacted
+- GitHub tokens (`ghp_*`, `gho_*`, `ghu_*`, `ghs_*`, `ghr_*`, and fine-grained `github_pat_*`) are redacted
+- A worker's broker key in its `/w/<key>` URL is redacted
+- Credentials in a URL (`scheme://user:password@`), including the egress proxy's per-worker token, are redacted
 - JWT tokens are redacted
 - GitHub registration tokens are redacted
 - Encrypted values and bearer tokens are redacted
