@@ -388,6 +388,22 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).toContain('(deny file-read* (regex "^/Users/test/\\\\.ssh/id_.*$"))');
     });
 
+    it('keeps a policy deny inside the workspace after the workspace is reopened', () => {
+      // The workspace is reopened after the final deny of the app data
+      // directory it lives in; a deny the policy names inside it must not be
+      // undone by that.
+      const workDir = '/Users/test/.localmost/workspaces/ws-1';
+      const forms = topLevelForms(generateSandboxProfile({
+        workDir,
+        proxyPort: DEFAULT_PROXY_PORT,
+        policy: { filesystem: { deny: [`${workDir}/secrets`] } },
+      }));
+      const reopen = forms.findIndex((f) => f === `(allow file-read* file-write*\n  (subpath "${workDir}"))`);
+      const deny = forms.indexOf(`(deny file-write* (subpath "${workDir}/secrets"))`);
+      expect(reopen).toBeGreaterThan(-1);
+      expect(deny).toBeGreaterThan(reopen);
+    });
+
     it('should deny specified filesystem paths', () => {
       const profile = generateSandboxProfile({
         workDir: '/path/to/project',

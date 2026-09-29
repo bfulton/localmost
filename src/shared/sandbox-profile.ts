@@ -396,7 +396,12 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
     lines.push('');
   }
 
-  // Policy-defined read restrictions (if any explicit deny)
+  lines.push(...neverReachableRules(escapedWorkDir, options.readOnlyPaths));
+  lines.push('');
+
+  // Policy-defined denies, after the workspace is reopened above so a deny
+  // the policy names inside the workspace still holds. A deny only ever
+  // narrows, so it can come last.
   if (policy?.filesystem?.deny) {
     lines.push(';; Policy-defined filesystem deny');
     for (const pattern of policy.filesystem.deny) {
@@ -412,9 +417,6 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
     }
     lines.push('');
   }
-
-  lines.push(...neverReachableRules(escapedWorkDir, options.readOnlyPaths));
-  lines.push('');
 
   // Device files
   lines.push(';; Device files');
