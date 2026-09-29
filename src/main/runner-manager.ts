@@ -5,6 +5,7 @@ import * as path from 'path';
 import { createHash, randomBytes } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
+import { StringDecoder } from 'string_decoder';
 import * as yaml from 'js-yaml';
 import type { DockerPolicy } from '../shared/docker-policy';
 import { DesktopBackend, DockerBackend } from './docker/docker-backend';
@@ -29,6 +30,61 @@ import { normalizeFilterConfig, isUserAllowed, areAllUsersAllowed, parseReposito
  * truncates silently past that.
  */
 const DOCKER_SOCKET_NAME = 'docker.sock';
+
+/**
+ * The longest line of worker output that is read as a line. The runner's own
+ * status lines are far shorter; anything longer is a job's output.
+ */
+const MAX_OUTPUT_LINE = 64 * 1024;
+
+/**
+ * Split a worker's output stream into whole lines.
+ *
+ * A pipe hands over whatever was written, cut anywhere: a runner line can
+ * arrive in two chunks, and splitting each chunk on its own read both halves
+ * as lines - the real one missed, and the tail of a line a job printed read
+ * as though it began a line. So the unfinished line is carried to the next
+ * chunk (and read at end of stream), and bytes are decoded across chunks.
+ * A line is given up as soon as it passes MAX_OUTPUT_LINE, and skipped to
+ * its end, rather than buffered without bound: a job that never prints a
+ * newline must not grow this process. onSkipped hears of each one once.
+ */
+export function lineReader(
+  onLine: (line: string) => void,
+  onSkipped: () => void
+): { write(chunk: Buffer | string): void; end(): void } {
+  const decoder = new StringDecoder('utf8');
+  let pending = '';
+  /** Inside a line already given up, up to its newline. */
+  let skipping = false;
+  const feed = (text: string): void => {
+    let start = 0;
+    for (let nl = text.indexOf('\n'); nl !== -1; nl = text.indexOf('\n', start)) {
+      const piece = text.slice(start, nl);
+      start = nl + 1;
+      if (skipping) {
+        skipping = false;
+        continue;
+      }
+      const line = pending + piece;
+      pending = '';
+      if (line.length > MAX_OUTPUT_LINE) onSkipped();
+      else if (line) onLine(line);
+    }
+    if (skipping) return;
+    pending += text.slice(start);
+    if (pending.length > MAX_OUTPUT_LINE) {
+      skipping = true;
+      pending = '';
+      onSkipped();
+    }
+  };
+  return {
+    write: (chunk) => feed(typeof chunk === 'string' ? chunk : decoder.write(chunk)),
+    // The last line may have no newline; the stream's end finishes it.
+    end: () => feed(`${decoder.end()}\n`),
+  };
+}
 
 /**
  * Get the hostname without .local suffix (common on macOS).
@@ -1252,21 +1308,22 @@ export class RunnerManager {
         }
       }
 
-      instance.process.stdout?.on('data', (data: Buffer) => {
-        const lines = data.toString().split('\n').filter(Boolean);
-        lines.forEach((line) => {
-          this.parseRunnerOutput(instanceNum, line);
-          this.logInstanceOutput(instanceNum, 'debug', line);
-        });
-      });
+      // One reader per stream: a line is only ever continued on its own stream.
+      const skipped = (stream: string) => () =>
+        this.logInstanceOutput(instanceNum, 'debug', `(${stream}: skipped a line over ${MAX_OUTPUT_LINE} characters)`);
+      const stdout = lineReader((line) => {
+        this.parseRunnerOutput(instanceNum, line);
+        this.logInstanceOutput(instanceNum, 'debug', line);
+      }, skipped('stdout'));
+      instance.process.stdout?.on('data', (data: Buffer) => stdout.write(data));
+      instance.process.stdout?.on('end', () => stdout.end());
 
-      instance.process.stderr?.on('data', (data: Buffer) => {
-        const lines = data.toString().split('\n').filter(Boolean);
-        lines.forEach((line) => {
-          this.parseRunnerOutput(instanceNum, line); // Also parse stderr for status
-          this.logInstanceOutput(instanceNum, 'error', line);
-        });
-      });
+      const stderr = lineReader((line) => {
+        this.parseRunnerOutput(instanceNum, line); // Also parse stderr for status
+        this.logInstanceOutput(instanceNum, 'error', line);
+      }, skipped('stderr'));
+      instance.process.stderr?.on('data', (data: Buffer) => stderr.write(data));
+      instance.process.stderr?.on('end', () => stderr.end());
 
       instance.process.on('error', (error) => {
         this.log('error', `Runner instance ${instanceNum} error: ${error.message}`);
@@ -1921,10 +1978,17 @@ export class RunnerManager {
       this.applyRepoPolicy(instanceNum).catch((err) => {
         this.log('debug', `Repo policy load failed: ${(err as Error).message}`);
       });
+      // A start line is nothing else, whatever its job name says.
+      return;
     }
 
-    // Detect job completion
-    const jobCompleteMatch = line.match(/Job .+ completed with result:\s*(\w+)/i);
+    // Detect job completion. Anchored like the start: a step can print
+    // "Job x completed with result: Succeeded" anywhere in its output, and
+    // an unanchored match ended the job there - its worker shown idle and
+    // its history closed while its steps were still running.
+    const jobCompleteMatch = line.match(
+      /^\s*(?:\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?:?\s*)?Job\s+(.+)\s+completed with result:\s*(\w+)\s*$/i
+    );
     if (jobCompleteMatch && instance.currentJob) {
       // Claim the job synchronously. The conclusion lookup below awaits, and
       // the runner can emit its completion line more than once; leaving
@@ -1960,7 +2024,7 @@ export class RunnerManager {
               status = 'cancelled';
             } else if (conclusion === null) {
               // Conclusion not yet set - use runner-reported result
-              const result = jobCompleteMatch[1].toLowerCase();
+              const result = jobCompleteMatch[2].toLowerCase();
               status = result === 'succeeded' ? 'completed' : result === 'failed' ? 'failed' : 'cancelled';
               this.log('info', `[instance ${instanceNum}] Job completed: ${jobName} conclusion=null, using runner result=${result} → status=${status}`);
             } else {
@@ -1972,14 +2036,14 @@ export class RunnerManager {
             }
           } catch {
             // Fall back to runner-reported result
-            const result = jobCompleteMatch[1].toLowerCase();
+            const result = jobCompleteMatch[2].toLowerCase();
             status = result === 'succeeded' ? 'completed' : result === 'failed' ? 'failed' : 'cancelled';
             this.log('warn', `[instance ${instanceNum}] Could not get job conclusion from GitHub, using runner result: ${result}`);
           }
         }
       } else {
         // No API available, use runner-reported result
-        const result = jobCompleteMatch[1].toLowerCase();
+        const result = jobCompleteMatch[2].toLowerCase();
         status = result === 'succeeded' ? 'completed' : result === 'failed' ? 'failed' : 'cancelled';
         this.log('info', `[instance ${instanceNum}] Job completed: ${jobName} result=${result} → status=${status}`);
       }
