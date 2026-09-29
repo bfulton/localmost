@@ -342,20 +342,73 @@ describe('Process Sandbox', () => {
       // come after the policy-declared write allow - otherwise a policy could
       // declare a write path into the pid directory or the proxy credentials
       // and reopen the very holes the read denials close.
-      const profile = profileWith({ dockerSocket: path.join(instanceDir, 'docker.sock') });
-      const runnerDir = path.join(os.homedir(), '.localmost', 'runner');
-      const policyAllow = profile.lastIndexOf('(allow file-write*');
-      const denyWrite = profile.indexOf('(deny file-write*\n  (subpath');
-      // The final re-allow of the job's own sandbox is the true last write rule.
-      const reallowOwn = profile.lastIndexOf(`(allow file-write*\n  (subpath "${instanceDir}"))`);
-      const denyBlock = profile.slice(profile.indexOf('(deny file-write*\n  (subpath'), reallowOwn);
-      expect(denyWrite).toBeGreaterThan(-1);
-      expect(denyBlock).toContain(`(subpath "${runnerDir}/pids")`);
-      expect(denyBlock).toContain(`(subpath "${runnerDir}/proxies")`);
-      expect(denyBlock).toContain(`(subpath "${runnerDir}/config")`);
-      expect(denyBlock).toContain(`(subpath "${runnerDir}/sandbox")`);
-      expect(reallowOwn).toBeGreaterThan(denyWrite);
-      expect(denyWrite).toBeGreaterThan(policyAllow > -1 ? -1 : -2);
+      const appDir = path.join(os.homedir(), '.localmost');
+      const runnerDir = path.join(appDir, 'runner');
+      const profile = profileWith({
+        dockerSocket: path.join(instanceDir, 'docker.sock'),
+        filesystemPolicy: { level: 'strict', read: [], write: ['~/.localmost'] },
+      });
+      expect(writable(profile, path.join(appDir, 'policies', 'owner-repo.json'))).toBe(false);
+      expect(writable(profile, path.join(runnerDir, 'pids', 'worker-1.pid'))).toBe(false);
+      expect(writable(profile, path.join(runnerDir, 'proxies', 'target-a', '1', '.credentials_rsaparams'))).toBe(false);
+      expect(writable(profile, path.join(runnerDir, 'config', '1', '.runner'))).toBe(false);
+      expect(writable(profile, path.join(runnerDir, 'sandbox-profiles', 'sandbox-1.sb'))).toBe(false);
+      expect(writable(profile, path.join(runnerDir, 'broker-sessions.json'))).toBe(false);
+      expect(writable(profile, path.join(runnerDir, 'sandbox', '2', 'run.sh'))).toBe(false);
+      // The job's own sandbox stays writable, all but its docker socket.
+      expect(writable(profile, path.join(instanceDir, '_work', 'out'))).toBe(true);
+      expect(writable(profile, path.join(instanceDir, 'docker.sock'))).toBe(false);
+    });
+
+    /**
+     * Whether a profile lets a job write a path: seatbelt applies the last
+     * file-write rule whose filters match it.
+     */
+    const writable = (profile: string, target: string): boolean => {
+      let verdict = false;
+      const rule = /\((allow|deny) file-write\*/g;
+      for (let match = rule.exec(profile); match; match = rule.exec(profile)) {
+        // The rule runs to the parenthesis that closes it.
+        let depth = 0;
+        let end = match.index;
+        for (; end < profile.length; end++) {
+          if (profile[end] === '(') depth++;
+          else if (profile[end] === ')' && --depth === 0) break;
+        }
+        const body = profile.slice(match.index, end).replace(/;;.*$/gm, '');
+        const filters = [...body.matchAll(/\((subpath|literal) "([^"]*)"\)/g)];
+        const matches = filters.length === 0 || filters.some(([, kind, value]) =>
+          target === value || (kind === 'subpath' && target.startsWith(`${value}/`)));
+        if (matches) verdict = match[1] === 'allow';
+      }
+      return verdict;
+    };
+
+    it("keeps the runner template and its integrity record unwritable, even under a policy that grants the app's directory", () => {
+      // Every worker runs a copy of runner/arc, checked against the record in
+      // runner/arc-manifests. A job that could write both could change the
+      // runner every later job runs, and the check would pass. A policy write
+      // path of ~ or ~/.localmost lies outside the runner directory, so it is
+      // not dropped; only the deny that ends the write rules stands in its way.
+      const appDir = path.join(os.homedir(), '.localmost');
+      const runnerDir = path.join(appDir, 'runner');
+      for (const grant of ['~', '~/.localmost']) {
+        const profile = profileWith({
+          filesystemPolicy: { level: 'strict', read: [], write: [grant] },
+        });
+        expect(writable(profile, path.join(appDir, 'some-file'))).toBe(true);
+        expect(writable(profile, path.join(runnerDir, 'arc', 'v2.336.0', 'bin', 'Runner.Worker.dll'))).toBe(false);
+        expect(writable(profile, path.join(runnerDir, 'arc', 'v9.9.9', '.env'))).toBe(false);
+        expect(writable(profile, path.join(runnerDir, 'arc-manifests', 'v2.336.0.json'))).toBe(false);
+        expect(writable(profile, path.join(runnerDir, 'arc-staging-a1b2c3', 'tree', 'run.sh'))).toBe(false);
+        // Renaming a directory the record and template live in, and putting
+        // another in its place, is a write to that directory itself.
+        expect(writable(profile, runnerDir)).toBe(false);
+        expect(writable(profile, appDir)).toBe(false);
+        // What a job may write in there is still writable.
+        expect(writable(profile, path.join(instanceDir, '_work', 'repo', 'out.o'))).toBe(true);
+        expect(writable(profile, path.join(runnerDir, 'tool-cache', 'node', '20', 'bin', 'node'))).toBe(true);
+      }
     });
 
     it('ignores a policy read or write path that resolves inside the runner directory', () => {

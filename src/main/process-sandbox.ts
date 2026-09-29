@@ -320,20 +320,22 @@ ${policyWrites ? `(allow file-write*\n${policyWrites})` : ';; No policy-declared
 
 ;; Never writable, whatever matched above - including a policy-declared write
 ;; path, since this is the last word. The app's control plane (a job that
-;; writes these approves its own policy) and the runner's secrets and bookkeeping
-;; (proxy credentials, registrations, session tokens, the pid files the startup
-;; sweep trusts, and other workers' sandboxes). This job's own sandbox is
-;; re-allowed last so it stays writable.
+;; writes these approves its own policy) and the whole runner directory: its
+;; secrets and bookkeeping (proxy credentials, registrations, session tokens,
+;; the pid files the startup sweep trusts, other workers' sandboxes) and the
+;; runner template every worker is copied from, with the record it is checked
+;; against. The runner directory is denied whole and the two places a job does
+;; write there are re-allowed after it, so nothing added there later is
+;; writable by default. The app directory's own node is denied so that it and
+;; the runner directory cannot be renamed away and replaced.
 (deny file-write*
+  (literal "${appDataDir}")
   (subpath "${policiesDir}")
   (literal "${configFile}")
   (literal "${cliSocket}")
-  (subpath "${runnerDir}/pids")
-  (subpath "${runnerDir}/proxies")
-  (subpath "${runnerDir}/config")
-  (subpath "${runnerDir}/sandbox-profiles")
-  (literal "${runnerDir}/broker-sessions.json")
-  (subpath "${runnerDir}/sandbox"))
+  (subpath "${runnerDir}"))
+(allow file-write*
+  (subpath "${toolCacheDir}"))
 (allow file-write*
   (subpath "${escapedDir}"))
 
