@@ -1209,6 +1209,38 @@ describe('message routing', () => {
 
       expect(internals.messageQueues.get('target-a')).toEqual([]);
     });
+
+    it('offers nothing to admission for a job it could not acquire', async () => {
+      // With no stored payload the worker's acquirejob is answered 404, so a
+      // worker spawned for it could never run it; and admission now refuses a
+      // job it cannot identify. Offered anyway, every redelivery - GitHub keeps
+      // offering a job nobody claimed - would be refused and recorded again.
+      // Left alone, the next redelivery is acquired and admitted properly.
+      addTargetWithRunner('target-a', 'runner-a.1');
+      mockHttpsRequest.mockImplementation((...args: unknown[]) => {
+        const callback = args[1] as (res: EventEmitter) => void;
+        const req = new EventEmitter() as EventEmitter & { setTimeout: () => void; write: () => void; end: () => void };
+        req.setTimeout = () => {};
+        req.write = () => {};
+        req.end = () => {
+          const res = new EventEmitter() as EventEmitter & { statusCode: number };
+          res.statusCode = 503;
+          callback(res);
+          res.emit('end');
+        };
+        return req;
+      });
+      const received = jest.fn();
+      service.on('job-received', received);
+
+      await receive('req-1', 2);
+
+      expect(received).not.toHaveBeenCalled();
+      expect(internals.messageQueues.get('target-a') ?? []).toEqual([]);
+      expect(deep().jobAssignments.has('req-1')).toBe(false);
+      expect(deep().jobRunServiceUrls.size).toBe(0);
+      expect(deep().jobInfo.size).toBe(0);
+    });
   });
 
   describe("which job's repository a worker may claim", () => {

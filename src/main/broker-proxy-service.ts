@@ -593,44 +593,45 @@ export class BrokerProxyService extends EventEmitter {
         return;
       }
 
-      // Store real run_service_url for forwarding job operations
-      // Store by multiple keys since runner may use different IDs
       const runServiceUrl = innerBody?.run_service_url;
       const billingOwnerId = innerBody?.billing_owner_id;
-      if (runServiceUrl) {
-        this.jobRunServiceUrls.set(jobId, runServiceUrl);
-        // Also store by messageId (used as jobMessageId in acquirejob)
-        // messageId was extracted as string to avoid precision loss
-        this.jobRunServiceUrls.set(messageId, runServiceUrl);
-        // Store job info for acquireJobUpstream
-        this.jobInfo.set(messageId, { billingOwnerId, runServiceUrl });
-        log()?.info(`[BrokerProxy] Job ${jobId} (messageId=${messageId}) received from ${state.target.displayName}, run_service_url=${runServiceUrl}, billingOwnerId=${billingOwnerId}`);
-      } else {
-        log()?.info(`[BrokerProxy] Job ${jobId} received from ${state.target.displayName} (no run_service_url)`);
-      }
+      log()?.info(`[BrokerProxy] Job ${jobId} (messageId=${messageId}) received from ${state.target.displayName}, run_service_url=${runServiceUrl ?? 'none'}, billingOwnerId=${billingOwnerId}`);
 
       // Acquire job from GitHub immediately using target's credentials
       // This claims the job so GitHub won't keep sending it on subsequent polls
       // Note: GitHub uses runner_request_id (UUID) as jobMessageId, not the broker's numeric messageId
-      let githubInfo: GitHubJobInfo = {};
-      if (runServiceUrl) {
-        const jobDetails = await this.acquireJobUpstream(state, instance, jobId, runServiceUrl, billingOwnerId);
-        if (jobDetails) {
-          this.acquiredJobDetails.set(jobId, jobDetails);
-          this.acquiredJobDetails.set(messageId, jobDetails);
-          log()?.info(`[BrokerProxy] Acquired job ${jobId} (messageId=${messageId}) upstream, stored details`);
+      const jobDetails = runServiceUrl
+        ? await this.acquireJobUpstream(state, instance, jobId, runServiceUrl, billingOwnerId)
+        : null;
+      if (!jobDetails) {
+        // Not acquired, so not ours to offer. This used to carry on: a worker
+        // spawned for it had its acquirejob answered 404, and admission - which
+        // refuses a job it cannot identify - would now refuse and record it
+        // again on every redelivery. GitHub keeps offering a job nobody has
+        // claimed, and the next offer is acquired afresh.
+        log()?.warn(`[BrokerProxy] Could not acquire job ${jobId} upstream; leaving it for GitHub to offer again`);
+        return;
+      }
 
-          // Extract run_id, job ID, actor, sha, ref from job details
-          try {
-            const parsed = JSON.parse(jobDetails);
-            githubInfo = extractGitHubJobInfo(parsed.contextData);
-            log()?.info(`[BrokerProxy] Extracted: run_id=${githubInfo.githubRunId}, job_id=${githubInfo.githubJobId}, repo=${githubInfo.githubRepo}, actor=${githubInfo.githubActor}, sha=${githubInfo.githubSha?.slice(0, 7)}, workflow=${githubInfo.githubWorkflow}`);
-          } catch (e) {
-            log()?.warn(`[BrokerProxy] Failed to parse job details for IDs: ${(e as Error).message}`);
-          }
-        } else {
-          log()?.warn(`[BrokerProxy] Failed to acquire job ${jobId} upstream, continuing anyway`);
-        }
+      // Store real run_service_url for forwarding job operations
+      // Store by multiple keys since runner may use different IDs
+      this.jobRunServiceUrls.set(jobId, runServiceUrl);
+      // Also store by messageId (used as jobMessageId in acquirejob)
+      // messageId was extracted as string to avoid precision loss
+      this.jobRunServiceUrls.set(messageId, runServiceUrl);
+      this.jobInfo.set(messageId, { billingOwnerId, runServiceUrl });
+      this.acquiredJobDetails.set(jobId, jobDetails);
+      this.acquiredJobDetails.set(messageId, jobDetails);
+      log()?.info(`[BrokerProxy] Acquired job ${jobId} (messageId=${messageId}) upstream, stored details`);
+
+      // Extract run_id, job ID, actor, sha, ref from job details
+      let githubInfo: GitHubJobInfo = {};
+      try {
+        const parsed = JSON.parse(jobDetails);
+        githubInfo = extractGitHubJobInfo(parsed.contextData);
+        log()?.info(`[BrokerProxy] Extracted: run_id=${githubInfo.githubRunId}, job_id=${githubInfo.githubJobId}, repo=${githubInfo.githubRepo}, actor=${githubInfo.githubActor}, sha=${githubInfo.githubSha?.slice(0, 7)}, workflow=${githubInfo.githubWorkflow}`);
+      } catch (e) {
+        log()?.warn(`[BrokerProxy] Failed to parse job details for IDs: ${(e as Error).message}`);
       }
 
       // Rewrite run_service_url to point to our proxy
