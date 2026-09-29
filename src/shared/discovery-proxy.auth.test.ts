@@ -301,6 +301,35 @@ describe('DiscoveryProxy under a policy', () => {
     }
   });
 
+  it('sends the checked host upstream, not the Host header sent', async () => {
+    // Forwarded as written, the Host header asks a shared front end - a CDN,
+    // a cloud load balancer - for a site the policy denied.
+    refuseUpstreamDials();
+    const { port, user, token } = await start({
+      allowlist: ['ok.example.com'],
+      denylist: ['bad.example.com'],
+      lookup: async () => ['192.0.2.10'],
+    });
+    const status = await new Promise<number>((resolve, reject) => {
+      const socket = net.connect(port, '127.0.0.1', () => {
+        socket.write(
+          'GET http://ok.example.com/ HTTP/1.1\r\nHost: bad.example.com\r\n' +
+            `Proxy-Authorization: ${basic(user, token)}\r\nConnection: close\r\n\r\n`
+        );
+      });
+      let data = '';
+      socket.on('data', (chunk) => { data += chunk.toString(); });
+      socket.on('error', reject);
+      socket.on('close', () => resolve(Number(/^HTTP\/1\.1 (\d{3})/.exec(data)?.[1] ?? 0)));
+    });
+    expect(status).toBe(502);
+    const sent = httpRequest.mock.calls
+      .map((call) => call[0] as http.RequestOptions)
+      .filter((opts) => opts.hostname?.endsWith('.example.com'))
+      .map((opts) => [opts.hostname, (opts.headers as http.OutgoingHttpHeaders).host]);
+    expect(sent).toEqual([['ok.example.com', 'ok.example.com']]);
+  });
+
   it('observes every port under --updaterc, where there is no allow list', async () => {
     refuseUpstreamDials();
     const { port, user, token } = await start({ lookup: async () => ['192.0.2.10'] });

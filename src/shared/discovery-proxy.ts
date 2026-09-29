@@ -339,14 +339,16 @@ export class DiscoveryProxy {
           return;
         }
 
-        // Forward the request, without the credentials meant for this proxy.
+        // Forward the request, without the credentials meant for this proxy,
+        // and with Host set to the host checked above rather than whatever the
+        // client wrote, which on a shared front end names another site.
         const proxyReq = http.request(
           {
             hostname: host,
             port,
             path: url.pathname + url.search,
             method: req.method,
-            headers: stripProxyAuth(req.headers),
+            headers: { ...stripProxyAuth(req.headers), host: url.host },
             lookup: pinnedLookup(screened),
           },
           (proxyRes) => {
