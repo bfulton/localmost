@@ -177,47 +177,69 @@ without echoing it.
   deploys or publishes.
 
 For jobs run by the background runner, secrets come from GitHub in the job
-payload as they would on any self-hosted runner.
+payload as they would on any self-hosted runner. They pass through the local
+proxy in transit, are handed to the runner binary, and are not parsed, logged
+or stored by localmost.
 
 ## Local Test Mode
 
 `localmost test` runs a checkout's workflow on the Mac, each step under its own
-sandbox profile. The checkout is treated as untrusted:
+sandbox profile. The checkout is treated as untrusted, and so is its
+`.localmostrc`, which is as much the checkout's to write as its code:
 
+- **Its policy is asked about, not applied.** Before running, the CLI lists
+  everything the checkout's `.localmostrc` grants beyond the workspace - every
+  write, every read past the OS baseline, every allowed host - and asks. A yes
+  is remembered for that checkout's location on disk and exactly those grants;
+  any change is asked again. Without a terminal, only `--yes` runs it. A policy
+  that stays within the workspace and the OS baseline runs without a prompt.
 - **Rooted at the workspace.** Every step's profile is rooted at the run's
   workspace, a private (`0700`) copy of the checkout. A `working-directory`, a
   local action's path or an action's entry point that resolves outside it is
-  refused, and fetched action code is readable but not writable.
-- **Never reachable.** Whatever the checkout's `.localmostrc` declares, a step
-  cannot read or write the app's data directory (the runner template every
-  worker is copied from, approvals, settings, other runs) or the credentials the
-  runner denies a job at every level (`~/.ssh`, `~/.aws`, `~/.gnupg`,
-  `~/.config`, the keychains, `.netrc`, `.npmrc` and the package-manager
-  credential files). The CLI socket is closed too.
-- **Nothing in home granted implicitly.** Steps run with `HOME` and the tool
-  cache inside the workspace; a home cache is writable only if the policy
-  declares it.
+  refused, and fetched action code is readable but not writable. A step can
+  change anything inside the workspace but not remove or replace the workspace
+  directory itself.
+- **Never reachable.** Whatever the policy declares, a step cannot read or
+  write the app's data directory (the runner template every worker is copied
+  from, approvals, settings, other runs; `~/.localmost` is closed even when the
+  CLI runs with another data directory) or the credentials the runner denies a
+  job at every level (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config`, the
+  keychains, `.netrc`, `.npmrc` and the package-manager credential files). The
+  CLI socket is closed too.
+- **Nothing in home or shared temp granted implicitly.** Steps run with `HOME`,
+  `TMPDIR` and the tool cache inside the workspace; a home cache is writable
+  only if the policy declares it. As in a runner job, `/tmp` and the per-user
+  `/var/folders` directories are not granted - only the entry a bare `mktemp`
+  creates - and xcrun's cache, the clang and Swift module cache and zsh's
+  here-documents are pointed into the workspace. A hard-coded `/tmp` path fails
+  here as it does in a job.
 - **Loopback-only network.** A step can reach loopback, except the broker's
-  port, and nothing else directly. The way out is the run's proxy, which needs
-  a per-run token, refuses names that resolve to internal or loopback
-  addresses, and connects only to the addresses it screened.
-- **Discovery does not write the disk.** Under `--updaterc` reads are allowed
-  and recorded; writes outside the workspace and temp are refused and reported.
+  port, and nothing else directly; `NO_PROXY` keeps loopback off the proxy. The
+  way out is the run's proxy, which needs a per-run token, refuses names that
+  resolve to internal or loopback addresses, and connects only to the addresses
+  it screened.
+- **Discovery is asked about every time.** Under `--updaterc` reads are allowed
+  and recorded, and writes outside the workspace are refused and reported.
   Discovery still lets a workflow read everything but the paths above and reach
-  any host, since that is what it exists to observe - so it is for checkouts
-  whose workflow you are willing to run with that much.
+  any host, since that is what it exists to observe, so the CLI says so and
+  asks before each run (or takes `--yes`). Use it on checkouts whose code you
+  trust with that much.
 - **No unsandboxed code in the workspace.** The app's own work in the
-  workspace - step scripts, output files, the cache intercept (which copies with
-  tar under the step's profile, scoped per repository and ref) and the checkout
+  workspace - step scripts, output files, action metadata, the cache intercept
+  (which copies with tar under the step's profile, scoped to the checkout's
+  location on disk and the repository and ref read from it) and the checkout
   intercept (which runs no git) - never follows what a step left there.
-  Whatever a job's steps leave running is killed when the job ends.
+- **Nothing outlives the job.** When a job ends, its steps' process groups are
+  killed, and then every process still running under one of the job's
+  profiles - found by asking the kernel about each process's sandbox, which a
+  process cannot leave the way it can leave its process group. That sweep runs
+  a short `python3` script; if python3 cannot run, only the process groups are
+  killed and the CLI says so. Interrupting the CLI (Ctrl-C, a kill, or the
+  terminal closing) runs the same cleanup.
 
-The checkout's own `.localmostrc` is applied without approval, as it is the
-developer's to test. It can still grant reads, hosts and writes outside the
-workspace beyond the paths above, so review one you did not write before
-testing with it. They pass through the local
-proxy in transit, are handed to the runner binary, and are not parsed, logged
-or stored by localmost.
+What test mode still trusts: signals are not filtered, as in the runner's
+profile, so a step can signal your other processes; and loopback is shared, so
+a step can reach any local service that listens on it.
 
 ## Authentication
 
