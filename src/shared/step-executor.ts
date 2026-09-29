@@ -14,6 +14,7 @@ import { SandboxPolicy, generateSandboxProfile, generateDiscoveryProfile } from 
 import { PidTreeWatcher } from './pid-tree-watch';
 import { parseActionRef, fetchAction, isInterceptedAction, readActionMetadata } from './action-fetcher';
 import { getGitInfo } from './workspace';
+import { resolveWithin } from './contained-path';
 
 // =============================================================================
 // Types
@@ -421,10 +422,13 @@ async function executeRunStep(
 ): Promise<StepResult> {
   const env = buildStepEnvironment(step, ctx, job);
   const shell = step.shell || job.defaults?.run?.shell || 'bash';
-  const workingDir =
-    step['working-directory'] ||
-    job.defaults?.run?.['working-directory'] ||
-    ctx.workDir;
+  // Relative to the workspace, as on GitHub, and never outside it. This is
+  // only where the step starts; its sandbox is rooted at the workspace either
+  // way.
+  const namedDir = step['working-directory'] || job.defaults?.run?.['working-directory'];
+  const workingDir = namedDir
+    ? resolveWithin(ctx.workDir, namedDir, 'working-directory')
+    : ctx.workDir;
 
   // Expand expressions in the script
   const script = expandExpression(step.run!, env, ctx);
@@ -447,6 +451,7 @@ async function executeRunStep(
       [scriptFile],
       {
         cwd: workingDir,
+        workDir: ctx.workDir,
         env,
         proxyPort: ctx.proxyPort,
         onOutput: ctx.onOutput,
@@ -522,7 +527,7 @@ async function executeLocalAction(
   job: WorkflowJob,
   stepName: string
 ): Promise<StepResult> {
-  const actionPath = path.join(ctx.workDir, step.uses!);
+  const actionPath = resolveWithin(ctx.workDir, step.uses!, 'Local action');
   return await executeActionFromPath(actionPath, step, ctx, job, stepName);
 }
 
@@ -579,12 +584,17 @@ async function executeActionFromPath(
       throw new Error('Node action missing "main" entry point');
     }
 
-    const mainPath = path.join(actionPath, main);
+    // GitHub runs a node action from the workspace, not from its own
+    // directory. Its code is readable and nothing more: an action directory
+    // fetched into the app's cache is shared by every run that uses it.
+    const mainPath = resolveWithin(actionPath, main, 'Action entry point', 'the action');
     const result = await runInSandbox(
       'node',
       [mainPath],
       {
-        cwd: actionPath,
+        cwd: ctx.workDir,
+        workDir: ctx.workDir,
+        readOnlyPaths: [actionPath],
         env,
         proxyPort: ctx.proxyPort,
         onOutput: ctx.onOutput,
@@ -1069,7 +1079,12 @@ async function runInSandbox(
   command: string,
   args: string[],
   options: {
+    /** Where the process starts; inside workDir. */
     cwd: string;
+    /** The workspace, which the profile is rooted at whatever cwd is. */
+    workDir: string;
+    /** Directories the step may read and never write, such as an action's code. */
+    readOnlyPaths?: string[];
     env: Record<string, string>;
     proxyPort: number;
     onOutput?: (line: string, stream: 'stdout' | 'stderr') => void;
@@ -1093,14 +1108,16 @@ async function runInSandbox(
       if (isDiscovery) {
         // Discovery mode: use special profile that logs all access
         profile = generateDiscoveryProfile({
-          workDir: options.cwd,
+          workDir: options.workDir,
+          readOnlyPaths: options.readOnlyPaths,
           proxyPort: options.proxyPort,
           logFile: options.sandboxLogFile ?? '',
         });
       } else {
         // Enforcement mode: apply sandbox with policy restrictions
         profile = generateSandboxProfile({
-          workDir: options.cwd,
+          workDir: options.workDir,
+          readOnlyPaths: options.readOnlyPaths,
           proxyPort: options.proxyPort,
           policy: policy || {},  // Empty policy = no network allowlist
           permissive: false,
@@ -1117,7 +1134,7 @@ async function runInSandbox(
       // or an action's own directory. Keyed off discovery mode, not
       // sandboxLogFile - the CLI sets that on every run, discovery or not.
       if (isDiscovery) {
-        const debugProfilePath = path.join(options.cwd, '.debug', 'sandbox-profile.sb');
+        const debugProfilePath = path.join(options.workDir, '.debug', 'sandbox-profile.sb');
         const debugDir = path.dirname(debugProfilePath);
         if (!fs.existsSync(debugDir)) {
           fs.mkdirSync(debugDir, { recursive: true });

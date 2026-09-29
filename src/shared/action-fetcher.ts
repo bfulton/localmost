@@ -8,6 +8,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { getAppDataDirWithoutElectron } from './paths';
+import { resolveWithin } from './contained-path';
 
 // =============================================================================
 // Types
@@ -230,6 +231,19 @@ function downloadAndExtract(url: string, destDir: string): Promise<void> {
 }
 
 /**
+ * The directory an action runs from: its repository, or a subdirectory of it.
+ *
+ * The subpath is the workflow's to write (`owner/repo/sub@v1`), and the
+ * directory becomes readable to the step, so it is held inside the extracted
+ * repository - neither "../.." nor a symlink the repository ships may lead
+ * out of it.
+ */
+export function resolveActionPath(actionDir: string, subPath?: string): string {
+  if (!subPath) return fs.realpathSync(actionDir);
+  return resolveWithin(actionDir, subPath, 'Action path', 'its repository');
+}
+
+/**
  * Fetch an action from GitHub.
  */
 export async function fetchAction(ref: ActionRef): Promise<CachedAction> {
@@ -266,8 +280,7 @@ export async function fetchAction(ref: ActionRef): Promise<CachedAction> {
     await downloadAndExtract(branchUrl, actionDir);
   }
 
-  // Handle subdirectory actions
-  const localPath = ref.path ? path.join(actionDir, ref.path) : actionDir;
+  const localPath = resolveActionPath(actionDir, ref.path);
 
   // Verify action.yml exists
   if (!fs.existsSync(path.join(localPath, 'action.yml')) &&

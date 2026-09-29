@@ -42,6 +42,8 @@ export interface SandboxPolicy {
 export interface SandboxProfileOptions {
   /** Working directory for the workflow */
   workDir: string;
+  /** Directories readable and never writable, such as a fetched action's code */
+  readOnlyPaths?: string[];
   /** Port of the proxy server - network traffic is restricted to this port */
   proxyPort: number;
   /** Policy to enforce */
@@ -172,7 +174,7 @@ function loopbackNetworkRules(proxyPort: number, escapedWorkDir: string): string
  * comes after every policy grant: seatbelt takes the last matching rule. The
  * workspace lives under the app data directory, so it is reopened last.
  */
-function neverReachableRules(escapedWorkDir: string): string[] {
+function neverReachableRules(escapedWorkDir: string, readOnlyPaths: string[] = []): string[] {
   const home = escapePath(os.homedir());
   const appDataDir = escapePath(getAppDataDirWithoutElectron());
   const userDataDir = escapePath(path.join(os.homedir(), 'Library', 'Application Support', 'localmost'));
@@ -200,6 +202,14 @@ function neverReachableRules(escapedWorkDir: string): string[] {
     ';; ...except this run\'s workspace, which lives inside the app data directory',
     '(allow file-read* file-write*',
     `  (subpath "${escapedWorkDir}"))`,
+    ...(readOnlyPaths.length > 0
+      ? [
+          ';; ...and the code of the actions this step runs, read-only: a fetched',
+          ';; action is cached in the app data directory for every run',
+          '(allow file-read*',
+          ...readOnlyPaths.map((p, i) => `  (subpath "${escapePath(p)}")${i === readOnlyPaths.length - 1 ? ')' : ''}`),
+        ]
+      : []),
   ];
 }
 
@@ -371,7 +381,7 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
     lines.push('');
   }
 
-  lines.push(...neverReachableRules(escapedWorkDir));
+  lines.push(...neverReachableRules(escapedWorkDir, options.readOnlyPaths));
   lines.push('');
 
   // Device files
@@ -454,6 +464,7 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
  */
 export function generateDiscoveryProfile(options: {
   workDir: string;
+  readOnlyPaths?: string[];
   proxyPort: number;
   logFile: string;  // Not used - reports go to system log, not a file
 }): string {
