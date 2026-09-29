@@ -105,12 +105,12 @@ loosen its own sandbox without the machine owner agreeing to it.
 - **GitHub's infrastructure**: OAuth, API responses, and runner binary distribution are trusted. If GitHub is compromised, localmost provides no additional protection.
 - **Malware on your machine**: If your system is already compromised, localmost cannot protect you.
 - **A compromised GitHub account**: If an attacker has access to your GitHub account, they can modify workflows that run on your runner.
-- **Allowlisted hosts**: Data can be exfiltrated to any host the active policy allows. Under `strict` that is runner infrastructure plus whatever the repository declares; looser levels allow more. The infrastructure hosts allowed at every level (`github.com`, `api.github.com`, `*.blob.core.windows.net`) accept writes from any account, so `strict` limits reach, not exfiltration - see Network Policy below.
+- **Allowlisted hosts**: Data can be exfiltrated to any host the active policy allows. Under `strict` that is runner infrastructure plus whatever the repository declares; looser levels allow more. Among the infrastructure hosts allowed at every level, `github.com`, `api.github.com` and `*.blob.core.windows.net` accept writes from any account, so `strict` limits reach, not exfiltration - see Network Policy below.
 - **Approved policies**: Once you approve a repository's `.localmostrc`, everything it declares is granted until you approve another. Approval is a judgement about that content, and is bound to it: what you approve is the policy you were shown, level included.
 - **Per-workflow filesystem sections**: A `workflows:` section can narrow or widen *network* access per workflow, because hosts are applied to the proxy when a job is claimed. Filesystem paths are taken from `shared:` only — the sandbox profile is built before the runner knows which workflow it will run, and cannot change afterwards.
 - **Per-workflow env sections**: The environment is fixed when the worker starts, for the same reason. `env: allow` is taken from `shared:` only; a per-workflow allow is not applied. `env: deny` is taken from `shared:` and from every workflow, and applied to every job - a per-workflow deny is honoured more widely than written rather than not at all.
 - **Per-workflow sections are not a boundary between contributors**: A `workflows.<name>` section is available to any commit that can run a workflow file with that name, including pull requests; approving a per-workflow grant approves it for anyone who can open a PR. The key matches a file name, and a pull request can add or change a workflow file like any other. Per-workflow sections keep a compromised dependency of one workflow from using another's grants, not a commit author.
-- **Loopback services, through the proxy**: A job's sandbox closes loopback ports other than its own proxy's unless the repository declares `network.loopback`, but the proxy itself reaches `localhost` and `127.0.0.1` - see Network Policy below. A service listening on loopback is protected from jobs only by its own authentication, as the broker is by its per-worker key.
+- **Loopback services, through the proxy**: A job's sandbox closes loopback ports other than its own proxy's unless the repository declares `network.loopback`, but the proxy itself reaches `localhost` and `127.0.0.1` - see Network Policy below. A service listening on loopback is protected from jobs only by its own authentication, as the broker is by its per-worker key. Containers are not under the sandbox's loopback rule at all: a container on a routable network reaches the host's loopback services, the broker included, through the daemon's address for the host (`host.docker.internal`) - see Docker Access below.
 - **Processes running as you**: The CLI control socket is guarded only by file permissions (`0600` in a `0700` directory) and the job sandbox's deny of it. Any process running as your user can control the app through it - pause, resume, add or remove targets - as it could by editing `~/.localmost` directly.
 - **Container egress**: Traffic from inside a container leaves through the daemon's network, not the job's proxy, so the host allowlist does not apply to it. The Docker filter decides what a container may be created with, not what it connects to once running - see Docker Access below.
 
@@ -127,9 +127,11 @@ hostname. macOS `sandbox-exec` cannot filter by hostname - its `(remote ...)`
 filter matches only addresses and ports - so the sandbox permits one outbound
 destination, the job's own proxy on loopback, and the proxy makes the decision.
 
-Other loopback ports are closed to a job by default: a debugger listening on
-9229, a browser's remote-debugging port, a local database or another tool's
-proxy is not the job's to reach, and neither is a port a concurrent job opened.
+Other loopback ports are closed to a job's direct connections by default: a
+debugger listening on 9229, a browser's remote-debugging port, a local database
+or another tool's proxy is not the job's to open a socket to, and neither is a
+port a concurrent job opened. Its proxy still reaches them, though (see
+below), so this narrows the ways to a local service rather than closing them.
 A repository whose jobs need loopback - a test suite that starts a server on an
 ephemeral `127.0.0.1` port and connects to it, or a service container published
 on a fixed port - declares it in `.localmostrc`, under `shared:` only, since the
@@ -138,7 +140,7 @@ profile is fixed when the worker starts:
 ```yaml
 shared:
   network:
-    loopback: true          # every loopback port, as before this was closed
+    loopback: true          # every loopback port but the broker's
     # loopback: [5432, 6379]  # or only these; seatbelt has no port ranges
 ```
 

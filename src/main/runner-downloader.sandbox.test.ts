@@ -314,6 +314,19 @@ describe('the runner template a sandbox is copied from', () => {
     expect(fs.existsSync(arc)).toBe(true);
   });
 
+  it('sweeps the _work an earlier build kept for later jobs at the next startup', async () => {
+    // An install that had the removed preserveWorkDir setting on still holds
+    // an earlier job's checkout, from any repository, under runner/work.
+    const kept = path.join(root, 'runner', 'work', '1');
+    write(path.join(kept, 'other-repo', 'package.json'), '{}');
+
+    await downloader.cleanupStaleConfiguration(() => undefined);
+
+    // The sweep renames each directory aside before deleting it in the
+    // background, so what matters is that nothing is left under its name.
+    expect(fs.existsSync(kept)).toBe(false);
+  });
+
   it('records the same version from two places at once without either failing', async () => {
     // A download and a worker's first start can both write a version's record.
     await expect(Promise.all(

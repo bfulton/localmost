@@ -191,15 +191,17 @@ workflows:
 
 ### Loopback
 
-A job's sandbox connects to one loopback port by default: its own egress proxy.
-Anything else listening on the Mac's loopback - a debugger on 9229, a browser's
-remote-debugging port, a development database, another job's server - is closed
-to it. A repository whose jobs need loopback opts in under `shared.network`:
+A job's sandbox connects directly to one loopback port by default: its own
+egress proxy. Anything else listening on the Mac's loopback - a debugger on
+9229, a browser's remote-debugging port, a development database, another job's
+server - is closed to the job's own sockets, though not to requests it sends
+through its proxy (below). A repository whose jobs need loopback opts in under
+`shared.network`:
 
 ```yaml
 shared:
   network:
-    loopback: true               # every loopback port (the old behaviour)
+    loopback: true               # every loopback port but the broker's
     # loopback: [5432, 6379]     # or only these
 ```
 
