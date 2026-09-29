@@ -416,7 +416,6 @@ export class BrokerProxyService extends EventEmitter {
   private pollInterval: NodeJS.Timeout | null = null;
   private isPolling = false;  // Prevent concurrent poll execution
   private messageQueues: Map<string, Array<string>> = new Map();  // Per-target message queues
-  private seenMessageIds: Set<string> = new Set();
   /**
    * Workers spawned for a specific job, and the job each was spawned for.
    *
