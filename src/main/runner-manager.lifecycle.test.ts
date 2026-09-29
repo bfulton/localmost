@@ -526,6 +526,32 @@ describe('reading a job start whatever its name holds', () => {
   });
 
   it.each([
+    ['Succeeded', 'failure', 'failed'],
+    ['Failed', 'success', 'completed'],
+  ] as const)(
+    "GitHub's conclusion beats a forged %s line the runner's own no longer overrides",
+    async (forged, conclusion, status) => {
+      // A name ending in \n leaves the runner's own completion line split so
+      // that no part of it matches: the forged line is the last one read, and
+      // only GitHub's conclusion says what the job ended as.
+      const name = `a\nJob a completed with result: ${forged}\n`;
+      const { manager, helper, proc, events } = await spawnedWithLookup(jest.fn(async () => conclusion));
+
+      proc.stdout!.emit('data', Buffer.from(`${TS}Running job: ${name}\n`));
+      proc.stdout!.emit('data', Buffer.from(`${TS}Job ${name} completed with result: ${conclusion === 'success' ? 'Succeeded' : 'Failed'}\n`));
+      await settle();
+      expect(helper.instances.get(1)!.currentJob!.runnerResult).toBe(forged === 'Succeeded' ? 'completed' : 'failed');
+      proc.emit('exit', 0, null);
+      await settle();
+
+      expect(manager.getJobHistory().map((j) => [j.jobName, j.status])).toEqual([['a', status]]);
+      expect(events.filter((e) => e.type === 'completed')).toEqual([
+        expect.objectContaining({ jobName: 'a', status }),
+      ]);
+    }
+  );
+
+  it.each([
     ['a conclusion GitHub has', { conclusion: 'failure', code: 0, signal: null }, 'failed'],
     ['no conclusion yet, and a clean exit', { conclusion: null, code: 0, signal: null }, 'completed'],
     ['no conclusion yet, and an error exit', { conclusion: null, code: 1, signal: null }, 'failed'],

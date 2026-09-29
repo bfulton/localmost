@@ -3025,10 +3025,10 @@ export class RunnerManager {
       this.cancelRun(repoInfo.owner, repoInfo.repo, githubRunId, reason, job.id),
       stop,
     ]);
-    // The runner may never report a stopped job's end; don't leave it running.
-    // Nor 'completed': a step can print a whole completion line of its own
-    // before the check is done. A completion the runner reports from here on
-    // finds the entry closed and leaves it.
+    // A refused job is cancelled, whatever else closed it. The worker's exit
+    // (closeJobOnExit) may have got there first, as 'completed' or 'failed'
+    // from GitHub's conclusion or the exit, and this record replaces it. An
+    // exit that lands after this finds the entry closed and leaves it.
     const entry = this.jobHistory.find((j) => j.id === job.id);
     if (entry && entry.status !== 'cancelled') {
       const completedAt = new Date().toISOString();
