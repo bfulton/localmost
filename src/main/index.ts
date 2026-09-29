@@ -107,7 +107,7 @@ import { resolveRegistryAuth } from './docker/registry-auth';
 import {
   decidePolicyForJob,
   recordPendingPolicy,
-  getApprovedPolicy,
+  getApprovedPolicyForCommit,
   formatApprovalRequest,
 } from './policy-cache';
 
@@ -184,7 +184,7 @@ async function checkRepoPolicyApproval(
 
     const auth = getGitHubAuth() || new GitHubAuth();
     const content = await auth.getFileContent(accessToken, owner, repo, '.localmostrc', sha);
-    const decision = decidePolicyForJob(repository, content);
+    const decision = decidePolicyForJob(repository, content, sha);
 
     if (decision.action === 'allow') return null;
     if (decision.action === 'invalid') {
@@ -327,13 +327,15 @@ app.whenReady().then(async () => {
     // Stage 1: approved container requests go to the operator's own daemon.
     // The socket the job sees is localmost's; the daemon's is never handed over.
     dockerBackend: new DesktopBackend(),
-    getRepoPolicy: async (owner: string, repo: string, _sha: string, workflowName: string) => {
+    getRepoPolicy: async (owner: string, repo: string, sha: string, workflowName: string) => {
       // Apply the policy that was approved, not whatever is in the repository
       // right now. A job only reaches this point once its policy has been
       // approved, and applying the approved copy means an unreviewed change
       // cannot take effect through a race. That covers the level too: it is
-      // declared in the same file and approved with the rest of it.
-      const approved = getApprovedPolicy(`${owner}/${repo}`);
+      // declared in the same file and approved with the rest of it. A commit
+      // the check found without that policy - its .localmostrc deleted -
+      // gets none of it.
+      const approved = getApprovedPolicyForCommit(`${owner}/${repo}`, sha);
       if (!approved) {
         return {
           hosts: [],

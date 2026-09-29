@@ -137,18 +137,66 @@ export type PolicyDecision =
   | { action: 'invalid'; reason: string };
 
 /**
+ * Which checked commits the approved policy covers, keyed by repository and
+ * commit: true when the commit's .localmostrc is the approved policy, false
+ * when it has none or a different one.
+ *
+ * The approval cache is per repository, but a job runs one commit, and a
+ * commit whose file was deleted must not inherit the grants of one that had
+ * it. A commit's content never changes, so an answer never goes stale; the
+ * map is bounded only because nothing else would ever empty it.
+ */
+const commitCoverage = new Map<string, boolean>();
+const COMMIT_COVERAGE_LIMIT = 1000;
+
+function commitKey(repository: string, sha: string): string {
+  return `${repository.toLowerCase()}@${sha}`;
+}
+
+function recordCommitCoverage(repository: string, sha: string, covered: boolean): void {
+  const key = commitKey(repository, sha);
+  commitCoverage.delete(key);
+  commitCoverage.set(key, covered);
+  if (commitCoverage.size > COMMIT_COVERAGE_LIMIT) {
+    commitCoverage.delete(commitCoverage.keys().next().value as string);
+  }
+}
+
+/**
+ * The approved policy to apply to a job at a given commit.
+ *
+ * Null for a commit the pre-spawn check found without the approved policy:
+ * no .localmostrc, so the baseline, or one that was refused. A commit it never
+ * checked gets the repository's approved policy, as before this existed.
+ */
+export function getApprovedPolicyForCommit(repository: string, sha: string): LocalmostrcConfig | null {
+  if (commitCoverage.get(commitKey(repository, sha)) === false) return null;
+  return getApprovedPolicy(repository);
+}
+
+/**
  * Decide whether a job may run under the repository's current policy.
  *
  * A .localmostrc grants access beyond the built-in baseline, so its arrival or
  * change is a request for more privilege and needs the machine owner's consent.
  * A repository with no policy is not asked about: it gets the baseline, which
- * grants nothing extra. Removing a policy is likewise allowed without asking -
- * it can only reduce access.
+ * grants nothing extra. Removing a policy is likewise allowed without asking,
+ * because the job then runs on the baseline: with the commit given, the
+ * decision is remembered, and getApprovedPolicyForCommit applies nothing to it.
  */
 export function decidePolicyForJob(
   repository: string,
-  localmostrcContent: string | null
+  localmostrcContent: string | null,
+  sha?: string
 ): PolicyDecision {
+  const decision = decide(repository, localmostrcContent);
+  if (sha) {
+    recordCommitCoverage(repository, sha, decision.action === 'allow' && decision.reason === 'unchanged');
+  }
+  return decision;
+}
+
+function decide(repository: string, localmostrcContent: string | null): PolicyDecision {
   const approved = getApprovedPolicy(repository);
 
   if (!localmostrcContent) {

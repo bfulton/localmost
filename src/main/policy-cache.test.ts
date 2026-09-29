@@ -18,6 +18,7 @@ import {
   approvePolicy,
   approvalStamp,
   getApprovedPolicy,
+  getApprovedPolicyForCommit,
   rejectPolicy,
 } from './policy-cache';
 import { LocalmostrcConfig } from '../shared/localmostrc';
@@ -178,5 +179,44 @@ describe('a pending policy does not displace the approved one', () => {
       JSON.stringify({ repository: REPO, config: { version: 1, shared: { network: { allow: ['index.crates.io'] } } }, approved: true, cachedAt: '' })
     );
     expect(decidePolicyForJob(REPO, POLICY)).toEqual({ action: 'allow', reason: 'unchanged' });
+  });
+});
+
+describe('a commit without a .localmostrc runs on the baseline', () => {
+  const approved = { version: 1, level: 'permissive' as const, shared: { network: { allow: ['index.crates.io'] } } };
+  const PERMISSIVE = 'version: 1\nlevel: permissive\nshared:\n  network:\n    allow:\n      - "index.crates.io"\n';
+
+  it('applies no approved grant to a commit whose policy was deleted', () => {
+    // Deleting the file was allowed as "narrowed", but the job then ran under
+    // the cached approved policy anyway: removing .localmostrc narrowed
+    // nothing, and an owner who deleted it to withdraw a grant kept granting it.
+    approve(approved);
+
+    expect(decidePolicyForJob(REPO, null, 'deleted-sha')).toEqual({ action: 'allow', reason: 'narrowed' });
+    expect(getApprovedPolicyForCommit(REPO, 'deleted-sha')).toBeNull();
+  });
+
+  it('still applies the approved policy to a commit whose file matches it', () => {
+    approve(approved);
+    decidePolicyForJob(REPO, null, 'deleted-sha');
+
+    expect(decidePolicyForJob(REPO, PERMISSIVE, 'kept-sha')).toEqual({ action: 'allow', reason: 'unchanged' });
+    expect(getApprovedPolicyForCommit(REPO, 'kept-sha')).toEqual(expect.objectContaining({ level: 'permissive' }));
+  });
+
+  it('applies no approved grant to a commit whose policy was refused', () => {
+    // Such a job is refused before it runs; if one ran anyway, the grants
+    // approved for different content are not the ones to give it.
+    approve(approved);
+    decidePolicyForJob(REPO, 'version: 1\nlevel: moderate\n', 'changed-sha');
+
+    expect(getApprovedPolicyForCommit(REPO, 'changed-sha')).toBeNull();
+  });
+
+  it('matches the commit to the repository it was checked for', () => {
+    approve(approved);
+    decidePolicyForJob('other/repo', null, 'shared-sha');
+
+    expect(getApprovedPolicyForCommit(REPO, 'shared-sha')).toEqual(expect.objectContaining({ level: 'permissive' }));
   });
 });

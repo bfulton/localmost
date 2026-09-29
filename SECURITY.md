@@ -153,7 +153,9 @@ approved keep running under it until another is approved. Approval is bound to
 the exact policy shown - its sha256 stamp - and is refused if a later job has
 replaced the pending policy since; every decision is appended, with its stamp,
 to `decisions.log` beside the cache. A repository with no policy is never held
-for approval — it gets the baseline, which grants nothing extra.
+for approval — it gets the baseline, which grants nothing extra. So does a
+commit whose `.localmostrc` was deleted: it is not held, and it runs on the
+baseline rather than under the policy approved for the repository before.
 
 `codeload.github.com` is deliberately **not** in that set, even though the
 runner uses it to download actions during job setup. Actions are third-party
