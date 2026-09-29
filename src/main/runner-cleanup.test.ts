@@ -246,6 +246,25 @@ describe('marker-based orphan reaping', () => {
     expect(fs.existsSync(`${stem}.withheld`)).toBe(false);
   });
 
+  it("gives an earlier run's worker its SIGTERM before killing by profile mark what escaped it", async () => {
+    // The mark sweep stops and kills without warning. The worker's group,
+    // found by its pid record, is sent SIGTERM first, so the runner can
+    // disconnect from GitHub; the mark then takes only what that missed.
+    fs.writeFileSync(path.join(pidDir, '1.pid'), `4242 STARTED-AT\n${path.join(pidDir, '1-feedface.mark')}\n`);
+    const stem = path.join(fs.realpathSync(pidDir), '1-feedface');
+    fs.writeFileSync(`${stem}.granted`, '');
+    fs.writeFileSync(`${stem}.withheld`, '');
+    let signalledBeforeReap: Array<[number, unknown]> | undefined;
+
+    await killOrphanedProcesses(sandboxBase, () => undefined, (pid) => (pid === 4242 ? 'STARTED-AT' : null), () => [], async () => {
+      signalledBeforeReap = [...signalled];
+      return [];
+    });
+
+    expect(signalledBeforeReap).toContainEqual([-4242, 'SIGTERM']);
+    expect(fs.existsSync(`${stem}.granted`)).toBe(false);
+  });
+
   it('drops a mark it could not sweep by, and half of one, rather than keep them for ever', async () => {
     // Without the developer tools the sweep never runs; a mark kept for it
     // would be kept for good, one for every job.
