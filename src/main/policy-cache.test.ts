@@ -264,6 +264,16 @@ describe('a commit without a .localmostrc runs on the baseline', () => {
     expect(getApprovedPolicyForCommit(REPO, 'shared-sha')).toBeNull();
   });
 
+  it('applies the approved policy to a commit checked under the name in another case', () => {
+    // GitHub's names are case-insensitive, and the check and the lookup can
+    // spell one differently: the check under the name GitHub reported, the
+    // lookup under the one the worker's policy is resolved by.
+    approve(approved);
+    expect(decidePolicyForJob('Owner/Repo', PERMISSIVE, 'case-sha')).toEqual({ action: 'allow', reason: 'unchanged' });
+
+    expect(getApprovedPolicyForCommit('owner/repo', 'case-sha')).toEqual(expect.objectContaining({ level: 'permissive' }));
+  });
+
   it('applies nothing once a different policy has been approved since the check', () => {
     // The commit was found carrying the policy approved then. If another is
     // approved before the job starts, that one is not the commit's own file.
