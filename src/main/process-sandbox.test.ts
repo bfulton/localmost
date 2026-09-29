@@ -722,6 +722,29 @@ describe('Process Sandbox', () => {
       expect(pattern.test(`com.google.Chrome.MachPortRendezvousServer.${process.pid}1`)).toBe(false);
       expect(pattern.test(`com.localmost.app.MachPortRendezvousServer.${process.pid + 1}`)).toBe(false);
     });
+
+    it("ends with its spawn's process marker, after every grant and deny, whatever the policy", () => {
+      // The marker is how the app finds what a finished job left running, in
+      // or out of its process group: a profile that reads one file and not
+      // its twin. Last, so neither a policy path nor the app directory rules
+      // can change which of the two it reads.
+      const pids = path.join(os.homedir(), '.localmost', 'runner', 'pids');
+      const processMarker = { granted: path.join(pids, '1-ab.granted'), withheld: path.join(pids, '1-ab.withheld') };
+      const profile = profileWith({
+        processMarker,
+        filesystemPolicy: { level: 'permissive', read: [pids], write: [pids], deny: [processMarker.granted] },
+      });
+      const rules = profile.trimEnd().split('\n').filter((line) => line.startsWith('('));
+      expect(rules.slice(-2)).toEqual([
+        `(deny file-read* (literal "${processMarker.withheld}"))`,
+        `(allow file-read* (literal "${processMarker.granted}"))`,
+      ]);
+      expect(permits(profile, 'file-read*', processMarker.granted)).toBe(true);
+      expect(permits(profile, 'file-read*', processMarker.withheld)).toBe(false);
+      // Read, never written: the job cannot touch the files themselves.
+      expect(permits(profile, 'file-write*', processMarker.granted)).toBe(false);
+      expect(profileWith({})).not.toMatch(/\.granted"|\.withheld"/);
+    });
   });
 
   describe("the app's own data directories", () => {

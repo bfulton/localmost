@@ -79,8 +79,9 @@ export interface ProcessMarker {
 }
 
 /**
- * The last rules of a step's profile: how the app finds the step's processes
- * when the job ends, including one that left its process group.
+ * The last rules of a step's profile, and of a runner worker's: how the app
+ * finds the job's processes when it ends, including one that left its
+ * process group.
  *
  * A process can leave its group with setsid() and close every descriptor it
  * inherited, but it cannot leave its sandbox. So the profile carries a mark
@@ -89,7 +90,7 @@ export interface ProcessMarker {
  * both - and an unsandboxed process reads both. Last, so no policy rule can
  * change the answer.
  */
-function processMarkerRules(marker?: ProcessMarker): string[] {
+export function processMarkerRules(marker?: ProcessMarker): string[] {
   if (!marker) return [];
   return [
     ';; How the app finds this run\'s processes when the job ends, even one that',

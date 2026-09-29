@@ -8,7 +8,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { spawn, execFileSync, ChildProcess, SpawnOptions } from 'child_process';
+import { spawn, ChildProcess, SpawnOptions } from 'child_process';
 import { WorkflowStep, WorkflowJob, MatrixCombination } from './workflow-parser';
 import {
   SandboxPolicy,
@@ -19,6 +19,7 @@ import {
   ProcessMarker,
 } from './sandbox-profile';
 import { PidTreeWatcher } from './pid-tree-watch';
+import { reapMarkedProcesses } from './sandbox-reaper';
 import { parseActionRef, fetchAction, isInterceptedAction, readActionMetadata } from './action-fetcher';
 import { resolveWithin } from './contained-path';
 import { getAppDataDirWithoutElectron } from './paths';
@@ -1187,81 +1188,6 @@ function stepProcessMarker(): ProcessMarker {
     jobMarker = { dir, granted: file(), withheld: file() };
   }
   return { granted: jobMarker.granted, withheld: jobMarker.withheld };
-}
-
-/**
- * Stop, then kill, every process of the user's that runs under a profile
- * carrying `marker`, and print their pids.
- *
- * sandbox_check answers for another process's profile: whether it is
- * sandboxed at all, and whether it may read a path. Only a profile carrying
- * the marker reads one file and not the other. Everything found is stopped
- * before anything is killed, so nothing it forks while the sweep runs is
- * missed, and a process that no longer matches once stopped - a pid reused
- * between the look and the stop - is let go. sandbox_check is variadic after
- * its third argument, so only the first three are declared: ctypes then
- * passes the path the way arm64 expects a variadic argument.
- */
-const REAP_SCRIPT = `
-import ctypes, os, signal, sys
-libc = ctypes.CDLL('/usr/lib/libSystem.B.dylib')
-check = libc.sandbox_check
-check.restype = ctypes.c_int
-check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
-listpids = libc.proc_listallpids
-listpids.restype = ctypes.c_int
-listpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
-granted, withheld = (os.fsencode(p) for p in sys.argv[1:3])
-FILTER_PATH = 1
-
-def reads(pid, p):
-    return check(pid, b'file-read-data', FILTER_PATH, ctypes.c_char_p(p))
-
-def ours(pid):
-    return check(pid, None, 0) == 1 and reads(pid, granted) == 0 and reads(pid, withheld) == 1
-
-def scan():
-    n = listpids(None, 0)
-    buf = (ctypes.c_int * (max(n, 0) + 1024))()
-    n = listpids(buf, ctypes.sizeof(buf))
-    me = os.getpid()
-    return {buf[i] for i in range(max(n, 0)) if buf[i] > 1 and buf[i] != me and ours(buf[i])}
-
-stopped = set()
-for _ in range(100):
-    found = scan() - stopped
-    if not found:
-        break
-    for pid in found:
-        try:
-            os.kill(pid, signal.SIGSTOP)
-            stopped.add(pid)
-        except OSError:
-            pass
-still = scan()
-for pid in stopped:
-    try:
-        os.kill(pid, signal.SIGKILL if pid in still else signal.SIGCONT)
-    except OSError:
-        pass
-print(' '.join(str(pid) for pid in sorted(stopped & still)))
-`;
-
-/**
- * Kill whatever runs under this job's marker, however it got out of its
- * step's process group. Returns false if the sweep could not run.
- */
-function reapMarkedProcesses(marker: ProcessMarker): boolean {
-  try {
-    execFileSync('/usr/bin/python3', ['-I', '-S', '-c', REAP_SCRIPT, marker.granted, marker.withheld], {
-      env: { PATH: '/usr/bin:/bin' },
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 15000,
-    });
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /** Remember a step's process group, so reapStepProcesses can end it. */

@@ -60,6 +60,13 @@ jest.mock('./runner-cleanup', () => ({
   parsePidRecord: jest.requireActual('./runner-cleanup').parsePidRecord,
 }));
 
+// The sweep by profile mark. Resolves to the pids it killed, or null when it
+// could not look.
+const mockReapMarked = jest.fn(async (_marker: { granted: string; withheld: string }): Promise<number[] | null> => []);
+jest.mock('../shared/sandbox-reaper', () => ({
+  reapMarkedProcessesAsync: (marker: { granted: string; withheld: string }) => mockReapMarked(marker),
+}));
+
 jest.mock('./docker/docker-filter-proxy', () => ({
   DockerFilterProxy: jest.fn().mockImplementation(() => ({
     start: jest.fn().mockResolvedValue(undefined),
@@ -88,12 +95,13 @@ jest.mock('fs', () => ({
   },
 }));
 
+import * as fs from 'fs';
 import { RunnerManager } from './runner-manager';
-
-type RunnerManagerOptions = ConstructorParameters<typeof RunnerManager>[0];
 import { GRACE_MS } from './process-group';
 import { spawnSandboxed } from './process-sandbox';
 import { createMockProcess, RunnerManagerTestHelper } from './test-utils';
+
+type RunnerManagerOptions = ConstructorParameters<typeof RunnerManager>[0];
 
 const mockSpawnSandboxed = spawnSandboxed as jest.MockedFunction<typeof spawnSandboxed>;
 
@@ -149,6 +157,8 @@ beforeEach(() => {
   jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] });
   mockSpawnSandboxed.mockReset();
   mockRemoveSandbox.mockClear();
+  mockReapMarked.mockReset();
+  mockReapMarked.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -288,5 +298,60 @@ describe("a slot whose last worker's job may still be running", () => {
     await manager.startInstance(1);
     expect(mockSpawnSandboxed).toHaveBeenCalledTimes(1);
     expect(helper.instances.get(1)!.process).toBe(proc);
+  });
+});
+
+describe('what a finished job left outside its process group', () => {
+  /** The profile mark the latest spawn was given. */
+  const lastMarker = () => {
+    const [, , options] = mockSpawnSandboxed.mock.calls[mockSpawnSandboxed.mock.calls.length - 1];
+    return (options as { processMarker?: { granted: string; withheld: string } }).processMarker;
+  };
+
+  it("is killed by its spawn's profile mark once the worker is done, before its sandbox goes", async () => {
+    stubKill(new Set());
+    const { helper } = newManager();
+    const { proc, sandboxDir } = await spawnWorker(helper, 24680, 'A');
+    const marker = lastMarker();
+    // Two files the profile reads one of and not the other, in the pid
+    // directory, named for the spawn.
+    expect(marker?.granted).toMatch(/\/pids\/1-[0-9a-f]+\.granted$/);
+    expect(marker?.withheld).toBe(marker!.granted.replace(/\.granted$/, '.withheld'));
+    expect(fs.writeFileSync).toHaveBeenCalledWith(marker!.granted, '', expect.objectContaining({ flag: 'wx' }));
+    expect(fs.writeFileSync).toHaveBeenCalledWith(marker!.withheld, '', expect.objectContaining({ flag: 'wx' }));
+    mockReapMarked.mockResolvedValueOnce([31337]);
+
+    proc.emit('exit', 0, null);
+    await settle();
+    expect(mockReapMarked).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(SETTLE_MS);
+    await settle();
+
+    expect(mockReapMarked).toHaveBeenCalledWith(marker);
+    expect(mockReapMarked.mock.invocationCallOrder[0]).toBeLessThan(mockRemoveSandbox.mock.invocationCallOrder[0]);
+    expect(mockRemoveSandbox).toHaveBeenCalledWith(sandboxDir);
+    // Swept, so the mark goes with it.
+    expect(fs.promises.unlink).toHaveBeenCalledWith(marker!.granted);
+    expect(fs.promises.unlink).toHaveBeenCalledWith(marker!.withheld);
+
+    // The next spawn in the slot carries a mark of its own.
+    await spawnWorker(helper, 24690, 'B');
+    expect(lastMarker()!.granted).not.toBe(marker!.granted);
+  });
+
+  it('keeps the mark for the startup sweep when the sweep could not look', async () => {
+    stubKill(new Set());
+    const { helper } = newManager();
+    const { proc } = await spawnWorker(helper, 24680);
+    const marker = lastMarker()!;
+    mockReapMarked.mockResolvedValueOnce(null);
+
+    proc.emit('exit', 0, null);
+    await jest.advanceTimersByTimeAsync(SETTLE_MS);
+    await settle();
+
+    expect(mockReapMarked).toHaveBeenCalledWith(marker);
+    expect(fs.promises.unlink).not.toHaveBeenCalledWith(marker.granted);
+    expect(fs.promises.unlink).not.toHaveBeenCalledWith(marker.withheld);
   });
 });

@@ -225,6 +225,48 @@ describe('marker-based orphan reaping', () => {
     expect(logged.some((m) => m.includes('1-deadbeef.mark'))).toBe(true);
   });
 
+  it("kills what an earlier run's jobs left under their profile marks, then drops the marks", async () => {
+    // The app quit, or crashed, before a finished job was swept: something
+    // it left outside its process group still runs under its profile, and
+    // the mark in that profile is how to find it. By real path, since that
+    // is what seatbelt answers for.
+    const stem = path.join(fs.realpathSync(pidDir), '1-feedface');
+    fs.writeFileSync(`${stem}.granted`, '');
+    fs.writeFileSync(`${stem}.withheld`, '');
+    const reaped: Array<{ granted: string; withheld: string }> = [];
+
+    const result = await killOrphanedProcesses(sandboxBase, () => undefined, () => null, () => [], async (marker) => {
+      reaped.push(marker);
+      return [7001];
+    });
+
+    expect(reaped).toEqual([{ granted: `${stem}.granted`, withheld: `${stem}.withheld` }]);
+    expect(result).toBe(true);
+    expect(fs.existsSync(`${stem}.granted`)).toBe(false);
+    expect(fs.existsSync(`${stem}.withheld`)).toBe(false);
+  });
+
+  it('drops a mark it could not sweep by, and half of one, rather than keep them for ever', async () => {
+    // Without the developer tools the sweep never runs; a mark kept for it
+    // would be kept for good, one for every job.
+    const stem = path.join(fs.realpathSync(pidDir), '1-feedface');
+    fs.writeFileSync(`${stem}.granted`, '');
+    fs.writeFileSync(`${stem}.withheld`, '');
+    fs.writeFileSync(path.join(pidDir, '2-cafe.withheld'), '');
+    const logged: string[] = [];
+    const reaped: unknown[] = [];
+
+    const result = await killOrphanedProcesses(sandboxBase, (m) => logged.push(m), () => null, () => [], async (marker) => {
+      reaped.push(marker);
+      return null;
+    });
+
+    expect(reaped).toHaveLength(1);
+    expect(result).toBe(false);
+    expect(fs.readdirSync(pidDir)).toEqual([]);
+    expect(logged.some((m) => m.includes('1-feedface'))).toBe(true);
+  });
+
   it('does not force-kill blind when the marker cannot be re-checked after the grace period', async () => {
     const logged: string[] = [];
 

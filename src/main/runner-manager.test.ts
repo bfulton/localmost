@@ -38,6 +38,11 @@ jest.mock('./proxy-server', () => ({
   })),
 }));
 
+// The sweep by profile mark runs python; stubbed, as nothing here runs sandboxed.
+jest.mock('../shared/sandbox-reaper', () => ({
+  reapMarkedProcessesAsync: jest.fn(async () => []),
+}));
+
 // Mock process-identity verification so tests can supply a matching start time,
 // and the marker helpers so no real lsof runs. parsePidRecord is the real one.
 const mockMarkerHolders = jest.fn((_p: string): number[] | null => []);

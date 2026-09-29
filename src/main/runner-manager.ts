@@ -15,7 +15,8 @@ import {
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
 import { SandboxFilesystemPolicy, spawnSandboxed } from './process-sandbox';
 import { inheritedWorkerEnv, packageCacheEnv } from './worker-env';
-import { DEFAULT_BROKER_PORT, type EnvPolicy } from '../shared/sandbox-profile';
+import { DEFAULT_BROKER_PORT, type EnvPolicy, type ProcessMarker } from '../shared/sandbox-profile';
+import { reapMarkedProcessesAsync } from '../shared/sandbox-reaper';
 import { groupHasMembers, sweepInGrace, sweepProcessGroup } from './process-group';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { GitHubClientError } from './github-client';
@@ -113,6 +114,8 @@ interface RunnerInstance {
   sandboxDir?: string;
   /** The process group this spawn's worker leads, kept after its handle is cleared. */
   groupId?: number;
+  /** The mark this spawn's profile carries; see createProcessMarker. */
+  processMarker?: ProcessMarker;
   /** Set when a claim found the approved policy had moved; the worker stays constrained. */
   policyDrifted?: boolean;
   /**
@@ -152,6 +155,7 @@ interface RunnerInstance {
 /** What a finished spawn leaves behind, swept once its exit sweep has run. */
 interface FinishedSpawn {
   markerPath?: string;
+  processMarker?: ProcessMarker;
   sandboxDir?: string;
   groupId?: number;
 }
@@ -1442,6 +1446,19 @@ export class RunnerManager {
         this.log('warn', `Could not create marker for instance ${instanceNum}: ${(err as Error).message}`);
       }
 
+      // The spawn's mark in its profile, which no process of the job can
+      // shed: every process the worker starts runs under that profile and
+      // cannot leave it, so the mark finds them all once the spawn is done -
+      // one that left the process group with setsid() and closed the marker
+      // descriptor included.
+      let processMarker: ProcessMarker | undefined;
+      try {
+        processMarker = this.createProcessMarker(instanceNum, markerPath);
+        instance.processMarker = processMarker;
+      } catch (err) {
+        this.log('warn', `Could not mark instance ${instanceNum}'s profile; what its job leaves outside its process group will not be found: ${(err as Error).message}`);
+      }
+
       try {
         instance.process = spawnSandboxed(runnerBinary, ['--once'], {
           cwd: sandboxDir,
@@ -1456,6 +1473,7 @@ export class RunnerManager {
           dockerSocket: dockerSocketPath,
           toolCacheDir,
           packageCacheDir,
+          processMarker,
         });
       } finally {
         // The child holds its own copy; this process must not, or lsof would
@@ -1623,6 +1641,12 @@ export class RunnerManager {
         if (instance.markerPath) {
           try { fs.unlinkSync(instance.markerPath); } catch { /* already gone */ }
           instance.markerPath = undefined;
+        }
+        if (instance.processMarker) {
+          for (const file of [instance.processMarker.granted, instance.processMarker.withheld]) {
+            try { fs.unlinkSync(file); } catch { /* already gone */ }
+          }
+          instance.processMarker = undefined;
         }
         this.discardSandbox(instanceNum, instance);
       }
@@ -1911,8 +1935,12 @@ export class RunnerManager {
     // must see this marker as a finished spawn's, not a running worker's.
     if (instance && markerPath && instance.markerPath === markerPath) instance.markerPath = undefined;
     const sandboxDir = instance?.sandboxDir;
-    if (instance) instance.sandboxDir = undefined;
-    this.settleSpawn({ markerPath, sandboxDir, groupId: instance?.groupId });
+    const processMarker = instance?.processMarker;
+    if (instance) {
+      instance.sandboxDir = undefined;
+      instance.processMarker = undefined;
+    }
+    this.settleSpawn({ markerPath, processMarker, sandboxDir, groupId: instance?.groupId });
   }
 
   /**
@@ -1930,7 +1958,7 @@ export class RunnerManager {
    * the marker and the sandbox survive to the startup sweep.
    */
   private settleSpawn(spawn: FinishedSpawn): void {
-    const key = spawn.markerPath ?? spawn.sandboxDir;
+    const key = spawn.markerPath ?? spawn.processMarker?.granted ?? spawn.sandboxDir;
     if (!key || this.settlingSpawns.has(key)) return;
     this.settlingSpawns.add(key);
     const timer = setTimeout(() => {
@@ -1943,13 +1971,28 @@ export class RunnerManager {
   }
 
   /**
-   * Whatever still holds a finished spawn's marker has escaped the process
-   * group - the case the marker exists for - and is signalled by exact pid.
+   * First whatever still runs under the spawn's profile mark is killed:
+   * after the exit sweep's SIGKILL, that is what left the process group. Then
+   * whatever still holds its marker, signalled by exact pid - which the mark
+   * has already reached when it could look, and covers when it could not.
    * Then its sandbox goes, once its process group is empty: a sandbox
    * something of the job still runs in is left to the startup sweep rather
    * than pulled out from under it.
    */
-  private async sweepFinishedSpawn({ markerPath, sandboxDir, groupId }: FinishedSpawn): Promise<void> {
+  private async sweepFinishedSpawn({ markerPath, processMarker, sandboxDir, groupId }: FinishedSpawn): Promise<void> {
+    if (processMarker) {
+      const killed = await reapMarkedProcessesAsync(processMarker);
+      if (killed === null) {
+        this.log('warn', `Could not look for what a finished job left outside its process group; ${path.basename(processMarker.granted)} is kept for the next startup's sweep`);
+      } else {
+        if (killed.length > 0) {
+          this.log('warn', `Killed ${killed.join(', ')}, left running outside its process group by a finished job`);
+        }
+        for (const file of [processMarker.granted, processMarker.withheld]) {
+          await fs.promises.unlink(file).catch(() => undefined);
+        }
+      }
+    }
     if (markerPath) {
       try {
         const outcome = await this.sweepMarker(markerPath, 2000);
@@ -2034,6 +2077,29 @@ export class RunnerManager {
     const markerPath = path.join(pidDir, `${instanceNum}-${randomBytes(8).toString('hex')}.mark`);
     fs.writeFileSync(markerPath, '');
     return markerPath;
+  }
+
+  /**
+   * Create the two files this spawn's profile reads one of and not the other
+   * (processMarkerRules), named for its marker file when it has one. They sit
+   * in the pid directory, which no job can write, and no other profile tells
+   * them apart. Removed once the finished spawn has been swept by them; the
+   * startup sweep takes any a crash or a failed sweep left.
+   */
+  private createProcessMarker(instanceNum: number, markerPath?: string): ProcessMarker {
+    let pidDir = this.pidDir();
+    fs.mkdirSync(pidDir, { recursive: true });
+    // Seatbelt matches real paths, and the sweep asks about these.
+    try {
+      pidDir = fs.realpathSync(pidDir);
+    } catch {
+      // Kept as spelled.
+    }
+    const stem = markerPath ? path.basename(markerPath, '.mark') : `${instanceNum}-${randomBytes(8).toString('hex')}`;
+    const marker = { granted: path.join(pidDir, `${stem}.granted`), withheld: path.join(pidDir, `${stem}.withheld`) };
+    fs.writeFileSync(marker.granted, '', { mode: 0o600, flag: 'wx' });
+    fs.writeFileSync(marker.withheld, '', { mode: 0o600, flag: 'wx' });
+    return marker;
   }
 
   private releaseInstanceSlot(instanceNum: number): void {

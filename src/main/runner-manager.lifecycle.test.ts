@@ -48,6 +48,11 @@ jest.mock('./proxy-server', () => ({
   })),
 }));
 
+// The sweep by profile mark runs python; stubbed, as nothing here runs sandboxed.
+jest.mock('../shared/sandbox-reaper', () => ({
+  reapMarkedProcessesAsync: jest.fn(async () => []),
+}));
+
 // Start times: the one recorded at spawn is 'START'. mockLookUpStartTime is
 // what a lookup made at escalation time sees; mayEscalate is the real rule.
 const mockLookUpStartTime = jest.fn((_pid: number): string | null | undefined => 'START');

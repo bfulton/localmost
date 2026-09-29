@@ -38,6 +38,11 @@ jest.mock('./proxy-server', () => ({
   })),
 }));
 
+// The sweep by profile mark runs python; stubbed, as nothing here runs sandboxed.
+jest.mock('../shared/sandbox-reaper', () => ({
+  reapMarkedProcessesAsync: jest.fn(async () => []),
+}));
+
 jest.mock('./runner-cleanup', () => ({
   processStartTime: jest.fn(() => 'START'),
   lookUpStartTime: jest.fn(() => 'START'),
