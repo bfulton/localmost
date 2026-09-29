@@ -10,7 +10,7 @@ import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { cleanupWorkspaces, getWorkspacesDir, listWorkspaces, removeWorkspace } from './workspace';
+import { cleanupWorkspaces, createWorkspace, getWorkspacesDir, listWorkspaces, removeWorkspace } from './workspace';
 
 let appData: string;
 
@@ -31,6 +31,23 @@ const makeWorkspace = (name: string, metadata: Record<string, unknown>) => {
   fs.writeFileSync(path.join(dir, '.localmost-workspace.json'), JSON.stringify(metadata));
   return dir;
 };
+
+describe('workspace creation', () => {
+  it('keeps workspaces private to the user, however the directory was left', async () => {
+    // A workspace is a copy of the checkout, and holds the step scripts that
+    // expanded ${{ secrets.X }}. The CLI runs with the shell's umask.
+    fs.chmodSync(getWorkspacesDir(), 0o755);
+    const source = path.join(appData, 'src');
+    fs.mkdirSync(source);
+    fs.writeFileSync(path.join(source, 'README'), 'hi\n');
+
+    const ws = await createWorkspace({ sourceDir: source, respectGitignore: false });
+
+    expect(fs.statSync(getWorkspacesDir()).mode & 0o777).toBe(0o700);
+    expect(fs.statSync(ws.path).mode & 0o777).toBe(0o700);
+    expect(fs.readFileSync(path.join(ws.path, 'README'), 'utf-8')).toBe('hi\n');
+  });
+});
 
 describe('workspace cleanup', () => {
   it('deletes the workspace directory it found, never a path its metadata names', () => {
