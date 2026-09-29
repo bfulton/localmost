@@ -197,6 +197,9 @@ describe('the runner template a sandbox is copied from', () => {
 
     await expect(build()).rejects.toThrow(/does not match/);
     expect(logged.join('\n')).toMatch(/\.env/);
+    // Deleting only this version would leave any older one there to be used,
+    // so the remedy names the whole arc directory.
+    expect(logged.join('\n')).toContain(`delete ${path.join(root, 'runner', 'arc')},`);
   });
 
   it('refuses a file removed from the template', async () => {
@@ -263,5 +266,60 @@ describe('the runner template a sandbox is copied from', () => {
     expect(mockFetch).not.toHaveBeenCalled();
     fs.writeFileSync(path.join(arc, 'run.sh'), '#!/bin/bash\necho changed\n');
     await expect(build()).rejects.toThrow(/does not match/);
+  });
+
+  it('replaces a template it downloads again, rather than extracting over what is there', async () => {
+    // Removing run.sh is enough for the app to offer the download again. A
+    // file planted beside it must not survive into the new template - nor
+    // into the record made from it, which would bless it for every worker.
+    const pristine = path.join(root, 'pristine');
+    layOutRunner(pristine);
+    serveRelease(await tarballOf(pristine));
+    fs.rmSync(pristine, { recursive: true });
+    fs.rmSync(path.join(arc, 'run.sh'));
+    write(path.join(arc, '.env'), 'DYLD_INSERT_LIBRARIES=/tmp/x.dylib\n');
+
+    await downloader.download(() => undefined);
+
+    expect(fs.existsSync(path.join(arc, '.env'))).toBe(false);
+    expect(fs.existsSync(path.join(arc, 'run.sh'))).toBe(true);
+    const sandbox = await build();
+    expect(fs.existsSync(path.join(sandbox, '.env'))).toBe(false);
+    // Nothing of the download is left beside the template.
+    expect(fs.readdirSync(path.join(root, 'runner')).sort()).toEqual(['arc', 'arc-manifests', 'sandbox']);
+    expect(fs.readdirSync(path.join(root, 'runner', 'arc'))).toEqual([`v${version}`]);
+  });
+
+  it('sweeps a download a quit interrupted at the next startup', async () => {
+    const leftover = path.join(root, 'runner', 'arc-staging-a1b2c3');
+    write(path.join(leftover, 'tree', 'run.sh'), '#!/bin/bash\n');
+    write(path.join(leftover, 'actions-runner-osx-arm64-9.9.9.tar.gz'), 'partial');
+
+    await downloader.cleanupStaleConfiguration(() => undefined, { cleanWorkDirs: false });
+
+    expect(fs.existsSync(leftover)).toBe(false);
+    expect(fs.existsSync(arc)).toBe(true);
+  });
+
+  it('records the same version from two places at once without either failing', async () => {
+    // A download and a worker's first start can both write a version's record.
+    await expect(Promise.all(
+      Array.from({ length: 8 }, () => downloader.recordArcManifest(version))
+    )).resolves.toBeDefined();
+    await expect(build()).resolves.toBeDefined();
+    expect(fs.readdirSync(path.join(root, 'runner', 'arc-manifests'))).toEqual([`v${version}.json`]);
+  });
+
+  it('leaves the installed template as it was when a download fails', async () => {
+    const pristine = path.join(root, 'pristine');
+    layOutRunner(pristine);
+    serveRelease(await tarballOf(pristine), 'f'.repeat(64));
+    fs.rmSync(pristine, { recursive: true });
+    await downloader.recordArcManifest(version);
+
+    await expect(downloader.download(() => undefined)).rejects.toThrow(/Checksum verification failed/);
+
+    await expect(build()).resolves.toBeDefined();
+    expect(fs.readdirSync(path.join(root, 'runner', 'arc'))).toEqual([`v${version}`]);
   });
 });

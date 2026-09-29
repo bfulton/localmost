@@ -334,8 +334,10 @@ Key security features:
   - This verification model trusts GitHub's infrastructure, which localmost already relies on for OAuth and API access
 - **Integrity record**: As the runner is extracted, localmost records the SHA-256 of every file and the target of every symlink, in `~/.localmost/runner/arc-manifests/`
   - Every worker runs a fresh copy of the installed runner, and registration runs one too. Each copy is checked against the record before it is used, so the check covers exactly what will run
-  - A file added, missing or changed stops the start, with a log line naming each difference; nothing runs from that copy
+  - A file added, missing or changed stops the start, with a log line naming each difference; nothing runs from that copy. Any difference counts, a `.DS_Store` left by browsing the directory in Finder included. To reinstall, quit localmost, delete `~/.localmost/runner/arc` (all of it: with one version gone, the newest one left would be used) and download the runner again
   - An install from before records were kept gets its record from a fresh download of the same release, checked against the published checksum - never from what is on disk, which may already have been changed
+  - A download is extracted aside and swapped in whole, replacing any installed copy of that version, so nothing left in the old directory survives into the new one or its record
+  - The record is only as trustworthy as the protection on where it is kept. Jobs cannot write any of `~/.localmost/runner` except their own sandbox and the tool cache, nor rename `~/.localmost` itself, whatever path a repository's policy declares writable; this is the last write rule in the job's sandbox profile, so a policy granting `~` or `~/.localmost` does not reach the runner, its record, or the staging directories downloads use
 - **Execution**: Runner binary is spawned as a child process with controlled environment
 - **Process Management**: Child processes are managed via Node.js ChildProcess handles
   - Processes are spawned with `detached: false` so they terminate when parent exits
