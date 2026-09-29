@@ -382,6 +382,9 @@ export class RunnerProxyManager {
 
   /**
    * Build a temporary sandbox directory with runner binaries.
+   *
+   * config.sh runs from here unsandboxed, holding a registration token, so it
+   * is the downloader's checked copy - the same one every worker gets.
    */
   private async buildTempSandbox(version: string): Promise<string> {
     const runnerDownloader = getRunnerDownloader();
@@ -398,32 +401,17 @@ export class RunnerProxyManager {
     const tempDir = path.join(getRunnerDir(), 'temp-proxy-' + Date.now());
     await fs.promises.mkdir(tempDir, { recursive: true });
 
-    // Copy arc contents to temp sandbox
-    await this.copyDir(arcDir, tempDir);
+    try {
+      await runnerDownloader.copyVerifiedArc(version, tempDir, (level, message) => {
+        if (level === 'error') getLogger()?.error(`[RunnerProxyManager] ${message}`);
+        else getLogger()?.info(`[RunnerProxyManager] ${message}`);
+      });
+    } catch (error) {
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+      throw error;
+    }
 
     return tempDir;
-  }
-
-  /**
-   * Copy directory recursively.
-   */
-  private async copyDir(src: string, dest: string): Promise<void> {
-    await fs.promises.mkdir(dest, { recursive: true });
-    const entries = await fs.promises.readdir(src, { withFileTypes: true });
-
-    for (const entry of entries) {
-      const srcPath = path.join(src, entry.name);
-      const destPath = path.join(dest, entry.name);
-
-      if (entry.isDirectory()) {
-        await this.copyDir(srcPath, destPath);
-      } else {
-        await fs.promises.copyFile(srcPath, destPath);
-        // Preserve executable permissions
-        const stat = await fs.promises.stat(srcPath);
-        await fs.promises.chmod(destPath, stat.mode);
-      }
-    }
   }
 
   /**

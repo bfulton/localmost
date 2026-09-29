@@ -253,6 +253,68 @@ describe('RunnerProxyManager', () => {
     });
   });
 
+  describe('registerInstance', () => {
+    const credentialJson: Record<string, string> = {
+      '.runner': JSON.stringify({ agentName: 'r.1', serverUrlV2: 'https://broker.actions.githubusercontent.com/' }),
+      '.credentials': JSON.stringify({ scheme: 'OAuth', data: {} }),
+      '.credentials_rsaparams': JSON.stringify({ d: 'x' }),
+    };
+    let copyVerifiedArc: jest.Mock<(version: string, dest: string) => Promise<void>>;
+
+    /** config.sh, as spawned: exits 0 once it has been looked at. */
+    const configSh = () => {
+      const { EventEmitter } = jest.requireActual('events') as typeof import('events');
+      const proc = new EventEmitter() as import('events').EventEmitter & { stdout: unknown; stderr: unknown };
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      setImmediate(() => proc.emit('close', 0));
+      return proc;
+    };
+
+    beforeEach(() => {
+      copyVerifiedArc = jest.fn<(version: string, dest: string) => Promise<void>>().mockResolvedValue(undefined);
+      mockGetGitHubAuth.mockReturnValue({
+        getRunnerRegistrationToken: jest.fn<() => Promise<string>>().mockResolvedValue('REGISTRATION-TOKEN'),
+      });
+      mockGetRunnerDownloader.mockReturnValue({
+        getInstalledVersion: jest.fn(() => '2.336.0'),
+        getArcDir: jest.fn(() => '/mock/runner/dir/arc/v2.336.0'),
+        copyVerifiedArc,
+      });
+      mockGetValidAccessToken.mockResolvedValue('user-token');
+      mockExistsSync.mockReturnValue(true);
+      mockMkdir.mockResolvedValue(undefined);
+      mockCopyFile.mockResolvedValue(undefined);
+      mockWriteFile.mockResolvedValue(undefined);
+      mockRm.mockResolvedValue(undefined);
+      mockReadFile.mockResolvedValue(credentialJson['.runner']);
+      mockReadFileSync.mockImplementation((p: string) => credentialJson[p.slice(p.lastIndexOf('/') + 1)]);
+      mockSpawn.mockImplementation(configSh);
+    });
+
+    it('runs config.sh only from a copy of the runner checked against its record', async () => {
+      // config.sh runs unsandboxed, holding a registration token.
+      await manager.registerInstance(createMockTarget(), 1);
+
+      expect(copyVerifiedArc).toHaveBeenCalledTimes(1);
+      const [version, dest] = copyVerifiedArc.mock.calls[0];
+      expect(version).toBe('2.336.0');
+      const [script, , options] = mockSpawn.mock.calls[0] as [string, string[], { cwd: string }];
+      expect(options.cwd).toBe(dest);
+      expect(script).toBe(`${dest}/config.sh`);
+    });
+
+    it('registers nothing, and leaves no copy behind, when the runner does not match its record', async () => {
+      copyVerifiedArc.mockRejectedValue(new Error('Runner v2.336.0 does not match its integrity record (changed: config.sh)'));
+
+      await expect(manager.registerInstance(createMockTarget(), 1)).rejects.toThrow(/integrity record/);
+
+      expect(mockSpawn).not.toHaveBeenCalled();
+      const dest = copyVerifiedArc.mock.calls[0][1];
+      expect(mockRm).toHaveBeenCalledWith(dest, { recursive: true, force: true });
+    });
+  });
+
   describe('unregisterAll', () => {
     it('should remove local credentials even if GitHub deletion fails', async () => {
       mockGetGitHubAuth.mockReturnValue({

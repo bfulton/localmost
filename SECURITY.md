@@ -331,6 +331,10 @@ Key security features:
   - Download is rejected if checksums don't match, preventing corrupted or tampered binaries
   - Note: The runner binaries use adhoc code signatures (no verified identity), so we don't verify signatures—the checksum provides equivalent integrity assurance
   - This verification model trusts GitHub's infrastructure, which localmost already relies on for OAuth and API access
+- **Integrity record**: As the runner is extracted, localmost records the SHA-256 of every file and the target of every symlink, in `~/.localmost/runner/arc-manifests/`
+  - Every worker runs a fresh copy of the installed runner, and registration runs one too. Each copy is checked against the record before it is used, so the check covers exactly what will run
+  - A file added, missing or changed stops the start, with a log line naming each difference; nothing runs from that copy
+  - An install from before records were kept gets its record from a fresh download of the same release, checked against the published checksum - never from what is on disk, which may already have been changed
 - **Execution**: Runner binary is spawned as a child process with controlled environment
 - **Process Management**: Child processes are managed via Node.js ChildProcess handles
   - Processes are spawned with `detached: false` so they terminate when parent exits
@@ -505,10 +509,15 @@ Look for:
 Runner binaries can be independently verified against GitHub's published checksums:
 
 1. Find the expected checksum at https://github.com/actions/runner/releases
-2. Compute the checksum of your downloaded runner:
+2. Download the same release and compute its checksum (localmost does not keep the tarball after extracting it):
    ```bash
-   shasum -a 256 ~/.localmost/runner/arc/v*/actions-runner-*.tar.gz
+   curl -LO https://github.com/actions/runner/releases/download/v<version>/actions-runner-osx-arm64-<version>.tar.gz
+   shasum -a 256 actions-runner-osx-arm64-<version>.tar.gz
    ```
-3. Compare the hashes
+3. Compare the hashes, then compare the release with what localmost installed:
+   ```bash
+   mkdir release && tar -xzf actions-runner-osx-arm64-<version>.tar.gz -C release
+   diff -r release ~/.localmost/runner/arc/v<version>
+   ```
 
-Note: localmost performs this verification automatically during download.
+Note: localmost performs the checksum verification automatically during download, and checks every copy of the runner it starts against the files it extracted.

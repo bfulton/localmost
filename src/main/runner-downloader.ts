@@ -24,6 +24,29 @@ export type ProgressCallback = (progress: DownloadProgress) => void;
 /** The only files buildSandbox takes from an instance's config directory. */
 const SANDBOX_CONFIG_FILES = ['.runner'];
 
+/**
+ * What a runner template held when it came from its release: each file's
+ * sha256 and each symlink's target, by path relative to the template.
+ */
+interface ArcManifest {
+  files: Map<string, string>;
+  symlinks: Map<string, string>;
+}
+
+/** Run fn over items, at most limit at a time. */
+async function mapWithLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const lanes = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]);
+    }
+  });
+  await Promise.all(lanes);
+  return results;
+}
+
 export interface RunnerRelease {
   version: string;
   url: string;
@@ -41,6 +64,8 @@ export class RunnerDownloader {
   private readonly baseDir: string;
   private readonly fallbackVersion = FALLBACK_RUNNER_VERSION;
   private selectedVersion: string | null = null;
+  /** Records being built from a release download, so concurrent starts share one. */
+  private manifestsInFlight: Map<string, Promise<ArcManifest>> = new Map();
 
   constructor() {
     this.baseDir = getRunnerDir();
@@ -69,6 +94,14 @@ export class RunnerDownloader {
   /** Get the persistent tool cache directory (shared across all instances) */
   getToolCacheDir(): string {
     return path.join(this.baseDir, 'tool-cache');
+  }
+
+  /**
+   * Where a version's integrity record lives: beside arc/, not in it, so a
+   * version directory holds exactly what its release did.
+   */
+  getArcManifestPath(version: string): string {
+    return path.join(this.baseDir, 'arc-manifests', `v${version}.json`);
   }
 
   /**
@@ -167,6 +200,173 @@ export class RunnerDownloader {
   }
 
   /**
+   * Copy a version's runner template to dest, then check the copy against the
+   * template's integrity record, and throw if they differ.
+   *
+   * Every worker runs a copy of arc/, so something that could write there once
+   * would reach every later job; and registration runs it unsandboxed. The
+   * copy is what gets checked, not the template, so nothing can change between
+   * the check and the run. A version with no record yet - installed before
+   * records were kept - gets one built from its release download, checked
+   * against GitHub's published checksum. Recording what is on disk instead
+   * would bless a template already changed.
+   */
+  async copyVerifiedArc(
+    version: string,
+    dest: string,
+    onLog?: (level: 'info' | 'error', message: string) => void
+  ): Promise<void> {
+    const log = onLog || (() => {});
+    const arcDir = this.getArcDir(version);
+    const manifest = await this.ensureArcManifest(version, log);
+    await this.copyDir(arcDir, dest);
+
+    const differences = await this.compareWithManifest(dest, manifest);
+    if (differences.length > 0) {
+      log('error', `Runner v${version} in ${arcDir} does not match the release it was installed from; no runner will start from it. Delete that directory and restart localmost to install the runner again.`);
+      for (const difference of differences.slice(0, 20)) {
+        log('error', `  ${difference}`);
+      }
+      if (differences.length > 20) {
+        log('error', `  ...and ${differences.length - 20} more`);
+      }
+      const more = differences.length > 1 ? `, and ${differences.length - 1} more` : '';
+      throw new Error(`Runner v${version} does not match its integrity record (${differences[0]}${more})`);
+    }
+  }
+
+  /** Record what a version's template holds now. Called as it is extracted. */
+  async recordArcManifest(version: string): Promise<void> {
+    await this.writeArcManifest(version, await this.manifestOf(this.getArcDir(version)));
+  }
+
+  private async ensureArcManifest(
+    version: string,
+    log: (level: 'info' | 'error', message: string) => void
+  ): Promise<ArcManifest> {
+    const recorded = this.readArcManifest(version);
+    if (recorded) return recorded;
+
+    let pending = this.manifestsInFlight.get(version);
+    if (!pending) {
+      log('info', `No integrity record for runner v${version}; building one from its release download...`);
+      pending = this.manifestFromRelease(version).finally(() => this.manifestsInFlight.delete(version));
+      this.manifestsInFlight.set(version, pending);
+    }
+    return pending;
+  }
+
+  /**
+   * Download a version's release, check it against its published checksum,
+   * and record what it holds. The download is extracted to a scratch directory
+   * that is removed afterwards; the installed template is not touched.
+   */
+  private async manifestFromRelease(version: string): Promise<ArcManifest> {
+    const { filename, url } = this.releaseAsset(version);
+    const scratch = await fs.promises.mkdtemp(path.join(this.baseDir, 'arc-verify-'));
+    try {
+      const expectedChecksum = await this.fetchExpectedChecksum(version, filename);
+      const tarballPath = path.join(scratch, filename);
+      await this.downloadFile(url, tarballPath, () => {});
+      await this.verifyChecksum(tarballPath, expectedChecksum);
+
+      const tree = path.join(scratch, 'tree');
+      await fs.promises.mkdir(tree);
+      await tar.extract({ file: tarballPath, cwd: tree, preserveOwner: false });
+
+      const manifest = await this.manifestOf(tree);
+      await this.writeArcManifest(version, manifest);
+      return manifest;
+    } finally {
+      await fs.promises.rm(scratch, { recursive: true, force: true });
+    }
+  }
+
+  /** A version's record, or undefined if there is none or it cannot be read. */
+  private readArcManifest(version: string): ArcManifest | undefined {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(this.getArcManifestPath(version), 'utf-8'));
+      const files = Object.entries(parsed?.files ?? {});
+      const symlinks = Object.entries(parsed?.symlinks ?? {});
+      const wellFormed = files.length > 0 &&
+        files.every(([, hash]) => typeof hash === 'string' && /^[0-9a-f]{64}$/.test(hash)) &&
+        symlinks.every(([, target]) => typeof target === 'string');
+      if (!wellFormed) return undefined;
+      return {
+        files: new Map(files as Array<[string, string]>),
+        symlinks: new Map(symlinks as Array<[string, string]>),
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async writeArcManifest(version: string, manifest: ArcManifest): Promise<void> {
+    const file = this.getArcManifestPath(version);
+    await fs.promises.mkdir(path.dirname(file), { recursive: true });
+    const sorted = (entries: Map<string, string>) =>
+      Object.fromEntries([...entries].sort(([a], [b]) => (a < b ? -1 : 1)));
+    // Written aside and renamed in, so a record is never read half-written.
+    const staging = `${file}.${process.pid}.tmp`;
+    await fs.promises.writeFile(
+      staging,
+      JSON.stringify({ files: sorted(manifest.files), symlinks: sorted(manifest.symlinks) }),
+      { mode: 0o600 }
+    );
+    await fs.promises.rename(staging, file);
+  }
+
+  /** The files and symlinks under a directory, by relative path. copyDir copies nothing else. */
+  private async listTree(root: string): Promise<{ files: string[]; symlinks: string[] }> {
+    const files: string[] = [];
+    const symlinks: string[] = [];
+    const walk = async (relative: string): Promise<void> => {
+      const entries = await fs.promises.readdir(path.join(root, relative), { withFileTypes: true });
+      for (const entry of entries) {
+        const entryPath = relative ? `${relative}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) await walk(entryPath);
+        else if (entry.isSymbolicLink()) symlinks.push(entryPath);
+        else if (entry.isFile()) files.push(entryPath);
+      }
+    };
+    await walk('');
+    return { files, symlinks };
+  }
+
+  private async manifestOf(root: string): Promise<ArcManifest> {
+    const { files, symlinks } = await this.listTree(root);
+    const hashes = await mapWithLimit(files, 16, (file) => this.computeFileChecksum(path.join(root, file)));
+    const targets = await Promise.all(symlinks.map((link) => fs.promises.readlink(path.join(root, link))));
+    return {
+      files: new Map(files.map((file, i) => [file, hashes[i]])),
+      symlinks: new Map(symlinks.map((link, i) => [link, targets[i]])),
+    };
+  }
+
+  /** How a directory differs from a record: every file added, missing or changed. */
+  private async compareWithManifest(root: string, manifest: ArcManifest): Promise<string[]> {
+    const actual = await this.manifestOf(root);
+    const differences: string[] = [];
+    for (const [file, hash] of actual.files) {
+      const expected = manifest.files.get(file);
+      if (expected === undefined) differences.push(`added: ${file}`);
+      else if (expected !== hash) differences.push(`changed: ${file}`);
+    }
+    for (const [link, target] of actual.symlinks) {
+      const expected = manifest.symlinks.get(link);
+      if (expected === undefined) differences.push(`added: ${link} -> ${target}`);
+      else if (expected !== target) differences.push(`changed: ${link} -> ${target} (was ${expected})`);
+    }
+    for (const file of manifest.files.keys()) {
+      if (!actual.files.has(file)) differences.push(`missing: ${file}`);
+    }
+    for (const link of manifest.symlinks.keys()) {
+      if (!actual.symlinks.has(link)) differences.push(`missing: ${link}`);
+    }
+    return differences;
+  }
+
+  /**
    * Get the path for preserved work directory (outside sandbox).
    */
   getWorkDir(instance: number): string {
@@ -219,7 +419,7 @@ export class RunnerDownloader {
     // Copy arc to sandbox
     log('info', `Copying arc to sandbox...`);
     const copyStart = Date.now();
-    await this.copyDir(arcDir, sandboxDir);
+    await this.copyVerifiedArc(version, sandboxDir, log);
     log('info', `Arc copy completed in ${Date.now() - copyStart}ms`);
 
     // Verify critical files exist
@@ -713,17 +913,20 @@ export class RunnerDownloader {
     await cleanupWorkDirs(workBase, onLog || (() => {}));
   }
 
-  async download(onProgress: ProgressCallback): Promise<void> {
-    const platform = this.getPlatform();
+  /** The release tarball for a version on this Mac's architecture. */
+  private releaseAsset(version: string): { filename: string; url: string } {
     const arch = this.getArch();
-
     if (!arch) {
       throw new Error(`Unsupported architecture: ${process.arch}`);
     }
+    const filename = `actions-runner-${this.getPlatform()}-${arch}-${version}.tar.gz`;
+    return { filename, url: `https://github.com/actions/runner/releases/download/v${version}/${filename}` };
+  }
+
+  async download(onProgress: ProgressCallback): Promise<void> {
 
     const version = this.getDownloadVersion();
-    const filename = `actions-runner-${platform}-${arch}-${version}.tar.gz`;
-    const downloadUrl = `https://github.com/actions/runner/releases/download/v${version}/${filename}`;
+    const { filename, url: downloadUrl } = this.releaseAsset(version);
     const arcDir = this.getArcDir(version);
 
     // Create arc directory
@@ -776,6 +979,10 @@ export class RunnerDownloader {
       if (fs.existsSync(listenerPath)) {
         await fs.promises.chmod(listenerPath, 0o755);
       }
+
+      // Recorded now, from what was just extracted from a checked download,
+      // before any worker exists that could have touched it.
+      await this.recordArcManifest(version);
 
       onProgress({ phase: 'complete', percent: 100, message: 'Runner downloaded and ready!' });
     } catch (error) {
@@ -1020,7 +1227,9 @@ export class RunnerDownloader {
         }
       }
     } finally {
-      fileStream.close();
+      // Waited for: the checksum is read from this file as soon as this
+      // returns, and writes may still be queued.
+      await new Promise<void>((resolve) => fileStream.end(() => resolve()));
     }
   }
 }
