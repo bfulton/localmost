@@ -9,7 +9,8 @@ import * as net from 'net';
 import * as fs from 'fs';
 import { app } from 'electron';
 import { getCliSocketPath } from './paths';
-import { getRunnerManager, getHeartbeatManager, getAuthState, getRunnerState } from './app-state';
+import { getRunnerManager, getHeartbeatManager, getAuthState, getRunnerState, getResourceMonitor } from './app-state';
+import { pauseRunner, resumeRunner } from './runner-pause';
 import { getSnapshot, selectEffectivePauseState } from './runner-state-service';
 import { getTargetManager } from './target-manager';
 import { getRunnerProxyManager } from './runner-proxy-manager';
@@ -293,21 +294,20 @@ export class CliServer {
           return { success: false, error: 'Runner manager not initialized' };
         }
 
-        if (!runnerManager.isRunning()) {
-          return {
-            success: true,
-            command: 'pause',
-            message: 'Runner is already paused',
-          };
-        }
-
+        // The pause the tray sets. Whether the runner is paused is that flag,
+        // not whether it has workers: they are spawned per job, so an idle
+        // runner has none and this used to call it paused while it took jobs.
         try {
-          await runnerManager.stop();
-          heartbeatManager?.stop();
+          const outcome = await pauseRunner();
+          if (outcome === 'not-started') {
+            return { success: false, error: 'Runner is not started, so there is nothing to pause' };
+          }
           return {
             success: true,
             command: 'pause',
-            message: 'Runner paused successfully',
+            message: outcome === 'already-paused'
+              ? 'Runner is already paused'
+              : 'Runner paused: it takes no new jobs, and a job already running finishes',
           };
         } catch (err) {
           return { success: false, error: `Failed to pause: ${(err as Error).message}` };
@@ -319,29 +319,24 @@ export class CliServer {
           return { success: false, error: 'Runner manager not initialized' };
         }
 
-        if (runnerManager.isRunning()) {
-          return {
-            success: true,
-            command: 'resume',
-            message: 'Runner is already running',
-          };
-        }
-
         if (!runnerManager.isConfigured()) {
           return { success: false, error: 'Runner is not configured. Please complete setup in the app.' };
         }
 
         try {
-          // The mode the app starts in: an empty pool, with a worker spawned
-          // for each admitted job.
-          await runnerManager.initialize();
-          // Note: heartbeat resume would require more setup (auth tokens, etc.)
-          // For now, CLI resume just starts the runner
-          return {
-            success: true,
-            command: 'resume',
-            message: 'Runner resumed successfully',
-          };
+          const outcome = await resumeRunner();
+          if (outcome === 'not-started') {
+            return { success: false, error: 'Runner is not started. Start it from the app.' };
+          }
+          let message = outcome === 'already-running' ? 'Runner is already running' : 'Runner resumed';
+          // Resuming lifts the pause, not the condition behind a resource
+          // pause, and new jobs wait on the condition.
+          const resourceMonitor = getResourceMonitor();
+          if (resourceMonitor?.shouldPause()) {
+            const reason = resourceMonitor.getPauseState().reason || 'a resource condition';
+            message += `, but it takes no new jobs until this clears: ${reason}`;
+          }
+          return { success: true, command: 'resume', message };
         } catch (err) {
           return { success: false, error: `Failed to resume: ${(err as Error).message}` };
         }

@@ -189,7 +189,7 @@ localmost stop
 # Check runner status
 localmost status
 
-# Pause the runner (stops accepting new jobs)
+# Pause the runner (takes no new jobs; a running job finishes)
 localmost pause
 
 # Resume the runner

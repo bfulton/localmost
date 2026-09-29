@@ -221,6 +221,19 @@ describe('RunnerManager', () => {
     });
   });
 
+  describe('isInitialized', () => {
+    it('is started by initialize() with no worker in the pool', async () => {
+      // The pool is empty until a job arrives, so isRunning() cannot say
+      // whether the runner was started - pause and resume decided by it.
+      expect(runnerManager.isInitialized()).toBe(false);
+
+      await runnerManager.initialize();
+
+      expect(runnerManager.isRunning()).toBe(false);
+      expect(runnerManager.isInitialized()).toBe(true);
+    });
+  });
+
   describe('isConfigured', () => {
     it('should delegate to downloader.hasAnyProxyCredentials', () => {
       // The mock returns true by default

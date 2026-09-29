@@ -28,6 +28,7 @@ const mockInitialize = jest.fn<() => Promise<void>>();
 const mockStop = jest.fn<() => Promise<void>>();
 const mockHeartbeatIsRunning = jest.fn<() => boolean>();
 const mockHeartbeatStop = jest.fn<() => void>();
+const mockResourceShouldPause = jest.fn<() => boolean>();
 
 jest.mock('./app-state', () => ({
   getRunnerState: () => mockGetStatus(),
@@ -46,6 +47,18 @@ jest.mock('./app-state', () => ({
   getAuthState: () => ({
     user: { login: 'testuser' },
   }),
+  getResourceMonitor: () => ({
+    shouldPause: mockResourceShouldPause,
+    getPauseState: () => ({ isPaused: mockResourceShouldPause(), reason: 'Battery at 20%', conditions: [] }),
+  }),
+}));
+
+// Mock the pause and resume the tray shares
+const mockPauseRunner = jest.fn<() => Promise<string>>();
+const mockResumeRunner = jest.fn<() => Promise<string>>();
+jest.mock('./runner-pause', () => ({
+  pauseRunner: () => mockPauseRunner(),
+  resumeRunner: () => mockResumeRunner(),
 }));
 
 // Mock runner-state-service
@@ -115,6 +128,9 @@ describe('CliServer', () => {
     mockHeartbeatStop.mockReset();
     mockSelectRunnerStatus.mockReset();
     mockSelectEffectivePauseState.mockReset();
+    mockResourceShouldPause.mockReset();
+    mockPauseRunner.mockReset();
+    mockResumeRunner.mockReset();
 
     // Default mock implementations
     mockGetStatusDisplayName.mockReturnValue('localmost.test');
@@ -125,6 +141,9 @@ describe('CliServer', () => {
     mockSelectRunnerStatus.mockReturnValue({ status: 'listening' });
     mockGetStatus.mockReturnValue({ status: 'listening' });
     mockSelectEffectivePauseState.mockReturnValue({ isPaused: false, reason: null });
+    mockResourceShouldPause.mockReturnValue(false);
+    mockPauseRunner.mockResolvedValue('paused');
+    mockResumeRunner.mockResolvedValue('resumed');
 
     mockGetTargets.mockReset();
     mockFindTargetByRef.mockReset();
@@ -217,9 +236,11 @@ describe('CliServer', () => {
     });
   });
 
-  it('should handle pause command when running', async () => {
-    mockIsRunning.mockReturnValue(true);
-    mockStop.mockResolvedValue(undefined);
+  it('pauses a listening runner that has no worker', async () => {
+    // Workers are spawned per job, so an idle runner has none. Deciding by
+    // them answered "already paused" for a runner that was taking jobs, and
+    // set no pause, so `localmost status` went on saying Listening.
+    mockIsRunning.mockReturnValue(false);
 
     await server.start();
 
@@ -228,14 +249,26 @@ describe('CliServer', () => {
     expect(response).toEqual({
       success: true,
       command: 'pause',
-      message: 'Runner paused successfully',
+      message: 'Runner paused: it takes no new jobs, and a job already running finishes',
     });
-    expect(mockStop).toHaveBeenCalled();
-    expect(mockHeartbeatStop).toHaveBeenCalled();
+    expect(mockPauseRunner).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves a running job to finish when pausing', async () => {
+    // It used to stop the pool, killing the job; the tray's pause never did.
+    mockIsRunning.mockReturnValue(true);
+
+    await server.start();
+
+    await sendRequest({ command: 'pause' });
+
+    expect(mockPauseRunner).toHaveBeenCalledTimes(1);
+    expect(mockStop).not.toHaveBeenCalled();
   });
 
   it('should handle pause command when already paused', async () => {
-    mockIsRunning.mockReturnValue(false);
+    mockIsRunning.mockReturnValue(true);
+    mockPauseRunner.mockResolvedValue('already-paused');
 
     await server.start();
 
@@ -249,12 +282,23 @@ describe('CliServer', () => {
     expect(mockStop).not.toHaveBeenCalled();
   });
 
-  it('should handle resume command when paused', async () => {
-    // Resume returns to the mode the app starts in: an empty pool that spawns
-    // a worker for each admitted job.
-    mockIsRunning.mockReturnValue(false);
-    mockIsConfigured.mockReturnValue(true);
-    mockInitialize.mockResolvedValue(undefined);
+  it('does not claim to pause a runner that was never started', async () => {
+    mockPauseRunner.mockResolvedValue('not-started');
+
+    await server.start();
+
+    const response = await sendRequest({ command: 'pause' });
+
+    expect(response).toEqual({
+      success: false,
+      error: 'Runner is not started, so there is nothing to pause',
+    });
+  });
+
+  it('resumes a paused runner that still has a job running', async () => {
+    // A pause leaves running jobs to finish, so a paused runner can have a
+    // worker. Deciding by workers called it already running and left it paused.
+    mockIsRunning.mockReturnValue(true);
 
     await server.start();
 
@@ -263,13 +307,15 @@ describe('CliServer', () => {
     expect(response).toEqual({
       success: true,
       command: 'resume',
-      message: 'Runner resumed successfully',
+      message: 'Runner resumed',
     });
-    expect(mockInitialize).toHaveBeenCalled();
+    expect(mockResumeRunner).toHaveBeenCalledTimes(1);
+    expect(mockInitialize).not.toHaveBeenCalled();
   });
 
   it('should handle resume command when already running', async () => {
-    mockIsRunning.mockReturnValue(true);
+    mockIsRunning.mockReturnValue(false);
+    mockResumeRunner.mockResolvedValue('already-running');
 
     await server.start();
 
@@ -280,7 +326,33 @@ describe('CliServer', () => {
       command: 'resume',
       message: 'Runner is already running',
     });
-    expect(mockInitialize).not.toHaveBeenCalled();
+  });
+
+  it('says when a resource condition still holds new jobs back after resuming', async () => {
+    mockResourceShouldPause.mockReturnValue(true);
+
+    await server.start();
+
+    const response = await sendRequest({ command: 'resume' });
+
+    expect(response).toEqual({
+      success: true,
+      command: 'resume',
+      message: 'Runner resumed, but it takes no new jobs until this clears: Battery at 20%',
+    });
+  });
+
+  it('does not claim to resume a runner that was never started', async () => {
+    mockResumeRunner.mockResolvedValue('not-started');
+
+    await server.start();
+
+    const response = await sendRequest({ command: 'resume' });
+
+    expect(response).toEqual({
+      success: false,
+      error: 'Runner is not started. Start it from the app.',
+    });
   });
 
   it('should handle resume command when not configured', async () => {
@@ -376,8 +448,8 @@ describe('CliServer', () => {
   });
 
   it('answers the requests on one connection in the order they were sent', async () => {
-    let finishStop: () => void = () => {};
-    mockStop.mockImplementation(() => new Promise<void>((resolve) => { finishStop = resolve; }));
+    let finishPause: () => void = () => {};
+    mockPauseRunner.mockImplementation(() => new Promise<string>((resolve) => { finishPause = () => resolve('paused'); }));
     await server.start();
 
     const responses = await new Promise<Array<{ command?: string }>>((resolve, reject) => {
@@ -386,7 +458,7 @@ describe('CliServer', () => {
         await new Promise((r) => setTimeout(r, 20));
         socket.write(JSON.stringify({ command: 'jobs' }) + '\n');
         await new Promise((r) => setTimeout(r, 20));
-        finishStop();
+        finishPause();
       });
       const seen: Array<{ command?: string }> = [];
       let buffer = '';
@@ -410,8 +482,8 @@ describe('CliServer', () => {
     // The first request holds the line; everything after it waits its turn.
     // Reading on regardless kept every waiting request in memory, however
     // many a client sent.
-    let finishStop: () => void = () => {};
-    mockStop.mockImplementation(() => new Promise<void>((resolve) => { finishStop = resolve; }));
+    let finishPause: () => void = () => {};
+    mockPauseRunner.mockImplementation(() => new Promise<string>((resolve) => { finishPause = () => resolve('paused'); }));
     await server.start();
 
     const socket = net.createConnection(testSocketPath);
@@ -426,7 +498,7 @@ describe('CliServer', () => {
     // taking it once enough requests were waiting.
     expect(socket.writableLength).toBeGreaterThan(flood.length / 2);
 
-    finishStop();
+    finishPause();
     socket.destroy();
   });
 
