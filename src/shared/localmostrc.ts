@@ -369,8 +369,17 @@ function validatePathArray(value: unknown, path: string, errors: ParseError[]): 
   if (!Array.isArray(value)) return;
   for (let i = 0; i < value.length; i++) {
     const entry = value[i];
-    if (typeof entry === 'string' && /["\\\x00-\x1f\x7f]/.test(entry)) {
+    if (typeof entry !== 'string') continue;
+    if (/["\\\x00-\x1f\x7f]/.test(entry)) {
       errors.push({ message: `${path}[${i}] must not contain quotes, backslashes or control characters` });
+    }
+    // No ".." traversal. A relative path is a legitimate workspace path
+    // (./build, ./Pods), emitted into the profile and resolved from the
+    // worker's own directory - but a ".." segment could climb out of the
+    // workspace into the app's runner directory (proxy credentials, pids,
+    // other sandboxes), which the resolved-against-main-cwd filter would miss.
+    if (entry.split('/').includes('..')) {
+      errors.push({ message: `${path}[${i}] must not contain ".." path segments` });
     }
   }
 }

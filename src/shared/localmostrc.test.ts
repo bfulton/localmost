@@ -313,6 +313,21 @@ shared:
       expect(result.errors[0].message).toMatch(/must not contain/i);
     });
 
+    it('rejects a filesystem path with .. traversal that could climb out of the workspace', () => {
+      // A relative workspace path is fine, but ".." could climb into the app's
+      // runner directory from the worker's own directory, past the filter.
+      const content = 'version: 1\nshared:\n  filesystem:\n    read:\n      - \'../../.localmost/runner/proxies\'';
+      const result = parseLocalmostrcContent(content);
+      expect(result.success).toBe(false);
+      expect(result.errors[0].message).toMatch(/must not contain "\.\."/);
+    });
+
+    it('still accepts a relative workspace path without traversal', () => {
+      const content = 'version: 1\nshared:\n  filesystem:\n    write:\n      - ./build\n      - ./Pods/';
+      const result = parseLocalmostrcContent(content);
+      expect(result.success).toBe(true);
+    });
+
     it('rejects a backslash in a filesystem path', () => {
       const content = 'version: 1\nshared:\n  filesystem:\n    write:\n      - \'/tmp/a\\\\b\'';
       const result = parseLocalmostrcContent(content);

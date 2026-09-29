@@ -238,6 +238,15 @@ function generateSandboxProfile({
     return resolved === runnerRoot || resolved.startsWith(runnerRoot + path.sep);
   };
   const outsideRunner = (entry: string): boolean => {
+    // A ".." segment could climb out of the workspace into the runner
+    // directory; the resolved-against-main-cwd check below would miss a
+    // relative one, since the profile resolves it from the worker's directory.
+    // Validation already rejects these; this is the backstop. Relative
+    // workspace paths without ".." are legitimate and kept.
+    if (expandPath(entry).split('/').includes('..')) {
+      onLog?.('error', `Ignoring traversing policy path: ${entry}`);
+      return false;
+    }
     if (withinRunnerDir(entry)) {
       onLog?.('error', `Ignoring policy path inside the runner directory: ${entry}`);
       return false;
