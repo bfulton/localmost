@@ -140,8 +140,8 @@ const UserFilterSettings: React.FC<UserFilterSettingsProps> = ({
       case 'contributors':
         return (
           'Check who triggered the workflow and all contributors to the repository, and ensure all are trusted. ' +
-          'A repository with any commit author not linked to a GitHub account is refused, as is one with more ' +
-          'than 500 author emails: no allowlist can admit an author GitHub cannot name.'
+          'A repository with any commit author not linked to a GitHub account is refused, and in practice so is ' +
+          'one with more than 500 author emails: no allowlist can admit an author GitHub cannot name.'
         );
       default:
         return '';

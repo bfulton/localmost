@@ -901,13 +901,23 @@ describe('writing a policy back', () => {
 
   it('quotes env patterns and workflow names that YAML would read as something else', () => {
     // `*` opens a YAML alias and `: ` a mapping, so unquoted either makes
-    // the rewritten file unparseable; `#` starts a comment.
+    // the rewritten file unparseable; `#` starts a comment. A name that
+    // reads as a number, bool, null or date parses, but as a different key,
+    // so its section would quietly stop applying to the workflow.
     const config: LocalmostrcConfig = {
       version: 1,
       shared: { env: { allow: ['LC_*'], deny: ['*_TOKEN', '*'] } },
       workflows: {
         'Release: tag #1': { secrets: { require: ['NPM_TOKEN'] } },
         'CI build': { env: { deny: ['*SECRET*'] } },
+        '1.0': { secrets: { require: ['A'] } },
+        '0x10': { secrets: { require: ['B'] } },
+        '1e3': { secrets: { require: ['C'] } },
+        True: { secrets: { require: ['D'] } },
+        true: { secrets: { require: ['E'] } },
+        NULL: { secrets: { require: ['F'] } },
+        '2024-01-01': { secrets: { require: ['G'] } },
+        'release-1.0': { secrets: { require: ['H'] } },
       },
     };
 

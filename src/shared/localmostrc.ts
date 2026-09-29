@@ -598,7 +598,8 @@ export function getRequiredSecrets(config: LocalmostrcConfig, workflowName: stri
  * value exactly. Strings are always quoted - an env pattern such as
  * `*_TOKEN` would otherwise open a YAML alias - and a section with nothing
  * in it is left out rather than written as a bare key, which YAML reads as
- * null and the parser refuses.
+ * null and the parser refuses. It writes the parsed config, so comments in
+ * a hand-written file are not kept.
  */
 export function serializeLocalmostrc(config: LocalmostrcConfig): string {
   const lines: string[] = [];
@@ -631,12 +632,13 @@ export function serializeLocalmostrc(config: LocalmostrcConfig): string {
 const quote = (value: string): string => JSON.stringify(value);
 
 /**
- * A workflow name as a mapping key: bare when it is made only of characters
- * YAML reads as themselves, quoted otherwise - a `: ` or ` #` in a name
- * would end the key early.
+ * A workflow name as a mapping key: bare only when it is plain characters
+ * and YAML reads it back as the same string, quoted otherwise - a `: ` or
+ * ` #` in a name would end the key early, and a name such as `1.0`, `True`
+ * or `null` would come back as a different key.
  */
 function yamlKey(name: string): string {
-  return /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(name) ? name : quote(name);
+  return /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(name) && yaml.load(name) === name ? name : quote(name);
 }
 
 /** A policy block: `key:` over its body, or `key: {}` when it has none. */

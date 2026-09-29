@@ -109,8 +109,9 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   it for the life of the process.
 - Under the **Repo contributors** scope, a repository with any commit author
   not linked to a GitHub account (an unattributed commit) is refused, since
-  anyone can write such a commit and no allowlist can admit it. So is one with
-  more than 500 author emails, the most GitHub links to accounts. Repositories
+  anyone can write such a commit and no allowlist can admit it. In practice so
+  is one with more than 500 author emails, since GitHub links only the first 500
+  to accounts and lists the rest as anonymous. Repositories
   this scope admitted before can now be refused; the refusal names the
   unattributed commit, email or name.
 
@@ -132,7 +133,9 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   than being discarded.
 - `localmost test --updaterc` no longer writes a `.localmostrc` it cannot read
   back. Env patterns such as `*_TOKEN` and workflow names containing `: ` are
-  quoted, and a section left empty is omitted rather than written as a bare key.
+  quoted, as is a workflow name such as `1.0` or `True` that YAML would read
+  back as a different key, and a section left empty is omitted rather than
+  written as a bare key.
 
 ### Changed
 - **Breaking policy change**: `docker: socket | contexts | credentials`, accepted
