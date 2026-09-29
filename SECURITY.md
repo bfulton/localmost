@@ -169,9 +169,21 @@ operation it sends upstream on the runner's credentials (renewing, finishing
 or completing a job) must name that worker's job and no other: any request id
 it carries must be one delivered to that worker, and any plan and job ids
 those of the job details it acquired. The operation is recognised however its
-path is spelled, in any case or percent-encoded. That key,
-not the closed port, is what keeps a job from acting as another worker or as
-the runner.
+path is spelled, in any case or percent-encoded, and its body must write each
+of those ids under its exact key (`planId`, not `PlanId`): the JSON decoders of
+.NET and Go read a key in any case, and Go's reads some other letters as ASCII
+ones (`requeſtId` as `requestId`), so a body that spells one otherwise, or has
+any key that is not plain ASCII, is refused. A path that decodes to anything
+but plain ASCII is refused too. The paths the broker answers itself (opening,
+polling and deleting a session, acknowledging a message, acquiring a job, and
+the worker's token endpoint) never go upstream: another spelling of one
+(`/Message`, `/message/`, `/%6dessage`), or another method on it, is refused.
+Any other path is not yet restricted: it is forwarded to GitHub's broker on
+the runner's credentials as it comes, with the target's upstream session id in
+place of any session id it carries.
+Forwarding only the paths the runner uses would close that; it is an open
+item. That key, not the closed port, is what keeps a job from acting as
+another worker, and from acting as the runner through the operations above.
 
 A repository declares one of three levels in its `.localmostrc` (`level:`; see
 Policy levels above), and one that declares none runs `strict`. Settings under
@@ -470,7 +482,7 @@ Each target's runner registrations live in `~/.localmost/runner/proxies/<target>
 - **The broker signs, not the worker.** The local broker makes every call to GitHub as the runner itself, with the registration's key, app-side. The runner's listener only ever talks to the broker, and the broker ignores the token a worker presents. The job's own operations (fetching actions, caches, artifacts, logs) go to GitHub with the token GitHub issues for that one job, not with anything of the runner's.
 - **The runner's token goes only to GitHub.** The broker acquires a job, on the runner's token, only from a run service at an https host under `actions.githubusercontent.com`. The job's operations are forwarded there or to GitHub's broker, and nowhere else. A job offered with any other run service is left unacquired.
 - **Each worker start gets its own key.** The runner will not start without a key and a token endpoint, so each worker is given a new RSA key and a token endpoint on its own broker address. That endpoint issues a token only for an assertion signed with that key, and stops answering when the worker exits.
-- **So a copied key is worth nothing.** A job can read its worker's key, but the key works only at its own worker's endpoint, and the token it gets opens nothing. A job cannot use it to act as the runner, including while localmost is paused or quit.
+- **So a copied key is worth nothing.** A job can read its worker's key, but the key works only at its own worker's endpoint, and the token it gets opens nothing. A job cannot use it to act as the runner, including while localmost is paused or quit. (What a running job can still send upstream through its own worker's broker address is described under Network Policy above.)
 - **Keys earlier versions exposed are replaced.** Before this, every job's sandbox held a copy of its runner's registration key, and those registrations are not ephemeral, so a key a job took then would still work. On the first start after upgrading, localmost registers each such runner again under the same name (`config.sh --replace`), which gives it a new key; GitHub stops honouring the old one. A registration that cannot be replaced at that start (offline, signed out) keeps its old key and is tried again at the next start. Removing and re-adding a target replaces its keys too.
 - **Registration tokens are not in `ps` for other users.** `config.sh` gets its registration token in its environment (`ACTIONS_RUNNER_INPUT_TOKEN`), not on its command line, which any local user can list. Processes running as you, jobs included, can still read another of your processes' initial environment on macOS; the token is valid for an hour and only registers runners.
 

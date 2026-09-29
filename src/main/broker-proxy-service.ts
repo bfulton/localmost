@@ -219,6 +219,43 @@ function planJobKey(planId: unknown, jobId: unknown): string | undefined {
   return JSON.stringify([planId.toLowerCase(), jobId.toLowerCase()]);
 }
 
+/**
+ * The body keys a job operation names its job by: the request ids, in the
+ * order they are tried, then the plan and job ids.
+ */
+const JOB_REQUEST_ID_KEYS = ['jobRequestId', 'requestId', 'runnerRequestId', 'runner_request_id', 'jobMessageId'];
+const JOB_PAIR_KEYS = ['planId', 'jobId'];
+
+/** Those keys by their lowercase, to the one spelling the gate reads. */
+const JOB_KEYS_BY_LOWERCASE = new Map([...JOB_REQUEST_ID_KEYS, ...JOB_PAIR_KEYS].map(key => [key.toLowerCase(), key]));
+
+/**
+ * Printable ASCII: all the runner writes in a job body's keys or in a path it
+ * sends. Beyond ASCII, decoders and routers fold case each their own way (Go's
+ * JSON decoder reads U+017F long s as s and U+212A Kelvin sign as k; .NET's
+ * reads neither), so a check here cannot match every one of them, and anything
+ * else is refused.
+ */
+const PLAIN_ASCII = /^[\x20-\x7e]*$/;
+
+/**
+ * The first key of a job operation's body that upstream could read as a job
+ * key the gate does not. The JSON decoders of .NET and Go match keys whatever
+ * their ASCII case (Go keeping the last), and Go's folds some other letters to
+ * ASCII too, so upstream a `PlanId`, `RequestId` or `requeſtId` beside the
+ * checked key could be the one that counts, and one on its own names a job the
+ * gate never looked at. As in the docker filter's caseAmbiguity, the ambiguity
+ * is refused rather than modelled: the runner writes each key once, in ASCII,
+ * as spelled here.
+ */
+function ambiguousJobKey(body: object): string | undefined {
+  return Object.keys(body).find(key => {
+    if (!PLAIN_ASCII.test(key)) return true;
+    const gated = JOB_KEYS_BY_LOWERCASE.get(key.toLowerCase());
+    return gated !== undefined && gated !== key;
+  });
+}
+
 /** The runner name a session request carries; the runner sends it as `agent.name`. */
 function agentNameFromSessionRequest(body: string): string | undefined {
   try {
@@ -238,6 +275,17 @@ const MAX_REQUEST_BODY_BYTES = 64 * 1024;
  * runner sends; the cap above would fail such a job at its very end.
  */
 const MAX_FORWARD_BODY_BYTES = 8 * 1024 * 1024;
+
+/**
+ * The paths handleRequest answers itself, as upstream routes them: decoded,
+ * lowercase, without empty segments. Each is a branch of its router, which
+ * matches only the exact spelling and method the runner sends. Any other
+ * spelling of one, or another method on it, reaches handleForward and is
+ * refused there: upstream it would reach the target's own session - to
+ * long-poll it, taking messages from admission, or to delete it - on the
+ * runner's token.
+ */
+const LOCALLY_SERVED_PATHS = ['/session', '/message', '/acknowledge', '/acquirejob', WORKER_TOKEN_PATH];
 
 class RequestBodyTooLargeError extends Error {
   constructor() {
@@ -1411,6 +1459,8 @@ export class BrokerProxyService extends EventEmitter {
 
     log()?.debug( `[BrokerProxy] ${method} ${url.pathname}`);
 
+    // Every path served here is in LOCALLY_SERVED_PATHS, so that handleForward
+    // refuses the spellings of it these exact matches miss.
     try {
       if (method === 'POST' && url.pathname === '/session') {
         await this.handleSessionCreate(req, res, key);
@@ -2131,15 +2181,29 @@ export class BrokerProxyService extends EventEmitter {
 
     // The path's segments as upstream routes them: decoded and case folded.
     // The job operation gate below matches these, not the spelling sent, so a
-    // /CompleteJob or /%63ompletejob is bound like the operation it names.
-    let routedSegments: string[];
+    // /CompleteJob or /%63ompletejob is bound like the operation it names. A
+    // path that decodes to anything but printable ASCII is refused, as no
+    // runner path does: a router folding case beyond ASCII could read
+    // /fini%C5%BFhjob as finishjob, or /%C5%BFession as session.
+    let routedSegments: string[] | undefined;
     try {
-      routedSegments = decodeURIComponent(url.pathname).toLowerCase().split('/').filter(Boolean);
+      const decoded = decodeURIComponent(url.pathname);
+      if (PLAIN_ASCII.test(decoded)) routedSegments = decoded.toLowerCase().split('/').filter(Boolean);
     } catch {
+      // Refused below, like a path that decodes to more than ASCII.
+    }
+    if (!routedSegments) {
       req.resume();
-      log()?.warn(`[BrokerProxy] Refused to forward ${req.method} ${forLog(url.pathname)}: its path does not decode`);
+      log()?.warn(`[BrokerProxy] Refused to forward ${req.method} ${forLog(url.pathname)}: its path does not decode to ASCII`);
       res.writeHead(403, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Path does not decode' }));
+      res.end(JSON.stringify({ error: 'Path does not decode to ASCII' }));
+      return;
+    }
+    if (LOCALLY_SERVED_PATHS.includes(`/${routedSegments.join('/')}`)) {
+      req.resume();
+      log()?.warn(`[BrokerProxy] Refused to forward ${req.method} ${forLog(url.pathname)}: it is a path served here, not upstream`);
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Path is served here, not upstream' }));
       return;
     }
 
@@ -2175,10 +2239,16 @@ export class BrokerProxyService extends EventEmitter {
     // request id. Live jobs have so far sent neither operation through this
     // server, so the route is left until it can be checked against one.
     //
-    // OPEN ITEM, other paths: anything that is not a job operation is still
-    // forwarded on the runner's token as it comes. Forwarding only the paths
-    // the runner uses would close that, but changes what reaches upstream, so
-    // it waits on a decision rather than being made here.
+    // OPEN ITEM, other paths: anything that is neither a job operation nor a
+    // spelling of a path served here (both matched on the decoded, lowercase,
+    // ASCII path; anything else refused above) is still forwarded on the
+    // runner's token as it comes, to serverUrlV2, with the target's upstream
+    // session id in place of any sessionId it carries. That includes spellings
+    // whose meaning depends on the upstream router, such as a dot segment
+    // encoded with its slash (/x/..%2fmessage), which is not resolved here.
+    // Forwarding only the paths the runner uses would close that, but changes
+    // what reaches upstream, so it waits on a decision rather than being made
+    // here.
     const jobOperations = ['acquirejob', 'renewjob', 'finishjob', 'jobrequest', 'completejob'];
     if (routedSegments.some(segment => jobOperations.some(op => segment.startsWith(op)))) {
       const refuse = (reason: string) => {
@@ -2200,11 +2270,16 @@ export class BrokerProxyService extends EventEmitter {
         refuse('its body names no job');
         return;
       }
+      const ambiguous = ambiguousJobKey(bodyJson);
+      if (ambiguous) {
+        refuse(`its body has a key ${forLog(ambiguous)}, which upstream may read as a job key this check does not`);
+        return;
+      }
       // Try multiple ID fields - runner uses different ones for different operations
-      const requestIds = [bodyJson.jobRequestId, bodyJson.requestId, bodyJson.runnerRequestId,
-        bodyJson.runner_request_id, bodyJson.jobMessageId].filter(Boolean);
+      const body = bodyJson; // narrowed, for the callbacks below
+      const requestIds = JOB_REQUEST_ID_KEYS.map(key => body[key]).filter(Boolean);
       const opJobId = requestIds[0];
-      const namesPlanJob = [bodyJson.planId, bodyJson.jobId].some(id => id !== undefined && id !== null && id !== '');
+      const namesPlanJob = JOB_PAIR_KEYS.some(key => body[key] !== undefined && body[key] !== null && body[key] !== '');
       // The id alone at info. The body carries the job's outputs and is job
       // code's to write, so it goes to debug, encoded and cut short.
       log()?.info(`[BrokerProxy] Job operation ${url.pathname} for ${opJobId ? forLog(opJobId) : 'no job id'}`);

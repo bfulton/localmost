@@ -167,7 +167,22 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   must be those of the job details the worker acquired. `completejob` and
   `renewjob`, which name a job by those ids alone, were forwarded for whatever
   ids the request carried, as was any operation whose path was spelled in
-  another case.
+  another case, or whose body named a job under a key in another case
+  (`PlanId`, `RequestId`) or spelled with a letter Go reads as an ASCII one
+  (`requeſtId`): the JSON decoders of .NET and Go read a key in any case, and
+  GitHub's services may use either. A body with any such key, or any key that
+  is not plain ASCII, is now refused, as is a path that decodes to anything but
+  plain ASCII.
+- The paths the broker answers itself - opening, polling and deleting a
+  session, acknowledging a message, acquiring a job, and the worker's token
+  endpoint - are no longer forwarded upstream when spelled another way
+  (`/Message`, `/message/`, `/%6dessage`, `DELETE /Session`) or sent with
+  another method. They went to GitHub's broker on the runner's credentials with
+  the target's own session, so a job could poll that session, taking jobs
+  before admission saw them, or delete it. Any other path that is not a job
+  operation is still forwarded upstream as it comes, on the runner's
+  credentials, with the target's session id in place of any session id it
+  carries.
 - An approved policy is bound to the repository's id as well as its name. A job
   from a different repository that now holds an approved name - the approved one
   deleted or renamed, and the name taken since - is refused until the policy is
