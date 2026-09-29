@@ -404,27 +404,18 @@ export class RunnerDownloader {
   }
 
   /**
-   * Get the path for preserved work directory (outside sandbox).
-   */
-  getWorkDir(instance: number): string {
-    return path.join(this.baseDir, 'work', String(instance));
-  }
-
-  /**
    * Build a sandbox for the given instance by copying arc + config.
    * This should be called before starting each runner instance.
    */
   async buildSandbox(
     instance: number,
     version: string,
-    onLog?: (level: 'info' | 'error', message: string) => void,
-    options?: { preserveWorkDir?: boolean }
+    onLog?: (level: 'info' | 'error', message: string) => void
   ): Promise<string> {
     const log = onLog || (() => {});
     const arcDir = this.getArcDir(version);
     const configDir = this.getConfigDir(instance);
     const sandboxDir = this.getSandboxDir(instance);
-    const preserveWorkDir = options?.preserveWorkDir ?? false;
 
     if (!fs.existsSync(arcDir)) {
       throw new Error(`Runner version ${version} not downloaded. Please download first.`);
@@ -480,24 +471,9 @@ export class RunnerDownloader {
       }
     }
 
-    // Set up preserved work directory if enabled
-    if (preserveWorkDir) {
-      const workDir = this.getWorkDir(instance);
-      const sandboxWorkDir = path.join(sandboxDir, '_work');
-
-      // Ensure preserved work directory exists
-      await fs.promises.mkdir(workDir, { recursive: true });
-
-      // Create symlink from sandbox/_work -> preserved work dir
-      try {
-        await fs.promises.symlink(workDir, sandboxWorkDir);
-        log('info', `Linked _work to preserved directory`);
-      } catch (symlinkErr) {
-        log('error', `Failed to create work dir symlink: ${(symlinkErr as Error).message}`);
-        // Non-fatal - runner will create _work directory normally
-      }
-    }
-
+    // _work is left for the runner to create inside this fresh sandbox. A
+    // work directory kept across starts would hand one job's checkout and
+    // dependencies to whichever job next took the slot, from any repository.
     return sandboxDir;
   }
 
@@ -910,14 +886,9 @@ export class RunnerDownloader {
    * Removes sandbox directories (they're rebuilt fresh on each start).
    * Validates config directories have required files.
    * @param onLog - Optional logging callback
-   * @param options.cleanWorkDirs - Whether to clean work directories (default: true)
    */
-  async cleanupStaleConfiguration(
-    onLog?: (message: string) => void,
-    options?: { cleanWorkDirs?: boolean }
-  ): Promise<void> {
+  async cleanupStaleConfiguration(onLog?: (message: string) => void): Promise<void> {
     const log = onLog || (() => {});
-    const shouldCleanWorkDirs = options?.cleanWorkDirs ?? true;
 
     const sandboxBase = path.join(this.baseDir, 'sandbox');
     if (fs.existsSync(sandboxBase)) {
@@ -943,10 +914,7 @@ export class RunnerDownloader {
     // downloading yet at startup, so any found are leftovers.
     await this.cleanupStagingDirectories(log);
 
-    // Clean up preserved work directories (unless disabled)
-    if (shouldCleanWorkDirs) {
-      await this.cleanupWorkDirectories(log);
-    }
+    await this.cleanupWorkDirectories(log);
   }
 
   private async cleanupStagingDirectories(log: (message: string) => void): Promise<void> {
@@ -963,12 +931,12 @@ export class RunnerDownloader {
   }
 
   /**
-   * Clean up preserved work directories.
-   * Called on startup and exit to avoid accumulating stale data.
+   * Remove the work directories the removed preserveWorkDir setting kept
+   * under runner/work. Nothing writes there any more; an install that had
+   * the setting on would otherwise keep a job's checkout on disk for good.
    */
-  async cleanupWorkDirectories(onLog?: (message: string) => void): Promise<void> {
-    const workBase = path.join(this.baseDir, 'work');
-    await cleanupWorkDirs(workBase, onLog || (() => {}));
+  private async cleanupWorkDirectories(log: (message: string) => void): Promise<void> {
+    await cleanupWorkDirs(path.join(this.baseDir, 'work'), log);
   }
 
   /** The release tarball for a version on this Mac's architecture. */

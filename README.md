@@ -262,7 +262,7 @@ Future feature ideas:
 - **Quick actions** - Re-run failed job, cancel all jobs.
 - **Spotlight integration** - Check status or pause builds from Spotlight.
 - **Artifact inspector** - Browse uploaded artifacts without leaving the app.
-- **Disk space monitoring** - Warn or pause when disk is low, auto-clean old work dirs.
+- **Disk space monitoring** - Warn or pause when disk is low, auto-clean trash directories and caches.
 - **Linux and Windows host support** - Run self-hosted runners on non-Mac machines for projects that need them.
 - **Higher parallelism cap** - Parallelize proxy registration to support 16+ concurrent runners (currently capped at 8 due to serial registration time).
 - **Managed Docker VM** - Run the daemon behind the filtering socket in a VM whose only mount is the workspace, so a filter defect is contained, container egress is policed, and `privileged` becomes grantable.

@@ -39,7 +39,6 @@ const PERSISTED_CONFIG_KEYS: (keyof ConfigSlice)[] = [
   'maxJobHistory',
   'sleepProtection',
   'sleepProtectionConsented',
-  'preserveWorkDir',
   'toolCacheLocation',
   'userFilter',
   'sandboxPolicyLevel',
@@ -125,11 +124,6 @@ export function loadPersistedConfig(): void {
     // Sleep protection
     if (diskConfig.sleepProtection && ['never', 'when-busy', 'always'].includes(diskConfig.sleepProtection)) {
       configUpdates.sleepProtection = diskConfig.sleepProtection;
-    }
-
-    // Preserve work dir
-    if (diskConfig.preserveWorkDir && ['never', 'always'].includes(diskConfig.preserveWorkDir)) {
-      configUpdates.preserveWorkDir = diskConfig.preserveWorkDir;
     }
 
     // User filter - supports both old 'mode' format and new 'scope/allowedUsers' format

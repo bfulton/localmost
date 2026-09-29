@@ -83,10 +83,6 @@ export const store = createStore<AppStore>()(
       set((state) => ({ config: { ...state.config, sleepProtectionConsented: true } }));
     },
 
-    setPreserveWorkDir: (preserveWorkDir: 'never' | 'session' | 'always') => {
-      set((state) => ({ config: { ...state.config, preserveWorkDir } }));
-    },
-
     setToolCacheLocation: (toolCacheLocation: ToolCacheLocation) => {
       set((state) => ({ config: { ...state.config, toolCacheLocation } }));
     },

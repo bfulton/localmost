@@ -117,8 +117,8 @@ shared:
       - "registry.npmjs.org"     # Exact match
     deny:                        # Explicit denials (optional, for clarity)
       - "*.analytics.com"
-    loopback: [5432]             # Local ports reachable directly; true for all.
-                                 # shared: only - see "Loopback" below
+    loopback: [5432]             # Loopback ports the job may connect to; true
+                                 # for all. shared: only. See "Loopback" below.
 
   filesystem:
     read:
@@ -189,6 +189,36 @@ workflows:
 | `./build/**` | All files under `build/` recursively |
 | `~/.ssh/id_*` | `~/.ssh/id_rsa`, `~/.ssh/id_ed25519`, etc. |
 
+### Loopback
+
+A job's sandbox connects directly to one loopback port by default: its own
+egress proxy. Anything else listening on the Mac's loopback - a debugger on
+9229, a browser's remote-debugging port, a development database, another job's
+server - is closed to the job's own sockets, though not to requests it sends
+through its proxy (below). A repository whose jobs need loopback opts in under
+`shared.network`:
+
+```yaml
+shared:
+  network:
+    loopback: true               # every loopback port but the broker's
+    # loopback: [5432, 6379]     # or only these
+```
+
+`true` is what a test suite that binds an ephemeral `127.0.0.1` port and
+connects to it needs, since its port is not known in advance. A list names fixed
+ports only: the sandbox profile language has no port ranges. Each entry is an
+integer from 1 to 65535, with no repeats. The sandbox profile is fixed when the
+worker starts, before the workflow is known, so `loopback` is valid in `shared:`
+only; under `workflows:` it is a validation error. The broker's port is closed
+whatever the policy says.
+
+The grant appears in the approval card and `localmost policy show` with a note
+that the job can reach local services on those ports, and it is part of the
+approval diff and stamp like every other key. It governs the job's direct
+connections; the job's proxy still reaches `localhost` and `127.0.0.1` as
+runner infrastructure - see SECURITY.md, Network Policy.
+
 ### Per-workflow policies
 
 Policies have two levels: **shared** (applies to all workflows) and **per-workflow** (scoped to a specific workflow file).
@@ -250,7 +280,9 @@ workflows:
 3. Explicit `deny` in workflow policy can revoke shared access
 
 **Why this matters:**
-- A compromised test dependency can't access deploy credentials
+- A compromised dependency of the test workflow can't use the deploy
+  workflow's grants - which protects against dependencies, not commit authors
+  (see Workflow matching)
 - Build workflow can't phone home to analytics even if deploy can
 - Each workflow gets exactly what it needs, nothing more
 
@@ -261,6 +293,10 @@ workflows:
   after the file and the two agree
 - `build` matches `.github/workflows/build.yml`
 - For matrix workflows, all jobs in the workflow share the workflow's policy
+- Keys are not a boundary. A `workflows.<name>` section is available to any
+  commit that can run a workflow file with that name, including pull requests,
+  which can add or change a workflow file like any other; approving a
+  per-workflow grant approves it for anyone who can open a PR
 
 **Discovery mode with per-workflow policies:**
 
@@ -312,11 +348,12 @@ Anything not listed is denied: an undeclared image, registry, mount or network
 mode, and every endpoint the proxy does not understand.
 
 A small baseline needs no declaration: `/_ping`, `/version`, `/info`, and reads
-about the job's own containers. Every client needs them to start, and none reach
-the host. `/info` keeps only the fields a client reads to start (version,
-platform, kernel, CPU and memory, storage driver, cgroup version, security
-options); the host name, proxy settings, registry mirrors, labels and counts of
-other containers are removed.
+about the job's own containers. Every client needs them to start, and none
+changes anything on the host. `/info` is answered with the fields clients use
+(`ServerVersion`, `OSType`, `Architecture`, `OperatingSystem`, `KernelVersion`,
+`NCPU`, `MemTotal`, `Driver`, `CgroupVersion`, `SecurityOptions`) and not the
+host name, data directory, proxy and registry settings or labels the daemon
+would otherwise report.
 
 There is no key at any level for `--pid=host`, `--network=host`, `--device`,
 mounting the daemon socket into a container, or the other host-reaching

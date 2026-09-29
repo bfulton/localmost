@@ -106,10 +106,13 @@ loosen its own sandbox without the machine owner agreeing to it.
 - **GitHub's infrastructure**: OAuth, API responses, and runner binary distribution are trusted. If GitHub is compromised, localmost provides no additional protection.
 - **Malware on your machine**: If your system is already compromised, localmost cannot protect you.
 - **A compromised GitHub account**: If an attacker has access to your GitHub account, they can modify workflows that run on your runner.
-- **Allowlisted hosts**: Data can be exfiltrated to any host the active policy allows. Under `strict` that is runner infrastructure plus whatever the repository declares; looser levels allow more.
+- **Allowlisted hosts**: Data can be exfiltrated to any host the active policy allows. Under `strict` that is runner infrastructure plus whatever the repository declares; looser levels allow more. Among the infrastructure hosts allowed at every level, `github.com`, `api.github.com` and `*.blob.core.windows.net` accept writes from any account, so `strict` limits reach, not exfiltration - see Network Policy below.
 - **Approved policies**: Once you approve a repository's `.localmostrc`, everything it declares is granted until you approve another. Approval is a judgement about that content, and is bound to it: what you approve is the policy you were shown, level included. A write grant on a place something outside the sandbox later acts on - `~/Library/LaunchAgents` and the other launchd directories, shell rc files, `~/.ssh`, `~/.gitconfig`, `~/.config`, `~/Library/Application Support`, `/usr/local/bin`, `/opt/homebrew/bin`, or a parent of any of them, `~` and `/` included - is marked with a warning in the approval screen and `localmost policy show`. It is not refused: a job granted one can leave code that runs as you, unsandboxed, after it ends, and approving it means accepting that.
 - **Per-workflow filesystem sections**: A `workflows:` section can narrow or widen *network* access per workflow, because hosts are applied to the proxy when a job is claimed. Filesystem paths are taken from `shared:` only — the sandbox profile is built before the runner knows which workflow it will run, and cannot change afterwards.
 - **Per-workflow env sections**: The environment is fixed when the worker starts, for the same reason. `env: allow` is taken from `shared:` only; a per-workflow allow is not applied. `env: deny` is taken from `shared:` and from every workflow, and applied to every job - a per-workflow deny is honoured more widely than written rather than not at all.
+- **Per-workflow sections are not a boundary between contributors**: A `workflows.<name>` section is available to any commit that can run a workflow file with that name, including pull requests; approving a per-workflow grant approves it for anyone who can open a PR. The key matches a file name, and a pull request can add or change a workflow file like any other. Per-workflow sections keep a compromised dependency of one workflow from using another's grants, not a commit author.
+- **Loopback services, through the proxy**: A job's sandbox closes loopback ports other than its own proxy's unless the repository declares `network.loopback`, but the proxy itself reaches `localhost` and `127.0.0.1` - see Network Policy below. A service listening on loopback is protected from jobs only by its own authentication, as the broker is by its per-worker key. Containers are not under the sandbox's loopback rule at all: a container on a routable network reaches the host's loopback services, the broker included, through the daemon's address for the host (`host.docker.internal`) - see Docker Access below.
+- **Processes running as you**: The CLI control socket is guarded only by file permissions (`0600` in a `0700` directory) and the job sandbox's deny of it. Any process running as your user can control the app through it - pause, resume, add or remove targets - as it could by editing `~/.localmost` directly.
 - **Container egress**: Traffic from inside a container leaves through the daemon's network, not the job's proxy, so the host allowlist does not apply to it. The Docker filter decides what a container may be created with, not what it connects to once running - see Docker Access below.
 
 - **The runner's own floor**: A job's sandbox also contains the runner process, so the profile must grant what the runner needs to function - the OS, its own installation, the tool cache, the workspace and temp. A repository cannot narrow below that floor, only add to it.
@@ -122,9 +125,44 @@ loosen its own sandbox without the machine owner agreeing to it.
 
 Job traffic is routed through a local proxy, which decides each connection by
 hostname. macOS `sandbox-exec` cannot filter by hostname - its `(remote ...)`
-filter matches only addresses and ports - so the sandbox permits only the
-worker's own proxy on loopback, plus any loopback ports the repository's approved
-policy declares, and the proxy makes the decision.
+filter matches only addresses and ports - so the sandbox permits one outbound
+destination, the job's own proxy on loopback, and the proxy makes the decision.
+
+Other loopback ports are closed to a job's direct connections by default: a
+debugger listening on 9229, a browser's remote-debugging port, a local database
+or another tool's proxy is not the job's to open a socket to, and neither is a
+port a concurrent job opened. Its proxy still reaches them, though (see
+below), so this narrows the ways to a local service rather than closing them.
+A repository whose jobs need loopback - a test suite that starts a server on an
+ephemeral `127.0.0.1` port and connects to it, or a service container published
+on a fixed port - declares it in `.localmostrc`, under `shared:` only, since the
+profile is fixed when the worker starts:
+
+```yaml
+shared:
+  network:
+    loopback: true          # every loopback port but the broker's
+    # loopback: [5432, 6379]  # or only these; seatbelt has no port ranges
+```
+
+The grant is shown in the approval card and `localmost policy show` with a note
+that the job can reach local services on those ports, and like every other key
+it is part of the approval diff and stamp. The broker's port stays closed
+whatever the policy says. Loopback is shared by everything on the Mac: a job
+granted a port reaches whatever listens there, a concurrent job's server
+included, whichever repository it belongs to, and two jobs that bind the same
+fixed port collide.
+
+This closes direct connections only. The proxy treats `localhost` and
+`127.0.0.1` as runner infrastructure (below), because the runner reaches the
+local broker through it, so a job that sends a request or opens a tunnel
+through its own proxy can still reach a service on loopback. A local service
+that jobs must not use needs its own authentication, as the broker has: each
+worker talks to it at an address carrying a key of its own
+(`http://127.0.0.1:<port>/w/<key>/`), and the broker answers each key only
+with its own worker's session and the jobs delivered to that worker. That key,
+not the closed port, is what keeps a job from acting as another worker or as
+the runner.
 
 Three levels are available in Settings under Job Security:
 
@@ -139,7 +177,9 @@ launched with `HTTP_PROXY` pointed at this proxy and cannot register or poll for
 jobs without them: `localhost`, `127.0.0.1`, `github.com`, `api.github.com`,
 `*.actions.githubusercontent.com` and `*.blob.core.windows.net`. A single proxy
 cannot distinguish the runner's own requests from a job's, so jobs reach those
-hosts too.
+hosts too - and those hosts accept writes from any account (a gist, a push
+to another repository, an upload to anyone's storage container), so even
+`strict` limits what a job can reach, not what it can send out.
 
 Under `strict` and `moderate`, an allowed host is reached only on its scheme's
 port: 443 through a `CONNECT` tunnel and 80 for plain HTTP. Any other port must
@@ -355,11 +395,12 @@ machine-level switch to withhold it - so the approval diff is where that
 decision gets made. Every grant under `docker:` is surfaced in the diff with the
 same prominence as a change to `level:`. Default is off: a repository that
 declares nothing under `docker:` has only the baseline of `/_ping`, `/version`,
-`/info` and reads about its own containers, none of which reach the host.
-The filter cuts `/info` down to the daemon's version, platform, kernel, CPU and
-memory, storage driver, cgroup version and security options; the rest (host
-name, proxy settings and their credentials, registry mirrors, labels, container
-and image counts) is withheld because it describes the operator's machine. The
+`/info` and reads about its own containers, none of which change anything on
+the host. They do describe it: the daemon's `/info` answer carries the host's
+name, the daemon's data directory, its proxy and registry configuration and
+labels, so localmost rewrites it to keep only what clients use to start -
+`ServerVersion`, `OSType`, `Architecture`, `OperatingSystem`, `KernelVersion`,
+`NCPU`, `MemTotal`, `Driver`, `CgroupVersion` and `SecurityOptions`. The
 design is in `docs/superpowers/specs/2026-09-05-docker-isolation-design.md`.
 
 ## Credential Storage
@@ -522,7 +563,7 @@ localmost includes a user filter that restricts which GitHub users' jobs are acc
 | Scope | What is checked |
 |-------|-----------------|
 | **Everyone** | Nothing: jobs from any user are accepted (default) |
-| **Trigger author** | The user who triggered the run (`github.actor`) |
+| **Trigger author** | The account that caused the event (`github.actor`), not the author of the code the run executes |
 | **Repo contributors** | The trigger author, and every contributor to the repository and author of the commits since |
 
 and who is allowed:
@@ -532,7 +573,7 @@ and who is allowed:
 | **Just me** | Only the authenticated user |
 | **Allowlist** | Only specific GitHub usernames |
 
-The trigger author is the person who set the run going, not necessarily the author of the code it runs; a comment or a re-run by an allowed user runs whatever the commit contains. **Repo contributors** covers the code as well, and checks the trigger author too, so it refuses at least what **Trigger author** refuses.
+**Trigger author** checks `github.actor`, the account that caused the event, not the author of the code being run. A comment or a re-run by an allowed user runs whatever the commit contains, and a maintainer who updates a fork's pull request from its base branch or pushes a commit to it makes the pull request's code - all of it, whoever wrote it - run as the maintainer. Use **Repo contributors** to gate on who wrote the code: it covers the code as well, and checks the trigger author too, so it refuses at least what **Trigger author** refuses.
 
 Under either filtering scope, a job whose trigger author cannot be read is refused, since it cannot be shown to be anyone allowed. Under **Repo contributors**, an author whose email is linked to no GitHub account counts as one no filter allows, since anyone can write such a commit. That holds for the repository's contributor list, which is read with anonymous contributors included; for the commits on the default branch dated within the day before its head was read, since GitHub serves the contributor list from a cache that can be a few hours old; and for every commit between that head and the job's commit. Each appears in the refusal as `(unattributed <commit, email or name>: no linked GitHub account, ...)`. So a repository with such an author in its history is refused under this scope, and no allowlist entry can admit it; nor, in practice, can one with more than 500 author emails, since GitHub links only the first 500 to accounts and lists the rest as anonymous. One gap remains: the recent-commit walk goes by commit date, which the committer sets, so a commit dated back more than a day and merged within the hours before the baseline was read can be missed, with its author.
 
@@ -589,6 +630,14 @@ Log messages are sanitized before being written to disk or displayed:
 - GitHub registration tokens are redacted
 - Encrypted values and bearer tokens are redacted
 - Sanitization applies to both the log file and renderer display
+
+What reaches the log file is set by the two log levels in Settings. The
+runner's standard output is logged at debug, so it is kept only when both the
+runner log level and the localmost log level are Debug; it then writes the
+runner's diagnostic trace, job names and runner URLs included, to
+`~/.localmost/logs`. At the defaults (Warning and Info) only the runner's error
+output is kept. A step's own output is not part of the runner's: it goes to the
+job's log on GitHub.
 
 ## Code Signing
 

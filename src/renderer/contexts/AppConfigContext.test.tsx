@@ -17,7 +17,6 @@ const TestConsumer: React.FC = () => {
       <span data-testid="max-job-history">{config.maxJobHistory}</span>
       <span data-testid="sleep-protection">{config.sleepProtection}</span>
       <span data-testid="sleep-consented">{String(config.sleepProtectionConsented)}</span>
-      <span data-testid="preserve-work-dir">{config.preserveWorkDir}</span>
       <span data-testid="tool-cache-location">{config.toolCacheLocation}</span>
       <span data-testid="user-filter-scope">{config.userFilter.scope}</span>
       <span data-testid="user-filter-allowed-users">{config.userFilter.allowedUsers}</span>
@@ -35,7 +34,6 @@ const TestConsumer: React.FC = () => {
       <button data-testid="set-max-job-history" onClick={() => config.setMaxJobHistory(20)}>Set Job History</button>
       <button data-testid="set-sleep-protection" onClick={() => config.setSleepProtection('when-busy')}>Set Sleep Protection</button>
       <button data-testid="consent-sleep" onClick={config.consentToSleepProtection}>Consent</button>
-      <button data-testid="set-preserve-work-dir" onClick={() => config.setPreserveWorkDir('session')}>Set Preserve</button>
       <button data-testid="set-tool-cache" onClick={() => config.setToolCacheLocation('per-sandbox')}>Set Tool Cache</button>
       <button data-testid="set-user-filter-just-me" onClick={() => config.setUserFilter({ scope: 'trigger', allowedUsers: 'just-me', allowlist: [] })}>Set Just Me</button>
       <button data-testid="set-user-filter-allowlist" onClick={() => config.setUserFilter({ scope: 'trigger', allowedUsers: 'allowlist', allowlist: [{ login: 'testuser', avatar_url: '', name: null }] })}>Set Allowlist</button>
@@ -99,7 +97,6 @@ describe('AppConfigContext', () => {
       expect(screen.getByTestId('max-log-scrollback').textContent).toBe('500');
       expect(screen.getByTestId('max-job-history').textContent).toBe('10');
       expect(screen.getByTestId('sleep-protection').textContent).toBe('never');
-      expect(screen.getByTestId('preserve-work-dir').textContent).toBe('never');
       expect(screen.getByTestId('tool-cache-location').textContent).toBe('persistent');
     });
 
@@ -112,7 +109,6 @@ describe('AppConfigContext', () => {
         maxJobHistory: 25,
         sleepProtection: 'always',
         sleepProtectionConsented: true,
-        preserveWorkDir: 'always',
         toolCacheLocation: 'per-sandbox',
       });
 
@@ -130,7 +126,6 @@ describe('AppConfigContext', () => {
         expect(screen.getByTestId('max-job-history').textContent).toBe('25');
         expect(screen.getByTestId('sleep-protection').textContent).toBe('always');
         expect(screen.getByTestId('sleep-consented').textContent).toBe('true');
-        expect(screen.getByTestId('preserve-work-dir').textContent).toBe('always');
         expect(screen.getByTestId('tool-cache-location').textContent).toBe('per-sandbox');
       });
     });
@@ -395,25 +390,6 @@ describe('AppConfigContext', () => {
   });
 
   describe('Runner Settings', () => {
-    it('should set preserve work dir', async () => {
-      render(
-        <AppConfigProvider>
-          <TestConsumer />
-        </AppConfigProvider>
-      );
-
-      await waitFor(() => {
-        expect(screen.getByTestId('is-loading').textContent).toBe('false');
-      });
-
-      await act(async () => {
-        screen.getByTestId('set-preserve-work-dir').click();
-      });
-
-      expect(screen.getByTestId('preserve-work-dir').textContent).toBe('session');
-      expect(mockLocalmost.settings.set).toHaveBeenCalledWith({ preserveWorkDir: 'session' });
-    });
-
     it('should set tool cache location', async () => {
       render(
         <AppConfigProvider>

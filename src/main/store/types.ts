@@ -54,7 +54,6 @@ export interface ConfigSlice {
   sleepProtectionConsented: boolean;
 
   // Runner settings
-  preserveWorkDir: 'never' | 'session' | 'always';
   toolCacheLocation: ToolCacheLocation;
 
   // User filter
@@ -188,7 +187,6 @@ export interface ConfigActions {
   setMaxJobHistory: (max: number) => void;
   setSleepProtection: (setting: SleepProtection) => void;
   consentToSleepProtection: () => void;
-  setPreserveWorkDir: (setting: 'never' | 'session' | 'always') => void;
   setToolCacheLocation: (setting: ToolCacheLocation) => void;
   setUserFilter: (filter: UserFilterConfig) => void;
   setSandboxPolicyLevel: (level: SandboxPolicyLevel) => void;
@@ -276,7 +274,6 @@ export const defaultConfigState: ConfigSlice = {
   maxJobHistory: 10,
   sleepProtection: 'never',
   sleepProtectionConsented: false,
-  preserveWorkDir: 'never',
   toolCacheLocation: 'persistent',
   userFilter: { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] },
   sandboxPolicyLevel: 'strict',
