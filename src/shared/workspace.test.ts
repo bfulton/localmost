@@ -127,11 +127,11 @@ describe('Workspace Management', () => {
       mockFs.existsSync.mockReturnValue(true);
       mockFs.rmSync.mockImplementation(() => {});
 
-      const result = removeWorkspace('ws-test123');
+      const result = removeWorkspace('ws-mumtvjt5-hm4ln8');
 
       expect(result).toBe(true);
       expect(mockFs.rmSync).toHaveBeenCalledWith(
-        expect.stringContaining('ws-test123'),
+        expect.stringContaining('ws-mumtvjt5-hm4ln8'),
         { recursive: true, force: true }
       );
     });
