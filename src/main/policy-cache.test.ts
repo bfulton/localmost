@@ -17,13 +17,15 @@ import {
   recordPendingPolicy,
   approvePolicy,
   approvalStamp,
-  getApprovedPolicy,
+  getPolicyEntry,
   getApprovedPolicyForCommit,
   rejectPolicy,
 } from './policy-cache';
 import { LocalmostrcConfig } from '../shared/localmostrc';
 
 const REPO = 'owner/repo';
+const SHA = 'a'.repeat(40);
+const approvedPolicy = () => getPolicyEntry(REPO)?.approved?.config ?? null;
 const POLICY = `version: 1
 
 shared:
@@ -47,11 +49,11 @@ describe('decidePolicyForJob', () => {
   it('allows a repository that has no policy at all', () => {
     // Nothing is being granted beyond the baseline, so there is nothing to
     // consent to. Asking here would block every repository on its first job.
-    expect(decidePolicyForJob(REPO, null)).toEqual({ action: 'allow', reason: 'no-policy' });
+    expect(decidePolicyForJob(REPO, null, SHA)).toEqual({ action: 'allow', reason: 'no-policy' });
   });
 
   it('requires approval the first time a policy appears', () => {
-    const decision = decidePolicyForJob(REPO, POLICY);
+    const decision = decidePolicyForJob(REPO, POLICY, SHA);
 
     expect(decision.action).toBe('needs-approval');
     if (decision.action === 'needs-approval') {
@@ -60,20 +62,20 @@ describe('decidePolicyForJob', () => {
   });
 
   it('allows an approved policy that has not changed', () => {
-    const first = decidePolicyForJob(REPO, POLICY);
+    const first = decidePolicyForJob(REPO, POLICY, SHA);
     if (first.action !== 'needs-approval') throw new Error('expected approval request');
     approve(first.request.newConfig);
 
-    expect(decidePolicyForJob(REPO, POLICY)).toEqual({ action: 'allow', reason: 'unchanged' });
+    expect(decidePolicyForJob(REPO, POLICY, SHA)).toEqual({ action: 'allow', reason: 'unchanged' });
   });
 
   it('requires approval again once an approved policy changes', () => {
-    const first = decidePolicyForJob(REPO, POLICY);
+    const first = decidePolicyForJob(REPO, POLICY, SHA);
     if (first.action !== 'needs-approval') throw new Error('expected approval request');
     approve(first.request.newConfig);
 
     const widened = POLICY + '      - "evil.example.com"\n';
-    const decision = decidePolicyForJob(REPO, widened);
+    const decision = decidePolicyForJob(REPO, widened, SHA);
 
     expect(decision.action).toBe('needs-approval');
     if (decision.action === 'needs-approval') {
@@ -83,35 +85,35 @@ describe('decidePolicyForJob', () => {
   });
 
   it('does not ask again when a policy is merely recorded, not approved', () => {
-    const first = decidePolicyForJob(REPO, POLICY);
+    const first = decidePolicyForJob(REPO, POLICY, SHA);
     if (first.action !== 'needs-approval') throw new Error('expected approval request');
     recordPendingPolicy(REPO, first.request.newConfig);
 
     // Recording what is pending must not count as consent.
-    expect(decidePolicyForJob(REPO, POLICY).action).toBe('needs-approval');
+    expect(decidePolicyForJob(REPO, POLICY, SHA).action).toBe('needs-approval');
   });
 
   it('holds a job whose .localmostrc cannot be parsed', () => {
     // A repository that has a policy but an unreadable one is the worst case to
     // guess at: allowing it runs code under a file nobody has reviewed, so the
     // job must not be treated as if the repository were unpoliced.
-    const decision = decidePolicyForJob(REPO, 'version: 1\nshared: [not a mapping');
+    const decision = decidePolicyForJob(REPO, 'version: 1\nshared: [not a mapping', SHA);
 
     expect(decision.action).toBe('invalid');
   });
 
   it('does not fall back to the approved policy when the new one is unparseable', () => {
-    const first = decidePolicyForJob(REPO, POLICY);
+    const first = decidePolicyForJob(REPO, POLICY, SHA);
     if (first.action !== 'needs-approval') throw new Error('expected approval');
     approve(first.request.newConfig);
 
-    expect(decidePolicyForJob(REPO, ': : :').action).toBe('invalid');
+    expect(decidePolicyForJob(REPO, ': : :', SHA).action).toBe('invalid');
   });
 
   it('allows a repository that removes its policy', () => {
     approve({ version: 1, shared: {} });
 
-    expect(decidePolicyForJob(REPO, null)).toEqual({ action: 'allow', reason: 'narrowed' });
+    expect(decidePolicyForJob(REPO, null, SHA)).toEqual({ action: 'allow', reason: 'narrowed' });
   });
 });
 
@@ -122,30 +124,30 @@ describe('a pending policy does not displace the approved one', () => {
     // A refused job's policy used to overwrite the approved entry, so every
     // job afterwards - including ones whose file matched what was approved -
     // was refused until someone approved whatever had been written last.
-    const first = decidePolicyForJob(REPO, POLICY);
+    const first = decidePolicyForJob(REPO, POLICY, SHA);
     if (first.action !== 'needs-approval') throw new Error('expected approval request');
     approve(first.request.newConfig);
 
-    const changed = decidePolicyForJob(REPO, permissive);
+    const changed = decidePolicyForJob(REPO, permissive, SHA);
     if (changed.action !== 'needs-approval') throw new Error('expected approval request');
     recordPendingPolicy(REPO, changed.request.newConfig);
 
-    expect(getApprovedPolicy(REPO)).toEqual(first.request.newConfig);
-    expect(decidePolicyForJob(REPO, POLICY)).toEqual({ action: 'allow', reason: 'unchanged' });
+    expect(approvedPolicy()).toEqual(first.request.newConfig);
+    expect(decidePolicyForJob(REPO, POLICY, SHA)).toEqual({ action: 'allow', reason: 'unchanged' });
   });
 
   it('refuses an approval quoting a policy that is no longer the pending one', () => {
-    const shown = decidePolicyForJob(REPO, POLICY);
+    const shown = decidePolicyForJob(REPO, POLICY, SHA);
     if (shown.action !== 'needs-approval') throw new Error('expected approval request');
     recordPendingPolicy(REPO, shown.request.newConfig);
     const stamp = approvalStamp(REPO, shown.request.newConfig);
 
-    const later = decidePolicyForJob(REPO, permissive);
+    const later = decidePolicyForJob(REPO, permissive, SHA);
     if (later.action !== 'needs-approval') throw new Error('expected approval request');
     recordPendingPolicy(REPO, later.request.newConfig);
 
     expect(() => approvePolicy(REPO, stamp)).toThrow(/changed since it was shown/);
-    expect(getApprovedPolicy(REPO)).toBeNull();
+    expect(approvedPolicy()).toBeNull();
   });
 
   it('records which policy was approved or rejected, by its stamp', () => {
@@ -159,7 +161,7 @@ describe('a pending policy does not displace the approved one', () => {
       expect.objectContaining({ repository: REPO, decision: 'approved', stamp: approvalStamp(REPO, { version: 1, level: 'moderate' }), via: 'app' }),
       expect.objectContaining({ repository: REPO, decision: 'rejected', stamp: approvalStamp(REPO, { version: 1, level: 'permissive' }), via: 'app' }),
     ]);
-    expect(getApprovedPolicy(REPO)).toEqual(expect.objectContaining({ level: 'moderate' }));
+    expect(approvedPolicy()).toEqual(expect.objectContaining({ level: 'moderate' }));
   });
 
   it('applies nothing from a cache entry that does not validate', () => {
@@ -168,8 +170,8 @@ describe('a pending policy does not displace the approved one', () => {
       path.join(tmpRoot, 'policies', 'owner_repo.json'),
       JSON.stringify({ repository: REPO, config: { version: 1, level: 'wide-open' }, approved: true, cachedAt: '' })
     );
-    expect(getApprovedPolicy(REPO)).toBeNull();
-    expect(decidePolicyForJob(REPO, POLICY).action).toBe('needs-approval');
+    expect(approvedPolicy()).toBeNull();
+    expect(decidePolicyForJob(REPO, POLICY, SHA).action).toBe('needs-approval');
   });
 
   it('still applies an approval written in the format before the split', () => {
@@ -178,7 +180,7 @@ describe('a pending policy does not displace the approved one', () => {
       path.join(tmpRoot, 'policies', 'owner_repo.json'),
       JSON.stringify({ repository: REPO, config: { version: 1, shared: { network: { allow: ['index.crates.io'] } } }, approved: true, cachedAt: '' })
     );
-    expect(decidePolicyForJob(REPO, POLICY)).toEqual({ action: 'allow', reason: 'unchanged' });
+    expect(decidePolicyForJob(REPO, POLICY, SHA)).toEqual({ action: 'allow', reason: 'unchanged' });
   });
 });
 
@@ -213,10 +215,41 @@ describe('a commit without a .localmostrc runs on the baseline', () => {
     expect(getApprovedPolicyForCommit(REPO, 'changed-sha')).toBeNull();
   });
 
-  it('matches the commit to the repository it was checked for', () => {
+  it('applies nothing to a commit the check never saw', () => {
+    // A job that skipped the pre-spawn check - no actor to filter on, or a
+    // worker that claimed a job other than the one it was spawned for - was
+    // given the repository's approved policy whether or not its commit
+    // carried it. Only a commit found carrying the approved policy gets it.
     approve(approved);
-    decidePolicyForJob('other/repo', null, 'shared-sha');
 
-    expect(getApprovedPolicyForCommit(REPO, 'shared-sha')).toEqual(expect.objectContaining({ level: 'permissive' }));
+    expect(getApprovedPolicyForCommit(REPO, 'unchecked-sha')).toBeNull();
+  });
+
+  it('applies nothing to a commit checked under another repository name', () => {
+    // The check is keyed on the name GitHub reported, the policy lookup on the
+    // target's name. After a rename they differ, and a commit that deleted
+    // its file under the new name took the old name's approval.
+    approve(approved);
+    decidePolicyForJob('owner/renamed', null, 'shared-sha');
+
+    expect(getApprovedPolicyForCommit(REPO, 'shared-sha')).toBeNull();
+  });
+
+  it('applies nothing once a different policy has been approved since the check', () => {
+    // The commit was found carrying the policy approved then. If another is
+    // approved before the job starts, that one is not the commit's own file.
+    approve(approved);
+    expect(decidePolicyForJob(REPO, PERMISSIVE, 'kept-sha')).toEqual({ action: 'allow', reason: 'unchanged' });
+    approve({ version: 1, level: 'moderate' });
+
+    expect(getApprovedPolicyForCommit(REPO, 'kept-sha')).toBeNull();
+  });
+
+  it('forgets that a commit was covered once a later check finds it is not', () => {
+    approve(approved);
+    decidePolicyForJob(REPO, PERMISSIVE, 'kept-sha');
+    decidePolicyForJob(REPO, null, 'kept-sha');
+
+    expect(getApprovedPolicyForCommit(REPO, 'kept-sha')).toBeNull();
   });
 });

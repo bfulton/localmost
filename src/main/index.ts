@@ -332,9 +332,9 @@ app.whenReady().then(async () => {
       // right now. A job only reaches this point once its policy has been
       // approved, and applying the approved copy means an unreviewed change
       // cannot take effect through a race. That covers the level too: it is
-      // declared in the same file and approved with the rest of it. A commit
-      // the check found without that policy - its .localmostrc deleted -
-      // gets none of it.
+      // declared in the same file and approved with the rest of it. Only a
+      // commit the pre-spawn check found carrying that policy gets it; one
+      // whose .localmostrc was deleted, or that was never checked, gets none.
       const approved = getApprovedPolicyForCommit(`${owner}/${repo}`, sha);
       if (!approved) {
         return {

@@ -76,9 +76,11 @@ export function getPolicyEntry(repository: string): PolicyEntry | null {
 }
 
 /**
- * The policy a repository's jobs run under, if one has been approved.
+ * The policy approved for a repository, whatever commit a job is at. Not
+ * exported: a job is given getApprovedPolicyForCommit, which also asks
+ * whether the job's own commit carries this policy.
  */
-export function getApprovedPolicy(repository: string): LocalmostrcConfig | null {
+function getApprovedPolicy(repository: string): LocalmostrcConfig | null {
   return getPolicyEntry(repository)?.approved?.config ?? null;
 }
 
@@ -137,41 +139,47 @@ export type PolicyDecision =
   | { action: 'invalid'; reason: string };
 
 /**
- * Which checked commits the approved policy covers, keyed by repository and
- * commit: true when the commit's .localmostrc is the approved policy, false
- * when it has none or a different one.
+ * The checked commits the approved policy covers, keyed by repository and
+ * commit, each with the stamp of the approved policy its .localmostrc matched.
  *
  * The approval cache is per repository, but a job runs one commit, and a
  * commit whose file was deleted must not inherit the grants of one that had
- * it. A commit's content never changes, so an answer never goes stale; the
- * map is bounded only because nothing else would ever empty it.
+ * it. So the approved policy goes only to a commit the pre-spawn check found
+ * carrying it. A commit it never saw, or saw under another name (the check
+ * keys on the name GitHub reports, the policy lookup on the target's), gets
+ * nothing, and neither does one whose approved policy has been replaced
+ * since: that is no longer the commit's own file. Every legitimate job is
+ * checked in this process, at the same commit, before its worker is spawned,
+ * so none loses its grants to this; an entry that is evicted or lost on
+ * restart fails to the baseline.
  */
-const commitCoverage = new Map<string, boolean>();
+const commitCoverage = new Map<string, string>();
 const COMMIT_COVERAGE_LIMIT = 1000;
 
 function commitKey(repository: string, sha: string): string {
   return `${repository.toLowerCase()}@${sha}`;
 }
 
-function recordCommitCoverage(repository: string, sha: string, covered: boolean): void {
+function recordCommitCoverage(repository: string, sha: string, coveredBy: LocalmostrcConfig | null): void {
   const key = commitKey(repository, sha);
   commitCoverage.delete(key);
-  commitCoverage.set(key, covered);
+  if (!coveredBy) return;
+  commitCoverage.set(key, approvalStamp(repository, coveredBy));
   if (commitCoverage.size > COMMIT_COVERAGE_LIMIT) {
     commitCoverage.delete(commitCoverage.keys().next().value as string);
   }
 }
 
 /**
- * The approved policy to apply to a job at a given commit.
- *
- * Null for a commit the pre-spawn check found without the approved policy:
- * no .localmostrc, so the baseline, or one that was refused. A commit it never
- * checked gets the repository's approved policy, as before this existed.
+ * The approved policy to apply to a job at a given commit: only one the
+ * pre-spawn check found that commit's .localmostrc matching, and only while it
+ * is still the approved policy. Anything else runs on the baseline.
  */
 export function getApprovedPolicyForCommit(repository: string, sha: string): LocalmostrcConfig | null {
-  if (commitCoverage.get(commitKey(repository, sha)) === false) return null;
-  return getApprovedPolicy(repository);
+  const coveredBy = commitCoverage.get(commitKey(repository, sha));
+  if (!coveredBy) return null;
+  const approved = getApprovedPolicy(repository);
+  return approved && approvalStamp(repository, approved) === coveredBy ? approved : null;
 }
 
 /**
@@ -181,18 +189,18 @@ export function getApprovedPolicyForCommit(repository: string, sha: string): Loc
  * change is a request for more privilege and needs the machine owner's consent.
  * A repository with no policy is not asked about: it gets the baseline, which
  * grants nothing extra. Removing a policy is likewise allowed without asking,
- * because the job then runs on the baseline: with the commit given, the
- * decision is remembered, and getApprovedPolicyForCommit applies nothing to it.
+ * because the job then runs on the baseline: only a commit decided here as
+ * carrying the approved policy is given it by getApprovedPolicyForCommit.
+ * The commit is required so that a caller cannot decide without recording.
  */
 export function decidePolicyForJob(
   repository: string,
   localmostrcContent: string | null,
-  sha?: string
+  sha: string
 ): PolicyDecision {
   const decision = decide(repository, localmostrcContent);
-  if (sha) {
-    recordCommitCoverage(repository, sha, decision.action === 'allow' && decision.reason === 'unchanged');
-  }
+  const covered = decision.action === 'allow' && decision.reason === 'unchanged';
+  recordCommitCoverage(repository, sha, covered ? getApprovedPolicy(repository) : null);
   return decision;
 }
 

@@ -17,7 +17,7 @@ jest.mock('../app-state', () => ({
 }));
 
 import { summarizeGrants, registerPolicyHandlers } from './policy';
-import { recordPendingPolicy, getApprovedPolicy, approvalStamp } from '../policy-cache';
+import { recordPendingPolicy, getPolicyEntry, approvalStamp } from '../policy-cache';
 import { IPC_CHANNELS, PolicySummary, Result } from '../../shared/types';
 
 describe('summarizeGrants', () => {
@@ -92,6 +92,7 @@ describe('approving from the app', () => {
   const approve = (...args: unknown[]) => handlers.get(IPC_CHANNELS.POLICY_APPROVE)!({}, ...args) as Promise<Result>;
   const reject = (...args: unknown[]) => handlers.get(IPC_CHANNELS.POLICY_REJECT)!({}, ...args) as Result;
   const REPO = 'owner/repo';
+  const approvedPolicy = () => getPolicyEntry(REPO)?.approved?.config ?? null;
 
   beforeEach(() => {
     fs.rmSync(path.join(tmpRoot, 'policies'), { recursive: true, force: true });
@@ -111,7 +112,7 @@ describe('approving from the app', () => {
     const [summary] = list();
 
     await expect(approve(REPO, summary.stamp)).resolves.toEqual({ success: true });
-    expect(getApprovedPolicy(REPO)).toEqual(expect.objectContaining({ level: 'moderate' }));
+    expect(approvedPolicy()).toEqual(expect.objectContaining({ level: 'moderate' }));
     expect(retireWorkersForRepository).toHaveBeenCalledWith(REPO);
   });
 
@@ -124,7 +125,7 @@ describe('approving from the app', () => {
 
     const result = await approve(REPO, shown.stamp);
     expect(result).toEqual({ success: false, error: expect.stringMatching(/changed since it was shown/) });
-    expect(getApprovedPolicy(REPO)).toBeNull();
+    expect(approvedPolicy()).toBeNull();
     expect(retireWorkersForRepository).not.toHaveBeenCalled();
   });
 
@@ -133,7 +134,7 @@ describe('approving from the app', () => {
     for (const stamp of [undefined, '', 'not-a-stamp', 42]) {
       expect((await approve(REPO, stamp)).success).toBe(false);
     }
-    expect(getApprovedPolicy(REPO)).toBeNull();
+    expect(approvedPolicy()).toBeNull();
   });
 
   it('refuses a repository name that is not one', async () => {
@@ -162,7 +163,7 @@ describe('approving from the app', () => {
     recordPendingPolicy(REPO, { version: 1, level: 'permissive' });
 
     expect(reject(REPO)).toEqual({ success: true });
-    expect(getApprovedPolicy(REPO)).toEqual(expect.objectContaining({ level: 'moderate' }));
+    expect(approvedPolicy()).toEqual(expect.objectContaining({ level: 'moderate' }));
     expect(list().map((s) => s.approved)).toEqual([true]);
   });
 });
