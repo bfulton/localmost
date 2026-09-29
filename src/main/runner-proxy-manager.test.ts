@@ -253,6 +253,122 @@ describe('RunnerProxyManager', () => {
     });
   });
 
+  describe('registerInstance', () => {
+    const credentialJson: Record<string, string> = {
+      '.runner': JSON.stringify({ agentName: 'r.1', serverUrlV2: 'https://broker.actions.githubusercontent.com/' }),
+      '.credentials': JSON.stringify({ scheme: 'OAuth', data: {} }),
+      '.credentials_rsaparams': JSON.stringify({ d: 'x' }),
+    };
+    let copyVerifiedArc: jest.Mock<(version: string, dest: string) => Promise<void>>;
+
+    /** config.sh, as spawned: exits 0 once it has been looked at. */
+    const configSh = () => {
+      const { EventEmitter } = jest.requireActual('events') as typeof import('events');
+      const proc = new EventEmitter() as import('events').EventEmitter & { stdout: unknown; stderr: unknown };
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      setImmediate(() => proc.emit('close', 0));
+      return proc;
+    };
+
+    beforeEach(() => {
+      copyVerifiedArc = jest.fn<(version: string, dest: string) => Promise<void>>().mockResolvedValue(undefined);
+      mockGetGitHubAuth.mockReturnValue({
+        getRunnerRegistrationToken: jest.fn<() => Promise<string>>().mockResolvedValue('REGISTRATION-TOKEN'),
+      });
+      mockGetRunnerDownloader.mockReturnValue({
+        getInstalledVersion: jest.fn(() => '2.336.0'),
+        getArcDir: jest.fn(() => '/mock/runner/dir/arc/v2.336.0'),
+        copyVerifiedArc,
+      });
+      mockGetValidAccessToken.mockResolvedValue('user-token');
+      mockExistsSync.mockReturnValue(true);
+      mockMkdir.mockResolvedValue(undefined);
+      mockCopyFile.mockResolvedValue(undefined);
+      mockWriteFile.mockResolvedValue(undefined);
+      mockRm.mockResolvedValue(undefined);
+      mockReadFile.mockResolvedValue(credentialJson['.runner']);
+      mockReadFileSync.mockImplementation((p: string) => credentialJson[p.slice(p.lastIndexOf('/') + 1)]);
+      mockSpawn.mockImplementation(configSh);
+    });
+
+    it('runs config.sh only from a copy of the runner checked against its record', async () => {
+      // config.sh runs unsandboxed, holding a registration token.
+      await manager.registerInstance(createMockTarget(), 1);
+
+      expect(copyVerifiedArc).toHaveBeenCalledTimes(1);
+      const [version, dest] = copyVerifiedArc.mock.calls[0];
+      expect(version).toBe('2.336.0');
+      const [script, , options] = mockSpawn.mock.calls[0] as [string, string[], { cwd: string }];
+      expect(options.cwd).toBe(dest);
+      expect(script).toBe(`${dest}/config.sh`);
+    });
+
+    it('hands config.sh the registration token in its environment, not its arguments', async () => {
+      // Any local user can read another process's arguments with ps.
+      await manager.registerInstance(createMockTarget(), 1);
+
+      const [, args, options] = mockSpawn.mock.calls[0] as [string, string[], { env: NodeJS.ProcessEnv }];
+      expect(args.join(' ')).not.toContain('REGISTRATION-TOKEN');
+      expect(args).not.toContain('--token');
+      expect(options.env.ACTIONS_RUNNER_INPUT_TOKEN).toBe('REGISTRATION-TOKEN');
+      expect(options.env.PATH).toBe(process.env.PATH);
+      expect(args).toEqual(expect.arrayContaining(['--name', 'localmost.test-host.testowner-testrepo.1', '--replace']));
+    });
+
+    it("marks a new registration's key as one no job has held", async () => {
+      await manager.registerInstance(createMockTarget(), 1);
+
+      expect(mockWriteFile).toHaveBeenCalledWith(
+        '/mock/runner/dir/proxies/test-target-id/1/.key-kept-from-jobs',
+        expect.any(String),
+        { mode: 0o600 }
+      );
+    });
+
+    it('registers nothing, and leaves no copy behind, when the runner does not match its record', async () => {
+      copyVerifiedArc.mockRejectedValue(new Error('Runner v2.336.0 does not match its integrity record (changed: config.sh)'));
+
+      await expect(manager.registerInstance(createMockTarget(), 1)).rejects.toThrow(/integrity record/);
+
+      expect(mockSpawn).not.toHaveBeenCalled();
+      const dest = copyVerifiedArc.mock.calls[0][1];
+      expect(mockRm).toHaveBeenCalledWith(dest, { recursive: true, force: true });
+    });
+  });
+
+  describe('replaceExposedKeys', () => {
+    // Earlier versions copied each registration's key into every job's
+    // sandbox. A job that took it could open sessions as that runner whenever
+    // localmost is not polling, so keeping new copies out is not enough.
+    const proxyDir = '/mock/runner/dir/proxies/test-target-id';
+    let registerInstance: jest.SpiedFunction<RunnerProxyManager['registerInstance']>;
+
+    beforeEach(() => {
+      mockReaddirSync.mockReturnValue(['1', '2', '3']);
+      mockReadFileSync.mockReturnValue('{}');
+      registerInstance = jest.spyOn(manager, 'registerInstance').mockResolvedValue({} as never);
+    });
+
+    it('re-registers each registration made before its key was kept from jobs, and only those', async () => {
+      mockExistsSync.mockImplementation((p: string) => p !== `${proxyDir}/2/.key-kept-from-jobs`);
+      const target = createMockTarget();
+
+      await manager.replaceExposedKeys(target);
+
+      expect(registerInstance.mock.calls).toEqual([[target, 2]]);
+    });
+
+    it('goes on to the next registration when one cannot be replaced, to try again at the next start', async () => {
+      mockExistsSync.mockImplementation((p: string) => !p.endsWith('.key-kept-from-jobs'));
+      registerInstance.mockRejectedValueOnce(new Error('Not authenticated'));
+
+      await expect(manager.replaceExposedKeys(createMockTarget())).resolves.toBeUndefined();
+
+      expect(registerInstance.mock.calls.map(([, n]) => n)).toEqual([1, 2, 3]);
+    });
+  });
+
   describe('unregisterAll', () => {
     it('should remove local credentials even if GitHub deletion fails', async () => {
       mockGetGitHubAuth.mockReturnValue({

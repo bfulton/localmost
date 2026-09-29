@@ -7,7 +7,6 @@ import { FALLBACK_RUNNER_VERSION } from '../shared/constants';
 import { spawnSandboxed } from './process-sandbox';
 import { getRunnerDir } from './paths';
 import {
-  validateChildPath,
   killOrphanedProcesses,
   cleanupSandboxDirectories,
   cleanupIncompleteConfigs,
@@ -21,6 +20,35 @@ export interface DownloadProgress {
 }
 
 export type ProgressCallback = (progress: DownloadProgress) => void;
+
+/** The only files buildSandbox takes from an instance's config directory. */
+const SANDBOX_CONFIG_FILES = ['.runner'];
+
+/** Where a runner release is downloaded and extracted before it is used. */
+const ARC_STAGING_PREFIX = 'arc-staging-';
+
+/**
+ * What a runner template held when it came from its release: each file's
+ * sha256 and each symlink's target, by path relative to the template.
+ */
+interface ArcManifest {
+  files: Map<string, string>;
+  symlinks: Map<string, string>;
+}
+
+/** Run fn over items, at most limit at a time. */
+async function mapWithLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const lanes = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]);
+    }
+  });
+  await Promise.all(lanes);
+  return results;
+}
 
 export interface RunnerRelease {
   version: string;
@@ -40,12 +68,12 @@ export class RunnerDownloader {
   private readonly baseDir: string;
   private readonly fallbackVersion = FALLBACK_RUNNER_VERSION;
   private selectedVersion: string | null = null;
+  /** Records being built from a release download, so concurrent starts share one. */
+  private manifestsInFlight: Map<string, Promise<ArcManifest>> = new Map();
 
   constructor() {
     this.baseDir = getRunnerDir();
   }
-
-  // validateChildPath is now imported from runner-cleanup.ts
 
   /** Get the arc directory for a specific version */
   getArcDir(version: string): string {
@@ -87,6 +115,25 @@ export class RunnerDownloader {
    */
   getToolCacheDir(targetId: string): string {
     return path.join(this.getTargetCacheDir(targetId), 'tool-cache');
+  }
+
+  /**
+   * Where a version's integrity record lives: beside arc/, not in it, so a
+   * version directory holds exactly what its release did.
+   */
+  getArcManifestPath(version: string): string {
+    return path.join(this.baseDir, 'arc-manifests', `v${version}.json`);
+  }
+
+  /**
+   * A fresh directory for a release download and its extracted tree. It sits
+   * in the runner directory, where jobs cannot write and where a rename into
+   * arc/ stays on one filesystem. One left behind by a quit mid-download is
+   * swept at the next startup.
+   */
+  private makeStagingDir(): Promise<string> {
+    fs.mkdirSync(this.baseDir, { recursive: true });
+    return fs.promises.mkdtemp(path.join(this.baseDir, ARC_STAGING_PREFIX));
   }
 
   /**
@@ -185,6 +232,178 @@ export class RunnerDownloader {
   }
 
   /**
+   * Copy a version's runner template to dest, then check the copy against the
+   * template's integrity record, and throw if they differ.
+   *
+   * Every worker runs a copy of arc/, so something that could write there once
+   * would reach every later job; and registration runs it unsandboxed. The
+   * copy is what gets checked, not the template, so nothing can change between
+   * the check and the run. A version with no record yet - installed before
+   * records were kept - gets one built from its release download, checked
+   * against GitHub's published checksum. Recording what is on disk instead
+   * would bless a template already changed.
+   */
+  async copyVerifiedArc(
+    version: string,
+    dest: string,
+    onLog?: (level: 'info' | 'error', message: string) => void
+  ): Promise<void> {
+    const log = onLog || (() => {});
+    const arcDir = this.getArcDir(version);
+    const manifest = await this.ensureArcManifest(version, log);
+    await this.copyDir(arcDir, dest);
+
+    const differences = await this.compareWithManifest(dest, manifest);
+    if (differences.length > 0) {
+      // Any difference refuses, a stray .DS_Store included: the list says
+      // which. The whole arc directory goes, not just this version, because
+      // with this one gone the newest version left there would be used.
+      log('error', `Runner v${version} in ${arcDir} does not match the release it was installed from; no runner will start from it. The differences are listed below (a file added there, even a .DS_Store left by Finder, counts). To reinstall, quit localmost, delete ${path.dirname(arcDir)}, then start localmost and download the runner again.`);
+      for (const difference of differences.slice(0, 20)) {
+        log('error', `  ${difference}`);
+      }
+      if (differences.length > 20) {
+        log('error', `  ...and ${differences.length - 20} more`);
+      }
+      const more = differences.length > 1 ? `, and ${differences.length - 1} more` : '';
+      throw new Error(`Runner v${version} does not match its integrity record (${differences[0]}${more})`);
+    }
+  }
+
+  /** Record what a version's template holds now. Called as it is extracted. */
+  async recordArcManifest(version: string): Promise<void> {
+    await this.writeArcManifest(version, await this.manifestOf(this.getArcDir(version)));
+  }
+
+  private async ensureArcManifest(
+    version: string,
+    log: (level: 'info' | 'error', message: string) => void
+  ): Promise<ArcManifest> {
+    const recorded = this.readArcManifest(version);
+    if (recorded) return recorded;
+
+    let pending = this.manifestsInFlight.get(version);
+    if (!pending) {
+      log('info', `No integrity record for runner v${version}; building one from its release download...`);
+      pending = this.manifestFromRelease(version).finally(() => this.manifestsInFlight.delete(version));
+      this.manifestsInFlight.set(version, pending);
+    }
+    return pending;
+  }
+
+  /**
+   * Download a version's release, check it against its published checksum,
+   * and record what it holds. The download is extracted to a scratch directory
+   * that is removed afterwards; the installed template is not touched.
+   */
+  private async manifestFromRelease(version: string): Promise<ArcManifest> {
+    const { filename, url } = this.releaseAsset(version);
+    const scratch = await this.makeStagingDir();
+    try {
+      const expectedChecksum = await this.fetchExpectedChecksum(version, filename);
+      const tarballPath = path.join(scratch, filename);
+      await this.downloadFile(url, tarballPath, () => {});
+      await this.verifyChecksum(tarballPath, expectedChecksum);
+
+      const tree = path.join(scratch, 'tree');
+      await fs.promises.mkdir(tree);
+      await tar.extract({ file: tarballPath, cwd: tree, preserveOwner: false });
+
+      const manifest = await this.manifestOf(tree);
+      await this.writeArcManifest(version, manifest);
+      return manifest;
+    } finally {
+      await fs.promises.rm(scratch, { recursive: true, force: true });
+    }
+  }
+
+  /** A version's record, or undefined if there is none or it cannot be read. */
+  private readArcManifest(version: string): ArcManifest | undefined {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(this.getArcManifestPath(version), 'utf-8'));
+      const files = Object.entries(parsed?.files ?? {});
+      const symlinks = Object.entries(parsed?.symlinks ?? {});
+      const wellFormed = files.length > 0 &&
+        files.every(([, hash]) => typeof hash === 'string' && /^[0-9a-f]{64}$/.test(hash)) &&
+        symlinks.every(([, target]) => typeof target === 'string');
+      if (!wellFormed) return undefined;
+      return {
+        files: new Map(files as Array<[string, string]>),
+        symlinks: new Map(symlinks as Array<[string, string]>),
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async writeArcManifest(version: string, manifest: ArcManifest): Promise<void> {
+    const file = this.getArcManifestPath(version);
+    await fs.promises.mkdir(path.dirname(file), { recursive: true });
+    const sorted = (entries: Map<string, string>) =>
+      Object.fromEntries([...entries].sort(([a], [b]) => (a < b ? -1 : 1)));
+    // Written aside and renamed in, so a record is never read half-written.
+    // The name is unique per write: a download and a first start can record
+    // the same version at once.
+    const staging = `${file}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+    await fs.promises.writeFile(
+      staging,
+      JSON.stringify({ files: sorted(manifest.files), symlinks: sorted(manifest.symlinks) }),
+      { mode: 0o600 }
+    );
+    await fs.promises.rename(staging, file);
+  }
+
+  /** The files and symlinks under a directory, by relative path. copyDir copies nothing else. */
+  private async listTree(root: string): Promise<{ files: string[]; symlinks: string[] }> {
+    const files: string[] = [];
+    const symlinks: string[] = [];
+    const walk = async (relative: string): Promise<void> => {
+      const entries = await fs.promises.readdir(path.join(root, relative), { withFileTypes: true });
+      for (const entry of entries) {
+        const entryPath = relative ? `${relative}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) await walk(entryPath);
+        else if (entry.isSymbolicLink()) symlinks.push(entryPath);
+        else if (entry.isFile()) files.push(entryPath);
+      }
+    };
+    await walk('');
+    return { files, symlinks };
+  }
+
+  private async manifestOf(root: string): Promise<ArcManifest> {
+    const { files, symlinks } = await this.listTree(root);
+    const hashes = await mapWithLimit(files, 16, (file) => this.computeFileChecksum(path.join(root, file)));
+    const targets = await Promise.all(symlinks.map((link) => fs.promises.readlink(path.join(root, link))));
+    return {
+      files: new Map(files.map((file, i) => [file, hashes[i]])),
+      symlinks: new Map(symlinks.map((link, i) => [link, targets[i]])),
+    };
+  }
+
+  /** How a directory differs from a record: every file added, missing or changed. */
+  private async compareWithManifest(root: string, manifest: ArcManifest): Promise<string[]> {
+    const actual = await this.manifestOf(root);
+    const differences: string[] = [];
+    for (const [file, hash] of actual.files) {
+      const expected = manifest.files.get(file);
+      if (expected === undefined) differences.push(`added: ${file}`);
+      else if (expected !== hash) differences.push(`changed: ${file}`);
+    }
+    for (const [link, target] of actual.symlinks) {
+      const expected = manifest.symlinks.get(link);
+      if (expected === undefined) differences.push(`added: ${link} -> ${target}`);
+      else if (expected !== target) differences.push(`changed: ${link} -> ${target} (was ${expected})`);
+    }
+    for (const file of manifest.files.keys()) {
+      if (!actual.files.has(file)) differences.push(`missing: ${file}`);
+    }
+    for (const link of manifest.symlinks.keys()) {
+      if (!actual.symlinks.has(link)) differences.push(`missing: ${link}`);
+    }
+    return differences;
+  }
+
+  /**
    * Get the path for preserved work directory (outside sandbox).
    */
   getWorkDir(instance: number): string {
@@ -237,7 +456,7 @@ export class RunnerDownloader {
     // Copy arc to sandbox
     log('info', `Copying arc to sandbox...`);
     const copyStart = Date.now();
-    await this.copyDir(arcDir, sandboxDir);
+    await this.copyVerifiedArc(version, sandboxDir, log);
     log('info', `Arc copy completed in ${Date.now() - copyStart}ms`);
 
     // Verify critical files exist
@@ -249,21 +468,15 @@ export class RunnerDownloader {
       }
     }
 
-    // Copy config files into sandbox (if config exists)
-    if (fs.existsSync(configDir)) {
-      const configFiles = await fs.promises.readdir(configDir);
-      for (const file of configFiles) {
-        // Security: Validate paths stay within their respective directories
-        const srcPath = validateChildPath(configDir, file);
-        const destPath = validateChildPath(sandboxDir, file);
-        if (!srcPath || !destPath) {
-          log('error', `Skipping suspicious config file name: ${file}`);
-          continue;
-        }
-        const stats = await fs.promises.stat(srcPath);
-        if (stats.isFile()) {
-          await fs.promises.copyFile(srcPath, destPath);
-        }
+    // Copy the runner's settings into the sandbox - and only those. The job
+    // can read its sandbox, so the registration's key (.credentials_rsaparams)
+    // and .credentials never go in, even when a legacy registration or an
+    // earlier version left them in the config dir. The worker is given a key
+    // made for its start by startInstance instead.
+    for (const file of SANDBOX_CONFIG_FILES) {
+      const srcPath = path.join(configDir, file);
+      if (fs.existsSync(srcPath) && (await fs.promises.stat(srcPath)).isFile()) {
+        await fs.promises.copyFile(srcPath, path.join(sandboxDir, file));
       }
     }
 
@@ -339,9 +552,14 @@ export class RunnerDownloader {
   }
 
   /**
-   * Copy proxy credentials to an instance's config directory.
-   * Used for multi-target support where workers use proxy credentials.
-   * The .runner file is modified to point to the local broker proxy.
+   * Take an instance's runner settings from a target's registration.
+   * Used for multi-target support, where every worker runs as one of a
+   * target's registered runners. The .runner file is modified to point to the
+   * local broker proxy.
+   *
+   * Only the .runner is copied. The registration's credentials stay in
+   * proxyBaseDir/<instance>/, where the broker reads them to make every call
+   * upstream; the worker never needs them (see worker-credentials.ts).
    *
    * Directory structure:
    * proxyBaseDir/<instance>/.runner, .credentials, .credentials_rsaparams
@@ -353,24 +571,26 @@ export class RunnerDownloader {
   ): Promise<void> {
     const log = onLog || (() => {});
     const configDir = this.getConfigDir(instance);
-    const configFiles = ['.runner', '.credentials', '.credentials_rsaparams'];
 
     // Credentials are in instance subdirectory (e.g., proxyBaseDir/1/, proxyBaseDir/2/)
     const proxyInstanceDir = path.join(proxyBaseDir, String(instance));
 
+    // The broker cannot serve a worker for a registration it cannot sign for.
+    for (const file of ['.runner', '.credentials', '.credentials_rsaparams']) {
+      if (!fs.existsSync(path.join(proxyInstanceDir, file))) {
+        throw new Error(`Missing proxy credential file: ${file} in ${proxyInstanceDir}`);
+      }
+    }
+
     // Ensure config directory exists
     await fs.promises.mkdir(configDir, { recursive: true });
 
-    // Copy credentials from proxy instance directory
-    for (const file of configFiles) {
-      const srcPath = path.join(proxyInstanceDir, file);
-      const destPath = path.join(configDir, file);
+    await fs.promises.copyFile(path.join(proxyInstanceDir, '.runner'), path.join(configDir, '.runner'));
 
-      if (!fs.existsSync(srcPath)) {
-        throw new Error(`Missing proxy credential file: ${file} in ${proxyInstanceDir}`);
-      }
-
-      await fs.promises.copyFile(srcPath, destPath);
+    // Earlier versions copied the key here too. Nothing reads it from here any
+    // more, so it goes rather than sit in a second place.
+    for (const file of ['.credentials', '.credentials_rsaparams']) {
+      await fs.promises.rm(path.join(configDir, file), { force: true });
     }
 
     // Modify .runner to point to local broker proxy
@@ -411,7 +631,6 @@ export class RunnerDownloader {
 
     const args = [
       '--url', options.url,
-      '--token', options.token,
       '--name', options.name,
       '--labels', options.labels.join(','),
       '--work', options.workFolder || '_work',
@@ -423,6 +642,10 @@ export class RunnerDownloader {
       const config = spawnSandboxed(configScript, args, {
         cwd: sandboxDir,
         stdio: ['ignore', 'pipe', 'pipe'],
+        // The runner reads any option from ACTIONS_RUNNER_INPUT_<NAME>, and
+        // drops the variable once read. Any local user can list a process's
+        // arguments; only this user can read its environment.
+        env: { ...process.env, ACTIONS_RUNNER_INPUT_TOKEN: options.token },
         // Registration contacts GitHub with the user's token and runs no
         // workflow code; there is no instance proxy at this point.
         allowDirectNetwork: true,
@@ -715,9 +938,27 @@ export class RunnerDownloader {
     const configBase = path.join(this.baseDir, 'config');
     await cleanupIncompleteConfigs(configBase, log);
 
+    // A release download interrupted by a quit leaves its staging directory
+    // behind, holding the tarball and a tree extracted from it. Nothing is
+    // downloading yet at startup, so any found are leftovers.
+    await this.cleanupStagingDirectories(log);
+
     // Clean up preserved work directories (unless disabled)
     if (shouldCleanWorkDirs) {
       await this.cleanupWorkDirectories(log);
+    }
+  }
+
+  private async cleanupStagingDirectories(log: (message: string) => void): Promise<void> {
+    let entries: string[];
+    try {
+      entries = await fs.promises.readdir(this.baseDir);
+    } catch {
+      return;
+    }
+    for (const entry of entries.filter((name) => name.startsWith(ARC_STAGING_PREFIX))) {
+      log(`Removing an interrupted runner download: ${entry}`);
+      await fs.promises.rm(path.join(this.baseDir, entry), { recursive: true, force: true });
     }
   }
 
@@ -730,23 +971,32 @@ export class RunnerDownloader {
     await cleanupWorkDirs(workBase, onLog || (() => {}));
   }
 
-  async download(onProgress: ProgressCallback): Promise<void> {
-    const platform = this.getPlatform();
+  /** The release tarball for a version on this Mac's architecture. */
+  private releaseAsset(version: string): { filename: string; url: string } {
     const arch = this.getArch();
-
     if (!arch) {
       throw new Error(`Unsupported architecture: ${process.arch}`);
     }
+    const filename = `actions-runner-${this.getPlatform()}-${arch}-${version}.tar.gz`;
+    return { filename, url: `https://github.com/actions/runner/releases/download/v${version}/${filename}` };
+  }
 
+  /**
+   * Download a version's release and install it as arc/v<version>.
+   *
+   * The release is extracted into a staging directory and swapped in whole,
+   * replacing any template already there. Extracting over an existing
+   * directory would keep whatever else it held - a file planted beside the
+   * runner, say - and the record made from it would bless that file. A failed
+   * download leaves the installed template as it was.
+   */
+  async download(onProgress: ProgressCallback): Promise<void> {
     const version = this.getDownloadVersion();
-    const filename = `actions-runner-${platform}-${arch}-${version}.tar.gz`;
-    const downloadUrl = `https://github.com/actions/runner/releases/download/v${version}/${filename}`;
+    const { filename, url: downloadUrl } = this.releaseAsset(version);
     const arcDir = this.getArcDir(version);
-
-    // Create arc directory
-    await fs.promises.mkdir(arcDir, { recursive: true });
-
-    const tarballPath = path.join(arcDir, filename);
+    const staging = await this.makeStagingDir();
+    const tarballPath = path.join(staging, filename);
+    const tree = path.join(staging, 'tree');
 
     try {
       // Fetch expected checksum first
@@ -771,41 +1021,49 @@ export class RunnerDownloader {
       // Extract the tarball
       onProgress({ phase: 'extracting', percent: 0, message: 'Extracting runner...' });
 
+      await fs.promises.mkdir(tree);
       await tar.extract({
         file: tarballPath,
-        cwd: arcDir,
+        cwd: tree,
         preserveOwner: false,
       });
-
-      // Clean up tarball
-      await fs.promises.unlink(tarballPath);
 
       // Make scripts executable
       const scripts = ['run.sh', 'config.sh', 'svc.sh'];
       for (const script of scripts) {
-        const scriptPath = path.join(arcDir, script);
+        const scriptPath = path.join(tree, script);
         if (fs.existsSync(scriptPath)) {
           await fs.promises.chmod(scriptPath, 0o755);
         }
       }
 
-      const listenerPath = path.join(arcDir, 'bin', 'Runner.Listener');
+      const listenerPath = path.join(tree, 'bin', 'Runner.Listener');
       if (fs.existsSync(listenerPath)) {
         await fs.promises.chmod(listenerPath, 0o755);
       }
 
+      // Recorded from what was just extracted from a checked download, before
+      // it is installed and so before any worker exists that could touch it.
+      await this.writeArcManifest(version, await this.manifestOf(tree));
+
+      // Swap it in. A template it replaces is moved into the staging
+      // directory and removed with it.
+      await fs.promises.mkdir(path.dirname(arcDir), { recursive: true });
+      if (fs.existsSync(arcDir)) {
+        await fs.promises.rename(arcDir, path.join(staging, 'replaced'));
+      }
+      await fs.promises.rename(tree, arcDir);
+
       onProgress({ phase: 'complete', percent: 100, message: 'Runner downloaded and ready!' });
     } catch (error) {
-      // Clean up failed download
-      if (fs.existsSync(arcDir)) {
-        await fs.promises.rm(arcDir, { recursive: true, force: true });
-      }
       onProgress({
         phase: 'error',
         percent: 0,
         message: `Download failed: ${(error as Error).message}`,
       });
       throw error;
+    } finally {
+      await fs.promises.rm(staging, { recursive: true, force: true });
     }
   }
 
@@ -1037,7 +1295,9 @@ export class RunnerDownloader {
         }
       }
     } finally {
-      fileStream.close();
+      // Waited for: the checksum is read from this file as soon as this
+      // returns, and writes may still be queued.
+      await new Promise<void>((resolve) => fileStream.end(() => resolve()));
     }
   }
 }

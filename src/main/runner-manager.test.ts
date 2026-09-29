@@ -79,6 +79,15 @@ import { DockerFilterProxy } from './docker/docker-filter-proxy';
 import type { DockerBackend } from './docker/docker-backend';
 import { createMockProcess, RunnerManagerTestHelper } from './test-utils';
 
+/** Stands in for the broker making a worker its per-start key. */
+const perStartCredential = async () => ({
+  credentials: {
+    scheme: 'OAuth',
+    data: { clientId: 'per-start-client', authorizationUrl: 'http://127.0.0.1:8787/w/key/_apis/oauth2/token', requireFipsCryptography: 'True' },
+  },
+  rsaParams: { d: 'D', dp: 'DP', dq: 'DQ', exponent: 'AQAB', inverseQ: 'IQ', modulus: 'N', p: 'P', q: 'Q' },
+});
+
 // Get the mocked function
 const mockSpawnSandboxed = spawnSandboxed as jest.MockedFunction<typeof spawnSandboxed>;
 
@@ -1750,6 +1759,7 @@ describe('RunnerManager', () => {
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
         issueBrokerUrl: () => `http://127.0.0.1:8787/w/${'c'.repeat(64)}/`,
+        issueWorkerCredential: perStartCredential,
         revokeBrokerUrl: (n) => revoked.push(n),
       });
       (fs.existsSync as jest.Mock).mockReturnValue(true);
@@ -2042,6 +2052,7 @@ describe('RunnerManager', () => {
           issued.push([n, t]);
           return `http://127.0.0.1:8787/w/${'a'.repeat(64)}/`;
         },
+        issueWorkerCredential: perStartCredential,
       });
       const helper = new RunnerManagerTestHelper(manager);
       (fs.existsSync as jest.Mock).mockReturnValue(true);
@@ -2055,6 +2066,79 @@ describe('RunnerManager', () => {
       const write = (fs.writeFileSync as jest.Mock).mock.calls.find(([file]) => String(file).endsWith('sandbox/1/.runner'));
       expect(write).toBeDefined();
       expect(JSON.parse(String(write![1])).serverUrlV2).toBe(`http://127.0.0.1:8787/w/${'a'.repeat(64)}/`);
+    });
+
+    it("gives the runner the broker's key for this start, never the registration's", async () => {
+      // The sandbox is readable by the job. The registration's RSA key would
+      // let the job act as the runner after it ends; the key the broker makes
+      // for this start opens nothing but this worker's own token endpoint.
+      const brokerUrl = `http://127.0.0.1:8787/w/${'a'.repeat(64)}/`;
+      const issuedFiles = {
+        credentials: {
+          scheme: 'OAuth',
+          data: { clientId: 'per-start-client', authorizationUrl: `${brokerUrl}_apis/oauth2/token`, requireFipsCryptography: 'True' },
+        },
+        rsaParams: { d: 'D', dp: 'DP', dq: 'DQ', exponent: 'AQAB', inverseQ: 'IQ', modulus: 'N', p: 'P', q: 'Q' },
+      };
+      const asked: number[] = [];
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        issueBrokerUrl: () => brokerUrl,
+        issueWorkerCredential: async (n) => {
+          asked.push(n);
+          return issuedFiles;
+        },
+      });
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (fs.readFileSync as jest.Mock).mockReturnValue(JSON.stringify({
+        agentName: 'r1',
+        serverUrl: 'https://pipelinesghubeus2.actions.githubusercontent.com/abc/',
+        serverUrlV2: 'http://localhost:8787/',
+      }));
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+
+      await manager.start();
+
+      expect(asked).toEqual([1]);
+      const written = (name: string) => (fs.writeFileSync as jest.Mock).mock.calls.find(([file]) => String(file).endsWith(`sandbox/1/${name}`));
+      const credentials = written('.credentials');
+      const rsaParams = written('.credentials_rsaparams');
+      expect(JSON.parse(String(credentials![1]))).toEqual(issuedFiles.credentials);
+      expect(JSON.parse(String(rsaParams![1]))).toEqual(issuedFiles.rsaParams);
+      expect(rsaParams![2]).toEqual(expect.objectContaining({ mode: 0o600 }));
+      // With serverUrl equal to the broker address the listener skips its
+      // second connection, to the pipelines service, which would need a token
+      // GitHub honours.
+      const runner = JSON.parse(String(written('.runner')![1]));
+      expect(runner.serverUrl).toBe(brokerUrl);
+      expect(runner.serverUrlV2).toBe(brokerUrl);
+      // Both files are written before the runner exists to read them.
+      const order = (fs.writeFileSync as jest.Mock).mock.invocationCallOrder;
+      const rsaIndex = (fs.writeFileSync as jest.Mock).mock.calls.indexOf(rsaParams!);
+      expect(order[rsaIndex]).toBeLessThan(mockSpawnSandboxed.mock.invocationCallOrder[0]);
+    });
+
+    it('does not start a worker the broker could not make a key for', async () => {
+      const revoked: number[] = [];
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        issueBrokerUrl: () => `http://127.0.0.1:8787/w/${'a'.repeat(64)}/`,
+        issueWorkerCredential: async () => undefined,
+        revokeBrokerUrl: (n) => revoked.push(n),
+      });
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (fs.readFileSync as jest.Mock).mockReturnValue('{}');
+      (manager as unknown as { runnerVersion: string }).runnerVersion = '1.0.0';
+      mockSpawnSandboxed.mockReset();
+
+      await (manager as unknown as { startInstance(n: number): Promise<void> }).startInstance(1);
+
+      expect(mockSpawnSandboxed).not.toHaveBeenCalled();
+      expect(revoked).toContain(1);
     });
 
     it('revokes the key and drops the pid file when the slot is released on job completion', () => {
@@ -2403,6 +2487,7 @@ describe('RunnerManager', () => {
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
         issueBrokerUrl: () => `http://127.0.0.1:8787/w/${'b'.repeat(64)}/`,
+        issueWorkerCredential: perStartCredential,
         revokeBrokerUrl: (n) => revoked.push(n),
       });
       (fs.existsSync as jest.Mock).mockReturnValue(true);
@@ -2413,6 +2498,7 @@ describe('RunnerManager', () => {
       jest.useFakeTimers();
       try {
         await manager.start();
+        expect(mockSpawnSandboxed).toHaveBeenCalled();
 
         proc.emit('exit', 0, null);
         await jest.advanceTimersByTimeAsync(0);

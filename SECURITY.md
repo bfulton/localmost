@@ -266,6 +266,16 @@ design is in `docs/superpowers/specs/2026-09-05-docker-isolation-design.md`.
 - **Non-sensitive data**: Settings like theme, runner count, and repository URLs remain in plaintext for easy user editing
 - **Access Control**: The `~/.localmost` directory and all contents are user-only (700 for directories, 600 for files). The app sets `umask(077)` at startup to ensure no group or world access.
 
+### Runner registrations
+
+Each target's runner registrations live in `~/.localmost/runner/proxies/<target>/<n>/`: the runner's settings and the registration's RSA key. GitHub trusts that key to act as the runner: whoever holds it can open a session under the runner's name and receive the jobs routed to it, with their secrets. It therefore never enters a job's sandbox.
+
+- **The broker signs, not the worker.** The local broker makes every call to GitHub as the runner itself, with the registration's key, app-side. The runner's listener only ever talks to the broker, and the broker ignores the token a worker presents. The job's own operations (fetching actions, caches, artifacts, logs) go to GitHub with the token GitHub issues for that one job, not with anything of the runner's.
+- **Each worker start gets its own key.** The runner will not start without a key and a token endpoint, so each worker is given a new RSA key and a token endpoint on its own broker address. That endpoint issues a token only for an assertion signed with that key, and stops answering when the worker exits.
+- **So a copied key is worth nothing.** A job can read its worker's key, but the key works only at its own worker's endpoint, and the token it gets opens nothing. A job cannot use it to act as the runner, including while localmost is paused or quit.
+- **Keys earlier versions exposed are replaced.** Before this, every job's sandbox held a copy of its runner's registration key, and those registrations are not ephemeral, so a key a job took then would still work. On the first start after upgrading, localmost registers each such runner again under the same name (`config.sh --replace`), which gives it a new key; GitHub stops honouring the old one. A registration that cannot be replaced at that start (offline, signed out) keeps its old key and is tried again at the next start. Removing and re-adding a target replaces its keys too.
+- **Registration tokens are not in `ps` for other users.** `config.sh` gets its registration token in its environment (`ACTIONS_RUNNER_INPUT_TOKEN`), not on its command line, which any local user can list. Processes running as you, jobs included, can still read another of your processes' initial environment on macOS; the token is valid for an hour and only registers runners.
+
 ## Encryption Export Compliance
 
 This app uses encryption **solely** for secure credential storage via OS-provided APIs:
@@ -329,6 +339,12 @@ Key security features:
   - Download is rejected if checksums don't match, preventing corrupted or tampered binaries
   - Note: The runner binaries use adhoc code signatures (no verified identity), so we don't verify signatures—the checksum provides equivalent integrity assurance
   - This verification model trusts GitHub's infrastructure, which localmost already relies on for OAuth and API access
+- **Integrity record**: As the runner is extracted, localmost records the SHA-256 of every file and the target of every symlink, in `~/.localmost/runner/arc-manifests/`
+  - Every worker runs a fresh copy of the installed runner, and registration runs one too. Each copy is checked against the record before it is used, so the check covers exactly what will run
+  - A file added, missing or changed stops the start, with a log line naming each difference; nothing runs from that copy. Any difference counts, a `.DS_Store` left by browsing the directory in Finder included. To reinstall, quit localmost, delete `~/.localmost/runner/arc` (all of it: with one version gone, the newest one left would be used) and download the runner again
+  - An install from before records were kept gets its record from a fresh download of the same release, checked against the published checksum - never from what is on disk, which may already have been changed
+  - A download is extracted aside and swapped in whole, replacing any installed copy of that version, so nothing left in the old directory survives into the new one or its record
+  - The record is only as trustworthy as the protection on where it is kept. Jobs cannot write any of `~/.localmost/runner` except their own sandbox and the tool cache, nor rename `~/.localmost` itself, whatever path a repository's policy declares writable; this is the last write rule in the job's sandbox profile, so a policy granting `~` or `~/.localmost` does not reach the runner, its record, or the staging directories downloads use
 - **Execution**: Runner binary is spawned as a child process with controlled environment
 - **Process Management**: Child processes are managed via Node.js ChildProcess handles
   - Processes are spawned with `detached: false` so they terminate when parent exits
@@ -514,10 +530,15 @@ Look for:
 Runner binaries can be independently verified against GitHub's published checksums:
 
 1. Find the expected checksum at https://github.com/actions/runner/releases
-2. Compute the checksum of your downloaded runner:
+2. Download the same release and compute its checksum (localmost does not keep the tarball after extracting it):
    ```bash
-   shasum -a 256 ~/.localmost/runner/arc/v*/actions-runner-*.tar.gz
+   curl -LO https://github.com/actions/runner/releases/download/v<version>/actions-runner-osx-arm64-<version>.tar.gz
+   shasum -a 256 actions-runner-osx-arm64-<version>.tar.gz
    ```
-3. Compare the hashes
+3. Compare the hashes, then compare the release with what localmost installed:
+   ```bash
+   mkdir release && tar -xzf actions-runner-osx-arm64-<version>.tar.gz -C release
+   diff -r release ~/.localmost/runner/arc/v<version>
+   ```
 
-Note: localmost performs this verification automatically during download.
+Note: localmost performs the checksum verification automatically during download, and checks every copy of the runner it starts against the files it extracted.
