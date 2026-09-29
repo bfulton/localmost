@@ -107,6 +107,12 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
 - The broker no longer logs the head of a job payload, which carries the job's
   secrets, and drops the payload once the worker has taken it instead of holding
   it for the life of the process.
+- Under the **Repo contributors** scope, a repository with any commit author
+  not linked to a GitHub account (an unattributed commit) is refused, since
+  anyone can write such a commit and no allowlist can admit it. So is one with
+  more than 500 author emails, the most GitHub links to accounts. Repositories
+  this scope admitted before can now be refused; the refusal names the
+  unattributed commit, email or name.
 
 ### Fixed
 - Per-workflow policy sections now match the workflow filename, as documented.
