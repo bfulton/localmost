@@ -118,6 +118,16 @@ describe('policy show renders the docker grants', () => {
     expect(out).toMatch(/docker network create: localmost-e2e-\* \(internal\)/);
   });
 
+  it('shows a loosened level first, which is the largest grant a policy can make', () => {
+    const out = capture({ level: 'permissive', network: { allow: ['github.com'] } });
+    expect(out).toMatch(/Level:[\s\S]*permissive[\s\S]*Network allow/);
+    expect(out).not.toMatch(/empty - uses defaults only/);
+  });
+
+  it('does not call a level-only policy empty', () => {
+    expect(capture({ level: 'moderate' })).toMatch(/moderate/);
+  });
+
   it('says nothing about docker when none is declared', () => {
     expect(capture({ network: { allow: ['github.com'] } })).not.toMatch(/docker/i);
   });

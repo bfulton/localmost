@@ -1,5 +1,11 @@
 import { describe, it, expect } from '@jest/globals';
-import { describePolicy, POLICY_SECTION_KEYS, WORKFLOW_POLICY_KEYS } from './policy-describe';
+import {
+  describePolicy,
+  DESCRIBED_POLICY_KEYS,
+  LOCALMOSTRC_KEYS,
+  POLICY_SECTION_KEYS,
+  WORKFLOW_POLICY_KEYS,
+} from './policy-describe';
 
 /**
  * A section declaring something under every key a policy may carry. The guard
@@ -7,6 +13,7 @@ import { describePolicy, POLICY_SECTION_KEYS, WORKFLOW_POLICY_KEYS } from './pol
  * and it has to come back out of describePolicy.
  */
 const everything = {
+  level: 'permissive' as const,
   network: { allow: ['github.com'], deny: ['evil.example'] },
   filesystem: { read: ['/etc'], write: ['~/.npm'], deny: ['~/.ssh'] },
   env: { allow: ['CI'], deny: ['AWS_SECRET_ACCESS_KEY'] },
@@ -22,7 +29,7 @@ describe('describePolicy', () => {
     const text = describePolicy(everything).map((g) => `${g.group} ${g.marker} ${g.value} ${g.summary}`).join('\n');
     for (const value of [
       'github.com', 'evil.example', '/etc', '~/.npm', '~/.ssh',
-      'CI', 'AWS_SECRET_ACCESS_KEY', 'docker.io', 'alpine:3', 'vk-*', 'DEPLOY_KEY',
+      'CI', 'AWS_SECRET_ACCESS_KEY', 'docker.io', 'alpine:3', 'vk-*', 'DEPLOY_KEY', 'permissive',
     ]) {
       expect(text).toContain(value);
     }
@@ -32,10 +39,35 @@ describe('describePolicy', () => {
     // The defect this guards: a key that validates and is enforced but that no
     // renderer prints is approved without being read. It has happened twice -
     // `docker:` was missing from the CLI, `env:` from the app.
-    for (const key of WORKFLOW_POLICY_KEYS) {
+    for (const key of DESCRIBED_POLICY_KEYS) {
       const only = { [key]: (everything as Record<string, unknown>)[key] };
       expect(describePolicy(only).length).toBeGreaterThan(0);
     }
+    // The level is the largest grant a policy can make. It sits at the top of
+    // the file rather than in a section, which is how it came to be enforced
+    // and never shown - `level: permissive` alone described as nothing.
+    expect(DESCRIBED_POLICY_KEYS).toContain('level');
+  });
+
+  it('describes every top-level key that is not structure, so a new one cannot grant unseen', () => {
+    const structural = ['version', 'shared', 'workflows'];
+    for (const key of LOCALMOSTRC_KEYS) {
+      if (structural.includes(key)) continue;
+      expect(DESCRIBED_POLICY_KEYS).toContain(key);
+    }
+  });
+
+  it('puts a loosened level first, ahead of the grants it makes larger', () => {
+    for (const level of ['moderate', 'permissive'] as const) {
+      const grants = describePolicy({ level, network: { allow: ['github.com'] } });
+      expect(grants[0].group).toBe('Level');
+      expect(grants[0].summary).toMatch(new RegExp(`^level: ${level}\\b`));
+    }
+    expect(describePolicy({ level: 'permissive' })[0].summary).toMatch(/every network host/);
+  });
+
+  it('says nothing for strict, which is the baseline and grants nothing extra', () => {
+    expect(describePolicy({ level: 'strict' })).toEqual([]);
   });
 
   it('keeps the workflow-only key out of the shared list, which is what validation scopes on', () => {

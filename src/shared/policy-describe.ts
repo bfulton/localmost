@@ -16,6 +16,13 @@
  */
 
 import { DockerPolicy, describeDockerGrants } from './docker-policy';
+import { SandboxPolicyLevel } from './types';
+
+/**
+ * Every key a .localmostrc may declare at the top of the file. The parser
+ * refuses any other, and every one that is not structure has to be described.
+ */
+export const LOCALMOSTRC_KEYS = ['version', 'level', 'shared', 'workflows'] as const;
 
 /** Every key a policy section may declare at any scope. */
 export const POLICY_SECTION_KEYS = ['network', 'filesystem', 'env', 'docker'] as const;
@@ -28,8 +35,16 @@ export const WORKFLOW_POLICY_KEYS = [...POLICY_SECTION_KEYS, 'secrets'] as const
 
 export type PolicySectionKey = (typeof POLICY_SECTION_KEYS)[number];
 
+/**
+ * Every key describePolicy has to render: the section keys, plus the level,
+ * which is declared once at the top of the file but widens every section.
+ */
+export const DESCRIBED_POLICY_KEYS = [...WORKFLOW_POLICY_KEYS, 'level'] as const;
+
 /** A section of a policy, as the grammar accepts it. */
 export interface DescribablePolicy {
+  /** Top of the file only; a caller describing the whole policy passes it in. */
+  level?: SandboxPolicyLevel;
   network?: { allow?: string[]; deny?: string[] };
   filesystem?: { read?: string[]; write?: string[]; deny?: string[] };
   env?: { allow?: string[]; deny?: string[] };
@@ -43,11 +58,20 @@ export interface PolicyGrant {
   group: string;
   /** Single character marking what the entry does: + grant, - deny, r/w access. */
   marker: string;
-  /** The declared value, as written. */
+  /** The declared value, as written, with what it means when that is not obvious. */
   value: string;
   /** The flat one-line form, already prefixed. */
   summary: string;
 }
+
+/**
+ * What a level grants beyond strict. Strict is the baseline and has no entry:
+ * it grants nothing a policy has to be approved for.
+ */
+const LEVEL_GRANTS: Record<Exclude<SandboxPolicyLevel, 'strict'>, string> = {
+  moderate: 'adds common package registries, toolchain locations and writable package-manager caches',
+  permissive: 'allows every network host, plus toolchain locations and writable package-manager caches',
+};
 
 export function describePolicy(policy: DescribablePolicy, prefix = ''): PolicyGrant[] {
   const grants: PolicyGrant[] = [];
@@ -56,6 +80,12 @@ export function describePolicy(policy: DescribablePolicy, prefix = ''): PolicyGr
       grants.push({ group, marker, value, summary: `${prefix}${label}: ${value}` });
     }
   };
+
+  // First, because it widens everything listed after it. It was once left
+  // out entirely, and `level: permissive` described as granting nothing.
+  if (policy.level && policy.level !== 'strict') {
+    add('Level', '+', 'level', [`${policy.level} (${LEVEL_GRANTS[policy.level]})`]);
+  }
 
   add('Network allow', '+', 'network', policy.network?.allow);
   add('Network deny', '-', 'network denied', policy.network?.deny);

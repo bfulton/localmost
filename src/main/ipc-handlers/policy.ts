@@ -17,28 +17,10 @@ import {
 } from '../policy-cache';
 import {
   getRunnerManager, getLogger } from '../app-state';
-import { DockerPolicy } from '../../shared/docker-policy';
-import { describePolicy } from '../../shared/policy-describe';
+import { DescribablePolicy, describePolicy } from '../../shared/policy-describe';
+import { LocalmostrcConfig } from '../../shared/localmostrc';
 
-/**
- * Describe what a policy grants, in the terms a reviewer cares about.
- */
-interface PolicySection {
-  network?: { allow?: string[] };
-  filesystem?: { read?: string[]; write?: string[] };
-  docker?: DockerPolicy;
-}
-
-/**
- * What a docker policy grants, in the reviewer's terms.
- *
- * Every action block is named even when it carries no conditions: `run: {}` is
- * a real grant - it permits creating and running containers - and an approval
- * screen that showed nothing for it would be asking consent for an invisible
- * capability.
- */
-
-function describeSection(section: PolicySection, prefix: string): string[] {
+function describeSection(section: DescribablePolicy, prefix: string): string[] {
   return describePolicy(section, prefix).map((grant) => grant.summary);
 }
 
@@ -49,11 +31,12 @@ function describeSection(section: PolicySection, prefix: string): string[] {
  * `workflows:` that appears nowhere in `shared`, and approving what the UI
  * showed would otherwise approve more than was shown.
  */
-export function summarizeGrants(config: {
-  shared?: PolicySection;
-  workflows?: Record<string, PolicySection>;
-}): string[] {
-  const grants = describeSection(config.shared || {}, '');
+export function summarizeGrants(
+  config: Pick<LocalmostrcConfig, 'level' | 'shared' | 'workflows'>
+): string[] {
+  // The level is declared once, at the top, and leads the list: it widens
+  // every section below it.
+  const grants = describeSection({ ...config.shared, level: config.level }, '');
   for (const [workflow, section] of Object.entries(config.workflows || {})) {
     grants.push(...describeSection(section || {}, `${workflow}: `));
   }

@@ -78,18 +78,22 @@ shared:
   console.log(`${colors.bold}Policy: ${colors.reset}${path.relative(cwd, localmostrcPath)}`);
   console.log();
 
+  // The level is declared once, at the top of the file, and widens every
+  // section, so it is shown with the shared policy and with any effective one.
+  const level = result.config.level;
+
   // Show specific workflow policy if requested
   if (options.workflow) {
     const effective = getEffectivePolicy(result.config, options.workflow);
     console.log(`${colors.bold}Effective policy for ${options.workflow}:${colors.reset}`);
-    printPolicy(effective);
+    printPolicy({ ...effective, level });
     return;
   }
 
   // Show full config
-  if (result.config.shared) {
+  if (result.config.shared || level) {
     console.log(`${colors.bold}Shared policy:${colors.reset}`);
-    printPolicy(result.config.shared);
+    printPolicy({ ...result.config.shared, level });
     console.log();
   }
 

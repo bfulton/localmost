@@ -41,6 +41,30 @@ describe('summarizeGrants', () => {
   });
 });
 
+describe('the level on the approval screen', () => {
+  it('shows a loosened level, which grants more than any other line', () => {
+    // A level-only policy used to summarise as nothing at all, and the card
+    // read "Grants nothing beyond the baseline" for level: permissive.
+    expect(summarizeGrants({ version: 1, level: 'permissive' } as never)).toEqual([
+      expect.stringMatching(/^level: permissive\b/),
+    ]);
+  });
+
+  it('shows the level ahead of the grants it widens', () => {
+    const grants = summarizeGrants({
+      level: 'moderate',
+      shared: { network: { allow: ['example.com'] } },
+      workflows: { ci: { network: { allow: ['ci.example.com'] } } },
+    } as never);
+    expect(grants[0]).toMatch(/^level: moderate\b/);
+    expect(grants.slice(1)).toEqual(['network: example.com', 'ci: network: ci.example.com']);
+  });
+
+  it('shows no level line for strict, which is the baseline', () => {
+    expect(summarizeGrants({ level: 'strict', shared: {} } as never)).toEqual([]);
+  });
+});
+
 describe('network grants on the approval screen', () => {
   it('shows a declared network and whether it is routable', () => {
     const grants = summarizeGrants({
