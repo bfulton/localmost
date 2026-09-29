@@ -25,6 +25,7 @@ jest.mock('./process-sandbox', () => ({
 }));
 
 import { RunnerDownloader } from './runner-downloader';
+import { spawnSandboxed } from './process-sandbox';
 import { FALLBACK_RUNNER_VERSION } from '../shared/constants';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -239,6 +240,37 @@ describe('RunnerDownloader', () => {
       });
 
       expect(downloader.hasAnyProxyCredentials()).toBe(false);
+    });
+  });
+
+  describe('configureInstance', () => {
+    it('hands config.sh the registration token in its environment, not its arguments', async () => {
+      // Any local user can read another process's arguments with ps.
+      const { EventEmitter } = jest.requireActual('events') as typeof import('events');
+      const sandboxDir = path.join(mockRunnerDir, 'sandbox', '1');
+      jest.spyOn(downloader, 'buildSandbox').mockResolvedValue(sandboxDir);
+      jest.spyOn(downloader, 'saveConfig').mockResolvedValue(undefined);
+      jest.spyOn(downloader, 'configureForBrokerProxy').mockResolvedValue(undefined);
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (spawnSandboxed as jest.Mock).mockImplementation(() => {
+        const proc = Object.assign(new EventEmitter(), { stdout: new EventEmitter(), stderr: new EventEmitter() });
+        setImmediate(() => proc.emit('close', 0));
+        return proc;
+      });
+
+      await downloader.configureInstance(1, '2.336.0', {
+        url: 'https://github.com/owner/repo',
+        token: 'REGISTRATION-TOKEN',
+        name: 'localmost.x.1',
+        labels: ['self-hosted'],
+      });
+
+      const [script, args, options] = (spawnSandboxed as jest.Mock).mock.calls[0] as [string, string[], { env: NodeJS.ProcessEnv }];
+      expect(script).toBe(path.join(sandboxDir, 'config.sh'));
+      expect(args.join(' ')).not.toContain('REGISTRATION-TOKEN');
+      expect(args).not.toContain('--token');
+      expect(options.env.ACTIONS_RUNNER_INPUT_TOKEN).toBe('REGISTRATION-TOKEN');
+      expect(args).toEqual(expect.arrayContaining(['--url', 'https://github.com/owner/repo', '--unattended']));
     });
   });
 

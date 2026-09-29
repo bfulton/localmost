@@ -430,7 +430,6 @@ export class RunnerProxyManager {
 
     const args = [
       '--url', options.url,
-      '--token', options.token,
       '--name', options.name,
       '--labels', options.labels.join(','),
       '--work', '_work',
@@ -442,6 +441,10 @@ export class RunnerProxyManager {
       const proc = spawn(configScript, args, {
         cwd: sandboxDir,
         stdio: ['ignore', 'pipe', 'pipe'],
+        // The runner reads any option from ACTIONS_RUNNER_INPUT_<NAME>, and
+        // drops the variable once read. Any local user can list a process's
+        // arguments; only this user can read its environment.
+        env: { ...process.env, ACTIONS_RUNNER_INPUT_TOKEN: options.token },
       });
 
       let stdout = '';

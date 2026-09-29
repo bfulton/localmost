@@ -267,6 +267,7 @@ Each target's runner registrations live in `~/.localmost/runner/proxies/<target>
 - **The broker signs, not the worker.** The local broker makes every call to GitHub itself, with the registration's key, app-side. A worker only ever talks to the broker, and the broker ignores the token a worker presents.
 - **Each worker start gets its own key.** The runner will not start without a key and a token endpoint, so each worker is given a new RSA key and a token endpoint on its own broker address. That endpoint issues a token only for an assertion signed with that key, and stops answering when the worker exits.
 - **So a copied key is worth nothing.** A job can read its worker's key, but the key works only at its own worker's endpoint, and the token it gets opens nothing. A job cannot use it to act as the runner, including while localmost is paused or quit.
+- **Registration tokens are not in `ps` for other users.** `config.sh` gets its registration token in its environment (`ACTIONS_RUNNER_INPUT_TOKEN`), not on its command line, which any local user can list. Processes running as you, jobs included, can still read another of your processes' initial environment on macOS; the token is valid for an hour and only registers runners.
 
 ## Encryption Export Compliance
 

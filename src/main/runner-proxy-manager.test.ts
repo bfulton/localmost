@@ -304,6 +304,18 @@ describe('RunnerProxyManager', () => {
       expect(script).toBe(`${dest}/config.sh`);
     });
 
+    it('hands config.sh the registration token in its environment, not its arguments', async () => {
+      // Any local user can read another process's arguments with ps.
+      await manager.registerInstance(createMockTarget(), 1);
+
+      const [, args, options] = mockSpawn.mock.calls[0] as [string, string[], { env: NodeJS.ProcessEnv }];
+      expect(args.join(' ')).not.toContain('REGISTRATION-TOKEN');
+      expect(args).not.toContain('--token');
+      expect(options.env.ACTIONS_RUNNER_INPUT_TOKEN).toBe('REGISTRATION-TOKEN');
+      expect(options.env.PATH).toBe(process.env.PATH);
+      expect(args).toEqual(expect.arrayContaining(['--name', 'localmost.test-host.testowner-testrepo.1', '--replace']));
+    });
+
     it('registers nothing, and leaves no copy behind, when the runner does not match its record', async () => {
       copyVerifiedArc.mockRejectedValue(new Error('Runner v2.336.0 does not match its integrity record (changed: config.sh)'));
 
