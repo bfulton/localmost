@@ -4,7 +4,7 @@
  * Handles parsing, validation, and merging of declarative sandbox policies.
  */
 import * as yaml from 'js-yaml';
-import { POLICY_SECTION_KEYS, WORKFLOW_POLICY_KEYS } from './policy-describe';
+import { LOCALMOSTRC_KEYS, POLICY_SECTION_KEYS, WORKFLOW_POLICY_KEYS } from './policy-describe';
 import * as fs from 'fs';
 import * as path from 'path';
 import { SandboxPolicy, NetworkPolicy, FilesystemPolicy, EnvPolicy } from './sandbox-profile';
@@ -160,6 +160,17 @@ export function validateLocalmostrc(parsed: unknown): ParseResult {
   }
 
   const config = parsed as Record<string, unknown>;
+
+  // Closed at the top as each section is: a key nobody parses grants nothing
+  // while reading as though it decides something, and a key a later version
+  // adds would otherwise be approved here without being shown. The list is
+  // shared with what describes a policy, whose guard test covers it.
+  for (const key of Object.keys(config)) {
+    if ((LOCALMOSTRC_KEYS as readonly string[]).includes(key)) continue;
+    errors.push({
+      message: `"${key}" is not a .localmostrc key. Accepted keys: ${LOCALMOSTRC_KEYS.join(', ')}.`,
+    });
+  }
 
   // Validate version
   if (config.version === undefined) {
