@@ -2,6 +2,7 @@
  * Tests for Sandbox Profile Generator
  */
 
+import * as path from 'path';
 import {
   generateSandboxProfile,
   generateDiscoveryProfile,
@@ -461,6 +462,99 @@ describe('Sandbox Profile Generator', () => {
         expect(forms).toContain(`(deny ${operation} (subpath "/private/etc/ssl/private"))`);
         expect(forms).toContain(`(deny ${operation} (regex "^/private/tmp/localmost-deny/.*\\\\.pem(/|$)"))`);
       }
+    });
+
+    it('denies writing the directories above a deny, so renaming one cannot carry it away', () => {
+      // A deny matches paths: a job granted /opt/out could rename out/a to
+      // out/b and read out/b/secret, or out/g to out/h and read every .pem.
+      const forms = topLevelForms(generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
+        policy: { filesystem: { write: ['/opt/out'], deny: ['/opt/out/a/secret', '/opt/out/g/*.pem', '/opt/out/keys-*'] } },
+      }));
+      for (const node of ['/opt/out/a', '/opt/out/g', '/opt/out', '/opt']) {
+        expect(forms).toContain(`(deny file-write* (literal "${node}"))`);
+      }
+      // Nodes, not what is in them, and never the root.
+      expect(forms.join('\n')).not.toMatch(/\(deny file-write\* \((subpath|literal) "\/"\)\)/);
+      expect(forms.join('\n')).not.toContain('(deny file-write* (subpath "/opt/out"))');
+      // After every grant, so what they grant does not reopen the nodes.
+      const grant = forms.findIndex((f) => f.includes('(subpath "/opt/out")'));
+      expect(forms.indexOf('(deny file-write* (literal "/opt/out"))')).toBeGreaterThan(grant);
+    });
+
+    it('denies what it cannot look up beneath as written and by the real path of what it can', () => {
+      // A component the app cannot look up - unsearchable, or a symlink loop -
+      // is one the job cannot pass through either. Throwing there stopped
+      // every run of the checkout over a deny that holds as written.
+      const actualFs = jest.requireActual<typeof import('fs')>('fs');
+      const real = actualFs.realpathSync(actualFs.mkdtempSync('/tmp/localmost-unresolvable-'));
+      const viaTmp = real.replace(/^\/private/, '');
+      actualFs.mkdirSync(path.join(real, 'locked', 'inner'), { recursive: true });
+      actualFs.symlinkSync('loop', path.join(real, 'loop'));
+      actualFs.chmodSync(path.join(real, 'locked'), 0o000);
+      try {
+        const forms = topLevelForms(generateSandboxProfile({
+          workDir: '/path/to/project',
+          proxyPort: DEFAULT_PROXY_PORT,
+          policy: { filesystem: { deny: [`${viaTmp}/locked/inner/secret`, `${viaTmp}/loop/secret`, `${viaTmp}/locked/*.pem`] } },
+        }));
+        for (const spelling of [viaTmp, real]) {
+          expect(forms).toContain(`(deny file-read* (subpath "${spelling}/locked/inner/secret"))`);
+          expect(forms).toContain(`(deny file-read* (subpath "${spelling}/loop/secret"))`);
+          expect(forms).toContain(`(deny file-write* (literal "${spelling}/locked/inner"))`);
+        }
+        expect(forms).toContain(`(deny file-read* (regex "^${real.replace(/\./g, '\\\\.')}/locked/.*\\\\.pem(/|$)"))`);
+      } finally {
+        actualFs.chmodSync(path.join(real, 'locked'), 0o755);
+        actualFs.rmSync(real, { recursive: true, force: true });
+      }
+    });
+
+    it('never looks inside a folder macOS asks the user about, however the deny reaches it', () => {
+      // Looking a path up inside ~/Documents, ~/Desktop, ~/Downloads, ~/Library
+      // or a volume makes macOS ask whether the app may, at every run, on a
+      // machine that may have nobody at it - and a refusal fails the lookup.
+      const actualFs = jest.requireActual<typeof import('fs')>('fs');
+      const looked: string[] = [];
+      const link = '/tmp/localmost-to-documents';
+      let build: () => string[] = () => [];
+      jest.isolateModules(() => {
+        const record = (p: import('fs').PathLike) => looked.push(String(p));
+        jest.doMock('fs', () => ({
+          ...actualFs,
+          lstatSync: jest.fn((p: import('fs').PathLike) => {
+            record(p);
+            return String(p) === `/private${link}` ? { isSymbolicLink: () => true } : { isSymbolicLink: () => false };
+          }),
+          readlinkSync: jest.fn((p: import('fs').PathLike) => {
+            record(p);
+            return '/Users/test/Documents/keys';
+          }),
+          realpathSync: jest.fn((p: import('fs').PathLike) => {
+            record(p);
+            return String(p);
+          }),
+        }));
+        const { generateSandboxProfile: generate } = require('./sandbox-profile');
+        build = () => topLevelForms(generate({
+          workDir: '/path/to/project',
+          proxyPort: DEFAULT_PROXY_PORT,
+          policy: {
+            filesystem: {
+              deny: ['~/Documents/finance', '~/Desktop/keys/*.pem', '~/Library/Messages', '/Volumes/Backup/secrets', `/private${link}/id`],
+            },
+          },
+        }));
+      });
+      const forms = build();
+      const guarded = ['Documents', 'Desktop', 'Downloads', 'Library'].map((name) => `/Users/test/${name}/`);
+      expect(looked.filter((p) => guarded.some((dir) => p.startsWith(dir)) || p.startsWith('/Volumes/'))).toEqual([]);
+      // Denied as written all the same, and through the link as far as the folder.
+      expect(forms).toContain('(deny file-read* (subpath "/Users/test/Documents/finance"))');
+      expect(forms).toContain('(deny file-read* (subpath "/Users/test/Documents/keys/id"))');
+      expect(forms).toContain('(deny file-read* (subpath "/Users/test/Library/Messages"))');
+      expect(forms).toContain('(deny file-read* (subpath "/Volumes/Backup/secrets"))');
     });
 
     it('applies no relative deny, which seatbelt would never match', () => {

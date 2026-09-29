@@ -1093,6 +1093,52 @@ describe('Process Sandbox', () => {
       expect(writable(profile, '/private/tmp/localmost-deny/other')).toBe(true);
     });
 
+    it('denies writing the directories above a deny, so renaming one cannot carry it away', () => {
+      // A deny matches paths: granted /opt/out, a job could rename out/a to
+      // out/b and read out/b/secret, or out/g to out/h and read every .pem.
+      const profile = profileWith({
+        filesystemPolicy: {
+          level: 'strict', read: ['/opt/out'], write: ['/opt/out'], deny: ['/opt/out/a/secret', '/opt/out/g/*.pem'],
+        },
+      });
+      for (const node of ['/opt/out/a', '/opt/out/g', '/opt/out', '/opt']) {
+        expect(writable(profile, node)).toBe(false);
+      }
+      // Nodes, not what is in them: the grant still writes beside the secret.
+      expect(writable(profile, '/opt/out/a/built')).toBe(true);
+      expect(writable(profile, '/opt/out/g/built.txt')).toBe(true);
+      expect(writable(profile, '/opt/out/other/built')).toBe(true);
+      expect(readable(profile, '/opt/out/a')).toBe(true);
+    });
+
+    it('builds a deny it cannot look up beneath, denied as written and by the real path of what it can', () => {
+      // A component the app cannot look up - unsearchable, or a symlink loop
+      // anyone could plant above a deny - is one the job cannot pass through
+      // either. Throwing there stopped every spawn for the repository.
+      const actualFs = jest.requireActual<typeof import('fs')>('fs');
+      const real = actualFs.realpathSync(actualFs.mkdtempSync('/tmp/localmost-unresolvable-'));
+      const viaTmp = real.replace(/^\/private/, '');
+      actualFs.mkdirSync(path.join(real, 'locked', 'inner'), { recursive: true });
+      actualFs.symlinkSync('loop', path.join(real, 'loop'));
+      actualFs.chmodSync(path.join(real, 'locked'), 0o000);
+      try {
+        const profile = profileWithRealPaths({
+          filesystemPolicy: {
+            level: 'strict', read: [], write: [], deny: [`${viaTmp}/locked/inner/secret`, `${viaTmp}/loop/secret`],
+          },
+        });
+        const denyRule = profile.slice(profile.lastIndexOf('(deny file-read* file-write*'));
+        for (const spelling of [viaTmp, real]) {
+          expect(denyRule).toContain(`(subpath "${spelling}/locked/inner/secret")`);
+          expect(denyRule).toContain(`(subpath "${spelling}/loop/secret")`);
+          expect(writable(profile, `${spelling}/locked/inner`)).toBe(false);
+        }
+      } finally {
+        actualFs.chmodSync(path.join(real, 'locked'), 0o755);
+        actualFs.rmSync(real, { recursive: true, force: true });
+      }
+    });
+
     it('escapes deny paths, and resolves a traversing one rather than dropping it', () => {
       // Dropping a deny widens the approved policy, so an absolute one with
       // ".." is kept, resolved as seatbelt would resolve the path it guards.

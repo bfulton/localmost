@@ -119,7 +119,10 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
 - A `filesystem.deny` entry with `*` in it now refuses what it matches in a
   runner job; it was written as a literal path and matched nothing. Every deny,
   in a runner job and in `localmost test`, is also applied by its real path, so
-  one written through `/tmp`, `/etc`, `/var` or a symlink of your own holds.
+  one written through `/tmp`, `/etc`, `/var` or a symlink of your own holds
+  (for a `*` entry, up to the first `*`). The directories above a deny are
+  closed to writes, so a job granted one can no longer rename it and read the
+  denied path under the new name.
 - `.localmostrc` refuses a network entry that is not a host pattern - a URL such
   as `https://evil.com`, a path, surrounding spaces, or a host in a spelling the
   proxy never compares - and a relative `filesystem.deny` entry. Each was

@@ -172,28 +172,117 @@ export function realPath(dir: string): string {
 }
 
 /**
- * The seatbelt filters a policy deny covers: the path and everything beneath
- * it, both as written and as seatbelt matches it. seatbelt matches the real
- * path, and /tmp, /etc and /var are symlinks into /private, so a deny of
- * /etc/ssl/private written alone held nothing against a grant of
- * /private/etc. A `*` entry is a (regex ...), its real spelling taken from
- * the directory before the first `*`; written as a subpath it named a file
- * called "*.pem", which nothing is. An absolute ".." is resolved, as seatbelt
- * resolves the path it guards. A relative entry is never matched against a
- * real path, so it covers nothing (validation refuses one).
+ * The folders macOS asks the user about before an app may look inside: the
+ * Desktop, Documents and Downloads folders, ~/Library (other apps' data,
+ * Mail, Messages, iCloud Drive) and every volume under /Volumes. The folder
+ * itself can be looked up; what is in it cannot without the question, asked
+ * at every spawn on a machine that may have nobody at it.
  */
-export function policyDenyFilters(entry: string): string[] {
+function consentGuardedFolders(): string[] {
+  const home = os.homedir();
+  return [...['Desktop', 'Documents', 'Downloads', 'Library'].map((name) => path.join(home, name)), '/Volumes'];
+}
+
+/**
+ * A policy deny's path as seatbelt matches it, as far as it can be looked
+ * up: each component is resolved in turn, links followed, until one cannot
+ * be - missing, unsearchable, a link loop - or the walk reaches a folder
+ * macOS guards with a consent prompt; the rest is appended as written.
+ *
+ * Unlike realPath this never throws. A component the app cannot look up is
+ * one the job, running as the same user, cannot pass through either, so the
+ * deny holds as written. Throwing stopped every run of the repository over a
+ * deny that held, and anyone who could plant a link loop above one could do
+ * that to another repository's jobs.
+ */
+function policyRealPath(target: string): string {
+  const guarded = new Set(consentGuardedFolders());
+  const pending = path.resolve(target).split('/').filter(Boolean);
+  let real = '/';
+  let links = 0;
+  while (pending.length > 0 && !guarded.has(real)) {
+    const part = pending[0];
+    if (part === '.' || part === '..') {
+      if (part === '..') real = path.dirname(real);
+      pending.shift();
+      continue;
+    }
+    const next = path.join(real, part);
+    let link: string | undefined;
+    try {
+      if (fs.lstatSync(next).isSymbolicLink()) {
+        // As many as the kernel follows before ELOOP.
+        if (++links > 32) break;
+        link = fs.readlinkSync(next);
+      }
+    } catch {
+      break;
+    }
+    pending.shift();
+    if (link === undefined) {
+      real = next;
+    } else {
+      pending.unshift(...link.split('/').filter(Boolean));
+      if (path.isAbsolute(link)) real = '/';
+    }
+  }
+  return path.join(real, ...pending);
+}
+
+/**
+ * The spellings a policy deny is matched by: as written, with an absolute
+ * ".." resolved as seatbelt resolves the path it guards, and by its real path
+ * (see policyRealPath). For a `*` entry the real spelling is taken from the
+ * directory before the first `*`: what the `*` stands for is known only once
+ * a path matches it, so a link past it is not followed. A relative entry is
+ * never matched against a real path, so it has none (validation refuses one).
+ */
+function policyDenySpellings(entry: string): { spellings: string[]; glob: boolean } {
   const expanded = expandPath(entry);
-  if (!path.isAbsolute(expanded)) return [];
+  if (!path.isAbsolute(expanded)) return { spellings: [], glob: false };
   const resolved = path.resolve(expanded);
   const star = resolved.indexOf('*');
-  if (star === -1) {
-    return [...new Set([resolved, realPath(resolved)])].map((spelling) => `(subpath "${escapePath(spelling)}")`);
-  }
+  if (star === -1) return { spellings: [...new Set([resolved, policyRealPath(resolved)])], glob: false };
   const cut = resolved.lastIndexOf('/', star);
-  const real = realPath(resolved.slice(0, cut) || '/');
-  const realSpelling = (real === '/' ? '' : real) + resolved.slice(cut);
-  return [...new Set([resolved, realSpelling])].map((spelling) => `(regex "${globToProfileRegex(spelling, true)}")`);
+  const real = policyRealPath(resolved.slice(0, cut) || '/');
+  return { spellings: [...new Set([resolved, (real === '/' ? '' : real) + resolved.slice(cut)])], glob: true };
+}
+
+/**
+ * The seatbelt filters a policy deny covers: the path and everything beneath
+ * it, in each of its spellings (see policyDenySpellings). seatbelt matches
+ * the real path, and /tmp, /etc and /var are symlinks into /private, so a
+ * deny of /etc/ssl/private written alone held nothing against a grant of
+ * /private/etc. A `*` entry is a (regex ...); written as a subpath it named a
+ * file called "*.pem", which nothing is.
+ */
+export function policyDenyFilters(entry: string): string[] {
+  const { spellings, glob } = policyDenySpellings(entry);
+  return spellings.map((spelling) =>
+    glob ? `(regex "${globToProfileRegex(spelling, true)}")` : `(subpath "${escapePath(spelling)}")`
+  );
+}
+
+/**
+ * The directories above what a policy deny covers, in each of its spellings,
+ * up to but not including /, as (literal ...) filters for a write deny. The
+ * deny matches paths, so a job granted write on one of these could rename it
+ * and read the denied path under the new name: out/a to out/b for a deny of
+ * out/a/secret, out/g to out/h for out/g/*.pem. For a `*` entry these are the
+ * directory before the first `*` and those above it; a directory the `*`
+ * stands for is known only once a path matches, so it is not covered. Nodes,
+ * not subtrees: what is in them stays as granted. Those not there yet too,
+ * as for the app's directories, where a link planted now would carry the
+ * denied path wherever it points.
+ */
+export function policyDenyAncestors(entry: string): string[] {
+  const { spellings, glob } = policyDenySpellings(entry);
+  const nodes = new Set<string>();
+  for (const spelling of spellings) {
+    const first = glob ? spelling.slice(0, spelling.lastIndexOf('/', spelling.indexOf('*'))) || '/' : path.dirname(spelling);
+    for (let node = first; node !== path.dirname(node); node = path.dirname(node)) nodes.add(node);
+  }
+  return [...nodes].map((node) => `(literal "${escapePath(node)}")`);
 }
 
 // Note: macOS sandbox-exec does NOT support hostname-based network filtering.
@@ -587,6 +676,11 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
     for (const filter of policy.filesystem.deny.flatMap((entry) => policyDenyFilters(entry))) {
       lines.push(`(deny file-read* ${filter})`);
       lines.push(`(deny file-write* ${filter})`);
+    }
+    // Nor the directories above them, as nodes: renaming one would carry a
+    // denied path out from under its deny (see policyDenyAncestors).
+    for (const node of new Set(policy.filesystem.deny.flatMap((entry) => policyDenyAncestors(entry)))) {
+      lines.push(`(deny file-write* ${node})`);
     }
     lines.push('');
   }

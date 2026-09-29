@@ -191,11 +191,19 @@ workflows:
 
 A `filesystem.deny` entry refuses reads and writes of that path and everything
 beneath it, even inside a granted path, and in a deny `*` matches any run of
-characters, `/` included. It holds however the path is reached: each entry is
-denied as written and by its real path, so a deny of `/tmp/x`, `/etc/...` or a
-path through a symlink of your own covers where it leads. A deny is an absolute
-path or starts with `~/`; a relative one is a validation error, since the
-sandbox never matches it.
+characters, `/` included. Each entry is denied as written and by its real path,
+so a deny of `/tmp/x`, `/etc/...` or a path through a symlink of your own covers
+where it leads. For a `*` entry the real path is taken up to the directory
+before the first `*`; a symlink past it, or a matched file that is itself a
+symlink, is not followed. The directories above a deny cannot be created,
+renamed or removed by the job, since renaming one would carry the denied path
+out from under it; for a `*` entry that means the directory before the first `*`
+and those above it, so a directory the `*` itself stands for can still be moved.
+The real path is looked up as far as it can be: a directory the app cannot look
+into, a symlink loop, or a folder macOS asks permission for (Desktop, Documents,
+Downloads, `~/Library`, `/Volumes`) ends the lookup there, and the rest is
+denied as written. A deny is absolute, `~`, or starts with `~/`; a relative one
+is a validation error, since the sandbox never matches it.
 
 ### Loopback
 

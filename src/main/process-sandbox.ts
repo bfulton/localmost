@@ -14,7 +14,7 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import { SandboxPolicyLevel } from '../shared/types';
-import { expandPath, policyDenyFilters, realPath, DEFAULT_BROKER_PORT } from '../shared/sandbox-profile';
+import { expandPath, policyDenyAncestors, policyDenyFilters, realPath, DEFAULT_BROKER_PORT } from '../shared/sandbox-profile';
 import {
   getAppDataDir,
   getConfigPath,
@@ -323,18 +323,23 @@ export function generateSandboxProfile({
   // app directory stays, and the own sandbox and caches are re-allowed after
   // the denies instead. For the same reason a deny list that cannot be read
   // stops the spawn rather than being skipped. Each is denied as written and
-  // by its real path, a `*` entry as a pattern (see policyDenyFilters); a
-  // relative entry never matches in seatbelt, so it is dropped and said to
-  // have no effect.
+  // by its real path, a `*` entry as a pattern (see policyDenyFilters), and
+  // the directories above it are closed to writes as nodes, so none can be
+  // renamed to carry it away (see policyDenyAncestors); a relative entry
+  // never matches in seatbelt, so it is dropped and said to have no effect.
   const declaredDenies = filesystemPolicy.deny ?? [];
   if (!Array.isArray(declaredDenies)) {
     throw new Error("The policy's deny list is not a list, so the job cannot be confined as approved");
   }
-  const policyDenies = declaredDenies.flatMap((entry: string) => {
-    if (path.isAbsolute(expandPath(entry))) return policyDenyFilters(entry).map((filter) => `  ${filter}`);
+  const absoluteDenies = declaredDenies.filter((entry: string) => {
+    if (path.isAbsolute(expandPath(entry))) return true;
     onLog?.('error', `Ignoring relative policy deny path, which would have no effect: ${entry}`);
-    return [];
-  }).join('\n');
+    return false;
+  });
+  const policyDenies = absoluteDenies.flatMap((entry: string) => policyDenyFilters(entry).map((filter) => `  ${filter}`)).join('\n');
+  const policyDenyNodes = [...new Set(absoluteDenies.flatMap((entry: string) => policyDenyAncestors(entry)))]
+    .map((node) => `  ${node}`)
+    .join('\n');
 
   // Loopback reaches every service on this machine, not just the job's own:
   // databases, a debugger listening on 9229, a browser's remote debugging on
@@ -596,6 +601,10 @@ ${ownNodeReads}
 ;; grant above - the policy's own and the toolchains a level brings - so the
 ;; deny is what matches last.
 ${policyDenies ? `(deny file-read* file-write*\n${policyDenies})` : ';; No policy-declared deny paths'}
+;; Nor the directories above them, as nodes: renaming one would carry a
+;; denied path out from under the deny, to be read and written under the new
+;; name. What is inside them stays as granted.
+${policyDenyNodes ? `(deny file-write*\n${policyDenyNodes})` : ';; No directories above a policy deny to close'}
 
 ;; The places a job does use in the app's directories, re-allowed after every
 ;; deny: its target's own caches and its own sandbox, which a deny covering
