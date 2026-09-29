@@ -6,6 +6,7 @@ import {
   POLICY_SECTION_KEYS,
   WORKFLOW_POLICY_KEYS,
 } from './policy-describe';
+import { MODERATE_NETWORK_ALLOWLIST, RUNNER_INFRASTRUCTURE_ALLOWLIST } from './network-allowlist';
 
 /**
  * A section declaring something under every key a policy may carry. The guard
@@ -64,6 +65,29 @@ describe('describePolicy', () => {
       expect(grants[0].summary).toMatch(new RegExp(`^level: ${level}\\b`));
     }
     expect(describePolicy({ level: 'permissive' })[0].summary).toMatch(/every network host/);
+  });
+
+  it('names what a loosened level opens, not just that it is common', () => {
+    // "Common package registries" read as a narrow grant. Moderate also opens
+    // whole CDN domains and GitHub content hosts anyone can publish to, and
+    // both levels make toolchain trees in the home directory writable, some
+    // of them on the user's PATH.
+    const [moderate] = describePolicy({ level: 'moderate' });
+    const wildcards = MODERATE_NETWORK_ALLOWLIST.filter(
+      (host) => host.startsWith('*.') && !RUNNER_INFRASTRUCTURE_ALLOWLIST.includes(host)
+    );
+    expect(wildcards).toEqual(expect.arrayContaining(['*.cloudfront.net', '*.fastly.net']));
+    for (const host of [...wildcards, 'raw.githubusercontent.com', 'objects.githubusercontent.com', 'codeload.github.com']) {
+      expect(moderate.summary).toContain(host);
+    }
+
+    for (const level of ['moderate', 'permissive'] as const) {
+      const [grant] = describePolicy({ level });
+      for (const dir of ['~/.cargo', '~/.local', '~/go', '~/Library/Caches']) {
+        expect(grant.summary).toContain(dir);
+      }
+      expect(grant.summary).toMatch(/PATH/);
+    }
   });
 
   it('says nothing for strict, which is the baseline and grants nothing extra', () => {
