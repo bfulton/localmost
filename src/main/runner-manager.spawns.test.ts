@@ -213,6 +213,39 @@ describe("a finished worker's sandbox", () => {
   });
 });
 
+describe("the sweep of a finished worker's process group", () => {
+  // A step that traps SIGTERM keeps the group answering until SIGKILL. Here
+  // nothing holds the marker and the profile sweep finds nothing, so every
+  // signal to the group comes from the group sweep itself.
+  const groupSignals = (calls: Array<[number, string | number | undefined]>, group: number) =>
+    calls.filter(([pid, signal]) => pid === -group && signal !== 0).map(([, signal]) => signal);
+
+  it('terminates, then kills, what is left in the group when the worker exits', async () => {
+    const { calls } = stubKill(new Set([24680]));
+    const { helper } = newManager();
+    const { proc } = await spawnWorker(helper, 24680);
+
+    proc.emit('exit', 0, null);
+    await settle();
+    expect(groupSignals(calls, 24680)).toEqual(['SIGTERM']);
+
+    await jest.advanceTimersByTimeAsync(GRACE_MS);
+    expect(groupSignals(calls, 24680)).toEqual(['SIGTERM', 'SIGKILL']);
+  });
+
+  it('terminates, then kills, the group of a worker reaped for never taking its job', async () => {
+    const { calls } = stubKill(new Set([24680]));
+    const { helper } = newManager();
+    await spawnWorker(helper, 24680);
+
+    helper.reapUnclaimedWorker(1);
+    expect(groupSignals(calls, 24680)).toEqual(['SIGTERM']);
+
+    await jest.advanceTimersByTimeAsync(GRACE_MS);
+    expect(groupSignals(calls, 24680)).toEqual(['SIGTERM', 'SIGKILL']);
+  });
+});
+
 describe("a slot whose last worker's job may still be running", () => {
   it("is not reserved while the previous worker's process group still answers", async () => {
     // A step that traps SIGTERM keeps the group alive through the grace
