@@ -9,11 +9,11 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
-import { execFileSync } from 'child_process';
+import { ChildProcess, execFileSync, spawn } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { executeStep, ExecutionContext } from './step-executor';
+import { executeStep, ExecutionContext, reapStepProcesses } from './step-executor';
 import { generateSandboxProfile, MACOS_BASELINE_READ_PATHS } from './sandbox-profile';
 import type { WorkflowJob, WorkflowStep } from './workflow-parser';
 
@@ -80,7 +80,65 @@ const archives = (): string[] => {
     fs.readdirSync(path.join(root, d)).map((f) => path.join(root, d, f)));
 };
 
+const alive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const gone = async (pid: number): Promise<boolean> => {
+  for (let i = 0; i < 250 && alive(pid); i++) await new Promise((resolve) => setTimeout(resolve, 20));
+  return !alive(pid);
+};
+
+/** A process that is not a step's: this suite's own child, under `profile` if given. */
+const bystander = (profile?: string): ChildProcess => {
+  if (!profile) return spawn('/bin/sleep', ['60'], { stdio: 'ignore' });
+  const profilePath = path.join(scratch, `bystander-${Date.now()}.sb`);
+  fs.writeFileSync(profilePath, profile);
+  return spawn('/usr/bin/sandbox-exec', ['-f', profilePath, '/bin/sleep', '60'], { stdio: 'ignore' });
+};
+
 if (canConstruct()) {
+  describe('what a step leaves running', () => {
+    const withReads = (): ExecutionContext => ({ ...ctx(), policy: { filesystem: { read: MACOS_BASELINE_READ_PATHS } } });
+
+    it('is killed at the end of the job even once it has left the step\'s process group', async () => {
+      // setsid() takes a process out of the group the step leads, so a kill
+      // of that group misses it, and it keeps its sandbox - the workspace,
+      // loopback ports - for as long as it likes. Its sandbox is what it
+      // cannot leave.
+      const others = [bystander(), bystander('(version 1)\n(allow default)\n')];
+      let survivor = 0;
+      try {
+        const result = await executeStep(
+          { run: "/usr/bin/perl -MPOSIX -e 'POSIX::setsid(); sleep 60' >/dev/null 2>&1 &\necho $! > survivor.pid" },
+          withReads(),
+          job
+        );
+        expect(result.status).toBe('success');
+        survivor = parseInt(fs.readFileSync(path.join(workDir, 'survivor.pid'), 'utf-8'), 10);
+        // Out of the step's group, and still running after the step.
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(alive(survivor)).toBe(true);
+        const pgid = parseInt(execFileSync('/bin/ps', ['-o', 'pgid=', '-p', String(survivor)], { encoding: 'utf-8' }), 10);
+        expect(pgid).toBe(survivor);
+
+        reapStepProcesses();
+
+        expect(await gone(survivor)).toBe(true);
+        // Nothing else: not this suite's own children, sandboxed or not.
+        for (const other of others) expect(alive(other.pid!)).toBe(true);
+      } finally {
+        if (survivor && alive(survivor)) process.kill(survivor, 'SIGKILL');
+        for (const other of others) other.kill('SIGKILL');
+      }
+    }, 20000);
+  });
+
   describe('the cache intercept through sandboxed tar', () => {
     it('saves and restores the workspace paths it names, and never what a link leads to', async () => {
       await run({ uses: 'actions/cache/save@v4', with: { key: 'deps-1', path: 'deps' } });
@@ -113,6 +171,24 @@ if (canConstruct()) {
     it('saves nothing rather than copying without a sandbox', async () => {
       await run({ uses: 'actions/cache/save@v4', with: { key: 'deps-1', path: 'deps' } });
       expect(archives()).toEqual([]);
+    });
+  });
+
+  describe('reaping inside a localmost job', () => {
+    it('never takes the job\'s own sandbox for a step\'s', async () => {
+      // Here every process, this suite included, runs under the job's
+      // profile, which can read the app's data under the checkout. A step
+      // cannot be started, but the reap that follows must still find nothing.
+      const other = bystander();
+      try {
+        await executeStep({ run: 'true' }, ctx(), job);
+        reapStepProcesses();
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(alive(other.pid!)).toBe(true);
+        expect(alive(process.pid)).toBe(true);
+      } finally {
+        other.kill('SIGKILL');
+      }
     });
   });
 }

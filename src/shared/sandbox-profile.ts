@@ -53,6 +53,38 @@ export interface SandboxProfileOptions {
   permissive?: boolean;
   /** Log file for sandbox violations */
   logFile?: string;
+  /** The files that mark a process as running under this run's profiles; see processMarkerRules. */
+  processMarker?: ProcessMarker;
+}
+
+/**
+ * Two files, alike but for their random names, that a step's profile reads
+ * one of and not the other.
+ */
+export interface ProcessMarker {
+  granted: string;
+  withheld: string;
+}
+
+/**
+ * The last rules of a step's profile: how the app finds the step's processes
+ * when the job ends, including one that left its process group.
+ *
+ * A process can leave its group with setsid() and close every descriptor it
+ * inherited, but it cannot leave its sandbox. So the profile carries a mark
+ * the kernel will answer for: it reads one file and not its twin. No other
+ * profile tells the two apart - one that reaches their directory reaches
+ * both - and an unsandboxed process reads both. Last, so no policy rule can
+ * change the answer.
+ */
+function processMarkerRules(marker?: ProcessMarker): string[] {
+  if (!marker) return [];
+  return [
+    ';; How the app finds this run\'s processes when the job ends, even one that',
+    ';; has left its process group: this profile reads one file and not its twin',
+    `(deny file-read* (literal "${escapePath(marker.withheld)}"))`,
+    `(allow file-read* (literal "${escapePath(marker.granted)}"))`,
+  ];
 }
 
 // =============================================================================
@@ -543,6 +575,8 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push('  (preference-domain "com.apple.dt.Xcode"))');
   lines.push('');
 
+  lines.push(...processMarkerRules(options.processMarker));
+
   return lines.join('\n');
 }
 
@@ -560,6 +594,7 @@ export function generateDiscoveryProfile(options: {
   readOnlyPaths?: string[];
   proxyPort: number;
   logFile: string;  // Not used - reports go to system log, not a file
+  processMarker?: ProcessMarker;
 }): string {
   const { workDir, proxyPort } = options;
   const escapedWorkDir = escapePath(workDir);
@@ -623,6 +658,7 @@ export function generateDiscoveryProfile(options: {
     '(allow user-preference-write',
     '  (preference-domain "com.apple.dt.Xcode"))',
     '',
+    ...processMarkerRules(options.processMarker),
   ];
 
   return lines.join('\n');

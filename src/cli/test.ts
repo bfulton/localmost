@@ -311,14 +311,7 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   });
   const proxyPort = await discoveryProxy.start();
 
-  // Each step leads a process group of its own, so the terminal's Ctrl-C
-  // reaches only this process. End the steps' groups before going.
-  const onInterrupt = (signal: NodeJS.Signals) => {
-    reapStepProcesses();
-    process.exit(signal === 'SIGINT' ? 130 : 143);
-  };
-  process.once('SIGINT', onInterrupt);
-  process.once('SIGTERM', onInterrupt);
+  const removeInterruptHandlers = installInterruptHandlers(reapStepProcesses);
 
   // Everything after the proxy starts runs inside try/finally: a throw in
   // workspace setup, parsing or job execution would otherwise leave the proxy
@@ -602,11 +595,38 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     environmentDiffs,
   };
   } finally {
-    process.removeListener('SIGINT', onInterrupt);
-    process.removeListener('SIGTERM', onInterrupt);
+    removeInterruptHandlers();
     reapStepProcesses();
     await discoveryProxy.stop();
   }
+}
+
+/** The signals that end a run early, and the exit status each ends it with. */
+const INTERRUPT_EXIT_CODES: Partial<Record<NodeJS.Signals, number>> = {
+  SIGINT: 130,
+  SIGTERM: 143,
+  // The terminal closing, or an SSH session dropping.
+  SIGHUP: 129,
+};
+
+/**
+ * End the steps' processes, then exit, when the run is interrupted. Returns
+ * a function that removes the handlers.
+ *
+ * Each step leads a process group of its own, so the terminal's signals reach
+ * only this process; without these, dying of one would leave every step
+ * running.
+ */
+export function installInterruptHandlers(reap: () => void): () => void {
+  const onInterrupt = (signal: NodeJS.Signals) => {
+    reap();
+    process.exit(INTERRUPT_EXIT_CODES[signal] ?? 1);
+  };
+  const signals = Object.keys(INTERRUPT_EXIT_CODES) as NodeJS.Signals[];
+  for (const signal of signals) process.once(signal, onInterrupt);
+  return () => {
+    for (const signal of signals) process.removeListener(signal, onInterrupt);
+  };
 }
 
 /**

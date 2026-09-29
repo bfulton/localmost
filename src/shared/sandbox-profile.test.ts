@@ -337,6 +337,23 @@ describe('Sandbox Profile Generator', () => {
       }
     });
 
+    it('ends with the process marker, so no policy rule can change what it answers', () => {
+      // The app finds a step's processes at the end of the job by asking the
+      // kernel what their profile lets them read. A policy deny or grant after
+      // the marker would make a step's process look like anyone else's.
+      const processMarker = { granted: '/Users/test/.localmost/m/mark-a', withheld: '/Users/test/.localmost/m/mark-b' };
+      const policy = { filesystem: { read: ['/**'], deny: ['/Users/test/**'] } };
+      for (const profile of [
+        generateSandboxProfile({ workDir: '/w', proxyPort: DEFAULT_PROXY_PORT, policy, processMarker }),
+        generateDiscoveryProfile({ workDir: '/w', proxyPort: DEFAULT_PROXY_PORT, logFile: '', processMarker }),
+      ]) {
+        expect(topLevelForms(profile).slice(-2)).toEqual([
+          '(deny file-read* (literal "/Users/test/.localmost/m/mark-b"))',
+          '(allow file-read* (literal "/Users/test/.localmost/m/mark-a"))',
+        ]);
+      }
+    });
+
     it('lets a step write inside the workspace but never replace the workspace directory itself', () => {
       // The reopen is a subpath, which covers the directory node too: a step
       // could rmdir it and leave a symlink in its place, and the app's own

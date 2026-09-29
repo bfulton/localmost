@@ -8,13 +8,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { spawn, ChildProcess, SpawnOptions } from 'child_process';
+import { spawn, execFileSync, ChildProcess, SpawnOptions } from 'child_process';
 import { WorkflowStep, WorkflowJob, MatrixCombination } from './workflow-parser';
 import {
   SandboxPolicy,
   generateSandboxProfile,
   generateDiscoveryProfile,
   MACOS_BASELINE_READ_PATHS,
+  ProcessMarker,
 } from './sandbox-profile';
 import { PidTreeWatcher } from './pid-tree-watch';
 import { parseActionRef, fetchAction, isInterceptedAction, readActionMetadata } from './action-fetcher';
@@ -895,6 +896,7 @@ function runSandboxedTar(
         workDir: ctx.workDir,
         proxyPort: ctx.proxyPort,
         policy: { filesystem: { read: MACOS_BASELINE_READ_PATHS } },
+        processMarker: stepProcessMarker(),
       })
     );
     const proc = spawn('/usr/bin/sandbox-exec', ['-f', profilePath, '/usr/bin/tar', ...args], {
@@ -1152,6 +1154,107 @@ function writeStepProfile(profile: string): { profilePath: string; remove: () =>
  */
 const stepProcessGroups = new Map<number, boolean>();
 
+/** This job's process marker and the private directory holding it, once a step has needed one. */
+let jobMarker: (ProcessMarker & { dir: string }) | undefined;
+
+/**
+ * The marker every profile this job spawns under carries (see
+ * processMarkerRules), made the first time a step needs it.
+ *
+ * Two empty files with random names in a fresh private directory under the
+ * app data directory, which no step can reach. Real paths, as seatbelt
+ * matches those.
+ */
+function stepProcessMarker(): ProcessMarker {
+  if (!jobMarker) {
+    const base = path.join(getAppDataDirWithoutElectron(), 'test-sandbox-profiles');
+    fs.mkdirSync(base, { recursive: true, mode: 0o700 });
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(base, 'job-')));
+    const file = () => {
+      const name = path.join(dir, `mark-${crypto.randomBytes(8).toString('hex')}`);
+      fs.writeFileSync(name, '', { mode: 0o600, flag: 'wx' });
+      return name;
+    };
+    jobMarker = { dir, granted: file(), withheld: file() };
+  }
+  return { granted: jobMarker.granted, withheld: jobMarker.withheld };
+}
+
+/**
+ * Stop, then kill, every process of the user's that runs under a profile
+ * carrying `marker`, and print their pids.
+ *
+ * sandbox_check answers for another process's profile: whether it is
+ * sandboxed at all, and whether it may read a path. Only a profile carrying
+ * the marker reads one file and not the other. Everything found is stopped
+ * before anything is killed, so nothing it forks while the sweep runs is
+ * missed, and a process that no longer matches once stopped - a pid reused
+ * between the look and the stop - is let go. sandbox_check is variadic after
+ * its third argument, so only the first three are declared: ctypes then
+ * passes the path the way arm64 expects a variadic argument.
+ */
+const REAP_SCRIPT = `
+import ctypes, os, signal, sys
+libc = ctypes.CDLL('/usr/lib/libSystem.B.dylib')
+check = libc.sandbox_check
+check.restype = ctypes.c_int
+check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+listpids = libc.proc_listallpids
+listpids.restype = ctypes.c_int
+listpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+granted, withheld = (os.fsencode(p) for p in sys.argv[1:3])
+FILTER_PATH = 1
+
+def reads(pid, p):
+    return check(pid, b'file-read-data', FILTER_PATH, ctypes.c_char_p(p))
+
+def ours(pid):
+    return check(pid, None, 0) == 1 and reads(pid, granted) == 0 and reads(pid, withheld) == 1
+
+def scan():
+    n = listpids(None, 0)
+    buf = (ctypes.c_int * (max(n, 0) + 1024))()
+    n = listpids(buf, ctypes.sizeof(buf))
+    me = os.getpid()
+    return {buf[i] for i in range(max(n, 0)) if buf[i] > 1 and buf[i] != me and ours(buf[i])}
+
+stopped = set()
+for _ in range(100):
+    found = scan() - stopped
+    if not found:
+        break
+    for pid in found:
+        try:
+            os.kill(pid, signal.SIGSTOP)
+            stopped.add(pid)
+        except OSError:
+            pass
+still = scan()
+for pid in stopped:
+    try:
+        os.kill(pid, signal.SIGKILL if pid in still else signal.SIGCONT)
+    except OSError:
+        pass
+print(' '.join(str(pid) for pid in sorted(stopped & still)))
+`;
+
+/**
+ * Kill whatever runs under this job's marker, however it got out of its
+ * step's process group. Returns false if the sweep could not run.
+ */
+function reapMarkedProcesses(marker: ProcessMarker): boolean {
+  try {
+    execFileSync('/usr/bin/python3', ['-I', '-S', '-c', REAP_SCRIPT, marker.granted, marker.withheld], {
+      env: { PATH: '/usr/bin:/bin' },
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 15000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Remember a step's process group, so reapStepProcesses can end it. */
 export function trackStepProcessGroup(proc: ChildProcess): void {
   const pid = proc.pid;
@@ -1171,10 +1274,17 @@ export function trackStepProcessGroup(proc: ChildProcess): void {
  * ends, as GitHub's runner cleans up orphans at the end of a job and not the
  * end of a step, so a server one step starts is still there for the next.
  *
- * A pid is never reused while it names a live process group, so while the
- * group has members its leader's pid addresses exactly them. Once the leader
- * has exited, a live process with that pid means the group emptied and the
- * pid was reused: that group is someone else's, and is left alone.
+ * First by process group. A pid is never reused while it names a live
+ * process group, so while the group has members its leader's pid addresses
+ * exactly them. Once the leader has exited, a live process with that pid
+ * means the group emptied and the pid was reused: that group is someone
+ * else's, and is left alone.
+ *
+ * Then by sandbox, since a process can leave its group with setsid() and
+ * outlive the job with its sandbox intact - able to write the workspace, and
+ * to hold a loopback port a later run's tests connect to. Its sandbox is the
+ * one thing it cannot leave, and every profile this job spawned carries its
+ * marker.
  */
 export function reapStepProcesses(): void {
   for (const [pgid, leaderExited] of stepProcessGroups) {
@@ -1193,6 +1303,16 @@ export function reapStepProcesses(): void {
     }
   }
   stepProcessGroups.clear();
+
+  if (jobMarker) {
+    const { dir, granted, withheld } = jobMarker;
+    if (!reapMarkedProcesses({ granted, withheld })) {
+      console.error('Warning: could not look for step processes that left their process group; some may still be running.');
+    }
+    // Removed either way; the next job makes its own.
+    jobMarker = undefined;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -1237,6 +1357,7 @@ async function runInSandbox(
           readOnlyPaths: options.readOnlyPaths,
           proxyPort: options.proxyPort,
           logFile: options.sandboxLogFile ?? '',
+          processMarker: stepProcessMarker(),
         });
       } else {
         // Enforcement mode: apply sandbox with policy restrictions
@@ -1247,6 +1368,7 @@ async function runInSandbox(
           policy: policy || {},  // Empty policy = no network allowlist
           permissive: false,
           logFile: options.sandboxLogFile,
+          processMarker: stepProcessMarker(),
         });
       }
 

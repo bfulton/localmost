@@ -1,5 +1,29 @@
-import { describe, it, expect } from '@jest/globals';
-import { buildWorkflowEnv, buildProxyEnv } from './test';
+import { describe, it, expect, jest } from '@jest/globals';
+import { buildWorkflowEnv, buildProxyEnv, installInterruptHandlers } from './test';
+
+describe('installInterruptHandlers', () => {
+  it('reaps the steps before exiting on Ctrl-C, a kill, or the terminal closing', () => {
+    // Steps run detached, so the terminal's signals no longer reach them; a
+    // closed terminal or dropped SSH session sends this process SIGHUP, whose
+    // default is to die without running any cleanup.
+    const exit = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    try {
+      for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]] as const) {
+        const reap = jest.fn();
+        const before = process.listenerCount(signal);
+        const remove = installInterruptHandlers(reap);
+        expect({ signal, added: process.listenerCount(signal) - before }).toEqual({ signal, added: 1 });
+        process.emit(signal, signal);
+        expect(reap).toHaveBeenCalledTimes(1);
+        expect(exit).toHaveBeenLastCalledWith(code);
+        remove();
+        expect(process.listenerCount(signal)).toBe(before);
+      }
+    } finally {
+      exit.mockRestore();
+    }
+  });
+});
 
 describe('buildProxyEnv', () => {
   it('sends traffic through the proxy but leaves loopback direct', () => {
