@@ -291,7 +291,8 @@ The application implements Electron security best practices:
   - `OnlyLoadAppFromAsar`: true
 - **ASAR Packaging**: Application code is packaged in ASAR archive
 - **Single Instance Lock**: Prevents multiple instances from running simultaneously
-- **External Link Handling**: External URLs open in system browser, not Electron
+- **Navigation**: The window may load only its own entry page. Any other navigation, including another `file://` page, is cancelled
+- **External Link Handling**: Only `https://github.com` links open, in the system browser; any other URL is refused rather than handed to the OS
 
 ## Content Security Policy
 
@@ -428,6 +429,14 @@ This approach simplifies workflows by:
 - All IPC communication uses named channels defined in `shared/types.ts`
 - Renderer can only invoke explicitly exposed methods via the preload script
 - No direct access to Node.js APIs from renderer process
+- IPC is answered only from the main window's top frame, showing the app's own page; a message from any other frame or web contents is refused
+- Every value the renderer sends is checked for shape before it is used. Target names must be GitHub names, and a target update may change only whether it is enabled
+- The renderer reads the app store but cannot write it: store actions it dispatches are ignored, and every change goes through a checked IPC handler
+- The settings the renderer reads never include the stored session or its refresh token
+
+### CLI Socket
+
+The `localmost` CLI talks to the app over a unix socket, mode `0600` inside a `0700` directory. There is no application token on top of that: any process running as the same user can connect and pause, resume, or add and remove targets. A job cannot reach the socket, because the sandbox denies it. Requests are capped in size and answered one at a time per connection, and the CLI writes its own files with umask `077`.
 
 ## Log Sanitization
 
