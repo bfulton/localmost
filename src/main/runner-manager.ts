@@ -1963,61 +1963,6 @@ export class RunnerManager {
     const instance = this.instances.get(instanceNum);
     if (!instance) return;
 
-    // Detect runner ready (listening for jobs)
-    if (line.includes('Listening for Jobs')) {
-      instance.status = 'listening';
-      this.updateAggregateStatus();
-      return;
-    }
-
-    // Detect fatal errors that require re-configuration
-    if (line.includes('runner registration has been deleted') ||
-        line.includes('please re-configure')) {
-      // Only trigger once per instance (fatalError flag prevents re-trigger)
-      if (!instance.fatalError) {
-        instance.status = 'error';
-        instance.fatalError = true;
-        // In proxy-only mode, workers use proxy credentials - the proxy registration was deleted
-        // Need to re-register the proxy for the target, not the individual worker
-        const targetContext = this.pendingTargetContext.get(String(instanceNum));
-        if (targetContext) {
-          this.log('error', `Runner ${instanceNum} fatal error - proxy registration for ${targetContext.targetDisplayName} was deleted, attempting re-registration`);
-        } else {
-          this.log('error', `Runner ${instanceNum} has a fatal error - registration deleted, attempting re-registration`);
-        }
-        this.updateAggregateStatus();
-
-        // Trigger re-registration asynchronously
-        if (this.onReregistrationNeeded) {
-          this.onReregistrationNeeded(instanceNum, 'registration_deleted').catch(err => {
-            this.log('error', `Re-registration failed for instance ${instanceNum}: ${(err as Error).message}`);
-          });
-        }
-      }
-      return;
-    }
-
-    // Detect session conflicts - broker proxy should handle this now
-    if (line.includes('session for this runner already exists')) {
-      // Only trigger once per instance (fatalError flag prevents re-trigger)
-      if (!instance.fatalError) {
-        instance.status = 'error';
-        instance.fatalError = true;
-        // In proxy-only mode, session conflicts should be handled by the broker proxy
-        this.log('warn', `Runner ${instanceNum} has session conflict - broker proxy should handle this`);
-        this.updateAggregateStatus();
-      }
-      return;
-    }
-
-    // Detect other connection errors (runner will retry)
-    if (line.includes('Runner connect error') ||
-        line.includes('Could not connect to the server')) {
-      instance.status = 'error';
-      this.updateAggregateStatus();
-      return;
-    }
-
     // Detect job start.
     //
     // Anchored, because this reads the job's own output: any text a job prints
@@ -2050,8 +1995,11 @@ export class RunnerManager {
       // a worker's.
       const targetContext = this.pendingTargetContext.get(String(instanceNum));
 
-      // Use target display name (owner/repo format) for repository if available
-      const repository = targetContext?.targetDisplayName || this.config?.url || 'unknown';
+      // The job's own owner/repo. An organization target's display name is
+      // the organization, and recording that left the history, the
+      // notification and Cancel - which splits this into owner and repo -
+      // with no repository to name.
+      const repository = (targetContext && this.policyRepository(targetContext)) || this.config?.url || 'unknown';
 
       // It got its job; the acquisition deadline no longer applies.
       this.disarmAcquireDeadline(instanceNum);
@@ -2100,6 +2048,69 @@ export class RunnerManager {
       });
       // A start line is nothing else, whatever its job name says.
       return;
+    }
+
+    // The runner's own status. None of it can come from a worker that has a
+    // job: the job's output reaches this parser too, and a job named or
+    // printing "Runner connect error" marked its live worker 'error' - the
+    // slot free for the next job - while one saying "please re-configure" had
+    // the target re-registered under it. A --once worker with a job has
+    // nothing more to say about its connection; it ends the job and exits.
+    // Each check is anchored, as the job start is, to the line the runner
+    // itself writes, behind its timestamp at most.
+    if (!instance.currentJob && instance.status !== 'busy') {
+      // Detect runner ready (listening for jobs)
+      if (/^\s*(?:\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?:?\s*)?Listening for Jobs\s*$/i.test(line)) {
+        instance.status = 'listening';
+        this.updateAggregateStatus();
+        return;
+      }
+
+      // Detect fatal errors that require re-configuration
+      if (/^\s*(?:\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?:?\s*)?(?:Failed to create a session\.\s*)?The runner registration has been deleted from the server, please re-configure\b/i.test(line)) {
+        // Only trigger once per instance (fatalError flag prevents re-trigger)
+        if (!instance.fatalError) {
+          instance.status = 'error';
+          instance.fatalError = true;
+          // In proxy-only mode, workers use proxy credentials - the proxy registration was deleted
+          // Need to re-register the proxy for the target, not the individual worker
+          const targetContext = this.pendingTargetContext.get(String(instanceNum));
+          if (targetContext) {
+            this.log('error', `Runner ${instanceNum} fatal error - proxy registration for ${targetContext.targetDisplayName} was deleted, attempting re-registration`);
+          } else {
+            this.log('error', `Runner ${instanceNum} has a fatal error - registration deleted, attempting re-registration`);
+          }
+          this.updateAggregateStatus();
+
+          // Trigger re-registration asynchronously
+          if (this.onReregistrationNeeded) {
+            this.onReregistrationNeeded(instanceNum, 'registration_deleted').catch(err => {
+              this.log('error', `Re-registration failed for instance ${instanceNum}: ${(err as Error).message}`);
+            });
+          }
+        }
+        return;
+      }
+
+      // Detect session conflicts - broker proxy should handle this now
+      if (/^\s*(?:\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?:?\s*)?(?:A|The) session for this runner already exists\b/i.test(line)) {
+        // Only trigger once per instance (fatalError flag prevents re-trigger)
+        if (!instance.fatalError) {
+          instance.status = 'error';
+          instance.fatalError = true;
+          // In proxy-only mode, session conflicts should be handled by the broker proxy
+          this.log('warn', `Runner ${instanceNum} has session conflict - broker proxy should handle this`);
+          this.updateAggregateStatus();
+        }
+        return;
+      }
+
+      // Detect other connection errors (runner will retry)
+      if (/^\s*(?:\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?:?\s*)?(?:Runner connect error:|Could not connect to the server\b)/i.test(line)) {
+        instance.status = 'error';
+        this.updateAggregateStatus();
+        return;
+      }
     }
 
     // Detect job completion. Anchored like the start: a step can print
