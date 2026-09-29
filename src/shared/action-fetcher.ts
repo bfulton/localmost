@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { getAppDataDirWithoutElectron } from './paths';
 import { resolveWithin } from './contained-path';
-import { isGitHubOwnerName, isGitHubRepoName } from './github-names';
+import { isGitHubLogin, isGitHubRepoName } from './github-names';
 
 // =============================================================================
 // Types
@@ -125,23 +125,42 @@ function getCacheKey(ref: ActionRef): string {
  *
  * The directory is removed before each fetch, and each part of it comes from
  * the workflow, so the reference is checked here as well as where it is
- * parsed, and the result must still be inside the cache. The version and
- * subpath are encoded rather than flattened, so two references never share
- * a directory: `releases/v1` and `releases_v1` once both became
- * `releases_v1`.
+ * parsed, and the result must still be inside the cache.
+ *
+ * Every reference gets one directory, `<owner>/<repo>/<version>` or
+ * `<owner>/<repo>/<version>@<subpath>`, and none lies inside another. The
+ * version and subpath are encoded rather than flattened, so `releases/v1`
+ * and `releases_v1` no longer both become `releases_v1`; and the subpath
+ * shares the version's name rather than being a directory under it, where
+ * o/r/x@v1 was o/r@v1's own `x` - replaced by fetching one, and followed
+ * wherever a link there led when serving the other. Encoding leaves no `@`
+ * in either part, so the name reads only one way.
  */
 function getActionDir(ref: ActionRef): string {
   if (!isActionRef(ref)) {
     throw new Error(`Not an action reference: ${JSON.stringify(ref)}`);
   }
-  const parts = [ref.owner, ref.repo, encodeURIComponent(ref.version)];
-  if (ref.path) {
-    parts.push(encodeURIComponent(ref.path));
-  }
+  const version = encodeURIComponent(ref.version);
+  const name = ref.path ? `${version}@${encodeURIComponent(ref.path)}` : version;
   const cacheDir = path.resolve(getActionsCacheDir());
-  const dir = path.resolve(cacheDir, ...parts);
+  const dir = path.resolve(cacheDir, ref.owner, ref.repo, name);
   if (!dir.startsWith(cacheDir + path.sep)) {
     throw new Error(`Action directory is outside the action cache: ${dir}`);
+  }
+  return dir;
+}
+
+/**
+ * The action's directory, once what is on disk there has been checked: a
+ * directory, not a link, whose real path is inside the cache's. Its path is
+ * worked out from the reference, but resolving the action inside it follows
+ * whatever is there, and the result is handed to steps to read.
+ */
+function heldActionDir(ref: ActionRef): string {
+  const dir = getActionDir(ref);
+  const cacheDir = fs.realpathSync(getActionsCacheDir());
+  if (!fs.lstatSync(dir).isDirectory() || !fs.realpathSync(dir).startsWith(cacheDir + path.sep)) {
+    throw new Error(`Action directory is not the action cache's own: ${dir}`);
   }
   return dir;
 }
@@ -161,7 +180,7 @@ function cachedEntry(ref: ActionRef, index = getCacheIndex()): CachedAction | nu
   const fetchedAt = Date.parse(cached.fetchedAt);
   if (!(fetchedAt <= Date.now())) return null;
   try {
-    return { ref, localPath: resolveActionPath(getActionDir(ref), ref.path), fetchedAt: cached.fetchedAt };
+    return { ref, localPath: resolveActionPath(heldActionDir(ref), ref.path), fetchedAt: cached.fetchedAt };
   } catch {
     return null;
   }
@@ -222,11 +241,13 @@ const isRefPath = (value: unknown): value is string =>
  * Whether a reference is one the cache may hold. Each part of it becomes a
  * directory under the cache that a fetch removes and replaces, so the owner
  * and repo must be names GitHub would accept, and the version and subpath
- * must hold no `..`. A version starting with `-` would read as an option.
+ * must hold no `..`. The owner is any login GitHub has issued, older
+ * accounts' included; none of those can be a dot segment or hold a `/`. A
+ * version starting with `-` would read as an option.
  */
 function isActionRef(ref: ActionRef): boolean {
   return (
-    isGitHubOwnerName(ref.owner) &&
+    isGitHubLogin(ref.owner) &&
     isGitHubRepoName(ref.repo) &&
     isRefPath(ref.version) &&
     !ref.version.startsWith('-') &&
@@ -290,12 +311,30 @@ function downloadAndExtract(url: string, destDir: string): Promise<void> {
     curl.stderr.on('data', (data: Buffer) => (curlError += data.toString()));
     tar.stderr.on('data', (data: Buffer) => (tarError += data.toString()));
 
-    tar.on('close', (code: number) => {
-      if (code === 0) {
-        resolve();
+    // Both have to succeed, so this waits for both. With -f, curl answers an
+    // error page by writing nothing and exiting non-zero, and tar extracts an
+    // empty stream without complaint: tar's word alone took a missing tag for
+    // an empty archive, so the branch was never tried, and would take a
+    // download cut off partway for a whole one.
+    let curlCode: number | null | undefined;
+    let tarCode: number | null | undefined;
+    const settle = () => {
+      if (curlCode === undefined || tarCode === undefined) return;
+      if (curlCode !== 0) {
+        reject(new Error(`Download failed: ${curlError || `curl exited with ${curlCode}`}`));
+      } else if (tarCode !== 0) {
+        reject(new Error(`Extraction failed: ${tarError}`));
       } else {
-        reject(new Error(`Extraction failed: ${tarError || curlError}`));
+        resolve();
       }
+    };
+    curl.on('close', (code: number | null) => {
+      curlCode = code;
+      settle();
+    });
+    tar.on('close', (code: number | null) => {
+      tarCode = code;
+      settle();
     });
 
     curl.on('error', (err: Error) => reject(err));
@@ -332,10 +371,9 @@ export async function fetchAction(ref: ActionRef): Promise<CachedAction> {
   // Fetch from GitHub
   const actionDir = getActionDir(ref);
 
-  // Clean existing if present
-  if (fs.existsSync(actionDir)) {
-    fs.rmSync(actionDir, { recursive: true, force: true });
-  }
+  // Clean existing if present - a dangling link included, which existsSync
+  // would call absent and extraction would then fail on.
+  fs.rmSync(actionDir, { recursive: true, force: true });
 
   // Download tarball. A commit's archive is served at archive/<sha>, not
   // under refs/; anything else is a tag or, failing that, a branch.
@@ -351,7 +389,7 @@ export async function fetchAction(ref: ActionRef): Promise<CachedAction> {
     }
   }
 
-  const localPath = resolveActionPath(actionDir, ref.path);
+  const localPath = resolveActionPath(heldActionDir(ref), ref.path);
 
   // Verify action.yml exists
   if (!fs.existsSync(path.join(localPath, 'action.yml')) &&

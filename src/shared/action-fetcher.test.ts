@@ -164,12 +164,21 @@ describe('resolveActionPath', () => {
 });
 
 /**
- * Stand-ins for curl and tar, recording how they were called. tar "extracts"
- * by running `extract` on its -C directory; without one it fails, as it does
- * when the download was not an archive.
+ * Stand-ins for curl and tar, recording how they were called, and behaving
+ * as the real ones do where the fetcher depends on it. curl exits with the
+ * code `curlExit` gives its URL: 22 is how -f answers an error page, having
+ * written nothing; any other failure, such as 56 for a connection lost
+ * partway, may have written part of the archive first. tar "extracts" by
+ * running `extract` on its -C directory when curl wrote something, and
+ * exits 0 either way - bsdtar extracts an empty stream without complaint.
+ * tar closes before curl, as it can when curl's output ends at its exit.
  */
-function fakeDownloads(extract?: (dest: string) => void): string[][] {
+function fakeDownloads(
+  extract?: (dest: string) => void,
+  curlExit: (url: string) => number = () => 0
+): string[][] {
   const calls: string[][] = [];
+  let wrote = false;
   spawnMock.mockImplementation(((command: string, args: string[]) => {
     calls.push([command, ...args]);
     const proc = Object.assign(new EventEmitter(), {
@@ -177,10 +186,19 @@ function fakeDownloads(extract?: (dest: string) => void): string[][] {
       stderr: new EventEmitter(),
       stdin: {},
     });
+    if (command === 'curl') {
+      const code = curlExit(args[args.length - 1]);
+      wrote = code !== 22;
+      setImmediate(() => setImmediate(() => {
+        if (code !== 0) proc.stderr.emit('data', Buffer.from(`curl: (${code}) failed`));
+        proc.emit('close', code);
+      }));
+    }
     if (command === 'tar') {
+      const received = wrote;
       setImmediate(() => {
-        if (extract) extract(args[args.indexOf('-C') + 1]);
-        proc.emit('close', extract ? 0 : 1);
+        if (extract && received) extract(args[args.indexOf('-C') + 1]);
+        proc.emit('close', 0);
       });
     }
     return proc;
@@ -243,6 +261,8 @@ describe('action references and the action cache', () => {
       version: 'releases/v1.2.0',
     });
     expect(parseActionRef(`owner/repo@${'a'.repeat(40)}`)).toMatchObject({ version: 'a'.repeat(40) });
+    // An older account's login can end in, or double, a hyphen.
+    expect(parseActionRef('old--login-/repo@v1')).toMatchObject({ owner: 'old--login-', repo: 'repo' });
   });
 
   it('never removes anything outside the cache, however the reference was built', async () => {
@@ -325,7 +345,7 @@ describe('action references and the action cache', () => {
   });
 
   it('tries a tag, then a branch, over HTTPS only and failing on an error page', async () => {
-    const calls = fakeDownloads();
+    const calls = fakeDownloads(undefined, () => 22);
     await expect(fetchAction({ owner: 'o', repo: 'r', version: 'releases/v1' })).rejects.toThrow();
     const curls = calls.filter(([command]) => command === 'curl');
     expect(curls.map((call) => call[call.length - 1])).toEqual([
@@ -336,6 +356,86 @@ describe('action references and the action cache', () => {
       // -f: an error page is not an archive; --proto: a redirect cannot
       // downgrade the fetch to plain HTTP.
       expect(call.slice(1, -1)).toEqual(['-sSfL', '--proto', '=https', '--proto-redir', '=https', '--']);
+    }
+  });
+
+  it('fetches an action pinned to a branch, once there is no such tag', async () => {
+    // With -f a missing tag is curl failing and tar extracting nothing,
+    // successfully: taken as a download, it left an empty directory and the
+    // branch was never tried, so `@main` could not run.
+    const calls = fakeDownloads(extractAction(), (url) => (url.includes('/refs/tags/') ? 22 : 0));
+    const fetched = await fetchAction({ owner: 'o', repo: 'r', version: 'main' });
+    expect(calls.filter(([command]) => command === 'curl').map((call) => call[call.length - 1])).toEqual([
+      'https://github.com/o/r/archive/refs/tags/main.tar.gz',
+      'https://github.com/o/r/archive/refs/heads/main.tar.gz',
+    ]);
+    expect(fs.existsSync(path.join(fetched.localPath, 'action.yml'))).toBe(true);
+  });
+
+  it('does not take a download curl gave up on for a whole one', async () => {
+    // tar succeeds on whatever part of the archive arrived.
+    const ref = { owner: 'o', repo: 'r', version: 'a'.repeat(40) };
+    fakeDownloads(extractAction(), () => 56);
+    await expect(fetchAction(ref)).rejects.toThrow(/curl: \(56\)/);
+    expect(getCachedAction(ref)).toBeNull();
+  });
+
+  it('keeps an action in a subdirectory apart from its repository\'s own tree', async () => {
+    // o/r/x@v1 once lived at o/r/v1/x, which is also where o/r@v1's own `x`
+    // is extracted. A repository shipping `x` as a link out of the cache
+    // then had o/r/x@v1 served from wherever it led, and fetching o/r/x@v1
+    // replaced part of o/r@v1.
+    const outside = path.join(configDir, 'outside');
+    fs.mkdirSync(path.join(outside, 'x'), { recursive: true });
+    fs.writeFileSync(path.join(outside, 'x', 'action.yml'), 'name: planted\n');
+    fakeDownloads((dest) => {
+      extractAction()(dest);
+      fs.symlinkSync(outside, path.join(dest, 'x'));
+    });
+    const repo = { owner: 'o', repo: 'r', version: 'v1' };
+    const fetched = await fetchAction(repo);
+    const sub = { ...repo, path: 'x' };
+    const index = JSON.parse(fs.readFileSync(indexPath(), 'utf-8'));
+    index['o/r@v1/x'] = { ref: sub, fetchedAt: new Date().toISOString() };
+    fs.writeFileSync(indexPath(), JSON.stringify(index));
+    expect(getCachedAction(sub)).toBeNull();
+
+    fakeDownloads(extractAction('x'));
+    const fetchedSub = await fetchAction(sub);
+    expect(fetchedSub.localPath.startsWith(fs.realpathSync(getActionsCacheDir()) + path.sep)).toBe(true);
+    expect(getCachedAction(repo)?.localPath).toBe(fetched.localPath);
+    expect(fs.lstatSync(path.join(fetched.localPath, 'x')).isSymbolicLink()).toBe(true);
+  });
+
+  it('serves nothing from an action directory that is not the cache\'s own', async () => {
+    // Its path is worked out from the reference; what is on disk there is
+    // not, and a link in its place would lead the action out of the cache.
+    const outside = path.join(configDir, 'outside');
+    fs.mkdirSync(path.join(outside, 'x'), { recursive: true });
+    fs.writeFileSync(path.join(outside, 'action.yml'), 'name: planted\n');
+    fs.writeFileSync(path.join(outside, 'x', 'action.yml'), 'name: planted\n');
+    for (const ref of [
+      { owner: 'o', repo: 'r', version: 'v1' },
+      { owner: 'o', repo: 'r', version: 'v1', path: 'x' },
+    ]) {
+      fakeDownloads(extractAction(ref.path));
+      const fetched = await fetchAction(ref);
+      const dir = ref.path ? path.dirname(fetched.localPath) : fetched.localPath;
+      fs.rmSync(dir, { recursive: true });
+      fs.symlinkSync(outside, dir);
+      expect({ ref, cached: getCachedAction(ref) }).toEqual({ ref, cached: null });
+      expect(listCachedActions()).toEqual([]);
+
+      // Nor from one that became a link while it was being extracted into.
+      fs.rmSync(dir);
+      fs.writeFileSync(indexPath(), '{}');
+      fakeDownloads((dest) => {
+        fs.rmSync(dest, { recursive: true });
+        fs.symlinkSync(outside, dest);
+      });
+      const outcome = await fetchAction(ref).then(() => 'served', () => 'refused');
+      expect({ ref, outcome }).toEqual({ ref, outcome: 'refused' });
+      fs.rmSync(dir);
     }
   });
 
