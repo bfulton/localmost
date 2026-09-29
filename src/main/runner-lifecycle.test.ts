@@ -30,7 +30,8 @@ jest.mock('./runner-proxy-manager', () => ({
   }),
 }));
 
-import { clearStaleRunnerRegistrations } from './runner-lifecycle';
+import { getGitHubAuth, getRunnerDownloader, getRunnerManager } from './app-state';
+import { clearStaleRunnerRegistrations, reRegisterSingleInstance } from './runner-lifecycle';
 
 const target = (id: string, enabled: boolean): Target => ({
   id,
@@ -70,5 +71,43 @@ describe('clearStaleRunnerRegistrations', () => {
     await clearStaleRunnerRegistrations();
 
     expect(mockReplaceExposedKeys).not.toHaveBeenCalled();
+  });
+});
+
+describe('reRegisterSingleInstance', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetValidAccessToken.mockResolvedValue('user-token');
+  });
+
+  it('re-registers the slot without starting a worker in it that no job was spawned for', async () => {
+    // Only the worker spawned for a job may take it. One started here has no
+    // job, never gets one, and held the slot - and with one runner, every
+    // job - until the app restarted. The next job's spawn starts the slot.
+    mockLoadConfig.mockReturnValue({
+      runnerConfig: { runnerName: 'host', labels: 'self-hosted' },
+      targets: [target('a', true)],
+    });
+    const getRunnerRegistrationToken = jest.fn<() => Promise<string>>().mockResolvedValue('reg-token');
+    jest.mocked(getGitHubAuth).mockReturnValue({ getRunnerRegistrationToken } as never);
+    const downloader = {
+      clearConfig: jest.fn<() => Promise<void>>().mockResolvedValue(undefined),
+      configureInstance: jest.fn<() => Promise<void>>().mockResolvedValue(undefined),
+      getInstalledVersion: jest.fn(() => '2.330.0'),
+    };
+    jest.mocked(getRunnerDownloader).mockReturnValue(downloader as never);
+    const manager = {
+      stopInstance: jest.fn<() => Promise<void>>().mockResolvedValue(undefined),
+      startInstance: jest.fn<() => Promise<void>>().mockResolvedValue(undefined),
+    };
+    jest.mocked(getRunnerManager).mockReturnValue(manager as never);
+
+    await reRegisterSingleInstance(1, 'registration_deleted');
+
+    expect(manager.stopInstance).toHaveBeenCalledWith(1);
+    expect(downloader.configureInstance).toHaveBeenCalledWith(1, '2.330.0', expect.objectContaining({
+      url: 'https://github.com/owner/a', token: 'reg-token', name: 'host.1',
+    }));
+    expect(manager.startInstance).not.toHaveBeenCalled();
   });
 });

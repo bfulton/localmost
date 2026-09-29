@@ -41,6 +41,17 @@ const DOCKER_SOCKET_NAME = 'docker.sock';
  */
 const MAX_OUTPUT_LINE = 64 * 1024;
 
+/** The name recorded for a job whose start line was over MAX_OUTPUT_LINE. */
+const OVERLONG_JOB_NAME = '(job name too long to read)';
+
+/** A job's history status from the conclusion GitHub gave it. */
+function statusForConclusion(conclusion: string): JobStatus {
+  if (conclusion === 'success') return 'completed';
+  if (conclusion === 'failure') return 'failed';
+  // 'cancelled', and the others (skipped, etc.)
+  return 'cancelled';
+}
+
 /**
  * Split a worker's output stream into whole lines.
  *
@@ -1144,7 +1155,8 @@ export class RunnerManager {
   }
 
   /**
-   * Start a single runner instance. Used for initial start and re-registration.
+   * Start a slot's worker, for the job spawnWorkerForJob placed in the slot.
+   * Every worker it starts gets the acquisition deadline.
    */
   async startInstance(instanceNum: number): Promise<void> {
     // Prevent concurrent sandbox builds for the same instance
@@ -1525,19 +1537,27 @@ export class RunnerManager {
         }
       }
 
-      // One reader per stream: a line is only ever continued on its own stream.
-      const skipped = (stream: string) => () =>
-        this.logInstanceOutput(instanceNum, 'debug', `(${stream}: skipped a line over ${MAX_OUTPUT_LINE} characters)`);
       // Parsed only while this is the slot's worker. A pipe's last data and
       // its end can come after the exit, when a new spawn may hold the slot;
       // parseRunnerOutput reads the slot, and a dead worker's line read there
       // could start a job on the new one. Still logged.
       const worker = instance.process;
       const isCurrent = () => this.instances.get(instanceNum) === instance && instance.process === worker;
+      // One reader per stream: a line is only ever continued on its own stream.
+      const skipped = (stream: string) => () =>
+        this.logInstanceOutput(instanceNum, 'debug', `(${stream}: skipped a line over ${MAX_OUTPUT_LINE} characters)`);
       const stdout = lineReader((line) => {
         if (isCurrent()) this.parseRunnerOutput(instanceNum, line);
         this.logInstanceOutput(instanceNum, 'debug', line);
-      }, skipped('stdout'));
+      }, () => {
+        // The runner never writes a line this long, so one skipped on stdout -
+        // where it writes a job's start - before the worker has its job is
+        // that job's start, with a name too long to read. Taken as anything
+        // else, the start went unread and the next line - the tail of the
+        // name, after a \n in it - was read as the runner's status.
+        if (isCurrent() && !instance.tookJob) this.recordJobStart(instanceNum, OVERLONG_JOB_NAME);
+        skipped('stdout')();
+      });
       instance.process.stdout?.on('data', (data: Buffer) => stdout.write(data));
       instance.process.stdout?.on('end', () => stdout.end());
 
@@ -1587,6 +1607,18 @@ export class RunnerManager {
           // worker, reparented, burning CPU; the group sweep in process-group
           // probes and signals the group, not just the leader.
           this.sweepWorkerGroup(instanceNum, workerPid);
+          // A job still current here is one whose completion line went unread
+          // - split by a \n in its name, skipped as too long, or never written
+          // by a worker that died mid-job. It is over all the same; left
+          // open, its history read 'running', with Cancel offered, until the
+          // app next started.
+          if (instance.currentJob) {
+            const job = instance.currentJob;
+            this.logSandboxSummary(instanceNum, job.name);
+            this.closeJobOnExit(instanceNum, job, code, signal).catch((err) => {
+              this.log('debug', `Closing job ${job.id} on exit failed: ${(err as Error).message}`);
+            });
+          }
           this.finalizeInstance(instanceNum);
           if (this.acquireDeadlines.has(instanceNum)) {
             this.abandonJobFor(instanceNum);
@@ -1646,11 +1678,10 @@ export class RunnerManager {
       this.instances.set(instanceNum, instance);
       // Spawned for a specific job: if the broker never routes that job here,
       // this worker will long-poll forever and hold its slot. Give it a
-      // deadline. A worker with no pending target was not spawned for a job
-      // and is not subject to one.
-      if (this.pendingTargetContext.has(String(instanceNum))) {
-        this.armAcquireDeadline(instanceNum);
-      }
+      // deadline. One started with no pending target gets one too: only the
+      // worker spawned for a job may take it, so that one never gets a job,
+      // and without a deadline it held the slot until the app restarted.
+      this.armAcquireDeadline(instanceNum);
       // Successfully started - clear the starting flag
       this.startingInstances.delete(instanceNum);
     } catch (error) {
@@ -1864,7 +1895,7 @@ export class RunnerManager {
    * This is the same death spiral releaseInstanceSlot() addresses for workers
    * that finish a job, reached by the path where no job ever starts.
    */
-  /** Start the acquisition deadline for a worker spawned for a specific job. */
+  /** Start the acquisition deadline for a worker that has not taken a job. */
   private armAcquireDeadline(instanceNum: number): void {
     this.disarmAcquireDeadline(instanceNum);
     const timer = setTimeout(() => {
@@ -2185,6 +2216,126 @@ export class RunnerManager {
     return count;
   }
 
+  /**
+   * Record the job a worker has started, from its start line. Once per
+   * worker: a worker runs with --once, so a second start is the job's output.
+   */
+  private recordJobStart(instanceNum: number, jobName: string): void {
+    const instance = this.instances.get(instanceNum);
+    if (!instance) return;
+
+    // A worker runs with --once: one spawn is exactly one job. So a start on
+    // a worker that has taken its job - even one whose completion has been
+    // read - is never a second job; it is the job's output echoing
+    // something that looks like one.
+    if (instance.tookJob || instance.status === 'busy' || instance.currentJob) {
+      this.log(
+        'debug',
+        `[instance ${instanceNum}] Ignoring job start while already running ${instance.currentJob?.name ?? 'a job'}: ${jobName}`
+      );
+      return;
+    }
+
+    instance.status = 'busy';
+    instance.tookJob = true;
+
+    // The job's context is the one spawnWorkerForJob stored under this slot's
+    // number before the worker started: only a worker spawned and announced
+    // for a job can take one, so its own slot is the only place to look.
+    // It stays there, since the policy and the filter backstop read it from
+    // there too. 'next' is admission's hand-off to spawnWorkerForJob, never
+    // a worker's.
+    const targetContext = this.pendingTargetContext.get(String(instanceNum));
+
+    // The job's own owner/repo. An organization target's display name is
+    // the organization, and recording that left the history, the
+    // notification and Cancel - which splits this into owner and repo -
+    // with no repository to name.
+    const repository = (targetContext && this.policyRepository(targetContext)) || this.config?.url || 'unknown';
+
+    // It got its job; the acquisition deadline no longer applies.
+    this.disarmAcquireDeadline(instanceNum);
+
+    instance.currentJob = {
+      name: jobName,
+      repository,
+      startedAt: new Date().toISOString(),
+      id: `job-${++this.jobIdCounter}`,
+      targetId: targetContext?.targetId,
+      targetDisplayName: targetContext?.targetDisplayName,
+      actionsUrl: targetContext?.actionsUrl,
+      githubRunId: targetContext?.githubRunId,
+      githubJobId: targetContext?.githubJobId,
+      githubActor: targetContext?.githubActor,
+      githubSha: targetContext?.githubSha,
+      githubRef: targetContext?.githubRef,
+      githubWorkflow: targetContext?.githubWorkflow,
+    };
+
+    this.log('debug', `[instance ${instanceNum}] Job started: ${jobName} (id: ${instance.currentJob.id})${targetContext ? ` from ${targetContext.targetDisplayName}` : ''}${instance.currentJob.actionsUrl ? ` url=${instance.currentJob.actionsUrl}` : ''}`);
+
+    this.addJobToHistory({
+      id: instance.currentJob.id,
+      jobName: jobName,
+      repository: instance.currentJob.repository,
+      status: 'running',
+      startedAt: instance.currentJob.startedAt,
+      runnerName: instance.name,
+      actionsUrl: instance.currentJob.actionsUrl,
+      githubRunId: instance.currentJob.githubRunId,
+      targetId: instance.currentJob.targetId,
+      targetDisplayName: instance.currentJob.targetDisplayName,
+    });
+
+    this.updateAggregateStatus();
+
+    // Check user filter asynchronously (don't block runner output processing)
+    this.checkJobUserFilter(instanceNum, instance.name).catch((err) => {
+      this.log('debug', `User filter check failed: ${(err as Error).message}`);
+    });
+
+    // Apply the repository's own network policy to this instance's proxy
+    this.applyRepoPolicy(instanceNum).catch((err) => {
+      this.log('debug', `Repo policy load failed: ${(err as Error).message}`);
+    });
+  }
+
+  /**
+   * Close the history entry of a job whose worker exited before its
+   * completion line was read. GitHub's conclusion when it has one, as for a
+   * completion line; otherwise what the exit says - a signal or a stop is a
+   * cancel, a clean exit a completed job, any other a failed one.
+   */
+  private async closeJobOnExit(
+    instanceNum: number,
+    job: NonNullable<RunnerInstance['currentJob']>,
+    code: number | null,
+    signal: NodeJS.Signals | null
+  ): Promise<void> {
+    let status: JobStatus = signal !== null || this.stopping ? 'cancelled' : code === 0 ? 'completed' : 'failed';
+    const [owner, repo] = job.repository.split('/');
+    if (this.getJobConclusion && job.githubJobId && owner && repo) {
+      try {
+        const conclusion = await this.getJobConclusion(owner, repo, job.githubJobId);
+        if (conclusion !== null) status = statusForConclusion(conclusion);
+      } catch {
+        // Fall back to what the exit says.
+      }
+    }
+    this.log('info', `[instance ${instanceNum}] Job ${job.name} ended with its worker's exit, its completion unread → status=${status}`);
+
+    // The filter backstop may have closed it while the conclusion was looked
+    // up: it stopped the job, and its record of that stands.
+    const entry = this.jobHistory.find((j) => j.id === job.id);
+    if (!entry || entry.status !== 'running') return;
+    const completedAt = new Date().toISOString();
+    this.updateJobInHistory(job.id, {
+      status,
+      completedAt,
+      runTimeSeconds: Math.round((Date.parse(completedAt) - Date.parse(job.startedAt)) / 1000),
+    });
+  }
+
   private async parseRunnerOutput(instanceNum: number, line: string): Promise<void> {
     const instance = this.instances.get(instanceNum);
     if (!instance) return;
@@ -2196,84 +2347,15 @@ export class RunnerManager {
     // file - and an unanchored match turned that into a phantom job, complete
     // with history entry, notification, and a worker marked busy. The runner
     // emits this at the start of a line, optionally behind its own timestamp.
-    const jobStartMatch = line.match(/^\s*(?:\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?:?\s*)?Running job:\s*(.+?)\s*$/i);
+    //
+    // The name is the workflow's to spell, and only \n ends a line here, so
+    // the name matches any character (the s flag): without it a CR, U+2028 or
+    // U+2029 in the name failed the match, the start went unread, and the
+    // runner-shaped line the name carried next was read as the runner's own
+    // status.
+    const jobStartMatch = line.match(/^\s*(?:\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?:?\s*)?Running job:\s*(.+?)\s*$/is);
     if (jobStartMatch) {
-      const jobName = jobStartMatch[1].trim();
-
-      // A worker runs with --once: one spawn is exactly one job. So a start on
-      // a worker that has taken its job - even one whose completion has been
-      // read - is never a second job; it is the job's output echoing
-      // something that looks like one.
-      if (instance.tookJob || instance.status === 'busy' || instance.currentJob) {
-        this.log(
-          'debug',
-          `[instance ${instanceNum}] Ignoring job start while already running ${instance.currentJob?.name ?? 'a job'}: ${jobName}`
-        );
-        return;
-      }
-
-      instance.status = 'busy';
-      instance.tookJob = true;
-
-      // The job's context is the one spawnWorkerForJob stored under this slot's
-      // number before the worker started: only a worker spawned and announced
-      // for a job can take one, so its own slot is the only place to look.
-      // It stays there, since the policy and the filter backstop read it from
-      // there too. 'next' is admission's hand-off to spawnWorkerForJob, never
-      // a worker's.
-      const targetContext = this.pendingTargetContext.get(String(instanceNum));
-
-      // The job's own owner/repo. An organization target's display name is
-      // the organization, and recording that left the history, the
-      // notification and Cancel - which splits this into owner and repo -
-      // with no repository to name.
-      const repository = (targetContext && this.policyRepository(targetContext)) || this.config?.url || 'unknown';
-
-      // It got its job; the acquisition deadline no longer applies.
-      this.disarmAcquireDeadline(instanceNum);
-
-      instance.currentJob = {
-        name: jobName,
-        repository,
-        startedAt: new Date().toISOString(),
-        id: `job-${++this.jobIdCounter}`,
-        targetId: targetContext?.targetId,
-        targetDisplayName: targetContext?.targetDisplayName,
-        actionsUrl: targetContext?.actionsUrl,
-        githubRunId: targetContext?.githubRunId,
-        githubJobId: targetContext?.githubJobId,
-        githubActor: targetContext?.githubActor,
-        githubSha: targetContext?.githubSha,
-        githubRef: targetContext?.githubRef,
-        githubWorkflow: targetContext?.githubWorkflow,
-      };
-
-      this.log('debug', `[instance ${instanceNum}] Job started: ${jobName} (id: ${instance.currentJob.id})${targetContext ? ` from ${targetContext.targetDisplayName}` : ''}${instance.currentJob.actionsUrl ? ` url=${instance.currentJob.actionsUrl}` : ''}`);
-
-      this.addJobToHistory({
-        id: instance.currentJob.id,
-        jobName: jobName,
-        repository: instance.currentJob.repository,
-        status: 'running',
-        startedAt: instance.currentJob.startedAt,
-        runnerName: instance.name,
-        actionsUrl: instance.currentJob.actionsUrl,
-        githubRunId: instance.currentJob.githubRunId,
-        targetId: instance.currentJob.targetId,
-        targetDisplayName: instance.currentJob.targetDisplayName,
-      });
-
-      this.updateAggregateStatus();
-
-      // Check user filter asynchronously (don't block runner output processing)
-      this.checkJobUserFilter(instanceNum, instance.name).catch((err) => {
-        this.log('debug', `User filter check failed: ${(err as Error).message}`);
-      });
-
-      // Apply the repository's own network policy to this instance's proxy
-      this.applyRepoPolicy(instanceNum).catch((err) => {
-        this.log('debug', `Repo policy load failed: ${(err as Error).message}`);
-      });
+      this.recordJobStart(instanceNum, jobStartMatch[1].trim());
       // A start line is nothing else, whatever its job name says.
       return;
     }
@@ -2350,9 +2432,10 @@ export class RunnerManager {
     // Detect job completion. Anchored like the start: a step can print
     // "Job x completed with result: Succeeded" anywhere in its output, and
     // an unanchored match ended the job there - its worker shown idle and
-    // its history closed while its steps were still running.
+    // its history closed while its steps were still running. Its name matches
+    // any character, as the start's does.
     const jobCompleteMatch = line.match(
-      /^\s*(?:\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?:?\s*)?Job\s+(.+)\s+completed with result:\s*(\w+)\s*$/i
+      /^\s*(?:\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?:?\s*)?Job\s+(.+)\s+completed with result:\s*(\w+)\s*$/is
     );
     if (jobCompleteMatch && instance.currentJob) {
       // Claim the job synchronously. The conclusion lookup below awaits, and
@@ -2381,22 +2464,13 @@ export class RunnerManager {
         if (owner && repo) {
           try {
             const conclusion = await this.getJobConclusion(owner, repo, githubJobId);
-            if (conclusion === 'success') {
-              status = 'completed';
-            } else if (conclusion === 'failure') {
-              status = 'failed';
-            } else if (conclusion === 'cancelled') {
-              status = 'cancelled';
-            } else if (conclusion === null) {
+            if (conclusion === null) {
               // Conclusion not yet set - use runner-reported result
               const result = jobCompleteMatch[2].toLowerCase();
               status = result === 'succeeded' ? 'completed' : result === 'failed' ? 'failed' : 'cancelled';
               this.log('info', `[instance ${instanceNum}] Job completed: ${jobName} conclusion=null, using runner result=${result} → status=${status}`);
             } else {
-              // Other conclusions (skipped, etc.) - treat as cancelled
-              status = 'cancelled';
-            }
-            if (conclusion !== null) {
+              status = statusForConclusion(conclusion);
               this.log('info', `[instance ${instanceNum}] Job completed: ${jobName} conclusion=${conclusion} → status=${status}`);
             }
           } catch {
