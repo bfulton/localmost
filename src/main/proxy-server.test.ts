@@ -383,6 +383,18 @@ describe('ProxyServer host access', () => {
       expect(checkHost(proxy, 'café.example').allowed).toBe(false);
     });
 
+    it('is not escaped by a non-ASCII full stop or another spelling of an IPv6 address', () => {
+      // The IDNA mapping turns U+3002 and U+FF0E into an ASCII dot, so
+      // 'bad.example.com\u3002' is bad.example.com with a trailing dot; the
+      // resolver dials it as such.
+      const proxy = denying('permissive', ['bad.example.com', '*.evil.test', '2001:db8::1', '[2001:DB8::2]']);
+      expect(checkHost(proxy, 'bad.example.com\u3002').allowed).toBe(false);
+      expect(checkHost(proxy, 'x.evil.test\uff0e').allowed).toBe(false);
+      expect(checkHost(proxy, '2001:0db8:0::1').allowed).toBe(false);
+      expect(checkHost(proxy, '2001:db8:0:0:0:0:0:2').allowed).toBe(false);
+      expect(checkHost(proxy, '2001:db8::3').allowed).toBe(true);
+    });
+
     it('replaces the previous job\'s denied hosts rather than accumulating', () => {
       const proxy = denying('permissive', ['a.example.com']);
       proxy.setPolicyDeniedHosts(['b.example.com']);
@@ -400,6 +412,25 @@ describe('ProxyServer host access', () => {
         const status = await new Promise<string>((resolve) => {
           const sock = net.connect(p.getPort(), '127.0.0.1', () =>
             sock.write(`CONNECT d1.cloudfront.net:443 HTTP/1.1\r\nHost: d1.cloudfront.net:443\r\nProxy-Authorization: ${authHeader('t')}\r\n\r\n`)
+          );
+          sock.on('error', () => resolve('closed'));
+          sock.once('data', (d) => { resolve(d.toString().split('\r\n')[0]); sock.destroy(); });
+          setTimeout(() => { resolve('timeout'); sock.destroy(); }, 1000).unref();
+        });
+        expect(status).toBe('HTTP/1.1 403 Forbidden');
+      } finally { await p.stop(); }
+    });
+
+    it('answers 403 to a CONNECT that writes a denied IPv6 address the long way', async () => {
+      // A CONNECT target is not a URL, so nothing on the way in compresses
+      // the address; before, [2001:0db8:0::1] went through and was dialled.
+      const p = new ProxyServer({ policyLevel: 'permissive', authToken: 't', lookup: () => new Promise<string[]>(() => undefined) });
+      p.setPolicyDeniedHosts(['2001:db8::1']);
+      await p.start();
+      try {
+        const status = await new Promise<string>((resolve) => {
+          const sock = net.connect(p.getPort(), '127.0.0.1', () =>
+            sock.write(`CONNECT [2001:0db8:0::1]:443 HTTP/1.1\r\nProxy-Authorization: ${authHeader('t')}\r\n\r\n`)
           );
           sock.on('error', () => resolve('closed'));
           sock.once('data', (d) => { resolve(d.toString().split('\r\n')[0]); sock.destroy(); });
@@ -871,7 +902,13 @@ describe('CONNECT targets', () => {
   it.each([
     ['[::1]:443', { host: '::1', port: 443 }],
     ['[2606:4700:4700::1111]:443', { host: '2606:4700:4700::1111', port: 443 }],
-    ['[::ffff:127.0.0.1]:443', { host: '::ffff:127.0.0.1', port: 443 }],
+    ['[::ffff:127.0.0.1]:443', { host: '::ffff:7f00:1', port: 443 }],
+    // One spelling for every check and for the dial: an IPv6 literal
+    // compressed, a name lowercased and in its ASCII form, with an IDNA full
+    // stop mapped to the '.' the resolver reads it as.
+    ['[2001:0DB8:0::1]:443', { host: '2001:db8::1', port: 443 }],
+    ['Bad.Example.com\u3002:443', { host: 'bad.example.com.', port: 443 }],
+    ['caf\u00e9.example:443', { host: 'xn--caf-dma.example', port: 443 }],
     ['api.github.com:80', { host: 'api.github.com', port: 80 }],
     ['127.0.0.1:8787', { host: '127.0.0.1', port: 8787 }],
     ['api.github.com', { host: 'api.github.com', port: 443 }],
@@ -882,6 +919,7 @@ describe('CONNECT targets', () => {
   it.each([
     '::1:443', 'host:443:extra', 'host:', ':443', '[1.2.3.4]:443', '[host]:443',
     'api.github.com:99999', 'api.github.com:-1', 'api.github.com:0', 'api.github.com:443@10.0.0.1:80', 'a/b:443', '',
+    'a%zz.example:443', 'a\uff1a8080:443', 'xn--i\u00f1valid.example:443', '[fe80::1%en0]:443',
   ])('refuses %s', (target) => {
     expect(parseConnectTarget(target)).toBeNull();
   });

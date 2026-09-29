@@ -9,10 +9,11 @@
 
 import * as http from 'http';
 import * as net from 'net';
-import { URL, domainToASCII } from 'url';
+import { URL } from 'url';
 import { SandboxPolicyLevel } from '../shared/types';
 import {
   HostLookup,
+  canonicalHost,
   dnsLookup,
   hostPatternMatches,
   isBlockedAddress,
@@ -94,15 +95,16 @@ export { MODERATE_NETWORK_ALLOWLIST } from '../shared/network-allowlist';
 export { parseConnectTarget } from '../shared/egress-screen';
 
 /**
- * A name as a deny entry compares it: lowercased, without trailing dots, and
- * in its ASCII (punycode) form. Each is another way to write the same host,
- * and a denied host must not be reachable by writing it differently. Allow
- * entries are not compared this way - a spelling the allowlist does not name
- * is refused, which is the safe side for an allow.
+ * A name as a deny entry compares it: in canonicalHost's spelling, without
+ * trailing dots. Each is another way to write the same host, and a denied
+ * host must not be reachable by writing it differently. The dots come off
+ * after the mapping, since the mapping is what turns an IDNA full stop into
+ * one. Allow entries are not compared this way - a spelling the allowlist
+ * does not name is refused, which is the safe side for an allow.
  */
 function denyForm(name: string): string {
-  const trimmed = name.toLowerCase().replace(/\.+$/, '');
-  return domainToASCII(trimmed) || trimmed;
+  const lower = name.toLowerCase();
+  return (canonicalHost(lower) ?? lower).replace(/\.+$/, '');
 }
 
 export class ProxyServer {

@@ -10,6 +10,7 @@ import * as crypto from 'crypto';
 import * as dns from 'dns';
 import * as http from 'http';
 import * as net from 'net';
+import { URL, domainToASCII } from 'url';
 
 /** Resolve a host to its addresses. */
 export type HostLookup = (host: string) => Promise<string[]>;
@@ -45,6 +46,26 @@ export function isProxyAuthorized(header: string | string[] | undefined, token: 
 }
 
 /**
+ * A host in the one spelling the checks compare and the dial uses, or null
+ * when it cannot be read as a host. An IPv6 literal is compressed and
+ * lowercased. Anything else goes through the WHATWG host mapping a URL's
+ * host gets: lowercased, in ASCII (punycode) form, with the IDNA full stops
+ * (U+3002, U+FF0E, U+FF61) as '.' and a numeric IPv4 shorthand written out.
+ * That is how the resolver reads the name too, so a spelling it treats as
+ * the same host cannot be a different host to the policy.
+ */
+export function canonicalHost(host: string): string | null {
+  if (net.isIP(host) === 6) {
+    try {
+      return new URL(`http://[${host}]`).hostname.slice(1, -1);
+    } catch {
+      return null; // a zone id, which only link-local addresses carry
+    }
+  }
+  return domainToASCII(host) || null;
+}
+
+/**
  * Parse a CONNECT request-target: authority-form host[:port] (RFC 9112
  * s3.2.3) - a bracketed IPv6 literal or a colon-free name/IPv4 literal. A
  * bare IPv6, userinfo, a path, an empty or out-of-range port are refused
@@ -52,13 +73,19 @@ export function isProxyAuthorized(header: string | string[] | undefined, token: 
  * dialled. Brackets come off here: net.isIP, the address screen and
  * net.connect all take the bare literal. (Not new URL('http://' + target):
  * that drops port 80 as the scheme default and accepts userinfo.)
+ *
+ * The host comes back in canonicalHost's spelling. A plain request's host
+ * arrives that way already, having been read as a URL; a CONNECT target did
+ * not, so a denied host written another way got past a deny that compared
+ * spellings.
  */
 const CONNECT_TARGET = /^(?:\[([0-9a-fA-F:.%a-zA-Z0-9]+)\]|([^[\]:/?#@\s]+))(?::(\d{1,5}))?$/;
 export function parseConnectTarget(target: string): { host: string; port: number } | null {
   const m = CONNECT_TARGET.exec(target);
   if (!m) return null;
-  const host = m[1] ?? m[2];
-  if (m[1] !== undefined && net.isIP(host) !== 6) return null; // brackets hold only an IPv6 literal
+  if (m[1] !== undefined && net.isIP(m[1]) !== 6) return null; // brackets hold only an IPv6 literal
+  const host = canonicalHost(m[1] ?? m[2]);
+  if (host === null) return null;
   const port = m[3] === undefined ? 443 : Number(m[3]);
   if (port < 1 || port > 65535) return null;
   return { host, port };
