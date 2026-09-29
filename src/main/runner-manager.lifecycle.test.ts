@@ -271,7 +271,43 @@ describe("reading the runner's status from its output", () => {
     expect(manager.hasAvailableSlot()).toBe(false);
   });
 
+  it('a job that prints a completion line and then a status line keeps its slot and its registration', async () => {
+    // A job that can put a runner-shaped line here can put the completion
+    // first. The worker is --once: having taken its job it is that job's
+    // until it exits, whatever the job says about its end.
+    const cases: Array<[string, Partial<ConstructorParameters<typeof RunnerManager>[0]>]> = [
+      ['no conclusion lookup', {}],
+      ['a conclusion lookup that has none yet', { getJobConclusion: jest.fn(async () => null) }],
+    ];
+    for (const [label, overrides] of cases) {
+      const { manager, helper, events, onReregistrationNeeded } = listening(overrides);
+      helper.setPendingTargetContext('1', {
+        targetId: 't', targetDisplayName: 'owner/repo', githubRepo: 'owner/repo', githubJobId: 7,
+      });
+      await helper.parseRunnerOutput(1, '2026-09-29 12:00:00Z: Running job: build');
+      await helper.parseRunnerOutput(1, 'Job build completed with result: Succeeded');
+
+      for (const line of [CONNECT_ERROR, REGISTRATION_DELETED, SESSION_EXISTS, 'Running job: another']) {
+        await helper.parseRunnerOutput(1, line);
+      }
+
+      const instance = helper.instances.get(1)!;
+      expect({ label, status: instance.status, fatalError: instance.fatalError }).toEqual(
+        { label, status: expect.not.stringMatching(/^error$/), fatalError: false }
+      );
+      expect(manager.hasAvailableSlot()).toBe(false);
+      expect(onReregistrationNeeded).not.toHaveBeenCalled();
+      // One spawn, one job: a second start is not recorded as another.
+      expect(events.filter((e) => e.type === 'started').map((e) => e.jobName)).toEqual(['build']);
+    }
+  });
+
   it('reads a status only from a line the runner starts with it', async () => {
+    const ready = listening();
+    ready.helper.setInstance(1, { name: 'runner-1', status: 'starting' });
+    await ready.helper.parseRunnerOutput(1, 'echo: Listening for Jobs');
+    expect(ready.helper.instances.get(1)!.status).toBe('starting');
+
     const { helper, onReregistrationNeeded } = listening();
 
     for (const line of [

@@ -139,6 +139,12 @@ interface RunnerInstance {
   name: string;
   jobsCompleted: number;
   fatalError: boolean; // Set when runner has an unrecoverable error (e.g., registration deleted)
+  /**
+   * Set when this spawn took its job, and never cleared: a --once worker has
+   * one job, and nothing it prints after taking it - a completion included -
+   * is the runner's status or a second job.
+   */
+  tookJob?: boolean;
 }
 
 /** Job event types for notifications */
@@ -1975,9 +1981,10 @@ export class RunnerManager {
       const jobName = jobStartMatch[1].trim();
 
       // A worker runs with --once: one spawn is exactly one job. So a start on
-      // a worker that already has a job is never a second job - it is the job's
-      // output echoing something that looks like one.
-      if (instance.status === 'busy' || instance.currentJob) {
+      // a worker that has taken its job - even one whose completion has been
+      // read - is never a second job; it is the job's output echoing
+      // something that looks like one.
+      if (instance.tookJob || instance.status === 'busy' || instance.currentJob) {
         this.log(
           'debug',
           `[instance ${instanceNum}] Ignoring job start while already running ${instance.currentJob?.name ?? 'a job'}: ${jobName}`
@@ -1986,6 +1993,7 @@ export class RunnerManager {
       }
 
       instance.status = 'busy';
+      instance.tookJob = true;
 
       // The job's context is the one spawnWorkerForJob stored under this slot's
       // number before the worker started: only a worker spawned and announced
@@ -2050,15 +2058,18 @@ export class RunnerManager {
       return;
     }
 
-    // The runner's own status. None of it can come from a worker that has a
-    // job: the job's output reaches this parser too, and a job named or
-    // printing "Runner connect error" marked its live worker 'error' - the
+    // The runner's own status. None of it is read from a worker that has
+    // taken its job: the job's output reaches this parser too, and a job named
+    // or printing "Runner connect error" marked its live worker 'error' - the
     // slot free for the next job - while one saying "please re-configure" had
-    // the target re-registered under it. A --once worker with a job has
-    // nothing more to say about its connection; it ends the job and exits.
-    // Each check is anchored, as the job start is, to the line the runner
-    // itself writes, behind its timestamp at most.
-    if (!instance.currentJob && instance.status !== 'busy') {
+    // the target re-registered under it. Nor once that job's completion has
+    // been read, since the job can print a completion line first. A worker
+    // with a job keeps it until the job ends, whatever its connection does
+    // meanwhile; a registration or session problem shows again at the next
+    // worker's start, before it has a job. Each check is anchored, as the job
+    // start is, to the line the runner itself writes, behind its timestamp at
+    // most.
+    if (!instance.tookJob) {
       // Detect runner ready (listening for jobs)
       if (/^\s*(?:\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?:?\s*)?Listening for Jobs\s*$/i.test(line)) {
         instance.status = 'listening';
@@ -2105,7 +2116,10 @@ export class RunnerManager {
         return;
       }
 
-      // Detect other connection errors (runner will retry)
+      // Detect other connection errors (runner will retry). The Listener
+      // (v2.336.0) writes "Runner connect error: ..."; "Could not connect to
+      // the server" has no known source in it and is kept, anchored, from
+      // before.
       if (/^\s*(?:\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?:?\s*)?(?:Runner connect error:|Could not connect to the server\b)/i.test(line)) {
         instance.status = 'error';
         this.updateAggregateStatus();
