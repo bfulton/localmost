@@ -39,11 +39,12 @@ describe('literal loopback through the proxy', () => {
       expect(checkHost(proxy, host, 9229, 'connect')).toEqual({ allowed: false, reason: 'loopback' });
     });
 
-    it('leaves the default broker port reachable until the real one is known', () => {
+    it('opens only the default broker port until the real one is known', () => {
       // Fail closed: the only loopback port a fresh proxy opens is the one
       // the runner cannot work without.
       const proxy = new ProxyServer({ policyLevel: level });
       expect(checkHost(proxy, '127.0.0.1', DEFAULT_BROKER_PORT)).toEqual({ allowed: true, reason: 'infrastructure' });
+      expect(checkHost(proxy, '127.0.0.1', DEFAULT_BROKER_PORT + 1).allowed).toBe(false);
     });
 
     it('opens the broker port it is told, and closes the default one', () => {
@@ -151,8 +152,9 @@ describe('loopback refusals on the wire', () => {
     } finally { svc.server.close(); await p.stop(); }
   });
 
-  it('reaches the broker port it was given, on every path', async () => {
+  it('reaches the broker port it was given, on every path, and no other', async () => {
     const broker = await localService();
+    const other = await localService();
     const acquired: string[] = [];
     const p = new ProxyServer({ policyLevel: 'strict', authToken: 't', onJobAcquired: async (id) => { acquired.push(id); } });
     p.setLoopbackPolicy(broker.port, undefined);
@@ -162,16 +164,21 @@ describe('loopback refusals on the wire', () => {
       expect(await request(p.getPort(), 'POST', `http://127.0.0.1:${broker.port}/w/key/acquirejob`, '{"jobMessageId":"m"}')).toBe(200);
       expect(await connectStatus(p.getPort(), `127.0.0.1:${broker.port}`)).toBe('HTTP/1.1 200 Connection Established');
       expect(acquired).toEqual(['m']);
-    } finally { broker.server.closeAllConnections(); broker.server.close(); await p.stop(); }
+      expect(await request(p.getPort(), 'GET', `http://127.0.0.1:${other.port}/`)).toBe(403);
+    } finally {
+      broker.server.closeAllConnections(); broker.server.close(); other.server.close(); await p.stop();
+    }
   });
 
-  it('reaches a port the policy declares', async () => {
+  it('reaches a port the policy declares, and not the one beside it', async () => {
     const svc = await localService();
+    const other = await localService();
     const p = new ProxyServer({ policyLevel: 'strict', authToken: 't' });
     p.setLoopbackPolicy(DEFAULT_BROKER_PORT, [svc.port]);
     await p.start();
     try {
       expect(await request(p.getPort(), 'GET', `http://127.0.0.1:${svc.port}/`)).toBe(200);
-    } finally { svc.server.closeAllConnections(); svc.server.close(); await p.stop(); }
+      expect(await connectStatus(p.getPort(), `127.0.0.1:${other.port}`)).toBe('HTTP/1.1 403 Forbidden');
+    } finally { svc.server.closeAllConnections(); svc.server.close(); other.server.close(); await p.stop(); }
   });
 });
