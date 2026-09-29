@@ -317,9 +317,12 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     ? undefined  // Discovery mode: allow all traffic through
     : (policy?.network?.allow || []);  // Enforcement mode: use policy or empty
 
-  // Start proxy for network isolation (sandbox restricts traffic to proxy only)
+  // Start proxy for network isolation (sandbox restricts traffic to proxy only).
+  // Enforcement reads the policy as the runner's proxy does: the deny list
+  // first, then the allow list on each scheme's port. Discovery applies none.
   const discoveryProxy = new DiscoveryProxy({
     allowlist: networkAllowlist,
+    denylist: options.updaterc ? undefined : policy?.network?.deny,
     onAccess: (host, port, allowed) => {
       if (options.verbose) {
         const status = allowed ? colors.dim : colors.red;

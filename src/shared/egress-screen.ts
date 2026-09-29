@@ -139,6 +139,48 @@ export function hostPatternMatches(pattern: HostPattern, host: string): boolean 
   return pattern.wildcard ? normalizedHost.endsWith(pattern.host) : normalizedHost === pattern.host;
 }
 
+/**
+ * Whether a policy's allow entry lets a connection to host:port through,
+ * asked for through a CONNECT tunnel or as a plain HTTP request. An entry
+ * that spells no port allows that scheme's port - 443 through CONNECT, 80
+ * for plain HTTP - and no other; one that spells a port allows that port,
+ * and only that one; one that spells something that is not a port allows
+ * nothing. Allowing a name used to allow every port on it.
+ */
+export function hostPatternAllows(entry: string, host: string, port: number, via: 'connect' | 'http'): boolean {
+  const pattern = parseHostPattern(entry);
+  if (!hostPatternMatches(pattern, host)) return false;
+  return pattern.port === undefined ? port === (via === 'connect' ? 443 : 80) : pattern.port === port;
+}
+
+/**
+ * A name as a deny entry compares it: in canonicalHost's spelling, without
+ * trailing dots. Each is another way to write the same host, and a denied
+ * host must not be reachable by writing it differently. The dots come off
+ * after the mapping, since the mapping is what turns an IDNA full stop into
+ * one. Allow entries are not compared this way - a spelling the allowlist
+ * does not name is refused, which is the safe side for an allow.
+ */
+export function denyForm(name: string): string {
+  const lower = name.toLowerCase();
+  return (canonicalHost(lower) ?? lower).replace(/\.+$/, '');
+}
+
+/**
+ * Whether a policy's deny entry refuses a connection to host:port. An entry
+ * that spells a port denies that port; one that spells none denies them all,
+ * and so does one whose port is not a port, since denying too much is the
+ * safe reading of a deny.
+ */
+export function hostPatternDenies(entry: string, host: string, port: number): boolean {
+  const deniedHost = denyForm(host);
+  const pattern = parseHostPattern(entry);
+  const named = pattern.wildcard
+    ? deniedHost.endsWith('.' + denyForm(pattern.host.slice(1)))
+    : deniedHost === denyForm(pattern.host);
+  return named && (typeof pattern.port === 'number' ? pattern.port === port : true);
+}
+
 function expandV6ToGroups(addr: string): number[] | null {
   let s = addr.trim();
   if (s.startsWith('[') && s.endsWith(']')) s = s.slice(1, -1);

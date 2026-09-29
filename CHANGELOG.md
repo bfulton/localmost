@@ -124,6 +124,9 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   as `https://evil.com`, a path, surrounding spaces, or a host in a spelling the
   proxy never compares - and a relative `filesystem.deny` entry. Each was
   accepted and shown, and allowed or denied nothing.
+- `localmost test` applies the checkout's `network.deny` and reaches an allowed
+  host only on its scheme's port (or the port an entry spells), as a runner job
+  does. Its proxy took the allow list alone and matched a host on any port.
 - An approved policy is bound to the repository's id as well as its name. A job
   from a different repository that now holds an approved name - the approved one
   deleted or renamed, and the name taken since - is refused until the policy is

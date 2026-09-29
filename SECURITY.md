@@ -307,8 +307,13 @@ sandbox profile. The checkout is treated as untrusted, and so is its
   broker's port stays closed either way; `NO_PROXY` keeps loopback off the
   proxy. The way out is the run's proxy, which needs a per-run token, refuses
   names that resolve to internal or loopback addresses, and connects only to
-  the addresses it screened. Discovery leaves loopback open, says so, and
-  records none of it: a checkout declares its loopback grant itself.
+  the addresses it screened. It reads the checkout's network policy as a
+  runner job's proxy does: a `network.deny` host is refused whatever the allow
+  list covers, and an allowed host is reached on 443 through `CONNECT` and 80
+  for plain HTTP, on another port only when an entry spells `host:port`.
+  Discovery applies neither, since it observes every host; it leaves loopback
+  open, says so, and records none of it: a checkout declares its loopback
+  grant itself.
 - **Discovery is asked about every time.** Under `--updaterc` reads are allowed
   and recorded, and writes outside the workspace are refused and reported.
   Discovery still lets a workflow read everything but the paths above and reach
