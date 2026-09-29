@@ -51,8 +51,8 @@ The test command must work without the Electron app.
   - [x] Action fetcher and cache
 - [x] Create `src/cli/test.ts` command structure
 - [x] Implement working tree snapshot
-  - [x] Fast copy via hard links (`cp -al`) with fallback to rsync
-  - [x] Respect `.gitignore` by default, `--no-ignore` flag to include all
+  - [x] Fast private copy via APFS clones, never hard links, with a byte-copy fallback
+  - [x] Respect `.gitignore` by default (the file list from git), `--no-ignore` flag to include all
   - [x] Create temp workspace in `~/.localmost/workspaces/`
 - [x] Add cleanup of old workspaces (keep last N, or age-based)
 
