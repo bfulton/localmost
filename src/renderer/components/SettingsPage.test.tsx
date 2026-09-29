@@ -283,4 +283,20 @@ describe('SettingsPage', () => {
       expect(screen.getByText('Parallelism')).toBeInTheDocument();
     });
   });
+
+  it('offers no setting to keep a job\'s _work directory for later jobs', async () => {
+    mockLocalmost.github.getAuthStatus.mockResolvedValue({
+      isAuthenticated: true,
+      user: { login: 'testuser', name: 'Test User', avatar_url: '' },
+    });
+    mockLocalmost.runner.isDownloaded.mockResolvedValue(true);
+
+    renderWithProviders(<SettingsPage {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Tool cache')).toBeInTheDocument();
+    });
+    expect(screen.queryByText('Cache work directory')).not.toBeInTheDocument();
+    expect(screen.queryByText(/_work directory/)).not.toBeInTheDocument();
+  });
 });

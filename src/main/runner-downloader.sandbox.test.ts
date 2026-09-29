@@ -93,6 +93,19 @@ describe('the sandbox a worker is built from', () => {
     await expect(downloader.copyProxyCredentials(1, path.join(runnerDir, 'proxies', 'target-a')))
       .rejects.toThrow('Missing proxy credential file');
   });
+
+  it("gives every job a _work of its own, never one kept from an earlier job's", async () => {
+    // The removed preserveWorkDir setting linked _work to runner/work/<n>,
+    // which outlived the sandbox and was handed to whatever job - from
+    // whatever repository - next took that slot. A caller still passing the
+    // option must get the same fresh sandbox as any other.
+    const buildWithOption = downloader.buildSandbox as (...args: unknown[]) => Promise<string>;
+    const sandbox = await buildWithOption.call(downloader, 1, version, undefined, { preserveWorkDir: true });
+
+    const work = path.join(sandbox, '_work');
+    expect(fs.existsSync(work) && fs.lstatSync(work).isSymbolicLink()).toBe(false);
+    expect(fs.existsSync(path.join(runnerDir, 'work'))).toBe(false);
+  });
 });
 
 /**
@@ -295,7 +308,7 @@ describe('the runner template a sandbox is copied from', () => {
     write(path.join(leftover, 'tree', 'run.sh'), '#!/bin/bash\n');
     write(path.join(leftover, 'actions-runner-osx-arm64-9.9.9.tar.gz'), 'partial');
 
-    await downloader.cleanupStaleConfiguration(() => undefined, { cleanWorkDirs: false });
+    await downloader.cleanupStaleConfiguration(() => undefined);
 
     expect(fs.existsSync(leftover)).toBe(false);
     expect(fs.existsSync(arc)).toBe(true);

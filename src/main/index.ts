@@ -27,7 +27,6 @@ import {
   setTargetManager,
   setResourceMonitor,
   getRunnerManager,
-  getRunnerDownloader,
   getHeartbeatManager,
   getCliServer,
   getBrokerProxyService,
@@ -484,13 +483,8 @@ app.whenReady().then(async () => {
 
   // Clean up any stale/corrupt runner configuration
   // Must await to ensure orphaned runner processes are killed before starting new ones
-  // Only clean work dirs if preserveWorkDir is not 'always'
   try {
-    const cleanWorkDirs = config.preserveWorkDir !== 'always';
-    await runnerDownloader.cleanupStaleConfiguration(
-      (message) => logger?.info(message),
-      { cleanWorkDirs }
-    );
+    await runnerDownloader.cleanupStaleConfiguration((message) => logger?.info(message));
   } catch (err) {
     logger?.warn(`Startup cleanup failed: ${(err as Error).message}. Will retry when runner starts.`);
   }
@@ -783,7 +777,6 @@ app.on('before-quit', async (event) => {
     const logger = getLogger();
     const heartbeatManager = getHeartbeatManager();
     const runnerManager = getRunnerManager();
-    const runnerDownloader = getRunnerDownloader();
     const brokerProxyService = getBrokerProxyService();
     const trayManager = getTrayManager();
     const mainWindow = getMainWindow();
@@ -818,11 +811,6 @@ app.on('before-quit', async (event) => {
       })(),
     ]);
 
-    // Clean up work directories (can be slow for large dirs)
-    if (runnerManager?.getPreserveWorkDir() !== 'always') {
-      await runnerDownloader?.cleanupWorkDirectories((msg) => logger?.info(msg));
-    }
-
     trayManager?.destroy();
     mainWindow?.destroy();
 
@@ -845,10 +833,8 @@ process.on('SIGINT', async () => {
   // Signal state machine that we're shutting down
   sendRunnerEvent({ type: 'STOP' });
 
-  const logger = getLogger();
   const heartbeatManager = getHeartbeatManager();
   const runnerManager = getRunnerManager();
-  const runnerDownloader = getRunnerDownloader();
   const brokerProxyService = getBrokerProxyService();
   const trayManager = getTrayManager();
   const mainWindow = getMainWindow();
@@ -873,11 +859,6 @@ process.on('SIGINT', async () => {
       await runnerManager?.stop();
     })(),
   ]);
-
-  // Clean up work directories unless set to 'always' preserve
-  if (runnerManager?.getPreserveWorkDir() !== 'always') {
-    await runnerDownloader?.cleanupWorkDirectories((msg) => logger?.info(msg));
-  }
 
   trayManager?.destroy();
   mainWindow?.destroy();

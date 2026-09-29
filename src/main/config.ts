@@ -78,7 +78,6 @@ export interface AppConfig {
   sleepProtection?: SleepProtection;
   logLevel?: LogLevel;
   runnerLogLevel?: LogLevel;
-  preserveWorkDir?: 'always' | 'never';
   userFilter?: UserFilterConfig;
   /** Sandbox policy level for all restrictions. Defaults to 'strict' */
   /** Auto-update preferences */

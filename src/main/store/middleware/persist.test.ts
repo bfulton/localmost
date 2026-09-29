@@ -81,6 +81,23 @@ describe('savePersistedConfig auth preservation', () => {
   });
 });
 
+describe('the removed preserveWorkDir setting', () => {
+  it('ignores a value an earlier build saved, and drops it at the next save', () => {
+    // Not an error: the rest of the file loads as before, and the setting
+    // simply no longer exists.
+    fs.writeFileSync(configPath, 'configVersion: 1\ntheme: dark\npreserveWorkDir: always\n');
+    loadPersistedConfig();
+
+    expect(store.getState().config.theme).toBe('dark');
+    expect(store.getState().config).not.toHaveProperty('preserveWorkDir');
+
+    savePersistedConfig();
+    const saved = yaml.load(fs.readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
+    expect(saved.theme).toBe('dark');
+    expect(saved).not.toHaveProperty('preserveWorkDir');
+  });
+});
+
 describe('savePersistedConfig hydration guard', () => {
   it('does not overwrite an existing config that failed to parse', () => {
     // A truncated/empty file is exactly what an interrupted write leaves behind.

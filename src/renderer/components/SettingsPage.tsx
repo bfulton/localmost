@@ -32,8 +32,6 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     setLogLevel,
     runnerLogLevel,
     setRunnerLogLevel,
-    preserveWorkDir,
-    setPreserveWorkDir,
     toolCacheLocation,
     setToolCacheLocation,
     userFilter,
@@ -460,21 +458,6 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
               </select>
               <p className={shared.formHint}>
                 Persistent caches tools like Node.js across restarts, separately for each repository or organization, shared by all of its jobs (pull requests and, for an organization, all of its repositories). Per-sandbox rebuilds each time (slower, but no job can leave anything for the next).
-              </p>
-            </div>
-
-            <div className={shared.formGroup}>
-              <label>Cache work directory</label>
-              <select
-                value={preserveWorkDir}
-                onChange={(e) => setPreserveWorkDir(e.target.value as 'never' | 'session' | 'always')}
-              >
-                <option value="never">Never (recommended)</option>
-                <option value="session">During session</option>
-                <option value="always">Always</option>
-              </select>
-              <p className={shared.formHint}>
-                Preserve workflow _work directory to cache dependencies like node_modules. "During session" clears on app start/quit.
               </p>
             </div>
           </section>

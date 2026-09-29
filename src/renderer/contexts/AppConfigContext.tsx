@@ -58,8 +58,6 @@ interface AppConfigContextValue {
   consentToSleepProtection: () => Promise<void>;
 
   // Runner settings
-  preserveWorkDir: 'never' | 'session' | 'always';
-  setPreserveWorkDir: (setting: 'never' | 'session' | 'always') => Promise<void>;
   toolCacheLocation: ToolCacheLocation;
   setToolCacheLocation: (setting: ToolCacheLocation) => Promise<void>;
 
@@ -112,7 +110,6 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
   const storeMaxJobHistory = useStore((state) => state?.config?.maxJobHistory ?? 10);
   const storeSleepProtection = useStore((state) => state?.config?.sleepProtection ?? 'never');
   const storeSleepProtectionConsented = useStore((state) => state?.config?.sleepProtectionConsented ?? false);
-  const storePreserveWorkDir = useStore((state) => state?.config?.preserveWorkDir ?? 'never');
   const storeToolCacheLocation = useStore((state) => state?.config?.toolCacheLocation ?? 'persistent');
   const storeUserFilter = useStore((state) => state?.config?.userFilter ?? NO_USER_FILTER);
   const storePower = useStore((state) => state?.config?.power ?? DEFAULT_POWER_CONFIG);
@@ -140,7 +137,6 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     maxJobHistory: number;
     sleepProtection: SleepProtection;
     sleepProtectionConsented: boolean;
-    preserveWorkDir: 'never' | 'session' | 'always';
     toolCacheLocation: ToolCacheLocation;
     userFilter: UserFilterConfig;
     power: PowerConfig;
@@ -156,7 +152,6 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     maxJobHistory: 10,
     sleepProtection: 'never',
     sleepProtectionConsented: false,
-    preserveWorkDir: 'never',
     toolCacheLocation: 'persistent',
     userFilter: { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] },
     power: DEFAULT_POWER_CONFIG,
@@ -174,7 +169,6 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
   const maxJobHistory = isZubridgeReady ? storeMaxJobHistory : fallbackState.maxJobHistory;
   const sleepProtection = isZubridgeReady ? storeSleepProtection : fallbackState.sleepProtection;
   const sleepProtectionConsented = isZubridgeReady ? storeSleepProtectionConsented : fallbackState.sleepProtectionConsented;
-  const preserveWorkDir = isZubridgeReady ? storePreserveWorkDir : fallbackState.preserveWorkDir;
   const toolCacheLocation = isZubridgeReady ? storeToolCacheLocation : fallbackState.toolCacheLocation;
   const userFilter = isZubridgeReady ? storeUserFilter : fallbackState.userFilter;
   const power = isZubridgeReady ? storePower : fallbackState.power;
@@ -228,7 +222,6 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
             typeof settings.sleepProtectionConsented === 'boolean'
               ? settings.sleepProtectionConsented
               : prev.sleepProtectionConsented,
-          preserveWorkDir: (settings.preserveWorkDir as 'never' | 'session' | 'always') || prev.preserveWorkDir,
           toolCacheLocation: (settings.toolCacheLocation as ToolCacheLocation) || prev.toolCacheLocation,
           // Normalize rather than accepting only the new shape: a config still
           // using the legacy `mode` field would otherwise be discarded here and
@@ -351,15 +344,6 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     }
   }, []);
 
-  const setPreserveWorkDir = useCallback(async (setting: 'never' | 'session' | 'always') => {
-    setFallbackState(prev => ({ ...prev, preserveWorkDir: setting }));
-    try {
-      await window.localmost.settings.set({ preserveWorkDir: setting });
-    } catch {
-      // Optimistic update handled by zubridge sync
-    }
-  }, []);
-
   const setToolCacheLocation = useCallback(async (setting: ToolCacheLocation) => {
     setFallbackState(prev => ({ ...prev, toolCacheLocation: setting }));
     try {
@@ -460,8 +444,6 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     setSleepProtection,
     sleepProtectionConsented,
     consentToSleepProtection,
-    preserveWorkDir,
-    setPreserveWorkDir,
     toolCacheLocation,
     setToolCacheLocation,
     userFilter,

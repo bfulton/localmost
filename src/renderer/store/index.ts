@@ -26,7 +26,6 @@ export const useMaxLogScrollback = () => useStore((state) => state.config.maxLog
 export const useMaxJobHistory = () => useStore((state) => state.config.maxJobHistory);
 export const useSleepProtection = () => useStore((state) => state.config.sleepProtection);
 export const useSleepProtectionConsented = () => useStore((state) => state.config.sleepProtectionConsented);
-export const usePreserveWorkDir = () => useStore((state) => state.config.preserveWorkDir);
 export const useToolCacheLocation = () => useStore((state) => state.config.toolCacheLocation);
 export const useUserFilter = () => useStore((state) => state.config.userFilter);
 export const usePower = () => useStore((state) => state.config.power);
@@ -91,7 +90,6 @@ export type StoreAction =
   | { type: 'setMaxJobHistory'; payload: number }
   | { type: 'setSleepProtection'; payload: AppState['config']['sleepProtection'] }
   | { type: 'consentToSleepProtection' }
-  | { type: 'setPreserveWorkDir'; payload: AppState['config']['preserveWorkDir'] }
   | { type: 'setToolCacheLocation'; payload: AppState['config']['toolCacheLocation'] }
   | { type: 'setUserFilter'; payload: AppState['config']['userFilter'] }
   | { type: 'setPower'; payload: AppState['config']['power'] }

@@ -224,9 +224,6 @@ export class RunnerManager {
   // Current runner version
   private runnerVersion: string | null = null;
 
-  // Preserve work directory setting: 'never' | 'session' | 'always'
-  private preserveWorkDir: 'never' | 'session' | 'always' = 'never';
-
   // Tool cache location: 'persistent' (shared) or 'per-sandbox' (rebuilt each time)
   private toolCacheLocation: 'persistent' | 'per-sandbox' = 'persistent';
 
@@ -460,10 +457,6 @@ export class RunnerManager {
         if (config && config.maxJobHistory) {
           this.maxJobHistory = Math.max(5, Math.min(50, config.maxJobHistory as number));
         }
-        if (config && typeof config.preserveWorkDir === 'string' &&
-            ['never', 'session', 'always'].includes(config.preserveWorkDir)) {
-          this.preserveWorkDir = config.preserveWorkDir as 'never' | 'session' | 'always';
-        }
         if (config && typeof config.toolCacheLocation === 'string' &&
             ['persistent', 'per-sandbox'].includes(config.toolCacheLocation)) {
           this.toolCacheLocation = config.toolCacheLocation as 'persistent' | 'per-sandbox';
@@ -598,10 +591,6 @@ export class RunnerManager {
   isConfigured(): boolean {
     // In proxy-only mode, check for proxy credentials instead of individual worker configs
     return this.downloader.hasAnyProxyCredentials();
-  }
-
-  getPreserveWorkDir(): 'never' | 'session' | 'always' {
-    return this.preserveWorkDir;
   }
 
   getToolCacheLocation(): 'persistent' | 'per-sandbox' {
@@ -1016,8 +1005,7 @@ export class RunnerManager {
         this.runnerVersion,
         (level, msg) => {
           this.log(level, `[sandbox ${instanceNum}] ${msg}`);
-        },
-        { preserveWorkDir: this.preserveWorkDir !== 'never' }
+        }
       );
     } catch (error) {
       this.log('error', `Failed to build sandbox for instance ${instanceNum}: ${(error as Error).message}`);

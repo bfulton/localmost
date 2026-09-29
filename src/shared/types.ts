@@ -262,8 +262,6 @@ export type SleepProtection = 'never' | 'when-busy' | 'always';
 /** Log level - controls what gets displayed/saved. Lower = more verbose */
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
-export type PreserveWorkDir = 'never' | 'session' | 'always';
-
 /** Tool cache location - controls where actions like setup-node cache downloaded tools */
 export type ToolCacheLocation = 'persistent' | 'per-sandbox';
 
@@ -285,8 +283,6 @@ export interface AppSettings {
   logLevel?: LogLevel;
   /** Minimum log level for runner output logs. Defaults to 'warn' */
   runnerLogLevel?: LogLevel;
-  /** Preserve workflow _work directory. Defaults to 'never' */
-  preserveWorkDir?: PreserveWorkDir;
   /** Tool cache location. Defaults to 'persistent' (shared across restarts) */
   toolCacheLocation?: ToolCacheLocation;
   /** Sandbox policy level for all sandbox restrictions. Defaults to 'strict' */
