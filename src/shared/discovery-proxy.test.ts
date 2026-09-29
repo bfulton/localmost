@@ -27,7 +27,7 @@ describe('DiscoveryProxy', () => {
     it('should return proxy URL', async () => {
       proxy = new DiscoveryProxy({ port: 0 });
       const port = await proxy.start();
-      expect(proxy.getProxyUrl()).toBe(`http://127.0.0.1:${port}`);
+      expect(proxy.getProxyUrl()).toMatch(new RegExp(`^http://localmost:[0-9a-f]{64}@127\\.0\\.0\\.1:${port}$`));
     });
 
     it('should handle stop gracefully', async () => {
