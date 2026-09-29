@@ -562,6 +562,32 @@ describe('Sandbox Profile Generator', () => {
       expect(result.readPaths).toContain('/opt/homebrew');
     });
 
+    it('reports a write the discovery profile refused, so the policy can declare it', () => {
+      const result = parseSandboxTrace(
+        [
+          'kernel: (Sandbox) Sandbox: npm(101) deny(1) file-write-create /opt/cache/x',
+          'kernel: (Sandbox) Sandbox: npm(102) allow file-write-data /work/out',
+        ].join('\n'),
+        '/work'
+      );
+      expect(result.writePaths).toEqual(['/opt/cache/x']);
+    });
+
+    it('never suggests what no policy can grant', () => {
+      // The app's own data and the developer's credentials are denied at every
+      // level; proposing them for .localmostrc would only mislead.
+      const result = parseSandboxTrace(
+        [
+          'kernel: (Sandbox) Sandbox: sh(101) deny(1) file-read-data /Users/test/.ssh/id_ed25519',
+          'kernel: (Sandbox) Sandbox: sh(102) deny(1) file-write-create /Users/test/.localmost/runner/x',
+          'kernel: (Sandbox) Sandbox: sh(103) allow file-read-data /Users/test/.aws/config',
+        ].join('\n'),
+        '/work'
+      );
+      expect(result.readPaths).toEqual([]);
+      expect(result.writePaths).toEqual([]);
+    });
+
     it('keeps unrelated siblings', () => {
       const result = parseSandboxTrace(trace(['/opt/a', '/opt/b']), '/work');
 
@@ -580,7 +606,48 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).toContain('(deny default)');
       // File operations with (with report) for logging to system log
       expect(profile).toContain('(allow file-read* (with report))');
-      expect(profile).toContain('(allow file-write* (with report))');
+      expect(profile).toContain('(allow file-write* (with report)\n  (subpath "/path/to/project")');
+    });
+
+    it('observes writes outside the workspace without letting them happen', () => {
+      // Discovery exists to see what a workflow touches, not to hand an
+      // untrusted checkout the disk: an unfiltered write allow let a
+      // --updaterc run write anywhere the user can.
+      const profile = generateDiscoveryProfile({
+        workDir: '/Users/test/.localmost/workspaces/ws-1',
+        proxyPort: DEFAULT_PROXY_PORT,
+        logFile: '',
+      });
+      const forms = topLevelForms(profile);
+      expect(forms).not.toContain('(allow file-write* (with report))');
+      expect(forms).not.toContain('(allow file-ioctl (with report))');
+      const writeGrants = forms.filter((f) => f.startsWith('(allow file-write*') || f.startsWith('(allow file-read* file-write*'));
+      const granted = writeGrants.flatMap((f) => [...f.matchAll(/\((?:subpath|literal) "([^"]+)"\)/g)].map((m) => m[1]));
+      expect(granted.sort()).toEqual(
+        [
+          '/Users/test/.localmost/workspaces/ws-1',
+          '/Users/test/.localmost/workspaces/ws-1',
+          '/var/folders/test/temp',
+          '/tmp',
+          '/private/tmp',
+          '/var/folders',
+          '/private/var/folders',
+          '/dev/null',
+          '/dev/random',
+          '/dev/urandom',
+          '/dev/tty',
+          '/dev/dtracehelper',
+        ].sort()
+      );
+      // Reads are still observed everywhere but what is never reachable.
+      expect(forms).toContain('(allow file-read* (with report))');
+      const deny = forms.findIndex((f) => f.startsWith('(deny file-read* file-write*') && f.includes('/Users/test/.ssh'));
+      expect(deny).toBeGreaterThan(forms.indexOf('(allow file-read* (with report))'));
+      expect(forms[deny]).toContain('(subpath "/Users/test/.localmost")');
+      expect(profile).toContain('(deny network-outbound (literal "/Users/test/.localmost/localmost.sock"))');
+      // Preferences are a persistence point too; the Xcode domain is the one
+      // the enforcement profile grants.
+      expect(forms).not.toContain('(allow user-preference-write)');
     });
 
     it('should identify as discovery profile', () => {

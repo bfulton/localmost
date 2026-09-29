@@ -174,31 +174,51 @@ function loopbackNetworkRules(proxyPort: number, escapedWorkDir: string): string
  * comes after every policy grant: seatbelt takes the last matching rule. The
  * workspace lives under the app data directory, so it is reopened last.
  */
+function neverReachablePaths(): { subpaths: string[]; literals: string[] } {
+  const home = os.homedir();
+  return {
+    subpaths: [
+      getAppDataDirWithoutElectron(),
+      path.join(home, 'Library', 'Application Support', 'localmost'),
+      `${home}/.ssh`,
+      `${home}/.aws`,
+      `${home}/.gnupg`,
+      `${home}/.kube`,
+      `${home}/.docker`,
+      `${home}/.config`,
+      `${home}/Library/Keychains`,
+    ],
+    literals: [
+      `${home}/.netrc`,
+      `${home}/.npmrc`,
+      `${home}/.m2/settings.xml`,
+      `${home}/.m2/settings-security.xml`,
+      `${home}/.gradle/gradle.properties`,
+      `${home}/.cargo/credentials`,
+      `${home}/.cargo/credentials.toml`,
+      `${home}/.nuget/NuGet/NuGet.Config`,
+    ],
+  };
+}
+
+/** Whether a path is one no policy can grant, so discovery never suggests it. */
+function isNeverReachable(p: string): boolean {
+  const { subpaths, literals } = neverReachablePaths();
+  return literals.includes(p) || subpaths.some((root) => p === root || p.startsWith(`${root}/`));
+}
+
 function neverReachableRules(escapedWorkDir: string, readOnlyPaths: string[] = []): string[] {
-  const home = escapePath(os.homedir());
-  const appDataDir = escapePath(getAppDataDirWithoutElectron());
-  const userDataDir = escapePath(path.join(os.homedir(), 'Library', 'Application Support', 'localmost'));
+  const { subpaths, literals } = neverReachablePaths();
+  const entries = [
+    ...subpaths.map((p) => `  (subpath "${escapePath(p)}")`),
+    ...literals.map((p) => `  (literal "${escapePath(p)}")`),
+  ];
+  entries[entries.length - 1] += ')';
   return [
     ';; Never reachable, whatever a policy declares above: the app\'s own data',
     ';; and the credentials a developer machine keeps',
     '(deny file-read* file-write*',
-    `  (subpath "${appDataDir}")`,
-    `  (subpath "${userDataDir}")`,
-    `  (subpath "${home}/.ssh")`,
-    `  (subpath "${home}/.aws")`,
-    `  (subpath "${home}/.gnupg")`,
-    `  (subpath "${home}/.kube")`,
-    `  (subpath "${home}/.docker")`,
-    `  (subpath "${home}/.config")`,
-    `  (subpath "${home}/Library/Keychains")`,
-    `  (literal "${home}/.netrc")`,
-    `  (literal "${home}/.npmrc")`,
-    `  (literal "${home}/.m2/settings.xml")`,
-    `  (literal "${home}/.m2/settings-security.xml")`,
-    `  (literal "${home}/.gradle/gradle.properties")`,
-    `  (literal "${home}/.cargo/credentials")`,
-    `  (literal "${home}/.cargo/credentials.toml")`,
-    `  (literal "${home}/.nuget/NuGet/NuGet.Config"))`,
+    ...entries,
     ';; ...except this run\'s workspace, which lives inside the app data directory',
     '(allow file-read* file-write*',
     `  (subpath "${escapedWorkDir}"))`,
@@ -482,11 +502,34 @@ export function generateDiscoveryProfile(options: {
     '(deny default)',
     '',
     ';; ------------------------------------------------------------',
-    ';; FILE ACCESS - Allow all with reporting to system log',
+    ';; FILE ACCESS - Reads everywhere and workspace writes, reported',
     ';; ------------------------------------------------------------',
+    ';; Discovery has to see what a workflow reads, so reads are allowed and',
+    ';; reported. Writes are not: the checkout under discovery is no more',
+    ';; trusted than any other, and a write outside the workspace is observed',
+    ';; just as well refused - a denial is logged too, and reported as a path',
+    ';; the policy would need.',
     '(allow file-read* (with report))',
-    '(allow file-write* (with report))',
-    '(allow file-ioctl (with report))',
+    '(allow file-write* (with report)',
+    `  (subpath "${escapedWorkDir}")`,
+    `  (subpath "${escapePath(os.tmpdir())}")`,
+    '  (subpath "/tmp")',
+    '  (subpath "/private/tmp")',
+    '  (subpath "/var/folders")',
+    '  (subpath "/private/var/folders"))',
+    '(allow file-write*',
+    '  (literal "/dev/null")',
+    '  (literal "/dev/random")',
+    '  (literal "/dev/urandom")',
+    '  (literal "/dev/tty")',
+    '  (literal "/dev/dtracehelper"))',
+    '(allow file-ioctl (with report)',
+    `  (subpath "${escapedWorkDir}"))`,
+    '',
+    ...neverReachableRules(escapedWorkDir, options.readOnlyPaths),
+    ';; Metadata stays broad, as in the enforcement profile: tools walk paths',
+    ';; they cannot open, and existence is not the secret.',
+    '(allow file-read-metadata)',
     '',
     ';; ------------------------------------------------------------',
     ';; NETWORK ACCESS - Localhost only (proxy handles filtering)',
@@ -495,6 +538,7 @@ export function generateDiscoveryProfile(options: {
     ';; a tool ignoring HTTP_PROXY reach the internet directly, bypassing the',
     ';; proxy that records which hosts a workflow actually needs.',
     ...loopbackNetworkRules(proxyPort, escapedWorkDir),
+    `(deny network-outbound (literal "${escapePath(getCliSocketPath())}"))`,
     '',
     ';; ------------------------------------------------------------',
     ';; PROCESS/SYSTEM OPERATIONS - Allow all (no reporting needed)',
@@ -507,7 +551,8 @@ export function generateDiscoveryProfile(options: {
     '(allow iokit*)',
     '(allow pseudo-tty)',
     '(allow user-preference-read)',
-    '(allow user-preference-write)',
+    '(allow user-preference-write',
+    '  (preference-domain "com.apple.dt.Xcode"))',
     '',
   ];
 
@@ -612,7 +657,11 @@ export function parseSandboxTrace(
   // Process names routinely contain hyphens and dots (git-remote-https,
   // com.apple.WebKit), so \w alone silently skips those lines and leaves the
   // discovered policy incomplete.
-  const traceRegex = /Sandbox:\s+([^(\s]+)\((\d+)\)\s+(allow|deny)\s+(\S+)\s+(.+)$/gm;
+  //
+  // A refusal reads `deny(1)`, with a count. The discovery profile refuses
+  // writes outside the workspace, so a refused write is still a write the
+  // workflow wanted, and is reported like an allowed one.
+  const traceRegex = /Sandbox:\s+([^(\s]+)\((\d+)\)\s+(allow|deny)(?:\(\d+\))?\s+(\S+)\s+(.+)$/gm;
 
   let match;
   while ((match = traceRegex.exec(traceContent)) !== null) {
@@ -626,8 +675,10 @@ export function parseSandboxTrace(
       }
     }
 
-    // Only process allow actions in discovery mode
-    if (action !== 'allow') continue;
+    // Refused writes count; a refused read is one of the paths no policy can
+    // grant, and anything else refused is not something discovery asked about.
+    const isWrite = operation.includes('write') || operation.includes('create') || operation.includes('unlink');
+    if (action !== 'allow' && !(operation.startsWith('file-') && isWrite)) continue;
 
     // Handle network operations on Unix sockets
     if (operation === 'network-outbound' || operation === 'network-bind') {
@@ -653,6 +704,9 @@ export function parseSandboxTrace(
     // Skip paths inside workDir (already allowed)
     if (filePath.startsWith(workDir)) continue;
 
+    // Never offer what no policy can grant.
+    if (isNeverReachable(filePath)) continue;
+
     // Skip system paths that are always allowed (temp dirs, devices)
     if (
       filePath.startsWith('/tmp') ||
@@ -667,7 +721,7 @@ export function parseSandboxTrace(
     }
 
     // Categorize by operation type
-    if (operation.includes('write') || operation.includes('create') || operation.includes('unlink')) {
+    if (isWrite) {
       // Convert to relative path with ~ if in home directory
       const relativePath = filePath.startsWith(homeDir)
         ? '~' + filePath.slice(homeDir.length)

@@ -254,6 +254,16 @@ if (!isMacOS) {
       expect(run(profile, ['/usr/bin/touch', path.join(home, '.cargo', 'bin', 'cargo')])).toBe(false);
     });
 
+    it('lets --updaterc observe reads and writes without writing the disk', () => {
+      const profile = generateDiscoveryProfile({ workDir, proxyPort: 1, logFile: '' });
+      expect(run(profile, ['/bin/cat', path.join(home, 'notes.txt')])).toBe(true);
+      expect(run(profile, ['/usr/bin/touch', path.join(workDir, 'built')])).toBe(true);
+      expect(run(profile, ['/usr/bin/touch', path.join(home, 'planted')])).toBe(false);
+      expect(run(profile, ['/usr/bin/touch', path.join(home, '.cargo', 'bin', 'cargo')])).toBe(false);
+      expect(run(profile, ['/bin/cat', path.join(home, '.ssh', 'id_ed25519')])).toBe(false);
+      expect(fs.existsSync(path.join(home, 'planted'))).toBe(false);
+    });
+
     it('keeps private keys unreadable even when the policy declares the home directory', () => {
       const profile = generateSandboxProfile({
         workDir,
