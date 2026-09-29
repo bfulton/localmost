@@ -28,8 +28,9 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   other than `no` (`--restart=always`, `unless-stopped`, `on-failure`) are
   refused, and registry credentials are attached by the proxy so the job never
   reads `~/.docker/config.json`. The containers and networks a job created are
-  removed when the job ends, the containers with their anonymous volumes.
-  Default off. Allowed in `shared` and per workflow.
+  removed when the job ends, the containers with their anonymous volumes, if
+  localmost is still running then (Docker Access in `SECURITY.md` has the
+  exceptions). Default off. Allowed in `shared` and per workflow.
   See `docs/superpowers/specs/2026-09-05-docker-isolation-design.md`
 - **Workflow Test Mode**: Run workflows locally before pushing with `localmost test`
   - Intercepts `actions/checkout` to use local working tree
@@ -150,21 +151,22 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   denied path under the new name.
 - `.localmostrc` refuses a network entry that is not a host pattern - a URL such
   as `https://evil.com`, a path, a range such as `10.0.0.0/8`, surrounding
-  spaces - and a relative
-  `filesystem.deny` entry. Each was accepted and shown, and allowed or denied
-  nothing. A network entry must also be in the spelling a request's host
-  arrives in (punycode, an address written out, no trailing dot), which an
-  allow entry spelled otherwise never matched; the error gives the entry to
-  write. An already approved policy with any such entry no longer loads, and
-  its jobs are refused until it is fixed and approved again.
+  spaces - and a relative `filesystem.deny` entry. Each was accepted and shown,
+  and allowed or denied nothing. A network entry must also be in the spelling a
+  request's host arrives in (punycode, an address written out, no trailing
+  dot), which an allow entry spelled otherwise never matched; the error gives
+  the entry to write. An already approved policy with any such entry no longer
+  loads, and its jobs are refused until it is fixed and approved again.
 - `localmost test` applies the checkout's `network.deny` and reaches an allowed
   host only on its scheme's port (or the port an entry spells), as a runner job
   does. Its proxy took the allow list alone and matched a host on any port.
   `--updaterc` writes a host reached on another port as `host:port`, so the
   next run allows what discovery saw, and reports rather than writes a host no
-  entry can name. A plain request goes upstream with the host that was checked
-  as its `Host`, as a runner job's does, not the header the client wrote, which
-  on a shared front end - a CDN, a cloud load balancer - asks for a denied site.
+  entry can name.
+- A plain HTTP request, from a runner job or from `localmost test`, goes
+  upstream with the host that was checked as its `Host`, not the header the
+  client wrote, which on a shared front end - a CDN, a cloud load balancer -
+  could name a site the policy does not allow.
 - A runner job cannot read or write the app's own data directory
   (`~/.localmost`) or Electron's (`~/Library/Application Support/localmost`),
   whatever its policy grants, beyond its own sandbox and its target's caches,
