@@ -56,6 +56,28 @@ describe('killOrphanedProcesses', () => {
     expect(signalled).toEqual([]);
   });
 
+  it('sends no SIGKILL when the pid changed hands during the grace period', async () => {
+    // The worker exited on SIGTERM, and in the two seconds before the
+    // escalation the OS gave its pid to a new process. A liveness probe
+    // cannot tell the two apart; the start time can.
+    fs.writeFileSync(path.join(pidDir, '1.pid'), '4242 STARTED-AT');
+    const looks = ['STARTED-AT', 'LATER-START'];
+    const startTimeOf = (pid: number) => (pid === 4242 ? (looks.length > 1 ? looks.shift()! : looks[0]) : null);
+
+    await killOrphanedProcesses(sandboxBase, () => undefined, startTimeOf);
+
+    expect(signalled.filter(([, sig]) => sig === 'SIGTERM')).toEqual([[-4242, 'SIGTERM']]);
+    expect(signalled.filter(([, sig]) => sig === 'SIGKILL')).toEqual([]);
+  });
+
+  it('still force-kills a worker that ignored SIGTERM', async () => {
+    fs.writeFileSync(path.join(pidDir, '1.pid'), '4242 STARTED-AT');
+
+    await killOrphanedProcesses(sandboxBase, () => undefined, startTimeOf({ 4242: 'STARTED-AT' }));
+
+    expect(signalled.filter(([, sig]) => sig === 'SIGKILL')).toEqual([[-4242, 'SIGKILL']]);
+  });
+
   it('never signals this process, even if a stale pid file names it', async () => {
     fs.writeFileSync(path.join(pidDir, '1.pid'), String(process.pid));
     await killOrphanedProcesses(sandboxBase, () => undefined);

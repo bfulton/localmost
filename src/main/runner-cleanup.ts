@@ -359,19 +359,20 @@ export async function killOrphanedProcesses(
           }
           // Give it time to gracefully disconnect from GitHub
           await new Promise(resolve => setTimeout(resolve, 2000));
-          // Force kill if still alive
-          try {
-            process.kill(pid, 0);
+          // Force kill only the worker that was verified above. It may have
+          // exited on SIGTERM and its pid been handed to a new process within
+          // the grace period, which a liveness probe cannot tell apart; the
+          // start time can, as it did before the SIGTERM.
+          if (startTimeOf(pid) === recordedStart) {
             log(`Force killing orphaned process ${pid}`);
             try {
               process.kill(-pid, 'SIGKILL');
             } catch {
               // Process group kill failed - fall back to single process
-              process.kill(pid, 'SIGKILL');
+              try { process.kill(pid, 'SIGKILL'); } catch { /* exited meanwhile */ }
             }
-          } catch {
-            // Process exited after SIGTERM - this is the expected success case
           }
+          // Otherwise it exited after SIGTERM - the expected success case.
         } catch {
           // Process not running (ESRCH) - already dead, nothing to do
         }
