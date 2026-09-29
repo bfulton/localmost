@@ -133,7 +133,7 @@ interface RunnerInstance {
 }
 
 /** Job event types for notifications */
-export type JobEventType = 'started' | 'completed' | 'refused';
+export type JobEventType = 'started' | 'completed' | 'refused' | 'cancel-failed';
 
 /** Job event data for notifications */
 export interface JobEvent {
@@ -141,7 +141,7 @@ export interface JobEvent {
   jobName: string;
   repository: string;
   status?: 'completed' | 'failed' | 'cancelled';
-  /** Why a refused job was not run */
+  /** Why a refused job was not run, or why its run could not be cancelled */
   reason?: string;
 }
 
@@ -2448,19 +2448,52 @@ export class RunnerManager {
   }
 
   /**
-   * Cancel a workflow run that must not proceed.
+   * Cancel a workflow run that must not proceed. Resolves to whether GitHub
+   * took the cancel.
+   *
+   * A failure is recorded on the job's history entry and notified, not only
+   * logged: a run meant to be cancelled that was not goes on running its
+   * other jobs, while the history said it was refused and nothing said
+   * otherwise. The entry is `historyId` when the caller knows it, else the
+   * latest one for the run.
    */
-  async cancelRun(owner: string, repo: string, githubRunId: number, reason: string): Promise<void> {
+  async cancelRun(
+    owner: string,
+    repo: string,
+    githubRunId: number,
+    reason: string,
+    historyId?: string
+  ): Promise<boolean> {
+    let failure: string;
     if (!this.cancelWorkflowRun) {
-      this.log('warn', 'Cannot cancel: cancelWorkflowRun not available');
-      return;
+      failure = 'cancelWorkflowRun not available';
+    } else {
+      try {
+        await this.cancelWorkflowRun(owner, repo, githubRunId);
+        this.log('info', `Cancelled workflow run ${githubRunId}: ${reason}`);
+        return true;
+      } catch (cancelErr) {
+        failure = (cancelErr as Error).message;
+      }
     }
-    try {
-      await this.cancelWorkflowRun(owner, repo, githubRunId);
-      this.log('info', `Cancelled workflow run ${githubRunId}: ${reason}`);
-    } catch (cancelErr) {
-      this.log('warn', `Failed to cancel workflow run ${githubRunId}: ${(cancelErr as Error).message}`);
+    this.log('warn', `Failed to cancel workflow run ${githubRunId}: ${failure}`);
+
+    const note = `cancel failed: ${failure}`;
+    let entry: JobHistoryEntry | undefined;
+    for (let i = this.jobHistory.length - 1; i >= 0 && !entry; i--) {
+      const candidate = this.jobHistory[i];
+      if (historyId ? candidate.id === historyId : candidate.githubRunId === githubRunId) entry = candidate;
     }
+    if (entry) {
+      this.updateJobInHistory(entry.id, { error: entry.error ? `${entry.error}; ${note}` : note });
+    }
+    this.onJobEvent?.({
+      type: 'cancel-failed',
+      jobName: entry?.jobName ?? `run ${githubRunId}`,
+      repository: entry?.repository ?? `${owner}/${repo}`,
+      reason: note,
+    });
+    return false;
   }
 
   /**
@@ -2469,6 +2502,10 @@ export class RunnerManager {
   private async checkJobUserFilter(instanceNum: number, _runnerName: string): Promise<void> {
     const instance = this.instances.get(instanceNum);
     if (!instance?.currentJob) return;
+    // The worker the job is running on. A --once worker runs one job, so while
+    // this process holds the slot, it is this job's.
+    const worker = instance.process;
+    const job = instance.currentJob;
 
     // No actor is a verdict for evaluateJobFilter, not a reason to skip it;
     // without a run or a repository there is nothing to cancel.
@@ -2492,8 +2529,31 @@ export class RunnerManager {
     );
     if (allowed) return;
 
-    this.log('info', `Job not allowed: ${reason}. Cancelling workflow run.`);
-    await this.cancelRun(repoInfo.owner, repoInfo.repo, githubRunId, reason);
+    this.log('info', `Job not allowed: ${reason}. Cancelling workflow run and stopping its worker.`);
+    this.updateJobInHistory(job.id, { error: reason });
+    // Stopped whether or not the cancel goes through, and without waiting for
+    // it: until the worker is gone the job's steps are running, and a cancel
+    // that failed would leave them running to the end. Only the worker the
+    // check began with - if the slot has a new one, that one is not this
+    // job's. GitHub shows a job stopped this way as lost rather than
+    // cancelled when the cancel has not landed first.
+    const stop = worker && this.instances.get(instanceNum) === instance && instance.process === worker
+      ? this.stopInstance(instanceNum)
+      : Promise.resolve();
+    await Promise.all([
+      this.cancelRun(repoInfo.owner, repoInfo.repo, githubRunId, reason, job.id),
+      stop,
+    ]);
+    // The runner may never report a stopped job's end; don't leave it running.
+    const entry = this.jobHistory.find((j) => j.id === job.id);
+    if (entry?.status === 'running') {
+      const completedAt = new Date().toISOString();
+      this.updateJobInHistory(job.id, {
+        status: 'cancelled',
+        completedAt,
+        runTimeSeconds: Math.round((Date.parse(completedAt) - Date.parse(job.startedAt)) / 1000),
+      });
+    }
   }
 
   private addJobToHistory(job: JobHistoryEntry, announceStart = true): void {

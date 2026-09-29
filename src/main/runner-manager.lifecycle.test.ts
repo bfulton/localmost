@@ -92,6 +92,7 @@ jest.mock('fs', () => ({
 
 import * as fs from 'fs';
 import { RunnerManager, JobEvent, lineReader } from './runner-manager';
+import { ProxyServer } from './proxy-server';
 import { spawnSandboxed } from './process-sandbox';
 import { createMockProcess, RunnerManagerTestHelper } from './test-utils';
 
@@ -101,6 +102,17 @@ const mockSpawnSandboxed = spawnSandboxed as jest.MockedFunction<typeof spawnSan
 const settle = async (): Promise<void> => {
   for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
 };
+
+/** Replace process.kill for the duration of a test, recording every call. */
+function stubKill(impl: (pid: number, sig?: string | number) => boolean = () => true) {
+  const calls: Array<[number, string | number | undefined]> = [];
+  const realKill = process.kill;
+  (process as unknown as { kill: unknown }).kill = ((pid: number, sig?: string | number) => {
+    calls.push([pid, sig]);
+    return impl(pid, sig);
+  }) as never;
+  return { calls, restore: () => { (process as unknown as { kill: unknown }).kill = realKill; } };
+}
 
 function newManager(overrides: Partial<ConstructorParameters<typeof RunnerManager>[0]> = {}) {
   const events: JobEvent[] = [];
@@ -249,5 +261,120 @@ describe("splitting a worker's output into lines", () => {
 
     expect(onSkipped).toHaveBeenCalledTimes(1);
     expect(lines).toEqual(['next']);
+  });
+});
+
+describe('cancelling a run', () => {
+  it('resolves true when GitHub accepts the cancel', async () => {
+    const cancelWorkflowRun = jest.fn(async () => undefined);
+    const { manager, events } = newManager({ cancelWorkflowRun });
+
+    await expect(manager.cancelRun('owner', 'repo', 42, 'refused')).resolves.toBe(true);
+    expect(events).toEqual([]);
+  });
+
+  it('on failure resolves false, records it on the refused job, and says so', async () => {
+    const cancelWorkflowRun = jest.fn(async () => { throw new Error('HTTP 403 Resource not accessible'); });
+    const onJobHistoryUpdate = jest.fn();
+    const { manager, events } = newManager({ cancelWorkflowRun, onJobHistoryUpdate });
+    manager.recordRefusedJob({ repository: 'owner/repo', jobName: 'job 7', reason: 'untrusted actor', githubRunId: 42 });
+    events.length = 0;
+
+    await expect(manager.cancelRun('owner', 'repo', 42, 'untrusted actor')).resolves.toBe(false);
+
+    const entry = manager.getJobHistory().find((j) => j.githubRunId === 42)!;
+    // The refusal reason is kept; the failure is added to it.
+    expect(entry.error).toBe('untrusted actor; cancel failed: HTTP 403 Resource not accessible');
+    expect(onJobHistoryUpdate).toHaveBeenLastCalledWith(
+      expect.arrayContaining([expect.objectContaining({ error: entry.error })])
+    );
+    expect(events).toEqual([
+      expect.objectContaining({
+        type: 'cancel-failed',
+        repository: 'owner/repo',
+        reason: 'cancel failed: HTTP 403 Resource not accessible',
+      }),
+    ]);
+  });
+
+  it('counts a missing cancel function as a failure, not a success', async () => {
+    const { manager, events } = newManager({ cancelWorkflowRun: undefined });
+
+    await expect(manager.cancelRun('owner', 'repo', 42, 'refused')).resolves.toBe(false);
+    expect(events).toEqual([expect.objectContaining({ type: 'cancel-failed' })]);
+  });
+});
+
+describe('the job-start backstop', () => {
+  // A job the filter refuses reached a worker anyway: the trigger scope with
+  // an actor who is not the machine owner.
+  const filterOverrides = {
+    getUserFilter: () => ({ scope: 'trigger' as const, allowedUsers: 'just-me' as const, allowlist: [] }),
+    getCurrentUserLogin: () => 'me',
+  };
+
+  async function claimed(cancelWorkflowRun: () => Promise<void>) {
+    const ctx = newManager({ ...filterOverrides, cancelWorkflowRun });
+    (fs.existsSync as jest.Mock).mockReturnValue(true);
+    const proc = createMockProcess(13579);
+    mockSpawnSandboxed.mockReturnValue(proc);
+    await ctx.helper.spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubRunId: 42, githubActor: 'stranger' } as never);
+    return { ...ctx, proc };
+  }
+
+  it.each([
+    ['succeeds', async () => undefined],
+    ['fails', async () => { throw new Error('HTTP 500'); }],
+  ])('stops the worker when the cancel %s, and the exit finalizes it', async (how, cancel) => {
+    const { helper, manager, proc, events } = await claimed(cancel);
+    const kill = stubKill();
+    try {
+      proc.stdout!.emit('data', Buffer.from('Running job: build\n'));
+      await settle();
+
+      expect(kill.calls).toContainEqual([-13579, 'SIGTERM']);
+      const entry = manager.getJobHistory().find((j) => j.jobName === 'build')!;
+      expect(entry.error).toContain("trigger author 'stranger' not in allowed users");
+      if (how === 'fails') {
+        expect(entry.error).toContain('cancel failed: HTTP 500');
+        expect(events).toContainEqual(expect.objectContaining({ type: 'cancel-failed' }));
+      }
+
+      // The worker exits on the SIGTERM; its exit finalizes the slot as for
+      // any other exit, sealing its proxy.
+      const proxy = (ProxyServer as unknown as jest.Mock).mock.results.at(-1)!.value;
+      const rotations = proxy.rotateAuthToken.mock.calls.length;
+      proc.emit('exit', null, 'SIGTERM');
+      await settle();
+      expect(proxy.rotateAuthToken.mock.calls.length).toBeGreaterThan(rotations);
+      expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith([]);
+
+      // Not left 'running' forever: the job was stopped.
+      expect(manager.getJobHistory().find((j) => j.jobName === 'build')!.status).toBe('cancelled');
+      expect(helper.instances.get(1)!.currentJob).toBeNull();
+    } finally {
+      kill.restore();
+    }
+  });
+
+  it('does not stop a worker that replaced the refused one during the check, and still closes the refused job', async () => {
+    const { helper, manager, proc } = await claimed(async () => undefined);
+    const kill = stubKill();
+    try {
+      // The start line sets the backstop going; it awaits the filter. While
+      // it does, the refused worker exits and a new spawn takes the slot.
+      proc.stdout!.emit('data', Buffer.from('Running job: build\n'));
+      helper.setInstance(1, { name: 'runner-1', status: 'busy', process: createMockProcess(97531) });
+      await settle();
+
+      expect(kill.calls.filter(([, sig]) => sig !== 0)).toEqual([]);
+      // Its history says why it ended, and does not say it is still running.
+      expect(manager.getJobHistory().find((j) => j.jobName === 'build')).toEqual(expect.objectContaining({
+        status: 'cancelled',
+        error: "trigger author 'stranger' not in allowed users",
+      }));
+    } finally {
+      kill.restore();
+    }
   });
 });
