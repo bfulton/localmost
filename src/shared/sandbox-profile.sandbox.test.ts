@@ -17,7 +17,11 @@
  *   ambient      Inside a localmost job, seatbelt refuses any nested profile
  *                that deviates from the one in force, so constructing one is
  *                impossible. What can still be shown is that the profile this
- *                process runs under refuses the same connection.
+ *                process runs under refuses the same connection, and that
+ *                the generated profiles carry the rules in question. The
+ *                generated profiles are not applied in this mode: CI inside
+ *                a job covers them only structurally, and the constructed
+ *                mode has to run on a machine outside one.
  *
  * Neither mode skips. macOS only, because seatbelt is.
  */
@@ -330,6 +334,22 @@ if (!isMacOS) {
       const result = await tryConnect(null, OFF_BOX, 9);
       expect(result.ok).toBe(false);
       expect(result.output).toContain('Operation not permitted');
+    });
+
+    it('generates profiles that carry the rules the constructed mode would apply', () => {
+      // Not a substitute for applying them - that needs a machine outside a
+      // job - but it holds the rules this file is about in place here too.
+      const workDir = '/Users/test/.localmost/workspaces/ws-1';
+      for (const profile of [
+        generateSandboxProfile({ workDir, proxyPort: 1, policy: readable }),
+        generateDiscoveryProfile({ workDir, proxyPort: 1, logFile: '' }),
+      ]) {
+        expect(profile).not.toContain('(local ip)');
+        expect(profile).toContain('(deny network*)');
+        expect(profile).toContain('(allow network-outbound (remote ip "localhost:*"))');
+        expect(profile).toContain(`(deny file-write* (literal "${workDir}"))`);
+        expect(profile).not.toContain('(subpath "/private/tmp")');
+      }
     });
   });
 }

@@ -708,37 +708,37 @@ async function runJob(
 
   // Whatever the steps left running ends with the job, as on GitHub.
   try {
-  for (const step of job.steps!) {
-    if (options.dryRun) {
-      const stepName = step.name || step.id || (step.uses ? `Run ${step.uses}` : 'Run script');
-      console.log(`  ${pending(stepName)} (dry run)`);
-      continue;
-    }
-
-    const result = await executeStep(step, jobContext, job);
-    stepResults.push(result);
-
-    // Print step result
-    if (!options.verbose) {
-      console.log(`  ${formatStepStatus(result.status, result.name, result.duration)}`);
-    }
-
-    // Handle failure
-    if (result.status === 'failure') {
-      jobStatus = 'failure';
-      if (result.error) {
-        console.log(`    ${colors.red}Error: ${result.error}${colors.reset}`);
-      } else if (result.exitCode !== undefined && result.exitCode !== 0) {
-        console.log(`    ${colors.red}Exit code: ${result.exitCode}${colors.reset}`);
-      } else {
-        console.log(`    ${colors.red}Step failed${colors.reset}`);
+    for (const step of job.steps!) {
+      if (options.dryRun) {
+        const stepName = step.name || step.id || (step.uses ? `Run ${step.uses}` : 'Run script');
+        console.log(`  ${pending(stepName)} (dry run)`);
+        continue;
       }
-      // Stop on first failure (unless continue-on-error)
-      if (!step['continue-on-error']) {
-        break;
+
+      const result = await executeStep(step, jobContext, job);
+      stepResults.push(result);
+
+      // Print step result
+      if (!options.verbose) {
+        console.log(`  ${formatStepStatus(result.status, result.name, result.duration)}`);
+      }
+
+      // Handle failure
+      if (result.status === 'failure') {
+        jobStatus = 'failure';
+        if (result.error) {
+          console.log(`    ${colors.red}Error: ${result.error}${colors.reset}`);
+        } else if (result.exitCode !== undefined && result.exitCode !== 0) {
+          console.log(`    ${colors.red}Exit code: ${result.exitCode}${colors.reset}`);
+        } else {
+          console.log(`    ${colors.red}Step failed${colors.reset}`);
+        }
+        // Stop on first failure (unless continue-on-error)
+        if (!step['continue-on-error']) {
+          break;
+        }
       }
     }
-  }
   } finally {
     reapStepProcesses();
   }
@@ -843,34 +843,34 @@ async function runReusableWorkflowJob(
 
     // Run steps in the called job, ending what they leave running with it
     try {
-    for (const step of calledJob.steps!) {
-      if (options.dryRun) {
-        const stepName = step.name || step.id || (step.uses ? `Run ${step.uses}` : 'Run script');
-        console.log(`    ${pending(stepName)} (dry run)`);
-        continue;
-      }
-
-      const result = await executeStep(step, calledContext, calledJob);
-      allStepResults.push(result);
-
-      if (!options.verbose) {
-        console.log(`    ${formatStepStatus(result.status, result.name, result.duration)}`);
-      }
-
-      if (result.status === 'failure') {
-        overallStatus = 'failure';
-        if (result.error) {
-          console.log(`      ${colors.red}Error: ${result.error}${colors.reset}`);
-        } else if (result.exitCode !== undefined && result.exitCode !== 0) {
-          console.log(`      ${colors.red}Exit code: ${result.exitCode}${colors.reset}`);
-        } else {
-          console.log(`      ${colors.red}Step failed${colors.reset}`);
+      for (const step of calledJob.steps!) {
+        if (options.dryRun) {
+          const stepName = step.name || step.id || (step.uses ? `Run ${step.uses}` : 'Run script');
+          console.log(`    ${pending(stepName)} (dry run)`);
+          continue;
         }
-        if (!step['continue-on-error']) {
-          break;
+
+        const result = await executeStep(step, calledContext, calledJob);
+        allStepResults.push(result);
+
+        if (!options.verbose) {
+          console.log(`    ${formatStepStatus(result.status, result.name, result.duration)}`);
+        }
+
+        if (result.status === 'failure') {
+          overallStatus = 'failure';
+          if (result.error) {
+            console.log(`      ${colors.red}Error: ${result.error}${colors.reset}`);
+          } else if (result.exitCode !== undefined && result.exitCode !== 0) {
+            console.log(`      ${colors.red}Exit code: ${result.exitCode}${colors.reset}`);
+          } else {
+            console.log(`      ${colors.red}Step failed${colors.reset}`);
+          }
+          if (!step['continue-on-error']) {
+            break;
+          }
         }
       }
-    }
     } finally {
       reapStepProcesses();
     }
