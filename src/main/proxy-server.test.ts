@@ -377,6 +377,30 @@ describe('screening the address a host resolves to', () => {
     expect(screen(proxy, ip)).toBe(false);
   });
 
+  it('blocks a GET whose allowed host resolves to loopback, but allows a literal loopback target', async () => {
+    // A repository-controlled name rebinding to 127.0.0.1 must not become a
+    // proxy path to a local service; the broker, reached at the literal
+    // 127.0.0.1, still must.
+    const rebind = new ProxyServer({ policyLevel: 'permissive', lookup: async () => ['127.0.0.1'] });
+    await rebind.start();
+    const literal = new ProxyServer({ policyLevel: 'permissive', lookup: async () => ['8.8.8.8'] });
+    await literal.start();
+    const req = (port: number, path: string) => new Promise<number>((resolve, reject) => {
+      const r = http.request({ hostname: '127.0.0.1', port, path, method: 'GET' }, (res) => { res.resume(); resolve(res.statusCode || 0); });
+      r.on('error', reject); r.end();
+    });
+    try {
+      // hostname that resolves to loopback -> refused
+      expect(await req(rebind.getPort(), 'http://rebind.example/')).toBe(403);
+      // literal loopback target reaches an upstream that is not listening ->
+      // 502 proves it was NOT screened out (a 403 would mean blocked).
+      expect(await req(literal.getPort(), 'http://127.0.0.1:9/')).toBe(502);
+    } finally {
+      await rebind.stop();
+      await literal.stop();
+    }
+  });
+
   it('blocks a GET whose allowed host resolves to a private address it could not otherwise reach', async () => {
     const p = new ProxyServer({ policyLevel: 'permissive', lookup: async () => ['10.1.2.3'] });
     await p.start();

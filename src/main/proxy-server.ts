@@ -193,6 +193,27 @@ export class ProxyServer {
     return true;
   }
 
+  /**
+   * Loopback (127/8, ::1, and IPv4-mapped loopback). Allowed only for a literal
+   * target - the broker is reached at the literal 127.0.0.1 - never for a name
+   * that resolves here, which would be an SSRF to a local service.
+   */
+  private isLoopbackAddress(ip: string): boolean {
+    const v = net.isIP(ip);
+    if (v === 4) return ip.split('.')[0] === '127';
+    if (v === 6) {
+      const groups = this.expandV6ToGroups(ip);
+      if (!groups) return false;
+      if (groups.every((g, i) => (i === 7 ? g === 1 : g === 0))) return true; // ::1
+      // IPv4-mapped/compatible loopback (::ffff:127.x, ::127.x)
+      if (groups[0] === 0 && groups[1] === 0 && groups[2] === 0 && groups[3] === 0 &&
+          groups[4] === 0 && (groups[5] === 0 || groups[5] === 0xffff)) {
+        return (groups[6] >> 8) === 127;
+      }
+    }
+    return false;
+  }
+
   private isBlockedV4(addr: string): boolean {
     const o = addr.split('.').map((n) => parseInt(n, 10));
     if (o.length !== 4 || o.some((n) => isNaN(n) || n < 0 || n > 255)) return true;
@@ -220,8 +241,14 @@ export class ProxyServer {
    * single address broke that fallback and stalled real downloads.
    */
   private async screenAddresses(host: string): Promise<string[] | null> {
+    // A literal target is trusted as written - the broker is reached at the
+    // literal 127.0.0.1, and the sandbox denies the broker port directly so the
+    // proxy is the only path. A name is not: it must resolve entirely to
+    // routable, off-box addresses, so a repository-controlled hostname cannot
+    // rebind to loopback (or any internal range) and reach a local service.
+    const literal = net.isIP(host) !== 0;
     let candidates: string[];
-    if (net.isIP(host)) {
+    if (literal) {
       candidates = [host];
     } else {
       try {
@@ -231,7 +258,9 @@ export class ProxyServer {
       }
     }
     if (candidates.length === 0) return null;
-    if (!candidates.every((ip) => !this.isBlockedAddress(ip))) return null;
+    const refused = (ip: string): boolean =>
+      this.isBlockedAddress(ip) || (!literal && this.isLoopbackAddress(ip));
+    if (!candidates.every((ip) => !refused(ip))) return null;
     return candidates;
   }
 
