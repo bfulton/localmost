@@ -180,7 +180,11 @@ the worker's token endpoint) never go upstream: another spelling of one
 (`/Message`, `/message/`, `/%6dessage`), or another method on it, is refused.
 Any other path is not yet restricted: it is forwarded to GitHub's broker on
 the runner's credentials as it comes, with the target's upstream session id in
-place of any session id it carries.
+place of any session id it carries. That id is put in under `sessionId`, so a
+query that also spells it another way (`SessionId`, or with a letter Go reads
+as an ASCII one), or has any parameter name that is not plain ASCII, is refused
+rather than forwarded: upstream could read that spelling beside or instead of
+the id put there.
 Forwarding only the paths the runner uses would close that; it is an open
 item. That key, not the closed port, is what keeps a job from acting as
 another worker, and from acting as the runner through the operations above.
@@ -432,9 +436,28 @@ What the filter refuses, each of which is an executable test against the proxy:
   and after the daemon itself restarts, outliving the job;
 - an image, registry, mount, network mode or build context the policy did not
   declare;
+- a request body with a key the daemon may read as another: two keys that
+  differ only in case, which the daemon's Go decoder merges, or any key, at any
+  depth, that is not plain ASCII, since that decoder also reads some other
+  letters as ASCII ones (`HoſtConfig` is `HostConfig` to it, so an unchecked
+  key could carry `--privileged` or a root bind); a query parameter named
+  outside plain ASCII; and a body nested deeper than any Docker request. A key
+  repeated exactly is not refused but never reaches the daemon: JSON.parse
+  keeps its last copy, while the daemon would decode every copy and keep what
+  the earlier ones put in a map or struct, so each permitted JSON body is
+  forwarded as the object the filter judged rather than as the bytes received;
+- a body sent as a type the daemon reads parameters from: Go's server takes a
+  form body's `fromImage` or `networkmode` over the URL's, so each action
+  accepts only the content types that carry no form - JSON for a create or
+  network create, a tar or none for a build, none or `text/plain` otherwise;
 - any endpoint, API version or request body the proxy does not fully
   understand. The filter fails closed: a request it cannot evaluate is refused,
   not passed through.
+
+The top level of a container create body is not yet an allowlist the way
+`HostConfig` is: a top-level key the filter does not know, such as a field a
+later API version adds, is forwarded unexamined. Building that allowlist from
+the bodies the CLI sends is an open item.
 
 Registry credentials never enter the sandbox. The proxy attaches authentication
 to a pull on the job's behalf; the job does not read `~/.docker/config.json` and

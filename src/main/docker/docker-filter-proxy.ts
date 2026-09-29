@@ -655,9 +655,11 @@ export class DockerFilterProxy {
       else res.end();
       return;
     }
-    // The verdict may pin the body it approved - mount sources resolved to the
-    // paths actually checked - so the daemon mounts what the filter judged
-    // rather than re-resolving a name the job can repoint in between.
+    // A permitted JSON body is forwarded as the object the verdict judged, not
+    // as the bytes received: the daemon reads a repeated key's earlier copies,
+    // which JSON.parse dropped. A create's is pinned further - mount sources
+    // resolved to the paths actually checked - so the daemon mounts what the
+    // filter judged rather than re-resolving a name the job can repoint.
     const body = rewrittenBody !== undefined ? Buffer.from(JSON.stringify(rewrittenBody)) : bufferedBody;
     const endpoint = this.backend.resolveEndpoint();
     if (!endpoint) {

@@ -14,7 +14,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { DockerPolicy, DockerMount, DockerNetworkPolicy, MountMode } from '../../shared/docker-policy';
-import { DockerRequest, DockerAction, classifyDockerRequest, containerIdFrom, imageRefFrom, networkIdFrom } from './docker-request';
+import { asciiEscaped, isPlainAscii } from '../../shared/json-keys';
+import {
+  DockerRequest, DockerAction, classifyDockerRequest, containerIdFrom, imageRefFrom, mediaTypeOf, networkIdFrom,
+} from './docker-request';
 
 export interface DockerEvalContext {
   /** The bound policy; null until the worker claims a job, which denies all. */
@@ -50,10 +53,16 @@ export interface DockerVerdict {
   /** The policy that would permit it, as YAML under `docker:` (for --updaterc discovery). */
   policyHint?: string;
   /**
-   * A create body whose mount sources are rewritten to the paths this verdict
-   * actually checked. Forwarding the spelling the client sent would let the
-   * daemon resolve it a second time, and the job can swap a symlink in the gap
-   * between the two resolutions; forwarding what was checked closes that.
+   * The body to forward in place of the bytes received: on any permitted
+   * request with a JSON body, the object this verdict judged, and on a create,
+   * one whose mount sources are rewritten to the paths it actually checked.
+   *
+   * Forwarding the bytes would let the daemon read what JSON.parse dropped: a
+   * key repeated exactly, which JSON.parse keeps only the last copy of, while
+   * Go decodes every copy in turn and a map or struct keeps what the earlier
+   * ones put there. And forwarding a mount source as the client spelled it
+   * would let the daemon resolve it a second time, after the job swapped a
+   * symlink in the gap between the two resolutions.
    */
   rewrittenBody?: unknown;
 }
@@ -808,7 +817,30 @@ function evaluateOwnContainer(req: DockerRequest, ctx: DockerEvalContext): Docke
 // -----------------------------------------------------------------------------
 
 /**
- * The first key in `value` that has a case-variant twin, named with its path.
+ * How deep a body may nest. A create's deepest real path -
+ * HostConfig.Mounts[].VolumeOptions.DriverConfig.Options - is six levels; a
+ * body far deeper is no Docker request, and walking it recursively would
+ * overflow the stack inside the request handler, which then never answers.
+ */
+const MAX_BODY_DEPTH = 32;
+
+/**
+ * The first key in `value` the daemon could read as a key this filter does
+ * not, named with its path: one that is not printable ASCII, or one that has
+ * a case-variant twin.
+ *
+ * Beyond ASCII case, Go's decoder folds some other letters to ASCII ones: it
+ * reads U+017F (long s) as `s`, escaped or not, so `HoſtConfig` is HostConfig
+ * to the daemon and an unknown key to every lookup here. Top-level keys are
+ * not an allowlist, and most nested objects are read only by name, so such a
+ * key carried privileged, a root bind or a mount propagation past every gate.
+ * Rather than copy Go's fold, which would have to be right for every letter
+ * and every future version, any key outside printable ASCII is refused, at
+ * every depth. The CLI writes its own keys in ASCII, and values - an
+ * environment variable, a label's value - are not checked. A key the job names
+ * itself, such as a label or a container path under Volumes, is refused too
+ * when it is not ASCII: the price of not modelling which objects are structs
+ * the daemon folds and which are maps it does not.
  *
  * Measured against a real daemon rather than reasoned about: a create body
  * carrying `HostConfig`, `hostconfig` and `HOSTCONFIG` came back with fields
@@ -821,31 +853,84 @@ function evaluateOwnContainer(req: DockerRequest, ctx: DockerEvalContext): Docke
  * So the ambiguity is refused instead of modelled. Go's encoder emits unique,
  * exactly-cased keys, so no real client sends a case-variant duplicate; a body
  * that does is either a client the filter does not model or an attempt to be
- * judged on one value and served another.
+ * judged on one value and served another. A key repeated exactly cannot be
+ * seen here - JSON.parse has already kept only its last copy - so the daemon
+ * is sent the parsed body instead of the bytes (see rewrittenBody).
+ *
+ * The walk recurses, so a body nested deeper than MAX_BODY_DEPTH is refused
+ * before it can exhaust the stack; `at` is the path from the body's root.
  */
-function caseAmbiguity(value: unknown, at = 'the request body'): string | undefined {
+function keyAmbiguity(value: unknown, at = '', depth = 0): string | undefined {
+  if (!Array.isArray(value) && !isPlainObject(value)) return undefined;
+  const where = at === '' ? 'the request body' : `the request body at ${at}`;
+  if (depth >= MAX_BODY_DEPTH) {
+    return `${where} is nested more than ${MAX_BODY_DEPTH} levels deep, deeper than any Docker API body; the localmost docker socket refuses it rather than walk it.`;
+  }
   if (Array.isArray(value)) {
     for (const [i, item] of value.entries()) {
-      const found = caseAmbiguity(item, `${at}[${i}]`);
+      const found = keyAmbiguity(item, `${at}[${i}]`, depth + 1);
       if (found) return found;
     }
     return undefined;
   }
-  if (!isPlainObject(value)) return undefined;
   const seen = new Map<string, string>();
   for (const key of Object.keys(value)) {
+    // Every key is checked before any is used in a path below, so `at` only
+    // ever names keys that passed.
+    if (!isPlainAscii(key)) {
+      return `${where} has a key "${asciiEscaped(key)}" that is not plain ASCII, which the daemon may read as another key: its decoder folds some other letters to ASCII ones, so the value it would use is not one this filter can read. Spell every key in ASCII.`;
+    }
     const folded = key.toLowerCase();
     const first = seen.get(folded);
     if (first !== undefined) {
-      return `${at} names both "${first}" and "${key}", which the daemon reads as the same key: it decodes them case-insensitively and merges or overwrites, so the value it would use is not the value this filter can read. Send each key once.`;
+      return `${where} names both "${first}" and "${key}", which the daemon reads as the same key: it decodes them case-insensitively and merges or overwrites, so the value it would use is not the value this filter can read. Send each key once.`;
     }
     seen.set(folded, key);
   }
   for (const [key, child] of Object.entries(value)) {
-    const found = caseAmbiguity(child, `${at}.${key}`);
+    const found = keyAmbiguity(child, at === '' ? key : `${at}.${key}`, depth + 1);
     if (found) return found;
   }
   return undefined;
+}
+
+/**
+ * The media types each action's body may be sent as; anything else is
+ * refused.
+ *
+ * The daemon's Go server reads parameters from a form body as well as from the
+ * URL, and FormValue prefers the body's: sent as
+ * application/x-www-form-urlencoded or multipart/form-data, a pull could take
+ * its `fromImage` and a build its `networkmode` from a body this filter
+ * streams through unread. So each action names the types Go never reads as a
+ * form: JSON for the two bodies the filter judges; a tar for a build context
+ * (x-tar from the CLI, tar from docker-py and dockerode), or none; and for
+ * every other action no type, or text/plain, which the CLI labels an empty
+ * attach with (and older CLIs every empty POST).
+ */
+const NO_BODY_MEDIA_TYPES: ReadonlySet<string> = new Set(['', 'text/plain']);
+const BODY_MEDIA_TYPES: Partial<Record<DockerAction, ReadonlySet<string>>> = {
+  create: new Set(['application/json']),
+  'network-create': new Set(['application/json']),
+  build: new Set(['application/x-tar', 'application/tar', '']),
+};
+
+function unexpectedMediaType(action: DockerAction, req: DockerRequest): string | undefined {
+  const type = mediaTypeOf(req);
+  if ((BODY_MEDIA_TYPES[action] ?? NO_BODY_MEDIA_TYPES).has(type)) return undefined;
+  return `content type "${asciiEscaped(type)}" is not one the localmost docker socket accepts on ${req.method} ${req.path}: the daemon could read parameters from such a body that this filter does not`;
+}
+
+/**
+ * The first query parameter named outside printable ASCII. The daemon reads
+ * its parameters by exact name, so none of these is one it knows; like a
+ * body key, it is refused rather than forwarded unexamined.
+ */
+function nonAsciiParam(query: Record<string, string>): string | undefined {
+  const key = Object.keys(query).find((name) => !isPlainAscii(name));
+  return key === undefined
+    ? undefined
+    : `query parameter "${asciiEscaped(key)}" is not plain ASCII; the localmost docker socket reads parameters by their ASCII names only`;
 }
 
 export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext): DockerVerdict {
@@ -859,10 +944,23 @@ export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext
   if (req.bodyError) return deny(req.bodyError);
 
   // Nor can it judge a body whose keys the daemon would read differently than
-  // it does. Checked once, here, so every action with a body is covered.
-  const ambiguous = caseAmbiguity(req.body);
+  // it does, a parameter it does not know, or a body the daemon could read
+  // parameters from. Checked once, here, so every action with a body or a
+  // query string is covered.
+  const ambiguous = keyAmbiguity(req.body) ?? nonAsciiParam(req.query) ?? unexpectedMediaType(action, req);
   if (ambiguous) return deny(ambiguous);
 
+  const verdict = judge(action, req, ctx, policy);
+  // A permitted JSON body goes to the daemon as the object judged, never as
+  // the bytes it arrived as (see rewrittenBody).
+  if (verdict.allowed && req.body !== undefined && verdict.rewrittenBody === undefined) {
+    return { ...verdict, rewrittenBody: req.body };
+  }
+  return verdict;
+}
+
+/** The verdict on a request whose body and query every action can read. */
+function judge(action: DockerAction, req: DockerRequest, ctx: DockerEvalContext, policy: DockerPolicy): DockerVerdict {
   switch (action) {
     case 'create':
       return evaluateCreate(req, ctx, policy);

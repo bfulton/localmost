@@ -1209,6 +1209,38 @@ describe('message routing', () => {
         expect(mockHttpsRequest).not.toHaveBeenCalled();
       });
 
+      it.each([
+        ['a second session id, in another case', (id: string) => `sessionId=${id}&SessionId=forged`],
+        ['a session id alone, in another case', () => 'SESSIONID=forged'],
+        ['a second session id with a long s, which Go reads as s', (id: string) => `sessionId=${id}&%C5%BFessionId=forged`],
+        ['any parameter named outside ASCII', (id: string) => `sessionId=${id}&st%C3%A4tus=x`],
+      ])('refuses a query upstream could read differently: %s', async (_, query) => {
+        // The upstream session id is put in place of the sessionId a request
+        // carries, by that exact name. Upstream reads query names whatever
+        // their case, and a folding decoder past ASCII, so a second spelling
+        // would reach it beside or instead of the id put there.
+        const sessionId = await acquiredWorker();
+        mockHttpsRequest.mockClear();
+
+        const res = await request('GET', `/runnerversion?${query(sessionId)}`);
+
+        expect(res.statusCode).toBe(403);
+        expect(mockHttpsRequest).not.toHaveBeenCalled();
+      });
+
+      it('forwards a query it can read, with the upstream session id in place of the local one', async () => {
+        const sessionId = await acquiredWorker();
+        mockHttpsRequest.mockClear();
+
+        const res = await request('GET', `/runnerversion?sessionId=${sessionId}&status=Online`);
+
+        expect(res.statusCode).toBe(200);
+        expect(mockHttpsRequest).toHaveBeenCalledTimes(1);
+        const { path } = mockHttpsRequest.mock.calls[0][0] as { path: string };
+        expect(new URLSearchParams(path.split('?')[1]).getAll('sessionId')).toEqual(['upstream-target-a']);
+        expect(path).toContain('status=Online');
+      });
+
       it('forwards nothing for a job that was delivered but not yet acquired', async () => {
         // Its ids are in the details acquirejob hands out; before that, the
         // worker has no business knowing them.
