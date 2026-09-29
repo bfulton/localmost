@@ -351,13 +351,26 @@ export interface GitHubUserSearchResult {
   name: string | null;
 }
 
-/** A repository policy the runner has recorded, for review in the app. */
+/**
+ * A repository policy the runner has recorded, for review in the app. A
+ * repository with both an approved policy and a pending one appears twice.
+ */
 export interface PolicySummary {
   repository: string;
   approved: boolean;
   cachedAt: string;
-  /** Human-readable summary of what the policy grants */
+  /** Human-readable summary of what the policy grants, level first */
   grants: string[];
+  /**
+   * For a pending policy that would replace an approved one: what it changes,
+   * one line each, e.g. "~ level: strict -> permissive".
+   */
+  changes?: string[];
+  /**
+   * sha256 of exactly this policy. Approving quotes it back, and is refused if
+   * the pending policy is no longer the one shown.
+   */
+  stamp: string;
 }
 
 // =============================================================================

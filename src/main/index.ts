@@ -107,7 +107,7 @@ import { resolveRegistryAuth } from './docker/registry-auth';
 import {
   decidePolicyForJob,
   recordPendingPolicy,
-  getCachedPolicy,
+  getApprovedPolicy,
   formatApprovalRequest,
 } from './policy-cache';
 
@@ -333,8 +333,8 @@ app.whenReady().then(async () => {
       // approved, and applying the approved copy means an unreviewed change
       // cannot take effect through a race. That covers the level too: it is
       // declared in the same file and approved with the rest of it.
-      const cached = getCachedPolicy(`${owner}/${repo}`);
-      if (!cached?.approved) {
+      const approved = getApprovedPolicy(`${owner}/${repo}`);
+      if (!approved) {
         return {
           hosts: [],
           level: 'strict' as const,
@@ -343,18 +343,18 @@ app.whenReady().then(async () => {
           docker: {},
         };
       }
-      const policy = getEffectivePolicy(cached.config, workflowName);
+      const policy = getEffectivePolicy(approved, workflowName);
       return {
         // Network is resolved per workflow and applied to the proxy per job.
         hosts: policy.network?.allow || [],
-        level: effectivePolicyLevel(cached.config),
+        level: effectivePolicyLevel(approved),
         // Filesystem comes from the shared section only. The sandbox profile
         // is built before the workflow is known and cannot change afterwards,
         // so a per-workflow filesystem section could not be applied - and
         // resolving it here would differ between spawn and claim and read as
         // policy drift.
-        readPaths: cached.config.shared?.filesystem?.read || [],
-        writePaths: cached.config.shared?.filesystem?.write || [],
+        readPaths: approved.shared?.filesystem?.read || [],
+        writePaths: approved.shared?.filesystem?.write || [],
         // Docker composes across shared and workflow: the socket is bound to
         // the merged policy when the job is claimed, after the workflow is known.
         docker: policy.docker ?? {},

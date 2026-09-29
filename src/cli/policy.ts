@@ -5,7 +5,9 @@
  *
  * Usage:
  *   localmost policy show              # Display current policy
- *   localmost policy diff              # Compare local vs cached
+ *   localmost policy diff              # Compare local vs approved
+ *   localmost policy approve           # Show the policy and its stamp
+ *   localmost policy approve --stamp S # Approve exactly that policy
  *   localmost policy validate          # Validate .localmostrc syntax
  */
 
@@ -24,6 +26,13 @@ import {
 } from '../shared/localmostrc';
 import { getAppDataDirWithoutElectron } from '../shared/paths';
 import { getRepositoryFromDir } from '../shared/workspace';
+import {
+  PolicyEntry,
+  approvalStamp,
+  approveConfig,
+  readPolicyEntry,
+  recordPolicyDecision,
+} from '../shared/policy-store';
 import { MACOS_BASELINE_READ_PATHS } from '../shared/sandbox-profile';
 
 // ANSI colors
@@ -78,34 +87,38 @@ shared:
   console.log(`${colors.bold}Policy: ${colors.reset}${path.relative(cwd, localmostrcPath)}`);
   console.log();
 
-  // The level is declared once, at the top of the file, and widens every
-  // section, so it is shown with the shared policy and with any effective one.
-  const level = result.config.level;
-
   // Show specific workflow policy if requested
   if (options.workflow) {
     const effective = getEffectivePolicy(result.config, options.workflow);
     console.log(`${colors.bold}Effective policy for ${options.workflow}:${colors.reset}`);
-    printPolicy({ ...effective, level });
+    // The level is declared once, at the top of the file, and widens every
+    // section, so it is shown with any effective policy too.
+    printPolicy({ ...effective, level: result.config.level });
     return;
   }
 
-  // Show full config
-  if (result.config.shared || level) {
+  printConfig(result.config);
+}
+
+/**
+ * Print every section of a policy, the level with the shared one.
+ */
+function printConfig(config: LocalmostrcConfig): void {
+  const level = config.level;
+  if (config.shared || level) {
     console.log(`${colors.bold}Shared policy:${colors.reset}`);
-    printPolicy({ ...result.config.shared, level });
+    printPolicy({ ...config.shared, level });
     console.log();
   }
 
-  if (result.config.workflows) {
-    for (const [name, policy] of Object.entries(result.config.workflows)) {
+  if (config.workflows) {
+    for (const [name, policy] of Object.entries(config.workflows)) {
       console.log(`${colors.bold}Workflow: ${name}${colors.reset}`);
       printPolicy(policy);
       console.log();
     }
   }
 }
-
 
 /**
  * Print a policy section.
@@ -133,29 +146,20 @@ export function printPolicy(policy: DescribablePolicy): void {
   }
 }
 
+function getPolicyCacheDir(): string {
+  return path.join(getAppDataDirWithoutElectron(), 'policies');
+}
+
 /**
- * Read the policy the background runner has cached for a repository.
- *
- * The app writes this as JSON with its approval state; reading it as a raw
- * .localmostrc, as this used to, meant the CLI could never see what the runner
- * had actually recorded.
+ * Read the policies the background runner has recorded for a repository: the
+ * approved one and any pending one, in the app's own format.
  */
-function readCachedPolicy(repository: string): {
-  path: string;
-  entry: { repository: string; config: LocalmostrcConfig; approved: boolean; cachedAt?: string } | null;
-} {
-  const cachedPath = path.join(
-    getAppDataDirWithoutElectron(),
-    'policies',
-    repository.replace('/', '_') + '.json'
-  );
-  if (!fs.existsSync(cachedPath)) {
-    return { path: cachedPath, entry: null };
-  }
+function readCachedPolicy(repository: string): PolicyEntry | null {
   try {
-    return { path: cachedPath, entry: JSON.parse(fs.readFileSync(cachedPath, 'utf-8')) };
-  } catch {
-    return { path: cachedPath, entry: null };
+    return readPolicyEntry(getPolicyCacheDir(), repository);
+  } catch (err) {
+    console.log(`${colors.yellow}Ignoring the cached policy for ${repository}: ${(err as Error).message}${colors.reset}`);
+    return null;
   }
 }
 
@@ -188,23 +192,19 @@ function handleDiff(): void {
     return;
   }
 
-  const { entry } = readCachedPolicy(repository);
+  const approved = readCachedPolicy(repository)?.approved;
 
-  if (!entry) {
-    console.log('No cached policy found - the runner has not seen this repository yet.');
-    console.log(`Local policy: ${path.relative(cwd, localPath)}`);
+  if (!approved) {
+    console.log('No approved policy - the runner will hold this repository\'s jobs until one is approved.');
+    console.log(`Local policy: ${path.relative(cwd, localPath)} - review and approve it with "localmost policy approve"`);
     return;
   }
 
   // Compute diff
-  const diffs = diffConfigs(entry.config, localResult.config);
+  const diffs = diffConfigs(approved.config, localResult.config);
 
   if (diffs.length === 0) {
-    console.log(
-      entry.approved
-        ? `${colors.green}\u2713${colors.reset} Policy unchanged and approved`
-        : `${colors.yellow}!${colors.reset} Policy unchanged but not yet approved - run "localmost policy approve"`
-    );
+    console.log(`${colors.green}\u2713${colors.reset} Policy unchanged and approved`);
     return;
   }
 
@@ -215,8 +215,14 @@ function handleDiff(): void {
 
 /**
  * Approve the repository's current policy for use by the background runner.
+ *
+ * Two steps, like the app: the first shows the whole policy and the stamp of
+ * exactly what was shown, and only a second run quoting that stamp approves.
+ * Approving in one step meant approving a file nobody had been shown - only a
+ * diff, printed afterwards, and nothing at all for a repository the runner
+ * had not seen - and whatever it held at that moment.
  */
-function handleApprove(): void {
+function handleApprove(options: PolicyOptions): void {
   const cwd = process.cwd();
   const repository = getRepositoryFromDir(cwd);
   if (!repository) {
@@ -239,31 +245,38 @@ function handleApprove(): void {
     process.exit(1);
   }
 
-  const { path: cachedPath, entry } = readCachedPolicy(repository);
-  if (entry) {
-    const diffs = diffConfigs(entry.config, localResult.config);
-    if (diffs.length > 0) {
-      console.log(`${colors.bold}Approving these changes:${colors.reset}`);
-      console.log();
-      console.log(formatPolicyDiff(diffs));
+  const config = localResult.config;
+  const stamp = approvalStamp(repository, config);
+
+  if (options.stamp === undefined) {
+    console.log(`${colors.bold}Policy for ${repository}:${colors.reset} ${path.relative(cwd, localPath)}`);
+    console.log();
+    printConfig(config);
+
+    const approved = readCachedPolicy(repository)?.approved;
+    if (approved) {
+      const diffs = diffConfigs(approved.config, config);
+      console.log(`${colors.bold}Changes from the approved policy:${colors.reset}`);
+      console.log(diffs.length > 0 ? formatPolicyDiff(diffs) : 'None');
       console.log();
     }
+
+    console.log('Nothing has been approved yet. To approve exactly this policy, run:');
+    console.log(`  localmost policy approve --stamp ${stamp}`);
+    process.exit(1);
   }
 
-  fs.mkdirSync(path.dirname(cachedPath), { recursive: true });
-  fs.writeFileSync(
-    cachedPath,
-    JSON.stringify(
-      {
-        repository,
-        config: localResult.config,
-        cachedAt: new Date().toISOString(),
-        approved: true,
-      },
-      null,
-      2
-    )
-  );
+  if (options.stamp !== stamp) {
+    console.log(
+      `${colors.red}The .localmostrc changed since that stamp was shown.${colors.reset} ` +
+        'Run "localmost policy approve" again to review what it holds now.'
+    );
+    process.exit(1);
+  }
+
+  const dir = getPolicyCacheDir();
+  approveConfig(dir, repository, config);
+  recordPolicyDecision(dir, { repository, decision: 'approved', stamp, via: 'cli' });
 
   console.log(`${colors.green}\u2713${colors.reset} Approved policy for ${repository}`);
   console.log('The runner will apply it to the next job from this repository.');
@@ -355,6 +368,8 @@ export interface PolicyOptions {
   workflow?: string;
   /** Force overwrite */
   force?: boolean;
+  /** The stamp `policy approve` printed for the policy being approved */
+  stamp?: string;
 }
 
 // =============================================================================
@@ -377,7 +392,7 @@ export function runPolicy(
       handleDiff();
       break;
     case 'approve':
-      handleApprove();
+      handleApprove(options);
       break;
 
     case 'validate':
@@ -412,6 +427,8 @@ export function parsePolicyArgs(args: string[]): {
       options.workflow = args[++i];
     } else if (arg === '--force' || arg === '-f') {
       options.force = true;
+    } else if (arg === '--stamp') {
+      options.stamp = args[++i];
     } else if (!arg.startsWith('-')) {
       subcommand = arg;
     }
@@ -435,18 +452,21 @@ ${colors.bold}USAGE:${colors.reset}
 ${colors.bold}SUBCOMMANDS:${colors.reset}
   show              Display current policy (default)
   diff              Compare local vs cached policy
-  approve           Approve this repo's policy for the background runner
+  approve           Show this repo's policy and the stamp that approves it
+  approve --stamp   Approve exactly the policy that stamp was shown for
   validate          Validate .localmostrc syntax
   init              Create a new .localmostrc template
 
 ${colors.bold}OPTIONS:${colors.reset}
   -w, --workflow <name>  Show effective policy for a specific workflow
   -f, --force            Overwrite existing file (for init)
+  --stamp <sha256>       Approve only if the policy is still the one shown
 
 ${colors.bold}EXAMPLES:${colors.reset}
   localmost policy show
   localmost policy show --workflow build
   localmost policy diff
+  localmost policy approve
   localmost policy validate
   localmost policy init
 

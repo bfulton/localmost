@@ -1,13 +1,24 @@
-import { describe, it, expect } from '@jest/globals';
+import { describe, it, expect, beforeEach } from '@jest/globals';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 
-jest.mock('electron', () => ({ ipcMain: { handle: jest.fn() } }));
-jest.mock('../policy-cache', () => ({
-  listCachedPolicies: jest.fn(), approvePolicy: jest.fn(), denyPolicy: jest.fn(),
-  removeCachedPolicy: jest.fn(), recordPolicyDecision: jest.fn(),
+const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'policy-ipc-'));
+const handlers = new Map<string, (...args: unknown[]) => unknown>();
+const retireWorkersForRepository = jest.fn(async () => undefined);
+
+jest.mock('electron', () => ({
+  ipcMain: { handle: (channel: string, handler: (...args: unknown[]) => unknown) => handlers.set(channel, handler) },
 }));
-jest.mock('../app-state', () => ({ getRunnerManager: jest.fn(), getLogger: jest.fn() }));
+jest.mock('../paths', () => ({ getAppDataDir: () => tmpRoot }));
+jest.mock('../app-state', () => ({
+  getRunnerManager: () => ({ retireWorkersForRepository }),
+  getLogger: () => undefined,
+}));
 
-import { summarizeGrants } from './policy';
+import { summarizeGrants, registerPolicyHandlers } from './policy';
+import { recordPendingPolicy, getApprovedPolicy, approvalStamp } from '../policy-cache';
+import { IPC_CHANNELS, PolicySummary, Result } from '../../shared/types';
 
 describe('summarizeGrants', () => {
   it('shows docker grants, which an operator is consenting to when they approve', () => {
@@ -72,5 +83,86 @@ describe('network grants on the approval screen', () => {
     });
     expect(grants.join('\n')).toMatch(/docker network create: vk-\* \(internal\)/);
     expect(grants.join('\n')).toMatch(/docker network create: build \(routable\)/);
+  });
+});
+
+describe('approving from the app', () => {
+  registerPolicyHandlers();
+  const list = () => handlers.get(IPC_CHANNELS.POLICY_LIST)!({}) as PolicySummary[];
+  const approve = (...args: unknown[]) => handlers.get(IPC_CHANNELS.POLICY_APPROVE)!({}, ...args) as Promise<Result>;
+  const reject = (...args: unknown[]) => handlers.get(IPC_CHANNELS.POLICY_REJECT)!({}, ...args) as Result;
+  const REPO = 'owner/repo';
+
+  beforeEach(() => {
+    fs.rmSync(path.join(tmpRoot, 'policies'), { recursive: true, force: true });
+    retireWorkersForRepository.mockClear();
+  });
+
+  it('lists a pending policy with the stamp of exactly what it shows', () => {
+    recordPendingPolicy(REPO, { version: 1, level: 'permissive' });
+    const [summary] = list();
+    expect(summary).toEqual(expect.objectContaining({ repository: REPO, approved: false }));
+    expect(summary.grants[0]).toMatch(/^level: permissive\b/);
+    expect(summary.stamp).toBe(approvalStamp(REPO, { version: 1, level: 'permissive' }));
+  });
+
+  it('approves what was listed', async () => {
+    recordPendingPolicy(REPO, { version: 1, level: 'moderate' });
+    const [summary] = list();
+
+    await expect(approve(REPO, summary.stamp)).resolves.toEqual({ success: true });
+    expect(getApprovedPolicy(REPO)).toEqual(expect.objectContaining({ level: 'moderate' }));
+    expect(retireWorkersForRepository).toHaveBeenCalledWith(REPO);
+  });
+
+  it('refuses when the pending policy changed after it was listed', async () => {
+    // The click used to approve whatever was on disk at that moment, which a
+    // refused job could have replaced after the card was drawn.
+    recordPendingPolicy(REPO, { version: 1, shared: { network: { allow: ['index.crates.io'] } } });
+    const [shown] = list();
+    recordPendingPolicy(REPO, { version: 1, level: 'permissive' });
+
+    const result = await approve(REPO, shown.stamp);
+    expect(result).toEqual({ success: false, error: expect.stringMatching(/changed since it was shown/) });
+    expect(getApprovedPolicy(REPO)).toBeNull();
+    expect(retireWorkersForRepository).not.toHaveBeenCalled();
+  });
+
+  it('refuses an approval that names no policy', async () => {
+    recordPendingPolicy(REPO, { version: 1, level: 'moderate' });
+    for (const stamp of [undefined, '', 'not-a-stamp', 42]) {
+      expect((await approve(REPO, stamp)).success).toBe(false);
+    }
+    expect(getApprovedPolicy(REPO)).toBeNull();
+  });
+
+  it('refuses a repository name that is not one', async () => {
+    for (const repository of ['a/../../../escaped', 'a/b/c', 7]) {
+      expect((await approve(repository, 'a'.repeat(64))).success).toBe(false);
+      expect(reject(repository).success).toBe(false);
+    }
+    expect(fs.existsSync(path.join(tmpRoot, 'escaped.json'))).toBe(false);
+  });
+
+  it('shows what a pending policy changes from the approved one, the level included', async () => {
+    recordPendingPolicy(REPO, { version: 1, shared: { network: { allow: ['index.crates.io'] } } });
+    await approve(REPO, list()[0].stamp);
+    recordPendingPolicy(REPO, { version: 1, level: 'permissive', shared: { network: { allow: ['index.crates.io'] } } });
+
+    const summaries = list();
+    const pending = summaries.find((s) => !s.approved)!;
+    const approved = summaries.find((s) => s.approved)!;
+    expect(pending.changes).toEqual(['~ level: strict -> permissive']);
+    expect(approved.grants).toEqual(['network: index.crates.io']);
+  });
+
+  it('rejecting a change leaves the approved policy in force', async () => {
+    recordPendingPolicy(REPO, { version: 1, level: 'moderate' });
+    await approve(REPO, list()[0].stamp);
+    recordPendingPolicy(REPO, { version: 1, level: 'permissive' });
+
+    expect(reject(REPO)).toEqual({ success: true });
+    expect(getApprovedPolicy(REPO)).toEqual(expect.objectContaining({ level: 'moderate' }));
+    expect(list().map((s) => s.approved)).toEqual([true]);
   });
 });

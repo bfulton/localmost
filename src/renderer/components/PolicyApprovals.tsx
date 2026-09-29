@@ -28,18 +28,23 @@ const PolicyApprovals: React.FC = () => {
     load();
   }, [load]);
 
-  const act = async (repository: string, action: 'approve' | 'reject') => {
+  const act = async (policy: PolicySummary, action: 'approve' | 'reject') => {
+    const { repository } = policy;
     setBusy(repository);
     setError(null);
     try {
+      // Approval quotes the stamp of the policy on this card, and main refuses
+      // it if the pending policy has been replaced since the card was drawn.
       const result =
         action === 'approve'
-          ? await window.localmost.policy.approve(repository)
+          ? await window.localmost.policy.approve(repository, policy.stamp)
           : await window.localmost.policy.reject(repository);
+      // Reload first: it clears the error, and a refusal has to stay visible
+      // next to the policy that replaced the one it was for.
+      await load();
       if (!result.success) {
         setError(result.error || `Could not ${action} ${repository}`);
       }
-      await load();
     } finally {
       setBusy(null);
     }
@@ -73,19 +78,32 @@ const PolicyApprovals: React.FC = () => {
                   <button
                     className={`${shared.btn} ${shared.btnSecondary}`}
                     disabled={busy === policy.repository}
-                    onClick={() => act(policy.repository, 'reject')}
+                    onClick={() => act(policy, 'reject')}
                   >
                     Reject
                   </button>
                   <button
                     className={`${shared.btn} ${shared.btnPrimary}`}
                     disabled={busy === policy.repository}
-                    onClick={() => act(policy.repository, 'approve')}
+                    onClick={() => act(policy, 'approve')}
                   >
                     Approve
                   </button>
                 </div>
               </div>
+              {policy.changes && (
+                <div data-testid="policy-changes">
+                  <p className={shared.formHint}>
+                    Changes from the approved policy, which stays in force until you decide:
+                  </p>
+                  <ul className={styles.grants}>
+                    {policy.changes.map(change => (
+                      <li key={change}>{change}</li>
+                    ))}
+                  </ul>
+                  <p className={shared.formHint}>In full, it grants:</p>
+                </div>
+              )}
               {policy.grants.length === 0 ? (
                 <p className={shared.formHint}>Grants nothing beyond the baseline.</p>
               ) : (

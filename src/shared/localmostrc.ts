@@ -119,9 +119,6 @@ export function effectivePolicyLevel(config?: LocalmostrcConfig | null): Sandbox
 }
 
 export function parseLocalmostrcContent(content: string): ParseResult {
-  const errors: ParseError[] = [];
-  const warnings: string[] = [];
-
   let parsed: unknown;
   try {
     parsed = yaml.load(content);
@@ -139,6 +136,20 @@ export function parseLocalmostrcContent(content: string): ParseResult {
       warnings: [],
     };
   }
+
+  return validateLocalmostrc(parsed);
+}
+
+/**
+ * Validate an already-parsed policy against the grammar.
+ *
+ * Separate from parsing so a policy read back from anywhere else - the
+ * approval cache, which is JSON - is held to exactly the grammar the
+ * repository's file was, rather than trusted for having been written by us.
+ */
+export function validateLocalmostrc(parsed: unknown): ParseResult {
+  const errors: ParseError[] = [];
+  const warnings: string[] = [];
 
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return {
