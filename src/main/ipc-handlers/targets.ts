@@ -7,6 +7,7 @@ import { IPC_CHANNELS, Target, Result, RunnerProxyStatus } from '../../shared/ty
 import { getTargetManager } from '../target-manager';
 import { getLogger, getBrokerProxyService } from '../app-state';
 import { store } from '../store/init';
+import { isGitHubOwnerName, isGitHubRepoName } from '../../shared/github-names';
 
 /**
  * Register all target-related IPC handlers.
@@ -27,12 +28,24 @@ export const registerTargetHandlers = (): void => {
     IPC_CHANNELS.TARGETS_ADD,
     async (
       _event,
-      type: 'repo' | 'org',
-      owner: string,
-      repo?: string
+      type: unknown,
+      owner: unknown,
+      repo?: unknown
     ): Promise<Result<Target>> => {
-      log()?.info(`[IPC] targets:add ${type} ${owner}${repo ? '/' + repo : ''}`);
-      return getTargetManager().addTargetAndAttach(type, owner, repo);
+      // The names become GitHub API paths requested with the user's token, so
+      // what the renderer sends is held to what GitHub accepts as a name.
+      if (type !== 'repo' && type !== 'org') {
+        return { success: false, error: 'Invalid target type: expected "repo" or "org"' };
+      }
+      if (!isGitHubOwnerName(owner)) {
+        return { success: false, error: 'Invalid target owner: expected a GitHub user or organization name' };
+      }
+      if (type === 'repo' && !isGitHubRepoName(repo)) {
+        return { success: false, error: 'Invalid repository: expected a GitHub repository name' };
+      }
+      const repoName = type === 'repo' ? (repo as string) : undefined;
+      log()?.info(`[IPC] targets:add ${type} ${owner}${repoName ? '/' + repoName : ''}`);
+      return getTargetManager().addTargetAndAttach(type, owner, repoName);
     }
   );
 

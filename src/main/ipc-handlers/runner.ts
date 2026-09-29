@@ -32,6 +32,7 @@ import {
   SetupState,
 } from '../../shared/types';
 import { DEFAULT_RUNNER_COUNT } from '../../shared/constants';
+import { isGitHubOwnerName, isGitHubRepoName } from '../../shared/github-names';
 
 /**
  * Register runner-related IPC handlers.
@@ -194,6 +195,10 @@ export const registerRunnerHandlers = (): void => {
         if (!options.orgName) {
           throw new Error('Organization name is required');
         }
+        // The name becomes GitHub API paths requested with the user's token.
+        if (!isGitHubOwnerName(options.orgName)) {
+          throw new Error('Invalid organization name');
+        }
         logger()?.info(`Getting registration token for org ${options.orgName}...`);
         registrationToken = await githubAuth.getOrgRunnerRegistrationToken(accessToken, options.orgName);
         configUrl = `https://github.com/${options.orgName}`;
@@ -207,6 +212,9 @@ export const registerRunnerHandlers = (): void => {
           throw new Error('Invalid repository URL');
         }
         [, owner, repo] = match;
+        if (!isGitHubOwnerName(owner) || !isGitHubRepoName(repo)) {
+          throw new Error('Invalid repository URL');
+        }
         logger()?.info(`Getting registration token for ${owner}/${repo}...`);
         registrationToken = await githubAuth.getRunnerRegistrationToken(accessToken, owner, repo);
         configUrl = `https://github.com/${owner}/${repo}`;
@@ -479,7 +487,11 @@ export const registerRunnerHandlers = (): void => {
   });
 
   // Cancel a running job
-  ipcMain.handle(IPC_CHANNELS.JOB_CANCEL, async (_event, owner: string, repo: string, runId: number) => {
+  ipcMain.handle(IPC_CHANNELS.JOB_CANCEL, async (_event, owner: unknown, repo: unknown, runId: unknown) => {
+    // These become the path of a POST made with the user's token.
+    if (!isGitHubOwnerName(owner) || !isGitHubRepoName(repo) || !Number.isSafeInteger(runId) || (runId as number) <= 0) {
+      return { success: false, error: 'Invalid workflow run' };
+    }
     const logger = getLogger();
     const auth = getGitHubAuth();
     const accessToken = await getValidAccessToken();
@@ -490,7 +502,7 @@ export const registerRunnerHandlers = (): void => {
 
     try {
       logger?.info(`Cancelling workflow run ${runId} in ${owner}/${repo}`);
-      await auth.cancelWorkflowRun(accessToken, owner, repo, runId);
+      await auth.cancelWorkflowRun(accessToken, owner, repo, runId as number);
       return { success: true };
     } catch (err) {
       const message = (err as Error).message;

@@ -509,6 +509,23 @@ describe('CliServer', () => {
       expect(mockAddTargetAndAttach).not.toHaveBeenCalled();
     });
 
+    it('rejects an owner or repo that is not a GitHub name, before anything is fetched', async () => {
+      await server.start();
+
+      for (const args of [
+        { type: 'repo' as const, owner: '../x', repo: 'supdb' },
+        { type: 'repo' as const, owner: 'bfulton', repo: '..' },
+        { type: 'repo' as const, owner: 'bfulton', repo: 'supdb/../../orgs/x' },
+        { type: 'repo' as const, owner: 'bfulton', repo: 'supdb?x=1' },
+        { type: 'org' as const, owner: 'x/../user' },
+      ]) {
+        const response = await sendRequest({ command: 'targets-add', args }) as { success: boolean; error: string };
+        expect({ args, success: response.success }).toEqual({ args, success: false });
+        expect(response.error).toMatch(/not a valid GitHub/);
+      }
+      expect(mockAddTargetAndAttach).not.toHaveBeenCalled();
+    });
+
     it('trims whitespace around an added target', async () => {
       mockAddTargetAndAttach.mockResolvedValue({ success: true, data: target });
       await server.start();

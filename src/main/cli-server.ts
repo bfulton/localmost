@@ -14,6 +14,7 @@ import { getSnapshot, selectEffectivePauseState } from './runner-state-service';
 import { getTargetManager } from './target-manager';
 import { getRunnerProxyManager } from './runner-proxy-manager';
 import type { Target } from '../shared/types';
+import { isGitHubOwnerName, isGitHubRepoName } from '../shared/github-names';
 import type {
   CliRequest,
   CliResponse,
@@ -307,10 +308,18 @@ export class CliServer {
         if (!ownerName) {
           return { success: false, error: 'Missing or invalid target owner' };
         }
+        // The names become GitHub API paths requested with the user's token;
+        // anything GitHub would not accept as a name is refused here.
+        if (!isGitHubOwnerName(ownerName)) {
+          return { success: false, error: `"${ownerName}" is not a valid GitHub user or organization name` };
+        }
 
         const repoName = asName(repo);
         if (type === 'repo' && !repoName) {
           return { success: false, error: 'Missing or invalid repo name for a repo target' };
+        }
+        if (type === 'repo' && !isGitHubRepoName(repoName)) {
+          return { success: false, error: `"${repoName}" is not a valid GitHub repository name` };
         }
 
         const result = await getTargetManager().addTargetAndAttach(
