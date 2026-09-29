@@ -21,9 +21,17 @@ export const sanitizeLogMessage = (message: string): string => {
 
   // Credentials in a URL's userinfo: the egress proxy's per-worker token
   // (http://localmost:<token>@...), a token in a git remote, a database
-  // password. Only user:password is taken; a bare user@ (git@, ssh://git@)
-  // carries no secret and stays readable.
-  sanitized = sanitized.replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, '$1[REDACTED]@');
+  // password, including one with an empty username (redis://:password@).
+  // Only user:password is taken; a bare user@ (git@, ssh://git@) carries no
+  // secret and stays readable - which also means a token used as the whole
+  // username (https://<token>@github.com) is caught only by the token rules
+  // above. A password holding an unencoded '/' or '@' is not a valid URL and
+  // may be missed or only partly redacted.
+  //
+  // The lookbehind, not \b, anchors the scheme: \b would retry at every word
+  // boundary inside a long dotted run, each try rescanning the rest of the
+  // line, and this runs on the main thread over worker stderr.
+  sanitized = sanitized.replace(/(?<![a-z0-9+.-])([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]*:[^\s/@]+@/gi, '$1[REDACTED]@');
 
   // JWT tokens (eyJ...)
   sanitized = sanitized.replace(/\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[REDACTED_JWT]');

@@ -50,6 +50,22 @@ describe('sanitizeLogMessage', () => {
       .toBe('db postgres://[REDACTED]@db.internal:5432/main');
   });
 
+  it('redacts a password given with an empty username', () => {
+    // redis://:password@host is how Redis URLs usually carry their secret.
+    expect(sanitizeLogMessage('cache redis://:hunter2secret@cache.internal:6379/0'))
+      .toBe('cache redis://[REDACTED]@cache.internal:6379/0');
+  });
+
+  it('sanitizes a long line of scheme-like text without stalling', () => {
+    // Logged on the main thread from worker stderr in chunks of up to 64 KB.
+    // A rule that retried at every word boundary inside a dotted run took
+    // seconds on this line.
+    const line = 'a.'.repeat(20000) + '://x:' + 'y'.repeat(20000);
+    const started = Date.now();
+    sanitizeLogMessage(line);
+    expect(Date.now() - started).toBeLessThan(250);
+  });
+
   it('leaves URLs without credentials, and other digests, readable', () => {
     // Only the /w/ key is a secret; a sha256 elsewhere is an identifier people
     // need to read in the log.
