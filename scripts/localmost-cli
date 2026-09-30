@@ -4,11 +4,19 @@
 # The app installs this script as a link, /usr/local/bin/localmost, so $0 is
 # usually the link and not the script. cli.js sits beside the script, in the
 # app's Resources: follow the links to the script first. A relative target
-# is relative to the directory holding the link.
+# is relative to the directory holding the link. A bare $0 is a name the
+# shell looked up as a script argument, in the working directory and then on
+# PATH ("sh localmost"): find it where the shell did.
 self=$0
 case $self in
   */*) ;;
-  *) self=./$self ;;
+  *)
+    if [ -e "./$self" ]; then
+      self=./$self
+    else
+      self=$(command -v -- "$self") || exit 1
+    fi
+    ;;
 esac
 hops=0
 while [ -L "$self" ]; do

@@ -65,6 +65,20 @@ describe('the installed localmost command', () => {
     expect(run('localmost', ['status'], scratch, [bin])).toEqual({ ran: 'bundled', args: ['status'] });
   });
 
+  it.each(['/bin/sh', '/bin/bash'])(
+    'runs the bundled cli.js when handed by name to %s, which finds it on PATH',
+    (shell) => {
+      fs.symlinkSync(path.join(resources, 'localmost-cli'), path.join(bin, 'localmost'));
+      // The shell searches PATH for a script it cannot find in the working
+      // directory, leaving $0 the bare name; a cli.js here must not run.
+      const cwd = path.join(scratch, 'checkout');
+      fs.mkdirSync(cwd);
+      fs.writeFileSync(path.join(cwd, 'cli.js'), cliJs('decoy'));
+
+      expect(run(shell, ['localmost', 'status'], cwd, [bin])).toEqual({ ran: 'bundled', args: ['status'] });
+    },
+  );
+
   it('resolves a relative link against the directory holding the link', () => {
     fs.symlinkSync(path.relative(bin, path.join(resources, 'localmost-cli')), path.join(bin, 'localmost'));
 
@@ -185,7 +199,9 @@ describe('the release update manifest', () => {
 });
 
 describe('the entitlements the app is signed with', () => {
-  const plist = require(path.join(REPO, 'node_modules', 'plist'));
+  // Read a plist as codesign does, with the system's own parser.
+  const readPlist = (file: string) =>
+    JSON.parse(execFileSync('/usr/bin/plutil', ['-convert', 'json', '-o', '-', file], { encoding: 'utf-8' }));
 
   const APP = path.join(REPO, 'build', 'out', 'localmost-darwin-arm64', 'localmost.app');
   const FRAMEWORKS = path.join(APP, 'Contents', 'Frameworks');
@@ -240,7 +256,7 @@ describe('the entitlements the app is signed with', () => {
     const options = osxSign.optionsForFile!(file);
 
     expect(options?.hardenedRuntime).toBe(true);
-    const entitlements = plist.parse(fs.readFileSync(options!.entitlements!, 'utf-8'));
+    const entitlements = readPlist(options!.entitlements!);
     expect(entitlements).toEqual(expected);
     // Stated outright: no device or personal information access, and never
     // the App Sandbox, which would stop the app running sandbox-exec.

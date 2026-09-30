@@ -476,27 +476,11 @@ module.exports = {
 
 ### package.json Updates
 
-```json
-{
-  "build": {
-    "appId": "com.localmost.app",
-    "productName": "localmost",
-    "mac": {
-      "category": "public.app-category.developer-tools",
-      "target": ["dmg", "zip"],
-      "hardenedRuntime": true,
-      "gatekeeperAssess": false,
-      "entitlements": "entitlements.plist",
-      "entitlementsInherit": "entitlements.plist"
-    },
-    "publish": {
-      "provider": "github",
-      "owner": "bfulton",
-      "repo": "localmost"
-    }
-  }
-}
-```
+None. The app is packaged and signed by forge, not electron-builder, so
+package.json has no `build` block: signing is the `osxSign` config above,
+and the updater's feed is `packaging/app-update.yml` (`provider: github`,
+`owner: bfulton`, `repo: localmost`), which forge copies into the app's
+Resources as an `extraResource`.
 
 ---
 
@@ -661,7 +645,8 @@ npm install --save-dev @electron-forge/publisher-github
 
 | File | Change |
 |------|--------|
-| package.json | Add dependencies, build config |
+| package.json | Add dependencies |
+| packaging/app-update.yml | New file - updater feed |
 | forge.config.js | Add publisher config |
 | src/main/auto-updater.ts | New file - core update logic |
 | src/main/ipc-handlers/updater.ts | New file - IPC handlers |
