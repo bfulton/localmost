@@ -9,7 +9,8 @@
 // Resources; osx-sign re-signs it with the app's identity when there is one.
 //
 // It is cached: SwiftPM rebuilds only what changed, and the copy and signing
-// are skipped when the binary and the entitlements are what was last signed.
+// are skipped when the built binary, the entitlements and the signing options
+// are what was last signed, and build/localmost-vm is still the file signed.
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -51,8 +52,22 @@ if (!existsSync(built)) {
   fail(`swift build produced no ${built}`);
 }
 
-const stamp = `${sha256(built)} ${sha256(ENTITLEMENTS)}\n`;
-if (existsSync(OUTPUT) && existsSync(STAMP) && readFileSync(STAMP, 'utf-8') === stamp) {
+const signing = ['--force', '--sign', '-', '--options', 'runtime', '--entitlements', ENTITLEMENTS];
+const inputs = { built: sha256(built), entitlements: sha256(ENTITLEMENTS), signing };
+
+function upToDate() {
+  if (!existsSync(OUTPUT) || !existsSync(STAMP)) return false;
+  let last;
+  try {
+    last = JSON.parse(readFileSync(STAMP, 'utf-8'));
+  } catch {
+    return false;
+  }
+  const now = JSON.stringify({ ...inputs, output: sha256(OUTPUT) });
+  return JSON.stringify(last) === now;
+}
+
+if (upToDate()) {
   console.log(`build:helper: ${OUTPUT} is up to date`);
   process.exit(0);
 }
@@ -62,7 +77,7 @@ if (existsSync(OUTPUT) && existsSync(STAMP) && readFileSync(STAMP, 'utf-8') === 
 const staging = `${OUTPUT}.tmp`;
 rmSync(staging, { force: true });
 copyFileSync(built, staging);
-run('/usr/bin/codesign', ['--force', '--sign', '-', '--options', 'runtime', '--entitlements', ENTITLEMENTS, staging]);
+run('/usr/bin/codesign', [...signing, staging]);
 renameSync(staging, OUTPUT);
-writeFileSync(STAMP, stamp);
+writeFileSync(STAMP, `${JSON.stringify({ ...inputs, output: sha256(OUTPUT) })}\n`);
 console.log(`build:helper: built and signed ${OUTPUT}`);
