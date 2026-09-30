@@ -671,7 +671,7 @@ check.
 
 | File | Status | Owns |
 |---|---|---|
-| `src/main/docker/docker-backend.ts` | rewritten | The `DockerBackend` and `WorkerDocker` interfaces (below). `DesktopBackend` is deleted. Until then it implements `LegacyDockerBackend`, the stage 1 interface under a new name, which goes with it. |
+| `src/main/docker/docker-backend.ts` | rewritten | The `DockerBackend` and `WorkerDocker` interfaces (below), `runnerWorkspaceRoot()`, and `noDockerBackend`: what `RunnerManager` serves when it is given no backend, a worker whose socket answers every request with `no Docker daemon is available to this job` (`NO_DAEMON_MESSAGE`), never a fallback daemon. `DesktopBackend` and `LegacyDockerBackend` are deleted (WP-E). |
 | `src/main/vm/vm-backend.ts` | new | `VmBackend implements DockerBackend`: `name = 'vm'`, `supportsPrivileged = false` (privileged stays refused, owner decision 2), `disposable = true`. `workspaceMountRoot` is the same as today's. |
 | `src/main/vm/vm-manager.ts` | new | Admission gate, boot, readiness, stop, `sweep()`, `onResume()`, `shutdownAll()`, the spare. |
 | `src/main/vm/helper-client.ts` | new | Spawn through `sandbox-exec`, NDJSON framing, the events and commands of §2.4, exit mapping. |
@@ -1377,3 +1377,18 @@ helper or CLI is missing. A build never ships without its VM.
 - **Mock registry** (`src/main/docker/puller/test-registry.ts`, owned by WP-D).
   An HTTP server with `/v2/`, token auth, manifests, blobs and a redirect host,
   plus switches for digest corruption.
+- **Native forwarder** (`test/e2e/support/native-worker-docker.ts`, owned by
+  WP-E; owner decision 3). A `DockerBackend` whose workers forward to a
+  Linux runner's native `dockerd` (`/var/run/docker.sock`, or `DOCKER_HOST`
+  when that is a unix socket) and pull through it. `disposable` is false, so
+  a stopped socket removes what its job made. Only `test/e2e/docker.spec.ts`
+  imports it, off macOS; a jest test in `docker-backend.test.ts` fails if
+  any file under `src/` names it.
+- **The e2e spec's Mac mode** (`test/e2e/support/vm-worker-docker.ts`, owned
+  by WP-E). The real `VmBackend`, `DefaultVmManager`, `GuestImage` and
+  `VmImagePuller` (anonymous `RegistryClient`) over `build/localmost-vm`,
+  `build/guest` and `build/docker-cli/docker`, with two stand-ins: cache
+  disks that give every VM a blank data disk and never schedule a refresh,
+  and a worker proxy that accepts and drops connections. It first replaces
+  the cached `electron` module with `{ app: { isPackaged: false } }`, since
+  the puller reads `app.isPackaged` and the spec runs in plain Node.
