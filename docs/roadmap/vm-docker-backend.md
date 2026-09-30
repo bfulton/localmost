@@ -931,6 +931,12 @@ written against the recommendation in each case, and says where.
   start.
 - Corporate TLS inspection and system proxies for the Mac-side puller. Node's
   TLS does not read the Keychain (R17).
+- A periodic update check. `autoDownload` fetches an update as soon as a
+  check finds it, but the app checks only once at launch and when the user
+  clicks Check; `updateSettings.checkIntervalHours` (default 24) is saved by
+  the settings page and read nowhere in main. A runner left up for weeks gets
+  a guest fix (R12) only after a restart. The check belongs beside the launch
+  check in `src/main/index.ts`, and should re-read `autoCheck` each time.
 
 ## Appendix: the risk register, in one line each
 
@@ -952,7 +958,7 @@ without it.
 | R9 | A host control socket in a job-writable directory, or a path-taking API | Sockets under `<data>/vm`; ids, not paths; a separate sandboxed helper |
 | R10 | Guest kernel and firewall correctness | Alpine `linux-virt` (verified module set); `check-config.sh`; firewall self-test |
 | R11 | Exec from virtiofs fails on some kernels | `nosuid`; verified on the shipped kernel |
-| R12 | localmost now ships a kernel, `runc` and `dockerd` | Pinned Alpine packages; ships with the app; `autoDownload` on |
+| R12 | localmost now ships a kernel, `runc` and `dockerd` | Pinned Alpine packages; ships with the app; `autoDownload` on. The app checks for updates only at launch and on request, so a long-running runner needs a periodic check too (see Open questions) |
 | R13 | No CLI without Docker Desktop; credential helper errors become anonymous pulls | Bundled CLI; loud helper failures |
 | R14 | Cross-job poisoning through shared writable caches | Per-repository cache written only by a refresh VM from verified blobs, rebuilt from blank on a schedule; images that needed credentials kept out (owner decision 1 above) |
 | R15 | Cold image stores on every job | Per-repository golden disk cloned per job |

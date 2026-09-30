@@ -24,10 +24,13 @@ export function initAutoUpdater(mainWindow: BrowserWindow): void {
 
   // Configure update source - uses GitHub Releases
   // Repository is auto-detected from package.json "repository" field
-  // Download as soon as an update is found: the app carries the Docker VM's
-  // kernel, runc and dockerd, and their fixes must reach users without a
-  // click. A download asked for while one runs joins it (electron-updater
-  // keeps one download promise), so the banner's button stays harmless.
+  // Download as soon as a check finds an update, and install it at the next
+  // quit: the app carries the Docker VM's kernel, runc and dockerd, and their
+  // fixes should not wait for a click. The app checks only at launch and when
+  // asked (index.ts), so a runner left up for weeks still needs a restart or
+  // a click on Check to find one; the design tracks that gap under R12. A
+  // download asked for while one runs joins it (electron-updater keeps one
+  // download promise), so the banner's button stays harmless.
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
 

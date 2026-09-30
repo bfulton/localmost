@@ -105,7 +105,7 @@ describe('auto-updater', () => {
       expect(status.currentVersion).toBe('1.0.0');
     });
 
-    it('should enable autoDownload, so fixes to the bundled guest reach users', () => {
+    it('should enable autoDownload, so an update a check finds downloads without a click', () => {
       initAutoUpdater(mockMainWindow as unknown as BrowserWindow);
 
       expect(mockAutoUpdater.autoDownload).toBe(true);
