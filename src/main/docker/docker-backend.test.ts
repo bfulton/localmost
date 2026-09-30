@@ -71,7 +71,9 @@ describe('the Docker Desktop backend stays removed', () => {
   const isTest = (rel: string): boolean => /\.test\.tsx?$/.test(rel);
 
   // Spelled in pieces, so that this file is not itself a match.
-  const removedNames = ['Desktop' + 'Backend', 'resolveDocker' + 'Endpoint', 'docker-' + 'desktop'];
+  // The last is the X-Registry-Auth resolver that backend's forwarded pull
+  // used: credentials no longer leave the Mac (§6.1).
+  const removedNames = ['Desktop' + 'Backend', 'resolveDocker' + 'Endpoint', 'docker-' + 'desktop', 'resolveRegistry' + 'Auth'];
 
   it('is named nowhere in src or test', () => {
     const found = [...filesUnder('src'), ...filesUnder('test')].flatMap((rel) =>

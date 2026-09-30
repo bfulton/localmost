@@ -15,13 +15,9 @@
  * the Mac and never forwards what it resolves (contract §6.1). A helper is
  * looked up only in fixed directories, runs asynchronously, and a helper that
  * is missing or fails is an error, never a quiet anonymous pull.
- *
- * resolveRegistryAuth is the Docker Desktop backend's: an X-Registry-Auth
- * header the filter attaches to a forwarded pull. It keeps that backend's
- * behaviour unchanged and goes when the backend does.
  */
 
-import { execFile, execFileSync } from 'child_process';
+import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -44,38 +40,7 @@ interface HelperCredentials {
   Secret?: string;
 }
 
-export interface RegistryAuthDeps {
-  readConfig: () => DockerConfig | null;
-  /** Run `docker-credential-<helper> get` with `serverUrl` on stdin. */
-  runHelper: (helper: string, serverUrl: string) => HelperCredentials | null;
-}
-
 const configPath = (): string => path.join(os.homedir(), '.docker', 'config.json');
-
-const nodeDeps: RegistryAuthDeps = {
-  readConfig: () => {
-    try {
-      return JSON.parse(fs.readFileSync(configPath(), 'utf-8')) as DockerConfig;
-    } catch {
-      // No config, or one we cannot read: the job simply pulls unauthenticated.
-      return null;
-    }
-  },
-  runHelper: (helper, serverUrl) => {
-    try {
-      const stdout = execFileSync(`docker-credential-${helper}`, ['get'], {
-        input: serverUrl,
-        encoding: 'utf-8',
-        timeout: 10_000,
-      });
-      return JSON.parse(stdout) as HelperCredentials;
-    } catch {
-      // A helper that errors means no stored credential for this registry,
-      // which is the same as having none.
-      return null;
-    }
-  },
-};
 
 /** Every key a registry may be stored under, most specific first. */
 function configKeys(registry: string): string[] {
@@ -83,53 +48,6 @@ function configKeys(registry: string): string[] {
     return [DEFAULT_REGISTRY_KEY, 'index.docker.io', DEFAULT_REGISTRY];
   }
   return [registry, `https://${registry}`, `${registry}/v1/`, `https://${registry}/v1/`];
-}
-
-/** The value of an X-Registry-Auth header: base64 of the AuthConfig JSON. */
-function encode(auth: Record<string, string>): string {
-  return Buffer.from(JSON.stringify(auth)).toString('base64');
-}
-
-/**
- * The X-Registry-Auth value for a registry, or undefined when the operator has
- * no credential for it. Never throws: a pull that cannot be authenticated is
- * still a pull, and an anonymous one may well succeed.
- */
-export function resolveRegistryAuth(registry: string, deps: RegistryAuthDeps = nodeDeps): string | undefined {
-  const config = deps.readConfig();
-  if (!config) return undefined;
-
-  const keys = configKeys(registry);
-  const serveraddress = keys[0];
-
-  const helper = keys.map((key) => config.credHelpers?.[key]).find((h) => h !== undefined) ?? config.credsStore;
-  if (helper) {
-    const credentials = deps.runHelper(helper, serveraddress);
-    if (credentials?.Secret) {
-      // A helper answers with the literal username <token> when the secret is
-      // an identity token rather than a password.
-      return credentials.Username === '<token>'
-        ? encode({ identitytoken: credentials.Secret, serveraddress })
-        : encode({ username: credentials.Username ?? '', password: credentials.Secret, serveraddress });
-    }
-  }
-
-  for (const key of keys) {
-    const entry = config.auths?.[key];
-    if (!entry) continue;
-    if (entry.identitytoken) return encode({ identitytoken: entry.identitytoken, serveraddress });
-    if (!entry.auth) continue;
-    const decoded = Buffer.from(entry.auth, 'base64').toString('utf-8');
-    const separator = decoded.indexOf(':');
-    if (separator === -1) continue;
-    return encode({
-      username: decoded.slice(0, separator),
-      password: decoded.slice(separator + 1),
-      serveraddress,
-    });
-  }
-
-  return undefined;
 }
 
 /** Where a credential helper may be. Never PATH: an app launched from Finder has PATH=/usr/bin:/bin:/usr/sbin:/sbin. */
