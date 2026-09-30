@@ -12,8 +12,9 @@ import * as path from 'path';
 import type { DockerPolicy } from '../../shared/docker-policy';
 
 /**
- * A daemon backend with a VM per worker (the VM Docker backend).
- * See docs/roadmap/vm-docker-backend-contract.md §5.1.
+ * Where a worker's Docker comes from. The app's is VmBackend, a VM per job;
+ * noDockerBackend, below, has none. See
+ * docs/roadmap/vm-docker-backend-contract.md §5.1.
  */
 export interface DockerBackend {
   /** Human name for logs. */

@@ -1382,8 +1382,8 @@ helper or CLI is missing. A build never ships without its VM.
   Linux runner's native `dockerd` (`/var/run/docker.sock`, or `DOCKER_HOST`
   when that is a unix socket) and pull through it. `disposable` is false, so
   a stopped socket removes what its job made. Only `test/e2e/docker.spec.ts`
-  imports it, off macOS; a jest test in `docker-backend.test.ts` fails if
-  any file under `src/` names it.
+  imports it, and it drives it only off macOS; a jest test in
+  `docker-backend.test.ts` fails if any file under `src/` names it.
 - **The e2e spec's Mac mode** (`test/e2e/support/vm-worker-docker.ts`, owned
   by WP-E). The real `VmBackend`, `DefaultVmManager`, `GuestImage` and
   `VmImagePuller` (anonymous `RegistryClient`) over `build/localmost-vm`,
@@ -1392,3 +1392,13 @@ helper or CLI is missing. A build never ships without its VM.
   and a worker proxy that accepts and drops connections. It first replaces
   the cached `electron` module with `{ app: { isPackaged: false } }`, since
   the puller reads `app.isPackaged` and the spec runs in plain Node.
+  It imports WP-D's puller and runs on WP-F's `build:native` output, and
+  `test/e2e` is outside `tsconfig.json`, so nothing checks it until it
+  runs. At integration, once D and F have merged: run `npm run
+  build:native`, then the spec on the Mac outside a job, which must pass
+  in full (10 of 10), and add a typecheck of `test/e2e` to
+  `npm run typecheck` (it cannot pass before D's modules exist), so that a
+  change to D's options or to `CacheDisks` fails CI rather than the next
+  manual run. When D's real `CacheDisks` replaces the stand-in in
+  `index.ts`, the blank one here and there can become one shared test
+  helper.
