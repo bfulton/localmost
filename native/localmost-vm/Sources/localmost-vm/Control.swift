@@ -93,6 +93,11 @@ struct ControllerHooks {
 
 let maxGraceMs = 60000
 
+/// How long a stop that arrived during start waits for start to finish.
+/// After that the helper reports `stopped` and exits, and VZ tears the VM
+/// down with it, so that a hung start never outlives Electron.
+let startStopDeadlineMs = 15000
+
 /// The most a message in an event may hold, so that every event fits one line.
 let maxMessageBytes = 2048
 
@@ -183,7 +188,9 @@ final class Controller {
             send(["event": "stopped", "reason": "requested", "synced": false])
             hooks.finish(cleanExitCode)
         case .starting:
+            guard !stopPending else { return }
             stopPending = true
+            hooks.after(startStopDeadlineMs) { [weak self] in self?.abandonStart() }
         case .running:
             state = .stopping
             stopRequested = true
@@ -197,6 +204,16 @@ final class Controller {
         case .stopped:
             break
         }
+    }
+
+    /// A stop is pending and start has still not finished: end the helper,
+    /// which ends VZ's hold on the VM.
+    private func abandonStart() {
+        guard state == .starting else { return }
+        state = .stopped
+        hooks.log("warn", "the VM's start did not finish within \(startStopDeadlineMs) ms of the stop: exiting")
+        send(["event": "stopped", "reason": "requested", "synced": false])
+        hooks.finish(cleanExitCode)
     }
 
     private func force() {

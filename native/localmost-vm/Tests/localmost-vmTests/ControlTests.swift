@@ -235,6 +235,35 @@ final class ControllerTests: XCTestCase {
         XCTAssertEqual(events, ["listening", "started", "stopped"])
     }
 
+    func testTheStartDeadlineDoesNothingOnceTheVmHasStopped() {
+        let c = controller()
+        c.begin(dockerSocket: "/d/docker.sock", agentSocket: "/d/agent.sock", preStart: {})
+        c.inputClosed()
+        machine.completeStart(nil)
+        machine.completeForce(nil)
+        XCTAssertEqual(exitCode, 0)
+        timers.forEach { $0.1() }
+        XCTAssertEqual(events, ["listening", "started", "stopped"], "the start deadline does nothing once stopped")
+    }
+
+    func testAStopWhileAStartHangsEndsTheHelperAfterTheDeadline() {
+        let c = controller()
+        c.begin(dockerSocket: "/d/docker.sock", agentSocket: "/d/agent.sock", preStart: {})
+        c.parentGone()
+        send(c, #"{"v":1,"id":1,"op":"stop","graceMs":0}"#)
+        XCTAssertEqual(timers.map(\.0), [startStopDeadlineMs], "one deadline, however many stops")
+        XCTAssertNil(exitCode, "still waiting for start")
+        timers[0].1()
+        XCTAssertEqual(events, ["listening", "stopped"])
+        XCTAssertEqual(out.last?["reason"] as? String, "requested")
+        XCTAssertEqual(out.last?["synced"] as? Bool, false)
+        XCTAssertEqual(exitCode, 0, "exiting lets VZ tear the VM down")
+        XCTAssertTrue(logs.contains { $0.hasPrefix("warn ") && $0.contains("did not finish") }, "\(logs)")
+        machine.completeStart(nil)
+        XCTAssertEqual(events, ["listening", "stopped"], "a start that finishes late changes nothing")
+        XCTAssertEqual(machine.forces, 0)
+    }
+
     func testAGuestThatCannotBeAskedIsForced() {
         let c = booted()
         machine.canRequest = false
@@ -373,7 +402,7 @@ final class ControllerTests: XCTestCase {
         let c = controller()
         c.fail(HelperError(.vzConfig, String(repeating: "x\n", count: 100_000)))
         let message = out[0]["message"] as! String
-        XCTAssertLessThanOrEqual(message.utf8.count, 4096)
+        XCTAssertLessThanOrEqual(message.utf8.count, 2048, "contract §2.4: a message is at most 2 KiB")
         XCTAssertEqual(exitCode, 68)
     }
 }
