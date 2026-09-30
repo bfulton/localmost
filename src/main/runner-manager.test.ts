@@ -2027,6 +2027,20 @@ describe('RunnerManager', () => {
       });
     });
 
+    it('gives the job the system PATH after the bundled CLI when the app has no PATH of its own', async () => {
+      const saved = process.env.PATH;
+      delete process.env.PATH;
+      try {
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+        await new RunnerManagerTestHelper(runnerManager).spawnForJob();
+      } finally {
+        process.env.PATH = saved;
+      }
+      const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+      expect(env.PATH).toBe(`${path.dirname(dockerCliPath())}:/usr/bin:/bin:/usr/sbin:/sbin`);
+    });
+
     it("applies the repository's approved env policy", async () => {
       await withHostEnv({ DEVELOPER_DIR: '/Applications/Xcode-beta.app', FOO_SECRET: 'hunter2', LANG: 'C' }, async () => {
         const manager = new RunnerManager({

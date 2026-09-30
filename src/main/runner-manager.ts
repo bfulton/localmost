@@ -35,6 +35,9 @@ import { normalizeFilterConfig, isUserAllowed, areAllUsersAllowed, parseReposito
  */
 const DOCKER_SOCKET_NAME = 'docker.sock';
 
+/** macOS's default PATH, for a job whose app was started with none. */
+const DEFAULT_SYSTEM_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
+
 /**
  * The longest line of worker output that is read as a line, in characters
  * (UTF-16 code units, as string length counts them). The runner's own status
@@ -1479,7 +1482,8 @@ export class RunnerManager {
       // The bundled CLI, first on PATH, reading an empty config of the job's
       // own rather than the operator's ~/.docker.
       env.DOCKER_CONFIG = path.join(sandboxDir, DOCKER_CONFIG_DIR_NAME);
-      env.PATH = env.PATH ? `${path.dirname(this.dockerCli)}:${env.PATH}` : path.dirname(this.dockerCli);
+      // With no PATH of its own, the job still gets the system's after it.
+      env.PATH = `${path.dirname(this.dockerCli)}:${env.PATH || DEFAULT_SYSTEM_PATH}`;
 
       // Make git hermetic and able to authenticate to this worker's proxy.
       // The sandbox does not grant the user's ~/.gitconfig, and git treats an
