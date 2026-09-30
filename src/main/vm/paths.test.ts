@@ -6,7 +6,7 @@
  * outside the directory it belongs in.
  */
 
-import { describe, it, expect, afterEach } from '@jest/globals';
+import { describe, it, expect, afterEach, jest } from '@jest/globals';
 import * as path from 'path';
 import { app } from 'electron';
 import {
@@ -305,19 +305,24 @@ describe('the resources paths', () => {
   const savedHelper = process.env.LOCALMOST_VM_HELPER;
 
   afterEach(() => {
+    jest.restoreAllMocks();
     setPackaged(false);
     setResourcesPath(savedResourcesPath);
     if (savedHelper === undefined) delete process.env.LOCALMOST_VM_HELPER;
     else process.env.LOCALMOST_VM_HELPER = savedHelper;
   });
 
-  it('finds everything under build/ when not packaged', () => {
+  it("finds everything under the checkout's build/ when not packaged", () => {
     delete process.env.LOCALMOST_VM_HELPER;
-    const build = path.join(app.getAppPath(), 'build');
-    expect(getVmResourcesDir()).toBe(build);
-    expect(helperPath()).toBe(path.join(build, 'localmost-vm'));
-    expect(guestDir()).toBe(path.join(build, 'guest'));
-    expect(dockerCliPath()).toBe(path.join(build, 'docker-cli', 'docker'));
+    // `electron .` makes the checkout the app path. `electron build/dist/main.js`,
+    // as the e2e tests launch it, makes the bundle's own directory the app path.
+    for (const appPath of ['/work/localmost', '/work/localmost/build/dist', '/work/localmost/build/dist/']) {
+      jest.spyOn(app, 'getAppPath').mockReturnValue(appPath);
+      expect(getVmResourcesDir()).toBe('/work/localmost/build');
+      expect(helperPath()).toBe('/work/localmost/build/localmost-vm');
+      expect(guestDir()).toBe('/work/localmost/build/guest');
+      expect(dockerCliPath()).toBe('/work/localmost/build/docker-cli/docker');
+    }
   });
 
   it("finds everything in the app's Resources when packaged", () => {

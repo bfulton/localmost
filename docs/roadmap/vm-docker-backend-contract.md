@@ -20,7 +20,7 @@ spike on 2026-09-30 ran it. Everything else is specified here, not yet tested.
 | digest | `^sha256:[0-9a-f]{64}$` | a registry, or the VM | Every digest from outside Electron is checked against this before any use (§6.3). |
 | `repoKey` | `^[0-9a-f]{16}$` | `repoKeyOf(repository)`: first 16 hex of `sha256(lowercase("owner/name"))` | Per-repository store and cache. |
 | `<data>` | absolute | `getAppDataDir()` | Normally `~/.localmost`. |
-| `<resources>` | absolute | `process.resourcesPath`, or `build/` in development | Where the guest is found (`<resources>/guest`). |
+| `<resources>` | absolute | `process.resourcesPath`, or the checkout's `build/` in development | Where the guest is found (`<resources>/guest`). Electron's app path is the checkout under `electron .` but `build/dist` under `electron build/dist/main.js` (the e2e launch); `getVmResourcesDir()` gives the same `build/` for both. |
 | `<helper>` | absolute | `helperPath()` in `vm/paths.ts` | `<resources>/localmost-vm` when packaged; `build/localmost-vm` in development (`build:helper` copies it there). The one path used by the spawn, the helper profile and the sweep. |
 | `<docker-cli>` | absolute | `dockerCliPath()` in `vm/paths.ts` | `<resources>/docker-cli/docker`; `build/docker-cli/docker` in development. |
 
@@ -649,7 +649,7 @@ check.
 | `src/main/vm/guest-image.ts` | new | Locate `<resources>/guest`, read `manifest.json`, check the artifact hashes once per launch. |
 | `src/main/vm/cache-disks.ts` | new | §6.5. |
 | `src/main/vm/types.ts` | new | Declarations only: `VmRequest`, `VmState`, `VmHandle`, `VmError`, `VmManager` (below), `AgentClient` (§3.4, below), `ImagePuller` (§6.4), `CacheDisks` and `StartRefreshVm` (§6.5). The implementations import them from here, so that no two of them import each other. |
-| `src/main/vm/paths.ts` | new | Every path in §1, each built only from an id checked against its §1 form (a malformed one throws): `vmDir()`, `vmJobFiles()`, `imageStoreDir()`, `refsJsonPath()`, `cacheFiles()`, `sandboxDirOf()` and `sandboxFiles()`, which take `<data>` as an argument, already realpathed by the caller (`sandboxFiles(<data>, sandboxId)` is built on `sandboxDirOf()`, never from a directory the caller hands over, because the share is what the helper profile grants). Also the §1 regexes, `repoKeyOf()`, `newVmId(slot)`, `vmIdSlot()`, `digestHex()` (§6.3), `blobPath()` (§6.3, with its second layer `placeBlob()` exported only for its test), `getVmResourcesDir()`, `guestDir()`, `helperPath()` (with the `LOCALMOST_VM_HELPER` rule of §7.3) and `dockerCliPath()`. |
+| `src/main/vm/paths.ts` | new | Every path in §1, each built only from an id checked against its §1 form (a malformed one throws): `vmDir()`, `vmJobFiles()`, `imageStoreDir()`, `refsJsonPath()`, `cacheFiles()`, `sandboxDirOf()` and `sandboxFiles()`, which take `<data>` as an argument, already realpathed by the caller (`sandboxFiles(<data>, sandboxId)` is built on `sandboxDirOf()`, never from a directory the caller hands over, because the share is what the helper profile grants). Also the §1 regexes, `repoKeyOf()`, `newVmId(slot)`, `vmIdSlot()`, `digestHex()` (§6.3), `blobPath()` (§6.3, with its second layer `placeBlob()` exported only for its test), `getVmResourcesDir()` (§1), `guestDir()`, `helperPath()` (with the `LOCALMOST_VM_HELPER` rule of §7.3) and `dockerCliPath()`. |
 | `src/main/resource-monitor/memory-pressure-monitor.ts` | new | Polls `sysctl -n kern.memorystatus_vm_pressure_level` every 5 s with async `execFile` (1 → `normal`, 2 → `warn`, 4 → `critical`; anything else → `warn`), and calls `vmManager.onMemoryPressure(level)` on a change. |
 | `src/main/docker/puller/registry-client.ts` | new | Registry v2 client: token auth, manifests, blobs, redirects, screened DNS. |
 | `src/main/docker/puller/image-store.ts` | new | The per-repository blob store and `refs.json`. |
@@ -1212,8 +1212,10 @@ helper or CLI is missing. A build never ships without its VM.
   `{ "version": "29.8.1", "url": "https://download.docker.com/mac/static/stable/aarch64/docker-29.8.1.tgz", "sha256": "5a8f5604d7673202b2af925229d15eb4bbb86f7f542e4ac8cd7aa3f14cfa0f8b", "member": "docker/docker" }`
   is fetched, checked, and extracted to `build/docker-cli/docker`. *Verified:*
   hash, member, and that it is a thin arm64 Mach-O that is linker-signed ad hoc.
-- Development runs find `<resources>` at `build/` (`build/localmost-vm`,
-  `build/guest`, `build/docker-cli`) through `getVmResourcesDir()`,
+- Development runs find `<resources>` at the checkout's `build/`
+  (`build/localmost-vm`, `build/guest`, `build/docker-cli`), whether Electron
+  was launched on the checkout or on `build/dist/main.js` (§1), through
+  `getVmResourcesDir()`,
   `helperPath()` and `dockerCliPath()` in `src/main/vm/paths.ts`. The helper
   profile, the spawn and the sweep all use `helperPath()`.
   `LOCALMOST_VM_HELPER` replaces the helper path only when `!app.isPackaged`

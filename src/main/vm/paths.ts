@@ -241,6 +241,11 @@ export function sandboxFiles(dataDir: string, sandboxId: string): SandboxFiles {
  * `<resources>`: the app's Resources when packaged, else the checkout's
  * build/, where build:helper, build:guest and fetch:docker-cli put what
  * packaging copies into Resources.
+ *
+ * Unpackaged, the app path depends on how Electron was launched: `electron .`
+ * gives the checkout, but `electron build/dist/main.js`, as the e2e tests
+ * launch it, gives the bundle's own directory, build/dist. Both mean the same
+ * build/.
  */
 export function getVmResourcesDir(): string {
   if (app.isPackaged) {
@@ -249,7 +254,12 @@ export function getVmResourcesDir(): string {
     }
     return process.resourcesPath;
   }
-  return path.join(app.getAppPath(), 'build');
+  const appPath = path.resolve(app.getAppPath());
+  const parent = path.dirname(appPath);
+  if (path.basename(appPath) === 'dist' && path.basename(parent) === 'build') {
+    return parent;
+  }
+  return path.join(appPath, 'build');
 }
 
 /** `<resources>/guest`: the kernel, initramfs, root disk and their manifest. */
