@@ -32,11 +32,13 @@ let vmBehaviour: { synced: boolean; readyError?: Error; vmId: string; gate?: Pro
 let shutdowns: number;
 let stops: string[];
 let disks: CacheDisksOptions;
+/** A daemon for a VM on another slot, when a test runs one. */
+let otherDaemon: TestDaemon | null;
 
 beforeEach(async () => {
-  dataDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cd-')));
-  fs.mkdirSync(vmJobFiles(dataDir, REFRESH_VM).dir, { recursive: true });
-  daemon = await TestDaemon.start(vmJobFiles(dataDir, REFRESH_VM).dockerSocket);
+  dataDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cache-disks-')));
+  daemon = await TestDaemon.start();
+  otherDaemon = null;
   now = Date.UTC(2026, 9, 1);
   guest = { ...GUEST };
   conditions = { onBattery: false, memoryPressure: 'normal' };
@@ -91,6 +93,8 @@ function cacheDisks(over: Partial<CacheDisksOptions> = {}): VmCacheDisks {
     conditions: () => conditions,
     debounceMs: 10,
     now: () => now,
+    connectDaemon: (socketPath) =>
+      socketPath === vmJobFiles(dataDir, REFRESH_VM).dockerSocket || !otherDaemon ? daemon.connect() : otherDaemon.connect(),
     ...over,
   };
   return new VmCacheDisks(disks);
@@ -238,9 +242,9 @@ describe('refreshes', () => {
   it('refuse a VM that is not on the refresh slot', async () => {
     await stock('alpine');
     vmBehaviour.vmId = '5-00000000000c';
-    fs.mkdirSync(vmJobFiles(dataDir, '5-00000000000c').dir, { recursive: true });
     // A daemon that would take the load, so only the slot check stops it.
-    const jobDaemon = await TestDaemon.start(vmJobFiles(dataDir, '5-00000000000c').dockerSocket);
+    otherDaemon = await TestDaemon.start();
+    const jobDaemon = otherDaemon;
     const cd = cacheDisks();
     cd.scheduleRefresh(REPO_KEY, REPOSITORY);
     await cd.settled(REPO_KEY);

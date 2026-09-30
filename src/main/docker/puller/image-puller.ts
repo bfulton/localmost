@@ -30,7 +30,7 @@ import type { DockerProgress } from '../docker-backend';
 import { imageStoreDir, repoKeyOf, VM_ID_RE, vmJobFiles } from '../../vm/paths';
 import type { CacheDisks, ImagePuller, ImagePullOptions, ImagePullResult, RosettaState } from '../../vm/types';
 import { cleanText } from './clean-text';
-import { hasImage, loadImage, tagImage } from './daemon-api';
+import { DaemonConnector, hasImage, loadImage, tagImage } from './daemon-api';
 import { dockerArchive, measureLayer, ArchiveLayer, LayerVerifyError } from './docker-archive';
 import { DigestMismatchError, ImageStore, StoreLayer } from './image-store';
 import {
@@ -80,6 +80,8 @@ export interface ImagePullerOptions {
   statfs?: (dir: string) => Promise<{ bavail: number; bsize: number }>;
   /** Bytes fetched between free-space checks while a pull streams (256 MiB). */
   freeSpaceCheckBytes?: number;
+  /** Tests only: how to reach a VM's docker.sock (see DaemonConnector). */
+  connectDaemon?: DaemonConnector;
   now?: () => number;
   log?: (level: 'debug' | 'info' | 'warn', message: string) => void;
 }
@@ -224,6 +226,19 @@ function transferError(error: unknown, signal: AbortSignal, what: string): Error
   return new PullError(`the transfer of ${what} broke off: ${cleanText((error as Error)?.message ?? String(error), 200)}`, true);
 }
 
+/** Until a stream wants more, or is gone; its listeners are removed either way. */
+function drained(stream: Transform): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      stream.off('drain', done);
+      stream.off('close', done);
+      resolve();
+    };
+    stream.on('drain', done);
+    stream.on('close', done);
+  });
+}
+
 function decompressorFor(mediaType: string): Transform {
   const compression = LAYER_TYPES.get(mediaType);
   if (compression === 'gzip') return zlib.createGunzip();
@@ -287,6 +302,7 @@ export class VmImagePuller implements ImagePuller {
     const { request, signal } = opts;
     signal.throwIfAborted();
     const vmDir = this.vmDirOf(opts.dockerSocketPath);
+    const daemon = { socketPath: opts.dockerSocketPath, connect: this.options.connectDaemon };
     const limits = this.options.limits();
     registryOrigin(request.registry);
     const repositoryPath = normalizeRepositoryPath(request.registry, request.repositoryPath);
@@ -334,7 +350,7 @@ export class VmImagePuller implements ImagePuller {
     const release = [publicStore.pin(this.blobsFor(resolved)), jobStore.pin(this.blobsFor(resolved))];
     try {
       let source: ImagePullResult['source'];
-      if (await hasImage(opts.dockerSocketPath, resolved.config.digest, signal)) {
+      if (await hasImage(daemon, resolved.config.digest, signal)) {
         source = 'vm';
         for (const id of layerIds) progress({ status: 'Already exists', id });
       } else {
@@ -362,7 +378,7 @@ export class VmImagePuller implements ImagePuller {
         source = fetched ? 'registry' : 'store';
         signal.throwIfAborted();
         const loaded = await loadImage(
-          opts.dockerSocketPath,
+          daemon,
           dockerArchive({ name: `${name}@${resolved.manifestDigest}`, config: config.bytes, configDigest: resolved.config.digest, layers }),
           signal
         ).catch(async (error) => {
@@ -375,7 +391,7 @@ export class VmImagePuller implements ImagePuller {
         if (loaded.some((id) => id !== resolved.config.digest)) {
           throw new PullError(`the Docker VM loaded ${cleanText(loaded.join(', '), 200)} for ${ref}, not ${resolved.config.digest}`);
         }
-        if (!(await hasImage(opts.dockerSocketPath, resolved.config.digest, signal))) {
+        if (!(await hasImage(daemon, resolved.config.digest, signal))) {
           throw new PullError(`the Docker VM does not show ${resolved.config.digest} after loading ${ref}`);
         }
         for (const id of layerIds) progress({ status: 'Pull complete', id });
@@ -399,7 +415,7 @@ export class VmImagePuller implements ImagePuller {
         }
       }
       if (source === 'vm' && isPublic) await this.touch(publicStore, ref, platform, resolved.manifestDigest);
-      if (tag !== undefined) await tagImage(opts.dockerSocketPath, resolved.config.digest, name, tag, signal);
+      if (tag !== undefined) await tagImage(daemon, resolved.config.digest, name, tag, signal);
       if (isPublic) this.options.cacheDisks.notePulled(repoKey, resolved.config.digest);
       progress({ status: `Digest: ${resolved.topDigest}` });
       progress({
@@ -663,12 +679,7 @@ export class VmImagePuller implements ImagePuller {
         budget.take(bytes.length);
         await writer.write(bytes);
         if (decompressError) throw decompressError;
-        if (!decompressor.write(bytes)) {
-          await new Promise<void>((resolve) => {
-            decompressor.once('drain', resolve);
-            decompressor.once('close', resolve);
-          });
-        }
+        if (!decompressor.write(bytes)) await drained(decompressor);
         if (decompressError) throw decompressError;
         sinceCheck += bytes.length;
         if (sinceCheck >= checkEvery) {

@@ -1,5 +1,5 @@
 /**
- * A mock Docker daemon on a unix socket, for the puller's and the cache
+ * A mock Docker daemon, for the puller's and the cache
  * refresh's tests: it records image loads (parsing the archive the way
  * dockerd would read it), tags, inspects, lists and removals, and can be
  * switched to answer the ways a hostile daemon could.
@@ -8,10 +8,8 @@
  */
 
 import * as crypto from 'crypto';
-import * as fs from 'fs';
 import * as http from 'http';
-import * as os from 'os';
-import * as path from 'path';
+import * as net from 'net';
 
 export interface DaemonCall {
   method: string;
@@ -59,25 +57,28 @@ export class TestDaemon {
 
   private constructor(
     private readonly server: http.Server,
-    readonly socketPath: string,
-    private readonly dir: string | null
+    readonly port: number
   ) {}
 
-  /** Listen at `socketPath`, or in a new temporary directory. */
-  static async start(socketPath?: string): Promise<TestDaemon> {
-    const dir = socketPath ? null : fs.mkdtempSync(path.join(os.tmpdir(), 'daemon-'));
-    const where = socketPath ?? path.join(dir!, 'docker.sock');
+  /**
+   * Listen on TCP 127.0.0.1. The code under test is handed `connect` as its
+   * DaemonConnector: a unix socket path under a job's TMPDIR can exceed the
+   * 103-byte limit, and a job may bind a local TCP port.
+   */
+  static async start(): Promise<TestDaemon> {
     let daemon: TestDaemon | null = null;
     const server = http.createServer((req, res) => daemon!.handle(req, res));
-    await new Promise<void>((resolve) => server.listen(where, resolve));
-    daemon = new TestDaemon(server, where, dir);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    daemon = new TestDaemon(server, (server.address() as net.AddressInfo).port);
     return daemon;
   }
+
+  /** A connection to this daemon, whatever socket path it is asked for. */
+  readonly connect = (): net.Socket => net.connect(this.port, '127.0.0.1');
 
   async close(): Promise<void> {
     this.server.closeAllConnections();
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
-    if (this.dir) fs.rmSync(this.dir, { recursive: true, force: true });
   }
 
   private send(res: http.ServerResponse, status: number, body: unknown): void {

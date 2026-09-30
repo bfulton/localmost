@@ -63,14 +63,14 @@ export const MEDIA = {
 
 export const sha256 = (bytes: Buffer): string => `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`;
 
-/** A deterministic ustar archive of regular files. */
-export function tarOf(files: Array<{ name: string; content: Buffer | string }>): Buffer {
+/** A deterministic ustar archive of regular files (mode 0644 unless given). */
+export function tarOf(files: Array<{ name: string; content: Buffer | string; mode?: number }>): Buffer {
   const blocks: Buffer[] = [];
   for (const file of files) {
     const content = Buffer.isBuffer(file.content) ? file.content : Buffer.from(file.content);
     const header = Buffer.alloc(512);
     header.write(file.name, 0, 100, 'utf-8');
-    header.write('0000644\0', 100);
+    header.write(`${(file.mode ?? 0o644).toString(8).padStart(7, '0')}\0`, 100);
     header.write('0000000\0', 108);
     header.write('0000000\0', 116);
     header.write(`${content.length.toString(8).padStart(11, '0')}\0`, 124);

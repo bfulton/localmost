@@ -22,7 +22,7 @@ import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
-import { DaemonError, listImages, loadImage, removeImage } from '../docker/puller/daemon-api';
+import { DaemonConnector, DaemonError, listImages, loadImage, removeImage } from '../docker/puller/daemon-api';
 import { dockerArchive, ArchiveLayer } from '../docker/puller/docker-archive';
 import { blobsOf, ImageStore, StoreRef } from '../docker/puller/image-store';
 import { cacheFiles, DIGEST_RE, imageStoreDir, REPO_KEY_RE, REFRESH_SLOT, repoKeyOf, VM_ID_RE, vmIdSlot, vmJobFiles } from './paths';
@@ -57,6 +57,8 @@ export interface CacheDisksOptions {
   debounceMs?: number;
   now?: () => number;
   log?: (level: 'debug' | 'info' | 'warn', message: string) => void;
+  /** Tests only: how to reach a VM's docker.sock (see DaemonConnector). */
+  connectDaemon?: DaemonConnector;
 }
 
 /** meta.json: what the golden disk holds and how it was made. */
@@ -330,17 +332,18 @@ export class CacheDisks implements CacheDisksApi {
         throw new Error(`the refresh VM ${vm.vmId} is not a refresh-slot VM of this data directory`);
       }
       await vm.ready();
+      const daemon = { socketPath: vm.dockerSocketPath, connect: this.options.connectDaemon };
       const loaded = new Set(fullBecause ? [] : [...held].filter((d) => images.has(d)));
       for (const ref of toLoad) {
-        await loadImage(vm.dockerSocketPath, dockerArchive(await this.archiveOf(store, ref)));
+        await loadImage(daemon, dockerArchive(await this.archiveOf(store, ref)));
         loaded.add(ref.configDigest);
       }
-      for (const image of await listImages(vm.dockerSocketPath)) {
+      for (const image of await listImages(daemon)) {
         if (!loaded.has(image.Id)) {
-          await removeImage(vm.dockerSocketPath, { id: image.Id });
+          await removeImage(daemon, { id: image.Id });
           continue;
         }
-        for (const tag of image.RepoTags) await removeImage(vm.dockerSocketPath, { tag });
+        for (const tag of image.RepoTags) await removeImage(daemon, { tag });
       }
       await vm.agent().shutdown();
       const stopped = await vm.stopped();

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach, jest } from '@jest/globals';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -12,6 +13,26 @@ import type { RegistryCredentials } from '../registry-auth';
 import { OVERSIZED } from './daemon-api';
 import { TestDaemon } from './test-daemon';
 import { MEDIA, REGISTRY_HOST, TestRegistry, buildImage, buildIndex, sha256, tarOf } from './test-registry';
+
+// Held so a test can watch the listeners on the puller's gunzip stream while
+// it writes: a wait for back-pressure that leaves its listeners behind piles
+// them up, one per chunk.
+const mockGunzipListeners = { most: 0 };
+jest.mock('zlib', () => {
+  const actual = jest.requireActual<typeof import('zlib')>('zlib');
+  return {
+    ...actual,
+    createGunzip: (options?: import('zlib').ZlibOptions) => {
+      const gunzip = actual.createGunzip(options);
+      const write = gunzip.write.bind(gunzip) as (...args: unknown[]) => boolean;
+      gunzip.write = ((...args: unknown[]) => {
+        mockGunzipListeners.most = Math.max(mockGunzipListeners.most, gunzip.listenerCount('close'), gunzip.listenerCount('drain'));
+        return write(...args);
+      }) as typeof gunzip.write;
+      return gunzip;
+    },
+  };
+});
 
 const REPOSITORY = 'octo/widgets';
 const REPO_KEY = repoKeyOf(REPOSITORY);
@@ -29,10 +50,9 @@ let credentials: RegistryCredentials | undefined;
 
 beforeEach(async () => {
   registry = await TestRegistry.start();
-  // Short: <data>/vm/jobs/<vmId>/docker.sock must fit a unix socket path.
-  dataDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ip-')));
+  dataDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'image-puller-')));
   fs.mkdirSync(vmJobFiles(dataDir, VM_ID).dir, { recursive: true });
-  daemon = await TestDaemon.start(vmJobFiles(dataDir, VM_ID).dockerSocket);
+  daemon = await TestDaemon.start();
   notePulled = jest.fn();
   limits = { pullMaxGiB: 10, jobPullMaxGiB: 30, minFreeGiB: 20 };
   free = 500 * GiB;
@@ -58,6 +78,7 @@ function puller(over: Partial<ImagePullerOptions> = {}): VmImagePuller {
     cacheDisks: { notePulled },
     limits: () => limits,
     statfs: async () => ({ bavail: Math.floor(free / 4096), bsize: 4096 }),
+    connectDaemon: daemon.connect,
     ...over,
   });
 }
@@ -75,7 +96,7 @@ function pull(p: VmImagePuller, over: PullOver = {}) {
     repository: REPOSITORY,
     request: { registry: REGISTRY_HOST, repositoryPath: IMAGE, tag: 'v1', ...over.request },
     rosetta: over.rosetta ?? 'ok',
-    dockerSocketPath: over.socket ?? daemon.socketPath,
+    dockerSocketPath: over.socket ?? vmJobFiles(dataDir, VM_ID).dockerSocket,
     onProgress: (line) => over.progress?.push(line),
     signal: over.signal ?? new AbortController().signal,
   });
@@ -243,6 +264,16 @@ describe('a pull', () => {
     registry.switches.dropBlobsOnce = new Set([layer]);
     await expect(pull(puller())).resolves.toMatchObject({ source: 'registry' });
     expect(blobRequests().filter((r) => r.path.endsWith(layer))).toHaveLength(2);
+  });
+
+  it('streams a large layer without piling listeners on the decompressor', async () => {
+    mockGunzipListeners.most = 0;
+    // Random bytes do not compress: many chunks, and back-pressure on most.
+    const image = buildImage({ layers: [tarOf([{ name: 'big', content: crypto.randomBytes(6 * 1024 * 1024) }])] });
+    registry.putImage(IMAGE, image, 'v1');
+    await pull(puller());
+    expect(mockGunzipListeners.most).toBeGreaterThan(0);
+    expect(mockGunzipListeners.most).toBeLessThan(5);
   });
 
   it('loads zstd and uncompressed layers as well as gzip', async () => {

@@ -10,6 +10,7 @@
  */
 
 import * as http from 'http';
+import type * as net from 'net';
 import { Readable } from 'stream';
 import { DIGEST_RE } from '../../vm/paths';
 import { cleanText } from './clean-text';
@@ -26,13 +27,26 @@ export class DaemonError extends Error {
 
 export const OVERSIZED = 'the Docker VM sent an oversized answer';
 
+/**
+ * Opens a connection for a VM's docker.sock. Tests only: they serve the mock
+ * daemon on TCP, because a unix socket path under a job's TMPDIR can exceed
+ * the 103-byte limit. Without it, the connection is to the socket itself.
+ */
+export type DaemonConnector = (socketPath: string) => net.Socket;
+
+/** A VM's docker.sock, and how to reach it. */
+export interface DaemonEndpoint {
+  socketPath: string;
+  connect?: DaemonConnector;
+}
+
 interface Answer {
   status: number;
   body: Buffer;
 }
 
 function call(
-  socketPath: string,
+  daemon: DaemonEndpoint,
   method: string,
   apiPath: string,
   signal: AbortSignal | undefined,
@@ -46,7 +60,9 @@ function call(
       settled = true;
       reject(error);
     };
-    const req = http.request({ socketPath, method, path: apiPath, headers: { host: 'docker', ...headers }, signal }, (res) => {
+    const connect = daemon.connect;
+    const target = connect ? { createConnection: () => connect(daemon.socketPath) } : { socketPath: daemon.socketPath };
+    const req = http.request({ ...target, method, path: apiPath, headers: { host: 'docker', ...headers }, signal }, (res) => {
       const chunks: Buffer[] = [];
       let size = 0;
       res.on('data', (chunk: Buffer) => {
@@ -114,8 +130,8 @@ function hexOf(digest: string): string {
  * whose `Id` is exactly that digest. The image id is the config digest, so
  * this finds an image loaded without a name.
  */
-export async function hasImage(socketPath: string, configDigest: string, signal?: AbortSignal): Promise<boolean> {
-  const answer = await call(socketPath, 'GET', `/images/sha256:${hexOf(configDigest)}/json`, signal);
+export async function hasImage(daemon: DaemonEndpoint, configDigest: string, signal?: AbortSignal): Promise<boolean> {
+  const answer = await call(daemon, 'GET', `/images/sha256:${hexOf(configDigest)}/json`, signal);
   if (answer.status === 404) return false;
   if (answer.status !== 200) throw new DaemonError(`the Docker VM could not inspect ${configDigest}: ${messageOf(answer)}`);
   const body = json(answer);
@@ -132,8 +148,8 @@ export async function hasImage(socketPath: string, configDigest: string, signal?
  * parsed: an error in it fails the load, and every image id it names must be
  * a valid digest. Returns the ids it named.
  */
-export async function loadImage(socketPath: string, archive: Readable, signal?: AbortSignal): Promise<string[]> {
-  const answer = await call(socketPath, 'POST', '/images/load?quiet=1', signal, archive, {
+export async function loadImage(daemon: DaemonEndpoint, archive: Readable, signal?: AbortSignal): Promise<string[]> {
+  const answer = await call(daemon, 'POST', '/images/load?quiet=1', signal, archive, {
     'content-type': 'application/x-tar',
     'transfer-encoding': 'chunked',
   });
@@ -168,10 +184,10 @@ export async function loadImage(socketPath: string, archive: Readable, signal?: 
 const REPO_RE = /^[a-z0-9.-]+(?::[0-9]{1,5})?\/[a-z0-9._/-]{1,255}$/;
 const TAG_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
 
-export async function tagImage(socketPath: string, configDigest: string, repo: string, tag: string, signal?: AbortSignal): Promise<void> {
+export async function tagImage(daemon: DaemonEndpoint, configDigest: string, repo: string, tag: string, signal?: AbortSignal): Promise<void> {
   if (!REPO_RE.test(repo) || !TAG_RE.test(tag)) throw new DaemonError(`not a name to tag: ${cleanText(`${repo}:${tag}`, 300)}`);
   const query = new URLSearchParams({ repo, tag }).toString();
-  const answer = await call(socketPath, 'POST', `/images/sha256:${hexOf(configDigest)}/tag?${query}`, signal);
+  const answer = await call(daemon, 'POST', `/images/sha256:${hexOf(configDigest)}/tag?${query}`, signal);
   if (answer.status !== 201 && answer.status !== 200) {
     throw new DaemonError(`the Docker VM could not tag ${configDigest} as ${repo}:${tag}: ${messageOf(answer)}`);
   }
@@ -183,8 +199,8 @@ export interface ListedImage {
 }
 
 /** Every image in the VM, with its tags; an entry that is not an image is refused. */
-export async function listImages(socketPath: string, signal?: AbortSignal): Promise<ListedImage[]> {
-  const answer = await call(socketPath, 'GET', '/images/json?all=1', signal);
+export async function listImages(daemon: DaemonEndpoint, signal?: AbortSignal): Promise<ListedImage[]> {
+  const answer = await call(daemon, 'GET', '/images/json?all=1', signal);
   if (answer.status !== 200) throw new DaemonError(`the Docker VM could not list images: ${messageOf(answer)}`);
   const body = json(answer);
   if (!Array.isArray(body)) throw new DaemonError('the Docker VM sent an image list that is not a list');
@@ -201,7 +217,7 @@ export async function listImages(socketPath: string, signal?: AbortSignal): Prom
  * Remove an image by id (with force), or untag one name. A 404 is not an
  * error: what was to go is gone.
  */
-export async function removeImage(socketPath: string, target: { id: string } | { tag: string }, signal?: AbortSignal): Promise<void> {
+export async function removeImage(daemon: DaemonEndpoint, target: { id: string } | { tag: string }, signal?: AbortSignal): Promise<void> {
   const name = 'id' in target ? `sha256:${hexOf(target.id)}` : target.tag;
   // A name goes into the path as the docker CLI sends it, so it may hold only
   // what an image reference can: no '?', '#', '%', space or '..'.
@@ -209,7 +225,7 @@ export async function removeImage(socketPath: string, target: { id: string } | {
     throw new DaemonError(`not an image name: ${cleanText(name, 200)}`);
   }
   const query = 'id' in target ? '?force=1' : '?noprune=1';
-  const answer = await call(socketPath, 'DELETE', `/images/${name}${query}`, signal);
+  const answer = await call(daemon, 'DELETE', `/images/${name}${query}`, signal);
   if (answer.status !== 200 && answer.status !== 404) {
     throw new DaemonError(`the Docker VM could not remove ${cleanText(name, 200)}: ${messageOf(answer)}`);
   }
