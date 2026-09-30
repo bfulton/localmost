@@ -350,7 +350,11 @@ describe('the SECURITY.md escapes', () => {
     const v = create({ Image: 'postgres:16', HostConfig: { Privileged: true } },
       { policy: { run: { images: ['postgres:16'], network: 'bridge' }, privileged: true }, sandboxDir: '/ws', workspaceRoot: '/ws', supportsPrivileged: false, realpath: (p) => p });
     expect(v.allowed).toBe(false);
-    expect(v.reason).toMatch(/managed VM/i);
+    expect(v.reason).toBe("privileged containers are not granted: they reach the Docker VM's kernel");
+    const unsupportedUndeclared = create({ Image: 'postgres:16', HostConfig: { Privileged: true } },
+      { policy: { run: { images: ['postgres:16'], network: 'bridge' } }, sandboxDir: '/ws', workspaceRoot: '/ws', supportsPrivileged: false, realpath: (p) => p });
+    expect(unsupportedUndeclared.reason).toBe("privileged containers are not granted: they reach the Docker VM's kernel");
+    expect(unsupportedUndeclared.policyHint).toBeUndefined();
     const vm = create({ Image: 'postgres:16', HostConfig: { Privileged: true } },
       { policy: { run: { images: ['postgres:16'], network: 'bridge' }, privileged: true }, sandboxDir: '/ws', workspaceRoot: '/ws', supportsPrivileged: true, realpath: (p) => p });
     expect(vm.allowed).toBe(true);
@@ -1242,5 +1246,123 @@ describe('bodies the daemon reads as a form', () => {
     expect(allowed(withType('POST', '/v1.45/build?t=app', 'application/x-tar', 'tar'))).toBe(true);
     expect(allowed(withType('POST', '/v1.45/build?t=app', 'application/tar', 'tar'))).toBe(true);
     expect(allowed(withType('POST', '/v1.45/containers/create', 'application/json; charset=utf-8', '{"Image":"postgres:16"}'))).toBe(true);
+  });
+});
+
+describe('the binds an allowed create approves for the VM', () => {
+  // Every bind the filter lets through is reported to the guest agent, which
+  // lm-bindpin checks each share-backed mount against before the container
+  // starts. Both sides normalise the same way (contract §3.7): the source is
+  // the pinned host path, byte for byte; the destination is cleaned; readOnly
+  // comes from the mode. These are the vectors of the Go side's
+  // guest/internal/mountinfo/testdata/binds.json, spelled as create bodies.
+  const policy: DockerPolicy = {
+    run: { images: ['alpine:3'], mounts: [{ path: './', mode: 'rw' }], network: 'bridge' },
+  };
+  const create = (hostConfig: Record<string, unknown>, c: DockerEvalContext = ctx(policy)) =>
+    evaluateDockerRequest(mk('POST', '/v1.45/containers/create', { Image: 'alpine:3', HostConfig: hostConfig }), c);
+
+  const vectors: Array<{
+    name: string;
+    hostConfig: Record<string, unknown>;
+    binds: Array<{ source: string; destination: string; readOnly: boolean }>;
+  }> = [
+    {
+      name: 'a plain bind is approved read-write at its destination',
+      hostConfig: { Binds: ['/ws/data:/data'] },
+      binds: [{ source: '/ws/data', destination: '/data', readOnly: false }],
+    },
+    {
+      name: "ro in a bind's options makes it read-only, among other options",
+      hostConfig: { Binds: ['/ws/data:/data:z,ro'] },
+      binds: [{ source: '/ws/data', destination: '/data', readOnly: true }],
+    },
+    {
+      name: 'a trailing slash on the destination is dropped, as dockerd drops it',
+      hostConfig: { Binds: ['/ws/data:/data/'] },
+      binds: [{ source: '/ws/data', destination: '/data', readOnly: false }],
+    },
+    {
+      name: 'a doubled slash and a dot in the destination are cleaned',
+      hostConfig: { Binds: ['/ws/data:/srv//app/./x'] },
+      binds: [{ source: '/ws/data', destination: '/srv/app/x', readOnly: false }],
+    },
+    {
+      name: 'a destination of / itself stays /',
+      hostConfig: { Binds: ['/ws/data:/'] },
+      binds: [{ source: '/ws/data', destination: '/', readOnly: false }],
+    },
+    {
+      name: 'a Mounts entry is approved from its Source, Target and ReadOnly',
+      hostConfig: { Mounts: [{ Type: 'bind', Source: '/ws/data', Target: '/d/', ReadOnly: true }] },
+      binds: [{ source: '/ws/data', destination: '/d', readOnly: true }],
+    },
+    {
+      name: 'the same source twice at two destinations is two approvals',
+      hostConfig: { Binds: ['/ws/data:/a:ro', '/ws/data:/b'] },
+      binds: [
+        { source: '/ws/data', destination: '/a', readOnly: true },
+        { source: '/ws/data', destination: '/b', readOnly: false },
+      ],
+    },
+    {
+      name: 'tmpfs and anonymous volumes are not binds, and approve nothing',
+      hostConfig: { Mounts: [{ Type: 'tmpfs', Target: '/run' }, { Type: 'volume', Target: '/v' }] },
+      binds: [],
+    },
+  ];
+
+  it.each(vectors)('$name', ({ hostConfig, binds }) => {
+    const verdict = create(hostConfig);
+    expect(verdict.allowed).toBe(true);
+    expect(verdict.approvedBinds).toEqual(binds);
+  });
+
+  it('is empty for a create with no mounts at all', () => {
+    const verdict = evaluateDockerRequest(mk('POST', '/v1.45/containers/create', { Image: 'alpine:3' }), ctx(policy));
+    expect(verdict.allowed).toBe(true);
+    expect(verdict.approvedBinds).toEqual([]);
+  });
+
+  it('approves the pinned source the daemon is sent, never the spelling the job used', () => {
+    // A source reached through a link inside the workspace is pinned to where
+    // it resolves, and that pinned path is what the hook must see.
+    const c = ctx(policy, { realpath: (p: string) => (p === '/ws/link' ? '/ws/real' : p) });
+    const verdict = create({ Binds: ['/ws/link:/data:ro'] }, c);
+    expect(verdict.allowed).toBe(true);
+    expect(verdict.approvedBinds).toEqual([{ source: '/ws/real', destination: '/data', readOnly: true }]);
+    const body = verdict.rewrittenBody as { HostConfig: { Binds: string[] } };
+    expect(body.HostConfig.Binds).toEqual(['/ws/real:/data:ro']);
+  });
+
+  it('refuses a relative destination, which no approval could match', () => {
+    for (const hostConfig of [
+      { Binds: ['/ws/data:data'] },
+      { Binds: ['/ws/data:./data:ro'] },
+      { Mounts: [{ Type: 'bind', Source: '/ws/data', Target: 'data' }] },
+      { Mounts: [{ Type: 'bind', Source: '/ws/data' }] },
+    ]) {
+      const verdict = create(hostConfig);
+      expect([hostConfig, verdict.allowed]).toEqual([hostConfig, false]);
+      expect(verdict.reason).toMatch(/destination/);
+    }
+  });
+
+  it('refuses two binds to one destination, as dockerd does, however it is spelled', () => {
+    for (const hostConfig of [
+      { Binds: ['/ws/a:/data', '/ws/b:/data'] },
+      { Binds: ['/ws/a:/data', '/ws/b:/data/'] },
+      { Binds: ['/ws/a:/data:ro'], Mounts: [{ Type: 'bind', Source: '/ws/b', Target: '//data' }] },
+    ]) {
+      const verdict = create(hostConfig);
+      expect([hostConfig, verdict.allowed]).toEqual([hostConfig, false]);
+      expect(verdict.reason).toMatch(/more than one mount/);
+    }
+  });
+
+  it('approves nothing on a refused create', () => {
+    const verdict = create({ Binds: ['/Users/me/.ssh:/ssh'] });
+    expect(verdict.allowed).toBe(false);
+    expect(verdict.approvedBinds).toBeUndefined();
   });
 });

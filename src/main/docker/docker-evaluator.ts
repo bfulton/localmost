@@ -15,6 +15,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { DockerPolicy, DockerMount, DockerNetworkPolicy, MountMode } from '../../shared/docker-policy';
 import { asciiEscaped, isPlainAscii } from '../../shared/json-keys';
+import type { ApprovedBind } from './docker-backend';
 import {
   DockerRequest, DockerAction, classifyDockerRequest, containerIdFrom, imageRefFrom, mediaTypeOf, networkIdFrom,
 } from './docker-request';
@@ -75,10 +76,18 @@ export interface DockerVerdict {
    * the job had put on it since it was judged. The resolved path narrows that
    * without closing it: the daemon resolves it once more when the container
    * starts, so a directory on it the job replaces with a symlink after it is
-   * checked and before the container starts is followed. That gap is still
-   * open.
+   * checked and before the container starts is followed. On the VM backend
+   * that gap is closed in the guest: the share is mounted nosymfollow, and
+   * lm-bindpin lets a container start only with the binds in approvedBinds.
    */
   rewrittenBody?: unknown;
+  /**
+   * On an allowed create, every bind it carries, as the guest's hook will
+   * match it (contract §3.7 "Bind matching"): the source exactly as pinned in
+   * rewrittenBody, the destination cleaned, and whether it is read-only.
+   * Empty when the create binds nothing; absent on anything else.
+   */
+  approvedBinds?: ApprovedBind[];
 }
 
 const ALLOW: DockerVerdict = { allowed: true };
@@ -294,7 +303,21 @@ const PROPAGATIONS: ReadonlySet<string> = new Set(['', 'private', 'rprivate', 's
 interface MountRequest {
   /** The host source as the request gave it. */
   source: string;
+  /** Where it lands in the container, cleaned by cleanDestination. */
+  destination: string;
   mode: MountMode;
+}
+
+/**
+ * A container path as dockerd cleans it, and as the guest's hook compares it:
+ * `.`, `..` and repeated slashes resolved, and no trailing slash except on
+ * `/` itself. Undefined for anything that is not an absolute path, which no
+ * approval could match. See contract §3.7 "Bind matching".
+ */
+function cleanDestination(destination: unknown): string | undefined {
+  if (typeof destination !== 'string' || !path.posix.isAbsolute(destination)) return undefined;
+  const clean = path.posix.normalize(destination);
+  return clean.length > 1 && clean.endsWith('/') ? clean.slice(0, -1) : clean;
 }
 
 const inside = (root: string, p: string): boolean => p === root || p.startsWith(root + path.sep);
@@ -310,16 +333,20 @@ function parseBind(bind: string): MountRequest | string {
   const parts = bind.split(':');
   // "src:dst" or "src:dst:opts". A source with no slash is a named volume.
   if (parts.length < 2 || parts.length > 3) return `bind "${bind}" is not of the form source:target[:options]`;
-  const [source, , options] = parts;
+  const [source, target, options] = parts;
   if (!path.isAbsolute(source)) {
     return `"${source}" is a named volume, not a workspace path; only declared workspace mounts are permitted`;
+  }
+  const destination = cleanDestination(target);
+  if (destination === undefined) {
+    return `bind "${bind}" has the relative destination "${target}"; a destination in the container must be an absolute path`;
   }
   let mode: MountMode = 'rw';
   for (const option of options ? options.split(',') : []) {
     if (!BIND_OPTIONS.has(option)) return `bind option "${option}" on "${bind}" is not permitted`;
     if (option === 'ro') mode = 'ro';
   }
-  return { source, mode };
+  return { source, destination, mode };
 }
 
 /** Parse one entry of HostConfig.Mounts; null when it needs no host check. */
@@ -346,6 +373,10 @@ function parseMount(mount: unknown): MountRequest | string | null {
   if (typeof source !== 'string' || !path.isAbsolute(source)) {
     return 'a bind mount needs an absolute Source';
   }
+  const destination = cleanDestination(pick(mount, 'Target'));
+  if (destination === undefined) {
+    return 'a bind mount needs an absolute Target, its destination in the container';
+  }
   const options = pick(mount, 'BindOptions');
   if (options !== undefined && options !== null) {
     if (!isPlainObject(options)) return 'BindOptions must be an object';
@@ -356,7 +387,7 @@ function parseMount(mount: unknown): MountRequest | string | null {
   }
   // Any casing that says read-only counts; a mount is rw only when none does.
   const readOnly = valuesFor(mount, 'ReadOnly').some((v) => v === true);
-  return { source, mode: readOnly ? 'ro' : 'rw' };
+  return { source, destination, mode: readOnly ? 'ro' : 'rw' };
 }
 
 function collectMounts(hostConfig: Record<string, unknown>): MountRequest[] | string {
@@ -379,6 +410,16 @@ function collectMounts(hostConfig: Record<string, unknown>): MountRequest[] | st
       if (typeof parsed === 'string') return parsed;
       if (parsed) requests.push(parsed);
     }
+  }
+  // dockerd refuses two mounts at one destination, and the guest's hook
+  // matches each mount to one approval by destination among the rest, so
+  // one approval could otherwise be claimed twice.
+  const destinations = new Set<string>();
+  for (const { destination } of requests) {
+    if (destinations.has(destination)) {
+      return `more than one mount has the destination "${destination}" in the container`;
+    }
+    destinations.add(destination);
   }
   return requests;
 }
@@ -410,7 +451,8 @@ function checkMounts(
   hostConfig: Record<string, unknown>,
   ctx: DockerEvalContext,
   declared: DockerMount[],
-  resolutions?: Map<string, string>
+  resolutions?: Map<string, string>,
+  approved?: ApprovedBind[]
 ): DockerVerdict {
   const requests = collectMounts(hostConfig);
   if (typeof requests === 'string') return deny(requests);
@@ -418,7 +460,7 @@ function checkMounts(
   const lstat = ctx.lstat ?? ((p: string) => fs.lstatSync(p));
   const root = ctx.workspaceRoot;
 
-  for (const { source, mode } of requests) {
+  for (const { source, destination, mode } of requests) {
     // Resolve before deciding, so `../` and symlinks are judged by where they
     // land, not how they are spelled. A source that does not exist cannot be
     // judged at all, and the daemon would create it on the host.
@@ -451,6 +493,9 @@ function checkMounts(
       );
     }
     resolutions?.set(source, resolved);
+    // The source as pinnedMountSources will forward it, so the hook in the
+    // guest compares what dockerd was actually sent.
+    approved?.push({ source: resolved, destination, readOnly: mode === 'ro' });
   }
   return ALLOW;
 }
@@ -513,12 +558,14 @@ function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: Dock
   if (privilegedValues.some((v) => v === true)) {
     if (!policy.privileged) {
       return deny(
-        'privileged containers are not declared in the repository docker policy; `privileged: true` requires a managed VM backend',
+        ctx.supportsPrivileged
+          ? 'privileged containers are not declared in the repository docker policy'
+          : "privileged containers are not granted: they reach the Docker VM's kernel",
         ctx.supportsPrivileged ? hints.privileged : undefined
       );
     }
     if (!ctx.supportsPrivileged) {
-      return deny('the repository docker policy declares privileged, which requires a managed VM backend; this daemon is not one');
+      return deny("privileged containers are not granted: they reach the Docker VM's kernel");
     }
   } else if (privilegedValues.some((v) => !isUnset(v) && v !== false)) {
     return deny('HostConfig.Privileged must be a boolean');
@@ -636,11 +683,14 @@ function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: Dock
   // Pin every mount source to the path that was actually checked, so the
   // daemon is sent what the filter judged rather than a name the job can
   // point somewhere else in between. The daemon still resolves that path
-  // again when the container starts (see rewrittenBody).
+  // again when the container starts (see rewrittenBody), which is why each
+  // one is also approved for the guest's hook by exactly that path.
   const resolutions = new Map<string, string>();
-  const verdict = checkMounts(hostConfig, ctx, policy.run.mounts ?? [], resolutions);
-  if (!verdict.allowed || resolutions.size === 0) return verdict;
-  return { allowed: true, rewrittenBody: pinMountSources(body, resolutions) };
+  const approvedBinds: ApprovedBind[] = [];
+  const verdict = checkMounts(hostConfig, ctx, policy.run.mounts ?? [], resolutions, approvedBinds);
+  if (!verdict.allowed) return verdict;
+  if (resolutions.size === 0) return { allowed: true, approvedBinds };
+  return { allowed: true, rewrittenBody: pinMountSources(body, resolutions), approvedBinds };
 }
 
 /**
