@@ -122,9 +122,11 @@ shared:
                                  # for all. shared: only. See "Loopback" below.
 
   filesystem:
-    read:
+    read:                        # Never a credential: ~/.ssh (known_hosts
+                                 # included), ~/.aws and the rest stay denied
+                                 # whatever is declared - see SECURITY.md
       - "~/.gitconfig"
-      - "~/.ssh/known_hosts"
+      - "/Applications/Xcode.app"  # Not on the strict floor
     write:
       - "./build/**"
     deny:
@@ -185,7 +187,7 @@ workflows:
 
 | Pattern | Matches |
 |---------|---------|
-| `*.github.com` | `api.github.com`, `raw.githubusercontent.com` |
+| `*.github.com` | Any name ending in `.github.com`, at any depth: `api.github.com`, `a.b.github.com`. Not `github.com` itself, nor `raw.githubusercontent.com` |
 | `registry.npmjs.org` | Exact match only |
 | `./build/**` | All files under `build/` recursively |
 | `~/.ssh/id_*` | `~/.ssh/id_rsa`, `~/.ssh/id_ed25519`, etc. |
@@ -208,11 +210,12 @@ is a validation error, since the sandbox never matches it.
 
 ### Loopback
 
-A job's sandbox connects directly to one loopback port by default: its own
-egress proxy. Anything else listening on the Mac's loopback - a debugger on
-9229, a browser's remote-debugging port, a development database, another job's
-server - is closed to the job's own sockets, and its proxy will not forward
-to it either (below). A repository whose jobs need loopback opts in under
+A job's sandbox connects directly to two loopback ports by default: its own
+egress proxy, and the broker's, which the runner dials directly. Anything else
+listening on the Mac's loopback - a debugger on 9229, a browser's
+remote-debugging port, a development database, another job's server - is
+closed to the job's own sockets, and its proxy will not forward to it either
+(below). A repository whose jobs need loopback opts in under
 `shared.network`:
 
 ```yaml
@@ -441,18 +444,19 @@ cannot join a container network there. The portable arrangement is a container
 with a foot in both networks - see `run.networks` above.
 
 **Connecting to loopback is refused unless declared.** A job may bind
-localhost, but it connects directly only to its worker's own proxy there, and
-to the loopback ports `shared.network.loopback` declares: a list of fixed
-ports, or `true` for all of them (a test suite that binds an ephemeral port and
-talks to it needs `true`, since seatbelt matches single ports, never ranges). A
-direct connect to anything else on loopback - a database, a debugger on 9229 -
-fails with `EPERM` on the connect, not on the bind; the broker's port fails
-whatever is declared. The proxy applies the same rule to a request for a
-loopback address, sent through `HTTP_PROXY` or tunnelled with `CONNECT`: it
-answers 403 unless the port is declared, or is the broker's - the runner
-reaches the broker at that port, and each worker's key to it, not the port,
-is what guards it. Only a literal address gets that far: `localhost`, as
-a name, is refused through the proxy on every port.
+localhost, but it connects directly only to its worker's own proxy there, the
+broker's port, and the loopback ports `shared.network.loopback` declares: a
+list of fixed ports, or `true` for all of them (a test suite that binds an
+ephemeral port and talks to it needs `true`, since seatbelt matches single
+ports, never ranges). A direct connect to anything else on loopback - a
+database, a debugger on 9229 - fails with `EPERM` on the connect, not on the
+bind; a `localmost test` step's connect to the broker's port fails whatever is
+declared. The proxy applies the same rule to a request for a loopback address,
+sent through `HTTP_PROXY` or tunnelled with `CONNECT`: it answers 403 unless
+the port is declared, or is the broker's - the runner reaches the broker at
+that port, and each worker's key to it, not the port, is what guards it. Only a
+literal address gets that far: `localhost`, as a name, is refused through the
+proxy on every port.
 
 ## Why Checked Into Git
 
@@ -542,7 +546,8 @@ nothing from the app's environment beyond `PATH`, `HOME`, `USER`, `LOGNAME`,
 `SHELL`, `LANG`, `LC_*`, `TERM`, `TZ` and `__CF_USER_TEXT_ENCODING`.
 
 **Loopback.** Without `network: loopback` a job reaches nothing on this Mac's
-loopback interface but its own proxy and, through it, the broker.
+loopback interface but its own proxy and the broker, directly and through the
+proxy.
 `loopback: true` grants every port -
 what a test suite that starts servers on ephemeral ports needs - and a list
 grants those ports alone; the sandbox matches single ports, not ranges.

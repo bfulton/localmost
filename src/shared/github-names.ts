@@ -8,9 +8,11 @@
  */
 
 /**
- * A user or organization login: letters, digits and single inner hyphens.
- * Underscore is admitted inside a name too, because a managed (EMU) user's
- * login is `handle_shortcode` and can own repositories.
+ * A user or organization login: letters, digits, `-` and `_`, beginning and
+ * ending with a letter or digit. Inside, hyphens and underscores may run
+ * together (`o--p`, `o_-p`): only the ends are held. Underscore is admitted
+ * because a managed (EMU) user's login is `handle_shortcode` and can own
+ * repositories.
  */
 const OWNER_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$/;
 
@@ -35,7 +37,7 @@ export const isGitHubRepoName = (value: unknown): value is string =>
 
 /**
  * A login as a user filter compares it: any login GitHub has issued. Older
- * accounts can hold one the owner rule refuses, such as a trailing or doubled
+ * accounts can hold one the owner rule refuses, such as one ending in a
  * hyphen, and a saved allowlist must keep them. Letters, digits, `-` and `_`
  * still cannot carry a path, a query or a dot segment.
  */
