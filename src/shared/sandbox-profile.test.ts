@@ -276,6 +276,8 @@ describe('Sandbox Profile Generator', () => {
         '(literal "/Users/test/.my.cnf")',
         '(literal "/Users/test/.mylogin.cnf")',
         '(literal "/Users/test/.yarnrc.yml")',
+        '(literal "/Users/test/.cache/huggingface/token")',
+        '(literal "/Users/test/.cache/huggingface/stored_tokens")',
       ]) {
         expect(forms[deny]).toContain(secret);
       }
@@ -310,6 +312,8 @@ describe('Sandbox Profile Generator', () => {
         '/Users/test/.local',
         '/Users/test/.local/share',
         '/Users/test/.local/share/gem',
+        '/Users/test/.cache',
+        '/Users/test/.cache/huggingface',
         '/Users/test',
         '/Users',
       ]) {

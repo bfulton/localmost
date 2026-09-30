@@ -578,6 +578,8 @@ describe('Process Sandbox', () => {
           home('.my.cnf'),
           home('.mylogin.cnf'),
           home('.yarnrc.yml'),
+          home('.cache', 'huggingface', 'token'),
+          home('.cache', 'huggingface', 'stored_tokens'),
         ]) {
           expect(readable(profile, credential)).toBe(false);
           expect(writable(profile, credential)).toBe(false);
@@ -587,7 +589,8 @@ describe('Process Sandbox', () => {
         for (const node of [
           home('.ssh'), home('Library', 'Keychains'), home('Library'), home('.m2'), home('.gradle'), home('.cargo'),
           home('.nuget'), home('.nuget', 'NuGet'), home('.azure'), home('.gem'), home('.terraform.d'), home('.local'),
-          home('.local', 'share'), home('.local', 'share', 'gem'), homeDir, path.dirname(homeDir),
+          home('.local', 'share'), home('.local', 'share', 'gem'), home('.cache'), home('.cache', 'huggingface'),
+          homeDir, path.dirname(homeDir),
         ]) {
           expect(writable(profile, node)).toBe(false);
         }
@@ -601,6 +604,7 @@ describe('Process Sandbox', () => {
           home('.gem', 'ruby', '3.4.0', 'gems'),
           home('.terraform.d', 'plugins', 'registry.terraform.io'),
           home('.local', 'share', 'other-tool'),
+          home('.cache', 'huggingface', 'hub', 'models--x'),
           home('Library', 'Caches', 'built'),
           home('project', 'built'),
         ]) {

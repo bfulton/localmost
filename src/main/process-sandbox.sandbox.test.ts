@@ -481,6 +481,14 @@ if (!isMacOS) {
         '.yarnrc.yml': 'SECRET-yarn',
         '.pgpass': 'SECRET-pgpass',
         '.vault-token': 'SECRET-vault',
+        '.terraformrc': 'SECRET-terraformrc',
+        '.boto': 'SECRET-boto',
+        '.s3cfg': 'SECRET-s3cmd',
+        '.my.cnf': 'SECRET-mysql',
+        '.mylogin.cnf': 'SECRET-mysql-login',
+        // moderate reads ~/.cache as a toolchain tree, with no grant at all.
+        '.cache/huggingface/token': 'SECRET-huggingface',
+        '.cache/huggingface/stored_tokens': 'SECRET-huggingface-stored',
       };
       // Credentials kept in a dotfiles repository and linked into place, as
       // GNU stow and the like do it: a directory and a single file.
@@ -627,6 +635,8 @@ if (!isMacOS) {
           ['.terraform.d', '.terraform.d-renamed', 'credentials.tfrc.json'],
           ['.local', '.local-renamed', path.join('share', 'gem', 'credentials')],
           [path.join('.local', 'share'), path.join('.local', 'share-renamed'), path.join('gem', 'credentials')],
+          ['.cache', '.cache-renamed', path.join('huggingface', 'token')],
+          [path.join('.cache', 'huggingface'), path.join('.cache', 'huggingface-renamed'), 'token'],
         ]) {
           expectNoRenameIntoView(run, from, to, shown);
         }
@@ -670,7 +680,7 @@ if (!isMacOS) {
         const whole = underGrant({ level: 'strict', read: ['~'], write: ['~'] }, fresh);
         expect(canCreateUnder(whole, path.join(fresh, 'elsewhere'))).toBe(true);
         expect(gradle(`/bin/mkdir -p '${path.join(fresh, '.gradle', 'caches')}'`).ok).toBe(false);
-        for (const dir of ['.gradle', '.m2', '.cargo', '.nuget', '.gem', '.terraform.d', '.local']) {
+        for (const dir of ['.gradle', '.m2', '.cargo', '.nuget', '.gem', '.terraform.d', '.local', '.cache']) {
           const target = path.join(fresh, dir);
           expect(whole(`/bin/mkdir '${target}'`).ok).toBe(false);
           expect(whole(`/bin/ln -s '${path.join(fresh, 'elsewhere')}' '${target}'`).ok).toBe(false);

@@ -465,7 +465,7 @@ function cliSocketRules(): string[] {
  * credential files kept inside the package-manager caches, which a level or
  * policy may otherwise grant. Directories as subpaths, files as literals: a
  * file whose directory holds what a job may use - RubyGems' installed gems,
- * Terraform's plugin cache - is named alone, and the directory stays as
+ * Terraform's plugin cache, Hugging Face's models - is named alone, and the directory stays as
  * granted. ~/.config covers what keeps to the XDG layout: gh, gcloud, git's
  * own credentials file.
  */
@@ -507,6 +507,11 @@ export function developerCredentialPaths(home: string = os.homedir()): { subpath
       // Yarn's npmAuthToken. Yarn 1's ~/.yarnrc is not here: it keeps no
       // token, and reads registry auth from ~/.npmrc.
       `${home}/.yarnrc.yml`,
+      // `huggingface-cli login`'s token, and every token it has saved. ~/.cache
+      // is a toolchain tree moderate reads, and the model cache beside them in
+      // ~/.cache/huggingface/hub is what a job may use.
+      `${home}/.cache/huggingface/token`,
+      `${home}/.cache/huggingface/stored_tokens`,
       `${home}/.m2/settings.xml`,
       `${home}/.m2/settings-security.xml`,
       `${home}/.gradle/gradle.properties`,
