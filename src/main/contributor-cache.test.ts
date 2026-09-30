@@ -38,15 +38,16 @@ describe('ContributorCache', () => {
     const auth = makeAuth({
       getRecentCommitAuthors: jest.fn().mockResolvedValue(['recent-stranger']),
     });
-    const before = Date.now();
-
     const authors = await makeCache(auth).getAllAuthors('token', 'owner', 'repo', 'base000');
+    const after = Date.now();
 
     expect(authors).toEqual(new Set(['trusted', 'recent-stranger']));
     // Walked from the head that was read, back well past the cache's lag.
     const [, owner, repo, sha, since] = auth.getRecentCommitAuthors.mock.calls[0] as [string, string, string, string, Date];
     expect([owner, repo, sha]).toEqual(['owner', 'repo', 'base000']);
-    expect(before - since.getTime()).toBeGreaterThanOrEqual(24 * 60 * 60 * 1000);
+    // At least a day before any moment the walk could have started: measured
+    // from after the call, which a loaded machine makes later than its start.
+    expect(after - since.getTime()).toBeGreaterThanOrEqual(24 * 60 * 60 * 1000);
   });
 
   it('fails closed when the recent commits cannot be listed', async () => {
