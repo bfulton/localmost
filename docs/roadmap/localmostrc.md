@@ -218,7 +218,7 @@ to it either (below). A repository whose jobs need loopback opts in under
 ```yaml
 shared:
   network:
-    loopback: true               # every loopback port but the broker's
+    loopback: true               # every loopback port
     # loopback: [5432, 6379]     # or only these
 ```
 
@@ -227,8 +227,9 @@ connects to it needs, since its port is not known in advance. A list names fixed
 ports only: the sandbox profile language has no port ranges. Each entry is an
 integer from 1 to 65535, with no repeats. The sandbox profile is fixed when the
 worker starts, before the workflow is known, so `loopback` is valid in `shared:`
-only; under `workflows:` it is a validation error. The broker's port is closed
-whatever the policy says.
+only; under `workflows:` it is a validation error. The broker's port is open
+whatever the policy says: the runner dials the broker directly, and each
+worker's key, not the port, is what guards it.
 
 The grant appears in the approval card and `localmost policy show` with a note
 that the job can reach local services on those ports, and it is part of the
@@ -449,8 +450,8 @@ fails with `EPERM` on the connect, not on the bind; the broker's port fails
 whatever is declared. The proxy applies the same rule to a request for a
 loopback address, sent through `HTTP_PROXY` or tunnelled with `CONNECT`: it
 answers 403 unless the port is declared, or is the broker's - the runner
-reaches the broker through the proxy, and each worker's key to it, not its
-port, is what guards it. Only a literal address gets that far: `localhost`, as
+reaches the broker at that port, and each worker's key to it, not the port,
+is what guards it. Only a literal address gets that far: `localhost`, as
 a name, is refused through the proxy on every port.
 
 ## Why Checked Into Git
@@ -516,7 +517,7 @@ that matches nothing. `localmost test --updaterc` writes a host it saw reached
 on another port as `host:port`. An `http://` URL tunnelled through `CONNECT`,
 rather than sent as a plain proxied request, needs a `host:80` entry. A literal
 loopback address (`127.0.0.1`, `::1`) is reachable at every level only on the
-broker's port, since the runner reaches the broker through the proxy there,
+broker's port, since the runner reaches the broker there,
 and on the ports `network.loopback` declares. `network.deny` entries read the
 same way and win over any allow, at every level; only the runner's own hosts on
 their scheme's port and the broker's port stay reachable.

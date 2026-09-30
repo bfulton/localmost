@@ -1507,9 +1507,10 @@ export class RunnerManager {
           // Create a new process group so we can kill all child processes
           detached: true,
           filesystemPolicy,
-          // The one loopback port the profile always opens: without it the
-          // job reaches nothing on loopback, its own proxy included.
+          // The loopback ports the profile always opens: the worker's own
+          // proxy, and the broker, which the runner dials directly.
           proxyPort: proxy.getPort(),
+          brokerPort: this.brokerPort(),
           dockerSocket: dockerSocketPath,
           toolCacheDir,
           packageCacheDir,

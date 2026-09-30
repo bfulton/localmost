@@ -1232,17 +1232,21 @@ describe('Process Sandbox', () => {
       expect(allowsRemote(all, '*')).toBe(true);
     });
 
-    it('keeps the broker denied as the last network rule, whatever loopback allows', () => {
-      for (const loopback of [true, [8787, 5432]] as const) {
+    it("opens the broker's port, which the runner dials directly", () => {
+      // The runner's HTTP client sends a loopback destination around its
+      // proxy, so its Listener opens its session and fetches its token from
+      // the broker at 127.0.0.1:<broker port> itself. The per-worker key in
+      // that address is what guards the broker, not a closed port: a job
+      // reaches the same port through its own proxy anyway.
+      for (const loopback of [undefined, [5432]] as const) {
         const profile = profileWith({
           proxyPort,
-          filesystemPolicy: { level: 'strict', read: [], write: [], loopback },
+          filesystemPolicy: { level: 'strict', read: [], write: [], ...(loopback ? { loopback } : {}) },
         });
-        const brokerDeny = profile.indexOf('(deny network-outbound (remote ip "localhost:8787"))');
-        expect(brokerDeny).toBeGreaterThan(-1);
-        const networkRules = [...profile.matchAll(/^\((?:allow|deny) (?:network|system-socket)[^\n]*/gm)];
-        expect(networkRules[networkRules.length - 1].index).toBe(brokerDeny);
+        expect(allowsRemote(profile, '8787')).toBe(true);
+        expect(profile).not.toMatch(/\(deny network-outbound \(remote ip/);
       }
+      expect(allowsRemote(profileWith({ proxyPort, brokerPort: 9999 }), '9999')).toBe(true);
     });
 
     it('opens no loopback at all without the proxy port, and says so', () => {

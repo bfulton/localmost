@@ -174,7 +174,7 @@ export interface SandboxFilesystemPolicy {
 export interface RunnerProfileOptions {
   /** The instance directory this worker runs in. */
   instanceDir: string;
-  /** The broker's port, denied to jobs because it carries job payloads. */
+  /** The broker's port, opened because the runner dials the broker directly; its per-worker key guards it. */
   brokerPort?: number;
   /** This worker's own egress proxy port, the one loopback port always open. */
   proxyPort?: number;
@@ -357,8 +357,13 @@ export function generateSandboxProfile({
 
   // Loopback reaches every service on this machine, not just the job's own:
   // databases, a debugger listening on 9229, a browser's remote debugging on
-  // 9222, local proxies. So a job gets this worker's own egress proxy, and
-  // beyond it only what its repository's approved policy declares. seatbelt
+  // 9222, local proxies. So a job gets this worker's own egress proxy and the
+  // broker, and beyond them only what its repository's approved policy
+  // declares. The broker is open because the runner dials it directly: its
+  // HTTP client sends a loopback destination around the proxy, so the
+  // Listener opens its session and fetches its token at 127.0.0.1:<broker>
+  // itself. What guards the broker is the per-worker key in that address,
+  // not a closed port - a job reaches the same port through its proxy. seatbelt
   // takes a single port or "*", never a range. The ports are validated where
   // the policy is parsed; this drops anything else as the backstop, since the
   // value lands in the profile. Dropping narrows, so it is safe here.
@@ -384,10 +389,11 @@ export function generateSandboxProfile({
     }
     const notPorts = listed.filter((port) => !isPort(port));
     if (notPorts.length) onLog?.('error', `Ignoring loopback entries that are not ports: ${notPorts.join(', ')}`);
-    const ports = [...new Set(listed.filter(isPort))].filter((port) => port !== proxyPort);
+    const ports = [...new Set(listed.filter(isPort))].filter((port) => port !== proxyPort && port !== brokerPort);
     return [
-      ';; This worker\'s own egress proxy.',
+      ';; This worker\'s own egress proxy, and the broker the runner dials directly.',
       loopbackRule(proxyPort),
+      ...(brokerPort !== proxyPort ? [loopbackRule(brokerPort)] : []),
       ...(ports.length ? [';; Ports the repository declares.', ...ports.map(loopbackRule)] : []),
     ].join('\n');
   })();
@@ -707,12 +713,6 @@ ${allowDirectNetwork ? ';; Runner registration talks to GitHub directly: app-dri
 (allow network-bind
   (subpath "${escapedDir}"))
 
-;; The broker's port, whatever loopback allows above, so this is the last
-;; network rule. It carries job payloads including secrets; the runner reaches
-;; it through the proxy, where the per-worker session key is what guards it,
-;; so a job has no reason to open it directly.
-(deny network-outbound (remote ip "localhost:${brokerPort}"))
-
 ;; ------------------------------------------------------------
 ;; MACH/IPC OPERATIONS - Permissive (required by system frameworks)
 ;; ------------------------------------------------------------
@@ -763,6 +763,11 @@ export interface SandboxOptions extends SpawnOptions {
    * all of it.
    */
   proxyPort?: number;
+  /**
+   * The port the broker listens on, which the runner dials directly and the
+   * profile therefore opens. The default broker port when absent.
+   */
+  brokerPort?: number;
   /**
    * The repository's approved policy, which decides how much filesystem the
    * job gets, what it denies, and which loopback ports it opens. Absent means
@@ -832,6 +837,7 @@ export function spawnSandboxed(
   const {
     allowDirectNetwork,
     proxyPort,
+    brokerPort,
     filesystemPolicy,
     dockerSocket,
     toolCacheDir,
@@ -854,6 +860,7 @@ export function spawnSandboxed(
     const profile = generateSandboxProfile({
       instanceDir,
       proxyPort,
+      ...(brokerPort !== undefined ? { brokerPort } : {}),
       allowDirectNetwork,
       filesystemPolicy,
       dockerSocket,

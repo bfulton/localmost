@@ -126,8 +126,11 @@ loosen its own sandbox without the machine owner agreeing to it.
 
 Job traffic is routed through a local proxy, which decides each connection by
 hostname. macOS `sandbox-exec` cannot filter by hostname - its `(remote ...)`
-filter matches only addresses and ports - so the sandbox permits one outbound
-destination, the job's own proxy on loopback, and the proxy makes the decision.
+filter matches only addresses and ports - so the sandbox permits the job's own
+proxy on loopback, and the proxy makes the decision. It also permits the local
+broker's port: the runner dials the broker directly at `127.0.0.1`, because its
+HTTP client sends a loopback destination around the proxy. What guards the
+broker is each worker's key (below), not a closed port.
 
 Other loopback ports are closed to a job's direct connections by default: a
 debugger listening on 9229, a browser's remote-debugging port, a local database
@@ -142,14 +145,13 @@ profile is fixed when the worker starts:
 ```yaml
 shared:
   network:
-    loopback: true          # every loopback port but the broker's
+    loopback: true          # every loopback port
     # loopback: [5432, 6379]  # or only these; seatbelt has no port ranges
 ```
 
 The grant is shown in the approval card and `localmost policy show` with a note
 that the job can reach local services on those ports, and like every other key
-it is part of the approval diff and stamp. The broker's port stays closed
-whatever the policy says. Loopback is shared by everything on the Mac: a job
+it is part of the approval diff and stamp. Loopback is shared by everything on the Mac: a job
 granted a port reaches whatever listens there, a concurrent job's server
 included, whichever repository it belongs to, and two jobs that bind the same
 fixed port collide.
@@ -160,8 +162,8 @@ level, `permissive` included: a plain request or a `CONNECT` tunnel to
 port is declared or is the broker's. `localhost`, and any other name for this
 machine, is refused on every port, declared and broker's included: only a
 literal address is forwarded to loopback. The broker's port stays
-open through the proxy because the runner reaches the local broker through
-it. What keeps a job from using that port is the broker's own
+open, through the proxy and directly, because the runner reaches the local
+broker. What keeps a job from using that port is the broker's own
 authentication: each worker talks to it at an address carrying a key of its own
 (`http://127.0.0.1:<port>/w/<key>/`), and the broker answers each key only
 with its own worker's session and the jobs delivered to that worker. A job
@@ -217,7 +219,7 @@ port 80 as a plain proxied request; a client that tunnels it through `CONNECT`
 instead needs a `host:80` entry. `permissive` stays unrestricted, ports
 included, except on this machine: a literal loopback address (`127.0.0.1`,
 `::1`) is reachable through the proxy at every level on the broker's port,
-because the runner reaches the broker through it at `127.0.0.1`, and on the
+because the runner reaches the broker at `127.0.0.1`, and on the
 ports `shared.network.loopback` declares - no others. The broker is guarded by
 each worker's key, not by its port. A name that resolves to loopback,
 `localhost` included, is refused.

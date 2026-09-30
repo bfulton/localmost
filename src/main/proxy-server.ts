@@ -156,9 +156,10 @@ export class ProxyServer {
    * real downloads.
    *
    * A literal target is trusted as written - the broker is reached at the
-   * literal 127.0.0.1, and the sandbox denies the broker port directly so the
-   * proxy is the only path. Every job can take that path: what guards the
-   * broker is the per-worker key in its URL, not the proxy or the port. A
+   * literal 127.0.0.1. Every job can reach that port, through the proxy or
+   * directly (the runner dials it directly, so the profile opens it): what
+   * guards the broker is the per-worker key in its URL, not the proxy or the
+   * port. A
    * name is not trusted as written: it must resolve entirely to
    * routable, off-box addresses, so a repository-controlled hostname cannot
    * rebind to loopback (or any internal range) and reach a local service.

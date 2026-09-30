@@ -602,6 +602,7 @@ if (!isMacOS) {
       // refused before it leaves the process, and one it allows completes
       // against the listen backlog while this process waits.
       let proxy: net.Server;
+      let broker: net.Server;
       let service: net.Server;
       let other: net.Server;
       const portOf = (server: net.Server) => (server.address() as net.AddressInfo).port;
@@ -616,17 +617,22 @@ if (!isMacOS) {
 
       beforeAll(async () => {
         proxy = await listen();
+        broker = await listen();
         service = await listen();
         other = await listen();
       });
 
       afterAll(async () => {
-        await Promise.all([proxy, service, other].map((server) => new Promise((resolve) => server.close(resolve))));
+        await Promise.all([proxy, broker, service, other].map((server) => new Promise((resolve) => server.close(resolve))));
       });
 
-      it('reaches its own proxy and nothing else on loopback by default', () => {
-        const run = underProfile({ proxyPort: portOf(proxy) });
+      it('reaches its own proxy and the broker, and nothing else on loopback by default', () => {
+        // The runner dials the broker directly - its HTTP client sends a
+        // loopback destination around the proxy - so a profile that closed
+        // the broker's port left every worker unable to open its session.
+        const run = underProfile({ proxyPort: portOf(proxy), brokerPort: portOf(broker) });
         expect(reaches(run, proxy)).toBe(true);
+        expect(reaches(run, broker)).toBe(true);
         expect(reaches(run, service)).toBe(false);
       });
 

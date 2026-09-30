@@ -38,6 +38,7 @@ import {
   generateDiscoveryProfile,
   MACOS_BASELINE_READ_PATHS,
   SandboxProfileOptions,
+  DEFAULT_BROKER_PORT,
 } from './sandbox-profile';
 import { getWorkspacesDir, removeWorkspace } from './workspace';
 
@@ -198,6 +199,22 @@ if (!isMacOS) {
         const discovery = generateDiscoveryProfile({ workDir, proxyPort, logFile: '' });
         expect(await tryConnect(discovery, '127.0.0.1', ports[1])).toMatchObject({ ok: true });
       });
+    });
+
+    it("refuses the app's broker port to a step even when all of loopback is granted", async () => {
+      // A step has no use for the broker. The deny has to hold after a grant
+      // of every loopback port - seatbelt decides that by where the rules sit,
+      // which a textual check cannot show - so this connects for real. Whether
+      // or not the app is listening, a refusal by the sandbox is "Operation
+      // not permitted"; a port nothing listens on answers "Connection refused".
+      for (const [mode, profile] of [
+        ['granted all', generateSandboxProfile({ workDir, proxyPort, policy: readable, loopback: true })],
+        ['discovery', generateDiscoveryProfile({ workDir, proxyPort, logFile: '' })],
+      ] as const) {
+        const result = await tryConnect(profile, '127.0.0.1', DEFAULT_BROKER_PORT);
+        expect({ mode, ok: result.ok }).toEqual({ mode, ok: false });
+        expect({ mode, denied: result.output.includes('Operation not permitted') }).toEqual({ mode, denied: true });
+      }
     });
   });
 
