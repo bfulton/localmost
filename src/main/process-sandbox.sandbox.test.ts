@@ -88,6 +88,22 @@ const bareMktemp = (run: (command: string) => { ok: boolean; stdout: string }, f
   return { ok: result.ok, entry: result.stdout };
 };
 
+/** A word for a shell command line, quoted so nothing in it is special. */
+const sq = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
+
+/**
+ * renamex_np(from, to, RENAME_SWAP), by its syscall (renameatx_np, 488, with
+ * AT_FDCWD), through the system perl: the one way to ask for an atomic swap
+ * without a compiler or a developer-tools python. Exits nonzero with the
+ * errno's text. Swapping a name with itself changes nothing when it is
+ * allowed, so it probes a node's rename permission without moving it.
+ */
+const swapCommand = (from: string, to: string): string =>
+  `/usr/bin/perl -e ${sq('my ($a, $b) = @ARGV; syscall(488, -2, $a, -2, $b, 2) == 0 or die "$!\\n"')} ${sq(from)} ${sq(to)}`;
+
+/** The case variant of a path's last component, on the case-insensitive volume. */
+const upperBase = (p: string): string => path.join(path.dirname(p), path.basename(p).toUpperCase());
+
 /**
  * Whether this process is outside any sandbox, so a profile can be constructed
  * and applied. Probed with `(allow default)`, the one profile seatbelt never
@@ -910,6 +926,195 @@ if (!isMacOS) {
       });
     });
   });
+
+  describe("the Docker VM's share through a constructed seatbelt profile", () => {
+    // Laid out as the app lays it out: the sandbox at
+    // <data>/runner/sandbox/<id>, the share <sandbox>/_work with its nonce,
+    // the VM sockets under <data>/vm/jobs. A directory outside <data> stands
+    // in for ~/.npm, granted by the policy, and another for the bundle's
+    // docker-cli. The name of <data> is short so the VM socket's path fits.
+    let data: string;
+    let outside: string;
+    let sandbox: string;
+    let share: string;
+    let nonce: string;
+    let npm: string;
+    let cli: string;
+    let profilePath: string;
+
+    beforeAll(() => {
+      data = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'l')));
+      outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'localmost-outside-')));
+      sandbox = path.join(data, 'runner', 'sandbox', '1-abcdef012345');
+      share = path.join(sandbox, '_work');
+      nonce = path.join(share, '.localmost-share');
+      npm = path.join(outside, 'npm');
+      cli = path.join(outside, 'docker-cli', 'docker');
+      fs.mkdirSync(path.join(share, 'repo', 'repo'), { recursive: true });
+      fs.writeFileSync(path.join(share, 'repo', 'repo', 'README'), 'checkout');
+      fs.mkdirSync(path.join(sandbox, '_temp'));
+      fs.mkdirSync(path.join(sandbox, 'sibling'));
+      fs.writeFileSync(nonce, 'a'.repeat(32), { mode: 0o600 });
+      fs.mkdirSync(npm);
+      fs.mkdirSync(path.dirname(cli));
+      fs.writeFileSync(cli, '#!/bin/sh\necho cli-ran\n', { mode: 0o755 });
+      fs.writeFileSync(path.join(path.dirname(cli), 'beside'), 'not the cli');
+      const previous = process.env.LOCALMOST_CONFIG_DIR;
+      process.env.LOCALMOST_CONFIG_DIR = data;
+      try {
+        profilePath = path.join(outside, 'runner.sb');
+        fs.writeFileSync(profilePath, generateSandboxProfile({
+          instanceDir: sandbox,
+          shareDir: share,
+          dockerCli: cli,
+          filesystemPolicy: { level: 'strict', read: [], write: [npm] },
+        }));
+      } finally {
+        if (previous === undefined) delete process.env.LOCALMOST_CONFIG_DIR;
+        else process.env.LOCALMOST_CONFIG_DIR = previous;
+      }
+    });
+
+    afterAll(() => {
+      fs.rmSync(data, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    });
+
+    /** A shell command under the runner profile, from the sandbox, as the job runs. */
+    const run = (command: string) => {
+      const result = spawnSync('/usr/bin/sandbox-exec', ['-f', profilePath, '/bin/sh', '-c', command], {
+        cwd: sandbox,
+        encoding: 'utf-8',
+        timeout: 15000,
+        env: { PATH: '/usr/bin:/bin', HOME: homeDir, TMPDIR: path.join(sandbox, '_temp') },
+      });
+      return { ok: result.status === 0, stdout: result.stdout.trim(), stderr: result.stderr };
+    };
+
+    /** Refused by seatbelt, not by anything else. */
+    const refused = (command: string): boolean => {
+      const result = run(command);
+      return !result.ok && result.stderr.includes('Operation not permitted');
+    };
+
+    /**
+     * The share and the sandbox are where they were, as the directories they
+     * were, with the nonce as the app wrote it. What else is in the share is
+     * the job's: `rm -rf _work` empties it, and only the node survives.
+     */
+    const intact = (): void => {
+      for (const dir of [sandbox, share]) {
+        const stat = fs.lstatSync(dir);
+        expect([dir, stat.isDirectory(), stat.isSymbolicLink(), stat.mode & 0o777]).toEqual([dir, true, false, 0o755]);
+      }
+      expect(fs.readFileSync(nonce, 'utf-8')).toBe('a'.repeat(32));
+    };
+
+    it('creates, writes and removes anything under _work, and mkdir -p of _work itself', () => {
+      const result = run(
+        'mkdir -p _work && mkdir -p _work/a && mkdir -p _work/x/y && echo hi > _work/x/y/f && ' +
+          'rm -rf _work/x/y && rm -rf _work/a _work/x && echo hi > _work/repo/repo/out && rm _work/repo/repo/out && echo ok'
+      );
+      expect(result).toMatchObject({ ok: true, stdout: 'ok' });
+      intact();
+    });
+
+    it('cannot rename, remove, chmod or relink _work', () => {
+      expect(refused('mv _work _w2')).toBe(true);
+      expect(refused('rm -rf _work')).toBe(true);
+      expect(refused('chmod 000 _work')).toBe(true);
+      expect(refused('touch _work')).toBe(true);
+      // The link would share wherever it points, were the directory gone. A
+      // decoy stands in for the home directory, so that a profile that let
+      // this through would send the tests after it nowhere that matters.
+      const decoy = path.join(outside, 'decoy-home');
+      fs.mkdirSync(decoy, { recursive: true });
+      run(`rm -rf _work; ln -s ${sq(decoy)} _work`);
+      intact();
+    });
+
+    it('cannot rename _work or the sandbox by a case variant of its name', () => {
+      expect(refused('mv _WORK _w2')).toBe(true);
+      expect(refused(`mv ${sq(upperBase(sandbox))} ${sq(path.join(outside, 'moved'))}`)).toBe(true);
+      expect(refused(`mv ../${sq(path.basename(sandbox).toUpperCase())} ../elsewhere`)).toBe(true);
+      intact();
+    });
+
+    it('cannot swap _work with a sibling, or the sandbox with another directory, with RENAME_SWAP', () => {
+      expect(refused(swapCommand('sibling', '_work'))).toBe(true);
+      expect(refused(swapCommand('sibling', '_WORK'))).toBe(true);
+      fs.mkdirSync(path.join(npm, 'decoy'), { recursive: true });
+      expect(refused(swapCommand(path.join(npm, 'decoy'), sandbox))).toBe(true);
+      expect(refused(swapCommand(path.join(npm, 'decoy'), upperBase(sandbox)))).toBe(true);
+      intact();
+    });
+
+    it('cannot move its sandbox into a path its policy lets it write, to put a link in its place', () => {
+      // The grant is real, so the refusal below is the node deny's.
+      expect(run(`touch ${sq(path.join(npm, 'probe'))} && echo ok`).stdout).toBe('ok');
+      expect(refused(`mv ${sq(sandbox)} ${sq(path.join(npm, 'x'))}`)).toBe(true);
+      intact();
+      expect(fs.existsSync(path.join(npm, 'x'))).toBe(false);
+    });
+
+    it("can neither read nor replace the share's nonce", () => {
+      expect(refused('cat _work/.localmost-share')).toBe(true);
+      expect(refused('echo forged > _work/.localmost-share')).toBe(true);
+      expect(refused('rm -f _work/.localmost-share')).toBe(true);
+      expect(refused('mv _work/.localmost-share _work/taken')).toBe(true);
+      expect(refused('cp _work/.localmost-share _work/copy')).toBe(true);
+      intact();
+    });
+
+    it('runs the bundled docker CLI, and reads nothing else beside it', () => {
+      expect(run(sq(cli)).stdout).toBe('cli-ran');
+      expect(refused(`cat ${sq(path.join(path.dirname(cli), 'beside'))}`)).toBe(true);
+    });
+
+    it('cannot connect to a unix socket under <data>/vm/jobs, and can to one in its own sandbox', async () => {
+      const vmSocket = path.join(data, 'vm', 'jobs', '1-0123456789ab', 'docker.sock');
+      // At the sandbox's top, so its path stays inside the 104 bytes a unix
+      // socket's may have.
+      const ownSocket = path.join(sandbox, 's.sock');
+      fs.mkdirSync(path.dirname(vmSocket), { recursive: true });
+      const accepted = new Map<string, number>();
+      const servers = [vmSocket, ownSocket].map((socketPath) => {
+        const server = net.createServer((socket) => {
+          accepted.set(socketPath, (accepted.get(socketPath) ?? 0) + 1);
+          socket.end('hello\n');
+        });
+        return new Promise<net.Server>((resolve, reject) => {
+          server.once('error', reject);
+          server.listen(socketPath, () => resolve(server));
+        });
+      });
+      const settled = await Promise.allSettled(servers);
+      const listening = settled.flatMap((s) => (s.status === 'fulfilled' ? [s.value] : []));
+      try {
+        expect(listening).toHaveLength(2);
+        const connect = (socketPath: string) =>
+          new Promise<{ code: number | null; stdout: string }>((resolve) => {
+            const child = spawn('/usr/bin/sandbox-exec', ['-f', profilePath, '/usr/bin/nc', '-U', socketPath], {
+              cwd: sandbox,
+              env: { PATH: '/usr/bin:/bin', HOME: homeDir },
+              stdio: ['ignore', 'pipe', 'ignore'],
+            });
+            let stdout = '';
+            child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString()));
+            child.on('close', (code) => resolve({ code, stdout }));
+          });
+        const toVm = await connect(vmSocket);
+        expect(toVm.code).not.toBe(0);
+        expect(toVm.stdout).toBe('');
+        expect(accepted.get(vmSocket)).toBeUndefined();
+        // The same client, the same kind of socket, in the job's own sandbox.
+        expect((await connect(ownSocket)).stdout).toBe('hello\n');
+        expect(accepted.get(ownSocket)).toBe(1);
+      } finally {
+        await Promise.all(listening.map((server) => new Promise((resolve) => server.close(resolve))));
+      }
+    });
+  });
 } else {
   describe("the runner profile's filesystem floor through the ambient seatbelt profile", () => {
     // Already inside a localmost job: the runner applied this repository's
@@ -989,6 +1194,110 @@ if (!isMacOS) {
       } finally {
         await new Promise((resolve) => server.close(resolve));
       }
+    });
+  });
+
+  describe("the Docker VM's share through the ambient seatbelt profile", () => {
+    // This job's own sandbox, share and nonce, found from its TMPDIR,
+    // <data>/runner/sandbox/<id>/_temp. The job is running in the share, so
+    // nothing here may move or empty it if the profile let it: each refusal
+    // is probed by something that changes nothing when allowed (a swap of a
+    // name with itself, the node's times, rmdir of a directory that is not
+    // empty), or is put back at once. The constructed tests do the real
+    // moves and removals on a sandbox of their own.
+    const sandbox = path.dirname(fs.realpathSync(os.tmpdir()));
+    const share = path.join(sandbox, '_work');
+    const nonce = path.join(share, '.localmost-share');
+    const data = path.dirname(path.dirname(path.dirname(sandbox)));
+
+    /** Refused by seatbelt, not by anything else. */
+    const refused = (command: string): boolean => {
+      const result = shell(command);
+      return !result.ok && result.stderr.includes('Operation not permitted');
+    };
+
+    it('runs where the app lays a job out, with the share and its nonce in place', () => {
+      expect(path.basename(path.dirname(sandbox))).toBe('sandbox');
+      expect(fs.lstatSync(share).isDirectory()).toBe(true);
+      // Metadata is readable, the contents are not.
+      expect(fs.existsSync(nonce)).toBe(true);
+    });
+
+    it('creates, writes and removes anything under _work, and mkdir -p of _work itself', () => {
+      const probe = path.join(share, `.${probeName()}`);
+      const result = shell(
+        `mkdir -p ${sq(share)} && mkdir -p ${sq(path.join(probe, 'a'))} && mkdir -p ${sq(path.join(probe, 'x', 'y'))} && ` +
+          `echo hi > ${sq(path.join(probe, 'x', 'y', 'f'))} && rm -rf ${sq(path.join(probe, 'x', 'y'))} && rm -rf ${sq(probe)} && echo ok`
+      );
+      fs.rmSync(probe, { recursive: true, force: true });
+      expect(result).toMatchObject({ ok: true, stdout: 'ok' });
+    });
+
+    it('cannot rename, remove, chmod or relink _work', () => {
+      const moved = path.join(sandbox, probeName());
+      const mode = fs.statSync(share).mode & 0o777;
+      const renamed = refused(`mv ${sq(share)} ${sq(moved)}`);
+      if (fs.existsSync(moved)) fs.renameSync(moved, share);
+      const chmodded = refused(`chmod 700 ${sq(share)}`);
+      fs.chmodSync(share, mode);
+      expect(renamed).toBe(true);
+      expect(chmodded).toBe(true);
+      expect(refused(swapCommand(share, share))).toBe(true);
+      expect(refused(`touch ${sq(share)}`)).toBe(true);
+      // Not empty, so an rmdir the profile allowed would fail otherwise; a
+      // job that cannot remove the node cannot put a link in its place.
+      expect(refused(`rmdir ${sq(share)}`)).toBe(true);
+    });
+
+    it('cannot rename _work or the sandbox by a case variant of its name', () => {
+      const moved = path.join(sandbox, probeName());
+      const renamed = refused(`mv ${sq(upperBase(share))} ${sq(moved)}`);
+      if (fs.existsSync(moved)) fs.renameSync(moved, share);
+      expect(renamed).toBe(true);
+      expect(refused(swapCommand(upperBase(share), upperBase(share)))).toBe(true);
+      expect(refused(swapCommand(upperBase(sandbox), upperBase(sandbox)))).toBe(true);
+      expect(refused(`touch ${sq(upperBase(sandbox))}`)).toBe(true);
+    });
+
+    it('cannot swap _work with a sibling, or the sandbox with anything, with RENAME_SWAP', () => {
+      const sibling = path.join(sandbox, '_temp', probeName());
+      fs.mkdirSync(sibling);
+      try {
+        const swapped = refused(swapCommand(sibling, share));
+        if (!fs.existsSync(nonce)) shell(swapCommand(sibling, share));
+        expect(swapped).toBe(true);
+      } finally {
+        fs.rmSync(sibling, { recursive: true, force: true });
+      }
+      // The sandbox, by a swap with itself: a move of it could not be put
+      // back, since its parent is closed to the job either way.
+      expect(refused(swapCommand(sandbox, sandbox))).toBe(true);
+      expect(refused(`touch ${sq(sandbox)}`)).toBe(true);
+      expect(refused(`rmdir ${sq(sandbox)}`)).toBe(true);
+    });
+
+    it("can neither read nor replace the share's nonce", () => {
+      expect(refused(`cat ${sq(nonce)}`)).toBe(true);
+      expect(refused(`touch ${sq(nonce)}`)).toBe(true);
+      expect(refused(`cp ${sq(nonce)} ${sq(path.join(sandbox, '_temp', probeName()))}`)).toBe(true);
+    });
+
+    it('runs the bundled docker CLI first on its PATH, and reads nothing else of the app bundle', () => {
+      const cliDir = (process.env.PATH ?? '').split(':')[0];
+      expect(path.basename(cliDir)).toBe('docker-cli');
+      expect(shell(`${sq(path.join(cliDir, 'docker'))} --version`).stdout).toMatch(/^Docker version /);
+      expect(refused(`ls ${sq(path.dirname(cliDir))}`)).toBe(true);
+    });
+
+    it("cannot connect to a unix socket in the app's data directory, where the VM sockets live", () => {
+      // The app's own CLI socket, which is listening while the app runs this
+      // job; <data>/vm/jobs is under the same deny, and this job cannot list
+      // it to find one of its sockets.
+      const cliSocket = path.join(data, 'localmost.sock');
+      expect(fs.existsSync(cliSocket)).toBe(true);
+      const result = shell(`/usr/bin/nc -U ${sq(cliSocket)} < /dev/null`);
+      expect(result.ok).toBe(false);
+      expect(refused(`ls ${sq(path.join(data, 'vm'))}`) || !fs.existsSync(path.join(data, 'vm'))).toBe(true);
     });
   });
 }

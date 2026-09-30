@@ -33,6 +33,7 @@ import {
   getUserDataDir,
   isAppSandboxed,
 } from './paths';
+import { SHARE_NONCE_FILE } from './vm/paths';
 
 /**
  * Allowed executable patterns within the runner directory.
@@ -187,6 +188,14 @@ export interface RunnerProfileOptions {
   filesystemPolicy?: SandboxFilesystemPolicy;
   /** The filtering docker socket the app serves this worker, if it has one. */
   dockerSocket?: string;
+  /**
+   * The Docker VM's share, `<instanceDir>/_work`, when the worker may have a
+   * Docker VM: the job keeps its contents but not the node, nor the sandbox
+   * node around it, and neither reads nor writes the share's nonce.
+   */
+  shareDir?: string;
+  /** The bundled docker CLI, which the job reads and runs; nothing else of the bundle. */
+  dockerCli?: string;
   /** This worker's target's tool cache, if it keeps one across jobs. */
   toolCacheDir?: string;
   /** This worker's target's package-manager cache; ignored under strict. */
@@ -200,6 +209,42 @@ export interface RunnerProfileOptions {
   onLog?: SandboxLogCallback;
 }
 
+/**
+ * The share rules (the design's share rule, clause 3). VZ resolves the
+ * share's path when the VM starts, which may be after the job's first steps
+ * have run, so the job must not be able to rename, replace, chmod or relink
+ * `_work` - nor the sandbox around it, which it could otherwise rename into a
+ * writable policy path and put a link in its place. The contents stay the
+ * job's. The nonce is the tripwire: a job that cannot read it cannot copy it,
+ * and one that cannot write it cannot replace it, so a match in the guest
+ * proves VZ shared the directory the app made. The bundled CLI is the one
+ * file of the app bundle the job reads.
+ */
+function shareRules(instanceDir: string, shareDir: string | undefined, dockerCli: string | undefined): string {
+  const escape = (value: string) => value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const lines: string[] = [];
+  if (shareDir !== undefined) {
+    if (path.dirname(shareDir) !== instanceDir || path.basename(shareDir) !== '_work') {
+      throw new Error(`the Docker VM share must be the work folder directly under the sandbox: ${shareDir}`);
+    }
+    lines.push(
+      ";; The Docker VM's share and the sandbox around it, as nodes: the job",
+      ';; cannot rename, replace, chmod or relink either (VZ resolves the share at start).',
+      `(deny file-write* (literal "${escape(shareDir)}") (literal "${escape(instanceDir)}"))`,
+      ";; The share's tripwire nonce: neither readable nor writable by the job, so a",
+      ';; match in the guest proves VZ shared the directory localmost made.',
+      `(deny file-read* file-write* (literal "${escape(path.join(shareDir, SHARE_NONCE_FILE))}"))`
+    );
+  }
+  if (dockerCli !== undefined) {
+    lines.push(
+      ';; The bundled docker CLI, and nothing else of the app bundle.',
+      `(allow file-read* (literal "${escape(dockerCli)}") (literal "${escape(path.dirname(dockerCli))}"))`
+    );
+  }
+  return lines.length > 0 ? `${lines.join('\n')}\n` : '';
+}
+
 export function generateSandboxProfile({
   instanceDir,
   brokerPort = DEFAULT_BROKER_PORT,
@@ -207,6 +252,8 @@ export function generateSandboxProfile({
   allowDirectNetwork = false,
   filesystemPolicy = { level: 'strict', read: [], write: [] },
   dockerSocket,
+  shareDir,
+  dockerCli,
   toolCacheDir: toolCache,
   packageCacheDir: packageCache,
   processMarker,
@@ -234,6 +281,7 @@ export function generateSandboxProfile({
       '',
     ].join('\n');
   })(dockerSocket);
+  const dockerShareRules = shareRules(instanceDir, shareDir, dockerCli);
 
   const escapedDir = instanceDir.replace(/"/g, '\\"');
   const homeDir = os.homedir().replace(/"/g, '\\"');
@@ -637,7 +685,7 @@ ${policyDenyNodes ? `(deny file-write*\n${policyDenyNodes})` : ';; No directorie
 ${ownCacheRules('file-read* file-write*')}
 (allow file-read* file-write*
   (subpath "${escapedDir}"))
-${dockerRules}
+${dockerRules}${dockerShareRules}
 
 ;; Device files that need read/write access (git, many tools redirect to /dev/null)
 (allow file-write*
@@ -784,6 +832,10 @@ export interface SandboxOptions extends SpawnOptions {
    * to it and nothing else; the daemon's own socket stays denied.
    */
   dockerSocket?: string;
+  /** The Docker VM's share, `<cwd>/_work`; see RunnerProfileOptions.shareDir. */
+  shareDir?: string;
+  /** The bundled docker CLI the job runs; see RunnerProfileOptions.dockerCli. */
+  dockerCli?: string;
   /**
    * The worker's target's own tool cache, kept across that target's jobs.
    * Absent means none: the runner keeps its tools in the job's work directory.
@@ -845,6 +897,8 @@ export function spawnSandboxed(
     brokerPort,
     filesystemPolicy,
     dockerSocket,
+    shareDir,
+    dockerCli,
     toolCacheDir,
     packageCacheDir,
     processMarker,
@@ -869,6 +923,8 @@ export function spawnSandboxed(
       allowDirectNetwork,
       filesystemPolicy,
       dockerSocket,
+      shareDir,
+      dockerCli,
       toolCacheDir,
       packageCacheDir,
       processMarker,

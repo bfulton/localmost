@@ -381,6 +381,66 @@ describe('Process Sandbox', () => {
     it('emits no docker socket rules when the worker was given no socket', () => {
       expect(profileWith({})).not.toContain('docker.sock');
     });
+  });
+
+  describe("the Docker VM's share in the runner profile", () => {
+    const shareDir = path.join(instanceDir, '_work');
+    const nonce = path.join(shareDir, '.localmost-share');
+    const dockerCli = '/Applications/localmost.app/Contents/Resources/docker-cli/docker';
+    const withShare = () => profileWith({ dockerSocket: path.join(instanceDir, 'docker.sock'), shareDir, dockerCli });
+
+    it('denies the share and the sandbox as nodes, and the nonce read and write, after re-allowing the sandbox', () => {
+      const profile = withShare();
+      const reallow = profile.lastIndexOf(`(allow file-read* file-write*\n  (subpath "${instanceDir}"))`);
+      const nodes = profile.indexOf(`(deny file-write* (literal "${shareDir}") (literal "${instanceDir}"))`);
+      const tripwire = profile.indexOf(`(deny file-read* file-write* (literal "${nonce}"))`);
+      expect(reallow).toBeGreaterThan(-1);
+      expect(nodes).toBeGreaterThan(reallow);
+      expect(tripwire).toBeGreaterThan(reallow);
+    });
+
+    it("leaves everything inside the share the job's to read and write", () => {
+      const profile = withShare();
+      expect(writable(profile, shareDir)).toBe(false);
+      expect(writable(profile, instanceDir)).toBe(false);
+      expect(readable(profile, shareDir)).toBe(true);
+      expect(readable(profile, nonce)).toBe(false);
+      expect(writable(profile, nonce)).toBe(false);
+      for (const inside of ['repo/repo/src/x.c', '_temp/step.sh', '_actions/a/b', '.localmost-share-not']) {
+        expect([inside, writable(profile, path.join(shareDir, inside))]).toEqual([inside, true]);
+        expect([inside, readable(profile, path.join(shareDir, inside))]).toEqual([inside, true]);
+      }
+      // The sandbox's other entries are unchanged: its temp, the CLI config.
+      expect(writable(profile, path.join(instanceDir, '_temp', 'x'))).toBe(true);
+      expect(writable(profile, path.join(instanceDir, '.docker', 'x'))).toBe(true);
+    });
+
+    it('reads the bundled docker CLI and its directory, and nothing else of the app bundle', () => {
+      const profile = withShare();
+      expect(profile).toContain(`(allow file-read* (literal "${dockerCli}") (literal "${path.dirname(dockerCli)}"))`);
+      expect(readable(profile, dockerCli)).toBe(true);
+      expect(readable(profile, path.dirname(dockerCli))).toBe(true);
+      expect(readable(profile, '/Applications/localmost.app/Contents/Resources/localmost-vm')).toBe(false);
+      expect(readable(profile, '/Applications/localmost.app/Contents/Resources/guest/rootfs.erofs')).toBe(false);
+    });
+
+    it('escapes the paths it interpolates, as every other path in the profile is', () => {
+      const profile = profileWith({ shareDir, dockerCli: '/odd/"quoted"/docker' });
+      expect(profile).toContain('(literal "/odd/\\"quoted\\"/docker")');
+      expect(profile).not.toContain('(literal "/odd/"quoted"/docker")');
+    });
+
+    it('refuses a share that is not the work folder directly under the sandbox', () => {
+      expect(() => profileWith({ shareDir: path.join(instanceDir, 'other') })).toThrow(/share/);
+      expect(() => profileWith({ shareDir: path.join(instanceDir, 'x', '_work') })).toThrow(/share/);
+    });
+
+    it('emits none of it for a worker given no share', () => {
+      const profile = profileWith({});
+      expect(profile).not.toContain('.localmost-share');
+      expect(profile).not.toContain(`(literal "${shareDir}")`);
+      expect(writable(profile, shareDir)).toBe(true);
+    });
 
     it('lets a job reach unix sockets only inside its own sandbox, not the shared temp dirs', () => {
       // A unix socket under /tmp or the user's $TMPDIR belongs to one of the
