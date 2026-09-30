@@ -517,7 +517,9 @@ describe('cleanupSandboxDirectories', () => {
 
     expect(calls.filter(({ paths }) => paths.some((p) => p === dir || p.startsWith(`${dir}/`)))).toEqual([]);
     expect(fs.readFileSync(path.join(dir, '_work', 'output'), 'utf-8')).toBe('job');
-    expect(logged.some((message) => message.includes('1-abc123') && /retry/.test(message))).toBe(true);
+    // Startup is the only caller: nothing retries sooner than the next launch
+    expect(logged.some((message) => message.includes('1-abc123') && /next launch/.test(message))).toBe(true);
+    expect(logged.some((message) => /retry/.test(message))).toBe(false);
   });
 
   it('finishes a removal an earlier run left part done', async () => {

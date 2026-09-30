@@ -428,7 +428,7 @@ app.whenReady().then(async () => {
   try {
     await runnerDownloader.cleanupStaleConfiguration((message) => logger?.info(message));
   } catch (err) {
-    logger?.warn(`Startup cleanup failed: ${(err as Error).message}. Will retry when runner starts.`);
+    logger?.warn(`Startup cleanup failed: ${(err as Error).message}. Leftovers stay until the next launch.`);
   }
 
   if (config.auth?.refreshToken) {

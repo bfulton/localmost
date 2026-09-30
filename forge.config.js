@@ -110,6 +110,9 @@ if (shouldSign) {
   packagerConfig.osxSign = {
     identity: signingIdentity,
     optionsForFile: signOptionsForFile,
+    // Unset, @electron/packager takes this as true and only warns when
+    // signing fails, so the build would go on to ship unsigned code.
+    continueOnError: false,
   };
 
   // Only notarize if signing is enabled and notarize credentials are available

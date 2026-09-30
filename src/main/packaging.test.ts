@@ -231,6 +231,7 @@ describe('the entitlements the app is signed with', () => {
 
   type SignOptions = {
     optionsForFile?: (file: string) => { entitlements?: string; hardenedRuntime?: boolean } | null;
+    continueOnError?: boolean;
   };
 
   let osxSign: SignOptions;
@@ -263,6 +264,16 @@ describe('the entitlements the app is signed with', () => {
     for (const key of Object.keys(entitlements)) {
       expect(key).toMatch(/^com\.apple\.security\.cs\./);
     }
+  });
+
+  it('fails the build when signing fails, rather than shipping it unsigned', () => {
+    // @electron/packager treats an unset continueOnError as true: a failed
+    // signApp becomes a warning and the build goes on with what is unsigned.
+    expect(osxSign.continueOnError).toBe(false);
+    // And the installed packager reads it that way, so a rename or a changed
+    // default there cannot quietly turn signing failures back into warnings.
+    const { createSignOpts } = require(path.join(REPO, 'node_modules', '@electron', 'packager', 'dist', 'mac'));
+    expect(createSignOpts(osxSign, 'darwin', '/x.app', '0', true).continueOnError).toBe(false);
   });
 
   it('ships no entitlements file the signing does not use', () => {

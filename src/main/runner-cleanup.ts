@@ -545,7 +545,7 @@ export async function cleanupSandboxDirectories(
         try {
           aside = await moveAsideForRemoval(dirPath);
         } catch {
-          log(`Warning: Could not move ${entry.name} aside to remove it, will retry when runner starts`);
+          log(`Warning: Could not move ${entry.name} aside to remove it; it stays until the next launch`);
           continue;
         }
         if (!aside) continue;
