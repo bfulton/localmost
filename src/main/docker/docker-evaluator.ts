@@ -656,6 +656,11 @@ function queryValue(query: Record<string, string>, name: string): string | undef
   return key === undefined ? undefined : query[key];
 }
 
+/** A tag, by distribution/reference's grammar. */
+const TAG = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
+/** A digest, by distribution/reference's grammar: algorithm ":" hex. */
+const DIGEST = /^[A-Za-z][A-Za-z0-9]*(?:[-_+.][A-Za-z][A-Za-z0-9]*)*:[0-9a-fA-F]{32,}$/;
+
 function evaluatePull(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
   // fromImage is read in moby's spelling only: moby ignores any other, so a
   // lone differently-cased one leaves this undefined and the pull is refused.
@@ -664,6 +669,16 @@ function evaluatePull(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
     return deny('importing an image (fromSrc) is not permitted; only pulls from a declared registry are');
   }
   if (!fromImage) return deny('image pull requires fromImage');
+  // The registry is judged from fromImage alone, which holds only while the
+  // tag cannot change it. moby parses the tag on its own and refuses one that
+  // is not a tag or a digest; Podman appends it to fromImage with ":" (in any
+  // casing of the name), so `localhost` with tag `5000/x` is a pull from
+  // localhost:5000. Neither grammar has a "/" or an "@", so a tag or digest
+  // leaves the name, and with it the registry, as it was judged.
+  const tag = queryValue(req.query, 'tag');
+  if (tag !== undefined && tag !== '' && !TAG.test(tag) && !DIGEST.test(tag)) {
+    return deny(`pull tag "${asciiEscaped(tag)}" is neither a tag nor a digest, and could name another image or registry`);
+  }
   const registry = registryOf(fromImage);
   if (!policy.pull) {
     return deny('the repository docker policy declares no pull action', hints.registry(registry));

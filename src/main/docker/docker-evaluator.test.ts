@@ -296,6 +296,41 @@ describe('the SECURITY.md escapes', () => {
     expect(evaluateDockerRequest(mk('POST', '/v1.45/images/create?fromImage=postgres&tag=16'), c).allowed).toBe(true);
   });
 
+  it('refuses a pull tag that is not a tag or a digest, since Podman appends it to fromImage', () => {
+    // Podman's compat pull joins fromImage and tag with ":" (mergeNameAndTagOrDigest),
+    // so a tag with a slash in it turns the image's name into a registry host:
+    // `localhost` + `5000/x` is localhost:5000/x, pulled on the docker.io
+    // credential this filter attached for `localhost`. Podman matches `TAG` too.
+    const c = ctx({ pull: { registries: ['docker.io'] } });
+    for (const query of [
+      'fromImage=localhost&tag=5000%2Fx',
+      'fromImage=evil.example.com&TAG=443%2Fx',
+      'fromImage=evil.example.com&Tag=443%2Fx',
+      'fromImage=postgres&tag=16%40sha256%3A0123456789abcdef0123456789abcdef',
+      'fromImage=postgres&tag=-16',
+      'fromImage=postgres&tag=16%3A1',
+      `fromImage=postgres&tag=${'a'.repeat(129)}`,
+    ]) {
+      const url = `/v1.45/images/create?${query}`;
+      expect([url, evaluateDockerRequest(mk('POST', url), c).allowed]).toEqual([url, false]);
+    }
+    // A tag, a digest, or no tag at all is what every client sends.
+    const hex = '0123456789abcdef'.repeat(4);
+    for (const query of [
+      'fromImage=postgres',
+      'fromImage=postgres&tag=',
+      'fromImage=postgres&tag=latest',
+      'fromImage=postgres&tag=v1.2.3',
+      'fromImage=postgres&tag=16_alpine-3.20',
+      `fromImage=postgres&tag=sha256%3A${hex}`,
+      `fromImage=postgres&tag=${'a'.repeat(128)}`,
+      'fromImage=localhost&tag=5000',
+    ]) {
+      const url = `/v1.45/images/create?${query}`;
+      expect([url, evaluateDockerRequest(mk('POST', url), c).allowed]).toEqual([url, true]);
+    }
+  });
+
   it('refuses a pull that is an import, or names no image', () => {
     const c = ctx({ pull: { registries: ['docker.io'] } });
     expect(evaluateDockerRequest(mk('POST', '/v1.45/images/create?fromSrc=http%3A%2F%2Fevil%2Fimg.tar'), c).allowed).toBe(false);

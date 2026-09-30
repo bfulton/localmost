@@ -398,6 +398,34 @@ describe('DockerFilterProxy forwarding', () => {
     expect(daemon.seen).toHaveLength(1);
   });
 
+  it('never offers the docker.io credential to a registry a pull tag would make of the image name', async () => {
+    // Podman joins fromImage and tag with ":", so these pull localhost:5000/x
+    // and evil.example.com:443/x. Judged by fromImage alone, both were Docker
+    // Hub images and went out with the operator's Docker Hub credential.
+    const dir = tmp();
+    const daemon = await fakeDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, {
+      backend: backendWith(daemon.sock),
+      attachRegistryAuth: (registry) => (registry === 'docker.io' ? 'dG9rZW4=' : undefined),
+    });
+    proxy.bind('owner/repo', { pull: { registries: ['docker.io'] } });
+
+    for (const query of ['fromImage=localhost&tag=5000%2Fx', 'fromImage=evil.example.com&TAG=443%2Fx']) {
+      const reply = await request(sock, 'POST', `/v1.45/images/create?${query}`);
+      expect([query, reply.status]).toEqual([query, 403]);
+    }
+    expect(daemon.seen).toHaveLength(0);
+
+    // A tag or a digest still pulls, with the credential.
+    const digest = `sha256%3A${'0123456789abcdef'.repeat(4)}`;
+    for (const tag of ['latest', 'v1.2.3', digest]) {
+      const reply = await request(sock, 'POST', `/v1.45/images/create?fromImage=postgres&tag=${tag}`);
+      expect([tag, reply.status]).toEqual([tag, 200]);
+    }
+    expect(daemon.seen).toHaveLength(3);
+    expect(daemon.seen.map((s) => s.headers['x-registry-auth'])).toEqual(['dG9rZW4=', 'dG9rZW4=', 'dG9rZW4=']);
+  });
+
   it('never offers the docker.io credential to a registry the daemon reads from an uppercase first component', async () => {
     // The daemon's reference parser reads `LOCALHOST/x` and `Evil/x` as
     // registry hosts. Read as Docker Hub namespaces, they were approved under
@@ -869,9 +897,13 @@ describe('the mount boundary is the sandbox the app created, not what the job ma
   // _work, or its own checkout, with a link to anywhere. Resolving the root
   // through those links on every request moved the boundary with them: with
   // `./` declared, everything under the link's target became "the workspace".
+  // The sandbox directory itself is the job's to rename too (the profile lets
+  // it make tmp.XXXXXXXXXX names beside it), so the root is the one resolved
+  // when the socket started, never resolved again per request.
   it.each([
     ['its checkout (_work/repo/repo)', 'checkout'],
     ['_work', 'work'],
+    ['its own sandbox directory', 'sandbox'],
   ])('refuses a mount outside the sandbox after the job links %s elsewhere', async (_label, which) => {
     const dir = tmp();
     const sandbox = path.join(dir, 's');
@@ -883,9 +915,11 @@ describe('the mount boundary is the sandbox the app created, not what the job ma
     const daemon = await fakeDaemon(dir);
     // The real backend and the real realpath: os.tmpdir() is itself a
     // symlink on macOS, which a legitimate mount must still get past.
-    const { proxy, sock } = await startProxy(sandbox, {
+    const started = await startProxy(sandbox, {
       backend: new DesktopBackend({ resolve: () => ({ socketPath: daemon.sock }) }),
     });
+    const { proxy } = started;
+    let sock = started.sock;
     const create = (bind: string) => request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3', HostConfig: { Binds: [bind] } });
 
     // Before: a narrower declared mount judges against the literal root as it
@@ -898,9 +932,23 @@ describe('the mount boundary is the sandbox the app created, not what the job ma
     expect((await create(`${victim}/.ssh:/x`)).status).toBe(403);
     expect(daemon.seen).toHaveLength(2);
 
+    // Each bind the job then tries: the victim by its own path, and by the
+    // link's spelling of it.
+    let binds = [`${victim}/.ssh:/x`, `${checkout}/.ssh:/x`, `${checkout}:/x`];
     if (which === 'checkout') {
       fs.renameSync(checkout, `${checkout}.x`);
       fs.symlinkSync(victim, checkout);
+    } else if (which === 'sandbox') {
+      // The victim is laid out as a sandbox, so a root resolved again through
+      // the link would find a checkout there with ./data in it. The socket
+      // moves with the directory, and the job keeps talking to it.
+      const victimData = path.join(victim, '_work', 'repo', 'repo', 'data');
+      fs.mkdirSync(victimData, { recursive: true });
+      const moved = path.join(dir, 'tmp.AbCdEfGhIj');
+      fs.renameSync(sandbox, moved);
+      fs.symlinkSync(victim, sandbox);
+      sock = path.join(moved, 'docker.sock');
+      binds = [`${victimData}:/d`, `${checkout}/data:/d`, `${checkout}:/d`, `${victim}/.ssh:/x`];
     } else {
       const staged = path.join(dir, 'staged');
       fs.mkdirSync(path.join(staged, 'repo'), { recursive: true });
@@ -910,9 +958,9 @@ describe('the mount boundary is the sandbox the app created, not what the job ma
     }
 
     // After: neither the victim's path nor the link's spelling of it gets through.
-    for (const bind of [`${victim}/.ssh:/x`, `${checkout}/.ssh:/x`, `${checkout}:/x`]) {
+    for (const bind of binds) {
       const reply = await create(bind);
-      expect(reply.status).toBe(403);
+      expect([bind, reply.status]).toEqual([bind, 403]);
     }
     expect(daemon.seen).toHaveLength(2);
   });
