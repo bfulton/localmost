@@ -109,17 +109,22 @@ func (c Client) Networks(ctx context.Context) ([]firewall.Network, error) {
 	return ns, err
 }
 
-// Event is one network event.
+// Event is one network or container event.
 type Event struct {
+	Type   string
 	Action string
 	ID     string
 }
 
-// NetworkEvents streams network events until ctx ends or the stream breaks.
-// `ready` is called once the stream is open, so that the caller can list
-// what already exists without missing anything created in between.
-func (c Client) NetworkEvents(ctx context.Context, ready func(), fn func(Event)) error {
-	filters := url.QueryEscape(`{"type":["network"]}`)
+// EventFilters are the events the agent follows: networks created and
+// destroyed (LOCALMOST-RELAY) and containers destroyed (bind approvals).
+const EventFilters = `{"event":["create","destroy"],"type":["container","network"]}`
+
+// Events streams those events until ctx ends or the stream breaks. `ready`
+// is called once the stream is open, so that the caller can list what
+// already exists without missing anything created in between.
+func (c Client) Events(ctx context.Context, ready func(), fn func(Event)) error {
+	filters := url.QueryEscape(EventFilters)
 	res, err := c.get(ctx, "/events?filters="+filters)
 	if err != nil {
 		return err
@@ -139,10 +144,10 @@ func (c Client) NetworkEvents(ctx context.Context, ready func(), fn func(Event))
 				ID string `json:"ID"`
 			} `json:"Actor"`
 		}
-		if json.Unmarshal(sc.Bytes(), &ev) != nil || ev.Type != "network" {
+		if json.Unmarshal(sc.Bytes(), &ev) != nil || (ev.Type != "network" && ev.Type != "container") {
 			continue
 		}
-		fn(Event{Action: ev.Action, ID: ev.Actor.ID})
+		fn(Event{Type: ev.Type, Action: ev.Action, ID: ev.Actor.ID})
 	}
 	if err := sc.Err(); err != nil {
 		return err

@@ -78,7 +78,7 @@ func (f *Fake) SetupNetwork(job bool) error { f.call("network"); return f.Networ
 
 func (f *Fake) StartDockerd(job bool) (agent.DockerVersion, error) {
 	f.call("dockerd")
-	return agent.DockerVersion{Version: "29.5.3", APIVersion: "1.54", MinAPIVersion: "1.24"}, f.DockerErr
+	return agent.DockerVersion{Version: "29.5.3", APIVersion: "1.54", MinAPIVersion: "1.40"}, f.DockerErr
 }
 
 func (f *Fake) SelfTest(job bool) agent.Selftest {

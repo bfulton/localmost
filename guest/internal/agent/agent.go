@@ -19,7 +19,9 @@ import (
 // AgentVersion is lm-agent's own version, reported by hello.
 const AgentVersion = "0.1.0"
 
-// MaxContainers bounds how many containers' approvals the agent holds.
+// MaxContainers bounds how many containers' approvals the agent holds at
+// once. A container's approvals are dropped when Docker destroys it, so the
+// bound is on containers that exist, not on how many a job ever creates.
 const MaxContainers = 4096
 
 // DockerVersion is what configure reports about dockerd.
@@ -98,6 +100,22 @@ type Agent struct {
 
 // New returns an agent over p.
 func New(p Platform) *Agent { return &Agent{P: p, binds: map[string][]proto.Bind{}} }
+
+// Ready reports whether configure has run every step and the self-test
+// passed. Until then the Docker API on vsock 2375 stays closed, so that a
+// daemon behind a firewall that failed never answers the host.
+func (a *Agent) Ready() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ready
+}
+
+// Forget drops a container's approvals once Docker has destroyed it.
+func (a *Agent) Forget(container string) {
+	a.mu.Lock()
+	delete(a.binds, container)
+	a.mu.Unlock()
+}
 
 // Serve handles one connection's requests in order until it closes. local
 // is the guest-local socket, where only binds-for is served.
@@ -246,6 +264,9 @@ func (a *Agent) configure(c *proto.Configure) (map[string]any, *proto.Error) {
 		a.mu.Unlock()
 	}
 	fields["rosetta"] = a.P.SetupRosetta(job && c.Rosetta)
+	// A failure to apply the firewall or make lm0 answers E_SELFTEST with
+	// no selftest field (contract §3.4 step 5): either way the firewall
+	// cannot be trusted.
 	if err := a.P.SetupNetwork(job); err != nil {
 		return nil, fail(proto.CodeSelftest, "the firewall could not be applied: %v", err)
 	}

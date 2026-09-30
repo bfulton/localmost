@@ -74,11 +74,11 @@ func TestRelayInterfaceForANetwork(t *testing.T) {
 func TestTrackerAddsOnCreateAndRemovesOnDestroy(t *testing.T) {
 	id := strings.Repeat("ab", 32)
 	var tr Tracker
-	add, ok := tr.Created(Network{ID: id, Driver: "bridge"})
-	if !ok || !reflect.DeepEqual(add, RelayRule("-A", "br-abababababab")) {
-		t.Fatalf("create: %v %v", add, ok)
+	add := tr.Created(Network{ID: id, Driver: "bridge"})
+	if !reflect.DeepEqual(add, [][]string{RelayRule("-A", "br-abababababab")}) {
+		t.Fatalf("create: %v", add)
 	}
-	if _, ok := tr.Created(Network{ID: id, Driver: "bridge"}); ok {
+	if again := tr.Created(Network{ID: id, Driver: "bridge"}); len(again) != 0 {
 		t.Fatal("a second create of the same network added a second rule")
 	}
 	del, ok := tr.Destroyed(id)
@@ -88,7 +88,7 @@ func TestTrackerAddsOnCreateAndRemovesOnDestroy(t *testing.T) {
 	if _, ok := tr.Destroyed(id); ok {
 		t.Fatal("a second destroy deleted again")
 	}
-	if _, ok := tr.Created(Network{ID: id, Driver: "bridge", Internal: true}); ok {
+	if got := tr.Created(Network{ID: id, Driver: "bridge", Internal: true}); len(got) != 0 {
 		t.Fatal("an internal network got a relay rule")
 	}
 }

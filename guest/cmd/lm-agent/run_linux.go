@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -30,6 +31,7 @@ func logf(format string, args ...any) {
 func run() error {
 	p := newPlatform(logf)
 	a := agent.New(p)
+	p.forget = a.Forget
 
 	control, err := vsock.Listen(controlPort)
 	if err != nil {
@@ -61,7 +63,7 @@ func run() error {
 				errc <- fmt.Errorf("vsock %d: %w", dockerPort, err)
 				return
 			}
-			go spliceDocker(c)
+			go serveDocker(a.Ready, c, dialDocker)
 		}
 	}()
 	go func() {
@@ -82,15 +84,13 @@ func run() error {
 	return <-errc
 }
 
-// spliceDocker copies one host connection to dockerd's socket. Before
-// dockerd is up there is nothing to reach, and the connection is closed.
-func spliceDocker(c *vsock.Conn) {
+// dialDocker connects to dockerd's socket for one host connection.
+func dialDocker() (relay.Conn, error) {
 	d, err := net.DialTimeout("unix", dockerSock, 5*time.Second)
 	if err != nil {
-		c.Close()
-		return
+		return nil, err
 	}
-	relay.Splice(c, d.(*net.UnixConn))
+	return d.(*net.UnixConn), nil
 }
 
 func listenLocal() (*net.UnixListener, error) {
@@ -114,8 +114,17 @@ func peerIsRoot(c *net.UnixConn) bool {
 		return false
 	}
 	var cred *unix.Ucred
-	raw.Control(func(fd uintptr) {
+	if cerr := raw.Control(func(fd uintptr) {
 		cred, err = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
-	})
-	return err == nil && cred != nil && cred.Uid == 0
+	}); cerr != nil {
+		return false
+	}
+	if err == nil && cred == nil {
+		err = errors.New("no peer credentials")
+	}
+	var uid uint32 = 1
+	if cred != nil {
+		uid = cred.Uid
+	}
+	return rootPeer(uid, err)
 }

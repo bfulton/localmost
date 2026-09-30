@@ -12,9 +12,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// HostCID is the host's context id.
-const HostCID = unix.VMADDR_CID_HOST
-
 // Conn is one vsock connection, pollable and half-closable.
 type Conn struct {
 	f    *os.File
@@ -79,7 +76,7 @@ func (l *Listener) Accept() (*Conn, error) {
 			return nil, err
 		}
 		vm, ok := sa.(*unix.SockaddrVM)
-		if !ok || vm.CID != HostCID {
+		if !ok || !FromHost(vm.CID) {
 			unix.Close(nfd)
 			continue
 		}

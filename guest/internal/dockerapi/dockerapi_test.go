@@ -52,22 +52,23 @@ func TestOversizedAnswersAreRefused(t *testing.T) {
 	}
 }
 
-func TestNetworkEventsCallsReadyThenEachNetworkEvent(t *testing.T) {
+func TestEventsCallsReadyThenEachNetworkAndContainerEvent(t *testing.T) {
 	c := serve(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("filters") != `{"type":["network"]}` {
+		if r.URL.Query().Get("filters") != `{"event":["create","destroy"],"type":["container","network"]}` {
 			http.Error(w, "filters", 400)
 			return
 		}
 		fmt.Fprintln(w, `{"Type":"network","Action":"create","Actor":{"ID":"n1"}}`)
-		fmt.Fprintln(w, `{"Type":"container","Action":"start","Actor":{"ID":"c1"}}`)
+		fmt.Fprintln(w, `{"Type":"container","Action":"destroy","Actor":{"ID":"c1"}}`)
+		fmt.Fprintln(w, `{"Type":"image","Action":"delete","Actor":{"ID":"i1"}}`)
 		fmt.Fprintln(w, `{"Type":"network","Action":"destroy","Actor":{"ID":"n1"}}`)
 	})
 	var got []string
 	readyAt := -1
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	c.NetworkEvents(ctx, func() { readyAt = len(got) }, func(e Event) { got = append(got, e.Action+" "+e.ID) })
-	if readyAt != 0 || strings.Join(got, ",") != "create n1,destroy n1" {
+	c.Events(ctx, func() { readyAt = len(got) }, func(e Event) { got = append(got, e.Type+" "+e.Action+" "+e.ID) })
+	if readyAt != 0 || strings.Join(got, ",") != "network create n1,container destroy c1,network destroy n1" {
 		t.Fatalf("ready at %d, events %v", readyAt, got)
 	}
 }

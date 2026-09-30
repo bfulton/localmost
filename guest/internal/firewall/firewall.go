@@ -105,28 +105,71 @@ func RelayInterface(n Network) (string, bool) {
 	return "br-" + n.ID[:12], true
 }
 
+// bridgeInterface is the interface a bridge network's bridge has: the name
+// its options give, or Docker's own br-<first 12 of its id>.
+func bridgeInterface(n Network) string {
+	if name, set := n.Options[BridgeNameOption]; set {
+		return name
+	}
+	if len(n.ID) >= 12 {
+		return "br-" + n.ID[:12]
+	}
+	return ""
+}
+
 // Tracker remembers which network each relay rule belongs to.
 type Tracker struct {
 	mu    sync.Mutex
 	rules map[string]string // network id -> interface
 }
 
-// Created returns the rule to add for a new network, if it gets one.
-func (t *Tracker) Created(n Network) ([]string, bool) {
-	iface, ok := RelayInterface(n)
-	if !ok {
-		return nil, false
+// Sync is what to run when the agent (re)subscribes to Docker's events and
+// lists the networks: flush LOCALMOST-RELAY, let the default bridge back
+// in, and add each routable network. It starts the tracker over from the
+// list, so that a destroy missed while the stream was down leaves no rule.
+func (t *Tracker) Sync(ns []Network) [][]string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.rules = map[string]string{}
+	out := [][]string{{"-F", "LOCALMOST-RELAY"}, RelayRule("-A", "docker0")}
+	for _, n := range ns {
+		if iface, ok := RelayInterface(n); ok {
+			if _, have := t.rules[n.ID]; !have {
+				t.rules[n.ID] = iface
+				out = append(out, RelayRule("-A", iface))
+			}
+		}
 	}
+	return out
+}
+
+// Created returns the rules to run for a new network, in order. A rule
+// another network left on the new one's interface (its destroy event was
+// missed) is deleted first, whether or not the new network is routable;
+// then a routable network gets its own rule.
+func (t *Tracker) Created(n Network) [][]string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.rules == nil {
 		t.rules = map[string]string{}
 	}
 	if _, have := t.rules[n.ID]; have {
-		return nil, false
+		return nil
 	}
-	t.rules[n.ID] = iface
-	return RelayRule("-A", iface), true
+	var out [][]string
+	if bridge := bridgeInterface(n); bridge != "" {
+		for id, iface := range t.rules {
+			if iface == bridge {
+				delete(t.rules, id)
+				out = append(out, RelayRule("-D", iface))
+			}
+		}
+	}
+	if iface, ok := RelayInterface(n); ok {
+		t.rules[n.ID] = iface
+		out = append(out, RelayRule("-A", iface))
+	}
+	return out
 }
 
 // Destroyed returns the rule to delete for a removed network, if it had one.

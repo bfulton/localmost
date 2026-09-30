@@ -41,6 +41,8 @@ const (
 type platform struct {
 	logf  func(string, ...any)
 	relay *relay.Relay
+	// forget drops a destroyed container's bind approvals.
+	forget func(container string)
 
 	mu      sync.Mutex
 	dockerd *exec.Cmd
@@ -243,7 +245,8 @@ func (p *platform) StartDockerd(job bool) (agent.DockerVersion, error) {
 
 // followNetworks keeps LOCALMOST-RELAY in step with Docker's networks for
 // as long as dockerd runs: it opens the event stream first and then lists
-// what exists, so that nothing created in between is missed.
+// what exists, so that nothing created in between is missed. It also drops
+// a container's bind approvals when Docker destroys it.
 func (p *platform) followNetworks(c dockerapi.Client) {
 	created := func(id string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -253,33 +256,52 @@ func (p *platform) followNetworks(c dockerapi.Client) {
 			p.logf("network %s: %v", short(id), err)
 			return
 		}
-		if rule, ok := p.tracker.Created(n); ok {
+		for _, rule := range p.tracker.Created(n) {
 			if err := command("iptables", rule...); err != nil {
 				p.logf("relay rule for %s: %v", short(id), err)
 			}
 		}
 	}
 	for p.DockerdRunning() {
-		err := c.NetworkEvents(context.Background(), func() {
+		err := c.Events(context.Background(), func() {
+			// Rebuild LOCALMOST-RELAY from what exists now, on the first
+			// subscription and after every reconnect.
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			ns, err := c.Networks(ctx)
+			list, err := c.Networks(ctx)
 			cancel()
 			if err != nil {
 				p.logf("networks: %v", err)
 				return
 			}
-			for _, n := range ns {
-				created(n.ID)
+			var ns []firewall.Network
+			for _, l := range list {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				n, err := c.Network(ctx, l.ID)
+				cancel()
+				if err != nil {
+					p.logf("network %s: %v", short(l.ID), err)
+					continue
+				}
+				ns = append(ns, n)
+			}
+			for _, rule := range p.tracker.Sync(ns) {
+				if err := command("iptables", rule...); err != nil {
+					p.logf("relay chain: %v", err)
+				}
 			}
 		}, func(ev dockerapi.Event) {
-			switch ev.Action {
-			case "create":
+			switch {
+			case ev.Type == "network" && ev.Action == "create":
 				created(ev.ID)
-			case "destroy":
+			case ev.Type == "network" && ev.Action == "destroy":
 				if rule, ok := p.tracker.Destroyed(ev.ID); ok {
 					if err := command("iptables", rule...); err != nil {
 						p.logf("relay rule for %s: %v", short(ev.ID), err)
 					}
+				}
+			case ev.Type == "container" && ev.Action == "destroy":
+				if p.forget != nil {
+					p.forget(ev.ID)
 				}
 			}
 		})
