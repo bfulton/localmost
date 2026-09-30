@@ -100,8 +100,10 @@ export interface VmManagerOptions {
   freeBytes?: (dir: string) => Promise<number>;
   /** Bytes a sparse file has allocated. */
   allocatedBytes?: (file: string) => Promise<number>;
-  /** A live process's executable, or null when there is no such process. */
+  /** A live process's executable, or null when there is no such process. processExecutableOf by default. */
   processExecutable?: (pid: number) => Promise<string | null>;
+  /** For tests: the device a path is on, as stat(2) follows it. */
+  deviceOf?: (p: string) => number;
   kill?: (pid: number, signal: NodeJS.Signals) => void;
   /** Exclude <data>/vm from Time Machine when it is made. */
   excludeFromBackup?: (dir: string) => Promise<void>;
@@ -133,13 +135,23 @@ const defaultAllocatedBytes = async (file: string): Promise<number> => {
   }
 };
 
-const defaultProcessExecutable = async (pid: number): Promise<string | null> => {
+/**
+ * The file a live process runs, or null when there is none or it cannot be
+ * told. Not `ps -o comm=`, which on macOS is the argv[0] the process gave
+ * itself: anything can call itself the helper. lsof names the text vnode, the
+ * executable itself, first among a process's txt entries (dyld follows).
+ * macOS only, as the app is.
+ */
+export async function processExecutableOf(pid: number): Promise<string | null> {
+  if (process.platform !== 'darwin') return null;
   try {
-    return (await execFileText('/bin/ps', ['-o', 'comm=', '-p', String(pid)])).trim() || null;
+    const out = await execFileText('/usr/sbin/lsof', ['-n', '-P', '-w', '-a', '-p', String(pid), '-d', 'txt', '-Fn']);
+    const name = out.split('\n').find((line) => line.startsWith('n'));
+    return name ? name.slice(1) : null;
   } catch {
     return null;
   }
-};
+}
 
 const defaultExcludeFromBackup = async (dir: string): Promise<void> => {
   await execFileText('/usr/bin/tmutil', ['addexclusion', dir]);
@@ -150,6 +162,8 @@ class Vm implements VmHandle {
   readonly dockerSocketPath: string;
   readonly files: ReturnType<typeof vmJobFiles>;
   status: VmState = 'queued';
+  /** Where it is: the gate, then each boot stage in turn, which a stop or an unexpected error names. */
+  stage: VmStage = 'admission';
   spare: boolean;
   helper: HelperClient | null = null;
   agentClient: UnixAgentClient | null = null;
@@ -236,6 +250,11 @@ export class DefaultVmManager implements VmManager {
     if (req.mode === 'job' && (req.sandboxId === undefined || req.shareNonce === undefined || req.proxyPort === undefined)) {
       throw new Error('a job VM needs its sandbox, its share nonce and its proxy port');
     }
+    // At most one spare (the design's "Pre-warmed spare lifecycle"): each
+    // holds a slot and its memory for a job that may not come for hours.
+    if (req.spare === true && [...this.vms].some((vm) => vm.spare)) {
+      throw new Error('there is already a spare Docker VM');
+    }
     const vm = new Vm(req, this.opts.dataDir, (target, reason) => this.stopVm(target, reason));
     this.vms.add(vm);
     this.queue.push(vm);
@@ -256,10 +275,14 @@ export class DefaultVmManager implements VmManager {
     return false;
   }
 
-  /** VMs holding memory: every one admitted and not yet gone. */
+  /**
+   * VMs holding memory: every one admitted and not yet gone. A VM leaves
+   * this.vms only once its helper has exited, so one that failed still
+   * counts while its helper is on its way out.
+   */
   private holding(): number {
     let n = 0;
-    for (const vm of this.vms) if (vm.status === 'booting' || vm.status === 'ready' || vm.status === 'stopping') n++;
+    for (const vm of this.vms) if (vm.status !== 'queued') n++;
     return n;
   }
 
@@ -270,14 +293,21 @@ export class DefaultVmManager implements VmManager {
    */
   private pump(): void {
     const { maxRunning } = this.opts.config();
+    const rank = (vm: Vm) => (vm.request.mode === 'refresh' ? 2 : vm.spare ? 1 : 0);
     while (this.queue.length > 0 && this.pressure !== 'critical' && this.holding() < maxRunning) {
-      const rank = (vm: Vm) => (vm.request.mode === 'refresh' ? 2 : vm.spare ? 1 : 0);
       const candidates = this.queue.filter((vm) => rank(vm) === 0 || this.pressure === 'normal');
       if (candidates.length === 0) return;
       const next = candidates.reduce((best, vm) => (rank(vm) < rank(best) ? vm : best));
       this.queue.splice(this.queue.indexOf(next), 1);
       next.status = 'booting';
       next.admit();
+    }
+    // A job that finds the gate full takes the spare's slot: the spare waits
+    // for a job that may never come, this one has come. Its stop pumps again.
+    if (this.pressure !== 'critical' && this.holding() >= maxRunning && this.queue.some((vm) => rank(vm) === 0)) {
+      for (const vm of this.vms) {
+        if (vm.spare && (vm.status === 'booting' || vm.status === 'ready')) void vm.stop('a job needs its slot');
+      }
     }
   }
 
@@ -333,15 +363,21 @@ export class DefaultVmManager implements VmManager {
         `Docker VM ${vm.vmId} ready in ${ready.bootMs} ms for ${vm.request.repository} ` +
           `(dockerd ${ready.docker.version}, API ${ready.docker.apiVersion}, Rosetta ${ready.rosetta})`
       );
+      vm.stage = 'running';
       exit = await vm.helper!.exited();
-      if (vm.status === 'ready') {
+      if (vm.status === 'ready' && vm.request.mode === 'refresh' && exit.code === 0 && exit.stopped?.reason === 'guest' && exit.stopped.synced === true) {
+        // A refresh ends this way: CacheDisks sends the agent shutdown, the
+        // guest powers off, and the helper has synced the disk it wrote.
+        vm.status = 'stopped';
+        this.opts.log('info', `Docker VM ${vm.vmId} powered off after its cache refresh for ${vm.request.repository}`);
+      } else if (vm.status === 'ready') {
         this.fail(vm, vmError('running', exit.errorCode ?? 'E_VM_STOPPED', "the job's Docker VM stopped unexpectedly"));
       }
     } catch (err) {
       if (err instanceof Cancelled) {
-        vm.rejectReady(vmError(vm.status === 'queued' ? 'admission' : 'helper', 'E_CANCELLED', `Docker VM ${vm.vmId} was stopped before it was ready`));
+        vm.rejectReady(vmError(vm.stage, 'E_CANCELLED', `Docker VM ${vm.vmId} was stopped before it was ready`));
       } else {
-        const failure = isVmError(err) ? err : vmError('helper', 'E_VM', (err as Error).message);
+        const failure = isVmError(err) ? err : vmError(vm.stage, 'E_VM', (err as Error).message);
         this.fail(vm, failure);
         vm.rejectReady(failure);
       }
@@ -380,6 +416,7 @@ export class DefaultVmManager implements VmManager {
     const config = this.opts.config();
 
     // The disk.
+    vm.stage = 'disk';
     await this.until(vm, this.makeVmDir(vm));
     if (req.mode === 'job') {
       const sizeGiB = await this.until(vm, this.dataDiskGiB(vm, config));
@@ -394,6 +431,7 @@ export class DefaultVmManager implements VmManager {
 
     // The checks Electron makes before the helper makes them again (§2.1),
     // the profile, and the spawn.
+    vm.stage = 'helper';
     try {
       await this.until(vm, this.opts.guest.verify());
     } catch (err) {
@@ -450,8 +488,10 @@ export class DefaultVmManager implements VmManager {
     vm.started = started;
 
     // The agent, once it answers, then configure.
+    vm.stage = 'agent';
     const agent = await this.until(vm, this.connectAgent(vm));
     vm.agentClient = agent;
+    vm.stage = 'configure';
     let result;
     try {
       result = await this.until(
@@ -481,7 +521,10 @@ export class DefaultVmManager implements VmManager {
       }
       throw vmError('configure', code, (err as Error).message);
     }
-    const failedSelfTests = Object.entries(result.selftest).filter(([, passed]) => !passed).map(([name]) => name);
+    // A refresh VM has no relay and no share, so its self-test checks the
+    // firewall rules alone and reports the rest false, as not run (§3.4).
+    const checked = req.mode === 'job' ? Object.entries(result.selftest) : [['rules', result.selftest.rules] as const];
+    const failedSelfTests = checked.filter(([, passed]) => !passed).map(([name]) => name);
     if (failedSelfTests.length > 0) {
       throw vmError('configure', 'E_SELFTEST', `the guest's firewall self-test failed: ${failedSelfTests.join(', ')}`);
     }
@@ -490,6 +533,7 @@ export class DefaultVmManager implements VmManager {
     // what the app wrote. Otherwise VZ shared something else, and both layers
     // that should have stopped that failed.
     if (req.mode === 'job') {
+      vm.stage = 'nonce';
       const expected = Buffer.from(req.shareNonce!);
       const got = Buffer.from(result.nonce ?? '');
       if (expected.length !== got.length || !crypto.timingSafeEqual(expected, got)) {
@@ -586,10 +630,12 @@ export class DefaultVmManager implements VmManager {
   /**
    * The share checks the helper makes again right before VZ starts (§2.1):
    * `_work` a real directory, not a link, at its own real path, under
-   * runner/sandbox, on the sandbox's device - so nothing is mounted over it.
+   * runner/sandbox, on the sandbox's device, and the sandbox on
+   * runner/sandbox's - so nothing is mounted over the share or its sandbox.
    */
   private checkShare(req: VmRequest): void {
     const dataDir = this.opts.dataDir;
+    const deviceOf = this.opts.deviceOf ?? ((p: string) => fs.statSync(p).dev);
     try {
       const base = fs.realpathSync(path.join(dataDir, 'runner', 'sandbox'));
       const sandbox = fs.realpathSync(sandboxDirOf(dataDir, req.sandboxId!));
@@ -598,7 +644,10 @@ export class DefaultVmManager implements VmManager {
       if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('it is not a directory');
       if (fs.realpathSync(share) !== share) throw new Error('it is not at its real path');
       if (!share.startsWith(`${base}/`)) throw new Error('it is not under runner/sandbox');
-      if (stat.dev !== fs.statSync(sandbox).dev) throw new Error('something is mounted over it');
+      if (deviceOf(share) !== deviceOf(sandbox)) throw new Error('something is mounted over it');
+      // A mount over the sandbox puts the share on the mounted device too,
+      // which the check above cannot see, nor the helper's mount-point check.
+      if (deviceOf(sandbox) !== deviceOf(base)) throw new Error('something is mounted over its sandbox');
       // <data> is real, and so is every directory the app made below it: the
       // share's path as built from the ids is its real path, or something on
       // the way was replaced.
@@ -717,7 +766,7 @@ export class DefaultVmManager implements VmManager {
   async sweep(): Promise<void> {
     const jobs = path.join(vmDir(this.opts.dataDir), 'jobs');
     const helper = this.opts.helperPath();
-    const processExecutable = this.opts.processExecutable ?? defaultProcessExecutable;
+    const processExecutable = this.opts.processExecutable ?? processExecutableOf;
     const kill = this.opts.kill ?? ((pid: number, signal: NodeJS.Signals) => process.kill(pid, signal));
     let swept = 0;
     for (const name of await fs.promises.readdir(jobs).catch(() => [] as string[])) {

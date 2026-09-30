@@ -4,12 +4,12 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
-import { spawn } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { DockerVmConfig } from '../config';
 import { GuestImage } from './guest-image';
-import { DefaultVmManager, VmManagerOptions } from './vm-manager';
+import { DefaultVmManager, processExecutableOf, VmManagerOptions } from './vm-manager';
 import type { VmError, VmHandle, VmRequest } from './types';
 import { FAKE_HELPER, fakeHelperSpawn, layOutVmData, shortTempDir, VmLayout } from '../test-utils/vm-fixtures';
 
@@ -240,6 +240,42 @@ describe('DefaultVmManager', () => {
       expect(spawned).toBe(0);
     });
 
+    describe("at the helper: the share checks Electron makes before the helper's", () => {
+      /** A device number for each path, as stat(2) follows it, with the ones given changed. */
+      const devices = (moved: Record<string, number>) => (p: string) => moved[p] ?? fs.statSync(p).dev;
+
+      const expectShareRefused = async (vm: VmHandle, why: string) => {
+        await expectFailure(vm, 'helper', 'E_SHARE');
+        expect(vm.failure()!.message).toContain(why);
+        expect(spawned).toBe(0);
+      };
+
+      it('refuses a share with something mounted over it', async () => {
+        const m = manager({ deviceOf: devices({ [layout.share]: 999 }) });
+        await expectShareRefused(m.start(jobRequest()), 'something is mounted over it');
+      });
+
+      it('refuses a sandbox with something mounted over it, which puts the share on its device too', async () => {
+        const m = manager({ deviceOf: devices({ [layout.share]: 999, [layout.sandbox]: 999 }) });
+        await expectShareRefused(m.start(jobRequest()), 'something is mounted over its sandbox');
+      });
+
+      it('refuses a sandbox that was replaced by a link to another sandbox', async () => {
+        // The VM asked for the share the link leads to, as a worker that
+        // resolved its sandbox after the swap would.
+        const other = layOutVmData(root, '2-abcdef012345');
+        const real = `${layout.sandbox}-real`;
+        fs.renameSync(layout.sandbox, real);
+        fs.symlinkSync(other.sandbox, layout.sandbox);
+        await expectShareRefused(manager().start(jobRequest({ shareRealPath: other.share })), 'its path runs through a link');
+      });
+
+      it('refuses a request for a share that is not the one its sandbox id names', async () => {
+        const other = layOutVmData(root, '2-abcdef012345');
+        await expectShareRefused(manager().start(jobRequest({ shareRealPath: other.share })), 'not the share the VM was asked for');
+      });
+    });
+
     it('at the helper: VZ would not start', async () => {
       scripts.push({ helper: { exitAfterListening: 69 } });
       await expectFailure(manager().start(jobRequest()), 'helper', 'E_VZ_START');
@@ -268,6 +304,16 @@ describe('DefaultVmManager', () => {
       const vm = manager().start(jobRequest());
       await expectFailure(vm, 'configure', 'E_SELFTEST');
       expect(vm.failure()!.message).toContain('internalForgedRejected');
+    });
+
+    it('at configure: a refresh VM checks the firewall rules alone, which is all its self-test runs', async () => {
+      const notRun = { internalNoRelay: false, internalForgedRejected: false, gatewayRejected: false, bridgeReachesRelay: false };
+      scripts.push({ configure: { answer: { selftest: { rules: true, ...notRun } } } });
+      await expect(manager().start(refreshRequest()).ready()).resolves.toMatchObject({ docker: { version: '29.5.3' } });
+      scripts.push({ configure: { answer: { selftest: { rules: false, ...notRun } } } });
+      const vm = managers[0].start(refreshRequest());
+      await expectFailure(vm, 'configure', 'E_SELFTEST');
+      expect(vm.failure()!.message).toContain('rules');
     });
 
     it('at the nonce: a guest that did not read back what the app wrote is torn down, and logged at error', async () => {
@@ -329,7 +375,8 @@ describe('DefaultVmManager', () => {
     const pid = Number(fs.readFileSync(path.join(dir, 'helper.pid'), 'utf-8'));
     await eventually(() => fs.existsSync(path.join(dir, 'agent.sock')), 'the helper to listen');
     await vm.stop('the job was cancelled');
-    expect(await failureOf(vm)).toMatchObject({ code: 'E_CANCELLED' });
+    // The stage the stop interrupted: the helper had started, the agent not answered.
+    expect(await failureOf(vm)).toMatchObject({ stage: 'agent', code: 'E_CANCELLED' });
     expect(vm.state()).toBe('stopped');
     expect(fs.existsSync(dir)).toBe(false);
     expect(alive(pid)).toBe(false);
@@ -355,6 +402,31 @@ describe('DefaultVmManager', () => {
     await stopping;
     expect(fs.existsSync(path.join(layout.data, 'vm', 'jobs', vm.vmId))).toBe(false);
     expect(spawned).toBe(0);
+    expect(await failureOf(vm)).toMatchObject({ stage: 'disk', code: 'E_CANCELLED' });
+  });
+
+  it('holds its slot at the gate while it fails, until its helper has gone', async () => {
+    // Stopped for the host with a helper that ignores SIGTERM: it is failed
+    // at once, but still holds its memory until the SIGKILL.
+    config.maxRunning = 1;
+    scripts.push({ helper: { ignoreSigterm: true, stopDelayMs: 60_000 } }, {}, {});
+    let free = 500 * GiB;
+    const m = manager({ freeBytes: async () => free, killAfterMs: 1500 });
+    const failing = m.start(jobRequest());
+    await failing.ready();
+    const waiting = m.start(jobRequest({ slot: 2 }));
+    free = 1 * GiB;
+    const stopping = m.checkFreeSpace();
+    await eventually(() => failing.state() === 'failed', 'the VM to fail');
+    // Anything that pumps the gate: another start.
+    const later = m.start(jobRequest({ slot: 3 }));
+    expect(waiting.state()).toBe('queued');
+    free = 500 * GiB;
+    await stopping;
+    await failing.stopped();
+    await waiting.ready();
+    await waiting.stop('done');
+    await later.ready();
   });
 
   describe('a VM that stops after it was ready', () => {
@@ -366,6 +438,25 @@ describe('DefaultVmManager', () => {
       await vm.stopped();
       expect(vm.state()).toBe('failed');
       expect(vm.failure()).toMatchObject({ stage: 'running', code: 'E_HELPER_KILLED', message: "the job's Docker VM stopped unexpectedly" });
+    });
+
+    it('is stopped, not failed, when a refresh VM powers off after its shutdown', async () => {
+      const m = manager();
+      const refresh = m.start(refreshRequest());
+      await refresh.ready();
+      await refresh.agent().shutdown();
+      await expect(refresh.stopped()).resolves.toEqual({ reason: 'guest', synced: true });
+      expect(refresh.state()).toBe('stopped');
+      expect(refresh.failure()).toBeUndefined();
+      expect(logs.filter((l) => l.level === 'warn' || l.level === 'error')).toEqual([]);
+    });
+
+    it('is failed when a refresh VM stops without syncing its disk', async () => {
+      scripts.push({ helper: { guestExitAfterMs: 800 } });
+      const refresh = manager().start(refreshRequest());
+      await refresh.ready();
+      await expect(refresh.stopped()).resolves.toEqual({ reason: 'guest', synced: false });
+      expect(refresh.state()).toBe('failed');
     });
 
     it('is failed when its agent exits and the guest powers off', async () => {
@@ -391,6 +482,44 @@ describe('DefaultVmManager', () => {
       expect(m.claimSpare(spare.vmId)).toBe(true);
       expect(m.claimSpare(spare.vmId)).toBe(false);
       expect(m.claimSpare('9-0123456789ab')).toBe(false);
+    });
+
+    it('is one in all: a second is refused while the first lives, and allowed once it is claimed or gone', async () => {
+      config.maxRunning = 4;
+      const m = manager();
+      const first = m.start(jobRequest({ spare: true }));
+      expect(() => m.start(jobRequest({ slot: 2, spare: true }))).toThrow(/already a spare/);
+      await first.ready();
+      expect(() => m.start(jobRequest({ slot: 2, spare: true }))).toThrow(/already a spare/);
+      // Claimed, it is a job's VM, and the next idle worker may have a spare.
+      expect(m.claimSpare(first.vmId)).toBe(true);
+      const second = m.start(jobRequest({ slot: 2, spare: true }));
+      await second.ready();
+      await second.stop('the worker exited');
+      const third = m.start(jobRequest({ slot: 3, spare: true }));
+      await third.ready();
+      expect(spawned).toBe(3);
+    });
+
+    it('gives its slot to a job that finds the gate full', async () => {
+      config.maxRunning = 1;
+      const m = manager();
+      const spare = m.start(jobRequest({ spare: true }));
+      await spare.ready();
+      const job = m.start(jobRequest({ slot: 2 }));
+      await job.ready();
+      await expect(spare.stopped()).resolves.toMatchObject({ reason: 'requested' });
+      expect(spare.state()).toBe('stopped');
+      expect(logs.some((l) => l.message === `Docker VM ${spare.vmId} stopping: a job needs its slot`)).toBe(true);
+    });
+
+    it('is not stopped for a job while the gate has room', async () => {
+      config.maxRunning = 2;
+      const m = manager();
+      const spare = m.start(jobRequest({ spare: true }));
+      await spare.ready();
+      await m.start(jobRequest({ slot: 2 })).ready();
+      expect(spare.state()).toBe('ready');
     });
   });
 
@@ -505,6 +634,25 @@ describe('DefaultVmManager', () => {
       } finally {
         stranger.kill('SIGKILL');
         helperLike.kill('SIGKILL');
+      }
+    });
+
+    it('reads a process\'s executable, not the argv[0] it gave itself', async () => {
+      // A process can call itself anything, the helper's path included; the
+      // sweep kills by the file it runs. macOS only: the app runs nowhere else.
+      const named = spawn('/bin/sleep', ['60'], { argv0: FAKE_HELPER });
+      try {
+        // Until it has exec'd sleep, the child is a copy of this node.
+        const args = () => execFileSync('/bin/ps', ['-o', 'args=', '-p', String(named.pid)], { encoding: 'utf-8' }).trim();
+        await eventually(() => args() === `${FAKE_HELPER} 60`, 'the process to exec');
+        if (process.platform === 'darwin') {
+          expect(await processExecutableOf(named.pid!)).toBe('/bin/sleep');
+        } else {
+          expect(await processExecutableOf(named.pid!)).toBeNull();
+        }
+        expect(await processExecutableOf(999_999)).toBeNull();
+      } finally {
+        named.kill('SIGKILL');
       }
     });
 

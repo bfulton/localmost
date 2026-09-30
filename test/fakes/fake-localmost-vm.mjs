@@ -102,6 +102,7 @@ if (mode === 'job') {
     if (fs.realpathSync(share) !== share) throw new Error('not its real path');
     if (!share.startsWith(`${sandboxBase}/`)) throw new Error('outside runner/sandbox');
     if (stat.dev !== fs.statSync(sandbox).dev) throw new Error('on another device');
+    if (fs.statSync(sandbox).dev !== fs.statSync(sandboxBase).dev) throw new Error('its sandbox is on another device');
   } catch (err) {
     fail('E_SHARE', `${share}: ${err.message}`);
   }
@@ -189,7 +190,10 @@ function answerAgent(connection, request) {
         docker: { version: '29.5.3', apiVersion: '1.54', minApiVersion: '1.24' },
         disk: 'formatted',
         rosetta: request.rosetta ? 'ok' : 'absent',
-        selftest: { rules: true, internalNoRelay: true, internalForgedRejected: true, gatewayRejected: true, bridgeReachesRelay: true },
+        // A refresh VM checks its rules alone and reports the rest as not run (§3.4).
+        selftest: mode === 'job'
+          ? { rules: true, internalNoRelay: true, internalForgedRejected: true, gatewayRejected: true, bridgeReachesRelay: true }
+          : { rules: true, internalNoRelay: false, internalForgedRejected: false, gatewayRejected: false, bridgeReachesRelay: false },
       };
       if (mode === 'job') {
         const fd = fs.openSync(path.join(request.share.mountPath, request.share.nonceFile), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);

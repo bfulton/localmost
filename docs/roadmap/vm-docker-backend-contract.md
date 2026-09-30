@@ -82,9 +82,13 @@ command line is a path the job chose.
 - Share (job mode): `S = realpath(<data>/runner/sandbox/<sandboxId>) + "/_work"`.
   It requires that `lstat(S)` is a directory and not a link, that
   `realpath(S) == S`, that `S` starts with `realpath(<data>/runner/sandbox) + "/"`,
-  that `st_dev(S) == st_dev(<sandbox>)`, and that `S` is not a mount point
-  (`statfs(S).f_mntonname != S`). The last two refuse a DMG, FUSE or SMB
-  mount placed over `_work`, which seatbelt's path rules do not see. The
+  that `st_dev(S) == st_dev(<sandbox>)`, that
+  `st_dev(<sandbox>) == st_dev(realpath(<data>/runner/sandbox))`, and that `S`
+  is not a mount point (`statfs(S).f_mntonname != S`). The last three refuse
+  a DMG, FUSE or SMB mount placed over `_work`, or over `<sandbox>`, which
+  seatbelt's path rules do not see. A mount over `<sandbox>` passes the first
+  device check and the mount-point check, since `_work` is then on the mounted
+  filesystem and is not its mount point; the second device check refuses it. The
   helper runs the checks right before `start`, and Electron runs the same
   checks before the spawn. If any check fails: `E_SHARE`.
 - Data disk: `<data>/vm/jobs/<vmId>/data.img` in job mode, or
@@ -386,7 +390,11 @@ code:
    each at most 512 bytes). Electron strips control characters and ANSI
    escapes from these lines, and from every other string the guest supplies,
    before it logs them.
-7. Self-test (job mode, §3.6). Any `false` fails with `E_SELFTEST`.
+7. Self-test (§3.6). In job mode every field is checked, and any `false`
+   fails with `E_SELFTEST`. In refresh mode, which has no relay and no share,
+   only `rules` is checked: the answer still carries all five fields, the
+   other four `false` (not run), and Electron checks `rules` alone. A refresh
+   answer with `rules: false` fails with `E_SELFTEST`.
 
 Guest-local op on `/run/localmost/agent.sock`, used only by `lm-bindpin`:
 `{"v":1,"id":1,"op":"binds-for","container":"<id>"}` answers
@@ -809,13 +817,34 @@ export interface VmError extends Error {
 }
 ```
 
-VmManager's own codes: `E_CANCELLED` (stopped before ready), `E_NO_DISK`
-(below the free-space floor: "not enough free disk for a Docker VM"),
-`E_VM_DIR`, `E_AGENT_SILENT` (no hello within 30 s), `E_SELFTEST` (an answer
-with a self-test that is not all true), `E_NONCE`, `E_DISK_FULL` ("host disk
-nearly full") and `E_VM_STOPPED` (a clean guest power-off after ready);
+VmManager's own codes: `E_CANCELLED` (stopped before ready; its stage is the
+one the stop interrupted, `admission` while queued), `E_NO_DISK` (below the
+free-space floor: "not enough free disk for a Docker VM"), `E_VM_DIR`,
+`E_AGENT_SILENT` (no hello within 30 s), `E_AGENT` (the agent client failed
+other than by a code of its own), `E_CONFIGURE` (`configure` failed other
+than by a code), `E_SELFTEST` (an answer whose self-test failed, §3.4 step 7),
+`E_NONCE`, `E_DISK_FULL` ("host disk nearly full"), `E_VM_STOPPED` (a guest
+power-off after ready, other than a refresh VM's synced one, below) and `E_VM`
+(anything else thrown in a boot, with the stage it was in);
 `AgentClient` adds `E_AGENT_CLOSED`, `E_AGENT_TIMEOUT`, `E_AGENT_PROTOCOL` and
-`E_AGENT_UNKNOWN` (a refusal code not in §3.4). A job VM whose disk was a
+`E_AGENT_UNKNOWN` (a refusal code not in §3.4).
+
+A refresh VM ends by powering off after CacheDisks sends `shutdown`: a
+`stopped` event with reason `guest`, `synced: true` and exit 0 is a clean stop
+(state `stopped`, no failure). Any other end of a ready VM, a refresh VM's
+unsynced power-off included, is `failed` at stage `running`.
+
+**The spare.** There is at most one. `start()` with `spare: true` throws while
+another spare lives (queued, booting, ready or stopping, and not yet claimed);
+`VmBackend` then boots none for that worker. A job that finds the gate full
+takes the spare's slot: the spare is stopped with the reason `a job needs its
+slot`. A VM holds its slot at the gate from its admission until its helper has
+exited, so a VM that failed still counts while its helper is on its way out.
+
+**The sweep's pid check.** `sweep()` sends SIGKILL to a `helper.pid` only when
+that pid's executable is `helperPath()`. The executable is the text vnode as
+`lsof -a -p <pid> -d txt -Fn` names it, not `ps -o comm=`, which on macOS is
+the argv[0] a process gave itself. A job VM whose disk was a
 clone of the golden disk and whose `configure` answers `E_DISK` is the one
 boot that is tried again: the golden disk is discarded and the VM boots once
 more on a blank disk.
@@ -1321,7 +1350,8 @@ helper or CLI is missing. A build never ships without its VM.
   grace, `set-time`, `approve-binds`) to stderr as `info` lines. It binds its
   sockets by name in the VM's directory, its working directory, so a long
   `<data>` cannot overflow a socket path on its side. The mount-point check
-  of §2.1 needs `statfs`, which Node lacks; the fake checks the device alone.
+  of §2.1 needs `statfs`, which Node lacks; the fake checks the two devices
+  alone, as `VmManager` does.
 - **Fake agent** (`guest/internal/agenttest`, owned by WP-A). An in-process Go
   implementation of §3.4 that WP-B can run on the Mac behind a unix socket to
   check its splicing.

@@ -359,9 +359,12 @@ denies) and clause 4 (the helper's profile, and its checks) protect it.
    id (`<slot>-<12 hex>`), never a path. It works out the share path itself from
    `<data>`. It checks that the share is a directory and not a link (`lstat`),
    and that `realpath(share) == realpath(<data>/runner/sandbox/<sandboxId>) + "/_work"`.
-   It also checks that nothing is mounted over the share: `st_dev` of the
-   share must equal `st_dev` of `<sandbox>`, and the share must not be a mount
-   point. Seatbelt's path rules do not see a mount placed over a directory
+   It also checks that nothing is mounted over the share or its sandbox:
+   `st_dev` of the share must equal `st_dev` of `<sandbox>`, `st_dev` of
+   `<sandbox>` must equal that of `<data>/runner/sandbox`, and the share must
+   not be a mount point. (A mount over `<sandbox>` itself passes the first
+   check and the mount-point check, since the share is then on the mounted
+   filesystem and is not its root.) Seatbelt's path rules do not see a mount placed over a directory
    (`hdiutil attach -mountpoint`, a macFUSE bindfs, `mount_smbfs`), and the
    helper's grant is by path, so without this check it would share whatever
    the mount shows. A DMG the job made holds only what the job could write
@@ -458,7 +461,7 @@ experiment. "V-spike" means verified in this design's spike on 2026-09-30.
 
 | # | Claim | Rests on | Evidence |
 |---|---|---|---|
-| S1 | A job cannot give a container the user's home or any Mac path outside its own `_work` (G-A). | (a) The VM has exactly one read-write share, `_work`, created by localmost (R1). (b) Profile node denies make it unswappable (rule 3); job code may run before `Start()`, and until then (b) and (c) are the only layers. (c) The helper checks the share (not a link, not a mount point, same device as the sandbox), and its profile's `file-issue-extension` rule, scoped to `(subpath "<S>")`, lets VZ's service reach only that real path, so a swap resolved at `Start()` fails. (d) A rename after `Start()` fails closed. (e) Symlinks planted on the host resolve in the guest, never on the Mac. (f) The VZ XPC service is itself sandboxed to the shared paths. (g) The nonce tripwire detects a failure of both (b) and (c). | (a), (d), (e), (f): V (register §1). (c): V-spike, with the scoped `file-issue-extension` rule present. A share path swapped for a link outside the grant failed `Start()` with EPERM, and an ungranted directory was refused the same way. A review probe confirmed that without that rule the VM starts but the guest cannot read the share, so the EPERM comes from that rule. The mount-point check: Build, WP-B. (b), (g): Build, WP-C sandbox test. |
+| S1 | A job cannot give a container the user's home or any Mac path outside its own `_work` (G-A). | (a) The VM has exactly one read-write share, `_work`, created by localmost (R1). (b) Profile node denies make it unswappable (rule 3); job code may run before `Start()`, and until then (b) and (c) are the only layers. (c) The helper checks the share (not a link, not a mount point, same device as the sandbox, and the sandbox the same device as `runner/sandbox`), and its profile's `file-issue-extension` rule, scoped to `(subpath "<S>")`, lets VZ's service reach only that real path, so a swap resolved at `Start()` fails. (d) A rename after `Start()` fails closed. (e) Symlinks planted on the host resolve in the guest, never on the Mac. (f) The VZ XPC service is itself sandboxed to the shared paths. (g) The nonce tripwire detects a failure of both (b) and (c). | (a), (d), (e), (f): V (register §1). (c): V-spike, with the scoped `file-issue-extension` rule present. A share path swapped for a link outside the grant failed `Start()` with EPERM, and an ungranted directory was refused the same way. A review probe confirmed that without that rule the VM starts but the guest cannot read the share, so the EPERM comes from that rule. The mount-point check: Build, WP-B. (b), (g): Build, WP-C sandbox test. |
 | S2 | A container cannot reach guest `/`, the guest `docker.sock` or `/proc` by swapping a bind source (R2). | `nosymfollow` on the share, plus `lm-bindpin` clearing it only on approved binds. | V-spike on the shipped kernel (Alpine 6.18.54) with `dockerd` 29.5.3 and `runc` 1.4.3. `create` with a bind, swap the source for a link to `/`, `start` failed. A bind of a planted link to `/Users/...` failed. A child bind inherited `nosymfollow` (inner link: ELOOP). `mount_setattr` clearing only `NOSYMFOLLOW` restored inner links and kept `ro,nosuid,nodev`. The hook itself: Build, WP-A. |
 | S3 | Containers of different jobs cannot reach each other, and a job cannot join another job's network. | Separate VMs. No NIC. vsock has no guest-to-guest path. Network names exist only inside one VM. | vsock CID 3 gives ENODEV (R7, V). Live cross-job test: Build, integration stage. |
 | S4 | Container egress goes only through the job's proxy, under the job's policy. | No NIC. The relay goes only to that worker's `ProxyServer`, which checks the per-worker token. The guest firewall rejects everything else sent to the guest root namespace from bridges. | No route and no DNS without a NIC (R7, V). V-spike: a default-bridge container reached a listener on `198.18.0.1:3128`. An `internal` network container got "Network unreachable". Relay end to end: Build, WP-A with WP-B. |
@@ -635,17 +638,21 @@ spawn repository's cache disk. At the claim:
 
 - If the claimed job's bound policy has `docker:`, and the claim is for the
   spawn repository, the spare becomes the job's VM.
-- Otherwise it is stopped.
+- Otherwise it is stopped, including when the claim is for another
+  repository and the worker's socket stays closed.
 
-The spare is also stopped when its worker is reaped or exits, on wake, and
-under memory pressure. A new spare is started when the next idle worker is
-spawned. A spare VM holds the share of a sandbox whose job has not started, so
+The spare is also stopped when its worker is reaped or exits, on wake, under
+memory pressure, and when a job's boot finds the admission gate full: the job
+takes the spare's slot. An idle worker spawned while a spare lives gets none.
+A new spare is started when the next idle worker is spawned after it is gone
+or claimed. A spare VM holds the share of a sandbox whose job has not started, so
 there is nothing in it to leak.
 
 **Startup sweep.** Before the runner pool starts, `VmManager.sweep()` handles
 each `<data>/vm/jobs/*`. It reads `helper.pid` and, if that pid is alive and is
-a process whose executable is this app's `helperPath()` (contract §1; the same
-pid-reuse checks the runner sweep uses), sends SIGKILL. Then it removes the directory. Leftover
+a process whose executable is this app's `helperPath()` (contract §1 and §5.1:
+the text vnode as lsof names it, not the argv[0] a process gives itself),
+sends SIGKILL. Then it removes the directory. Leftover
 `cache/*/data.img.new` refresh clones are removed too. A VM can never outlive
 the app for more than one launch.
 
