@@ -76,6 +76,13 @@ const isVmError = (err: unknown): err is VmError =>
 /** Thrown inside a boot that stop() cancelled. */
 class Cancelled extends Error {}
 
+/**
+ * Thrown when the guest found the repository's golden disk, cloned for this
+ * VM, corrupt: the golden disk has been discarded, and the VM boots once more
+ * on a blank disk (the design's "Cache disk corruption").
+ */
+class CorruptClone extends Error {}
+
 export interface VmManagerOptions {
   /** <data>, realpathed. */
   dataDir: string;
@@ -150,6 +157,8 @@ class Vm implements VmHandle {
   failed: VmError | undefined;
   /** The data disk's apparent size, promised to this VM. */
   apparentBytes = 0;
+  /** Whether the data disk is a clone of the repository's golden disk. */
+  diskKind: 'clone' | 'blank' = 'blank';
   readonly abort = new AbortController();
   /**
    * The boot stage in progress. A stop abandons it, but it keeps running -
@@ -301,7 +310,21 @@ export class DefaultVmManager implements VmManager {
     let exit: HelperExit | undefined;
     try {
       await this.until(vm, vm.admitted, false);
-      const ready = await this.boot(vm, began);
+      let ready: VmReady;
+      try {
+        ready = await this.boot(vm, began);
+      } catch (err) {
+        if (!(err instanceof CorruptClone)) throw err;
+        this.opts.log('warn', `Docker VM ${vm.vmId}: ${err.message}; it boots again on a blank disk`);
+        await this.until(vm, this.resetForBlankDisk(vm));
+        try {
+          ready = await this.boot(vm, began);
+        } catch (again) {
+          // Once only: a second corrupt disk is a failure like any other.
+          if (again instanceof CorruptClone) throw vmError('configure', 'E_DISK', again.message);
+          throw again;
+        }
+      }
       vm.status = 'ready';
       vm.resolveReady(ready);
       this.startDiskWatch();
@@ -362,7 +385,7 @@ export class DefaultVmManager implements VmManager {
       const sizeGiB = await this.until(vm, this.dataDiskGiB(vm, config));
       vm.apparentBytes = sizeGiB * GiB;
       try {
-        await this.until(vm, this.opts.cacheDisks.prepareJobDisk(req.repoKey, vm.files.dataDisk, sizeGiB));
+        vm.diskKind = await this.until(vm, this.opts.cacheDisks.prepareJobDisk(req.repoKey, vm.files.dataDisk, sizeGiB));
       } catch (err) {
         if (err instanceof Cancelled) throw err;
         throw vmError('disk', 'E_DISK', `could not prepare the VM's data disk: ${(err as Error).message}`);
@@ -449,10 +472,12 @@ export class DefaultVmManager implements VmManager {
     } catch (err) {
       if (err instanceof Cancelled) throw err;
       const code = err instanceof AgentClientError ? err.code : 'E_CONFIGURE';
-      if (code === 'E_DISK' && req.mode === 'job') {
+      if (code === 'E_DISK' && req.mode === 'job' && vm.diskKind === 'clone') {
         // The disk was a clone of the repository's golden disk, which the
-        // guest found corrupt: the cache goes, and the next job starts blank.
+        // guest found corrupt: the cache goes, and this VM, once, and every
+        // later job until the next refresh, starts blank.
         await this.opts.cacheDisks.discard(req.repoKey, 'corrupt').catch(() => {});
+        throw new CorruptClone("the repository's cache disk was corrupt and has been discarded");
       }
       throw vmError('configure', code, (err as Error).message);
     }
@@ -476,6 +501,17 @@ export class DefaultVmManager implements VmManager {
       rosetta: result.rosetta,
       bootMs: Date.now() - began,
     };
+  }
+
+  /** Stop the helper that found the clone corrupt, and empty the VM's directory for a second boot. */
+  private async resetForBlankDisk(vm: Vm): Promise<void> {
+    vm.agentClient?.close();
+    vm.agentClient = null;
+    if (vm.helper && !vm.helper.hasExited()) await vm.helper.stop(0);
+    vm.helper = null;
+    vm.started = undefined;
+    vm.apparentBytes = 0;
+    await fs.promises.rm(vm.files.dir, { recursive: true, force: true });
   }
 
   /** Hello, again and again, until the agent answers or has been silent too long. */

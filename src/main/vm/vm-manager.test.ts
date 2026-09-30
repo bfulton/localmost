@@ -257,10 +257,10 @@ describe('DefaultVmManager', () => {
       expect(vm.failure()!.message).toBe('dockerd: no');
     });
 
-    it('at configure: a corrupt cache disk, which is discarded', async () => {
-      scripts.push({ configure: { error: { code: 'E_DISK', message: 'e2fsck found errors' } } });
+    it('at configure: a blank disk the guest cannot use', async () => {
+      scripts.push({ configure: { error: { code: 'E_DISK', message: 'mke2fs failed' } } });
       await expectFailure(manager().start(jobRequest()), 'configure', 'E_DISK');
-      expect(discarded).toEqual([{ repoKey: '0123456789abcdef', reason: 'corrupt' }]);
+      expect(discarded).toEqual([]);
     });
 
     it('at configure: a firewall self-test that did not pass', async () => {
@@ -284,6 +284,40 @@ describe('DefaultVmManager', () => {
       await new Promise((resolve) => setTimeout(resolve, 200));
       expect(spawned).toBe(1);
     });
+  });
+
+  it('discards a corrupt cache disk and boots once more, on a blank disk', async () => {
+    // The guest could not use the clone of the repository's golden disk: the
+    // golden disk goes, and the job still gets its VM.
+    scripts.push({ configure: { error: { code: 'E_DISK', message: 'e2fsck found errors' } } }, {});
+    const kinds: Array<'clone' | 'blank'> = ['clone', 'blank'];
+    const m = manager();
+    (m as unknown as { opts: VmManagerOptions }).opts.cacheDisks.prepareJobDisk = async (repoKey, dest, sizeGiB) => {
+      prepared.push({ repoKey, dest, sizeGiB });
+      fs.writeFileSync(dest, '');
+      return kinds.shift()!;
+    };
+    const vm = m.start(jobRequest());
+    await expect(vm.ready()).resolves.toMatchObject({ docker: { version: '29.5.3' } });
+    expect(discarded).toEqual([{ repoKey: '0123456789abcdef', reason: 'corrupt' }]);
+    expect(spawned).toBe(2);
+    expect(prepared).toHaveLength(2);
+    expect(logs.some((l) => l.level === 'warn' && /cache disk was corrupt and has been discarded; it boots again on a blank disk/.test(l.message))).toBe(true);
+  });
+
+  it('boots a corrupt clone again only once', async () => {
+    scripts.push(
+      { configure: { error: { code: 'E_DISK', message: 'e2fsck found errors' } } },
+      { configure: { error: { code: 'E_DISK', message: 'e2fsck found errors' } } }
+    );
+    const m = manager();
+    (m as unknown as { opts: VmManagerOptions }).opts.cacheDisks.prepareJobDisk = async (_repoKey, dest) => {
+      fs.writeFileSync(dest, '');
+      return 'clone';
+    };
+    const vm = m.start(jobRequest());
+    expect(await failureOf(vm)).toMatchObject({ stage: 'configure' });
+    expect(spawned).toBe(2);
   });
 
   it('leaves nothing behind when stopped mid-boot', async () => {
