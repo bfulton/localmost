@@ -641,7 +641,7 @@ check.
 | File | Status | Owns |
 |---|---|---|
 | `src/main/docker/docker-backend.ts` | rewritten | The `DockerBackend` and `WorkerDocker` interfaces (below). `DesktopBackend` is deleted. Until then it implements `LegacyDockerBackend`, the stage 1 interface under a new name, which goes with it. |
-| `src/main/vm/vm-backend.ts` | new | `VmBackend implements DockerBackend`: `name = 'vm'`, `supportsPrivileged = false` (owner decision pending; design, Decisions for the owner), `disposable = true`. `workspaceMountRoot` is the same as today's. |
+| `src/main/vm/vm-backend.ts` | new | `VmBackend implements DockerBackend`: `name = 'vm'`, `supportsPrivileged = false` (privileged stays refused, owner decision 2), `disposable = true`. `workspaceMountRoot` is the same as today's. |
 | `src/main/vm/vm-manager.ts` | new | Admission gate, boot, readiness, stop, `sweep()`, `onResume()`, `shutdownAll()`, the spare. |
 | `src/main/vm/helper-client.ts` | new | Spawn through `sandbox-exec`, NDJSON framing, the events and commands of §2.4, exit mapping. |
 | `src/main/vm/helper-profile.ts` | new | `buildHelperProfile()` (§2.5). |

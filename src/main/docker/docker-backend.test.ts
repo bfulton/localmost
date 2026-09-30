@@ -1,5 +1,5 @@
 /**
- * Tests for the DockerBackend seam and its stage 1 implementation.
+ * Tests for the LegacyDockerBackend seam and its stage 1 implementation.
  *
  * The backend is what the filtering socket forwards approved requests to. At
  * stage 1 that is the operator's own daemon, which is why privileged can never
