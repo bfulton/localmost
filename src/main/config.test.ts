@@ -19,7 +19,7 @@ jest.mock('./encryption', () => ({
   decryptValue: (v: string) => v.replace(/^enc:/, ''),
 }));
 
-import { saveConfig, loadConfig, resolveDockerVmConfig, SETTABLE_CONFIG_KEYS } from './config';
+import { saveConfig, loadConfig, resolveDockerVmConfig, DockerVmConfigSource, SETTABLE_CONFIG_KEYS } from './config';
 
 beforeEach(() => {
   if (fs.existsSync(configPath)) fs.rmSync(configPath);
@@ -94,6 +94,36 @@ describe('SETTABLE_CONFIG_KEYS', () => {
 
   it('does not let the renderer set the Docker VM sizes, which config.yaml alone holds', () => {
     expect(SETTABLE_CONFIG_KEYS).not.toContain('dockerVm');
+  });
+});
+
+describe('DockerVmConfigSource', () => {
+  const host = { cores: 8, memoryBytes: 16 * 1024 ** 3 };
+
+  it('reads config.yaml once, and again only when refreshed', () => {
+    let reads = 0;
+    let section: Record<string, unknown> = { cpus: 2 };
+    const source = new DockerVmConfigSource({ read: () => (reads++, section), host, log: () => {} });
+    expect(source.current().cpus).toBe(2);
+    expect(source.current().cpus).toBe(2);
+    expect(reads).toBe(1);
+    section = { cpus: 3 };
+    expect(source.current().cpus).toBe(2);
+    expect(source.refresh().cpus).toBe(3);
+    expect(source.current().cpus).toBe(3);
+    expect(reads).toBe(2);
+  });
+
+  it('logs a clamp once for each value, however often it is read again', () => {
+    const logs: string[] = [];
+    let section: Record<string, unknown> = { cpus: 100 };
+    const source = new DockerVmConfigSource({ read: () => section, host, log: (m) => logs.push(m) });
+    for (let i = 0; i < 5; i++) source.refresh();
+    expect(logs).toEqual(['dockerVm.cpus 100 is outside 1-64; using 64']);
+    section = { cpus: 200 };
+    source.refresh();
+    source.refresh();
+    expect(logs).toEqual(['dockerVm.cpus 100 is outside 1-64; using 64', 'dockerVm.cpus 200 is outside 1-64; using 64']);
   });
 });
 

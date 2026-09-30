@@ -59,7 +59,7 @@ import {
 import { CliServer } from './cli-server';
 
 // Config and security
-import { loadConfig, resolveDockerVmConfig } from './config';
+import { loadConfig, DockerVmConfigSource } from './config';
 import { installSecurityHandlers } from './security';
 import { ensureAppDataDir, getAppDataDir } from './paths';
 
@@ -281,10 +281,13 @@ app.whenReady().then(async () => {
   // booted at the claim of a job whose policy grants Docker, and goes with
   // its worker. Every path is the app's own: <data>, realpathed once, and
   // the helper, guest and CLI in Resources (or the checkout's build/).
-  const dockerVmConfig = () =>
-    resolveDockerVmConfig(loadConfig().dockerVm, { cores: os.cpus().length, memoryBytes: os.totalmem() }, (message) =>
-      logger?.warn(`[docker-vm] ${message}`)
-    );
+  // Read from config.yaml at each worker spawn, and cached in between.
+  const dockerVmConfigSource = new DockerVmConfigSource({
+    read: () => loadConfig().dockerVm,
+    host: { cores: os.cpus().length, memoryBytes: os.totalmem() },
+    log: (message) => logger?.warn(`[docker-vm] ${message}`),
+  });
+  const dockerVmConfig = () => dockerVmConfigSource.current();
   const guestImage = new GuestImage(guestDir());
   const vmLog = (level: 'debug' | 'info' | 'warn' | 'error', message: string) => logger?.[level](`[docker-vm] ${message}`);
   vmManager = new DefaultVmManager({
@@ -370,7 +373,7 @@ app.whenReady().then(async () => {
     // Approved container requests go to the job's own Docker VM. The socket
     // the job sees is localmost's; the VM's is never handed over.
     dockerBackend,
-    getDockerVmConfig: dockerVmConfig,
+    getDockerVmConfig: () => dockerVmConfigSource.refresh(),
     // Apply the policy that was approved, not whatever is in the repository
     // right now. A job only reaches this point once its policy has been
     // approved, and applying the approved copy means an unreviewed change

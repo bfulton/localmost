@@ -142,6 +142,45 @@ const DOCKER_VM_RANGES: Record<Exclude<keyof DockerVmConfig, 'prewarm'>, [number
 };
 
 /**
+ * The `dockerVm` section as the running app reads it: resolved once, and
+ * again only when refresh() is called, at each worker spawn. The VM manager
+ * reads it at every state change and every 10 s while VMs run, and a read of
+ * config.yaml is synchronous file I/O on Electron main. Each warning is
+ * logged once for each distinct text, so a clamped value is reported once,
+ * not at every read.
+ */
+export class DockerVmConfigSource {
+  private cached: DockerVmConfig | undefined;
+  private readonly logged = new Set<string>();
+
+  constructor(
+    private readonly opts: {
+      read: () => AppConfig['dockerVm'] | undefined;
+      host: DockerVmHost;
+      log: (message: string) => void;
+    }
+  ) {}
+
+  current(): DockerVmConfig {
+    this.cached ??= this.resolve();
+    return this.cached;
+  }
+
+  refresh(): DockerVmConfig {
+    this.cached = this.resolve();
+    return this.cached;
+  }
+
+  private resolve(): DockerVmConfig {
+    return resolveDockerVmConfig(this.opts.read(), this.opts.host, (message) => {
+      if (this.logged.has(message)) return;
+      this.logged.add(message);
+      this.opts.log(message);
+    });
+  }
+}
+
+/**
  * The `dockerVm` section of config.yaml as the VM backend uses it. Every key
  * is optional. A value of the wrong type is taken as absent, and one out of
  * range is clamped, each with a line through `log`; keys it does not know
