@@ -816,15 +816,50 @@ packages pinned in the contract:
   §5.2): the spike's `Resolver Start failed` came from the missing `udp`
   match, not from `xt_nat`.
 
+- At integration (2026-09-30, this Mac, outside any job, the merged tree):
+  the guest built twice byte-identical (`build:guest --verify-reproducible`,
+  and identical to WP-A's own build); the helper built with `build:helper`
+  (ad hoc, hardened runtime, only the virtualization entitlement). Through
+  `DefaultVmManager`, `VmBackend` and a real filter socket, driven by the
+  bundled CLI, with the helper under the profile `buildHelperProfile`
+  writes: two job VMs booted at the claim (the erofs root and the data disk
+  under the profile, Rosetta `ok`); the Mac-side puller pulled `alpine:3`
+  (arm64) and `amd64/alpine:3`, which ran as `x86_64` under Rosetta, as did
+  `--platform linux/amd64 alpine:3`; a pull by digest then ran and inspected
+  by that digest; an approved `:ro` workspace bind read, refused writes and
+  kept `nosuid`. G-A: a host-side swap of `-v` sources to links to a victim
+  directory, `/`, `/run` and `/var/run` between create and start, a
+  container accomplice's swap to the same, and a container's own planted
+  link on its second start were all refused; the `--mount` form and a start,
+  swap, restart started on a stale, empty mount (S1(e)) and showed nothing
+  of the victim. A default-bridge container reached a stand-in
+  `ProxyServer` through the relay with the worker's token injected, and
+  nothing else: not the Mac's LAN address, not another port on the relay
+  address or the gateway, no DNS (refused at once); an internal-network
+  container got no proxy settings and could not reach the relay. Two
+  concurrent VMs gave their containers the same address, and neither could
+  reach the other's server; one could not inspect or join the other's
+  network by id. SIGKILL of a helper, and of the process standing in for
+  Electron main, each took the helper and its VZ process down within
+  30 ms; the next manager's sweep removed what the killed process left.
+  Teardown left no VM directory, helper, socket, disk or VZ process. With
+  `CacheDisks` wired as `index.ts` wires it, a job's public pull scheduled a
+  refresh at release; the refresh VM (slot 0, refresh mode) loaded the image
+  from the Mac's store into a blank disk, powered off with `synced: true`,
+  and the disk was promoted; the next job's VM was cloned from it and its
+  pull of the same image reported it already in the VM.
+
 Not yet verified, and owned by work packages:
-- Disks (the erofs root and the data disk) under the helper's profile.
-- The relay end to end through `ProxyServer`.
-- `docker load` of real registry images with gzip and zstd layers.
+- `docker load` of a real registry image with zstd layers, and a private
+  GHCR image with the operator's osxkeychain credentials (the owner).
 - The helper when signed with Developer ID and the hardened runtime and
-  launched from the installed app.
+  launched from the installed app; the §7.4 `codesign` checks on a signed
+  `npm run package` (integration ran it unsigned only: the layout,
+  `LSMinimumSystemVersion` 14.0 and the prePackage checks passed).
+- The golden cache disk and its refresh VM in the installed app, on battery
+  and under memory pressure.
 - Memory with four concurrent VMs (R5).
-- Sleep/wake clock drift and a VM launched by the app using Rosetta. These
-  need the owner at the machine.
+- Sleep/wake clock drift. This needs the owner at the machine.
 
 ## Test strategy
 
