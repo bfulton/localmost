@@ -4,13 +4,15 @@
 // §4.3). It runs on the owner's Mac, outside any localmost job: it boots
 // VMs, which a job's seatbelt profile and hosted CI runners do not allow.
 //
-//   node scripts/guest/build-guest.js [--verify-reproducible] [--force]
+//   node scripts/guest/build-guest.js [--verify-reproducible] [--force] [--write-fixture]
 //
 // The output is cached under a hash of every input (the lock file, guest/,
 // scripts/guest/, and the Go and zlib versions); a second run with the same
 // inputs is a cache hit. --verify-reproducible builds the artifacts a second
 // time from scratch, in the same checkout, and fails unless they are
-// byte-identical. --force ignores the cache.
+// byte-identical. --force ignores the cache. --write-fixture rewrites
+// test/fixtures/vm-guest-daemon-answers.json from the smoke boot's answers,
+// which is the only way that file changes.
 
 const crypto = require('crypto');
 const fs = require('fs');
@@ -30,6 +32,7 @@ const ROOT = path.resolve(__dirname, '..', '..');
 const OUT = path.join(ROOT, 'build', 'guest');
 const CACHE = path.join(ROOT, 'build', 'guest-cache');
 const LOCK = path.join(__dirname, 'packages.lock.json');
+const FIXTURE = path.join(ROOT, 'test', 'fixtures', 'vm-guest-daemon-answers.json');
 
 const GUEST_VERSION = '2026.10.0';
 const DATA_FORMAT = 1;
@@ -370,9 +373,29 @@ function writeOutputs(built, smokeResult, lock) {
   return manifest;
 }
 
+/**
+ * The filter's baseline fixture (test/fixtures/vm-guest-daemon-answers.json)
+ * from a smoke boot's answers and the manifest of the image it booted.
+ */
+function daemonFixture(smokeResult, manifest) {
+  return {
+    comment:
+      'The daemon answers of the guest build smoke boot (scripts/guest/build-guest.js), forwarded unchanged from dockerd ' +
+      'over vsock 2375: /_ping (GET and HEAD), /version and /info, with the Date header dropped. The filter test compares ' +
+      'its synthesised baseline (contract 5.3) with these, field by field, after its /info rewrite. Recorded from guest ' +
+      `${manifest.guestVersion} with rootfs.erofs sha256 ${manifest.artifacts['rootfs.erofs'].sha256}. Written by ` +
+      '`npm run build:guest -- --write-fixture`; do not edit by hand.',
+    guestVersion: manifest.guestVersion,
+    docker: smokeResult.docker,
+    baseline: smokeResult.baseline,
+    answers: smokeResult.answers,
+  };
+}
+
 async function main(argv) {
   const verify = argv.includes('--verify-reproducible');
   const force = argv.includes('--force');
+  const writeFixture = argv.includes('--write-fixture');
   const lock = JSON.parse(fs.readFileSync(LOCK, 'utf8'));
   fs.mkdirSync(CACHE, { recursive: true });
   const key = cacheKey();
@@ -387,6 +410,12 @@ async function main(argv) {
     const outputs = Object.fromEntries(fs.readdirSync(OUT).map((n) => [n, sha256File(path.join(OUT, n))]));
     fs.writeFileSync(path.join(CACHE, 'built.json'), JSON.stringify({ key, outputs }, null, 2) + '\n');
     log(`wrote ${Object.keys(outputs).join(', ')} to ${path.relative(ROOT, OUT)}`);
+  }
+  if (writeFixture) {
+    const smokeResult = JSON.parse(fs.readFileSync(path.join(CACHE, 'smoke.json'), 'utf8'));
+    const manifest = JSON.parse(fs.readFileSync(path.join(OUT, 'manifest.json'), 'utf8'));
+    fs.writeFileSync(FIXTURE, JSON.stringify(daemonFixture(smokeResult, manifest), null, 2) + '\n');
+    log(`wrote ${path.relative(ROOT, FIXTURE)}`);
   }
   if (verify) {
     log('--verify-reproducible: building the artifacts again from scratch');
@@ -406,4 +435,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseCheckConfig, MODULE_ROOTS, GUEST_VERSION };
+module.exports = { parseCheckConfig, daemonFixture, MODULE_ROOTS, GUEST_VERSION };

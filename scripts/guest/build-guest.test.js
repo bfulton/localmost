@@ -1,6 +1,27 @@
 'use strict';
 
-const { parseCheckConfig } = require('./build-guest');
+const { parseCheckConfig, daemonFixture } = require('./build-guest');
+
+describe('daemonFixture', () => {
+  it('records the smoke answers with the image they came from and how to regenerate them', () => {
+    const smoke = {
+      hello: { ok: true },
+      timings: { helloMs: 1 },
+      docker: { engine: '29.5.3', minApiVersion: '1.40' },
+      baseline: { ServerVersion: '29.5.3' },
+      answers: { ping: { status: 200, headers: {}, body: 'OK' } },
+    };
+    const manifest = { guestVersion: '2026.10.0', artifacts: { 'rootfs.erofs': { sha256: 'ab'.repeat(32), size: 1 } } };
+    const f = daemonFixture(smoke, manifest);
+    expect(Object.keys(f)).toEqual(['comment', 'guestVersion', 'docker', 'baseline', 'answers']);
+    expect(f.comment).toContain(`rootfs.erofs sha256 ${'ab'.repeat(32)}`);
+    expect(f.comment).toContain('npm run build:guest -- --write-fixture');
+    expect(f.guestVersion).toBe('2026.10.0');
+    expect(f.docker).toBe(smoke.docker);
+    expect(f.baseline).toBe(smoke.baseline);
+    expect(f.answers).toBe(smoke.answers);
+  });
+});
 
 function report(lines) {
   const flags = Array.from({ length: 24 }, (_, i) => `- CONFIG_FLAG_${i}: enabled`);

@@ -13,7 +13,10 @@ const { writeTar } = require('./tar');
 
 const sha256 = (b) => crypto.createHash('sha256').update(b).digest('hex');
 
-const APPLETS = ['sh', 'cat', 'ls', 'echo', 'sleep', 'ip', 'wget', 'nslookup', 'nc', 'true', 'id', 'mount', 'cp', 'ln', 'rm', 'mkdir', 'stat', 'grep', 'dd', 'uname', 'env', 'printenv', 'hostname'];
+const APPLETS = [
+  'sh', 'cat', 'ls', 'echo', 'sleep', 'ip', 'wget', 'nslookup', 'nc', 'true', 'id', 'mount', 'cp', 'ln', 'rm', 'mkdir',
+  'stat', 'grep', 'dd', 'uname', 'env', 'printenv', 'hostname', 'tr', 'time', 'dmesg', 'chroot', 'kill', 'pidof', 'test', '[',
+];
 
 /** The layer tar: busybox and its applet links, plus any extra files. */
 function layer(busybox, extra = []) {
