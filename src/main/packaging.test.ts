@@ -1,8 +1,9 @@
 /**
  * What the release build ships around the app code: the `localmost` command
- * the app installs, the update manifest a release carries, and the
- * entitlements the app and its helpers are signed with. Nothing here builds
- * or signs anything; each piece is run or loaded as the build would.
+ * the app installs, the update manifest a release carries, the entitlements
+ * the app and its helpers are signed with, and the usage their Info.plist
+ * files declare. Nothing here builds or signs anything; each piece is run or
+ * loaded as the build would.
  */
 
 import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
@@ -320,5 +321,153 @@ describe('the camera helper the app ships', () => {
     const magic = fs.readFileSync(helper).subarray(0, 4).toString('hex');
     expect(magic).toBe('cafebabe');
     expect(fs.statSync(helper).mode & 0o111).not.toBe(0);
+  });
+});
+
+describe('the usage descriptions the app declares', () => {
+  // Electron's template app says why it would use the camera, microphone,
+  // audio capture and Bluetooth. The app is signed without the entitlements
+  // for any of them, so its Info.plist must not claim them either.
+  const readPlist = (file: string) =>
+    JSON.parse(execFileSync('/usr/bin/plutil', ['-convert', 'json', '-o', '-', file], { encoding: 'utf-8' }));
+  const { removeUsageDescriptions, USAGE_DESCRIPTION } = require(path.join(REPO, 'scripts', 'remove-usage-descriptions.js'));
+
+  // What @electron/packager starts from, and so what the app ships unless
+  // something takes the keys out.
+  const TEMPLATE = path.join(REPO, 'node_modules', 'electron', 'dist', 'Electron.app', 'Contents');
+  const ELECTRON_USAGE = [
+    'NSAudioCaptureUsageDescription',
+    'NSBluetoothAlwaysUsageDescription',
+    'NSBluetoothPeripheralUsageDescription',
+    'NSCameraUsageDescription',
+    'NSMicrophoneUsageDescription',
+  ];
+  const usageKeys = (plist: Record<string, unknown>) => Object.keys(plist).filter((key) => USAGE_DESCRIPTION.test(key));
+  const withoutUsage = (plist: Record<string, unknown>) =>
+    Object.fromEntries(Object.entries(plist).filter(([key]) => !USAGE_DESCRIPTION.test(key)));
+
+  const savedEnv = { ...process.env };
+  let scratch: string;
+  let staging: string;
+
+  // A packaged app's layout under root: the app's plist as the template has
+  // it, and a helper's with a usage description added, as packager's
+  // usageDescription option would.
+  const layOut = (root: string) => {
+    const contents = path.join(root, 'localmost.app', 'Contents');
+    fs.mkdirSync(path.join(contents, 'Resources'), { recursive: true });
+    fs.copyFileSync(path.join(TEMPLATE, 'Info.plist'), path.join(contents, 'Info.plist'));
+    const helper = path.join(contents, 'Frameworks', 'localmost Helper.app', 'Contents');
+    fs.mkdirSync(helper, { recursive: true });
+    fs.copyFileSync(
+      path.join(TEMPLATE, 'Frameworks', 'Electron Helper.app', 'Contents', 'Info.plist'),
+      path.join(helper, 'Info.plist'),
+    );
+    execFileSync('/usr/bin/plutil', ['-insert', 'NSCameraUsageDescription', '-string', 'x', path.join(helper, 'Info.plist')]);
+    return { plist: path.join(contents, 'Info.plist'), helper: path.join(helper, 'Info.plist') };
+  };
+
+  beforeEach(() => {
+    scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'usage-descriptions-')));
+    staging = path.join(scratch, 'localmost-darwin-arm64');
+  });
+
+  afterEach(() => {
+    process.env = { ...savedEnv };
+    jest.restoreAllMocks();
+    fs.rmSync(scratch, { recursive: true, force: true });
+  });
+
+  it("removes every usage description from the app's and its helpers' plists, and nothing else", () => {
+    const { plist, helper } = layOut(staging);
+    const before = readPlist(plist);
+    const helperBefore = readPlist(helper);
+    // The template does carry them; otherwise this would prove nothing.
+    expect(usageKeys(before).sort()).toEqual(ELECTRON_USAGE);
+
+    const removed: string[] = removeUsageDescriptions(staging);
+
+    expect(readPlist(plist)).toEqual(withoutUsage(before));
+    expect(readPlist(helper)).toEqual(withoutUsage(helperBefore));
+    expect(removed).toHaveLength(ELECTRON_USAGE.length + 1);
+  });
+
+  it('leaves a plist reached through a link alone', () => {
+    layOut(staging);
+    const outside = path.join(scratch, 'outside');
+    const { plist } = layOut(outside);
+    fs.symlinkSync(path.join(outside, 'localmost.app'), path.join(staging, 'localmost.app', 'Contents', 'Linked.app'));
+    const before = fs.readFileSync(plist);
+
+    removeUsageDescriptions(staging);
+
+    expect(fs.readFileSync(plist)).toEqual(before);
+  });
+
+  it('fails when there is no app to edit, rather than letting the strings ship', () => {
+    fs.mkdirSync(staging);
+    expect(() => removeUsageDescriptions(staging)).toThrow(/No app bundle/);
+  });
+
+  it('runs in the installed packager after the plists are written and before the app is signed', async () => {
+    // A real MacApp from the installed @electron/packager, given the forge
+    // config's packager options, with every step stubbed but the one that
+    // runs the hook: copyExtraResources. The plist the signing step sees is
+    // the one the signature covers.
+    process.env.APPLE_IDENTITY = '-';
+    process.env.RELEASE_BUILD = 'false';
+    jest.spyOn(console, 'log').mockImplementation(() => {});
+    let packagerConfig: Record<string, unknown> = {};
+    jest.isolateModules(() => {
+      packagerConfig = require(path.join(REPO, 'forge.config.js')).packagerConfig;
+    });
+    const extra = path.join(scratch, 'extra-resource');
+    fs.writeFileSync(extra, 'x');
+
+    const { MacApp } = require(path.join(REPO, 'node_modules', '@electron', 'packager', 'dist', 'mac'));
+    const macApp = new MacApp(
+      { ...packagerConfig, extraResource: [extra], platform: 'darwin', arch: 'arm64', out: scratch, tmpdir: false },
+      path.join(scratch, 'template'),
+    );
+    const steps: string[] = [];
+    let plist = '';
+    let atSigning: Record<string, unknown> | undefined;
+    const step = (name: string, run: () => void = () => {}) => async () => {
+      steps.push(name);
+      run();
+    };
+    Object.assign(macApp, {
+      initialize: step('initialize'),
+      // Where packager writes the plists: the template's keys and all.
+      updatePlistFiles: step('updatePlistFiles', () => {
+        plist = layOut(staging).plist;
+      }),
+      copyIcon: step('copyIcon'),
+      renameElectron: step('renameElectron'),
+      renameAppAndHelpers: step('renameAppAndHelpers'),
+      signAppIfSpecified: step('sign', () => {
+        atSigning = readPlist(plist);
+      }),
+      notarizeAppIfSpecified: step('notarize'),
+      move: step('move'),
+    });
+
+    await macApp.create();
+
+    expect(steps).toEqual([
+      'initialize',
+      'updatePlistFiles',
+      'copyIcon',
+      'renameElectron',
+      'renameAppAndHelpers',
+      'sign',
+      'notarize',
+      'move',
+    ]);
+    // copyExtraResources ran for real, and the hook after it.
+    expect(fs.readFileSync(path.join(staging, 'localmost.app', 'Contents', 'Resources', 'extra-resource'), 'utf-8')).toBe('x');
+    expect(atSigning).toBeDefined();
+    expect(usageKeys(atSigning!)).toEqual([]);
+    expect(atSigning!.NSPrincipalClass).toBe('AtomApplication');
   });
 });

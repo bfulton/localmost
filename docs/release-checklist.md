@@ -34,6 +34,7 @@
 - [ ] `codesign -d --entitlements -` on each of these (both arches, under `build/out/localmost-darwin-<arch>/localmost.app`) lists only the keys shown, and no `device.*`, `personal-information.*` or `app-sandbox` key:
   - the app, and `Contents/Frameworks/localmost Helper (GPU).app`: only `com.apple.security.cs.allow-jit`
   - `Contents/Frameworks/localmost Helper (Plugin).app`: only `com.apple.security.cs.allow-unsigned-executable-memory` and `com.apple.security.cs.disable-library-validation`
+- [ ] `plutil -p Contents/Info.plist` on each arch's app shows no `UsageDescription` key, and `codesign --verify --deep --strict --verbose=2` on the app passes (the plist is edited before signing, so the signature must cover it)
 - [ ] `node scripts/generate-latest-mac-yml.js`
   - Needs both arches made; copies each arch's update zip to `build/out/make/localmost-X.Y.Z-<arch>-mac.zip`
   - Verify `latest-mac.yml` lists both `-mac.zip` files and `path:` names a zip (the in-app updater installs only from a zip)
