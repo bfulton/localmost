@@ -108,6 +108,9 @@ jobs:
   # virtualization, so VM tests run on the owner's Mac.
   native:
     runs-on: macos-latest
+    # hdiutil in the share tests, or a helper that never exits in the
+    # binary tests, would otherwise hold a hosted runner for six hours.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
