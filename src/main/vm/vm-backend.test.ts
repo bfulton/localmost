@@ -81,6 +81,9 @@ class FakeManager implements VmManager {
   vms: FakeVm[] = [];
   claimed: string[] = [];
   start(req: VmRequest): VmHandle {
+    // As DefaultVmManager: one spare at a time.
+    const live = (v: FakeVm) => v.request.spare && !this.claimed.includes(v.vmId) && v.status !== 'stopped' && v.status !== 'failed';
+    if (req.spare && this.vms.some(live)) throw new Error('there is already a spare Docker VM');
     const vm = new FakeVm(`${req.slot}-${(this.vms.length + 1).toString(16).padStart(12, '0')}`, req);
     this.vms.push(vm);
     return vm;
@@ -261,6 +264,28 @@ describe('VmBackend', () => {
       const w = worker({ spawnRepository: undefined });
       w.prewarm();
       expect(manager.vms).toHaveLength(0);
+    });
+
+    it("is not booted for a second worker while the first's lives, which leaves that worker open", async () => {
+      const first = worker();
+      const second = worker({ slot: 4, sandboxId: '4-abcdef012345' });
+      first.prewarm();
+      second.prewarm();
+      expect(manager.vms).toHaveLength(1);
+      expect(logs).toContainEqual({ level: 'debug', message: 'No spare Docker VM for this worker: there is already a spare Docker VM' });
+      // The second worker still boots its job's VM at the claim.
+      second.bind('owner/repo', grants);
+      expect(manager.vms).toHaveLength(2);
+      expect(manager.vms[1].request).toMatchObject({ slot: 4, repository: 'owner/repo' });
+      expect(manager.vms[1].request.spare).toBeUndefined();
+    });
+
+    it('is stopped when the claim leaves the socket closed', () => {
+      const w = worker();
+      w.prewarm();
+      w.dropSpare('the claim is for someone/else, so the socket stays closed');
+      w.dropSpare('again');
+      expect(manager.vms[0].stops).toEqual(['the claim is for someone/else, so the socket stays closed']);
     });
 
     it('is replaced by a fresh boot when it was stopped before the claim', () => {

@@ -758,8 +758,14 @@ export interface WorkerDocker {
    *  - Any bind after release() has started: records nothing, boots nothing.
    */
   bind(repository: string, policy: DockerPolicy): void;
-  /** When the worker is spawned and dockerVm.prewarm is on. */
+  /** When the worker is spawned and dockerVm.prewarm is on. Boots none while another worker's spare lives. */
   prewarm(): void;
+  /**
+   * At a claim that leaves the socket closed (a job of another repository
+   * than the spawn's, or a policy that drifted): stop the spare, if any.
+   * The filter's staysClosed(reason) calls it.
+   */
+  dropSpare(reason: string): void;
   /** The VM's docker.sock once ready. Waits while it boots, up to timeoutMs. */
   endpoint(timeoutMs: number): Promise<EndpointState>;
   /** A VM is ready right now: the baseline is forwarded, not synthesised. */
@@ -972,7 +978,7 @@ builds) with loading disabled, and adds a root for each `modprobe` failure in
 | `startDockerProxy` | `new DockerFilterProxy({ backend, worker: backend.forWorker({ slot, sandboxDir, sandboxId, shareNonce, spawnRepository, proxy, log }), … })`. Then, if `config.dockerVm.prewarm`, `worker.prewarm()`. |
 | Job env | Keep `DOCKER_HOST` and `DOCKER_BUILDKIT=0`. Add `DOCKER_CONFIG=<sandbox>/.docker`, an empty directory made by `buildSandbox`, so the CLI reads no operator config. Prepend `dirname(<docker-cli>)` to `PATH`. |
 | Profile | `spawnSandboxed(…, { shareDir: <sandbox>/_work, dockerCli: <docker-cli>, vmHelper: <helper> })` |
-| `bindDockerSocket` (the claim) | Unchanged. `socket.bind()` now calls `worker.bind()`, which boots only on the first bind with grants (§5.1). It is reached from `onJobAcquired` → `applyPolicyForTarget` and again from `applyRepoPolicy` at the "Running job" line; `startInstance` can also reach a previous spawn's socket while its un-awaited `stopDockerProxy` is still running. vm-backend tests cover a double bind and a bind while stopping. |
+| `bindDockerSocket` (the claim) | `socket.bind()` now calls `worker.bind()`, which boots only on the first bind with grants (§5.1). Where the socket stays closed (the claim is not for the spawn repository, or the policy drifted), `socket.staysClosed(reason)` calls `worker.dropSpare(reason)`, so a spare that no job of this worker will use is stopped at the claim, not at the worker's exit. It is reached from `onJobAcquired` → `applyPolicyForTarget` and again from `applyRepoPolicy` at the "Running job" line; `startInstance` can also reach a previous spawn's socket while its un-awaited `stopDockerProxy` is still running. vm-backend tests cover a double bind and a bind while stopping. |
 | `stopDockerProxy` (worker exit, reap, app stop) | Unchanged. `socket.stop()` now releases the VM. |
 | App start (`index.ts`) | `await vmManager.sweep()` before the pool's first spawn. |
 | App quit | `await vmManager.shutdownAll()`: every helper is stopped with `graceMs: 0` and awaited, 10 s at most. |

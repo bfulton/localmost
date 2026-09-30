@@ -94,6 +94,11 @@ export interface WorkerDocker {
   bind(repository: string, policy: DockerPolicy): void;
   /** When the worker is spawned and dockerVm.prewarm is on. */
   prewarm(): void;
+  /**
+   * At a claim that leaves the socket closed (a job of another repository
+   * than the spawn's): the spare, if any, is of no use and is stopped.
+   */
+  dropSpare(reason: string): void;
   /** The VM's docker.sock once ready. Waits while it boots, up to timeoutMs. */
   endpoint(timeoutMs: number): Promise<EndpointState>;
   /** A VM is ready right now: the baseline is forwarded, not synthesised. */
@@ -206,6 +211,7 @@ export class DesktopBackend implements DockerBackend, LegacyDockerBackend {
     return {
       bind: () => {},
       prewarm: () => {},
+      dropSpare: () => {},
       endpoint: async () => {
         const found = endpoint();
         return found ? { kind: 'ready', socketPath: found.socketPath } : { kind: 'none', reason: NO_DAEMON_MESSAGE };

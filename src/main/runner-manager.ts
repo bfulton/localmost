@@ -2756,6 +2756,7 @@ export class RunnerManager {
       instance.policyDrifted = true;
       this.closeProxyPolicy(proxy);
       proxy.setPolicyDeniedHosts(policy.deniedHosts ?? []);
+      this.dockerProxies.get(instanceNum)?.staysClosed("the repository's policy changed since this worker started, so the Docker socket stays closed");
       this.log(
         'warn',
         `[instance ${instanceNum}] ${repository} policy changed since this worker started; running with runner infrastructure only and retiring the worker`
@@ -2802,6 +2803,7 @@ export class RunnerManager {
         'warn',
         `[instance ${instanceNum}] Docker socket stays closed: spawned for ${spawnedFor ?? 'no job'}, claimed ${claimedFor}, policy is for ${repository}`
       );
+      socket.staysClosed(`the claim is for ${claimedFor}, not ${spawnedFor ?? 'no job'}, so the Docker socket stays closed`);
       return;
     }
     socket.bind(repository, docker);

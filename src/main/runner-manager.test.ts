@@ -73,6 +73,7 @@ jest.mock('./docker/docker-filter-proxy', () => ({
         repository = repo;
       }),
       boundRepository: jest.fn(() => repository),
+      staysClosed: jest.fn(),
     };
   }),
 }));
@@ -121,6 +122,7 @@ interface DockerSocketStub {
   stop: jest.Mock;
   bind: jest.Mock;
   boundRepository: () => string | undefined;
+  staysClosed: jest.Mock;
 }
 const dockerSocketOf = (helper: RunnerManagerTestHelper, instanceNum: number): DockerSocketStub =>
   helper.dockerProxy(instanceNum) as DockerSocketStub;
@@ -3052,6 +3054,8 @@ describe('RunnerManager', () => {
 
       expect(socket.bind).not.toHaveBeenCalled();
       expect(socket.boundRepository()).toBeUndefined();
+      // Its spare, booted for owner/repo, is stopped at the claim.
+      expect(socket.staysClosed).toHaveBeenCalledWith('the claim is for other/repo, not owner/repo, so the Docker socket stays closed');
     });
 
     it('stops the docker socket when the worker exits', async () => {
@@ -3312,7 +3316,7 @@ describe('a worker constrained by policy drift stays constrained', () => {
       setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(),
       setPolicyLevel: jest.fn(), getStats: jest.fn(), getPolicyLevel: jest.fn(),
     };
-    const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn() };
+    const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn(), staysClosed: jest.fn() };
     helper.setProxy(1, proxy);
     helper.setDockerProxy(1, dockerSocket);
     // A stamp that cannot match the policy above: the approved policy moved
@@ -3327,6 +3331,7 @@ describe('a worker constrained by policy drift stays constrained', () => {
     await helper.applyPolicyOnClaim(1, 'owner/repo', 'abc1234');
     expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith([]);
     expect(dockerSocket.bind).not.toHaveBeenCalled();
+    expect(dockerSocket.staysClosed).toHaveBeenCalledWith(expect.stringMatching(/policy changed since this worker started/));
 
     // The job-start refresh must not undo that. It runs without isClaim, so it
     // never re-checks drift, and it used to fall straight through to widening.
@@ -3368,7 +3373,7 @@ describe('a worker nobody spawned for a job', () => {
       getRepoPolicy: async () => ({ hosts: ['example.com'], level: 'strict' as const, readPaths: [], writePaths: [], docker }),
     });
     const helper = new RunnerManagerTestHelper(manager);
-    const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn() };
+    const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn(), staysClosed: jest.fn() };
     helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel: jest.fn() });
     helper.setDockerProxy(1, dockerSocket);
     helper.setInstance(1, { name: 'runner-1', status: 'listening' });
@@ -3385,7 +3390,7 @@ describe('a worker nobody spawned for a job', () => {
       getRepoPolicy: async () => ({ hosts: [], level: 'strict' as const, readPaths: [], writePaths: [], docker }),
     });
     const helper = new RunnerManagerTestHelper(manager);
-    const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn() };
+    const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn(), staysClosed: jest.fn() };
     helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel: jest.fn() });
     helper.setDockerProxy(1, dockerSocket);
     helper.setInstance(1, { name: 'runner-1', status: 'listening' });

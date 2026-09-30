@@ -313,6 +313,15 @@ export class DockerFilterProxy {
     this.worker.bind(repository, policy);
   }
 
+  /**
+   * A claim this socket stays closed for - a job of another repository than
+   * the spawn's, or a policy that drifted - so nothing is bound, and the
+   * worker stops its spare, which no job of this worker will use.
+   */
+  staysClosed(reason: string): void {
+    this.worker.dropSpare(reason);
+  }
+
   /** The repository this socket is bound to, or undefined while it denies all. */
   boundRepository(): string | undefined {
     return this.repository;

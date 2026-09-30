@@ -97,7 +97,7 @@ import { helperPath, HELPER_OVERRIDE_ENV } from './vm/paths';
 import { DefaultVmManager } from './vm/vm-manager';
 import { VmBackend } from './vm/vm-backend';
 import type { DockerVmConfig } from './config';
-import type { CacheDisks, ImagePuller } from './vm/types';
+import type { CacheDisks, ImagePuller, VmHandle } from './vm/types';
 import type { LogEntry } from '../shared/types';
 import { createMockProcess, RunnerManagerTestHelper } from './test-utils';
 import { FAKE_HELPER, shortTempDir, writeGuest } from './test-utils/vm-fixtures';
@@ -309,9 +309,12 @@ describe('a docker job on the VM backend, through the runner', () => {
       excludeFromBackup: async () => {},
     });
     const start = vmManager.start.bind(vmManager);
+    const handles: VmHandle[] = [];
     vmManager.start = (req) => {
       started.push({ spare: req.spare, repository: req.repository });
-      return start(req);
+      const handle = start(req);
+      handles.push(handle);
+      return handle;
     };
     const backend = new VmBackend({
       vmManager,
@@ -355,11 +358,15 @@ describe('a docker job on the VM backend, through the runner', () => {
     expect(logs.some((l) => /\(the spare\) is the job's, for owner\/repo/.test(l.message))).toBe(true);
     await exit(same);
     // A claim the runner routes elsewhere never opens the socket (the runner
-    // binds only the spawn repository), so the spare boots and is never
-    // adopted - it is stopped with the worker.
+    // binds only the spawn repository), so the spare is never adopted: it is
+    // stopped at the claim, not left holding a slot until the worker exits.
     started.length = 0;
     const other = await run('someone/else');
     expect(started).toEqual([{ spare: true, repository: 'owner/repo' }]);
+    const spare = handles.at(-1)!;
+    await spare.stopped();
+    // Stopping if it had been admitted, leaving the queue if not: either way, for the claim.
+    expect(logs.some((l) => l.message.includes(`Docker VM ${spare.vmId}`) && l.message.includes('the claim is for someone/else, not owner/repo'))).toBe(true);
     expect(logs.filter((l) => /\(the spare\) is the job's/.test(l.message))).toHaveLength(1);
     await exit(other);
   }, 120_000);

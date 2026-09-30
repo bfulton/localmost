@@ -112,9 +112,9 @@ class VmWorker implements WorkerDocker {
     };
   }
 
-  private boot(repository: string, spare = false): VmHandle | null {
+  private boot(repository: string): VmHandle | null {
     try {
-      const vm = this.opts.vmManager.start(this.jobRequest(repository, spare));
+      const vm = this.opts.vmManager.start(this.jobRequest(repository));
       vm.ready().then(
         (ready) => {
           if (this.vm === vm) this.readyInfo = ready;
@@ -175,8 +175,19 @@ class VmWorker implements WorkerDocker {
 
   prewarm(): void {
     if (this.releasing || this.closed || this.vm || this.spare || !this.ctx.spawnRepository) return;
-    this.spare = this.boot(this.ctx.spawnRepository, true);
-    if (this.spare) this.log('debug', `Docker VM ${this.spare.vmId} booting as the spare for ${this.ctx.spawnRepository}`);
+    try {
+      // Not through boot(): a spare refused - there is one already, for
+      // another worker - leaves this worker as it was, open for its claim.
+      this.spare = this.opts.vmManager.start(this.jobRequest(this.ctx.spawnRepository, true));
+    } catch (err) {
+      this.log('debug', `No spare Docker VM for this worker: ${(err as Error).message}`);
+      return;
+    }
+    this.log('debug', `Docker VM ${this.spare.vmId} booting as the spare for ${this.ctx.spawnRepository}`);
+  }
+
+  dropSpare(reason: string): void {
+    this.stopSpare(reason);
   }
 
   /** Why a VM that failed failed, as the job's 503 says it. */

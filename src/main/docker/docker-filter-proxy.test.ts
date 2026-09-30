@@ -84,6 +84,7 @@ const backendWith = (
   const worker: WorkerDocker = {
     bind: (repository, policy) => calls.binds.push({ repository, policy }),
     prewarm: () => {},
+    dropSpare: () => {},
     endpoint: async () => (endpoint ? { kind: 'ready', socketPath: endpoint } : { kind: 'none', reason: 'no Docker daemon is available to this job' }),
     running: () => endpoint !== null,
     baseline: () => ({ status: 503, headers: { 'Content-Type': 'application/json' }, body: { message: 'no Docker daemon is available to this job' } }),
