@@ -149,7 +149,17 @@ test.describe('a job using docker through the filtering socket', () => {
       socketPath = path.join(scratch, 'docker.sock');
       const captured: DockerFilterProxyLogEntry[] = [];
       logs = captured;
-      proxy = new DockerFilterProxy({ backend, onLog: (entry) => captured.push(entry) });
+      // The worker the runner would make for this socket; the desktop one
+      // forwards to the operator's daemon, and pulls through it.
+      const worker = backend.forWorker({
+        slot: 1,
+        sandboxDir: scratch,
+        sandboxId: '1-000000000000',
+        shareNonce: '',
+        proxy: () => ({ port: 0, url: '' }),
+        log: () => {},
+      });
+      proxy = new DockerFilterProxy({ backend, worker, onLog: (entry) => captured.push(entry) });
       await proxy.start(socketPath);
       proxy.bind(REPOSITORY, policy);
     }
@@ -208,7 +218,10 @@ test.describe('a job using docker through the filtering socket', () => {
     // through the runner's filter.
     if (logs) {
       const since = logsSince(at);
-      expect(since.some((l) => /forwarded POST \/images\/create/.test(l.message))).toBe(true);
+      // A pull is never forwarded: the worker pulls it (the desktop one
+      // through the daemon, the VM one on the Mac).
+      expect(since.some((l) => /pulled POST \/images\/create through the worker/.test(l.message))).toBe(true);
+      expect(since.some((l) => /forwarded POST \/images\/create/.test(l.message))).toBe(false);
       expect(since.some((l) => /forwarded POST \/containers\/create/.test(l.message))).toBe(true);
       expect(since.filter((l) => /^(denied|refused) /.test(l.message))).toEqual([]);
     }

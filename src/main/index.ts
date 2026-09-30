@@ -3,10 +3,17 @@
  * Orchestrates app lifecycle and initializes all modules.
  */
 
-import { app, BrowserWindow, Notification } from 'electron';
+import { app, BrowserWindow, Notification, powerMonitor } from 'electron';
+import * as fs from 'fs';
+import * as os from 'os';
 import * as nodePath from 'path';
 import { RunnerManager, JobEvent } from './runner-manager';
-import { DesktopBackend } from './docker/docker-backend';
+import { VmBackend } from './vm/vm-backend';
+import { DefaultVmManager } from './vm/vm-manager';
+import { GuestImage } from './vm/guest-image';
+import { getVmResourcesDir, guestDir, helperPath } from './vm/paths';
+import type { CacheDisks, ImagePuller } from './vm/types';
+import { MemoryPressureMonitor } from './resource-monitor/memory-pressure-monitor';
 import { GitHubAuth } from './github-auth';
 import { RunnerDownloader } from './runner-downloader';
 import { HeartbeatManager, toHeartbeatTarget } from './heartbeat-manager';
@@ -52,9 +59,9 @@ import {
 import { CliServer } from './cli-server';
 
 // Config and security
-import { loadConfig } from './config';
+import { loadConfig, DockerVmConfigSource } from './config';
 import { installSecurityHandlers } from './security';
-import { ensureAppDataDir } from './paths';
+import { ensureAppDataDir, getAppDataDir } from './paths';
 
 // Logging
 import { initLogFile } from './log-file';
@@ -104,7 +111,6 @@ import {
 
 // Zustand store
 import { initStore, connectWindow, cleanupStore, store } from './store/init';
-import { resolveRegistryAuth } from './docker/registry-auth';
 import {
   decidePolicyForJob,
   recordPendingPolicy,
@@ -171,6 +177,40 @@ const repoPolicyApproval: PolicyApprovalDeps = {
   decidePolicyForJob,
   recordPendingPolicy,
   announce: (request) => getLogger()?.warn(formatApprovalRequest(request)),
+};
+
+/** The per-job Docker VMs, and the monitor that holds their boots back under memory pressure. */
+let vmManager: DefaultVmManager | null = null;
+let memoryPressureMonitor: MemoryPressureMonitor | null = null;
+
+/**
+ * Until the Mac-side puller and the cache disks (work package D) are merged:
+ * a pull is refused with a message, and every job's data disk starts blank.
+ * The integration replaces both with the real ImagePuller and CacheDisks.
+ *
+ * So a build from before that integration, which also has no packaged
+ * helper or guest (work package F), gives every docker job a 503 or a
+ * refused pull: it must not be installed on a runner that serves docker
+ * jobs, the owner's CI runner included.
+ */
+const pullerUntilMerged: ImagePuller = {
+  pull: async () => {
+    throw new Error('pulling images on the Mac is not part of this build yet');
+  },
+};
+const cacheDisksUntilMerged: CacheDisks = {
+  prepareJobDisk: async (_repoKey, dest, sizeGiB) => {
+    const file = await fs.promises.open(dest, 'wx', 0o600);
+    try {
+      await file.truncate(sizeGiB * 1024 ** 3);
+    } finally {
+      await file.close();
+    }
+    return 'blank';
+  },
+  notePulled: () => {},
+  scheduleRefresh: () => {},
+  discard: async () => {},
 };
 
 app.whenReady().then(async () => {
@@ -242,12 +282,48 @@ app.whenReady().then(async () => {
   // Contributor cache for user filtering
   const contributorCache = new ContributorCache(githubAuth, (msg) => logger?.debug(msg));
 
+  // The per-job Docker VMs (docs/roadmap/vm-docker-backend.md). One is
+  // booted at the claim of a job whose policy grants Docker, and goes with
+  // its worker. Every path is the app's own: <data>, realpathed once, and
+  // the helper, guest and CLI in Resources (or the checkout's build/).
+  // Read from config.yaml at each worker spawn, and cached in between.
+  const dockerVmConfigSource = new DockerVmConfigSource({
+    read: () => loadConfig().dockerVm,
+    host: { cores: os.cpus().length, memoryBytes: os.totalmem() },
+    log: (message) => logger?.warn(`[docker-vm] ${message}`),
+  });
+  const dockerVmConfig = () => dockerVmConfigSource.current();
+  const guestImage = new GuestImage(guestDir());
+  const vmLog = (level: 'debug' | 'info' | 'warn' | 'error', message: string) => logger?.[level](`[docker-vm] ${message}`);
+  vmManager = new DefaultVmManager({
+    dataDir: fs.realpathSync(getAppDataDir()),
+    resources: getVmResourcesDir(),
+    helperPath,
+    guest: guestImage,
+    config: dockerVmConfig,
+    cacheDisks: cacheDisksUntilMerged,
+    log: vmLog,
+  });
+  // Before any worker exists: whatever an earlier run left - a helper still
+  // running, a VM's directory, an unfinished refresh disk - goes first.
+  await vmManager.sweep().catch((err: Error) => logger?.warn(`[docker-vm] Startup sweep failed: ${err.message}`));
+  const dockerBackend = new VmBackend({
+    vmManager,
+    guest: guestImage,
+    puller: pullerUntilMerged,
+    cacheDisks: cacheDisksUntilMerged,
+    config: dockerVmConfig,
+  });
+  // VZ has no Linux time sync, and a VM's clock stops while the Mac sleeps.
+  powerMonitor.on('resume', () => vmManager?.onResume());
+  memoryPressureMonitor = new MemoryPressureMonitor({
+    onChange: (level) => vmManager?.onMemoryPressure(level),
+    log: (level, message) => vmLog(level, message),
+  });
+  memoryPressureMonitor.start();
+
   const runnerManager = new RunnerManager({
     onLog: sendLog,
-    // Resolved here, in the app, where ~/.docker is readable. The job never
-    // sees a credential: the filtering socket attaches this to a pull the
-    // policy already permits, so naming a registry is the whole grant.
-    attachRegistryAuth: (registry: string) => resolveRegistryAuth(registry),
     onStatusChange: sendStatusUpdate,
     onJobHistoryUpdate: sendJobHistoryUpdate,
     // Bind this job to the worker being spawned for it, by its slot (the
@@ -299,9 +375,10 @@ app.whenReady().then(async () => {
     getJobTarget: (instanceNum: number, jobId: string) => brokerProxyService.getJobTargetForWorker(instanceNum, jobId),
     // The one loopback port every worker's proxy keeps open.
     getBrokerPort: () => brokerProxyService.getPort(),
-    // Stage 1: approved container requests go to the operator's own daemon.
-    // The socket the job sees is localmost's; the daemon's is never handed over.
-    dockerBackend: new DesktopBackend(),
+    // Approved container requests go to the job's own Docker VM. The socket
+    // the job sees is localmost's; the VM's is never handed over.
+    dockerBackend,
+    getDockerVmConfig: () => dockerVmConfigSource.refresh(),
     // Apply the policy that was approved, not whatever is in the repository
     // right now. A job only reaches this point once its policy has been
     // approved, and applying the approved copy means an unreviewed change
@@ -762,6 +839,10 @@ app.on('before-quit', async (event) => {
         // unref'd timer that will not fire once we quit, so finish those now -
         // after this point nothing is left to reap them.
         finishPendingSweeps();
+        // Each worker's socket released its VM as it stopped; this stops what
+        // is left - a spare, a cache refresh - bounded at 10 s.
+        memoryPressureMonitor?.stop();
+        await vmManager?.shutdownAll();
       })(),
     ]);
 
@@ -811,6 +892,8 @@ process.on('SIGINT', async () => {
       const runningJobs = runnerManager?.getJobHistory().filter(j => j.status === 'running') || [];
       await cancelJobsOnOurRunners(runningJobs);
       await runnerManager?.stop();
+      memoryPressureMonitor?.stop();
+      await vmManager?.shutdownAll();
     })(),
   ]);
 

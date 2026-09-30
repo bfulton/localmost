@@ -17,9 +17,9 @@ import * as net from 'net';
 import * as path from 'path';
 import * as zlib from 'zlib';
 import { DockerPolicy } from '../../shared/docker-policy';
-import { LegacyDockerBackend } from './docker-backend';
+import { ApprovedBind, DockerBackend, DockerProgress, NO_DAEMON_MESSAGE, WorkerDocker } from './docker-backend';
 import { DockerAction, DockerRequest, classifyDockerRequest, containerIdFrom, networkIdFrom, parseDockerRequest } from './docker-request';
-import { evaluateDockerRequest, registryOf } from './docker-evaluator';
+import { evaluateDockerRequest, pullRequestOf } from './docker-evaluator';
 
 export interface DockerFilterProxyLogEntry {
   level: 'info' | 'warn' | 'debug';
@@ -29,14 +29,16 @@ export interface DockerFilterProxyLogEntry {
 }
 
 export interface DockerFilterProxyOptions {
-  backend: LegacyDockerBackend;
+  backend: DockerBackend;
+  /** This worker's daemon: its VM, its pulls, its approvals. From backend.forWorker. */
+  worker: WorkerDocker;
   onLog?: (entry: DockerFilterProxyLogEntry) => void;
   /** Oldest API version forwarded. Default v1.24. */
   minApiVersion?: string;
   /** Newest API version forwarded, and the one the job is told to negotiate to. Default v1.45. */
   maxApiVersion?: string;
-  /** The X-Registry-Auth value to attach to a pull from a registry, if any. */
-  attachRegistryAuth?: (registry: string) => string | undefined;
+  /** How long a request waits for the job's VM to be ready. Default 60 s (dockerVm.bootTimeoutSec). */
+  bootTimeoutMs?: number;
   /** Injected for tests; defaults to fs.realpathSync. */
   realpath?: (p: string) => string;
   /** How long one removal waits for the daemon when the socket stops. Injected for tests; default 10s. */
@@ -88,7 +90,29 @@ const INFO_FIELDS: ReadonlySet<string> = new Set([
  */
 const MAX_INFO_BYTES = 1024 * 1024;
 
-const NO_DAEMON_MESSAGE = 'no Docker daemon is available to this job';
+/**
+ * Every daemon answer the filter holds to parse - a create, a network create,
+ * /version, /info - is capped at this. With guest root, dockerd's answers are
+ * the job's to choose, and Electron main is shared by every job.
+ */
+const MAX_DAEMON_ANSWER_BYTES = MAX_JSON_BODY_BYTES;
+
+const OVERSIZED_ANSWER_MESSAGE = 'the Docker VM sent an oversized answer';
+
+const APPROVAL_FAILED_MESSAGE = "could not register the approved binds with the job's Docker VM";
+
+const DEFAULT_BOOT_TIMEOUT_MS = 60_000;
+
+/** A container id as the daemon assigns one. */
+const CONTAINER_ID_RE = /^[0-9a-f]{64}$/;
+/** A network's id is the same form. */
+const NETWORK_ID_RE = CONTAINER_ID_RE;
+
+/**
+ * A build that failed looking up a registry: the classic builder pulling a
+ * FROM image from inside the VM, which reaches no registry.
+ */
+const REGISTRY_LOOKUP_FAILURE = /lookup [^\s"]+ on 198\.18\.0\.1|dial tcp: lookup [^\s"]+|no such host/;
 
 /**
  * How long one removal may take when the socket stops. A forced remove kills
@@ -203,12 +227,15 @@ export class DockerFilterProxy {
   /** Networks created through this socket, by id and by the name the job asked for. */
   private readonly ownNetworkIds = new Set<string>();
   private readonly ownNetworkAliases = new Map<string, string>();
+  /** The ids of owned networks created internal: no proxy is injected into their containers. */
+  private readonly internalNetworkIds = new Set<string>();
   private repository: string | undefined;
-  private readonly backend: LegacyDockerBackend;
+  private readonly backend: DockerBackend;
+  private readonly worker: WorkerDocker;
   private readonly onLog: (entry: DockerFilterProxyLogEntry) => void;
   private readonly minApiVersion: ApiVersion;
   private readonly maxApiVersion: ApiVersion;
-  private readonly attachRegistryAuth?: (registry: string) => string | undefined;
+  private readonly bootTimeoutMs: number;
   private readonly realpath: (p: string) => string;
   private readonly removeTimeoutMs: number;
   private readonly connections: Set<net.Socket> = new Set();
@@ -221,18 +248,20 @@ export class DockerFilterProxy {
    */
   private readonly upstreamAgent = new http.Agent({ keepAlive: false });
   private warnedNoDaemon = false;
+  private warnedBaseImage = false;
   /** The stop in progress, so a second caller waits for the same removals. */
   private stopping: Promise<void> | null = null;
 
   constructor(options: DockerFilterProxyOptions) {
     this.backend = options.backend;
+    this.worker = options.worker;
     this.onLog = options.onLog ?? (() => {});
     this.minApiVersion = parseApiVersion(options.minApiVersion ?? DEFAULT_MIN_API_VERSION);
     this.maxApiVersion = parseApiVersion(options.maxApiVersion ?? DEFAULT_MAX_API_VERSION);
     if (compareApiVersions(this.minApiVersion, this.maxApiVersion) > 0) {
       throw new Error('minApiVersion is above maxApiVersion');
     }
-    this.attachRegistryAuth = options.attachRegistryAuth;
+    this.bootTimeoutMs = options.bootTimeoutMs ?? DEFAULT_BOOT_TIMEOUT_MS;
     this.realpath = options.realpath ?? ((p) => fs.realpathSync(p));
     this.removeTimeoutMs = options.removeTimeoutMs ?? REMOVE_TIMEOUT_MS;
   }
@@ -258,6 +287,7 @@ export class DockerFilterProxy {
       this.ownNetworkAliases.delete(known);
       this.ownNetworkIds.delete(known);
     }
+    this.internalNetworkIds.delete(networkId);
   }
 
   /** Forget every identifier for a container the job has removed. */
@@ -280,6 +310,18 @@ export class DockerFilterProxy {
     this.repository = repository;
     this.policy = policy;
     this.onLog({ level: 'info', message: `docker socket bound to ${repository}` });
+    // The worker decides whether this is the bind that boots its VM: the
+    // first one with grants does, and no other (contract §5.1).
+    this.worker.bind(repository, policy);
+  }
+
+  /**
+   * A claim this socket stays closed for - a job of another repository than
+   * the spawn's, or a policy that drifted - so nothing is bound, and the
+   * worker stops its spare, which no job of this worker will use.
+   */
+  staysClosed(reason: string): void {
+    this.worker.dropSpare(reason);
   }
 
   /** The repository this socket is bound to, or undefined while it denies all. */
@@ -365,21 +407,36 @@ export class DockerFilterProxy {
       });
       if (this.socketPath) fs.rmSync(this.socketPath, { force: true });
     }
-    await this.removeOwned();
+    // A daemon thrown away with the worker needs no sweep: the VM, and every
+    // container and network in it, goes when the worker's VM is released.
+    if (!this.backend.disposable) await this.removeOwned();
+    else this.forgetOwned();
     this.upstreamAgent.destroy();
+    try {
+      await this.worker.release();
+    } catch (err) {
+      this.onLog({ level: 'warn', message: `could not release the job's Docker VM: ${(err as Error).message}` });
+    }
+  }
+
+  private forgetOwned(): void {
+    this.ownContainerAliases.clear();
+    this.ownContainerIds.clear();
+    this.ownNetworkAliases.clear();
+    this.ownNetworkIds.clear();
+    this.internalNetworkIds.clear();
   }
 
   /** Force-remove every container, then every network, this socket created. */
   private async removeOwned(): Promise<void> {
     const containers = [...new Set(this.ownContainerAliases.values())];
     const networks = [...new Set(this.ownNetworkAliases.values())];
-    this.ownContainerAliases.clear();
-    this.ownContainerIds.clear();
-    this.ownNetworkAliases.clear();
-    this.ownNetworkIds.clear();
+    this.forgetOwned();
     if (containers.length === 0 && networks.length === 0) return;
 
-    const endpoint = this.backend.resolveEndpoint();
+    // Now or never: nothing is waited for at stop.
+    const state = await this.worker.endpoint(0);
+    const endpoint = state.kind === 'ready' ? { socketPath: state.socketPath } : null;
     if (!endpoint) {
       const what = [...containers.map((id) => `container ${id}`), ...networks.map((id) => `network ${id}`)];
       this.onLog({ level: 'warn', message: `could not remove ${what.join(', ')} the job created: ${NO_DAEMON_MESSAGE}` });
@@ -486,7 +543,11 @@ export class DockerFilterProxy {
   }
 
   /** Null when the request may proceed; otherwise the status and message that refuse it. */
-  private decide(req: DockerRequest): { refusal: { status: number; message: string } | null; rewrittenBody?: unknown } {
+  private decide(req: DockerRequest): {
+    refusal: { status: number; message: string } | null;
+    rewrittenBody?: unknown;
+    approvedBinds?: ApprovedBind[];
+  } {
     // A target the parser could not read is a request the filter cannot judge.
     // Before this, the parse threw out of the request handler: no refusal was
     // written and the connection sat open until the client gave up.
@@ -532,9 +593,63 @@ export class DockerFilterProxy {
       return { refusal: { status: 403, message } };
     }
     if (classifyDockerRequest(req) === 'create') {
-      return { refusal: null, rewrittenBody: this.pinnedNetworks(verdict.rewrittenBody ?? req.body) };
+      return {
+        refusal: null,
+        rewrittenBody: this.pinnedNetworks(verdict.rewrittenBody ?? req.body),
+        approvedBinds: verdict.approvedBinds ?? [],
+      };
     }
     return { refusal: null, rewrittenBody: verdict.rewrittenBody };
+  }
+
+  /**
+   * Whether a create's container reaches the job's proxy: on the default
+   * bridge, or on a network this job created routable. None, an internal
+   * network the job created, and any name that is not one of those, do not.
+   * One routable network among several is enough.
+   */
+  private isRoutable(body: Record<string, unknown>): boolean {
+    const networks: string[] = [];
+    for (const [key, section] of Object.entries(body)) {
+      if (!isPlainRecord(section)) continue;
+      if (key.toLowerCase() === 'hostconfig') {
+        for (const [field, value] of Object.entries(section)) {
+          if (field.toLowerCase() === 'networkmode' && typeof value === 'string') networks.push(value);
+        }
+      } else if (key.toLowerCase() === 'networkingconfig') {
+        for (const [field, endpoints] of Object.entries(section)) {
+          if (field.toLowerCase() !== 'endpointsconfig' || !isPlainRecord(endpoints)) continue;
+          networks.push(...Object.keys(endpoints));
+        }
+      }
+    }
+    if (networks.length === 0) return true;
+    return networks.some((name) => {
+      if (name === '' || name === 'default' || name === 'bridge') return true;
+      const id = this.ownNetworkAliases.get(name);
+      return id !== undefined && !this.internalNetworkIds.has(id);
+    });
+  }
+
+  /**
+   * An approved create body with the job's proxy settings in its Env when
+   * the container is routable (contract §5.3): the VM has no network card,
+   * and the proxy is how a container reaches anything. A variable the job set
+   * itself is kept.
+   */
+  private withProxyEnv(body: unknown): unknown {
+    if (!isPlainRecord(body) || !this.isRoutable(body)) return body;
+    const proxyEnv = this.worker.containerProxyEnv();
+    if (Object.keys(proxyEnv).length === 0) return body;
+    const envKey = Object.keys(body).find((key) => key.toLowerCase() === 'env') ?? 'Env';
+    const current = Array.isArray(body[envKey]) ? (body[envKey] as unknown[]) : [];
+    const set = new Set(
+      current.filter((entry): entry is string => typeof entry === 'string').map((entry) => entry.split('=')[0])
+    );
+    const added = Object.entries(proxyEnv)
+      .filter(([name]) => !set.has(name))
+      .map(([name, value]) => `${name}=${value}`);
+    return { ...body, [envKey]: [...current, ...added] };
   }
 
   /**
@@ -593,13 +708,50 @@ export class DockerFilterProxy {
   }
 
   /** Said once per socket: a declaration is a permission, not a requirement. */
-  private warnNoDaemon(): void {
+  private warnNoDaemon(reason: string): void {
     if (this.warnedNoDaemon) return;
     this.warnedNoDaemon = true;
-    this.onLog({
-      level: 'warn',
-      message: `no Docker daemon resolved for the ${this.backend.name} backend; the job runs without Docker`,
-    });
+    this.onLog({ level: 'warn', message: `no Docker daemon for this job (${this.backend.name} backend): ${reason}` });
+  }
+
+  /**
+   * Where a permitted request goes: the worker's daemon once it is ready,
+   * waited for up to the boot timeout. Null, with a 503 written, when there
+   * is none - the VM failed, never booted, or did not boot in time - and the
+   * first such answer is also logged at warn.
+   */
+  private async endpointOr503(res: http.ServerResponse): Promise<string | null> {
+    let state;
+    try {
+      state = await this.worker.endpoint(this.bootTimeoutMs);
+    } catch (err) {
+      state = { kind: 'none' as const, reason: (err as Error).message };
+    }
+    if (state.kind === 'ready') return state.socketPath;
+    this.warnNoDaemon(state.reason);
+    this.writeRefusal(res, 503, state.reason);
+    return null;
+  }
+
+  /**
+   * /_ping, /version and /info with no VM running: the synthesised answers of
+   * contract §5.3, with the API version clamped as a forwarded one is.
+   */
+  private answerBaseline(parsed: DockerRequest, res: http.ServerResponse): void {
+    const action = classifyDockerRequest(parsed);
+    const path = action === 'ping' ? '/_ping' : action === 'version' ? '/version' : '/info';
+    const answer = this.worker.baseline(path);
+    const headers: Record<string, string> = { ...answer.headers };
+    for (const name of Object.keys(headers)) {
+      if (name.toLowerCase() === 'api-version') headers[name] = this.clampVersion(headers[name]);
+    }
+    let body = answer.body;
+    if (action === 'version' && isPlainRecord(body) && typeof body.ApiVersion === 'string') {
+      body = { ...body, ApiVersion: this.clampVersion(body.ApiVersion) };
+    }
+    const payload = parsed.method === 'HEAD' ? Buffer.alloc(0) : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body));
+    res.writeHead(answer.status, { ...headers, 'Content-Length': String(payload.length) });
+    res.write(payload);
   }
 
   // ---------------------------------------------------------------------------
@@ -651,28 +803,124 @@ export class DockerFilterProxy {
     res: http.ServerResponse,
     bufferedBody: Buffer | null
   ): void {
-    const { refusal, rewrittenBody } = this.decide(parsed);
-    if (refusal) {
-      this.writeRefusal(res, refusal.status, refusal.message);
+    this.dispatchAsync(parsed, req, res, bufferedBody).catch((err: Error) => {
+      this.onLog({ level: 'warn', message: `could not answer ${parsed.method} ${parsed.path}: ${err.message}` });
+      if (!res.headersSent) this.writeRefusal(res, 500, 'the localmost docker socket failed to answer');
+      if (!res.writableEnded) res.end();
+    });
+  }
+
+  private async dispatchAsync(
+    parsed: DockerRequest,
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    bufferedBody: Buffer | null
+  ): Promise<void> {
+    const finish = (): void => {
       if (bufferedBody === null) this.endAfterDrain(req, res);
       else res.end();
+    };
+    const { refusal, rewrittenBody, approvedBinds } = this.decide(parsed);
+    if (refusal) {
+      this.writeRefusal(res, refusal.status, refusal.message);
+      finish();
+      return;
+    }
+    const action = classifyDockerRequest(parsed);
+    // A socket with no VM behind it still answers what every client asks
+    // first, without booting one.
+    if ((action === 'ping' || action === 'version' || action === 'info') && !this.worker.running()) {
+      this.answerBaseline(parsed, res);
+      finish();
+      return;
+    }
+    const socketPath = await this.endpointOr503(res);
+    if (socketPath === null) {
+      finish();
+      return;
+    }
+    if (action === 'pull') {
+      await this.pull(parsed, req, res);
+      finish();
       return;
     }
     // A permitted JSON body is forwarded as the object the verdict judged, not
     // as the bytes received: the daemon reads a repeated key's earlier copies,
     // which JSON.parse dropped. A create's is pinned further - mount sources
     // resolved to the paths actually checked - so the daemon mounts what the
-    // filter judged rather than re-resolving a name the job can repoint.
-    const body = rewrittenBody !== undefined ? Buffer.from(JSON.stringify(rewrittenBody)) : bufferedBody;
-    const endpoint = this.backend.resolveEndpoint();
-    if (!endpoint) {
-      this.warnNoDaemon();
-      this.writeRefusal(res, 503, NO_DAEMON_MESSAGE);
-      if (bufferedBody === null) this.endAfterDrain(req, res);
-      else res.end();
+    // filter judged rather than re-resolving a name the job can repoint - and
+    // given the proxy, now that the VM that relays it is up.
+    const judged = action === 'create' ? this.withProxyEnv(rewrittenBody) : rewrittenBody;
+    const body = judged !== undefined ? Buffer.from(JSON.stringify(judged)) : bufferedBody;
+    const url = action === 'build' ? this.withProxyBuildArgs(parsed) : undefined;
+    this.forward(parsed, req, res, body, socketPath, { approvedBinds, url });
+  }
+
+  /**
+   * An allowed pull, done by the worker on the Mac rather than forwarded: the
+   * daemon in the VM never contacts a registry, and the job's own
+   * X-Registry-Auth, like every credential, is dropped. The answer is
+   * Docker's usual progress stream, one JSON object per line; a failure after
+   * the headers is the stream's last line, as dockerd reports one.
+   */
+  private async pull(parsed: DockerRequest, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const request = pullRequestOf(parsed.query);
+    if (typeof request === 'string') {
+      this.writeRefusal(res, 400, request);
       return;
     }
-    this.forward(parsed, req, res, body, endpoint.socketPath);
+    const abort = new AbortController();
+    const onClose = (): void => {
+      if (!res.writableFinished) abort.abort();
+    };
+    res.on('close', onClose);
+    // Read to the end, though a pull has no body, so that the job hanging up
+    // is seen while the pull runs.
+    req.resume();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.flushHeaders();
+    const write = (p: DockerProgress): void => {
+      if (!res.writableEnded && !res.destroyed) res.write(`${JSON.stringify(p)}\n`);
+    };
+    try {
+      this.onLog({ level: 'debug', message: `pulled ${parsed.method} ${parsed.path} through the worker, not forwarded` });
+      await this.worker.pull(request, write, abort.signal);
+    } catch (err) {
+      const message = (err as Error).message;
+      this.onLog({ level: 'info', message: `pull of ${parsed.query.fromImage} failed: ${message}` });
+      write({ errorDetail: { message }, error: message });
+    } finally {
+      res.off('close', onClose);
+    }
+  }
+
+  /**
+   * A build's URL with the job's proxy settings merged into its buildargs,
+   * keeping any the job set: the classic builder runs each RUN step in a
+   * routable container, which reaches out only through the proxy.
+   */
+  private withProxyBuildArgs(parsed: DockerRequest): string | undefined {
+    const proxyEnv = this.worker.containerProxyEnv();
+    if (Object.keys(proxyEnv).length === 0) return undefined;
+    const raw = parsed.raw.url;
+    const queryStart = raw.indexOf('?');
+    const params = new URLSearchParams(queryStart === -1 ? '' : raw.slice(queryStart + 1));
+    let buildArgs: Record<string, unknown> = {};
+    const current = params.get('buildargs');
+    if (current) {
+      try {
+        const decoded: unknown = JSON.parse(current);
+        if (isPlainRecord(decoded)) buildArgs = decoded;
+      } catch {
+        // The evaluator passed it; a value that is not JSON the daemon refuses anyway.
+        return undefined;
+      }
+    }
+    for (const [name, value] of Object.entries(proxyEnv)) if (!(name in buildArgs)) buildArgs[name] = value;
+    params.set('buildargs', JSON.stringify(buildArgs));
+    const path = queryStart === -1 ? raw : raw.slice(0, queryStart);
+    const versioned = parsed.apiVersion ? path : `/v${bareVersion(this.maxApiVersion)}${path}`;
+    return `${versioned}?${params.toString()}`;
   }
 
   /**
@@ -729,10 +977,6 @@ export class DockerFilterProxy {
     // /info is rewritten on the way back, so it is asked for in a form that
     // can be read; relayInfo still copes with a daemon that compresses anyway.
     if (classifyDockerRequest(parsed) === 'info') delete headers['accept-encoding'];
-    if (classifyDockerRequest(parsed) === 'pull' && this.attachRegistryAuth && parsed.query.fromImage) {
-      const auth = this.attachRegistryAuth(registryOf(parsed.query.fromImage));
-      if (auth) headers['x-registry-auth'] = auth;
-    }
     return headers;
   }
 
@@ -741,7 +985,8 @@ export class DockerFilterProxy {
     req: http.IncomingMessage,
     res: http.ServerResponse,
     bufferedBody: Buffer | null,
-    socketPath: string
+    socketPath: string,
+    extra: { approvedBinds?: ApprovedBind[]; url?: string } = {}
   ): void {
     const headers = this.forwardedHeaders(parsed, req);
     if (bufferedBody !== null) {
@@ -758,7 +1003,7 @@ export class DockerFilterProxy {
     let answered = false;
     const action = classifyDockerRequest(parsed);
     const upstream = http.request(
-      { socketPath, path: this.forwardedUrl(parsed), method: parsed.method, headers, agent: this.upstreamAgent },
+      { socketPath, path: extra.url ?? this.forwardedUrl(parsed), method: parsed.method, headers, agent: this.upstreamAgent },
       (upstreamRes) => {
         upstreamRes.on('error', () => res.destroy());
         // A container the daemon actually removed is no longer this job's to
@@ -772,7 +1017,7 @@ export class DockerFilterProxy {
           const addressed = networkIdFrom(parsed);
           if (addressed) this.disownNetwork(addressed);
         }
-        this.relayFor(action, upstreamRes, res, parsed).then(() => {
+        this.relayFor(action, upstreamRes, res, parsed, { socketPath, approvedBinds: extra.approvedBinds ?? [] }).then(() => {
           answered = true;
           if (bufferedBody !== null) {
             res.end();
@@ -817,7 +1062,8 @@ export class DockerFilterProxy {
     action: DockerAction,
     upstreamRes: http.IncomingMessage,
     res: http.ServerResponse,
-    parsed: DockerRequest
+    parsed: DockerRequest,
+    context: { socketPath: string; approvedBinds: ApprovedBind[] }
   ): Promise<void> {
     switch (action) {
       case 'ping':
@@ -827,9 +1073,11 @@ export class DockerFilterProxy {
       case 'info':
         return this.relayInfo(upstreamRes, res);
       case 'create':
-        return this.relayCreate(upstreamRes, res, parsed);
+        return this.relayCreate(upstreamRes, res, parsed, context);
       case 'network-create':
         return this.relayNetworkCreate(upstreamRes, res, parsed);
+      case 'build':
+        return this.relayBuild(upstreamRes, res);
       default:
         return this.relay(upstreamRes, res);
     }
@@ -854,6 +1102,62 @@ export class DockerFilterProxy {
     return new Promise((resolve) => upstreamRes.on('end', resolve));
   }
 
+  /**
+   * A build's stream, relayed as it comes and read on the way for the one
+   * failure the job cannot act on without being told: the classic builder
+   * pulling a FROM image from inside the VM, which reaches no registry.
+   */
+  private relayBuild(upstreamRes: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    let tail = '';
+    upstreamRes.on('data', (chunk: Buffer) => {
+      if (this.warnedBaseImage) return;
+      tail = (tail + chunk.toString('utf8')).slice(-4096);
+      if (REGISTRY_LOOKUP_FAILURE.test(tail)) {
+        this.warnedBaseImage = true;
+        this.onLog({
+          level: 'warn',
+          message:
+            "docker build could not reach a registry from inside the job's Docker VM, which has no route to one: " +
+            'pull the base images with docker pull before docker build',
+        });
+      }
+    });
+    return this.relay(upstreamRes, res);
+  }
+
+  /**
+   * A daemon answer held whole to be parsed, never past
+   * MAX_DAEMON_ANSWER_BYTES: past it the connection is destroyed, and
+   * resolves null. With guest root, the daemon's answers are the job's to
+   * choose.
+   */
+  private readCapped(upstreamRes: http.IncomingMessage): Promise<Buffer | null> {
+    return new Promise((resolve) => {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      upstreamRes.on('data', (c: Buffer) => {
+        size += c.length;
+        if (size > MAX_DAEMON_ANSWER_BYTES) {
+          chunks.length = 0;
+          upstreamRes.destroy();
+          resolve(null);
+          return;
+        }
+        chunks.push(c);
+      });
+      upstreamRes.on('end', () => resolve(Buffer.concat(chunks)));
+      upstreamRes.on('close', () => resolve(size > MAX_DAEMON_ANSWER_BYTES ? null : Buffer.concat(chunks)));
+    });
+  }
+
+  /** Write a whole answer read with readCapped, as the daemon's with its length. */
+  private writeWhole(upstreamRes: http.IncomingMessage, res: http.ServerResponse, status: number, body: Buffer): void {
+    const headers = { ...this.relayedHeaders(upstreamRes), 'content-length': String(body.length) };
+    delete headers['transfer-encoding'];
+    res.writeHead(status, headers);
+    if (body.length > 0) res.write(body);
+  }
+
   /** The daemon's ping, with the API version clamped so the client negotiates down to ours. */
   private relayPing(upstreamRes: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const headers = this.relayedHeaders(upstreamRes);
@@ -865,100 +1169,114 @@ export class DockerFilterProxy {
     return new Promise((resolve) => upstreamRes.on('end', resolve));
   }
 
-  /** The daemon's /version, with ApiVersion clamped the same way. */
   /**
-   * Relay a container create and record the id the daemon assigned, so the
-   * verbs that follow - inspect, start, attach, wait, remove - can be scoped
-   * to containers this job actually created. The body is small and the client
-   * needs the id before it can proceed, so buffering it costs nothing.
+   * Relay a network create and record the network, by id, by requested name,
+   * and whether it is internal. The id is schema-checked like a container's
+   * (contract §5.3): it becomes an alias key, a path in forwarded URLs, and
+   * the NetworkMode pinned into later creates, so an answer whose id is not
+   * 64 hex - "host", with guest root - is refused, and nothing is owned.
    */
-  /** Relay a network create and record the network, by id and by requested name. */
-  private relayNetworkCreate(upstreamRes: http.IncomingMessage, res: http.ServerResponse, requested: DockerRequest): Promise<void> {
-    return new Promise((resolve) => {
-      const chunks: Buffer[] = [];
-      upstreamRes.on('data', (c: Buffer) => chunks.push(c));
-      upstreamRes.on('end', () => {
-        const raw = Buffer.concat(chunks);
-        const status = upstreamRes.statusCode ?? 502;
-        if (status >= 200 && status < 300) {
-          try {
-            const parsed = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
-            if (typeof parsed.Id === 'string' && parsed.Id.length > 0) {
-              this.ownNetwork(parsed.Id, parsed.Id);
-              const body = requested.body;
-              const name = isPlainRecord(body) ? readFolded(body, 'Name') : undefined;
-              if (typeof name === 'string' && name.length > 0) this.ownNetwork(name, parsed.Id);
-            }
-          } catch {
-            // An unreadable create response leaves the network unowned, which
-            // fails closed: the job cannot address what it cannot name.
-          }
-        }
-        const headers = { ...this.relayedHeaders(upstreamRes), 'content-length': String(raw.length) };
-        delete headers['transfer-encoding'];
-        res.writeHead(status, headers);
-        if (raw.length > 0) res.write(raw);
-        resolve();
-      });
-    });
+  private async relayNetworkCreate(upstreamRes: http.IncomingMessage, res: http.ServerResponse, requested: DockerRequest): Promise<void> {
+    const raw = await this.readCapped(upstreamRes);
+    if (raw === null) {
+      this.writeRefusal(res, 502, OVERSIZED_ANSWER_MESSAGE);
+      return;
+    }
+    const status = upstreamRes.statusCode ?? 502;
+    if (status < 200 || status >= 300) {
+      this.writeWhole(upstreamRes, res, status, raw);
+      return;
+    }
+    let id: string | undefined;
+    try {
+      const parsed = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
+      if (typeof parsed.Id === 'string' && NETWORK_ID_RE.test(parsed.Id)) id = parsed.Id;
+    } catch {
+      // Handled below: a create answer without an id is not one.
+    }
+    if (id === undefined) {
+      this.writeRefusal(res, 502, 'the Docker daemon sent a network create answer without a network id');
+      return;
+    }
+    this.ownNetwork(id, id);
+    const body = requested.body;
+    const name = isPlainRecord(body) ? readFolded(body, 'Name') : undefined;
+    if (typeof name === 'string' && name.length > 0) this.ownNetwork(name, id);
+    // Internal only when every casing says so, as the evaluator judged it.
+    if (isPlainRecord(body) && readFolded(body, 'Internal') === true) this.internalNetworkIds.add(id);
+    this.writeWhole(upstreamRes, res, status, raw);
   }
 
-  private relayCreate(upstreamRes: http.IncomingMessage, res: http.ServerResponse, requested: DockerRequest): Promise<void> {
-    return new Promise((resolve) => {
-      const chunks: Buffer[] = [];
-      upstreamRes.on('data', (c: Buffer) => chunks.push(c));
-      upstreamRes.on('end', () => {
-        const raw = Buffer.concat(chunks);
-        // Only a created container is owned; an error response names none.
-        const status = upstreamRes.statusCode ?? 502;
-        if (status >= 200 && status < 300) {
-          try {
-            const parsed = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
-            if (typeof parsed.Id === 'string' && parsed.Id.length > 0) {
-              // A job addresses its container by whichever identifier it
-              // knows: the id the daemon just assigned, or the --name it
-              // asked for, which is the only one it ever sees when it uses one.
-              this.own(parsed.Id, parsed.Id);
-              const name = requested.query.name;
-              if (name) this.own(name, parsed.Id);
-            }
-          } catch {
-            // An unreadable create response leaves the container unowned: the
-            // job cannot address it, which fails closed rather than open.
-          }
-        }
-        const headers = { ...this.relayedHeaders(upstreamRes), 'content-length': String(raw.length) };
-        delete headers['transfer-encoding'];
-        res.writeHead(status, headers);
-        if (raw.length > 0) res.write(raw);
-        resolve();
-      });
-    });
+  /**
+   * Relay a container create, and make the container the job's own only once
+   * the VM has its approved binds (contract §5.3): the daemon's answer is held
+   * until the guest agent has them, and a start by name that arrives first is
+   * refused, since the container is not yet the job's. The argument does not
+   * rest on this ordering - lm-bindpin fails a container whose share-backed
+   * mounts were not approved - but a container the VM cannot account for is
+   * never handed to the job: if the approval fails, it is removed.
+   */
+  private async relayCreate(
+    upstreamRes: http.IncomingMessage,
+    res: http.ServerResponse,
+    requested: DockerRequest,
+    context: { socketPath: string; approvedBinds: ApprovedBind[] }
+  ): Promise<void> {
+    const raw = await this.readCapped(upstreamRes);
+    if (raw === null) {
+      this.writeRefusal(res, 502, OVERSIZED_ANSWER_MESSAGE);
+      return;
+    }
+    const status = upstreamRes.statusCode ?? 502;
+    if (status < 200 || status >= 300) {
+      this.writeWhole(upstreamRes, res, status, raw);
+      return;
+    }
+    let id: string | undefined;
+    try {
+      const parsed = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
+      if (typeof parsed.Id === 'string' && CONTAINER_ID_RE.test(parsed.Id)) id = parsed.Id;
+    } catch {
+      // Handled below: a create answer without an id is not one.
+    }
+    if (id === undefined) {
+      this.writeRefusal(res, 502, 'the Docker daemon sent a create answer without a container id');
+      return;
+    }
+    try {
+      await this.worker.approveBinds(id, context.approvedBinds);
+    } catch (err) {
+      this.onLog({ level: 'warn', message: `${APPROVAL_FAILED_MESSAGE} for container ${id}: ${(err as Error).message}` });
+      await this.removeFromDaemon(context.socketPath, `/containers/${id}?force=1`);
+      this.writeRefusal(res, 500, APPROVAL_FAILED_MESSAGE);
+      return;
+    }
+    // A job addresses its container by whichever identifier it knows: the id
+    // the daemon just assigned, or the --name it asked for, which is the only
+    // one it ever sees when it uses one.
+    this.own(id, id);
+    const name = requested.query.name;
+    if (name) this.own(name, id);
+    this.writeWhole(upstreamRes, res, status, raw);
   }
 
-  private relayVersion(upstreamRes: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    return new Promise((resolve) => {
-      const chunks: Buffer[] = [];
-      upstreamRes.on('data', (c: Buffer) => chunks.push(c));
-      upstreamRes.on('end', () => {
-        const raw = Buffer.concat(chunks);
-        let body: Buffer;
-        try {
-          const parsed = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
-          if (typeof parsed.ApiVersion === 'string') parsed.ApiVersion = this.clampVersion(parsed.ApiVersion);
-          body = Buffer.from(JSON.stringify(parsed));
-        } catch {
-          this.refuse(res, 502, 'docker daemon returned an unreadable version response');
-          resolve();
-          return;
-        }
-        const headers = { ...this.relayedHeaders(upstreamRes), 'content-length': String(body.length) };
-        delete headers['transfer-encoding'];
-        res.writeHead(upstreamRes.statusCode ?? 502, headers);
-        res.write(body);
-        resolve();
-      });
-    });
+  /** The daemon's /version, with ApiVersion clamped the same way. */
+  private async relayVersion(upstreamRes: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const raw = await this.readCapped(upstreamRes);
+    if (raw === null) {
+      this.writeRefusal(res, 502, OVERSIZED_ANSWER_MESSAGE);
+      return;
+    }
+    let body: Buffer;
+    try {
+      const parsed = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
+      if (typeof parsed.ApiVersion === 'string') parsed.ApiVersion = this.clampVersion(parsed.ApiVersion);
+      body = Buffer.from(JSON.stringify(parsed));
+    } catch {
+      this.writeRefusal(res, 502, 'docker daemon returned an unreadable version response');
+      return;
+    }
+    this.writeWhole(upstreamRes, res, upstreamRes.statusCode ?? 502, body);
   }
 
   /**
@@ -1058,14 +1376,26 @@ export class DockerFilterProxy {
       this.refuseRaw(client, refusal.status, refusal.message);
       return;
     }
-    const endpoint = this.backend.resolveEndpoint();
-    if (!endpoint) {
-      this.warnNoDaemon();
-      this.refuseRaw(client, 503, NO_DAEMON_MESSAGE);
-      return;
-    }
+    // The client's bytes wait in the socket while the VM boots.
+    client.pause();
+    this.worker
+      .endpoint(this.bootTimeoutMs)
+      .catch((err: Error) => ({ kind: 'none' as const, reason: err.message }))
+      .then((state) => {
+        if (state.kind !== 'ready') {
+          this.warnNoDaemon(state.reason);
+          this.refuseRaw(client, 503, state.reason);
+          return;
+        }
+        client.resume();
+        this.upgradeTo(state.socketPath, parsed, req, client, head);
+      });
+  }
 
-    const upstream = net.connect(endpoint.socketPath, () => {
+  /** Relay an approved attach raw, once the daemon has agreed to upgrade. */
+  private upgradeTo(socketPath: string, parsed: DockerRequest, req: http.IncomingMessage, client: net.Socket, head: Buffer): void {
+    const method = req.method ?? 'GET';
+    const upstream = net.connect(socketPath, () => {
       // Replay the request line and headers as received, then hand both
       // sides to each other; the daemon's 101 travels back over the same pipe.
       const lines = [`${method} ${this.forwardedUrl(parsed)} HTTP/1.1`];

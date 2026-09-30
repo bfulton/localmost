@@ -14,7 +14,8 @@ import * as http from 'http';
 import * as net from 'net';
 import * as zlib from 'zlib';
 import { DockerFilterProxy, DockerFilterProxyLogEntry } from './docker-filter-proxy';
-import { LegacyDockerBackend, DesktopBackend } from './docker-backend';
+import { ApprovedBind, DesktopBackend, DockerBackend, PullRequest, WorkerContext, WorkerDocker } from './docker-backend';
+import type { DockerPolicy } from '../../shared/docker-policy';
 
 interface Reply { status: number; headers: http.IncomingHttpHeaders; body: string }
 
@@ -53,13 +54,63 @@ const request = (
     req.end();
   });
 
-/** A backend whose workspace is the whole sandbox directory the socket is served in. */
-const backendWith = (endpoint: string | null, supportsPrivileged = false): LegacyDockerBackend => ({
-  name: 'test',
-  supportsPrivileged,
-  resolveEndpoint: () => (endpoint ? { socketPath: endpoint } : null),
-  workspaceMountRoot: (sandboxDir) => sandboxDir,
-});
+/** What a fake worker was asked to do, for the tests to read. */
+interface WorkerCalls {
+  binds: Array<{ repository: string; policy: DockerPolicy }>;
+  pulls: PullRequest[];
+  approvals: Array<{ containerId: string; binds: ApprovedBind[] }>;
+  releases: number;
+}
+
+/** A backend and the worker it hands the socket, as the filter is built with them. */
+interface Fixture {
+  backend: DockerBackend;
+  worker: WorkerDocker;
+  calls: WorkerCalls;
+}
+
+/**
+ * A fake worker in front of a fake daemon: the endpoint is the daemon's when
+ * there is one, and a VM counts as running exactly then, so the baseline is
+ * forwarded. Everything else a test overrides.
+ */
+const backendWith = (
+  endpoint: string | null,
+  supportsPrivileged = false,
+  overrides: Partial<WorkerDocker> & { disposable?: boolean; workspaceMountRoot?: (sandboxDir: string) => string } = {}
+): Fixture => {
+  const calls: WorkerCalls = { binds: [], pulls: [], approvals: [], releases: 0 };
+  const { disposable = false, workspaceMountRoot, ...workerOverrides } = overrides;
+  const worker: WorkerDocker = {
+    bind: (repository, policy) => calls.binds.push({ repository, policy }),
+    prewarm: () => {},
+    dropSpare: () => {},
+    endpoint: async () => (endpoint ? { kind: 'ready', socketPath: endpoint } : { kind: 'none', reason: 'no Docker daemon is available to this job' }),
+    running: () => endpoint !== null,
+    baseline: () => ({ status: 503, headers: { 'Content-Type': 'application/json' }, body: { message: 'no Docker daemon is available to this job' } }),
+    pull: async (req, onProgress) => {
+      calls.pulls.push(req);
+      onProgress({ status: 'Pulling from ' + req.repositoryPath, id: req.tag ?? req.digest });
+      onProgress({ status: 'Done' });
+    },
+    approveBinds: async (containerId, binds) => {
+      calls.approvals.push({ containerId, binds });
+    },
+    containerProxyEnv: () => ({}),
+    release: async () => {
+      calls.releases++;
+    },
+    ...workerOverrides,
+  };
+  const backend: DockerBackend = {
+    name: 'test',
+    supportsPrivileged,
+    disposable,
+    workspaceMountRoot: workspaceMountRoot ?? ((sandboxDir) => sandboxDir),
+    forWorker: () => worker,
+  };
+  return { backend, worker, calls };
+};
 
 const proxies: DockerFilterProxy[] = [];
 const dirs: string[] = [];
@@ -81,18 +132,20 @@ afterEach(async () => {
 
 const startProxy = async (
   dir: string,
-  opts: Partial<ConstructorParameters<typeof DockerFilterProxy>[0]> & { backend?: LegacyDockerBackend } = {}
-): Promise<{ proxy: DockerFilterProxy; sock: string; logs: DockerFilterProxyLogEntry[] }> => {
+  opts: Partial<Omit<ConstructorParameters<typeof DockerFilterProxy>[0], 'backend' | 'worker'>> & { backend?: Fixture } = {}
+): Promise<{ proxy: DockerFilterProxy; sock: string; logs: DockerFilterProxyLogEntry[]; calls: WorkerCalls }> => {
   const logs: DockerFilterProxyLogEntry[] = [];
   const sock = path.join(dir, 'docker.sock');
+  const { backend: fixture = backendWith(null), ...rest } = opts;
   const proxy = new DockerFilterProxy({
-    backend: opts.backend ?? backendWith(null),
+    backend: fixture.backend,
+    worker: fixture.worker,
     onLog: (entry) => logs.push(entry),
-    ...opts,
+    ...rest,
   });
   proxies.push(proxy);
   await proxy.start(sock);
-  return { proxy, sock, logs };
+  return { proxy, sock, logs, calls: fixture.calls };
 };
 
 describe('DockerFilterProxy', () => {
@@ -161,7 +214,8 @@ describe('DockerFilterProxy', () => {
 
   it('refuses a socket path the kernel would truncate', async () => {
     const dir = tmp();
-    const proxy = new DockerFilterProxy({ backend: backendWith(null) });
+    const { backend, worker } = backendWith(null);
+    const proxy = new DockerFilterProxy({ backend, worker });
     const tooLong = path.join(dir, 'x'.repeat(120), 'docker.sock');
     await expect(proxy.start(tooLong)).rejects.toThrow(/104/);
   });
@@ -204,7 +258,10 @@ const fakeDaemon = (dir: string): Promise<{ sock: string; seen: Seen[] }> =>
           res.end(JSON.stringify({ Version: '28.0.0', ApiVersion: '1.52', MinAPIVersion: '1.24' }));
         } else if (p === '/containers/create') {
           res.writeHead(201, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ Id: 'abc123', Warnings: [] }));
+          res.end(JSON.stringify({ Id: 'abc1230000000000000000000000000000000000000000000000000000000000', Warnings: [] }));
+        } else if (p === '/networks/create') {
+          res.writeHead(201, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ Id: 'ae'.repeat(32), Warning: '' }));
         } else if (p === '/images/create') {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.write(JSON.stringify({ status: 'Pulling' }) + '\n');
@@ -231,7 +288,7 @@ describe('DockerFilterProxy forwarding', () => {
     const reply = await request(sock, 'POST', '/v1.45/containers/create?name=db', { Image: 'postgres:16' }, { Connection: 'keep-alive' });
 
     expect(reply.status).toBe(201);
-    expect(JSON.parse(reply.body).Id).toBe('abc123');
+    expect(JSON.parse(reply.body).Id).toBe('abc1230000000000000000000000000000000000000000000000000000000000');
     expect(daemon.seen).toHaveLength(1);
     expect(daemon.seen[0].method).toBe('POST');
     expect(daemon.seen[0].url).toBe('/v1.45/containers/create?name=db');
@@ -288,7 +345,7 @@ describe('DockerFilterProxy forwarding', () => {
       '"Options":{"com.docker.network.bridge.host_binding_ipv4":"0.0.0.0"},"Options":{}}';
     const reply = await request(sock, 'POST', '/v1.45/networks/create', body, { 'content-type': 'application/json' });
 
-    expect(reply.status).toBe(200);
+    expect(reply.status).toBe(201);
     expect(daemon.seen).toHaveLength(1);
     const forwarded = daemon.seen[0].body.toString();
     expect(forwarded.match(/"Options"/g)).toHaveLength(1);
@@ -299,14 +356,10 @@ describe('DockerFilterProxy forwarding', () => {
   it('refuses a pull or build whose parameters could come from a form body, without touching the daemon', async () => {
     // Go's FormValue prefers a form body's parameters to the URL's, and the
     // proxy streams a non-JSON body through unread: the daemon would pull
-    // from the body's registry on the operator's docker.io credentials, or
-    // build on the host network.
+    // from the body's registry, or build on the host network.
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, {
-      backend: backendWith(daemon.sock),
-      attachRegistryAuth: () => 'dG9rZW4=',
-    });
+    const { proxy, sock, calls } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' }, pull: { registries: ['docker.io'] }, build: { context: './' } });
 
     const form = { 'content-type': 'application/x-www-form-urlencoded' };
@@ -315,11 +368,14 @@ describe('DockerFilterProxy forwarding', () => {
     const built = await request(sock, 'POST', '/v1.45/build?t=app', 'networkmode=host&t=app', form);
     expect(built.status).toBe(403);
     expect(daemon.seen).toHaveLength(0);
+    expect(calls.pulls).toHaveLength(0);
 
-    // The same pull and build as the CLI sends them still go through.
+    // The same pull and build as the CLI sends them still go through: the
+    // pull on the Mac, the build to the daemon.
     expect((await request(sock, 'POST', '/v1.45/images/create?fromImage=postgres&tag=16')).status).toBe(200);
     expect((await request(sock, 'POST', '/v1.45/build?t=app', 'tar', { 'content-type': 'application/x-tar' })).status).toBe(200);
-    expect(daemon.seen).toHaveLength(2);
+    expect(calls.pulls).toHaveLength(1);
+    expect(daemon.seen).toHaveLength(1);
   });
 
   it('refuses a body nested deeper than any Docker body, and answers', async () => {
@@ -347,36 +403,104 @@ describe('DockerFilterProxy forwarding', () => {
     expect(daemon.seen[0].url).toBe('/v1.45/containers/create');
   });
 
-  it('attaches registry auth on a pull so the job never holds the secret', async () => {
+  it('pulls on the Mac through the worker, streaming its progress, and never forwards the pull', async () => {
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, {
-      backend: backendWith(daemon.sock),
-      attachRegistryAuth: (registry) => (registry === 'docker.io' ? 'dG9rZW4=' : undefined),
-    });
+    const { proxy, sock, calls, logs } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', { pull: { registries: ['docker.io', 'ghcr.io'] } });
 
-    // The job sends a header of its own; it must not reach the daemon.
-    const reply = await request(sock, 'POST', '/v1.45/images/create?fromImage=postgres&tag=16', undefined, { 'X-Registry-Auth': 'forged' });
+    // The job's own credential headers go nowhere: nothing is forwarded.
+    const reply = await request(sock, 'POST', '/v1.45/images/create?fromImage=postgres&tag=16', undefined, {
+      'X-Registry-Auth': 'forged',
+      'X-Registry-Config': 'forged',
+    });
     expect(reply.status).toBe(200);
-    expect(reply.body).toContain('Pulling');
-    expect(daemon.seen[0].headers['x-registry-auth']).toBe('dG9rZW4=');
+    expect(reply.headers['content-type']).toBe('application/json');
+    expect(reply.body.trim().split('\n').map((line) => JSON.parse(line))).toEqual([
+      { status: 'Pulling from library/postgres', id: '16' },
+      { status: 'Done' },
+    ]);
+    expect(calls.pulls).toEqual([{ registry: 'docker.io', repositoryPath: 'library/postgres', tag: '16' }]);
+    expect(logs.some((l) => l.message === 'pulled POST /images/create through the worker, not forwarded')).toBe(true);
+    expect(logs.some((l) => /^forwarded POST \/images/.test(l.message))).toBe(false);
+    expect(daemon.seen).toHaveLength(0);
 
-    // A registry we hold nothing for is forwarded with no auth at all.
-    await request(sock, 'POST', '/v1.45/images/create?fromImage=ghcr.io%2Fowner%2Fapp&tag=1', undefined, { 'X-Registry-Auth': 'forged' });
-    expect(daemon.seen[1].headers['x-registry-auth']).toBeUndefined();
+    await request(sock, 'POST', '/v1.45/images/create?fromImage=ghcr.io%2Fowner%2Fapp&tag=1&platform=linux%2Famd64');
+    expect(calls.pulls[1]).toEqual({ registry: 'ghcr.io', repositoryPath: 'owner/app', tag: '1', platform: 'linux/amd64' });
+    expect(daemon.seen).toHaveLength(0);
   });
 
-  it('refuses a pull whose query another daemon could read as a different image, before it reaches the daemon', async () => {
+  it('reads a pull by digest as a digest, from the name or from the tag parameter', async () => {
+    const dir = tmp();
+    const { proxy, sock, calls } = await startProxy(dir, { backend: backendWith(dir) });
+    proxy.bind('owner/repo', { pull: { registries: ['docker.io'] } });
+    const digest = `sha256:${'0123456789abcdef'.repeat(4)}`;
+
+    await request(sock, 'POST', `/v1.45/images/create?fromImage=${encodeURIComponent(`alpine@${digest}`)}`);
+    await request(sock, 'POST', `/v1.45/images/create?fromImage=alpine&tag=${encodeURIComponent(digest)}`);
+    await request(sock, 'POST', '/v1.45/images/create?fromImage=alpine');
+    expect(calls.pulls).toEqual([
+      { registry: 'docker.io', repositoryPath: 'library/alpine', digest },
+      { registry: 'docker.io', repositoryPath: 'library/alpine', digest },
+      { registry: 'docker.io', repositoryPath: 'library/alpine', tag: 'latest' },
+    ]);
+  });
+
+  it('ends the progress stream with the error, as the daemon would, when the pull fails after the headers', async () => {
+    const dir = tmp();
+    const fixture = backendWith(dir, false, {
+      pull: async (_req, onProgress) => {
+        onProgress({ status: 'Pulling' });
+        throw new Error('image alpine has no arm64 build, and amd64 images need Rosetta for Linux');
+      },
+    });
+    const { proxy, sock } = await startProxy(dir, { backend: fixture });
+    proxy.bind('owner/repo', { pull: { registries: ['docker.io'] } });
+
+    const reply = await request(sock, 'POST', '/v1.45/images/create?fromImage=alpine&tag=3');
+    expect(reply.status).toBe(200);
+    const lines = reply.body.trim().split('\n').map((line) => JSON.parse(line));
+    expect(lines[lines.length - 1]).toEqual({
+      errorDetail: { message: 'image alpine has no arm64 build, and amd64 images need Rosetta for Linux' },
+      error: 'image alpine has no arm64 build, and amd64 images need Rosetta for Linux',
+    });
+  });
+
+  it('aborts the pull when the job hangs up', async () => {
+    const dir = tmp();
+    let aborted!: () => void;
+    const abortSeen = new Promise<void>((resolve) => (aborted = resolve));
+    const fixture = backendWith(dir, false, {
+      // Progress keeps coming, as it does while layers download; the socket
+      // stays half-open for a client that only shut its sending side, so the
+      // hang-up is seen at the next write.
+      pull: (_req, onProgress, signal) =>
+        new Promise((_resolve, reject) => {
+          const ticker = setInterval(() => onProgress({ status: 'Downloading' }), 20);
+          signal.addEventListener('abort', () => {
+            clearInterval(ticker);
+            aborted();
+            reject(new Error('aborted'));
+          });
+        }),
+    });
+    const { proxy, sock } = await startProxy(dir, { backend: fixture });
+    proxy.bind('owner/repo', { pull: { registries: ['docker.io'] } });
+
+    const req = http.request({ socketPath: sock, path: '/v1.45/images/create?fromImage=alpine&tag=3', method: 'POST', agent: false }, (res) => {
+      res.once('data', () => req.destroy());
+    });
+    req.on('error', () => {});
+    req.end();
+    await abortSeen;
+  });
+
+  it('refuses a pull whose query another daemon could read as a different image, before it is pulled', async () => {
     // On Podman each of these pulls evil.example.com/x, while a filter that
-    // reads the first value judged postgres and attached the docker.io
-    // credential to it.
+    // reads the first value judged postgres.
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, {
-      backend: backendWith(daemon.sock),
-      attachRegistryAuth: (registry) => (registry === 'docker.io' ? 'dG9rZW4=' : undefined),
-    });
+    const { proxy, sock, calls } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', { pull: { registries: ['docker.io'] } });
 
     for (const query of [
@@ -388,8 +512,7 @@ describe('DockerFilterProxy forwarding', () => {
       const reply = await request(sock, 'POST', `/v1.45/images/create?${query}`);
       expect(reply.status).toBe(400);
     }
-    // Nothing reached the daemon, so no credential was offered for any of them.
-    expect(daemon.seen).toHaveLength(0);
+    expect(calls.pulls).toHaveLength(0);
 
     // The one list a client repeats, a build's tags, still goes through.
     proxy.bind('owner/repo', { build: { context: './' } });
@@ -398,58 +521,48 @@ describe('DockerFilterProxy forwarding', () => {
     expect(daemon.seen).toHaveLength(1);
   });
 
-  it('never offers the docker.io credential to a registry a pull tag would make of the image name', async () => {
+  it('never pulls from a registry a pull tag would make of the image name', async () => {
     // Podman joins fromImage and tag with ":", so these pull localhost:5000/x
     // and evil.example.com:443/x. Judged by fromImage alone, both were Docker
-    // Hub images and went out with the operator's Docker Hub credential.
+    // Hub images.
     const dir = tmp();
-    const daemon = await fakeDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, {
-      backend: backendWith(daemon.sock),
-      attachRegistryAuth: (registry) => (registry === 'docker.io' ? 'dG9rZW4=' : undefined),
-    });
+    const { proxy, sock, calls } = await startProxy(dir, { backend: backendWith(dir) });
     proxy.bind('owner/repo', { pull: { registries: ['docker.io'] } });
 
     for (const query of ['fromImage=localhost&tag=5000%2Fx', 'fromImage=evil.example.com&TAG=443%2Fx']) {
       const reply = await request(sock, 'POST', `/v1.45/images/create?${query}`);
       expect([query, reply.status]).toEqual([query, 403]);
     }
-    expect(daemon.seen).toHaveLength(0);
+    expect(calls.pulls).toHaveLength(0);
 
-    // A tag or a digest still pulls, with the credential.
+    // A tag or a digest still pulls, from Docker Hub.
     const digest = `sha256%3A${'0123456789abcdef'.repeat(4)}`;
     for (const tag of ['latest', 'v1.2.3', digest]) {
       const reply = await request(sock, 'POST', `/v1.45/images/create?fromImage=postgres&tag=${tag}`);
       expect([tag, reply.status]).toEqual([tag, 200]);
     }
-    expect(daemon.seen).toHaveLength(3);
-    expect(daemon.seen.map((s) => s.headers['x-registry-auth'])).toEqual(['dG9rZW4=', 'dG9rZW4=', 'dG9rZW4=']);
+    expect(calls.pulls.map((p) => p.registry)).toEqual(['docker.io', 'docker.io', 'docker.io']);
   });
 
-  it('never offers the docker.io credential to a registry the daemon reads from an uppercase first component', async () => {
+  it('pulls an uppercase first component from the registry the daemon reads it as', async () => {
     // The daemon's reference parser reads `LOCALHOST/x` and `Evil/x` as
     // registry hosts. Read as Docker Hub namespaces, they were approved under
-    // docker.io and sent the operator's Docker Hub credential.
+    // docker.io.
     const dir = tmp();
-    const daemon = await fakeDaemon(dir);
-    const { proxy, sock } = await startProxy(dir, {
-      backend: backendWith(daemon.sock),
-      attachRegistryAuth: (registry) => (registry === 'docker.io' ? 'dG9rZW4=' : undefined),
-    });
+    const { proxy, sock, calls } = await startProxy(dir, { backend: backendWith(dir) });
     proxy.bind('owner/repo', { pull: { registries: ['docker.io'] } });
 
     for (const image of ['Evil/x', 'LOCALHOST/x']) {
       const reply = await request(sock, 'POST', `/v1.45/images/create?fromImage=${encodeURIComponent(image)}&tag=1`);
       expect(reply.status).toBe(403);
     }
-    expect(daemon.seen).toHaveLength(0);
+    expect(calls.pulls).toHaveLength(0);
 
-    // Declared as the registry it is, it is pulled, with no Docker Hub credential.
+    // Declared as the registry it is, it is asked of that registry.
     proxy.bind('owner/repo', { pull: { registries: ['LOCALHOST'] } });
     const declared = await request(sock, 'POST', '/v1.45/images/create?fromImage=LOCALHOST%2Fx&tag=1');
     expect(declared.status).toBe(200);
-    expect(daemon.seen).toHaveLength(1);
-    expect(daemon.seen[0].headers['x-registry-auth']).toBeUndefined();
+    expect(calls.pulls).toEqual([{ registry: 'LOCALHOST', repositoryPath: 'x', tag: '1' }]);
   });
 
   it('clamps the API version the daemon advertises, so the client negotiates down to ours', async () => {
@@ -562,7 +675,7 @@ describe('DockerFilterProxy forwarding', () => {
       // only addresses containers it created, so the create is served too.
       if (req.url?.includes('/containers/create')) {
         res.writeHead(201, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ Id: 'abc', Warnings: [] }));
+        res.end(JSON.stringify({ Id: 'abc1230000000000000000000000000000000000000000000000000000000000', Warnings: [] }));
         return;
       }
       // And the removal that follows when the socket stops.
@@ -583,7 +696,7 @@ describe('DockerFilterProxy forwarding', () => {
     expect((await request(proxySock, 'POST', '/v1.45/containers/create', { Image: 'postgres:16' })).status).toBe(201);
 
     const headersSeen = new Promise<number>((resolve, reject) => {
-      const req = http.request({ socketPath: proxySock, path: '/v1.45/containers/abc/wait?condition=next-exit', method: 'POST', agent: false }, (res) => {
+      const req = http.request({ socketPath: proxySock, path: '/v1.45/containers/abc1230000000000000000000000000000000000000000000000000000000000/wait?condition=next-exit', method: 'POST', agent: false }, (res) => {
         resolve(res.statusCode!);
         res.resume();
       });
@@ -651,7 +764,7 @@ const fakeAttachDaemon = (dir: string): Promise<{ sock: string; heads: string[] 
         // answers the create that precedes the attach, then upgrades - and
         // the removal that follows when the socket stops.
         if (buffered.slice(0, end).includes('/containers/create')) {
-          const payload = JSON.stringify({ Id: 'abc123', Warnings: [] });
+          const payload = JSON.stringify({ Id: 'abc1230000000000000000000000000000000000000000000000000000000000', Warnings: [] });
           socket.write(
             `HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: ${payload.length}\r\nConnection: close\r\n\r\n${payload}`
           );
@@ -704,9 +817,9 @@ describe('DockerFilterProxy attach', () => {
     // Own the container first, as `docker run` does before attaching.
     expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'postgres:16' })).status).toBe(201);
 
-    const { head, socket } = await attach(sock, '/v1.45/containers/abc123/attach?stream=1&stdin=1&stdout=1', 'X-Registry-Auth: forged\r\n');
+    const { head, socket } = await attach(sock, '/v1.45/containers/abc1230000000000000000000000000000000000000000000000000000000000/attach?stream=1&stdin=1&stdout=1', 'X-Registry-Auth: forged\r\n');
     expect(head).toMatch(/^HTTP\/1\.1 101/);
-    expect(daemon.heads[0]).toMatch(/^POST \/v1\.45\/containers\/abc123\/attach\?stream=1&stdin=1&stdout=1 HTTP\/1\.1/);
+    expect(daemon.heads[0]).toMatch(/^POST \/v1\.45\/containers\/abc1230000000000000000000000000000000000000000000000000000000000\/attach\?stream=1&stdin=1&stdout=1 HTTP\/1\.1/);
     expect(daemon.heads[0]).toMatch(/Upgrade: tcp/);
     expect(daemon.heads[0]).not.toMatch(/X-Registry-Auth/i);
 
@@ -725,7 +838,7 @@ describe('DockerFilterProxy attach', () => {
     const { head, socket } = await attach(sock, '/v1.45/containers/mine/attach?stream=1&stdout=1');
     socket.destroy();
     expect(head).toMatch(/^HTTP\/1\.1 101/);
-    expect(daemon.heads[0]).toMatch(/^POST \/v1\.45\/containers\/abc123\/attach\?stream=1&stdout=1 HTTP\/1\.1/);
+    expect(daemon.heads[0]).toMatch(/^POST \/v1\.45\/containers\/abc1230000000000000000000000000000000000000000000000000000000000\/attach\?stream=1&stdout=1 HTTP\/1\.1/);
   });
 
   it('refuses an attach the policy does not permit on the raw connection, before the daemon sees it', async () => {
@@ -733,7 +846,7 @@ describe('DockerFilterProxy attach', () => {
     const daemon = await fakeAttachDaemon(dir);
     const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
 
-    const { head, socket } = await attach(sock, '/v1.45/containers/abc123/attach?stream=1');
+    const { head, socket } = await attach(sock, '/v1.45/containers/abc1230000000000000000000000000000000000000000000000000000000000/attach?stream=1');
     expect(head).toMatch(/^HTTP\/1\.1 403/);
     expect(head).toMatch(/Content-Type: application\/json/);
     expect(daemon.heads).toHaveLength(0);
@@ -784,16 +897,16 @@ describe('container ownership tracking', () => {
     const foreignStart = await request(sock, 'POST', '/v1.45/containers/theirs999/start');
     expect(foreignStart.status).toBe(403);
 
-    // The fake daemon answers create with Id 'abc123'.
+    // The fake daemon answers create with Id 'abc1230000000000000000000000000000000000000000000000000000000000'.
     const created = await request(sock, 'POST', '/v1.45/containers/create', { Image: 'postgres:16' });
     expect(created.status).toBe(201);
 
     // Now the verbs the CLI issues next must go through for that container.
     for (const [method, url] of [
-      ['GET', '/v1.45/containers/abc123/json'],
-      ['POST', '/v1.45/containers/abc123/start'],
-      ['POST', '/v1.45/containers/abc123/wait'],
-      ['DELETE', '/v1.45/containers/abc123'],
+      ['GET', '/v1.45/containers/abc1230000000000000000000000000000000000000000000000000000000000/json'],
+      ['POST', '/v1.45/containers/abc1230000000000000000000000000000000000000000000000000000000000/start'],
+      ['POST', '/v1.45/containers/abc1230000000000000000000000000000000000000000000000000000000000/wait'],
+      ['DELETE', '/v1.45/containers/abc1230000000000000000000000000000000000000000000000000000000000'],
     ] as const) {
       const res = await request(sock, method, url);
       expect({ url, status: res.status }).toEqual({ url, status: expect.any(Number) });
@@ -871,7 +984,7 @@ describe('mount sources are pinned before forwarding', () => {
 
     const daemon = await fakeDaemon(dir);
     const { proxy, sock } = await startProxy(dir, {
-      backend: { name: 'test', supportsPrivileged: false, resolveEndpoint: () => ({ socketPath: daemon.sock }), workspaceMountRoot: () => workspace },
+      backend: backendWith(daemon.sock, false, { workspaceMountRoot: () => workspace }),
     });
     proxy.bind('owner/repo', { run: { images: ['postgres:16'], mounts: [{ path: './', mode: 'rw' }], network: 'bridge' } });
 
@@ -915,8 +1028,9 @@ describe('the mount boundary is the sandbox the app created, not what the job ma
     const daemon = await fakeDaemon(dir);
     // The real backend and the real realpath: os.tmpdir() is itself a
     // symlink on macOS, which a legitimate mount must still get past.
+    const desktop = new DesktopBackend({ resolve: () => ({ socketPath: daemon.sock }) });
     const started = await startProxy(sandbox, {
-      backend: new DesktopBackend({ resolve: () => ({ socketPath: daemon.sock }) }),
+      backend: { backend: desktop, worker: desktop.forWorker({} as WorkerContext), calls: { binds: [], pulls: [], approvals: [], releases: 0 } },
     });
     const { proxy } = started;
     let sock = started.sock;
@@ -1021,7 +1135,7 @@ describe('which containers a job may address', () => {
     expect((await request(sock, 'DELETE', '/v1.45/containers/mine')).status).toBeLessThan(400);
     // The container is gone; the daemon may hand that name to anyone next.
     expect((await request(sock, 'GET', '/v1.45/containers/mine/json')).status).toBe(403);
-    expect((await request(sock, 'GET', '/v1.45/containers/abc123/json')).status).toBe(403);
+    expect((await request(sock, 'GET', '/v1.45/containers/abc1230000000000000000000000000000000000000000000000000000000000/json')).status).toBe(403);
   });
 
   it('sends the daemon the id a name was created with, so a name freed by --rm cannot reach its next holder', async () => {
@@ -1033,20 +1147,20 @@ describe('which containers a job may address', () => {
     // container holds the name now.
     await request(sock, 'POST', '/v1.45/containers/create?name=mine', { Image: 'postgres:16' });
     expect((await request(sock, 'POST', '/v1.45/containers/mine/kill?signal=KILL')).status).toBeLessThan(400);
-    expect(daemon.seen[daemon.seen.length - 1].url).toBe('/v1.45/containers/abc123/kill?signal=KILL');
+    expect(daemon.seen[daemon.seen.length - 1].url).toBe('/v1.45/containers/abc1230000000000000000000000000000000000000000000000000000000000/kill?signal=KILL');
     // Unversioned, and on a bare container path, the same.
     expect((await request(sock, 'POST', '/containers/mine/wait?condition=removed')).status).toBeLessThan(400);
-    expect(daemon.seen[daemon.seen.length - 1].url).toBe('/v1.45/containers/abc123/wait?condition=removed');
+    expect(daemon.seen[daemon.seen.length - 1].url).toBe('/v1.45/containers/abc1230000000000000000000000000000000000000000000000000000000000/wait?condition=removed');
     expect((await request(sock, 'DELETE', '/v1.45/containers/mine?force=1')).status).toBeLessThan(400);
-    expect(daemon.seen[daemon.seen.length - 1].url).toBe('/v1.45/containers/abc123?force=1');
+    expect(daemon.seen[daemon.seen.length - 1].url).toBe('/v1.45/containers/abc1230000000000000000000000000000000000000000000000000000000000?force=1');
   });
 
   it('does not accept a bare prefix of an owned id', async () => {
     const { sock } = await setup();
-    // The fake daemon answers create with Id abc123. A prefix could resolve on
+    // The fake daemon answers create with Id abc1230000000000000000000000000000000000000000000000000000000000. A prefix could resolve on
     // the real daemon to a container this job never created.
     expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'postgres:16' })).status).toBe(201);
-    expect((await request(sock, 'GET', '/v1.45/containers/abc123/json')).status).toBeLessThan(400);
+    expect((await request(sock, 'GET', '/v1.45/containers/abc1230000000000000000000000000000000000000000000000000000000000/json')).status).toBeLessThan(400);
     expect((await request(sock, 'GET', '/v1.45/containers/ab/json')).status).toBe(403);
   });
 });
@@ -1063,7 +1177,7 @@ describe('networks a job creates', () => {
     expect((await request(sock, 'POST', '/v1.45/networks/create', { Name: 'vk-1', Internal: true })).status).toBe(201);
 
     // Both the id the daemon assigned and the name the job asked for.
-    expect((await request(sock, 'GET', '/v1.45/networks/net123')).status).toBeLessThan(400);
+    expect((await request(sock, 'GET', `/v1.45/networks/${NET_ID}`)).status).toBeLessThan(400);
     expect((await request(sock, 'GET', '/v1.45/networks/vk-1')).status).toBeLessThan(400);
     // A container may join it.
     expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3', HostConfig: { NetworkMode: 'vk-1' } })).status).toBe(201);
@@ -1072,7 +1186,28 @@ describe('networks a job creates', () => {
 
     expect((await request(sock, 'DELETE', '/v1.45/networks/vk-1')).status).toBeLessThan(400);
     expect((await request(sock, 'GET', '/v1.45/networks/vk-1')).status).toBe(403);
-    expect((await request(sock, 'GET', '/v1.45/networks/net123')).status).toBe(403);
+    expect((await request(sock, 'GET', `/v1.45/networks/${NET_ID}`)).status).toBe(403);
+  });
+
+  it('are not the job\'s when the daemon answers with an id that is not one', async () => {
+    // With guest root the answer is the job's to choose; an id like "host",
+    // owned, would be pinned into a later create's NetworkMode.
+    for (const hostile of ['host', 'none', '../x', 'AE'.repeat(32), '']) {
+      const dir = tmp();
+      const daemon = await networkDaemon(dir, hostile);
+      const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
+      proxy.bind('owner/repo', {
+        run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] },
+      });
+      const reply = await request(sock, 'POST', '/v1.45/networks/create', { Name: 'vk-1', Internal: true });
+      expect([hostile, reply.status, JSON.parse(reply.body).message]).toEqual([hostile, 502, 'the Docker daemon sent a network create answer without a network id']);
+      // Neither the name nor the id is the job's.
+      expect((await request(sock, 'GET', '/v1.45/networks/vk-1')).status).toBe(403);
+      if (hostile !== '') expect((await request(sock, 'GET', `/v1.45/networks/${encodeURIComponent(hostile)}`)).status).toBe(403);
+      const joined = await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3', HostConfig: { NetworkMode: 'vk-1' } });
+      expect(joined.status).toBe(403);
+      expect(daemon.seen.filter((line) => line.startsWith('POST /v1.45/containers/create'))).toEqual([]);
+    }
   });
 
   it('are addressed at the daemon by the id they were created with', async () => {
@@ -1087,9 +1222,9 @@ describe('networks a job creates', () => {
     expect((await request(sock, 'POST', '/v1.45/networks/create', { Name: 'vk-1', Internal: true })).status).toBe(201);
 
     expect((await request(sock, 'GET', '/v1.45/networks/vk-1?verbose=true')).status).toBeLessThan(400);
-    expect(daemon.seen[daemon.seen.length - 1]).toBe('GET /v1.45/networks/net123?verbose=true');
+    expect(daemon.seen[daemon.seen.length - 1]).toBe(`GET /v1.45/networks/${NET_ID}?verbose=true`);
     expect((await request(sock, 'DELETE', '/networks/vk-1')).status).toBeLessThan(400);
-    expect(daemon.seen[daemon.seen.length - 1]).toBe('DELETE /v1.45/networks/net123');
+    expect(daemon.seen[daemon.seen.length - 1]).toBe(`DELETE /v1.45/networks/${NET_ID}`);
   });
 
   it('are joined at create by the id they were created with, not by a name anyone may take next', async () => {
@@ -1116,8 +1251,8 @@ describe('networks a job creates', () => {
     ).toBe(201);
     expect(daemon.bodies[daemon.bodies.length - 1]).toEqual({
       Image: 'alpine:3',
-      HostConfig: { NetworkMode: 'net123' },
-      NetworkingConfig: { EndpointsConfig: { 'vk-1': { Aliases: ['db'], NetworkID: 'net123' } } },
+      HostConfig: { NetworkMode: NET_ID },
+      NetworkingConfig: { EndpointsConfig: { 'vk-1': { Aliases: ['db'], NetworkID: NET_ID } } },
     });
 
     // The daemon reads these keys in any casing, so the pin does too.
@@ -1132,8 +1267,8 @@ describe('networks a job creates', () => {
     ).toBe(201);
     expect(daemon.bodies[daemon.bodies.length - 1]).toEqual({
       Image: 'alpine:3',
-      HostConfig: { networkmode: 'net123' },
-      NetworkingConfig: { endpointsconfig: { 'vk-1': { NetworkID: 'net123' } } },
+      HostConfig: { networkmode: NET_ID },
+      NetworkingConfig: { endpointsconfig: { 'vk-1': { NetworkID: NET_ID } } },
     });
 
     // The declared network is not the job's to pin, and is sent as named.
@@ -1172,8 +1307,12 @@ describe('networks a job creates', () => {
   });
 });
 
+/** The ids the fake daemons give the networks they create: 64 hex, as dockerd's. */
+const NET_ID = 'ae'.repeat(32);
+const NET1_ID = '1'.padStart(64, '0');
+
 /** A fake daemon that also answers network create. */
-const networkDaemon = (dir: string): Promise<{ sock: string; seen: string[]; bodies: unknown[] }> =>
+const networkDaemon = (dir: string, networkId: string = NET_ID): Promise<{ sock: string; seen: string[]; bodies: unknown[] }> =>
   new Promise((resolve) => {
     const sock = path.join(dir, 'netd.sock');
     const seen: string[] = [];
@@ -1188,10 +1327,10 @@ const networkDaemon = (dir: string): Promise<{ sock: string; seen: string[]; bod
         const p = req.url!.replace(/^\/v\d+\.\d+/, '').split('?')[0];
         if (p === '/networks/create') {
           res.writeHead(201, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ Id: 'net123', Warning: '' }));
+          res.end(JSON.stringify({ Id: networkId, Warning: '' }));
         } else if (p === '/containers/create') {
           res.writeHead(201, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ Id: 'abc123', Warnings: [] }));
+          res.end(JSON.stringify({ Id: 'abc1230000000000000000000000000000000000000000000000000000000000', Warnings: [] }));
         } else {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true }));
@@ -1422,6 +1561,9 @@ interface LifetimeDaemonOptions {
  * whether the job's socket still existed when it arrived. It also counts the
  * container removals in flight at once, and the ids it removed.
  */
+/** The daemon's id for the nth container it creates: 64 hex, as dockerd's are. */
+const cid = (n: number): string => `c${n.toString(16).padStart(63, '0')}`;
+
 const lifetimeDaemon = (
   dir: string,
   jobSocket: string,
@@ -1462,10 +1604,10 @@ const lifetimeDaemon = (
         if (p === '/containers/create') {
           containers += 1;
           res.writeHead(201, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ Id: `c${containers}`, Warnings: [] }));
+          res.end(JSON.stringify({ Id: cid(containers), Warnings: [] }));
         } else if (p === '/networks/create') {
           res.writeHead(201, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ Id: 'net1', Warning: '' }));
+          res.end(JSON.stringify({ Id: NET1_ID, Warning: '' }));
         } else if (req.method === 'DELETE' && p.startsWith('/containers/')) {
           const id = p.slice('/containers/'.length);
           const attempt = (attempts.get(id) ?? 0) + 1;
@@ -1523,7 +1665,7 @@ describe('containers a job leaves behind', () => {
     expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
     expect((await request(sock, 'POST', '/v1.45/networks/create', { Name: 'vk-1', Internal: true })).status).toBe(201);
     // The job removed this one itself; it is not removed a second time.
-    expect((await request(sock, 'DELETE', '/v1.45/containers/c3')).status).toBeLessThan(400);
+    expect((await request(sock, 'DELETE', `/v1.45/containers/${cid(3)}`)).status).toBeLessThan(400);
     const before = daemon.seen.length;
 
     await proxy.stop();
@@ -1532,11 +1674,11 @@ describe('containers a job leaves behind', () => {
     // Each container once, by id, however many names it had - forced, since a
     // running one is the case that matters, with its anonymous volumes.
     expect(sweep.slice(0, 2).sort()).toEqual([
-      'DELETE /containers/c1?force=1&v=1',
-      'DELETE /containers/c2?force=1&v=1',
+      `DELETE /containers/${cid(1)}?force=1&v=1`,
+      `DELETE /containers/${cid(2)}?force=1&v=1`,
     ]);
     // A network with a container still attached cannot be removed, so it goes last.
-    expect(sweep.slice(2)).toEqual(['DELETE /networks/net1']);
+    expect(sweep.slice(2)).toEqual([`DELETE /networks/${NET1_ID}`]);
     // The socket was already gone, so the job could not start another meanwhile.
     expect(daemon.socketPresent.slice(before)).toEqual([false, false, false]);
   });
@@ -1553,7 +1695,7 @@ describe('containers a job leaves behind', () => {
 
     expect(proxy.isRunning()).toBe(false);
     expect(fs.existsSync(sock)).toBe(false);
-    expect(logs.some((l) => l.level === 'warn' && /c1/.test(l.message) && /500/.test(l.message))).toBe(true);
+    expect(logs.some((l) => l.level === 'warn' && l.message.includes(cid(1)) && /500/.test(l.message))).toBe(true);
   });
 
   it('logs the containers it could not reach the daemon to remove, and still stops', async () => {
@@ -1561,7 +1703,10 @@ describe('containers a job leaves behind', () => {
     const sock = path.join(dir, 'docker.sock');
     const daemon = await lifetimeDaemon(dir, sock);
     let endpoint: string | null = daemon.sock;
-    const backend: LegacyDockerBackend = { ...backendWith(null), resolveEndpoint: () => (endpoint ? { socketPath: endpoint } : null) };
+    const backend = backendWith(null, false, {
+      endpoint: async () => (endpoint ? { kind: 'ready', socketPath: endpoint } : { kind: 'none', reason: 'gone' }),
+      running: () => endpoint !== null,
+    });
     const { proxy, logs } = await startProxy(dir, { backend });
     proxy.bind('owner/repo', policy);
     expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
@@ -1571,7 +1716,7 @@ describe('containers a job leaves behind', () => {
     await proxy.stop();
 
     expect(proxy.isRunning()).toBe(false);
-    expect(logs.some((l) => l.level === 'warn' && /c1/.test(l.message))).toBe(true);
+    expect(logs.some((l) => l.level === 'warn' && l.message.includes(cid(1)))).toBe(true);
   });
 
   it('makes a second stop wait for the first one to finish removing', async () => {
@@ -1640,8 +1785,8 @@ describe('containers a job leaves behind', () => {
 
     await proxy.stop();
 
-    expect(daemon.removed).toEqual(new Set(['c1']));
-    expect(daemon.seen).toContain('DELETE /networks/net1');
+    expect(daemon.removed).toEqual(new Set([cid(1)]));
+    expect(daemon.seen).toContain(`DELETE /networks/${NET1_ID}`);
     expect(logs.filter((l) => l.level === 'warn')).toEqual([]);
   });
 
@@ -1695,7 +1840,7 @@ describe('containers a job leaves behind', () => {
 
     await proxy.stop();
 
-    expect(daemon.seen.filter((s) => s.startsWith('DELETE'))).toEqual(['DELETE /containers/c1?force=1&v=1']);
+    expect(daemon.seen.filter((s) => s.startsWith('DELETE'))).toEqual([`DELETE /containers/${cid(1)}?force=1&v=1`]);
     expect(logs.filter((l) => l.level === 'warn')).toEqual([]);
   });
 
@@ -1712,6 +1857,422 @@ describe('containers a job leaves behind', () => {
     await proxy.stop();
 
     expect(proxy.isRunning()).toBe(false);
-    expect(logs.some((l) => l.level === 'warn' && /container c1/.test(l.message) && /no answer/.test(l.message))).toBe(true);
+    expect(logs.some((l) => l.level === 'warn' && l.message.includes(`container ${cid(1)}`) && /no answer/.test(l.message))).toBe(true);
   }, 3000);
+});
+
+// ---------------------------------------------------------------------------
+// The per-job VM (contract §5.3), against a fake WorkerDocker.
+// ---------------------------------------------------------------------------
+
+describe('the worker behind the socket', () => {
+  const CID = 'f'.repeat(64);
+  const proxyEnv = {
+    HTTP_PROXY: 'http://localmost:tok@198.18.0.1:3128',
+    HTTPS_PROXY: 'http://localmost:tok@198.18.0.1:3128',
+    http_proxy: 'http://localmost:tok@198.18.0.1:3128',
+    https_proxy: 'http://localmost:tok@198.18.0.1:3128',
+    NO_PROXY: 'localhost,127.0.0.1,::1',
+    no_proxy: 'localhost,127.0.0.1,::1',
+  };
+
+  /** A daemon answering create with CID and everything else with 200, recording all it is sent. */
+  const vmDaemon = (dir: string, answers: Record<string, (res: http.ServerResponse) => void> = {}) =>
+    new Promise<{ sock: string; seen: Seen[] }>((resolve) => {
+      const sock = path.join(dir, 'vm.sock');
+      const seen: Seen[] = [];
+      const server = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on('data', (c: Buffer) => chunks.push(c));
+        req.on('end', () => {
+          seen.push({ method: req.method!, url: req.url!, headers: req.headers, body: Buffer.concat(chunks) });
+          const p = req.url!.replace(/^\/v\d+\.\d+/, '').split('?')[0];
+          const custom = answers[`${req.method} ${p}`];
+          if (custom) return custom(res);
+          if (p === '/containers/create') {
+            res.writeHead(201, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ Id: CID, Warnings: [] }));
+          } else if (p === '/networks/create') {
+            res.writeHead(201, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ Id: seen.length.toString(16).padStart(64, '0'), Warning: '' }));
+          } else {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end('{}');
+          }
+        });
+      });
+      servers.push(server);
+      server.listen(sock, () => resolve({ sock, seen }));
+    });
+
+  const policy: DockerPolicy = {
+    run: { images: ['alpine:3'], mounts: [{ path: './', mode: 'rw' }], network: 'bridge', networks: [{ name: 'open-*', internal: false }, { name: 'vk-*', internal: true }] },
+    build: { context: './' },
+  };
+
+  const envOf = (seen: Seen): string[] => (JSON.parse(seen.body.toString()) as { Env?: string[] }).Env ?? [];
+
+  it('tells the worker of every bind, which decides whether one boots a VM', async () => {
+    const dir = tmp();
+    const { proxy, calls } = await startProxy(dir, { backend: backendWith(null) });
+    proxy.bind('owner/repo', policy);
+    proxy.bind('owner/repo', {});
+    expect(calls.binds).toEqual([{ repository: 'owner/repo', policy }, { repository: 'owner/repo', policy: {} }]);
+  });
+
+  it('drops the job\'s registry credentials from every request, a build\'s included', async () => {
+    const dir = tmp();
+    const daemon = await vmDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
+    proxy.bind('owner/repo', policy);
+    const forged = { 'X-Registry-Auth': 'forged', 'X-Registry-Config': 'forged' };
+    await request(sock, 'POST', '/v1.45/build?t=app', 'tar', { 'content-type': 'application/x-tar', ...forged });
+    await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' }, forged);
+    await request(sock, 'GET', '/v1.45/version', undefined, forged);
+    expect(daemon.seen).toHaveLength(3);
+    for (const seen of daemon.seen) {
+      expect([seen.url, seen.headers['x-registry-auth'], seen.headers['x-registry-config']]).toEqual([seen.url, undefined, undefined]);
+    }
+  });
+
+  it('refuses POST /auth and the checkpoint endpoints, whatever the policy', async () => {
+    const dir = tmp();
+    const daemon = await vmDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
+    proxy.bind('owner/repo', { ...policy, pull: { registries: ['docker.io'] } });
+    const owned = await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' });
+    expect(owned.status).toBe(201);
+    for (const [method, url] of [
+      ['POST', '/v1.45/auth'],
+      ['GET', `/v1.45/containers/${CID}/checkpoints`],
+      ['POST', `/v1.45/containers/${CID}/checkpoints`],
+      ['DELETE', `/v1.45/containers/${CID}/checkpoints/c1`],
+    ]) {
+      const reply = await request(sock, method, url, method === 'POST' ? {} : undefined);
+      expect([method, url, reply.status]).toEqual([method, url, 403]);
+    }
+    expect(daemon.seen.map((s) => s.url)).toEqual(['/v1.45/containers/create']);
+  });
+
+  describe('a container create', () => {
+    it('gets the job\'s proxy on the default bridge, keeping any variable the job set', async () => {
+      const dir = tmp();
+      const daemon = await vmDaemon(dir);
+      const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, false, { containerProxyEnv: () => proxyEnv }) });
+      proxy.bind('owner/repo', policy);
+      await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3', Env: ['HTTPS_PROXY=http://mine:1', 'A=b'] });
+      await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3', HostConfig: { NetworkMode: 'default' } });
+      const [custom, plain] = daemon.seen.map(envOf);
+      expect(custom).toEqual([
+        'HTTPS_PROXY=http://mine:1',
+        'A=b',
+        'HTTP_PROXY=http://localmost:tok@198.18.0.1:3128',
+        'http_proxy=http://localmost:tok@198.18.0.1:3128',
+        'https_proxy=http://localmost:tok@198.18.0.1:3128',
+        'NO_PROXY=localhost,127.0.0.1,::1',
+        'no_proxy=localhost,127.0.0.1,::1',
+      ]);
+      expect(plain.sort()).toEqual(Object.entries(proxyEnv).map(([k, v]) => `${k}=${v}`).sort());
+    });
+
+    it('gets it on a network the job created routable, and not on an internal one or none', async () => {
+      const dir = tmp();
+      const daemon = await vmDaemon(dir);
+      const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, false, { containerProxyEnv: () => proxyEnv }) });
+      proxy.bind('owner/repo', policy);
+      expect((await request(sock, 'POST', '/v1.45/networks/create', { Name: 'open-1', Internal: false })).status).toBe(201);
+      expect((await request(sock, 'POST', '/v1.45/networks/create', { Name: 'vk-1', Internal: true })).status).toBe(201);
+      const creates = [
+        { Image: 'alpine:3', HostConfig: { NetworkMode: 'open-1' } },
+        { Image: 'alpine:3', HostConfig: { NetworkMode: 'vk-1' } },
+        { Image: 'alpine:3', HostConfig: { NetworkMode: 'none' } },
+        { Image: 'alpine:3', HostConfig: { NetworkMode: 'vk-1' }, NetworkingConfig: { EndpointsConfig: { 'vk-1': {}, 'open-1': {} } } },
+      ];
+      for (const body of creates) expect((await request(sock, 'POST', '/v1.45/containers/create', body)).status).toBe(201);
+      const envs = daemon.seen.slice(2).map(envOf);
+      expect(envs.map((env) => env.some((e) => e.startsWith('HTTP_PROXY=')))).toEqual([true, false, false, true]);
+    });
+
+    it('is not given a proxy when the worker has none to give', async () => {
+      const dir = tmp();
+      const daemon = await vmDaemon(dir);
+      const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
+      proxy.bind('owner/repo', policy);
+      await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' });
+      expect(JSON.parse(daemon.seen[0].body.toString())).toEqual({ Image: 'alpine:3' });
+    });
+
+    it('is answered, and owned, only once the VM has its approved binds; a start by name before then is refused', async () => {
+      const dir = tmp();
+      const workspace = fs.realpathSync(dir);
+      fs.mkdirSync(path.join(workspace, 'data'));
+      const daemon = await vmDaemon(dir);
+      let approve!: () => void;
+      const approvals: Array<{ containerId: string; binds: ApprovedBind[] }> = [];
+      const fixture = backendWith(daemon.sock, false, {
+        approveBinds: (containerId, binds) => {
+          approvals.push({ containerId, binds });
+          return new Promise<void>((resolve) => (approve = resolve));
+        },
+      });
+      const { proxy, sock } = await startProxy(dir, { backend: fixture });
+      proxy.bind('owner/repo', policy);
+
+      const created = request(sock, 'POST', '/v1.45/containers/create?name=db', {
+        Image: 'alpine:3',
+        HostConfig: { Binds: [`${workspace}/data:/data/:ro`] },
+      });
+      await new Promise<void>((resolve) => {
+        const poll = () => (approvals.length > 0 ? resolve() : setTimeout(poll, 5));
+        poll();
+      });
+      expect(approvals).toEqual([{ containerId: CID, binds: [{ source: `${workspace}/data`, destination: '/data', readOnly: true }] }]);
+      const early = await request(sock, 'POST', '/v1.45/containers/db/start');
+      expect(early.status).toBe(403);
+
+      approve();
+      const reply = await created;
+      expect(reply.status).toBe(201);
+      expect(JSON.parse(reply.body).Id).toBe(CID);
+      expect((await request(sock, 'POST', '/v1.45/containers/db/start')).status).toBe(200);
+      expect(daemon.seen.map((s) => `${s.method} ${s.url}`)).toEqual([
+        'POST /v1.45/containers/create?name=db',
+        `POST /v1.45/containers/${CID}/start`,
+      ]);
+    });
+
+    it('removes the container and answers 500 when the approval fails', async () => {
+      const dir = tmp();
+      const daemon = await vmDaemon(dir);
+      const fixture = backendWith(daemon.sock, false, {
+        approveBinds: async () => {
+          throw new Error('the guest agent did not answer approve-binds in 10s');
+        },
+      });
+      const { proxy, sock, logs } = await startProxy(dir, { backend: fixture });
+      proxy.bind('owner/repo', policy);
+
+      const reply = await request(sock, 'POST', '/v1.45/containers/create?name=db', { Image: 'alpine:3' });
+      expect(reply.status).toBe(500);
+      expect(JSON.parse(reply.body).message).toBe("could not register the approved binds with the job's Docker VM");
+      expect(daemon.seen.map((s) => `${s.method} ${s.url}`)).toEqual([
+        'POST /v1.45/containers/create?name=db',
+        `DELETE /containers/${CID}?force=1`,
+      ]);
+      expect((await request(sock, 'POST', '/v1.45/containers/db/start')).status).toBe(403);
+      expect(logs.some((l) => l.level === 'warn' && /approve-binds/.test(l.message))).toBe(true);
+    });
+
+    it('refuses an answer with no container id in it', async () => {
+      const dir = tmp();
+      const daemon = await vmDaemon(dir, {
+        'POST /containers/create': (res) => {
+          res.writeHead(201, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ Id: '../../etc', Warnings: [] }));
+        },
+      });
+      const { proxy, sock, calls } = await startProxy(dir, { backend: backendWith(daemon.sock) });
+      proxy.bind('owner/repo', policy);
+      expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(502);
+      expect(calls.approvals).toEqual([]);
+    });
+  });
+
+  describe('a daemon answer the filter holds to parse', () => {
+    /** Streams JSON-looking bytes until the filter hangs up; resolves with how many it wrote. */
+    const flood = (status: number) => {
+      let written = 0;
+      let done!: (n: number) => void;
+      const finished = new Promise<number>((resolve) => (done = resolve));
+      const answer = (res: http.ServerResponse) => {
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        const chunk = Buffer.alloc(64 * 1024, 'a');
+        const pump = () => {
+          while (written < 64 * 1024 * 1024) {
+            written += chunk.length;
+            if (!res.write(chunk)) {
+              res.once('drain', pump);
+              return;
+            }
+          }
+          res.end();
+        };
+        res.on('close', () => done(written));
+        pump();
+      };
+      return { answer, finished };
+    };
+
+    it.each([
+      ['a create', 'POST /containers/create', 201, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' }],
+      ['a network create', 'POST /networks/create', 201, 'POST', '/v1.45/networks/create', { Name: 'vk-1', Internal: true }],
+      ['/version', 'GET /version', 200, 'GET', '/v1.45/version', undefined],
+    ] as Array<[string, string, number, string, string, unknown]>)('is refused with 502 when %s answer is oversized, without holding it', async (_what, key, status, method, url, body) => {
+      const dir = tmp();
+      const { answer, finished } = flood(status);
+      const daemon = await vmDaemon(dir, { [key]: answer });
+      const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
+      proxy.bind('owner/repo', policy);
+      const reply = await request(sock, method, url, body);
+      expect(reply.status).toBe(502);
+      expect(JSON.parse(reply.body).message).toBe('the Docker VM sent an oversized answer');
+      // Cut off long before the daemon was done.
+      expect(await finished).toBeLessThan(16 * 1024 * 1024);
+    });
+
+    it('is not held at all when it is a stream the filter only relays: an inspect is piped', async () => {
+      const dir = tmp();
+      const big = 'x'.repeat(2 * 1024 * 1024);
+      const daemon = await vmDaemon(dir, {
+        [`GET /containers/${CID}/json`]: (res) => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ Id: CID, pad: big }));
+        },
+      });
+      const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
+      proxy.bind('owner/repo', policy);
+      await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' });
+      const reply = await request(sock, 'GET', `/v1.45/containers/${CID}/json`);
+      expect(reply.status).toBe(200);
+      expect(JSON.parse(reply.body).pad).toHaveLength(big.length);
+    });
+  });
+
+  it("merges the job's proxy into a build's buildargs, keeping the job's values", async () => {
+    const dir = tmp();
+    const daemon = await vmDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock, false, { containerProxyEnv: () => proxyEnv }) });
+    proxy.bind('owner/repo', policy);
+    const own = encodeURIComponent(JSON.stringify({ HTTP_PROXY: 'http://mine:1', VERSION: '2' }));
+    await request(sock, 'POST', `/v1.45/build?t=app&buildargs=${own}`, 'tar', { 'content-type': 'application/x-tar' });
+    await request(sock, 'POST', '/build?t=app', 'tar', { 'content-type': 'application/x-tar' });
+    const [withOwn, bare] = daemon.seen.map((s) => new URL(s.url, 'http://x'));
+    expect(withOwn.pathname).toBe('/v1.45/build');
+    expect(withOwn.searchParams.get('t')).toBe('app');
+    expect(JSON.parse(withOwn.searchParams.get('buildargs')!)).toEqual({ ...proxyEnv, HTTP_PROXY: 'http://mine:1', VERSION: '2' });
+    expect(bare.pathname).toBe('/v1.45/build');
+    expect(JSON.parse(bare.searchParams.get('buildargs')!)).toEqual(proxyEnv);
+  });
+
+  it('logs the base-image rule once when a build cannot reach a registry from the VM', async () => {
+    const dir = tmp();
+    const daemon = await vmDaemon(dir, {
+      'POST /build': (res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.write(JSON.stringify({ stream: 'Step 1/2 : FROM node:22\n' }) + '\n');
+        res.end(JSON.stringify({ errorDetail: { message: 'Get "https://registry-1.docker.io/v2/": dial tcp: lookup registry-1.docker.io on 198.18.0.1:53: connection refused' } }) + '\n');
+      },
+    });
+    const { proxy, sock, logs } = await startProxy(dir, { backend: backendWith(daemon.sock) });
+    proxy.bind('owner/repo', policy);
+    for (let i = 0; i < 2; i++) await request(sock, 'POST', '/v1.45/build?t=app', 'tar', { 'content-type': 'application/x-tar' });
+    expect(logs.filter((l) => /pull the base images with docker pull before docker build/.test(l.message))).toHaveLength(1);
+  });
+
+  describe('the baseline', () => {
+    const baselineWorker = (running: boolean) =>
+      backendWith(null, false, {
+        running: () => running,
+        baseline: (p): { status: number; headers: Record<string, string>; body: unknown } =>
+          p === '/_ping'
+            ? { status: 200, headers: { 'Api-Version': '1.54', 'Content-Type': 'text/plain; charset=utf-8', 'Builder-Version': '1' }, body: 'OK' }
+            : p === '/version'
+              ? { status: 200, headers: { 'Api-Version': '1.54', 'Content-Type': 'application/json' }, body: { Version: '29.5.3', ApiVersion: '1.54' } }
+              : { status: 200, headers: { 'Content-Type': 'application/json' }, body: { OSType: 'linux', NCPU: 4 } },
+        endpoint: async () => ({ kind: 'none', reason: 'the job has no Docker VM' }),
+      });
+
+    it('is answered from the worker with no VM running, clamped as a forwarded one is, and boots nothing', async () => {
+      const dir = tmp();
+      const { sock } = await startProxy(dir, { backend: baselineWorker(false) });
+      const ping = await request(sock, 'GET', '/_ping');
+      expect([ping.status, ping.body, ping.headers['api-version'], ping.headers['builder-version']]).toEqual([200, 'OK', '1.45', '1']);
+      const head = await request(sock, 'HEAD', '/_ping');
+      expect([head.status, head.body]).toEqual([200, '']);
+      const version = await request(sock, 'GET', '/v1.45/version');
+      expect(JSON.parse(version.body)).toEqual({ Version: '29.5.3', ApiVersion: '1.45' });
+      const info = await request(sock, 'GET', '/v1.45/info');
+      expect(JSON.parse(info.body)).toEqual({ OSType: 'linux', NCPU: 4 });
+    });
+
+    it('is forwarded, and /info cut down, once a VM is running', async () => {
+      const dir = tmp();
+      const daemon = await vmDaemon(dir, {
+        'GET /info': (res) => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ OSType: 'linux', Name: 'the-vm', HttpProxy: 'http://secret' }));
+        },
+      });
+      const { sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
+      const info = await request(sock, 'GET', '/v1.45/info');
+      expect(JSON.parse(info.body)).toEqual({ OSType: 'linux' });
+      expect(daemon.seen.map((s) => s.url)).toEqual(['/v1.45/info']);
+    });
+  });
+
+  describe('waiting for the VM', () => {
+    it('forwards once the VM is ready, having waited for it', async () => {
+      const dir = tmp();
+      const daemon = await vmDaemon(dir);
+      let ready!: () => void;
+      const booted = new Promise<void>((resolve) => (ready = resolve));
+      const waits: number[] = [];
+      const fixture = backendWith(daemon.sock, false, {
+        endpoint: async (timeoutMs) => {
+          waits.push(timeoutMs);
+          await booted;
+          return { kind: 'ready', socketPath: daemon.sock };
+        },
+      });
+      const { proxy, sock } = await startProxy(dir, { backend: fixture, bootTimeoutMs: 45_000 });
+      proxy.bind('owner/repo', policy);
+      const pending = request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(daemon.seen).toHaveLength(0);
+      ready();
+      expect((await pending).status).toBe(201);
+      expect(waits).toEqual([45_000]);
+    });
+
+    it("answers 503 with the worker's reason when there is no VM, and says so once at warn", async () => {
+      const dir = tmp();
+      const fixture = backendWith(null, false, {
+        endpoint: async () => ({ kind: 'none', reason: 'no Docker VM capacity' }),
+      });
+      const { proxy, sock, logs } = await startProxy(dir, { backend: fixture });
+      proxy.bind('owner/repo', policy);
+      for (let i = 0; i < 2; i++) {
+        const reply = await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' });
+        expect([reply.status, JSON.parse(reply.body).message]).toEqual([503, 'no Docker VM capacity']);
+      }
+      const attach = await request(sock, 'POST', '/v1.45/containers/x/attach?stream=1', undefined, { Connection: 'Upgrade', Upgrade: 'tcp' });
+      expect(attach.status).toBe(403);
+      expect(logs.filter((l) => l.level === 'warn' && /no Docker VM capacity/.test(l.message))).toHaveLength(1);
+    });
+  });
+
+  describe('stopping', () => {
+    it('removes nothing from a daemon that goes with the worker, and releases the worker', async () => {
+      const dir = tmp();
+      const daemon = await vmDaemon(dir);
+      const fixture = backendWith(daemon.sock, false, { disposable: true });
+      const { proxy, sock, calls } = await startProxy(dir, { backend: fixture });
+      proxy.bind('owner/repo', policy);
+      expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
+      await proxy.stop();
+      expect(daemon.seen.filter((s) => s.method === 'DELETE')).toEqual([]);
+      expect(calls.releases).toBe(1);
+    });
+
+    it('still removes what the job made from a daemon it shares, then releases', async () => {
+      const dir = tmp();
+      const daemon = await vmDaemon(dir);
+      const { proxy, sock, calls } = await startProxy(dir, { backend: backendWith(daemon.sock) });
+      proxy.bind('owner/repo', policy);
+      expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);
+      await proxy.stop();
+      expect(daemon.seen.filter((s) => s.method === 'DELETE').map((s) => s.url)).toEqual([`/containers/${CID}?force=1&v=1`]);
+      expect(calls.releases).toBe(1);
+    });
+  });
 });

@@ -8,6 +8,7 @@
  * workspace. See docs/superpowers/specs/2026-09-05-docker-isolation-design.md.
  */
 
+import * as http from 'http';
 import * as path from 'path';
 import { resolveDockerEndpoint, DockerEndpoint } from '../../shared/docker-access';
 import type { DockerPolicy } from '../../shared/docker-policy';
@@ -93,6 +94,11 @@ export interface WorkerDocker {
   bind(repository: string, policy: DockerPolicy): void;
   /** When the worker is spawned and dockerVm.prewarm is on. */
   prewarm(): void;
+  /**
+   * At a claim that leaves the socket closed (a job of another repository
+   * than the spawn's): the spare, if any, is of no use and is stopped.
+   */
+  dropSpare(reason: string): void;
   /** The VM's docker.sock once ready. Waits while it boots, up to timeoutMs. */
   endpoint(timeoutMs: number): Promise<EndpointState>;
   /** A VM is ready right now: the baseline is forwarded, not synthesised. */
@@ -136,13 +142,6 @@ export interface LegacyDockerBackend {
   workspaceMountRoot(sandboxDir: string, repository?: string): string;
 }
 
-export interface DesktopBackendOptions {
-  /** Endpoint lookup, injected for testing. Defaults to resolveDockerEndpoint. */
-  resolve?: () => DockerEndpoint | null;
-  /** The sandbox subdir the runner checks out into. Defaults to the runner's `_work`. */
-  workspaceSubdir?: string;
-}
-
 /**
  * The runner is configured with `--work _work`, so a job's checkout lives
  * under this subdir of its sandbox directory. Keep this aligned with the
@@ -151,13 +150,45 @@ export interface DesktopBackendOptions {
 const RUNNER_WORK_FOLDER = '_work';
 
 /**
+ * The directory declared mount paths resolve against, for every backend: the
+ * runner checks out into _work/<repo>/<repo>, which is GITHUB_WORKSPACE and
+ * what a policy's `./` refers to. Rooting at _work made anything narrower
+ * than `./` unmatchable, since ./tmp resolved to _work/tmp. Without a
+ * repository, the work folder.
+ */
+export function runnerWorkspaceRoot(sandboxDir: string, repository?: string, workSubdir = RUNNER_WORK_FOLDER): string {
+  const work = path.join(sandboxDir, workSubdir);
+  const name = repository?.split('/').pop();
+  return name ? path.join(work, name, name) : work;
+}
+
+/** Said when a request needs a daemon and there is none. */
+export const NO_DAEMON_MESSAGE = 'no Docker daemon is available to this job';
+
+/** The longest pull progress line the desktop worker reads before refusing the stream. */
+const MAX_PROGRESS_LINE_BYTES = 64 * 1024;
+
+export interface DesktopBackendOptions {
+  /** Endpoint lookup, injected for testing. Defaults to resolveDockerEndpoint. */
+  resolve?: () => DockerEndpoint | null;
+  /** The sandbox subdir the runner checks out into. Defaults to the runner's `_work`. */
+  workspaceSubdir?: string;
+  /** The X-Registry-Auth value for a pull from a registry, if any: the operator's credentials, which the job never holds. */
+  registryAuth?: (registry: string) => string | undefined;
+}
+
+/**
  * Stage 1: the operator's existing daemon, found exactly as the app finds it
  * today. Nothing contains a container that escapes this daemon, which is why
- * privileged can never be granted here.
+ * privileged can never be granted here. It stays, behind the stage 2
+ * interface, only until the VM backend replaces it: the filter's pulls, which
+ * it no longer forwards, go through this worker to the same daemon.
  */
-export class DesktopBackend implements LegacyDockerBackend {
+export class DesktopBackend implements DockerBackend, LegacyDockerBackend {
   readonly name = 'docker-desktop';
   readonly supportsPrivileged = false;
+  /** One daemon for every worker, so a stopped socket removes what its job made. */
+  readonly disposable = false;
 
   constructor(private readonly opts: DesktopBackendOptions = {}) {}
 
@@ -166,11 +197,113 @@ export class DesktopBackend implements LegacyDockerBackend {
   }
 
   workspaceMountRoot(sandboxDir: string, repository?: string): string {
-    const work = path.join(sandboxDir, this.opts.workspaceSubdir ?? RUNNER_WORK_FOLDER);
-    // The runner checks out into _work/<repo>/<repo>, which is GITHUB_WORKSPACE
-    // and what a policy's `./` refers to. Rooting at _work made anything
-    // narrower than `./` unmatchable, since ./tmp resolved to _work/tmp.
-    const name = repository?.split('/').pop();
-    return name ? path.join(work, name, name) : work;
+    return runnerWorkspaceRoot(sandboxDir, repository, this.opts.workspaceSubdir);
+  }
+
+  /**
+   * Today's behaviour behind the per-worker interface: every request goes to
+   * the operator's daemon, found afresh; there is no VM to boot, no binds to
+   * approve and no proxy to inject.
+   */
+  forWorker(_ctx: WorkerContext): WorkerDocker {
+    const endpoint = (): DockerEndpoint | null => this.resolveEndpoint();
+    const registryAuth = this.opts.registryAuth;
+    return {
+      bind: () => {},
+      prewarm: () => {},
+      dropSpare: () => {},
+      endpoint: async () => {
+        const found = endpoint();
+        return found ? { kind: 'ready', socketPath: found.socketPath } : { kind: 'none', reason: NO_DAEMON_MESSAGE };
+      },
+      running: () => endpoint() !== null,
+      baseline: () => ({
+        status: 503,
+        headers: { 'Content-Type': 'application/json' },
+        body: { message: NO_DAEMON_MESSAGE },
+      }),
+      pull: (req, onProgress, signal) => {
+        const found = endpoint();
+        if (!found) return Promise.reject(new Error(NO_DAEMON_MESSAGE));
+        return pullThroughDaemon(found.socketPath, req, registryAuth?.(req.registry), onProgress, signal);
+      },
+      approveBinds: async () => {},
+      containerProxyEnv: () => ({}),
+      release: async () => {},
+    };
   }
 }
+
+/**
+ * A pull the daemon makes itself, with the operator's credentials attached
+ * here and never by the job: POST /images/create, whose progress lines are
+ * handed on one by one as the daemon sends them. Rejects when the daemon
+ * refuses the pull; a failure it reports inside the stream is a progress
+ * line like any other, as the CLI reads it.
+ */
+function pullThroughDaemon(
+  socketPath: string,
+  req: PullRequest,
+  auth: string | undefined,
+  onProgress: (p: DockerProgress) => void,
+  signal: AbortSignal
+): Promise<void> {
+  const query = new URLSearchParams({ fromImage: `${req.registry}/${req.repositoryPath}` });
+  if (req.digest) query.set('tag', req.digest);
+  else if (req.tag) query.set('tag', req.tag);
+  if (req.platform) query.set('platform', req.platform);
+  return new Promise((resolve, reject) => {
+    const upstream = http.request(
+      {
+        socketPath,
+        method: 'POST',
+        path: `/images/create?${query.toString()}`,
+        headers: auth ? { 'X-Registry-Auth': auth } : {},
+        agent: false,
+        signal,
+      },
+      (res) => {
+        const status = res.statusCode ?? 502;
+        let pending = '';
+        let refused = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk: string) => {
+          if (status !== 200) {
+            if (refused.length < MAX_PROGRESS_LINE_BYTES) refused += chunk;
+            return;
+          }
+          pending += chunk;
+          for (let nl = pending.indexOf('\n'); nl !== -1; nl = pending.indexOf('\n')) {
+            const line = pending.slice(0, nl).trim();
+            pending = pending.slice(nl + 1);
+            if (line === '') continue;
+            try {
+              onProgress(JSON.parse(line) as DockerProgress);
+            } catch {
+              // A line the daemon did not send as JSON is not progress.
+            }
+          }
+          if (pending.length > MAX_PROGRESS_LINE_BYTES) res.destroy(new Error('the daemon sent a progress line over 64 KiB'));
+        });
+        res.on('error', reject);
+        res.on('end', () => {
+          if (status === 200) {
+            resolve();
+            return;
+          }
+          let message = `the daemon answered ${status}`;
+          try {
+            const parsed = JSON.parse(refused) as { message?: unknown };
+            if (typeof parsed.message === 'string') message = parsed.message;
+          } catch {
+            // Not JSON: the status is all there is to say.
+          }
+          reject(new Error(message));
+        });
+      }
+    );
+    upstream.on('error', reject);
+    upstream.end();
+  });
+}
+

@@ -25,6 +25,20 @@ export interface VmRequest {
   repoKey: string;
   /** Job only: the worker's ProxyServer port on 127.0.0.1. */
   proxyPort?: number;
+  /**
+   * Job only: booted ahead of a claim for the worker's spawn repository
+   * (dockerVm.prewarm). Admitted after every job boot and only while memory
+   * pressure is normal; stopped on wake and under pressure until claimed.
+   */
+  spare?: boolean;
+}
+
+/** How a VM ended, once its helper has exited. */
+export interface VmStopped {
+  /** `guest` (powered off), `requested`, or `error`, as the helper said; `killed` when it said nothing. */
+  reason: 'guest' | 'requested' | 'error' | 'killed';
+  /** Refresh mode: the data disk was F_FULLFSYNC'd after a clean guest stop, so it may be promoted. */
+  synced: boolean;
 }
 
 export type VmState = 'queued' | 'booting' | 'ready' | 'stopping' | 'stopped' | 'failed';
@@ -80,13 +94,6 @@ export interface VmError extends Error {
   code: string;
 }
 
-/** The helper's `stopped` event (§2.4), or what VmManager saw when the helper exited without one. */
-export interface VmStopped {
-  reason: 'guest' | 'requested' | 'error';
-  /** True only after a `guest` stop in refresh mode whose F_FULLFSYNC of the data disk succeeded. */
-  synced: boolean;
-}
-
 export interface VmHandle {
   readonly vmId: string;
   readonly dockerSocketPath: string;
@@ -96,16 +103,24 @@ export interface VmHandle {
   agent(): AgentClient;
   stop(reason: string): Promise<void>;
   /**
-   * Resolves once the VM has stopped, however it stopped, and never rejects.
-   * A refresh promotes its disk only on `synced: true` (§6.5).
+   * Resolves once the helper has exited and the VM's directory is gone,
+   * however the VM stopped, and never rejects. A refresh promotes its disk
+   * only on `synced: true` (§6.5).
    */
   stopped(): Promise<VmStopped>;
+  /** Why the VM failed, once state() is `failed`: at boot, or after it was ready. */
+  failure(): VmError | undefined;
 }
 
 export interface VmManager {
   sweep(): Promise<void>;
   /** Admission-gated; never blocks the caller. */
   start(req: VmRequest): VmHandle;
+  /**
+   * Make a spare VM an ordinary job VM, so that waking or memory pressure no
+   * longer stops it. False when it is no longer a live spare.
+   */
+  claimSpare(vmId: string): boolean;
   onResume(): void;
   onMemoryPressure(level: 'normal' | 'warn' | 'critical'): void;
   shutdownAll(): Promise<void>;

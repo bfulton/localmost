@@ -100,7 +100,7 @@ importing `VmManager`.
 | `src/main/docker/docker-filter-proxy.test.ts` | C, E | C rewrites fixtures to a fake `WorkerDocker`; E deletes what is left of `DesktopBackend` fixtures. E rebases on C. |
 | `src/main/docker/docker-backend.ts` | 0, C, E | 0 writes the new interfaces beside `DesktopBackend`; C adapts `DesktopBackend` to them; E deletes it. |
 | `.github/workflows/ci.yaml` | B, D | B adds the `native` job; D pins `setup-node`. |
-| `test/e2e/docker.spec.ts` | C, E | C adds the VM assertions; E replaces the Linux path *(decision 3)*. E rebases on C. |
+| `test/e2e/docker.spec.ts` | C, E | C moves the spec to the new filter options (a `WorkerDocker`) and the pull log line. E builds the Mac mode on `VmBackend` and adds the VM assertions there (moved from C, which has no helper or guest to boot: no VM without `docker:`, a boot at the claim, the pull line saying "on the Mac", the VM's directory gone afterwards), and replaces the Linux path *(decision 3)*. E rebases on C. |
 | the contract | any | Changed in the package's own branch and reconciled at integration. |
 
 ---
@@ -657,7 +657,10 @@ has the evidence):
   - **on the Mac, outside a job:** it builds `VmBackend` and `VmManager`
     against the resources in `build/` (`build/localmost-vm`, `build/guest`,
     `build/docker-cli`), which must exist; the precondition is that they do,
-    with a message naming `npm run build:native`.
+    with a message naming `npm run build:native`. This mode carries the VM
+    assertions (moved here from WP-C, which cannot boot a VM): a job whose
+    policy has no `docker:` boots no VM; a job with one boots at the claim;
+    the pull line says "on the Mac"; the VM's directory is gone afterwards.
   - **off macOS** *(decision 3, recommended option)*: it uses
     `test/e2e/support/native-worker-docker.ts`, a test-only `WorkerDocker`
     that forwards to the runner's native `dockerd`, with pulls forwarded

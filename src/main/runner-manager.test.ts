@@ -12,6 +12,7 @@ jest.mock('./runner-downloader', () => ({
     removeSandbox: jest.fn().mockResolvedValue(undefined),
     getToolCacheDir: jest.fn().mockImplementation((targetId: string) => `/Users/test/.localmost/runner/caches/${targetId}/tool-cache`),
     getTargetCacheDir: jest.fn().mockImplementation((targetId: string) => `/Users/test/.localmost/runner/caches/${targetId}`),
+    writeShareNonce: jest.fn(() => "a".repeat(32)),
     buildSandbox: jest.fn().mockImplementation((instance: number) => Promise.resolve(`/Users/test/.localmost/runner/sandbox/${instance}`)),
     isDownloaded: jest.fn().mockReturnValue(true),
     isConfigured: jest.fn().mockImplementation((_instance: number) => true),
@@ -72,6 +73,7 @@ jest.mock('./docker/docker-filter-proxy', () => ({
         repository = repo;
       }),
       boundRepository: jest.fn(() => repository),
+      staysClosed: jest.fn(),
     };
   }),
 }));
@@ -86,7 +88,14 @@ import { LogEntry, RunnerState, JobHistoryEntry } from '../shared/types';
 import { DockerPolicy } from '../shared/docker-policy';
 import { spawnSandboxed } from './process-sandbox';
 import { DockerFilterProxy } from './docker/docker-filter-proxy';
-import type { LegacyDockerBackend } from './docker/docker-backend';
+import { dockerCliPath } from './vm/paths';
+import type { DockerBackend, WorkerContext, WorkerDocker } from './docker/docker-backend';
+import type { DockerVmConfig } from './config';
+
+const vmConfig: DockerVmConfig = {
+  prewarm: false, cpus: 4, memoryMiB: 8192, maxRunning: 2, dataDiskGiB: 64, bootTimeoutSec: 60,
+  cacheLimitGiB: 20, pullMaxGiB: 10, jobPullMaxGiB: 30, minFreeGiB: 20,
+};
 import { createMockProcess, RunnerManagerTestHelper } from './test-utils';
 
 /** Stands in for the broker making a worker its per-start key. */
@@ -104,14 +113,16 @@ const mockSpawnSandboxed = spawnSandboxed as jest.MockedFunction<typeof spawnSan
 /** What the mocked DockerFilterProxy hands back: the manager's view of a worker's socket. */
 interface DockerSocketStub {
   options: {
-    backend?: LegacyDockerBackend;
+    backend?: DockerBackend;
+    worker?: WorkerDocker;
+    bootTimeoutMs?: number;
     onLog?: (entry: { level: 'info' | 'warn' | 'debug'; message: string }) => void;
-    attachRegistryAuth?: (registry: string) => string | undefined;
   };
   start: jest.Mock;
   stop: jest.Mock;
   bind: jest.Mock;
   boundRepository: () => string | undefined;
+  staysClosed: jest.Mock;
 }
 const dockerSocketOf = (helper: RunnerManagerTestHelper, instanceNum: number): DockerSocketStub =>
   helper.dockerProxy(instanceNum) as DockerSocketStub;
@@ -2006,13 +2017,28 @@ describe('RunnerManager', () => {
         expect(env.FOO_SECRET).toBeUndefined();
         expect(env.SSH_AUTH_SOCK).toBeUndefined();
         expect(env.NODE_OPTIONS).toBeUndefined();
-        // What the runner and a shell need to know who and where they are.
-        expect(env.PATH).toBe(process.env.PATH);
+        // What the runner and a shell need to know who and where they are -
+        // with the bundled docker CLI's directory first on PATH.
+        expect(env.PATH).toBe(`${path.dirname(dockerCliPath())}:${process.env.PATH}`);
         expect(env.HOME).toBe(process.env.HOME);
         // And what the app sets for the runner itself.
         expect(env.ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT).toBe('true');
         expect(env.HTTPS_PROXY).toBeDefined();
       });
+    });
+
+    it('gives the job the system PATH after the bundled CLI when the app has no PATH of its own', async () => {
+      const saved = process.env.PATH;
+      delete process.env.PATH;
+      try {
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+        await new RunnerManagerTestHelper(runnerManager).spawnForJob();
+      } finally {
+        process.env.PATH = saved;
+      }
+      const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+      expect(env.PATH).toBe(`${path.dirname(dockerCliPath())}:/usr/bin:/bin:/usr/sbin:/sbin`);
     });
 
     it("applies the repository's approved env policy", async () => {
@@ -2836,29 +2862,108 @@ describe('RunnerManager', () => {
       expect(options).not.toHaveProperty('dockerGrants');
     });
 
-    it("builds each worker's docker socket on the configured backend and registry auth", async () => {
-      const dockerBackend: LegacyDockerBackend = {
+    it("builds each worker's docker socket on its own worker of the backend, with the §5.4 context", async () => {
+      const contexts: WorkerContext[] = [];
+      const worker = { prewarm: jest.fn() } as unknown as WorkerDocker;
+      const dockerBackend: DockerBackend = {
         name: 'test',
         supportsPrivileged: false,
-        resolveEndpoint: () => null,
+        disposable: true,
         workspaceMountRoot: (dir) => dir,
+        forWorker: (ctx) => {
+          contexts.push(ctx);
+          return worker;
+        },
       };
-      const attachRegistryAuth = jest.fn();
       const manager = new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
         dockerBackend,
-        attachRegistryAuth,
+        dockerCli: '/Applications/localmost.app/Contents/Resources/docker-cli/docker',
+        getDockerVmConfig: () => ({ ...vmConfig, bootTimeoutSec: 45 }),
+      });
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+
+      await new RunnerManagerTestHelper(manager).spawnForJob({ targetId: 't1', targetDisplayName: 'Owner/Repo' });
+
+      const socket = dockerSocketOf(new RunnerManagerTestHelper(manager), 1);
+      expect(socket.options.backend).toBe(dockerBackend);
+      expect(socket.options.worker).toBe(worker);
+      expect(socket.options.bootTimeoutMs).toBe(45_000);
+      expect(contexts).toHaveLength(1);
+      const [ctx] = contexts;
+      expect(ctx).toMatchObject({
+        slot: 1,
+        sandboxDir: '/Users/test/.localmost/runner/sandbox/1',
+        sandboxId: '1',
+        shareNonce: 'a'.repeat(32),
+        spawnRepository: 'Owner/Repo',
+      });
+      // The worker's proxy, read when asked: its port and its token-bearing URL.
+      expect(ctx.proxy()).toEqual({ port: 12345, url: expect.stringMatching(/^http:\/\/localmost:[0-9a-f]+@127\.0\.0\.1:12345$/) });
+      // No spare unless dockerVm.prewarm says so.
+      expect(worker.prewarm).not.toHaveBeenCalled();
+    });
+
+    it('gives the job the bundled CLI first on its PATH, an empty config of its own, the share rules and the helper deny', async () => {
+      const cli = '/Applications/localmost.app/Contents/Resources/docker-cli/docker';
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        dockerCli: cli,
+        vmHelper: '/Applications/localmost.app/Contents/Resources/localmost-vm',
       });
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
 
       await new RunnerManagerTestHelper(manager).spawnForJob();
 
-      const socket = dockerSocketOf(new RunnerManagerTestHelper(manager), 1);
-      expect(socket.options.backend).toBe(dockerBackend);
-      expect(socket.options.attachRegistryAuth).toBe(attachRegistryAuth);
+      const [, , options] = mockSpawnSandboxed.mock.calls[mockSpawnSandboxed.mock.calls.length - 1];
+      const env = options!.env as NodeJS.ProcessEnv;
+      expect(env.DOCKER_CONFIG).toBe('/Users/test/.localmost/runner/sandbox/1/.docker');
+      expect(env.PATH!.split(':')[0]).toBe('/Applications/localmost.app/Contents/Resources/docker-cli');
+      expect(env.DOCKER_HOST).toBe('unix:///Users/test/.localmost/runner/sandbox/1/docker.sock');
+      expect(env.DOCKER_BUILDKIT).toBe('0');
+      expect(options).toMatchObject({
+        shareDir: '/Users/test/.localmost/runner/sandbox/1/_work',
+        dockerCli: cli,
+        // The helper, which the job's profile refuses to run.
+        vmHelper: '/Applications/localmost.app/Contents/Resources/localmost-vm',
+      });
+    });
+
+    it('boots a spare for the worker when dockerVm.prewarm is on', async () => {
+      const worker = { prewarm: jest.fn() } as unknown as WorkerDocker;
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        dockerBackend: { name: 'test', supportsPrivileged: false, disposable: true, workspaceMountRoot: (d) => d, forWorker: () => worker },
+        getDockerVmConfig: () => ({ ...vmConfig, prewarm: true }),
+      });
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+      await new RunnerManagerTestHelper(manager).spawnForJob();
+      expect(worker.prewarm).toHaveBeenCalledTimes(1);
+    });
+
+    it('starts no worker whose share nonce cannot be written', async () => {
+      const manager = new RunnerManager({ onLog: mockOnLog, onStatusChange: mockOnStatusChange, onJobHistoryUpdate: mockOnJobHistoryUpdate });
+      const helper = new RunnerManagerTestHelper(manager);
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+      (manager as unknown as { downloader: { writeShareNonce: jest.Mock } }).downloader.writeShareNonce.mockImplementationOnce(() => {
+        throw new Error("EEXIST: file already exists, open '_work/.localmost-share'");
+      });
+      mockSpawnSandboxed.mockClear();
+      await helper.spawnForJob();
+      expect(mockSpawnSandboxed).not.toHaveBeenCalled();
+      expect(mockOnLog).toHaveBeenCalledWith(
+        expect.objectContaining({ level: 'error', message: expect.stringMatching(/work folder of instance 1: EEXIST/) })
+      );
     });
 
     it("forwards the docker socket's log entries to the runner log", async () => {
@@ -2963,6 +3068,8 @@ describe('RunnerManager', () => {
 
       expect(socket.bind).not.toHaveBeenCalled();
       expect(socket.boundRepository()).toBeUndefined();
+      // Its spare, booted for owner/repo, is stopped at the claim.
+      expect(socket.staysClosed).toHaveBeenCalledWith('the claim is for other/repo, not owner/repo, so the Docker socket stays closed');
     });
 
     it('stops the docker socket when the worker exits', async () => {
@@ -3223,7 +3330,7 @@ describe('a worker constrained by policy drift stays constrained', () => {
       setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(),
       setPolicyLevel: jest.fn(), getStats: jest.fn(), getPolicyLevel: jest.fn(),
     };
-    const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn() };
+    const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn(), staysClosed: jest.fn() };
     helper.setProxy(1, proxy);
     helper.setDockerProxy(1, dockerSocket);
     // A stamp that cannot match the policy above: the approved policy moved
@@ -3238,6 +3345,7 @@ describe('a worker constrained by policy drift stays constrained', () => {
     await helper.applyPolicyOnClaim(1, 'owner/repo', 'abc1234');
     expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith([]);
     expect(dockerSocket.bind).not.toHaveBeenCalled();
+    expect(dockerSocket.staysClosed).toHaveBeenCalledWith(expect.stringMatching(/policy changed since this worker started/));
 
     // The job-start refresh must not undo that. It runs without isClaim, so it
     // never re-checks drift, and it used to fall straight through to widening.
@@ -3279,7 +3387,7 @@ describe('a worker nobody spawned for a job', () => {
       getRepoPolicy: async () => ({ hosts: ['example.com'], level: 'strict' as const, readPaths: [], writePaths: [], docker }),
     });
     const helper = new RunnerManagerTestHelper(manager);
-    const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn() };
+    const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn(), staysClosed: jest.fn() };
     helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel: jest.fn() });
     helper.setDockerProxy(1, dockerSocket);
     helper.setInstance(1, { name: 'runner-1', status: 'listening' });
@@ -3296,7 +3404,7 @@ describe('a worker nobody spawned for a job', () => {
       getRepoPolicy: async () => ({ hosts: [], level: 'strict' as const, readPaths: [], writePaths: [], docker }),
     });
     const helper = new RunnerManagerTestHelper(manager);
-    const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn() };
+    const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn(), staysClosed: jest.fn() };
     helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel: jest.fn() });
     helper.setDockerProxy(1, dockerSocket);
     helper.setInstance(1, { name: 'runner-1', status: 'listening' });

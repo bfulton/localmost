@@ -90,6 +90,147 @@ export interface AppConfig {
   power?: PowerConfig;
   /** Notification settings */
   notifications?: NotificationsConfig;
+  /** The per-job Docker VMs; read from config.yaml only, see resolveDockerVmConfig. */
+  dockerVm?: Partial<Record<keyof DockerVmConfig, unknown>>;
+}
+
+/**
+ * The per-job Docker VMs, as used: every key present, in range. See
+ * docs/roadmap/vm-docker-backend-contract.md §5.6. No key enables a fallback
+ * daemon; there is none.
+ */
+export interface DockerVmConfig {
+  /** Boot one spare VM for the next spawned worker: memory for latency. */
+  prewarm: boolean;
+  /** Per VM. */
+  cpus: number;
+  /** Per VM; committed lazily, returned only when the VM stops. */
+  memoryMiB: number;
+  /** How many VMs may run at once; more wait at the admission gate. */
+  maxRunning: number;
+  /** The most a VM's data disk may be; less when free space is short. */
+  dataDiskGiB: number;
+  /** How long a docker request waits for the job's VM. */
+  bootTimeoutSec: number;
+  /** Per repository: golden disk and image store, least recently used dropped at refresh. */
+  cacheLimitGiB: number;
+  /** Compressed bytes one pull may fetch. */
+  pullMaxGiB: number;
+  /** Compressed bytes all of one job's pulls may fetch. */
+  jobPullMaxGiB: number;
+  /** Free space on the data directory's volume under which boots and pulls are refused. */
+  minFreeGiB: number;
+}
+
+/** What resolveDockerVmConfig sizes its defaults from. */
+export interface DockerVmHost {
+  cores: number;
+  memoryBytes: number;
+}
+
+/** Each numeric key's range; a value outside it is clamped and logged. 0 for maxRunning means automatic. */
+const DOCKER_VM_RANGES: Record<Exclude<keyof DockerVmConfig, 'prewarm'>, [number, number]> = {
+  cpus: [1, 64],
+  memoryMiB: [1024, 65536],
+  maxRunning: [0, 64],
+  dataDiskGiB: [8, 4096],
+  bootTimeoutSec: [5, 600],
+  cacheLimitGiB: [1, 4096],
+  pullMaxGiB: [1, 1024],
+  jobPullMaxGiB: [1, 4096],
+  minFreeGiB: [1, 4096],
+};
+
+/**
+ * The `dockerVm` section as the running app reads it: resolved once, and
+ * again only when refresh() is called, at each worker spawn. The VM manager
+ * reads it at every state change and every 10 s while VMs run, and a read of
+ * config.yaml is synchronous file I/O on Electron main. Each warning is
+ * logged once for each distinct text, so a clamped value is reported once,
+ * not at every read.
+ */
+export class DockerVmConfigSource {
+  private cached: DockerVmConfig | undefined;
+  private readonly logged = new Set<string>();
+
+  constructor(
+    private readonly opts: {
+      read: () => AppConfig['dockerVm'] | undefined;
+      host: DockerVmHost;
+      log: (message: string) => void;
+    }
+  ) {}
+
+  current(): DockerVmConfig {
+    this.cached ??= this.resolve();
+    return this.cached;
+  }
+
+  refresh(): DockerVmConfig {
+    this.cached = this.resolve();
+    return this.cached;
+  }
+
+  private resolve(): DockerVmConfig {
+    return resolveDockerVmConfig(this.opts.read(), this.opts.host, (message) => {
+      if (this.logged.has(message)) return;
+      this.logged.add(message);
+      this.opts.log(message);
+    });
+  }
+}
+
+/**
+ * The `dockerVm` section of config.yaml as the VM backend uses it. Every key
+ * is optional. A value of the wrong type is taken as absent, and one out of
+ * range is clamped, each with a line through `log`; keys it does not know
+ * are ignored.
+ */
+export function resolveDockerVmConfig(
+  raw: AppConfig['dockerVm'] | undefined,
+  host: DockerVmHost,
+  log: (message: string) => void = () => {}
+): DockerVmConfig {
+  const GiB = 1024 ** 3;
+  const defaults: DockerVmConfig = {
+    prewarm: false,
+    cpus: Math.max(1, Math.min(4, host.cores)),
+    memoryMiB: 8192,
+    maxRunning: 0,
+    dataDiskGiB: 64,
+    bootTimeoutSec: 60,
+    cacheLimitGiB: 20,
+    pullMaxGiB: 10,
+    jobPullMaxGiB: 30,
+    minFreeGiB: 20,
+  };
+  const section: Record<string, unknown> = typeof raw === 'object' && raw !== null ? raw : {};
+  const resolved: DockerVmConfig = { ...defaults };
+
+  if (section.prewarm !== undefined) {
+    if (typeof section.prewarm === 'boolean') resolved.prewarm = section.prewarm;
+    else log(`dockerVm.prewarm must be true or false; using ${defaults.prewarm}`);
+  }
+  for (const key of Object.keys(DOCKER_VM_RANGES) as Array<keyof typeof DOCKER_VM_RANGES>) {
+    const value = section[key];
+    if (value === undefined) continue;
+    if (typeof value !== 'number' || !Number.isInteger(value)) {
+      log(`dockerVm.${key} must be a whole number; using ${defaults[key]}`);
+      continue;
+    }
+    const [min, max] = DOCKER_VM_RANGES[key];
+    const clamped = Math.min(max, Math.max(min, value));
+    if (clamped !== value) log(`dockerVm.${key} ${value} is outside ${min}-${max}; using ${clamped}`);
+    resolved[key] = clamped;
+  }
+  if (resolved.jobPullMaxGiB < resolved.pullMaxGiB) {
+    log(`dockerVm.jobPullMaxGiB ${resolved.jobPullMaxGiB} is less than pullMaxGiB; using ${resolved.pullMaxGiB}`);
+    resolved.jobPullMaxGiB = resolved.pullMaxGiB;
+  }
+  if (resolved.maxRunning === 0) {
+    resolved.maxRunning = Math.max(1, Math.floor(host.memoryBytes / GiB / 8));
+  }
+  return resolved;
 }
 
 /**

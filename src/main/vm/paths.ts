@@ -49,6 +49,9 @@ export const SHARE_DIR_NAME = '_work';
 /** The share's tripwire nonce, inside the share, which the job can neither read nor write. */
 export const SHARE_NONCE_FILE = '.localmost-share';
 
+/** The job's DOCKER_CONFIG, in its sandbox and outside the share. */
+export const DOCKER_CONFIG_DIR_NAME = '.docker';
+
 /** The helper's file name, in Resources when packaged and in build/ otherwise. */
 export const HELPER_NAME = 'localmost-vm';
 
@@ -233,7 +236,7 @@ export function sandboxFiles(dataDir: string, sandboxId: string): SandboxFiles {
     share,
     shareNonce: path.join(share, SHARE_NONCE_FILE),
     dockerSocket: path.join(dir, 'docker.sock'),
-    dockerConfig: path.join(dir, '.docker'),
+    dockerConfig: path.join(dir, DOCKER_CONFIG_DIR_NAME),
   };
 }
 
