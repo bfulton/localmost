@@ -47,6 +47,17 @@ describe('parseFrame', () => {
 });
 
 describe('sanitizeGuestText', () => {
+  it('turns Unicode line breaks and format characters into spaces, which could fake a line or reorder one', () => {
+    // U+2028/U+2029 break a line in some viewers; the bidi overrides and
+    // isolates (U+202A-U+202E, U+2066-U+2069) and marks (U+200E, U+200F)
+    // reorder what a reader sees; a lone surrogate is not text at all.
+    expect(sanitizeGuestText('a\u2028b\u2029c')).toBe('a b c');
+    expect(sanitizeGuestText('ok \u202Etxt.exe\u202C \u2066x\u2069 \u200E\u200F\uFEFF\u200B')).toBe('ok  txt.exe   x      ');
+    expect(sanitizeGuestText('x\uD800y')).toBe('x y');
+    // Text outside those classes is left as it is.
+    expect(sanitizeGuestText('héllo wörld 日本 😀')).toBe('héllo wörld 日本 😀');
+  });
+
   it('drops ANSI escapes and turns every other control character into a space', () => {
     expect(sanitizeGuestText('\u001b[31mred\u001b[0m ok\r\nnext\u0007\u009b')).toBe('red ok  next  ');
     expect(sanitizeGuestText('\u001b]0;title\u0007after')).toBe('after');

@@ -15,15 +15,22 @@ export const PROTOCOL_V = 1;
 /** A CSI or OSC escape sequence, then any other C0/C1 control character or DEL. */
 const ANSI_ESCAPE = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)?|[@-Z\\-_])/g;
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/g;
+/**
+ * What else can fake a line break or reorder what a reader sees: the line and
+ * paragraph separators, every format character (the bidi overrides, isolates
+ * and marks among them), and a lone surrogate, which is not text.
+ */
+const UNICODE_UNSAFE = /[\p{Zl}\p{Zp}\p{Cf}\p{Cs}]/gu;
 
 /**
  * Text from the helper, the guest or dockerd, made fit for a log line: ANSI
- * escapes removed, every other control character (newlines included) turned
- * into a space, and at most `max` characters kept.
+ * escapes removed, every other control character (newlines included) and
+ * every Unicode separator or format character turned into a space, and at
+ * most `max` characters kept.
  */
 export function sanitizeGuestText(value: unknown, max = 512): string {
   const text = typeof value === 'string' ? value : String(value);
-  const clean = text.replace(ANSI_ESCAPE, '').replace(CONTROL, ' ');
+  const clean = text.replace(ANSI_ESCAPE, '').replace(CONTROL, ' ').replace(UNICODE_UNSAFE, ' ');
   return clean.length > max ? `${clean.slice(0, max)}…` : clean;
 }
 
