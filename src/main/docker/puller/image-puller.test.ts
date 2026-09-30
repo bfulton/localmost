@@ -250,6 +250,17 @@ describe('a pull', () => {
     expect(blobRequests().filter((r) => r.path.endsWith(layer))).toHaveLength(2);
   });
 
+  it('refuses a foreign layer, and a descriptor with urls, before fetching anything', async () => {
+    const foreign = buildImage({ editManifest: (m) => { m.layers[0].mediaType = MEDIA.dockerForeign; } });
+    const withUrls = buildImage({ editManifest: (m) => { m.layers[0].urls = ['https://cdn.test/layer']; } });
+    registry.putImage(IMAGE, foreign, 'foreign');
+    registry.putImage(IMAGE, withUrls, 'urls');
+    await expect(pull(puller(), { request: { tag: 'foreign' } })).rejects.toThrow('must be fetched from a URL the image names');
+    await expect(pull(puller(), { request: { tag: 'urls' } })).rejects.toThrow('must be fetched from a URL the image names');
+    expect(blobRequests()).toHaveLength(0);
+    expect(registry.requestsTo('cdn.test')).toHaveLength(0);
+  });
+
   it('fails on a layer whose uncompressed bytes do not match its diff_id', async () => {
     const image = buildImage({ editConfig: (c) => { (c.rootfs as { diff_ids: string[] }).diff_ids[0] = sha256(Buffer.from('other')); } });
     registry.putImage(IMAGE, image, 'v1');
