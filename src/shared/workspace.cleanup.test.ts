@@ -177,6 +177,132 @@ describe('workspace creation', () => {
     }
   });
 
+  it.each([
+    ['in another case', '.LOCALMOST-WORKSPACE.JSON'],
+    ['with a long s, which APFS folds to s', '.localmoſt-workspace.json'],
+  ])('neither fails nor writes through a checkout entry named as its metadata %s', async (_, name) => {
+    // The volume takes the name for the metadata's, which the exclude, by
+    // the exact name, did not: the entry was copied first, and the metadata
+    // write after it either failed the run or went through the link.
+    const victim = path.join(appData, 'victim');
+    fs.writeFileSync(victim, 'the user\'s\n');
+    const source = path.join(appData, 'folded');
+    fs.mkdirSync(source);
+    git(source, 'init', '-q');
+    fs.writeFileSync(path.join(source, 'a.txt'), 'a\n');
+    fs.symlinkSync(victim, path.join(source, name));
+    git(source, 'add', 'a.txt', name);
+
+    for (const options of [{ respectGitignore: true }, { respectGitignore: false }, { stagedOnly: true }]) {
+      const ws = await createWorkspace({ sourceDir: source, ...options });
+
+      expect(fs.readFileSync(victim, 'utf-8')).toBe('the user\'s\n');
+      expect(fs.readFileSync(path.join(ws.path, 'a.txt'), 'utf-8')).toBe('a\n');
+      const metadata = path.join(ws.path, '.localmost-workspace.json');
+      expect(fs.lstatSync(metadata).isFile()).toBe(true);
+      expect(JSON.parse(fs.readFileSync(metadata, 'utf-8')).id).toBe(ws.id);
+      // One entry, as the temp directory is on the Mac's default volume,
+      // which does not tell the two names apart.
+      expect(fs.readdirSync(ws.path).filter((entry) => entry.toLowerCase().endsWith('-workspace.json'))).toEqual([
+        '.localmost-workspace.json',
+      ]);
+    }
+  });
+
+  it.each([
+    ['a file in another case', '.LOCALMOST-WORKSPACE.JSON', 'file'],
+    ['a file with a long s', '.localmoſt-workspace.json', 'file'],
+    ['a directory in another case', '.LOCALMOST-WORKSPACE.JSON', 'directory'],
+    ['a directory with a long s', '.localmoſt-workspace.json', 'directory'],
+  ])('keeps its own metadata over %s the volume takes for its name', async (_, name, kind) => {
+    // The copy finds the name already taken by the metadata, written first:
+    // a file is copied only as a new one, and a directory is not descended,
+    // so neither replaces the metadata nor puts anything in the workspace.
+    // Each needs its own checkout, as the checkout's volume folds the names
+    // too.
+    const source = path.join(appData, 'folded');
+    fs.mkdirSync(source);
+    git(source, 'init', '-q');
+    fs.writeFileSync(path.join(source, 'a.txt'), 'a\n');
+    const entry = kind === 'file' ? name : `${name}/inner`;
+    fs.mkdirSync(path.dirname(path.join(source, entry)), { recursive: true });
+    fs.writeFileSync(path.join(source, entry), JSON.stringify({ id: 'forged' }));
+    git(source, 'add', 'a.txt', entry);
+
+    for (const options of [{ respectGitignore: true }, { respectGitignore: false }, { stagedOnly: true }]) {
+      const ws = await createWorkspace({ sourceDir: source, ...options });
+
+      const metadata = path.join(ws.path, '.localmost-workspace.json');
+      expect(fs.lstatSync(metadata).isFile()).toBe(true);
+      expect(JSON.parse(fs.readFileSync(metadata, 'utf-8')).id).toBe(ws.id);
+      expect(fs.readdirSync(ws.path).sort()).toEqual(['.localmost-workspace.json', 'a.txt']);
+    }
+  });
+
+  it('never writes its metadata through a link already at its name, even in a directory at its own id', async () => {
+    // The metadata is written into the workspace directory before anything
+    // else is; a directory already at the id - two runs given the same one -
+    // is refused there rather than shared, and nothing at the name is
+    // written through.
+    const victim = path.join(appData, 'victim');
+    fs.writeFileSync(victim, 'the user\'s\n');
+    const source = path.join(appData, 'src');
+    fs.mkdirSync(source);
+    fs.writeFileSync(path.join(source, 'a.txt'), 'a\n');
+    jest.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+    jest.spyOn(Math, 'random').mockReturnValue(0.5);
+    const taken = path.join(getWorkspacesDir(), `ws-${(1_700_000_000_000).toString(36)}-${(0.5).toString(36).substring(2, 8)}`);
+    fs.mkdirSync(taken);
+    fs.symlinkSync(victim, path.join(taken, '.localmost-workspace.json'));
+
+    await expect(createWorkspace({ sourceDir: source, respectGitignore: false })).rejects.toThrow(/EEXIST/);
+
+    expect(fs.readFileSync(victim, 'utf-8')).toBe('the user\'s\n');
+    expect(fs.existsSync(path.join(taken, 'a.txt'))).toBe(false);
+  });
+
+  it('never copies through a directory of the checkout replaced by a link, however the workspace is listed', async () => {
+    // A committed config/f, whose config is now a link to a directory
+    // outside the checkout: git still lists config/f, and a copier that
+    // looked through the link cloned what it found there.
+    const outside = path.join(appData, 'outside');
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, 'f'), 'SECRET\n');
+
+    /** Every regular file in a tree, whatever is at a link. */
+    const files = (dir: string): string[] =>
+      fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+        const at = path.join(dir, entry.name);
+        if (entry.isDirectory()) return files(at);
+        return entry.isFile() ? [at] : [];
+      });
+
+    const checkouts = [
+      // config listed as the untracked link it now is, beside config/f.
+      { dir: 'listed', ignore: '' },
+      // Only config/f listed: nothing else lays down config first.
+      { dir: 'ignored', ignore: '/config\n' },
+    ];
+    for (const { dir, ignore } of checkouts) {
+      const source = path.join(appData, dir);
+      committedRepo(source, { 'a.txt': 'a\n', 'config/f': 'f\n' });
+      fs.writeFileSync(path.join(source, '.gitignore'), ignore);
+      fs.rmSync(path.join(source, 'config'), { recursive: true });
+      fs.symlinkSync(outside, path.join(source, 'config'));
+      fs.writeFileSync(path.join(source, 'b.txt'), 'b\n');
+      git(source, 'add', 'b.txt');
+
+      for (const options of [{ respectGitignore: true }, { stagedOnly: true }]) {
+        const ws = await createWorkspace({ sourceDir: source, ...options });
+
+        expect(fs.readFileSync(path.join(ws.path, 'a.txt'), 'utf-8')).toBe('a\n');
+        const config = fs.lstatSync(path.join(ws.path, 'config'), { throwIfNoEntry: false });
+        expect(config === undefined || config.isSymbolicLink()).toBe(true);
+        expect(files(ws.path).filter((file) => fs.readFileSync(file, 'utf-8').includes('SECRET'))).toEqual([]);
+      }
+    }
+  }, 15000);
+
   it('copies a staged checkout\'s links as links, never what they point to', async () => {
     // A tracked link to a file of the user's put that file's contents in
     // the workspace, for every step to read.
