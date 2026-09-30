@@ -669,12 +669,13 @@ describe('DefaultVmManager', () => {
       // sweep kills by the file it runs. macOS only: the app runs nowhere else.
       const named = spawn('/bin/sleep', ['60'], { argv0: FAKE_HELPER });
       try {
-        // Until it has exec'd sleep, the child is a copy of this node.
-        const args = () => execFileSync('/bin/ps', ['-o', 'args=', '-p', String(named.pid)], { encoding: 'utf-8' }).trim();
-        await eventually(() => args() === `${FAKE_HELPER} 60`, 'the process to exec');
         if (process.platform === 'darwin') {
+          // Until it has exec'd sleep, the child is a copy of this node.
+          const args = () => execFileSync('/bin/ps', ['-o', 'args=', '-p', String(named.pid)], { encoding: 'utf-8' }).trim();
+          await eventually(() => args() === `${FAKE_HELPER} 60`, 'the process to exec');
           expect(await processExecutableOf(named.pid!)).toBe('/bin/sleep');
         } else {
+          // Elsewhere nothing is swept: no process is ever taken for the helper.
           expect(await processExecutableOf(named.pid!)).toBeNull();
         }
         expect(await processExecutableOf(999_999)).toBeNull();
