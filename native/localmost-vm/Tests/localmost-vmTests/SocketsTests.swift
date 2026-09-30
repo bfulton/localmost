@@ -95,6 +95,103 @@ final class UnixListenerTests: XCTestCase {
         listener.close()
         XCTAssertNil(lstatOf(path))
     }
+
+    func testWhenTheSecondSocketCannotBeBoundTheFirstIsRemoved() throws {
+        let docker = tmp.real + "/docker.sock"
+        let agent = try tmp.write("agent.sock", 3)
+        XCTAssertThrowsError(try bindListeners([(docker, { $0.release() }), (agent, { $0.release() })], maxConnections: 4)) {
+            XCTAssertEqual(($0 as? HelperError)?.code, .socket)
+        }
+        XCTAssertNil(lstatOf(docker), "the socket bound first is closed and removed")
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: agent)).count, 3, "the file in the way is left alone")
+    }
+
+    func testBothSocketsAreBoundInOrder() throws {
+        let docker = tmp.real + "/docker.sock", agent = tmp.real + "/agent.sock"
+        let listeners = try bindListeners([(docker, { $0.release() }), (agent, { $0.release() })], maxConnections: 4)
+        defer { listeners.forEach { $0.close() } }
+        XCTAssertEqual(listeners.map(\.path), [docker, agent])
+    }
+
+    /// Out of file descriptors, accept fails with EMFILE, and XNU drops the
+    /// connection it could not hand over rather than leave it in the backlog
+    /// (where it would wake the listener again at once). So the client sees
+    /// its connection closed, the listener does not spin, and once
+    /// descriptors are free the next connection is accepted.
+    func testRunningOutOfDescriptorsNeitherSpinsNorWedges() throws {
+        let path = tmp.real + "/docker.sock"
+        let accepted = expectation(description: "accepted once descriptors are free")
+        let listener = try UnixListener(path: path, maxConnections: 4) { conn in
+            conn.release()
+            accepted.fulfill()
+        }
+        defer { listener.close() }
+        // The client's socket is made first: connecting needs no new descriptor.
+        let client = socket(AF_UNIX, SOCK_STREAM, 0)
+        XCTAssertGreaterThanOrEqual(client, 0)
+        defer { Darwin.close(client) }
+
+        var saved = rlimit()
+        XCTAssertEqual(getrlimit(RLIMIT_NOFILE, &saved), 0)
+        var held: [Int32] = []
+        func restore() {
+            held.forEach { Darwin.close($0) }
+            held.removeAll()
+            var r = saved
+            setrlimit(RLIMIT_NOFILE, &r)
+        }
+        defer { restore() }
+        let lowest = dup(0)
+        XCTAssertGreaterThanOrEqual(lowest, 0)
+        held.append(lowest)
+        var low = rlimit(rlim_cur: rlim_t(lowest + 16), rlim_max: saved.rlim_max)
+        XCTAssertEqual(setrlimit(RLIMIT_NOFILE, &low), 0)
+        while true {
+            let fd = dup(0)
+            if fd < 0 { break }
+            held.append(fd)
+        }
+
+        let before = listener.wakeups
+        XCTAssertEqual(connectTo(client, path), 0)
+        XCTAssertTrue(waitForEOF(client), "the connection is closed, not left hanging")
+        Thread.sleep(forTimeInterval: 0.5)
+        let wakeups = listener.wakeups - before
+        restore()
+        XCTAssertLessThan(wakeups, 50, "the listener spun on EMFILE")
+
+        let next = try connectUnix(path)
+        defer { Darwin.close(next) }
+        wait(for: [accepted], timeout: 10)
+    }
+}
+
+/// The helper raises its own descriptor limit: launchd's default soft limit
+/// of 256 is less than its connections can use (§2.3).
+final class FileLimitTests: XCTestCase {
+    /// RLIM_INFINITY, which Swift does not import.
+    private let unlimited = rlim_t(Int64.max)
+
+    func testTheTargetIsTheWantedLimitWithinTheHardLimitAndNeverLower() {
+        XCTAssertEqual(fileLimitTarget(current: 256, max: unlimited, wanted: 1024), 1024)
+        XCTAssertEqual(fileLimitTarget(current: 256, max: 512, wanted: 1024), 512)
+        XCTAssertEqual(fileLimitTarget(current: 4096, max: unlimited, wanted: 1024), 4096)
+    }
+
+    func testTheSoftLimitIsRaised() throws {
+        var saved = rlimit()
+        XCTAssertEqual(getrlimit(RLIMIT_NOFILE, &saved), 0)
+        defer {
+            var r = saved
+            setrlimit(RLIMIT_NOFILE, &r)
+        }
+        var low = rlimit(rlim_cur: 256, rlim_max: saved.rlim_max)
+        XCTAssertEqual(setrlimit(RLIMIT_NOFILE, &low), 0)
+        raiseFileLimit()
+        var now = rlimit()
+        XCTAssertEqual(getrlimit(RLIMIT_NOFILE, &now), 0)
+        XCTAssertEqual(now.rlim_cur, min(rlim_t(helperFileLimit), saved.rlim_max))
+    }
 }
 
 final class LoopbackTests: XCTestCase {
@@ -115,8 +212,8 @@ final class LoopbackTests: XCTestCase {
 
 // MARK: - Test sockets
 
-func connectUnix(_ path: String) throws -> Int32 {
-    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+/// Connects an existing socket to a unix path; connect(2)'s result.
+func connectTo(_ fd: Int32, _ path: String) -> Int32 {
     var addr = sockaddr_un()
     addr.sun_family = sa_family_t(AF_UNIX)
     withUnsafeMutableBytes(of: &addr.sun_path) { raw in
@@ -124,9 +221,14 @@ func connectUnix(_ path: String) throws -> Int32 {
         raw.copyBytes(from: bytes)
         raw[bytes.count] = 0
     }
-    let rc = withUnsafePointer(to: &addr) {
+    return withUnsafePointer(to: &addr) {
         $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
     }
+}
+
+func connectUnix(_ path: String) throws -> Int32 {
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    let rc = connectTo(fd, path)
     guard rc == 0 else {
         let e = errno
         Darwin.close(fd)

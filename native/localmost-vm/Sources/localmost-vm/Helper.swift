@@ -51,6 +51,7 @@ final class Helper {
         var share: CheckedShare?
         let rosetta: RosettaPlan
         let configuration: VZVirtualMachineConfiguration
+        raiseFileLimit()
         do {
             try checkParent(ppid)
             paths = try HelperPaths(args)
@@ -90,14 +91,10 @@ final class Helper {
 
         startConsole()
         do {
-            listeners = [
-                try UnixListener(path: paths.dockerSocket, maxConnections: maxConnectionsPerSocket) { conn in
-                    machine.dial(GuestPort.docker, for: conn)
-                },
-                try UnixListener(path: paths.agentSocket, maxConnections: maxConnectionsPerSocket) { conn in
-                    machine.dial(GuestPort.agent, for: conn)
-                },
-            ]
+            listeners = try bindListeners([
+                (paths.dockerSocket, { machine.dial(GuestPort.docker, for: $0) }),
+                (paths.agentSocket, { machine.dial(GuestPort.agent, for: $0) }),
+            ], maxConnections: maxConnectionsPerSocket)
         } catch let e as HelperError {
             controller.fail(e)
         } catch {

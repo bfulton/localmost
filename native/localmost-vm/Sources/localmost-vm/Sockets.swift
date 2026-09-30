@@ -43,6 +43,14 @@ final class UnixListener {
     private let lock = NSLock()
     private var count = 0
     private var closed = false
+    private var wakeCount = 0
+
+    /// How many times the listener has woken to accept, for tests.
+    var wakeups: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return wakeCount
+    }
 
     var active: Int {
         lock.lock()
@@ -103,10 +111,16 @@ final class UnixListener {
     }
 
     private func acceptAll() {
+        lock.lock()
+        wakeCount += 1
+        lock.unlock()
         while true {
             let conn = accept(fd, nil, nil)
             if conn < 0 {
                 if errno == EINTR { continue }
+                // EAGAIN: none left. EMFILE or ENFILE: XNU has already
+                // dropped the connection it could not hand over, so nothing
+                // is left in the backlog to wake this again.
                 return
             }
             _ = fcntl(conn, F_SETFD, FD_CLOEXEC)
@@ -140,6 +154,47 @@ final class UnixListener {
         source?.cancel()
         unlink(path)
     }
+}
+
+/// Binds each socket in order. If one cannot be bound, those already bound
+/// are closed and removed before the error is thrown.
+func bindListeners(_ sockets: [(path: String, onAccept: (UnixListener.Connection) -> Void)],
+                   maxConnections: Int) throws -> [UnixListener] {
+    var bound: [UnixListener] = []
+    do {
+        for socket in sockets {
+            bound.append(try UnixListener(path: socket.path, maxConnections: maxConnections, socket.onAccept))
+        }
+    } catch {
+        bound.forEach { $0.close() }
+        throw error
+    }
+    return bound
+}
+
+/// The descriptor limit the helper wants. Its sockets alone may hold about
+/// 770 descriptors at the §2.3 limits (two sockets of 64 connections, two
+/// descriptors each, and 256 relays of two), and launchd's default soft
+/// limit is 256.
+let helperFileLimit = 1024
+
+/// The soft limit to set: `wanted`, within the hard limit, and never lower
+/// than it is.
+func fileLimitTarget(current: rlim_t, max: rlim_t, wanted: rlim_t) -> rlim_t {
+    guard current < wanted else { return current }
+    return Swift.min(wanted, max)
+}
+
+/// Raises the soft RLIMIT_NOFILE to `helperFileLimit`, or to the hard limit
+/// when that is lower. A failure leaves the limit as it was; a connection
+/// that finds none left is closed at once, as one past the §2.3 limits is.
+func raiseFileLimit() {
+    var limit = rlimit()
+    guard getrlimit(RLIMIT_NOFILE, &limit) == 0 else { return }
+    let target = fileLimitTarget(current: limit.rlim_cur, max: limit.rlim_max, wanted: rlim_t(helperFileLimit))
+    guard target != limit.rlim_cur else { return }
+    limit.rlim_cur = target
+    _ = setrlimit(RLIMIT_NOFILE, &limit)
 }
 
 /// Dials 127.0.0.1:<port>, the worker's proxy. This is the helper's only TCP
