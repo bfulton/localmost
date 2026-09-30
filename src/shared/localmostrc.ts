@@ -12,6 +12,7 @@ import {
   WORKFLOW_POLICY_KEYS,
   loopbackValues,
 } from './policy-describe';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as net from 'net';
 import * as path from 'path';
@@ -91,39 +92,132 @@ export interface ParseResult {
 const LOCALMOSTRC_FILENAMES = ['.localmostrc', '.localmostrc.yml', '.localmostrc.yaml'];
 
 /**
+ * Why what is at a .localmostrc path is refused, or null when it is a regular
+ * file or nothing.
+ *
+ * The file comes with the checkout, so whoever controls the repository
+ * decides what is at that name, and the CLI that reads and writes it runs as
+ * the user, outside any sandbox. A link there - dangling, which reads as no
+ * file at all - would have a write land wherever it points, outside the
+ * checkout; a device or FIFO would have a read never return. Only a regular
+ * file is a policy.
+ */
+function notRegularFile(filePath: string, stat: fs.Stats | null): string | null {
+  if (stat === null || stat.isFile()) return null;
+  return refusal(
+    filePath,
+    stat.isSymbolicLink() ? 'a link' : stat.isDirectory() ? 'a directory' : 'a device, FIFO or socket'
+  );
+}
+
+function refusal(filePath: string, kind: string): string {
+  return (
+    `${filePath} is not a regular file (it is ${kind}), so localmost will not read or write it. ` +
+    'Replace it with a regular file, or remove it.'
+  );
+}
+
+/** lstat, with null for nothing there. */
+function lstatOrNull(filePath: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(filePath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+/**
  * Find the .localmostrc file in a repository.
+ *
+ * Throws when the first name present is anything but a regular file, rather
+ * than skipping it: a link or device where the policy belongs is refused
+ * outright, not read past or written through.
  */
 export function findLocalmostrc(repoRoot: string): string | null {
   for (const filename of LOCALMOSTRC_FILENAMES) {
     const filePath = path.join(repoRoot, filename);
-    if (fs.existsSync(filePath)) {
-      return filePath;
-    }
+    const stat = lstatOrNull(filePath);
+    if (stat === null) continue;
+    const problem = notRegularFile(filePath, stat);
+    if (problem) throw new Error(problem);
+    return filePath;
   }
   return null;
 }
 
 /**
+ * Write a .localmostrc, replacing a regular file or creating one, and never
+ * following a link.
+ *
+ * The content goes to a new file created beside the destination - O_EXCL, so
+ * not through anything already at that name - which is then renamed over it.
+ * A rename replaces a link rather than writing through it, so even a link
+ * swapped in after the check below cannot carry the write out of the
+ * checkout. A replaced file keeps its mode; a new one is 0644, as a file to
+ * be checked in is, rather than the CLI's private umask.
+ */
+export function writeLocalmostrc(filePath: string, content: string): void {
+  const check = (): fs.Stats | null => {
+    const stat = lstatOrNull(filePath);
+    const problem = notRegularFile(filePath, stat);
+    if (problem) throw new Error(problem);
+    return stat;
+  };
+  const existing = check();
+  const mode = existing ? existing.mode & 0o777 : 0o644;
+
+  const temp = path.join(
+    path.dirname(filePath),
+    `.${path.basename(filePath)}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`
+  );
+  const fd = fs.openSync(temp, 'wx', mode);
+  try {
+    try {
+      fs.fchmodSync(fd, mode);
+      fs.writeFileSync(fd, content);
+    } finally {
+      fs.closeSync(fd);
+    }
+    check();
+    fs.renameSync(temp, filePath);
+  } catch (err) {
+    fs.rmSync(temp, { force: true });
+    throw err;
+  }
+}
+
+/**
  * Parse a .localmostrc file.
+ *
+ * Opened without following a link and without blocking, and read only once
+ * the open file is known to be a regular one: a link swapped in after
+ * findLocalmostrc looked is refused rather than followed, and a FIFO or
+ * device is refused rather than waited on or read forever.
  */
 export function parseLocalmostrc(filePath: string): ParseResult {
-  if (!fs.existsSync(filePath)) {
-    return {
-      success: false,
-      errors: [{ message: `File not found: ${filePath}` }],
-      warnings: [],
-    };
+  const failed = (message: string): ParseResult => ({ success: false, errors: [{ message }], warnings: [] });
+
+  let fd: number;
+  try {
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return failed(`File not found: ${filePath}`);
+    // O_NOFOLLOW refuses a link as ELOOP.
+    if (code === 'ELOOP') return failed(refusal(filePath, 'a link'));
+    return failed(`Failed to read file: ${(err as Error).message}`);
   }
 
   let content: string;
   try {
-    content = fs.readFileSync(filePath, 'utf-8');
+    const problem = notRegularFile(filePath, fs.fstatSync(fd));
+    if (problem) return failed(problem);
+    content = fs.readFileSync(fd, 'utf-8');
   } catch (err) {
-    return {
-      success: false,
-      errors: [{ message: `Failed to read file: ${(err as Error).message}` }],
-      warnings: [],
-    };
+    return failed(`Failed to read file: ${(err as Error).message}`);
+  } finally {
+    fs.closeSync(fd);
   }
 
   return parseLocalmostrcContent(content);

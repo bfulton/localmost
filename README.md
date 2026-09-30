@@ -257,7 +257,7 @@ Future feature ideas:
 
 - **Fail a blocked job visibly** - a job refused by the filter is cancelled through the GitHub API before any worker starts, so it appears as cancelled rather than failing with a message explaining why.
 - **Roll discovery output up further** - `--updaterc` now drops paths already covered by a listed ancestor, which removes the bulk of the redundancy. It still records content-addressed cache paths (npm's `_cacache/content-v2/sha512/...`) verbatim, which differ per machine and per dependency change; those want rolling up to their cache directory.
-- **Show a diff when `--updaterc` rewrites a policy** - it writes directly, with no diff and no confirmation, so a discovery run can widen a checked-in policy without the change being obvious.
+- **Show a full diff when `--updaterc` rewrites a policy** - it names the file and lists every grant it adds before asking, but it rewrites the whole file from the parsed policy, so the comments and formatting it drops are not shown.
 - **Homebrew formula** - `npx localmost` works; `brew install localmost` does not exist.
 - **Quick actions** - Re-run failed job, cancel all jobs.
 - **Spotlight integration** - Check status or pause builds from Spotlight.

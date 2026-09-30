@@ -1,4 +1,4 @@
-import { describe, it, expect, jest } from '@jest/globals';
+import { describe, it, expect, jest, beforeEach, afterEach } from '@jest/globals';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -16,6 +16,7 @@ import {
   parseLocalmostrcContent,
   serializeLocalmostrc,
 } from '../shared/localmostrc';
+import { callInChild } from '../shared/test-utils/call-in-child';
 
 describe('CLI test command', () => {
   describe('parseTestArgs', () => {
@@ -256,6 +257,7 @@ describe('mergeDiscoveredAccess', () => {
     expect(additions).toEqual([
       { label: 'network.allow', items: ['github.com'] },
       { label: 'filesystem.write', items: ['~/.npm'] },
+      { label: 'workflows', items: ['"ci"'] },
     ]);
   });
 
@@ -322,7 +324,10 @@ describe('mergeDiscoveredAccess', () => {
 
     expect(config.shared?.docker).toEqual({ build: { context: './' } });
     expect(config.workflows).toEqual({ ci: {} });
-    expect(additions).toEqual([{ label: 'docker.build.context', items: ['./'] }]);
+    expect(additions).toEqual([
+      { label: 'docker.build.context', items: ['./'] },
+      { label: 'workflows', items: ['"ci"'] },
+    ]);
   });
 
   it('ignores a hint that is not a valid docker policy rather than widening the file', () => {
@@ -421,5 +426,95 @@ describe('handleUpdateRc', () => {
     expect(output).toContain('a..b');
     expect(output).toContain(long);
     expect(output).toMatch(/not written/);
+  });
+});
+
+describe('handleUpdateRc and what is at .localmostrc', () => {
+  // The checkout decides what is at that name, and the CLI writing it runs
+  // as the user, outside any sandbox: a link there sent the rewritten policy
+  // - workflow name and all - wherever the repository pointed it.
+  let root: string;
+  let cwd: string;
+  let outside: string;
+  let lines: string[];
+  const found = { hosts: ['github.com'], readPaths: [], writePaths: [] };
+  const update = () => handleUpdateRc(cwd, { name: '$(touch pwned)' } as never, found, [], true);
+
+  beforeEach(() => {
+    root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'updaterc-link-')));
+    cwd = path.join(root, 'repo');
+    outside = path.join(root, 'outside');
+    fs.mkdirSync(cwd);
+    fs.mkdirSync(outside);
+    lines = [];
+    jest.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      lines.push(args.join(' '));
+    });
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('refuses a dangling link, and creates nothing where it points', async () => {
+    const victim = path.join(outside, '.zshenv');
+    fs.symlinkSync(victim, path.join(cwd, '.localmostrc'));
+
+    await expect(update()).rejects.toThrow(/\.localmostrc is not a regular file/);
+
+    expect(fs.existsSync(victim)).toBe(false);
+    expect(fs.readlinkSync(path.join(cwd, '.localmostrc'))).toBe(victim);
+    expect(fs.readdirSync(cwd)).toEqual(['.localmostrc']);
+  });
+
+  it('refuses a link to a file outside the checkout, and leaves that file alone', async () => {
+    const target = path.join(outside, 'target');
+    fs.writeFileSync(target, 'version: 1\n');
+    fs.symlinkSync(target, path.join(cwd, '.localmostrc'));
+
+    await expect(update()).rejects.toThrow(/not a regular file/);
+
+    expect(fs.readFileSync(target, 'utf-8')).toBe('version: 1\n');
+    expect(fs.readdirSync(cwd)).toEqual(['.localmostrc']);
+  });
+
+  it('refuses a link to /dev/zero without reading it', () => {
+    // Run in a child: reading /dev/zero never ends, and would hang the suite.
+    fs.symlinkSync('/dev/zero', path.join(cwd, '.localmostrc'));
+    const result = callInChild(
+      path.join(__dirname, 'test.ts'),
+      'handleUpdateRc',
+      [cwd, { name: 'CI' }, found, [], true],
+      { cwd, env: { ...process.env, HOME: root }, timeoutMs: 20_000 }
+    );
+    expect(result.timedOut).toBe(false);
+    expect(result.status).not.toBe(0);
+    expect(result.output).toMatch(/\.localmostrc is not a regular file/);
+  }, 30_000);
+
+  it('names the file it will write, and the workflow entry it adds', async () => {
+    // A workflow's name is chosen by whoever wrote the workflow, and a new
+    // policy gains an entry under it, so that entry is shown with the rest.
+    await update();
+
+    const output = lines.join('\n');
+    expect(output).toContain(`These will be added to ${path.join(cwd, '.localmostrc')}:`);
+    expect(output).toMatch(/workflows\S*\n.*\+.* "\$\(touch pwned\)"/);
+    const written = parseLocalmostrcContent(fs.readFileSync(path.join(cwd, '.localmostrc'), 'utf-8'));
+    expect(Object.keys(written.config?.workflows ?? {})).toEqual(['$(touch pwned)']);
+    expect(fs.existsSync(path.join(cwd, 'pwned'))).toBe(false);
+  });
+
+  it('names the resolved file, not the path it was reached by', async () => {
+    const via = path.join(root, 'via');
+    fs.symlinkSync(cwd, via);
+    fs.writeFileSync(path.join(cwd, '.localmostrc.yml'), 'version: 1\n');
+
+    await handleUpdateRc(via, { name: 'CI' } as never, found, [], true);
+
+    expect(lines.join('\n')).toContain(`These will be added to ${path.join(cwd, '.localmostrc.yml')}:`);
+    expect(fs.readFileSync(path.join(cwd, '.localmostrc.yml'), 'utf-8')).toMatch(/github\.com/);
+    expect(fs.existsSync(path.join(cwd, '.localmostrc'))).toBe(false);
   });
 });

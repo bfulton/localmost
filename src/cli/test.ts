@@ -45,6 +45,7 @@ import {
   hostPatternProblem,
   LocalmostrcConfig,
   serializeLocalmostrc,
+  writeLocalmostrc,
   LOCALMOSTRC_VERSION,
 } from '../shared/localmostrc';
 import { SandboxPolicy, LoopbackGrant, parseSandboxTrace, MACOS_BASELINE_READ_PATHS } from '../shared/sandbox-profile';
@@ -1147,18 +1148,20 @@ export async function confirmDiscovery(options: {
 }
 
 /**
- * List what a discovery run wants to add, and ask before writing it.
+ * List what a discovery run wants to add, and the file it will write it to,
+ * and ask before writing it.
  *
  * `.localmostrc` is checked in and grants sandbox access, so a discovery run
  * must not widen it silently. Without a terminal to ask on, nothing is written
  * unless --yes was passed.
  */
 async function confirmPolicyChange(
+  destination: string,
   additions: { label: string; items: string[] }[],
   assumeYes: boolean
 ): Promise<boolean> {
   console.log();
-  console.log(`${colors.bold}These will be added to .localmostrc:${colors.reset}`);
+  console.log(`${colors.bold}These will be added to ${destination}:${colors.reset}`);
   for (const { label, items } of additions) {
     if (items.length === 0) continue;
     console.log(`  ${colors.bold}${label}${colors.reset}`);
@@ -1462,17 +1465,16 @@ export async function handleUpdateRc(
     return;
   }
 
-  const approved = await confirmPolicyChange(additions, assumeYes);
+  // Named as the file it is, with any link in the path to the checkout
+  // resolved: findLocalmostrc has refused anything at the name itself but a
+  // regular file, and writeLocalmostrc will not follow one put there later.
+  const destination = existingPath ?? path.join(cwd, '.localmostrc');
+  const resolved = path.join(fs.realpathSync(path.dirname(destination)), path.basename(destination));
+  const approved = await confirmPolicyChange(resolved, additions, assumeYes);
   if (!approved) return;
 
-  const content = serializeLocalmostrc(config);
-  if (existingPath) {
-    fs.writeFileSync(existingPath, content);
-    console.log(`${colors.green}✓${colors.reset} Updated ${path.relative(cwd, existingPath)}`);
-  } else {
-    fs.writeFileSync(path.join(cwd, '.localmostrc'), content);
-    console.log(`${colors.green}✓${colors.reset} Created .localmostrc`);
-  }
+  writeLocalmostrc(destination, serializeLocalmostrc(config));
+  console.log(`${colors.green}✓${colors.reset} ${existingPath ? 'Updated' : 'Created'} ${path.relative(cwd, destination)}`);
 }
 
 /** What a discovery run found that a policy could grant. */
@@ -1567,6 +1569,12 @@ export function mergeDiscoveredAccess(
       { label: 'filesystem.write', items: writePaths },
       ...dockerAdditions(undefined, suggestedDocker),
     ]);
+    // The workflow's entry is written too, so it is listed with the rest.
+    // Its name is whatever the workflow file says, so it is shown quoted, as
+    // it is written, where a newline or a terminal escape in it shows as one.
+    if (additions.length > 0) {
+      additions.push({ label: 'workflows', items: [JSON.stringify(workflowName)] });
+    }
     return { config, additions };
   }
 
