@@ -261,6 +261,21 @@ describe('Sandbox Profile Generator', () => {
         '(subpath "/Users/test/Library/Keychains")',
         '(literal "/Users/test/.netrc")',
         '(literal "/Users/test/.npmrc")',
+        // The plaintext stores other tools keep their tokens and passwords in.
+        '(subpath "/Users/test/.azure")',
+        '(literal "/Users/test/.git-credentials")',
+        '(literal "/Users/test/.pypirc")',
+        '(literal "/Users/test/.gem/credentials")',
+        '(literal "/Users/test/.local/share/gem/credentials")',
+        '(literal "/Users/test/.terraform.d/credentials.tfrc.json")',
+        '(literal "/Users/test/.terraformrc")',
+        '(literal "/Users/test/.pgpass")',
+        '(literal "/Users/test/.vault-token")',
+        '(literal "/Users/test/.boto")',
+        '(literal "/Users/test/.s3cfg")',
+        '(literal "/Users/test/.my.cnf")',
+        '(literal "/Users/test/.mylogin.cnf")',
+        '(literal "/Users/test/.yarnrc.yml")',
       ]) {
         expect(forms[deny]).toContain(secret);
       }
@@ -290,6 +305,11 @@ describe('Sandbox Profile Generator', () => {
         '/Users/test/.cargo',
         '/Users/test/.nuget',
         '/Users/test/.nuget/NuGet',
+        '/Users/test/.gem',
+        '/Users/test/.terraform.d',
+        '/Users/test/.local',
+        '/Users/test/.local/share',
+        '/Users/test/.local/share/gem',
         '/Users/test',
         '/Users',
       ]) {

@@ -471,6 +471,16 @@ if (!isMacOS) {
         '.cargo/credentials.toml': 'SECRET-cargo',
         '.nuget/NuGet/NuGet.Config': 'SECRET-nuget',
         'Library/Keychains/login.keychain-db': 'SECRET-keychain',
+        // The plaintext stores other tools keep their tokens and passwords in.
+        '.git-credentials': 'SECRET-git',
+        '.pypirc': 'SECRET-pypi',
+        '.gem/credentials': 'SECRET-rubygems',
+        '.local/share/gem/credentials': 'SECRET-rubygems-xdg',
+        '.terraform.d/credentials.tfrc.json': 'SECRET-terraform',
+        '.azure/msal_token_cache.json': 'SECRET-azure',
+        '.yarnrc.yml': 'SECRET-yarn',
+        '.pgpass': 'SECRET-pgpass',
+        '.vault-token': 'SECRET-vault',
       };
       // Credentials kept in a dotfiles repository and linked into place, as
       // GNU stow and the like do it: a directory and a single file.
@@ -581,6 +591,20 @@ if (!isMacOS) {
         }
       });
 
+      it('a read grant on the home directory cannot read the credentials kept there, git and PyPI tokens included', () => {
+        // ~/.git-credentials is where git's store helper keeps tokens in the
+        // clear, and ~/.pypirc is where twine finds an upload token: a policy
+        // that read ~ read both, since the floor did not name them.
+        const run = underGrant({ level: 'strict', read: ['~'], write: [] });
+        // The grant is in force, so each refusal below is the floor's doing.
+        expect(run(`/bin/cat '${path.join(home, 'notes.txt')}'`).stdout).toBe('notes');
+        for (const file of Object.keys(credentials)) {
+          const result = run(`/bin/cat '${path.join(home, file)}'`);
+          expect([file, result.stdout]).toEqual([file, '']);
+          expect([file, result.stderr]).toEqual([file, expect.stringContaining('Operation not permitted')]);
+        }
+      });
+
       it('a write grant on the home directory cannot move ~/.ssh, or a directory above a credential, to a readable name', () => {
         const run = underGrant({ level: 'strict', read: ['~'], write: ['~'] });
         // Ordinary files in the home directory stay as granted.
@@ -597,6 +621,12 @@ if (!isMacOS) {
           ['.nuget', '.nuget-renamed', path.join('NuGet', 'NuGet.Config')],
           ['Library', 'Library-renamed', path.join('Keychains', 'login.keychain-db')],
           [path.join('Library', 'Keychains'), path.join('Library', 'Keychains-renamed'), 'login.keychain-db'],
+          ['.git-credentials', 'git-credentials-renamed', ''],
+          ['.azure', '.azure-renamed', 'msal_token_cache.json'],
+          ['.gem', '.gem-renamed', 'credentials'],
+          ['.terraform.d', '.terraform.d-renamed', 'credentials.tfrc.json'],
+          ['.local', '.local-renamed', path.join('share', 'gem', 'credentials')],
+          [path.join('.local', 'share'), path.join('.local', 'share-renamed'), path.join('gem', 'credentials')],
         ]) {
           expectNoRenameIntoView(run, from, to, shown);
         }
@@ -640,7 +670,7 @@ if (!isMacOS) {
         const whole = underGrant({ level: 'strict', read: ['~'], write: ['~'] }, fresh);
         expect(canCreateUnder(whole, path.join(fresh, 'elsewhere'))).toBe(true);
         expect(gradle(`/bin/mkdir -p '${path.join(fresh, '.gradle', 'caches')}'`).ok).toBe(false);
-        for (const dir of ['.gradle', '.m2', '.cargo', '.nuget']) {
+        for (const dir of ['.gradle', '.m2', '.cargo', '.nuget', '.gem', '.terraform.d', '.local']) {
           const target = path.join(fresh, dir);
           expect(whole(`/bin/mkdir '${target}'`).ok).toBe(false);
           expect(whole(`/bin/ln -s '${path.join(fresh, 'elsewhere')}' '${target}'`).ok).toBe(false);
