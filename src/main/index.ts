@@ -12,7 +12,10 @@ import { VmBackend } from './vm/vm-backend';
 import { DefaultVmManager } from './vm/vm-manager';
 import { GuestImage } from './vm/guest-image';
 import { getVmResourcesDir, guestDir, helperPath } from './vm/paths';
-import type { CacheDisks, ImagePuller } from './vm/types';
+import { CacheDisks } from './vm/cache-disks';
+import { VmImagePuller } from './docker/puller/image-puller';
+import { RegistryClient } from './docker/puller/registry-client';
+import { resolveRegistryCredentials } from './docker/registry-auth';
 import { MemoryPressureMonitor } from './resource-monitor/memory-pressure-monitor';
 import { GitHubAuth } from './github-auth';
 import { RunnerDownloader } from './runner-downloader';
@@ -183,35 +186,8 @@ const repoPolicyApproval: PolicyApprovalDeps = {
 let vmManager: DefaultVmManager | null = null;
 let memoryPressureMonitor: MemoryPressureMonitor | null = null;
 
-/**
- * Until the Mac-side puller and the cache disks (work package D) are merged:
- * a pull is refused with a message, and every job's data disk starts blank.
- * The integration replaces both with the real ImagePuller and CacheDisks.
- *
- * So a build from before that integration, which also has no packaged
- * helper or guest (work package F), gives every docker job a 503 or a
- * refused pull: it must not be installed on a runner that serves docker
- * jobs, the owner's CI runner included.
- */
-const pullerUntilMerged: ImagePuller = {
-  pull: async () => {
-    throw new Error('pulling images on the Mac is not part of this build yet');
-  },
-};
-const cacheDisksUntilMerged: CacheDisks = {
-  prepareJobDisk: async (_repoKey, dest, sizeGiB) => {
-    const file = await fs.promises.open(dest, 'wx', 0o600);
-    try {
-      await file.truncate(sizeGiB * 1024 ** 3);
-    } finally {
-      await file.close();
-    }
-    return 'blank';
-  },
-  notePulled: () => {},
-  scheduleRefresh: () => {},
-  discard: async () => {},
-};
+/** The per-repository golden data disks, and their refreshes (contract §6.5). */
+let cacheDisks: CacheDisks | null = null;
 
 app.whenReady().then(async () => {
   // Set restrictive umask so all files/directories are user-only (no group/world access)
@@ -295,23 +271,59 @@ app.whenReady().then(async () => {
   const dockerVmConfig = () => dockerVmConfigSource.current();
   const guestImage = new GuestImage(guestDir());
   const vmLog = (level: 'debug' | 'info' | 'warn' | 'error', message: string) => logger?.[level](`[docker-vm] ${message}`);
+  const dataDir = fs.realpathSync(getAppDataDir());
+  // A refresh VM is booted by the same manager as a job's, in slot 0, and
+  // queues behind every job boot; CacheDisks is handed only this function.
+  cacheDisks = new CacheDisks({
+    dataDir,
+    startRefreshVm: ({ repository, repoKey }) => {
+      if (!vmManager) throw new Error('the Docker VM manager is not running');
+      return vmManager.start({ mode: 'refresh', slot: 0, repository, repoKey });
+    },
+    guest: () => {
+      const manifest = guestImage.manifest();
+      return { guestVersion: manifest.guestVersion, dataFormat: manifest.dataFormat };
+    },
+    cacheLimitGiB: () => dockerVmConfig().cacheLimitGiB,
+    dataDiskGiB: () => dockerVmConfig().dataDiskGiB,
+    conditions: () => ({
+      onBattery: powerMonitor.isOnBatteryPower(),
+      memoryPressure: memoryPressureMonitor?.level() ?? 'normal',
+    }),
+    log: vmLog,
+  });
   vmManager = new DefaultVmManager({
-    dataDir: fs.realpathSync(getAppDataDir()),
+    dataDir,
     resources: getVmResourcesDir(),
     helperPath,
     guest: guestImage,
     config: dockerVmConfig,
-    cacheDisks: cacheDisksUntilMerged,
+    cacheDisks,
     log: vmLog,
   });
   // Before any worker exists: whatever an earlier run left - a helper still
   // running, a VM's directory, an unfinished refresh disk - goes first.
   await vmManager.sweep().catch((err: Error) => logger?.warn(`[docker-vm] Startup sweep failed: ${err.message}`));
+  // Pulls run here, on the Mac, with the operator's credentials, which never
+  // enter a VM (§6). What a failing credential helper printed goes to the
+  // app log only.
+  const puller = new VmImagePuller({
+    dataDir,
+    client: new RegistryClient({
+      credentials: (registry) => resolveRegistryCredentials(registry, { log: (m) => logger?.warn(`[docker-vm] ${m}`) }),
+    }),
+    cacheDisks,
+    limits: () => {
+      const { pullMaxGiB, jobPullMaxGiB, minFreeGiB } = dockerVmConfig();
+      return { pullMaxGiB, jobPullMaxGiB, minFreeGiB };
+    },
+    log: vmLog,
+  });
   const dockerBackend = new VmBackend({
     vmManager,
     guest: guestImage,
-    puller: pullerUntilMerged,
-    cacheDisks: cacheDisksUntilMerged,
+    puller,
+    cacheDisks,
     config: dockerVmConfig,
   });
   // VZ has no Linux time sync, and a VM's clock stops while the Mac sleeps.
@@ -842,7 +854,7 @@ app.on('before-quit', async (event) => {
         // Each worker's socket released its VM as it stopped; this stops what
         // is left - a spare, a cache refresh - bounded at 10 s.
         memoryPressureMonitor?.stop();
-        await vmManager?.shutdownAll();
+        await Promise.all([cacheDisks?.shutdown(), vmManager?.shutdownAll()]);
       })(),
     ]);
 
@@ -893,7 +905,7 @@ process.on('SIGINT', async () => {
       await cancelJobsOnOurRunners(runningJobs);
       await runnerManager?.stop();
       memoryPressureMonitor?.stop();
-      await vmManager?.shutdownAll();
+      await Promise.all([cacheDisks?.shutdown(), vmManager?.shutdownAll()]);
     })(),
   ]);
 

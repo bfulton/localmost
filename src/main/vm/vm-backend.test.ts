@@ -134,7 +134,7 @@ describe('VmBackend', () => {
       vmManager: manager,
       guest: new GuestImage(path.join(root, 'guest')),
       puller: puller as unknown as ImagePuller,
-      cacheDisks: { scheduleRefresh: (repoKey) => refreshes.push(repoKey) },
+      cacheDisks: { scheduleRefresh: (repoKey, repository) => refreshes.push(`${repoKey} ${repository}`) },
       config: () => config,
     });
 
@@ -417,7 +417,7 @@ describe('VmBackend', () => {
       await Promise.all([w.release(), w.release()]);
       await w.release();
       expect(manager.vms[0].stops).toEqual(['the job ended']);
-      expect(refreshes).toEqual([repoKeyOf('owner/repo')]);
+      expect(refreshes).toEqual([`${repoKeyOf('owner/repo')} Owner/Repo`]);
       expect(logs.map((l) => l.message)).toContain(`Docker VM ${manager.vms[0].vmId} released: the job ended`);
     });
 

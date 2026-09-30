@@ -355,7 +355,7 @@ class VmWorker implements WorkerDocker {
       }
       // What the job pulled from a registry is in the Mac's store; a refresh
       // loads it into the repository's cache disk for the next job.
-      if (this.pulledNew && this.bootedFor) this.opts.cacheDisks.scheduleRefresh(repoKeyOf(this.bootedFor));
+      if (this.pulledNew && this.bootedFor) this.opts.cacheDisks.scheduleRefresh(repoKeyOf(this.bootedFor), this.bootedFor);
     })();
     return this.releasing;
   }
