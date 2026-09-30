@@ -24,10 +24,13 @@
  *   { "stdout": ["line", ...] }    extra stdout lines after `started`
  *   { "rosetta": "installed" }     the `started` rosetta value (default notInstalled)
  *   { "agentAfterMs": n }          agent.sock connections are closed until n ms after start
- *   { "guestExitAfterMs": n }      the guest powers off n ms after start
  *   { "stopExitCode": n }          the exit code after a stop or SIGTERM (default 0)
  *   { "stopDelayMs": n }           how long a stop takes
  *   { "ignoreSigterm": true }      only SIGKILL ends it
+ *
+ * SIGUSR2 is the guest powering off by itself (`stopped` reason `guest`), at
+ * the moment a test chooses rather than after a delay a loaded machine may
+ * not keep to.
  *
  * What it is told is written to stderr as `info <what>` lines, which the
  * client logs, so a test can see a stop's grace, a set-time or an approval.
@@ -228,6 +231,8 @@ function answerAgent(connection, request) {
 }
 function serveAgent(connection) {
   if (Date.now() - started < (helper.agentAfterMs ?? 0)) {
+    // Logged, so a test can wait for the client to be trying the agent.
+    log('debug', 'agent.sock: the agent is not up yet');
     connection.destroy();
     return;
   }
@@ -278,7 +283,10 @@ emit({
   startMs: Date.now() - started,
 });
 for (const line of helper.stdout ?? []) process.stdout.write(`${line}\n`);
-if (helper.guestExitAfterMs !== undefined) setTimeout(() => stop('guest'), helper.guestExitAfterMs);
+process.on('SIGUSR2', () => {
+  log('info', 'the guest powered off');
+  stop('guest');
+});
 
 // --- Commands (§2.4) --------------------------------------------------------------
 

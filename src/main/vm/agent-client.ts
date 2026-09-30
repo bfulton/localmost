@@ -240,7 +240,10 @@ export class UnixAgentClient implements AgentClient {
       return;
     }
     const id = answer.id;
-    if (this.expired.delete(id)) return;
+    if (this.expired.delete(id)) {
+      this.opts.log?.('debug', `dropped the late answer to request ${id}, which had timed out`);
+      return;
+    }
     const waiting = this.pending.get(id);
     if (!waiting) {
       this.violate(`an answer to request ${id}, which is not waiting`);

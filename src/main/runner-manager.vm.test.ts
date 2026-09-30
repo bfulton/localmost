@@ -100,7 +100,7 @@ import type { DockerVmConfig } from './config';
 import type { CacheDisks, ImagePuller, VmHandle } from './vm/types';
 import type { LogEntry } from '../shared/types';
 import { createMockProcess, RunnerManagerTestHelper } from './test-utils';
-import { FAKE_HELPER, shortTempDir, writeGuest } from './test-utils/vm-fixtures';
+import { assertVmSocketsFit, FAKE_HELPER, shortTempDir, writeGuest } from './test-utils/vm-fixtures';
 
 const config: DockerVmConfig = {
   prewarm: false, cpus: 1, memoryMiB: 1024, maxRunning: 2, dataDiskGiB: 64, bootTimeoutSec: 30,
@@ -124,6 +124,15 @@ const request = (socketPath: string, method: string, p: string, body?: unknown):
     req.end();
   });
 
+/** Poll until `check` holds, for as long as a loaded machine may need. */
+async function until(check: () => boolean, what: string, ms = 30_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 describe('a docker job on the VM backend, through the runner', () => {
   let data: string;
   let previousCwd: string;
@@ -135,6 +144,7 @@ describe('a docker job on the VM backend, through the runner', () => {
 
   beforeEach(async () => {
     data = shortTempDir();
+    assertVmSocketsFit(data);
     previousCwd = process.cwd();
     process.chdir(data);
     for (const name of ['LOCALMOST_CONFIG_DIR', HELPER_OVERRIDE_ENV]) saved[name] = process.env[name];
@@ -257,7 +267,9 @@ describe('a docker job on the VM backend, through the runner', () => {
     expect(create.status).toBe(201);
     expect(JSON.parse(create.body).Id).toBe(CID);
     expect(daemonSeen).toContain('POST /v1.45/containers/create');
-    expect(logs.some((l) => l.message.includes(`approve-binds ${CID} []`))).toBe(true);
+    // The helper's own log of the approval comes on its stderr, which may be
+    // read after the agent's answer on the socket.
+    await until(() => logs.some((l) => l.message.includes(`approve-binds ${CID} []`)), 'the approval in the helper log');
     const pulled = await request(socket, 'POST', '/v1.45/images/create?fromImage=alpine&tag=3');
     expect(pulled.status).toBe(200);
     expect(pulls).toHaveLength(1);
@@ -267,12 +279,10 @@ describe('a docker job on the VM backend, through the runner', () => {
     expect(vmDirs).toHaveLength(1);
     const vmId = vmDirs[0];
 
-    // The worker exits: its socket stops, and the VM goes with it.
+    // The worker exits: its socket stops, and the VM goes with it. The
+    // release is logged once the VM has gone, a moment after its directory.
     worker.emit('exit', 0, null);
-    const deadline = Date.now() + 30_000;
-    while (fs.existsSync(path.join(data, 'vm', 'jobs', vmId)) && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
+    await until(() => logs.some((l) => l.message.includes(`Docker VM ${vmId} released: the job ended`)), 'the release');
     expect(fs.existsSync(path.join(data, 'vm', 'jobs', vmId))).toBe(false);
 
     const messages = logs.map((l) => l.message);

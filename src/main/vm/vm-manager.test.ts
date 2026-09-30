@@ -3,7 +3,7 @@
  * §5.6; the design's Edge cases).
  */
 
-import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
+import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
 import { execFileSync, spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -11,7 +11,12 @@ import type { DockerVmConfig } from '../config';
 import { GuestImage } from './guest-image';
 import { DefaultVmManager, processExecutableOf, VmManagerOptions } from './vm-manager';
 import type { VmError, VmHandle, VmRequest } from './types';
-import { FAKE_HELPER, fakeHelperSpawn, layOutVmData, shortTempDir, VmLayout } from '../test-utils/vm-fixtures';
+import { assertVmSocketsFit, FAKE_HELPER, fakeHelperSpawn, layOutVmData, shortTempDir, VmLayout } from '../test-utils/vm-fixtures';
+
+// Each test spawns real processes - the fake helper is a node - and these
+// suites also run inside a job's sandbox on a loaded CI machine: jest's 5 s
+// default is not a bound any test here means to assert.
+jest.setTimeout(30_000);
 
 const GiB = 1024 ** 3;
 
@@ -45,6 +50,15 @@ const alive = (pid: number): boolean => {
     return false;
   }
 };
+
+describe('the VM test fixtures', () => {
+  it("say so when a VM's socket path under the test's data directory would be too long", () => {
+    // Inside a job TMPDIR is deep in the sandbox; this says why a connect
+    // would fail, rather than letting it fail later with ENAMETOOLONG or worse.
+    expect(() => assertVmSocketsFit(`/${'x'.repeat(67)}`)).toThrow(/104 bytes, past the 103 a unix socket's path may have/);
+    expect(() => assertVmSocketsFit(`/${'x'.repeat(66)}`)).not.toThrow();
+  });
+});
 
 describe('DefaultVmManager', () => {
   let root: string;
@@ -124,6 +138,10 @@ describe('DefaultVmManager', () => {
 
   const failureOf = async (vm: VmHandle): Promise<VmError> => (await vm.ready().catch((err: VmError) => err)) as VmError;
 
+  /** The pid of a VM's helper, from the file the manager wrote. */
+  const helperPid = (vm: VmHandle): number =>
+    Number(fs.readFileSync(path.join(layout.data, 'vm', 'jobs', vm.vmId, 'helper.pid'), 'utf-8'));
+
   describe('a job VM', () => {
     it('boots to ready, reports the guest, and is gone once stopped', async () => {
       const m = manager();
@@ -134,7 +152,10 @@ describe('DefaultVmManager', () => {
       expect(vm.state()).toBe('ready');
       await expect(vm.agent().status()).resolves.toMatchObject({ dockerd: 'running' });
       expect(logs.some((l) => l.level === 'info' && l.message.startsWith(`Docker VM ${vm.vmId} ready in `))).toBe(true);
-      // The profile and the pid file are the VM's; the configure carried the share and the relay.
+      // The profile and the pid file are the VM's; the configure carried the
+      // share and the relay. The fake logs it on its stderr, which may be read
+      // after the agent's answer on the socket.
+      await eventually(() => logs.some((l) => l.message.includes('configure {')), "the fake's log of the configure");
       const configure = logs.find((l) => l.message.includes('configure {'))!.message;
       expect(configure).toContain(`"mountPath":"${layout.share}"`);
       expect(configure).toContain('"relay":{"address":"198.18.0.1","port":3128,"vsockPort":3128}');
@@ -373,7 +394,10 @@ describe('DefaultVmManager', () => {
     const dir = path.join(layout.data, 'vm', 'jobs', vm.vmId);
     await eventually(() => fs.existsSync(path.join(dir, 'helper.pid')), 'the helper to start');
     const pid = Number(fs.readFileSync(path.join(dir, 'helper.pid'), 'utf-8'));
-    await eventually(() => fs.existsSync(path.join(dir, 'agent.sock')), 'the helper to listen');
+    // The VM has started and the manager is saying hello to its agent: not
+    // the socket's existence, which comes before the helper's started event.
+    const trying = `[vm ${vm.vmId}] agent.sock: the agent is not up yet`;
+    await eventually(() => logs.some((l) => l.message === trying), 'the manager to try the agent');
     await vm.stop('the job was cancelled');
     // The stage the stop interrupted: the helper had started, the agent not answered.
     expect(await failureOf(vm)).toMatchObject({ stage: 'agent', code: 'E_CANCELLED' });
@@ -408,12 +432,14 @@ describe('DefaultVmManager', () => {
   it('holds its slot at the gate while it fails, until its helper has gone', async () => {
     // Stopped for the host with a helper that ignores SIGTERM: it is failed
     // at once, but still holds its memory until the SIGKILL.
+    // The helper goes when the test kills it, not on a timer a loaded machine may miss.
     config.maxRunning = 1;
-    scripts.push({ helper: { ignoreSigterm: true, stopDelayMs: 60_000 } }, {}, {});
+    scripts.push({ helper: { ignoreSigterm: true, stopDelayMs: 600_000 } }, {}, {});
     let free = 500 * GiB;
-    const m = manager({ freeBytes: async () => free, killAfterMs: 1500 });
+    const m = manager({ freeBytes: async () => free, killAfterMs: 600_000 });
     const failing = m.start(jobRequest());
     await failing.ready();
+    const pid = helperPid(failing);
     const waiting = m.start(jobRequest({ slot: 2 }));
     free = 1 * GiB;
     const stopping = m.checkFreeSpace();
@@ -422,6 +448,7 @@ describe('DefaultVmManager', () => {
     const later = m.start(jobRequest({ slot: 3 }));
     expect(waiting.state()).toBe('queued');
     free = 500 * GiB;
+    process.kill(pid, 'SIGKILL');
     await stopping;
     await failing.stopped();
     await waiting.ready();
@@ -452,17 +479,17 @@ describe('DefaultVmManager', () => {
     });
 
     it('is failed when a refresh VM stops without syncing its disk', async () => {
-      scripts.push({ helper: { guestExitAfterMs: 800 } });
       const refresh = manager().start(refreshRequest());
       await refresh.ready();
+      process.kill(helperPid(refresh), 'SIGUSR2');
       await expect(refresh.stopped()).resolves.toEqual({ reason: 'guest', synced: false });
       expect(refresh.state()).toBe('failed');
     });
 
     it('is failed when its agent exits and the guest powers off', async () => {
-      scripts.push({ helper: { guestExitAfterMs: 800 } });
       const vm = manager().start(jobRequest());
       await vm.ready();
+      process.kill(helperPid(vm), 'SIGUSR2');
       await expect(vm.stopped()).resolves.toMatchObject({ reason: 'guest' });
       expect(vm.state()).toBe('failed');
       expect(vm.failure()).toMatchObject({ stage: 'running', message: "the job's Docker VM stopped unexpectedly" });
@@ -670,7 +697,8 @@ describe('DefaultVmManager', () => {
       await Promise.all([stubborn.ready(), plain.ready()]);
       const began = Date.now();
       await m.shutdownAll();
-      expect(Date.now() - began).toBeLessThan(5000);
+      // Bounded by shutdownAllMs, not the stubborn helper's minute; generous for a loaded machine.
+      expect(Date.now() - began).toBeLessThan(20_000);
       await Promise.all([stubborn.stopped(), plain.stopped()]);
       expect([stubborn.state(), plain.state()]).toEqual(['stopped', 'stopped']);
     });

@@ -156,22 +156,23 @@ describe('UnixAgentClient', () => {
   });
 
   it('times out each op on its own clock, and drops a late answer without breaking the connection', async () => {
-    let first = true;
+    let first: number | undefined;
     answer = (r) => {
-      if (r.op === 'status' && first) {
-        first = false;
-        // Answered, but only after the client has given up on it.
-        const id = r.id;
-        setTimeout(() => lastConnection?.write(`${JSON.stringify({ v: 1, id, ok: true, dockerd: 'exited', uptimeMs: 9 })}\n`), 200);
+      if (r.op === 'status' && first === undefined) {
+        // Held until the client has given up on it, then answered below.
+        first = r.id as number;
         return null;
       }
       return r.op === 'status' ? { dockerd: 'running', uptimeMs: 1 } : {};
     };
-    const { c } = client({ timeoutsMs: { status: 100 } });
+    const { c, logs } = client({ timeoutsMs: { status: 100 } });
     const began = Date.now();
     await expect(c.status()).rejects.toMatchObject({ code: 'E_AGENT_TIMEOUT', message: expect.stringMatching(/status/) });
     expect(Date.now() - began).toBeGreaterThanOrEqual(90);
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    lastConnection!.write(`${JSON.stringify({ v: 1, id: first, ok: true, dockerd: 'exited', uptimeMs: 9 })}\n`);
+    // Waited for by what the client does with it, not by a clock.
+    const dropped = `dropped the late answer to request ${first}, which had timed out`;
+    while (!logs.includes(dropped)) await new Promise((resolve) => setTimeout(resolve, 10));
     await expect(c.status()).resolves.toEqual({ dockerd: 'running', uptimeMs: 1 });
   });
 

@@ -14,23 +14,52 @@ import { GUEST_ARTIFACTS } from '../vm/guest-image';
 export const FAKE_HELPER = path.resolve(__dirname, '..', '..', '..', 'test', 'fakes', 'fake-localmost-vm.mjs');
 
 /**
- * A new directory with as short a real path as the temp directory allows. A
- * VM's sockets are `<data>/vm/jobs/<vmId>/docker.sock`, 36 bytes past
- * `<data>`, and a unix socket's path must fit in 104 bytes - which a job's
- * own TMPDIR, deep in its sandbox, leaves little room for.
+ * A new directory with as short a real path as the temp directory allows: a
+ * name of one hex digit if one is free, then two, then three. A VM's sockets
+ * are `<data>/vm/jobs/<vmId>/docker.sock`, 35 or 36 bytes past `<data>`, and
+ * a unix socket's path must fit in 103 bytes and its NUL - which a job's own
+ * TMPDIR, deep in its sandbox, leaves little room for.
  */
 export function shortTempDir(): string {
   const base = fs.realpathSync(os.tmpdir());
-  for (let attempt = 0; attempt < 1000; attempt++) {
-    const dir = path.join(base, crypto.randomBytes(2).toString('hex').slice(0, 3));
-    try {
-      fs.mkdirSync(dir, { mode: 0o700 });
-      return dir;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+  for (const length of [1, 2, 3]) {
+    const names = Array.from({ length: 16 ** length }, (_, i) => i.toString(16).padStart(length, '0'));
+    // Shuffled, so parallel test files do not all race for the same name.
+    for (let i = names.length - 1; i > 0; i--) {
+      const j = crypto.randomInt(i + 1);
+      [names[i], names[j]] = [names[j], names[i]];
+    }
+    for (const name of names) {
+      const dir = path.join(base, name);
+      try {
+        fs.mkdirSync(dir, { mode: 0o700 });
+        return dir;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      }
     }
   }
   throw new Error(`no free short directory name in ${base}`);
+}
+
+/** The most a unix socket's path may have, less its NUL. */
+const MAX_SOCKET_PATH_BYTES = 103;
+
+/**
+ * Throw, saying why, when a VM's sockets under `data` would not fit in a
+ * unix socket's path: a test that connects to one would otherwise fail
+ * later with an error that does not say so. The longest VM id, a two-digit
+ * slot, is the one measured.
+ */
+export function assertVmSocketsFit(data: string): void {
+  const longest = path.join(data, 'vm', 'jobs', '99-0123456789ab', 'docker.sock');
+  const bytes = Buffer.byteLength(longest);
+  if (bytes > MAX_SOCKET_PATH_BYTES) {
+    throw new Error(
+      `a Docker VM socket under ${data} would be ${bytes} bytes, past the ${MAX_SOCKET_PATH_BYTES} a unix socket's path may have: ` +
+        'run the tests with a shorter TMPDIR'
+    );
+  }
 }
 
 /** A `<data>` laid out as the app lays one out for a job VM, before its helper starts. */
@@ -50,6 +79,7 @@ export interface VmLayout {
 export function layOutVmData(root: string, sandboxId = '1-abcdef012345'): VmLayout {
   const data = path.join(root, 'd');
   const resources = path.join(root, 'r');
+  assertVmSocketsFit(data);
   const sandbox = path.join(data, 'runner', 'sandbox', sandboxId);
   const share = path.join(sandbox, '_work');
   fs.mkdirSync(share, { recursive: true });

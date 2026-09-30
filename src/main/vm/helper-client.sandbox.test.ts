@@ -17,13 +17,18 @@
  *                the helper never runs, and the client reports a failed exit.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
+import { describe, it, expect, beforeAll, afterAll, jest } from '@jest/globals';
 import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { buildHelperProfile } from './helper-profile';
 import { HelperClient, sandboxedHelperSpawn } from './helper-client';
+
+// Each test spawns real processes under sandbox-exec, and these
+// suites also run inside a job's sandbox on a loaded CI machine: jest's 5 s
+// default is not a bound any test here means to assert.
+jest.setTimeout(30_000);
 
 const isMacOS = process.platform === 'darwin';
 

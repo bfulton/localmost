@@ -2,7 +2,7 @@
  * HelperClient against the fake helper, spawned directly (contract §2.4, §8).
  */
 
-import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
+import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
 import type { ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
@@ -10,6 +10,11 @@ import { PassThrough } from 'stream';
 import * as path from 'path';
 import { HelperClient, HelperRunArgs, exitErrorCode, helperArgs } from './helper-client';
 import { fakeHelperSpawn, layOutVmData, shortTempDir, VmLayout } from '../test-utils/vm-fixtures';
+
+// Each test spawns real processes - the fake helper is a node - and these
+// suites also run inside a job's sandbox on a loaded CI machine: jest's 5 s
+// default is not a bound any test here means to assert.
+jest.setTimeout(30_000);
 
 describe('the helper argument line', () => {
   it('is exactly the §2.1 flags for each mode', () => {
