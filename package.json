@@ -30,6 +30,7 @@
     "prebuild": "npm run icons && npm run build-info",
     "build-info": "node scripts/generate-build-info.js",
     "build:guest": "node scripts/guest/build-guest.js",
+    "build:helper": "node scripts/build-helper.mjs",
     "lint": "eslint src --ext .ts,.tsx",
     "pretypecheck": "npm run build-info",
     "typecheck": "tsc --noEmit -p tsconfig.json",

@@ -62,6 +62,20 @@ jobs:
       - name: Run tests
         run: npm test
 
+      # The guest programs' portable tests (protocol, parsing, bind matching)
+      # on Linux, natively. On macOS they run in the native job below.
+      - name: Setup Go
+        if: runner.os == 'Linux'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: guest/go.mod
+          cache-dependency-path: guest/go.sum
+
+      - name: Test the guest programs
+        if: runner.os == 'Linux'
+        working-directory: guest
+        run: go test ./...
+
       # A real docker CLI, a real daemon, and the filtering socket between them.
       # Outside a job it serves the socket itself over the runner's native
       # daemon; inside a localmost job it drives the socket the runner serves,
@@ -85,3 +99,39 @@ jobs:
           else
             echo "- **Type**: GitHub-hosted runner (fallback)" >> $GITHUB_STEP_SUMMARY
           fi
+
+  # The Docker VM's native code: the Swift helper (native/localmost-vm) and
+  # the Go guest programs (guest/). It runs on a GitHub-hosted Apple silicon
+  # runner, whatever the check above selects, because the self-hosted leg
+  # runs inside a localmost job and the fallback leg has no Swift with
+  # Virtualization. Nothing here boots a VM: hosted runners have no nested
+  # virtualization, so VM tests run on the owner's Mac.
+  native:
+    runs-on: macos-latest
+    # hdiutil in the share tests, or a helper that never exits in the
+    # binary tests, would otherwise hold a hosted runner for six hours.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the VM helper
+        run: swift build --package-path native/localmost-vm
+
+      - name: Test the VM helper
+        run: swift test --package-path native/localmost-vm
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: guest/go.mod
+          cache-dependency-path: guest/go.sum
+
+      - name: Test the guest programs
+        working-directory: guest
+        run: go test ./...
+
+      - name: Vet the guest programs for Linux
+        working-directory: guest
+        env:
+          GOOS: linux
+        run: go vet ./...
