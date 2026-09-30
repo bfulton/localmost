@@ -27,6 +27,7 @@
     "make": "npm run build && electron-forge make --arch=arm64",
     "prebuild": "npm run icons && npm run build-info",
     "build-info": "node scripts/generate-build-info.js",
+    "build:guest": "node scripts/guest/build-guest.js",
     "lint": "eslint src --ext .ts,.tsx",
     "pretypecheck": "npm run build-info",
     "typecheck": "tsc --noEmit -p tsconfig.json",

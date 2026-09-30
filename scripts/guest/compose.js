@@ -23,9 +23,13 @@ const DAEMON_JSON = {
   'log-opts': { 'max-size': '10m', 'max-file': '2' },
 };
 
-/** Empty directories the root needs as mount points and state directories. */
+/**
+ * Empty directories the root needs as mount points and state directories.
+ * Users and Volumes are the share's mount roots: the agent mounts a tmpfs
+ * on one and the share below it (guest/internal/share MountRoots).
+ */
 const ROOT_DIRS = [
-  'dev', 'proc', 'sys', 'run', 'tmp', 'mnt', 'root',
+  'dev', 'proc', 'sys', 'run', 'tmp', 'mnt', 'root', 'Users', 'Volumes',
   'etc/docker', 'etc/localmost', 'usr/libexec/localmost',
   'var/lib/docker', 'var/lib/containerd', 'var/log', 'var/tmp',
 ];
@@ -225,7 +229,7 @@ function composeInitramfs({ busyboxStatic, kernel, moduleRoots, init }) {
     ...['bin', 'dev', 'lib', 'newroot', 'proc', 'sys'].map((name) => ({ name, mode: 0o040755 })),
     { name: 'bin/busybox', mode: 0o100755, data: busyboxStatic },
     ...mods,
-    { name: 'init', mode: 0o100755, data: Buffer.from(init(mods.map((m) => modName(m.name)))) },
+    { name: 'init', mode: 0o100755, data: Buffer.from(init(mods.map((m) => path.posix.basename(m.name, '.ko')))) },
   ];
   return gzipFixed(newc(entries));
 }
@@ -239,7 +243,7 @@ function composeBuildInitramfs({ busyboxStatic, packages, kernel, moduleRoots, i
   const out = new Map();
   const { add, addDir } = adder(out);
   for (const pkg of packages) for (const e of pkg.entries) add(entryItem(e, pkg.name), pkg.name);
-  for (const d of ['dev', 'proc', 'sys', 'in', 'out', 'mnt/r', 'tmp', 'lib']) addDir(d);
+  for (const d of ['bin', 'dev', 'etc', 'proc', 'sys', 'in', 'out', 'mnt/r', 'tmp', 'lib']) addDir(d);
   const mods = initramfsModules(kernel, moduleRoots);
   const entries = [];
   const S = { file: 0o100000, dir: 0o040000, symlink: 0o120000 };
@@ -260,7 +264,6 @@ function composeBuildInitramfs({ busyboxStatic, packages, kernel, moduleRoots, i
   entries.push(...mods.filter((m) => !out.has(m.name)));
   entries.push({ name: 'etc/build-modules', mode: 0o100644, data: Buffer.from(mods.map((m) => path.posix.basename(m.name)).join('\n') + '\n') });
   entries.push({ name: 'init', mode: 0o100755, data: init });
-  if (!out.has('etc')) entries.push({ name: 'etc', mode: 0o040755 });
   return gzipFixed(newc(entries));
 }
 

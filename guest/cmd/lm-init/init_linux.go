@@ -18,10 +18,10 @@ import (
 )
 
 const (
-	agentPath   = "/usr/libexec/localmost/lm-agent"
-	moduleList  = "/etc/localmost/modules"
-	guestPATH   = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-	killGrace   = 5 * time.Second
+	agentPath  = "/usr/libexec/localmost/lm-agent"
+	moduleList = "/etc/localmost/modules"
+	guestPATH  = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	killGrace  = 5 * time.Second
 )
 
 func logf(format string, args ...any) {

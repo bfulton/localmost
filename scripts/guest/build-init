@@ -1,0 +1,42 @@
+#!/bin/busybox sh
+# /init of the guest build VM (contract §4.3 steps 3 and 6). It boots the
+# pinned kernel with erofs-utils and e2fsprogs, reads rootfs.tar, the
+# kernel config and moby's check-config.sh from the read-only share "share",
+# writes rootfs.erofs and the check-config report to the share "out", checks
+# that the image mounts and its binaries run, and powers off. The last line
+# it prints is BUILD-OK or BUILD-FAILED <reason>.
+/bin/busybox mkdir -p /usr/bin /usr/sbin /sbin /proc /sys /dev /in /out /mnt/r
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+exec >/dev/hvc0 2>&1
+
+fail() { echo "BUILD-FAILED $*"; sync; poweroff -f; }
+
+for m in $(cat /etc/build-modules); do
+  insmod "/lib/$m" || fail "insmod $m"
+done
+mount -t virtiofs -o ro share /in || fail "mount share"
+mount -t virtiofs out /out || fail "mount out"
+
+# check-config.sh reads the running kernel's release for its version checks,
+# which is the pinned kernel this VM runs.
+sh /in/check-config.sh /in/kernel.config.gz > /out/check-config.txt 2>&1
+echo "BUILD check-config exit $?"
+
+echo "BUILD $(mkfs.erofs --version 2>&1 | head -1)"
+mkfs.erofs -zlz4hc --all-root -T0 -U 00000000-0000-0000-0000-000000000001 --tar=f /out/rootfs.erofs /in/rootfs.tar \
+  || fail "mkfs.erofs"
+sync
+
+losetup /dev/loop0 /out/rootfs.erofs || fail "losetup"
+mount -t erofs -o ro /dev/loop0 /mnt/r || fail "mount the image"
+[ -x /mnt/r/sbin/lm-init ] || fail "no /sbin/lm-init in the image"
+chroot /mnt/r /sbin/mke2fs -V || fail "exec from the image"
+umount /mnt/r
+losetup -d /dev/loop0
+umount /out
+sync
+echo BUILD-OK
+poweroff -f
