@@ -163,8 +163,8 @@ dials the guest on vsock port 2375. `lm-agent` accepts it and connects to
 Docker protocol. Upgraded connections (attach, exec) work the same way.
 
 **The baseline, before any VM.** `/_ping`, `/version` and `/info` are answered
-by the filter from the guest manifest (`guest/manifest.json`) and the
-configured VM size whenever no VM is running for that socket. A job whose
+by the filter from the guest manifest (`guest/manifest.json`, contract §5.3)
+whenever no VM is running for that socket. A job whose
 policy has no `docker:` section therefore sees a working daemon that refuses
 everything but the baseline, and no VM ever boots for it. Once a VM is ready,
 these calls go to it, and `/info` is rewritten as today.

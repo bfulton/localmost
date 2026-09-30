@@ -23,12 +23,14 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   `build` actions a job needs, with the registries, images, workspace mounts
   (`ro`/`rw`), network mode and build context each covers. The job is never
   handed a daemon socket: each worker gets a socket localmost owns, and only
-  declared requests are forwarded, to a Linux VM that localmost boots for that
-  job alone when a job whose policy has a `docker:` section is claimed, and
-  discards, with every container, network, volume and built image in it, when
-  the job ends. The VM is given none of your files but the job's work
-  folder, has no network card, and reaches the network only through the job's
-  own proxy. Anything unlisted is denied, and host bind mounts,
+  declared requests are forwarded, to a Linux VM of that job's own, which
+  localmost boots when a job whose policy has a `docker:` section is claimed
+  (or, with the opt-in `dockerVm.prewarm`, as a spare when an idle worker is
+  spawned, stopped at the claim unless that job uses it) and discards, with
+  every container, network, volume and built image in it, when the job ends.
+  The VM is given none of your files but the job's work folder, has no
+  network card, and reaches the network only through the job's own proxy.
+  Anything unlisted is denied, and host bind mounts,
   `--privileged`/`--pid=host`/`--network=host`/`--device` and a restart policy
   other than `no` (`--restart=always`, `unless-stopped`, `on-failure`) are
   refused. Images are pulled on the Mac, checked digest by digest and loaded
@@ -482,10 +484,10 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   - A routable network - the default bridge, or one declared `internal:
     false` - means egress through the job's proxy, subject to its network
     allowlist, where it meant the daemon's own unfiltered network; the approval
-    text says so. localmost injects `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY`
-    into routable containers and, as build args, into builds, keeping any
-    value the job sets. Traffic that ignores them - plain TCP, ssh, UDP, DNS
-    lookups of outside names - has no route and fails
+    text says so. localmost injects `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`,
+    `https_proxy` and `NO_PROXY` into routable containers and, as build args,
+    into builds, keeping any value the job sets. Traffic that ignores them -
+    plain TCP, ssh, UDP, DNS lookups of outside names - has no route and fails
   - A build cannot pull its `FROM` image: `docker pull` base images first
   - Registries on the LAN, on the Mac itself or served over plain http cannot
     be pulled from, even when listed in `pull.registries`; only public https

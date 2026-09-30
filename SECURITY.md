@@ -138,9 +138,9 @@ or another tool's proxy is not the job's to open a socket to, and neither is a
 port a concurrent job opened, and its proxy will not forward to one for it
 either (see below).
 A repository whose jobs need loopback - a test suite that starts a server on an
-ephemeral `127.0.0.1` port and connects to it, or a service container published
-on a fixed port - declares it in `.localmostrc`, under `shared:` only, since the
-profile is fixed when the worker starts:
+ephemeral `127.0.0.1` port and connects to it, or a local database the job
+starts itself on a fixed port - declares it in `.localmostrc`, under `shared:`
+only, since the profile is fixed when the worker starts:
 
 ```yaml
 shared:
@@ -491,14 +491,19 @@ every vsock port and the proxy token: the VM's kernel, not only its root user.
 It would also bypass `internal:` networks and the bind hook below. Nothing
 here contains a privileged container, which is why none is granted.
 
-**The Docker VM.** A VM is booted when a job whose bound policy has a
-`docker:` section is claimed, and only then. When the worker exits, the VM is
+**The Docker VM.** By default a VM is booted only when a job whose bound
+policy has a `docker:` section is claimed. With the opt-in `dockerVm.prewarm`,
+one spare is booted when an idle worker is spawned, before any claim; it holds
+only that worker's sandbox, whose job has not started, and at the claim it is
+stopped unless the job's policy has a `docker:` section and the job is for the
+repository the worker was spawned for. A repository's cache disk is built by a
+VM of its own that runs no job code (below). When the worker exits, the VM is
 stopped and its directory, with its disk, is deleted; its containers,
 networks, volumes, built images and tags go with it, so nothing a job created
 is left on a daemon and no removal sweep is needed. The guest is localmost's
-own, shipped inside the app and updated with it: Alpine's `linux-virt`
-kernel, `dockerd`, `containerd` and `runc` on a read-only root, with small
-localmost init, agent and hook programs. Each VM is run by a separate helper
+own, shipped inside the app and updated with it: Alpine's `linux-virt` kernel,
+`dockerd`, `containerd` and `runc` on a read-only root, with small localmost
+init, agent and hook programs. Each VM is run by a separate helper
 (`Contents/Resources/localmost-vm`), signed with only the
 `com.apple.security.virtualization` entitlement and started under a
 deny-default seatbelt profile written for that one VM.
@@ -514,22 +519,23 @@ Rosetta runtime, when Rosetta for Linux is installed, and it has no network
 card. localmost creates `_work` itself before any process runs in the sandbox,
 and the job's profile denies writes to the `_work` and `<sandbox>` nodes
 themselves, so the job cannot rename, remove, replace, chmod or relink either;
-their contents stay writable. That matters because the job's steps are
-already running while the VM boots, and Virtualization.framework resolves the
-share's path only when the VM starts. Until then two layers stand between a
-swapped `_work` and the VM: those node denies, and the helper. The helper is
-given ids, never a path from the job. It derives the share's path itself and
-checks that it is a real directory, not a link, on the same device as the
-sandbox, and not a mount point, so a DMG, FUSE or SMB mount placed over
-`_work` makes it refuse the share. Its profile lets Virtualization.framework's
-service reach only that real path: the rule that issues the service its
-sandbox extension is scoped to `_work`'s subtree, so if `_work` had been
-replaced by a link, its target would lie outside that subtree and the VM
-would fail to start. A tripwire detects a
-failure of both layers: before the worker starts, localmost writes a random
-nonce to `_work/.localmost-share`, which the job's profile lets it neither
-read nor replace, and a VM whose guest reads anything else there is torn
-down, with the mismatch logged as an error.
+their contents stay writable. That matters because the job's steps are already
+running while the VM boots, and Virtualization.framework resolves the share's
+path only when the VM starts. Until then two layers stand between a swapped
+`_work` and the VM: those node denies, and the helper. The helper is given
+ids, never a path from the job. It derives the share's path itself and checks
+that it is a real directory, not a link, on the same device as the sandbox,
+and not a mount point, so a DMG, FUSE or SMB mount placed over `_work` makes
+it refuse the share. Its profile lets Virtualization.framework's service reach
+no directory of yours but that real path: the rule that issues the service its
+sandbox extension for the share is scoped to `_work`'s subtree, and is never
+broadened (any rule Rosetta's share needs names only Apple's runtime), so if
+`_work` had been replaced by a link, its target would lie outside that subtree
+and the VM would fail to start. A tripwire detects a failure of both layers:
+before the worker starts, localmost writes a random nonce to
+`_work/.localmost-share`, which the job's profile lets it neither read nor
+replace, and a VM whose guest reads anything else there is torn down, with the
+mismatch logged as an error.
 
 Inside the guest the share is mounted at the same absolute path it has on the
 Mac, `nosymfollow`, `nosuid` and `nodev`, so no path lookup through it follows
@@ -547,15 +553,15 @@ share from inside the VM, and a link the job plants resolves in the guest,
 never on the Mac.
 
 **Jobs cannot reach each other's containers.** Each job's containers run in
-its own VM. The VM has no network card, and vsock, its only channel, has no
-path from one guest to another, so containers of different jobs share no
-bridge and cannot address each other. Docker networks exist only inside one
-VM, so a job cannot join another job's network by naming it. Two findings from
-the Docker Desktop backend are fixed by this: containers of different jobs on
-Docker Desktop's shared default bridge reached each other by IP, and so did
-builds, since the classic builder runs every `RUN` step on that bridge; and
-the filter admitted any network whose name the policy allowed, even one a
-concurrent job had created.
+its own VM. The VM has no network card, and vsock, its only channel besides
+its own share, has no path from one guest to another, so containers of
+different jobs share no bridge and cannot address each other. Docker networks
+exist only inside one VM, so a job cannot join another job's network by naming
+it. Two findings from the Docker Desktop backend are fixed by this: containers
+of different jobs on Docker Desktop's shared default bridge reached each other
+by IP, and so did builds, since the classic builder runs every `RUN` step on
+that bridge; and the filter admitted any network whose name the policy
+allowed, even one a concurrent job had created.
 
 **Container egress goes through the job's proxy.** Without a network card the
 guest has no route out. The one way out is a relay: the guest agent accepts
@@ -623,8 +629,11 @@ floor are enforced while the bytes stream.
 repository: a blob store on the Mac, and a data disk built from those
 verified blobs by a VM of its own that has no share and no relay and runs no
 job code. Each job's VM starts from an APFS clone of that disk, and the clone
-is discarded after the job, so no job can change what the next one starts
-with, and built images and tags never carry over. Every job of the repository
+is discarded after the job, so nothing a job does inside its VM - its
+containers, volumes, built images and tags, or its writes to the disk -
+carries over. What carries over is only the public images its pulls fetched
+and verified on the Mac, which the refresh VM extracts onto the repository's
+next disk (see the cache disk's input, below). Every job of the repository
 can use every image in that cache, whatever its own workflow's policy says:
 through `docker build` with `FROM <ref>@sha256:…` (the classic builder uses a
 local image without pulling, and the filter does not read the Dockerfile),
@@ -646,11 +655,11 @@ another kernel.
 
 **The VM's control plane is not the job's.** The helper's sockets are under
 `~/.localmost/vm`, which every job's profile denies for reads and writes. The
-helper takes ids, not paths; it serves those two sockets and the relay, and
-listens on and dials nothing else. Everything the guest or its daemon answers
-is treated as hostile: size-capped, checked against its expected shape,
-stripped of control characters before it is logged, and never used to choose
-a path on the Mac.
+helper is given ids and localmost's own directories, never a path the job
+chose; it serves those two sockets and the relay, and listens on and dials
+nothing else. Everything the guest or its daemon answers is treated as
+hostile: size-capped, checked against its expected shape, stripped of control
+characters before it is logged, and never used to choose a path on the Mac.
 
 **Nothing is left running.** Each helper watches the app's process, and the
 pipe the app holds open to it: when localmost exits, crashes or is killed,
@@ -687,19 +696,21 @@ What this does not contain:
 
 Nothing but the approved `.localmostrc` grants any of this - there is no
 machine-level switch to withhold it - so the approval diff is where that
-decision gets made. Every grant under `docker:` is surfaced in the diff with the
-same prominence as a change to `level:`. Default is off: a repository that
-declares nothing under `docker:` has only the baseline of `/_ping`, `/version`,
-`/info` and reads about its own containers, none of which change anything, and
-no VM boots for it: until a VM is running, localmost answers those three from
-the guest image's manifest and the configured VM size. They would otherwise
-describe the daemon's host: its name, data directory, proxy and registry
-configuration and labels, so a running VM's `/info` is rewritten to keep only
-what clients use to start - `ServerVersion`, `OSType`, `Architecture`,
-`OperatingSystem`, `KernelVersion`, `NCPU`, `MemTotal`, `Driver`,
-`CgroupVersion` and `SecurityOptions`. The filter's design is in
+decision gets made. Every grant under `docker:` is surfaced in the diff with
+the same prominence as a change to `level:`. Default is off: a repository that
+declares nothing under `docker:` has only the baseline of `/_ping`,
+`/version`, `/info` and reads about its own containers, none of which change
+anything, and no VM boots for its jobs (a pre-warmed spare, if one is enabled,
+is stopped at the claim): until a VM is running, localmost answers those three
+from the guest image's manifest. They would otherwise describe the daemon's
+host: its name, data directory, proxy and registry configuration and labels,
+so a running VM's `/info` is rewritten to keep only what clients use to start
+- `ServerVersion`, `OSType`, `Architecture`, `OperatingSystem`,
+`KernelVersion`, `NCPU`, `MemTotal`, `Driver`, `CgroupVersion` and
+`SecurityOptions`. The filter's design is in
 `docs/superpowers/specs/2026-09-05-docker-isolation-design.md`, and the VM's,
-with the evidence for each claim above, in `docs/roadmap/vm-docker-backend.md`.
+with the evidence for each claim above, in
+`docs/roadmap/vm-docker-backend.md`.
 
 ## Credential Storage
 
@@ -948,7 +959,7 @@ Code signing is required for distribution to prevent tampering warnings and esta
 - "Developer ID Application" certificate for distribution outside App Store
 - "Developer ID Installer" certificate if distributing PKG installers
 
-**Entitlements**: The app and every helper are signed with the hardened runtime and only the exceptions each needs. The app, its main, GPU and renderer helpers and Squirrel's ShipIt carry `com.apple.security.cs.allow-jit` (`packaging/entitlements.plist`); the plugin helper carries `cs.allow-unsigned-executable-memory` and `cs.disable-library-validation`, as Chromium's does (`packaging/entitlements.plugin.plist`); the camera helper in Resources (`is-camera-on`, which only reads CoreMediaIO's is-running-somewhere property of each camera to pause during video calls) carries none (`packaging/entitlements.none.plist`), and so does the `docker` CLI bundled for jobs (`Resources/docker-cli/docker`); the Docker VM helper in Resources (`localmost-vm`) carries only `com.apple.security.virtualization`, with no JIT or library-validation exception (`packaging/entitlements.virtualization.plist`). The Docker VM's guest files (`Resources/guest`) are data the helper hands the VM, not macOS code, and are not signed themselves; the app checks their hashes against the guest manifest once per launch. No device or personal information entitlement - camera, microphone, USB, Bluetooth, printing, location - and not the App Sandbox, under which the app could not run jobs under `sandbox-exec`. @electron/osx-sign reads entitlements only from `optionsForFile`; given none, it signs with its own defaults, which grant the device and location entitlements, and releases through 0.2.0 carried them. The app's Info.plist declares no usage either: Electron's template says why it would use the camera, microphone, audio capture and Bluetooth, and a packager hook (`scripts/remove-usage-descriptions.js`, run just before signing) removes every `NS...UsageDescription` key from the app's and its helpers' Info.plist.
+**Entitlements**: The app and every helper are signed with the hardened runtime and only the exceptions each needs. The app, its main, GPU and renderer helpers and Squirrel's ShipIt carry `com.apple.security.cs.allow-jit` (`packaging/entitlements.plist`); the plugin helper carries `cs.allow-unsigned-executable-memory` and `cs.disable-library-validation`, as Chromium's does (`packaging/entitlements.plugin.plist`); the camera helper in Resources (`is-camera-on`, which only reads CoreMediaIO's is-running-somewhere property of each camera to pause during video calls) carries none (`packaging/entitlements.none.plist`), and so does the `docker` CLI bundled for jobs (`Resources/docker-cli/docker`); the Docker VM helper in Resources (`localmost-vm`) carries only `com.apple.security.virtualization`, with no JIT or library-validation exception (`packaging/entitlements.virtualization.plist`). The Docker VM's guest files (`Resources/guest`) are data the helper hands the VM, not macOS code, and are not signed themselves; they are covered by the app bundle's seal like any other resource, so `codesign --verify` fails if one is changed, and the app also checks their hashes against the guest manifest once per launch. No device or personal information entitlement - camera, microphone, USB, Bluetooth, printing, location - and not the App Sandbox, under which the app could not run jobs under `sandbox-exec`. @electron/osx-sign reads entitlements only from `optionsForFile`; given none, it signs with its own defaults, which grant the device and location entitlements, and releases through 0.2.0 carried them. The app's Info.plist declares no usage either: Electron's template says why it would use the camera, microphone, audio capture and Bluetooth, and a packager hook (`scripts/remove-usage-descriptions.js`, run just before signing) removes every `NS...UsageDescription` key from the app's and its helpers' Info.plist.
 
 **Forge config for signing and notarization:**
 ```js

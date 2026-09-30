@@ -356,12 +356,13 @@ own, served by localmost outside the sandbox, and `DOCKER_HOST` points the job a
 it. A filtering proxy behind that socket parses every Docker API request, checks
 it against the approved policy, and forwards only what is permitted to a Linux
 VM of the job's own. The VM boots when a job whose policy has a `docker:`
-section is claimed, sees no directory of the Mac but the job's work folder,
-which holds the checkout (and Apple's Rosetta runtime, for amd64 images), and
-is discarded, with every container, network, volume and built image in it,
-when the job ends. localmost never uses the operator's
-Docker Desktop, Colima or Podman for jobs, and the job's `docker` is a CLI
-bundled with the app.
+section is claimed (or, with the opt-in `dockerVm.prewarm`, as a spare when an
+idle worker is spawned, stopped at the claim unless that job uses it). It sees
+no directory of the Mac but the job's work folder, which holds the checkout,
+and Apple's Rosetta runtime for amd64 images, and it is discarded, with every
+container, network, volume and built image in it, when the job ends.
+localmost never uses the operator's Docker Desktop, Colima or Podman for jobs,
+and the job's `docker` is a CLI bundled with the app.
 
 Actions are CLI-shaped, so a policy reads the way a workflow author thinks:
 
