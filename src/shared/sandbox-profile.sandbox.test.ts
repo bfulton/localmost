@@ -429,6 +429,8 @@ if (!isMacOS) {
       fs.mkdirSync(workDir);
       fs.mkdirSync(path.join(home, '.ssh'));
       fs.writeFileSync(path.join(home, '.ssh', 'id_ed25519'), 'PRIVATE KEY\n');
+      fs.writeFileSync(path.join(home, '.git-credentials'), 'https://user:token@github.com\n');
+      fs.writeFileSync(path.join(home, '.pypirc'), '[pypi]\npassword = pypi-token\n');
       fs.mkdirSync(path.join(home, '.cargo', 'bin'), { recursive: true });
       fs.writeFileSync(path.join(home, 'notes.txt'), 'hello\n');
     });
@@ -587,14 +589,16 @@ if (!isMacOS) {
       }
     });
 
-    it('keeps private keys unreadable even when the policy declares the home directory', () => {
+    it('keeps private keys and plaintext tokens unreadable even when the policy declares the home directory', () => {
       const profile = generateSandboxProfile({
         workDir,
         proxyPort: 1,
         policy: { filesystem: { read: [...MACOS_BASELINE_READ_PATHS, '~'] } },
       });
       expect(run(profile, ['/bin/cat', path.join(home, 'notes.txt')])).toBe(true);
-      expect(run(profile, ['/bin/cat', path.join(home, '.ssh', 'id_ed25519')])).toBe(false);
+      for (const file of [path.join('.ssh', 'id_ed25519'), '.git-credentials', '.pypirc']) {
+        expect([file, run(profile, ['/bin/cat', path.join(home, file)])]).toEqual([file, false]);
+      }
     });
 
     /**

@@ -460,9 +460,14 @@ function cliSocketRules(): string[] {
 
 /**
  * The credentials a developer machine keeps, which no job or step reaches at
- * any level, read or write: SSH, cloud and signing keys, the keychains, and
- * the credential files kept inside the package-manager caches, which a level
- * or policy may otherwise grant. Directories as subpaths, files as literals.
+ * any level, read or write: SSH, cloud and signing keys, the keychains, the
+ * plaintext files other tools keep tokens and passwords in, and the
+ * credential files kept inside the package-manager caches, which a level or
+ * policy may otherwise grant. Directories as subpaths, files as literals: a
+ * file whose directory holds what a job may use - RubyGems' installed gems,
+ * Terraform's plugin cache, Hugging Face's models - is named alone, and the directory stays as
+ * granted. ~/.config covers what keeps to the XDG layout: gh, gcloud, git's
+ * own credentials file.
  */
 export function developerCredentialPaths(home: string = os.homedir()): { subpaths: string[]; literals: string[] } {
   return {
@@ -473,11 +478,40 @@ export function developerCredentialPaths(home: string = os.homedir()): { subpath
       `${home}/.kube`,
       `${home}/.docker`,
       `${home}/.config`,
+      // Azure CLI: its token cache and service principal secrets.
+      `${home}/.azure`,
       `${home}/Library/Keychains`,
     ],
     literals: [
       `${home}/.netrc`,
       `${home}/.npmrc`,
+      // git's store helper, which keeps tokens in the clear.
+      `${home}/.git-credentials`,
+      // twine's upload tokens.
+      `${home}/.pypirc`,
+      // RubyGems' push key, where older RubyGems keep it and, when that is
+      // missing, where newer ones do.
+      `${home}/.gem/credentials`,
+      `${home}/.local/share/gem/credentials`,
+      // `terraform login`'s tokens, and the CLI configuration's credentials blocks.
+      `${home}/.terraform.d/credentials.tfrc.json`,
+      `${home}/.terraformrc`,
+      // libpq's passwords, Vault's token, boto's and s3cmd's keys.
+      `${home}/.pgpass`,
+      `${home}/.vault-token`,
+      `${home}/.boto`,
+      `${home}/.s3cfg`,
+      // The MySQL client's password, in the clear and in its login path file.
+      `${home}/.my.cnf`,
+      `${home}/.mylogin.cnf`,
+      // Yarn's npmAuthToken. Yarn 1's ~/.yarnrc is not here: it keeps no
+      // token, and reads registry auth from ~/.npmrc.
+      `${home}/.yarnrc.yml`,
+      // `huggingface-cli login`'s token, and every token it has saved. ~/.cache
+      // is a toolchain tree moderate reads, and the model cache beside them in
+      // ~/.cache/huggingface/hub is what a job may use.
+      `${home}/.cache/huggingface/token`,
+      `${home}/.cache/huggingface/stored_tokens`,
       `${home}/.m2/settings.xml`,
       `${home}/.m2/settings-security.xml`,
       `${home}/.gradle/gradle.properties`,

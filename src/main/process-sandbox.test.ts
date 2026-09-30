@@ -564,6 +564,22 @@ describe('Process Sandbox', () => {
           home('.cargo', 'credentials'),
           home('.cargo', 'credentials.toml'),
           home('.nuget', 'NuGet', 'NuGet.Config'),
+          home('.azure', 'msal_token_cache.json'),
+          home('.git-credentials'),
+          home('.pypirc'),
+          home('.gem', 'credentials'),
+          home('.local', 'share', 'gem', 'credentials'),
+          home('.terraform.d', 'credentials.tfrc.json'),
+          home('.terraformrc'),
+          home('.pgpass'),
+          home('.vault-token'),
+          home('.boto'),
+          home('.s3cfg'),
+          home('.my.cnf'),
+          home('.mylogin.cnf'),
+          home('.yarnrc.yml'),
+          home('.cache', 'huggingface', 'token'),
+          home('.cache', 'huggingface', 'stored_tokens'),
         ]) {
           expect(readable(profile, credential)).toBe(false);
           expect(writable(profile, credential)).toBe(false);
@@ -572,7 +588,9 @@ describe('Process Sandbox', () => {
         // as a node: none can be renamed, removed or replaced.
         for (const node of [
           home('.ssh'), home('Library', 'Keychains'), home('Library'), home('.m2'), home('.gradle'), home('.cargo'),
-          home('.nuget'), home('.nuget', 'NuGet'), homeDir, path.dirname(homeDir),
+          home('.nuget'), home('.nuget', 'NuGet'), home('.azure'), home('.gem'), home('.terraform.d'), home('.local'),
+          home('.local', 'share'), home('.local', 'share', 'gem'), home('.cache'), home('.cache', 'huggingface'),
+          homeDir, path.dirname(homeDir),
         ]) {
           expect(writable(profile, node)).toBe(false);
         }
@@ -583,6 +601,10 @@ describe('Process Sandbox', () => {
           home('.m2', 'repository', 'x.jar'),
           home('.nuget', 'NuGet', 'nugetorgadd.trk'),
           home('.cargo', 'registry', 'index'),
+          home('.gem', 'ruby', '3.4.0', 'gems'),
+          home('.terraform.d', 'plugins', 'registry.terraform.io'),
+          home('.local', 'share', 'other-tool'),
+          home('.cache', 'huggingface', 'hub', 'models--x'),
           home('Library', 'Caches', 'built'),
           home('project', 'built'),
         ]) {
