@@ -93,9 +93,11 @@ describe('parseLocalmostrc', () => {
   });
 
   // Each read runs in a child: a read of either never returns, and would
-  // hang the suite rather than fail it.
+  // hang the suite rather than fail it. /dev/urandom rather than /dev/zero,
+  // which a job's sandbox will not open: the refusal there came from the
+  // open, and never reached the check this is for.
   it.each([
-    ['/dev/zero', () => '/dev/zero'],
+    ['/dev/urandom', () => '/dev/urandom'],
     ['a FIFO', () => {
       const fifo = path.join(repo, 'fifo');
       execFileSync('/usr/bin/mkfifo', [fifo]);
