@@ -280,7 +280,7 @@ root (R8). It grants nothing without the job's proxy token.
 /usr/libexec/localmost/lm-bindpin
 /usr/libexec/localmost/runc              the real runc (Alpine runc package, moved)
 /usr/bin/runc                            lm-runc, the wrapper
-/usr/libexec/localmost/x86_64-selftest   static x86-64 busybox (Alpine x86_64 busybox-static), for the Rosetta self-test
+/usr/libexec/localmost/x86_64/busybox    static x86-64 busybox (Alpine x86_64 busybox-static), for the Rosetta self-test (named busybox so the multiplexer runs the applet: binfmt CF does not preserve argv0)
 /etc/docker/daemon.json                  below
 /etc/resolv.conf                         "nameserver 198.18.0.1"
 /var/run -> ../run
@@ -342,14 +342,18 @@ code:
    `disk: corrupt` with `ok: false` and code `E_DISK`. Mount it on
    `/var/lib/docker`.
 3. Share (job mode). `mountPath` must be absolute and normalised (no `.`, `..`,
-   `//` or NUL), at most 1024 bytes, and its top-level component must not exist
-   in the root (`E_SHARE_PATH`). Mount a tmpfs on `/<top>`, `mkdir -p`, then
+   `//` or NUL), at most 1024 bytes, and its top-level component must be one of
+   the guest root's mount roots — `Users` or `Volumes`, the empty directories
+   the read-only root ships for this — or `E_SHARE_PATH`. (The root is
+   read-only, so a tmpfs can only cover a directory it already has; every
+   other top-level name is refused, which also keeps the tmpfs from hiding a
+   directory the guest uses.) Mount a tmpfs on `/<top>`, `mkdir -p`, then
    `mount("work", mountPath, "virtiofs", MS_NOSUID|MS_NODEV|MS_NOSYMFOLLOW)`
    (`E_SHARE_MOUNT`). Read `nonceFile` with `O_NOFOLLOW`, capped at 64 bytes.
 4. Rosetta (when `rosetta`). Mount virtiofs `rosetta` on `/run/rosetta`, mount
    `binfmt_misc`, and write this to `register`:
    `:rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/run/rosetta/rosetta:CF`.
-   Run `/usr/libexec/localmost/x86_64-selftest true`. The result is `ok` or
+   Run `/usr/libexec/localmost/x86_64/busybox true`. The result is `ok` or
    `broken`; with `rosetta: false` it is `absent`. This step never fails
    `configure`.
 5. Network (job mode). Create a dummy interface `lm0` with `198.18.0.1/32`,
@@ -490,7 +494,9 @@ in Go (the hook), with shared test vectors in
   refuses a relative destination. `dockerd` cleans destinations the same way
   (`/data/` becomes `/data`).
 - `readOnly`: in the evaluator, from the bind's `ro` mode or `Mounts[].ReadOnly`;
-  in `config.json`, true exactly when the mount's `options` contain `ro`.
+  in `config.json`, true when the mount's `options` contain `ro` or `rro`
+  (dockerd and runc write `rro`, recursive read-only, for a read-only bind on
+  this version; *verified*, WP-A).
 - One approval list per container. Each mount must match one approval; each
   approval may be used by at most one mount. The same source approved twice
   with different destinations or modes is two approvals, each matched on
@@ -529,7 +535,7 @@ localmost.app/Contents/Resources/guest/
   "agentProtocol": 1,
   "alpine": { "branch": "v3.24", "release": "3.24.2" },
   "kernel": { "package": "linux-virt-6.18.54-r0", "release": "6.18.54-0-virt" },
-  "docker": { "engine": "29.5.3", "apiVersion": "1.54", "minApiVersion": "1.24", "containerd": "2.3.6", "runc": "1.4.3" },
+  "docker": { "engine": "29.5.3", "apiVersion": "1.54", "minApiVersion": "1.40", "containerd": "2.3.6", "runc": "1.4.3" },
   "artifacts": {
     "vmlinux": { "sha256": "…", "size": 0 },
     "initramfs.cpio.gz": { "sha256": "…", "size": 0 },
@@ -796,9 +802,12 @@ export interface AgentClient {
 
 The roots are `virtiofs`, `vmw_vsock_virtio_transport`, `virtio_blk`,
 `virtio-rng`, `ext4`, `erofs`, `overlay`, `br_netfilter`, `veth`, `dummy`,
-`nf_tables`, `nft_compat`, `nft_chain_nat`, `xt_addrtype`, `xt_conntrack`,
+`nf_tables`, `nft_compat`, `nft_chain_nat`, `nft_nat`, `nft_masq`,
+`xt_addrtype`, `xt_conntrack`,
 `xt_MASQUERADE`, `xt_nat`, `xt_mark`, `ipt_REJECT`, `iptable_filter`,
-`iptable_nat` and `binfmt_misc`. The build takes their closure through
+`iptable_nat` and `binfmt_misc`. (`nft_nat` and `nft_masq` were added by
+WP-A: `nft_chain_nat` alone did not carry the iptables-nft DNAT/MASQUERADE
+rules Docker's networks set up.) The build takes their closure through
 `modules.dep`, and `manifest.modules` records the final list. WP-A adds a root
 only when `dockerd` or `check-config.sh` shows it is needed. It is an
 allowlist. Because `lm-init` sets `kernel.modules_disabled=1` once these are
