@@ -557,7 +557,7 @@ describe('cleanupSandboxDirectories', () => {
 
   it('never follows a link a writer outside every job profile swaps in while it removes a sandbox', async () => {
     // A container a job started writes the workspace it bind-mounts through
-    // Docker Desktop's file sharing, under no job's profile, so moving the
+    // its Docker VM's virtiofs share, under no job's profile, so moving the
     // sandbox aside does not stop it. Here a shell working in the sandbox,
     // which follows the tree wherever it is moved, stands in for it: it
     // swaps each directory there for a link to the user's files, and back,

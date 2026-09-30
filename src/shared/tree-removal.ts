@@ -49,9 +49,9 @@ const REMOVAL_BATCH = 32;
  * anywhere in it - even one swapped in while this walks it.
  *
  * Moving the tree aside stops only the writers seatbelt confines. A container
- * a job or step started writes the workspace it bind-mounts through Docker
- * Desktop's file sharing, under no profile, and may keep writing the tree
- * wherever it is. A walk by path, as fs.rm's is, loses to such a writer: it
+ * a job or step started writes the workspace it bind-mounts through its
+ * Docker VM's virtiofs share, whose server is not under the job's profile,
+ * and may keep writing the tree wherever it is. A walk by path, as fs.rm's is, loses to such a writer: it
  * finds a directory, the writer swaps it for a link, and the walk goes
  * through the link and deletes what it points to. So this never uses a path
  * more than one level below the directory the tree was moved into, which

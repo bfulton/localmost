@@ -38,12 +38,13 @@ export interface DockerEvalContext {
    * Mount sources must resolve inside it.
    */
   workspaceRoot: string;
-  /** Whether the backend may honour `privileged`. Stage 1: false. */
+  /** Whether the backend may honour `privileged`. The VM backend: false (owner decision 2). */
   supportsPrivileged: boolean;
   /**
    * Ids of containers created through this socket. Per-container reads and
-   * writes are permitted only against these: the daemon is shared with the
-   * operator and with other jobs, so an unscoped id reaches outside this job.
+   * writes are permitted only against these: a container the job did not
+   * create through this socket is one the filter never judged, and with a
+   * daemon the job shares (the Linux e2e forwarder) it is someone else's.
    */
   ownContainerIds?: ReadonlySet<string>;
   /**
