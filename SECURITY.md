@@ -766,6 +766,9 @@ packagerConfig: {
         ? 'packaging/entitlements.plugin.plist'
         : 'packaging/entitlements.plist',
     }),
+    // Unset, @electron/packager takes this as true and only warns when
+    // signing fails, so the build would go on to ship unsigned code.
+    continueOnError: false,
   },
   osxNotarize: {
     appleId: process.env.APPLE_ID,

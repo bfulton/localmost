@@ -270,6 +270,10 @@ describe('the entitlements the app is signed with', () => {
     // @electron/packager treats an unset continueOnError as true: a failed
     // signApp becomes a warning and the build goes on with what is unsigned.
     expect(osxSign.continueOnError).toBe(false);
+    // And the installed packager reads it that way, so a rename or a changed
+    // default there cannot quietly turn signing failures back into warnings.
+    const { createSignOpts } = require(path.join(REPO, 'node_modules', '@electron', 'packager', 'dist', 'mac'));
+    expect(createSignOpts(osxSign, 'darwin', '/x.app', '0', true).continueOnError).toBe(false);
   });
 
   it('ships no entitlements file the signing does not use', () => {
