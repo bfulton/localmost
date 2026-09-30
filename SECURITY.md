@@ -66,8 +66,8 @@ localmost is an Electron desktop application that manages GitHub Actions self-ho
 - **Filesystem reads**: Under `strict` a job reads the OS, the runner's own directories, its workspace, and whatever its `.localmostrc` declares - nothing else. `moderate` and `permissive` additionally grant the standard toolchain locations (`/opt/homebrew`, `/usr/local`, Xcode) and the package-manager caches. At every level a job is denied `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.config`, `~/.azure`, `~/Library/Keychains`, `~/.netrc`, `~/.npmrc`, the files other tools keep tokens and passwords in as plain text (`~/.git-credentials`, `~/.pypirc`, `~/.gem/credentials` and `~/.local/share/gem/credentials`, `~/.terraform.d/credentials.tfrc.json`, `~/.terraformrc`, `~/.pgpass`, `~/.vault-token`, `~/.boto`, `~/.s3cfg`, `~/.my.cnf`, `~/.mylogin.cnf`, `~/.yarnrc.yml`, `~/.cache/huggingface/token` and `stored_tokens`), this app's credential store and approval cache, and the credential files kept inside the package-manager caches (`~/.m2/settings.xml`, `~/.gradle/gradle.properties`, cargo credentials, `NuGet.Config`), read and write, whatever write paths its policy declares, and none can be renamed into view (see Home directory access above). Granting write on `~/.gradle`, `~/.m2`, `~/.cargo` or `~/.nuget` is warned about on approval, since your own builds load and run what is kept there
 - **Network exfiltration**: A job's sandbox permits no outbound connection except to its own filtering proxy and the local broker's port, so the host policy holds even for code that ignores `HTTP_PROXY` and opens a raw socket. A direct connection to any other loopback port is refused too, unless its approved policy declares that port with `network.loopback`, and the proxy holds a request for a loopback address to the same ports, so going through `HTTP_PROXY` does not reach a service bound only to loopback either. The proxy judges the Mac's own routable addresses - a global IPv6 address, or a public IPv4 one, on one of its interfaces - like any remote host, so under `permissive`, or with such an address in an allow entry, a job reaches a service listening on all interfaces there (Docker Desktop publishes ports that way by default). Under `strict` the reachable set is runner infrastructure plus what the repository declares — not npm, PyPI or other registries
 - **Other processes**: A job can signal only processes in its own sandbox - its children and the members of its process group that share its sandbox - not the app, another worker's job or anything else you run. It cannot look up the app's own Chromium port rendezvous service either
-- **What a job leaves running**: Nothing of a job is meant to outlive it. Every job's sandbox is a new directory (`~/.localmost/runner/sandbox/<n>-<id>`), with its docker socket inside, so the next job's runner, checkout and socket are at paths no earlier job's profile grants. When a worker exits, its process group is sent SIGTERM and, ten seconds later, SIGKILL, and its slot takes no other job until the group is empty or has been sent SIGKILL. Two seconds after that, anything still running under that job's sandbox profile is killed - found by asking the kernel which processes run under the profile carrying the job's mark, which a process cannot leave the way it can leave its process group with `setsid()` - and then, once nothing is left in its process group, the job's sandbox directory is removed. It is first moved aside, to a name in `~/.localmost/runner/sandbox` that no job's profile grants, so that a process still running under the job's profile can no longer change the tree, and it is removed from there without following a link planted anywhere in it - even one swapped in for a directory while the removal runs, by a container of the job's writing its bind-mounted workspace, say, which no profile confines - so the removal deletes nothing outside the tree. If the app quits first, the next startup does the same for every job it had not swept. That sweep runs a short script with the developer tools' `python3`, found through `xcode-select`; without the developer tools only the process group, and the processes holding the marker file descriptor the runner's shells pass down, are swept. So a process that left the group with `setsid()` and closed its inherited descriptors keeps its finished job's profile for about twelve seconds after the job ends, and without the developer tools until it exits. Until then it can write its own old sandbox directory while that is still in place (and after that a new directory at the same path, which the next startup removes), the paths its policy declares, and its target's caches, which the target's next job uses; connect to the loopback ports its policy declares; and listen on any free loopback port, where a later job, or one running in another slot, whose policy declares that port reaches it instead of the service it expects. It cannot reach the next job's sandbox or docker socket, nor use its proxy, which stops serving it when the job ends
-- **Container work**: A job is never handed the Docker daemon socket. It talks to a filtering socket localmost owns, which forwards only the `pull`, `run` and `build` requests the repository's approved `.localmostrc` declares - see Docker Access below
+- **What a job leaves running**: Nothing of a job is meant to outlive it. Every job's sandbox is a new directory (`~/.localmost/runner/sandbox/<n>-<id>`), with its docker socket inside, so the next job's runner, checkout and socket are at paths no earlier job's profile grants. When a worker exits, its process group is sent SIGTERM and, ten seconds later, SIGKILL, and its slot takes no other job until the group is empty or has been sent SIGKILL. Two seconds after that, anything still running under that job's sandbox profile is killed - found by asking the kernel which processes run under the profile carrying the job's mark, which a process cannot leave the way it can leave its process group with `setsid()` - and then, once nothing is left in its process group, the job's sandbox directory is removed. It is first moved aside, to a name in `~/.localmost/runner/sandbox` that no job's profile grants, so that a process still running under the job's profile can no longer change the tree, and it is removed from there without following a link planted anywhere in it - even one swapped in for a directory while the removal runs, by a container of the job's writing its bind-mounted workspace through the Docker VM's share, say, which the job's profile does not confine - so the removal deletes nothing outside the tree. If the app quits first, the next startup does the same for every job it had not swept. That sweep runs a short script with the developer tools' `python3`, found through `xcode-select`; without the developer tools only the process group, and the processes holding the marker file descriptor the runner's shells pass down, are swept. So a process that left the group with `setsid()` and closed its inherited descriptors keeps its finished job's profile for about twelve seconds after the job ends, and without the developer tools until it exits. Until then it can write its own old sandbox directory while that is still in place (and after that a new directory at the same path, which the next startup removes), the paths its policy declares, and its target's caches, which the target's next job uses; connect to the loopback ports its policy declares; and listen on any free loopback port, where a later job, or one running in another slot, whose policy declares that port reaches it instead of the service it expects. It cannot reach the next job's sandbox or docker socket, nor use its proxy, which stops serving it when the job ends
+- **Container work**: A job is never handed a Docker daemon socket. It talks to a filtering socket localmost owns, which forwards only the `pull`, `run` and `build` requests the repository's approved `.localmostrc` declares, to a Linux VM of the job's own whose only share is the job's work folder and whose only way out is the job's proxy - see Docker Access below
 - **Credential exposure**: OAuth tokens are encrypted at rest using macOS Keychain
 
 ### Policy levels
@@ -112,9 +112,9 @@ loosen its own sandbox without the machine owner agreeing to it.
 - **Per-workflow filesystem sections**: A `workflows:` section can narrow or widen *network* access per workflow, because hosts are applied to the proxy when a job is claimed. Filesystem paths are taken from `shared:` only — the sandbox profile is built before the runner knows which workflow it will run, and cannot change afterwards.
 - **Per-workflow env sections**: The environment is fixed when the worker starts, for the same reason. `env: allow` is taken from `shared:` only; a per-workflow allow is not applied. `env: deny` is taken from `shared:` and from every workflow, and applied to every job - a per-workflow deny is honoured more widely than written rather than not at all.
 - **Per-workflow sections are not a boundary between contributors**: A `workflows.<name>` section is available to any commit that can run a workflow file with that name, including pull requests; approving a per-workflow grant approves it for anyone who can open a PR. The key matches a file name, and a pull request can add or change a workflow file like any other. Per-workflow sections keep a compromised dependency of one workflow from using another's grants, not a commit author.
-- **Loopback services on declared ports, and the broker**: A job reaches loopback ports other than its own proxy's only when the repository declares them with `network.loopback`, directly or through its proxy, and it always reaches the broker's port, directly and through its proxy - see Network Policy below. A service on a declared port is protected from jobs only by its own authentication, as the broker is by its per-worker key. Containers are not under the sandbox's loopback rule at all: a container on a routable network reaches the host's loopback services, the broker included, through the daemon's address for the host (`host.docker.internal`) - see Docker Access below.
+- **Loopback services on declared ports, and the broker**: A job reaches loopback ports other than its own proxy's only when the repository declares them with `network.loopback`, directly or through its proxy, and it always reaches the broker's port, directly and through its proxy - see Network Policy below. A service on a declared port is protected from jobs only by its own authentication, as the broker is by its per-worker key. A job's containers reach loopback only through the job's proxy, so under the same rule: the ports its policy declares, and the broker's - see Docker Access below.
 - **Processes running as you**: The CLI control socket is guarded only by file permissions (`0600` in a `0700` directory) and the job sandbox's deny of it. Any process running as your user can control the app through it - pause, resume, add or remove targets - as it could by editing `~/.localmost` directly.
-- **Container egress**: Traffic from inside a container leaves through the daemon's network, not the job's proxy, so the host allowlist does not apply to it. The Docker filter decides what a container may be created with, not what it connects to once running - see Docker Access below.
+- **Apple's Virtualization.framework, and the Docker VM's kernel**: A job's containers run in a Linux VM of its own. A bug in Apple's virtiofs server or device emulation, which is closed source and has not been fuzzed here, is not contained by anything localmost adds. A kernel exploit from a container gives root in that VM, which holds only what the job can already reach and its repository's cache of public images - see Docker Access below.
 
 - **The runner's own floor**: A job's sandbox also contains the runner process, so the profile must grant what the runner needs to function - the OS, its own installation, the tool cache, the workspace and temp. A repository cannot narrow below that floor, only add to it.
 - **Package caches under `moderate` and `permissive`**: These levels used to grant write on `~/.npm`, `~/.cargo`, `~/.rustup`, `~/.gradle`, `~/.m2`, `~/.nuget`, `~/.dotnet`, `~/.local`, `~/go`, `~/Library/Caches` and similar. Those trees are not only caches: they hold directories on your `PATH` and configuration your own tools load, so a job could plant code you would later run outside any sandbox. They are now read-only to jobs. Instead the job's environment points its package managers at a package cache of its own - its target's, or with per-sandbox selected one inside the job's sandbox - by these variables: `npm_config_cache`, `YARN_CACHE_FOLDER`, `YARN_GLOBAL_FOLDER`, `npm_config_store_dir` (pnpm), `XDG_CACHE_HOME`, `XDG_DATA_HOME`, `CARGO_HOME`, `GRADLE_USER_HOME`, `MAVEN_OPTS` and `MAVEN_ARGS` (`maven.repo.local`), `GOPATH`, `GOCACHE`, `NUGET_PACKAGES`, `NUGET_HTTP_CACHE_PATH`, `DOTNET_CLI_HOME`, `PIP_CACHE_DIR`, `electron_config_cache` and `npm_config_devdir` (node-gyp). The trade-offs: a job starts from an empty cache rather than yours; your own configuration in those trees (`~/.cargo/config.toml`, `~/.gradle/init.d` and the like) no longer applies to jobs; rustup cannot install a toolchain that `rust-toolchain.toml` asks for, since `~/.rustup` is read-only; because `XDG_DATA_HOME` moves too, what you installed under `~/.local/share` - mise's tools, uv's Pythons, pipx's packages - is not found by a job, which installs its own copy into the package cache instead; a workflow that sets one of these variables itself back to your home directory is refused on write - which includes a workflow that sets `MAVEN_OPTS` for its JVM flags on a Maven older than 3.9, which reads only `MAVEN_OPTS`; and a tool that writes somewhere else in your home - `~/Library/Caches` for Playwright browsers, CocoaPods or Homebrew - fails with "Operation not permitted" unless the repository declares that path. With the persistent cache selected, the package cache is kept across a target's jobs and shared by all of them, like the tool cache - and it holds what those jobs execute, not only downloaded packages: Gradle's `init.d` scripts and `gradle.properties`, Cargo's `config.toml` (a `rustc-wrapper`, say) and `bin`, `GOPATH/bin`. Within a target, a pull request's job can leave configuration or binaries there that a later default-branch job loads with that branch's secrets. With per-sandbox selected, the package cache is inside the job's own sandbox and goes with it.
@@ -417,22 +417,24 @@ port reaches whatever listens on it, not only what the step started.
 ### Docker Access
 
 A repository may declare `docker:` in its approved `.localmostrc`. The job is
-never handed the daemon socket. localmost serves a unix socket of its own inside
+never handed a daemon socket. localmost serves a unix socket of its own inside
 the worker's sandbox directory and points `DOCKER_HOST` at it; a filtering proxy
 behind that socket parses every Docker API request, checks it against the policy
-bound to that worker, and forwards only what passes to the daemon. The socket is
-created denying everything, is bound to the repository's policy when the job is
-claimed, and is destroyed with the job. The containers the job created through
-it go too: when the socket stops, each one still on the daemon is force-removed
-with its anonymous volumes, then each network the job created. The socket
-closes before that sweep, so the job cannot start another during it; a create
-already on its way to the daemon when the socket closes can still leave a
-container that is created but never started. A removal the daemon refuses or
-never answers is tried once more, then logged, and if localmost itself is
-killed before the job's worker exits, nothing runs the sweep. A worker that
-claims a job for a repository other than the one its socket is bound to gets no
-docker access at all. The profile denies `~/.docker` in full; the only socket a
-job can reach is the one localmost serves, and it cannot unlink or replace it.
+bound to that worker, and forwards only what passes. The socket is created
+denying everything, is bound to the repository's policy when the job is
+claimed, and is destroyed with the job. A worker that claims a job for a
+repository other than the one its socket is bound to gets no docker access at
+all. The profile denies `~/.docker` in full. The job's `docker` is a pinned CLI
+bundled with the app, first on its `PATH`, reading an empty configuration
+directory in its sandbox (`DOCKER_CONFIG`); the only socket it can reach is the
+one localmost serves, and it cannot unlink or replace it.
+
+Behind the filter is a Linux VM that belongs to the job - see The Docker VM
+below - not Docker Desktop or any other daemon of the operator's. localmost
+never uses the operator's Docker installation for jobs, and nothing falls back
+to one: a VM that fails to start, or fails any of its checks, means no Docker
+for that job, and the socket answers every request beyond the baseline
+(below) with 503 and the reason.
 
 What the filter refuses, each of which is an executable test against the proxy:
 
@@ -441,22 +443,20 @@ What the filter refuses, each of which is an executable test against the proxy:
   resolves outside the workspace, since a source is resolved before it is
   checked. The workspace itself is never resolved again: the sandbox directory
   is resolved once, when the socket starts, and `_work/<repo>/<repo>` is joined
-  to it as written, so a job that replaces its checkout or `_work` with a link
-  moves nothing. After resolving, each directory from the sandbox directory
-  down to the source is checked, and a symlink among them is refused. The
-  daemon is sent the resolved path, not the spelling it was given. That does
-  not hold through to the mount: the daemon resolves the path again when the
-  container starts, and a job that swaps a symlink onto it after it is checked
-  and before the container starts mounts what the link names. Closing that is
-  an open item;
+  to it as written, so a job that replaces its checkout with a link moves
+  nothing. After resolving, each directory from the sandbox directory down to
+  the source is checked, and a symlink among them is refused. The daemon is
+  sent the resolved path, not the spelling it was given. The daemon resolves
+  that path again when the container starts, inside the VM, where a link put
+  in its place after the check makes the start fail (The Docker VM, below);
 - mounting the daemon socket into a container;
-- `--privileged`, `--pid=host`, `--network=host`, `--device`, and the other
-  host-reaching container settings (`IpcMode`, `UtsMode`, `UsernsMode`,
-  `CgroupParent`, `SecurityOpt`), none of which has a spelling in the policy
-  grammar;
+- `--pid=host`, `--network=host`, `--device`, and the other host-reaching
+  container settings (`IpcMode`, `UtsMode`, `UsernsMode`, `CgroupParent`,
+  `SecurityOpt`), none of which has a spelling in the policy grammar, and
+  `--privileged`, which has one that validation refuses (below);
 - a restart policy other than `no` (`--restart=always`, `unless-stopped`,
   `on-failure`), with which the daemon brings a container back after it exits
-  and after the daemon itself restarts, outliving the job;
+  without any request the filter sees;
 - an image, registry, mount, network mode or build context the policy did not
   declare;
 - a request body with a key the daemon may read as another: two keys that
@@ -475,40 +475,229 @@ What the filter refuses, each of which is an executable test against the proxy:
   network create, a tar or none for a build, none or `text/plain` otherwise;
 - any endpoint, API version or request body the proxy does not fully
   understand. The filter fails closed: a request it cannot evaluate is refused,
-  not passed through.
+  not passed through. `POST /auth` and the checkpoint endpoints are among
+  those refused.
 
 The top level of a container create body is not yet an allowlist the way
 `HostConfig` is: a top-level key the filter does not know, such as a field a
 later API version adds, is forwarded unexamined. Building that allowlist from
 the bodies the CLI sends is an open item.
 
-Registry credentials never enter the sandbox. The proxy attaches authentication
-to a pull on the job's behalf; the job does not read `~/.docker/config.json` and
-never holds the secret.
+`privileged` is the one host-reaching setting the grammar names, and
+validation refuses it. A privileged container would hold every capability,
+the VM's raw data disk with the repository's cached images, the whole `_work`
+(the runner's step scripts and the checkout's `.git` credentials included),
+every vsock port and the proxy token: the VM's kernel, not only its root user.
+It would also bypass `internal:` networks and the bind hook below. Nothing
+here contains a privileged container, which is why none is granted.
 
-What the filter does not contain:
+**The Docker VM.** A VM is booted when a job whose bound policy has a
+`docker:` section is claimed, and only then. When the worker exits, the VM is
+stopped and its directory, with its disk, is deleted; its containers,
+networks, volumes, built images and tags go with it, so nothing a job created
+is left on a daemon and no removal sweep is needed. The guest is localmost's
+own, shipped inside the app and updated with it: Alpine's `linux-virt`
+kernel, `dockerd`, `containerd` and `runc` on a read-only root, with small
+localmost init, agent and hook programs. Each VM is run by a separate helper
+(`Contents/Resources/localmost-vm`), signed with only the
+`com.apple.security.virtualization` entitlement and started under a
+deny-default seatbelt profile written for that one VM.
 
-- **Container egress.** Traffic from inside a container leaves through the
-  daemon's network, not the job's proxy, so the policy's host allowlist does not
-  apply to it. The filter constrains what a container is created with, not what
-  it connects to once running.
-- **A filter defect.** The daemon is the operator's own, so a request that
-  passes the filter runs with the daemon's reach. There is no second boundary
-  behind the filter yet. That is what the managed-VM backend in the design adds,
-  and why `privileged` is rejected until it exists.
+**The user's home is out of reach.** Docker Desktop shares all of `/Users`
+into its VM, so the daemon's second resolution of a bind source, at container
+start, could land anywhere in the home directory: a job could create a
+container with an approved bind, replace the source with a link to `~`, and
+start it. The job's VM has exactly one host directory, the job's own
+`<sandbox>/_work`: the runner's work folder, which holds the checkout and so
+every path a policy's `mounts:` can name. Its only other share, when Rosetta
+for Linux is installed, is Apple's Rosetta runtime, and it has no network
+card. localmost creates `_work` itself before any process runs in the sandbox,
+and the job's profile denies writes to the `_work` and `<sandbox>` nodes
+themselves, so the job cannot rename, remove, replace, chmod or relink either;
+their contents stay writable. That matters because the job's steps are
+already running while the VM boots, and Virtualization.framework resolves the
+share's path only when the VM starts. Until then two layers stand between a
+swapped `_work` and the VM: those node denies, and the helper. The helper is
+given ids, never a path from the job. It derives the share's path itself and
+checks that it is a real directory, not a link, on the same device as the
+sandbox, and not a mount point, so a DMG, FUSE or SMB mount placed over
+`_work` makes it refuse the share. Its profile lets Virtualization.framework's
+service reach only that real path: the rule that issues the service its
+sandbox extension is scoped to `_work`'s subtree, so if `_work` had been
+replaced by a link, its target would lie outside that subtree and the VM
+would fail to start. A tripwire detects a
+failure of both layers: before the worker starts, localmost writes a random
+nonce to `_work/.localmost-share`, which the job's profile lets it neither
+read nor replace, and a VM whose guest reads anything else there is torn
+down, with the mismatch logged as an error.
+
+Inside the guest the share is mounted at the same absolute path it has on the
+Mac, `nosymfollow`, `nosuid` and `nodev`, so no path lookup through it follows
+a symlink, and a bind whose source is a link, or passes through one, fails to
+mount. `runc` is wrapped so that every container start runs a hook
+(`lm-bindpin`) that checks each mount from the share against the binds the
+filter approved for that container - by source, destination and read-only
+flag, then by mount id in the container's own mount namespace - and only then
+turns symlink-following back on for those binds alone, so that links inside
+an approved bind work and resolve within the container. A share mount that was
+not approved, or any error at all, including an agent the hook cannot reach,
+fails the start. So create, swap, start fails at the start, whether the swap
+is made by the job on the Mac or by another of its containers writing the
+share from inside the VM, and a link the job plants resolves in the guest,
+never on the Mac.
+
+**Jobs cannot reach each other's containers.** Each job's containers run in
+its own VM. The VM has no network card, and vsock, its only channel, has no
+path from one guest to another, so containers of different jobs share no
+bridge and cannot address each other. Docker networks exist only inside one
+VM, so a job cannot join another job's network by naming it. Two findings from
+the Docker Desktop backend are fixed by this: containers of different jobs on
+Docker Desktop's shared default bridge reached each other by IP, and so did
+builds, since the classic builder runs every `RUN` step on that bridge; and
+the filter admitted any network whose name the policy allowed, even one a
+concurrent job had created.
+
+**Container egress goes through the job's proxy.** Without a network card the
+guest has no route out. The one way out is a relay: the guest agent accepts
+connections on a guest-only address, `198.18.0.1:3128`, and carries them over
+vsock to the helper, which connects them only to that worker's own filtering
+proxy on the Mac's loopback. The proxy requires the worker's token, which is
+rotated at every worker start and again when the job ends, and applies the
+job's own policy: the hosts its `network.allow` grants, loopback only as its
+`network.loopback` declares, and the local broker's port, which the proxy
+always opens and which the per-worker broker key guards; that key never
+enters the VM. On a create whose network is routable (the default bridge, or
+a network the job created with `internal: false`), and on every build,
+localmost adds `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy` and `https_proxy`
+pointing at the relay with the token, and a `NO_PROXY` of `localhost`,
+`127.0.0.1` and `::1`, keeping any value the job set itself. Traffic that
+ignores those settings - plain TCP, ssh, UDP, lookups of outside names - has
+no route and fails at once: it is refused, not filtered. Nothing in the VM
+reaches the LAN, and it reaches the Mac's loopback only through the proxy. A
+Dockerfile that declares `ARG HTTP_PROXY` records the injected URL, token
+included, in the image's history; the token is useless once the job ends.
+
+A container on an `internal: true` network has no default route. It can
+still forge one, since `NET_RAW` is in Docker's default capabilities: a frame
+sent to its gateway's hardware address and addressed to the relay would be
+delivered. So the guest firewall accepts the relay address only on the
+bridges of routable networks, which the agent follows from Docker's network
+events, and rejects everything else sent to the guest itself. The agent
+checks those rules, and that a forged route is rejected, every time a VM
+starts, and a VM that fails the check is torn down. Behind the firewall, the
+proxy token is the backstop: only routable containers are given it.
+
+**Registry credentials never enter the sandbox or the VM.** A pull is not
+forwarded to the daemon. localmost pulls on the Mac: it reads the operator's
+`~/.docker/config.json`, credential helpers and `credsStore` itself, takes
+credentials to the registry's token exchange there, fetches the image, and
+loads it into the VM over the Docker API as an archive. `X-Registry-Auth` and
+`X-Registry-Config` are stripped from every forwarded request, and a job's own
+is dropped. Credentials are sent only to the registry's own origin and to a
+token service that passed the screening below, never on a redirect.
+Credential helpers are run only from `/opt/homebrew/bin`, `/usr/local/bin` and
+`/Applications/Docker.app/Contents/Resources/bin`, never looked up on
+`PATH`. A configured helper that is missing, or fails for any reason but
+"credentials not found", fails the pull with a message naming the helper and
+the config key, rather than letting it go ahead anonymously.
+
+**What a pull reaches.** The puller speaks only https, to registries on public
+addresses: a registry whose name resolves to a loopback, link-local or private
+address is refused, as `ProxyServer` refuses one, and so is plain http, so a
+LAN, loopback or plain-http registry cannot be pulled from even when the
+policy lists it. Registries commonly redirect blob downloads to a CDN, and the
+puller follows https redirects, each screened the same way, to any public
+host. So granting a registry in `pull.registries` also means that localmost
+fetches from wherever that registry redirects, outside the job's
+`network.allow`; the approval text for `pull.registries` says so. A layer the
+image says must be fetched from a URL of its own (a foreign or
+non-distributable layer) is refused. Every digest the registry names is
+checked to be `sha256:` and 64 hex characters before it is used for anything,
+since store paths are built from it; every blob is checked against its digest
+as it streams, and every uncompressed layer against the image config's
+`diff_ids`, and a mismatch fails the pull. Byte limits per pull and per job,
+a limit on how far a layer may expand when decompressed, and a free-space
+floor are enforced while the bytes stream.
+
+**What the per-repository cache exposes.** Pulled images are kept per
+repository: a blob store on the Mac, and a data disk built from those
+verified blobs by a VM of its own that has no share and no relay and runs no
+job code. Each job's VM starts from an APFS clone of that disk, and the clone
+is discarded after the job, so no job can change what the next one starts
+with, and built images and tags never carry over. Every job of the repository
+can use every image in that cache, whatever its own workflow's policy says:
+through `docker build` with `FROM <ref>@sha256:…` (the classic builder uses a
+local image without pulling, and the filter does not read the Dockerfile),
+through `run.images: ['*']` with an image id, or, with root in the VM, by
+reading the raw disk. So an image that needed credentials never enters the
+cache: after a pull, localmost asks the registry anonymously for the same
+manifest digest, and an image the registry will not serve that way is kept
+only for the job that pulled it, in its VM's directory, and deleted with the
+VM.
+
+**Root in the VM is worth little more than the job.** A kernel exploit from a
+container gives root in the VM. The VM holds only this job's share (the
+runner's step scripts in `_work/_temp` and its actions in `_work/_actions`
+included, which the job can already write), this job's proxy token, this
+job's pulls, and its repository's cache of public images. Once it has loaded
+its fixed module allowlist, the guest disables module loading and `kexec`
+until it powers off, so root there cannot load a kernel module or boot
+another kernel.
+
+**The VM's control plane is not the job's.** The helper's sockets are under
+`~/.localmost/vm`, which every job's profile denies for reads and writes. The
+helper takes ids, not paths; it serves those two sockets and the relay, and
+listens on and dials nothing else. Everything the guest or
+its daemon answers is treated as hostile: size-capped, checked against its
+expected shape, stripped of control characters before it is logged, and
+never used to choose a path on the Mac.
+
+**Nothing is left running.** Each helper watches the app: when localmost
+exits, crashes or is killed, every helper stops its VM and exits, and a VM
+dies within about two seconds of its helper. The next launch removes the VM
+directories left behind. Because the VM has no network card, it never raises
+macOS's Local Network prompt.
+
+What this does not contain:
+
+- **A bug in Apple's virtiofs server or device emulation.** The
+  Virtualization.framework service runs sandboxed to the one share, but it is
+  closed source and has not been fuzzed here.
+- **A kernel exploit from a container.** It gives root in the VM, which the
+  above bounds but does not prevent.
+- **The cache disk's input.** The VM that builds a repository's cache disk
+  extracts layers from every public image the repository pulled, from any
+  publisher, onto the disk every later job of the repository clones. A flaw
+  in `dockerd`'s layer extraction or in the guest's ext4 would therefore reach
+  later jobs of the same repository. The disk is rebuilt from blank when the
+  guest changes, when it is more than seven days old and after any refresh
+  that failed, which limits how long such a flaw persists but does not
+  prevent it.
+- **Privileged containers**, which are refused for that reason (above).
+- **Hard links the job makes inside `_work`** to files it can already write.
+  Seatbelt refuses `link()` on a file the job cannot write, so this adds
+  nothing.
+- **Hostname policy for traffic that ignores the proxy settings.** That
+  traffic has no route at all. It fails; it is not filtered.
+- **A filter defect.** A request that passes the filter wrongly runs in the
+  job's own VM, so it reaches what root in the VM reaches, as above, and no
+  more.
 
 Nothing but the approved `.localmostrc` grants any of this - there is no
 machine-level switch to withhold it - so the approval diff is where that
 decision gets made. Every grant under `docker:` is surfaced in the diff with the
 same prominence as a change to `level:`. Default is off: a repository that
 declares nothing under `docker:` has only the baseline of `/_ping`, `/version`,
-`/info` and reads about its own containers, none of which change anything on
-the host. They do describe it: the daemon's `/info` answer carries the host's
-name, the daemon's data directory, its proxy and registry configuration and
-labels, so localmost rewrites it to keep only what clients use to start -
-`ServerVersion`, `OSType`, `Architecture`, `OperatingSystem`, `KernelVersion`,
-`NCPU`, `MemTotal`, `Driver`, `CgroupVersion` and `SecurityOptions`. The
-design is in `docs/superpowers/specs/2026-09-05-docker-isolation-design.md`.
+`/info` and reads about its own containers, none of which change anything, and
+no VM boots for it: until a VM is running, localmost answers those three from
+the guest image's manifest and the configured VM size. They would otherwise
+describe the daemon's host: its name, data directory, proxy and registry
+configuration and labels, so a running VM's `/info` is rewritten to keep only
+what clients use to start - `ServerVersion`, `OSType`, `Architecture`,
+`OperatingSystem`, `KernelVersion`, `NCPU`, `MemTotal`, `Driver`,
+`CgroupVersion` and `SecurityOptions`. The filter's design is in
+`docs/superpowers/specs/2026-09-05-docker-isolation-design.md`, and the VM's,
+with the evidence for each claim above, in `docs/roadmap/vm-docker-backend.md`.
 
 ## Credential Storage
 
@@ -620,7 +809,7 @@ localmost adds isolation layers that the stock GitHub Actions Runner lacks:
 | File system (write) | The job's own sandbox directory (workspace and temp), its target's own tool cache, under `moderate`/`permissive` its target's package cache, bare `mktemp` entries in the per-user temp, and what its approved policy declares |
 | File system (read) | Essential system paths (`/usr/bin`, `/System/Library`, `/Library/Developer`); under `moderate`/`permissive` also Homebrew, `/usr/local`, Xcode and the package-manager caches; and what its approved policy declares |
 | Network | Allowlisted hosts only (GitHub, npm, PyPI, etc.) via HTTP proxy |
-| Docker daemon | Through a filtering socket; only declared `pull`/`run`/`build` requests are forwarded |
+| Docker daemon | Through a filtering socket to a Linux VM of the job's own; only declared `pull`/`run`/`build` requests are forwarded |
 | Home directory | **Denied** — no access to `~/.ssh`, `~/.aws`, etc. |
 | Other applications | **Denied** — no access to `/Applications`, except Xcode (`/Applications/Xcode.app`) under `moderate`/`permissive`, and what its approved policy declares |
 
@@ -757,21 +946,23 @@ Code signing is required for distribution to prevent tampering warnings and esta
 - "Developer ID Application" certificate for distribution outside App Store
 - "Developer ID Installer" certificate if distributing PKG installers
 
-**Entitlements**: The app and every helper are signed with the hardened runtime and only the exceptions Electron needs. The app, its main, GPU and renderer helpers and Squirrel's ShipIt carry `com.apple.security.cs.allow-jit` (`packaging/entitlements.plist`); the plugin helper carries `cs.allow-unsigned-executable-memory` and `cs.disable-library-validation`, as Chromium's does (`packaging/entitlements.plugin.plist`); the camera helper in Resources (`is-camera-on`, which only reads CoreMediaIO's is-running-somewhere property of each camera to pause during video calls) carries none (`packaging/entitlements.none.plist`). No device or personal information entitlement - camera, microphone, USB, Bluetooth, printing, location - and not the App Sandbox, under which the app could not run jobs under `sandbox-exec`. @electron/osx-sign reads entitlements only from `optionsForFile`; given none, it signs with its own defaults, which grant the device and location entitlements, and releases through 0.2.0 carried them. The app's Info.plist declares no usage either: Electron's template says why it would use the camera, microphone, audio capture and Bluetooth, and a packager hook (`scripts/remove-usage-descriptions.js`, run just before signing) removes every `NS...UsageDescription` key from the app's and its helpers' Info.plist.
+**Entitlements**: The app and every helper are signed with the hardened runtime and only the exceptions each needs. The app, its main, GPU and renderer helpers and Squirrel's ShipIt carry `com.apple.security.cs.allow-jit` (`packaging/entitlements.plist`); the plugin helper carries `cs.allow-unsigned-executable-memory` and `cs.disable-library-validation`, as Chromium's does (`packaging/entitlements.plugin.plist`); the camera helper in Resources (`is-camera-on`, which only reads CoreMediaIO's is-running-somewhere property of each camera to pause during video calls) carries none (`packaging/entitlements.none.plist`), and so does the `docker` CLI bundled for jobs (`Resources/docker-cli/docker`); the Docker VM helper in Resources (`localmost-vm`) carries only `com.apple.security.virtualization`, with no JIT or library-validation exception (`packaging/entitlements.virtualization.plist`). The Docker VM's guest files (`Resources/guest`) are data the helper hands the VM, not macOS code, and are not signed themselves; the app checks their hashes against the guest manifest once per launch. No device or personal information entitlement - camera, microphone, USB, Bluetooth, printing, location - and not the App Sandbox, under which the app could not run jobs under `sandbox-exec`. @electron/osx-sign reads entitlements only from `optionsForFile`; given none, it signs with its own defaults, which grant the device and location entitlements, and releases through 0.2.0 carried them. The app's Info.plist declares no usage either: Electron's template says why it would use the camera, microphone, audio capture and Bluetooth, and a packager hook (`scripts/remove-usage-descriptions.js`, run just before signing) removes every `NS...UsageDescription` key from the app's and its helpers' Info.plist.
 
 **Forge config for signing and notarization:**
 ```js
 packagerConfig: {
   osxSign: {
     identity: process.env.APPLE_IDENTITY,
-    optionsForFile: (filePath) => ({
-      hardenedRuntime: true,
-      entitlements: filePath.includes('(Plugin).app')
-        ? 'packaging/entitlements.plugin.plist'
-        : filePath.endsWith('.app/Contents/Resources/is-camera-on')
-          ? 'packaging/entitlements.none.plist'
-          : 'packaging/entitlements.plist',
-    }),
+    optionsForFile: (filePath) => {
+      const inResources = (...p) => filePath.endsWith(path.join('.app', 'Contents', 'Resources', ...p));
+      let plist = 'entitlements.plist';
+      if (filePath.includes('(Plugin).app')) plist = 'entitlements.plugin.plist';
+      else if (inResources('is-camera-on') || inResources('docker-cli', 'docker')) plist = 'entitlements.none.plist';
+      else if (inResources('localmost-vm')) plist = 'entitlements.virtualization.plist';
+      return { hardenedRuntime: true, entitlements: path.join('packaging', plist) };
+    },
+    // The guest is data for the VM, not macOS code.
+    ignore: (filePath) => filePath.includes('.app/Contents/Resources/guest/'),
     // Unset, @electron/packager takes this as true and only warns when
     // signing fails, so the build would go on to ship unsigned code.
     continueOnError: false,
