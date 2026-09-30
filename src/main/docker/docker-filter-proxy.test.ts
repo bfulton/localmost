@@ -14,7 +14,7 @@ import * as http from 'http';
 import * as net from 'net';
 import * as zlib from 'zlib';
 import { DockerFilterProxy, DockerFilterProxyLogEntry } from './docker-filter-proxy';
-import { ApprovedBind, DesktopBackend, DockerBackend, PullRequest, WorkerContext, WorkerDocker } from './docker-backend';
+import { ApprovedBind, DockerBackend, PullRequest, runnerWorkspaceRoot, WorkerDocker } from './docker-backend';
 import type { DockerPolicy } from '../../shared/docker-policy';
 
 interface Reply { status: number; headers: http.IncomingHttpHeaders; body: string }
@@ -1026,11 +1026,10 @@ describe('the mount boundary is the sandbox the app created, not what the job ma
     fs.mkdirSync(path.join(victim, '.ssh'), { recursive: true });
     fs.writeFileSync(path.join(victim, '.ssh', 'id_ed25519'), 'SECRET');
     const daemon = await fakeDaemon(dir);
-    // The real backend and the real realpath: os.tmpdir() is itself a
-    // symlink on macOS, which a legitimate mount must still get past.
-    const desktop = new DesktopBackend({ resolve: () => ({ socketPath: daemon.sock }) });
+    // Every backend's mount root and the real realpath: os.tmpdir() is itself
+    // a symlink on macOS, which a legitimate mount must still get past.
     const started = await startProxy(sandbox, {
-      backend: { backend: desktop, worker: desktop.forWorker({} as WorkerContext), calls: { binds: [], pulls: [], approvals: [], releases: 0 } },
+      backend: backendWith(daemon.sock, false, { workspaceMountRoot: runnerWorkspaceRoot }),
     });
     const { proxy } = started;
     let sock = started.sock;

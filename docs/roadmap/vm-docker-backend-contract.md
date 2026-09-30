@@ -822,7 +822,7 @@ check.
 
 | File | Status | Owns |
 |---|---|---|
-| `src/main/docker/docker-backend.ts` | rewritten | The `DockerBackend` and `WorkerDocker` interfaces (below). `DesktopBackend` is deleted. Until then it implements `LegacyDockerBackend`, the stage 1 interface under a new name, which goes with it. |
+| `src/main/docker/docker-backend.ts` | rewritten | The `DockerBackend` and `WorkerDocker` interfaces (below), `runnerWorkspaceRoot()`, and `noDockerBackend`: what `RunnerManager` serves when it is given no backend, a worker whose socket answers every request with `no Docker daemon is available to this job` (`NO_DAEMON_MESSAGE`), never a fallback daemon. `DesktopBackend` and `LegacyDockerBackend` are deleted (WP-E). |
 | `src/main/vm/vm-backend.ts` | new | `VmBackend implements DockerBackend`: `name = 'vm'`, `supportsPrivileged = false` (privileged stays refused, owner decision 2), `disposable = true`. `workspaceMountRoot` is the same as today's. |
 | `src/main/vm/vm-manager.ts` | new | Admission gate, boot, readiness, stop, `sweep()`, `onResume()`, `shutdownAll()`, the spare. |
 | `src/main/vm/helper-client.ts` | new | Spawn through `sandbox-exec`, NDJSON framing, the events and commands of §2.4, exit mapping. |
@@ -1722,3 +1722,28 @@ without its VM.
 - **Mock registry** (`src/main/docker/puller/test-registry.ts`, owned by WP-D).
   An HTTP server with `/v2/`, token auth, manifests, blobs and a redirect host,
   plus switches for digest corruption.
+- **Native forwarder** (`test/e2e/support/native-worker-docker.ts`, owned by
+  WP-E; owner decision 3). A `DockerBackend` whose workers forward to a
+  Linux runner's native `dockerd` (`/var/run/docker.sock`, or `DOCKER_HOST`
+  when that is a unix socket) and pull through it. `disposable` is false, so
+  a stopped socket removes what its job made. Only `test/e2e/docker.spec.ts`
+  imports it, and it drives it only off macOS; a jest test in
+  `docker-backend.test.ts` fails if any file under `src/` names it.
+- **The e2e spec's Mac mode** (`test/e2e/support/vm-worker-docker.ts`, owned
+  by WP-E). The real `VmBackend`, `DefaultVmManager`, `GuestImage` and
+  `VmImagePuller` (anonymous `RegistryClient`) over `build/localmost-vm`,
+  `build/guest` and `build/docker-cli/docker`, with two stand-ins: cache
+  disks that give every VM a blank data disk and never schedule a refresh,
+  and a worker proxy that accepts and drops connections. It first replaces
+  the cached `electron` module with `{ app: { isPackaged: false } }`, since
+  the puller reads `app.isPackaged` and the spec runs in plain Node.
+  It imports WP-D's puller and runs on WP-F's `build:native` output, and
+  `test/e2e` is outside `tsconfig.json`, so nothing checks it until it
+  runs. At integration, once D and F have merged: run `npm run
+  build:native`, then the spec on the Mac outside a job, which must pass
+  in full (10 of 10), and add a typecheck of `test/e2e` to
+  `npm run typecheck` (it cannot pass before D's modules exist), so that a
+  change to D's options or to `CacheDisks` fails CI rather than the next
+  manual run. When D's real `CacheDisks` replaces the stand-in in
+  `index.ts`, the blank one here and there can become one shared test
+  helper.

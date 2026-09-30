@@ -8,7 +8,7 @@ import * as os from 'os';
 import { StringDecoder } from 'string_decoder';
 import * as yaml from 'js-yaml';
 import type { DockerPolicy } from '../shared/docker-policy';
-import { DesktopBackend, DockerBackend } from './docker/docker-backend';
+import { DockerBackend, noDockerBackend } from './docker/docker-backend';
 import { DockerFilterProxy } from './docker/docker-filter-proxy';
 import {
   SandboxPolicyLevel, RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
@@ -297,7 +297,10 @@ interface RunnerManagerOptions {
    * own key never goes into a sandbox, which the job can read.
    */
   issueWorkerCredential?: (instanceNum: number) => Promise<WorkerCredentialFiles | undefined>;
-  /** The daemon a worker's permitted container requests go to: each worker's own Docker VM. */
+  /**
+   * The daemon a worker's permitted container requests go to: each worker's
+   * own Docker VM. Without one, no worker has Docker (noDockerBackend).
+   */
   dockerBackend?: DockerBackend;
   /** The dockerVm settings: the boot timeout and the spare, here. Read at each spawn. */
   getDockerVmConfig?: () => DockerVmConfig;
@@ -442,7 +445,7 @@ export class RunnerManager {
     this.issueBrokerUrl = options.issueBrokerUrl;
     this.revokeBrokerUrl = options.revokeBrokerUrl;
     this.issueWorkerCredential = options.issueWorkerCredential;
-    this.dockerBackend = options.dockerBackend ?? new DesktopBackend();
+    this.dockerBackend = options.dockerBackend ?? noDockerBackend;
     this.getDockerVmConfig =
       options.getDockerVmConfig ??
       (() => resolveDockerVmConfig(undefined, { cores: os.cpus().length, memoryBytes: os.totalmem() }));
