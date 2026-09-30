@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 import * as http from 'http';
+import { app } from 'electron';
 import {
   PullError,
   RegistryClient,
@@ -203,12 +204,93 @@ describe('where credentials go', () => {
     expect(registry.requestsTo(AUTH_HOST)).toHaveLength(0);
   });
 
+  it.each([
+    ['a Bearer challenge naming another realm', 'Bearer realm="https://other.test/steal",service="cdn.test"'],
+    ['a Basic challenge', 'Basic realm="cdn.test"'],
+  ])('never answers %s from a redirect target, and sends the credentials nowhere', async (_what, challenge) => {
+    // The registry redirects the session's very first request, so no token
+    // has been asked for yet; the CDN then asks for credentials itself.
+    registry.switches.openBlobs = true;
+    registry.switches.cdnChallenge = challenge;
+    registry.switches.redirectBlobsTo = `https://${CDN_HOST}/blobs/`;
+    const image = buildImage();
+    registry.putImage(REPO, image, 'v1');
+    const session = await operator().open({ registry: REGISTRY_HOST, repositoryPath: REPO });
+    await expect(session.blob(image.configDigest)).rejects.toThrow(
+      `\`${CDN_HOST}\` (where the registry redirected) answered 401; localmost answers only the registry's own challenge`
+    );
+    expect(registry.requestsTo('other.test')).toHaveLength(0);
+    expect(registry.requestsTo(AUTH_HOST)).toHaveLength(0);
+    for (const request of registry.requests) expect(request.headers.authorization).toBeUndefined();
+    expect(session.usedCredentials).toBe(false);
+  });
+
   it('refuses a token service that redirects, and sends the credentials nowhere else', async () => {
     registry.switches.tokenRedirect = `https://${CDN_HOST}/steal`;
     registry.putImage(REPO, buildImage(), 'v1');
     const session = await operator().open({ registry: REGISTRY_HOST, repositoryPath: REPO });
     await expect(session.manifest('v1')).rejects.toThrow('redirected the token request');
     expect(registry.requestsTo(CDN_HOST)).toHaveLength(0);
+  });
+});
+
+describe('an expired token', () => {
+  it('is renewed once, with the challenge the registry sends, and the request retried', async () => {
+    registry.users.set('me', 'pw');
+    registry.setPrivate(REPO);
+    registry.switches.tokenMaxUses = 1;
+    const image = buildImage();
+    registry.putImage(REPO, image, 'v1');
+    const session = await client(withCredentials({ kind: 'basic', username: 'me', password: 'pw' })).open({
+      registry: REGISTRY_HOST,
+      repositoryPath: REPO,
+    });
+    await session.manifest('v1');
+    await expect(blobText(await session.blob(image.configDigest))).resolves.toEqual(image.config);
+    const tokens = registry.requestsTo(AUTH_HOST);
+    expect(tokens).toHaveLength(2);
+    for (const token of tokens) expect(token.headers.authorization).toBe(`Basic ${Buffer.from('me:pw').toString('base64')}`);
+  });
+
+  it('is renewed at most once for one request: a second 401 is the answer', async () => {
+    registry.putImage(REPO, buildImage(), 'v1');
+    const session = await client().open({ registry: REGISTRY_HOST, repositoryPath: REPO });
+    await session.manifest('v1');
+    expect(registry.requestsTo(AUTH_HOST)).toHaveLength(1);
+    expect(registry.requestsTo(REGISTRY_HOST)).toHaveLength(2);
+    // Every token has now expired, the new one too.
+    registry.switches.tokenMaxUses = 0;
+    await expect(session.manifest('v1')).rejects.toThrow(`pull access denied for ${REGISTRY_HOST}/${REPO}`);
+    expect(registry.requestsTo(AUTH_HOST)).toHaveLength(2);
+    expect(registry.requestsTo(REGISTRY_HOST)).toHaveLength(4);
+  });
+});
+
+describe('request()', () => {
+  it('sends an authorization only to the origin it names', async () => {
+    const c = client();
+    const target = new URL(`https://${CDN_HOST}/blobs/x`);
+    const { res, hops } = await c.request(
+      target,
+      { method: 'GET', authorization: { origin: `https://${REGISTRY_HOST}`, value: 'Bearer for-the-registry' }, redirects: 'follow' },
+      () => 'the CDN'
+    );
+    res.resume();
+    expect(hops).toBe(0);
+    expect(registry.requestsTo(CDN_HOST)[0].headers.authorization).toBeUndefined();
+  });
+});
+
+describe('the test-only options', () => {
+  afterEach(() => {
+    (app as { isPackaged: boolean }).isPackaged = false;
+  });
+
+  it('are refused in a packaged app', () => {
+    (app as { isPackaged: boolean }).isPackaged = true;
+    expect(() => new RegistryClient({ connectTo: registry.connectTo })).toThrow('test-only');
+    expect(() => new RegistryClient({ ca: registry.ca })).toThrow('test-only');
+    expect(() => new RegistryClient({ lookup: registry.lookup })).not.toThrow();
   });
 });
 

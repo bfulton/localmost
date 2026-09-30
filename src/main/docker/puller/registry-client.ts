@@ -12,7 +12,10 @@
  * - An Authorization header goes only to the origin it belongs to, and never
  *   on a redirect hop. Basic credentials go only to a screened https token
  *   service, only in the token request, never on a redirect of it. No
- *   cookies are ever sent.
+ *   cookies are ever sent. Only the registry's own challenge (a 401 from its
+ *   origin, not from a redirect target) is ever answered.
+ * - A token that expires mid-pull is renewed: a request answered 401 after a
+ *   token was obtained runs the challenge again, once, and is retried.
  * - Redirects are followed, to https only, at most five hops.
  * - Every digest is checked against `sha256:<64 hex>` before it is used, and a
  *   manifest is identified by the hash of its bytes, never by the
@@ -25,6 +28,7 @@ import * as crypto from 'crypto';
 import * as http from 'http';
 import * as https from 'https';
 import * as net from 'net';
+import { app } from 'electron';
 import { dnsLookup, HostLookup, isBlockedAddress, isLoopbackAddress, pinnedLookup } from '../../../shared/egress-screen';
 import { DIGEST_RE } from '../../vm/paths';
 import type { RegistryCredentials } from '../registry-auth';
@@ -353,12 +357,16 @@ export interface RegistryClientOptions {
   lookup?: HostLookup;
   /** The operator's credentials for a registry (resolveRegistryCredentials). Anonymous when absent. */
   credentials?: (registry: string) => Promise<RegistryCredentials | undefined>;
-  /** Extra trusted certificates. Tests only: production trusts Node's bundled roots. */
+  /**
+   * Extra trusted certificates. Tests only, and refused in a packaged app:
+   * production trusts Node's bundled roots.
+   */
   ca?: string | Buffer | Array<string | Buffer>;
   /**
-   * Tests only: where to connect for an address that passed the screen. The
-   * mock registry's names resolve to public TEST-NET addresses so that they
-   * pass, and this sends the connection to the mock.
+   * Tests only, and refused in a packaged app: where to connect for an
+   * address that passed the screen. The mock registry's names resolve to
+   * public TEST-NET addresses so that they pass, and this sends the
+   * connection to the mock. Production passes neither this nor `ca`.
    */
   connectTo?: (address: string, port: number) => { address: string; port: number };
   /** Idle time on a connection before it is dropped. */
@@ -380,6 +388,13 @@ interface RequestOptions {
   signal?: AbortSignal;
 }
 
+/** An answer, where it came from, and how many redirects led there: 0 when it came from the URL asked for. */
+export interface Answered {
+  res: http.IncomingMessage;
+  url: URL;
+  hops: number;
+}
+
 /** One manifest as fetched: its bytes, what they hash to, and the header's claim. */
 export interface FetchedManifest {
   bytes: Buffer;
@@ -394,6 +409,11 @@ export class RegistryClient {
   private readonly agent: https.Agent;
 
   constructor(private readonly options: RegistryClientOptions = {}) {
+    // They undo the address screen and the TLS roots. Checked against
+    // app.isPackaged, not NODE_ENV, which a packaged app's environment can set.
+    if (app.isPackaged && (options.connectTo !== undefined || options.ca !== undefined)) {
+      throw new Error('connectTo and ca are test-only options of the registry client');
+    }
     this.lookup = options.lookup ?? dnsLookup;
     this.agent = new https.Agent({ keepAlive: true, maxSockets: 8 });
   }
@@ -441,7 +461,7 @@ export class RegistryClient {
    * screened, at most five. The authorization goes on the first request
    * only, and only to its own origin; no hop carries it or a cookie.
    */
-  async request(start: URL, options: RequestOptions, describe: (url: URL, hop: number) => string): Promise<http.IncomingMessage> {
+  async request(start: URL, options: RequestOptions, describe: (url: URL, hop: number) => string): Promise<Answered> {
     let url = start;
     for (let hop = 0; ; hop++) {
       if (url.protocol !== 'https:') {
@@ -466,7 +486,7 @@ export class RegistryClient {
         }
         continue;
       }
-      return res;
+      return { res, url, hops: hop };
     }
   }
 
@@ -512,7 +532,6 @@ export class RegistrySession {
   /** Whether the operator's credentials were sent (to the token service, or to a registry that asked). */
   usedCredentials = false;
   private authorization: string | undefined;
-  private authenticated = false;
 
   constructor(
     private readonly client: RegistryClient,
@@ -522,6 +541,11 @@ export class RegistrySession {
     private readonly credentials: RegistryCredentials | undefined,
     private readonly signal: AbortSignal | undefined
   ) {}
+
+  /** Whether this session holds the operator's credentials, whether or not it has sent them yet. */
+  get hasCredentials(): boolean {
+    return this.credentials !== undefined;
+  }
 
   /** How the docker CLI would name a reference in this repository. */
   describe(reference: string): string {
@@ -533,14 +557,30 @@ export class RegistrySession {
     checkDigest(reference, this.describe(cleanText(reference, 100)));
   }
 
-  /** A request to the registry's own API, answering one bearer or basic challenge. */
+  private basicAuthorization(credentials: { username: string; password: string }): string {
+    return `Basic ${Buffer.from(`${credentials.username}:${credentials.password}`).toString('base64')}`;
+  }
+
+  /** Whether answering a challenge would change what the retried request sends. */
+  private canAnswer(challenge: Challenge): boolean {
+    if (challenge.scheme === 'bearer') return true;
+    return this.credentials?.kind === 'basic' && this.authorization !== this.basicAuthorization(this.credentials);
+  }
+
+  /**
+   * A request to the registry's own API. A 401 from the registry's origin is
+   * answered once per request: the first time for the session's token, and
+   * again whenever that token has expired. A 401 from a redirect target is
+   * never answered, because its challenge names a realm the target chose
+   * (§6.1): it fails the request.
+   */
   private async api(method: 'GET' | 'HEAD', apiPath: string, accept?: string): Promise<http.IncomingMessage> {
     const url = new URL(`/v2/${this.repositoryPath}/${apiPath}`, this.origin);
     const headers: Record<string, string> = accept ? { accept } : {};
     const describe = (target: URL, hop: number) =>
       hop === 0 ? `registry \`${this.registry}\`` : `\`${target.host}\` (where the registry redirected)`;
-    for (;;) {
-      const res = await this.client.request(
+    for (let answered = false; ; answered = true) {
+      const { res, url: from, hops } = await this.client.request(
         url,
         {
           method,
@@ -551,11 +591,16 @@ export class RegistrySession {
         },
         describe
       );
-      if (res.statusCode !== 401 || this.authenticated) return res;
+      if (res.statusCode !== 401) return res;
+      if (hops > 0) {
+        drain(res);
+        throw new PullError(
+          `${describe(from, hops)} answered 401; localmost answers only the registry's own challenge`
+        );
+      }
       const challenge = parseChallenge(res.headers['www-authenticate']);
+      if (answered || !challenge || !this.canAnswer(challenge)) return res;
       drain(res);
-      this.authenticated = true;
-      if (!challenge) return this.api(method, apiPath, accept);
       await this.authenticate(challenge);
     }
   }
@@ -564,7 +609,7 @@ export class RegistrySession {
     if (challenge.scheme === 'basic') {
       if (this.credentials?.kind === 'basic') {
         this.usedCredentials = true;
-        this.authorization = `Basic ${Buffer.from(`${this.credentials.username}:${this.credentials.password}`).toString('base64')}`;
+        this.authorization = this.basicAuthorization(this.credentials);
       }
       return;
     }
@@ -584,7 +629,7 @@ export class RegistrySession {
     }
     const scope = `repository:${this.repositoryPath}:pull`;
     const service = challenge.params.service;
-    let res: http.IncomingMessage;
+    let answer: Answered;
     const describe = () => `the registry's token service ${realm.host}`;
     if (this.credentials?.kind === 'identity-token') {
       const form = new URLSearchParams({
@@ -595,7 +640,7 @@ export class RegistrySession {
         ...(service ? { service } : {}),
       });
       this.usedCredentials = true;
-      res = await this.client.request(
+      answer = await this.client.request(
         realm,
         {
           method: 'POST',
@@ -613,13 +658,11 @@ export class RegistrySession {
       let authorization: { origin: string; value: string } | undefined;
       if (this.credentials?.kind === 'basic') {
         this.usedCredentials = true;
-        authorization = {
-          origin: url.origin,
-          value: `Basic ${Buffer.from(`${this.credentials.username}:${this.credentials.password}`).toString('base64')}`,
-        };
+        authorization = { origin: url.origin, value: this.basicAuthorization(this.credentials) };
       }
-      res = await this.client.request(url, { method: 'GET', authorization, redirects: 'refuse', signal: this.signal }, describe);
+      answer = await this.client.request(url, { method: 'GET', authorization, redirects: 'refuse', signal: this.signal }, describe);
     }
+    const res = answer.res;
     if (res.statusCode !== 200) {
       const text = await registryErrorText(res);
       throw new PullError(
@@ -628,14 +671,14 @@ export class RegistrySession {
           : `${this.registry}'s token service refused an anonymous token${text ? `: ${text}` : ''}`
       );
     }
-    let answer: unknown;
+    let body: unknown;
     try {
-      answer = JSON.parse((await readBody(res, MAX_TOKEN_ANSWER_BYTES, 'token')).toString('utf-8'));
+      body = JSON.parse((await readBody(res, MAX_TOKEN_ANSWER_BYTES, 'token')).toString('utf-8'));
     } catch (error) {
       if (error instanceof PullError) throw error;
       throw new PullError(`${this.registry}'s token service sent an answer that is not JSON`);
     }
-    const token = isRecord(answer) ? (answer.token ?? answer.access_token) : undefined;
+    const token = isRecord(body) ? (body.token ?? body.access_token) : undefined;
     if (typeof token !== 'string' || !/^[\x21-\x7e]{1,16384}$/.test(token)) {
       throw new PullError(`${this.registry}'s token service sent no usable token`);
     }

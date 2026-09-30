@@ -12,7 +12,7 @@ import { RegistryClient, PullError } from './registry-client';
 import type { RegistryCredentials } from '../registry-auth';
 import { OVERSIZED } from './daemon-api';
 import { TestDaemon } from './test-daemon';
-import { MEDIA, REGISTRY_HOST, TestRegistry, buildImage, buildIndex, sha256, tarOf } from './test-registry';
+import { AUTH_HOST, MEDIA, REGISTRY_HOST, TestRegistry, buildImage, buildIndex, sha256, tarOf } from './test-registry';
 
 // Held so a test can watch the listeners on the puller's gunzip stream while
 // it writes: a wait for back-pressure that leaves its listeners behind piles
@@ -275,6 +275,15 @@ describe('a pull', () => {
     registry.switches.dropBlobsOnce = new Set([layer]);
     await expect(pull(puller())).resolves.toMatchObject({ source: 'registry' });
     expect(blobRequests().filter((r) => r.path.endsWith(layer))).toHaveLength(2);
+  });
+
+  it('renews an expired token partway through, as Docker does', async () => {
+    const image = buildImage({ layers: ['a', 'b', 'c'].map((name) => tarOf([{ name, content: name.repeat(1000) }])) });
+    registry.putImage(IMAGE, image, 'v1');
+    // Each token is good for two requests: the pull's HEAD, GETs and three layers cross it twice.
+    registry.switches.tokenMaxUses = 2;
+    await expect(pull(puller())).resolves.toMatchObject({ source: 'registry', configDigest: image.configDigest });
+    expect(registry.requestsTo(AUTH_HOST).length).toBeGreaterThanOrEqual(3);
   });
 
   it('streams a large layer without piling listeners on the decompressor', async () => {

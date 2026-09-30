@@ -247,6 +247,14 @@ export interface RegistrySwitches {
   holdBlobs?: Promise<void>;
   /** Blobs whose first response is cut off halfway, as a dropped connection would. */
   dropBlobsOnce?: Set<string>;
+  /** With holdBlobs: hold only these blobs, and serve the rest at once. */
+  holdOnly?: Set<string>;
+  /** Serve blob requests (and their redirects) without asking for a token, as some registries do. */
+  openBlobs?: boolean;
+  /** The CDN answers every request with 401 and this WWW-Authenticate challenge. */
+  cdnChallenge?: string;
+  /** A token is good for this many registry requests; past it, a Bearer challenge with error="invalid_token". */
+  tokenMaxUses?: number;
 }
 
 function tokenFor(user: string | null, scope: string): string {
@@ -298,6 +306,7 @@ export class TestRegistry {
   readonly refreshTokens = new Map<string, string>();
   private readonly repositories = new Map<string, Repository>();
   private readonly sockets = new Set<Duplex>();
+  private readonly tokenUses = new Map<string, number>();
 
   private constructor(
     private readonly server: https.Server,
@@ -432,11 +441,11 @@ export class TestRegistry {
     this.send(res, 200, { token: tokenFor(user, scope), expires_in: 300 });
   }
 
-  private challenge(res: http.ServerResponse, name: string): void {
+  private challenge(res: http.ServerResponse, name: string, error?: string): void {
     const realm = this.switches.realm ?? `https://${AUTH_HOST}/token`;
     const header = this.switches.basicChallenge
       ? `Basic realm="${REGISTRY_HOST}"`
-      : `Bearer realm="${realm}",service="${REGISTRY_HOST}",scope="repository:${name}:pull"`;
+      : `Bearer realm="${realm}",service="${REGISTRY_HOST}",scope="repository:${name}:pull"${error ? `,error="${error}"` : ''}`;
     this.send(res, 401, { errors: [{ code: 'UNAUTHORIZED', message: 'authentication required' }] }, { 'www-authenticate': header });
   }
 
@@ -469,7 +478,12 @@ export class TestRegistry {
     }
     const [, name, kind, reference] = match;
     const repo = this.repositories.get(name);
-    if (!repo || !this.authorized(req, repo, name)) {
+    if (this.expired(req.headers.authorization)) {
+      this.challenge(res, name, 'invalid_token');
+      return;
+    }
+    const open = kind === 'blobs' && this.switches.openBlobs && repo !== undefined;
+    if (!repo || (!open && !this.authorized(req, repo, name))) {
       if (req.headers.authorization) {
         this.send(res, 401, {
           errors: [{ code: 'UNAUTHORIZED', message: 'authentication required', detail: [{ Type: 'repository', Name: name, Action: 'pull' }] }],
@@ -519,7 +533,20 @@ export class TestRegistry {
     this.serveBlob(res, reference, blob);
   }
 
+  /** Counts a use of the request's bearer token; true once it is past tokenMaxUses. */
+  private expired(header: string | undefined): boolean {
+    const max = this.switches.tokenMaxUses;
+    if (max === undefined || !header?.startsWith('Bearer ')) return false;
+    const uses = (this.tokenUses.get(header) ?? 0) + 1;
+    this.tokenUses.set(header, uses);
+    return uses > max;
+  }
+
   private cdn(req: http.IncomingMessage, res: http.ServerResponse, url: URL): void {
+    if (this.switches.cdnChallenge) {
+      this.send(res, 401, { errors: [{ code: 'UNAUTHORIZED', message: 'authentication required' }] }, { 'www-authenticate': this.switches.cdnChallenge });
+      return;
+    }
     const digest = url.pathname.slice(url.pathname.lastIndexOf('/') + 1);
     const hops = Number(url.searchParams.get('hops') ?? '0');
     if (hops > 0) {
@@ -549,7 +576,7 @@ export class TestRegistry {
       res.write(bytes.subarray(0, Math.floor(bytes.length / 2)), () => res.socket?.destroy());
       return;
     }
-    const hold = this.switches.holdBlobs;
+    const hold = this.switches.holdOnly && !this.switches.holdOnly.has(digest) ? undefined : this.switches.holdBlobs;
     if (hold) {
       res.flushHeaders();
       void hold.then(() => res.end(bytes));
