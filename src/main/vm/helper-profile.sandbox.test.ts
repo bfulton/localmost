@@ -227,14 +227,19 @@ if (!isMacOS) {
     it("cannot list or write the app's data directory, where the helper's profile grants the VM directories", () => {
       // <data>/vm is made at the first VM boot, and a denied path whose parent
       // is missing fails with ENOENT, not EPERM. So the refusals that count
-      // are on what is certainly there while a job runs: <data> itself and
-      // runner/sandbox. <data>/vm is under the same deny, when it exists.
+      // are on what is certainly there while a job runs: a write in <data>,
+      // and a listing of runner/arc, the template every worker is copied
+      // from. (Not <data>, runner or runner/sandbox, which the job profile
+      // gives back as nodes on the way down to the job's own sandbox.)
+      // <data>/vm is under the same deny, when it exists.
       const probe = path.join(data, `localmost-probe-${process.pid}`);
       const write = shell(`/usr/bin/touch ${sq(probe)}`);
       fs.rmSync(probe, { force: true });
       expect(write.ok).toBe(false);
       expect(write.stderr).toContain('Operation not permitted');
-      const listing = shell(`/bin/ls ${sq(path.join(data, 'runner', 'sandbox'))}`);
+      const template = path.join(data, 'runner', 'arc');
+      expect(fs.existsSync(template)).toBe(true);
+      const listing = shell(`/bin/ls ${sq(template)}`);
       expect(listing.ok).toBe(false);
       expect(listing.stderr).toContain('Operation not permitted');
       const vm = path.join(data, 'vm');
