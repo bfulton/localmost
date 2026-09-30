@@ -6,8 +6,8 @@ package vsock
 
 import (
 	"fmt"
-	"os"
-	"time"
+	"io"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
@@ -15,30 +15,69 @@ import (
 // HostCID is the host's context id.
 const HostCID = unix.VMADDR_CID_HOST
 
-// Conn is one vsock connection, pollable and half-closable.
+// Conn is one vsock connection, half-closable.
+//
+// It keeps the fd blocking and reads and writes it with raw syscalls,
+// rather than wrapping it in an os.File. os.File drives the Go network
+// poller, and on this kernel a *dialed* AF_VSOCK fd wrapped that way never
+// delivered host→guest bytes to a reader (an accepted fd did), which broke
+// the proxy relay's response direction. Blocking syscalls in the per-
+// direction goroutines the splice already uses have no such asymmetry.
 type Conn struct {
-	f    *os.File
-	fd   int
-	peer uint32
+	fd     int
+	peer   uint32
+	mu     sync.Mutex
+	closed bool
 }
 
 func newConn(fd int, peer uint32) (*Conn, error) {
-	if err := unix.SetNonblock(fd, true); err != nil {
-		unix.Close(fd)
-		return nil, err
-	}
-	return &Conn{f: os.NewFile(uintptr(fd), "vsock"), fd: fd, peer: peer}, nil
+	return &Conn{fd: fd, peer: peer}, nil
 }
 
-func (c *Conn) Read(b []byte) (int, error)  { return c.f.Read(b) }
-func (c *Conn) Write(b []byte) (int, error) { return c.f.Write(b) }
-func (c *Conn) Close() error                { return c.f.Close() }
+func (c *Conn) Read(b []byte) (int, error) {
+	for {
+		n, err := unix.Read(c.fd, b)
+		if err == unix.EINTR {
+			continue
+		}
+		if n == 0 && len(b) > 0 && err == nil {
+			return 0, io.EOF
+		}
+		return n, err
+	}
+}
 
-// CloseWrite half-closes the connection.
+func (c *Conn) Write(b []byte) (int, error) {
+	total := 0
+	for total < len(b) {
+		n, err := unix.Write(c.fd, b[total:])
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			return total, io.ErrShortWrite
+		}
+		total += n
+	}
+	return total, nil
+}
+
+// Close closes the connection, once.
+func (c *Conn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil
+	}
+	c.closed = true
+	return unix.Close(c.fd)
+}
+
+// CloseWrite half-closes the connection so the peer reads EOF.
 func (c *Conn) CloseWrite() error { return unix.Shutdown(c.fd, unix.SHUT_WR) }
-
-// SetDeadline sets read and write deadlines.
-func (c *Conn) SetDeadline(t time.Time) error { return c.f.SetDeadline(t) }
 
 // Peer is the connection's remote CID.
 func (c *Conn) Peer() uint32 { return c.peer }

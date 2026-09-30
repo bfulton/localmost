@@ -157,10 +157,12 @@ type OCIMount struct {
 	Options     []string `json:"options,omitempty"`
 }
 
-// ReadOnly is true exactly when the mount's options contain "ro".
+// ReadOnly is true when the mount's options mark it read-only: "ro", or
+// "rro" (recursive read-only), which is what dockerd and runc write into
+// config.json for a read-only bind on this version.
 func (m OCIMount) ReadOnly() bool {
 	for _, o := range m.Options {
-		if o == "ro" {
+		if o == "ro" || o == "rro" {
 			return true
 		}
 	}

@@ -108,7 +108,7 @@ describe('composeRootfs', () => {
     expect(m['usr/libexec/localmost/runc'].data.toString()).toBe('REAL RUNC');
     expect(m['sbin/lm-init'].data.toString()).toBe('INIT');
     expect(m['sbin/modprobe']).toMatchObject({ type: 'symlink', linkname: 'lm-init' });
-    expect(m['usr/libexec/localmost/x86_64-selftest'].mode).toBe(0o755);
+    expect(m['usr/libexec/localmost/x86_64/busybox'].mode).toBe(0o755);
   });
 
   it('writes daemon.json exactly and the resolver that points at the relay address', () => {

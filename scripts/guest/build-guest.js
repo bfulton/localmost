@@ -38,9 +38,9 @@ const AGENT_PROTOCOL = 1;
 /** The module allowlist's roots (contract §5.2). The build takes their closure. */
 const MODULE_ROOTS = [
   'virtiofs', 'vmw_vsock_virtio_transport', 'virtio_blk', 'virtio-rng', 'ext4', 'erofs', 'overlay',
-  'br_netfilter', 'veth', 'dummy', 'nf_tables', 'nft_compat', 'nft_chain_nat', 'xt_addrtype',
-  'xt_conntrack', 'xt_MASQUERADE', 'xt_nat', 'xt_mark', 'ipt_REJECT', 'iptable_filter', 'iptable_nat',
-  'binfmt_misc',
+  'br_netfilter', 'veth', 'dummy', 'nf_tables', 'nft_compat', 'nft_chain_nat', 'nft_nat', 'nft_masq',
+  'xt_addrtype', 'xt_conntrack', 'xt_MASQUERADE', 'xt_nat', 'xt_mark', 'ipt_REJECT', 'iptable_filter',
+  'iptable_nat', 'binfmt_misc',
 ];
 const INITRAMFS_MODULES = ['virtio_blk', 'erofs'];
 const BUILD_VM_MODULES = ['virtiofs', 'virtio_blk', 'erofs', 'loop', 'ext4'];

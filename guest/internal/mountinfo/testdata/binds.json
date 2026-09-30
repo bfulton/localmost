@@ -51,6 +51,14 @@
       "ok": false
     },
     {
+      "name": "docker writes rro for a read-only bind, which counts as read-only",
+      "share": "/S/_work",
+      "dockerBinds": ["/S/_work/a:/data:ro"],
+      "approved": [{ "source": "/S/_work/a", "destination": "/data", "readOnly": true }],
+      "mounts": [{ "destination": "/data", "type": "bind", "source": "/S/_work/a", "options": ["rbind", "rro", "rprivate"] }],
+      "ok": true
+    },
+    {
       "name": "read-write approved but the mount is read-only",
       "share": "/S/_work",
       "dockerBinds": ["/S/_work/a:/data"],

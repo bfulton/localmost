@@ -180,7 +180,7 @@ function composeRootfs({ packages, kernel, moduleRoots, binaries, x86Selftest, r
   exe('sbin/lm-init', binaries['lm-init']);
   exe('usr/libexec/localmost/lm-agent', binaries['lm-agent']);
   exe('usr/libexec/localmost/lm-bindpin', binaries['lm-bindpin']);
-  exe('usr/libexec/localmost/x86_64-selftest', x86Selftest);
+  exe('usr/libexec/localmost/x86_64/busybox', x86Selftest);
   // The kernel's usermode helper and dockerd both run /sbin/modprobe; lm-init
   // answers as modprobe once loading is disabled (it loads nothing).
   add({ name: 'sbin/modprobe', type: 'symlink', mode: 0o777, linkname: 'lm-init' }, 'localmost');

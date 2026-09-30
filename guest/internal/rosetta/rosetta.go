@@ -19,5 +19,5 @@ const (
 // Paths in the guest.
 const (
 	MountPoint = "/run/rosetta"
-	Selftest   = "/usr/libexec/localmost/x86_64-selftest"
+	Selftest   = "/usr/libexec/localmost/x86_64/busybox"
 )

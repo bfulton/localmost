@@ -42,8 +42,8 @@ func Setup(enabled bool, logf func(string, ...any)) string {
 	// The static busybox runs as `busybox true`: argv[0] names the applet.
 	cmd := exec.CommandContext(ctx, Selftest, "true")
 	cmd.Args[0] = "busybox"
-	if err := cmd.Run(); err != nil {
-		logf("rosetta: self-test: %v", err)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		logf("rosetta: self-test: %v: %s", err, string(out))
 		return Broken
 	}
 	return OK
