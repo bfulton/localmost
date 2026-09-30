@@ -260,6 +260,8 @@ describe('RunnerProxyManager', () => {
       '.credentials_rsaparams': JSON.stringify({ d: 'x' }),
     };
     let copyVerifiedArc: jest.Mock<(version: string, dest: string) => Promise<void>>;
+    let makeRegistrationDir: jest.Mock<() => Promise<string>>;
+    let removeRegistrationDir: jest.Mock<(dir: string) => Promise<void>>;
 
     /** config.sh, as spawned: exits 0 once it has been looked at. */
     const configSh = () => {
@@ -273,6 +275,8 @@ describe('RunnerProxyManager', () => {
 
     beforeEach(() => {
       copyVerifiedArc = jest.fn<(version: string, dest: string) => Promise<void>>().mockResolvedValue(undefined);
+      makeRegistrationDir = jest.fn<() => Promise<string>>().mockResolvedValue('/mock/runner/dir/temp-proxy-Ab12Cd');
+      removeRegistrationDir = jest.fn<(dir: string) => Promise<void>>().mockResolvedValue(undefined);
       mockGetGitHubAuth.mockReturnValue({
         getRunnerRegistrationToken: jest.fn<() => Promise<string>>().mockResolvedValue('REGISTRATION-TOKEN'),
       });
@@ -280,6 +284,8 @@ describe('RunnerProxyManager', () => {
         getInstalledVersion: jest.fn(() => '2.336.0'),
         getArcDir: jest.fn(() => '/mock/runner/dir/arc/v2.336.0'),
         copyVerifiedArc,
+        makeRegistrationDir,
+        removeRegistrationDir,
       });
       mockGetValidAccessToken.mockResolvedValue('user-token');
       mockExistsSync.mockReturnValue(true);
@@ -333,7 +339,33 @@ describe('RunnerProxyManager', () => {
 
       expect(mockSpawn).not.toHaveBeenCalled();
       const dest = copyVerifiedArc.mock.calls[0][1];
-      expect(mockRm).toHaveBeenCalledWith(dest, { recursive: true, force: true });
+      expect(removeRegistrationDir.mock.calls).toEqual([[dest]]);
+    });
+
+    it("runs config.sh in a directory the downloader made for this registration, and hands it back", async () => {
+      // The downloader sweeps one a quit left behind - a copy of the runner
+      // and the registration's key - but never one still in use.
+      await manager.registerInstance(createMockTarget(), 1);
+
+      expect(makeRegistrationDir).toHaveBeenCalledTimes(1);
+      expect(copyVerifiedArc.mock.calls[0][1]).toBe('/mock/runner/dir/temp-proxy-Ab12Cd');
+      expect(removeRegistrationDir.mock.calls).toEqual([['/mock/runner/dir/temp-proxy-Ab12Cd']]);
+      expect(mockMkdir).not.toHaveBeenCalledWith(expect.stringContaining('temp-proxy-'), expect.anything());
+    });
+
+    it('hands the directory back when config.sh fails', async () => {
+      mockSpawn.mockImplementation(() => {
+        const { EventEmitter } = jest.requireActual('events') as typeof import('events');
+        const proc = new EventEmitter() as import('events').EventEmitter & { stdout: unknown; stderr: unknown };
+        proc.stdout = new EventEmitter();
+        proc.stderr = new EventEmitter();
+        setImmediate(() => proc.emit('close', 1));
+        return proc;
+      });
+
+      await expect(manager.registerInstance(createMockTarget(), 1)).rejects.toThrow();
+
+      expect(removeRegistrationDir.mock.calls).toEqual([['/mock/runner/dir/temp-proxy-Ab12Cd']]);
     });
   });
 

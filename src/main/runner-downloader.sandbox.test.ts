@@ -460,6 +460,51 @@ describe('the runner template a sandbox is copied from', () => {
     expect(fs.existsSync(arc)).toBe(true);
   });
 
+  it('sweeps a registration a quit interrupted at the next startup', async () => {
+    // config.sh runs in a copy of the runner and leaves the registration's
+    // key there; a quit before it is copied out leaves both behind.
+    const leftover = path.join(root, 'runner', 'temp-proxy-a1b2c3');
+    layOutRunner(leftover);
+    write(path.join(leftover, '.credentials_rsaparams'), JSON.stringify({ d: 'REGISTRATION-PRIVATE-KEY' }), 0o600);
+
+    await downloader.cleanupStaleConfiguration(() => undefined);
+
+    expect(fs.existsSync(leftover)).toBe(false);
+    expect(fs.existsSync(arc)).toBe(true);
+  });
+
+  it('gives each registration a directory of its own that only the app can open', async () => {
+    const dirs = await Promise.all(Array.from({ length: 4 }, () => downloader.makeRegistrationDir()));
+
+    expect(new Set(dirs).size).toBe(dirs.length);
+    for (const dir of dirs) {
+      expect(path.dirname(dir)).toBe(path.join(root, 'runner'));
+      expect(path.basename(dir)).toMatch(/^temp-proxy-/);
+      expect(fs.statSync(dir).mode & 0o777).toBe(0o700);
+    }
+  });
+
+  it('leaves a registration still in progress alone when it sweeps', async () => {
+    const dir = await downloader.makeRegistrationDir();
+    write(path.join(dir, '.credentials_rsaparams'), JSON.stringify({ d: 'REGISTRATION-PRIVATE-KEY' }), 0o600);
+
+    await downloader.cleanupStaleConfiguration(() => undefined);
+
+    expect(fs.existsSync(path.join(dir, '.credentials_rsaparams'))).toBe(true);
+    await downloader.removeRegistrationDir(dir);
+    expect(fs.existsSync(dir)).toBe(false);
+  });
+
+  it('removes only a directory it made for a registration', async () => {
+    const dir = await downloader.makeRegistrationDir();
+    await downloader.removeRegistrationDir(dir);
+
+    // Once released, the same path is no longer one of its own.
+    await expect(downloader.removeRegistrationDir(dir)).rejects.toThrow(/Refusing/);
+    await expect(downloader.removeRegistrationDir(arc)).rejects.toThrow(/Refusing/);
+    expect(fs.existsSync(arc)).toBe(true);
+  });
+
   it('sweeps the _work an earlier build kept for later jobs at the next startup', async () => {
     // An install that had the removed preserveWorkDir setting on still holds
     // an earlier job's checkout, from any repository, under runner/work.

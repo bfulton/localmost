@@ -28,6 +28,8 @@ const SANDBOX_CONFIG_FILES = ['.runner'];
 
 /** Where a runner release is downloaded and extracted before it is used. */
 const ARC_STAGING_PREFIX = 'arc-staging-';
+/** Where registration runs config.sh: a copy of the runner, and the key it makes. */
+const REGISTRATION_PREFIX = 'temp-proxy-';
 
 /**
  * What a runner template held when it came from its release: each file's
@@ -73,6 +75,8 @@ export class RunnerDownloader {
   private selectedVersion: string | null = null;
   /** Records being built from a release download, so concurrent starts share one. */
   private manifestsInFlight: Map<string, Promise<ArcManifest>> = new Map();
+  /** Staging and registration directories still in use, which a sweep leaves alone. */
+  private readonly scratchInUse = new Set<string>();
 
   constructor() {
     this.baseDir = getRunnerDir();
@@ -135,8 +139,42 @@ export class RunnerDownloader {
    * swept at the next startup.
    */
   private makeStagingDir(): Promise<string> {
-    fs.mkdirSync(this.baseDir, { recursive: true });
-    return fs.promises.mkdtemp(path.join(this.baseDir, ARC_STAGING_PREFIX));
+    return this.makeScratchDir(ARC_STAGING_PREFIX);
+  }
+
+  /**
+   * A fresh directory for one registration to run config.sh in, which only
+   * the app can open: a copy of the runner goes in, and config.sh leaves the
+   * registration's key beside it. Its name is unique to this call. Hand it
+   * back to removeRegistrationDir once done; one left behind by a quit
+   * mid-registration is swept at the next startup.
+   */
+  makeRegistrationDir(): Promise<string> {
+    return this.makeScratchDir(REGISTRATION_PREFIX);
+  }
+
+  /** Remove a directory makeRegistrationDir made. Refuses any other path, since this deletes a whole tree. */
+  async removeRegistrationDir(dir: string): Promise<void> {
+    if (!this.scratchInUse.has(dir) || !path.basename(dir).startsWith(REGISTRATION_PREFIX)) {
+      throw new Error(`Refusing to remove ${dir}: not a registration directory in ${this.baseDir}`);
+    }
+    await this.removeScratchDir(dir);
+  }
+
+  /** mkdtemp makes it 0700 whatever the umask, and marks it in use until removeScratchDir. */
+  private async makeScratchDir(prefix: string): Promise<string> {
+    await fs.promises.mkdir(this.baseDir, { recursive: true });
+    const dir = await fs.promises.mkdtemp(path.join(this.baseDir, prefix));
+    this.scratchInUse.add(dir);
+    return dir;
+  }
+
+  private async removeScratchDir(dir: string): Promise<void> {
+    try {
+      await fs.promises.rm(dir, { recursive: true, force: true });
+    } finally {
+      this.scratchInUse.delete(dir);
+    }
   }
 
   /**
@@ -946,8 +984,10 @@ export class RunnerDownloader {
     await cleanupIncompleteConfigs(configBase, log);
 
     // A release download interrupted by a quit leaves its staging directory
-    // behind, holding the tarball and a tree extracted from it. Nothing is
-    // downloading yet at startup, so any found are leftovers.
+    // behind, holding the tarball and a tree extracted from it; a
+    // registration leaves a copy of the runner and the key config.sh made.
+    // Nothing is downloading or registering yet at startup, and one that is
+    // is left alone, so any found are leftovers.
     await this.cleanupStagingDirectories(log);
 
     await this.cleanupWorkDirectories(log);
@@ -960,9 +1000,16 @@ export class RunnerDownloader {
     } catch {
       return;
     }
-    for (const entry of entries.filter((name) => name.startsWith(ARC_STAGING_PREFIX))) {
-      log(`Removing an interrupted runner download: ${entry}`);
-      await fs.promises.rm(path.join(this.baseDir, entry), { recursive: true, force: true });
+    const kinds: Array<[string, string]> = [
+      [ARC_STAGING_PREFIX, 'an interrupted runner download'],
+      [REGISTRATION_PREFIX, 'an interrupted registration'],
+    ];
+    for (const entry of entries) {
+      const kind = kinds.find(([prefix]) => entry.startsWith(prefix));
+      const dir = path.join(this.baseDir, entry);
+      if (!kind || this.scratchInUse.has(dir)) continue;
+      log(`Removing ${kind[1]}: ${entry}`);
+      await fs.promises.rm(dir, { recursive: true, force: true });
     }
   }
 
@@ -1067,7 +1114,7 @@ export class RunnerDownloader {
       });
       throw error;
     } finally {
-      await fs.promises.rm(staging, { recursive: true, force: true });
+      await this.removeScratchDir(staging);
     }
   }
 
