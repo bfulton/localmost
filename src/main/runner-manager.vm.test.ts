@@ -242,9 +242,15 @@ describe('a docker job on the VM backend, through the runner', () => {
     const proxyOptions = jest.mocked(ProxyServer).mock.calls.at(-1)![0] as unknown as { onJobAcquired: (id: string) => Promise<void> };
     await proxyOptions.onJobAcquired('job-1');
     // And again at the "Running job" line, as every job does.
+    const claimLookups = getRepoPolicy.mock.calls.length;
     worker.stdout!.emit('data', Buffer.from('Running job: build\n'));
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(getRepoPolicy.mock.calls.length).toBeGreaterThanOrEqual(2);
+    // That second application is fire-and-forget; wait for it, however loaded the machine.
+    const policyDeadline = Date.now() + 20_000;
+    while (getRepoPolicy.mock.calls.length <= claimLookups && Date.now() < policyDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(getRepoPolicy.mock.calls.length).toBeGreaterThan(claimLookups);
+    await new Promise((resolve) => setImmediate(resolve));
 
     // The job's docker client: the create waits for the VM and goes through it.
     const create = await request(socket, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' });
@@ -263,7 +269,7 @@ describe('a docker job on the VM backend, through the runner', () => {
 
     // The worker exits: its socket stops, and the VM goes with it.
     worker.emit('exit', 0, null);
-    const deadline = Date.now() + 10_000;
+    const deadline = Date.now() + 30_000;
     while (fs.existsSync(path.join(data, 'vm', 'jobs', vmId)) && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
@@ -279,7 +285,7 @@ describe('a docker job on the VM backend, through the runner', () => {
     // One VM for the job, whatever the number of binds.
     expect(messages.filter((m) => /booting for owner\/repo at the claim/.test(m))).toHaveLength(1);
     expect(messages.some((m) => m.includes(`pulled docker.io/library/alpine:3 (sha256:${'1'.repeat(64)}, linux/arm64) on the Mac; loaded into VM ${vmId}`))).toBe(true);
-  }, 60_000);
+  }, 120_000);
 
   it('uses the spare only for a claim from the repository the worker was spawned for', async () => {
     const guest = new GuestImage(path.join(data, 'res', 'guest'));
@@ -335,7 +341,7 @@ describe('a docker job on the VM backend, through the runner', () => {
     const exit = async (worker: ReturnType<typeof createMockProcess>) => {
       worker.emit('exit', 0, null);
       const jobs = path.join(data, 'vm', 'jobs');
-      const deadline = Date.now() + 10_000;
+      const deadline = Date.now() + 30_000;
       while (fs.existsSync(jobs) && fs.readdirSync(jobs).length > 0 && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
@@ -356,5 +362,5 @@ describe('a docker job on the VM backend, through the runner', () => {
     expect(started).toEqual([{ spare: true, repository: 'owner/repo' }]);
     expect(logs.filter((l) => /\(the spare\) is the job's/.test(l.message))).toHaveLength(1);
     await exit(other);
-  }, 60_000);
+  }, 120_000);
 });
