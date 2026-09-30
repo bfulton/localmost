@@ -15,10 +15,12 @@ runs:
 
         if ! docker version --format 'client {{.Client.Version}} / server {{.Server.Version}}'; then
           echo "::error::No reachable Docker daemon."
-          echo "On the localmost runner this means the job was served no docker socket:"
-          echo "the repository's docker policy was not approved. Until the job's Docker"
-          echo "VM is ready the socket answers this step itself, so a VM that failed to"
-          echo "start shows in the next step instead, with the reason."
+          echo "On the localmost runner every job is served a docker socket, which answers"
+          echo "this step itself until the job's Docker VM is ready. So this step fails there"
+          echo "only when that socket cannot answer even that: the app's Docker VM guest is"
+          echo "missing or unreadable (the reason is in the error above), or DOCKER_HOST"
+          echo "names no socket. A docker policy that was not approved passes this step and"
+          echo "is refused in the next one."
           exit 1
         fi
 
