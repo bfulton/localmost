@@ -1,0 +1,4 @@
+# SwiftPM's output when `swift build` or `swift test` runs in this directory.
+# `npm run build:helper` builds under the checkout's build/ instead.
+/.build/
+/.swiftpm/
