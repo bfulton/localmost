@@ -54,6 +54,17 @@ describe('updateTrayMenu', () => {
     trayManager.create();
   });
 
+  it('shows no session as not connected, and offers no Pause', () => {
+    authState = null;
+
+    updateTrayMenu();
+
+    const labels = menuLabels();
+    expect(labels[0]).toBe('GitHub: Not connected');
+    expect(labels).not.toContain('⏸  Pause');
+    expect(labels).not.toContain('▶  Resume');
+  });
+
   it('shows a live session as connected, with Pause', () => {
     authState = { user: { login: 'bfulton' }, accessToken: 'tok' };
 

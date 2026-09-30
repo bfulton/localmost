@@ -1,5 +1,11 @@
 import { describe, it, expect } from '@jest/globals';
-import { isGitHubOwnerName, isGitHubRepoName, isGitHubLogin, parseGitHubRepoUrl } from './github-names';
+import {
+  isGitHubOwnerName,
+  isGitHubRepoName,
+  isGitHubLogin,
+  parseGitHubRepoUrl,
+  parseSavedGitHubRepoUrl,
+} from './github-names';
 
 describe('isGitHubOwnerName', () => {
   it('accepts the logins GitHub issues', () => {
@@ -95,6 +101,37 @@ describe('parseGitHubRepoUrl', () => {
       7,
     ]) {
       expect({ url, parsed: parseGitHubRepoUrl(url) }).toEqual({ url, parsed: null });
+    }
+  });
+});
+
+describe('parseSavedGitHubRepoUrl', () => {
+  it('reads a saved URL whose owner is a login only older accounts can have', () => {
+    // GitHub once issued logins with a trailing or doubled hyphen, and the
+    // setup wizard saved such an owner's html_url as it was. A runner saved
+    // before targets re-registers from that URL, so refusing the owner would
+    // leave it registered nowhere.
+    for (const owner of ['old-name-', 'a--b', '-lead']) {
+      const url = `https://github.com/${owner}/my.repo`;
+      expect({ url, parsed: parseSavedGitHubRepoUrl(url) }).toEqual({ url, parsed: { owner, repo: 'my.repo' } });
+    }
+    expect(parseGitHubRepoUrl('https://github.com/old-name-/r')).toBeNull();
+  });
+
+  it('otherwise reads exactly what parseGitHubRepoUrl reads', () => {
+    expect(parseSavedGitHubRepoUrl('https://github.com/o/my.repo.git/')).toEqual({ owner: 'o', repo: 'my.repo' });
+    for (const url of [
+      'https://github.com/../x',
+      'https://github.com/./r',
+      'https://github.com/o.x/r',
+      'https://github.com/o%2Fx/r',
+      'https://github.com/o/r?x',
+      'https://github.com/o/r.git.git',
+      'https://evil.example/github.com/o/r',
+      'https://github.com.evil.example/o/r',
+      'git@github.com:o/r.git',
+    ]) {
+      expect({ url, parsed: parseSavedGitHubRepoUrl(url) }).toEqual({ url, parsed: null });
     }
   });
 });

@@ -70,7 +70,7 @@ describe('a refresh that can never succeed', () => {
     expect(trayRedraws).toEqual([true]);
   });
 
-    it('leaves a recoverable HTTP failure alone: a 500 is not proof of a spent token', async () => {
+  it('leaves a recoverable HTTP failure alone: a 500 is not proof of a spent token', async () => {
     // Review caught this: refreshAccessToken throws for 429 and 5xx too, and
     // treating every non-network error as expiry would strand a live session
     // behind a Reconnect button over a transient upstream failure.

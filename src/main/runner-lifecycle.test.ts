@@ -176,6 +176,25 @@ describe('a runner saved before targets, by its repository URL', () => {
     }
   });
 
+  it('re-registers a repository whose owner is a login only older accounts can have', async () => {
+    // GitHub once issued logins with a trailing or doubled hyphen, and the
+    // wizard saved such an owner's html_url as it was. The old pattern let
+    // any owner through here, so holding it to the rule for new logins
+    // would leave these runners registered nowhere.
+    const repoUrl = 'https://github.com/old-name-/r';
+    mockLoadConfig.mockReturnValue({ runnerConfig: { level: 'repo', runnerName: 'host', repoUrl } });
+    const single = register();
+    await reRegisterSingleInstance(1, 'registration_deleted');
+    expect(single.getRunnerRegistrationToken.mock.calls).toEqual([['user-token', 'old-name-', 'r']]);
+
+    const first = register();
+    await reRegisterRunner1({ level: 'repo', runnerName: 'host', repoUrl, runnerCount: 1 }, 'user-token');
+    expect(first.getRunnerRegistrationToken.mock.calls).toEqual([['user-token', 'old-name-', 'r']]);
+    expect(first.downloader.configureInstance).toHaveBeenCalledWith(1, '2.330.0', expect.objectContaining({
+      url: 'https://github.com/old-name-/r',
+    }));
+  });
+
   it('registers nowhere for a URL that only mentions github.com, or is on another host', async () => {
     for (const repoUrl of ['https://evil.example/github.com/o/r', 'https://github.com.evil.example/o/r']) {
       mockLoadConfig.mockReturnValue({ runnerConfig: { level: 'repo', runnerName: 'host', repoUrl } });

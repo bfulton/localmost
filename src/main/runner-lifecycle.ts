@@ -14,7 +14,7 @@ import {
 } from './app-state';
 import { AppConfig } from './config';
 import { DEFAULT_RUNNER_COUNT } from '../shared/constants';
-import { parseGitHubRepoUrl } from '../shared/github-names';
+import { parseSavedGitHubRepoUrl } from '../shared/github-names';
 /** Delay before retry in milliseconds. */
 const RETRY_DELAY_MS = 2000;
 
@@ -84,10 +84,11 @@ const getRegistrationTargets = (config: AppConfig): RegistrationTarget[] => {
 /**
  * The repository a config from before targets names by its URL: GitHub's
  * html_url for it, as the setup wizard saved it. A repo name keeps its dots,
- * and a URL that is not a repository on github.com names none.
+ * an owner may be an older login new accounts cannot take, and a URL that is
+ * not a repository on github.com names none.
  */
 const repoTargetFromUrl = (repoUrl: string | undefined): RegistrationTarget | undefined => {
-  const parsed = repoUrl ? parseGitHubRepoUrl(repoUrl) : null;
+  const parsed = repoUrl ? parseSavedGitHubRepoUrl(repoUrl) : null;
   if (!parsed) return undefined;
   return {
     type: 'repo',

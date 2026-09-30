@@ -53,9 +53,24 @@ export const isGitHubLogin = (value: unknown): value is string =>
  * but at its start - names no repository. A repo name keeps its dots: only a
  * final `.git` is the suffix, and no name GitHub keeps ends in one.
  */
-export const parseGitHubRepoUrl = (value: unknown): { owner: string; repo: string } | null => {
+export const parseGitHubRepoUrl = (value: unknown): { owner: string; repo: string } | null =>
+  parseRepoUrl(value, isGitHubOwnerName);
+
+/**
+ * The same, for a URL a config has already saved: its owner may be any login
+ * GitHub has issued. The setup wizard saved an older account's html_url as it
+ * was, trailing or doubled hyphen and all, and a runner saved before targets
+ * re-registers from it. A login still cannot carry a path, a query or a dot.
+ */
+export const parseSavedGitHubRepoUrl = (value: unknown): { owner: string; repo: string } | null =>
+  parseRepoUrl(value, isGitHubLogin);
+
+const parseRepoUrl = (
+  value: unknown,
+  isOwner: (name: string) => boolean
+): { owner: string; repo: string } | null => {
   if (typeof value !== 'string') return null;
   const match = /^https:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(value);
-  if (!match || !isGitHubOwnerName(match[1]) || !isGitHubRepoName(match[2])) return null;
+  if (!match || !isOwner(match[1]) || !isGitHubRepoName(match[2])) return null;
   return { owner: match[1], repo: match[2] };
 };
