@@ -1,6 +1,10 @@
 {
   "comment": "The daemon answers of the guest build smoke boot (scripts/guest/build-guest.js), forwarded unchanged from dockerd over vsock 2375: /_ping (GET and HEAD), /version and /info, with the Date header dropped. The filter test compares its synthesised baseline (contract 5.3) with these, field by field, after its /info rewrite. Recorded from guest 2026.10.0 with rootfs.erofs sha256 95e1441f13a94b264c24bef4fbbe0eefb8abf2d365a04f278339d2577c411613. Written by `npm run build:guest -- --write-fixture`; do not edit by hand.",
   "guestVersion": "2026.10.0",
+  "vm": {
+    "cpus": 2,
+    "memoryMiB": 2048
+  },
   "docker": {
     "engine": "29.5.3",
     "apiVersion": "1.54",
@@ -130,7 +134,7 @@
         "transfer-encoding": "chunked"
       },
       "body": {
-        "ID": "362e5ecd-f0c3-480d-8189-0fb01d9c6b9b",
+        "ID": "89d3e998-054e-423b-9e3d-64695756f91a",
         "Containers": 0,
         "ContainersRunning": 0,
         "ContainersPaused": 0,
@@ -196,7 +200,7 @@
         "NFd": 24,
         "OomKillDisable": false,
         "NGoroutines": 50,
-        "SystemTime": "2026-09-30T20:54:46.333779Z",
+        "SystemTime": "2026-09-30T22:25:10.077619958Z",
         "LoggingDriver": "json-file",
         "CgroupDriver": "cgroupfs",
         "CgroupVersion": "2",

@@ -7,16 +7,19 @@ describe('daemonFixture', () => {
     const smoke = {
       hello: { ok: true },
       timings: { helloMs: 1 },
+      vm: { cpus: 2, memoryMiB: 2048 },
       docker: { engine: '29.5.3', minApiVersion: '1.40' },
       baseline: { ServerVersion: '29.5.3' },
       answers: { ping: { status: 200, headers: {}, body: 'OK' } },
     };
     const manifest = { guestVersion: '2026.10.0', artifacts: { 'rootfs.erofs': { sha256: 'ab'.repeat(32), size: 1 } } };
     const f = daemonFixture(smoke, manifest);
-    expect(Object.keys(f)).toEqual(['comment', 'guestVersion', 'docker', 'baseline', 'answers']);
+    expect(Object.keys(f)).toEqual(['comment', 'guestVersion', 'vm', 'docker', 'baseline', 'answers']);
     expect(f.comment).toContain(`rootfs.erofs sha256 ${'ab'.repeat(32)}`);
     expect(f.comment).toContain('npm run build:guest -- --write-fixture');
     expect(f.guestVersion).toBe('2026.10.0');
+    // The size /info's NCPU and MemTotal come from, which the synthesised answer takes from config.
+    expect(f.vm).toBe(smoke.vm);
     expect(f.docker).toBe(smoke.docker);
     expect(f.baseline).toBe(smoke.baseline);
     expect(f.answers).toBe(smoke.answers);

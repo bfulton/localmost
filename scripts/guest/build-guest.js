@@ -55,6 +55,8 @@ const BASELINE_FIELDS = ['ServerVersion', 'OSType', 'Architecture', 'OperatingSy
 const CHECK_CONFIG_SHA256 = '3ec868d650d91b54e4b6e070966afde03a9ac6463982b4eb83ebd0dc47c7bd62';
 
 const ARTIFACTS = ['vmlinux', 'initramfs.cpio.gz', 'rootfs.erofs'];
+/** The smoke boot's size, recorded in the fixture: /info's NCPU and MemTotal follow it. */
+const SMOKE_VM = { cpus: 2, memoryMiB: 2048 };
 const CMDLINE = 'console=hvc0 rdinit=/init ro quiet panic=-1 ipv6.disable=1';
 
 const sha256 = (b) => crypto.createHash('sha256').update(b).digest('hex');
@@ -255,8 +257,8 @@ async function smoke(work) {
     kernel: path.join(work, 'vmlinux'),
     initrd: path.join(work, 'initramfs.cpio.gz'),
     cmdline: `${CMDLINE} lm.mode=refresh`,
-    cpus: 2,
-    memoryMiB: 2048,
+    cpus: SMOKE_VM.cpus,
+    memoryMiB: SMOKE_VM.memoryMiB,
     console: path.join(work, 'smoke-console.log'),
     timeoutSec: 180,
     disks: [
@@ -295,6 +297,7 @@ async function smoke(work) {
     return {
       hello: hello,
       timings: { helloMs, configureMs },
+      vm: SMOKE_VM,
       status,
       docker: {
         engine: version.Version,
@@ -386,6 +389,7 @@ function daemonFixture(smokeResult, manifest) {
       `${manifest.guestVersion} with rootfs.erofs sha256 ${manifest.artifacts['rootfs.erofs'].sha256}. Written by ` +
       '`npm run build:guest -- --write-fixture`; do not edit by hand.',
     guestVersion: manifest.guestVersion,
+    vm: smokeResult.vm,
     docker: smokeResult.docker,
     baseline: smokeResult.baseline,
     answers: smokeResult.answers,
