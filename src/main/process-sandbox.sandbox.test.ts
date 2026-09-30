@@ -101,6 +101,14 @@ const sq = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
 const swapCommand = (from: string, to: string): string =>
   `/usr/bin/perl -e ${sq('my ($a, $b) = @ARGV; syscall(488, -2, $a, -2, $b, 2) == 0 or die "$!\\n"')} ${sq(from)} ${sq(to)}`;
 
+/**
+ * chmod(2) of a path to the mode it already has, through the system perl:
+ * chmod(1) skips the call when the mode would not change. Changes nothing
+ * when it is allowed, so it probes a node's mode permission safely.
+ */
+const sameModeCommand = (target: string): string =>
+  `/usr/bin/perl -e ${sq('my $m = (stat $ARGV[0])[2] & 07777; chmod($m, $ARGV[0]) or die "$!\\n"')} ${sq(target)}`;
+
 /** The case variant of a path's last component, on the case-insensitive volume. */
 const upperBase = (p: string): string => path.join(path.dirname(p), path.basename(p).toUpperCase());
 
@@ -1035,6 +1043,10 @@ if (!isMacOS) {
     });
 
     it('cannot rename, remove, chmod or relink _work', () => {
+      // Refused for the operation, not its effect: the ambient form probes
+      // this way. The same call on a directory inside the share works.
+      expect(refused(sameModeCommand('_work'))).toBe(true);
+      expect(run(sameModeCommand('_work/repo'))).toMatchObject({ ok: true, stderr: '' });
       expect(refused('mv _work _w2')).toBe(true);
       expect(refused('rm -rf _work')).toBe(true);
       expect(refused('chmod 000 _work')).toBe(true);
@@ -1078,6 +1090,13 @@ if (!isMacOS) {
       expect(refused('rm -f _work/.localmost-share')).toBe(true);
       expect(refused('mv _work/.localmost-share _work/taken')).toBe(true);
       expect(refused('cp _work/.localmost-share _work/copy')).toBe(true);
+      // A hard link or a clone would give it a name the read deny does not cover.
+      expect(refused('ln _work/.localmost-share _work/linked')).toBe(true);
+      expect(refused('ln _work/.localmost-share _temp/linked')).toBe(true);
+      expect(refused('cp -c _work/.localmost-share _temp/cloned')).toBe(true);
+      for (const name of ['_work/copy', '_work/linked', '_temp/linked', '_temp/cloned']) {
+        expect([name, fs.existsSync(path.join(sandbox, name))]).toEqual([name, false]);
+      }
       intact();
     });
 
@@ -1227,12 +1246,14 @@ if (!isMacOS) {
 
   describe("the Docker VM's share through the ambient seatbelt profile", () => {
     // This job's own sandbox, share and nonce, found from its TMPDIR,
-    // <data>/runner/sandbox/<id>/_temp. The job is running in the share, so
-    // nothing here may move or empty it if the profile let it: each refusal
-    // is probed by something that changes nothing when allowed (a swap of a
-    // name with itself, the node's times, rmdir of a directory that is not
-    // empty), or is put back at once. The constructed tests do the real
-    // moves and removals on a sandbox of their own.
+    // <data>/runner/sandbox/<id>/_temp. The job is running in the share, and
+    // the first runs of these tests are under an installed app whose profile
+    // may allow what they probe, so nothing here may move or empty the share
+    // if the profile let it: each refusal is probed by something that
+    // changes nothing when allowed (a swap of a name with itself, the node's
+    // times, a chmod to the mode it has, rmdir of a directory that is not
+    // empty). The constructed tests do the real moves and removals on a
+    // sandbox of their own.
     const sandbox = path.dirname(fs.realpathSync(os.tmpdir()));
     const share = path.join(sandbox, '_work');
     const nonce = path.join(share, '.localmost-share');
@@ -1262,15 +1283,13 @@ if (!isMacOS) {
     });
 
     it('cannot rename, remove, chmod or relink _work', () => {
-      const moved = path.join(sandbox, probeName());
-      const mode = fs.statSync(share).mode & 0o777;
-      const renamed = refused(`mv ${sq(share)} ${sq(moved)}`);
-      if (fs.existsSync(moved)) fs.renameSync(moved, share);
-      const chmodded = refused(`chmod 700 ${sq(share)}`);
-      fs.chmodSync(share, mode);
-      expect(renamed).toBe(true);
-      expect(chmodded).toBe(true);
+      // The probes work on a directory of the job's own, so each refusal
+      // below is the node deny's.
+      const own = path.join(sandbox, '_temp');
+      expect(shell(swapCommand(own, own))).toMatchObject({ ok: true, stderr: '' });
+      expect(shell(sameModeCommand(own))).toMatchObject({ ok: true, stderr: '' });
       expect(refused(swapCommand(share, share))).toBe(true);
+      expect(refused(sameModeCommand(share))).toBe(true);
       expect(refused(`touch ${sq(share)}`)).toBe(true);
       // Not empty, so an rmdir the profile allowed would fail otherwise; a
       // job that cannot remove the node cannot put a link in its place.
@@ -1278,36 +1297,37 @@ if (!isMacOS) {
     });
 
     it('cannot rename _work or the sandbox by a case variant of its name', () => {
-      const moved = path.join(sandbox, probeName());
-      const renamed = refused(`mv ${sq(upperBase(share))} ${sq(moved)}`);
-      if (fs.existsSync(moved)) fs.renameSync(moved, share);
-      expect(renamed).toBe(true);
       expect(refused(swapCommand(upperBase(share), upperBase(share)))).toBe(true);
       expect(refused(swapCommand(upperBase(sandbox), upperBase(sandbox)))).toBe(true);
+      expect(refused(`touch ${sq(upperBase(share))}`)).toBe(true);
       expect(refused(`touch ${sq(upperBase(sandbox))}`)).toBe(true);
     });
 
-    it('cannot swap _work with a sibling, or the sandbox with anything, with RENAME_SWAP', () => {
-      const sibling = path.join(sandbox, '_temp', probeName());
-      fs.mkdirSync(sibling);
-      try {
-        const swapped = refused(swapCommand(sibling, share));
-        if (!fs.existsSync(nonce)) shell(swapCommand(sibling, share));
-        expect(swapped).toBe(true);
-      } finally {
-        fs.rmSync(sibling, { recursive: true, force: true });
-      }
-      // The sandbox, by a swap with itself: a move of it could not be put
-      // back, since its parent is closed to the job either way.
+    it('cannot swap the sandbox, or rename or remove it', () => {
+      // By a swap with itself: a real move of either node could not be put
+      // back safely, since the job runs in the share.
       expect(refused(swapCommand(sandbox, sandbox))).toBe(true);
       expect(refused(`touch ${sq(sandbox)}`)).toBe(true);
       expect(refused(`rmdir ${sq(sandbox)}`)).toBe(true);
     });
 
-    it("can neither read nor replace the share's nonce", () => {
+    it("can neither read nor replace the share's nonce, nor give it another name", () => {
       expect(refused(`cat ${sq(nonce)}`)).toBe(true);
       expect(refused(`touch ${sq(nonce)}`)).toBe(true);
-      expect(refused(`cp ${sq(nonce)} ${sq(path.join(sandbox, '_temp', probeName()))}`)).toBe(true);
+      const names = [
+        path.join(sandbox, '_temp', probeName()),
+        path.join(sandbox, '_temp', probeName()),
+        path.join(share, `.${probeName()}`),
+        path.join(sandbox, '_temp', probeName()),
+      ];
+      try {
+        expect(refused(`cp ${sq(nonce)} ${sq(names[0])}`)).toBe(true);
+        expect(refused(`ln ${sq(nonce)} ${sq(names[1])}`)).toBe(true);
+        expect(refused(`ln ${sq(nonce)} ${sq(names[2])}`)).toBe(true);
+        expect(refused(`cp -c ${sq(nonce)} ${sq(names[3])}`)).toBe(true);
+      } finally {
+        for (const name of names) fs.rmSync(name, { force: true });
+      }
     });
 
     it('runs the bundled docker CLI first on its PATH, and reads nothing else of the app bundle', () => {
