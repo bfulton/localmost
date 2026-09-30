@@ -1,0 +1,61 @@
+{
+  "_source": "Stand-in until WP-A's smoke boot records the real answers: the /_ping, /version and /info a job sees from a running guest (dockerd 29.5.3, API 1.54) through the filter, whose maxApiVersion clamps the API version to 1.45 and whose /info rewrite keeps INFO_FIELDS. Replace with the recording, keeping this shape.",
+  "vm": { "cpus": 4, "memoryMiB": 8192 },
+  "ping": {
+    "status": 200,
+    "headers": {
+      "api-version": "1.45",
+      "builder-version": "1",
+      "cache-control": "no-cache, no-store, must-revalidate",
+      "content-type": "text/plain; charset=utf-8",
+      "docker-experimental": "false",
+      "ostype": "linux",
+      "pragma": "no-cache"
+    },
+    "body": "OK"
+  },
+  "version": {
+    "status": 200,
+    "headers": {
+      "api-version": "1.45",
+      "content-type": "application/json",
+      "docker-experimental": "false",
+      "ostype": "linux"
+    },
+    "body": {
+      "Platform": { "Name": "" },
+      "Components": [
+        {
+          "Name": "Engine",
+          "Version": "29.5.3",
+          "Details": { "ApiVersion": "1.54", "Arch": "arm64", "BuildTime": "2026-09-01T00:00:00.000000000+00:00", "Experimental": "false", "GitCommit": "0000000", "GoVersion": "go1.25.1", "KernelVersion": "6.18.54-0-virt", "MinAPIVersion": "1.24", "Os": "linux" }
+        }
+      ],
+      "Version": "29.5.3",
+      "ApiVersion": "1.45",
+      "MinAPIVersion": "1.24",
+      "GitCommit": "0000000",
+      "GoVersion": "go1.25.1",
+      "Os": "linux",
+      "Arch": "arm64",
+      "KernelVersion": "6.18.54-0-virt",
+      "BuildTime": "2026-09-01T00:00:00.000000000+00:00"
+    }
+  },
+  "info": {
+    "status": 200,
+    "headers": { "content-type": "application/json" },
+    "body": {
+      "ServerVersion": "29.5.3",
+      "OSType": "linux",
+      "Architecture": "aarch64",
+      "OperatingSystem": "localmost guest (Alpine Linux v3.24)",
+      "KernelVersion": "6.18.54-0-virt",
+      "NCPU": 4,
+      "MemTotal": 8331636736,
+      "Driver": "overlay2",
+      "CgroupVersion": "2",
+      "SecurityOptions": ["name=seccomp,profile=builtin", "name=cgroupns"]
+    }
+  }
+}
