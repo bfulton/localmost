@@ -12,6 +12,7 @@ jest.mock('../shared/workspace', () => ({ getRepositoryFromDir: () => 'owner/my.
 import { parsePolicyArgs, printPolicy, runPolicy } from './policy';
 import { approvalStamp, approvePending, policyFilePath, readPolicyEntry, recordPending } from '../shared/policy-store';
 import { parseLocalmostrcContent } from '../shared/localmostrc';
+import { callInChild } from '../shared/test-utils/call-in-child';
 
 afterAll(() => {
   fs.rmSync(dataDir, { recursive: true, force: true });
@@ -354,4 +355,106 @@ describe('policy approve', () => {
     expect(readPolicyEntry(policiesDir, REPO)?.approved?.config.level).toBe('permissive');
     expect(output.join('\n')).toMatch(/Could not record/);
   });
+});
+
+describe('policy init', () => {
+  const originalLog = console.log;
+  let root: string;
+  let dir: string;
+  let outside: string;
+  let output: string[];
+  const rc = () => path.join(dir, '.localmostrc');
+  const SENTINEL = 'version: 1\nlevel: permissive\n# mine\n';
+
+  beforeEach(() => {
+    root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cli-policy-init-')));
+    dir = path.join(root, 'repo');
+    outside = path.join(root, 'outside');
+    fs.mkdirSync(dir);
+    fs.mkdirSync(outside);
+    output = [];
+    console.log = (...args: unknown[]) => void output.push(args.join(' '));
+    jest.spyOn(process, 'cwd').mockReturnValue(dir);
+  });
+
+  afterEach(() => {
+    console.log = originalLog;
+    jest.restoreAllMocks();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('creates the template when there is no policy', () => {
+    runPolicy('init', {});
+    const written = parseLocalmostrcContent(fs.readFileSync(rc(), 'utf-8'));
+    expect(written.errors).toEqual([]);
+    expect(written.config?.level).toBe('strict');
+  });
+
+  it('leaves an existing policy byte for byte without --force', () => {
+    fs.writeFileSync(rc(), SENTINEL);
+    runPolicy('init', {});
+    expect(fs.readFileSync(rc(), 'utf-8')).toBe(SENTINEL);
+    expect(output.join('\n')).toMatch(/already exists/);
+  });
+
+  it('replaces an existing policy with --force, which it used to parse and ignore', () => {
+    fs.writeFileSync(rc(), SENTINEL);
+    runPolicy('init', { force: true });
+    const text = fs.readFileSync(rc(), 'utf-8');
+    expect(text).not.toBe(SENTINEL);
+    expect(parseLocalmostrcContent(text).config?.level).toBe('strict');
+    expect(fs.readdirSync(dir)).toEqual(['.localmostrc']);
+  });
+
+  it('replaces the policy under the name it has, rather than adding one beside it', () => {
+    fs.writeFileSync(path.join(dir, '.localmostrc.yml'), SENTINEL);
+    runPolicy('init', { force: true });
+    expect(parseLocalmostrcContent(fs.readFileSync(path.join(dir, '.localmostrc.yml'), 'utf-8')).config?.level)
+      .toBe('strict');
+    expect(fs.readdirSync(dir)).toEqual(['.localmostrc.yml']);
+  });
+
+  it.each([
+    ['without --force', {}],
+    ['with --force', { force: true }],
+  ])('refuses a dangling link %s, and creates nothing where it points', (_label, options) => {
+    const victim = path.join(outside, '.zshenv');
+    fs.symlinkSync(victim, rc());
+    expect(() => runPolicy('init', options)).toThrow(/\.localmostrc is not a regular file/);
+    expect(fs.existsSync(victim)).toBe(false);
+    expect(fs.readlinkSync(rc())).toBe(victim);
+  });
+
+  it('refuses a link to a file outside the checkout with --force, and leaves that file alone', () => {
+    const target = path.join(outside, 'target');
+    fs.writeFileSync(target, SENTINEL);
+    fs.symlinkSync(target, rc());
+    expect(() => runPolicy('init', { force: true })).toThrow(/not a regular file/);
+    expect(fs.readFileSync(target, 'utf-8')).toBe(SENTINEL);
+    expect(fs.readlinkSync(rc())).toBe(target);
+  });
+});
+
+describe('what policy commands read at .localmostrc', () => {
+  it.each(['show', 'validate', 'diff', 'init'])(
+    'policy %s refuses a link to /dev/zero without reading it',
+    (subcommand) => {
+      // In a child: reading /dev/zero never ends, and would hang the suite.
+      const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cli-policy-zero-')));
+      try {
+        fs.symlinkSync('/dev/zero', path.join(root, '.localmostrc'));
+        const result = callInChild(path.join(__dirname, 'policy.ts'), 'runPolicy', [subcommand, {}], {
+          cwd: root,
+          env: { ...process.env, HOME: root },
+          timeoutMs: 15_000,
+        });
+        expect(result.timedOut).toBe(false);
+        expect(result.status).not.toBe(0);
+        expect(result.output).toMatch(/\.localmostrc is not a regular file/);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    },
+    30_000
+  );
 });

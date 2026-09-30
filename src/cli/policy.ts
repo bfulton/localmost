@@ -11,7 +11,6 @@
  *   localmost policy validate          # Validate .localmostrc syntax
  */
 
-import * as fs from 'fs';
 import * as path from 'path';
 import { DescribablePolicy, PolicyScope, describePolicy } from '../shared/policy-describe';
 import {
@@ -21,6 +20,7 @@ import {
   formatPolicyDiff,
   LocalmostrcConfig,
   serializeLocalmostrc,
+  writeLocalmostrc,
   LOCALMOSTRC_VERSION,
 } from '../shared/localmostrc';
 import { getAppDataDirWithoutElectron } from '../shared/paths';
@@ -388,13 +388,17 @@ function handleValidate(): void {
 }
 
 /**
- * Initialize a new .localmostrc file.
+ * Initialize a new .localmostrc file, or with --force replace the one there.
+ *
+ * Whatever is at the name must be a regular file or nothing: findLocalmostrc
+ * refuses anything else, and writeLocalmostrc replaces the file rather than
+ * writing through a link, so neither form writes outside the checkout.
  */
-function handleInit(): void {
+function handleInit(options: PolicyOptions): void {
   const cwd = process.cwd();
   const existingPath = findLocalmostrc(cwd);
 
-  if (existingPath) {
+  if (existingPath && !options.force) {
     console.log(`${colors.yellow}.localmostrc already exists:${colors.reset} ${path.relative(cwd, existingPath)}`);
     console.log('Use --force to overwrite.');
     return;
@@ -422,11 +426,14 @@ function handleInit(): void {
     },
   };
 
-  const content = serializeLocalmostrc(template);
-  const newPath = path.join(cwd, '.localmostrc');
-  fs.writeFileSync(newPath, content);
+  // Replaced under the name it has: a new .localmostrc beside a .yml would
+  // take its place unseen, and leave the old file there reading as the policy.
+  const destination = existingPath ?? path.join(cwd, '.localmostrc');
+  writeLocalmostrc(destination, serializeLocalmostrc(template));
 
-  console.log(`${colors.green}\u2713${colors.reset} Created .localmostrc`);
+  console.log(
+    `${colors.green}\u2713${colors.reset} ${existingPath ? 'Replaced' : 'Created'} ${path.relative(cwd, destination)}`
+  );
   console.log();
   console.log('Customize the policy, then run:');
   console.log('  localmost test --updaterc');
@@ -473,7 +480,7 @@ export function runPolicy(
       handleValidate();
       break;
     case 'init':
-      handleInit();
+      handleInit(options);
       break;
     default:
       console.error(`Unknown subcommand: ${subcommand}`);

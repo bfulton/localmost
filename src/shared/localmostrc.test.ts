@@ -2,10 +2,7 @@
  * Tests for .localmostrc Parser and Validator
  */
 
-import * as fs from 'fs';
 import {
-  findLocalmostrc,
-  parseLocalmostrc,
   parseLocalmostrcContent,
   effectivePolicyLevel,
   mergePolicies,
@@ -18,106 +15,11 @@ import {
 } from './localmostrc';
 import { SandboxPolicy } from './sandbox-profile';
 
-// Mock fs
-jest.mock('fs');
-
-const mockFs = fs as jest.Mocked<typeof fs>;
+// Finding and reading the file on disk: localmostrc.file.test.ts.
 
 describe('localmostrc', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-  });
-
-  // ===========================================================================
-  // findLocalmostrc
-  // ===========================================================================
-
-  describe('findLocalmostrc', () => {
-    it('should find .localmostrc file', () => {
-      mockFs.existsSync.mockImplementation((p) => p === '/repo/.localmostrc');
-
-      const result = findLocalmostrc('/repo');
-
-      expect(result).toBe('/repo/.localmostrc');
-    });
-
-    it('should find .localmostrc.yml file', () => {
-      mockFs.existsSync.mockImplementation((p) => p === '/repo/.localmostrc.yml');
-
-      const result = findLocalmostrc('/repo');
-
-      expect(result).toBe('/repo/.localmostrc.yml');
-    });
-
-    it('should find .localmostrc.yaml file', () => {
-      mockFs.existsSync.mockImplementation((p) => p === '/repo/.localmostrc.yaml');
-
-      const result = findLocalmostrc('/repo');
-
-      expect(result).toBe('/repo/.localmostrc.yaml');
-    });
-
-    it('should prefer .localmostrc over .localmostrc.yml', () => {
-      mockFs.existsSync.mockImplementation(
-        (p) => p === '/repo/.localmostrc' || p === '/repo/.localmostrc.yml'
-      );
-
-      const result = findLocalmostrc('/repo');
-
-      expect(result).toBe('/repo/.localmostrc');
-    });
-
-    it('should return null if no file found', () => {
-      mockFs.existsSync.mockReturnValue(false);
-
-      const result = findLocalmostrc('/repo');
-
-      expect(result).toBeNull();
-    });
-  });
-
-  // ===========================================================================
-  // parseLocalmostrc
-  // ===========================================================================
-
-  describe('parseLocalmostrc', () => {
-    it('should return error if file not found', () => {
-      mockFs.existsSync.mockReturnValue(false);
-
-      const result = parseLocalmostrc('/nonexistent.yml');
-
-      expect(result.success).toBe(false);
-      expect(result.errors[0].message).toContain('not found');
-    });
-
-    it('should return error if file cannot be read', () => {
-      mockFs.existsSync.mockReturnValue(true);
-      mockFs.readFileSync.mockImplementation(() => {
-        throw new Error('Permission denied');
-      });
-
-      const result = parseLocalmostrc('/unreadable.yml');
-
-      expect(result.success).toBe(false);
-      expect(result.errors[0].message).toContain('Failed to read');
-    });
-
-    it('should parse valid content from file', () => {
-      const content = `
-version: 1
-shared:
-  network:
-    allow:
-      - github.com
-`;
-      mockFs.existsSync.mockReturnValue(true);
-      mockFs.readFileSync.mockReturnValue(content);
-
-      const result = parseLocalmostrc('/test.yml');
-
-      expect(result.success).toBe(true);
-      expect(result.config?.version).toBe(1);
-    });
   });
 
   // ===========================================================================
