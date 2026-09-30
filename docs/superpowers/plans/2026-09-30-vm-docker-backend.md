@@ -617,7 +617,9 @@ a fake `StartRefreshVm`.
 
 - Delete: `DesktopBackend` from `src/main/docker/docker-backend.ts` and its
   tests; `src/shared/docker-access.ts`, `docker-access.test.ts`,
-  `docker-access.sandbox.test.ts`.
+  `docker-access.sandbox.test.ts`; the legacy sync `resolveRegistryAuth`
+  from `src/main/docker/registry-auth.ts` and its tests (WP-D left it for
+  `DesktopBackend`, beside the puller's `resolveRegistryCredentials`).
 - Modify: `src/main/index.ts` (no `DesktopBackend`, no `resolveRegistryAuth`
   wiring into the filter), `src/main/docker/docker-filter-proxy.test.ts`
   (fixtures that built a `DesktopBackend`),

@@ -655,7 +655,7 @@ check.
 | `src/main/docker/puller/image-store.ts` | new | The per-repository blob store and `refs.json`. |
 | `src/main/docker/puller/docker-archive.ts` | new | The `docker save`-shaped tar stream for `POST /images/load`. |
 | `src/main/docker/puller/image-puller.ts` | new | `ImagePuller` (§6.4). |
-| `src/main/docker/registry-auth.ts` | changed | Async. Looks helpers up only in `/opt/homebrew/bin`, `/usr/local/bin` and `/Applications/Docker.app/Contents/Resources/bin`, never `PATH`, and runs them with async `execFile` (10 s timeout). Throws `RegistryAuthError` when a configured helper is missing or fails other than "not found", with the design's message naming the helper and the config key (`credsStore` or `credHelpers.<registry>`). |
+| `src/main/docker/registry-auth.ts` | changed | Adds `resolveRegistryCredentials(registry): Promise<RegistryCredentials \| undefined>` for the puller, where `RegistryCredentials` is `{ kind: 'basic', username, password }` or `{ kind: 'identity-token', token }`. The sync `resolveRegistryAuth` (the X-Registry-Auth header `DesktopBackend`'s filter attaches) keeps its behaviour so `index.ts` compiles unchanged; WP-E deletes it with its wiring and its tests. The new function is async. It looks helpers up only in `/opt/homebrew/bin`, `/usr/local/bin` and `/Applications/Docker.app/Contents/Resources/bin`, never `PATH`, and runs them with async `execFile` (10 s timeout). Throws `RegistryAuthError` when a configured helper is missing or fails other than "not found", with the design's message naming the helper and the config key (`credsStore` or `credHelpers.<registry>`). |
 | `src/main/docker/docker-filter-proxy.ts` | changed | §5.3. |
 | `src/main/docker/docker-evaluator.ts` | changed | Parses and normalises bind destinations from `Binds` and `Mounts` (§3.7 "Bind matching"; today `MountRequest` has only `source` and `mode`), refuses a relative or duplicate destination, and returns `approvedBinds` on an allowed create. |
 | `src/shared/docker-policy.ts` | changed | `UNFILTERED_EGRESS` becomes `PROXIED_EGRESS` = `egress through this job's proxy, subject to its network allowlist`. `hasDockerGrants(policy)` is exported. The approval text for `pull.registries` adds `and fetching from wherever that registry redirects (any public https host)`. The `privileged: true` refusal no longer says "this build does not have a managed VM backend"; it says `privileged containers are not granted: they reach the Docker VM's kernel`. |
@@ -963,7 +963,7 @@ design's "Registries on the LAN, loopback or plain HTTP"). `docker.io` maps to
 `Accept` header lists OCI index and manifest types and Docker manifest-list
 and schema2 types. Schema1 is refused. Auth is the
 `WWW-Authenticate: Bearer realm=…,service=…,scope=…` token exchange, using
-basic credentials from `resolveRegistryAuth` when there are any, under the
+basic credentials from `resolveRegistryCredentials` when there are any, under the
 rules below.
 
 **Redirects.** Followed (CDN blob hosts) only to `https:` URLs, at most 5
@@ -982,7 +982,7 @@ job's `network.allow`; the approval text and `SECURITY.md` say so.
   the registry chooses it. It must be `https:`, and its host must pass the
   same screening. Otherwise the pull fails (`the registry's token service
   <realm> is not a public https URL`). Basic credentials from
-  `resolveRegistryAuth` are sent only to a realm that passed, only in the
+  `resolveRegistryCredentials` are sent only to a realm that passed, only in the
   token request, and never on a redirect of it.
 - The bearer token from the realm is sent only to the registry's origin.
 
