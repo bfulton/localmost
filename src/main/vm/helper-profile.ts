@@ -10,7 +10,8 @@
  * file-issue-extension rule, scoped to the share's real path, is what makes a
  * share that became a link elsewhere fail with EPERM: the second layer of the
  * share rule. It is never broadened. A refresh VM has no share, so no
- * extension rule at all, and its one disk is the repository's data.img.new.
+ * extension rule at all - neither that one nor virtiofs's own - and its one
+ * disk is the repository's data.img.new.
  *
  * Every path is built here from ids, through vm/paths, and escaped as the job
  * profile escapes its paths. The caller passes <data> already realpathed.
@@ -95,11 +96,12 @@ export function buildHelperProfile(opts: HelperProfileOptions): string {
       '(allow file-issue-extension',
       '  (require-all',
       '    (extension-class "com.apple.app-sandbox.read-write" "com.apple.app-sandbox.read")',
-      `    (subpath "${share}")))`
+      `    (subpath "${share}")))`,
+      ';; The virtiofs device\'s own extension, for the share.',
+      '(allow generic-issue-extension (extension-class "com.apple.virtualization.extension.fuse"))'
     );
   }
 
-  lines.push('(allow generic-issue-extension (extension-class "com.apple.virtualization.extension.fuse"))');
   if (!refresh) {
     lines.push(
       ';; The relay from the guest\'s 198.18.0.1:3128 to this worker\'s proxy.',

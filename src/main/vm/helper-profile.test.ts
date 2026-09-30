@@ -118,10 +118,11 @@ describe('buildHelperProfile in refresh mode', () => {
       `(allow file-read* (literal "${refresh.helper}") (subpath "${refresh.resources}/guest"))`,
       `(allow file-read* file-write* (subpath "${vmDir(refresh.vmId)}"))`,
       `(allow file-read* file-write* (literal "${data}/vm/cache/0123456789abcdef/data.img.new"))`,
-      '(allow generic-issue-extension (extension-class "com.apple.virtualization.extension.fuse"))',
       `(allow network-bind network-inbound (subpath "${vmDir(refresh.vmId)}"))`,
     ]);
     expect(profile).not.toContain('file-issue-extension');
+    // The virtiofs extension is for a share, which a refresh VM has none of.
+    expect(profile).not.toContain('generic-issue-extension');
     expect(profile).not.toContain('network-outbound');
   });
 
