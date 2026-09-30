@@ -1138,27 +1138,31 @@ describe('Process Sandbox', () => {
       // A component the app cannot look up - unsearchable, or a symlink loop
       // anyone could plant above a deny - is one the job cannot pass through
       // either. Throwing there stopped every spawn for the repository.
+      // Written through a link, as /tmp is one into /private, so it has two
+      // spellings. Built under the real temp directory: a job may not write /tmp.
       const actualFs = jest.requireActual<typeof import('fs')>('fs');
-      const real = actualFs.realpathSync(actualFs.mkdtempSync('/tmp/localmost-unresolvable-'));
-      const viaTmp = real.replace(/^\/private/, '');
+      const base = actualFs.realpathSync(actualFs.mkdtempSync(path.join(os.tmpdir(), 'localmost-unresolvable-')));
+      const real = path.join(base, 'real');
+      const written = path.join(base, 'written');
       actualFs.mkdirSync(path.join(real, 'locked', 'inner'), { recursive: true });
+      actualFs.symlinkSync('real', written);
       actualFs.symlinkSync('loop', path.join(real, 'loop'));
       actualFs.chmodSync(path.join(real, 'locked'), 0o000);
       try {
         const profile = profileWithRealPaths({
           filesystemPolicy: {
-            level: 'strict', read: [], write: [], deny: [`${viaTmp}/locked/inner/secret`, `${viaTmp}/loop/secret`],
+            level: 'strict', read: [], write: [], deny: [`${written}/locked/inner/secret`, `${written}/loop/secret`],
           },
         });
         const denyRule = profile.slice(profile.lastIndexOf('(deny file-read* file-write*'));
-        for (const spelling of [viaTmp, real]) {
+        for (const spelling of [written, real]) {
           expect(denyRule).toContain(`(subpath "${spelling}/locked/inner/secret")`);
           expect(denyRule).toContain(`(subpath "${spelling}/loop/secret")`);
           expect(writable(profile, `${spelling}/locked/inner`)).toBe(false);
         }
       } finally {
         actualFs.chmodSync(path.join(real, 'locked'), 0o755);
-        actualFs.rmSync(real, { recursive: true, force: true });
+        actualFs.rmSync(base, { recursive: true, force: true });
       }
     });
 

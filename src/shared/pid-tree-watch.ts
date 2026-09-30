@@ -5,9 +5,6 @@
  * Used in discovery mode to track which PIDs belong to our sandbox process tree.
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
 import { spawn, ChildProcess } from 'child_process';
 
 // Python script for pid_tree_watch (uses kqueue + libproc)
@@ -134,35 +131,6 @@ if __name__ == '__main__':
 `;
 
 /**
- * Get the path to the pid_tree_watch Python script.
- * Creates it if it doesn't exist.
- */
-export function getPidTreeWatchScript(): string | null {
-  if (process.platform !== 'darwin') {
-    return null;
-  }
-
-  const binDir = path.join(os.homedir(), '.localmost', 'bin');
-  const scriptPath = path.join(binDir, 'pid_tree_watch.py');
-
-  // Ensure bin directory exists
-  if (!fs.existsSync(binDir)) {
-    fs.mkdirSync(binDir, { recursive: true });
-  }
-
-  // Write script if it doesn't exist or is outdated
-  const currentContent = fs.existsSync(scriptPath)
-    ? fs.readFileSync(scriptPath, 'utf-8')
-    : '';
-
-  if (currentContent !== PID_TREE_WATCH_SCRIPT) {
-    fs.writeFileSync(scriptPath, PID_TREE_WATCH_SCRIPT, { mode: 0o755 });
-  }
-
-  return scriptPath;
-}
-
-/**
  * PID tree watcher instance.
  * Spawns the pid_tree_watch helper and collects PIDs in real-time.
  */
@@ -177,19 +145,21 @@ export class PidTreeWatcher {
    * @returns true if watching started successfully
    */
   start(pid: number): boolean {
-    const script = getPidTreeWatchScript();
-    if (!script) {
+    if (process.platform !== 'darwin') {
       return false;
     }
 
     this.rootPid = pid;
     this.collectedPids.add(pid);
 
-    this.process = spawn(script, [String(pid)], {
+    // Handed to python on its command line. It used to be written to
+    // ~/.localmost/bin and run from there, which a job may not write: run
+    // inside one, the write threw and every step of a discovery run failed.
+    this.process = spawn('/usr/bin/env', ['python3', '-c', PID_TREE_WATCH_SCRIPT, String(pid)], {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    // Without this listener a failed exec - no python3, script not executable -
+    // Without this listener a failed exec - no python3 on PATH -
     // emits an unhandled 'error' event and takes the process down. Discovery
     // degrades to unfiltered logs, which is far better than a crash.
     this.process.on('error', (err: Error) => {

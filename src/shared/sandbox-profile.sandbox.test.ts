@@ -614,7 +614,7 @@ if (!isMacOS) {
       // Loopback: only the proxy under enforcement, the granted ports on
       // request, everything under discovery.
       expect(enforcement).toContain('(allow network-outbound (remote ip "localhost:1"))');
-      expect(enforcement).not.toContain('"localhost:*"))');
+      expect(enforcement).not.toContain('(allow network-outbound (remote ip "localhost:*"))');
       expect(
         generateSandboxProfile({ workDir, proxyPort: 1, policy: readable, loopback: [5432] })
       ).toContain('(allow network-outbound (remote ip "localhost:5432"))');

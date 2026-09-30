@@ -487,19 +487,24 @@ describe('Sandbox Profile Generator', () => {
       // A component the app cannot look up - unsearchable, or a symlink loop -
       // is one the job cannot pass through either. Throwing there stopped
       // every run of the checkout over a deny that holds as written.
+      // Written through a link, as /tmp is one into /private, so it has two
+      // spellings. Built under the real temp directory: a job may not write /tmp.
       const actualFs = jest.requireActual<typeof import('fs')>('fs');
-      const real = actualFs.realpathSync(actualFs.mkdtempSync('/tmp/localmost-unresolvable-'));
-      const viaTmp = real.replace(/^\/private/, '');
+      const actualOs = jest.requireActual<typeof import('os')>('os');
+      const base = actualFs.realpathSync(actualFs.mkdtempSync(path.join(actualOs.tmpdir(), 'localmost-unresolvable-')));
+      const real = path.join(base, 'real');
+      const written = path.join(base, 'written');
       actualFs.mkdirSync(path.join(real, 'locked', 'inner'), { recursive: true });
+      actualFs.symlinkSync('real', written);
       actualFs.symlinkSync('loop', path.join(real, 'loop'));
       actualFs.chmodSync(path.join(real, 'locked'), 0o000);
       try {
         const forms = topLevelForms(generateSandboxProfile({
           workDir: '/path/to/project',
           proxyPort: DEFAULT_PROXY_PORT,
-          policy: { filesystem: { deny: [`${viaTmp}/locked/inner/secret`, `${viaTmp}/loop/secret`, `${viaTmp}/locked/*.pem`] } },
+          policy: { filesystem: { deny: [`${written}/locked/inner/secret`, `${written}/loop/secret`, `${written}/locked/*.pem`] } },
         }));
-        for (const spelling of [viaTmp, real]) {
+        for (const spelling of [written, real]) {
           expect(forms).toContain(`(deny file-read* (subpath "${spelling}/locked/inner/secret"))`);
           expect(forms).toContain(`(deny file-read* (subpath "${spelling}/loop/secret"))`);
           expect(forms).toContain(`(deny file-write* (literal "${spelling}/locked/inner"))`);
@@ -507,7 +512,7 @@ describe('Sandbox Profile Generator', () => {
         expect(forms).toContain(`(deny file-read* (regex "^${real.replace(/\./g, '\\\\.')}/locked/.*\\\\.pem(/|$)"))`);
       } finally {
         actualFs.chmodSync(path.join(real, 'locked'), 0o755);
-        actualFs.rmSync(real, { recursive: true, force: true });
+        actualFs.rmSync(base, { recursive: true, force: true });
       }
     });
 
