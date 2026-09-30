@@ -54,13 +54,20 @@ export interface DockerPolicy {
   pull?: DockerPullPolicy;
   run?: DockerRunPolicy;
   build?: DockerBuildPolicy;
-  /** Grammar-present but rejected at approval unless the backend is a managed VM. */
+  /** Grammar-present but refused at approval: a privileged container reaches the Docker VM's kernel. */
   privileged?: boolean;
 }
 
 /** True when the policy grants nothing (used to keep `off` == `{}`/absent). */
 export const isEmptyDockerPolicy = (p?: DockerPolicy): boolean =>
   !p || (!p.pull && !p.run && !p.build && !p.privileged);
+
+/**
+ * True when the policy grants any Docker action. Only then does a claimed
+ * job get a Docker VM; without one the socket answers the baseline and
+ * refuses the rest, and nothing boots.
+ */
+export const hasDockerGrants = (p?: DockerPolicy): boolean => !isEmptyDockerPolicy(p);
 
 // =============================================================================
 // Validation
@@ -103,12 +110,14 @@ export function validateDockerPolicy(value: unknown, path: string, push: (messag
   if (value.privileged !== undefined && typeof value.privileged !== 'boolean') {
     push(`${path}.privileged must be a boolean`);
   } else if (value.privileged === true) {
-    // Kept in the grammar so the capability gap stays visible, and refused
-    // until a backend exists that can contain it. Accepting the declaration
-    // here and then refusing every request it implies would read as a broken
-    // policy rather than a stage that has not shipped.
+    // Kept in the grammar so the gap stays visible, and refused. A privileged
+    // container gets every capability in the job's Docker VM: the raw data
+    // disk, the whole shared work folder with the runner's step scripts, and
+    // the kernel's attack surface, which turns a guest kernel bug into a
+    // one-liner. Accepting the declaration here and then refusing every
+    // request it implies would read as a broken policy.
     push(
-      `${path}.privileged requires a managed VM backend, which this build does not have; ` +
+      `${path}.privileged: privileged containers are not granted: they reach the Docker VM's kernel; ` +
         'remove it, or run the work without privileged containers'
     );
   }
@@ -483,13 +492,20 @@ export function parseDockerPolicyHint(hint: string): DockerPolicy | undefined {
 
 /**
  * What a container on a routable network can reach, said wherever one is
- * granted. Its traffic leaves through the daemon's network rather than the
- * job's proxy, so the policy's host allowlist never sees it, and the daemon
- * forwards to the host's own loopback (host.docker.internal) - local
- * databases, debuggers and the app's broker among them.
+ * granted. The job's Docker VM has no network card: a routable container is
+ * given the job's own proxy (HTTP_PROXY and the rest), relayed out of the VM,
+ * so it reaches exactly what the job's network allowlist and loopback policy
+ * permit. Traffic that ignores the proxy settings has no route at all.
  */
-const UNFILTERED_EGRESS =
-  'unfiltered egress: bypasses the network allowlist and reaches loopback services on the host';
+const PROXIED_EGRESS = "egress through this job's proxy, subject to its network allowlist";
+
+/**
+ * Said of every granted registry. The image is fetched by localmost itself,
+ * outside the job, and a registry commonly redirects blob downloads to a CDN,
+ * which localmost follows to any public https host - a host the job's own
+ * network allowlist may never name.
+ */
+const REGISTRY_REDIRECTS = 'and fetching from wherever that registry redirects (any public https host)';
 
 /**
  * The container grants a docker policy makes, one line each, for anything that
@@ -503,7 +519,7 @@ export function describeDockerGrants(docker: DockerPolicy | undefined, prefix: s
   if (docker.pull) {
     const registries = docker.pull.registries ?? [];
     if (registries.length === 0) grants.push(`${prefix}docker pull`);
-    for (const registry of registries) grants.push(`${prefix}docker pull: ${registry}`);
+    for (const registry of registries) grants.push(`${prefix}docker pull: ${registry}, ${REGISTRY_REDIRECTS}`);
   }
   if (docker.run) {
     const { images = [], mounts = [], network, networks = [] } = docker.run;
@@ -515,14 +531,14 @@ export function describeDockerGrants(docker: DockerPolicy | undefined, prefix: s
     // Creating a network is a grant, and whether it is routable is the part an
     // operator most needs to see.
     for (const n of networks) {
-      grants.push(`${prefix}docker network create: ${n.name} (${n.internal ? 'internal' : `routable: ${UNFILTERED_EGRESS}`})`);
+      grants.push(`${prefix}docker network create: ${n.name} (${n.internal ? 'internal' : `routable: ${PROXIED_EGRESS}`})`);
     }
     // A named network may be one the operator made internal, but nothing in
     // the policy says so, and only none is known to have no route at all.
     if (network !== undefined) {
       grants.push(network === 'none'
         ? `${prefix}docker network: ${network}`
-        : `${prefix}docker network: ${network} (${UNFILTERED_EGRESS})`);
+        : `${prefix}docker network: ${network} (${PROXIED_EGRESS})`);
     }
   }
   // A build needs no run.network to be routable: the filter lets one through
@@ -530,7 +546,7 @@ export function describeDockerGrants(docker: DockerPolicy | undefined, prefix: s
   // the daemon's default bridge. The egress is implicit, so it is spelled out.
   if (docker.build) {
     const build = docker.build.context === undefined ? 'docker build' : `docker build: ${docker.build.context}`;
-    grants.push(`${prefix}${build} (RUN steps: ${UNFILTERED_EGRESS})`);
+    grants.push(`${prefix}${build} (RUN steps: ${PROXIED_EGRESS})`);
   }
   if (docker.privileged) grants.push(`${prefix}docker privileged`);
   return grants;

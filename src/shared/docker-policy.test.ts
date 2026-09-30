@@ -8,6 +8,7 @@ import {
   serializeDockerPolicy,
   parseDockerPolicyHint,
   describeDockerGrants,
+  hasDockerGrants,
   DockerPolicy,
 } from './docker-policy';
 
@@ -17,6 +18,15 @@ describe('docker policy', () => {
     expect(isEmptyDockerPolicy({})).toBe(true);
     const granted: DockerPolicy = { run: { images: ['postgres:16'] } };
     expect(isEmptyDockerPolicy(granted)).toBe(false);
+  });
+
+  it('says a policy grants Docker actions exactly when it is not empty, which is what boots a VM', () => {
+    expect(hasDockerGrants(undefined)).toBe(false);
+    expect(hasDockerGrants({})).toBe(false);
+    expect(hasDockerGrants({ privileged: false })).toBe(false);
+    expect(hasDockerGrants({ pull: { registries: [] } })).toBe(true);
+    expect(hasDockerGrants({ run: {} })).toBe(true);
+    expect(hasDockerGrants({ build: {} })).toBe(true);
   });
 });
 
@@ -47,8 +57,8 @@ describe('validateDockerPolicy', () => {
   });
 
   it('accepts pull, build and run together', () => {
-    // privileged is deliberately absent: it is rejected until a managed VM
-    // backend exists, and has a case of its own below.
+    // privileged is deliberately absent: it is refused, and has a case of its
+    // own below.
     expect(collect({
       pull: { registries: ['docker.io', 'ghcr.io'] },
       run: { images: ['postgres:16'] },
@@ -353,11 +363,14 @@ describe('privileged at validation time', () => {
     return errs;
   };
 
-  it('rejects privileged: true, naming the backend it would require', () => {
+  it('rejects privileged: true, saying what a privileged container would reach', () => {
     // The design keeps privileged in the grammar so the gap stays honest, and
-    // rejects it until a managed VM can contain it. Accepting it here and
-    // refusing every request later reads as a broken policy, not a stage.
-    expect(collect({ privileged: true }).join('\n')).toMatch(/managed VM/i);
+    // the owner keeps it refused on the VM backend: a privileged container
+    // turns a guest kernel bug into a one-liner. Accepting it here and
+    // refusing every request later would read as a broken policy.
+    const message = collect({ privileged: true }).join('\n');
+    expect(message).toMatch(/privileged containers are not granted: they reach the Docker VM's kernel/);
+    expect(message).not.toMatch(/managed VM backend/i);
   });
 
   it('accepts privileged: false, which grants nothing', () => {
@@ -441,16 +454,18 @@ describe('a glob in run.images must say what tag it covers', () => {
 });
 
 describe('describeDockerGrants on container networks', () => {
-  // What an operator approving a routable network needs to read: the job's
-  // allowlist stops at the job's own proxy, and a container is not behind it.
-  const unfiltered = /unfiltered egress.*bypasses the network allowlist.*loopback services on the host/;
+  // What an operator approving a routable network needs to read: a
+  // container's traffic leaves only through the job's own proxy, under the
+  // job's network allowlist, since the VM it runs in has no network card.
+  const proxied = /egress through this job's proxy, subject to its network allowlist/;
 
-  it('says a declared run.network is unfiltered egress that reaches the host, unless it is none', () => {
+  it("says a declared run.network egresses through the job's proxy, unless it is none", () => {
     const grants = describeDockerGrants({ run: { network: 'bridge' } }, '');
     expect(grants).toHaveLength(1);
     expect(grants[0]).toMatch(/^docker network: bridge \(/);
-    expect(grants[0]).toMatch(unfiltered);
-    // none has no network at all, so there is nothing to warn about.
+    expect(grants[0]).toMatch(proxied);
+    expect(grants[0]).not.toMatch(/unfiltered/);
+    // none has no network at all, so there is nothing to say.
     expect(describeDockerGrants({ run: { network: 'none' } }, '')).toEqual(['docker network: none']);
   });
 
@@ -460,20 +475,31 @@ describe('describeDockerGrants on container networks', () => {
     }, '');
     expect(grants).toHaveLength(2);
     expect(grants[0]).toMatch(/^docker network create: open-\* \(routable/);
-    expect(grants[0]).toMatch(unfiltered);
+    expect(grants[0]).toMatch(proxied);
     expect(grants[1]).toBe('docker network create: vk-* (internal)');
   });
 
-  it('says a build is unfiltered egress too, since its RUN steps default to the daemon bridge', () => {
+  it('says a build egresses through the proxy too, since its RUN steps default to the bridge', () => {
     // The filter lets a build through with no network mode at all, whatever
     // run.network says, and the classic builder then runs each step routable.
     const withContext = describeDockerGrants({ build: { context: './' } }, '');
     expect(withContext).toHaveLength(1);
     expect(withContext[0]).toMatch(/^docker build: \.\/ \(RUN steps: /);
-    expect(withContext[0]).toMatch(unfiltered);
+    expect(withContext[0]).toMatch(proxied);
     const bare = describeDockerGrants({ build: {} }, '');
     expect(bare).toHaveLength(1);
     expect(bare[0]).toMatch(/^docker build \(RUN steps: /);
-    expect(bare[0]).toMatch(unfiltered);
+    expect(bare[0]).toMatch(proxied);
+  });
+});
+
+describe('describeDockerGrants on pulls', () => {
+  it('says a granted registry also sends localmost wherever that registry redirects', () => {
+    // localmost follows a registry's redirects to its CDN, outside the job's
+    // network allowlist, so granting the registry grants that too.
+    expect(describeDockerGrants({ pull: { registries: ['docker.io', 'ghcr.io'] } }, '')).toEqual([
+      'docker pull: docker.io, and fetching from wherever that registry redirects (any public https host)',
+      'docker pull: ghcr.io, and fetching from wherever that registry redirects (any public https host)',
+    ]);
   });
 });
