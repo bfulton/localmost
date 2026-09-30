@@ -141,12 +141,13 @@ export async function createWorkspace(options: WorkspaceOptions): Promise<Worksp
 
   // The metadata is createWorkspace's to write, not the checkout's to put
   // there, so it is written first, as a new file, into the empty workspace:
-  // nothing may be at its name yet, and a directory already at this id is
-  // refused rather than shared. The copy then finds the name taken by any
-  // checkout entry the volume takes for it - ".LOCALMOST-WORKSPACE.JSON",
-  // or one with a long s for the s, which the exclude by exact name misses -
-  // and skips that entry. Written after the copy, such an entry failed the
-  // run, and a link there had the write go wherever it pointed.
+  // nothing may be at its name yet, and 'wx' refuses a link or file already
+  // there in a directory left at this id, which mkdir reuses. The copy then
+  // finds the name taken by any checkout entry the volume takes for it -
+  // ".LOCALMOST-WORKSPACE.JSON", or one with a long s for the s, which the
+  // exclude by exact name misses - and skips that entry. Written after the
+  // copy, such an entry failed the run, and a link there had the write go
+  // wherever it pointed.
   fs.writeFileSync(path.join(workspacePath, METADATA_FILE), JSON.stringify(workspace, null, 2), { flag: 'wx' });
 
   const isMetadata = (rel: string): boolean => rel === METADATA_FILE;
@@ -358,7 +359,9 @@ async function copyTree(
           await fs.promises.mkdir(path.join(destDir, rel), { mode: 0o700 });
         } catch (err) {
           // Two names the checkout's volume tells apart and the workspace's
-          // does not: the first made stands, and only if it is a directory.
+          // does not, or a name taken by the workspace's metadata, written
+          // before the copy (see createWorkspace): the first made stands,
+          // and only if it is a directory.
           if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
           return (await fs.promises.lstat(path.join(destDir, rel))).isDirectory();
         }
@@ -385,7 +388,9 @@ async function copyTree(
         await fs.promises.copyFile(from, to, fs.constants.COPYFILE_EXCL | fs.constants.COPYFILE_FICLONE);
       }
     } catch (err) {
-      // Listed twice, by names the workspace's volume does not tell apart.
+      // Listed twice, by names the workspace's volume does not tell apart,
+      // or taken by the workspace's metadata, written before the copy (see
+      // createWorkspace): the first one made stands, never overwritten.
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
     }
   };

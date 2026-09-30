@@ -201,9 +201,41 @@ describe('workspace creation', () => {
       const metadata = path.join(ws.path, '.localmost-workspace.json');
       expect(fs.lstatSync(metadata).isFile()).toBe(true);
       expect(JSON.parse(fs.readFileSync(metadata, 'utf-8')).id).toBe(ws.id);
+      // One entry, as the temp directory is on the Mac's default volume,
+      // which does not tell the two names apart.
       expect(fs.readdirSync(ws.path).filter((entry) => entry.toLowerCase().endsWith('-workspace.json'))).toEqual([
         '.localmost-workspace.json',
       ]);
+    }
+  });
+
+  it.each([
+    ['a file in another case', '.LOCALMOST-WORKSPACE.JSON', 'file'],
+    ['a file with a long s', '.localmoſt-workspace.json', 'file'],
+    ['a directory in another case', '.LOCALMOST-WORKSPACE.JSON', 'directory'],
+    ['a directory with a long s', '.localmoſt-workspace.json', 'directory'],
+  ])('keeps its own metadata over %s the volume takes for its name', async (_, name, kind) => {
+    // The copy finds the name already taken by the metadata, written first:
+    // a file is copied only as a new one, and a directory is not descended,
+    // so neither replaces the metadata nor puts anything in the workspace.
+    // Each needs its own checkout, as the checkout's volume folds the names
+    // too.
+    const source = path.join(appData, 'folded');
+    fs.mkdirSync(source);
+    git(source, 'init', '-q');
+    fs.writeFileSync(path.join(source, 'a.txt'), 'a\n');
+    const entry = kind === 'file' ? name : `${name}/inner`;
+    fs.mkdirSync(path.dirname(path.join(source, entry)), { recursive: true });
+    fs.writeFileSync(path.join(source, entry), JSON.stringify({ id: 'forged' }));
+    git(source, 'add', 'a.txt', entry);
+
+    for (const options of [{ respectGitignore: true }, { respectGitignore: false }, { stagedOnly: true }]) {
+      const ws = await createWorkspace({ sourceDir: source, ...options });
+
+      const metadata = path.join(ws.path, '.localmost-workspace.json');
+      expect(fs.lstatSync(metadata).isFile()).toBe(true);
+      expect(JSON.parse(fs.readFileSync(metadata, 'utf-8')).id).toBe(ws.id);
+      expect(fs.readdirSync(ws.path).sort()).toEqual(['.localmost-workspace.json', 'a.txt']);
     }
   });
 
