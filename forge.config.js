@@ -102,6 +102,9 @@ const packagerConfig = {
     GUEST_DIR,
     DOCKER_CLI_DIR,
   ],
+  // The VM backend needs macOS 14 (design decision 12); Electron's template
+  // says 12.0.
+  extendInfo: { LSMinimumSystemVersion: '14.0' },
   // Electron's template declares camera, microphone, audio capture and
   // Bluetooth usage the app has no entitlement for; extendInfo cannot remove
   // a key, so this hook does. It is the last step before osx-sign, so the

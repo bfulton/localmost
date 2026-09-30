@@ -564,6 +564,34 @@ describe('the checks before the Docker VM is packaged', () => {
   });
 });
 
+describe('the macOS version the app requires', () => {
+  const savedEnv = { ...process.env };
+  let packagerConfig: { extendInfo?: Record<string, unknown> };
+
+  beforeEach(() => {
+    process.env.APPLE_IDENTITY = '-';
+    process.env.RELEASE_BUILD = 'false';
+    jest.spyOn(console, 'log').mockImplementation(() => {});
+    jest.isolateModules(() => {
+      packagerConfig = require(path.join(REPO, 'forge.config.js')).packagerConfig;
+    });
+  });
+
+  afterEach(() => {
+    process.env = { ...savedEnv };
+    jest.restoreAllMocks();
+  });
+
+  it("is macOS 14, over Electron's own minimum", async () => {
+    expect(packagerConfig.extendInfo).toEqual({ LSMinimumSystemVersion: '14.0' });
+    // The installed packager's own merge, over the template's value.
+    const { MacApp } = require(path.join(REPO, 'node_modules', '@electron', 'packager', 'dist', 'mac'));
+    const template = { CFBundleExecutable: 'Electron', LSMinimumSystemVersion: '12.0' };
+    const merged = await MacApp.prototype.extendPlist.call({}, { ...template }, packagerConfig.extendInfo);
+    expect(merged).toEqual({ ...template, LSMinimumSystemVersion: '14.0' });
+  });
+});
+
 describe('the entitlements the app is signed with', () => {
   // Read a plist as codesign does, with the system's own parser.
   const readPlist = (file: string) =>
@@ -769,7 +797,7 @@ describe('the usage descriptions the app declares', () => {
     writePlist(path.join(contents, 'Info.plist'), {
       CFBundleExecutable: 'localmost',
       CFBundleIdentifier: 'com.localmost.app',
-      LSMinimumSystemVersion: '12.0',
+      LSMinimumSystemVersion: '14.0',
       NSHighResolutionCapable: true,
       NSPrincipalClass: 'AtomApplication',
       ...Object.fromEntries(ELECTRON_USAGE.map((key) => [key, 'This app needs access to it.'])),
