@@ -608,6 +608,29 @@ a fake `StartRefreshVm`.
   helper, pulls, lands in the job's own store, and is absent from
   `images/<repoKey>`. With the helper renamed away, the pull fails naming it
   and the config key.
+- [ ] A pull by index digest, then a lookup by that reference in the VM
+  (§5.3 "Digest references"). *Verified live (WP-D fix pass, WP-B's helper
+  and test guest, dockerd 29.5.3 overlay2):* the classic store finds the
+  loaded image only by `sha256:<config>`; `name@<digest>` answers 404 for
+  inspect and create. The filter's rewrite is WP-C's, and its e2e check is
+  the integration stage's.
+
+**Still open after WP-D, and whose they are** (WP-D ran the rest; its report
+has the evidence):
+
+- *Owner:* build and push the zstd image to the owner's GHCR (public), and
+  record `test/fixtures/zstd-image.json`. WP-D did not publish under the
+  owner's account. A zstd image served by the mock registry was pulled by the
+  real puller and ran in a real guest.
+- *Owner, at the machine:* the positive half of the private-GHCR check, which
+  reads the keychain through `docker-credential-osxkeychain` and can raise a
+  keychain dialog. The negative half (helper renamed away) passed live.
+- *Integration:* re-run the live checks (`vm-build/wp-d/live.mjs` and
+  `vm-build/wp-d-fix/live-digest.mjs`) on WP-A's `vzrun` and product guest;
+  they ran on WP-B's helper and test guest.
+- *Integration, before merge:* the full unit suite on both CI legs. The
+  in-job self-hosted leg (openssl, 127.0.0.1 binds, `/bin/cp -c` under the
+  job profile) has been reasoned about, not observed.
 
 ---
 

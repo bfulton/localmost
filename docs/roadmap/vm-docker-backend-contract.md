@@ -655,7 +655,7 @@ check.
 | `src/main/docker/puller/image-store.ts` | new | The per-repository blob store and `refs.json`. |
 | `src/main/docker/puller/docker-archive.ts` | new | The `docker save`-shaped tar stream for `POST /images/load`. |
 | `src/main/docker/puller/image-puller.ts` | new | `ImagePuller` (§6.4). |
-| `src/main/docker/registry-auth.ts` | changed | Adds `resolveRegistryCredentials(registry): Promise<RegistryCredentials \| undefined>` for the puller, where `RegistryCredentials` is `{ kind: 'basic', username, password }` or `{ kind: 'identity-token', token }`. The sync `resolveRegistryAuth` (the X-Registry-Auth header `DesktopBackend`'s filter attaches) keeps its behaviour so `index.ts` compiles unchanged; WP-E deletes it with its wiring and its tests. The new function is async. It looks helpers up only in `/opt/homebrew/bin`, `/usr/local/bin` and `/Applications/Docker.app/Contents/Resources/bin`, never `PATH`, and runs them with async `execFile` (10 s timeout). Throws `RegistryAuthError` when a configured helper is missing or fails other than "not found", with the design's message naming the helper and the config key (`credsStore` or `credHelpers.<registry>`). |
+| `src/main/docker/registry-auth.ts` | changed | Adds `resolveRegistryCredentials(registry): Promise<RegistryCredentials \| undefined>` for the puller, where `RegistryCredentials` is `{ kind: 'basic', username, password }` or `{ kind: 'identity-token', token }`. The sync `resolveRegistryAuth` (the X-Registry-Auth header `DesktopBackend`'s filter attaches) keeps its behaviour so `index.ts` compiles unchanged; WP-E deletes it with its wiring and its tests. The new function is async. It looks helpers up only in `/opt/homebrew/bin`, `/usr/local/bin` and `/Applications/Docker.app/Contents/Resources/bin`, never `PATH`, and runs them with async `execFile` (10 s timeout). Throws `RegistryAuthError` when a configured helper is missing or fails other than "not found", with the design's message naming the helper and the config key (`credsStore` or `credHelpers.<registry>`) and how the helper ended (exit status, signal, timeout, or an answer over 64 KiB). What the helper printed never goes into that error, which reaches the job's log: it goes, cleaned, to the `log` option, and `index.ts` passes `resolveRegistryCredentials(r, { log: (m) => logger.warn(m) })`. |
 | `src/main/docker/docker-filter-proxy.ts` | changed | §5.3. |
 | `src/main/docker/docker-evaluator.ts` | changed | Parses and normalises bind destinations from `Binds` and `Mounts` (§3.7 "Bind matching"; today `MountRequest` has only `source` and `mode`), refuses a relative or duplicate destination, and returns `approvedBinds` on an allowed create. |
 | `src/shared/docker-policy.ts` | changed | `UNFILTERED_EGRESS` becomes `PROXIED_EGRESS` = `egress through this job's proxy, subject to its network allowlist`. `hasDockerGrants(policy)` is exported. The approval text for `pull.registries` adds `and fetching from wherever that registry redirects (any public https host)`. The `privileged: true` refusal no longer says "this build does not have a managed VM backend"; it says `privileged containers are not granted: they reach the Docker VM's kernel`. |
@@ -736,6 +736,13 @@ export interface WorkerDocker {
   /** The synthesised answers of §5.3 "Baseline". */
   baseline(path: '/_ping' | '/version' | '/info'): { status: number; headers: Record<string, string>; body: unknown };
   pull(req: PullRequest, onProgress: (p: DockerProgress) => void, signal: AbortSignal): Promise<void>;
+  /**
+   * The image id (`sha256:<config digest>`) a pull by digest in this job
+   * resolved `<registry>/<repositoryPath>@<digest>` to, or undefined. The
+   * VM's classic image store cannot find a loaded image by a digest
+   * reference (§6.4 step 5), so the filter looks it up here. (Added by WP-D.)
+   */
+  imageForDigest(req: PullRequest): string | undefined;
   approveBinds(containerId: string, binds: ApprovedBind[]): Promise<void>;
   /** HTTP(S)_PROXY, http(s)_proxy and NO_PROXY for routable containers and builds; {} when no VM. */
   containerProxyEnv(): Record<string, string>;
@@ -865,7 +872,25 @@ builds) with loading disabled, and adds a root for each `modprobe` failure in
   forwarded. The filter answers `200 application/json` and streams
   `worker.pull()` progress, one JSON object per line. A failure after the
   headers is sent as `{"errorDetail":{"message":…},"error":…}`. A job's own
-  `X-Registry-Auth` header is dropped.
+  `X-Registry-Auth` header is dropped. For a pull by digest, the worker
+  records the `configDigest` the puller returned under the request's
+  `<registry>/<repositoryPath>@<digest>` (normalized as the puller does:
+  registry lowercased, `library/` for a single-name Docker Hub image; a
+  `name:tag@digest` reference is keyed by its digest, as Docker does), and
+  `worker.imageForDigest()` answers it for the rest of the job.
+- **Digest references.** The guest's classic image store finds a loaded
+  image by a tag or by its id, never by `name@sha256:…`: the load cannot
+  record a repo digest, only a registry pull can (verified live on dockerd
+  29.5.3, overlay2: after the puller's load, inspect and create of
+  `name@<index digest>` and of `name@<manifest digest>` answer 404, and
+  `sha256:<config digest>` works). So, after the policy check on the
+  reference as the job wrote it, the filter rewrites a digest reference that
+  `worker.imageForDigest()` knows to that image id: the create's `Image`,
+  and the name in `GET /images/{name}/json`. One it does not know is
+  forwarded as it is and gets dockerd's 404, which makes the CLI pull (`docker
+  run`), after which it is known. A classic build's `FROM name@sha256:…`
+  cannot be rewritten (the filter does not read the Dockerfile) and fails
+  even after a pull; `FROM name:tag` after a `docker pull` works.
 - **Create.** On an allowed create:
   1. If the network is routable (the default bridge, `bridge`, or a network the
      job created with `internal: false`), merge `worker.containerProxyEnv()`
@@ -992,6 +1017,17 @@ job's `network.allow`; the approval text and `SECURITY.md` say so.
   `resolveRegistryCredentials` are sent only to a realm that passed, only in the
   token request, and never on a redirect of it.
 - The bearer token from the realm is sent only to the registry's origin.
+- Only a 401 from the registry's own origin, on the request itself (not a
+  redirect hop), is answered. A 401 from a redirect target fails the request
+  (`<host> (where the registry redirected) answered 401; localmost answers
+  only the registry's own challenge`), whatever challenge it carries, and no
+  credentials are sent anywhere.
+- Each request answers at most one challenge, so a token that expires during
+  a pull (Docker Hub's last 300 s) is renewed and the request retried once; a
+  second 401 is the answer.
+- `RegistryClientOptions.connectTo` and `ca` exist for the mock registry
+  only, and the client refuses them when `app.isPackaged`. Production passes
+  neither.
 
 **Foreign and non-distributable layers.** A descriptor with a `urls` field, or
 with media type `application/vnd.docker.image.rootfs.foreign.diff.tar.gzip`
@@ -1061,26 +1097,33 @@ where `ref` is `<registry>/<path>:<tag>` or `<registry>/<path>@<digest>`,
 the tar header of §6.4 step 4 states before the bytes. Every value read back
 from it is validated as above, and an entry with any malformed field is
 refused and left out. Reading a blob checks its digest again. A
-blob that fails is deleted, by its validated path, and fetched again. The
+blob that fails is deleted, by its validated path, and fetched again: a
+manifest or config within the same pull, and a layer (which fails as it is
+measured or as the archive of §6.4 step 4 streams) by running the fetch and
+load once more. The
 store and the golden disk share `cacheLimitGiB`. When they exceed it, the
 least recently pulled references are dropped at the next refresh: until the
 remaining references' blobs plus their estimate on the golden disk (each
 distinct uncompressed layer once) fit, then every blob no remaining reference
 holds is deleted, except blobs a pull in progress has pinned.
 
-**Which store.** When the operator's credentials were sent (to the token
-service, or to a registry that asked for basic auth), then once the manifest
-and config are resolved and before any layer is fetched, the puller asks the
-registry anonymously for the same manifest digest (a token exchange with no
-credentials, then a `HEAD`). Asking before the layers, not after, lets them
-stream straight into the store they belong to; the digest asked about is the
-same either way. A pull that sent no credentials is public without asking.
+**Which store.** When the pull's session holds the operator's credentials
+for the registry (sent yet or not: a manifest and config read from a store
+send nothing, and the layers would then be fetched with them), or when the
+index, manifest or config was read from the job's own store (which only a
+private image puts there), then once the manifest and config are resolved and
+before any layer is fetched, the puller asks the registry anonymously for the
+same manifest digest (a token exchange with no credentials, then a `HEAD`).
+Asking before the layers, not after, lets them stream straight into the store
+they belong to; the digest asked about is the same either way. A pull with
+neither fetched everything anonymously and is public without asking.
 If the registry serves it, the image is public:
 its blobs go to `<data>/vm/images/<repoKey>` and it becomes eligible for the
 golden disk. If not, its blobs go to `<data>/vm/jobs/<vmId>/blobs` and are
-deleted with the VM, and `notePulled` is not called. (This is option (a) of
-the design's owner decision 1; option (b) would key the store by policy hash
-instead.)
+deleted with the VM, it is not recorded in `refs.json` (which alone decides
+what a refresh loads, §6.5), and `notePulled` is not called. (This is option
+(a) of the design's owner decision 1, which the owner chose; option (b) would
+key the store by policy hash instead.)
 
 ### 6.4 `ImagePuller`
 
@@ -1100,9 +1143,10 @@ export interface ImagePuller {
 
 The steps:
 
-1. Resolve the tag with a manifest `HEAD`. If `Docker-Content-Digest`
-   (validated) equals the manifest digest `refs.json` holds for this tag and
-   platform, and that manifest is in the store (re-hashed on read), use it.
+1. Resolve the tag with a manifest `HEAD`. If either store holds a blob
+   with the digest `Docker-Content-Digest` (validated) names, re-hashed on
+   read, use it: the stores are content-addressed, so that blob is the
+   manifest (or index) the tag names now, and `refs.json` need not be asked.
    Otherwise `GET` the manifest (or the index, then the chosen platform's
    manifest) and hash the raw bytes (§6.3). Parse the config descriptor.
 2. `GET /images/sha256:<configDigest>/json` on the VM, with the answer capped
@@ -1114,19 +1158,34 @@ The steps:
 3. Fetch any blobs that are missing from the store (`source: 'registry'`, or
    `'store'` if all were present).
 4. `POST /images/load` a tar holding `oci-layout`, `index.json` (annotation
-   `io.containerd.image.name` = `<registry>/<path>@<manifestDigest>`),
+   `io.containerd.image.name` = `<registry>/<path>@<digest>`, the digest the
+   reference named or the tag resolved to: the index's for a multi-platform
+   image; the classic store ignores it, so it is a label only),
    `manifest.json` (`RepoTags: null`), `blobs/sha256/<config>`, an OCI
    manifest over the layers as the archive holds them (media type
    `application/vnd.oci.image.layer.v1.tar`, digest = diff_id), which the
    index names, and the *uncompressed* layer tars. The stream is
    deterministic (fixed order, mtime 0, owner 0), and each layer is checked
-   again as it streams (§6.3). *Verified:* a Mac-built archive of this shape
-   loaded, and the image id equalled the config digest.
-5. `POST /images/sha256:<configDigest>/tag?repo=<registry>/<path>&tag=<tag>`.
-6. For a public image only (§6.3 "Which store"): `cacheDisks.notePulled(repoKey, configDigest)`.
+   again as it streams (§6.3), and never past the size its tar header states.
+   *Verified:* a Mac-built archive of this shape loaded, and the image id
+   equalled the config digest.
+5. For a pull by tag, `POST /images/sha256:<configDigest>/tag?repo=<registry>/<path>&tag=<tag>`.
+   A pull by digest is left untagged: the classic store records a repo
+   digest only on a registry pull, so the image is found by its id alone,
+   and the filter maps the reference (§5.3 "Digest references").
+6. For a public image only (§6.3 "Which store"): record it in `refs.json`,
+   and `cacheDisks.notePulled(repoKey, configDigest)`, which is a hint.
 
 The load and tag answers are capped and schema-checked like every daemon
 answer (§5.3).
+
+Pulls run in Electron main, which every job shares, and each holds a
+decompressor (zstd's window can reach 128 MiB, libzstd's default limit, which
+is kept so that images compressed with large windows load), its manifests and
+its config in memory. So one VM runs at most three pulls at once and all VMs
+together eight; the rest wait their turn, and a cancelled wait gives up its
+place. A transfer that breaks and is retried gives back what it took from the
+pull and job budgets.
 
 ### 6.5 `CacheDisks`
 
@@ -1135,12 +1194,15 @@ answer (§5.3).
 export interface CacheDisks {
   /** A clone of the golden disk (clonefile), or a new sparse file when there is none. */
   prepareJobDisk(repoKey: string, dest: string, sizeGiB: number): Promise<'clone' | 'blank'>;
+  /** A hint, for the log: refs.json alone decides what a refresh loads. It gates nothing. */
   notePulled(repoKey: string, configDigest: string): void;
   /**
-   * Debounced 60 s, one at a time per repository, skipped on battery or memory
-   * pressure. `repository` (owner/name) is what StartRefreshVm is given; it must
-   * be the one `repoKey` was made from. (WP-D added it: a refresh VM's
-   * VmRequest needs the repository, which a repoKey cannot give back.)
+   * Debounced 60 s (and run at most 10 minutes after the first schedule),
+   * one at a time per repository, held back (rescheduled) while on battery or
+   * under memory pressure. `repository` (owner/name) is what StartRefreshVm is
+   * given; it must be the one `repoKey` was made from. (WP-D added it: a
+   * refresh VM's VmRequest needs the repository, which a repoKey cannot give
+   * back.)
    */
   scheduleRefresh(repoKey: string, repository: string): void;
   discard(repoKey: string, reason: 'corrupt' | 'dataFormat' | 'limit'): Promise<void>;
@@ -1169,15 +1231,18 @@ A refresh does four things:
 1. Choose incremental or full. It is **full** (a new blank `data.img.new`)
    when there is no golden disk, when `meta.json`'s `guestVersion` differs
    from the manifest's, when the golden disk was last built from blank more
-   than 7 days ago, when the previous refresh of this repository failed, or
-   when the cache limit dropped references (an ext4 image does not shrink).
-   Otherwise it is **incremental**: clone `data.img` to `data.img.new`. An
-   incremental refresh with nothing to load starts no VM.
+   than 7 days ago, when the previous refresh of this repository failed, when
+   the cache limit dropped references (an ext4 image does not shrink), or when
+   the golden disk's size is no longer `dataDiskGiB` (lowered, every job
+   would get a blank disk; raised, jobs would get the old size). Otherwise it
+   is **incremental**: clone `data.img` to `data.img.new`. An incremental
+   refresh with nothing to load starts no VM.
 2. Start a refresh-mode VM on it through `StartRefreshVm` (slot 0, the
    admission gate's lowest priority). Load, through `docker.sock`, every
    public reference in `refs.json` within the limit whose config digest is
    not already in `meta.json` (incremental), or every one (full), streaming
-   each archive from the store.
+   each archive from the store. An image counts as held only once the load
+   answer names no other id and an inspect by its id finds it.
 3. `DELETE` every image whose id is not a config digest from that list,
    remove every tag, and `shutdown`.
 4. On `stopped` with `synced: true`, rename `data.img.new` over `data.img` and
@@ -1185,6 +1250,16 @@ A refresh does four things:
    when it was last built from blank, the last refresh). On any failure,
    delete `data.img.new` and record the failure, so that the next refresh is
    full. A `discard` while a refresh runs means that refresh is not promoted.
+
+Every refresh runs under one deadline (30 minutes by default), passed to each
+daemon call and bounding each wait on the VM (`ready()`, the agent's
+`shutdown`, `stopped()`). At the deadline the VM is stopped and the refresh
+fails as above, so a refresh VM that stops answering cannot hold the
+repository's refreshes, its slot-0 VM or its pinned blobs. The concrete
+`CacheDisks` also has `shutdown()`, which `index.ts` awaits at quit: it
+cancels scheduled refreshes, refuses new ones, and ends a running one at once
+(recorded as failed). Its `settled(repoKey)` is for tests only: on battery it
+can wait indefinitely.
 
 `meta.json` is `{ "v": 1, dataFormat, guestVersion, configDigests,
 builtFromBlankAt, lastRefreshAt, lastRefreshFailed }`; one that does not
