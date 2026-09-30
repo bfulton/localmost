@@ -274,6 +274,9 @@ to `decisions.log` beside the cache. A repository with no policy is never held
 for approval — it gets the baseline, which grants nothing extra. So does a
 commit whose `.localmostrc` was deleted: it is not held, and it runs on the
 baseline rather than under the policy approved for the repository before. The
+policy is the file named `.localmostrc` at the repository's root and no other:
+a `.localmostrc.yml` or `.localmostrc.yaml` is not read, by the runner or by
+`localmost test`, so it grants nothing and is never held for approval. The
 approved policy is applied only to a commit the runner checked before spawning
 its worker and found carrying exactly that policy; a job at any other commit,
 or one approved away since the check, runs on the baseline.
@@ -754,7 +757,7 @@ Code signing is required for distribution to prevent tampering warnings and esta
 - "Developer ID Application" certificate for distribution outside App Store
 - "Developer ID Installer" certificate if distributing PKG installers
 
-**Entitlements**: The app and every helper are signed with the hardened runtime and only the exceptions Electron needs. The app, its main, GPU and renderer helpers and Squirrel's ShipIt carry `com.apple.security.cs.allow-jit` (`packaging/entitlements.plist`); the plugin helper carries `cs.allow-unsigned-executable-memory` and `cs.disable-library-validation`, as Chromium's does (`packaging/entitlements.plugin.plist`); the camera helper in Resources (`is-camera-on`, which only reads CoreMediaIO's is-running-somewhere property of each camera to pause during video calls) carries none (`packaging/entitlements.none.plist`). No device or personal information entitlement - camera, microphone, USB, Bluetooth, printing, location - and not the App Sandbox, under which the app could not run jobs under `sandbox-exec`. @electron/osx-sign reads entitlements only from `optionsForFile`; given none, it signs with its own defaults, which grant the device and location entitlements, and releases through 0.2.0 carried them.
+**Entitlements**: The app and every helper are signed with the hardened runtime and only the exceptions Electron needs. The app, its main, GPU and renderer helpers and Squirrel's ShipIt carry `com.apple.security.cs.allow-jit` (`packaging/entitlements.plist`); the plugin helper carries `cs.allow-unsigned-executable-memory` and `cs.disable-library-validation`, as Chromium's does (`packaging/entitlements.plugin.plist`); the camera helper in Resources (`is-camera-on`, which only reads CoreMediaIO's is-running-somewhere property of each camera to pause during video calls) carries none (`packaging/entitlements.none.plist`). No device or personal information entitlement - camera, microphone, USB, Bluetooth, printing, location - and not the App Sandbox, under which the app could not run jobs under `sandbox-exec`. @electron/osx-sign reads entitlements only from `optionsForFile`; given none, it signs with its own defaults, which grant the device and location entitlements, and releases through 0.2.0 carried them. The app's Info.plist declares no usage either: Electron's template says why it would use the camera, microphone, audio capture and Bluetooth, and a packager hook (`scripts/remove-usage-descriptions.js`, run just before signing) removes every `NS...UsageDescription` key from the app's and its helpers' Info.plist.
 
 **Forge config for signing and notarization:**
 ```js

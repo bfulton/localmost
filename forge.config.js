@@ -2,6 +2,7 @@ const { FusesPlugin } = require('@electron-forge/plugin-fuses');
 const { FuseV1Options, FuseVersion } = require('@electron/fuses');
 const { execSync } = require('child_process');
 const path = require('path');
+const { afterCopyExtraResources: removeUsageDescriptions } = require('./scripts/remove-usage-descriptions');
 
 // Detect signing identities from keychain
 function getSigningIdentities() {
@@ -89,6 +90,13 @@ const packagerConfig = {
     path.join(__dirname, 'packaging', 'app-update.yml'),
     CAMERA_HELPER,
   ],
+  // Electron's template declares camera, microphone, audio capture and
+  // Bluetooth usage the app has no entitlement for; extendInfo cannot remove
+  // a key, so this hook does. It is the last step before osx-sign, so the
+  // signature covers the edited Info.plist (see the script). Packager runs it
+  // only when extraResource above is set: without that list, it is skipped
+  // and the strings ship (src/main/packaging.test.ts checks both).
+  afterCopyExtraResources: [removeUsageDescriptions],
   // Only the built app code, package.json and LICENSE go in the bundle.
   // build/ also holds forge's own output, so allow only build/dist within it.
   ignore: [

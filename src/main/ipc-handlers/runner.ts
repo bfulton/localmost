@@ -33,7 +33,7 @@ import {
   SetupState,
 } from '../../shared/types';
 import { DEFAULT_RUNNER_COUNT, MAX_RUNNER_COUNT, MIN_JOB_HISTORY, MAX_JOB_HISTORY } from '../../shared/constants';
-import { isGitHubOwnerName, isGitHubRepoName, parseGitHubRepoUrl } from '../../shared/github-names';
+import { isGitHubLogin, isGitHubOwnerName, isGitHubRepoName, parseGitHubRepoUrl } from '../../shared/github-names';
 
 /**
  * A runner release number. It becomes the arc directory a download creates,
@@ -525,8 +525,11 @@ export const registerRunnerHandlers = (): void => {
 
   // Cancel a running job
   ipcMain.handle(IPC_CHANNELS.JOB_CANCEL, async (_event, owner: unknown, repo: unknown, runId: unknown) => {
-    // These become the path of a POST made with the user's token.
-    if (!isGitHubOwnerName(owner) || !isGitHubRepoName(repo) || !Number.isSafeInteger(runId) || (runId as number) <= 0) {
+    // These become the path of a POST made with the user's token. The owner
+    // is the one GitHub's job record named, so it is held to any login GitHub
+    // has issued - an older one can end in a hyphen - which still cannot
+    // carry a path; the stricter rule is for names typed in.
+    if (!isGitHubLogin(owner) || !isGitHubRepoName(repo) || !Number.isSafeInteger(runId) || (runId as number) <= 0) {
       return { success: false, error: 'Invalid workflow run' };
     }
     const logger = getLogger();

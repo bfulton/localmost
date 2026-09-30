@@ -509,12 +509,20 @@ describe('handleUpdateRc and what is at .localmostrc', () => {
   it('names the resolved file, not the path it was reached by', async () => {
     const via = path.join(root, 'via');
     fs.symlinkSync(cwd, via);
-    fs.writeFileSync(path.join(cwd, '.localmostrc.yml'), 'version: 1\n');
+    fs.writeFileSync(path.join(cwd, '.localmostrc'), 'version: 1\n');
 
     await handleUpdateRc(via, { name: 'CI' } as never, found, [], true);
 
-    expect(lines.join('\n')).toContain(`These will be added to ${path.join(cwd, '.localmostrc.yml')}:`);
-    expect(fs.readFileSync(path.join(cwd, '.localmostrc.yml'), 'utf-8')).toMatch(/github\.com/);
-    expect(fs.existsSync(path.join(cwd, '.localmostrc'))).toBe(false);
+    expect(lines.join('\n')).toContain(`These will be added to ${path.join(cwd, '.localmostrc')}:`);
+    expect(fs.readFileSync(path.join(cwd, '.localmostrc'), 'utf-8')).toMatch(/github\.com/);
+  });
+
+  it('writes .localmostrc, not a .localmostrc.yml the runner would never read', async () => {
+    fs.writeFileSync(path.join(cwd, '.localmostrc.yml'), 'version: 1\n');
+
+    await handleUpdateRc(cwd, { name: 'CI' } as never, found, [], true);
+
+    expect(fs.readFileSync(path.join(cwd, '.localmostrc'), 'utf-8')).toMatch(/github\.com/);
+    expect(fs.readFileSync(path.join(cwd, '.localmostrc.yml'), 'utf-8')).toBe('version: 1\n');
   });
 });

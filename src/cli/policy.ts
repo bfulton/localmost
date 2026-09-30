@@ -15,11 +15,13 @@ import * as path from 'path';
 import { DescribablePolicy, PolicyScope, describePolicy } from '../shared/policy-describe';
 import {
   findLocalmostrc,
+  LOCALMOSTRC_FILENAME,
   parseLocalmostrc,
   diffConfigs,
   formatPolicyDiff,
   LocalmostrcConfig,
   serializeLocalmostrc,
+  unreadLocalmostrcNote,
   writeLocalmostrc,
   LOCALMOSTRC_VERSION,
 } from '../shared/localmostrc';
@@ -50,6 +52,15 @@ const colors = {
 // =============================================================================
 
 /**
+ * With no .localmostrc found: say so if the checkout has a policy under a
+ * name localmost does not read, which would otherwise look ignored.
+ */
+function printUnreadNote(cwd: string): void {
+  const unread = unreadLocalmostrcNote(cwd);
+  if (unread) console.log(`${colors.yellow}${unread}${colors.reset}`);
+}
+
+/**
  * Show the current policy for a repository.
  */
 function handleShow(options: PolicyOptions): void {
@@ -58,6 +69,7 @@ function handleShow(options: PolicyOptions): void {
 
   if (!localmostrcPath) {
     console.log(`${colors.yellow}No .localmostrc found${colors.reset}`);
+    printUnreadNote(cwd);
     console.log();
     console.log('Create one with:');
     console.log('  localmost test --updaterc');
@@ -191,6 +203,7 @@ function handleDiff(): void {
 
   if (!localPath) {
     console.log('No .localmostrc found in current directory.');
+    printUnreadNote(cwd);
     return;
   }
 
@@ -252,6 +265,7 @@ function handleApprove(options: PolicyOptions): void {
   const localPath = findLocalmostrc(cwd);
   if (!localPath) {
     console.log('No .localmostrc found - there is nothing to approve.');
+    printUnreadNote(cwd);
     return;
   }
 
@@ -364,6 +378,7 @@ function handleValidate(): void {
 
   if (!localPath) {
     console.log(`${colors.red}\u2717${colors.reset} No .localmostrc found`);
+    printUnreadNote(cwd);
     process.exit(1);
   }
 
@@ -426,9 +441,8 @@ function handleInit(options: PolicyOptions): void {
     },
   };
 
-  // Replaced under the name it has: a new .localmostrc beside a .yml would
-  // take its place unseen, and leave the old file there reading as the policy.
-  const destination = existingPath ?? path.join(cwd, '.localmostrc');
+  const destination = path.join(cwd, LOCALMOSTRC_FILENAME);
+  if (!existingPath) printUnreadNote(cwd);
   writeLocalmostrc(destination, serializeLocalmostrc(template));
 
   console.log(

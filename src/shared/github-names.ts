@@ -8,9 +8,10 @@
  */
 
 /**
- * A user or organization login: letters, digits, `-` and `_`, beginning and
- * ending with a letter or digit. Inside, hyphens and underscores may run
- * together (`o--p`, `o_-p`): only the ends are held. Underscore is admitted
+ * A user or organization login as GitHub issues one today: letters, digits,
+ * `-` and `_`, beginning and ending with a letter or digit. Inside, hyphens
+ * and underscores may run together (`o--p`, `o_-p`), which GitHub itself
+ * refuses but which cannot carry a path either. Underscore is admitted
  * because a managed (EMU) user's login is `handle_shortcode` and can own
  * repositories.
  */

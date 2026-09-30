@@ -1,6 +1,10 @@
 import { admitJob, buildAdmissionDeps, checkRepoPolicyApproval, JobAdmissionDeps, PolicyApprovalDeps } from './job-admission';
 import type { GitHubJobInfo } from './broker-proxy-service';
 import type { PolicyDecision } from './policy-cache';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { findLocalmostrc, LOCALMOSTRC_FILENAME } from '../shared/localmostrc';
 
 describe('admitJob', () => {
   const target = { id: 't1', displayName: 'owner/repo' };
@@ -289,5 +293,65 @@ describe('checkRepoPolicyApproval', () => {
     expect(reason).toMatch(/different repository/);
     expect(reason).toContain('Settings > Job Security');
     expect(reason).not.toMatch(/has not been approved|policy approve/);
+  });
+
+  describe('which file is the policy', () => {
+    // A checkout holding one file of each name `localmost test` has read:
+    // the runner must take a policy from exactly the files the CLI does, or
+    // a workflow passes locally under grants its real jobs never get.
+    let checkout: string;
+
+    beforeEach(() => {
+      checkout = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'admission-rc-')));
+    });
+
+    afterEach(() => {
+      fs.rmSync(checkout, { recursive: true, force: true });
+    });
+
+    /** The policy the runner decides on for the checkout: the content it fetched, or null. */
+    async function fetched(): Promise<{ asked: string[]; content: string | null; reason: string | null }> {
+      const asked: string[] = [];
+      const d = {
+        ...deps({ action: 'allow', reason: 'no-policy' }),
+        // The contents API, answering from the checkout: null for no such file.
+        getFileContent: jest.fn(async (_token: string, _owner: string, _repo: string, filePath: string) => {
+          asked.push(filePath);
+          const file = path.join(checkout, filePath);
+          return fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : null;
+        }),
+      };
+      const reason = await checkRepoPolicyApproval(d, 'owner', 'repo', 'abc1234', 4242);
+      const content = d.decidePolicyForJob.mock.calls[0]?.[1] as string | null;
+      return { asked, content, reason };
+    }
+
+    it.each(['.localmostrc', '.localmostrc.yml', '.localmostrc.yaml'])(
+      'takes %s as the policy exactly when the CLI does',
+      async (name) => {
+        fs.writeFileSync(path.join(checkout, name), `version: 1 # ${name}\n`);
+
+        const cli = findLocalmostrc(checkout);
+        const runner = await fetched();
+
+        expect(runner.asked).toEqual([LOCALMOSTRC_FILENAME]);
+        expect(runner.content !== null).toBe(cli !== null);
+        if (cli !== null) {
+          expect(path.basename(cli)).toBe(LOCALMOSTRC_FILENAME);
+          expect(runner.content).toBe(fs.readFileSync(cli, 'utf-8'));
+        }
+      }
+    );
+
+    it('runs a job whose checkout has only a .localmostrc.yml on the baseline', async () => {
+      // As the docs say: no other name is a policy. Not held for approval,
+      // and nothing in the file is granted.
+      fs.writeFileSync(path.join(checkout, '.localmostrc.yml'), 'version: 1\nlevel: permissive\n');
+
+      const runner = await fetched();
+
+      expect(runner.content).toBeNull();
+      expect(runner.reason).toBeNull();
+    });
   });
 });
