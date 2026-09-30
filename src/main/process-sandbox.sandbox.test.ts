@@ -1,13 +1,15 @@
 /**
- * Integration coverage for the runner profile's filesystem floor, signals and
- * loopback at the seatbelt layer.
+ * Integration coverage for the runner profile's filesystem floor, signals,
+ * loopback and unix sockets at the seatbelt layer.
  *
  * The unit tests assert which rules the runner profile contains. They cannot
  * show that seatbelt accepts them - a rule the engine rejects fails every
  * worker spawn - or that a process under them is kept out of the shared temp
- * directories, the user's toolchain trees, the app's own data, other
- * processes and loopback services it was not granted, whatever spelling a
- * future rule takes. So two modes, as every *.sandbox.test.ts has:
+ * directories, the user's toolchain trees, the app's own data, the
+ * operator's own Docker, other processes and loopback services it was not
+ * granted, whatever spelling a future rule takes. So three modes, as every
+ * *.sandbox.test.ts has: off macOS, which has no seatbelt and asserts only
+ * that, and these two:
  *
  *   constructed  On an unsandboxed machine, build the runner profile and
  *                apply it with sandbox-exec. Tests both directions: what the
@@ -108,6 +110,57 @@ const swapCommand = (from: string, to: string): string =>
  */
 const sameModeCommand = (target: string): string =>
   `/usr/bin/perl -e ${sq('my $m = (stat $ARGV[0])[2] & 07777; chmod($m, $ARGV[0]) or die "$!\\n"')} ${sq(target)}`;
+
+/**
+ * Connect to a unix socket with nc under the profile at `profilePath`, from
+ * `cwd`. Asynchronous, so a socket this process serves can accept while the
+ * client waits; killed after 15 seconds should nothing close it.
+ */
+const connectUnder = (profilePath: string, socketPath: string, cwd: string) =>
+  new Promise<{ code: number | null; stdout: string }>((resolve) => {
+    const child = spawn('/usr/bin/sandbox-exec', ['-f', profilePath, '/usr/bin/nc', '-U', socketPath], {
+      cwd,
+      env: { PATH: '/usr/bin:/bin', HOME: homeDir },
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    let stdout = '';
+    child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString()));
+    const timer = setTimeout(() => child.kill('SIGKILL'), 15000);
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout });
+    });
+  });
+
+const closeServers = (servers: net.Server[]) =>
+  Promise.all(servers.map((server) => new Promise((resolve) => server.close(resolve))));
+
+/**
+ * Serve each of `socketPaths` with a listener that answers "hello" and
+ * counts, in `accepted`, the connections it takes. All or none: one that
+ * cannot listen closes the others and fails the caller.
+ */
+const serveSockets = async (socketPaths: string[], accepted: Map<string, number>): Promise<net.Server[]> => {
+  const settled = await Promise.allSettled(
+    socketPaths.map((socketPath) => {
+      const server = net.createServer((socket) => {
+        accepted.set(socketPath, (accepted.get(socketPath) ?? 0) + 1);
+        socket.end('hello\n');
+      });
+      return new Promise<net.Server>((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(socketPath, () => resolve(server));
+      });
+    })
+  );
+  const listening = settled.flatMap((s) => (s.status === 'fulfilled' ? [s.value] : []));
+  const failed = settled.find((s): s is PromiseRejectedResult => s.status === 'rejected');
+  if (failed) {
+    await closeServers(listening);
+    throw failed.reason;
+  }
+  return listening;
+};
 
 /** The case variant of a path's last component, on the case-insensitive volume. */
 const upperBase = (p: string): string => path.join(path.dirname(p), path.basename(p).toUpperCase());
@@ -1125,31 +1178,9 @@ if (!isMacOS) {
       const ownSocket = path.join(sandbox, 's.sock');
       fs.mkdirSync(path.dirname(vmSocket), { recursive: true });
       const accepted = new Map<string, number>();
-      const servers = [vmSocket, ownSocket].map((socketPath) => {
-        const server = net.createServer((socket) => {
-          accepted.set(socketPath, (accepted.get(socketPath) ?? 0) + 1);
-          socket.end('hello\n');
-        });
-        return new Promise<net.Server>((resolve, reject) => {
-          server.once('error', reject);
-          server.listen(socketPath, () => resolve(server));
-        });
-      });
-      const settled = await Promise.allSettled(servers);
-      const listening = settled.flatMap((s) => (s.status === 'fulfilled' ? [s.value] : []));
+      const listening = await serveSockets([vmSocket, ownSocket], accepted);
       try {
-        expect(listening).toHaveLength(2);
-        const connect = (socketPath: string) =>
-          new Promise<{ code: number | null; stdout: string }>((resolve) => {
-            const child = spawn('/usr/bin/sandbox-exec', ['-f', profilePath, '/usr/bin/nc', '-U', socketPath], {
-              cwd: sandbox,
-              env: { PATH: '/usr/bin:/bin', HOME: homeDir },
-              stdio: ['ignore', 'pipe', 'ignore'],
-            });
-            let stdout = '';
-            child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString()));
-            child.on('close', (code) => resolve({ code, stdout }));
-          });
+        const connect = (socketPath: string) => connectUnder(profilePath, socketPath, sandbox);
         const toVm = await connect(vmSocket);
         expect(toVm.code).not.toBe(0);
         expect(toVm.stdout).toBe('');
@@ -1158,8 +1189,116 @@ if (!isMacOS) {
         expect((await connect(ownSocket)).stdout).toBe('hello\n');
         expect(accepted.get(ownSocket)).toBe(1);
       } finally {
-        await Promise.all(listening.map((server) => new Promise((resolve) => server.close(resolve))));
+        await closeServers(listening);
       }
+    });
+  });
+
+  describe("the operator's own Docker through a constructed seatbelt profile", () => {
+    // Docker Desktop, where the operator still runs it: its socket at
+    // ~/.docker/run/docker.sock, linked from /var/run/docker.sock, and the
+    // registry credentials in ~/.docker/config.json. No job uses either. A
+    // job that connected to the socket would bypass the filter in full, and
+    // one that read config.json would hold the credentials that pulls made on
+    // the Mac keep from it (S6). A stand-in home holds a listening socket and
+    // a config.json of its own, and a link to the socket stands in for
+    // /var/run/docker.sock. Its name is short so the socket's path fits.
+    let root: string;
+    let home: string;
+    let sandbox: string;
+    let desktopSocket: string;
+    let desktopLink: string;
+    let config: string;
+    let served: string;
+    let servers: net.Server[] = [];
+    const accepted = new Map<string, number>();
+
+    beforeAll(async () => {
+      root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'h')));
+      home = path.join(root, 'u');
+      sandbox = path.join(root, 's');
+      desktopSocket = path.join(home, '.docker', 'run', 'docker.sock');
+      desktopLink = path.join(root, 'docker.sock');
+      config = path.join(home, '.docker', 'config.json');
+      // Where the runner serves a worker its filtering socket: its sandbox.
+      served = path.join(sandbox, 'docker.sock');
+      fs.mkdirSync(path.dirname(desktopSocket), { recursive: true });
+      fs.mkdirSync(path.join(sandbox, '_temp'), { recursive: true });
+      fs.mkdirSync(path.join(sandbox, '_work'));
+      fs.writeFileSync(config, '{"auths":{"https://index.docker.io/v1/":{"auth":"SECRET-docker"}}}');
+      fs.symlinkSync(desktopSocket, desktopLink);
+      servers = await serveSockets([desktopSocket, served], accepted);
+    });
+
+    afterAll(async () => {
+      await closeServers(servers);
+      fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    /** Write the runner profile built from `options`, the stand-in its home, and return its path. */
+    const profileFor = (options: Omit<RunnerProfileOptions, 'instanceDir'>): string => {
+      jest.mocked(os.homedir).mockReturnValue(home);
+      let profile: string;
+      try {
+        profile = generateSandboxProfile({ instanceDir: sandbox, ...options });
+      } finally {
+        jest.mocked(os.homedir).mockImplementation(realHomedir);
+      }
+      const profilePath = path.join(root, `${probeName()}.sb`);
+      fs.writeFileSync(profilePath, profile);
+      return profilePath;
+    };
+
+    // A worker given no docker at all, and what every worker is given now,
+    // whatever its docker policy: its filtering socket and the VM's share.
+    // The second policy also reads and writes the whole home directory, the
+    // widest grant a policy can make, so what stays closed is the floor's.
+    const profiles: Array<[string, () => string]> = [
+      ['given nothing', () => profileFor({})],
+      [
+        'given its docker socket, its share and the whole home directory',
+        () =>
+          profileFor({
+            dockerSocket: served,
+            shareDir: path.join(sandbox, '_work'),
+            filesystemPolicy: { level: 'strict', read: ['~'], write: ['~'] },
+          }),
+      ],
+    ];
+
+    it.each(profiles)(
+      "reaches a socket in its own sandbox, and neither Docker's socket nor the link to it, %s",
+      async (_name, build) => {
+        const profilePath = build();
+        accepted.clear();
+        // The same client, the same kind of socket, in the job's own sandbox:
+        // what makes each refusal below the profile's.
+        expect((await connectUnder(profilePath, served, sandbox)).stdout).toBe('hello\n');
+        expect(accepted.get(served)).toBe(1);
+        for (const socketPath of [desktopSocket, desktopLink]) {
+          const result = await connectUnder(profilePath, socketPath, sandbox);
+          expect([socketPath, result.code === 0, result.stdout]).toEqual([socketPath, false, '']);
+        }
+        expect(accepted.get(desktopSocket)).toBeUndefined();
+      }
+    );
+
+    it.each(profiles)('can neither read ~/.docker/config.json nor give it another name, %s', (_name, build) => {
+      const env = { PATH: '/usr/bin:/bin', HOME: home, TMPDIR: path.join(sandbox, '_temp') };
+      const run = (command: string) => shell(command, build(), env);
+      const result = run(`/bin/cat ${sq(config)}`);
+      expect(result.stdout).not.toContain('SECRET');
+      expect(result.ok).toBe(false);
+      expect(result.stderr).toContain('Operation not permitted');
+      // A copy or a move would give it a name the deny does not cover.
+      for (const verb of ['/bin/cp', '/bin/mv', '/bin/ln']) {
+        const renamed = path.join(sandbox, '_temp', 'config.json');
+        const moved = run(`${verb} ${sq(config)} ${sq(renamed)}`);
+        const planted = fs.existsSync(renamed);
+        fs.rmSync(renamed, { force: true });
+        expect([verb, moved.ok, planted]).toEqual([verb, false, false]);
+      }
+      expect(fs.readFileSync(config, 'utf-8')).toContain('SECRET-docker');
     });
   });
 } else {
@@ -1346,6 +1485,49 @@ if (!isMacOS) {
       const result = shell(`/usr/bin/nc -U ${sq(cliSocket)} < /dev/null`);
       expect(result.ok).toBe(false);
       expect(refused(`ls ${sq(path.join(data, 'vm'))}`) || !fs.existsSync(path.join(data, 'vm'))).toBe(true);
+    });
+  });
+
+  describe("the operator's own Docker through the ambient seatbelt profile", () => {
+    // The real paths, on the machine this job runs on: Docker Desktop's
+    // socket and the link to it, and its registry credentials. Whether they
+    // are there or not, this job must reach none of them; the socket the
+    // runner serves it is the positive case that gives that meaning.
+    const dockerHost = process.env.DOCKER_HOST;
+    const servedSocket = dockerHost?.startsWith('unix://') ? dockerHost.slice('unix://'.length) : undefined;
+    const desktopSockets = ['/var/run/docker.sock', path.join(homeDir, '.docker', 'run', 'docker.sock')];
+
+    /**
+     * What a connect from this process, under the job's profile, comes to:
+     * 'connected', or the error's code. Any listener counts, so a bypass
+     * shows whatever serves the socket.
+     */
+    const connectFromHere = (socketPath: string) =>
+      new Promise<string>((resolve) => {
+        const socket = net.connect(socketPath);
+        socket.once('connect', () => {
+          socket.destroy();
+          resolve('connected');
+        });
+        socket.once('error', (err: NodeJS.ErrnoException) => resolve(err.code ?? err.message));
+      });
+
+    it("is pointed at the socket the runner serves it, not Docker's own", () => {
+      expect(servedSocket).toBeDefined();
+      expect(desktopSockets).not.toContain(servedSocket);
+    });
+
+    it("connects to the served socket, and to neither of Docker's own", async () => {
+      expect(await connectFromHere(servedSocket ?? '')).toBe('connected');
+      for (const socketPath of desktopSockets) {
+        expect([socketPath, await connectFromHere(socketPath)]).not.toEqual([socketPath, 'connected']);
+      }
+    });
+
+    it('cannot read ~/.docker/config.json', () => {
+      const result = shell(`/bin/cat ${sq(path.join(homeDir, '.docker', 'config.json'))}`);
+      expect(result.ok).toBe(false);
+      expect(result.stdout).toBe('');
     });
   });
 }
