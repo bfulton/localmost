@@ -19,7 +19,7 @@ spike on 2026-09-30 ran it. Everything else is specified here, not yet tested.
 | `vmId` | `^(?:0\|[1-9][0-9]?)-[0-9a-f]{12}$` | `VmManager` (`<slot>-<randomBytes(6) hex>`) | One VM. It is never reused. A refresh VM has no worker and uses slot `0` (`0-<12 hex>`). No leading zero, so nothing but `0-` reads as the refresh slot. |
 | digest | `^sha256:[0-9a-f]{64}$` | a registry, or the VM | Every digest from outside Electron is checked against this before any use (§6.3). |
 | `repoKey` | `^[0-9a-f]{16}$` | `repoKeyOf(repository)`: first 16 hex of `sha256(lowercase("owner/name"))` | Per-repository store and cache. |
-| `<data>` | absolute | `getAppDataDir()` | Normally `~/.localmost`. |
+| `<data>` | absolute | `getAppDataDir()` | Normally `~/.localmost`. Its real path must lie under `/Users`, `/Volumes` or `/private`, the guest's share mount roots (§3.4 step 3); for any other, `VmManager` refuses the VM before the helper runs, with a message that names the path. The e2e launcher's `LOCALMOST_CONFIG_DIR` under `os.tmpdir()` resolves under `/private/var/folders`, which is covered. |
 | `<resources>` | absolute | `process.resourcesPath`, or the checkout's `build/` in development | Where the guest is found (`<resources>/guest`). Electron's app path is the checkout under `electron .` but `build/dist` under `electron build/dist/main.js` (the e2e launch); `getVmResourcesDir()` gives the same `build/` for both. |
 | `<helper>` | absolute | `helperPath()` in `vm/paths.ts` | `<resources>/localmost-vm` when packaged; `build/localmost-vm` in development (`build:helper` copies it there). The one path used by the spawn, the helper profile and the sweep. |
 | `<docker-cli>` | absolute | `dockerCliPath()` in `vm/paths.ts` | `<resources>/docker-cli/docker`; `build/docker-cli/docker` in development. |
@@ -241,6 +241,11 @@ peer CID is 2 (the host), and close any other at once. Without
 after boot) no other peer exists, but the check keeps a guest process from
 reaching unfiltered `dockerd` or `approve-binds` if one ever did.
 
+`lm-agent` also keeps 2375 closed until `configure` has run every step and
+the self-test has passed: before that, and for good after a `configure` that
+failed, it closes each connection at once. A `dockerd` behind a firewall that
+failed never answers the host, whatever the host does next.
+
 Port 3128 on the host is reachable by all code in the VM, including guest
 root (R8). It grants nothing without the job's proxy token.
 
@@ -262,7 +267,13 @@ root (R8). It grants nothing without the job's proxy token.
      could load any module. Anything that needs a module later (Docker loads
      some on demand) must be in the §5.2 allowlist; WP-A's acceptance runs
      every Docker feature the filter permits with loading disabled.
-   - Mount the data disk (§3.5), bring up `lo`, and start `lm-agent`. If the
+   - After loading is disabled, `/sbin/modprobe` is a link to `lm-init`. It
+     loads nothing: it succeeds for a module that is loaded or built in, and
+     otherwise fails and writes `localmost: module request "<name>" (<module>)
+     refused: …` to the kernel log, so a missing allowlist entry shows in
+     `dmesg` (§5.2).
+   - Bring up `lo` and start `lm-agent`. (The agent mounts the data disk, in
+     `configure` step 2; §3.5.) If the
      agent exits, for any reason, `lm-init` syncs and powers off. It never
      restarts it: the agent's state (bind approvals, the relay, the
      `configure` result, the `dockerd` it started) cannot be rebuilt, and
@@ -276,11 +287,15 @@ root (R8). It grants nothing without the job's proxy token.
 
 ```
 /sbin/lm-init
+/sbin/modprobe -> lm-init                loads nothing after boot; logs each refused request (§3.2)
+/etc/localmost/modules                   the module load order the build wrote (§5.2)
+/etc/localmost/release.json              guestVersion, agentProtocol, dataFormat and the Alpine release, for hello
+/Users  /Volumes  /private               empty: the share's mount roots (§3.4 step 3)
 /usr/libexec/localmost/lm-agent
 /usr/libexec/localmost/lm-bindpin
 /usr/libexec/localmost/runc              the real runc (Alpine runc package, moved)
 /usr/bin/runc                            lm-runc, the wrapper
-/usr/libexec/localmost/x86_64-selftest   static x86-64 busybox (Alpine x86_64 busybox-static), for the Rosetta self-test
+/usr/libexec/localmost/x86_64/busybox    static x86-64 busybox (Alpine x86_64 busybox-static), for the Rosetta self-test (named busybox so the multiplexer runs the applet: binfmt CF does not preserve argv0)
 /etc/docker/daemon.json                  below
 /etc/resolv.conf                         "nameserver 198.18.0.1"
 /var/run -> ../run
@@ -342,28 +357,41 @@ code:
    `disk: corrupt` with `ok: false` and code `E_DISK`. Mount it on
    `/var/lib/docker`.
 3. Share (job mode). `mountPath` must be absolute and normalised (no `.`, `..`,
-   `//` or NUL), at most 1024 bytes, and its top-level component must not exist
-   in the root (`E_SHARE_PATH`). Mount a tmpfs on `/<top>`, `mkdir -p`, then
+   `//` or NUL), at most 1024 bytes, and its top-level component must be one of
+   the guest root's mount roots — `Users`, `Volumes` or `private`, the empty
+   directories the read-only root ships for this — or `E_SHARE_PATH`. (The
+   root is read-only, so a tmpfs can only cover a directory it already has;
+   every other top-level name is refused, which also keeps the tmpfs from
+   hiding a directory the guest uses. `private` is where the Mac's temporary
+   directories resolve; the Linux root has no `/private` of its own.) Mount a tmpfs on `/<top>`, `mkdir -p`, then
    `mount("work", mountPath, "virtiofs", MS_NOSUID|MS_NODEV|MS_NOSYMFOLLOW)`
    (`E_SHARE_MOUNT`). Read `nonceFile` with `O_NOFOLLOW`, capped at 64 bytes.
 4. Rosetta (when `rosetta`). Mount virtiofs `rosetta` on `/run/rosetta`, mount
    `binfmt_misc`, and write this to `register`:
    `:rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/run/rosetta/rosetta:CF`.
-   Run `/usr/libexec/localmost/x86_64-selftest true`. The result is `ok` or
+   Run `/usr/libexec/localmost/x86_64/busybox true`. The result is `ok` or
    `broken`; with `rosetta: false` it is `absent`. This step never fails
    `configure`.
 5. Network (job mode). Create a dummy interface `lm0` with `198.18.0.1/32`,
    bring it up, and apply the rules in §3.6. Start the relay: TCP listen on
    `198.18.0.1:3128`, and for each connection dial vsock CID 2 port 3128 and copy
-   bytes both ways. Subscribe to Docker's network events once `dockerd` is up
-   (step 6) and keep `LOCALMOST-RELAY` in step with them (§3.6). In refresh
-   mode there is no `lm0` and no relay, but the rules still apply.
+   bytes both ways. Subscribe to Docker's network and container events once
+   `dockerd` is up (step 6): network events keep `LOCALMOST-RELAY` in step
+   (§3.6), and a container's `destroy` drops its bind approvals. In refresh
+   mode there is no `lm0` and no relay, but the rules still apply. A failure
+   here answers `E_SELFTEST` with no `selftest` field: the firewall cannot be
+   trusted either way, and Electron treats both alike.
 6. Start `dockerd --config-file /etc/docker/daemon.json`. Wait up to 30 s for
    `GET /_ping` on `/run/docker.sock` (`E_DOCKERD`, with the last 20 log lines,
    each at most 512 bytes). Electron strips control characters and ANSI
    escapes from these lines, and from every other string the guest supplies,
    before it logs them.
 7. Self-test (job mode, §3.6). Any `false` fails with `E_SELFTEST`.
+
+The agent holds approvals for at most 4096 containers at once (`E_BINDS`
+past that). A container's approvals are dropped when Docker destroys it, so
+the bound is on containers that exist; approvals of a container destroyed
+while the event stream was reconnecting stay until the VM stops.
 
 Guest-local op on `/run/localmost/agent.sock`, used only by `lm-bindpin`:
 `{"v":1,"id":1,"op":"binds-for","container":"<id>"}` answers
@@ -397,10 +425,16 @@ iptables -I INPUT 1 -j LOCALMOST-INPUT
 networks. It starts with `-A LOCALMOST-RELAY -i docker0 -j ACCEPT` (the
 default bridge). The agent follows Docker's network events: on `create` of a
 bridge network that is not `internal`, it appends `-i br-<first 12 of id>
--j ACCEPT`; on `destroy`, it deletes that rule. A packet that falls through
-`LOCALMOST-RELAY` returns to `LOCALMOST-INPUT` and is rejected. Until the
-event is handled, a new routable network cannot reach the relay, which fails
-closed.
+-j ACCEPT`; on `destroy`, it deletes that rule. On `create` it first deletes
+any rule another network left on the new network's bridge interface (a
+missed `destroy`), whether or not the new network is routable. Each time it
+subscribes to the event stream, the first time and after every reconnect, it
+rebuilds the chain from Docker's list of networks: `-F LOCALMOST-RELAY`, the
+`docker0` rule, then one rule per routable network. A packet that falls
+through `LOCALMOST-RELAY` returns to `LOCALMOST-INPUT` and is rejected. Until
+the event is handled, a new routable network cannot reach the relay, which
+fails closed. *Verified*, WP-A acceptance: a new network's rule appears and a
+container on it reaches the relay; after `network rm` the rule is gone.
 
 Why the interface match matters: the relay address is on `lm0`, and Linux
 accepts a packet for any local address on any interface (the weak-host
@@ -410,7 +444,15 @@ model). `NET_RAW` is in Docker's default capabilities, so a container on an
 alone would accept it. The backstop behind this rule is the proxy token,
 which is injected only into routable containers. The filter does not also
 drop `NET_RAW` for internal containers: the interface match is enough, and
-dropping it would break `ping` inside internal networks.
+dropping it would break `ping` inside internal networks. *Verified*, WP-A
+acceptance, from a real `internal` network: a TCP connect bound to `eth0`
+(`SO_BINDTODEVICE`, which `NET_RAW` allows; with no route Linux takes the
+relay address as on the link and the bridge answers its ARP) is reset, a
+hand-made SYN sent the same way gets a RST and never a SYN-ACK, and a
+`0.0.0.0` listener in the guest is refused from the gateway. `AF_PACKET` is
+not available at all (§5.2), and `AF_VSOCK` from a container fails with
+EPERM under Docker's default seccomp profile, so a container cannot dial the
+relay's vsock port around the firewall.
 
 REJECT, not DROP, so that a DNS lookup or a direct connection fails at once
 instead of timing out. *Verified:* with no listener on `198.18.0.1:53`,
@@ -469,9 +511,19 @@ listener on its gateway (R8). The spike did not test forged frames.
   fd's mount id with `statx(STATX_MNT_ID)`, and clears the flag with
   `mount_setattr(fd, "", AT_EMPTY_PATH, …)`, only after every mount has
   passed every check. Any error, including an agent that cannot be reached,
-  exits 1 when a share-backed mount is present. Its failure message on
-  stderr, which `runc` passes through to the job, is
-  `localmost: bind <source> -> <destination> was not approved for this container`.
+  exits 1 when a share-backed mount is present. In the mount table it
+  matches each share mount's root, mount point and per-mount `ro` flag
+  against the approvals, and it requires every approval that a
+  share-backed `config.json` mount matched to be one of those share mounts:
+  an approved source that `runc` resolved off the share is refused. Its
+  failure message on stderr, which `runc` passes through to the job, is
+  `localmost: bind <source> -> <destination> was not approved for this container`,
+  with ` (as mounted; …)` added when the mount table failed, or
+  `localmost: bind <source> -> <destination> is not a mount of the share (its source resolved elsewhere)`.
+  `dockerd` cuts the hook's stderr short in the error it returns, so a
+  client may see only the start of either message. The mount point is where
+  `runc` actually mounted: an image whose destination path goes through a
+  symlink (`/app -> /usr/src/app`) is refused, and the message says so.
   *Verified primitive:* `mount_setattr(…, {attr_clr: MOUNT_ATTR_NOSYMFOLLOW})`
   on a child bind of a `nosymfollow` virtiofs mount clears only that flag and
   keeps `ro,nosuid,nodev`.
@@ -490,7 +542,9 @@ in Go (the hook), with shared test vectors in
   refuses a relative destination. `dockerd` cleans destinations the same way
   (`/data/` becomes `/data`).
 - `readOnly`: in the evaluator, from the bind's `ro` mode or `Mounts[].ReadOnly`;
-  in `config.json`, true exactly when the mount's `options` contain `ro`.
+  in `config.json`, true when the mount's `options` contain `ro` or `rro`
+  (dockerd and runc write `rro`, recursive read-only, for a read-only bind on
+  this version; *verified*, WP-A).
 - One approval list per container. Each mount must match one approval; each
   approval may be used by at most one mount. The same source approved twice
   with different destinations or modes is two approvals, each matched on
@@ -529,14 +583,14 @@ localmost.app/Contents/Resources/guest/
   "agentProtocol": 1,
   "alpine": { "branch": "v3.24", "release": "3.24.2" },
   "kernel": { "package": "linux-virt-6.18.54-r0", "release": "6.18.54-0-virt" },
-  "docker": { "engine": "29.5.3", "apiVersion": "1.54", "minApiVersion": "1.24", "containerd": "2.3.6", "runc": "1.4.3" },
+  "docker": { "engine": "29.5.3", "apiVersion": "1.54", "minApiVersion": "1.40", "containerd": "2.3.6", "runc": "1.4.3" },
   "artifacts": {
     "vmlinux": { "sha256": "…", "size": 0 },
     "initramfs.cpio.gz": { "sha256": "…", "size": 0 },
     "rootfs.erofs": { "sha256": "…", "size": 0 }
   },
   "modules": ["virtiofs", "…"],
-  "packages": [{ "name": "…", "version": "…", "repo": "main", "sha256": "…", "license": "…" }],
+  "packages": [{ "name": "…", "version": "…", "arch": "aarch64", "repo": "main", "sha256": "…", "license": "…" }],
   "baseline": {
     "ServerVersion": "29.5.3", "OSType": "linux", "Architecture": "aarch64",
     "OperatingSystem": "localmost guest (Alpine Linux v3.24)", "KernelVersion": "6.18.54-0-virt",
@@ -544,6 +598,9 @@ localmost.app/Contents/Resources/guest/
   }
 }
 ```
+
+`packages[].arch` is `aarch64`, or `x86_64` for the static busybox of the
+Rosetta self-test.
 
 `baseline` is recorded by the build's smoke boot (§4.3, step 7) from the real
 daemon's `/info`, restricted to the filter's `/info` allowlist. The filter
@@ -630,7 +687,13 @@ check.
    mode. It checks `hello` and `configure`, and records `baseline` and `docker`
    from the daemon. With `--vsock-unix 1025:<path>` and `--vsock-unix
    2375:<path>`, `vzrun` exposes guest ports as unix sockets, like the helper
-   does. It is also the development harness for the guest.
+   does. It is also the development harness for the guest. Its copies
+   half-close: when one direction ends, the other side's write is shut down
+   and the other direction keeps going (a Docker client half-closes an
+   attach stream once its stdin is done, and the output must still arrive).
+   `npm run build:guest -- --write-fixture` then rewrites
+   `test/fixtures/vm-guest-daemon-answers.json` from these answers, the
+   filter test's recorded fixture; nothing else changes that file.
 8. Write `manifest.json` with the sha256 and size of each artifact, and write
    `LICENSES.md`.
 
@@ -796,17 +859,43 @@ export interface AgentClient {
 
 The roots are `virtiofs`, `vmw_vsock_virtio_transport`, `virtio_blk`,
 `virtio-rng`, `ext4`, `erofs`, `overlay`, `br_netfilter`, `veth`, `dummy`,
-`nf_tables`, `nft_compat`, `nft_chain_nat`, `xt_addrtype`, `xt_conntrack`,
-`xt_MASQUERADE`, `xt_nat`, `xt_mark`, `ipt_REJECT`, `iptable_filter`,
-`iptable_nat` and `binfmt_misc`. The build takes their closure through
+`nf_tables`, `nft_compat`, `nft_chain_nat`, `nft_nat`, `nft_masq`,
+`xt_addrtype`, `xt_conntrack`,
+`xt_MASQUERADE`, `xt_nat`, `xt_mark`, `xt_tcpudp`, `xt_set`,
+`ip_set_hash_net`, `nf_conntrack_netlink`, `ipt_REJECT`, `iptable_filter`,
+`iptable_nat` and `binfmt_misc`. Added by WP-A, each from a refused request
+in `dmesg`:
+
+- `nft_nat` and `nft_masq`: `nft_chain_nat` alone did not carry the
+  iptables-nft DNAT/MASQUERADE rules Docker's networks set up.
+- `xt_tcpudp` (`ipt_tcp`, `ipt_udp`): `iptables` checks the `tcp` and `udp`
+  matches' revisions against the kernel. Without it, Docker's embedded DNS
+  failed on every user-defined network (`Resolver Start failed` for
+  `-t nat -I DOCKER_OUTPUT -d 127.0.0.11 -p udp --dport 53 -j DNAT …`), and
+  `iptables -S` warned `Extension tcp revision 0 not supported`.
+- `nf_conntrack_netlink` (`nfnetlink-subsys-1`): `dockerd` deletes a
+  container's conntrack entries when its address is released. Without it
+  that failed (`Failed to delete conntrack state`), and a stale entry could
+  let a later container with the same address match `LOCALMOST-INPUT`'s
+  `ESTABLISHED` rule.
+- `xt_set` (`ipt_set`) and `ip_set_hash_net`: Docker's bridge driver checks
+  for the `set` match and uses a `hash:net` set of its bridges.
+
+Three requests are refused by design, and are the only refusals WP-A's
+acceptance allows in `dmesg`: `net-pf-10` (IPv6 is off, `ipv6.disable=1`),
+`net-pf-17` (`af_packet`: raw packet sockets, which Docker's default
+`CAP_NET_RAW` would open to every container; `dockerd` wants them only to
+send unsolicited ARP when an address is reused, and logs a warning without)
+and `net-pf-16-proto-6` (`xfrm_user`: IPsec for encrypted overlay networks,
+which a single-host guest has none of). The build takes their closure through
 `modules.dep`, and `manifest.modules` records the final list. WP-A adds a root
 only when `dockerd` or `check-config.sh` shows it is needed. It is an
 allowlist. Because `lm-init` sets `kernel.modules_disabled=1` once these are
 loaded (§3.2), anything `dockerd` or `iptables` would load on demand must be
 in the list: WP-A's acceptance exercises every Docker feature the filter
 permits (bridge and internal networks, embedded DNS, published-port refusal,
-builds) with loading disabled, and adds a root for each `modprobe` failure in
-`dmesg`.
+builds) with loading disabled, reads `dmesg` afterwards, and fails on any
+refused request but the three above.
 
 ### 5.3 Filter changes (`DockerFilterProxy`)
 

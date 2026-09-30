@@ -3,8 +3,10 @@ module.exports = {
   rootDir: '..',
   preset: 'ts-jest',
   testEnvironment: 'node',
-  roots: ['<rootDir>/src'],
-  testMatch: ['**/*.test.ts', '**/*.test.tsx'],
+  // scripts/guest holds the guest image's build modules (CommonJS, run by
+  // plain node), tested here so that CI runs them with everything else.
+  roots: ['<rootDir>/src', '<rootDir>/scripts/guest'],
+  testMatch: ['**/*.test.ts', '**/*.test.tsx', '<rootDir>/scripts/guest/**/*.test.js'],
   moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx', 'json'],
   collectCoverageFrom: [
     'src/**/*.{ts,tsx}',

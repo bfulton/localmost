@@ -387,8 +387,12 @@ denies) and clause 4 (the helper's profile, and its checks) protect it.
    absolute path it has on the Mac. The filter pins each bind source to its
    host real path, and that path means the same thing to `dockerd` in the
    guest. The guest root is read-only, so the agent mounts a tmpfs over the
-   share path's top-level directory (normally `/Users`) first. It refuses a
-   top-level name that the guest root already has (`/usr`, `/var`, `/etc`, …).
+   share path's top-level directory first. That directory must be one of an
+   allowlist of empty mount roots the root ships: `/Users` (normally),
+   `/Volumes` (a home on another volume) and `/private` (the Mac's temporary
+   directories). Every other top-level name is refused, so the tmpfs never
+   hides a directory the guest uses (`/usr`, `/var`, `/etc`, …), and
+   `<data>` must lie under one of the three (contract §1).
 6. **Mount flags.** Tag `work`, `MS_NOSUID | MS_NODEV | MS_NOSYMFOLLOW`. With
    `nosymfollow`, no path lookup through the share follows a symlink. `runc`'s
    bind of a source that is a link, or passes through one, fails with ELOOP.
@@ -410,8 +414,12 @@ denies) and clause 4 (the helper's profile, and its checks) protect it.
    4. Enter the container's mount namespace (`setns` on `/proc/<pid>/ns/mnt`)
       and read `mountinfo`. Take every mount of the `work` virtiofs superblock,
       and record its **mount id** (the first `mountinfo` field). Each must be
-      one of the approved binds, matched by its root within the share and its
-      mount point under the container rootfs. Otherwise exit 1.
+      one of the approved binds, matched by its root within the share, its
+      mount point under the container rootfs and its read-only flag. And
+      every approval that step 3 matched must be one of these mounts: an
+      approved source that `runc` resolved off the share (a link swapped in
+      that `nosymfollow` somehow did not stop) is not a share mount at all,
+      and is refused. Otherwise exit 1.
    5. Open each matched mount by its mount id, never by a path lookup alone.
       The parent directories of a mount point lie in the container's rootfs and
       in approved binds, and the job on the Mac can change those binds while
@@ -458,8 +466,8 @@ experiment. "V-spike" means verified in this design's spike on 2026-09-30.
 
 | # | Claim | Rests on | Evidence |
 |---|---|---|---|
-| S1 | A job cannot give a container the user's home or any Mac path outside its own `_work` (G-A). | (a) The VM has exactly one read-write share, `_work`, created by localmost (R1). (b) Profile node denies make it unswappable (rule 3); job code may run before `Start()`, and until then (b) and (c) are the only layers. (c) The helper checks the share (not a link, not a mount point, same device as the sandbox), and its profile's `file-issue-extension` rule, scoped to `(subpath "<S>")`, lets VZ's service reach only that real path, so a swap resolved at `Start()` fails. (d) A rename after `Start()` fails closed. (e) Symlinks planted on the host resolve in the guest, never on the Mac. (f) The VZ XPC service is itself sandboxed to the shared paths. (g) The nonce tripwire detects a failure of both (b) and (c). | (a), (d), (e), (f): V (register §1). (c): V-spike, with the scoped `file-issue-extension` rule present. A share path swapped for a link outside the grant failed `Start()` with EPERM, and an ungranted directory was refused the same way. A review probe confirmed that without that rule the VM starts but the guest cannot read the share, so the EPERM comes from that rule. The mount-point check: Build, WP-B. (b), (g): Build, WP-C sandbox test. |
-| S2 | A container cannot reach guest `/`, the guest `docker.sock` or `/proc` by swapping a bind source (R2). | `nosymfollow` on the share, plus `lm-bindpin` clearing it only on approved binds. | V-spike on the shipped kernel (Alpine 6.18.54) with `dockerd` 29.5.3 and `runc` 1.4.3. `create` with a bind, swap the source for a link to `/`, `start` failed. A bind of a planted link to `/Users/...` failed. A child bind inherited `nosymfollow` (inner link: ELOOP). `mount_setattr` clearing only `NOSYMFOLLOW` restored inner links and kept `ro,nosuid,nodev`. The hook itself: Build, WP-A. |
+| S1 | A job cannot give a container the user's home or any Mac path outside its own `_work` (G-A). | (a) The VM has exactly one read-write share, `_work`, created by localmost (R1). (b) Profile node denies make it unswappable (rule 3); job code may run before `Start()`, and until then (b) and (c) are the only layers. (c) The helper checks the share (not a link, not a mount point, same device as the sandbox), and its profile's `file-issue-extension` rule, scoped to `(subpath "<S>")`, lets VZ's service reach only that real path, so a swap resolved at `Start()` fails. (d) A rename after `Start()` fails closed. (e) Symlinks planted on the host resolve in the guest, never on the Mac: Apple's virtiofs server does not follow a link on the Mac side, and this is the only layer when the guest still holds a directory's inode from before the swap (below). (f) The VZ XPC service is itself sandboxed to the shared paths. (g) The nonce tripwire detects a failure of both (b) and (c). | (a), (d), (e), (f): V (register §1). (e) again, V, WP-A acceptance: when the source directory is replaced by a link on the Mac after the guest last looked it up, the guest's virtiofs dentry is stale, `--mount` and a restart bind the old directory's inode, and the container starts. `mountinfo` shows the bind at the old root; the directory lists as empty and reading a file in it fails with ENOENT or ELOOP ("Symbolic link loop"). Neither `nosymfollow` nor `lm-bindpin` sees a link here (the guest never resolves one), so what stops the link's target being served is the Mac-side server, which resolves the stale inode by its path and refuses to follow the link. It is Apple's code, not localmost's, and a change in it would reopen this path; the acceptance checks it on every run. (c): V-spike, with the scoped `file-issue-extension` rule present. A share path swapped for a link outside the grant failed `Start()` with EPERM, and an ungranted directory was refused the same way. A review probe confirmed that without that rule the VM starts but the guest cannot read the share, so the EPERM comes from that rule. The mount-point check: Build, WP-B. (b), (g): Build, WP-C sandbox test. |
+| S2 | A container cannot reach guest `/`, the guest `docker.sock` or `/proc` by swapping a bind source (R2). | `nosymfollow` on the share, plus `lm-bindpin`, which clears it only on approved binds and refuses an approved bind that is not a share mount. When the swap is made on the Mac after the guest looked the source up, a third layer is what holds: see S1(e). | V-spike on the shipped kernel (Alpine 6.18.54) with `dockerd` 29.5.3 and `runc` 1.4.3. `create` with a bind, swap the source for a link to `/`, `start` failed. A bind of a planted link to `/Users/...` failed. A child bind inherited `nosymfollow` (inner link: ELOOP). `mount_setattr` clearing only `NOSYMFOLLOW` restored inner links and kept `ro,nosuid,nodev`. V, WP-A acceptance, for links to `/`, `/run` and `/var/lib/docker` each: `-v` then swap, and a container that plants the link through an rw bind and restarts, never start: dockerd's `stat` hits ELOOP under `nosymfollow`, and its `mkdir` of the source then fails EEXIST. `--mount` then swap, and start then swap then restart, do start, on a stale mount (see S1(e)). With `nosymfollow` removed from the share on purpose, `lm-bindpin` refused the ones that never start (a link to `/` because `/` carries the share as a submount; `/run` and `/var/lib/docker` because they are not share mounts). Without both, `/run` and `/var/lib/docker` reached the container, which the acceptance's G-A checks detect. |
 | S3 | Containers of different jobs cannot reach each other, and a job cannot join another job's network. | Separate VMs. No NIC. vsock has no guest-to-guest path. Network names exist only inside one VM. | vsock CID 3 gives ENODEV (R7, V). Live cross-job test: Build, integration stage. |
 | S4 | Container egress goes only through the job's proxy, under the job's policy. | No NIC. The relay goes only to that worker's `ProxyServer`, which checks the per-worker token. The guest firewall rejects everything else sent to the guest root namespace from bridges. | No route and no DNS without a NIC (R7, V). V-spike: a default-bridge container reached a listener on `198.18.0.1:3128`. An `internal` network container got "Network unreachable". Relay end to end: Build, WP-A with WP-B. |
 | S5 | An `internal` network container reaches nothing outside its network. | No default route. The guest's INPUT chain accepts the relay address only from the bridges of routable networks, which the agent tracks from Docker's network events, and rejects everything else. A container can forge the route away: `NET_RAW` is in Docker's default capabilities, so it can send a frame to its gateway's MAC addressed to `198.18.0.1`, and Linux's weak-host model would deliver it to `lm0`. The interface match is what stops that. The backstop is the proxy token, which is injected only into routable containers. | V-spike: no route to the relay, and it *did* reach a `0.0.0.0` listener on its gateway (R8 confirmed). The spike tested routing only, not forged frames. The interface-scoped rule and the forged-route probe: Build, WP-A self-test and live test 6. |
@@ -786,18 +794,19 @@ packages pinned in the contract:
   spike machine.
 - The pinned static `docker` CLI (29.8.1, macOS arm64) is a Mach-O that is
   linker-signed ad hoc. It will be re-signed with the app.
+- By WP-A's acceptance (`scripts/guest/acceptance.js`, the built guest under
+  `vzrun`, outside any job): `lm-bindpin` as a real hook, with its `setns`
+  from Go, the mount-id checks through `openat2`/`statx` and `mount_setattr`,
+  and against real `dockerd` and `runc` (S2); the firewall INPUT rules, the
+  relay chain following Docker's network events, a bound connect and a raw
+  SYN from a real internal network, and the self-test (S5); the relay both
+  ways through `vzrun`, including bytes delivered while a connection stays
+  open; and Docker's embedded DNS by name on a user-defined network. That
+  last one failed until `xt_tcpudp` was in the module allowlist (contract
+  §5.2): the spike's `Resolver Start failed` came from the missing `udp`
+  match, not from `xt_nat`.
 
 Not yet verified, and owned by work packages:
-
-- `lm-bindpin` as a real hook, including its `setns` from Go and the
-  mount-id checks through `openat2`/`statx`.
-- The firewall INPUT rules, the interface-scoped relay chain, a forged-route
-  probe from an internal network, and the self-test.
-- Docker's embedded DNS on user-defined networks. The spike's `dockerd` log
-  showed `Resolver Start failed … DNAT/SNAT rules failed` for the internal
-  network container, with no `xt_nat` loaded; the contract's module list
-  includes it. WP-A's acceptance checks that a container resolves another by
-  name.
 - Disks (the erofs root and the data disk) under the helper's profile.
 - The relay end to end through `ProxyServer`.
 - `docker load` of real registry images with gzip and zstd layers.
