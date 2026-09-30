@@ -224,22 +224,36 @@ if (!isMacOS) {
       expect(path.basename(path.dirname(path.dirname(sandbox)))).toBe('runner');
     });
 
-    it("cannot list or write the VM directories the helper's profile grants", () => {
-      const listing = shell(`/bin/ls ${sq(path.join(data, 'vm', 'jobs'))}`);
-      expect(listing.ok).toBe(false);
-      const write = shell(`/usr/bin/touch ${sq(path.join(data, 'vm', 'probe'))}`);
+    it("cannot list or write the app's data directory, where the helper's profile grants the VM directories", () => {
+      // <data>/vm is made at the first VM boot, and a denied path whose parent
+      // is missing fails with ENOENT, not EPERM. So the refusals that count
+      // are on what is certainly there while a job runs: <data> itself and
+      // runner/sandbox. <data>/vm is under the same deny, when it exists.
+      const probe = path.join(data, `localmost-probe-${process.pid}`);
+      const write = shell(`/usr/bin/touch ${sq(probe)}`);
+      fs.rmSync(probe, { force: true });
       expect(write.ok).toBe(false);
       expect(write.stderr).toContain('Operation not permitted');
+      const listing = shell(`/bin/ls ${sq(path.join(data, 'runner', 'sandbox'))}`);
+      expect(listing.ok).toBe(false);
+      expect(listing.stderr).toContain('Operation not permitted');
+      const vm = path.join(data, 'vm');
+      const vmListing = shell(`/bin/ls ${sq(vm)}`);
+      expect(vmListing.ok).toBe(false);
+      expect(vmListing.stderr.includes('Operation not permitted') || !fs.existsSync(vm)).toBe(true);
     });
 
     it('cannot run the helper, which carries the virtualization entitlement', () => {
-      // Found beside the bundled CLI, which the job's PATH starts with.
+      // Found beside the bundled CLI, which the job's PATH starts with. The
+      // job profile denies its exec by path; the constructed form of this is
+      // in process-sandbox.sandbox.test.ts, with a compiled stand-in. Until
+      // packaging ships the helper there is nothing at the path to refuse.
       const cliDir = (process.env.PATH ?? '').split(':')[0];
       expect(path.basename(cliDir)).toBe('docker-cli');
       const helper = path.join(path.dirname(cliDir), 'localmost-vm');
       const result = shell(`${sq(helper)} version`);
       expect(result.ok).toBe(false);
-      expect(result.stderr).toContain('Operation not permitted');
+      expect(result.stderr.includes('Operation not permitted') || !fs.existsSync(helper)).toBe(true);
     });
 
     it('cannot put itself under a profile of its own', () => {
