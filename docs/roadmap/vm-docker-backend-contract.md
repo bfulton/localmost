@@ -15,8 +15,8 @@ spike on 2026-09-30 ran it. Everything else is specified here, not yet tested.
 | Name | Form | Made by | Meaning |
 |---|---|---|---|
 | `slot` | integer 1–99 | runner-manager | The worker's instance number. |
-| `sandboxId` | `^[0-9]{1,2}-[0-9a-f]{12}$` | `buildSandbox` (already this shape) | The basename of the worker's sandbox directory. |
-| `vmId` | `^[0-9]{1,2}-[0-9a-f]{12}$` | `VmManager` (`<slot>-<randomBytes(6) hex>`) | One VM. It is never reused. A refresh VM has no worker and uses slot `0` (`0-<12 hex>`). |
+| `sandboxId` | `^(?:0\|[1-9][0-9]?)-[0-9a-f]{12}$` | `buildSandbox` (already this shape) | The basename of the worker's sandbox directory. The slot has no leading zero, as nothing writes one. |
+| `vmId` | `^(?:0\|[1-9][0-9]?)-[0-9a-f]{12}$` | `VmManager` (`<slot>-<randomBytes(6) hex>`) | One VM. It is never reused. A refresh VM has no worker and uses slot `0` (`0-<12 hex>`). No leading zero, so nothing but `0-` reads as the refresh slot. |
 | digest | `^sha256:[0-9a-f]{64}$` | a registry, or the VM | Every digest from outside Electron is checked against this before any use (§6.3). |
 | `repoKey` | `^[0-9a-f]{16}$` | `repoKeyOf(repository)`: first 16 hex of `sha256(lowercase("owner/name"))` | Per-repository store and cache. |
 | `<data>` | absolute | `getAppDataDir()` | Normally `~/.localmost`. |
@@ -649,7 +649,7 @@ check.
 | `src/main/vm/guest-image.ts` | new | Locate `<resources>/guest`, read `manifest.json`, check the artifact hashes once per launch. |
 | `src/main/vm/cache-disks.ts` | new | §6.5. |
 | `src/main/vm/types.ts` | new | Declarations only: `VmRequest`, `VmState`, `VmHandle`, `VmError`, `VmManager` (below), `AgentClient` (§3.4, below), `ImagePuller` (§6.4), `CacheDisks` and `StartRefreshVm` (§6.5). The implementations import them from here, so that no two of them import each other. |
-| `src/main/vm/paths.ts` | new | Every path in §1, each built only from an id checked against its §1 form (a malformed one throws): `vmDir()`, `vmJobFiles()`, `imageStoreDir()`, `refsJsonPath()`, `cacheFiles()`, `sandboxDirOf()` and `sandboxFiles()`, which take `<data>` as an argument, already realpathed by the caller. Also the §1 regexes, `repoKeyOf()`, `newVmId(slot)`, `vmIdSlot()`, `digestHex()` (§6.3), `blobPath()` (§6.3), `getVmResourcesDir()`, `guestDir()`, `helperPath()` (with the `LOCALMOST_VM_HELPER` rule of §7.3) and `dockerCliPath()`. |
+| `src/main/vm/paths.ts` | new | Every path in §1, each built only from an id checked against its §1 form (a malformed one throws): `vmDir()`, `vmJobFiles()`, `imageStoreDir()`, `refsJsonPath()`, `cacheFiles()`, `sandboxDirOf()` and `sandboxFiles()`, which take `<data>` as an argument, already realpathed by the caller (`sandboxFiles(<data>, sandboxId)` is built on `sandboxDirOf()`, never from a directory the caller hands over, because the share is what the helper profile grants). Also the §1 regexes, `repoKeyOf()`, `newVmId(slot)`, `vmIdSlot()`, `digestHex()` (§6.3), `blobPath()` (§6.3, with its second layer `placeBlob()` exported only for its test), `getVmResourcesDir()`, `guestDir()`, `helperPath()` (with the `LOCALMOST_VM_HELPER` rule of §7.3) and `dockerCliPath()`. |
 | `src/main/resource-monitor/memory-pressure-monitor.ts` | new | Polls `sysctl -n kern.memorystatus_vm_pressure_level` every 5 s with async `execFile` (1 → `normal`, 2 → `warn`, 4 → `critical`; anything else → `warn`), and calls `vmManager.onMemoryPressure(level)` on a change. |
 | `src/main/docker/puller/registry-client.ts` | new | Registry v2 client: token auth, manifests, blobs, redirects, screened DNS. |
 | `src/main/docker/puller/image-store.ts` | new | The per-repository blob store and `refs.json`. |
@@ -1018,7 +1018,9 @@ traversal read and delete. So:
   form is refused: `the registry sent a malformed digest for <ref>`.
 - Store paths are built only from the validated 64-hex part, by one function
   (`blobPath(storeRoot, hex)`) that re-checks the hex and asserts the result
-  lies under the store root.
+  is a direct child of `<storeRoot>/blobs/sha256` named exactly `<hex>`. "Under
+  the store root" would not be enough: a per-job store's root is the VM's
+  directory, beside `helper.sb` and `data.img`.
 - A manifest is identified by the SHA-256 of the raw bytes fetched, never by
   `Docker-Content-Digest`. The header is at most a hint for the `HEAD`
   comparison in §6.4 step 1; a manifest that is used is always hashed, and a

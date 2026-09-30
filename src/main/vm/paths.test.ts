@@ -20,6 +20,7 @@ import {
   dockerCliPath,
   getVmResourcesDir,
   guestDir,
+  placeBlob,
   helperPath,
   imageStoreDir,
   newVmId,
@@ -92,6 +93,8 @@ describe('the id forms', () => {
     }
     for (const id of [
       '100-0123456789ab',
+      '00-0123456789ab',
+      '05-0123456789ab',
       '-0123456789ab',
       '1-0123456789AB',
       '1-0123456789a',
@@ -107,7 +110,9 @@ describe('the id forms', () => {
 
   it('shapes a sandbox id as buildSandbox makes it', () => {
     expect('7-a1b2c3d4e5f6').toMatch(SANDBOX_ID_RE);
+    expect('10-a1b2c3d4e5f6').toMatch(SANDBOX_ID_RE);
     expect('7-a1b2c3d4e5f').not.toMatch(SANDBOX_ID_RE);
+    expect('07-a1b2c3d4e5f6').not.toMatch(SANDBOX_ID_RE);
     expect('7-a1b2c3d4e5f6/..').not.toMatch(SANDBOX_ID_RE);
   });
 
@@ -167,6 +172,8 @@ describe('newVmId and vmIdSlot', () => {
   it('reads no slot from something that is not a vm id', () => {
     expect(vmIdSlot('100-0123456789ab')).toBeNull();
     expect(vmIdSlot('../0-0123456789ab')).toBeNull();
+    // Nothing makes a slot with a leading zero, so '00-' is not read as a refresh VM.
+    expect(vmIdSlot('00-0123456789ab')).toBeNull();
   });
 });
 
@@ -196,6 +203,27 @@ describe('blobPath', () => {
         expect(isUnder(storeRoot, result)).toBe(true);
       }
     }
+  });
+
+  it('places nothing but a direct child of blobs/sha256, even without the hex check', () => {
+    // The second layer on its own. A per-job store's root is the VM's own
+    // directory, so "somewhere under the root" would still reach helper.sb or
+    // data.img beside the store.
+    const vmRoot = path.join(DATA, 'vm', 'jobs', VM_ID);
+    for (const storeRoot of [root, vmRoot, `${vmRoot}/`, '/']) {
+      const blobs = path.join(path.resolve(storeRoot), 'blobs', 'sha256');
+      for (const hex of [HEX, ...HOSTILE, '../../helper.sb', '../../data.img', '../x', 'x/..']) {
+        let result: string;
+        try {
+          result = placeBlob(storeRoot, hex);
+        } catch {
+          continue;
+        }
+        expect(path.dirname(result)).toBe(blobs);
+        expect(path.basename(result)).toBe(hex);
+      }
+    }
+    expect(() => placeBlob(vmRoot, '../../helper.sb')).toThrow(/outside/);
   });
 
   it('refuses a relative store root', () => {
@@ -246,7 +274,7 @@ describe('the data paths', () => {
   it("names a job sandbox's share, nonce, socket and CLI config", () => {
     const sandbox = sandboxDirOf(DATA, '7-a1b2c3d4e5f6');
     expect(sandbox).toBe(`${DATA}/runner/sandbox/7-a1b2c3d4e5f6`);
-    expect(sandboxFiles(sandbox)).toEqual({
+    expect(sandboxFiles(DATA, '7-a1b2c3d4e5f6')).toEqual({
       share: `${sandbox}/_work`,
       shareNonce: `${sandbox}/_work/.localmost-share`,
       dockerSocket: `${sandbox}/docker.sock`,
@@ -258,6 +286,7 @@ describe('the data paths', () => {
     for (const id of [...HOSTILE, '100-0123456789ab', '1-0123456789AB']) {
       expect(() => vmJobFiles(DATA, id)).toThrow(/vm id/);
       expect(() => sandboxDirOf(DATA, id)).toThrow(/sandbox id/);
+      expect(() => sandboxFiles(DATA, id)).toThrow(/sandbox id/);
       expect(() => imageStoreDir(DATA, id)).toThrow(/repository key/);
       expect(() => cacheFiles(DATA, id)).toThrow(/repository key/);
       expect(() => refsJsonPath(DATA, id)).toThrow(/repository key/);
@@ -267,7 +296,7 @@ describe('the data paths', () => {
   it('refuses a relative data directory', () => {
     expect(() => vmDir('.localmost')).toThrow(/absolute/);
     expect(() => vmJobFiles('', VM_ID)).toThrow(/absolute/);
-    expect(() => sandboxFiles('runner/sandbox/7-a1b2c3d4e5f6')).toThrow(/absolute/);
+    expect(() => sandboxFiles('.localmost', '7-a1b2c3d4e5f6')).toThrow(/absolute/);
   });
 });
 

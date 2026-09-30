@@ -19,11 +19,17 @@ import * as crypto from 'crypto';
 import * as path from 'path';
 import { app } from 'electron';
 
-/** A worker's sandbox directory name, as buildSandbox makes it: `<slot>-<12 hex>`. */
-export const SANDBOX_ID_RE = /^[0-9]{1,2}-[0-9a-f]{12}$/;
+/**
+ * A worker's sandbox directory name, as buildSandbox makes it: `<slot>-<12 hex>`.
+ * The slot is written as a number is, with no leading zero.
+ */
+export const SANDBOX_ID_RE = /^(?:0|[1-9][0-9]?)-[0-9a-f]{12}$/;
 
-/** One VM, never reused: `<slot>-<12 hex>`, slot 0 for a refresh VM. */
-export const VM_ID_RE = /^[0-9]{1,2}-[0-9a-f]{12}$/;
+/**
+ * One VM, never reused: `<slot>-<12 hex>`, slot 0 for a refresh VM. No
+ * leading zero, so nothing but `0-` reads as the refresh slot.
+ */
+export const VM_ID_RE = /^(?:0|[1-9][0-9]?)-[0-9a-f]{12}$/;
 
 /** The only digest form accepted from a registry, the VM or refs.json. */
 export const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
@@ -100,20 +106,30 @@ function requireForm(value: string, form: RegExp, what: string): string {
 /**
  * Where a blob lives in a store: `<storeRoot>/blobs/sha256/<hex>`. The one
  * way a blob path is built. It re-checks the hex, whatever the caller already
- * checked, and asserts that the result lies under the root.
+ * checked, and then places it with placeBlob.
  *
  * The store root is `<data>/vm/images/<repoKey>` for public images and the
  * VM's own directory for images that needed credentials (contract §6.3).
  */
 export function blobPath(storeRoot: string, hex: string): string {
-  const root = path.resolve(requireAbsolute(storeRoot, 'a blob store root'));
   if (typeof hex !== 'string' || !HEX64_RE.test(hex)) {
     throw new Error(`not the hex of a sha256 digest: ${JSON.stringify(hex)}`);
   }
-  const blob = path.join(root, 'blobs', 'sha256', hex);
-  const rel = path.relative(root, blob);
-  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
-    throw new Error(`blob path ${blob} is outside its store ${root}`);
+  return placeBlob(storeRoot, hex);
+}
+
+/**
+ * blobPath's second layer: the name must land as a direct child of
+ * `<storeRoot>/blobs/sha256`, under exactly its own name. "Somewhere under the
+ * root" is not enough, because a per-job store's root is the VM's directory,
+ * which also holds helper.sb and data.img. Exported so a test can show that
+ * this layer holds without the hex check; build blob paths with blobPath.
+ */
+export function placeBlob(storeRoot: string, hex: string): string {
+  const blobs = path.join(path.resolve(requireAbsolute(storeRoot, 'a blob store root')), 'blobs', 'sha256');
+  const blob = path.join(blobs, hex);
+  if (path.dirname(blob) !== blobs || path.basename(blob) !== hex) {
+    throw new Error(`blob path ${blob} is outside its store ${blobs}`);
   }
   return blob;
 }
@@ -205,8 +221,13 @@ export interface SandboxFiles {
   dockerConfig: string;
 }
 
-export function sandboxFiles(sandboxDir: string): SandboxFiles {
-  const dir = requireAbsolute(sandboxDir, 'the sandbox directory');
+/**
+ * Built on sandboxDirOf, from a checked id, not from a directory the caller
+ * hands over: the share is the path the helper profile grants and issues its
+ * extension for, so it must be a worker's sandbox and nothing else.
+ */
+export function sandboxFiles(dataDir: string, sandboxId: string): SandboxFiles {
+  const dir = sandboxDirOf(dataDir, sandboxId);
   const share = path.join(dir, SHARE_DIR_NAME);
   return {
     share,
