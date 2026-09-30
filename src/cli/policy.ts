@@ -442,6 +442,7 @@ function handleInit(options: PolicyOptions): void {
   };
 
   const destination = path.join(cwd, LOCALMOSTRC_FILENAME);
+  if (!existingPath) printUnreadNote(cwd);
   writeLocalmostrc(destination, serializeLocalmostrc(template));
 
   console.log(

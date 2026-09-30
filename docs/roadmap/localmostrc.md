@@ -19,8 +19,9 @@ That was:
 Each repo declares its sandbox policy in a file named `.localmostrc` at its root.
 That is the only name read, by the runner at a job's commit and by `localmost test`
 and `localmost policy` in a checkout alike: a `.localmostrc.yml` or
-`.localmostrc.yaml` is not a policy, and the CLI says so when it finds one.
-
+`.localmostrc.yaml` is not a policy, and the CLI says so when it finds one. A
+`.localmostrc` that `policy init` or `test --updaterc` writes beside one does
+not take its grants; rename the file first to keep them.
 
 ```yaml
 # .localmostrc

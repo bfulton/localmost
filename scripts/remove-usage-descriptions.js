@@ -13,6 +13,7 @@
  *
  * Run as @electron/packager's afterCopyExtraResources hook, the last step
  * before it signs the app, so the signature covers the edited plists.
+ * Packager runs that hook only when the config sets extraResource.
  */
 
 const { execFileSync } = require('child_process');

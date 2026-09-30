@@ -85,6 +85,15 @@ describe('unreadLocalmostrcNote', () => {
     expect(unreadLocalmostrcNote(repo)).toMatch(/^\.localmostrc\.yml is not read/);
   });
 
+  it('says a .localmostrc localmost writes does not start from it', () => {
+    // policy init and test --updaterc write a new .localmostrc beside it,
+    // from the template or this run's access alone.
+    fs.writeFileSync(path.join(repo, '.localmostrc.yml'), 'version: 1\n');
+    expect(unreadLocalmostrcNote(repo)).toMatch(
+      /A \.localmostrc that localmost writes does not start from it: rename it first to keep its grants\.$/
+    );
+  });
+
   it('names a link there without following it', () => {
     fs.symlinkSync(path.join(outside, 'victim'), path.join(repo, '.localmostrc.yml'));
     expect(unreadLocalmostrcNote(repo)).toMatch(/^\.localmostrc\.yml is not read/);

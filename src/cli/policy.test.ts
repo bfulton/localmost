@@ -414,6 +414,9 @@ describe('policy init', () => {
     expect(parseLocalmostrcContent(fs.readFileSync(rc(), 'utf-8')).config?.level).toBe('strict');
     expect(fs.readFileSync(path.join(dir, '.localmostrc.yml'), 'utf-8')).toBe(SENTINEL);
     expect(output.join('\n')).toMatch(/Created \.localmostrc$/m);
+    // And says so, as the other subcommands do, so the .yml's grants do not
+    // look carried over.
+    expect(output.join('\n')).toMatch(/\.localmostrc\.yml is not read: .*rename it first to keep its grants/);
   });
 
   it.each(['show', 'validate', 'diff', 'approve'])(

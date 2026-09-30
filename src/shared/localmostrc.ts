@@ -167,7 +167,8 @@ export function unreadLocalmostrcNote(repoRoot: string): string | null {
     if (lstatOrNull(path.join(repoRoot, name)) === null) continue;
     return (
       `${name} is not read: localmost takes a repository's policy only from ${LOCALMOSTRC_FILENAME}, ` +
-      `for jobs and for localmost test alike. Rename it to ${LOCALMOSTRC_FILENAME} to use it.`
+      `for jobs and for localmost test alike. Rename it to ${LOCALMOSTRC_FILENAME} to use it. ` +
+      `A ${LOCALMOSTRC_FILENAME} that localmost writes does not start from it: rename it first to keep its grants.`
     );
   }
   return null;

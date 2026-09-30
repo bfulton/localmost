@@ -421,12 +421,18 @@ describe('the usage descriptions the app declares', () => {
     jest.isolateModules(() => {
       packagerConfig = require(path.join(REPO, 'forge.config.js')).packagerConfig;
     });
-    const extra = path.join(scratch, 'extra-resource');
-    fs.writeFileSync(extra, 'x');
+    // Packager runs the hook only when extraResource is set, so the config's
+    // own list goes in: were it dropped, the hook would silently not run.
+    // Only its entries a checkout has are kept; the build products among
+    // them exist only after a build.
+    const extraResource = packagerConfig.extraResource as string[];
+    expect(Array.isArray(extraResource)).toBe(true);
+    const present = extraResource.filter((file) => fs.existsSync(file));
+    expect(present).toContain(path.join(REPO, 'scripts', 'localmost-cli'));
 
     const { MacApp } = require(path.join(REPO, 'node_modules', '@electron', 'packager', 'dist', 'mac'));
     const macApp = new MacApp(
-      { ...packagerConfig, extraResource: [extra], platform: 'darwin', arch: 'arm64', out: scratch, tmpdir: false },
+      { ...packagerConfig, extraResource: present, platform: 'darwin', arch: 'arm64', out: scratch, tmpdir: false },
       path.join(scratch, 'template'),
     );
     const steps: string[] = [];
@@ -465,7 +471,9 @@ describe('the usage descriptions the app declares', () => {
       'move',
     ]);
     // copyExtraResources ran for real, and the hook after it.
-    expect(fs.readFileSync(path.join(staging, 'localmost.app', 'Contents', 'Resources', 'extra-resource'), 'utf-8')).toBe('x');
+    expect(fs.readFileSync(path.join(staging, 'localmost.app', 'Contents', 'Resources', 'localmost-cli'))).toEqual(
+      fs.readFileSync(path.join(REPO, 'scripts', 'localmost-cli')),
+    );
     expect(atSigning).toBeDefined();
     expect(usageKeys(atSigning!)).toEqual([]);
     expect(atSigning!.NSPrincipalClass).toBe('AtomApplication');
