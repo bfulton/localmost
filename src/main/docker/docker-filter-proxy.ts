@@ -872,6 +872,7 @@ export class DockerFilterProxy {
       if (!res.writableEnded && !res.destroyed) res.write(`${JSON.stringify(p)}\n`);
     };
     try {
+      this.onLog({ level: 'debug', message: `pulled ${parsed.method} ${parsed.path} through the worker, not forwarded` });
       await this.worker.pull(request, write, abort.signal);
     } catch (err) {
       const message = (err as Error).message;

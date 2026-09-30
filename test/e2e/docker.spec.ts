@@ -218,7 +218,10 @@ test.describe('a job using docker through the filtering socket', () => {
     // through the runner's filter.
     if (logs) {
       const since = logsSince(at);
-      expect(since.some((l) => /forwarded POST \/images\/create/.test(l.message))).toBe(true);
+      // A pull is never forwarded: the worker pulls it (the desktop one
+      // through the daemon, the VM one on the Mac).
+      expect(since.some((l) => /pulled POST \/images\/create through the worker/.test(l.message))).toBe(true);
+      expect(since.some((l) => /forwarded POST \/images\/create/.test(l.message))).toBe(false);
       expect(since.some((l) => /forwarded POST \/containers\/create/.test(l.message))).toBe(true);
       expect(since.filter((l) => /^(denied|refused) /.test(l.message))).toEqual([]);
     }

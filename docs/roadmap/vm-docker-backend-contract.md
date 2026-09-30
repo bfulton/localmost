@@ -931,7 +931,8 @@ builds) with loading disabled, and adds a root for each `modprobe` failure in
 - **Log lines** that the e2e suite matches:
   - `pulled <ref> (<manifest digest>, <platform>) on the Mac; loaded into VM <vmId>`
   - `... ; already in VM <vmId>`
-  - `forwarded <METHOD> <path>` (unchanged)
+  - `forwarded <METHOD> <path>` (unchanged), which a pull never logs
+  - `pulled <METHOD> <path> through the worker, not forwarded` (the filter's, at debug)
   - `denied …` / `refused …` (unchanged)
 
 ### 5.4 runner-manager lifecycle hooks

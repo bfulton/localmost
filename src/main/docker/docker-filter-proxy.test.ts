@@ -402,7 +402,7 @@ describe('DockerFilterProxy forwarding', () => {
   it('pulls on the Mac through the worker, streaming its progress, and never forwards the pull', async () => {
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
-    const { proxy, sock, calls } = await startProxy(dir, { backend: backendWith(daemon.sock) });
+    const { proxy, sock, calls, logs } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', { pull: { registries: ['docker.io', 'ghcr.io'] } });
 
     // The job's own credential headers go nowhere: nothing is forwarded.
@@ -417,6 +417,8 @@ describe('DockerFilterProxy forwarding', () => {
       { status: 'Done' },
     ]);
     expect(calls.pulls).toEqual([{ registry: 'docker.io', repositoryPath: 'library/postgres', tag: '16' }]);
+    expect(logs.some((l) => l.message === 'pulled POST /images/create through the worker, not forwarded')).toBe(true);
+    expect(logs.some((l) => /^forwarded POST \/images/.test(l.message))).toBe(false);
     expect(daemon.seen).toHaveLength(0);
 
     await request(sock, 'POST', '/v1.45/images/create?fromImage=ghcr.io%2Fowner%2Fapp&tag=1&platform=linux%2Famd64');
