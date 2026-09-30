@@ -59,6 +59,9 @@ export class NativeDockerBackend implements DockerBackend {
       }),
       pull: (req, onProgress, signal) =>
         present() ? pullThroughDaemon(socketPath, req, onProgress, signal) : Promise.reject(new Error(NO_DAEMON_MESSAGE)),
+      // The daemon pulled from the registry itself, so it records the
+      // repo digest and finds the image by it.
+      imageForDigest: () => undefined,
       approveBinds: async () => {},
       containerProxyEnv: () => ({}),
       release: async () => {},

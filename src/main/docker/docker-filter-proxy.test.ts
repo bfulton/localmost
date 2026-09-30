@@ -93,6 +93,7 @@ const backendWith = (
       onProgress({ status: 'Pulling from ' + req.repositoryPath, id: req.tag ?? req.digest });
       onProgress({ status: 'Done' });
     },
+    imageForDigest: () => undefined,
     approveBinds: async (containerId, binds) => {
       calls.approvals.push({ containerId, binds });
     },
@@ -2074,6 +2075,88 @@ describe('the worker behind the socket', () => {
       proxy.bind('owner/repo', policy);
       expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(502);
       expect(calls.approvals).toEqual([]);
+    });
+  });
+
+  describe('a digest reference', () => {
+    const DIGEST = `sha256:${'d'.repeat(64)}`;
+    const IMAGE_ID = `sha256:${'c'.repeat(64)}`;
+    const digestPolicy: DockerPolicy = { run: { images: ['alpine:3', `alpine@${DIGEST}`], network: 'bridge' } };
+    const byDigest = { registry: 'docker.io', repositoryPath: 'library/alpine', digest: DIGEST };
+
+    /** A worker that pulled alpine@DIGEST this job, and records what it was asked. */
+    const pulledWorker = (sock: string, known: string | null = IMAGE_ID) => {
+      const asked: PullRequest[] = [];
+      const fixture = backendWith(sock, false, {
+        imageForDigest: (req) => {
+          asked.push(req);
+          return req.registry === byDigest.registry && req.repositoryPath === byDigest.repositoryPath && req.digest === DIGEST ? (known ?? undefined) : undefined;
+        },
+      });
+      return { fixture, asked };
+    };
+
+    it("is created by the image id this job's pull by digest resolved it to, however it is spelled", async () => {
+      const dir = tmp();
+      const daemon = await vmDaemon(dir);
+      const { fixture, asked } = pulledWorker(daemon.sock);
+      const { proxy, sock } = await startProxy(dir, { backend: fixture });
+      proxy.bind('owner/repo', digestPolicy);
+      for (const image of [`alpine@${DIGEST}`, `docker.io/library/alpine@${DIGEST}`]) {
+        expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: image })).status).toBe(201);
+      }
+      expect(daemon.seen.map((s) => JSON.parse(s.body.toString()).Image)).toEqual([IMAGE_ID, IMAGE_ID]);
+      expect(asked).toEqual([byDigest, byDigest]);
+    });
+
+    it('is inspected by that image id', async () => {
+      const dir = tmp();
+      const daemon = await vmDaemon(dir);
+      const { proxy, sock } = await startProxy(dir, { backend: pulledWorker(daemon.sock).fixture });
+      proxy.bind('owner/repo', digestPolicy);
+      expect((await request(sock, 'GET', `/v1.45/images/alpine@${DIGEST}/json`)).status).toBe(200);
+      expect((await request(sock, 'GET', `/images/${encodeURIComponent(`alpine@${DIGEST}`)}/json`)).status).toBe(200);
+      expect(daemon.seen.map((s) => s.url)).toEqual([`/v1.45/images/${IMAGE_ID}/json`, `/v1.45/images/${IMAGE_ID}/json`]);
+    });
+
+    it('goes as the job wrote it when no pull of this job resolved it, and a tag is never looked up', async () => {
+      const dir = tmp();
+      const daemon = await vmDaemon(dir);
+      const { fixture, asked } = pulledWorker(daemon.sock, null);
+      const { proxy, sock } = await startProxy(dir, { backend: fixture });
+      proxy.bind('owner/repo', digestPolicy);
+      await request(sock, 'POST', '/v1.45/containers/create', { Image: `alpine@${DIGEST}` });
+      await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' });
+      await request(sock, 'GET', `/v1.45/images/alpine@${DIGEST}/json`);
+      expect(daemon.seen.map((s) => (s.body.length ? JSON.parse(s.body.toString()).Image : s.url))).toEqual([
+        `alpine@${DIGEST}`,
+        'alpine:3',
+        `/v1.45/images/alpine@${DIGEST}/json`,
+      ]);
+      expect(asked).toEqual([byDigest, byDigest]);
+    });
+
+    it('is judged by the policy as the job wrote it, before any lookup', async () => {
+      const dir = tmp();
+      const daemon = await vmDaemon(dir);
+      const { fixture, asked } = pulledWorker(daemon.sock);
+      const { proxy, sock } = await startProxy(dir, { backend: fixture });
+      proxy.bind('owner/repo', { run: { images: ['alpine:3'], network: 'bridge' } });
+      expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: `alpine@${DIGEST}` })).status).toBe(403);
+      expect((await request(sock, 'GET', `/v1.45/images/alpine@${DIGEST}/json`)).status).toBe(403);
+      expect(daemon.seen).toEqual([]);
+      expect(asked).toEqual([]);
+    });
+
+    it('is left alone when the worker answers something that is not an image id', async () => {
+      const dir = tmp();
+      const daemon = await vmDaemon(dir);
+      const { proxy, sock } = await startProxy(dir, { backend: pulledWorker(daemon.sock, '../../containers/x').fixture });
+      proxy.bind('owner/repo', digestPolicy);
+      await request(sock, 'POST', '/v1.45/containers/create', { Image: `alpine@${DIGEST}` });
+      await request(sock, 'GET', `/v1.45/images/alpine@${DIGEST}/json`);
+      expect(JSON.parse(daemon.seen[0].body.toString()).Image).toBe(`alpine@${DIGEST}`);
+      expect(daemon.seen[1].url).toBe(`/v1.45/images/alpine@${DIGEST}/json`);
     });
   });
 

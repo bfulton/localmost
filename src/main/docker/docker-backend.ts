@@ -120,6 +120,13 @@ export interface WorkerDocker {
     body: unknown;
   };
   pull(req: PullRequest, onProgress: (p: DockerProgress) => void, signal: AbortSignal): Promise<void>;
+  /**
+   * The image id (`sha256:<config digest>`) a pull by digest in this job
+   * resolved `<registry>/<repositoryPath>@<digest>` to, or undefined. The
+   * VM's classic image store cannot find a loaded image by a digest
+   * reference (contract §6.4 step 5), so the filter looks it up here.
+   */
+  imageForDigest(req: PullRequest): string | undefined;
   approveBinds(containerId: string, binds: ApprovedBind[]): Promise<void>;
   /** HTTP(S)_PROXY, http(s)_proxy and NO_PROXY for routable containers and builds; {} when no VM. */
   containerProxyEnv(): Record<string, string>;
@@ -174,6 +181,7 @@ export const noDockerBackend: DockerBackend = {
       body: { message: NO_DAEMON_MESSAGE },
     }),
     pull: () => Promise.reject(new Error(NO_DAEMON_MESSAGE)),
+    imageForDigest: () => undefined,
     approveBinds: () => Promise.reject(new Error(NO_DAEMON_MESSAGE)),
     containerProxyEnv: () => ({}),
     release: async () => {},

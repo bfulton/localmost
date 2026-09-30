@@ -18,7 +18,7 @@ import * as path from 'path';
 import * as zlib from 'zlib';
 import { DockerPolicy } from '../../shared/docker-policy';
 import { ApprovedBind, DockerBackend, DockerProgress, NO_DAEMON_MESSAGE, WorkerDocker } from './docker-backend';
-import { DockerAction, DockerRequest, classifyDockerRequest, containerIdFrom, networkIdFrom, parseDockerRequest } from './docker-request';
+import { DockerAction, DockerRequest, classifyDockerRequest, containerIdFrom, imageRefFrom, networkIdFrom, parseDockerRequest } from './docker-request';
 import { evaluateDockerRequest, pullRequestOf } from './docker-evaluator';
 
 export interface DockerFilterProxyLogEntry {
@@ -136,6 +136,9 @@ const REMOVE_RETRY_DELAY_MS = 250;
 
 const DEFAULT_MIN_API_VERSION = 'v1.24';
 const DEFAULT_MAX_API_VERSION = 'v1.45';
+
+/** An image id, as dockerd names a loaded image: `sha256:` and the config digest. */
+const IMAGE_ID = /^sha256:[0-9a-f]{64}$/;
 
 type ApiVersion = [number, number];
 
@@ -653,6 +656,42 @@ export class DockerFilterProxy {
   }
 
   /**
+   * The image id a pull by digest in this job resolved `ref` to, or undefined
+   * for a reference by tag, one no pull of this job resolved, or an answer
+   * that is not an image id (contract §5.3 "Digest references"). The daemon
+   * in the VM cannot find a loaded image by `name@sha256:…`: only a registry
+   * pull records a repo digest, and the puller loads images instead. Called
+   * only after the policy allowed the reference as the job wrote it.
+   */
+  private digestImage(ref: string): string | undefined {
+    if (!ref.includes('@')) return undefined;
+    const request = pullRequestOf({ fromImage: ref });
+    if (typeof request === 'string' || request.digest === undefined) return undefined;
+    const id = this.worker.imageForDigest(request);
+    return id !== undefined && IMAGE_ID.test(id) ? id : undefined;
+  }
+
+  /** An approved create body whose `Image`, a digest reference this job pulled, is named by its image id. */
+  private withDigestImage(body: unknown): unknown {
+    if (!isPlainRecord(body)) return body;
+    const imageKey = Object.keys(body).find((key) => key.toLowerCase() === 'image');
+    const image = imageKey === undefined ? undefined : body[imageKey];
+    if (imageKey === undefined || typeof image !== 'string') return body;
+    const id = this.digestImage(image);
+    return id === undefined ? body : { ...body, [imageKey]: id };
+  }
+
+  /** An approved image inspect's URL naming the image id, when it asks for a digest reference this job pulled. */
+  private digestImageUrl(parsed: DockerRequest): string | undefined {
+    const ref = imageRefFrom(parsed);
+    const id = ref === undefined ? undefined : this.digestImage(ref);
+    if (id === undefined) return undefined;
+    const queryStart = parsed.raw.url.indexOf('?');
+    const query = queryStart === -1 ? '' : parsed.raw.url.slice(queryStart);
+    return `/${parsed.apiVersion ?? `v${bareVersion(this.maxApiVersion)}`}/images/${id}/json${query}`;
+  }
+
+  /**
    * An approved create body with each owned network named by the id it was
    * created with, for the same reason pinnedPath pins a URL: the name is freed
    * when anyone removes the network, and the next network of that name is not
@@ -850,9 +889,12 @@ export class DockerFilterProxy {
     // resolved to the paths actually checked - so the daemon mounts what the
     // filter judged rather than re-resolving a name the job can repoint - and
     // given the proxy, now that the VM that relays it is up.
-    const judged = action === 'create' ? this.withProxyEnv(rewrittenBody) : rewrittenBody;
+    // A digest reference this job's pull resolved is named by the image id,
+    // which is how the VM's daemon finds an image the puller loaded.
+    const judged = action === 'create' ? this.withDigestImage(this.withProxyEnv(rewrittenBody)) : rewrittenBody;
     const body = judged !== undefined ? Buffer.from(JSON.stringify(judged)) : bufferedBody;
-    const url = action === 'build' ? this.withProxyBuildArgs(parsed) : undefined;
+    const url =
+      action === 'build' ? this.withProxyBuildArgs(parsed) : action === 'image-inspect' ? this.digestImageUrl(parsed) : undefined;
     this.forward(parsed, req, res, body, socketPath, { approvedBinds, url });
   }
 

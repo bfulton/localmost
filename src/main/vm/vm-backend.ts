@@ -33,6 +33,13 @@ import type { CacheDisks, ImagePuller, VmHandle, VmManager, VmReady, VmRequest }
 const RELAY_HOST = '198.18.0.1';
 const RELAY_PORT = 3128;
 
+/** An image id, as dockerd names a loaded image: the config digest. */
+const IMAGE_ID_RE = /^sha256:[0-9a-f]{64}$/;
+
+/** A pull by digest's key: the reference as the puller normalized it, keyed by its digest alone. */
+const digestKey = (req: PullRequest): string | undefined =>
+  req.digest === undefined ? undefined : `${req.registry}/${req.repositoryPath}@${req.digest}`;
+
 /** What a container never sends through the proxy. The job lists its own services itself. */
 const NO_PROXY = 'localhost,127.0.0.1,::1';
 
@@ -79,6 +86,8 @@ class VmWorker implements WorkerDocker {
   private releasing: Promise<void> | null = null;
   /** A pull fetched something the repository's cache disk does not hold yet. */
   private pulledNew = false;
+  /** What each pull by digest this job resolved to: `<registry>/<path>@<digest>` to the image id. */
+  private readonly digestImages = new Map<string, string>();
   private readonly shareRealPath: string | null;
 
   constructor(private readonly ctx: WorkerContext, private readonly opts: VmBackendOptions) {
@@ -306,12 +315,21 @@ class VmWorker implements WorkerDocker {
       signal,
     });
     const ref = `${req.registry}/${req.repositoryPath}${req.digest ? `@${req.digest}` : `:${req.tag ?? 'latest'}`}`;
+    // The load cannot record a repo digest, so dockerd finds this image only
+    // by its id; the filter asks for it here (§5.3 "Digest references").
+    const key = digestKey(req);
+    if (key !== undefined && IMAGE_ID_RE.test(result.configDigest)) this.digestImages.set(key, result.configDigest);
     if (result.source === 'vm') {
       this.log('info', `pulled ${ref} (${result.manifestDigest}, ${result.platform}) on the Mac; already in VM ${vm.vmId}`);
     } else {
       this.pulledNew = true;
       this.log('info', `pulled ${ref} (${result.manifestDigest}, ${result.platform}) on the Mac; loaded into VM ${vm.vmId}`);
     }
+  }
+
+  imageForDigest(req: PullRequest): string | undefined {
+    const key = digestKey(req);
+    return key === undefined ? undefined : this.digestImages.get(key);
   }
 
   async approveBinds(containerId: string, binds: ApprovedBind[]): Promise<void> {

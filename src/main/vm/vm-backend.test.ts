@@ -397,6 +397,34 @@ describe('VmBackend', () => {
       );
     });
 
+    it('remembers, for the job, the image each pull by digest resolved to, and nothing a tag pull resolved', async () => {
+      const w = worker();
+      w.bind('owner/repo', grants);
+      manager.vms[0].becomeReady();
+      const signal = new AbortController().signal;
+      const digest = `sha256:${'c'.repeat(64)}`;
+      const byDigest = { registry: 'docker.io', repositoryPath: 'library/alpine', digest };
+      expect(w.imageForDigest(byDigest)).toBeUndefined();
+      await w.pull({ registry: 'docker.io', repositoryPath: 'library/alpine', tag: '3' }, () => {}, signal);
+      expect(w.imageForDigest({ registry: 'docker.io', repositoryPath: 'library/alpine', tag: '3' })).toBeUndefined();
+      await w.pull(byDigest, () => {}, signal);
+      expect(w.imageForDigest(byDigest)).toBe(`sha256:${'b'.repeat(64)}`);
+      // The key is the whole reference: another repository or digest is not it.
+      expect(w.imageForDigest({ ...byDigest, repositoryPath: 'library/busybox' })).toBeUndefined();
+      expect(w.imageForDigest({ ...byDigest, registry: 'ghcr.io' })).toBeUndefined();
+      expect(w.imageForDigest({ ...byDigest, digest: `sha256:${'e'.repeat(64)}` })).toBeUndefined();
+    });
+
+    it('records no image for a digest pull whose config digest is not one', async () => {
+      puller.pull.mockImplementation(async () => ({ manifestDigest: `sha256:${'a'.repeat(64)}`, configDigest: 'sha256:../../x', platform: 'linux/arm64', source: 'registry' }));
+      const w = worker();
+      w.bind('owner/repo', grants);
+      manager.vms[0].becomeReady();
+      const byDigest = { registry: 'docker.io', repositoryPath: 'library/alpine', digest: `sha256:${'c'.repeat(64)}` };
+      await w.pull(byDigest, () => {}, new AbortController().signal);
+      expect(w.imageForDigest(byDigest)).toBeUndefined();
+    });
+
     it("hands approvals to the VM's agent, and refuses them with no VM ready", async () => {
       const w = worker();
       await expect(w.approveBinds('f'.repeat(64), [])).rejects.toThrow(/not ready/);
