@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -142,10 +143,24 @@ func setup() error {
 	return nil
 }
 
+// cleanup removes whatever of the scratch network exists. It looks before
+// it deletes: `ip` resolves a link name with an ioctl that makes the kernel
+// request a "netdev-<name>" module for a name that does not exist, and each
+// such request is logged as refused.
 func cleanup(logf func(string, ...any)) {
-	run("ip", "netns", "del", NS)
-	run("ip", "link", "del", vethH)
-	run("ip", "link", "del", Bridge)
+	if exists("/run/netns/" + NS) {
+		run("ip", "netns", "del", NS)
+	}
+	for _, link := range []string{vethH, Bridge} {
+		if exists("/sys/class/net/" + link) {
+			run("ip", "link", "del", link)
+		}
+	}
+}
+
+func exists(p string) bool {
+	_, err := os.Lstat(p)
+	return err == nil
 }
 
 func run(name string, args ...string) error {
