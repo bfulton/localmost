@@ -93,6 +93,7 @@ const startRefreshVm: StartRefreshVm = (req) => {
       stoppedResolve({ reason: 'requested', synced: false });
     },
     stopped: () => stopped,
+    failure: () => undefined,
   };
   return handle;
 };
