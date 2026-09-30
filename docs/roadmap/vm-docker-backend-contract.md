@@ -10,6 +10,13 @@ as this file's update, and the version stamps below (`"v":1`, `schema`,
 `agentProtocol`) move with it. Where a value is marked *verified*, the design
 spike on 2026-09-30 ran it. Everything else is specified here, not yet tested.
 
+Until the backend first ships, version 1 is still being written: what the
+work packages settle while building it (the helper's event and command keys,
+`E_PROTO`, `synced` on every `stopped`, `stopped` before `listening`, and the
+rest recorded below) is part of version 1, and the stamps stay at 1. Every
+change after the first release moves them. HelperClient, the fake helper
+(§8) and the helper all follow the text as it stands here.
+
 ## 1. Identifiers and host paths
 
 | Name | Form | Made by | Meaning |
@@ -64,7 +71,7 @@ which follows the repo's three-mode pattern.
 localmost-vm run
   --vm-id <vmId>
   --mode job|refresh
-  --data-dir <abs path>          # <data>; the helper realpaths it once
+  --data-dir <abs path>          # <data>; the helper resolves it once, from <data>/vm/jobs/<vmId> (below)
   --resources <abs path>         # <resources>; the helper reads guest/ from here
   --sandbox-id <sandboxId>       # job mode only
   --repo-key <repoKey>           # refresh mode only
@@ -95,9 +102,22 @@ command line is a path the job chose.
   `<data>`, which seatbelt's path rules do not see. Every check is made on
   descriptors of paths the §2.5 profile grants, so it needs no rule of its
   own. The helper runs the checks before it builds the VM and again right
-  before `start`; Electron runs the §2.1 checks before the spawn. If any
-  check fails: `E_SHARE`. *Verified (WP-B):* a DMG mounted over `_work`
-  gives `E_SHARE` before `start` under the profile.
+  before `start`, and the second time also requires the same directory as
+  the first (`st_dev`, `st_ino` and `f_fsid` equal), not merely one at the
+  same path. Electron runs the §2.1 checks before the spawn. If any check
+  fails: `E_SHARE`. *Verified (WP-B):* a DMG mounted over `_work` gives
+  `E_SHARE` before `start` under the profile.
+- These checks hold at the moment each is made, and only for `_work` and
+  the directories above it. A mount placed between the last check and VZ
+  resolving the path, or anywhere below `_work`, is still inside the
+  `(subpath "<S>")` grant, which goes by path. What stops a job from making
+  such a mount is the job profile (§5.5): it is deny-default and never
+  allows `file-mount`, and it must never be given it. The helper's checks
+  are a point-in-time backstop for that. *Verified:* seatbelt's write rules
+  do not stop a DiskArbitration mount: under `(allow default)` with
+  `(deny file-write* (subpath T))`, `hdiutil attach -mountpoint` mounted a
+  DMG on `T/_work` and on `T/_work/sub`; with `(deny file-mount)` both
+  failed with "Permission denied".
 - Data disk: `<data>/vm/jobs/<vmId>/data.img` in job mode, or
   `<data>/vm/cache/<repoKey>/data.img.new` in refresh mode. Electron prepares it
   (clone or new sparse file) before the spawn. If it is missing: `E_DISK`.
@@ -137,7 +157,16 @@ command line is a path the job chose.
 These three are all there is. The helper listens on no other vsock port and
 dials no other address. It never parses the bytes it copies. Limits: 64
 concurrent connections per unix socket, 256 relay connections, and a 1 MiB
-buffer per direction.
+buffer per direction. A connection past a limit is closed at once. The
+helper raises its own soft `RLIMIT_NOFILE` to 1024 (within the hard limit)
+at start, since those limits need about 770 descriptors and launchd's
+default is 256.
+
+The unix sockets exist from `listening`, but until `started` there is no VM
+to dial, and a connection made then is closed at once. Electron connects to
+`docker.sock` and `agent.sock` only after `started`. The relay's connect to
+the proxy is non-blocking and gives up after 5 s, closing the guest's
+connection.
 
 Verified: a host vsock listener, a host dial to a guest port, and a static Go
 guest agent on both ends.
@@ -162,7 +191,9 @@ to a command has an `id` and no `event`.
 
 The order is `listening`, `started`, `stopped`; a failure ends it early with
 `stopped`. A stop requested before `started` is carried out, with no grace,
-once the VM has started.
+once the VM has started. If start has still not finished 15 s after that
+stop, the helper emits `stopped` (reason `requested`) and exits, and VZ
+tears the VM down with it.
 
 **Commands (Electron → helper)** are named by an `op` field, as the agent's
 requests are, for example `{"v":1,"id":7,"op":"stop","graceMs":0}`. Each has
@@ -233,10 +264,6 @@ escaped as the job profile escapes its paths.
     (subpath "<S>")))
 (allow generic-issue-extension (extension-class "com.apple.virtualization.extension.fuse"))
 (allow network-outbound (remote ip "localhost:<proxy-port>"))
-;; job mode with --rosetta auto: VZ asks the helper for this one extension
-;; when it shares Rosetta. A generic extension of the Rosetta class only,
-;; never a file-issue-extension.
-(allow generic-issue-extension (extension-class "com.apple.virtualization.extension.rosetta-directory-share"))
 ;; refresh mode, instead of the job-mode rules above: its one disk, and no
 ;; share, so no extension rule at all.
 (allow file-read* file-write* (literal "<data>/vm/cache/<repoKey>/data.img.new"))
@@ -270,19 +297,27 @@ an ungranted share: its own open of `S` fails, with `E_SHARE`, before
 `start`. When `_work` is swapped for a link to an ungranted directory right
 after `listening`, past the helper's last check, `start` fails with EPERM
 (`E_VZ_START`, "a directory sharing device configuration is invalid" over
-`NSPOSIXErrorDomain 1`) in 11 of 12 runs; in the twelfth VZ had already
-resolved the real directory, and every read through the link failed in the
-guest. The relay reaches `127.0.0.1:<proxy-port>`; a helper told to dial
-another port is refused by seatbelt (EPERM) and closes the guest's
-connection. The same holds with the helper signed by an Apple Development
-identity with the hardened runtime. Rosetta: sharing it works under these
-rules, but `sandbox-exec` tracing shows one denial,
-`generic-issue-extension com.apple.virtualization.extension.rosetta-directory-share`,
-which is exactly the Rosetta rule above; with it the denial is gone and an
-x86-64 static binary still runs in the guest. The only other denials are
-Foundation's reads of `~/.CFUserTextEncoding`, the helper's own directory
-and the global preferences, and a `mach-task-name` lookup of the VZ XPC
-process; none is needed, and none is granted.
+`NSPOSIXErrorDomain 1`) in 11 of 12 runs. In the twelfth, `start` was not
+refused: the VM started, `started` was emitted, and the share mounted in
+the guest, but every read of it failed with EPERM, so nothing outside was
+read. That run fails closed only because of the nonce check (the agent's
+`configure` answer, §3.4, against the nonce Electron wrote; design S1(g)):
+Electron must treat that check as mandatory, and never read `started` as
+proof that the share is the right directory. The relay reaches
+`127.0.0.1:<proxy-port>`; a helper told to dial another port is refused by
+seatbelt (EPERM) and closes the guest's connection. The same holds with the
+helper signed by an Apple Development identity with the hardened runtime.
+Rosetta needs no rule of its own: under exactly these rules the Rosetta
+share mounts, binfmt registers, and an x86-64 static binary runs in the
+guest. `sandbox-exec` tracing shows one denial when Rosetta is shared,
+`generic-issue-extension com.apple.virtualization.extension.rosetta-directory-share`;
+Rosetta works with it denied, so it is benign and not granted. The only
+other denials are Foundation's reads of `~/.CFUserTextEncoding`, the
+helper's own directory and the global preferences, and a `mach-task-name`
+lookup of the VZ XPC process; none is needed, and none is granted. A hijacked
+stream's half-close crosses the relay: `printf 'hi\n' | docker run -i --rm`
+of a one-binary `cat` image, through `docker.sock`, prints `hi` and returns;
+with the relay's `shutdown(SHUT_WR)` removed it never returns.
 
 ## 3. The guest
 
@@ -981,6 +1016,15 @@ in `src/shared/sandbox-profile.ts` already denies its workspace node the
 same way.) The sandbox test checks them in the constructed and ambient modes,
 including `mv _WORK x`, `mv ../<SANDBOX in other case> x` and
 `renamex_np(RENAME_SWAP)`.
+
+The job profile is deny-default and has no `file-mount` rule, and none is
+ever added: that is what keeps a job from mounting a DMG, FUSE or SMB
+filesystem over `_work` or anywhere inside it, which the share's path-based
+grant would then hand to VZ (§2.1; the helper's device and mount-point
+checks are only a point-in-time backstop). Seatbelt's write rules do not
+stop such a mount on their own. The sandbox test asserts, in both the
+constructed and the ambient form, that `hdiutil attach -nobrowse
+-mountpoint` of a DMG onto `_work` and onto a directory inside it fails.
 
 `<data>/vm` needs no rule. It is inside `<data>`, which is already denied in full.
 
