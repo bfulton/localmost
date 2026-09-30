@@ -332,9 +332,8 @@ describe('the usage descriptions the app declares', () => {
     JSON.parse(execFileSync('/usr/bin/plutil', ['-convert', 'json', '-o', '-', file], { encoding: 'utf-8' }));
   const { removeUsageDescriptions, USAGE_DESCRIPTION } = require(path.join(REPO, 'scripts', 'remove-usage-descriptions.js'));
 
-  // What @electron/packager starts from, and so what the app ships unless
-  // something takes the keys out.
-  const TEMPLATE = path.join(REPO, 'node_modules', 'electron', 'dist', 'Electron.app', 'Contents');
+  // The usage descriptions Electron's template app carries, and so what the
+  // app ships unless something takes them out.
   const ELECTRON_USAGE = [
     'NSAudioCaptureUsageDescription',
     'NSBluetoothAlwaysUsageDescription',
@@ -350,20 +349,35 @@ describe('the usage descriptions the app declares', () => {
   let scratch: string;
   let staging: string;
 
-  // A packaged app's layout under root: the app's plist as the template has
-  // it, and a helper's with a usage description added, as packager's
-  // usageDescription option would.
+  // A plist as packager writes one, in the format it writes, built here
+  // rather than copied from node_modules/electron/dist: a CI job's install
+  // does not always download Electron's app.
+  const writePlist = (file: string, keys: Record<string, unknown>) => {
+    fs.writeFileSync(file, JSON.stringify(keys));
+    execFileSync('/usr/bin/plutil', ['-convert', 'xml1', file]);
+  };
+
+  // A packaged app's layout under root: the app's plist with the template's
+  // usage descriptions among its other keys, and a helper's with one added,
+  // as packager's usageDescription option would.
   const layOut = (root: string) => {
     const contents = path.join(root, 'localmost.app', 'Contents');
     fs.mkdirSync(path.join(contents, 'Resources'), { recursive: true });
-    fs.copyFileSync(path.join(TEMPLATE, 'Info.plist'), path.join(contents, 'Info.plist'));
+    writePlist(path.join(contents, 'Info.plist'), {
+      CFBundleExecutable: 'localmost',
+      CFBundleIdentifier: 'com.localmost.app',
+      LSMinimumSystemVersion: '12.0',
+      NSHighResolutionCapable: true,
+      NSPrincipalClass: 'AtomApplication',
+      ...Object.fromEntries(ELECTRON_USAGE.map((key) => [key, 'This app needs access to it.'])),
+    });
     const helper = path.join(contents, 'Frameworks', 'localmost Helper.app', 'Contents');
     fs.mkdirSync(helper, { recursive: true });
-    fs.copyFileSync(
-      path.join(TEMPLATE, 'Frameworks', 'Electron Helper.app', 'Contents', 'Info.plist'),
-      path.join(helper, 'Info.plist'),
-    );
-    execFileSync('/usr/bin/plutil', ['-insert', 'NSCameraUsageDescription', '-string', 'x', path.join(helper, 'Info.plist')]);
+    writePlist(path.join(helper, 'Info.plist'), {
+      CFBundleIdentifier: 'com.localmost.app.helper',
+      LSUIElement: true,
+      NSCameraUsageDescription: 'x',
+    });
     return { plist: path.join(contents, 'Info.plist'), helper: path.join(helper, 'Info.plist') };
   };
 
@@ -382,7 +396,7 @@ describe('the usage descriptions the app declares', () => {
     const { plist, helper } = layOut(staging);
     const before = readPlist(plist);
     const helperBefore = readPlist(helper);
-    // The template does carry them; otherwise this would prove nothing.
+    // The fixture does carry them; otherwise this would prove nothing.
     expect(usageKeys(before).sort()).toEqual(ELECTRON_USAGE);
 
     const removed: string[] = removeUsageDescriptions(staging);
