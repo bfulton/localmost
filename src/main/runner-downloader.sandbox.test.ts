@@ -115,6 +115,100 @@ describe('the sandbox a worker is built from', () => {
     }
   });
 
+  it("makes the work folder, the Docker VM's share, itself, and an empty DOCKER_CONFIG beside it", async () => {
+    // The share must be the directory localmost made, before anything runs in
+    // the sandbox: made by the runner, it would be whatever the job left at
+    // the name. The CLI's config directory is not in the share.
+    await downloader.copyProxyCredentials(1, path.join(runnerDir, 'proxies', 'target-a'));
+    const sandbox = await downloader.buildSandbox(1, version);
+
+    for (const name of ['_work', '.docker']) {
+      const stat = fs.lstatSync(path.join(sandbox, name));
+      expect([name, stat.isDirectory(), stat.isSymbolicLink()]).toEqual([name, true, false]);
+      expect(fs.readdirSync(path.join(sandbox, name))).toEqual([]);
+    }
+    expect(fs.statSync(path.join(sandbox, '.docker')).mode & 0o777).toBe(0o700);
+  });
+
+  it('makes both with a plain mkdir, which refuses a name that already exists, before copying the runner', async () => {
+    await downloader.copyProxyCredentials(1, path.join(runnerDir, 'proxies', 'target-a'));
+    const made: Array<{ dir: string; recursive: boolean; afterCopy: boolean }> = [];
+    let copied = false;
+    const realCopy = downloader.copyVerifiedArc.bind(downloader);
+    jest.spyOn(downloader, 'copyVerifiedArc').mockImplementation(async (...args) => {
+      await realCopy(...args);
+      copied = true;
+    });
+    const realMkdir = fs.promises.mkdir.bind(fs.promises);
+    jest.spyOn(fs.promises, 'mkdir').mockImplementation((async (dir: fs.PathLike, options?: fs.MakeDirectoryOptions) => {
+      made.push({ dir: String(dir), recursive: options?.recursive === true, afterCopy: copied });
+      return realMkdir(dir, options);
+    }) as never);
+
+    const sandbox = await downloader.buildSandbox(1, version);
+
+    for (const name of ['_work', '.docker']) {
+      expect(made.filter((m) => m.dir === path.join(sandbox, name))).toEqual([
+        { dir: path.join(sandbox, name), recursive: false, afterCopy: false },
+      ]);
+    }
+  });
+
+  it('builds no sandbox when the work folder cannot be made fresh', async () => {
+    await downloader.copyProxyCredentials(1, path.join(runnerDir, 'proxies', 'target-a'));
+    const realMkdir = fs.promises.mkdir.bind(fs.promises);
+    jest.spyOn(fs.promises, 'mkdir').mockImplementation((async (dir: fs.PathLike, options?: fs.MakeDirectoryOptions) => {
+      if (path.basename(String(dir)) === '_work') {
+        throw Object.assign(new Error(`EEXIST: file already exists, mkdir '${String(dir)}'`), { code: 'EEXIST' });
+      }
+      return realMkdir(dir, options);
+    }) as never);
+
+    await expect(downloader.buildSandbox(1, version)).rejects.toThrow(/EEXIST/);
+    expect(fs.readdirSync(downloader.getSandboxBase())).toEqual([]);
+  });
+
+  describe("the share's nonce", () => {
+    let sandbox: string;
+    const noncePath = () => path.join(sandbox, '_work', '.localmost-share');
+
+    beforeEach(async () => {
+      await downloader.copyProxyCredentials(1, path.join(runnerDir, 'proxies', 'target-a'));
+      sandbox = await downloader.buildSandbox(1, version);
+    });
+
+    it('is 32 hex, written where the guest reads it, readable by the app alone', () => {
+      const nonce = downloader.writeShareNonce(sandbox);
+      expect(nonce).toMatch(/^[0-9a-f]{32}$/);
+      expect(fs.readFileSync(noncePath(), 'utf-8')).toBe(nonce);
+      expect(fs.statSync(noncePath()).mode & 0o777).toBe(0o600);
+      // A fresh one every time: a job cannot learn a later sandbox's nonce.
+      const other = fs.mkdtempSync(path.join(root, 'other-'));
+      fs.mkdirSync(path.join(other, '_work'));
+      expect(downloader.writeShareNonce(other)).not.toBe(nonce);
+    });
+
+    it('is never written over a file already there', () => {
+      fs.writeFileSync(noncePath(), 'planted');
+      expect(() => downloader.writeShareNonce(sandbox)).toThrow(/EEXIST/);
+      expect(fs.readFileSync(noncePath(), 'utf-8')).toBe('planted');
+    });
+
+    it('is never written through a link, dangling or not', () => {
+      const target = path.join(root, 'victim');
+      fs.writeFileSync(target, 'kept');
+      fs.symlinkSync(target, noncePath());
+      expect(() => downloader.writeShareNonce(sandbox)).toThrow(/EEXIST/);
+      expect(fs.readFileSync(target, 'utf-8')).toBe('kept');
+
+      fs.rmSync(noncePath());
+      const missing = path.join(root, 'missing');
+      fs.symlinkSync(missing, noncePath());
+      expect(() => downloader.writeShareNonce(sandbox)).toThrow(/EEXIST/);
+      expect(fs.existsSync(missing)).toBe(false);
+    });
+  });
+
   it('removes a sandbox it built, and refuses anything that is not one', async () => {
     await downloader.copyProxyCredentials(1, path.join(runnerDir, 'proxies', 'target-a'));
     const sandbox = await downloader.buildSandbox(1, version);
@@ -208,7 +302,6 @@ describe('the sandbox a worker is built from', () => {
     const replaced = await downloader.buildSandbox(2, version);
     // Its job can write anywhere in its sandbox, and can replace the
     // sandbox's own directory, since its profile grants that path.
-    fs.mkdirSync(path.join(linkedFrom, '_work'));
     fs.symlinkSync(victim, path.join(linkedFrom, '_work', 'link'));
     fs.rmSync(replaced, { recursive: true, force: true });
     fs.symlinkSync(victim, replaced);

@@ -6,6 +6,7 @@ import * as tar from 'tar';
 import { FALLBACK_RUNNER_VERSION } from '../shared/constants';
 import { spawnSandboxed } from './process-sandbox';
 import { getRunnerDir } from './paths';
+import { SHARE_DIR_NAME, SHARE_NONCE_FILE } from './vm/paths';
 import {
   killOrphanedProcesses,
   cleanupSandboxDirectories,
@@ -25,6 +26,9 @@ export type ProgressCallback = (progress: DownloadProgress) => void;
 
 /** The only files buildSandbox takes from an instance's config directory. */
 const SANDBOX_CONFIG_FILES = ['.runner'];
+
+/** The job's DOCKER_CONFIG, in its sandbox and outside the share. */
+export const DOCKER_CONFIG_DIR_NAME = '.docker';
 
 /** Where a runner release is downloaded and extracted before it is used. */
 const ARC_STAGING_PREFIX = 'arc-staging-';
@@ -486,6 +490,15 @@ export class RunnerDownloader {
     await fs.promises.mkdir(sandboxDir);
 
     try {
+      // The runner's work folder, which is also the one directory a Docker VM
+      // is shared (contract §1): made here, by the app, with a plain mkdir
+      // that refuses a name already there, before anything runs in the
+      // sandbox. The worker's profile then denies the job the node itself,
+      // so it stays this directory. Beside it, not in the share, an empty
+      // DOCKER_CONFIG, so the job's CLI reads none of the operator's.
+      await fs.promises.mkdir(path.join(sandboxDir, SHARE_DIR_NAME));
+      await fs.promises.mkdir(path.join(sandboxDir, DOCKER_CONFIG_DIR_NAME), { mode: 0o700 });
+
       // Copy arc to sandbox
       log('info', `Copying arc to sandbox...`);
       const copyStart = Date.now();
@@ -518,10 +531,27 @@ export class RunnerDownloader {
       throw err;
     }
 
-    // _work is left for the runner to create inside this fresh sandbox. A
-    // work directory kept across starts would hand one job's checkout and
-    // dependencies to whichever job next took the slot, from any repository.
+    // _work is as new as the sandbox. A work directory kept across starts
+    // would hand one job's checkout and dependencies to whichever job next
+    // took the slot, from any repository.
     return sandboxDir;
+  }
+
+  /**
+   * Write the share's tripwire: a fresh random nonce in
+   * `<sandbox>/_work/.localmost-share`, before the worker starts. The job's
+   * profile lets it neither read nor replace the file, so when the guest
+   * reads the same nonce back through its share, the share is the directory
+   * this app made (the design's share rule, clause 8).
+   *
+   * Created exclusively: `wx` is O_CREAT|O_EXCL, which fails on any name
+   * already there, a link included, dangling or not, so it never writes
+   * through one.
+   */
+  writeShareNonce(sandboxDir: string): string {
+    const nonce = crypto.randomBytes(16).toString('hex');
+    fs.writeFileSync(path.join(sandboxDir, SHARE_DIR_NAME, SHARE_NONCE_FILE), nonce, { flag: 'wx', mode: 0o600 });
+    return nonce;
   }
 
   /**
