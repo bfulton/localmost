@@ -169,11 +169,22 @@ func (m OCIMount) ReadOnly() bool {
 	return false
 }
 
-// UnapprovedError names a share-backed bind with no approval.
-type UnapprovedError struct{ Source, Destination string }
+// UnapprovedError names a share-backed bind with no approval. Mounted is
+// set when it comes from the mount table rather than config.json.
+type UnapprovedError struct {
+	Source, Destination string
+	Mounted             bool
+}
 
 func (e *UnapprovedError) Error() string {
-	return fmt.Sprintf("localmost: bind %s -> %s was not approved for this container", e.Source, e.Destination)
+	msg := fmt.Sprintf("localmost: bind %s -> %s was not approved for this container", e.Source, e.Destination)
+	if e.Mounted {
+		// The destination is where runc mounted, after the image's
+		// symlinks: an approved bind whose destination goes through one
+		// lands elsewhere and is refused.
+		msg += " (as mounted; a destination that goes through a symlink in the image is refused, and so is a read-only flag that differs from the approval)"
+	}
+	return msg
 }
 
 // Pair is a share-backed mount (an index into the list it came from) and
@@ -253,8 +264,11 @@ type Matched struct {
 
 // MatchMountinfo is step 4 of rule 7: every share mount under the rootfs
 // must be one approved bind, identified by its root within the share (the
-// host source) and its mount point under the rootfs (the destination), and
-// each approval covers at most one mount.
+// host source), its mount point under the rootfs (the destination) and its
+// per-mount read-only flag, and each approval covers at most one mount. The
+// mount point is where runc actually mounted, so an image whose destination
+// path goes through a symlink (/app -> /usr/src/app) is refused here; the
+// error says so.
 func MatchMountinfo(share, rootfs string, mounts []Mount, approved []proto.Bind) ([]Matched, error) {
 	used := make([]bool, len(approved))
 	var out []Matched
@@ -264,9 +278,9 @@ func MatchMountinfo(share, rootfs string, mounts []Mount, approved []proto.Bind)
 			source = share + m.Root
 		}
 		dest := strings.TrimPrefix(m.MountPoint, rootfs)
-		a := take(approved, used, source, dest, false, false)
+		a := take(approved, used, source, dest, m.HasOption("ro"), true)
 		if a < 0 {
-			return nil, &UnapprovedError{Source: source, Destination: dest}
+			return nil, &UnapprovedError{Source: source, Destination: dest, Mounted: true}
 		}
 		out = append(out, Matched{Mount: m, Approval: a})
 	}

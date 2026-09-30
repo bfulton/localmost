@@ -74,8 +74,11 @@ func (d *fakeDeps) Enter(pid int) (Namespace, error) {
 	return d.ns, nil
 }
 
-func shareMount(id int, root, dest string) mountinfo.Mount {
-	return mountinfo.Mount{ID: id, Parent: 1, Major: 0, Minor: 42, Root: root, MountPoint: rootfs + dest, FSType: "virtiofs", Source: "work", Options: []string{"rw", "nosymfollow"}}
+func shareMount(id int, root, dest string, opts ...string) mountinfo.Mount {
+	if len(opts) == 0 {
+		opts = []string{"rw", "nosymfollow"}
+	}
+	return mountinfo.Mount{ID: id, Parent: 1, Major: 0, Minor: 42, Root: root, MountPoint: rootfs + dest, FSType: "virtiofs", Source: "work", Options: opts}
 }
 
 // A container with two approved binds of the share, as runc left it.
@@ -97,7 +100,7 @@ func twoBinds() *fakeDeps {
 			mounts: []mountinfo.Mount{
 				{ID: 60, Major: 0, Minor: 42, Root: "/", MountPoint: sharePath, FSType: "virtiofs", Source: "work"},
 				shareMount(90, "/a", "/a"),
-				shareMount(91, "/b", "/b"),
+				shareMount(91, "/b", "/b", "ro", "nosymfollow"),
 			},
 			ids: map[string]int{"a": 90, "b": 91},
 		},

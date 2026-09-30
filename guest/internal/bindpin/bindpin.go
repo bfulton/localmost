@@ -128,21 +128,29 @@ func Run(stdin io.Reader, d Deps) error {
 		// approvals: any share mount found below still fails.
 		approved = nil
 	}
-	if _, err := mountinfo.MatchConfig(share.Path, cfg.Mounts, approved); err != nil {
+	pairs, err := mountinfo.MatchConfig(share.Path, cfg.Mounts, approved)
+	if err != nil {
 		return err
+	}
+	required := make([]int, len(pairs))
+	for i, p := range pairs {
+		required[i] = p.Approval
 	}
 	ns, err := d.Enter(st.Pid)
 	if err != nil {
 		return fmt.Errorf("localmost: could not enter the container's mount namespace: %w", err)
 	}
-	return Pin(ns, share, rootfs, approved)
+	return Pin(ns, share, rootfs, approved, required)
 }
 
 // Pin is steps 4 to 6 of rule 7, inside the container's namespace: every
-// share mount below the rootfs must be an approved bind; each is opened
-// beneath the rootfs and must be the mount with the recorded id; and only
-// once all of them passed is nosymfollow cleared on each.
-func Pin(ns Namespace, share Share, rootfs string, approved []proto.Bind) error {
+// share mount below the rootfs must be an approved bind, and every approval
+// in required (those config.json's share-backed mounts matched) must be one
+// of them, so that an approved source that runc resolved off the share (a
+// link swapped in before the mount) is refused; each is opened beneath the
+// rootfs and must be the mount with the recorded id; and only once all of
+// them passed is nosymfollow cleared on each.
+func Pin(ns Namespace, share Share, rootfs string, approved []proto.Bind, required []int) error {
 	all, err := ns.Mountinfo()
 	if err != nil {
 		return fmt.Errorf("localmost: could not read the container's mount table: %w", err)
@@ -151,6 +159,15 @@ func Pin(ns Namespace, share Share, rootfs string, approved []proto.Bind) error 
 	matched, err := mountinfo.MatchMountinfo(share.Path, rootfs, mounts, approved)
 	if err != nil {
 		return err
+	}
+	found := map[int]bool{}
+	for _, m := range matched {
+		found[m.Approval] = true
+	}
+	for _, a := range required {
+		if !found[a] {
+			return fmt.Errorf("localmost: bind %s -> %s is not a mount of the share (its source resolved elsewhere)", approved[a].Source, approved[a].Destination)
+		}
 	}
 	var handles []Handle
 	defer func() {

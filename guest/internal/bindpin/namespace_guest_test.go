@@ -163,7 +163,7 @@ func pin(t *testing.T, pid int, s Share, rootfs string, approved []proto.Bind) e
 			res <- err
 			return
 		}
-		res <- Pin(ns, s, rootfs, approved)
+		res <- Pin(ns, s, rootfs, approved, nil)
 	}()
 	return <-res
 }
