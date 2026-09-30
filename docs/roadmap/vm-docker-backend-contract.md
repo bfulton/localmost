@@ -640,7 +640,7 @@ check.
 
 | File | Status | Owns |
 |---|---|---|
-| `src/main/docker/docker-backend.ts` | rewritten | The `DockerBackend` and `WorkerDocker` interfaces (below). `DesktopBackend` is deleted. |
+| `src/main/docker/docker-backend.ts` | rewritten | The `DockerBackend` and `WorkerDocker` interfaces (below). `DesktopBackend` is deleted. Until then it implements `LegacyDockerBackend`, the stage 1 interface under a new name, which goes with it. |
 | `src/main/vm/vm-backend.ts` | new | `VmBackend implements DockerBackend`: `name = 'vm'`, `supportsPrivileged = false` (owner decision pending; design, Decisions for the owner), `disposable = true`. `workspaceMountRoot` is the same as today's. |
 | `src/main/vm/vm-manager.ts` | new | Admission gate, boot, readiness, stop, `sweep()`, `onResume()`, `shutdownAll()`, the spare. |
 | `src/main/vm/helper-client.ts` | new | Spawn through `sandbox-exec`, NDJSON framing, the events and commands of §2.4, exit mapping. |
@@ -648,7 +648,8 @@ check.
 | `src/main/vm/agent-client.ts` | new | §3.4 over `agent.sock`, with schema validation of every answer. |
 | `src/main/vm/guest-image.ts` | new | Locate `<resources>/guest`, read `manifest.json`, check the artifact hashes once per launch. |
 | `src/main/vm/cache-disks.ts` | new | §6.5. |
-| `src/main/vm/paths.ts` | new | Every path in §1, `repoKeyOf()`, `helperPath()` and `dockerCliPath()`. |
+| `src/main/vm/types.ts` | new | Declarations only: `VmRequest`, `VmState`, `VmHandle`, `VmError`, `VmManager` (below), `AgentClient` (§3.4, below), `ImagePuller` (§6.4), `CacheDisks` and `StartRefreshVm` (§6.5). The implementations import them from here, so that no two of them import each other. |
+| `src/main/vm/paths.ts` | new | Every path in §1, each built only from an id checked against its §1 form (a malformed one throws): `vmDir()`, `vmJobFiles()`, `imageStoreDir()`, `refsJsonPath()`, `cacheFiles()`, `sandboxDirOf()` and `sandboxFiles()`, which take `<data>` as an argument, already realpathed by the caller. Also the §1 regexes, `repoKeyOf()`, `newVmId(slot)`, `vmIdSlot()`, `digestHex()` (§6.3), `blobPath()` (§6.3), `getVmResourcesDir()`, `guestDir()`, `helperPath()` (with the `LOCALMOST_VM_HELPER` rule of §7.3) and `dockerCliPath()`. |
 | `src/main/resource-monitor/memory-pressure-monitor.ts` | new | Polls `sysctl -n kern.memorystatus_vm_pressure_level` every 5 s with async `execFile` (1 → `normal`, 2 → `warn`, 4 → `critical`; anything else → `warn`), and calls `vmManager.onMemoryPressure(level)` on a change. |
 | `src/main/docker/puller/registry-client.ts` | new | Registry v2 client: token auth, manifests, blobs, redirects, screened DNS. |
 | `src/main/docker/puller/image-store.ts` | new | The per-repository blob store and `refs.json`. |
@@ -744,7 +745,7 @@ export interface WorkerDocker {
 ```
 
 ```ts
-// src/main/vm/vm-manager.ts
+// src/main/vm/types.ts (VmManager is implemented in vm-manager.ts)
 export interface VmRequest {
   mode: 'job' | 'refresh';
   /** 1–99 for a job; 0 for a refresh. Refreshes queue behind every job boot at the admission gate. */
@@ -758,7 +759,7 @@ export interface VmHandle {
   readonly vmId: string;
   readonly dockerSocketPath: string;
   state(): VmState;
-  /** Resolves on configure success; rejects with VmError { stage, code, message }. */
+  /** Resolves on configure success; rejects with a VmError. */
   ready(): Promise<{ docker: { version: string; apiVersion: string }; rosetta: 'ok' | 'absent' | 'broken'; bootMs: number }>;
   agent(): AgentClient;
   stop(reason: string): Promise<void>;
@@ -769,6 +770,25 @@ export interface VmManager {
   onResume(): void;
   onMemoryPressure(level: 'normal' | 'warn' | 'critical'): void;
   shutdownAll(): Promise<void>;
+}
+/** An Error naming where the VM failed; `code` is a §2.4 or §3.4 code, or VmManager's own. */
+export interface VmError extends Error {
+  stage: 'admission' | 'disk' | 'helper' | 'agent' | 'configure' | 'nonce' | 'running';
+  code: string;
+}
+```
+
+```ts
+// src/main/vm/types.ts: §3.4 over agent.sock. Every answer is schema-checked
+// and bounded before it is returned; a refusal rejects with the agent's code.
+export interface AgentClient {
+  hello(): Promise<{ agent: string; guestVersion: string; kernel: string; agentProtocol: 1 }>;
+  configure(req: AgentConfigureRequest): Promise<AgentConfigureResult>;   // the §3.4 fields
+  approveBinds(container: string, binds: ApprovedBind[]): Promise<void>;
+  setTime(unixMs: number): Promise<void>;
+  status(): Promise<{ dockerd: 'running' | 'exited'; uptimeMs: number }>;
+  shutdown(): Promise<void>;
+  close(): void;
 }
 ```
 
@@ -1040,6 +1060,7 @@ instead.)
 ### 6.4 `ImagePuller`
 
 ```ts
+// src/main/vm/types.ts
 export interface ImagePuller {
   pull(opts: {
     repository: string;                      // owner/name: the cache key
@@ -1081,6 +1102,7 @@ answer (§5.3).
 ### 6.5 `CacheDisks`
 
 ```ts
+// src/main/vm/types.ts
 export interface CacheDisks {
   /** A clone of the golden disk (clonefile), or a new sparse file when there is none. */
   prepareJobDisk(repoKey: string, dest: string, sizeGiB: number): Promise<'clone' | 'blank'>;
