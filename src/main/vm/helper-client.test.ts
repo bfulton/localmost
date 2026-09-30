@@ -3,7 +3,10 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
+import type { ChildProcess } from 'child_process';
+import { EventEmitter } from 'events';
 import * as fs from 'fs';
+import { PassThrough } from 'stream';
 import * as path from 'path';
 import { HelperClient, HelperRunArgs, exitErrorCode, helperArgs } from './helper-client';
 import { fakeHelperSpawn, layOutVmData, shortTempDir, VmLayout } from '../test-utils/vm-fixtures';
@@ -192,5 +195,42 @@ describe('HelperClient with the fake helper', () => {
     c.start();
     await c.exited();
     expect(logs).toContainEqual({ level: 'error', message: 'start failed' });
+  });
+});
+
+describe('HelperClient and the end of the helper', () => {
+  it("takes the stopped event the helper wrote before it exited, even when it is read after the exit", async () => {
+    // Node may report a child's exit while its stdout still holds unread
+    // lines. The helper writes stopped and exits right after, so the exit
+    // must wait for stdout's end, or a refresh loses its synced flag.
+    const child = Object.assign(new EventEmitter(), {
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      pid: 4242,
+      kill: () => true,
+    });
+    const dir = '/d/vm/jobs/0-0123456789ab';
+    const c = new HelperClient({
+      helper: '/unused/localmost-vm',
+      args: { vmId: '0-0123456789ab', mode: 'refresh', dataDir: '/d', resources: '/r', repoKey: '0123456789abcdef', cpus: 1, memoryMiB: 1024, rosetta: 'off' },
+      spawn: () => child as unknown as ChildProcess,
+      env: {},
+      expectSockets: { dockerSocket: `${dir}/docker.sock`, agentSocket: `${dir}/agent.sock` },
+      log: () => {},
+    });
+    c.start();
+    const line = (body: Record<string, unknown>) => child.stdout.write(`${JSON.stringify({ v: 1, ...body })}\n`);
+    line({ event: 'listening', dockerSocket: `${dir}/docker.sock`, agentSocket: `${dir}/agent.sock` });
+    line({ event: 'started', pid: 4242, rosetta: 'off', startMs: 5 });
+    await new Promise((resolve) => setImmediate(resolve));
+    // The exit first; the last line and the streams' end after it.
+    child.emit('exit', 0, null);
+    line({ event: 'stopped', reason: 'guest', synced: true });
+    child.stdout.end();
+    child.stderr.end();
+    await new Promise((resolve) => setImmediate(resolve));
+    child.emit('close', 0, null);
+    expect(await c.exited()).toMatchObject({ code: 0, stopped: { reason: 'guest', synced: true } });
   });
 });

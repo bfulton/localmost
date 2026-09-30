@@ -166,7 +166,11 @@ export class HelperClient extends EventEmitter {
       this.opts.log('error', `the helper could not be started: ${err.message}`);
       this.finish(null, null, 'E_HELPER_EXIT');
     });
-    child.on('exit', (code, signal) => this.finish(code, signal));
+    // 'close', not 'exit': Node may report the exit while stdout still holds
+    // the helper's last lines, and its stopped event, written just before it
+    // exits, carries the synced flag a refresh needs. 'close' comes once the
+    // process has exited and its stdio has ended.
+    child.on('close', (code, signal) => this.finish(code, signal));
   }
 
   pid(): number | undefined {
