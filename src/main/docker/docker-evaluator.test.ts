@@ -1254,8 +1254,9 @@ describe('the binds an allowed create approves for the VM', () => {
   // lm-bindpin checks each share-backed mount against before the container
   // starts. Both sides normalise the same way (contract §3.7): the source is
   // the pinned host path, byte for byte; the destination is cleaned; readOnly
-  // comes from the mode. These are the vectors of the Go side's
-  // guest/internal/mountinfo/testdata/binds.json, spelled as create bodies.
+  // comes from the mode. The vectors below add the Mounts spelling and
+  // tmpfs and volumes to the ones both sides read from
+  // guest/internal/mountinfo/testdata/binds.json.
   const policy: DockerPolicy = {
     run: { images: ['alpine:3'], mounts: [{ path: './', mode: 'rw' }], network: 'bridge' },
   };
@@ -1316,6 +1317,34 @@ describe('the binds an allowed create approves for the VM', () => {
     const verdict = create(hostConfig);
     expect(verdict.allowed).toBe(true);
     expect(verdict.approvedBinds).toEqual(binds);
+  });
+
+  describe('the vectors lm-bindpin also runs, from its testdata', () => {
+    // One file, read by both sides, so the two normalisations cannot drift:
+    // guest/internal/mountinfo's tests run the same cases against the hook.
+    const shared = JSON.parse(
+      fs.readFileSync(path.resolve(__dirname, '..', '..', '..', 'guest', 'internal', 'mountinfo', 'testdata', 'binds.json'), 'utf-8')
+    ) as {
+      destinations: Array<{ in: string; out?: string; refused?: boolean }>;
+      cases: Array<{ name: string; share: string; dockerBinds: string[]; approved: Array<{ source: string; destination: string; readOnly: boolean }> }>;
+    };
+
+    it.each(shared.destinations)('the destination $in', ({ in: destination, out, refused }) => {
+      const verdict = create({ Binds: [`/ws/data:${destination}`] });
+      if (refused) {
+        expect(verdict.allowed).toBe(false);
+        expect(verdict.reason).toMatch(/destination/);
+      } else {
+        expect(verdict.allowed).toBe(true);
+        expect(verdict.approvedBinds).toEqual([{ source: '/ws/data', destination: out, readOnly: false }]);
+      }
+    });
+
+    it.each(shared.cases)('$name', ({ share, dockerBinds, approved }) => {
+      const verdict = create({ Binds: dockerBinds }, ctx(policy, { sandboxDir: share, workspaceRoot: share }));
+      expect(verdict.allowed).toBe(true);
+      expect(verdict.approvedBinds).toEqual(approved);
+    });
   });
 
   it('is empty for a create with no mounts at all', () => {
