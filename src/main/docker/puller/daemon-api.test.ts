@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
-import { DaemonEndpoint, DaemonError, OVERSIZED, listImages, removeImage, tagImage } from './daemon-api';
+import { Readable } from 'stream';
+import { DaemonEndpoint, DaemonError, OVERSIZED, listImages, loadImage, removeImage, tagImage } from './daemon-api';
 import { TestDaemon } from './test-daemon';
 import { sha256 } from './test-registry';
 
@@ -46,6 +47,19 @@ describe('removeImage', () => {
   ])('refuses a name with %s, as a hostile image list could hold, before any request', async (_what, tag) => {
     await expect(removeImage(endpoint, { tag })).rejects.toThrow('not an image name');
     expect(daemon.calls).toHaveLength(0);
+  });
+});
+
+describe('loadImage', () => {
+  it('destroys the archive it was streaming when the call ends early, so its layer files close', async () => {
+    daemon.switches.hang = 'load';
+    const archive = new Readable({ read() { this.push(Buffer.alloc(1024)); } });
+    const controller = new AbortController();
+    const attempt = loadImage(endpoint, archive, controller.signal);
+    await new Promise((r) => setTimeout(r, 50));
+    controller.abort();
+    await expect(attempt).rejects.toThrow('cancelled');
+    expect(archive.destroyed).toBe(true);
   });
 });
 

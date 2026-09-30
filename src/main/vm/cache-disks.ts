@@ -12,17 +12,25 @@
  * Because the refresh VM writes untrusted layers into state that outlives a
  * job, a refresh starts from blank when the guest changed, when the golden
  * disk was last built from blank more than 7 days ago, after any failed
- * refresh, and when the cache limit dropped images.
+ * refresh, and when the cache limit dropped images. It also starts from blank
+ * when dockerVm.dataDiskGiB no longer matches the golden disk's size.
+ *
+ * What a refresh loads is decided by refs.json alone: the puller records only
+ * public images there (owner decision 1). notePulled is a hint and changes
+ * nothing. Every step of a refresh runs under one deadline, after which its
+ * VM is stopped and the refresh fails like any other.
  *
  * CacheDisks takes a StartRefreshVm instead of importing VmManager, so that
  * it can be built and tested against a fake.
  */
 
 import { execFile } from 'child_process';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { performance } from 'perf_hooks';
 import { promisify } from 'util';
-import { DaemonConnector, DaemonError, listImages, loadImage, removeImage } from '../docker/puller/daemon-api';
+import { DaemonConnector, DaemonError, hasImage, listImages, loadImage, removeImage } from '../docker/puller/daemon-api';
 import { dockerArchive, ArchiveLayer } from '../docker/puller/docker-archive';
 import { blobsOf, ImageStore, StoreRef } from '../docker/puller/image-store';
 import { cacheFiles, DIGEST_RE, imageStoreDir, REPO_KEY_RE, REFRESH_SLOT, repoKeyOf, VM_ID_RE, vmIdSlot, vmJobFiles } from './paths';
@@ -33,6 +41,12 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 /** A golden disk last built from blank longer ago than this is rebuilt from blank. */
 const REBUILD_AFTER_MS = 7 * DAY_MS;
 const DEBOUNCE_MS = 60_000;
+/** Jobs that keep finishing inside the debounce still get a refresh this long after the first. */
+const MAX_WAIT_MS = 10 * 60_000;
+/** A refresh loads at most cacheLimitGiB (20 GiB by default) into a fresh VM: generous. */
+const REFRESH_TIMEOUT_MS = 30 * 60_000;
+/** How long a failed refresh waits for its VM to stop. */
+const STOP_WAIT_MS = 30_000;
 const MAX_CONFIG_BYTES = 16 * 1024 * 1024;
 const MAX_META_BYTES = 4 * 1024 * 1024;
 const GUEST_VERSION_RE = /^[\x21-\x7e]{1,64}$/;
@@ -55,6 +69,10 @@ export interface CacheDisksOptions {
   /** A refresh waits while either holds. */
   conditions?: () => { onBattery: boolean; memoryPressure: 'normal' | 'warn' | 'critical' };
   debounceMs?: number;
+  /** However often a refresh is scheduled again, it runs this long after the first schedule. */
+  maxWaitMs?: number;
+  /** How long one refresh may take, from its VM's start to its stop. */
+  refreshTimeoutMs?: number;
   now?: () => number;
   log?: (level: 'debug' | 'info' | 'warn', message: string) => void;
   /** Tests only: how to reach a VM's docker.sock (see DaemonConnector). */
@@ -132,21 +150,60 @@ async function createSparse(file: string, sizeGiB: number): Promise<void> {
   }
 }
 
-/** `<registry>/<path>` from a stored reference, for the archive's image name. */
-function imageName(ref: string): string {
-  const at = ref.indexOf('@');
-  if (at >= 0) return ref.slice(0, at);
-  const colon = ref.lastIndexOf(':');
-  return colon > ref.lastIndexOf('/') ? ref.slice(0, colon) : ref;
+/**
+ * The archive's image name for a stored reference: the reference itself for
+ * a pull by digest, and for a pull by tag the digest the tag resolved to.
+ */
+function imageName(ref: StoreRef): string {
+  if (ref.ref.includes('@')) return ref.ref;
+  const colon = ref.ref.lastIndexOf(':');
+  const name = colon > ref.ref.lastIndexOf('/') ? ref.ref.slice(0, colon) : ref.ref;
+  return `${name}@${ref.indexDigest ?? ref.manifestDigest}`;
+}
+
+/** `promise`, or the signal's reason once it aborts, whichever comes first. */
+function within<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', abort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', abort);
+        reject(error);
+      }
+    );
+  });
+}
+
+/** Wait for `promise` at most `ms`; what it settles to is ignored. */
+async function atMost(promise: Promise<unknown>, ms: number): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  await Promise.race([
+    promise.catch(() => undefined),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, ms);
+      timer.unref?.();
+    }),
+  ]);
+  clearTimeout(timer);
 }
 
 export class CacheDisks implements CacheDisksApi {
   private readonly timers = new Map<string, NodeJS.Timeout>();
+  /** When a repository's pending refresh was first scheduled (performance.now()), for maxWaitMs. */
+  private readonly firstScheduled = new Map<string, number>();
   private readonly running = new Map<string, Promise<void>>();
+  /** Each running refresh's deadline, which shutdown() also trips. */
+  private readonly aborts = new Map<string, AbortController>();
   private readonly again = new Map<string, string>();
-  private readonly pending = new Map<string, Set<string>>();
   private readonly generation = new Map<string, number>();
   private readonly waiters = new Map<string, Array<() => void>>();
+  private closed = false;
   private readonly now: () => number;
   private readonly log: (level: 'debug' | 'info' | 'warn', message: string) => void;
 
@@ -178,9 +235,16 @@ export class CacheDisks implements CacheDisksApi {
   private async writeMeta(repoKey: string, meta: Meta): Promise<void> {
     const { dir, meta: file } = this.files(repoKey);
     await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
-    const tmp = `${file}.tmp-${process.pid}-${this.now()}`;
-    await fs.promises.writeFile(tmp, JSON.stringify(meta, null, 1), { mode: 0o600 });
-    await fs.promises.rename(tmp, file);
+    // A new file ('wx': never through a symlink, never over another file),
+    // renamed into place, and removed if anything fails.
+    const tmp = `${file}.tmp-${crypto.randomBytes(8).toString('hex')}`;
+    try {
+      await fs.promises.writeFile(tmp, JSON.stringify(meta, null, 1), { flag: 'wx', mode: 0o600 });
+      await fs.promises.rename(tmp, file);
+    } catch (error) {
+      await fs.promises.rm(tmp, { force: true });
+      throw error;
+    }
   }
 
   async prepareJobDisk(repoKey: string, dest: string, sizeGiB: number): Promise<'clone' | 'blank'> {
@@ -209,27 +273,38 @@ export class CacheDisks implements CacheDisksApi {
     return 'blank';
   }
 
+  /**
+   * A hint only: what a refresh loads comes from refs.json, where the puller
+   * records only public images (owner decision 1). Nothing here gates what
+   * reaches the golden disk.
+   */
   notePulled(repoKey: string, configDigest: string): void {
     if (!REPO_KEY_RE.test(repoKey) || !DIGEST_RE.test(configDigest)) return;
-    let set = this.pending.get(repoKey);
-    if (!set) {
-      set = new Set();
-      this.pending.set(repoKey, set);
-    }
-    set.add(configDigest);
+    this.log('debug', `pulled ${configDigest} for ${repoKey}; the next refresh reads refs.json`);
   }
 
+  /**
+   * Debounced: the refresh runs once no schedule has come for debounceMs,
+   * and at the latest maxWaitMs after the first schedule it answers.
+   */
   scheduleRefresh(repoKey: string, repository: string): void {
+    if (this.closed) return;
     if (!REPO_KEY_RE.test(repoKey) || repoKeyOf(repository) !== repoKey) {
       this.log('warn', `not scheduling a cache refresh: ${repository} is not the repository of ${repoKey}`);
       return;
     }
     const existing = this.timers.get(repoKey);
     if (existing) clearTimeout(existing);
+    const at = performance.now();
+    const first = this.firstScheduled.get(repoKey) ?? at;
+    this.firstScheduled.set(repoKey, first);
+    const debounce = this.options.debounceMs ?? DEBOUNCE_MS;
+    const latest = first + (this.options.maxWaitMs ?? MAX_WAIT_MS) - at;
     const timer = setTimeout(() => {
       this.timers.delete(repoKey);
+      this.firstScheduled.delete(repoKey);
       void this.fire(repoKey, repository);
-    }, this.options.debounceMs ?? DEBOUNCE_MS);
+    }, Math.max(0, Math.min(debounce, latest)));
     timer.unref?.();
     this.timers.set(repoKey, timer);
   }
@@ -247,11 +322,18 @@ export class CacheDisks implements CacheDisksApi {
       this.scheduleRefresh(repoKey, repository);
       return;
     }
-    const run = this.refresh(repoKey, repository).catch((error) => {
+    const timeoutMs = this.options.refreshTimeoutMs ?? REFRESH_TIMEOUT_MS;
+    const deadline = new AbortController();
+    const timer = setTimeout(() => deadline.abort(new Error(`it took longer than ${Math.round(timeoutMs / 1000)} s`)), timeoutMs);
+    timer.unref?.();
+    this.aborts.set(repoKey, deadline);
+    const run = this.refresh(repoKey, repository, deadline.signal).catch((error) => {
       this.log('warn', `cache refresh for ${repository} failed: ${(error as Error).message}`);
     });
     this.running.set(repoKey, run);
     await run;
+    clearTimeout(timer);
+    this.aborts.delete(repoKey);
     this.running.delete(repoKey);
     const next = this.again.get(repoKey);
     if (next !== undefined) {
@@ -267,7 +349,11 @@ export class CacheDisks implements CacheDisksApi {
     this.waiters.delete(repoKey);
   }
 
-  /** Resolves once no refresh of the repository is scheduled or running. For tests and shutdown. */
+  /**
+   * Tests only: resolves once no refresh of the repository is scheduled or
+   * running. A refresh that waits on battery is rescheduled for as long as
+   * the Mac is on battery, so this can wait that long; shutdown() does not.
+   */
   settled(repoKey: string): Promise<void> {
     if (!this.timers.has(repoKey) && !this.running.has(repoKey)) return Promise.resolve();
     return new Promise((resolve) => {
@@ -275,6 +361,22 @@ export class CacheDisks implements CacheDisksApi {
       list.push(resolve);
       this.waiters.set(repoKey, list);
     });
+  }
+
+  /**
+   * App quit: nothing is scheduled any more, a scheduled refresh never runs,
+   * and a running one is stopped (its VM too) and recorded as failed, so the
+   * next one starts from blank. Resolves once every running refresh is done.
+   */
+  async shutdown(): Promise<void> {
+    this.closed = true;
+    for (const timer of this.timers.values()) clearTimeout(timer);
+    this.timers.clear();
+    this.firstScheduled.clear();
+    this.again.clear();
+    for (const deadline of this.aborts.values()) deadline.abort(new Error('localmost is quitting'));
+    await Promise.all(this.running.values());
+    for (const repoKey of [...this.waiters.keys()]) this.wake(repoKey);
   }
 
   async discard(repoKey: string, reason: 'corrupt' | 'dataFormat' | 'limit'): Promise<void> {
@@ -285,14 +387,19 @@ export class CacheDisks implements CacheDisksApi {
     this.log('info', `discarded the golden disk of ${repoKey}: ${reason}`);
   }
 
-  /** One refresh (§6.5): choose full or incremental, load in a refresh VM, promote only a synced disk. */
-  private async refresh(repoKey: string, repository: string): Promise<void> {
+  /**
+   * One refresh (§6.5): choose full or incremental, load in a refresh VM,
+   * promote only a synced disk. Every wait on the VM or its daemon ends when
+   * `deadline` aborts, which fails the refresh.
+   */
+  private async refresh(repoKey: string, repository: string, deadline: AbortSignal): Promise<void> {
     const files = this.files(repoKey);
     const guest = this.options.guest();
     const generation = this.generation.get(repoKey) ?? 0;
     const store = new ImageStore(imageStoreDir(this.options.dataDir, repoKey), (message) => this.log('warn', message));
     const meta = await this.readMeta(repoKey);
-    const hasGolden = await fs.promises.lstat(files.golden).then((s) => s.isFile(), () => false);
+    const golden = await fs.promises.lstat(files.golden).then((s) => (s.isFile() ? s : null), () => null);
+    const diskBytes = Math.floor(this.options.dataDiskGiB() * GiB);
 
     const { kept, dropped } = await store.trim(this.options.cacheLimitGiB() * GiB);
     const images = new Map<string, StoreRef>();
@@ -300,19 +407,20 @@ export class CacheDisks implements CacheDisksApi {
 
     const now = this.now();
     const fullBecause =
-      !hasGolden || !meta ? 'there is no golden disk'
+      !golden || !meta ? 'there is no golden disk'
         : meta.dataFormat !== guest.dataFormat || meta.guestVersion !== guest.guestVersion ? 'the guest changed'
           : now - meta.builtFromBlankAt > REBUILD_AFTER_MS ? 'it was last built from blank over 7 days ago'
             : meta.lastRefreshFailed ? 'the last refresh failed'
               : dropped.length > 0 ? `the cache limit dropped ${dropped.length} image${dropped.length === 1 ? '' : 's'}`
-                : null;
+                : golden.size !== diskBytes ? 'dockerVm.dataDiskGiB changed'
+                  : null;
     const held = new Set(meta?.configDigests ?? []);
     const toLoad = fullBecause ? [...images.values()] : [...images.values()].filter((r) => !held.has(r.configDigest));
     if (!fullBecause && toLoad.length === 0) {
       this.log('debug', `cache refresh for ${repository}: the golden disk already holds every image`);
-      this.pending.delete(repoKey);
       return;
     }
+    const hasGolden = golden !== null;
     if (images.size === 0) {
       if (hasGolden) await this.discard(repoKey, 'limit');
       return;
@@ -331,22 +439,26 @@ export class CacheDisks implements CacheDisksApi {
       if (vmIdSlot(vm.vmId) !== REFRESH_SLOT || vm.dockerSocketPath !== vmJobFiles(this.options.dataDir, vm.vmId).dockerSocket) {
         throw new Error(`the refresh VM ${vm.vmId} is not a refresh-slot VM of this data directory`);
       }
-      await vm.ready();
+      await within(vm.ready(), deadline);
       const daemon = { socketPath: vm.dockerSocketPath, connect: this.options.connectDaemon };
       const loaded = new Set(fullBecause ? [] : [...held].filter((d) => images.has(d)));
       for (const ref of toLoad) {
-        await loadImage(daemon, dockerArchive(await this.archiveOf(store, ref)));
+        const ids = await loadImage(daemon, dockerArchive(await this.archiveOf(store, ref)), deadline);
+        // Recorded as held only once the daemon shows it by its id, the config digest.
+        if (ids.some((id) => id !== ref.configDigest) || !(await hasImage(daemon, ref.configDigest, deadline))) {
+          throw new Error(`the refresh VM did not load ${ref.configDigest} for ${ref.ref}`);
+        }
         loaded.add(ref.configDigest);
       }
-      for (const image of await listImages(daemon)) {
+      for (const image of await listImages(daemon, deadline)) {
         if (!loaded.has(image.Id)) {
-          await removeImage(daemon, { id: image.Id });
+          await removeImage(daemon, { id: image.Id }, deadline);
           continue;
         }
-        for (const tag of image.RepoTags) await removeImage(daemon, { tag });
+        for (const tag of image.RepoTags) await removeImage(daemon, { tag }, deadline);
       }
-      await vm.agent().shutdown();
-      const stopped = await vm.stopped();
+      await within(vm.agent().shutdown(), deadline);
+      const stopped = await within(vm.stopped(), deadline);
       if (!stopped.synced) throw new Error(`the refresh VM stopped (${stopped.reason}) without syncing its disk`);
       if ((this.generation.get(repoKey) ?? 0) !== generation) throw new Error('the golden disk was discarded during the refresh');
       await fs.promises.rename(files.refresh, files.golden);
@@ -359,10 +471,9 @@ export class CacheDisks implements CacheDisksApi {
         lastRefreshAt: now,
         lastRefreshFailed: false,
       });
-      this.pending.delete(repoKey);
       this.log('info', `cache refresh for ${repository}: the golden disk holds ${loaded.size} image${loaded.size === 1 ? '' : 's'}`);
     } catch (error) {
-      if (vm) await vm.stop('cache refresh failed').catch(() => undefined);
+      if (vm) await atMost(vm.stop('cache refresh failed'), STOP_WAIT_MS);
       await fs.promises.rm(files.refresh, { force: true });
       const previous = (this.generation.get(repoKey) ?? 0) === generation ? await this.readMeta(repoKey) : null;
       await this.writeMeta(repoKey, {
@@ -392,6 +503,6 @@ export class CacheDisks implements CacheDisksApi {
       open: () =>
         fs.createReadStream('', { fd: fs.openSync(store.pathOf(layer.digest), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW) }),
     }));
-    return { name: `${imageName(ref.ref)}@${ref.manifestDigest}`, config, configDigest: ref.configDigest, layers };
+    return { name: imageName(ref), config, configDigest: ref.configDigest, layers };
   }
 }

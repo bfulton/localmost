@@ -197,11 +197,16 @@ export interface ImagePuller {
 export interface CacheDisks {
   /** A clone of the golden disk (clonefile), or a new sparse file when there is none. */
   prepareJobDisk(repoKey: string, dest: string, sizeGiB: number): Promise<'clone' | 'blank'>;
+  /**
+   * A hint, for the log: what a refresh loads comes from refs.json, where the
+   * puller records only public images. It gates nothing.
+   */
   notePulled(repoKey: string, configDigest: string): void;
   /**
-   * Debounced 60 s, one at a time per repository, skipped on battery or memory
-   * pressure. `repository` (owner/name) is what StartRefreshVm is given; it
-   * must be the one `repoKey` was made from.
+   * Debounced 60 s (and run at most 10 minutes after the first schedule),
+   * one at a time per repository, and held back while on battery or under
+   * memory pressure. `repository` (owner/name) is what StartRefreshVm is
+   * given; it must be the one `repoKey` was made from.
    */
   scheduleRefresh(repoKey: string, repository: string): void;
   discard(repoKey: string, reason: 'corrupt' | 'dataFormat' | 'limit'): Promise<void>;

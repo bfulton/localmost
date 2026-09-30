@@ -32,6 +32,8 @@ export interface DaemonSwitches {
   loadedId?: string;
   /** Answer the inspect of any image with this Id. */
   inspectId?: string;
+  /** Never answer this endpoint: a daemon that has stopped responding. */
+  hang?: 'load' | 'list';
 }
 
 function untar(bytes: Buffer): Map<string, Buffer> {
@@ -110,6 +112,7 @@ export class TestDaemon {
       return this.send(res, 200, { Id: inspect[1], RepoTags: this.images.get(inspect[1]) });
     }
     if (method === 'POST' && url.pathname === '/images/load') {
+      if (this.switches.hang === 'load') return;
       if (this.switches.oversize === 'load') return this.oversized(res);
       if (this.switches.loadError) {
         return this.send(res, 200, JSON.stringify({ errorDetail: { message: this.switches.loadError }, error: this.switches.loadError }) + '\n');
@@ -133,6 +136,7 @@ export class TestDaemon {
       return;
     }
     if (method === 'GET' && url.pathname === '/images/json') {
+      if (this.switches.hang === 'list') return;
       if (this.switches.oversize === 'list') return this.oversized(res);
       return this.send(res, 200, [...this.images].map(([Id, RepoTags]) => ({ Id, RepoTags: RepoTags.length ? RepoTags : null })));
     }

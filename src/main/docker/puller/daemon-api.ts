@@ -58,6 +58,8 @@ function call(
     const fail = (error: Error) => {
       if (settled) return;
       settled = true;
+      // An archive still streaming holds its layers' files open: close them.
+      body?.destroy();
       reject(error);
     };
     const connect = daemon.connect;
