@@ -95,6 +95,40 @@ describe('the Docker Desktop backend stays removed', () => {
     expect(found).toEqual([]);
   });
 
+  it('spells docker.sock only where the app names the sockets it serves, and never beside /var/run', () => {
+    // Whole strings are not the only spelling: path.join('/var', 'run',
+    // 'docker.sock') finds the daemon as surely. So the name itself is
+    // allowed only in the files that build a socket the app serves, or say
+    // what one is, and in no file that also spells /var/run.
+    const allowed = [
+      // DOCKER_SOCKET_NAME: the filtering socket, in the worker's sandbox.
+      'src/main/runner-manager.ts',
+      // A job VM's socket, and the refresh VM's, under <data>/vm.
+      'src/main/vm/paths.ts',
+      // A comment in the helper's profile, on the sockets it binds there.
+      'src/main/vm/helper-profile.ts',
+      // Discovery's hint when a job reached a socket of that name.
+      'src/cli/test.ts',
+      // The longest VM socket path, for the tests that must fit it.
+      'src/main/test-utils/vm-fixtures.ts',
+    ].map((rel) => path.join(...rel.split('/')));
+    // Code only: a comment line's apostrophe ("the VM's docker.sock") is not
+    // a string, and a comment connects to nothing.
+    const code = (rel: string): string =>
+      read(rel)
+        .split('\n')
+        .filter((line) => !/^\s*(\/\/|\/\*|\*)/.test(line))
+        .join('\n');
+    const socketName = /["'`][^"'`\n]*docker\.sock/;
+    const varRun = [/["'`][^"'`\n]*\/var\/run/, /["'`]\/var["'`]\s*,\s*["'`]run["'`]/];
+    const spelling = filesUnder('src')
+      .filter((rel) => !isTest(rel) && socketName.test(code(rel)))
+      .filter((rel) => !allowed.includes(rel) || varRun.some((re) => re.test(code(rel))));
+    expect(spelling).toEqual([]);
+    // Each allowed file still spells it, so the list cannot outlive its reason.
+    expect(allowed.filter((rel) => !socketName.test(code(rel)))).toEqual([]);
+  });
+
   it("imports the e2e spec's native forwarder from no app code", () => {
     // The Linux leg of test/e2e/docker.spec.ts forwards to a runner's native
     // dockerd through it (owner decision 3). It is a second backend, so it
