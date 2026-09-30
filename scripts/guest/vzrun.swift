@@ -145,23 +145,14 @@ let vm = VZVirtualMachine(configuration: cfg)
 
 // ---- byte copying ----------------------------------------------------------------
 
-/// Copies bytes both ways between two sockets on their own threads, half-closing
-/// each direction at EOF, then calls `done`.
-// Copies bytes both ways between two sockets on their own threads. When
-// either direction ends, both fds are shut down, which ends the other
-// direction too: a relay or a Docker request/response is finished once one
-// side closes, and nothing this program carries needs one direction to
-// outlive the other.
+// Copies bytes both ways between two sockets on their own threads. When one
+// direction reaches EOF, its destination is half-closed (SHUT_WR) so the peer
+// reads EOF too, and the other direction keeps flowing: a Docker client
+// half-closes a hijacked attach or exec stream once its stdin is done (the
+// CLI does even when there is no stdin), and the container's output must
+// still arrive after that. `done` runs once both directions have ended.
 func splice(_ a: Int32, _ b: Int32, done: @escaping () -> Void) {
     let group = DispatchGroup()
-    let state = OpaquePointer(UnsafeMutablePointer<Int32>.allocate(capacity: 1))
-    UnsafeMutablePointer<Int32>(state).initialize(to: 0)
-    func closeBoth() {
-        if OSAtomicCompareAndSwap32(0, 1, UnsafeMutablePointer<Int32>(state)) {
-            shutdown(a, SHUT_RDWR)
-            shutdown(b, SHUT_RDWR)
-        }
-    }
     func pump(_ from: Int32, _ to: Int32) {
         group.enter()
         Thread.detachNewThread {
@@ -175,15 +166,20 @@ func splice(_ a: Int32, _ b: Int32, done: @escaping () -> Void) {
                     if w <= 0 { off = -1; break }
                     off += w
                 }
-                if off < 0 { break }
+                if off < 0 {
+                    // The destination is gone: nothing more can be delivered
+                    // either way, so end the reading side too.
+                    shutdown(from, SHUT_RD)
+                    break
+                }
             }
-            closeBoth()
+            shutdown(to, SHUT_WR)
             group.leave()
         }
     }
     pump(a, b)
     pump(b, a)
-    group.notify(queue: .global()) { UnsafeMutablePointer<Int32>(state).deallocate(); done() }
+    group.notify(queue: .global()) { done() }
 }
 
 func unixAddr(_ path: String) -> sockaddr_un {
@@ -242,41 +238,11 @@ final class FromGuest: NSObject, VZVirtioSocketListenerDelegate {
     init(path: String) { self.path = path }
     func listener(_ listener: VZVirtioSocketListener, shouldAcceptNewConnection conn: VZVirtioSocketConnection, from device: VZVirtioSocketDevice) -> Bool {
         hold(conn)
-        let vsock = conn.fileDescriptor
-        // Never block the VZ queue: dial and copy elsewhere. When either
-        // direction ends, close the VZ connection on the main (VZ) queue:
-        // VZ flushes a from-guest connection's buffered host→guest bytes to
-        // the guest only on close, not on a bare shutdown(SHUT_WR), so the
-        // proxy's response reaches the container only this way.
+        // Never block the VZ queue: dial and copy elsewhere.
         DispatchQueue.global().async {
             let fd = connectUnix(self.path)
             if fd < 0 { DispatchQueue.main.async { releaseConn(conn) }; return }
-            let group = DispatchGroup()
-            func pump(_ from: Int32, _ to: Int32) {
-                group.enter()
-                Thread.detachNewThread {
-                    var buf = [UInt8](repeating: 0, count: 64 * 1024)
-                    while true {
-                        let n = read(from, &buf, buf.count)
-                        if n <= 0 { break }
-                        var off = 0
-                        while off < n {
-                            let w = buf.withUnsafeBytes { write(to, $0.baseAddress! + off, n - off) }
-                            if w <= 0 { off = -1; break }
-                            off += w
-                        }
-                        if off < 0 { break }
-                    }
-                    // Close the proxy fd and the VZ connection; closing the
-                    // connection unblocks the other pump's read of the vsock.
-                    shutdown(fd, SHUT_RDWR)
-                    DispatchQueue.main.async { releaseConn(conn) }
-                    group.leave()
-                }
-            }
-            pump(fd, vsock)
-            pump(vsock, fd)
-            group.notify(queue: .global()) { close(fd) }
+            splice(fd, conn.fileDescriptor) { close(fd); DispatchQueue.main.async { releaseConn(conn) } }
         }
         return true
     }
