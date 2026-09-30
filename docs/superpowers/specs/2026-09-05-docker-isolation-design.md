@@ -3,8 +3,13 @@
 A filtering Docker socket that localmost owns, so container work is subject to
 repository policy instead of escaping it.
 
-> **Status:** design. Supersedes the access model in
-> `docs/roadmap/docker-access.md`, which remains accurate for 0.3.0 as shipped.
+> **Status:** stage 1 implemented. Stage 2 is designed, and in progress, in
+> [VM Docker Backend — One Linux VM per Job](../../roadmap/vm-docker-backend.md):
+> an embedded Virtualization.framework helper runs one Linux VM per job, which
+> answers the first open question below. Unlike the progression table below,
+> stage 2 does not make `privileged` grantable: the owner decided it stays
+> refused. Supersedes the access model in `docs/roadmap/docker-access.md`, which
+> describes pre-release 0.3.0 builds.
 
 ## Problem
 
@@ -346,10 +351,14 @@ remains the whole of the access control.
 - Whether stage 2's VM is Lima/Colima shelled out to, or an embedded
   Virtualization.framework helper. Deferred deliberately: both sit behind
   `DockerBackend`, and the choice is better made with stage 1 usage in hand.
+  *Answered:* an embedded Virtualization.framework helper, `localmost-vm`,
+  running one VM per job ([the VM design](../../roadmap/vm-docker-backend.md)).
 - Per-container memory floor under a VM-per-container runtime, which stage 3
   would need in order to feed the existing resource-aware scheduler.
 - Removing a job's containers after localmost itself was killed. The socket's
   record of what the job created lives in memory, so a crash leaves those
   containers running. A likely shape: label each approved create with the
   socket that made it (`dev.localmost.job=<uuid>`), and at startup remove the
-  labelled containers whose socket is gone.
+  labelled containers whose socket is gone. *Answered by stage 2:* the whole
+  daemon is the job's VM, each VM's helper stops it when localmost dies, and
+  the next launch removes what is left, so there is nothing to label.

@@ -18,20 +18,29 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   repositories. Existing installations will be prompted to accept the new permission; until
   accepted, jobs from private repos with a policy are refused rather than run under a weaker
   sandbox
-- **Opt-in container work through a filtering Docker socket**: an approved
-  `.localmostrc` may declare the `pull`, `run` and `build` actions a job needs,
-  with the registries, images, workspace mounts (`ro`/`rw`), network mode and
-  build context each covers. The job is never handed the daemon socket: each
-  worker gets a socket localmost owns, and only declared requests are forwarded
-  to the daemon. Anything unlisted is denied, host bind mounts,
+- **Opt-in container work through a filtering Docker socket, in a Linux VM
+  per job**: an approved `.localmostrc` may declare the `pull`, `run` and
+  `build` actions a job needs, with the registries, images, workspace mounts
+  (`ro`/`rw`), network mode and build context each covers. The job is never
+  handed a daemon socket: each worker gets a socket localmost owns, and only
+  declared requests are forwarded, to a Linux VM of that job's own, which
+  localmost boots when a job whose policy has a `docker:` section is claimed
+  (or, with the opt-in `dockerVm.prewarm`, as a spare when an idle worker is
+  spawned, stopped at the claim unless that job uses it) and discards, with
+  every container, network, volume and built image in it, when the job ends.
+  The VM is given none of your files but the job's work folder, has no
+  network card, and reaches the network only through the job's own proxy.
+  Anything unlisted is denied, and host bind mounts,
   `--privileged`/`--pid=host`/`--network=host`/`--device` and a restart policy
   other than `no` (`--restart=always`, `unless-stopped`, `on-failure`) are
-  refused, and registry credentials are attached by the proxy so the job never
-  reads `~/.docker/config.json`. The containers and networks a job created are
-  removed when the job ends, the containers with their anonymous volumes, if
-  localmost is still running then (Docker Access in `SECURITY.md` has the
-  exceptions). Default off. Allowed in `shared` and per workflow.
-  See `docs/superpowers/specs/2026-09-05-docker-isolation-design.md`
+  refused. Images are pulled on the Mac, checked digest by digest and loaded
+  into the VM, so registry credentials never enter the sandbox or the VM, and
+  a repository's public images are cached for its later jobs. The VM runs
+  localmost's own small Alpine-based guest, shipped inside the app, and the
+  job's `docker` is a CLI bundled with the app. Default off. Allowed in
+  `shared` and per workflow. See
+  `docs/superpowers/specs/2026-09-05-docker-isolation-design.md` and
+  `docs/roadmap/vm-docker-backend.md`
 - **Workflow Test Mode**: Run workflows locally before pushing with `localmost test`
   - Intercepts `actions/checkout` to use local working tree
   - Intercepts `actions/cache` for local caching
@@ -356,14 +365,15 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   have run instead; run as `sh localmost`, it ran `localmost/cli.js` under
   the working directory. The command runs with the `node` first on `PATH`,
   so it needs Node.js.
-- The app is signed with only the entitlements Electron needs: `cs.allow-jit`
+- The app is signed with only the entitlements each part needs: `cs.allow-jit`
   on the app, its main, GPU and renderer helpers and ShipIt, the plugin
-  helper's two `cs.*` exceptions, and none on the camera helper. Releases
-  through 0.2.0 carried @electron/osx-sign's defaults - camera, microphone,
-  USB, Bluetooth, printing and location - on the app, its main helper and
-  ShipIt, since the signing options meant to replace them were ignored. A
-  signing failure now stops the build, where it shipped unsigned or partly
-  signed code.
+  helper's two `cs.*` exceptions, none on the camera helper or the bundled
+  `docker` CLI, and only `com.apple.security.virtualization` on the Docker VM
+  helper, `localmost-vm`. Releases through 0.2.0 carried @electron/osx-sign's
+  defaults - camera, microphone, USB, Bluetooth, printing and location - on
+  the app, its main helper and ShipIt, since the signing options meant to
+  replace them were ignored. A signing failure now stops the build, where it
+  shipped unsigned or partly signed code.
 - Pause during video calls runs the camera helper shipped in the app's
   `Contents/Resources`, signed with the hardened runtime and no entitlements.
   The packaged app ran the helper from the build machine's path
@@ -371,6 +381,27 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   other Mac the detection silently did nothing, and on one where that path
   existed it ran whatever was there. Stopping the monitor now stops the
   helper, which ran on until the camera next changed.
+- A job's container could be given your home directory. Pre-release 0.3.0
+  builds ran jobs' containers on your own daemon - Docker Desktop shares all
+  of `/Users` into its VM - and the daemon resolved a bind source again when
+  the container started: a job that created a container with an approved workspace bind and
+  then replaced the source with a link to `~` started it with your home
+  mounted read-write, and a container with a writable workspace mount could do
+  the same from inside. Each job's containers now run in a VM that shares only
+  the job's work folder, which the job cannot rename or replace, and the guest
+  mounts it without following symlinks, re-enabling them only on the binds the
+  filter approved, so a swapped bind source fails the start.
+- Containers of different jobs reached each other by IP on Docker Desktop's
+  shared default bridge, and so did builds, whose `RUN` steps run there. Each
+  job's containers now run in a VM of its own, with no network card.
+- A job could join another concurrent job's Docker network by naming it: the
+  filter admitted any network whose name the policy allowed, even one the job
+  had not created. Docker networks now exist only inside the job's own VM.
+- Container traffic bypassed the job's network policy. It left through Docker
+  Desktop's network, which the host allowlist never saw, and reached the Mac's
+  loopback services through `host.docker.internal`. The job's VM has no
+  network card: containers reach the network only through the job's own proxy,
+  under the same allowlist and loopback rules as the job.
 
 ### Fixed
 - In-app updates find a zip to install. The update feed listed only the
@@ -433,12 +464,51 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   written as a bare key.
 
 ### Changed
+- **Breaking**: localmost needs macOS 14 or later; 0.2.0 ran on macOS 12. The
+  Docker VM is built on Virtualization.framework, and localmost supports it
+  from macOS 14 on. On macOS 12 or 13, stay on 0.2.0, and do not download
+  this update when 0.2.x offers it: 0.2.x compares only the version, since the
+  update feed names no minimum macOS version, and the update installs over
+  0.2.x and then will not open, because the app requires macOS 14. If it was
+  installed, reinstall 0.2.0 from its release
 - **Breaking**: Intel Macs are no longer supported. localmost is built for
-  Apple silicon (arm64) only, still on macOS 12 or later; 0.2.0 was the last
-  release with an Intel build. On an Intel Mac, 0.2.x still reports this
-  update as available, as that check compares only the version, but the
-  update feed lists no Intel file, so downloading it fails with "No files
-  provided" and nothing is installed
+  Apple silicon (arm64) only; 0.2.0 was the last release with an Intel
+  build. On an Intel Mac, 0.2.x still reports this update as available, as
+  that check compares only the version, but the update feed lists no Intel
+  file, so downloading it fails with "No files provided" and nothing is
+  installed
+- **Updates download automatically**: the updater downloads a new release as
+  soon as it finds one, and installs it when the app quits, as before; it
+  used to wait to be asked to download. The app now ships a Linux kernel,
+  `runc` and `dockerd` for its Docker VM, and their fixes arrive this way
+- **Breaking, against pre-release 0.3.0 builds**: container work no longer
+  uses Docker Desktop, or any other daemon of yours (Colima, Podman). Each
+  job's containers run in a Linux VM of its own (see Added), and your own
+  Docker installation is left alone. What changes for a policy:
+  - A routable network - the default bridge, or one declared `internal:
+    false` - means egress through the job's proxy, subject to its network
+    allowlist, where it meant the daemon's own unfiltered network; the approval
+    text says so. localmost injects `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`,
+    `https_proxy` and `NO_PROXY` into routable containers and, as build args,
+    into builds, keeping any value the job sets. Traffic that ignores them -
+    plain TCP, ssh, UDP, DNS lookups of outside names - has no route and fails
+  - A build cannot pull its `FROM` image: `docker pull` base images first
+  - Registries on the LAN, on the Mac itself or served over plain http cannot
+    be pulled from, even when listed in `pull.registries`; only public https
+    registries can
+  - Listing a registry in `pull.registries` also grants localmost fetching
+    from wherever that registry redirects (any public https host), outside the
+    job's `network.allow`; the approval text says so
+  - Credential helpers named by `credsStore` or `credHelpers` are looked up
+    only in `/opt/homebrew/bin`, `/usr/local/bin` and Docker.app's bundled
+    `bin`, not on `PATH`. A missing or failing helper fails the pull, naming
+    the config key, where it used to pull anonymously; with Docker Desktop
+    removed and `credsStore: desktop` still configured, every pull fails
+    until `~/.docker/config.json` is edited
+  - An image the registry would not serve anonymously is pulled again by
+    every job; it is never cached for the repository
+  - `chown` inside a container on a workspace bind does not persist; keep data
+    directories on volumes
 - **Breaking policy change**: `docker: socket | contexts | credentials`, accepted
   by pre-release 0.3.0 builds, is now a validation error naming the actions that
   replace it. Migrate by declaring what the job does: `socket` and `contexts`

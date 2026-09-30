@@ -12,6 +12,8 @@ a `dockerd` inside that VM instead of to Docker Desktop.
 > [the implementation plan](../superpowers/plans/2026-09-30-vm-docker-backend.md).
 > The evidence is the VZ risk register (R1–R29, cited by number below) and a
 > design spike run on 2026-09-30 (see [What was verified](#what-was-verified)).
+> The owner has decided the three questions review raised, each as
+> recommended (see [Decisions for the owner](#decisions-for-the-owner)).
 
 ## Problem
 
@@ -161,8 +163,8 @@ dials the guest on vsock port 2375. `lm-agent` accepts it and connects to
 Docker protocol. Upgraded connections (attach, exec) work the same way.
 
 **The baseline, before any VM.** `/_ping`, `/version` and `/info` are answered
-by the filter from the guest manifest (`guest/manifest.json`) and the
-configured VM size whenever no VM is running for that socket. A job whose
+by the filter from the guest manifest (`guest/manifest.json`, contract §5.3)
+whenever no VM is running for that socket. A job whose
 policy has no `docker:` section therefore sees a working daemon that refuses
 everything but the baseline, and no VM ever boots for it. Once a VM is ready,
 these calls go to it, and `/info` is rewritten as today.
@@ -475,7 +477,7 @@ experiment. "V-spike" means verified in this design's spike on 2026-09-30.
 | S4 | Container egress goes only through the job's proxy, under the job's policy. | No NIC. The relay goes only to that worker's `ProxyServer`, which checks the per-worker token. The guest firewall rejects everything else sent to the guest root namespace from bridges. | No route and no DNS without a NIC (R7, V). V-spike: a default-bridge container reached a listener on `198.18.0.1:3128`. An `internal` network container got "Network unreachable". Relay end to end: Build, WP-A with WP-B. |
 | S5 | An `internal` network container reaches nothing outside its network. | No default route. The guest's INPUT chain accepts the relay address only from the bridges of routable networks, which the agent tracks from Docker's network events, and rejects everything else. A container can forge the route away: `NET_RAW` is in Docker's default capabilities, so it can send a frame to its gateway's MAC addressed to `198.18.0.1`, and Linux's weak-host model would deliver it to `lm0`. The interface match is what stops that. The backstop is the proxy token, which is injected only into routable containers. | V-spike: no route to the relay, and it *did* reach a `0.0.0.0` listener on its gateway (R8 confirmed). The spike tested routing only, not forged frames. The interface-scoped rule and the forged-route probe: Build, WP-A self-test and live test 6. |
 | S6 | Registry credentials never enter the VM. | Pulls run on the Mac. Only the image archive crosses into the VM. | V-spike: `docker load` of an archive built on the Mac worked, and the image id equalled the config digest. The puller: Build, WP-D. |
-| S7 | One job cannot poison another's images. It *can* use every image in its repository's cache, including images its own workflow's policy never allowed. | The cache is per repository. The golden disk is written only by the refresh VM from verified blobs, and is rebuilt from blank on a schedule. Job disks are clones and are discarded. There are no tags on the golden disk. What the cache exposes: any job of the repository can run a cached image through `docker build` with `FROM <ref>@sha256:…` (the classic builder uses a local image without pulling, and the filter does not read the Dockerfile), through `run.images: ['*']` with an image id, or, with guest root, by reading `/dev/vdb`. So an image that the registry would not serve anonymously never enters the shared store or the golden disk (decision pending, below). | Design (R14). Build, WP-D. The residual in the refresh VM is listed below. |
+| S7 | One job cannot poison another's images. It *can* use every image in its repository's cache, including images its own workflow's policy never allowed. | The cache is per repository. The golden disk is written only by the refresh VM from verified blobs, and is rebuilt from blank on a schedule. Job disks are clones and are discarded. There are no tags on the golden disk. What the cache exposes: any job of the repository can run a cached image through `docker build` with `FROM <ref>@sha256:…` (the classic builder uses a local image without pulling, and the filter does not read the Dockerfile), through `run.images: ['*']` with an image id, or, with guest root, by reading `/dev/vdb`. So an image that the registry would not serve anonymously never enters the shared store or the golden disk (owner decision 1, below). | Design (R14). Build, WP-D. The residual in the refresh VM is listed below. |
 | S8 | Guest root is worth no more than the job already has, plus the public images in its repository's cache. | One VM per job holds only this job's share (including the runner's `_work/_temp` and `_work/_actions`, which the job can already write), this job's proxy token, this job's pulls, and its repository's cache of public images. Guest root cannot load a kernel module or kexec a new kernel: after loading its module allowlist, `lm-init` sets `kernel.modules_disabled=1` and `kernel.kexec_load_disabled=1` (the kernel has `MODULE_SIG` but not `MODULE_SIG_FORCE`, so without this any module would load). | R3. The residual is the VZ/virtiofs attack surface (R22), and a guest kernel exploit, below. |
 | S9 | The VM control plane is not reachable by any job, and a job cannot start a VM of its own. | The helper sockets are under `<data>/vm/jobs/`, which every job profile denies. The API takes ids, not paths. The job profile denies `process-exec` of `<helper>` by literal (contract §5.5): seatbelt execs a Mach-O the profile cannot read, so the bundle's read deny alone would let a job run the entitled helper and boot VMs outside `maxRunning`. | Profile rule (R9, V). WP-C review probe: a binary the job profile could not read still ran; with the exec deny, the path, a case variant, a link and a `..` spelling were all refused. Test: Build, WP-C sandbox test (constructed with a compiled stand-in at the helper path; ambient against the packaged helper). |
 | S10 | No Local Network privacy prompt, and no LAN or host-loopback reach from containers beyond what the job has. | vsock only. No NIC. Host loopback is reached only through the proxy, under the job's `loopback` policy, the same as the job. That includes the local broker's port, which `ProxyServer` always opens as infrastructure (`proxy-server.ts`, `port === this.brokerPort`). It is guarded by the per-worker broker key, which lives outside `_work` and never enters the VM. | R6/R25. vsock round trip in both directions: V-spike. |
@@ -487,9 +489,10 @@ What this backend does **not** contain, stated as plainly as `SECURITY.md` must:
   sandboxed to the one share, but it is closed source and has not been fuzzed
   here.
 - **A kernel exploit from a container.** It gives guest root, which S8 bounds
-  but does not prevent. `privileged` stays refused on this backend for now
-  (see [Decisions for the owner](#decisions-for-the-owner)): it would turn such
-  an exploit into a one-liner, and it also bypasses `internal:` and the hook.
+  but does not prevent. `privileged` stays refused on this backend (owner
+  decision 2, see [Decisions for the owner](#decisions-for-the-owner)): it
+  would turn such an exploit into a one-liner, and it also bypasses
+  `internal:` and the hook.
 - **The refresh VM's input.** The refresh VM extracts layers from every public
   image the repository pulled, from any publisher, onto the golden disk that
   every later job of the repository clones. A flaw in `dockerd`'s layer
@@ -721,8 +724,8 @@ refuse the share with `E_SHARE`, and the job has no Docker.
   `docker history` of such an image. Container-to-container
   HTTP by service name should be listed in `NO_PROXY` by the job. The injected
   `NO_PROXY` covers only `localhost`, `127.0.0.1` and `::1`.
-- **`privileged` stays refused**, as today, until the owner decides
-  otherwise (see [Decisions for the owner](#decisions-for-the-owner)).
+- **`privileged` stays refused**, as today (owner decision 2, see
+  [Decisions for the owner](#decisions-for-the-owner)).
 - **Pulls happen on the Mac** and show Docker's usual progress. The first pull
   of an image by a repository downloads it, later jobs load it from the
   repository's cache disk, and a tag is re-resolved against the registry on
@@ -733,7 +736,7 @@ refuse the share with `E_SHARE`, and the job has no Docker.
   after one to confirm it.
 - **Private images are pulled every job.** An image the registry would not
   serve anonymously is kept only for the job that pulled it, never in the
-  repository's cache (pending the owner's decision).
+  repository's cache (owner decision 1).
 - **Credential helpers must be where localmost looks.** A `credsStore` or
   `credHelpers` entry in `~/.docker/config.json` names a helper that must be
   in `/opt/homebrew/bin`, `/usr/local/bin` or Docker.app's bundled `bin`. An
@@ -894,8 +897,8 @@ Not yet verified, and owned by work packages:
 
 ## Decisions for the owner
 
-These came out of review and go beyond the fourteen decisions. The design is
-written against the recommendation in each case, and says where.
+These came out of review and go beyond the fourteen decisions. The owner
+chose the recommendation in each case, and the design is written against it.
 
 1. **What the per-repository cache may hold.** The golden disk and the
    Mac-side store are shared by every workflow of a repository. Any job of the
@@ -916,6 +919,10 @@ written against the recommendation in each case, and says where.
    Under either option, public cached images remain usable by any job of the
    repository through `FROM`, image ids and guest root; the design accepts
    that and says so in S7.
+
+   **Decided: (a).** Images that needed registry credentials never enter the
+   shared store or the golden disk; they are kept for the job that pulled
+   them.
 2. **`privileged`.** The original spec's stage 2 made it grantable on a VM
    backend. It is not one of the fourteen decisions, and a privileged
    container turns a guest kernel exploit into a one-liner against R22's
@@ -927,6 +934,8 @@ written against the recommendation in each case, and says where.
    **Recommended: keep it refused for now**, and decide after decision 1. If
    it is granted later, `docker-policy.ts` validation changes, and the
    approval text lists exactly what it exposes.
+
+   **Decided: it stays refused.**
 3. **The Linux leg of the e2e docker spec.** `ci.yaml` runs
    `test/e2e/docker.spec.ts` on every leg, including the `ubuntu-latest`
    fallback, where no VM can run. Today, outside a job, it serves the filter
@@ -937,6 +946,8 @@ written against the recommendation in each case, and says where.
    decision 3 (one backend) holds for the product, and the filter keeps its
    real-CLI, real-daemon coverage on Linux. The alternative is to run the
    spec on macOS only, which loses that coverage.
+
+   **Decided: the test-only forwarder under `test/`.**
 
 ## Open questions
 
