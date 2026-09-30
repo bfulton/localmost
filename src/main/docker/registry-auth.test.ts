@@ -184,18 +184,39 @@ describe('resolveRegistryCredentials', () => {
     ).resolves.toEqual({ kind: 'basic', username: 'u', password: 'p' });
   });
 
-  it('fails loudly, naming the helper and the key, on any other helper failure', async () => {
+  it('fails loudly, naming the helper, the key and its exit status, on any other helper failure', async () => {
     helper(scratch, 'broken', "echo 'error getting credentials - err: exit status 1, out: `keychain locked`'; exit 1");
-    const attempt = resolveRegistryCredentials('ghcr.io', {
+    const log = jest.fn<(message: string) => void>();
+    const error = await resolveRegistryCredentials('ghcr.io', {
       readConfig: async () => ({ credHelpers: { 'ghcr.io': 'broken' } }),
       helperDirs: [scratch],
-    });
-    await expect(attempt).rejects.toBeInstanceOf(RegistryAuthError);
-    await expect(attempt).rejects.toThrow(
-      'the Docker credential helper `docker-credential-broken` (from `credHelpers.ghcr.io` in ~/.docker/config.json) failed'
+      log,
+    }).catch((e: Error) => e);
+    expect(error).toBeInstanceOf(RegistryAuthError);
+    expect((error as Error).message).toBe(
+      'the Docker credential helper `docker-credential-broken` (from `credHelpers.ghcr.io` in ~/.docker/config.json) failed: ' +
+        "it exited with status 1 (localmost's log has its output); fix it, or remove `credHelpers.ghcr.io` from ~/.docker/config.json"
     );
-    await expect(attempt).rejects.toThrow('keychain locked');
-    await expect(attempt).rejects.toThrow('or remove `credHelpers.ghcr.io` from ~/.docker/config.json');
+    // What the helper printed is the operator's: the app log has it, the job's log (this error) does not.
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('keychain locked'));
+  });
+
+  it('never runs a directory, or a file that is not executable, that is named like the helper', async () => {
+    fs.mkdirSync(path.join(scratch, 'docker-credential-adir'));
+    fs.writeFileSync(path.join(scratch, 'docker-credential-plain'), '#!/bin/sh\necho \'{"Username":"u","Secret":"s"}\'\n', { mode: 0o644 });
+    for (const name of ['adir', 'plain']) {
+      await expect(
+        resolveRegistryCredentials('quay.io', { readConfig: async () => ({ credsStore: name }), helperDirs: [scratch] })
+      ).rejects.toThrow(`\`docker-credential-${name}\` (from \`credsStore\` in ~/.docker/config.json) was not found in ${scratch}`);
+    }
+  });
+
+  it('refuses an answer larger than 64 KiB', async () => {
+    // Valid credential JSON, only too long: 100,000 characters of secret.
+    helper(scratch, 'huge', `awk 'BEGIN { s = sprintf("%100000s", ""); gsub(/ /, "a", s); printf "{\\"Username\\":\\"u\\",\\"Secret\\":\\"%s\\"}", s }'`);
+    await expect(
+      resolveRegistryCredentials('quay.io', { readConfig: async () => ({ credsStore: 'huge' }), helperDirs: [scratch] })
+    ).rejects.toThrow('`docker-credential-huge` (from `credsStore` in ~/.docker/config.json) failed: its answer was larger than 64 KiB');
   });
 
   it('fails loudly when the helper exits 0 without a readable answer', async () => {
@@ -216,14 +237,20 @@ describe('resolveRegistryCredentials', () => {
     ).rejects.toThrow('did not answer within');
   });
 
-  it('strips control characters from what a failing helper printed', async () => {
+  it('strips control characters from what a failing helper printed before it is logged', async () => {
     helper(scratch, 'noisy', 'printf "bad\\033[31m red\\007"; exit 3');
+    const log = jest.fn<(message: string) => void>();
     const error = await resolveRegistryCredentials('quay.io', {
       readConfig: async () => ({ credsStore: 'noisy' }),
       helperDirs: [scratch],
+      log,
     }).catch((e: Error) => e);
     expect(error).toBeInstanceOf(RegistryAuthError);
+    expect((error as Error).message).toContain('it exited with status 3');
     expect((error as Error).message).not.toMatch(/[\x00-\x1f\x7f]/);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0]).toContain('bad');
+    expect(log.mock.calls[0][0]).not.toMatch(/[\x00-\x1f\x7f]/);
   });
 
   it('refuses a helper name that is not a plain file name', async () => {

@@ -163,6 +163,12 @@ export interface CredentialDeps {
   /** Searched in order; the first that has the helper wins. */
   helperDirs: readonly string[];
   timeoutMs: number;
+  /**
+   * The app log, for what a failing helper printed. That output is the
+   * operator's, so it goes here, cleaned, and never into the error, which
+   * reaches the job's log.
+   */
+  log: (message: string) => void;
 }
 
 const CONFIG_FILE = '~/.docker/config.json';
@@ -195,6 +201,7 @@ function withDefaults(overrides: Partial<CredentialDeps>): CredentialDeps {
     configFile,
     helperDirs: CREDENTIAL_HELPER_DIRS,
     timeoutMs: 10_000,
+    log: () => undefined,
     ...overrides,
   };
 }
@@ -219,7 +226,9 @@ async function findHelper(file: string, dirs: readonly string[]): Promise<string
   return null;
 }
 
-type HelperRun = { ok: true; stdout: string } | { ok: false; code: number | null; output: string; timedOut: boolean };
+type HelperRun =
+  | { ok: true; stdout: string }
+  | { ok: false; code: number | null; signal: string | null; output: string; timedOut: boolean; tooLarge: boolean };
 
 /** Run `<helper> get` with the server on stdin, asynchronously, bounded in time and output. */
 function runHelperGet(file: string, serverUrl: string, timeoutMs: number): Promise<HelperRun> {
@@ -233,12 +242,15 @@ function runHelperGet(file: string, serverUrl: string, timeoutMs: number): Promi
           resolve({ ok: true, stdout });
           return;
         }
-        const failure = error as Error & { code?: number | string; killed?: boolean };
+        const failure = error as Error & { code?: number | string; killed?: boolean; signal?: string | null };
+        const tooLarge = failure.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
         resolve({
           ok: false,
           code: typeof failure.code === 'number' ? failure.code : null,
+          signal: failure.signal ?? null,
           output: `${stdout ?? ''} ${stderr ?? ''}`.trim() || failure.message,
-          timedOut: failure.killed === true,
+          timedOut: failure.killed === true && !tooLarge,
+          tooLarge,
         });
       }
     );
@@ -306,10 +318,20 @@ export async function resolveRegistryCredentials(
     const result = await runHelperGet(found, serverUrl, deps.timeoutMs);
     if (!result.ok) {
       if (result.code === 1 && NOT_FOUND.test(result.output)) return fromAuths(config, keys);
+      // What the helper printed is the operator's: the app log has it, the
+      // job's log (where this error goes) only the helper, the key and how
+      // it ended.
+      deps.log(`${file} (from \`${key}\`) failed: ${cleanText(result.output, 2000)}`);
       const why = result.timedOut
         ? `it did not answer within ${Math.max(1, Math.round(deps.timeoutMs / 1000))} s`
-        : cleanText(result.output, 300);
-      throw new RegistryAuthError(`${describeHelper(file, key)} failed: ${why}; fix it, or remove \`${key}\` from ${CONFIG_FILE}`);
+        : result.tooLarge
+          ? `its answer was larger than ${HELPER_OUTPUT_MAX / 1024} KiB`
+          : result.code !== null
+            ? `it exited with status ${result.code}`
+            : `it was stopped by ${result.signal ?? 'a signal'}`;
+      throw new RegistryAuthError(
+        `${describeHelper(file, key)} failed: ${why} (localmost's log has its output); fix it, or remove \`${key}\` from ${CONFIG_FILE}`
+      );
     }
     let answer: HelperCredentials;
     try {
