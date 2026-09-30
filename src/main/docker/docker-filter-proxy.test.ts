@@ -259,6 +259,9 @@ const fakeDaemon = (dir: string): Promise<{ sock: string; seen: Seen[] }> =>
         } else if (p === '/containers/create') {
           res.writeHead(201, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ Id: 'abc1230000000000000000000000000000000000000000000000000000000000', Warnings: [] }));
+        } else if (p === '/networks/create') {
+          res.writeHead(201, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ Id: 'ae'.repeat(32), Warning: '' }));
         } else if (p === '/images/create') {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.write(JSON.stringify({ status: 'Pulling' }) + '\n');
@@ -342,7 +345,7 @@ describe('DockerFilterProxy forwarding', () => {
       '"Options":{"com.docker.network.bridge.host_binding_ipv4":"0.0.0.0"},"Options":{}}';
     const reply = await request(sock, 'POST', '/v1.45/networks/create', body, { 'content-type': 'application/json' });
 
-    expect(reply.status).toBe(200);
+    expect(reply.status).toBe(201);
     expect(daemon.seen).toHaveLength(1);
     const forwarded = daemon.seen[0].body.toString();
     expect(forwarded.match(/"Options"/g)).toHaveLength(1);
@@ -1174,7 +1177,7 @@ describe('networks a job creates', () => {
     expect((await request(sock, 'POST', '/v1.45/networks/create', { Name: 'vk-1', Internal: true })).status).toBe(201);
 
     // Both the id the daemon assigned and the name the job asked for.
-    expect((await request(sock, 'GET', '/v1.45/networks/net123')).status).toBeLessThan(400);
+    expect((await request(sock, 'GET', `/v1.45/networks/${NET_ID}`)).status).toBeLessThan(400);
     expect((await request(sock, 'GET', '/v1.45/networks/vk-1')).status).toBeLessThan(400);
     // A container may join it.
     expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3', HostConfig: { NetworkMode: 'vk-1' } })).status).toBe(201);
@@ -1183,7 +1186,28 @@ describe('networks a job creates', () => {
 
     expect((await request(sock, 'DELETE', '/v1.45/networks/vk-1')).status).toBeLessThan(400);
     expect((await request(sock, 'GET', '/v1.45/networks/vk-1')).status).toBe(403);
-    expect((await request(sock, 'GET', '/v1.45/networks/net123')).status).toBe(403);
+    expect((await request(sock, 'GET', `/v1.45/networks/${NET_ID}`)).status).toBe(403);
+  });
+
+  it('are not the job\'s when the daemon answers with an id that is not one', async () => {
+    // With guest root the answer is the job's to choose; an id like "host",
+    // owned, would be pinned into a later create's NetworkMode.
+    for (const hostile of ['host', 'none', '../x', 'AE'.repeat(32), '']) {
+      const dir = tmp();
+      const daemon = await networkDaemon(dir, hostile);
+      const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
+      proxy.bind('owner/repo', {
+        run: { images: ['alpine:3'], network: 'bridge', networks: [{ name: 'vk-*', internal: true }] },
+      });
+      const reply = await request(sock, 'POST', '/v1.45/networks/create', { Name: 'vk-1', Internal: true });
+      expect([hostile, reply.status, JSON.parse(reply.body).message]).toEqual([hostile, 502, 'the Docker daemon sent a network create answer without a network id']);
+      // Neither the name nor the id is the job's.
+      expect((await request(sock, 'GET', '/v1.45/networks/vk-1')).status).toBe(403);
+      if (hostile !== '') expect((await request(sock, 'GET', `/v1.45/networks/${encodeURIComponent(hostile)}`)).status).toBe(403);
+      const joined = await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3', HostConfig: { NetworkMode: 'vk-1' } });
+      expect(joined.status).toBe(403);
+      expect(daemon.seen.filter((line) => line.startsWith('POST /v1.45/containers/create'))).toEqual([]);
+    }
   });
 
   it('are addressed at the daemon by the id they were created with', async () => {
@@ -1198,9 +1222,9 @@ describe('networks a job creates', () => {
     expect((await request(sock, 'POST', '/v1.45/networks/create', { Name: 'vk-1', Internal: true })).status).toBe(201);
 
     expect((await request(sock, 'GET', '/v1.45/networks/vk-1?verbose=true')).status).toBeLessThan(400);
-    expect(daemon.seen[daemon.seen.length - 1]).toBe('GET /v1.45/networks/net123?verbose=true');
+    expect(daemon.seen[daemon.seen.length - 1]).toBe(`GET /v1.45/networks/${NET_ID}?verbose=true`);
     expect((await request(sock, 'DELETE', '/networks/vk-1')).status).toBeLessThan(400);
-    expect(daemon.seen[daemon.seen.length - 1]).toBe('DELETE /v1.45/networks/net123');
+    expect(daemon.seen[daemon.seen.length - 1]).toBe(`DELETE /v1.45/networks/${NET_ID}`);
   });
 
   it('are joined at create by the id they were created with, not by a name anyone may take next', async () => {
@@ -1227,8 +1251,8 @@ describe('networks a job creates', () => {
     ).toBe(201);
     expect(daemon.bodies[daemon.bodies.length - 1]).toEqual({
       Image: 'alpine:3',
-      HostConfig: { NetworkMode: 'net123' },
-      NetworkingConfig: { EndpointsConfig: { 'vk-1': { Aliases: ['db'], NetworkID: 'net123' } } },
+      HostConfig: { NetworkMode: NET_ID },
+      NetworkingConfig: { EndpointsConfig: { 'vk-1': { Aliases: ['db'], NetworkID: NET_ID } } },
     });
 
     // The daemon reads these keys in any casing, so the pin does too.
@@ -1243,8 +1267,8 @@ describe('networks a job creates', () => {
     ).toBe(201);
     expect(daemon.bodies[daemon.bodies.length - 1]).toEqual({
       Image: 'alpine:3',
-      HostConfig: { networkmode: 'net123' },
-      NetworkingConfig: { endpointsconfig: { 'vk-1': { NetworkID: 'net123' } } },
+      HostConfig: { networkmode: NET_ID },
+      NetworkingConfig: { endpointsconfig: { 'vk-1': { NetworkID: NET_ID } } },
     });
 
     // The declared network is not the job's to pin, and is sent as named.
@@ -1283,8 +1307,12 @@ describe('networks a job creates', () => {
   });
 });
 
+/** The ids the fake daemons give the networks they create: 64 hex, as dockerd's. */
+const NET_ID = 'ae'.repeat(32);
+const NET1_ID = '1'.padStart(64, '0');
+
 /** A fake daemon that also answers network create. */
-const networkDaemon = (dir: string): Promise<{ sock: string; seen: string[]; bodies: unknown[] }> =>
+const networkDaemon = (dir: string, networkId: string = NET_ID): Promise<{ sock: string; seen: string[]; bodies: unknown[] }> =>
   new Promise((resolve) => {
     const sock = path.join(dir, 'netd.sock');
     const seen: string[] = [];
@@ -1299,7 +1327,7 @@ const networkDaemon = (dir: string): Promise<{ sock: string; seen: string[]; bod
         const p = req.url!.replace(/^\/v\d+\.\d+/, '').split('?')[0];
         if (p === '/networks/create') {
           res.writeHead(201, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ Id: 'net123', Warning: '' }));
+          res.end(JSON.stringify({ Id: networkId, Warning: '' }));
         } else if (p === '/containers/create') {
           res.writeHead(201, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ Id: 'abc1230000000000000000000000000000000000000000000000000000000000', Warnings: [] }));
@@ -1579,7 +1607,7 @@ const lifetimeDaemon = (
           res.end(JSON.stringify({ Id: cid(containers), Warnings: [] }));
         } else if (p === '/networks/create') {
           res.writeHead(201, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ Id: 'net1', Warning: '' }));
+          res.end(JSON.stringify({ Id: NET1_ID, Warning: '' }));
         } else if (req.method === 'DELETE' && p.startsWith('/containers/')) {
           const id = p.slice('/containers/'.length);
           const attempt = (attempts.get(id) ?? 0) + 1;
@@ -1650,7 +1678,7 @@ describe('containers a job leaves behind', () => {
       `DELETE /containers/${cid(2)}?force=1&v=1`,
     ]);
     // A network with a container still attached cannot be removed, so it goes last.
-    expect(sweep.slice(2)).toEqual(['DELETE /networks/net1']);
+    expect(sweep.slice(2)).toEqual([`DELETE /networks/${NET1_ID}`]);
     // The socket was already gone, so the job could not start another meanwhile.
     expect(daemon.socketPresent.slice(before)).toEqual([false, false, false]);
   });
@@ -1758,7 +1786,7 @@ describe('containers a job leaves behind', () => {
     await proxy.stop();
 
     expect(daemon.removed).toEqual(new Set([cid(1)]));
-    expect(daemon.seen).toContain('DELETE /networks/net1');
+    expect(daemon.seen).toContain(`DELETE /networks/${NET1_ID}`);
     expect(logs.filter((l) => l.level === 'warn')).toEqual([]);
   });
 
@@ -1866,7 +1894,7 @@ describe('the worker behind the socket', () => {
             res.end(JSON.stringify({ Id: CID, Warnings: [] }));
           } else if (p === '/networks/create') {
             res.writeHead(201, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ Id: `n${seen.length}`.padEnd(64, '0'), Warning: '' }));
+            res.end(JSON.stringify({ Id: seen.length.toString(16).padStart(64, '0'), Warning: '' }));
           } else {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end('{}');

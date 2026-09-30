@@ -105,6 +105,8 @@ const DEFAULT_BOOT_TIMEOUT_MS = 60_000;
 
 /** A container id as the daemon assigns one. */
 const CONTAINER_ID_RE = /^[0-9a-f]{64}$/;
+/** A network's id is the same form. */
+const NETWORK_ID_RE = CONTAINER_ID_RE;
 
 /**
  * A build that failed looking up a registry: the classic builder pulling a
@@ -1167,7 +1169,13 @@ export class DockerFilterProxy {
     return new Promise((resolve) => upstreamRes.on('end', resolve));
   }
 
-  /** Relay a network create and record the network, by id, by requested name, and whether it is internal. */
+  /**
+   * Relay a network create and record the network, by id, by requested name,
+   * and whether it is internal. The id is schema-checked like a container's
+   * (contract §5.3): it becomes an alias key, a path in forwarded URLs, and
+   * the NetworkMode pinned into later creates, so an answer whose id is not
+   * 64 hex - "host", with guest root - is refused, and nothing is owned.
+   */
   private async relayNetworkCreate(upstreamRes: http.IncomingMessage, res: http.ServerResponse, requested: DockerRequest): Promise<void> {
     const raw = await this.readCapped(upstreamRes);
     if (raw === null) {
@@ -1175,22 +1183,27 @@ export class DockerFilterProxy {
       return;
     }
     const status = upstreamRes.statusCode ?? 502;
-    if (status >= 200 && status < 300) {
-      try {
-        const parsed = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
-        if (typeof parsed.Id === 'string' && parsed.Id.length > 0) {
-          this.ownNetwork(parsed.Id, parsed.Id);
-          const body = requested.body;
-          const name = isPlainRecord(body) ? readFolded(body, 'Name') : undefined;
-          if (typeof name === 'string' && name.length > 0) this.ownNetwork(name, parsed.Id);
-          // Internal only when every casing says so, as the evaluator judged it.
-          if (isPlainRecord(body) && readFolded(body, 'Internal') === true) this.internalNetworkIds.add(parsed.Id);
-        }
-      } catch {
-        // An unreadable create response leaves the network unowned, which
-        // fails closed: the job cannot address what it cannot name.
-      }
+    if (status < 200 || status >= 300) {
+      this.writeWhole(upstreamRes, res, status, raw);
+      return;
     }
+    let id: string | undefined;
+    try {
+      const parsed = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
+      if (typeof parsed.Id === 'string' && NETWORK_ID_RE.test(parsed.Id)) id = parsed.Id;
+    } catch {
+      // Handled below: a create answer without an id is not one.
+    }
+    if (id === undefined) {
+      this.writeRefusal(res, 502, 'the Docker daemon sent a network create answer without a network id');
+      return;
+    }
+    this.ownNetwork(id, id);
+    const body = requested.body;
+    const name = isPlainRecord(body) ? readFolded(body, 'Name') : undefined;
+    if (typeof name === 'string' && name.length > 0) this.ownNetwork(name, id);
+    // Internal only when every casing says so, as the evaluator judged it.
+    if (isPlainRecord(body) && readFolded(body, 'Internal') === true) this.internalNetworkIds.add(id);
     this.writeWhole(upstreamRes, res, status, raw);
   }
 

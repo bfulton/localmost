@@ -932,7 +932,11 @@ builds) with loading disabled, and adds a root for each `modprobe` failure in
   oversized answer`. Answers the filter does not parse - the container,
   network and image inspects a job reads, logs, attach, the load progress -
   are piped, never buffered. Parsed answers are schema-checked like agent
-  answers; a create answer must carry a 64-hex `Id`.
+  answers: a container create answer and a network create answer must each
+  carry a 64-hex `Id`, or the job gets 502 and nothing is recorded as its
+  own. (A network id becomes an alias key, a path in forwarded URLs and the
+  `NetworkMode` pinned into later creates, so an id like `host` must never be
+  owned.)
 - **Credentials of any kind never enter the VM.** `X-Registry-Auth` and
   `X-Registry-Config` are stripped from every forwarded request, `/build`
   included (`forwardedHeaders` already does this; a test keeps it). `POST
