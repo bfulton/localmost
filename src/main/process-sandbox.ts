@@ -15,7 +15,9 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import { SandboxPolicyLevel } from '../shared/types';
 import {
+  developerCredentialPaths,
   expandPath,
+  neverReachableAncestors,
   policyDenyAncestors,
   policyDenyFilters,
   realPath,
@@ -443,6 +445,19 @@ export function generateSandboxProfile({
   const appDirAncestorsDenied = appDirAncestors.length
     ? `(deny file-write*\n${appDirAncestors.map((node) => `  (literal "${node.replace(/"/g, '\\"')}")`).join('\n')})`
     : ';; Both app directories sit at the root: nothing above them to rename';
+  // The credentials a developer machine keeps: the same list a localmost test
+  // step never reaches. The credential files kept inside the package-manager
+  // caches are subtracted by name, since the caches themselves have to be
+  // readable for builds to work.
+  const credentials = developerCredentialPaths();
+  const credentialsDenied = [
+    ...credentials.subpaths.map((dir) => `  (subpath "${escapeForProfile(dir)}")`),
+    ...credentials.literals.map((file) => `  (literal "${escapeForProfile(file)}")`),
+  ].join('\n');
+  const credentialAncestors = neverReachableAncestors([...credentials.subpaths, ...credentials.literals]);
+  const credentialAncestorsDenied = credentialAncestors.length
+    ? `(deny file-write*\n${credentialAncestors.map((node) => `  ${node}`).join('\n')})`
+    : ';; No directories above the credentials to close';
   // The directory nodes in there on the way down to the job's own sandbox and
   // its target's caches - the app directory, runner/, runner/sandbox,
   // runner/caches and the like. .NET reads every ancestor of what it opens.
@@ -559,16 +574,12 @@ ${policyReads}
   (literal "/dev/dtracehelper")
   (literal "/dev/tty"))
 
-;; Never readable, whatever a future path above might overlap: the secrets a
-;; developer machine keeps and this app's own credential store.
-(deny file-read*
-  (subpath "${homeDir}/.ssh")
-  (subpath "${homeDir}/.aws")
-  (subpath "${homeDir}/.gnupg")
-  (subpath "${homeDir}/.kube")
-  (subpath "${homeDir}/.docker")
-  (subpath "${homeDir}/.config")
-  (subpath "${homeDir}/Library/Keychains")
+;; Never readable or writable, whatever a path above grants or might overlap:
+;; the secrets a developer machine keeps, and this app's own credential store.
+;; Writes too, or a write grant of ~, ~/Library or a package cache renames a
+;; credential to a name the grants cover, and reads it there.
+(deny file-read* file-write*
+${credentialsDenied}
   (subpath "${userDataDir}")
   (subpath "${policiesDir}")
   ;; The runner directory's own secrets, denied by name so that neither a
@@ -581,18 +592,13 @@ ${policyReads}
   ;; The broker's session file and the temporary sibling it is written
   ;; through, whatever that one's name.
   (prefix "${runnerDir}/broker-sessions.json")
-  (literal "${configFile}")
-  (literal "${homeDir}/.netrc")
-  (literal "${homeDir}/.npmrc")
-  ;; Credentials that live inside the package-manager caches granted above.
-  ;; The cache directories have to be readable for builds to work, so the
-  ;; secret files within them are subtracted by name.
-  (literal "${homeDir}/.m2/settings.xml")
-  (literal "${homeDir}/.m2/settings-security.xml")
-  (literal "${homeDir}/.gradle/gradle.properties")
-  (literal "${homeDir}/.cargo/credentials")
-  (literal "${homeDir}/.cargo/credentials.toml")
-  (literal "${homeDir}/.nuget/NuGet/NuGet.Config"))
+  (literal "${configFile}"))
+;; Nor the directories above those credentials, as nodes: renaming one - a
+;; package cache, ~/.nuget/NuGet, ~/Library, ~ - would carry a credential out
+;; from under the deny above, to be read under the new name. After every
+;; grant, and nothing below gives a write back there. What is inside them
+;; stays as granted: a job with write on ~/.gradle still writes its caches.
+${credentialAncestorsDenied}
 
 ;; Never readable or writable, whatever was granted above - a policy path of
 ;; ~, /Users or ~/Library included, which keeps the rest of what it grants:

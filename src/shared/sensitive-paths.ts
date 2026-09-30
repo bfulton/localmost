@@ -55,6 +55,21 @@ const SENSITIVE_WRITE_PLACES: SensitivePlace[] = [
   // Where pipx, uv and the like install, and where people keep their own.
   { path: '~/.local/bin', why: ON_PATH },
   { path: '~/bin', why: ON_PATH },
+  // The package caches a job's own package managers are pointed away from:
+  // your builds load what is kept in them, not only downloads.
+  {
+    path: '~/.gradle',
+    why: 'Gradle runs the init scripts here and loads the plugins and dependencies cached here in your own builds, outside the sandbox',
+  },
+  {
+    path: '~/.m2',
+    why: 'Maven loads the extensions and dependencies kept here in your own builds, outside the sandbox',
+  },
+  {
+    path: '~/.cargo',
+    why: "cargo's bin directory is on your PATH, and cargo runs what its config here names and the build scripts of the crates cached here, outside the sandbox",
+  },
+  { path: '~/.nuget', why: 'your own .NET builds load the packages cached here, outside the sandbox' },
 ];
 
 // The data volume is firmlinked at the root, so the home directory and
@@ -128,7 +143,7 @@ export function sensitiveWriteReason(entry: string, home: string = os.homedir())
   if (homeRegion && contains(region, homeRegion.literal)) {
     return (
       'your whole home directory: a job could leave code that launchd, your shell, git or your apps ' +
-      'run outside the sandbox, and change your SSH keys'
+      'run outside the sandbox'
     );
   }
 

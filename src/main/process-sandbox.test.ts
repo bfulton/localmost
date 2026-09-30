@@ -539,6 +539,56 @@ describe('Process Sandbox', () => {
 
   describe("the runner profile's filesystem floor", () => {
     it.each(['strict', 'moderate', 'permissive'] as const)(
+      'keeps the credentials a developer machine holds closed to a write grant under %s, and the directories above them',
+      (level) => {
+        // The floor matches paths. With only reads denied, a write grant on a
+        // package cache, ~/Library or ~ let a job rename a credential - or the
+        // directory it sits in - to a name the grants cover, and read it there.
+        const grants = ['~', '~/.gradle', '~/.m2', '~/.cargo', '~/.nuget', '~/Library'];
+        const profile = profileWith({ filesystemPolicy: { level, read: grants, write: grants } });
+        const home = (...parts: string[]) => path.join(homeDir, ...parts);
+        for (const credential of [
+          home('.ssh', 'id_ed25519'),
+          home('.aws', 'credentials'),
+          home('.config', 'gh', 'hosts.yml'),
+          home('.docker', 'config.json'),
+          home('Library', 'Keychains', 'login.keychain-db'),
+          home('.netrc'),
+          home('.npmrc'),
+          home('.m2', 'settings.xml'),
+          home('.m2', 'settings-security.xml'),
+          home('.gradle', 'gradle.properties'),
+          home('.cargo', 'credentials'),
+          home('.cargo', 'credentials.toml'),
+          home('.nuget', 'NuGet', 'NuGet.Config'),
+        ]) {
+          expect(readable(profile, credential)).toBe(false);
+          expect(writable(profile, credential)).toBe(false);
+        }
+        // Each directory the floor names, and every directory above an entry,
+        // as a node: none can be renamed, removed or replaced.
+        for (const node of [
+          home('.ssh'), home('Library', 'Keychains'), home('Library'), home('.m2'), home('.gradle'), home('.cargo'),
+          home('.nuget'), home('.nuget', 'NuGet'), homeDir, path.dirname(homeDir),
+        ]) {
+          expect(writable(profile, node)).toBe(false);
+        }
+        // Nodes, not subtrees: what the grants give beside them stays given.
+        for (const target of [
+          home('.gradle', 'caches', 'modules-2'),
+          home('.gradle', 'wrapper', 'dists'),
+          home('.m2', 'repository', 'x.jar'),
+          home('.nuget', 'NuGet', 'nugetorgadd.trk'),
+          home('.cargo', 'registry', 'index'),
+          home('Library', 'Caches', 'built'),
+          home('project', 'built'),
+        ]) {
+          expect(writable(profile, target)).toBe(true);
+        }
+      }
+    );
+
+    it.each(['strict', 'moderate', 'permissive'] as const)(
       'grants no shared temp directory as a whole under %s',
       (level) => {
         // /tmp and the per-user /var/folders tree are shared with the user's
@@ -954,7 +1004,8 @@ describe('Process Sandbox', () => {
             filesystemPolicy: { level: 'strict', read: ['/private/tmp'], write: ['/private/tmp'] },
           });
         });
-        const deny = profile.slice(profile.indexOf('(deny file-read* file-write*'));
+        // The deny of the app's directories, after the credentials' own.
+        const deny = profile.slice(profile.indexOf('(deny file-read* file-write*', profile.indexOf(';; Never readable or writable, whatever was granted')));
         const denied = deny.slice(0, deny.indexOf('))\n') + 2);
         expect(denied).toContain(`(subpath "${unborn}")`);
         expect(denied).toContain(`(subpath "/private${unborn}")`);

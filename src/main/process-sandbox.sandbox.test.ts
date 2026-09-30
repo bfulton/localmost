@@ -31,6 +31,14 @@ import * as os from 'os';
 import * as path from 'path';
 import { generateSandboxProfile, RunnerProfileOptions } from './process-sandbox';
 
+// The real home by default; one block below stands a directory of its own in
+// for it, since os.homedir() is what the profile is built from.
+jest.mock('os', () => {
+  const actual = jest.requireActual<typeof import('os')>('os');
+  return { ...actual, homedir: jest.fn(actual.homedir) };
+});
+const realHomedir = jest.requireActual<typeof import('os')>('os').homedir;
+
 const isMacOS = process.platform === 'darwin';
 const homeDir = os.homedir();
 
@@ -446,6 +454,129 @@ if (!isMacOS) {
         const run = underHomeGrant();
         expect(cat(run, path.join(sibling, 'token'))).toBe(false);
         expect(run(`/bin/ls '${sibling}'`).ok).toBe(false);
+      });
+    });
+
+    describe('under write grants that reach the credentials a developer machine keeps', () => {
+      // A stand-in home, so the developer's own keys are never in play: the
+      // profile is built with HOME pointing at it, and its app directories
+      // are where a user's machine has them, inside it. Each credential holds
+      // a marker that must never reach the job's output.
+      let home: string;
+      let instance: string;
+      const credentials: Record<string, string> = {
+        '.ssh/id_ed25519': 'SECRET-ssh',
+        '.netrc': 'SECRET-netrc',
+        '.m2/settings.xml': 'SECRET-maven',
+        '.gradle/gradle.properties': 'SECRET-gradle',
+        '.cargo/credentials.toml': 'SECRET-cargo',
+        '.nuget/NuGet/NuGet.Config': 'SECRET-nuget',
+        'Library/Keychains/login.keychain-db': 'SECRET-keychain',
+      };
+
+      beforeAll(() => {
+        home = path.join(base, 'home');
+        instance = path.join(home, '.localmost', 'runner', 'sandbox', '1');
+        for (const dir of [path.join(instance, '_temp'), path.join(home, 'Library', 'Application Support', 'localmost'),
+          path.join(home, '.gradle', 'caches'), path.join(home, '.gradle', 'wrapper')]) {
+          fs.mkdirSync(dir, { recursive: true });
+        }
+        for (const [file, content] of Object.entries(credentials)) {
+          fs.mkdirSync(path.dirname(path.join(home, file)), { recursive: true });
+          fs.writeFileSync(path.join(home, file), content);
+        }
+        fs.writeFileSync(path.join(home, 'notes.txt'), 'notes');
+      });
+
+      /** A runner for shell commands in the job at `instance`, its profile built with `home` as the home directory. */
+      const underGrant = (filesystemPolicy: RunnerProfileOptions['filesystemPolicy']) => {
+        const savedConfig = process.env.LOCALMOST_CONFIG_DIR;
+        const getPath = jest.mocked(app.getPath);
+        const previousUserData = app.getPath('userData');
+        jest.mocked(os.homedir).mockReturnValue(home);
+        process.env.LOCALMOST_CONFIG_DIR = path.join(home, '.localmost');
+        getPath.mockReturnValue(path.join(home, 'Library', 'Application Support', 'localmost'));
+        let profile: string;
+        try {
+          profile = generateSandboxProfile({ instanceDir: instance, filesystemPolicy });
+        } finally {
+          jest.mocked(os.homedir).mockImplementation(realHomedir);
+          if (savedConfig === undefined) delete process.env.LOCALMOST_CONFIG_DIR;
+          else process.env.LOCALMOST_CONFIG_DIR = savedConfig;
+          getPath.mockReturnValue(previousUserData);
+        }
+        const profilePath = path.join(base, `${probeName()}.sb`);
+        fs.writeFileSync(profilePath, profile);
+        const env = { PATH: '/usr/bin:/bin', HOME: home, TMPDIR: path.join(instance, '_temp') };
+        return (command: string) => shell(command, profilePath, env);
+      };
+
+      /**
+       * Rename `from` to `to` in the job and print `shown` from under the new
+       * name, then assert the sandbox refused the rename and nothing of the
+       * credentials came out. Undone from outside the sandbox should the
+       * sandbox let it through.
+       */
+      const expectNoRenameIntoView = (run: (command: string) => ReturnType<typeof shell>, from: string, to: string, shown: string) => {
+        const result = run(`/bin/mv '${path.join(home, from)}' '${path.join(home, to)}' && /bin/cat '${path.join(home, to, shown)}'`);
+        if (fs.existsSync(path.join(home, to))) fs.renameSync(path.join(home, to), path.join(home, from));
+        expect(result.stdout).not.toContain('SECRET');
+        expect(result.ok).toBe(false);
+        expect(result.stderr).toContain('Operation not permitted');
+      };
+
+      afterAll(() => {
+        for (const [file, content] of Object.entries(credentials)) {
+          expect(fs.readFileSync(path.join(home, file), 'utf-8')).toBe(content);
+        }
+      });
+
+      it('a write grant on a package cache cannot move its credential file to a readable name', () => {
+        // moderate reads the package caches in the home directory, less the
+        // credential files kept inside them, which are subtracted by name. A
+        // write grant there let a job rename one to a name the read covers.
+        const run = underGrant({ level: 'moderate', read: [], write: ['~/.gradle', '~/.m2', '~/.cargo', '~/.nuget'] });
+        // The grant is in force, so each refusal below is the floor's doing.
+        expect(canCreateUnder(run, path.join(home, '.gradle', 'caches'))).toBe(true);
+        expect(canCreateUnder(run, path.join(home, '.gradle', 'wrapper'))).toBe(true);
+        expect(canCreateUnder(run, path.join(home, '.m2', 'repository'))).toBe(true);
+        expect(canCreate(run, path.join(home, '.nuget', 'NuGet', probeName()))).toBe(true);
+        for (const [from, to] of [
+          ['.gradle/gradle.properties', '.gradle/renamed'],
+          ['.m2/settings.xml', '.m2/renamed'],
+          ['.cargo/credentials.toml', '.cargo/renamed'],
+          ['.nuget/NuGet/NuGet.Config', '.nuget/NuGet/renamed'],
+        ]) {
+          expectNoRenameIntoView(run, from, to, '');
+        }
+        // Nor the directory the credential file sits in.
+        expectNoRenameIntoView(run, '.nuget/NuGet', '.nuget/renamed', 'NuGet.Config');
+        for (const file of Object.keys(credentials)) {
+          expect(run(`/bin/cat '${path.join(home, file)}'`).stdout).not.toContain('SECRET');
+        }
+      });
+
+      it('a write grant on the home directory cannot move ~/.ssh, or a directory above a credential, to a readable name', () => {
+        const run = underGrant({ level: 'strict', read: ['~'], write: ['~'] });
+        // Ordinary files in the home directory stay as granted.
+        expect(canCreate(run, path.join(home, probeName()))).toBe(true);
+        expect(canCreateUnder(run, path.join(home, 'elsewhere'))).toBe(true);
+        expect(canCreateUnder(run, path.join(home, '.gradle', 'caches'))).toBe(true);
+        expect(run(`/bin/cat '${path.join(home, 'notes.txt')}'`).stdout).toBe('notes');
+        for (const [from, to, shown] of [
+          ['.ssh', '.ssh-renamed', 'id_ed25519'],
+          ['.netrc', 'netrc-renamed', ''],
+          ['.m2', '.m2-renamed', 'settings.xml'],
+          ['.gradle', '.gradle-renamed', 'gradle.properties'],
+          ['.cargo', '.cargo-renamed', 'credentials.toml'],
+          ['.nuget', '.nuget-renamed', path.join('NuGet', 'NuGet.Config')],
+          ['Library', 'Library-renamed', path.join('Keychains', 'login.keychain-db')],
+          [path.join('Library', 'Keychains'), path.join('Library', 'Keychains-renamed'), 'login.keychain-db'],
+        ]) {
+          expectNoRenameIntoView(run, from, to, shown);
+        }
+        // Nor written in place: an authorized key or an SSH config is a way in.
+        expect(canCreate(run, path.join(home, '.ssh', 'authorized_keys'))).toBe(false);
       });
     });
 
