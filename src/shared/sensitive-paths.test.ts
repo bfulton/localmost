@@ -29,6 +29,15 @@ describe('isSensitiveWritePath', () => {
       '/opt/homebrew/bin',
       '~/.local/bin',
       '~/bin',
+      // What your own builds load and run from the package caches: Gradle's
+      // init.d, Maven's settings and extensions, cargo's config and bin,
+      // and the packages each keeps.
+      '~/.gradle',
+      '~/.gradle/init.d',
+      '~/.m2',
+      '~/.cargo',
+      '~/.cargo/registry',
+      '~/.nuget',
     ]) {
       expect([entry, sensitive(entry)]).toEqual([entry, true]);
     }
@@ -91,7 +100,8 @@ describe('isSensitiveWritePath', () => {
       './DerivedData/**',
       'build/**',
       '~/.npm',
-      '~/.cargo/registry',
+      '~/.cargo-cache',
+      '~/.m2x',
       '~/Library/Caches/org.swift.swiftpm',
       '~/.configure-cache',
       '~/Library/Application Supportive',
@@ -114,7 +124,18 @@ describe('isSensitiveWritePath', () => {
     // not that it is the place.
     expect(sensitiveWriteReason('/Library', HOME)).toMatch(/^includes \/Library\/Launch\*: launchd/);
     expect(sensitiveWriteReason('/Library/LaunchAgents', HOME)).toMatch(/^launchd/);
+    expect(sensitiveWriteReason('~/.gradle', HOME)).toMatch(/Gradle runs/);
     expect(sensitiveWriteReason('~', HOME)).toMatch(/home directory/);
+    // What the sandbox refuses whatever is granted is not said to be granted.
+    expect(sensitiveWriteReason('~', HOME)).not.toMatch(/SSH/);
+    // A grant on it, or in it, is said to do nothing rather than described
+    // as what it would let a job do: no write to the keys or the commands
+    // an SSH config runs.
+    for (const entry of ['~/.ssh', '~/.ssh/authorized_keys', '~/.config', '~/.config/gh']) {
+      expect([entry, sensitiveWriteReason(entry, HOME)]).toEqual([entry, expect.stringMatching(/refused .*whatever is granted/)]);
+    }
+    expect(sensitiveWriteReason('~/.ssh', HOME)).not.toMatch(/commands your SSH config runs/);
+    expect(sensitiveWriteReason('~/.config', HOME)).not.toMatch(/act on/);
     expect(sensitiveWriteReason('/', HOME)).toMatch(/whole disk/);
     expect(sensitiveWriteReason('./build', HOME)).toBeUndefined();
   });

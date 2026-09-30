@@ -26,6 +26,10 @@ interface SensitivePlace {
 const LAUNCHD = 'launchd runs what is written here, outside the sandbox';
 const SHELL_RC = 'your shell runs this file as it starts or exits, outside the sandbox';
 const ON_PATH = 'on your PATH: what is written here runs as your own commands, outside the sandbox';
+// Credentials the sandbox keeps from a job, read and write, at every level:
+// a grant there does nothing, but a repository asking for one is still worth
+// a second look, so it is marked rather than passed over.
+const REFUSED = 'refused to a job whatever is granted, so this grant does nothing; a repository asking for it deserves a second look';
 
 const SENSITIVE_WRITE_PLACES: SensitivePlace[] = [
   { path: '~/Library/LaunchAgents', why: LAUNCHD },
@@ -43,9 +47,9 @@ const SENSITIVE_WRITE_PLACES: SensitivePlace[] = [
   { path: '~/.bash_profile', why: SHELL_RC },
   { path: '~/.bash_login', why: SHELL_RC },
   { path: '~/.profile', why: SHELL_RC },
-  { path: '~/.ssh', why: 'your SSH keys, and the commands your SSH config runs' },
+  { path: '~/.ssh', why: `your SSH keys and config: ${REFUSED}` },
   { path: '~/.gitconfig', why: 'git runs the commands this file names, in every repository you work in' },
-  { path: '~/.config', why: 'configuration your own tools load and act on, outside the sandbox' },
+  { path: '~/.config', why: `configuration and tokens your own tools keep: ${REFUSED}` },
   {
     path: '~/Library/Application Support',
     why: 'data and configuration your own apps load, outside the sandbox',
@@ -55,6 +59,21 @@ const SENSITIVE_WRITE_PLACES: SensitivePlace[] = [
   // Where pipx, uv and the like install, and where people keep their own.
   { path: '~/.local/bin', why: ON_PATH },
   { path: '~/bin', why: ON_PATH },
+  // The package caches a job's own package managers are pointed away from:
+  // your builds load what is kept in them, not only downloads.
+  {
+    path: '~/.gradle',
+    why: 'Gradle runs the init scripts here and loads the plugins and dependencies cached here in your own builds, outside the sandbox',
+  },
+  {
+    path: '~/.m2',
+    why: 'Maven loads the extensions and dependencies kept here in your own builds, outside the sandbox',
+  },
+  {
+    path: '~/.cargo',
+    why: "cargo's bin directory is on your PATH, and cargo runs what its config here names and the build scripts of the crates cached here, outside the sandbox",
+  },
+  { path: '~/.nuget', why: 'your own .NET builds load the packages cached here, outside the sandbox' },
 ];
 
 // The data volume is firmlinked at the root, so the home directory and
@@ -128,7 +147,7 @@ export function sensitiveWriteReason(entry: string, home: string = os.homedir())
   if (homeRegion && contains(region, homeRegion.literal)) {
     return (
       'your whole home directory: a job could leave code that launchd, your shell, git or your apps ' +
-      'run outside the sandbox, and change your SSH keys'
+      'run outside the sandbox'
     );
   }
 

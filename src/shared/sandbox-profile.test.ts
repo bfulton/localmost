@@ -250,7 +250,7 @@ describe('Sandbox Profile Generator', () => {
         policy: { filesystem: { read: ['~'], write: ['~'] } },
       });
       const forms = topLevelForms(profile);
-      const lastGrant = forms.map((f) => f.includes('"/Users/test"')).lastIndexOf(true);
+      const lastGrant = forms.map((f) => f.startsWith('(allow') && f.includes('"/Users/test"')).lastIndexOf(true);
       const deny = forms.findIndex((f) => f.startsWith('(deny file-read* file-write*') && f.includes('/Users/test/.ssh'));
       expect(deny).toBeGreaterThan(lastGrant);
       for (const secret of [
@@ -266,6 +266,75 @@ describe('Sandbox Profile Generator', () => {
       }
       // Nothing after the deny reopens any of it.
       expect(forms.slice(deny + 1).filter((f) => f.startsWith('(allow file-') && f.includes('/Users/test/.'))).toEqual([]);
+    });
+
+    it('denies writing the directories above what is never reachable, so none is renamed into view', () => {
+      // The denies match paths: granted ~/Library or ~, a step could rename
+      // Application Support, ~/.m2 or ~/.nuget/NuGet and read what they hold
+      // under the new name. Nodes, not subtrees, after every policy grant.
+      const profile = generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
+        policy: { filesystem: { read: ['~'], write: ['~', '~/Library', '~/.gradle'] } },
+      });
+      const forms = topLevelForms(profile);
+      const writes = forms.findIndex((f) => f.startsWith('(allow file-write*') && f.includes('"/Users/test/.gradle"'));
+      const nodes = forms.findIndex((f, i) => i > writes && f.startsWith('(deny file-write*') && f.includes('(literal "/Users/test/.m2")'));
+      expect(writes).toBeGreaterThan(-1);
+      expect(nodes).toBeGreaterThan(writes);
+      for (const node of [
+        '/Users/test/Library/Application Support',
+        '/Users/test/Library',
+        '/Users/test/.m2',
+        '/Users/test/.gradle',
+        '/Users/test/.cargo',
+        '/Users/test/.nuget',
+        '/Users/test/.nuget/NuGet',
+        '/Users/test',
+        '/Users',
+      ]) {
+        expect(forms[nodes]).toContain(`(literal "${node}")`);
+        expect(forms[nodes]).not.toContain(`(subpath "${node}")`);
+      }
+      // Nothing after it reopens a write there.
+      expect(forms.slice(nodes + 1).filter((f) => f.startsWith('(allow file-write') && /"\/Users\/test(\/(\.m2|\.gradle|\.cargo|\.nuget|Library)[^/"]*)?"/.test(f))).toEqual([]);
+    });
+
+    it('denies a credential linked into place by the path the link resolves to, and the directories above both', () => {
+      // Dotfile managers link ~/.aws to ~/dotfiles/aws; a cache is moved to
+      // another volume and linked back. seatbelt matches the path a link
+      // resolves to, so the credentials written as ~/.aws alone held nothing.
+      const actualFs = jest.requireActual<typeof import('fs')>('fs');
+      const links: Record<string, string> = { '/Users/test/.aws': 'dotfiles/aws', '/Users/test/.m2': '/opt/cache/m2' };
+      let forms: string[] = [];
+      jest.isolateModules(() => {
+        jest.doMock('fs', () => ({
+          ...actualFs,
+          lstatSync: jest.fn((p: import('fs').PathLike) => ({ isSymbolicLink: () => String(p) in links })),
+          readlinkSync: jest.fn((p: import('fs').PathLike) => links[String(p)]),
+          realpathSync: jest.fn((p: import('fs').PathLike) => String(p)),
+        }));
+        const { generateSandboxProfile: generate } = require('./sandbox-profile');
+        forms = topLevelForms(generate({
+          workDir: '/path/to/project',
+          proxyPort: DEFAULT_PROXY_PORT,
+          policy: { filesystem: { read: ['~'], write: ['~'] } },
+        }));
+      });
+      const denied = forms.find((f) => f.startsWith('(deny file-read* file-write*') && f.includes('/Users/test/.ssh'));
+      for (const filter of [
+        '(subpath "/Users/test/.aws")',
+        '(subpath "/Users/test/dotfiles/aws")',
+        '(literal "/Users/test/.m2/settings.xml")',
+        '(literal "/opt/cache/m2/settings.xml")',
+        '(literal "/opt/cache/m2/settings-security.xml")',
+      ]) {
+        expect(denied).toContain(filter);
+      }
+      const nodes = forms.find((f) => f.startsWith('(deny file-write*') && f.includes('(literal "/Users/test/.m2")'));
+      for (const node of ['/Users/test/.m2', '/opt/cache/m2', '/opt/cache', '/opt', '/Users/test/dotfiles', '/Users/test']) {
+        expect(nodes).toContain(`(literal "${node}")`);
+      }
     });
 
     it('grants nothing of the app data directory, with or without a policy', () => {

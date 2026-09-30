@@ -596,6 +596,108 @@ if (!isMacOS) {
       expect(run(profile, ['/bin/cat', path.join(home, 'notes.txt')])).toBe(true);
       expect(run(profile, ['/bin/cat', path.join(home, '.ssh', 'id_ed25519')])).toBe(false);
     });
+
+    /**
+     * Whether a step under `profile` can rename `from` to `to` and read
+     * `shown` from under the new name. Undone from outside the sandbox should
+     * the sandbox let it through.
+     */
+    const renamesIntoView = (profile: string, from: string, to: string, shown: string): boolean => {
+      const ok = run(profile, ['/bin/sh', '-c', `/bin/mv '${from}' '${to}' && /bin/cat '${path.join(to, shown)}'`]);
+      if (fs.existsSync(to)) fs.renameSync(to, from);
+      return ok;
+    };
+
+    it('a write grant of ~/Library cannot rename Application Support', () => {
+      // The app's Electron data directory is never reachable, and neither are
+      // the keychains, but both are denied by path: renamed, the directory
+      // above either would carry it to a name the grant covers.
+      const library = path.join(home, 'Library');
+      fs.mkdirSync(path.join(library, 'Application Support', 'localmost'), { recursive: true });
+      fs.mkdirSync(path.join(library, 'Keychains'), { recursive: true });
+      fs.writeFileSync(path.join(library, 'Application Support', 'localmost', 'Cookies'), 'cookies\n');
+      fs.writeFileSync(path.join(library, 'Keychains', 'login.keychain-db'), 'keychain\n');
+      const profile = generateSandboxProfile({
+        workDir,
+        proxyPort: 1,
+        policy: { filesystem: { read: [...MACOS_BASELINE_READ_PATHS, '~/Library'], write: ['~/Library'] } },
+      });
+      // The grant is in force, so each refusal below is the floor's doing.
+      expect(run(profile, ['/bin/mkdir', '-p', path.join(library, 'Caches', 'built')])).toBe(true);
+      expect(run(profile, ['/bin/mkdir', '-p', path.join(library, 'Application Support', 'another-app')])).toBe(true);
+      expect(renamesIntoView(profile, path.join(library, 'Application Support'), path.join(library, 'renamed'),
+        path.join('localmost', 'Cookies'))).toBe(false);
+      expect(renamesIntoView(profile, path.join(library, 'Keychains'), path.join(library, 'renamed'),
+        'login.keychain-db')).toBe(false);
+      expect(fs.readFileSync(path.join(library, 'Application Support', 'localmost', 'Cookies'), 'utf-8')).toBe('cookies\n');
+    });
+
+    it('a write grant of ~ cannot rename a directory above a credential file, or the file itself', () => {
+      for (const [file, content] of [
+        [path.join('.m2', 'settings.xml'), 'maven\n'],
+        [path.join('.gradle', 'gradle.properties'), 'gradle\n'],
+        [path.join('.nuget', 'NuGet', 'NuGet.Config'), 'nuget\n'],
+        ['.netrc', 'netrc\n'],
+      ]) {
+        fs.mkdirSync(path.dirname(path.join(home, file)), { recursive: true });
+        fs.writeFileSync(path.join(home, file), content);
+      }
+      const profile = generateSandboxProfile({
+        workDir,
+        proxyPort: 1,
+        policy: { filesystem: { read: [...MACOS_BASELINE_READ_PATHS, '~'], write: ['~'] } },
+      });
+      expect(run(profile, ['/usr/bin/touch', path.join(home, 'built')])).toBe(true);
+      expect(run(profile, ['/bin/mkdir', '-p', path.join(home, '.gradle', 'caches', 'built')])).toBe(true);
+      for (const [from, to, shown] of [
+        ['.m2', '.m2-renamed', 'settings.xml'],
+        ['.gradle', '.gradle-renamed', 'gradle.properties'],
+        ['.nuget', '.nuget-renamed', path.join('NuGet', 'NuGet.Config')],
+        [path.join('.nuget', 'NuGet'), path.join('.nuget', 'renamed'), 'NuGet.Config'],
+        ['.netrc', 'netrc-renamed', ''],
+        ['.ssh', '.ssh-renamed', 'id_ed25519'],
+      ]) {
+        expect(renamesIntoView(profile, path.join(home, from), path.join(home, to), shown)).toBe(false);
+      }
+    });
+
+    it('a write grant of ~ cannot reach a credential linked into place, by the path the link resolves to', () => {
+      // Dotfile managers link ~/.aws to ~/dotfiles/aws, and a single file
+      // such as ~/.cargo/credentials.toml the same way. seatbelt matches the
+      // path a link resolves to, so a deny of ~/.aws alone held nothing there.
+      const dotfiles = path.join(home, 'dotfiles');
+      fs.mkdirSync(path.join(dotfiles, 'aws'), { recursive: true });
+      fs.mkdirSync(path.join(dotfiles, 'cargo'), { recursive: true });
+      fs.writeFileSync(path.join(dotfiles, 'aws', 'credentials'), 'aws\n');
+      fs.writeFileSync(path.join(dotfiles, 'cargo', 'credentials.toml'), 'cargo\n');
+      fs.symlinkSync(path.join('dotfiles', 'aws'), path.join(home, '.aws'));
+      fs.symlinkSync(path.join('..', 'dotfiles', 'cargo', 'credentials.toml'), path.join(home, '.cargo', 'credentials.toml'));
+      const profile = generateSandboxProfile({
+        workDir,
+        proxyPort: 1,
+        policy: { filesystem: { read: [...MACOS_BASELINE_READ_PATHS, '~'], write: ['~'] } },
+      });
+      // The grant is in force beside them, so each refusal below is the floor's doing.
+      expect(run(profile, ['/bin/mkdir', '-p', path.join(dotfiles, 'other', 'built')])).toBe(true);
+      for (const file of [
+        path.join('.aws', 'credentials'),
+        path.join('dotfiles', 'aws', 'credentials'),
+        path.join('.cargo', 'credentials.toml'),
+        path.join('dotfiles', 'cargo', 'credentials.toml'),
+      ]) {
+        expect([file, run(profile, ['/bin/cat', path.join(home, file)])]).toEqual([file, false]);
+      }
+      for (const [from, to, shown] of [
+        [path.join('dotfiles', 'aws', 'credentials'), path.join('dotfiles', 'aws', 'renamed'), ''],
+        [path.join('dotfiles', 'aws'), path.join('dotfiles', 'aws-renamed'), 'credentials'],
+        ['dotfiles', 'dotfiles-renamed', path.join('aws', 'credentials')],
+        ['.aws', '.aws-renamed', 'credentials'],
+        [path.join('dotfiles', 'cargo', 'credentials.toml'), path.join('dotfiles', 'cargo', 'renamed'), ''],
+      ]) {
+        expect([from, renamesIntoView(profile, path.join(home, from), path.join(home, to), shown)]).toEqual([from, false]);
+      }
+      expect(fs.readFileSync(path.join(home, '.aws', 'credentials'), 'utf-8')).toBe('aws\n');
+    });
   });
 } else {
   describe('test-mode network confinement through the ambient profile', () => {

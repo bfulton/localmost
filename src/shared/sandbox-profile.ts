@@ -459,26 +459,14 @@ function cliSocketRules(): string[] {
 }
 
 /**
- * What a step never reaches, whatever the policy declares, then the workspace.
- *
- * The app data directory holds the runner template every worker's sandbox is
- * copied from, the approval cache, settings, the CLI socket and other runs'
- * workspaces; the Electron user data directory holds the credential store. A
- * test run that could write the template would reach every later real job,
- * and one that could write the approvals would approve its own policy. The
- * developer's own credentials are the same list the runner denies a job at
- * every level: a policy can never grant them there, so it cannot here either.
- *
- * A checkout's .localmostrc is applied in test mode without approval, so this
- * comes after every policy grant: seatbelt takes the last matching rule. The
- * workspace lives under the app data directory, so it is reopened last.
+ * The credentials a developer machine keeps, which no job or step reaches at
+ * any level, read or write: SSH, cloud and signing keys, the keychains, and
+ * the credential files kept inside the package-manager caches, which a level
+ * or policy may otherwise grant. Directories as subpaths, files as literals.
  */
-function neverReachablePaths(): { subpaths: string[]; literals: string[] } {
-  const home = os.homedir();
+export function developerCredentialPaths(home: string = os.homedir()): { subpaths: string[]; literals: string[] } {
   return {
     subpaths: [
-      ...appDataDirs(),
-      path.join(home, 'Library', 'Application Support', 'localmost'),
       `${home}/.ssh`,
       `${home}/.aws`,
       `${home}/.gnupg`,
@@ -500,6 +488,64 @@ function neverReachablePaths(): { subpaths: string[]; literals: string[] } {
   };
 }
 
+/**
+ * The credentials of developerCredentialPaths as seatbelt filters for a deny,
+ * each in every spelling it could be matched by (see policyDenySpellings):
+ * as written and by its real path. seatbelt matches the path a link resolves
+ * to, and dotfile managers link ~/.aws to ~/dotfiles/aws, or a single file
+ * such as ~/.m2/settings-security.xml; written alone, the deny held nothing
+ * against a job reading through the link, or granted what it resolves to.
+ */
+export function developerCredentialFilters(home: string = os.homedir()): string[] {
+  const { subpaths, literals } = developerCredentialPaths(home);
+  return [...new Set([
+    ...subpaths.flatMap((dir) => policyDenyFilters(dir)),
+    ...literals.flatMap((file) => policyDenySpellings(file).spellings.map((spelling) => `(literal "${escapePath(spelling)}")`)),
+  ])];
+}
+
+/**
+ * The directories above what is never reachable, as (literal ...) filters
+ * for a write deny, in each spelling seatbelt could match them by, up to but
+ * not including /. The denies match paths, so a job or step granted write on
+ * one of these - a package cache, ~/Library, ~ - could rename it and read
+ * what it holds under the new name: ~/.m2 to ~/.m2x for settings.xml,
+ * ~/Library/Application Support for the app's credential store. Nodes, not
+ * subtrees: what is in them stays as granted, a cache's own files included.
+ * Those not there yet too, where a link planted now would carry a credential
+ * written later wherever it points: a write grant of ~ cannot create a
+ * missing ~/.gradle, say, which the user creates instead.
+ */
+export function neverReachableAncestors(entries: string[]): string[] {
+  return [...new Set(entries.flatMap((entry) => policyDenyAncestors(entry)))];
+}
+
+/**
+ * What a step never reaches, whatever the policy declares, then the workspace.
+ *
+ * The app data directory holds the runner template every worker's sandbox is
+ * copied from, the approval cache, settings, the CLI socket and other runs'
+ * workspaces; the Electron user data directory holds the credential store. A
+ * test run that could write the template would reach every later real job,
+ * and one that could write the approvals would approve its own policy. The
+ * developer's own credentials are the same list the runner denies a job at
+ * every level: a policy can never grant them there, so it cannot here either.
+ *
+ * A checkout's .localmostrc is applied in test mode without approval, so this
+ * comes after every policy grant: seatbelt takes the last matching rule. The
+ * workspace lives under the app data directory, so it is reopened last.
+ */
+function neverReachablePaths(): { subpaths: string[]; literals: string[] } {
+  const home = os.homedir();
+  const credentials = developerCredentialPaths(home);
+  return { subpaths: [...appDataPaths(home), ...credentials.subpaths], literals: credentials.literals };
+}
+
+/** The app's own data: its data directories and its Electron data directory. */
+function appDataPaths(home: string): string[] {
+  return [...appDataDirs(), path.join(home, 'Library', 'Application Support', 'localmost')];
+}
+
 /** Whether a path is one no policy can grant, so discovery never suggests it. */
 function isNeverReachable(p: string): boolean {
   const { subpaths, literals } = neverReachablePaths();
@@ -509,15 +555,25 @@ function isNeverReachable(p: string): boolean {
 function neverReachableRules(escapedWorkDir: string, readOnlyPaths: string[] = []): string[] {
   const { subpaths, literals } = neverReachablePaths();
   const entries = [
-    ...subpaths.map((p) => `  (subpath "${escapePath(p)}")`),
-    ...literals.map((p) => `  (literal "${escapePath(p)}")`),
+    ...appDataPaths(os.homedir()).map((p) => `  (subpath "${escapePath(p)}")`),
+    ...developerCredentialFilters().map((filter) => `  ${filter}`),
   ];
   entries[entries.length - 1] += ')';
+  const nodes = neverReachableAncestors([...subpaths, ...literals]).map((node) => `  ${node}`);
+  if (nodes.length > 0) nodes[nodes.length - 1] += ')';
   return [
     ';; Never reachable, whatever a policy declares above: the app\'s own data',
     ';; and the credentials a developer machine keeps',
     '(deny file-read* file-write*',
     ...entries,
+    ...(nodes.length > 0
+      ? [
+          ';; Nor the directories above them, as nodes: renaming one would carry what',
+          ';; it holds out from under the deny, to be read under the new name',
+          '(deny file-write*',
+          ...nodes,
+        ]
+      : []),
     ';; ...except this run\'s workspace, which lives inside the app data directory',
     '(allow file-read* file-write*',
     `  (subpath "${escapedWorkDir}"))`,
