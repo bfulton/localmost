@@ -96,7 +96,10 @@ the only host directory it can see is that job's own work folder.
   enter the VM.
 - **A cache per repository.** Pulled images that passed the digest check are
   kept in a per-repository data disk. Each job gets an APFS clone of it. Built
-  images and tags never carry over from one job to the next.
+  images and tags never carry over from one job to the next. Every job of the
+  repository can use everything in that cache, whatever its own workflow's
+  policy says, so an image that needed the operator's registry credentials is
+  kept out of it (see [Decisions for the owner](#decisions-for-the-owner)).
 - **localmost's own guest.** A small Alpine-based guest ships inside the app:
   kernel, `dockerd`, `containerd`, `runc`, a read-only root, and small
   localmost init, agent and hook programs. It is updated with the app.
@@ -141,9 +144,9 @@ These were settled before this design and are not open questions.
 | `localmost-vm` | `Contents/Resources/localmost-vm` | Swift | Runs one VM. It validates its arguments, configures VZ, exposes two unix sockets, relays vsock 3128 to the job's proxy, and stops the VM on request. |
 | Guest kernel + initramfs | `Contents/Resources/guest/` | – | Alpine `linux-virt`, unpacked from EFI zboot. The initramfs mounts the erofs root and hands over to `lm-init`. |
 | `rootfs.erofs` | `Contents/Resources/guest/` | – | Read-only root: Alpine packages plus `lm-init`, `lm-agent`, `lm-runc`, `lm-bindpin`. |
-| `lm-init` | guest PID 1 | Go | Mounts, loads modules, starts and supervises the agent, reaps zombies. |
+| `lm-init` | guest PID 1 | Go | Mounts, loads the module allowlist and then disables module loading, starts the agent (and powers off if it exits), reaps zombies. |
 | `lm-agent` | guest | Go | vsock control (1025), Docker API splice (2375), proxy relay (198.18.0.1:3128 to vsock 3128), mounts the share, firewall, starts `dockerd`, self-test, clock, bind approvals. |
-| `lm-runc` | guest `/usr/bin/runc` | Go | Wrapper. On `create` it adds the `lm-bindpin` hook to the bundle's `config.json`, then execs the real `runc`. |
+| `lm-runc` | guest `/usr/bin/runc` | Go | Wrapper. On `create`, `run` and `restore` it adds the `lm-bindpin` hook to the bundle's `config.json`, then execs the real `runc`. |
 | `lm-bindpin` | guest | Go | OCI `createRuntime` hook. Every share-backed mount must be an approved bind. It clears `nosymfollow` on those binds only. |
 | bundled `docker` CLI | `Contents/Resources/docker-cli/docker` | – | Pinned static macOS arm64 CLI, first on the job's PATH. |
 
@@ -171,10 +174,16 @@ these calls go to it, and `/info` is rewritten as today.
 2. Get credentials from the operator's Docker config. A credential helper that
    fails is an error, never an anonymous pull.
 3. Fetch the index or manifest, choose the platform (see Rosetta), then fetch
-   the config and layers.
+   the config and layers. Every digest the registry names is checked against
+   `^sha256:[0-9a-f]{64}$` before it is used for anything, because store paths
+   are built from it (contract §6.3).
 4. Check every blob against its descriptor digest as it streams, and each
-   uncompressed layer against the config's `diff_ids`.
-5. Store the blobs in the repository's image store.
+   uncompressed layer against the config's `diff_ids`. Byte limits per pull,
+   per job and per layer, and a free-space floor, are enforced while the
+   bytes stream.
+5. Store the blobs in the repository's image store. An image the registry
+   would not serve anonymously goes to a store private to this job instead
+   (see [Decisions for the owner](#decisions-for-the-owner)).
 6. Build a `docker save`-shaped archive (OCI `index.json` plus `manifest.json`,
    uncompressed layers) and `POST /images/load` it through the VM's
    `docker.sock`.
@@ -193,12 +202,22 @@ there, dials vsock 3128 on the host, and the helper connects that to
 `127.0.0.1:<the worker's proxy port>`. `ProxyServer` checks the token and the
 policy as it does for the job itself. Nothing else leaves the VM.
 
+The token is the worker's proxy token, which runner-manager rotates at every
+worker start and again when the job ends (`rotateAuthToken` in
+`startInstance`, in the failed-start path and in `finalizeInstance`). A VM
+that outlives its job for a moment, or a relay connection still open when the
+slot is reused, therefore holds a token the proxy no longer accepts.
+
 **Approved binds.** When the daemon answers a create the filter approved, the
 filter sends the agent the binds it approved (`approve-binds`, with the
-container id) before it passes the answer to the job. The job cannot start a
-container it has not seen created, so the approval is in the guest before any
-`runc create` for that container. `lm-bindpin` reads it back from the agent at
-start.
+container id) before it passes the answer to the job, and records the
+container as the job's own only after the approval has landed. That ordering
+is not what makes this safe: a job can start a container by the `--name` it
+chose before it has seen the create answer, and the start may reach the daemon
+before the approval reaches the agent. Recording ownership only after the
+approval makes the filter refuse such an early start, but the argument does
+not rest on that. It rests on `lm-bindpin` failing closed: a container whose
+share-backed mounts have no approval in the agent does not start.
 
 **Teardown.** When the worker exits, the socket stops and `WorkerDocker.release()`
 stops the VM. The helper exits and the VM directory, with its disk clone, is
@@ -238,11 +257,21 @@ before anything else is granted.
   thrown away after the job, and `.full` would make each guest fsync cost
   about 5.5 ms instead of about 0.1 ms (R16).
 - **Cache refresh**: the golden disk is written only by a *refresh VM*. It has
-  no share and no relay and never runs job code. It works on a clone of the
-  golden disk attached with `.fsync`. It loads digest-verified images from the
+  no share and no relay and never runs job code. Usually it works on a clone
+  of the golden disk attached with `.fsync`, and loads only the images the
+  golden disk does not hold yet. It loads digest-verified images from the
   Mac-side store and removes anything else. On a clean guest shutdown the
   helper `F_FULLFSYNC`s the file, and the clone is renamed over the golden
   disk. A job's disk is never promoted.
+- **Rebuilt from blank.** The refresh VM is the one place where untrusted
+  input (layers from any publisher the repository pulled from) is written
+  into state that outlives a job. A flaw in `dockerd`'s layer extraction or in
+  ext4 would otherwise persist, and build up, across incremental refreshes. So
+  a refresh starts from a blank disk instead of a clone when the guest
+  version changed since the golden disk was made, when the golden disk is
+  more than 7 days old, and after any refresh that failed. It then reloads
+  every reference within the limit. That costs reload time, not downloads:
+  the blobs are already in the Mac-side store.
 
 ### Rosetta
 
@@ -264,14 +293,34 @@ explains:
 
 ## The share layout rule
 
-This is the rule that closes G-A (R1). Every clause below is load-bearing.
+This is the rule that closes G-A (R1). The layers that stop a swapped share
+are clauses 3 (the job cannot swap it) and 4 (the helper's profile refuses
+anything but the real directory). Clause 8 detects a failure of both. Clauses
+6 and 7 are what stop a swap of a bind source inside the share.
+
+**Job code can run before the VM starts.** The VM boots asynchronously at the
+claim, and it can wait in the admission queue for up to `bootTimeoutSec`. The
+job's steps are running all that time, so the share must already be safe
+before `Start()`. Before `Start()`, only clause 3 (the job profile's node
+denies) and clause 4 (the helper's profile, and its checks) protect it.
 
 1. **Which directory.** The share is `<sandbox>/_work`, the runner's work
    folder. The runner is configured with `--work _work`. It checks out into
    `_work/<repo>/<repo>`, which is `GITHUB_WORKSPACE`. The workspace, and so
-   every path a policy's `mounts:` can name, is therefore inside the share. The
-   filter socket `<sandbox>/docker.sock`, the job's `_temp`, the runner binaries
-   and the credentials are siblings of `_work` and are not shared.
+   every path a policy's `mounts:` can name, is therefore inside the share.
+   The runner also keeps its own working state under its work folder, so this
+   is inside the share too: `_work/_temp` (the step scripts, the file-command
+   files such as `GITHUB_ENV` and `GITHUB_OUTPUT`, and `_github_workflow/event.json`),
+   `_work/_actions` (the downloaded actions) and `_work/_tool` (the tool
+   cache). The job can write all of these already, so sharing them grants no
+   new access (S8 holds). A policy's `mounts:` cannot name them, because they
+   lie outside `GITHUB_WORKSPACE`, which is the mount root. Guest root can
+   reach them, though, so anything that gives a container guest root (a kernel
+   exploit, or `privileged` if it is ever granted) can rewrite the scripts of
+   later steps. The approval text for `privileged` must say so. The filter
+   socket `<sandbox>/docker.sock`, localmost's `<sandbox>/_temp` (the job's
+   `TMPDIR`), `<sandbox>/.docker`, the runner binaries and the credentials are
+   siblings of `_work` and are not shared.
 2. **Created by localmost, before any process runs in the sandbox.**
    `buildSandbox` makes `<sandbox>/_work` itself, with a plain `mkdir` that fails
    if the name exists, right after making the sandbox directory. Today the runner
@@ -284,22 +333,56 @@ This is the rule that closes G-A (R1). Every clause below is load-bearing.
    ;; cannot rename, replace, chmod or relink either. VZ resolves the share's
    ;; path when the VM starts, so a link here would share wherever it points.
    (deny file-write* (literal "<sandbox>/_work") (literal "<sandbox>"))
+   ;; The share's tripwire (clause 8): the job can neither read the nonce nor
+   ;; replace it, so a match proves VZ shared the directory localmost made.
+   (deny file-read* file-write* (literal "<sandbox>/_work/.localmost-share"))
    ```
 
-   The contents stay writable. The `<sandbox>` node needs the deny as well,
-   because otherwise the job could rename its whole sandbox into a writable
-   policy path such as `~/.npm` and put a link in its place. The ancestors of
-   `<sandbox>` (`runner/sandbox`, `runner`, `<data>`, and `~` and `/Users` above
-   them) are already denied as nodes by the existing app-directory rules.
+   The contents stay writable. All three denies are new in the runner job's
+   profile (`process-sandbox.ts`), which today re-allows the whole sandbox
+   subtree, node included. The `localmost test` step profile already has the
+   same kind of rule for its workspace (`src/shared/sandbox-profile.ts`: "not
+   the workspace directory itself: the app writes into it unsandboxed"). The
+   `<sandbox>` node needs the deny as well, because otherwise the job could
+   rename its whole sandbox into a writable policy path such as `~/.npm` and
+   put a link in its place. The ancestors of `<sandbox>` (`runner/sandbox`,
+   `runner`, `<data>`, and `~` and `/Users` above them) are already denied as
+   nodes by the existing app-directory rules.
+
+   A review probe under `sandbox-exec` (in the spike directory,
+   `review-case/` and `review-probe/nodedeny.sh`) showed that these denies hold against
+   `mv`, `rm -rf` and `chmod` of `_work`, against `mv` of `<sandbox>`, against
+   case variants of the names (`mv _WORK`, `mv ../SB` on the case-insensitive
+   volume), and against `renamex_np(RENAME_SWAP)`. `mkdir -p` of an existing
+   `_work` still works. The side effects are listed under Edge cases.
 4. **Pinned by the helper, too.** The helper is given the VM id and the sandbox
    id (`<slot>-<12 hex>`), never a path. It works out the share path itself from
    `<data>`. It checks that the share is a directory and not a link (`lstat`),
    and that `realpath(share) == realpath(<data>/runner/sandbox/<sandboxId>) + "/_work"`.
-   It passes VZ that real path. Its own seatbelt profile grants file access and
-   `com.apple.virtualization.extension.fuse` extension issuing on that real path
-   only. So even if a link were somehow planted, VZ's resolution at `Start()`
-   would land outside the helper's grant, and the start would fail with EPERM
-   (verified, below). That gives two independent layers.
+   It also checks that nothing is mounted over the share: `st_dev` of the
+   share must equal `st_dev` of `<sandbox>`, and the share must not be a mount
+   point. Seatbelt's path rules do not see a mount placed over a directory
+   (`hdiutil attach -mountpoint`, a macFUSE bindfs, `mount_smbfs`), and the
+   helper's grant is by path, so without this check it would share whatever
+   the mount shows. A DMG the job made holds only what the job could write
+   anyway, but a bindfs or SMB loopback of `$HOME` would not. It passes VZ the
+   real path. Its own seatbelt profile grants file access, and the issuing of
+   sandbox extensions, on that real path only:
+
+   ```scheme
+   (allow file-issue-extension
+     (require-all
+       (extension-class "com.apple.app-sandbox.read-write" "com.apple.app-sandbox.read")
+       (subpath "<S>")))
+   ```
+
+   This `file-issue-extension` rule is the mechanism of the second layer.
+   VZ's XPC service reaches the share only through a sandbox extension that
+   the helper issues for the path VZ resolved at `Start()`. If a link were
+   somehow planted, the resolved path would lie outside `<S>`, the helper could
+   not issue the extension, and the start would fail with EPERM (verified,
+   below). Without the rule, the VM starts but every read of the share in the
+   guest fails. The rule must never be broadened beyond `(subpath "<S>")`.
 5. **Identical path in the guest.** The agent mounts the share at the same
    absolute path it has on the Mac. The filter pins each bind source to its
    host real path, and that path means the same thing to `dockerd` in the
@@ -312,36 +395,60 @@ This is the rule that closes G-A (R1). Every clause below is load-bearing.
    `nosuid` also keeps exec of workspace-built binaries working (R11). A child
    bind inherits `nosymfollow`.
 7. **The hook's exact behaviour** (`lm-bindpin`, registered by `lm-runc` as a
-   `createRuntime` hook on every `runc create`):
+   `createRuntime` hook on every `runc create`, `run` and `restore`):
    1. Read the OCI state (`id`, `pid`, `bundle`) from stdin, and
       `<bundle>/config.json`.
    2. Ask the agent (`/run/localmost/agent.sock`, root only) for the approved
-      binds of container `id`.
+      binds of container `id`. If the agent cannot be reached, or answers
+      anything but a valid list, and `config.json` has any mount whose source
+      is at or below the share, exit 1.
    3. Check every mount in `config.json` whose source is at or below the share
-      mount path. Its source, destination and read-only flag must equal one
-      approved bind *exactly*. Otherwise exit 1, and `runc` fails the start with
-      `localmost: bind <src> was not approved for this container`.
+      mount path. After normalising both sides (contract §3.7), its source,
+      destination and read-only flag must equal one approved bind. Otherwise
+      exit 1, and `runc` fails the start with
+      `localmost: bind <src> -> <dst> was not approved for this container`.
    4. Enter the container's mount namespace (`setns` on `/proc/<pid>/ns/mnt`)
-      and read `mountinfo`. Take every mount of the `work` virtiofs superblock.
-      It must be one of the approved binds, matched by its root within the
-      share and its mount point under the container rootfs. Otherwise exit 1.
-   5. For each matched mount, call `mount_setattr(AT_FDCWD, mountpoint,
-      AT_SYMLINK_NOFOLLOW, {attr_clr: MOUNT_ATTR_NOSYMFOLLOW})`. That clears
-      `nosymfollow` and leaves `ro`, `nosuid` and `nodev` as they are.
-   6. Exit 0. Mounts that do not come from the share are not touched: `/etc/hosts`,
+      and read `mountinfo`. Take every mount of the `work` virtiofs superblock,
+      and record its **mount id** (the first `mountinfo` field). Each must be
+      one of the approved binds, matched by its root within the share and its
+      mount point under the container rootfs. Otherwise exit 1.
+   5. Open each matched mount by its mount id, never by a path lookup alone.
+      The parent directories of a mount point lie in the container's rootfs and
+      in approved binds, and the job on the Mac can change those binds while
+      the hook runs, so a path could be redirected to a different mount. For
+      each mount: open the container rootfs as a directory fd; from it, open
+      the mount point with `openat2(…, RESOLVE_NO_SYMLINKS |
+      RESOLVE_NO_MAGICLINKS | RESOLVE_BENEATH, O_PATH)`, or with `open_tree`
+      under the same resolution; check with `statx(STATX_MNT_ID)` that the fd
+      is the mount with the recorded id. Any mismatch or error exits 1.
+   6. Only after **every** mount has passed steps 3 to 5, clear the flag on
+      each through its fd: `mount_setattr(fd, "", AT_EMPTY_PATH,
+      {attr_clr: MOUNT_ATTR_NOSYMFOLLOW})`. That clears `nosymfollow` and
+      leaves `ro`, `nosuid` and `nodev` as they are. An error here exits 1,
+      and `runc` tears the container down.
+   7. Exit 0. Mounts that do not come from the share are not touched: `/etc/hosts`,
       `resolv.conf` and named volumes live on the data disk.
+
+   Any error at all exits 1 whenever a share-backed mount is present. The
+   hook never exits 0 without having checked every such mount.
 
    The effect: symlinks *inside* an approved bind work in the container, and
    resolve in the container's own root. The *source* of every bind was resolved
    by `runc` under `nosymfollow`, so it cannot have gone through a link.
    `lm-runc` is installed as `/usr/bin/runc`, with the real `runc` at
    `/usr/libexec/localmost/runc`. That way both runtime names the filter permits
-   (`""` and `runc`) pass through the hook, and so does a restart.
+   (`""` and `runc`) pass through the hook, and so does a restart. The filter's
+   endpoint allowlist has no checkpoint endpoints, so `runc restore` is not
+   reachable today. `lm-runc` handles it anyway, so that adding checkpoints
+   later cannot skip the hook.
 8. **Tripwire.** Before the worker starts, localmost writes a random nonce to
-   `<sandbox>/_work/.localmost-share`. `configure` returns what the guest reads
-   there. If it does not match, the VM is torn down and the job runs without
-   Docker. The job can overwrite the file, but doing so only denies itself
-   Docker.
+   `<sandbox>/_work/.localmost-share`. The job profile denies the job both
+   reading and writing that file (clause 3), so the job cannot copy the
+   nonce and cannot replace it. `configure` returns what the guest reads there.
+   If it does not match, the VM is torn down and the job's Docker requests get
+   503. A match is a real attestation that VZ shared the directory localmost
+   made. A mismatch means clauses 3 and 4 both failed, so it is logged at
+   error, not warn.
 
 ## Security properties
 
@@ -351,17 +458,17 @@ experiment. "V-spike" means verified in this design's spike on 2026-09-30.
 
 | # | Claim | Rests on | Evidence |
 |---|---|---|---|
-| S1 | A job cannot give a container the user's home or any Mac path outside its own `_work` (G-A). | (a) The VM has exactly one read-write share, `_work`, created by localmost (R1). (b) Profile node denies make it unswappable (rule 3). (c) The helper's seatbelt grants only that real path, so a swap resolved at `Start()` fails. (d) A rename after `Start()` fails closed. (e) Symlinks planted on the host resolve in the guest, never on the Mac. (f) The VZ XPC service is itself sandboxed to the shared paths. | (a), (d), (e), (f): V (register §1). (c): V-spike. A share path swapped for a link to a directory outside the helper profile's grant failed `Start()` with EPERM, and an ungranted directory was refused the same way. (b): Build, WP-C sandbox test. |
+| S1 | A job cannot give a container the user's home or any Mac path outside its own `_work` (G-A). | (a) The VM has exactly one read-write share, `_work`, created by localmost (R1). (b) Profile node denies make it unswappable (rule 3); job code may run before `Start()`, and until then (b) and (c) are the only layers. (c) The helper checks the share (not a link, not a mount point, same device as the sandbox), and its profile's `file-issue-extension` rule, scoped to `(subpath "<S>")`, lets VZ's service reach only that real path, so a swap resolved at `Start()` fails. (d) A rename after `Start()` fails closed. (e) Symlinks planted on the host resolve in the guest, never on the Mac. (f) The VZ XPC service is itself sandboxed to the shared paths. (g) The nonce tripwire detects a failure of both (b) and (c). | (a), (d), (e), (f): V (register §1). (c): V-spike, with the scoped `file-issue-extension` rule present. A share path swapped for a link outside the grant failed `Start()` with EPERM, and an ungranted directory was refused the same way. A review probe confirmed that without that rule the VM starts but the guest cannot read the share, so the EPERM comes from that rule. The mount-point check: Build, WP-B. (b), (g): Build, WP-C sandbox test. |
 | S2 | A container cannot reach guest `/`, the guest `docker.sock` or `/proc` by swapping a bind source (R2). | `nosymfollow` on the share, plus `lm-bindpin` clearing it only on approved binds. | V-spike on the shipped kernel (Alpine 6.18.54) with `dockerd` 29.5.3 and `runc` 1.4.3. `create` with a bind, swap the source for a link to `/`, `start` failed. A bind of a planted link to `/Users/...` failed. A child bind inherited `nosymfollow` (inner link: ELOOP). `mount_setattr` clearing only `NOSYMFOLLOW` restored inner links and kept `ro,nosuid,nodev`. The hook itself: Build, WP-A. |
 | S3 | Containers of different jobs cannot reach each other, and a job cannot join another job's network. | Separate VMs. No NIC. vsock has no guest-to-guest path. Network names exist only inside one VM. | vsock CID 3 gives ENODEV (R7, V). Live cross-job test: Build, integration stage. |
 | S4 | Container egress goes only through the job's proxy, under the job's policy. | No NIC. The relay goes only to that worker's `ProxyServer`, which checks the per-worker token. The guest firewall rejects everything else sent to the guest root namespace from bridges. | No route and no DNS without a NIC (R7, V). V-spike: a default-bridge container reached a listener on `198.18.0.1:3128`. An `internal` network container got "Network unreachable". Relay end to end: Build, WP-A with WP-B. |
-| S5 | An `internal` network container reaches nothing outside its network. | No default route, and an INPUT reject from bridges for everything but the relay address. | V-spike: no route to the relay. It *did* reach a `0.0.0.0` listener on its gateway (R8 confirmed), which the INPUT rule closes. That rule: Build, WP-A self-test. |
+| S5 | An `internal` network container reaches nothing outside its network. | No default route. The guest's INPUT chain accepts the relay address only from the bridges of routable networks, which the agent tracks from Docker's network events, and rejects everything else. A container can forge the route away: `NET_RAW` is in Docker's default capabilities, so it can send a frame to its gateway's MAC addressed to `198.18.0.1`, and Linux's weak-host model would deliver it to `lm0`. The interface match is what stops that. The backstop is the proxy token, which is injected only into routable containers. | V-spike: no route to the relay, and it *did* reach a `0.0.0.0` listener on its gateway (R8 confirmed). The spike tested routing only, not forged frames. The interface-scoped rule and the forged-route probe: Build, WP-A self-test and live test 6. |
 | S6 | Registry credentials never enter the VM. | Pulls run on the Mac. Only the image archive crosses into the VM. | V-spike: `docker load` of an archive built on the Mac worked, and the image id equalled the config digest. The puller: Build, WP-D. |
-| S7 | One job cannot poison another's images. | The cache is per repository. The golden disk is written only by the refresh VM from verified blobs. Job disks are clones and are discarded. There are no tags on the golden disk. | Design (R14). Build, WP-D. |
-| S8 | Guest root is worth no more than the job already has. | One VM per job holds only this job's share, this job's proxy token and this job's images. | R3. The residual is the VZ/virtiofs attack surface (R22), below. |
+| S7 | One job cannot poison another's images. It *can* use every image in its repository's cache, including images its own workflow's policy never allowed. | The cache is per repository. The golden disk is written only by the refresh VM from verified blobs, and is rebuilt from blank on a schedule. Job disks are clones and are discarded. There are no tags on the golden disk. What the cache exposes: any job of the repository can run a cached image through `docker build` with `FROM <ref>@sha256:…` (the classic builder uses a local image without pulling, and the filter does not read the Dockerfile), through `run.images: ['*']` with an image id, or, with guest root, by reading `/dev/vdb`. So an image that the registry would not serve anonymously never enters the shared store or the golden disk (decision pending, below). | Design (R14). Build, WP-D. The residual in the refresh VM is listed below. |
+| S8 | Guest root is worth no more than the job already has, plus the public images in its repository's cache. | One VM per job holds only this job's share (including the runner's `_work/_temp` and `_work/_actions`, which the job can already write), this job's proxy token, this job's pulls, and its repository's cache of public images. Guest root cannot load a kernel module or kexec a new kernel: after loading its module allowlist, `lm-init` sets `kernel.modules_disabled=1` and `kernel.kexec_load_disabled=1` (the kernel has `MODULE_SIG` but not `MODULE_SIG_FORCE`, so without this any module would load). | R3. The residual is the VZ/virtiofs attack surface (R22), and a guest kernel exploit, below. |
 | S9 | The VM control plane is not reachable by any job. | The helper sockets are under `<data>/vm/jobs/`, which every job profile denies. The API takes ids, not paths. | Profile rule (R9, V). Test: Build, WP-C sandbox test. |
-| S10 | No Local Network privacy prompt, and no LAN or host-loopback reach from containers. | vsock only. No NIC. Host loopback is reached only through the proxy, under the job's `loopback` policy, the same as the job. | R6/R25. vsock round trip in both directions: V-spike. |
-| S11 | A crashed or killed localmost leaves nothing running that keeps reaching anything. | A VM dies within about 2 s of its helper being killed. The startup sweep removes the directories left behind. | R27 (V). Sweep: Build, WP-C. |
+| S10 | No Local Network privacy prompt, and no LAN or host-loopback reach from containers beyond what the job has. | vsock only. No NIC. Host loopback is reached only through the proxy, under the job's `loopback` policy, the same as the job. That includes the local broker's port, which `ProxyServer` always opens as infrastructure (`proxy-server.ts`, `port === this.brokerPort`). It is guarded by the per-worker broker key, which lives outside `_work` and never enters the VM. | R6/R25. vsock round trip in both directions: V-spike. |
+| S11 | A crashed or killed localmost leaves nothing running that keeps reaching anything. | The helper watches its parent: EOF on stdin, or the exit of the parent pid it recorded at start (kqueue `EVFILT_PROC`/`NOTE_EXIT`), is `stop` with `graceMs: 0`. A VM dies within about 2 s of its helper exiting or being killed. The startup sweep removes the directories left behind. | Helper death: R27 (V). Parent death: Build, WP-B (SIGKILL of the parent, helper and VZ XPC process gone within 3 s). Sweep: Build, WP-C. |
 
 What this backend does **not** contain, stated as plainly as `SECURITY.md` must:
 
@@ -369,9 +476,16 @@ What this backend does **not** contain, stated as plainly as `SECURITY.md` must:
   sandboxed to the one share, but it is closed source and has not been fuzzed
   here.
 - **A kernel exploit from a container.** It gives guest root, which S8 bounds
-  but does not prevent. `privileged` becomes grantable on this backend, because
-  it too only reaches guest root. Privileged containers also bypass
-  `internal:` and the hook.
+  but does not prevent. `privileged` stays refused on this backend for now
+  (see [Decisions for the owner](#decisions-for-the-owner)): it would turn such
+  an exploit into a one-liner, and it also bypasses `internal:` and the hook.
+- **The refresh VM's input.** The refresh VM extracts layers from every public
+  image the repository pulled, from any publisher, onto the golden disk that
+  every later job of the repository clones. A flaw in `dockerd`'s layer
+  extraction or in the guest's ext4 would therefore reach later jobs of the
+  same repository. The golden disk is rebuilt from blank on a schedule and
+  after every guest update (Disks and sync modes), which limits how long such
+  a flaw persists but does not prevent it. This sits next to R22.
 - **Hard links the job itself makes** inside `_work` to files it can already
   write (R23). Seatbelt refuses `link()` on a file the job cannot write, so this
   adds nothing.
@@ -399,6 +513,21 @@ VM failed. The socket then answers 503, "the job's Docker VM stopped
 unexpectedly". The VM is never restarted silently, because its containers and
 images are gone. The job continues and its docker steps fail.
 
+**Agent exit.** The agent holds state that cannot be rebuilt: the bind
+approvals, the relay, the `configure` result and the `dockerd` it started. So
+`lm-init` does not restart it. An agent exit powers the guest off, the helper
+reports `stopped` with reason `guest`, and `VmManager` marks the VM failed
+with the same 503 as a helper crash.
+
+**Electron crash.** Each helper watches its parent (S11). When Electron main
+dies, by a crash or SIGKILL, every helper stops its VM at once and exits. The
+next launch's sweep removes the directories.
+
+**Guest text in the job log.** Everything the guest supplies that reaches a
+log (the `E_DOCKERD` log lines, agent error messages, console excerpts) is
+treated as hostile: control characters and ANSI escapes are stripped, and
+each string is capped, before it is logged.
+
 **Sleep and wake.** On `powerMonitor` `resume`, the running VMs get `set-time`
 from the Mac clock (VZ has no Linux time sync; R18), and the pre-warmed spare,
 if any, is discarded. VMs are not paused across sleep.
@@ -406,11 +535,26 @@ if any, is discarded. VMs are not paused across sleep.
 **Low memory.** Each VM is configured with `dockerVm.memoryMiB` (8192 by
 default). The memory is committed lazily, and only a stopped VM gives it back
 (R4). An admission gate allows at most `dockerVm.maxRunning` VMs (default:
-physical RAM divided by 8 GiB, at least 1). A boot beyond that waits in FIFO
-order, and the job's docker requests wait with it, up to the boot timeout, then
-get 503 "no Docker VM capacity". Under host memory pressure the spare is not
-started. A container killed by the guest OOM killer exits 137, which Docker
-reports as usual.
+physical RAM divided by 8 GiB, at least 1). Refresh VMs go through the same
+gate at the lowest priority. A boot beyond that waits in FIFO order, and the
+job's docker requests wait with it, up to the boot timeout, then get 503 "no
+Docker VM capacity". Host memory pressure is read by a new monitor in
+`src/main/resource-monitor/` that polls `kern.memorystatus_vm_pressure_level`
+(1 normal, 2 warn, 4 critical). At warn the spare is not started and
+refreshes wait; at critical new boots are queued. A container killed by the
+guest OOM killer exits 137, which Docker reports as usual.
+
+**Low disk.** A job's pulls land on the Mac first and then in the VM's data
+disk, both of which grow on the Mac's disk. Docker Desktop capped all of this
+with one fixed VM disk; here the caps are explicit (contract §5.6, §6.3): a
+byte limit per pull and per job enforced while blobs stream, a limit on how
+far a layer may expand when decompressed, and a free-space floor under which
+a boot or a pull is refused. A new data disk's apparent size is the smaller
+of `dockerVm.dataDiskGiB` and the free space above the floor that no other
+running VM has already been promised. While VMs run, `VmManager` watches free
+space; below half the floor it stops the VM whose disk grew most, with the
+reason "host disk nearly full". `cacheLimitGiB` still trims the cache at
+refresh.
 
 **Rosetta absent or broken.** No Rosetta share. arm64 images work. amd64
 pulls are refused with the message above, naming the fix. A broken Rosetta
@@ -423,10 +567,41 @@ linux/amd64` of an image that has both is honoured.
 
 **Private registry credentials.** Read on the Mac by the puller (the operator's
 `~/.docker/config.json`, credential helpers and `credsStore`) and used for the
-registry's token exchange there. They are never forwarded. If the configured
-helper is missing (ENOENT) or fails for any reason other than "credentials not
-found", the pull fails with an error naming the helper. A helper that reports
-"not found" means an anonymous pull, as the docker CLI does.
+registry's token exchange there. They are never forwarded. Credential helpers
+are looked up only in a fixed list of directories (`/opt/homebrew/bin`,
+`/usr/local/bin`, `/Applications/Docker.app/Contents/Resources/bin`), not on
+`PATH`, because an app launched from Finder has `PATH=/usr/bin:/bin:/usr/sbin:/sbin`,
+and they run asynchronously, off the main thread's critical path. If the
+configured helper is missing or fails for any reason other than "credentials
+not found", the pull fails with an error that names the helper and the config
+key to change:
+
+> the Docker credential helper `docker-credential-desktop` (from `credsStore`
+> in ~/.docker/config.json) was not found in /opt/homebrew/bin, /usr/local/bin
+> or /Applications/Docker.app/Contents/Resources/bin; install it, or remove
+> `credsStore` from ~/.docker/config.json
+
+A helper that reports "not found" means an anonymous pull, as the docker CLI
+does.
+
+**Registries on the LAN, loopback or plain HTTP.** The puller screens every
+registry address as `ProxyServer` does, refusing loopback, link-local and
+private addresses, and it speaks only https. A registry listed in
+`pull.registries` that is on the LAN, on the Mac itself, or served over plain
+http, which Docker Desktop could pull from, is refused:
+
+> registry `nas.local:5000` resolves to a private address (192.168.1.20);
+> localmost pulls only from public https registries
+
+A future policy key could allow a named private registry, with its own
+approval text. It is not part of this design.
+
+**Registry redirects.** A registry commonly redirects blob downloads to a CDN.
+The puller follows https redirects, screened, to any public host, so granting
+a registry in `pull.registries` also means Electron fetches from wherever that
+registry redirects. That is outside the job's `network.allow`, and the policy
+approval text for `pull.registries` says so. No credentials go to a redirect
+target.
 
 **Digest mismatch.** A blob whose SHA-256 does not match its descriptor, or a
 layer whose uncompressed SHA-256 does not match the config's `diff_ids`, is
@@ -447,6 +622,12 @@ A golden disk whose `meta.json` `dataFormat` differs from the guest manifest's
 of the same repository clone the same golden disk, which is read-only to them.
 Refreshes of one repository are serialized and coalesced.
 
+**Repeated binds.** runner-manager applies a job's policy more than once: at
+the acquire (`onJobAcquired`), again at the "Running job" line, and possibly
+against a previous spawn's socket that is still stopping. `WorkerDocker.bind()`
+is therefore idempotent (contract §5.1): only the first bind with grants
+boots, and a bind on a socket that is stopping never boots.
+
 **Pre-warmed spare lifecycle** (`dockerVm.prewarm: true`; off by default).
 There is at most one spare. It is booted when an idle worker is spawned for a
 target, so its sandbox, and therefore its share, already exists. It uses the
@@ -463,8 +644,8 @@ there is nothing in it to leak.
 
 **Startup sweep.** Before the runner pool starts, `VmManager.sweep()` handles
 each `<data>/vm/jobs/*`. It reads `helper.pid` and, if that pid is alive and is
-a `localmost-vm` started from this app's Resources (the same pid-reuse checks
-the runner sweep uses), sends SIGKILL. Then it removes the directory. Leftover
+a process whose executable is this app's `helperPath()` (contract §1; the same
+pid-reuse checks the runner sweep uses), sends SIGKILL. Then it removes the directory. Leftover
 `cache/*/data.img.new` refresh clones are removed too. A VM can never outlive
 the app for more than one launch.
 
@@ -482,6 +663,20 @@ it does today.
 **The share root itself.** An `rm -rf "$GITHUB_WORKSPACE"` works, because the
 checkout is a subdirectory of the share. Only `_work` itself is fixed (R24).
 
+**Side effects of the node denies.** Because `_work` and `<sandbox>` are
+denied as nodes, operations on those nodes themselves fail even when they
+would change nothing that matters. In the review probe: `rsync -a src/ _work/`
+exits 23 (it sets the times and mode of `_work`), `tar -x` of an archive with
+a `.` entry into `_work` exits 1, and `touch _work` and `xattr -w` on `_work`
+fail with EPERM. `mkdir -p _work/...` and writes inside `_work` work. A job
+that copies into `_work` as a whole should copy into a subdirectory.
+Workflows do not normally do this; the runner writes inside `_work`, not to
+it.
+
+**Mounts over the share.** A job that mounts something over `_work` before
+the VM starts (a DMG, a FUSE filesystem, an SMB share) makes the helper
+refuse the share with `E_SHARE`, and the job has no Docker.
+
 ## What changes for users
 
 - **No Docker Desktop.** localmost no longer uses or needs Docker Desktop for
@@ -491,25 +686,46 @@ checkout is a subdirectory of the share. Only `_work` itself is fixed (R24).
 - **`routable` means through the job's proxy.** On the default bridge, and on a
   network declared `internal: false`, containers get `HTTP_PROXY`/`HTTPS_PROXY`
   pointing at the job's proxy. They reach exactly what the job's
-  `network.allow` permits, and loopback per the job's `loopback` policy.
+  `network.allow` permits, and loopback per the job's `loopback` policy, plus
+  the local broker's port, which the job's proxy always opens and which its
+  per-worker key guards.
   Traffic that ignores the proxy settings has no route: plain TCP to an
   external database, `git` over ssh, UDP, and DNS lookups of outside names. It
   fails fast. The approval text changes from `UNFILTERED_EGRESS` to "egress
   through this job's proxy, subject to its network allowlist".
 - **`internal: true`** means no egress at all, which was already the intent.
-  Now it is enforced by the guest's routing and firewall.
+  Now it is enforced by the guest's routing and an interface-scoped firewall,
+  with the proxy token as the backstop.
 - **Proxy settings are injected** into routable containers and into builds
   (`--build-arg`). A value the job sets itself is kept. Docker leaves the
-  predefined proxy build args out of the image history. Container-to-container
+  predefined proxy build args out of `docker history` unless the Dockerfile
+  declares them with `ARG` ([Dockerfile reference, "Predefined ARGs"](https://docs.docker.com/reference/dockerfile/#predefined-args)).
+  A Dockerfile that declares `ARG HTTP_PROXY` records the injected URL,
+  token included, in the image's history. The token is rotated when the job
+  ends, so it is useless afterwards, but the job log should not print
+  `docker history` of such an image. Container-to-container
   HTTP by service name should be listed in `NO_PROXY` by the job. The injected
   `NO_PROXY` covers only `localhost`, `127.0.0.1` and `::1`.
-- **`privileged` becomes grantable.** The VM is the boundary. It is still a
-  distinct, prominent grant in the approval diff.
+- **`privileged` stays refused**, as today, until the owner decides
+  otherwise (see [Decisions for the owner](#decisions-for-the-owner)).
 - **Pulls happen on the Mac** and show Docker's usual progress. The first pull
   of an image by a repository downloads it, later jobs load it from the
   repository's cache disk, and a tag is re-resolved against the registry on
-  every pull (a manifest `HEAD`, which Docker Hub does not count against rate
-  limits).
+  every pull with a manifest `HEAD`. Docker's documentation says a `HEAD`
+  request is not counted against Docker Hub's pull limit
+  ([Docker Hub usage and limits](https://docs.docker.com/docker-hub/usage/pulls/));
+  WP-D's live acceptance checks the `ratelimit-remaining` header before and
+  after one to confirm it.
+- **Private images are pulled every job.** An image the registry would not
+  serve anonymously is kept only for the job that pulled it, never in the
+  repository's cache (pending the owner's decision).
+- **Credential helpers must be where localmost looks.** A `credsStore` or
+  `credHelpers` entry in `~/.docker/config.json` names a helper that must be
+  in `/opt/homebrew/bin`, `/usr/local/bin` or Docker.app's bundled `bin`. An
+  operator who removes Docker Desktop while its `credsStore: desktop` is still
+  configured sees every pull fail, public images included, with a message
+  naming the key, until the config is edited.
+- **No LAN, loopback or plain-http registries** (see Edge cases).
 - **Build base images must be pulled first** (see Edge cases).
 - **Bind ownership** follows virtiofs: `chown` inside a container on a
   workspace bind does not persist (R21). Data directories belong on volumes,
@@ -546,9 +762,17 @@ packages pinned in the contract:
   0.35 s, and the guest finished at 0.8 s.
 - A VZ host process under a **deny-default** seatbelt profile booted the guest.
   It needed `(import "system.sb")`, reads of its own binary and the guest
-  artifacts, read-write on the share, and `generic-issue-extension` for class
-  `com.apple.virtualization.extension.fuse`. The same profile refused to share
-  an ungranted directory, and a granted path that was a link to one (EPERM).
+  artifacts, read-write on the share, `generic-issue-extension` for class
+  `com.apple.virtualization.extension.fuse`, and `file-issue-extension` for
+  the `com.apple.app-sandbox.read-write` and `.read` classes scoped to
+  `(subpath <share>)`. The same profile refused to share an ungranted
+  directory, and a granted path that was a link to one (EPERM). A review probe
+  with the same inputs but without the `file-issue-extension` rule booted, but
+  every read of the share in the guest failed with "Operation not permitted";
+  with the rule, the share worked. That probe also attached a read-write data
+  disk in a granted directory without any extension rule and started. The
+  spike never attached the erofs root under the profile, so disks under the
+  profile remain unverified until WP-B.
 - `dockerd` 29.5.3 (API 1.54) with `containerd` 2.3.6, `runc` 1.4.3, overlay2,
   cgroup v2 and **iptables on** started from the erofs root on the ext4 data
   disk and answered 0.2 s after it was started (0.32 s after the guest kernel
@@ -565,8 +789,16 @@ packages pinned in the contract:
 
 Not yet verified, and owned by work packages:
 
-- `lm-bindpin` as a real hook, including its `setns` from Go.
-- The firewall INPUT rules and the self-test.
+- `lm-bindpin` as a real hook, including its `setns` from Go and the
+  mount-id checks through `openat2`/`statx`.
+- The firewall INPUT rules, the interface-scoped relay chain, a forged-route
+  probe from an internal network, and the self-test.
+- Docker's embedded DNS on user-defined networks. The spike's `dockerd` log
+  showed `Resolver Start failed … DNAT/SNAT rules failed` for the internal
+  network container, with no `xt_nat` loaded; the contract's module list
+  includes it. WP-A's acceptance checks that a container resolves another by
+  name.
+- Disks (the erofs root and the data disk) under the helper's profile.
 - The relay end to end through `ProxyServer`.
 - `docker load` of real registry images with gzip and zstd layers.
 - The helper when signed with Developer ID and the hardened runtime and
@@ -583,36 +815,112 @@ Not yet verified, and owned by work packages:
   waiting for or timing out on the VM. They also cover the helper and agent
   NDJSON framing and limits, and the `VmManager` state machine against a fake
   helper. For the puller: a local mock registry, token auth, platform choice,
-  CDN redirects, digest and `diff_id` mismatches, gzip and zstd, and loud
-  credential-helper failure. The rest: `ImageStore`, `CacheDisks` (clone,
+  CDN redirects (no credentials on any redirect hop), realm screening, refused
+  foreign layers, digest and `diff_id` mismatches, digests shaped like path
+  traversal, byte limits, gzip and zstd, and loud credential-helper failure.
+  For the filter: oversized daemon answers are refused without buffering
+  them. The rest: `ImageStore`, `CacheDisks` (clone,
   refresh bookkeeping), profile generation (node denies, helper profile), guest
   composition (deterministic cpio/tar, case-clash preservation, lock-file
   verification), zboot unpacking, the `signOptionsForFile` branch, and
   packaging (extraResource, `LSMinimumSystemVersion` 14.0, entitlements).
 - **Sandbox tests (real `sandbox-exec`, as `*.sandbox.test.ts` do today).**
-  A job can create, write and remove anything under `_work` but cannot rename,
-  remove, chmod or replace `_work` or `<sandbox>`. A job cannot connect to
-  `<data>/vm/jobs/*/docker.sock`.
-- **Swift.** `swift test` for argument and path validation. The helper is
-  compiled in `check.yaml`. GitHub-hosted runners have no nested
-  virtualization, so the helper cannot boot a VM there (R28).
+  They follow the repo's three modes: off macOS (an explicit assertion that
+  the platform is not darwin), constructed (the test builds the profile and
+  runs under `sandbox-exec`), and ambient (inside a localmost job, where
+  seatbelt refuses a nested profile, so the test asserts against the job's
+  own profile instead). Every new assertion is written in both the
+  constructed and the ambient form. A job can create, write and remove
+  anything under `_work` but cannot rename, remove, chmod or replace `_work`
+  or `<sandbox>`, including by case variants of the names and by
+  `renamex_np(RENAME_SWAP)`. It cannot read or replace `_work/.localmost-share`.
+  It cannot connect to `<data>/vm/jobs/*/docker.sock`. The helper's own
+  profile is exercised the same way, in `helper-profile.sandbox.test.ts`;
+  unit tests run the fake helper directly, without `sandbox-exec`.
+- **Swift and Go in CI.** A dedicated `macos-latest` (arm64, GitHub-hosted)
+  job, in `ci.yaml`, runs `swift build` and `swift test` for
+  `native/localmost-vm`, and `go test ./...` and `GOOS=linux go vet ./...` for
+  `guest/`. The ubuntu leg also runs the guest's `go test ./...` natively.
+  Linux-only syscall code is behind `//go:build linux`, and the pure logic
+  (mountinfo parsing, bind matching, the protocol) is tested on any OS.
+  `check.yaml` is the reusable runner-selection workflow and runs no builds;
+  it is not changed. GitHub-hosted runners have no nested virtualization, so
+  no CI job boots a VM (R28).
+- **Guest builds happen only on the owner's Mac, outside any job.** The
+  self-hosted leg runs inside a localmost job's seatbelt profile, which grants
+  no `file-issue-extension`, so VZ shares cannot work there either. The guest
+  build, `--verify-reproducible` and the smoke boot run on the owner's Mac,
+  outside any job, as a step of `docs/release-checklist.md`.
 - **Guest.** `go test` for `lm-bindpin` mountinfo matching, `lm-runc`'s
-  `config.json` rewrite and the agent protocol, run on the Mac. `check-config.sh`
-  from moby runs against the kernel config at build time.
+  `config.json` rewrite and the agent protocol. `check-config.sh` from moby
+  runs against the kernel config at build time.
 - **Live VM tests** (self-hosted, against the installed app). The repo's
   **Docker Access** workflow (`docker-localmost`) exercises pull, run and a
   read-only workspace mount through the VM. A new **Docker VM escape**
   workflow runs the **G-A regression suite** as a job: the create, swap, start
-  attack with links to `$HOME` and `/`, the swap from inside a container with a
-  writable mount followed by a restart, renaming `_work`, cross-job reach
-  (two concurrent jobs: joining the other's network by name, reaching its
-  container IP), and egress with and without the injected proxy. The
-  install-while-idle rule applies: CI's localmost legs run the installed app,
-  not the tree.
-- **The e2e docker suite** (`test/e2e/docker.spec.ts`, Playwright, local). It
-  gains assertions that a VM booted for the docker job and not for a job with
-  no `docker:`, that the pull was served on the Mac, and that the VM is gone
-  after the job.
+  attack with links to `$HOME` and `/`; a container with a writable mount
+  that swaps another container's bind source before that container starts,
+  and swaps its own and restarts; renaming `_work`; cross-job reach (two
+  concurrent jobs, each serving its own random nonce, that must never fetch
+  the other's, and joining the other's network by name); egress with and
+  without the injected proxy; and a forged-route probe from an internal
+  network. Its `.localmostrc` section must be approved by the owner before it
+  can run. The install-while-idle rule applies: CI's localmost legs run the
+  installed app, not the tree.
+- **The e2e docker suite** (`test/e2e/docker.spec.ts`, Playwright). It builds
+  the filter in-process; it never packages or launches the app. On the Mac,
+  outside a job, it builds `VmBackend` and `VmManager` against the
+  resources in `build/` (the helper, the guest and the CLI, which must have
+  been built). It gains assertions that a VM booted for the docker job and not
+  for a job with no `docker:`, that the pull was served on the Mac, and that
+  the VM is gone after the job. What its Linux leg runs is an owner decision
+  (below).
+
+## Decisions for the owner
+
+These came out of review and go beyond the fourteen decisions. The design is
+written against the recommendation in each case, and says where.
+
+1. **What the per-repository cache may hold.** The golden disk and the
+   Mac-side store are shared by every workflow of a repository. Any job of the
+   repository can use any image in them, whatever its own workflow's policy
+   says (S7). If a broader workflow pulled a private image with the
+   operator's credentials, a narrower one could use it. The options:
+   - **(a) Recommended: keep images that needed credentials out of the shared
+     cache.** After a pull, the puller asks the registry anonymously for the
+     same manifest digest (a token exchange and a `HEAD`). If the registry
+     serves it, the image is public and is cached. If not, its blobs go to a
+     store private to the job (`<data>/vm/jobs/<vmId>/blobs`) and are deleted
+     with the VM. Private images are then downloaded every job, and public
+     images keep their cache hits across policy edits.
+   - (b) Key the cache by (repository, hash of the effective docker policy).
+     Every workflow with a different policy, and every policy edit, then gets
+     a cold cache.
+
+   Under either option, public cached images remain usable by any job of the
+   repository through `FROM`, image ids and guest root; the design accepts
+   that and says so in S7.
+2. **`privileged`.** The original spec's stage 2 made it grantable on a VM
+   backend. It is not one of the fourteen decisions, and a privileged
+   container turns a guest kernel exploit into a one-liner against R22's
+   surface. It gets every capability, including `CAP_SYS_MODULE` (which
+   `modules_disabled` now blunts), the raw data disk with the repository's
+   cached images, the whole `_work` (including the runner's step scripts and
+   the checkout's `.git` credentials), every vsock port and the relay token.
+   That is the guest kernel, not only guest root.
+   **Recommended: keep it refused for now**, and decide after decision 1. If
+   it is granted later, `docker-policy.ts` validation changes, and the
+   approval text lists exactly what it exposes.
+3. **The Linux leg of the e2e docker spec.** `ci.yaml` runs
+   `test/e2e/docker.spec.ts` on every leg, including the `ubuntu-latest`
+   fallback, where no VM can run. Today, outside a job, it serves the filter
+   over the runner's native `dockerd` through `DesktopBackend`, which this
+   design deletes. **Recommended:** a test-only `WorkerDocker` under `test/`
+   that forwards to a native `dockerd`, used only by the e2e spec when not on
+   macOS. It never lives in `src/` and can never be chosen by the app, so
+   decision 3 (one backend) holds for the product, and the filter keeps its
+   real-CLI, real-daemon coverage on Linux. The alternative is to run the
+   spec on macOS only, which loses that coverage.
 
 ## Open questions
 
@@ -646,7 +954,7 @@ without it.
 | R11 | Exec from virtiofs fails on some kernels | `nosuid`; verified on the shipped kernel |
 | R12 | localmost now ships a kernel, `runc` and `dockerd` | Pinned Alpine packages; ships with the app; `autoDownload` on |
 | R13 | No CLI without Docker Desktop; credential helper errors become anonymous pulls | Bundled CLI; loud helper failures |
-| R14 | Cross-job poisoning through shared writable caches | Per-repository cache written only by a refresh VM from verified blobs |
+| R14 | Cross-job poisoning through shared writable caches | Per-repository cache written only by a refresh VM from verified blobs, rebuilt from blank on a schedule; images that needed credentials kept out (owner decision 1 above) |
 | R15 | Cold image stores on every job | Per-repository golden disk cloned per job |
 | R16 | Full disk sync makes guest fsync slow | `.none` for job clones, `.fsync` plus `F_FULLFSYNC` for refresh |
 | R17 | Pulls in the VM put credentials in the guest; CDN hosts; lost system CAs | Pulls on the Mac; CA/proxy support is an open question |
@@ -660,5 +968,5 @@ without it.
 | R25 | A Local Network privacy prompt | vsock only |
 | R26 | Stock gvproxy maps the host's loopback and dials anything | Not used; see the network stack backlog item |
 | R27 | Signing, size, disk growth, crash cleanup, licences | Helper entitlement branch; Time Machine exclusion; startup sweep; GPL sources with releases |
-| R28 | Hosted CI has no nested virtualization | Live VM tests self-hosted; helper compiled in `check.yaml` |
+| R28 | Hosted CI has no nested virtualization | Live VM tests self-hosted; helper and guest code compiled and unit-tested in a `macos-latest` CI job; guest builds on the owner's Mac |
 | R29 | Published ports would be reachable by other jobs | Still refused by the filter |

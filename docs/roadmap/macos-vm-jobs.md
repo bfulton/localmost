@@ -42,10 +42,15 @@ For such a repository, a claimed job runs in a macOS VM:
    vsock from localmost's broker proxy. It never talks to GitHub's broker
    directly and never holds the registration's key. Its egress goes through
    the job's `ProxyServer` over vsock, as the Linux VM's containers do.
-5. **Policy grants become shares.** `filesystem.read` and `filesystem.write`
-   entries become virtiofs shares into the guest (read-only or read-write). A
-   deny is simply not shared. The workspace is guest-local. Artifacts and caches
-   go out through the runner's normal upload paths.
+5. **Policy grants become shares.** `filesystem.read` entries become
+   read-only virtiofs shares into the guest. `filesystem.write` entries are
+   never shared read-write from the operator's own directories (see Edge
+   cases): each becomes a share of a per-job APFS clone of the directory,
+   discarded after the job, or read-only when the grant does not need writes
+   to persist. A deny is simply not shared. The workspace is guest-local.
+   Artifacts and caches go out through the runner's normal upload paths.
+   Every share, not only the workspace, follows the Docker backend's
+   unswappable-share rule.
 6. **Docker through the sibling Linux VM.** M2 has no nested virtualization,
    and Apple's nested virtualization (macOS 15, M3 or later) is only for Linux
    guests. So a macOS VM job cannot run Docker itself. Its `DOCKER_HOST`
@@ -76,6 +81,31 @@ For such a repository, a claimed job runs in a macOS VM:
   Linux VM, above. The simulator inside the guest works; a guest cannot run
   its own VMs.
 
+## Edge cases
+
+- **Writable shares of operator paths.** A read-write share of a path such as
+  `~/.npm` would let the guest plant symlinks and FIFOs there, and they appear
+  on the Mac as real ones (R23 of the Docker backend's register). The
+  operator's own unsandboxed tools then follow them. The same share would also
+  carry one job's writes to every later job and to the operator (R14). So a
+  writable grant is shared only as a per-job clone (APFS `clonefile` of the
+  directory, made before the VM starts and deleted after), or read-only.
+  Anything the job must hand back goes through the runner's upload paths.
+- **Every share is resolved at `Start()`.** VZ resolves a share's host path
+  when the VM starts (R1), so a link planted at any shared path shares
+  wherever it points. Each share, workspace or policy grant, is a directory
+  localmost creates or clones itself, is denied as a node to anything the job
+  runs on the host, is checked by the helper (not a link, not a mount point,
+  same device), and is granted in the helper's profile by its real path,
+  with the `file-issue-extension` rule scoped to it.
+- **Restored state repeats entropy.** Restoring one saved state for every job
+  restarts each job from the same kernel RNG and entropy pool, and the same
+  in-memory keys of anything that was running. Right after restore, before the
+  runner starts, localmost reseeds the guest RNG through the guest agent
+  (fresh bytes from the host written to the guest's random device with
+  credit, as `RNDADDENTROPY` does), and the golden state is taken with no
+  service running that holds keys.
+
 ## Image maintenance
 
 - **Build.** `VZMacOSRestoreImage` downloads the IPSW, then
@@ -100,7 +130,7 @@ For such a repository, a claimed job runs in a macOS VM:
 | `.localmostrc` | In a macOS VM job |
 |---|---|
 | `network.allow` / `deny` / `loopback` | Enforced by the job's `ProxyServer`. The guest has no NIC and reaches it over vsock. |
-| `filesystem.read` / `write` | virtiofs shares, read-only or read-write |
+| `filesystem.read` / `write` | Read: read-only virtiofs shares. Write: a share of a per-job clone, discarded after the job, or read-only |
 | `filesystem.deny` | Not shared (nothing to deny) |
 | `docker:` | Filtered socket over vsock, backed by a sibling Linux VM |
 | `level:` | Still shapes the proxy's defaults. Seatbelt is not used in the guest. |
