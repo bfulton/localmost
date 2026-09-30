@@ -375,8 +375,8 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
 ### Fixed
 - In-app updates find a zip to install. The update feed listed only the
   DMGs, and the updater installs only from a zip, so every download failed
-  with `ERR_UPDATER_ZIP_FILE_NOT_FOUND`. Each release now ships a zip for
-  each architecture, listed in the feed ahead of the DMGs.
+  with `ERR_UPDATER_ZIP_FILE_NOT_FOUND`. Each release now ships a zip,
+  listed in the feed ahead of the DMG.
 - `localmost policy init --force` replaces an existing policy. The flag was
   read and ignored, while the refusal without it said to pass it.
 - The tray shows an expired GitHub session as "GitHub: Session expired,
@@ -433,6 +433,12 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   written as a bare key.
 
 ### Changed
+- **Breaking**: Intel Macs are no longer supported. localmost is built for
+  Apple silicon (arm64) only, still on macOS 12 or later; 0.2.0 was the last
+  release with an Intel build. On an Intel Mac, 0.2.x still reports this
+  update as available, as that check compares only the version, but the
+  update feed lists no Intel file, so downloading it fails with "No files
+  provided" and nothing is installed
 - **Breaking policy change**: `docker: socket | contexts | credentials`, accepted
   by pre-release 0.3.0 builds, is now a validation error naming the actions that
   replace it. Migrate by declaring what the job does: `socket` and `contexts`

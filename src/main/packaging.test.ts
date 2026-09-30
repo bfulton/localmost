@@ -131,7 +131,6 @@ describe('the release update manifest', () => {
   const version: string = require(path.join(REPO, 'package.json')).version;
 
   const GENERATOR = path.join(REPO, 'scripts', 'generate-latest-mac-yml.js');
-  const ARCHES = ['arm64', 'x64'] as const;
 
   let makeDir: string;
 
@@ -150,6 +149,15 @@ describe('the release update manifest', () => {
   const generate = () =>
     execFileSync(process.execPath, [GENERATOR, makeDir], { encoding: 'utf-8', stdio: 'pipe' });
 
+  const manifest = () => yaml.load(fs.readFileSync(path.join(makeDir, 'latest-mac.yml'), 'utf-8'));
+
+  // The files a Mac's updater keeps from the manifest, as
+  // MacUpdater.doDownloadUpdate filters them before it downloads anything.
+  const filesFor = (isArm64Mac: boolean) => {
+    const base = new URL(`https://github.com/bfulton/localmost/releases/download/v${version}/`);
+    return MacUpdater.filterFilesForArch(resolveFiles(manifest(), base), isArm64Mac);
+  };
+
   beforeEach(() => {
     makeDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'latest-mac-')));
   });
@@ -158,44 +166,93 @@ describe('the release update manifest', () => {
     fs.rmSync(makeDir, { recursive: true, force: true });
   });
 
-  it.each([
-    ['an arm64 Mac', true, 'arm64'],
-    ['an Intel Mac', false, 'x64'],
-  ])('offers %s a zip of its own arch to download', (_mac, isArm64Mac, arch) => {
-    ARCHES.forEach(make);
+  it('offers an Apple silicon Mac the arm64 zip to download', () => {
+    make('arm64');
     generate();
 
-    const info = yaml.load(fs.readFileSync(path.join(makeDir, 'latest-mac.yml'), 'utf-8'));
-    expect(info.version).toBe(version);
-    const base = new URL(`https://github.com/bfulton/localmost/releases/download/v${version}/`);
-    const files = MacUpdater.filterFilesForArch(resolveFiles(info, base), isArm64Mac);
+    expect(manifest().version).toBe(version);
     // What MacUpdater.doDownloadUpdate asks for before it downloads anything.
-    const chosen = findFile(files, 'zip', ['pkg', 'dmg']);
+    const chosen = findFile(filesFor(true), 'zip', ['pkg', 'dmg']);
 
     expect(chosen).toBeTruthy();
-    expect(chosen.info.url).toBe(`localmost-${version}-${arch}-mac.zip`);
+    expect(chosen.info.url).toBe(`localmost-${version}-arm64-mac.zip`);
     // The release asset it names is in the make directory to attach, and is
     // maker-zip's archive, checksummed and sized as the updater verifies it.
     const asset = path.join(makeDir, chosen.info.url);
-    expect(fs.readFileSync(asset, 'utf-8')).toBe(`zip ${arch} app`);
+    expect(fs.readFileSync(asset, 'utf-8')).toBe('zip arm64 app');
     expect(chosen.info.sha512).toBe(sha512(asset));
     expect(chosen.info.size).toBe(fs.statSync(asset).size);
   });
 
-  it('points the legacy path and sha512 at a zip', () => {
-    ARCHES.forEach(make);
+  it('offers an Intel Mac no file, so its download fails without installing anything', () => {
+    make('arm64');
     generate();
 
-    const info = yaml.load(fs.readFileSync(path.join(makeDir, 'latest-mac.yml'), 'utf-8'));
-    expect(info.path).toMatch(/-mac\.zip$/);
+    // An Intel Mac keeps only the files not named arm64, which is none, and
+    // the updater refuses to download from an empty list. It still reports
+    // the version as available: that check reads only the version.
+    const files = filesFor(false);
+    expect(files).toEqual([]);
+    expect(() => findFile(files, 'zip', ['pkg', 'dmg'])).toThrow(
+      expect.objectContaining({ code: 'ERR_UPDATER_NO_FILES_PROVIDED' }),
+    );
+  });
+
+  it('lists only the arm64 zip and DMG', () => {
+    make('arm64');
+    generate();
+
+    expect(manifest().files.map((f: { url: string }) => f.url)).toEqual([
+      `localmost-${version}-arm64-mac.zip`,
+      `localmost-${version}-arm64.dmg`,
+    ]);
+  });
+
+  it('points the legacy path and sha512 at a zip', () => {
+    make('arm64');
+    generate();
+
+    const info = manifest();
+    expect(info.path).toBe(`localmost-${version}-arm64-mac.zip`);
     expect(info.sha512).toBe(sha512(path.join(makeDir, info.path)));
   });
 
-  it('refuses a release missing either arch, which would leave those Macs without updates', () => {
-    make('arm64');
+  it('refuses a release without the arm64 build, which would leave every Mac without updates', () => {
+    fs.writeFileSync(path.join(makeDir, `localmost-${version}-arm64.dmg`), 'dmg arm64');
 
-    expect(generate).toThrow(/x64/);
+    expect(generate).toThrow(/zip\/darwin\/arm64/);
     expect(fs.existsSync(path.join(makeDir, 'latest-mac.yml'))).toBe(false);
+  });
+
+  it.each([
+    ['an Intel DMG', `localmost-${version}-x64.dmg`],
+    ['an Intel zip', `zip/darwin/x64/localmost-darwin-x64-${version}.zip`],
+    ['an Intel update zip', `localmost-${version}-x64-mac.zip`],
+    ['a universal DMG', `localmost-${version}-universal.dmg`],
+  ])('refuses a make directory holding %s, so no Intel build is published', (_what, file) => {
+    make('arm64');
+    fs.mkdirSync(path.dirname(path.join(makeDir, file)), { recursive: true });
+    fs.writeFileSync(path.join(makeDir, file), 'intel');
+
+    expect(generate).toThrow(new RegExp(file.replace(/[.]/g, '\\.')));
+    expect(fs.existsSync(path.join(makeDir, 'latest-mac.yml'))).toBe(false);
+    expect(fs.existsSync(path.join(makeDir, `localmost-${version}-arm64-mac.zip`))).toBe(false);
+  });
+});
+
+describe('the arch the app is built for', () => {
+  // Loading the config reads the keychain's signing identities, as the
+  // build does; the hook itself touches nothing.
+  const { hooks } = require(path.join(REPO, 'forge.config.js'));
+
+  it('packages for Apple silicon', async () => {
+    await expect(hooks.prePackage({}, 'darwin', 'arm64')).resolves.toBeUndefined();
+  });
+
+  it.each(['x64', 'universal', 'x64,arm64'])('refuses to package for %s', async (arch) => {
+    await expect(hooks.prePackage({}, 'darwin', arch)).rejects.toThrow(
+      `localmost is built for Apple silicon (arm64) only, not ${arch}`,
+    );
   });
 });
 

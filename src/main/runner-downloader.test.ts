@@ -7,6 +7,7 @@ jest.mock('fs', () => ({
   createReadStream: jest.fn(),
   promises: {
     mkdir: jest.fn(),
+    mkdtemp: jest.fn(),
     chmod: jest.fn(),
     unlink: jest.fn(),
     rm: jest.fn().mockResolvedValue(undefined),
@@ -192,12 +193,32 @@ describe('RunnerDownloader', () => {
     });
   });
 
-  describe('platform detection', () => {
-    // These are private methods but we can test them indirectly through download
-    it('should handle different platforms', () => {
-      // The download method uses getPlatform and getArch internally
-      // This is tested implicitly through the download URL construction
-      expect(downloader).toBeDefined();
+  describe('the release it downloads', () => {
+    const realArch = process.arch;
+    const runningOn = (arch: string) => Object.defineProperty(process, 'arch', { value: arch });
+
+    afterEach(() => runningOn(realArch));
+
+    it('fetches the Apple silicon (arm64) runner', async () => {
+      runningOn('arm64');
+      (fs.existsSync as jest.Mock).mockReturnValue(false);
+      (fs.promises.mkdtemp as jest.Mock).mockResolvedValue(path.join(mockRunnerDir, 'arc-staging-1'));
+      // A release whose notes carry no checksum: the error names the asset
+      // the download looked for.
+      mockFetch.mockResolvedValue({ ok: true, json: async () => ({ body: '' }) });
+
+      await expect(downloader.download(() => {})).rejects.toThrow('Checksum not found for osx-arm64 in release notes');
+    });
+
+    it.each(['x64', 'ia32'])('refuses to fetch a runner for %s, before touching the network or disk', async (arch) => {
+      runningOn(arch);
+      (fs.existsSync as jest.Mock).mockReturnValue(false);
+
+      await expect(downloader.download(() => {})).rejects.toThrow(
+        `localmost runs on Apple silicon (arm64) only, not ${arch}`,
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(fs.promises.mkdtemp).not.toHaveBeenCalled();
     });
   });
 

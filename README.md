@@ -50,6 +50,8 @@ Features:
 
 localmost is a macOS app that manages GitHub's official [actions-runner](https://github.com/actions/runner) binary. It handles authentication, registration, runner process lifecycle, and automatic fallback — the tedious parts of self-hosted runners.
 
+**Requirements:** a Mac with Apple silicon, running macOS 12 or later. Intel Macs are not supported.
+
 **Security note:** Running CI jobs on your local machine has inherent risks—especially for public repos that accept external contributions. localmost sandboxes runner processes and restricts network access, but these are not VM-level isolation. See [SECURITY.md](SECURITY.md) for details on the threat model and recommendations.
 
 ## Architecture
@@ -238,7 +240,7 @@ npm start
 # Run tests
 npm test
 
-# Build for macOS (creates .dmg)
+# Build for Apple silicon (creates .dmg)
 npm run make
 ```
 

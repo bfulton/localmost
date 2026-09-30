@@ -20,24 +20,19 @@
   export APPLE_TEAM_ID="XXXXXXXXXX"
   ```
 - [ ] `rm -rf build/out/make`
-- [ ] `npm run make -- --arch=x64`
-- [ ] Verify output shows:
-  - `Signing: Developer ID Application: ...`
-  - `Notarize: true`
-  - `Release build: true`
-- [ ] `npm run make -- --arch=arm64`
+- [ ] `npm run make` (Apple silicon only: the script passes `--arch=arm64`, and the build refuses any other arch)
 - [ ] Verify output shows:
   - `Signing: Developer ID Application: ...`
   - `Notarize: true`
   - `Release build: true`
 - [ ] Test the DMG installs correctly
-- [ ] `codesign -d --entitlements -` on each of these (both arches, under `build/out/localmost-darwin-<arch>/localmost.app`) lists only the keys shown, and no `device.*`, `personal-information.*` or `app-sandbox` key:
+- [ ] `codesign -d --entitlements -` on each of these (under `build/out/localmost-darwin-arm64/localmost.app`) lists only the keys shown, and no `device.*`, `personal-information.*` or `app-sandbox` key:
   - the app, and `Contents/Frameworks/localmost Helper (GPU).app`: only `com.apple.security.cs.allow-jit`
   - `Contents/Frameworks/localmost Helper (Plugin).app`: only `com.apple.security.cs.allow-unsigned-executable-memory` and `com.apple.security.cs.disable-library-validation`
-- [ ] `plutil -p` on each arch's `Contents/Info.plist` and on each `Contents/Frameworks/localmost Helper*.app/Contents/Info.plist` shows no `UsageDescription` key, and `codesign --verify --deep --strict --verbose=2` on the app passes (the plist is edited before signing, so the signature must cover it)
+- [ ] `plutil -p` on the app's `Contents/Info.plist` and on each `Contents/Frameworks/localmost Helper*.app/Contents/Info.plist` shows no `UsageDescription` key, and `codesign --verify --deep --strict --verbose=2` on the app passes (the plist is edited before signing, so the signature must cover it)
 - [ ] `node scripts/generate-latest-mac-yml.js`
-  - Needs both arches made; copies each arch's update zip to `build/out/make/localmost-X.Y.Z-<arch>-mac.zip`
-  - Verify `latest-mac.yml` lists both `-mac.zip` files and `path:` names a zip (the in-app updater installs only from a zip)
+  - Needs the arm64 build made, and nothing else in `build/out/make` (it refuses an Intel, universal or other version's DMG or zip); copies the update zip to `build/out/make/localmost-X.Y.Z-arm64-mac.zip`
+  - Verify `latest-mac.yml` lists the `-arm64-mac.zip` and `-arm64.dmg` files only, and `path:` names the zip (the in-app updater installs only from a zip)
 
 ## Post-Build
 - [ ] Smoke test basic functionality through installed app:
@@ -56,9 +51,7 @@
   - Release title: X.Y.Z
   - Release notes: copy from CHANGELOG.md
   - Attach `build/out/make/localmost-X.Y.Z-arm64.dmg`
-  - Attach `build/out/make/localmost-X.Y.Z-x64.dmg`
   - Attach `build/out/make/localmost-X.Y.Z-arm64-mac.zip`
-  - Attach `build/out/make/localmost-X.Y.Z-x64-mac.zip`
   - Attach `build/out/make/latest-mac.yml`
 - [ ] Publish release
 - [ ] Bump the release version in [package.json](https://github.com/bfulton/localmost/edit/main/package.json)

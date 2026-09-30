@@ -1030,13 +1030,14 @@ export class RunnerDownloader {
     await cleanupWorkDirs(path.join(this.baseDir, 'work'), log);
   }
 
-  /** The release tarball for a version on this Mac's architecture. */
+  /** The release tarball for a version, for Apple silicon. */
   private releaseAsset(version: string): { filename: string; url: string } {
-    const arch = this.getArch();
-    if (!arch) {
-      throw new Error(`Unsupported architecture: ${process.arch}`);
+    // localmost is built for Apple silicon only, so the runner it installs is
+    // too; an Intel (x64) Mac is not supported.
+    if (process.arch !== 'arm64') {
+      throw new Error(`localmost runs on Apple silicon (arm64) only, not ${process.arch}`);
     }
-    const filename = `actions-runner-${this.getPlatform()}-${arch}-${version}.tar.gz`;
+    const filename = `actions-runner-${this.getPlatform()}-arm64-${version}.tar.gz`;
     return { filename, url: `https://github.com/actions/runner/releases/download/v${version}/${filename}` };
   }
 
@@ -1128,14 +1129,6 @@ export class RunnerDownloader {
 
   private getPlatform(): string {
     return 'osx';
-  }
-
-  private getArch(): string | null {
-    // macOS supports both Intel (x64) and Apple Silicon (arm64)
-    if (process.arch === 'x64' || process.arch === 'arm64') {
-      return process.arch;
-    }
-    return null;
   }
 
   /**

@@ -150,6 +150,13 @@ module.exports = {
   packagerConfig,
   rebuildConfig: {},
   hooks: {
+    // localmost is built for Apple silicon only: refuse an Intel or
+    // universal build rather than make one.
+    prePackage: async (config, platform, arch) => {
+      if (arch !== 'arm64') {
+        throw new Error(`localmost is built for Apple silicon (arm64) only, not ${arch}`);
+      }
+    },
     postPackage: async (config, packageResult) => {
       const fs = require('fs');
 

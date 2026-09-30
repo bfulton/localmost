@@ -287,7 +287,7 @@ describe('the runner template a sandbox is copied from', () => {
 
   /** Serve a release: its API entry with the tarball's checksum, and the tarball. */
   const serveRelease = (tarball: Buffer, checksum = createHash('sha256').update(tarball).digest('hex')) => {
-    const platform = `osx-${process.arch}`;
+    const platform = 'osx-arm64';
     mockFetch.mockImplementation(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       if (url.startsWith('https://api.github.com/')) {
