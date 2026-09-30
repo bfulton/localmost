@@ -11,6 +11,7 @@ import { ImagePullerOptions, PullLimits, VmImagePuller, choosePlatform, parsePla
 import { RegistryClient, PullError } from './registry-client';
 import type { RegistryCredentials } from '../registry-auth';
 import { OVERSIZED } from './daemon-api';
+import { ImageStore } from './image-store';
 import { TestDaemon } from './test-daemon';
 import { AUTH_HOST, MEDIA, REGISTRY_HOST, TestRegistry, buildImage, buildIndex, sha256, tarOf } from './test-registry';
 
@@ -111,6 +112,20 @@ const jobBlobs = () => {
   return fs.existsSync(dir) ? fs.readdirSync(dir) : [];
 };
 const blobRequests = () => registry.requestsTo(REGISTRY_HOST).filter((r) => r.path.includes('/blobs/') && r.method === 'GET');
+const layerOf = (image: ReturnType<typeof buildImage>) => [...image.blobs.keys()].find((d) => d !== image.configDigest)!;
+const loadCalls = () => daemon.calls.filter((c) => c.method === 'POST' && c.path.startsWith('/images/load'));
+
+/** Until `condition` holds; the bound only matters when it never does. */
+async function until(condition: () => boolean): Promise<void> {
+  for (let i = 0; i < 2000 && !condition(); i++) await new Promise((r) => setTimeout(r, 10));
+  expect(condition()).toBe(true);
+}
+
+/** The user a mock-registry bearer token stands for: null for an anonymous one, or no token at all. */
+function bearerUser(header: string | string[] | undefined): string | null {
+  if (typeof header !== 'string' || !header.startsWith('Bearer ')) return null;
+  return (JSON.parse(Buffer.from(header.slice(7), 'base64url').toString('utf-8')) as { user: string | null }).user;
+}
 
 describe('a pull', () => {
   it('fetches, verifies, loads and tags an image, and reports it', async () => {
@@ -261,10 +276,89 @@ describe('a pull', () => {
     expect(registry.requestsTo('cdn.test')).toHaveLength(0);
   });
 
-  it('fails on a layer whose uncompressed bytes do not match its diff_id', async () => {
+  it('fails on a layer whose uncompressed bytes do not match its diff_id as it is fetched, before any load', async () => {
     const image = buildImage({ editConfig: (c) => { (c.rootfs as { diff_ids: string[] }).diff_ids[0] = sha256(Buffer.from('other')); } });
     registry.putImage(IMAGE, image, 'v1');
-    await expect(pull(puller())).rejects.toThrow(`diff_id ${sha256(Buffer.from('other'))}`);
+    await expect(pull(puller())).rejects.toThrow(
+      `layer ${layerOf(image)} of ${REGISTRY_HOST}/${IMAGE}:v1 uncompresses to ${sha256(image.layers[0])}, not its diff_id ${sha256(Buffer.from('other'))}`
+    );
+    expect(publicBlobs()).toEqual([]);
+    expect(jobBlobs()).toEqual([]);
+    // Refused at fetch: the check as the archive streams never had to catch it.
+    expect(loadCalls()).toHaveLength(0);
+  });
+
+  it('refuses a config whose bytes do not match its digest, before reading it', async () => {
+    const image = buildImage();
+    registry.putImage(IMAGE, image, 'v1');
+    registry.switches.corruptBlobs = new Set([image.configDigest]);
+    const corrupted = Buffer.from(image.config);
+    corrupted[corrupted.length - 1] ^= 0xff;
+    await expect(pull(puller())).rejects.toThrow(
+      `${REGISTRY_HOST} sent ${sha256(corrupted)} for the config ${image.configDigest} of ${REGISTRY_HOST}/${IMAGE}:v1`
+    );
+    expect(blobRequests().filter((r) => !r.path.endsWith(image.configDigest))).toHaveLength(0);
+  });
+
+  it('refuses an index entry whose manifest hashes to another digest', async () => {
+    const wanted = buildImage({ architecture: 'arm64', variant: 'v8' });
+    const other = buildImage({ architecture: 'arm64', variant: 'v8' });
+    const index = buildIndex([{ image: wanted, platform: { architecture: 'arm64', os: 'linux', variant: 'v8' } }]);
+    registry.putIndex(IMAGE, index, [wanted, other], 'v1');
+    // Asked for the entry's digest, the registry sends another image's manifest.
+    registry.putManifest(IMAGE, other.manifest, MEDIA.ociManifest, wanted.manifestDigest);
+    await expect(pull(puller())).rejects.toThrow(`whose digest is ${other.manifestDigest}, not ${wanted.manifestDigest}`);
+    expect(blobRequests()).toHaveLength(0);
+    expect(loadCalls()).toHaveLength(0);
+  });
+
+  it('names the digest a pull by index digest asked for, and returns the config digest the image is found by', async () => {
+    const image = buildImage({ architecture: 'arm64', variant: 'v8' });
+    const index = buildIndex([{ image, platform: { architecture: 'arm64', os: 'linux', variant: 'v8' } }]);
+    registry.putIndex(IMAGE, index, [image]);
+    const result = await pull(puller(), { request: { tag: undefined, digest: index.digest } });
+    expect(result).toMatchObject({ manifestDigest: image.manifestDigest, configDigest: image.configDigest, platform: 'linux/arm64/v8' });
+    expect(JSON.parse(daemon.loads[0].entries.get('index.json')!.toString()).manifests[0].annotations).toEqual({
+      'io.containerd.image.name': `${REGISTRY_HOST}/${IMAGE}@${index.digest}`,
+    });
+    // Untagged, as dockerd's classic store leaves a digest pull: found by its id, the config digest (§6.4).
+    expect(daemon.images.get(result.configDigest)).toEqual([]);
+    const refs = JSON.parse(fs.readFileSync(refsJsonPath(dataDir, REPO_KEY), 'utf-8')).refs;
+    expect(refs).toEqual([expect.objectContaining({ ref: `${REGISTRY_HOST}/${IMAGE}@${index.digest}`, indexDigest: index.digest })]);
+  });
+
+  it('fetches again a stored layer that fails its check as it is loaded', async () => {
+    const image = buildImage();
+    registry.putImage(IMAGE, image, 'v1');
+    await pull(puller());
+    const layer = layerOf(image);
+    const file = path.join(imageStoreDir(dataDir, REPO_KEY), 'blobs', 'sha256', layer.slice(7));
+    const altered = fs.readFileSync(file);
+    altered[4] ^= 0xff; // the gzip mtime: still a valid stream of the same tar
+    fs.writeFileSync(file, altered);
+    daemon.images.clear();
+    const fetched = blobRequests().filter((r) => r.path.endsWith(layer)).length;
+    await expect(pull(puller())).resolves.toMatchObject({ source: 'registry', configDigest: image.configDigest });
+    expect(blobRequests().filter((r) => r.path.endsWith(layer))).toHaveLength(fetched + 1);
+    expect(fs.readFileSync(file)).toEqual(image.blobs.get(layer));
+    expect(daemon.images.has(image.configDigest)).toBe(true);
+  });
+
+  it('fetches again a job-store layer that fails its check as it is measured', async () => {
+    registry.users.set('me', 'pw');
+    registry.setPrivate(IMAGE);
+    credentials = { kind: 'basic', username: 'me', password: 'pw' };
+    const image = buildImage();
+    registry.putImage(IMAGE, image, 'v1');
+    await pull(puller());
+    const layer = layerOf(image);
+    const file = path.join(vmJobFiles(dataDir, VM_ID).blobStore, 'blobs', 'sha256', layer.slice(7));
+    const altered = fs.readFileSync(file);
+    altered[4] ^= 0xff;
+    fs.writeFileSync(file, altered);
+    daemon.images.clear();
+    await expect(pull(puller())).resolves.toMatchObject({ source: 'registry', configDigest: image.configDigest });
+    expect(fs.readFileSync(file)).toEqual(image.blobs.get(layer));
     expect(publicBlobs()).toEqual([]);
   });
 
@@ -309,6 +403,90 @@ describe('a pull', () => {
     registry.putImage(IMAGE, buildImage(), 'v1');
     await expect(pull(puller(), { socket: path.join(dataDir, 'docker.sock') })).rejects.toThrow();
     await expect(pull(puller(), { socket: path.join(dataDir, 'vm', 'jobs', '..', 'x', 'docker.sock') })).rejects.toThrow();
+    // Named like a VM's, but not where VmManager puts one.
+    const elsewhere = path.join(dataDir, 'elsewhere', VM_ID, 'docker.sock');
+    await expect(pull(puller(), { socket: elsewhere })).rejects.toThrow(`not a VM's docker socket: ${elsewhere}`);
+    expect(registry.requests).toHaveLength(0);
+    expect(fs.existsSync(path.join(dataDir, 'elsewhere'))).toBe(false);
+  });
+
+  it('makes every pull on a store wait for its first sweep', async () => {
+    const publicRoot = imageStoreDir(dataDir, REPO_KEY);
+    let open: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => (open = resolve));
+    const swept: string[] = [];
+    const sweep = jest.spyOn(ImageStore.prototype, 'sweepTemp').mockImplementation(async function (this: ImageStore) {
+      swept.push(this.root);
+      if (this.root === publicRoot) await gate;
+    });
+    try {
+      registry.putImage(IMAGE, buildImage(), 'v1');
+      const p = puller();
+      const first = pull(p);
+      const second = pull(p);
+      await until(() => swept.includes(publicRoot));
+      await new Promise((r) => setTimeout(r, 100));
+      // Neither pull may write to the store while its sweep may still delete what it writes.
+      expect(registry.requests).toHaveLength(0);
+      open();
+      await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+      expect(swept.filter((root) => root === publicRoot)).toHaveLength(1);
+    } finally {
+      sweep.mockRestore();
+    }
+  });
+});
+
+describe('concurrency', () => {
+  it("runs at most maxPullsPerVm of one VM's pulls at a time, and queues the rest", async () => {
+    registry.putImage(IMAGE, buildImage(), 'v1');
+    registry.putImage(IMAGE, buildImage(), 'v2');
+    let release: () => void = () => undefined;
+    registry.switches.holdBlobs = new Promise<void>((resolve) => (release = resolve));
+    const p = puller({ maxPullsPerVm: 1 });
+    const first = pull(p);
+    const second = pull(p, { request: { tag: 'v2' } });
+    await until(() => blobRequests().length > 0);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(registry.requestsTo(REGISTRY_HOST, `/v2/${IMAGE}/manifests/v2`)).toHaveLength(0);
+    release();
+    await expect(first).resolves.toMatchObject({ source: 'registry' });
+    await expect(second).resolves.toMatchObject({ source: 'registry' });
+  });
+
+  it('caps pulls across every VM too', async () => {
+    registry.putImage(IMAGE, buildImage(), 'v1');
+    registry.putImage(IMAGE, buildImage(), 'v2');
+    let release: () => void = () => undefined;
+    registry.switches.holdBlobs = new Promise<void>((resolve) => (release = resolve));
+    const p = puller({ maxPulls: 1 });
+    const first = pull(p);
+    const second = pull(p, { request: { tag: 'v2' }, socket: vmJobFiles(dataDir, '4-0123456789ac').dockerSocket });
+    await until(() => blobRequests().length > 0);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(registry.requestsTo(REGISTRY_HOST, `/v2/${IMAGE}/manifests/v2`)).toHaveLength(0);
+    release();
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+  });
+
+  it('lets a queued pull be cancelled, and it holds no place in the queue', async () => {
+    registry.putImage(IMAGE, buildImage(), 'v1');
+    registry.putImage(IMAGE, buildImage(), 'v2');
+    registry.putImage(IMAGE, buildImage(), 'v3');
+    let release: () => void = () => undefined;
+    registry.switches.holdBlobs = new Promise<void>((resolve) => (release = resolve));
+    const p = puller({ maxPullsPerVm: 1 });
+    const first = pull(p);
+    const controller = new AbortController();
+    const queued = pull(p, { request: { tag: 'v2' }, signal: controller.signal });
+    const third = pull(p, { request: { tag: 'v3' } });
+    await until(() => blobRequests().length > 0);
+    controller.abort();
+    await expect(queued).rejects.toThrow('cancelled');
+    release();
+    await expect(first).resolves.toBeTruthy();
+    await expect(third).resolves.toBeTruthy();
+    expect(registry.requestsTo(REGISTRY_HOST, `/v2/${IMAGE}/manifests/v2`)).toHaveLength(0);
   });
 });
 
@@ -356,9 +534,47 @@ describe('which store (owner decision 1)', () => {
     expect(fs.existsSync(refsJsonPath(dataDir, REPO_KEY))).toBe(false);
     expect(notePulled).not.toHaveBeenCalled();
     expect(daemon.loads).toHaveLength(1);
-    // The anonymous probe carried no credentials.
+    // The anonymous probe carried no credentials: its token was asked for
+    // with no Authorization, and stands for no user.
     const probes = registry.requestsTo(REGISTRY_HOST, `/v2/${IMAGE}/manifests/${image.manifestDigest}`).filter((r) => r.method === 'HEAD');
     expect(probes.length).toBeGreaterThan(0);
+    for (const probe of probes) expect(bearerUser(probe.headers.authorization)).toBeNull();
+    expect(probes.some((probe) => probe.headers.authorization?.startsWith('Bearer '))).toBe(true);
+    const tokens = registry.requestsTo(AUTH_HOST);
+    expect(tokens.filter((t) => t.headers.authorization === undefined).length).toBeGreaterThan(0);
+  });
+
+  it('keeps a private image out of the repository store when it is pulled again by digest, from the job store', async () => {
+    registry.users.set('me', 'pw');
+    registry.setPrivate(IMAGE);
+    credentials = { kind: 'basic', username: 'me', password: 'pw' };
+    const image = buildImage();
+    registry.putImage(IMAGE, image, 'v1');
+    await pull(puller());
+    // The job removes it (`docker rmi`), then pulls it by digest: the
+    // manifest and config come from the job store, and nothing is sent.
+    daemon.images.clear();
+    const again = await pull(puller(), { request: { tag: undefined, digest: image.manifestDigest } });
+    expect(again.source).toBe('store');
+    expect(publicBlobs()).toEqual([]);
+    expect(fs.existsSync(refsJsonPath(dataDir, REPO_KEY))).toBe(false);
+    expect(notePulled).not.toHaveBeenCalled();
+  });
+
+  it('keeps it out even when the operator has no credentials by the second pull', async () => {
+    registry.users.set('me', 'pw');
+    registry.setPrivate(IMAGE);
+    credentials = { kind: 'basic', username: 'me', password: 'pw' };
+    const image = buildImage();
+    registry.putImage(IMAGE, image, 'v1');
+    await pull(puller());
+    credentials = undefined;
+    daemon.images.clear();
+    const again = await pull(puller(), { request: { tag: undefined, digest: image.manifestDigest } });
+    expect(again.source).toBe('store');
+    expect(publicBlobs()).toEqual([]);
+    expect(fs.existsSync(refsJsonPath(dataDir, REPO_KEY))).toBe(false);
+    expect(notePulled).not.toHaveBeenCalled();
   });
 });
 
@@ -477,6 +693,42 @@ describe('limits', () => {
     await pull(p);
     await expect(pull(p, { request: { tag: 'v2' } })).rejects.toThrow('(dockerVm.jobPullMaxGiB)');
     expect(publicBlobs()).not.toContain(second.diffIds[0].slice(7));
+  });
+
+  it("stops two pulls running at once in one job that together pass jobPullMaxGiB, as the bytes stream", async () => {
+    const first = buildImage({ layers: [tarOf([{ name: 'x', content: Buffer.alloc(30_000, 'a') }])], compression: 'none' });
+    const second = buildImage({ layers: [tarOf([{ name: 'y', content: Buffer.alloc(30_000, 'b') }])], compression: 'none' });
+    registry.putImage(IMAGE, first, 'v1');
+    registry.putImage(IMAGE, second, 'v2');
+    limits = { ...limits, jobPullMaxGiB: 50_000 / GiB };
+    // Each layer fits on its own, so both pass the check before their fetch; only the bytes can tell.
+    const layers = [layerOf(first), layerOf(second)];
+    let release: () => void = () => undefined;
+    registry.switches.holdBlobs = new Promise<void>((resolve) => (release = resolve));
+    registry.switches.holdOnly = new Set(layers);
+    const p = puller();
+    const outcomes = [pull(p), pull(p, { request: { tag: 'v2' } })].map((attempt) =>
+      attempt.then(
+        () => 'pulled',
+        (error: Error) => error.message
+      )
+    );
+    await until(() => layers.every((layer) => blobRequests().some((r) => r.path.endsWith(layer))));
+    release();
+    const results = await Promise.all(outcomes);
+    expect(results.filter((r) => r === 'pulled')).toHaveLength(1);
+    expect(results.find((r) => r !== 'pulled')).toContain('(dockerVm.jobPullMaxGiB)');
+  });
+
+  it('does not count what a dropped transfer took against the limits when it is retried', async () => {
+    const image = buildImage({ layers: [tarOf([{ name: 'x', content: Buffer.alloc(100_000, 'y') }])], compression: 'none' });
+    registry.putImage(IMAGE, image, 'v1');
+    const layer = layerOf(image);
+    registry.switches.dropBlobsOnce = new Set([layer]);
+    // Room for the image once, not for it and half of it again.
+    limits = { ...limits, pullMaxGiB: (image.blobs.get(layer)!.length + image.config.length + 1024) / GiB };
+    await expect(pull(puller())).resolves.toMatchObject({ source: 'registry' });
+    expect(blobRequests().filter((r) => r.path.endsWith(layer))).toHaveLength(2);
   });
 
   it('cuts off a blob that streams past its declared size', async () => {

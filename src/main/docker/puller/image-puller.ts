@@ -11,14 +11,22 @@
  * 3. Fetch the blobs the store lacks, each verified as it streams: the
  *    compressed bytes against the descriptor, the uncompressed bytes
  *    against the config's diff_id, within the byte limits.
- * 4. Load a docker-save archive of the image into the VM.
- * 5. Tag it with the name the job asked for.
- * 6. For a public image only, note it for the repository's cache disk.
+ * 4. Load a docker-save archive of the image into the VM. A stored layer
+ *    that fails its check again is deleted and fetched once more.
+ * 5. Tag it with the name the job asked for. A pull by digest leaves the
+ *    image untagged: dockerd's classic store finds it only by its id, the
+ *    config digest this returns (§5.3 has the filter map the reference).
+ * 6. For a public image only, record it in refs.json for the repository's
+ *    cache disk.
  *
- * "Public" is owner decision 1 (§6.3 "Which store"): an image pulled with
- * the operator's credentials is public only if the registry also serves its
- * manifest anonymously. Otherwise its blobs go to the job's own store, in the
- * VM's directory, and go with the VM.
+ * "Public" is owner decision 1 (§6.3 "Which store"): whenever the pull holds
+ * the operator's credentials, or read anything from the job's own store, the
+ * image is public only if the registry also serves its manifest anonymously.
+ * Otherwise its blobs go to the job's own store, in the VM's directory, and go
+ * with the VM.
+ *
+ * Every pull runs in Electron main, so one VM runs at most three at once and
+ * all VMs together eight; the rest wait their turn.
  */
 
 import * as fs from 'fs';
@@ -60,8 +68,16 @@ const FREE_SPACE_CHECK_BYTES = 256 * MiB;
 const MAX_CONFIG_BYTES = 16 * MiB;
 /** How often, in bytes, a layer's download reports progress. */
 const PROGRESS_STEP = 512 * 1024;
-/** At most this many jobs' pull totals are remembered. */
+/** At most this many jobs' pull totals, and VM stores' sweeps, are remembered. */
 const MAX_JOBS_TRACKED = 512;
+/**
+ * Pulls run in Electron main, which every job shares, and each holds a
+ * decompressor (zstd's window can reach 128 MiB), its manifests and its
+ * config in memory. So one VM runs this many at once, and all VMs together
+ * DEFAULT_MAX_PULLS; the rest wait their turn.
+ */
+const DEFAULT_MAX_PULLS_PER_VM = 3;
+const DEFAULT_MAX_PULLS = 8;
 
 export interface PullLimits {
   pullMaxGiB: number;
@@ -82,6 +98,10 @@ export interface ImagePullerOptions {
   freeSpaceCheckBytes?: number;
   /** Tests only: how to reach a VM's docker.sock (see DaemonConnector). */
   connectDaemon?: DaemonConnector;
+  /** Pulls one VM runs at once; more wait their turn. */
+  maxPullsPerVm?: number;
+  /** Pulls every VM together runs at once. */
+  maxPulls?: number;
   now?: () => number;
   log?: (level: 'debug' | 'info' | 'warn', message: string) => void;
 }
@@ -193,11 +213,78 @@ class Budget {
     if (size > this.remaining()) throw this.refuse();
   }
 
-  /** As bytes arrive. */
-  take(bytes: number): void {
+  /** As bytes arrive; `attempt` counts what one transfer took. */
+  take(bytes: number, attempt: { bytes: number }): void {
     if (bytes > this.remaining()) throw this.refuse();
     this.pulled += bytes;
     this.job.pulled += bytes;
+    attempt.bytes += bytes;
+  }
+
+  /** Give back what a broken transfer took, before it is retried: none of it was kept. */
+  refund(attempt: { bytes: number }): void {
+    this.pulled -= attempt.bytes;
+    this.job.pulled -= attempt.bytes;
+    attempt.bytes = 0;
+  }
+}
+
+/** A place in line for pulls: so many per VM, so many in all, first come first served. */
+class PullSlots {
+  private total = 0;
+  private readonly perVm = new Map<string, number>();
+  private readonly waiting: Array<{ vm: string; start: () => void }> = [];
+
+  constructor(
+    private readonly maxPerVm: number,
+    private readonly max: number
+  ) {}
+
+  private free(vm: string): boolean {
+    return this.total < this.max && (this.perVm.get(vm) ?? 0) < this.maxPerVm;
+  }
+
+  private take(vm: string): () => void {
+    this.total++;
+    this.perVm.set(vm, (this.perVm.get(vm) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.total--;
+      const count = (this.perVm.get(vm) ?? 1) - 1;
+      if (count <= 0) this.perVm.delete(vm);
+      else this.perVm.set(vm, count);
+      this.next();
+    };
+  }
+
+  private next(): void {
+    for (let i = 0; i < this.waiting.length; ) {
+      if (this.free(this.waiting[i].vm)) this.waiting.splice(i, 1)[0].start();
+      else i++;
+    }
+  }
+
+  /** Resolves with the release once the pull may run; a cancelled wait gives up its place. */
+  acquire(vm: string, signal: AbortSignal): Promise<() => void> {
+    if (this.waiting.length === 0 && this.free(vm)) return Promise.resolve(this.take(vm));
+    return new Promise((resolve, reject) => {
+      const entry = {
+        vm,
+        start: () => {
+          signal.removeEventListener('abort', cancel);
+          resolve(this.take(vm));
+        },
+      };
+      const cancel = () => {
+        const at = this.waiting.indexOf(entry);
+        if (at >= 0) this.waiting.splice(at, 1);
+        reject(new PullError('the pull was cancelled'));
+      };
+      signal.addEventListener('abort', cancel, { once: true });
+      this.waiting.push(entry);
+    });
   }
 }
 
@@ -213,6 +300,8 @@ interface ResolvedImage {
   /** Filled in once the config is read, for a single-platform manifest. */
   platform?: string;
   requested?: RequestedPlatform;
+  /** Whether the index or the manifest was read from the job's own store. */
+  fromJobStore: boolean;
 }
 
 /**
@@ -248,7 +337,10 @@ function decompressorFor(mediaType: string): Transform {
 
 export class VmImagePuller implements ImagePuller {
   private readonly jobs = new Map<string, { pulled: number }>();
-  private readonly swept = new Set<string>();
+  /** Each store's first sweep, which every pull on it waits for: repository stores, and (bounded) VM stores. */
+  private readonly repositorySweeps = new Map<string, Promise<void>>();
+  private readonly vmSweeps = new Map<string, Promise<void>>();
+  private readonly slots: PullSlots;
   private readonly now: () => number;
   private readonly log: (level: 'debug' | 'info' | 'warn', message: string) => void;
 
@@ -256,6 +348,7 @@ export class VmImagePuller implements ImagePuller {
     if (!path.isAbsolute(options.dataDir)) throw new Error('the puller needs an absolute data directory');
     this.now = options.now ?? Date.now;
     this.log = options.log ?? (() => undefined);
+    this.slots = new PullSlots(options.maxPullsPerVm ?? DEFAULT_MAX_PULLS_PER_VM, options.maxPulls ?? DEFAULT_MAX_PULLS);
   }
 
   /** The VM's own directory, from its docker.sock, which must be exactly where VmManager puts one. */
@@ -278,12 +371,22 @@ export class VmImagePuller implements ImagePuller {
     return job;
   }
 
-  private async store(root: string): Promise<ImageStore> {
+  /**
+   * A store, once the first sweep of what earlier runs left behind is done.
+   * Every pull waits for that one sweep, so that it cannot delete what a
+   * pull running beside it is writing.
+   */
+  private async store(root: string, kind: 'repository' | 'vm'): Promise<ImageStore> {
     const store = new ImageStore(root, (message) => this.log('warn', message));
-    if (!this.swept.has(root)) {
-      this.swept.add(root);
-      await store.sweepTemp();
+    const sweeps = kind === 'repository' ? this.repositorySweeps : this.vmSweeps;
+    let sweep = sweeps.get(root);
+    if (!sweep) {
+      sweep = store.sweepTemp().catch((error: Error) => this.log('warn', `could not sweep ${root}: ${error.message}`));
+      sweeps.set(root, sweep);
+      // A VM's store goes with the VM; forget the oldest.
+      if (kind === 'vm' && sweeps.size > MAX_JOBS_TRACKED) sweeps.delete(sweeps.keys().next().value!);
     }
+    await sweep;
     return store;
   }
 
@@ -299,9 +402,19 @@ export class VmImagePuller implements ImagePuller {
   }
 
   async pull(opts: ImagePullOptions): Promise<ImagePullResult> {
+    opts.signal.throwIfAborted();
+    const vmDir = this.vmDirOf(opts.dockerSocketPath);
+    const release = await this.slots.acquire(vmDir, opts.signal);
+    try {
+      return await this.pullNow(opts, vmDir);
+    } finally {
+      release();
+    }
+  }
+
+  private async pullNow(opts: ImagePullOptions, vmDir: string): Promise<ImagePullResult> {
     const { request, signal } = opts;
     signal.throwIfAborted();
-    const vmDir = this.vmDirOf(opts.dockerSocketPath);
     const daemon = { socketPath: opts.dockerSocketPath, connect: this.options.connectDaemon };
     const limits = this.options.limits();
     registryOrigin(request.registry);
@@ -317,13 +430,13 @@ export class VmImagePuller implements ImagePuller {
     const repoKey = repoKeyOf(opts.repository);
 
     await this.checkFreeSpace(limits.minFreeGiB);
-    const publicStore = await this.store(imageStoreDir(this.options.dataDir, repoKey));
-    const jobStore = await this.store(vmJobFiles(this.options.dataDir, path.basename(vmDir)).blobStore);
+    const publicStore = await this.store(imageStoreDir(this.options.dataDir, repoKey), 'repository');
+    const jobStore = await this.store(vmJobFiles(this.options.dataDir, path.basename(vmDir)).blobStore, 'vm');
     const progress = (p: DockerProgress) => opts.onProgress(p);
     progress({ status: `Pulling from ${repositoryPath}`, id: tag ?? request.digest! });
 
     const session = await this.options.client.open({ registry, repositoryPath }, 'operator', signal);
-    const resolved = await this.resolve(session, [publicStore, jobStore], reference, ref, requested, opts.rosetta);
+    const resolved = await this.resolve(session, publicStore, jobStore, reference, ref, requested, opts.rosetta);
 
     // The config: from a store, or fetched (small, in memory, verified).
     const budget = new Budget(limits, this.jobTotal(vmDir), ref);
@@ -331,9 +444,17 @@ export class VmImagePuller implements ImagePuller {
     const imageConfig = parseConfig(config.bytes, resolved.layers.length, ref);
     const platform = this.checkConfigPlatform(resolved, imageConfig, opts.rosetta, ref);
 
-    // Which store (owner decision 1): public unless credentials were needed.
+    // Which store (owner decision 1, §6.3): public only when the registry
+    // serves the manifest anonymously, asked whenever the answer could be
+    // no. That is whenever the session holds the operator's credentials,
+    // sent yet or not (a manifest and config read from a store send
+    // nothing, and the layers would then be fetched with them), and whenever
+    // anything came from the job's own store, which only a private image
+    // puts there. A pull with neither fetched everything anonymously.
+    const mustAsk =
+      session.hasCredentials || session.usedCredentials || resolved.fromJobStore || config.from === jobStore;
     let isPublic = true;
-    if (session.usedCredentials) {
+    if (mustAsk) {
       try {
         const anonymous = await this.options.client.open({ registry, repositoryPath }, 'anonymous', signal);
         isPublic = await anonymous.serves(resolved.manifestDigest);
@@ -355,42 +476,54 @@ export class VmImagePuller implements ImagePuller {
         for (const id of layerIds) progress({ status: 'Already exists', id });
       } else {
         const known = await this.knownSizes(publicStore, resolved.manifestDigest);
-        const layers: ArchiveLayer[] = [];
+        let layers: ArchiveLayer[] = [];
         let fetched = false;
-        for (const [i, layer] of resolved.layers.entries()) {
-          const id = layerIds[i];
-          const diffId = imageConfig.diffIds[i];
-          const holder = await this.holderOf(sources, layer.digest);
-          let uncompressedSize: number;
-          let store: ImageStore;
-          if (holder) {
-            progress({ status: 'Already exists', id });
-            store = holder;
-            uncompressedSize = known.get(layer.digest) ?? (await measureLayer(this.archiveSource(store, layer, diffId), this.expansionLimit(layer.size, limits)));
-          } else {
-            progress({ status: 'Pulling fs layer', id });
-            uncompressedSize = await this.fetchLayer(session, target, layer, diffId, budget, limits, ref, id, progress, signal);
-            store = target;
-            fetched = true;
-          }
-          layers.push({ ...this.archiveSource(store, layer, diffId), uncompressedSize });
-        }
-        source = fetched ? 'registry' : 'store';
-        signal.throwIfAborted();
-        const loaded = await loadImage(
-          daemon,
-          dockerArchive({ name: `${name}@${resolved.manifestDigest}`, config: config.bytes, configDigest: resolved.config.digest, layers }),
-          signal
-        ).catch(async (error) => {
-          if (error instanceof LayerVerifyError) {
+        // A stored layer that fails its check again (as it is measured, or as
+        // the archive streams) is deleted from both stores, and the pull runs
+        // once more, which fetches it from the registry (§6.3).
+        for (let attempt = 0; ; attempt++) {
+          try {
+            layers = [];
+            for (const [i, layer] of resolved.layers.entries()) {
+              const id = layerIds[i];
+              const diffId = imageConfig.diffIds[i];
+              const holder = await this.holderOf(sources, layer.digest);
+              let uncompressedSize: number;
+              let store: ImageStore;
+              if (holder) {
+                progress({ status: 'Already exists', id });
+                store = holder;
+                uncompressedSize =
+                  known.get(layer.digest) ??
+                  (await measureLayer(this.archiveSource(store, layer, diffId), this.expansionLimit(layer.size, limits)));
+              } else {
+                progress({ status: 'Pulling fs layer', id });
+                uncompressedSize = await this.fetchLayer(session, target, layer, diffId, budget, limits, ref, id, progress, signal);
+                store = target;
+                fetched = true;
+              }
+              layers.push({ ...this.archiveSource(store, layer, diffId), uncompressedSize });
+            }
+            signal.throwIfAborted();
+            const loaded = await loadImage(
+              daemon,
+              dockerArchive({ name: `${name}@${resolved.topDigest}`, config: config.bytes, configDigest: resolved.config.digest, layers }),
+              signal
+            );
+            if (loaded.some((id) => id !== resolved.config.digest)) {
+              throw new PullError(`the Docker VM loaded ${cleanText(loaded.join(', '), 200)} for ${ref}, not ${resolved.config.digest}`);
+            }
+            break;
+          } catch (error) {
+            if (!(error instanceof LayerVerifyError)) throw error;
             await publicStore.remove(error.digest).catch(() => undefined);
             await jobStore.remove(error.digest).catch(() => undefined);
+            known.delete(error.digest);
+            if (attempt > 0 || signal.aborted) throw error;
+            this.log('warn', `${error.message}; deleted, and fetched again`);
           }
-          throw error;
-        });
-        if (loaded.some((id) => id !== resolved.config.digest)) {
-          throw new PullError(`the Docker VM loaded ${cleanText(loaded.join(', '), 200)} for ${ref}, not ${resolved.config.digest}`);
         }
+        source = fetched ? 'registry' : 'store';
         if (!(await hasImage(daemon, resolved.config.digest, signal))) {
           throw new PullError(`the Docker VM does not show ${resolved.config.digest} after loading ${ref}`);
         }
@@ -436,10 +569,11 @@ export class VmImagePuller implements ImagePuller {
     return null;
   }
 
-  private async fromStores(stores: ImageStore[], digest: string, max: number): Promise<Buffer | null> {
+  /** A small blob from the first store that holds it, verified, and which store that was. */
+  private async fromStores(stores: ImageStore[], digest: string, max: number): Promise<{ bytes: Buffer; from: ImageStore } | null> {
     for (const store of stores) {
       const bytes = await store.readVerified(digest, max);
-      if (bytes) return bytes;
+      if (bytes) return { bytes, from: store };
     }
     return null;
   }
@@ -447,22 +581,24 @@ export class VmImagePuller implements ImagePuller {
   /** Step 1: the index or manifest the reference names, and the platform's manifest under it. */
   private async resolve(
     session: RegistrySession,
-    stores: ImageStore[],
+    publicStore: ImageStore,
+    jobStore: ImageStore,
     reference: string,
     ref: string,
     requested: RequestedPlatform | undefined,
     rosetta: RosettaState
   ): Promise<ResolvedImage> {
+    const stores = [publicStore, jobStore];
+    let fromJobStore = false;
     let top: { digest: string; bytes: Buffer; mediaType?: string } | null = null;
-    if (reference.startsWith('sha256:')) {
-      const stored = await this.fromStores(stores, reference, MAX_MANIFEST_BYTES);
-      if (stored) top = { digest: reference, bytes: stored };
-    } else {
-      const head = await session.head(reference);
-      if (head === null) throw new PullError(`manifest for ${ref} not found: manifest unknown`);
-      if (head.digest) {
-        const stored = await this.fromStores(stores, head.digest, MAX_MANIFEST_BYTES);
-        if (stored) top = { digest: head.digest, bytes: stored };
+    // A tag is resolved with a HEAD; any stored blob with the digest it
+    // names is that manifest, since the store is content-addressed.
+    const digest = reference.startsWith('sha256:') ? reference : await this.headDigest(session, reference, ref);
+    if (digest !== undefined) {
+      const stored = await this.fromStores(stores, digest, MAX_MANIFEST_BYTES);
+      if (stored) {
+        top = { digest, bytes: stored.bytes };
+        fromJobStore ||= stored.from === jobStore;
       }
     }
     if (!top) {
@@ -482,10 +618,13 @@ export class VmImagePuller implements ImagePuller {
         config: document.config,
         layers: document.layers,
         requested,
+        fromJobStore,
       };
     }
     const { descriptor, platform } = choosePlatform(document.manifests, requested, rosetta, ref);
-    let manifestBytes = await this.fromStores(stores, descriptor.digest, MAX_MANIFEST_BYTES);
+    const stored = await this.fromStores(stores, descriptor.digest, MAX_MANIFEST_BYTES);
+    fromJobStore ||= stored?.from === jobStore;
+    let manifestBytes = stored?.bytes;
     let mediaType: string | undefined = descriptor.mediaType;
     if (!manifestBytes) {
       const fetched = await session.manifest(descriptor.digest);
@@ -507,7 +646,15 @@ export class VmImagePuller implements ImagePuller {
       layers: manifest.layers,
       platform,
       requested,
+      fromJobStore,
     };
+  }
+
+  /** The digest a tag names now, from a manifest HEAD; undefined when the registry did not say. */
+  private async headDigest(session: RegistrySession, tag: string, ref: string): Promise<string | undefined> {
+    const head = await session.head(tag);
+    if (head === null) throw new PullError(`manifest for ${ref} not found: manifest unknown`);
+    return head.digest;
   }
 
   /** The config's platform must be what was chosen, or, for a single manifest, one the VM runs (§6.2). */
@@ -544,14 +691,15 @@ export class VmImagePuller implements ImagePuller {
     budget: Budget,
     ref: string,
     signal: AbortSignal
-  ): Promise<{ bytes: Buffer }> {
+  ): Promise<{ bytes: Buffer; from?: ImageStore }> {
     const stored = await this.fromStores(stores, descriptor.digest, max);
-    if (stored) return { bytes: stored };
+    if (stored) return stored;
     if (descriptor.size > max) throw new PullError(`the config of ${ref} is larger than ${max} bytes`);
-    budget.reserve(descriptor.size);
     let bytes: Buffer | null = null;
     for (let attempt = 0; bytes === null; attempt++) {
+      const taken = { bytes: 0 };
       try {
+        budget.reserve(descriptor.size);
         const res = await session.blob(descriptor.digest);
         const chunks: Buffer[] = [];
         let size = 0;
@@ -562,13 +710,14 @@ export class VmImagePuller implements ImagePuller {
             res.destroy();
             throw new PullError(`blob ${descriptor.digest} of ${ref} is larger than the ${descriptor.size} bytes its descriptor declares`);
           }
-          budget.take(piece.length);
+          budget.take(piece.length, taken);
           chunks.push(piece);
         }
         bytes = Buffer.concat(chunks);
       } catch (error) {
         const failure = transferError(error, signal, `the config of ${ref}`);
         if (attempt > 0 || !(failure instanceof PullError) || !failure.transient) throw failure;
+        budget.refund(taken);
         this.log('info', `retrying the config of ${ref}: ${failure.message}`);
       }
     }
@@ -616,10 +765,13 @@ export class VmImagePuller implements ImagePuller {
     signal: AbortSignal
   ): Promise<number> {
     for (let attempt = 0; ; attempt++) {
+      const taken = { bytes: 0 };
       try {
-        return await this.fetchLayerOnce(session, store, layer, diffId, budget, limits, ref, id, progress, signal);
+        return await this.fetchLayerOnce(session, store, layer, diffId, budget, taken, limits, ref, id, progress, signal);
       } catch (error) {
         if (attempt === 0 && error instanceof PullError && error.transient && !signal.aborted) {
+          // What the broken transfer took was not kept: it does not count.
+          budget.refund(taken);
           this.log('info', `retrying layer ${layer.digest} of ${ref}: ${error.message}`);
           continue;
         }
@@ -634,6 +786,7 @@ export class VmImagePuller implements ImagePuller {
     layer: ContentDescriptor,
     diffId: string,
     budget: Budget,
+    taken: { bytes: number },
     limits: PullLimits,
     ref: string,
     id: string,
@@ -676,7 +829,7 @@ export class VmImagePuller implements ImagePuller {
           res.destroy();
           throw new PullError(`blob ${layer.digest} of ${ref} is larger than the ${layer.size} bytes its descriptor declares`);
         }
-        budget.take(bytes.length);
+        budget.take(bytes.length, taken);
         await writer.write(bytes);
         if (decompressError) throw decompressError;
         if (!decompressor.write(bytes)) await drained(decompressor);
