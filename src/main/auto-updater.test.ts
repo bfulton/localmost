@@ -60,7 +60,8 @@ describe('auto-updater', () => {
 
     // Reset autoUpdater state - remove all listeners so initAutoUpdater can re-register
     mockAutoUpdater.removeAllListeners();
-    mockAutoUpdater.autoDownload = true;
+    // The opposite of what initAutoUpdater sets, so each setting is proven.
+    mockAutoUpdater.autoDownload = false;
     mockAutoUpdater.autoInstallOnAppQuit = false;
     (mockAutoUpdater.checkForUpdates as jest.Mock).mockClear();
     (mockAutoUpdater.downloadUpdate as jest.Mock).mockClear();
@@ -104,10 +105,10 @@ describe('auto-updater', () => {
       expect(status.currentVersion).toBe('1.0.0');
     });
 
-    it('should disable autoDownload', () => {
+    it('should enable autoDownload, so fixes to the bundled guest reach users', () => {
       initAutoUpdater(mockMainWindow as unknown as BrowserWindow);
 
-      expect(mockAutoUpdater.autoDownload).toBe(false);
+      expect(mockAutoUpdater.autoDownload).toBe(true);
     });
 
     it('should enable autoInstallOnAppQuit', () => {

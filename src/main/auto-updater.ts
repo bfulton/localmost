@@ -24,7 +24,11 @@ export function initAutoUpdater(mainWindow: BrowserWindow): void {
 
   // Configure update source - uses GitHub Releases
   // Repository is auto-detected from package.json "repository" field
-  autoUpdater.autoDownload = false;
+  // Download as soon as an update is found: the app carries the Docker VM's
+  // kernel, runc and dockerd, and their fixes must reach users without a
+  // click. A download asked for while one runs joins it (electron-updater
+  // keeps one download promise), so the banner's button stays harmless.
+  autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
 
   // Redirect electron-updater logs to our logger instead of stdout
