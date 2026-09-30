@@ -17,7 +17,7 @@ import * as net from 'net';
 import * as path from 'path';
 import * as zlib from 'zlib';
 import { DockerPolicy } from '../../shared/docker-policy';
-import { DockerBackend } from './docker-backend';
+import { LegacyDockerBackend } from './docker-backend';
 import { DockerAction, DockerRequest, classifyDockerRequest, containerIdFrom, networkIdFrom, parseDockerRequest } from './docker-request';
 import { evaluateDockerRequest, registryOf } from './docker-evaluator';
 
@@ -29,7 +29,7 @@ export interface DockerFilterProxyLogEntry {
 }
 
 export interface DockerFilterProxyOptions {
-  backend: DockerBackend;
+  backend: LegacyDockerBackend;
   onLog?: (entry: DockerFilterProxyLogEntry) => void;
   /** Oldest API version forwarded. Default v1.24. */
   minApiVersion?: string;
@@ -204,7 +204,7 @@ export class DockerFilterProxy {
   private readonly ownNetworkIds = new Set<string>();
   private readonly ownNetworkAliases = new Map<string, string>();
   private repository: string | undefined;
-  private readonly backend: DockerBackend;
+  private readonly backend: LegacyDockerBackend;
   private readonly onLog: (entry: DockerFilterProxyLogEntry) => void;
   private readonly minApiVersion: ApiVersion;
   private readonly maxApiVersion: ApiVersion;

@@ -14,7 +14,7 @@ import * as http from 'http';
 import * as net from 'net';
 import * as zlib from 'zlib';
 import { DockerFilterProxy, DockerFilterProxyLogEntry } from './docker-filter-proxy';
-import { DockerBackend, DesktopBackend } from './docker-backend';
+import { LegacyDockerBackend, DesktopBackend } from './docker-backend';
 
 interface Reply { status: number; headers: http.IncomingHttpHeaders; body: string }
 
@@ -54,7 +54,7 @@ const request = (
   });
 
 /** A backend whose workspace is the whole sandbox directory the socket is served in. */
-const backendWith = (endpoint: string | null, supportsPrivileged = false): DockerBackend => ({
+const backendWith = (endpoint: string | null, supportsPrivileged = false): LegacyDockerBackend => ({
   name: 'test',
   supportsPrivileged,
   resolveEndpoint: () => (endpoint ? { socketPath: endpoint } : null),
@@ -81,7 +81,7 @@ afterEach(async () => {
 
 const startProxy = async (
   dir: string,
-  opts: Partial<ConstructorParameters<typeof DockerFilterProxy>[0]> & { backend?: DockerBackend } = {}
+  opts: Partial<ConstructorParameters<typeof DockerFilterProxy>[0]> & { backend?: LegacyDockerBackend } = {}
 ): Promise<{ proxy: DockerFilterProxy; sock: string; logs: DockerFilterProxyLogEntry[] }> => {
   const logs: DockerFilterProxyLogEntry[] = [];
   const sock = path.join(dir, 'docker.sock');
@@ -1561,7 +1561,7 @@ describe('containers a job leaves behind', () => {
     const sock = path.join(dir, 'docker.sock');
     const daemon = await lifetimeDaemon(dir, sock);
     let endpoint: string | null = daemon.sock;
-    const backend: DockerBackend = { ...backendWith(null), resolveEndpoint: () => (endpoint ? { socketPath: endpoint } : null) };
+    const backend: LegacyDockerBackend = { ...backendWith(null), resolveEndpoint: () => (endpoint ? { socketPath: endpoint } : null) };
     const { proxy, logs } = await startProxy(dir, { backend });
     proxy.bind('owner/repo', policy);
     expect((await request(sock, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' })).status).toBe(201);

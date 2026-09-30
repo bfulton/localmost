@@ -86,7 +86,7 @@ import { LogEntry, RunnerState, JobHistoryEntry } from '../shared/types';
 import { DockerPolicy } from '../shared/docker-policy';
 import { spawnSandboxed } from './process-sandbox';
 import { DockerFilterProxy } from './docker/docker-filter-proxy';
-import type { DockerBackend } from './docker/docker-backend';
+import type { LegacyDockerBackend } from './docker/docker-backend';
 import { createMockProcess, RunnerManagerTestHelper } from './test-utils';
 
 /** Stands in for the broker making a worker its per-start key. */
@@ -104,7 +104,7 @@ const mockSpawnSandboxed = spawnSandboxed as jest.MockedFunction<typeof spawnSan
 /** What the mocked DockerFilterProxy hands back: the manager's view of a worker's socket. */
 interface DockerSocketStub {
   options: {
-    backend?: DockerBackend;
+    backend?: LegacyDockerBackend;
     onLog?: (entry: { level: 'info' | 'warn' | 'debug'; message: string }) => void;
     attachRegistryAuth?: (registry: string) => string | undefined;
   };
@@ -2837,7 +2837,7 @@ describe('RunnerManager', () => {
     });
 
     it("builds each worker's docker socket on the configured backend and registry auth", async () => {
-      const dockerBackend: DockerBackend = {
+      const dockerBackend: LegacyDockerBackend = {
         name: 'test',
         supportsPrivileged: false,
         resolveEndpoint: () => null,

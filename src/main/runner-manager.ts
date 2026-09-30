@@ -8,7 +8,7 @@ import * as os from 'os';
 import { StringDecoder } from 'string_decoder';
 import * as yaml from 'js-yaml';
 import type { DockerPolicy } from '../shared/docker-policy';
-import { DesktopBackend, DockerBackend } from './docker/docker-backend';
+import { DesktopBackend, LegacyDockerBackend } from './docker/docker-backend';
 import { DockerFilterProxy } from './docker/docker-filter-proxy';
 import {
   SandboxPolicyLevel, RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
@@ -289,7 +289,7 @@ interface RunnerManagerOptions {
    */
   issueWorkerCredential?: (instanceNum: number) => Promise<WorkerCredentialFiles | undefined>;
   /** The daemon a worker's permitted container requests go to. The operator's own by default. */
-  dockerBackend?: DockerBackend;
+  dockerBackend?: LegacyDockerBackend;
   /** Registry credentials, attached to a pull by the worker's socket so the job never holds them. */
   attachRegistryAuth?: (registry: string) => string | undefined;
 }
@@ -341,7 +341,7 @@ export class RunnerManager {
   // Filtering docker sockets, one per spawn: minted with the worker, bound
   // to its repository's policy on claim, stopped when it exits.
   private dockerProxies: Map<number, DockerFilterProxy> = new Map();
-  private readonly dockerBackend: DockerBackend;
+  private readonly dockerBackend: LegacyDockerBackend;
   private readonly attachRegistryAuth?: (registry: string) => string | undefined;
 
   // Flag to track intentional stops vs job completion restarts
