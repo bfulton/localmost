@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
-import { ChildProcess, execFileSync, spawn } from 'child_process';
+import { ChildProcess, execFileSync, spawn, spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -94,6 +94,21 @@ const gone = async (pid: number): Promise<boolean> => {
   return !alive(pid);
 };
 
+/**
+ * A `ps` field of `pid`, asked again until `done` accepts it or ten seconds
+ * pass, and the last answer either way. What a process does once started -
+ * exec, setsid() - it does in its own time, which on a loaded machine can be
+ * well after its parent has reported it started.
+ */
+const psUntil = async (pid: number, field: string, done: (value: string) => boolean): Promise<string> => {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const value = (spawnSync('/bin/ps', ['-o', `${field}=`, '-p', String(pid)], { encoding: 'utf-8' }).stdout ?? '').trim();
+    if (done(value) || Date.now() >= deadline) return value;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+};
+
 /** A process that is not a step's: this suite's own child, under `profile` if given. */
 const bystander = (profile?: string): ChildProcess => {
   if (!profile) return spawn('/bin/sleep', ['60'], { stdio: 'ignore' });
@@ -121,11 +136,18 @@ if (canConstruct()) {
         );
         expect(result.status).toBe('success');
         survivor = parseInt(fs.readFileSync(path.join(workDir, 'survivor.pid'), 'utf-8'), 10);
-        // Out of the step's group, and still running after the step.
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        // Out of the step's group, and still running after the step. The
+        // step reports the survivor before it has necessarily called
+        // setsid(), and until it has, the kill of the step's group would take
+        // it, so that is waited for; and the others are waited for until they
+        // run /bin/sleep, which sandbox-exec starts only once its profile is on.
+        const pgid = Number(await psUntil(survivor, 'pgid', (value) => Number(value) === survivor));
         expect(alive(survivor)).toBe(true);
-        const pgid = parseInt(execFileSync('/bin/ps', ['-o', 'pgid=', '-p', String(survivor)], { encoding: 'utf-8' }), 10);
-        expect(pgid).toBe(survivor);
+        expect({ survivor, pgid }).toEqual({ survivor, pgid: survivor });
+        for (const other of others) {
+          const command = await psUntil(other.pid!, 'comm', (value) => value === '/bin/sleep');
+          expect({ pid: other.pid, command }).toEqual({ pid: other.pid, command: '/bin/sleep' });
+        }
 
         reapStepProcesses();
 
@@ -136,7 +158,7 @@ if (canConstruct()) {
         if (survivor && alive(survivor)) process.kill(survivor, 'SIGKILL');
         for (const other of others) other.kill('SIGKILL');
       }
-    }, 20000);
+    }, 30000);
   });
 
   describe('the cache intercept through sandboxed tar', () => {
