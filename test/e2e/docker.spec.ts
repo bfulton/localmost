@@ -82,16 +82,19 @@ const findDockerCli = (): string | undefined => {
   return undefined;
 };
 
-// Inside a localmost job, DOCKER_HOST names a socket the runner serves the job,
-// never the daemon itself; GITHUB_ACTIONS marks a job, as opposed to a
-// developer shell that happens to export DOCKER_HOST, and localmost runs jobs
-// on macOS only.
+// GITHUB_ACTIONS marks a job, as opposed to a developer shell that happens to
+// export DOCKER_HOST, and this repository's jobs run on macOS only on the
+// localmost runner: its fallback is ubuntu-latest. Inside a localmost job,
+// DOCKER_HOST names a socket the runner serves the job, never the daemon
+// itself. A job on the Mac with no such socket is a failure naming that, not
+// a reason to boot a VM of this file's own.
 const dockerHost = process.env.DOCKER_HOST;
 const hostSocket = dockerHost?.startsWith('unix://') ? dockerHost.slice('unix://'.length) : undefined;
-const insideJob = process.env.GITHUB_ACTIONS === 'true' && process.platform === 'darwin' && hostSocket !== undefined;
+const daemonSockets = ['/var/run/docker.sock', path.join(os.homedir(), '.docker', 'run', 'docker.sock')];
+const inJobOnMac = process.env.GITHUB_ACTIONS === 'true' && process.platform === 'darwin';
 
 type Mode = 'job' | 'vm' | 'native';
-const mode: Mode = insideJob ? 'job' : process.platform === 'darwin' ? 'vm' : 'native';
+const mode: Mode = inJobOnMac ? 'job' : process.platform === 'darwin' ? 'vm' : 'native';
 
 /** What `npm run build:native` leaves in build/, which the Mac mode runs on, as a packaged app runs on Resources. */
 const vmResources = path.resolve(__dirname, '..', '..', 'build');
@@ -116,12 +119,20 @@ const missingReason = ((): string | null => {
       : `the VM backend's build is missing: ${missing.map((file) => path.relative(process.cwd(), file)).join(', ')}. ` +
           'Run npm run build:native first; on the Mac this suite boots a real Docker VM from build/.';
   }
-  if (!dockerCli) return 'no docker CLI on PATH to drive the socket with. Install Docker where these tests run.';
   if (mode === 'job') {
-    return fs.existsSync(hostSocket!)
+    // The socket first: without one served, there is nothing to drive.
+    if (hostSocket === undefined) {
+      return 'this job was served no docker socket: DOCKER_HOST is not a unix:// socket. The localmost runner serves every job one.';
+    }
+    if (daemonSockets.includes(hostSocket)) {
+      return `DOCKER_HOST names the daemon's own socket, ${hostSocket}, not one the runner serves. The localmost runner never hands a job the daemon.`;
+    }
+    if (!dockerCli) return 'no docker CLI on PATH to drive the socket with. The localmost runner puts its bundled CLI first on the PATH.';
+    return fs.existsSync(hostSocket)
       ? null
-      : `DOCKER_HOST names ${hostSocket}, but nothing is served there. The runner serves a job its docker socket only once the repository's docker policy is approved.`;
+      : `DOCKER_HOST names ${hostSocket}, but nothing is served there. The runner serves every job its docker socket for as long as the job runs.`;
   }
+  if (!dockerCli) return 'no docker CLI on PATH to drive the socket with. Install Docker where these tests run.';
   return fs.existsSync(nativeSocket)
     ? null
     : `no Docker daemon at ${nativeSocket}. Install and start Docker where these tests run.`;
@@ -246,12 +257,20 @@ test.describe('a job using docker through the filtering socket', () => {
   });
 
   test.afterAll(async () => {
-    // Before the proxy stops, and tolerant of a test that already removed it.
-    if (env && mode !== 'vm') await docker('network', 'rm', network).catch(() => undefined);
-    await proxy?.stop();
-    await vms?.shutdown();
-    if (scratch) fs.rmSync(scratch, { recursive: true, force: true });
-    if (jobWorkspace) fs.rmSync(jobWorkspace, { recursive: true, force: true });
+    // The directories go whatever fails first: <data> holds each VM's
+    // directory and its sparse data disk.
+    try {
+      // Before the proxy stops, and tolerant of a test that already removed it.
+      if (env && mode !== 'vm') await docker('network', 'rm', network).catch(() => undefined);
+      try {
+        await proxy?.stop();
+      } finally {
+        await vms?.shutdown();
+      }
+    } finally {
+      if (scratch) fs.rmSync(scratch, { recursive: true, force: true });
+      if (jobWorkspace) fs.rmSync(jobWorkspace, { recursive: true, force: true });
+    }
   });
 
   /** Run the docker CLI as the job, reporting the exit code rather than throwing on it. */
@@ -274,6 +293,9 @@ test.describe('a job using docker through the filtering socket', () => {
   /** The VM booted for this job at the claim. */
   const claimedVm = (): VmHandle => vms!.started[0];
 
+  // The VM's own checks, where this process boots the VM. Inside a job the
+  // VM is the installed app's, which this process cannot see; off macOS
+  // there is none (owner decision 3).
   if (mode === 'vm') {
     test('boots no VM for a job whose policy has no docker section, and answers it from the guest', async () => {
       // A second worker, claimed for a job whose policy grants nothing: its
@@ -311,13 +333,6 @@ test.describe('a job using docker through the filtering socket', () => {
       const ready = await vm.ready();
       expect(ready.docker.apiVersion).toMatch(/^1\.\d+$/);
       expect(fs.existsSync(vms!.vmDir(vm))).toBe(true);
-    });
-  } else {
-    test('checks the Docker VM on the Mac, outside a job, where one can boot', () => {
-      // Inside a job the VM is the installed app's, which this process cannot
-      // see; off macOS there is none (owner decision 3). The Mac mode above
-      // is where the VM's own checks run.
-      expect(mode === 'job' ? insideJob : process.platform !== 'darwin').toBe(true);
     });
   }
 

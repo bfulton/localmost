@@ -125,9 +125,15 @@ export class VmHarness {
   static async create(data: string, resources: string, log: (level: Level, message: string) => void): Promise<VmHarness> {
     const proxy = net.createServer((client) => client.destroy());
     await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
-    const harness = new VmHarness(fs.realpathSync(data), fs.realpathSync(resources), proxy, log);
-    await harness.manager.sweep();
-    return harness;
+    try {
+      const harness = new VmHarness(fs.realpathSync(data), fs.realpathSync(resources), proxy, log);
+      await harness.manager.sweep();
+      return harness;
+    } catch (err) {
+      // No harness to shut down, so the listener would outlive the spec.
+      await new Promise<void>((resolve) => proxy.close(() => resolve()));
+      throw err;
+    }
   }
 
   /** A sandbox for a worker in `slot`, with its share, its nonce and an empty DOCKER_CONFIG. */
