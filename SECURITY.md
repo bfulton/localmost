@@ -67,7 +67,7 @@ localmost is an Electron desktop application that manages GitHub Actions self-ho
 - **Network exfiltration**: A job's sandbox permits no outbound connection except to its own filtering proxy and the local broker's port, so the host policy holds even for code that ignores `HTTP_PROXY` and opens a raw socket. A direct connection to any other loopback port is refused too, unless its approved policy declares that port with `network.loopback`, and the proxy holds a request for a loopback address to the same ports, so going through `HTTP_PROXY` does not reach a service bound only to loopback either. The proxy judges the Mac's own routable addresses - a global IPv6 address, or a public IPv4 one, on one of its interfaces - like any remote host, so under `permissive`, or with such an address in an allow entry, a job reaches a service listening on all interfaces there (Docker Desktop publishes ports that way by default). Under `strict` the reachable set is runner infrastructure plus what the repository declares — not npm, PyPI or other registries
 - **Other processes**: A job can signal only processes in its own sandbox - its children and the members of its process group that share its sandbox - not the app, another worker's job or anything else you run. It cannot look up the app's own Chromium port rendezvous service either
 - **What a job leaves running**: Nothing of a job is meant to outlive it. Every job's sandbox is a new directory (`~/.localmost/runner/sandbox/<n>-<id>`), with its docker socket inside, so the next job's runner, checkout and socket are at paths no earlier job's profile grants. When a worker exits, its process group is sent SIGTERM and, ten seconds later, SIGKILL, and its slot takes no other job until the group is empty or has been sent SIGKILL. Two seconds after that, anything still running under that job's sandbox profile is killed - found by asking the kernel which processes run under the profile carrying the job's mark, which a process cannot leave the way it can leave its process group with `setsid()` - and then, once nothing is left in its process group, the job's sandbox directory is removed. It is first moved aside, to a name in `~/.localmost/runner/sandbox` that no job's profile grants, so that a process still running under the job's profile can no longer change the tree, and it is removed from there without following a link planted anywhere in it - even one swapped in for a directory while the removal runs, by a container of the job's writing its bind-mounted workspace through the Docker VM's share, say, which the job's profile does not confine - so the removal deletes nothing outside the tree. If the app quits first, the next startup does the same for every job it had not swept. That sweep runs a short script with the developer tools' `python3`, found through `xcode-select`; without the developer tools only the process group, and the processes holding the marker file descriptor the runner's shells pass down, are swept. So a process that left the group with `setsid()` and closed its inherited descriptors keeps its finished job's profile for about twelve seconds after the job ends, and without the developer tools until it exits. Until then it can write its own old sandbox directory while that is still in place (and after that a new directory at the same path, which the next startup removes), the paths its policy declares, and its target's caches, which the target's next job uses; connect to the loopback ports its policy declares; and listen on any free loopback port, where a later job, or one running in another slot, whose policy declares that port reaches it instead of the service it expects. It cannot reach the next job's sandbox or docker socket, nor use its proxy, which stops serving it when the job ends
-- **Container work**: A job is never handed a Docker daemon socket. It talks to a filtering socket localmost owns, which forwards only the `pull`, `run` and `build` requests the repository's approved `.localmostrc` declares, to a Linux VM of the job's own whose only share is the job's work folder and whose only way out is the job's proxy - see Docker Access below
+- **Container work**: A job is never handed a Docker daemon socket. It talks to a filtering socket localmost owns, which forwards only the `pull`, `run` and `build` requests the repository's approved `.localmostrc` declares, to a Linux VM of the job's own that is given none of your files but the job's work folder and whose only way out is the job's proxy - see Docker Access below
 - **Credential exposure**: OAuth tokens are encrypted at rest using macOS Keychain
 
 ### Policy levels
@@ -507,10 +507,10 @@ deny-default seatbelt profile written for that one VM.
 into its VM, so the daemon's second resolution of a bind source, at container
 start, could land anywhere in the home directory: a job could create a
 container with an approved bind, replace the source with a link to `~`, and
-start it. The job's VM has exactly one host directory, the job's own
+start it. The job's VM is given one directory of yours, the job's own
 `<sandbox>/_work`: the runner's work folder, which holds the checkout and so
-every path a policy's `mounts:` can name. Its only other share, when Rosetta
-for Linux is installed, is Apple's Rosetta runtime, and it has no network
+every path a policy's `mounts:` can name. Besides it the VM gets only Apple's
+Rosetta runtime, when Rosetta for Linux is installed, and it has no network
 card. localmost creates `_work` itself before any process runs in the sandbox,
 and the job's profile denies writes to the `_work` and `<sandbox>` nodes
 themselves, so the job cannot rename, remove, replace, chmod or relink either;
@@ -647,13 +647,14 @@ another kernel.
 **The VM's control plane is not the job's.** The helper's sockets are under
 `~/.localmost/vm`, which every job's profile denies for reads and writes. The
 helper takes ids, not paths; it serves those two sockets and the relay, and
-listens on and dials nothing else. Everything the guest or
-its daemon answers is treated as hostile: size-capped, checked against its
-expected shape, stripped of control characters before it is logged, and
-never used to choose a path on the Mac.
+listens on and dials nothing else. Everything the guest or its daemon answers
+is treated as hostile: size-capped, checked against its expected shape,
+stripped of control characters before it is logged, and never used to choose
+a path on the Mac.
 
-**Nothing is left running.** Each helper watches the app: when localmost
-exits, crashes or is killed, every helper stops its VM and exits, and a VM
+**Nothing is left running.** Each helper watches the app's process, and the
+pipe the app holds open to it: when localmost exits, crashes or is killed,
+every helper stops its VM and exits, and a VM
 dies within about two seconds of its helper. The next launch removes the VM
 directories left behind. Because the VM has no network card, it never raises
 macOS's Local Network prompt.
@@ -679,9 +680,10 @@ What this does not contain:
   nothing.
 - **Hostname policy for traffic that ignores the proxy settings.** That
   traffic has no route at all. It fails; it is not filtered.
-- **A filter defect.** A request that passes the filter wrongly runs in the
-  job's own VM, so it reaches what root in the VM reaches, as above, and no
-  more.
+- **A filter defect.** A request that passes the filter wrongly still runs
+  in the job's own VM, never on a daemon of the operator's, and reaches what
+  the VM holds (above); one that lets a privileged container through reaches
+  the VM's kernel as well.
 
 Nothing but the approved `.localmostrc` grants any of this - there is no
 machine-level switch to withhold it - so the approval diff is where that

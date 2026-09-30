@@ -26,7 +26,7 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   declared requests are forwarded, to a Linux VM that localmost boots for that
   job alone when a job whose policy has a `docker:` section is claimed, and
   discards, with every container, network, volume and built image in it, when
-  the job ends. The VM shares no directory of the Mac but the job's work
+  the job ends. The VM is given none of your files but the job's work
   folder, has no network card, and reaches the network only through the job's
   own proxy. Anything unlisted is denied, and host bind mounts,
   `--privileged`/`--pid=host`/`--network=host`/`--device` and a restart policy
