@@ -164,7 +164,12 @@ export async function measureLayer(layer: ArchiveLayerSource, limit = Number.MAX
   return size;
 }
 
-async function* archiveChunks(image: ArchiveInput): AsyncGenerator<Buffer> {
+/**
+ * The archive's bytes, chunk by chunk, as dockerArchive streams them. A
+ * layer's bytes never run past the size its tar header states: past it,
+ * dockerd would read them as further tar entries.
+ */
+export async function* archiveChunks(image: ArchiveInput): AsyncGenerator<Buffer> {
   const hex = (digest: string) => digest.slice('sha256:'.length);
   const seen = new Set<string>();
   const layers = image.layers.filter((layer) => {

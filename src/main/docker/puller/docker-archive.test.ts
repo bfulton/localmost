@@ -2,7 +2,7 @@ import { describe, it, expect } from '@jest/globals';
 import * as crypto from 'crypto';
 import { Readable } from 'stream';
 import * as zlib from 'zlib';
-import { ArchiveInput, LayerVerifyError, dockerArchive, measureLayer, tarHeader } from './docker-archive';
+import { ArchiveInput, LayerVerifyError, archiveChunks, dockerArchive, measureLayer, tarHeader } from './docker-archive';
 import { MEDIA, compress, tarOf } from './test-registry';
 
 const sha = (bytes: Buffer) => `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`;
@@ -156,9 +156,41 @@ describe('dockerArchive', () => {
     await expect(collect(dockerArchive(input([layer])))).rejects.toThrow(`layer ${good.digest} no longer matches its digest`);
   });
 
-  it('fails a layer that is longer than its recorded size', async () => {
+  /** Every chunk the archive gave before it failed, and the error; read chunk by chunk, so nothing is buffered away. */
+  async function untilFailure(image: ArchiveInput): Promise<{ bytes: Buffer; error: unknown }> {
+    const chunks: Buffer[] = [];
+    try {
+      for await (const chunk of archiveChunks(image)) chunks.push(chunk);
+    } catch (error) {
+      return { bytes: Buffer.concat(chunks), error };
+    }
+    return { bytes: Buffer.concat(chunks), error: undefined };
+  }
+
+  /** How many bytes followed a layer's tar header before the archive stopped. */
+  function bytesAfterHeader(bytes: Buffer, diffId: string): number {
+    const name = Buffer.from(`blobs/sha256/${diffId.slice(7)}\0`);
+    for (let offset = 0; offset + 512 <= bytes.length; offset += 512) {
+      if (bytes.subarray(offset, offset + name.length).equals(name)) return bytes.length - offset - 512;
+    }
+    throw new Error('no header for the layer');
+  }
+
+  it('fails a layer that is longer than its recorded size, without a byte past what its header states', async () => {
     const layer = { ...layerOf(tarB, 'zstd'), uncompressedSize: tarB.length - 512 };
-    await expect(collect(dockerArchive(input([layer])))).rejects.toThrow(LayerVerifyError);
+    const { bytes, error } = await untilFailure(input([layer]));
+    expect(error).toBeInstanceOf(LayerVerifyError);
+    expect((error as Error).message).toContain(`is longer than the ${tarB.length - 512} bytes it had when it was verified`);
+    expect(bytesAfterHeader(bytes, layer.diffId)).toBeLessThanOrEqual(tarB.length - 512);
+  });
+
+  it('fails a layer that is shorter than its recorded size, before its padding or anything after it', async () => {
+    const layer = { ...layerOf(tarB, 'gzip'), uncompressedSize: tarB.length + 512 };
+    const { bytes, error } = await untilFailure(input([layer, layerOf(tarC, 'none')]));
+    expect(error).toBeInstanceOf(LayerVerifyError);
+    expect((error as Error).message).toContain(`is ${tarB.length} bytes, not the ${tarB.length + 512} it had when it was verified`);
+    // The daemon sees the entry cut short: a truncated archive, which it refuses.
+    expect(bytesAfterHeader(bytes, layer.diffId)).toBe(tarB.length);
   });
 
   it('fails a layer that is not the compression its media type names', async () => {

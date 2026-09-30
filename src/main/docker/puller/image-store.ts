@@ -24,6 +24,8 @@ const TMP_PREFIX = '.tmp-';
 const HEX64 = /^[0-9a-f]{64}$/;
 /** What createWriter names a blob in progress. */
 const TMP_NAME = /^\.tmp-[0-9a-f]{16}$/;
+/** What writeRefs names refs.json in progress. */
+const REFS_TMP_NAME = /^refs\.json\.tmp-[0-9a-f]{16}$/;
 const MAX_REFS_BYTES = 16 * 1024 * 1024;
 const MAX_LAYERS = 256;
 /** `<registry>/<path>:<tag>` or `<registry>/<path>@sha256:<hex>`, as the puller writes them. */
@@ -275,19 +277,22 @@ export class ImageStore {
     return bytes;
   }
 
-  /** Remove what interrupted writes left behind. Run before the store is first written in a process. */
+  /**
+   * Remove what interrupted writes left behind: blobs in progress, and
+   * refs.json in progress. Run before the store is first written in a process.
+   */
   async sweepTemp(): Promise<void> {
-    let names: string[];
-    try {
-      names = await fs.promises.readdir(this.blobsDir);
-    } catch {
-      return;
-    }
-    await Promise.all(
-      names
-        .filter((n) => TMP_NAME.test(n))
-        .map((n) => fs.promises.rm(path.join(this.blobsDir, n), { force: true }))
-    );
+    const sweep = async (dir: string, pattern: RegExp) => {
+      let names: string[];
+      try {
+        names = await fs.promises.readdir(dir);
+      } catch {
+        return;
+      }
+      await Promise.all(names.filter((n) => pattern.test(n)).map((n) => fs.promises.rm(path.join(dir, n), { force: true })));
+    };
+    await sweep(this.blobsDir, TMP_NAME);
+    await sweep(this.root, REFS_TMP_NAME);
   }
 
   /** Hold blobs against a trim while a pull or a load uses them. The returned function releases them. */

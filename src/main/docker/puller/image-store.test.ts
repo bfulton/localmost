@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
+import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -83,6 +83,18 @@ describe('writing blobs', () => {
     expect(listBlobs()).toEqual([kept.slice(7)]);
   });
 
+  it('sweeps an interrupted refs.json write too, and nothing else', async () => {
+    await store.recordRef(entry());
+    const left = path.join(root, `refs.json.tmp-${'0'.repeat(16)}`);
+    const other = path.join(root, 'refs.json.tmp-not-ours');
+    fs.writeFileSync(left, '{ half');
+    fs.writeFileSync(other, 'x');
+    await new ImageStore(root).sweepTemp();
+    expect(fs.existsSync(left)).toBe(false);
+    expect(fs.existsSync(other)).toBe(true);
+    expect(await store.readRefs()).toHaveLength(1);
+  });
+
   it('refuses a malformed digest before any file is made', async () => {
     for (const bad of ['sha256:../../helper.sb', `sha256:${'A'.repeat(64)}`, `sha512:${'a'.repeat(128)}`, 'sha256:abc']) {
       await expect(store.createWriter(bad)).rejects.toThrow();
@@ -103,6 +115,16 @@ describe('reading blobs', () => {
     fs.writeFileSync(path.join(blobsDir(), digest.slice(7)), 'tampered');
     await expect(store.readVerified(digest, 1024)).resolves.toBeNull();
     expect(listBlobs()).toEqual([]);
+  });
+
+  it('never reads a blob through a symlink, even to bytes that match', async () => {
+    const bytes = Buffer.from('bytes kept somewhere else');
+    const target = path.join(scratch, 'elsewhere');
+    fs.writeFileSync(target, bytes);
+    fs.mkdirSync(blobsDir(), { recursive: true });
+    fs.symlinkSync(target, path.join(blobsDir(), digestOf(bytes).slice(7)));
+    await expect(store.readVerified(digestOf(bytes), 1024)).resolves.toBeNull();
+    expect(fs.readFileSync(target)).toEqual(bytes);
   });
 
   it('answers null for a blob it does not have, and refuses one past the bound', async () => {
@@ -160,6 +182,32 @@ describe('refs.json', () => {
     expect(refs).toEqual([good]);
     await store.trim(0);
     expect(fs.readFileSync(canary, 'utf-8')).toBe('keep me');
+  });
+
+  it('leaves refs.json whole when a write dies partway', async () => {
+    await store.recordRef(entry({ ref: 'docker.io/library/kept:1' }));
+    const realWriteFile = fs.promises.writeFile.bind(fs.promises);
+    const writeFile = jest.spyOn(fs.promises, 'writeFile').mockImplementationOnce(async (file, data, options) => {
+      // Half the new contents reach the disk, then the process dies.
+      const text = String(data);
+      await realWriteFile(file as string, text.slice(0, text.length / 2), options as fs.WriteFileOptions);
+      throw new Error('killed mid-write');
+    });
+    try {
+      await expect(store.recordRef(entry({ ref: 'docker.io/library/new:1' }))).rejects.toThrow('killed mid-write');
+    } finally {
+      writeFile.mockRestore();
+    }
+    expect((await store.readRefs()).map((r) => r.ref)).toEqual(['docker.io/library/kept:1']);
+    expect(fs.readdirSync(root).filter((f) => f.startsWith('refs.json'))).toEqual(['refs.json']);
+  });
+
+  it('never reads refs.json through a symlink', async () => {
+    const elsewhere = path.join(scratch, 'refs-elsewhere.json');
+    fs.writeFileSync(elsewhere, JSON.stringify({ v: 1, refs: [entry()] }));
+    fs.mkdirSync(root, { recursive: true });
+    fs.symlinkSync(elsewhere, path.join(root, 'refs.json'));
+    await expect(store.readRefs()).resolves.toEqual([]);
   });
 
   it('reads a refs.json that is not JSON as empty, and a missing one too', async () => {

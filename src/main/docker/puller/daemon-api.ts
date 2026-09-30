@@ -180,8 +180,12 @@ export async function loadImage(daemon: DaemonEndpoint, archive: Readable, signa
   return ids;
 }
 
-/** `repo` and `tag` as the tag endpoint takes them: the image's name, and a tag. */
-const REPO_RE = /^[a-z0-9.-]+(?::[0-9]{1,5})?\/[a-z0-9._/-]{1,255}$/;
+/**
+ * `repo` and `tag` as the tag endpoint takes them: the image's name (a
+ * registry host, then path components in Docker's reference grammar, so no
+ * empty or `..` component), and a tag.
+ */
+const REPO_RE = /^[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[0-9]{1,5})?(?:\/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)+$/;
 const TAG_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
 
 export async function tagImage(daemon: DaemonEndpoint, configDigest: string, repo: string, tag: string, signal?: AbortSignal): Promise<void> {
