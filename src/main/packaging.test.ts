@@ -190,12 +190,50 @@ describe('the release update manifest', () => {
 
     // An Intel Mac keeps only the files not named arm64, which is none, and
     // the updater refuses to download from an empty list. It still reports
-    // the version as available: that check reads only the version.
+    // the version as available: that check reads only the version and the
+    // minimum OS, not the files.
     const files = filesFor(false);
     expect(files).toEqual([]);
     expect(() => findFile(files, 'zip', ['pkg', 'dmg'])).toThrow(
       expect.objectContaining({ code: 'ERR_UPDATER_NO_FILES_PROVIDED' }),
     );
+  });
+
+  // What AppUpdater.isUpdateAvailable asks before it offers a version: it
+  // compares os.release(), the Darwin version, with minimumSystemVersion.
+  const supportedOn = (darwinRelease: string) => {
+    const { AppUpdater } = require(path.join(updaterOut, 'AppUpdater'));
+    const release = jest.spyOn(require('os'), 'release').mockReturnValue(darwinRelease);
+    try {
+      return AppUpdater.prototype.checkIfUpdateSupported.call(
+        { _logger: { info: () => {}, warn: () => {} } },
+        manifest(),
+      );
+    } finally {
+      release.mockRestore();
+    }
+  };
+
+  it.each([
+    ['macOS 12.7', '21.6.0'],
+    ['macOS 13.0', '22.1.0'],
+    ['macOS 13.7', '22.6.0'],
+  ])('offers no update to %s, which cannot open it', (_macos, darwin) => {
+    make('arm64');
+    generate();
+
+    expect(supportedOn(darwin)).toBe(false);
+  });
+
+  it.each([
+    ['macOS 14.0', '23.0.0'],
+    ['macOS 15.6', '24.6.0'],
+    ['macOS 26.6', '25.6.0'],
+  ])('offers the update to %s', (_macos, darwin) => {
+    make('arm64');
+    generate();
+
+    expect(supportedOn(darwin)).toBe(true);
   });
 
   it('lists only the arm64 zip and DMG', () => {
@@ -584,11 +622,34 @@ describe('the macOS version the app requires', () => {
 
   it("is macOS 14, over Electron's own minimum", async () => {
     expect(packagerConfig.extendInfo).toEqual({ LSMinimumSystemVersion: '14.0' });
+    // The update manifest's minimum comes from the same value.
+    expect(require(path.join(REPO, 'scripts', 'macos-minimum.js')).MACOS_MINIMUM).toBe('14.0');
     // The installed packager's own merge, over the template's value.
     const { MacApp } = require(path.join(REPO, 'node_modules', '@electron', 'packager', 'dist', 'mac'));
     const template = { CFBundleExecutable: 'Electron', LSMinimumSystemVersion: '12.0' };
     const merged = await MacApp.prototype.extendPlist.call({}, { ...template }, packagerConfig.extendInfo);
     expect(merged).toEqual({ ...template, LSMinimumSystemVersion: '14.0' });
+  });
+});
+
+describe('the Darwin version of a macOS release', () => {
+  // electron-updater compares os.release(), which is the Darwin version.
+  const darwinVersionOf = (macos: string) => require(path.join(REPO, 'scripts', 'macos-minimum.js')).darwinVersionOf(macos);
+
+  it.each([
+    ['11.0', '20.0.0'],
+    ['14.0', '23.0.0'],
+    ['15.0', '24.0.0'],
+    // The year-numbered release after macOS 15.
+    ['26.0', '25.0.0'],
+  ])('maps macOS %s to Darwin %s', (macos, darwin) => {
+    expect(darwinVersionOf(macos)).toBe(darwin);
+  });
+
+  // A point release's Darwin minor does not follow the macOS one (macOS 13.0
+  // is Darwin 22.1), so only a major release can be a minimum.
+  it.each(['14.1', '14', '10.15', '16.0', 'fourteen'])('refuses %s', (macos) => {
+    expect(() => darwinVersionOf(macos)).toThrow(/macOS/);
   });
 });
 

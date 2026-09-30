@@ -1171,7 +1171,11 @@ const GUEST_DIR = path.join(__dirname, 'build', 'guest');          // -> Resourc
 const DOCKER_CLI_DIR = path.join(__dirname, 'build', 'docker-cli'); // -> Resources/docker-cli/docker
 
 packagerConfig.extraResource.push(VM_HELPER, GUEST_DIR, DOCKER_CLI_DIR);
-packagerConfig.extendInfo = { LSMinimumSystemVersion: '14.0' };
+// MACOS_MINIMUM ('14.0') is in scripts/macos-minimum.js; the update manifest
+// (scripts/generate-latest-mac-yml.js) carries its Darwin version as
+// minimumSystemVersion (23.0.0), so an older install's updater does not offer
+// this release to a Mac on macOS 12 or 13, which could not open it.
+packagerConfig.extendInfo = { LSMinimumSystemVersion: MACOS_MINIMUM };
 
 // The app's own Resources (/localmost.app/Contents/Resources), not a nested
 // helper app's, which also ends in .app/Contents/Resources.
@@ -1255,6 +1259,9 @@ without its VM.
 - `entitlements.virtualization.plist` has exactly one key.
 - `extendInfo.LSMinimumSystemVersion === '14.0'`, and the usage-description
   test's plist fixture says `14.0`.
+- The generated `latest-mac.yml`, run through electron-updater's own
+  `checkIfUpdateSupported` with `os.release()` stubbed, is refused on Darwin
+  21 and 22 (macOS 12 and 13) and offered on Darwin 23 and later.
 - The "ships no entitlements file the signing does not use" test still passes.
 
 ## 8. Fakes for parallel work

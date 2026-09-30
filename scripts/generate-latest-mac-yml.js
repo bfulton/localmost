@@ -17,6 +17,12 @@
  * Any other DMG or zip in the make directory - an Intel (x64) or universal
  * build, or one left from another version - is refused rather than ignored,
  * so that no build but this one is published beside the manifest.
+ *
+ * The manifest also carries minimumSystemVersion, the Darwin version of the
+ * macOS the app's Info.plist requires (scripts/macos-minimum.js). An older
+ * install's updater compares it with os.release() and does not offer the
+ * release to a Mac that could not open it. electron-updater 6.6.2, the
+ * version 0.2.0 shipped, already does.
  */
 
 const fs = require('fs');
@@ -24,6 +30,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 const pkg = require('../package.json');
+const { MACOS_MINIMUM, darwinVersionOf } = require('./macos-minimum');
 const version = pkg.version;
 
 const outDir = process.argv[2] || path.join(__dirname, '..', 'build', 'out', 'make');
@@ -84,6 +91,7 @@ ${files.map(f => `  - url: ${f.url}
     size: ${f.size}`).join('\n')}
 path: ${zip.url}
 sha512: ${zip.sha512}
+minimumSystemVersion: ${darwinVersionOf(MACOS_MINIMUM)}
 releaseDate: '${new Date().toISOString()}'
 `;
 

@@ -4,6 +4,7 @@ const { execSync } = require('child_process');
 const path = require('path');
 const { afterCopyExtraResources: removeUsageDescriptions } = require('./scripts/remove-usage-descriptions');
 const vmResources = require('./scripts/check-vm-resources');
+const { MACOS_MINIMUM } = require('./scripts/macos-minimum');
 
 // Detect signing identities from keychain
 function getSigningIdentities() {
@@ -103,8 +104,9 @@ const packagerConfig = {
     DOCKER_CLI_DIR,
   ],
   // The VM backend needs macOS 14 (design decision 12); Electron's template
-  // says 12.0.
-  extendInfo: { LSMinimumSystemVersion: '14.0' },
+  // says 12.0. The update manifest carries the same minimum
+  // (scripts/macos-minimum.js).
+  extendInfo: { LSMinimumSystemVersion: MACOS_MINIMUM },
   // Electron's template declares camera, microphone, audio capture and
   // Bluetooth usage the app has no entitlement for; extendInfo cannot remove
   // a key, so this hook does. It is the last step before osx-sign, so the

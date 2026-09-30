@@ -41,6 +41,7 @@
 - [ ] `node scripts/generate-latest-mac-yml.js`
   - Needs the arm64 build made, and nothing else in `build/out/make` (it refuses an Intel, universal or other version's DMG or zip); copies the update zip to `build/out/make/localmost-X.Y.Z-arm64-mac.zip`
   - Verify `latest-mac.yml` lists the `-arm64-mac.zip` and `-arm64.dmg` files only, and `path:` names the zip (the in-app updater installs only from a zip)
+  - Verify `latest-mac.yml` has `minimumSystemVersion: 23.0.0`, the Darwin version of the `LSMinimumSystemVersion` above (macOS 14), so the updater on a Mac too old to open the release does not offer it
 
 ## Post-Build
 - [ ] Smoke test basic functionality through installed app:
