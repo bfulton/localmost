@@ -6,7 +6,7 @@ import * as tar from 'tar';
 import { FALLBACK_RUNNER_VERSION } from '../shared/constants';
 import { spawnSandboxed } from './process-sandbox';
 import { getRunnerDir } from './paths';
-import { SHARE_DIR_NAME, SHARE_NONCE_FILE } from './vm/paths';
+import { DOCKER_CONFIG_DIR_NAME, SHARE_DIR_NAME, SHARE_NONCE_FILE } from './vm/paths';
 import {
   killOrphanedProcesses,
   cleanupSandboxDirectories,
@@ -27,8 +27,6 @@ export type ProgressCallback = (progress: DownloadProgress) => void;
 /** The only files buildSandbox takes from an instance's config directory. */
 const SANDBOX_CONFIG_FILES = ['.runner'];
 
-/** The job's DOCKER_CONFIG, in its sandbox and outside the share. */
-export const DOCKER_CONFIG_DIR_NAME = '.docker';
 
 /** Where a runner release is downloaded and extracted before it is used. */
 const ARC_STAGING_PREFIX = 'arc-staging-';

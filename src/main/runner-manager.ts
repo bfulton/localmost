@@ -8,7 +8,7 @@ import * as os from 'os';
 import { StringDecoder } from 'string_decoder';
 import * as yaml from 'js-yaml';
 import type { DockerPolicy } from '../shared/docker-policy';
-import { DesktopBackend, LegacyDockerBackend } from './docker/docker-backend';
+import { DesktopBackend, DockerBackend } from './docker/docker-backend';
 import { DockerFilterProxy } from './docker/docker-filter-proxy';
 import {
   SandboxPolicyLevel, RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
@@ -21,10 +21,11 @@ import { groupHasMembers, sweepInGrace, sweepProcessGroup } from './process-grou
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { GitHubClientError } from './github-client';
 import { RunnerDownloader } from './runner-downloader';
+import { dockerCliPath, DOCKER_CONFIG_DIR_NAME, SHARE_DIR_NAME } from './vm/paths';
 import type { WorkerCredentialFiles } from './worker-credentials';
 import type { BrokerJobTarget } from './broker-proxy-service';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
-import { loadConfig } from './config';
+import { loadConfig, resolveDockerVmConfig, type DockerVmConfig } from './config';
 import { normalizeFilterConfig, isUserAllowed, areAllUsersAllowed, parseRepository } from './runner/user-filter';
 
 /**
@@ -131,6 +132,11 @@ interface RunnerInstance {
   sandboxDir?: string;
   /** The process group this spawn's worker leads, kept after its handle is cleared. */
   groupId?: number;
+  /**
+   * The tripwire this spawn's sandbox holds in `_work/.localmost-share`,
+   * written before the worker starts: its Docker VM must read it back.
+   */
+  shareNonce?: string;
   /** The mark this spawn's profile carries; see createProcessMarker. */
   processMarker?: ProcessMarker;
   /** Set when a claim found the approved policy had moved; the worker stays constrained. */
@@ -288,10 +294,12 @@ interface RunnerManagerOptions {
    * own key never goes into a sandbox, which the job can read.
    */
   issueWorkerCredential?: (instanceNum: number) => Promise<WorkerCredentialFiles | undefined>;
-  /** The daemon a worker's permitted container requests go to. The operator's own by default. */
-  dockerBackend?: LegacyDockerBackend;
-  /** Registry credentials, attached to a pull by the worker's socket so the job never holds them. */
-  attachRegistryAuth?: (registry: string) => string | undefined;
+  /** The daemon a worker's permitted container requests go to: each worker's own Docker VM. */
+  dockerBackend?: DockerBackend;
+  /** The dockerVm settings: the boot timeout and the spare, here. Read at each spawn. */
+  getDockerVmConfig?: () => DockerVmConfig;
+  /** The bundled docker CLI, first on the job's PATH. dockerCliPath() by default. */
+  dockerCli?: string;
 }
 
 /**
@@ -341,8 +349,9 @@ export class RunnerManager {
   // Filtering docker sockets, one per spawn: minted with the worker, bound
   // to its repository's policy on claim, stopped when it exits.
   private dockerProxies: Map<number, DockerFilterProxy> = new Map();
-  private readonly dockerBackend: LegacyDockerBackend;
-  private readonly attachRegistryAuth?: (registry: string) => string | undefined;
+  private readonly dockerBackend: DockerBackend;
+  private readonly getDockerVmConfig: () => DockerVmConfig;
+  private readonly dockerCli: string;
 
   // Flag to track intentional stops vs job completion restarts
   private stopping = false;
@@ -428,7 +437,10 @@ export class RunnerManager {
     this.revokeBrokerUrl = options.revokeBrokerUrl;
     this.issueWorkerCredential = options.issueWorkerCredential;
     this.dockerBackend = options.dockerBackend ?? new DesktopBackend();
-    this.attachRegistryAuth = options.attachRegistryAuth;
+    this.getDockerVmConfig =
+      options.getDockerVmConfig ??
+      (() => resolveDockerVmConfig(undefined, { cores: os.cpus().length, memoryBytes: os.totalmem() }));
+    this.dockerCli = options.dockerCli ?? dockerCliPath();
 
     this.downloader = new RunnerDownloader();
     this.configPath = getConfigPath();
@@ -1137,17 +1149,44 @@ export class RunnerManager {
    * has a socket before it has a job, and default-deny is the state it
    * starts in rather than one set afterwards. Policy is bound on claim.
    */
-  private async startDockerProxy(instanceNum: number, socketPath: string): Promise<DockerFilterProxy> {
+  private async startDockerProxy(
+    instanceNum: number,
+    socketPath: string,
+    sandboxDir: string,
+    shareNonce: string
+  ): Promise<DockerFilterProxy> {
     // A leftover from a spawn that failed after this point.
     await this.stopDockerProxy(instanceNum);
+    const vmConfig = this.getDockerVmConfig();
+    const spawnContext = this.pendingTargetContext.get(String(instanceNum));
+    const log = (entry: { level: 'debug' | 'info' | 'warn'; message: string }) =>
+      this.log(entry.level, `[docker ${instanceNum}] ${entry.message}`);
+    // The worker's daemon: its own Docker VM, booted at the claim when the
+    // claimed job's policy grants Docker (contract §5.4).
+    const worker = this.dockerBackend.forWorker({
+      slot: instanceNum,
+      sandboxDir,
+      sandboxId: path.basename(sandboxDir),
+      shareNonce,
+      spawnRepository: spawnContext ? this.policyRepository(spawnContext) : undefined,
+      // Read when needed: the slot's proxy is reused across its jobs, and its
+      // token rotates at every start and every exit.
+      proxy: () => {
+        const proxy = this.proxyServers.get(instanceNum);
+        return { port: proxy?.getPort() ?? 0, url: proxy?.getProxyUrl() ?? '' };
+      },
+      log,
+    });
     const socket = new DockerFilterProxy({
       backend: this.dockerBackend,
-      attachRegistryAuth: this.attachRegistryAuth,
-      onLog: (entry) => this.log(entry.level, `[docker ${instanceNum}] ${entry.message}`),
+      worker,
+      bootTimeoutMs: vmConfig.bootTimeoutSec * 1000,
+      onLog: log,
     });
     await socket.start(socketPath);
     this.dockerProxies.set(instanceNum, socket);
     this.log('debug', `Docker socket for instance ${instanceNum} listening at ${socketPath}; bound when a job is claimed`);
+    if (vmConfig.prewarm) worker.prewarm();
     return socket;
   }
 
@@ -1224,6 +1263,21 @@ export class RunnerManager {
       return;
     }
     instance.sandboxDir = sandboxDir;
+
+    // The share's tripwire, written before anything runs in the sandbox, so
+    // the Docker VM can prove it was given this directory (contract §1).
+    let shareNonce: string;
+    try {
+      shareNonce = this.downloader.writeShareNonce(sandboxDir);
+      instance.shareNonce = shareNonce;
+    } catch (error) {
+      this.log('error', `Cannot prepare the work folder of instance ${instanceNum}: ${(error as Error).message}`);
+      instance.status = 'error';
+      this.discardSandbox(instanceNum, instance);
+      this.updateAggregateStatus();
+      this.startingInstances.delete(instanceNum);
+      return;
+    }
 
     const runnerBinary = path.join(sandboxDir, 'run.sh');
 
@@ -1403,7 +1457,7 @@ export class RunnerManager {
       // with every job - an earlier job's leftover, whose profile granted the
       // earlier path, cannot connect to it - and it goes with the sandbox.
       const dockerSocketPath = path.join(sandboxDir, DOCKER_SOCKET_NAME);
-      const dockerSocket = await this.startDockerProxy(instanceNum, dockerSocketPath);
+      const dockerSocket = await this.startDockerProxy(instanceNum, dockerSocketPath, sandboxDir, shareNonce);
       // The last wait before the spawn. A stop() in the meantime finalized
       // this instance and took its sandbox to be swept, as a finished
       // spawn's; a worker started there now would lose it as it runs.
@@ -1418,6 +1472,10 @@ export class RunnerManager {
       // being a property of any request the filter can see, so `build:` policy
       // would describe an endpoint a real `docker build` never calls.
       env.DOCKER_BUILDKIT = '0';
+      // The bundled CLI, first on PATH, reading an empty config of the job's
+      // own rather than the operator's ~/.docker.
+      env.DOCKER_CONFIG = path.join(sandboxDir, DOCKER_CONFIG_DIR_NAME);
+      env.PATH = env.PATH ? `${path.dirname(this.dockerCli)}:${env.PATH}` : path.dirname(this.dockerCli);
 
       // Make git hermetic and able to authenticate to this worker's proxy.
       // The sandbox does not grant the user's ~/.gitconfig, and git treats an
@@ -1512,6 +1570,9 @@ export class RunnerManager {
           proxyPort: proxy.getPort(),
           brokerPort: this.brokerPort(),
           dockerSocket: dockerSocketPath,
+          // The Docker VM's share: the job keeps its contents, not the node.
+          shareDir: path.join(sandboxDir, SHARE_DIR_NAME),
+          dockerCli: this.dockerCli,
           toolCacheDir,
           packageCacheDir,
           processMarker,

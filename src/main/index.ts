@@ -244,10 +244,6 @@ app.whenReady().then(async () => {
 
   const runnerManager = new RunnerManager({
     onLog: sendLog,
-    // Resolved here, in the app, where ~/.docker is readable. The job never
-    // sees a credential: the filtering socket attaches this to a pull the
-    // policy already permits, so naming a registry is the whole grant.
-    attachRegistryAuth: (registry: string) => resolveRegistryAuth(registry),
     onStatusChange: sendStatusUpdate,
     onJobHistoryUpdate: sendJobHistoryUpdate,
     // Bind this job to the worker being spawned for it, by its slot (the
@@ -301,7 +297,9 @@ app.whenReady().then(async () => {
     getBrokerPort: () => brokerProxyService.getPort(),
     // Stage 1: approved container requests go to the operator's own daemon.
     // The socket the job sees is localmost's; the daemon's is never handed over.
-    dockerBackend: new DesktopBackend(),
+    // Registry credentials are resolved here, in the app, where ~/.docker is
+    // readable, and attached to a pull the policy already permits.
+    dockerBackend: new DesktopBackend({ registryAuth: (registry: string) => resolveRegistryAuth(registry) }),
     // Apply the policy that was approved, not whatever is in the repository
     // right now. A job only reaches this point once its policy has been
     // approved, and applying the approved copy means an unreviewed change

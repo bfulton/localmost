@@ -23,6 +23,7 @@ jest.mock('./runner-downloader', () => ({
     getConfigDir: jest.fn().mockImplementation((i: number) => `/Users/test/.localmost/runner/config/${i}`),
     getToolCacheDir: jest.fn().mockImplementation((t: string) => `/Users/test/.localmost/runner/caches/${t}/tool-cache`),
     getTargetCacheDir: jest.fn().mockImplementation((t: string) => `/Users/test/.localmost/runner/caches/${t}`),
+    writeShareNonce: jest.fn(() => "a".repeat(32)),
     buildSandbox: jest.fn().mockImplementation((i: number) =>
       Promise.resolve(`/Users/test/.localmost/runner/sandbox/${i}-${(++mockSandboxesBuilt).toString(16).padStart(12, '0')}`)
     ),

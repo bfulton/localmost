@@ -149,7 +149,17 @@ test.describe('a job using docker through the filtering socket', () => {
       socketPath = path.join(scratch, 'docker.sock');
       const captured: DockerFilterProxyLogEntry[] = [];
       logs = captured;
-      proxy = new DockerFilterProxy({ backend, onLog: (entry) => captured.push(entry) });
+      // The worker the runner would make for this socket; the desktop one
+      // forwards to the operator's daemon, and pulls through it.
+      const worker = backend.forWorker({
+        slot: 1,
+        sandboxDir: scratch,
+        sandboxId: '1-000000000000',
+        shareNonce: '',
+        proxy: () => ({ port: 0, url: '' }),
+        log: () => {},
+      });
+      proxy = new DockerFilterProxy({ backend, worker, onLog: (entry) => captured.push(entry) });
       await proxy.start(socketPath);
       proxy.bind(REPOSITORY, policy);
     }

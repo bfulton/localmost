@@ -15,7 +15,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { DockerPolicy, DockerMount, DockerNetworkPolicy, MountMode } from '../../shared/docker-policy';
 import { asciiEscaped, isPlainAscii } from '../../shared/json-keys';
-import type { ApprovedBind } from './docker-backend';
+import type { ApprovedBind, PullRequest } from './docker-backend';
 import {
   DockerRequest, DockerAction, classifyDockerRequest, containerIdFrom, imageRefFrom, mediaTypeOf, networkIdFrom,
 } from './docker-request';
@@ -740,6 +740,59 @@ function evaluatePull(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
     );
   }
   return ALLOW;
+}
+
+/** A repository path by distribution/reference's grammar: lower-case components, slash-separated. */
+const REPOSITORY_PATH = /^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:\/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*$/;
+
+/**
+ * What an allowed pull asks for, read exactly as evaluatePull judged it: the
+ * registry by the daemon's rule (registryOf), the repository path with
+ * Docker Hub's `library/` for a single name, and the tag or digest from
+ * fromImage or, taking precedence as the daemon's does, the tag parameter.
+ * The filter pulls this on the Mac instead of forwarding the request. A
+ * string when the reference cannot be read as one image.
+ */
+export function pullRequestOf(query: Record<string, string>): PullRequest | string {
+  const fromImage = query.fromImage;
+  if (!fromImage) return 'image pull requires fromImage';
+  const { registry, remainder } = splitRegistry(fromImage);
+  let name = remainder;
+  let tag: string | undefined;
+  let digest: string | undefined;
+  const at = name.indexOf('@');
+  if (at !== -1) {
+    digest = name.slice(at + 1);
+    name = name.slice(0, at);
+  } else {
+    const colon = name.lastIndexOf(':');
+    if (colon > name.lastIndexOf('/')) {
+      tag = name.slice(colon + 1);
+      name = name.slice(0, colon);
+    }
+  }
+  const queryTag = queryValue(query, 'tag');
+  if (queryTag !== undefined && queryTag !== '') {
+    if (DIGEST.test(queryTag)) {
+      digest = queryTag;
+      tag = undefined;
+    } else {
+      tag = queryTag;
+    }
+  }
+  if (registry === DEFAULT_REGISTRY && !name.includes('/')) name = `library/${name}`;
+  if (!REPOSITORY_PATH.test(name)) return `"${asciiEscaped(fromImage)}" is not an image name localmost can pull`;
+  if (tag !== undefined && !TAG.test(tag)) return `pull tag "${asciiEscaped(tag)}" is not a tag`;
+  if (digest !== undefined && !DIGEST.test(digest)) return `pull digest "${asciiEscaped(digest)}" is not a digest`;
+  if (tag === undefined && digest === undefined) tag = 'latest';
+  const platform = queryValue(query, 'platform');
+  return {
+    registry,
+    repositoryPath: name,
+    ...(tag !== undefined ? { tag } : {}),
+    ...(digest !== undefined ? { digest } : {}),
+    ...(platform ? { platform } : {}),
+  };
 }
 
 /**

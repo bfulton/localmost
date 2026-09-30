@@ -14,6 +14,7 @@ jest.mock('./runner-downloader', () => ({
   RunnerDownloader: jest.fn().mockImplementation(() => ({
     getToolCacheDir: jest.fn().mockImplementation((targetId: string) => `/Users/test/.localmost/runner/caches/${targetId}/tool-cache`),
     getTargetCacheDir: jest.fn().mockImplementation((targetId: string) => `/Users/test/.localmost/runner/caches/${targetId}`),
+    writeShareNonce: jest.fn(() => "a".repeat(32)),
     buildSandbox: jest.fn().mockImplementation((instance: number) => Promise.resolve(`/Users/test/.localmost/runner/sandbox/${instance}`)),
     removeSandbox: jest.fn().mockResolvedValue(undefined),
     isDownloaded: jest.fn().mockReturnValue(true),
