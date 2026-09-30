@@ -151,6 +151,12 @@ class Vm implements VmHandle {
   /** The data disk's apparent size, promised to this VM. */
   apparentBytes = 0;
   readonly abort = new AbortController();
+  /**
+   * The boot stage in progress. A stop abandons it, but it keeps running -
+   * a mkdir, a clone - so the teardown waits for it before it removes the
+   * VM's directory, or the stage would make it again afterwards.
+   */
+  inflight: Promise<unknown> = Promise.resolve();
   admit!: () => void;
   readonly admitted: Promise<void>;
   readonly readyPromise: Promise<VmReady>;
@@ -271,7 +277,8 @@ export class DefaultVmManager implements VmManager {
   // ---------------------------------------------------------------------------
 
   /** Race a stage against the VM being stopped. */
-  private until<T>(vm: Vm, work: Promise<T>): Promise<T> {
+  private until<T>(vm: Vm, work: Promise<T>, inflight = true): Promise<T> {
+    if (inflight) vm.inflight = work.catch(() => undefined);
     if (vm.abort.signal.aborted) return Promise.reject(new Cancelled());
     return new Promise<T>((resolve, reject) => {
       const onAbort = () => reject(new Cancelled());
@@ -293,7 +300,7 @@ export class DefaultVmManager implements VmManager {
     const began = Date.now();
     let exit: HelperExit | undefined;
     try {
-      await this.until(vm, vm.admitted);
+      await this.until(vm, vm.admitted, false);
       const ready = await this.boot(vm, began);
       vm.status = 'ready';
       vm.resolveReady(ready);
@@ -316,6 +323,7 @@ export class DefaultVmManager implements VmManager {
         vm.rejectReady(failure);
       }
     } finally {
+      await vm.inflight;
       const index = this.queue.indexOf(vm);
       if (index !== -1) this.queue.splice(index, 1);
       if (vm.helper && !vm.helper.hasExited()) {

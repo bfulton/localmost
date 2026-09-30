@@ -301,6 +301,28 @@ describe('DefaultVmManager', () => {
     expect(alive(pid)).toBe(false);
   });
 
+  it('leaves no directory when stopped while a stage is still making it', async () => {
+    // The stage a stop abandons still runs to its end; the teardown waits for
+    // it, or it would make the VM's directory again after it was removed.
+    let excluding!: () => void;
+    const excluded = new Promise<void>((resolve) => (excluding = resolve));
+    let entered!: () => void;
+    const inStage = new Promise<void>((resolve) => (entered = resolve));
+    const m = manager({
+      excludeFromBackup: async () => {
+        entered();
+        await excluded;
+      },
+    });
+    const vm = m.start(jobRequest());
+    await inStage;
+    const stopping = vm.stop('the job was cancelled');
+    excluding();
+    await stopping;
+    expect(fs.existsSync(path.join(layout.data, 'vm', 'jobs', vm.vmId))).toBe(false);
+    expect(spawned).toBe(0);
+  });
+
   describe('a VM that stops after it was ready', () => {
     it('is failed when its helper crashes', async () => {
       const vm = manager().start(jobRequest());
