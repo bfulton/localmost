@@ -80,6 +80,13 @@ export interface VmError extends Error {
   code: string;
 }
 
+/** The helper's `stopped` event (§2.4), or what VmManager saw when the helper exited without one. */
+export interface VmStopped {
+  reason: 'guest' | 'requested' | 'error';
+  /** True only after a `guest` stop in refresh mode whose F_FULLFSYNC of the data disk succeeded. */
+  synced: boolean;
+}
+
 export interface VmHandle {
   readonly vmId: string;
   readonly dockerSocketPath: string;
@@ -88,6 +95,11 @@ export interface VmHandle {
   ready(): Promise<VmReady>;
   agent(): AgentClient;
   stop(reason: string): Promise<void>;
+  /**
+   * Resolves once the VM has stopped, however it stopped, and never rejects.
+   * A refresh promotes its disk only on `synced: true` (§6.5).
+   */
+  stopped(): Promise<VmStopped>;
 }
 
 export interface VmManager {
@@ -186,8 +198,12 @@ export interface CacheDisks {
   /** A clone of the golden disk (clonefile), or a new sparse file when there is none. */
   prepareJobDisk(repoKey: string, dest: string, sizeGiB: number): Promise<'clone' | 'blank'>;
   notePulled(repoKey: string, configDigest: string): void;
-  /** Debounced 60 s, one at a time per repository, skipped on battery or memory pressure. */
-  scheduleRefresh(repoKey: string): void;
+  /**
+   * Debounced 60 s, one at a time per repository, skipped on battery or memory
+   * pressure. `repository` (owner/name) is what StartRefreshVm is given; it
+   * must be the one `repoKey` was made from.
+   */
+  scheduleRefresh(repoKey: string, repository: string): void;
   discard(repoKey: string, reason: 'corrupt' | 'dataFormat' | 'limit'): Promise<void>;
 }
 

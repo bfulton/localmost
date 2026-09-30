@@ -763,6 +763,13 @@ export interface VmHandle {
   ready(): Promise<{ docker: { version: string; apiVersion: string }; rosetta: 'ok' | 'absent' | 'broken'; bootMs: number }>;
   agent(): AgentClient;
   stop(reason: string): Promise<void>;
+  /**
+   * Resolves once the VM has stopped, however it stopped, and never rejects:
+   * the helper's `stopped` event (§2.4), or `{ reason: 'error', synced: false }`
+   * when the helper exited without one. A refresh promotes its disk only on
+   * `synced: true` (§6.5). (Added by WP-D, which needs the flag.)
+   */
+  stopped(): Promise<{ reason: 'guest' | 'requested' | 'error'; synced: boolean }>;
 }
 export interface VmManager {
   sweep(): Promise<void>;
@@ -1043,16 +1050,32 @@ SHA-256 is computed. It is renamed into place only if the digest matches the
 descriptor. Each layer is decompressed (gzip, or zstd through Node's
 `zlib.zstdDecompress`, which needs Node 22.15 or later; Electron 43's Node is
 24.18), and its uncompressed SHA-256 must equal the config's validated
-`diff_ids[i]`. `refs.json` maps `<registry>/<path>:<tag>` and `@<digest>` to
-`{ manifestDigest, configDigest, platform, lastPulled }`, and every value read
-back from it is validated as above. Reading a blob checks its digest again. A
+`diff_ids[i]`. The manifest, the config and (for a multi-platform image) the
+index are stored beside the layers once the whole image has verified, so a
+later pull of the same tag needs only the `HEAD`. `refs.json` is
+`{ "v": 1, "refs": [ … ] }`, one entry per reference and platform, the newest
+replacing an older one:
+`{ ref, platform, manifestDigest, configDigest, indexDigest?, layers: [{ digest, mediaType, size, diffId, uncompressedSize }], lastPulled }`,
+where `ref` is `<registry>/<path>:<tag>` or `<registry>/<path>@<digest>`,
+`platform` matches `linux/(arm64(/vN)?|amd64)`, and `uncompressedSize` is what
+the tar header of §6.4 step 4 states before the bytes. Every value read back
+from it is validated as above, and an entry with any malformed field is
+refused and left out. Reading a blob checks its digest again. A
 blob that fails is deleted, by its validated path, and fetched again. The
 store and the golden disk share `cacheLimitGiB`. When they exceed it, the
-least recently pulled references are dropped at the next refresh.
+least recently pulled references are dropped at the next refresh: until the
+remaining references' blobs plus their estimate on the golden disk (each
+distinct uncompressed layer once) fit, then every blob no remaining reference
+holds is deleted, except blobs a pull in progress has pinned.
 
-**Which store.** After the blobs verify, the puller asks the registry
-anonymously for the same manifest digest (a token exchange with no
-credentials, then a `HEAD`). If the registry serves it, the image is public:
+**Which store.** When the operator's credentials were sent (to the token
+service, or to a registry that asked for basic auth), then once the manifest
+and config are resolved and before any layer is fetched, the puller asks the
+registry anonymously for the same manifest digest (a token exchange with no
+credentials, then a `HEAD`). Asking before the layers, not after, lets them
+stream straight into the store they belong to; the digest asked about is the
+same either way. A pull that sent no credentials is public without asking.
+If the registry serves it, the image is public:
 its blobs go to `<data>/vm/images/<repoKey>` and it becomes eligible for the
 golden disk. If not, its blobs go to `<data>/vm/jobs/<vmId>/blobs` and are
 deleted with the VM, and `notePulled` is not called. (This is option (a) of
@@ -1092,8 +1115,12 @@ The steps:
    `'store'` if all were present).
 4. `POST /images/load` a tar holding `oci-layout`, `index.json` (annotation
    `io.containerd.image.name` = `<registry>/<path>@<manifestDigest>`),
-   `manifest.json` (`RepoTags: null`), `blobs/sha256/<config>` and the
-   *uncompressed* layer tars. *Verified:* a Mac-built archive of this shape
+   `manifest.json` (`RepoTags: null`), `blobs/sha256/<config>`, an OCI
+   manifest over the layers as the archive holds them (media type
+   `application/vnd.oci.image.layer.v1.tar`, digest = diff_id), which the
+   index names, and the *uncompressed* layer tars. The stream is
+   deterministic (fixed order, mtime 0, owner 0), and each layer is checked
+   again as it streams (§6.3). *Verified:* a Mac-built archive of this shape
    loaded, and the image id equalled the config digest.
 5. `POST /images/sha256:<configDigest>/tag?repo=<registry>/<path>&tag=<tag>`.
 6. For a public image only (§6.3 "Which store"): `cacheDisks.notePulled(repoKey, configDigest)`.
@@ -1109,8 +1136,13 @@ export interface CacheDisks {
   /** A clone of the golden disk (clonefile), or a new sparse file when there is none. */
   prepareJobDisk(repoKey: string, dest: string, sizeGiB: number): Promise<'clone' | 'blank'>;
   notePulled(repoKey: string, configDigest: string): void;
-  /** Debounced 60 s, one at a time per repository, skipped on battery or memory pressure. */
-  scheduleRefresh(repoKey: string): void;
+  /**
+   * Debounced 60 s, one at a time per repository, skipped on battery or memory
+   * pressure. `repository` (owner/name) is what StartRefreshVm is given; it must
+   * be the one `repoKey` was made from. (WP-D added it: a refresh VM's
+   * VmRequest needs the repository, which a repoKey cannot give back.)
+   */
+  scheduleRefresh(repoKey: string, repository: string): void;
   discard(repoKey: string, reason: 'corrupt' | 'dataFormat' | 'limit'): Promise<void>;
 }
 
@@ -1120,26 +1152,43 @@ export type StartRefreshVm = (req: { repository: string; repoKey: string }) => V
 
 `CacheDisks` is constructed with a `StartRefreshVm` function. `index.ts`
 passes one that calls `vmManager.start({ mode: 'refresh', slot: 0, … })`.
+The handle it returns must be a slot-0 VM of this `<data>` (`0-<12 hex>`,
+its `docker.sock` where §1 puts it), or the refresh fails.
+
+`prepareJobDisk` clones only with a readable `meta.json` whose `dataFormat`
+is the guest's (a mismatch discards the golden disk), and only a golden disk
+no larger than `sizeGiB`; otherwise it makes a sparse file of `sizeGiB`. The
+destination must be a VM's `data.img` (§1) and must not exist. The clone is
+`clonefile(2)` through `/bin/cp -c`, because Node's `copyFile` cannot clone on
+macOS: its libuv answers `COPYFILE_FICLONE_FORCE` with `ENOSYS` and makes a
+full byte copy for `COPYFILE_FICLONE` (measured with Node 22 on macOS 26).
+Source and destination must be on one volume. Off macOS it is a plain copy.
 
 A refresh does four things:
 
 1. Choose incremental or full. It is **full** (a new blank `data.img.new`)
    when there is no golden disk, when `meta.json`'s `guestVersion` differs
    from the manifest's, when the golden disk was last built from blank more
-   than 7 days ago, or when the previous refresh of this repository failed.
-   Otherwise it is **incremental**: clone `data.img` to `data.img.new`.
+   than 7 days ago, when the previous refresh of this repository failed, or
+   when the cache limit dropped references (an ext4 image does not shrink).
+   Otherwise it is **incremental**: clone `data.img` to `data.img.new`. An
+   incremental refresh with nothing to load starts no VM.
 2. Start a refresh-mode VM on it through `StartRefreshVm` (slot 0, the
    admission gate's lowest priority). Load, through `docker.sock`, every
    public reference in `refs.json` within the limit whose config digest is
    not already in `meta.json` (incremental), or every one (full), streaming
    each archive from the store.
-3. `DELETE` every image whose id is not a config digest from that list, and
-   `shutdown`.
+3. `DELETE` every image whose id is not a config digest from that list,
+   remove every tag, and `shutdown`.
 4. On `stopped` with `synced: true`, rename `data.img.new` over `data.img` and
    update `meta.json` (`dataFormat`, `guestVersion`, the config digests held,
    when it was last built from blank, the last refresh). On any failure,
    delete `data.img.new` and record the failure, so that the next refresh is
-   full.
+   full. A `discard` while a refresh runs means that refresh is not promoted.
+
+`meta.json` is `{ "v": 1, dataFormat, guestVersion, configDigests,
+builtFromBlankAt, lastRefreshAt, lastRefreshFailed }`; one that does not
+validate is treated as absent.
 
 ## 7. Signing and packaging
 
