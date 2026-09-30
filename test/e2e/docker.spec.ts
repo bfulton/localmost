@@ -8,15 +8,8 @@
  * and a wait relay end to end, and that a refusal reaches the CLI as an
  * error it prints. So this runs the commands a workflow step would run.
  *
- * It reaches a real filter one of two ways, so it runs on every leg and never
- * skips:
- *
- *   Outside a job (a developer machine, a GitHub-hosted runner): this file
- *   serves the socket itself, the way RunnerManager does - at the root of a
- *   sandbox directory, bound on claim to the policy, forwarding to the
- *   operator's daemon through the desktop backend on the Mac, and off macOS
- *   to the runner's native dockerd through a test-only worker (owner
- *   decision 3) - and asserts on the proxy's own log as well as on the CLI.
+ * It reaches a real filter one of three ways, so it runs on every leg and
+ * never skips:
  *
  *   Inside a localmost job: the runner already serves the job a filtering
  *   socket bound to this repository's approved .localmostrc, and DOCKER_HOST
@@ -24,8 +17,22 @@
  *   one this file built. The CLI's exit codes and output carry the proof
  *   there, since the production proxy's log is not this process's to read.
  *
- * A missing daemon (outside) or served socket (inside) is a failure naming
- * what to provision. Never a skip, never a fake: the point is the real thing.
+ *   On the Mac, outside a job: this file serves the socket itself, the way
+ *   RunnerManager does - in a worker's sandbox, bound on claim to the policy
+ *   - over the app's own backend: VmBackend and VmManager, with the helper,
+ *   guest and docker CLI that `npm run build:native` leaves in build/. A
+ *   real VM boots at the claim, and the job's pulls are made on the Mac. It
+ *   asserts on the proxy's and the worker's log as well as on the CLI, and
+ *   on the VM: none for a job whose policy has no docker section, one booted
+ *   at the claim for this one, and its directory gone when the job ends.
+ *
+ *   Off macOS (the ubuntu-latest CI leg), where no VM runs: the same, over a
+ *   test-only worker that forwards to the runner's native dockerd and pulls
+ *   through it (owner decision 3). It lives in test/e2e/support and the app
+ *   can never choose it.
+ *
+ * A missing daemon, build or served socket is a failure naming what to
+ * provision. Never a skip, never a fake: the point is the real thing.
  */
 
 import { test, expect } from '@playwright/test';
@@ -33,11 +40,13 @@ import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { DesktopBackend, DockerBackend } from '../../src/main/docker/docker-backend';
+import type { DockerBackend, WorkerDocker } from '../../src/main/docker/docker-backend';
 import { DockerFilterProxy, DockerFilterProxyLogEntry } from '../../src/main/docker/docker-filter-proxy';
-import { resolveDockerEndpoint } from '../../src/shared/docker-access';
+import { shortTempDir } from '../../src/main/test-utils/vm-fixtures';
+import type { VmHandle } from '../../src/main/vm/types';
 import { DockerPolicy } from '../../src/shared/docker-policy';
 import { NATIVE_DAEMON_SOCKET, NativeDockerBackend } from './support/native-worker-docker';
+import type { VmHarness } from './support/vm-worker-docker';
 
 const IMAGE = 'alpine:3';
 
@@ -72,38 +81,51 @@ const findDockerCli = (): string | undefined => {
   }
   return undefined;
 };
-const dockerCli = findDockerCli();
 
 // Inside a localmost job, DOCKER_HOST names a socket the runner serves the job,
 // never the daemon itself; GITHUB_ACTIONS marks a job, as opposed to a
-// developer shell that happens to export DOCKER_HOST.
+// developer shell that happens to export DOCKER_HOST, and localmost runs jobs
+// on macOS only.
 const dockerHost = process.env.DOCKER_HOST;
-const servedSocket = dockerHost?.startsWith('unix://') ? dockerHost.slice('unix://'.length) : undefined;
-const daemonPaths = ['/var/run/docker.sock', path.join(os.homedir(), '.docker', 'run', 'docker.sock')];
-const insideJob =
-  process.env.GITHUB_ACTIONS === 'true' && servedSocket !== undefined && !daemonPaths.includes(servedSocket);
+const hostSocket = dockerHost?.startsWith('unix://') ? dockerHost.slice('unix://'.length) : undefined;
+const insideJob = process.env.GITHUB_ACTIONS === 'true' && process.platform === 'darwin' && hostSocket !== undefined;
+
+type Mode = 'job' | 'vm' | 'native';
+const mode: Mode = insideJob ? 'job' : process.platform === 'darwin' ? 'vm' : 'native';
+
+/** What `npm run build:native` leaves in build/, which the Mac mode runs on, as a packaged app runs on Resources. */
+const vmResources = path.resolve(__dirname, '..', '..', 'build');
+const vmBuild = {
+  helper: path.join(vmResources, 'localmost-vm'),
+  guest: path.join(vmResources, 'guest', 'manifest.json'),
+  cli: path.join(vmResources, 'docker-cli', 'docker'),
+};
 
 /** Off macOS, the runner's own daemon: where DOCKER_HOST points, if anywhere, else the usual socket. */
-const nativeSocket = servedSocket ?? NATIVE_DAEMON_SOCKET;
+const nativeSocket = hostSocket ?? NATIVE_DAEMON_SOCKET;
 
-const endpoint = insideJob
-  ? null
-  : process.platform === 'darwin'
-    ? resolveDockerEndpoint()
-    : fs.existsSync(nativeSocket)
-      ? { socketPath: nativeSocket }
-      : null;
+/** The job's docker: the bundled CLI on the Mac, as the app puts it first on a job's PATH, else the one on PATH. */
+const dockerCli = mode === 'vm' ? vmBuild.cli : findDockerCli();
 
 /** What is missing to run this for real, if anything. Reported as a failure, never a skip. */
-const missingReason = !dockerCli
-  ? 'no docker CLI on PATH to drive the socket with. Install Docker where these tests run.'
-  : insideJob
-    ? fs.existsSync(servedSocket!)
+const missingReason = ((): string | null => {
+  if (mode === 'vm') {
+    const missing = Object.values(vmBuild).filter((file) => !fs.existsSync(file));
+    return missing.length === 0
       ? null
-      : `DOCKER_HOST names ${servedSocket}, but nothing is served there. The runner serves a job its docker socket only once the repository's docker policy is approved.`
-    : endpoint
+      : `the VM backend's build is missing: ${missing.map((file) => path.relative(process.cwd(), file)).join(', ')}. ` +
+          'Run npm run build:native first; on the Mac this suite boots a real Docker VM from build/.';
+  }
+  if (!dockerCli) return 'no docker CLI on PATH to drive the socket with. Install Docker where these tests run.';
+  if (mode === 'job') {
+    return fs.existsSync(hostSocket!)
       ? null
-      : 'no Docker daemon: found no daemon socket. Install and start Docker where these tests run.';
+      : `DOCKER_HOST names ${hostSocket}, but nothing is served there. The runner serves a job its docker socket only once the repository's docker policy is approved.`;
+  }
+  return fs.existsSync(nativeSocket)
+    ? null
+    : `no Docker daemon at ${nativeSocket}. Install and start Docker where these tests run.`;
+})();
 
 interface Run {
   code: number | null;
@@ -112,6 +134,9 @@ interface Run {
 }
 
 test.describe('a job using docker through the filtering socket', () => {
+  // A real VM boots at the claim, and the first pull fetches from a registry.
+  test.describe.configure({ timeout: mode === 'vm' ? 180_000 : 60_000 });
+
   // First, and never skipped: the suite runs against real Docker or it fails
   // saying what to provision. A green run here means a real job actually worked.
   test('has a real Docker daemon and CLI to drive, rather than skipping', () => {
@@ -128,6 +153,11 @@ test.describe('a job using docker through the filtering socket', () => {
   const nonce = `hello-${process.pid}-${Date.now()}`;
   const network = `localmost-e2e-${process.pid}`;
 
+  /** The Mac mode's VMs; and how many the backend had asked for just before and just after the claim. */
+  let vms: VmHarness | undefined;
+  let startedBeforeClaim = -1;
+  let startedAtClaim = -1;
+
   // A real directory outside any workspace, so the refusal is "outside the job
   // workspace" rather than "cannot be resolved". Stands in for ~/.ssh.
   const outside = '/etc';
@@ -137,52 +167,75 @@ test.describe('a job using docker through the filtering socket', () => {
     // a confusing consequence (a proxy with no endpoint, a spawn of no CLI).
     if (missingReason) throw new Error(missingReason);
 
-    // Short prefix: a socket path is capped at 104 bytes and tmpdir is long.
-    scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'localmost-e2e-'));
-
     let socketPath: string;
-    if (insideJob) {
-      socketPath = servedSocket!;
+    let dockerConfig: string;
+    if (mode === 'job') {
+      // Short prefix: a socket path is capped at 104 bytes and tmpdir is long.
+      scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'localmost-e2e-'));
+      socketPath = hostSocket!;
       // Inside the job's own checkout, which the production proxy roots mounts
       // at; a declared "./" permits any path below it, at or below its mode.
       jobWorkspace = fs.mkdtempSync(path.join(process.cwd(), '.docker-e2e-'));
       workspace = fs.realpathSync.native(jobWorkspace);
+      dockerConfig = path.join(scratch, 'docker-config');
+      fs.mkdirSync(dockerConfig);
     } else {
-      // No VM runs off macOS: there the worker forwards to the runner's own
-      // dockerd, and the app never chooses it (owner decision 3).
-      const backend: DockerBackend =
-        process.platform === 'darwin' ? new DesktopBackend() : new NativeDockerBackend(nativeSocket);
+      const captured: DockerFilterProxyLogEntry[] = [];
+      logs = captured;
+      let backend: DockerBackend;
+      let worker: WorkerDocker;
+      let sandboxDir: string;
+      if (mode === 'vm') {
+        // <data> as short as the temp directory allows: a VM's sockets are
+        // 35 or 36 bytes below it, and a socket path fits in 103.
+        scratch = shortTempDir();
+        // Loaded only here: it builds on the VM backend's modules, the puller
+        // among them, and stands in Electron's API for them, none of which
+        // the other modes use.
+        const { VmHarness } = require('./support/vm-worker-docker') as typeof import('./support/vm-worker-docker');
+        vms = await VmHarness.create(scratch, vmResources, (level, message) =>
+          captured.push({ level: level === 'error' ? 'warn' : level, message: `[vm manager] ${message}` })
+        );
+        const sandbox = vms.newSandbox(1);
+        sandboxDir = sandbox.sandboxDir;
+        backend = vms.backend;
+        worker = vms.forWorker(1, sandbox, (entry) => captured.push(entry));
+        dockerConfig = path.join(sandboxDir, '.docker');
+      } else {
+        // Short prefix: a socket path is capped at 104 bytes and tmpdir is long.
+        scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'localmost-e2e-'));
+        sandboxDir = scratch;
+        backend = new NativeDockerBackend(nativeSocket);
+        worker = backend.forWorker({
+          slot: 1,
+          sandboxDir,
+          sandboxId: '1-000000000000',
+          shareNonce: '',
+          proxy: () => ({ port: 0, url: '' }),
+          log: (entry) => captured.push(entry),
+        });
+        dockerConfig = path.join(scratch, 'docker-config');
+        fs.mkdirSync(dockerConfig);
+      }
       // The checkout the backend roots mounts at, for the repository this
       // socket is bound to below: the runner lays it out as
       // _work/<repo>/<repo>, and declared paths resolve against it. Resolved
       // as the daemon sees it, since tmpdir is under /var, a symlink.
-      const workDir = backend.workspaceMountRoot(scratch, REPOSITORY);
+      const workDir = backend.workspaceMountRoot(sandboxDir, REPOSITORY);
       fs.mkdirSync(workDir, { recursive: true });
       workspace = fs.realpathSync.native(workDir);
 
-      socketPath = path.join(scratch, 'docker.sock');
-      const captured: DockerFilterProxyLogEntry[] = [];
-      logs = captured;
-      // The worker the runner would make for this socket; each of these
-      // forwards to its daemon, and pulls through it.
-      const worker = backend.forWorker({
-        slot: 1,
-        sandboxDir: scratch,
-        sandboxId: '1-000000000000',
-        shareNonce: '',
-        proxy: () => ({ port: 0, url: '' }),
-        log: () => {},
-      });
+      socketPath = path.join(sandboxDir, 'docker.sock');
       proxy = new DockerFilterProxy({ backend, worker, onLog: (entry) => captured.push(entry) });
       await proxy.start(socketPath);
+      startedBeforeClaim = vms?.started.length ?? -1;
       proxy.bind(REPOSITORY, policy);
+      startedAtClaim = vms?.started.length ?? -1;
     }
     fs.writeFileSync(path.join(workspace, 'hello.txt'), `${nonce}\n`);
 
     // The job's environment: the served socket, and a docker config of its
     // own so the operator's contexts and credential helpers play no part.
-    const dockerConfig = path.join(scratch, 'docker-config');
-    fs.mkdirSync(dockerConfig);
     env = {
       PATH: process.env.PATH,
       HOME: process.env.HOME,
@@ -194,16 +247,17 @@ test.describe('a job using docker through the filtering socket', () => {
 
   test.afterAll(async () => {
     // Before the proxy stops, and tolerant of a test that already removed it.
-    if (env) await docker('network', 'rm', network).catch(() => undefined);
+    if (env && mode !== 'vm') await docker('network', 'rm', network).catch(() => undefined);
     await proxy?.stop();
+    await vms?.shutdown();
     if (scratch) fs.rmSync(scratch, { recursive: true, force: true });
     if (jobWorkspace) fs.rmSync(jobWorkspace, { recursive: true, force: true });
   });
 
   /** Run the docker CLI as the job, reporting the exit code rather than throwing on it. */
-  const docker = (...args: string[]): Promise<Run> =>
+  const dockerWith = (jobEnv: NodeJS.ProcessEnv, ...args: string[]): Promise<Run> =>
     new Promise((resolve, reject) => {
-      const child = spawn(dockerCli!, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
+      const child = spawn(dockerCli!, args, { env: jobEnv, stdio: ['ignore', 'pipe', 'pipe'] });
       let stdout = '';
       let stderr = '';
       child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString()));
@@ -211,10 +265,61 @@ test.describe('a job using docker through the filtering socket', () => {
       child.on('error', reject);
       child.on('close', (code) => resolve({ code, stdout, stderr }));
     });
+  const docker = (...args: string[]): Promise<Run> => dockerWith(env, ...args);
 
   /** The socket's log entries since a point in the test, when this file serves it. */
   const mark = (): number => logs?.length ?? 0;
   const logsSince = (at: number): DockerFilterProxyLogEntry[] => (logs ?? []).slice(at);
+
+  /** The VM booted for this job at the claim. */
+  const claimedVm = (): VmHandle => vms!.started[0];
+
+  if (mode === 'vm') {
+    test('boots no VM for a job whose policy has no docker section, and answers it from the guest', async () => {
+      // A second worker, claimed for a job whose policy grants nothing: its
+      // socket is served and bound, as every worker's is, and nothing boots.
+      const sandbox = vms!.newSandbox(2);
+      const socketPath = path.join(sandbox.sandboxDir, 'docker.sock');
+      const entries: DockerFilterProxyLogEntry[] = [];
+      const worker = vms!.forWorker(2, sandbox, (entry) => entries.push(entry));
+      const other = new DockerFilterProxy({ backend: vms!.backend, worker, onLog: (entry) => entries.push(entry) });
+      await other.start(socketPath);
+      try {
+        const before = vms!.started.length;
+        other.bind(REPOSITORY, {});
+        const otherEnv = { ...env, DOCKER_HOST: `unix://${socketPath}`, DOCKER_CONFIG: path.join(sandbox.sandboxDir, '.docker') };
+
+        // The CLI still starts: the baseline comes from the guest's manifest.
+        const version = await dockerWith(otherEnv, 'version', '--format', '{{.Server.Os}}/{{.Server.Arch}}');
+        expect(version.code, version.stderr).toBe(0);
+        expect(version.stdout.trim()).toBe('linux/arm64');
+        const run = await dockerWith(otherEnv, 'run', '--rm', IMAGE, 'true');
+        expect(run.code).not.toBe(0);
+
+        expect(vms!.started.length).toBe(before);
+        expect(entries.filter((l) => /Docker VM .* booting/.test(l.message))).toEqual([]);
+      } finally {
+        await other.stop();
+      }
+    });
+
+    test("boots the job's own VM at the claim, and none before it", async () => {
+      expect([startedBeforeClaim, startedAtClaim]).toEqual([0, 1]);
+      const vm = claimedVm();
+      expect(vm.vmId).toMatch(/^1-[0-9a-f]{12}$/);
+      expect(logs!.some((l) => l.message === `Docker VM ${vm.vmId} booting for ${REPOSITORY} at the claim`)).toBe(true);
+      const ready = await vm.ready();
+      expect(ready.docker.apiVersion).toMatch(/^1\.\d+$/);
+      expect(fs.existsSync(vms!.vmDir(vm))).toBe(true);
+    });
+  } else {
+    test('checks the Docker VM on the Mac, outside a job, where one can boot', () => {
+      // Inside a job the VM is the installed app's, which this process cannot
+      // see; off macOS there is none (owner decision 3). The Mac mode above
+      // is where the VM's own checks run.
+      expect(mode === 'job' ? insideJob : process.platform !== 'darwin').toBe(true);
+    });
+  }
 
   test('pulls the declared image and runs it with the declared read-only workspace mount', async () => {
     const at = mark();
@@ -232,12 +337,21 @@ test.describe('a job using docker through the filtering socket', () => {
     // through the runner's filter.
     if (logs) {
       const since = logsSince(at);
-      // A pull is never forwarded: the worker pulls it (the desktop one
-      // through the daemon, the VM one on the Mac).
+      // A pull is never forwarded: the worker pulls it (the VM's on the Mac,
+      // the native one through its daemon).
       expect(since.some((l) => /pulled POST \/images\/create through the worker/.test(l.message))).toBe(true);
       expect(since.some((l) => /forwarded POST \/images\/create/.test(l.message))).toBe(false);
       expect(since.some((l) => /forwarded POST \/containers\/create/.test(l.message))).toBe(true);
       expect(since.filter((l) => /^(denied|refused) /.test(l.message))).toEqual([]);
+    }
+    if (mode === 'vm') {
+      // Made on the Mac, where the credentials are, and loaded into this job's VM.
+      const pulled = new RegExp(
+        String.raw`^pulled docker\.io/library/alpine:3 \(sha256:[0-9a-f]{64}, linux/arm64[^)]*\) on the Mac; (loaded into|already in) VM ` +
+          claimedVm().vmId +
+          '$'
+      );
+      expect(logsSince(at).filter((l) => pulled.test(l.message))).toHaveLength(1);
     }
   });
 
@@ -299,9 +413,9 @@ test.describe('a job using docker through the filtering socket', () => {
     // The arrangement a job needs to seal a run: the agent sits alone on an
     // internal network with no route anywhere, and a broker container joins
     // both that network and a routable one, so it is the only way out. On
-    // macOS the internal network's gateway lives inside Docker Desktop's VM
-    // and cannot be bound from the host at all, so a host-side broker is not
-    // an option - this is the portable shape.
+    // macOS the internal network's gateway lives inside the job's VM and
+    // cannot be bound from the host at all, so a host-side broker is not an
+    // option - this is the portable shape.
     //
     // Both names have to pass: one arrives as HostConfig.NetworkMode, the
     // other as NetworkingConfig.EndpointsConfig, and until they were held to
@@ -351,4 +465,20 @@ test.describe('a job using docker through the filtering socket', () => {
       expect(logsSince(at).some((l) => /denied POST \/networks\/create/.test(l.message))).toBe(true);
     }
   });
+
+  if (mode === 'vm') {
+    // Last: the job ends, as a worker's exit ends it, and its VM goes with it.
+    test("releases the job's VM when the job ends, and its directory goes with it", async () => {
+      const vm = claimedVm();
+      const at = mark();
+
+      await proxy!.stop();
+
+      expect(vm.state()).toBe('stopped');
+      expect(fs.existsSync(vms!.vmDir(vm))).toBe(false);
+      expect(logsSince(at).some((l) => l.message === `Docker VM ${vm.vmId} released: the job ended`)).toBe(true);
+      // Not a failure: the stop was the job's end, asked for.
+      expect(vm.failure()).toBeUndefined();
+    });
+  }
 });

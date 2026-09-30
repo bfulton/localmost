@@ -6,7 +6,7 @@
  * like "loopback only" and matches a connection to anywhere. So the profiles
  * are applied with sandbox-exec and a real process tries what a step would.
  *
- * As in docker-access.sandbox.test.ts, which mode applies depends on whether
+ * As in every *.sandbox.test.ts, which mode applies depends on whether
  * this process is already inside a sandbox:
  *
  *   constructed  On an unsandboxed machine, build a profile and apply it with

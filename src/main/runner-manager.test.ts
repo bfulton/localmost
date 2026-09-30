@@ -89,6 +89,7 @@ import { DockerPolicy } from '../shared/docker-policy';
 import { spawnSandboxed } from './process-sandbox';
 import { DockerFilterProxy } from './docker/docker-filter-proxy';
 import { dockerCliPath } from './vm/paths';
+import { NO_DAEMON_MESSAGE, noDockerBackend } from './docker/docker-backend';
 import type { DockerBackend, WorkerContext, WorkerDocker } from './docker/docker-backend';
 import type { DockerVmConfig } from './config';
 
@@ -2905,6 +2906,25 @@ describe('RunnerManager', () => {
       expect(ctx.proxy()).toEqual({ port: 12345, url: expect.stringMatching(/^http:\/\/localmost:[0-9a-f]+@127\.0\.0\.1:12345$/) });
       // No spare unless dockerVm.prewarm says so.
       expect(worker.prewarm).not.toHaveBeenCalled();
+    });
+
+    it('serves a worker no daemon at all when the runner was given no backend', async () => {
+      // Never a fallback to the operator's own daemon (owner decision 3).
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+      });
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+
+      await new RunnerManagerTestHelper(manager).spawnForJob({ targetId: 't1', targetDisplayName: 'Owner/Repo' });
+
+      const socket = dockerSocketOf(new RunnerManagerTestHelper(manager), 1);
+      expect(socket.options.backend).toBe(noDockerBackend);
+      const worker = socket.options.worker as WorkerDocker;
+      worker.bind('Owner/Repo', { run: { images: ['alpine:3'] } });
+      expect(await worker.endpoint(1000)).toEqual({ kind: 'none', reason: NO_DAEMON_MESSAGE });
     });
 
     it('gives the job the bundled CLI first on its PATH, an empty config of its own, the share rules and the helper deny', async () => {

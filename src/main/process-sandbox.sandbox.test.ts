@@ -7,7 +7,7 @@
  * worker spawn - or that a process under them is kept out of the shared temp
  * directories, the user's toolchain trees, the app's own data, other
  * processes and loopback services it was not granted, whatever spelling a
- * future rule takes. So the same two modes as the docker isolation test:
+ * future rule takes. So two modes, as every *.sandbox.test.ts has:
  *
  *   constructed  On an unsandboxed machine, build the runner profile and
  *                apply it with sandbox-exec. Tests both directions: what the
