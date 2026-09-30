@@ -489,6 +489,22 @@ export function developerCredentialPaths(home: string = os.homedir()): { subpath
 }
 
 /**
+ * The credentials of developerCredentialPaths as seatbelt filters for a deny,
+ * each in every spelling it could be matched by (see policyDenySpellings):
+ * as written and by its real path. seatbelt matches the path a link resolves
+ * to, and dotfile managers link ~/.aws to ~/dotfiles/aws, or a single file
+ * such as ~/.m2/settings-security.xml; written alone, the deny held nothing
+ * against a job reading through the link, or granted what it resolves to.
+ */
+export function developerCredentialFilters(home: string = os.homedir()): string[] {
+  const { subpaths, literals } = developerCredentialPaths(home);
+  return [...new Set([
+    ...subpaths.flatMap((dir) => policyDenyFilters(dir)),
+    ...literals.flatMap((file) => policyDenySpellings(file).spellings.map((spelling) => `(literal "${escapePath(spelling)}")`)),
+  ])];
+}
+
+/**
  * The directories above what is never reachable, as (literal ...) filters
  * for a write deny, in each spelling seatbelt could match them by, up to but
  * not including /. The denies match paths, so a job or step granted write on
@@ -522,14 +538,12 @@ export function neverReachableAncestors(entries: string[]): string[] {
 function neverReachablePaths(): { subpaths: string[]; literals: string[] } {
   const home = os.homedir();
   const credentials = developerCredentialPaths(home);
-  return {
-    subpaths: [
-      ...appDataDirs(),
-      path.join(home, 'Library', 'Application Support', 'localmost'),
-      ...credentials.subpaths,
-    ],
-    literals: credentials.literals,
-  };
+  return { subpaths: [...appDataPaths(home), ...credentials.subpaths], literals: credentials.literals };
+}
+
+/** The app's own data: its data directories and its Electron data directory. */
+function appDataPaths(home: string): string[] {
+  return [...appDataDirs(), path.join(home, 'Library', 'Application Support', 'localmost')];
 }
 
 /** Whether a path is one no policy can grant, so discovery never suggests it. */
@@ -541,8 +555,8 @@ function isNeverReachable(p: string): boolean {
 function neverReachableRules(escapedWorkDir: string, readOnlyPaths: string[] = []): string[] {
   const { subpaths, literals } = neverReachablePaths();
   const entries = [
-    ...subpaths.map((p) => `  (subpath "${escapePath(p)}")`),
-    ...literals.map((p) => `  (literal "${escapePath(p)}")`),
+    ...appDataPaths(os.homedir()).map((p) => `  (subpath "${escapePath(p)}")`),
+    ...developerCredentialFilters().map((filter) => `  ${filter}`),
   ];
   entries[entries.length - 1] += ')';
   const nodes = neverReachableAncestors([...subpaths, ...literals]).map((node) => `  ${node}`);

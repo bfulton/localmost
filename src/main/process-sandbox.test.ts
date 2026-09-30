@@ -280,11 +280,13 @@ describe('Process Sandbox', () => {
   /**
    * Build runner profiles for each set of sandbox options in turn, within one
    * load of the module, and return their text. `getconf` answers the per-user
-   * temp directory lookup, or throws.
+   * temp directory lookup, or throws; `fsExtra` adds to or replaces the mocked
+   * fs, to stand links in, say.
    */
   const profilesWith = (
     optionSets: Record<string, unknown>[],
-    getconf: () => string = () => '/var/folders/zz/zyxw_vut0000gn/T/\n'
+    getconf: () => string = () => '/var/folders/zz/zyxw_vut0000gn/T/\n',
+    fsExtra: Record<string, unknown> = {}
   ): string[] => {
     let profiles: string[] = [];
     jest.isolateModules(() => {
@@ -299,6 +301,7 @@ describe('Process Sandbox', () => {
         unlinkSync: jest.fn(),
         mkdirSync: jest.fn(),
         realpathSync: jest.fn((p: string) => p),
+        ...fsExtra,
       }));
 
       const { spawnSandboxed: sandboxedSpawn } = require('./process-sandbox');
@@ -587,6 +590,35 @@ describe('Process Sandbox', () => {
         }
       }
     );
+
+    it('keeps a credential linked into place closed by the path the link resolves to, and the directories above both', () => {
+      // Dotfile managers link ~/.aws to ~/dotfiles/aws; a cache is moved to
+      // another volume and linked back. seatbelt matches the path a link
+      // resolves to, so the floor written as ~/.aws alone held nothing there.
+      const home = (...parts: string[]) => path.join(homeDir, ...parts);
+      const links: Record<string, string> = { [home('.aws')]: 'dotfiles/aws', [home('.m2')]: '/opt/cache/m2' };
+      const grants = ['~', '/opt/cache'];
+      const [profile] = profilesWith([{ filesystemPolicy: { level: 'strict', read: grants, write: grants } }], undefined, {
+        lstatSync: jest.fn((p: string) => ({ isSymbolicLink: () => p in links })),
+        readlinkSync: jest.fn((p: string) => links[p]),
+      });
+      for (const credential of [
+        home('dotfiles', 'aws', 'credentials'),
+        '/opt/cache/m2/settings.xml',
+        '/opt/cache/m2/settings-security.xml',
+      ]) {
+        expect(readable(profile, credential)).toBe(false);
+        expect(writable(profile, credential)).toBe(false);
+      }
+      for (const node of [
+        home('dotfiles', 'aws'), home('dotfiles'), home('.aws'), home('.m2'), '/opt/cache/m2', '/opt/cache', '/opt', homeDir,
+      ]) {
+        expect(writable(profile, node)).toBe(false);
+      }
+      // Nodes, not subtrees: what the grants give beside them stays given.
+      expect(writable(profile, home('dotfiles', 'zsh', 'zshrc'))).toBe(true);
+      expect(writable(profile, '/opt/cache/m2/repository/x.jar')).toBe(true);
+    });
 
     it.each(['strict', 'moderate', 'permissive'] as const)(
       'grants no shared temp directory as a whole under %s',

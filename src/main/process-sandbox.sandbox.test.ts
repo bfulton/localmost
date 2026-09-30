@@ -463,7 +463,6 @@ if (!isMacOS) {
       // are where a user's machine has them, inside it. Each credential holds
       // a marker that must never reach the job's output.
       let home: string;
-      let instance: string;
       const credentials: Record<string, string> = {
         '.ssh/id_ed25519': 'SECRET-ssh',
         '.netrc': 'SECRET-netrc',
@@ -473,32 +472,55 @@ if (!isMacOS) {
         '.nuget/NuGet/NuGet.Config': 'SECRET-nuget',
         'Library/Keychains/login.keychain-db': 'SECRET-keychain',
       };
+      // Credentials kept in a dotfiles repository and linked into place, as
+      // GNU stow and the like do it: a directory and a single file.
+      const linkedCredentials: Record<string, string> = {
+        'dotfiles/aws/credentials': 'SECRET-aws',
+        'dotfiles/m2/settings-security.xml': 'SECRET-maven-security',
+      };
+      const links: Record<string, string> = {
+        '.aws': 'dotfiles/aws',
+        '.m2/settings-security.xml': '../dotfiles/m2/settings-security.xml',
+      };
+
+      /** The job's sandbox under a stand-in home. */
+      const instanceIn = (at: string) => path.join(at, '.localmost', 'runner', 'sandbox', '1');
+
+      /** A stand-in home with nothing in it but the app's own directories. */
+      const makeHome = (at: string) => {
+        for (const dir of [path.join(instanceIn(at), '_temp'), path.join(at, 'Library', 'Application Support', 'localmost')]) {
+          fs.mkdirSync(dir, { recursive: true });
+        }
+      };
 
       beforeAll(() => {
         home = path.join(base, 'home');
-        instance = path.join(home, '.localmost', 'runner', 'sandbox', '1');
-        for (const dir of [path.join(instance, '_temp'), path.join(home, 'Library', 'Application Support', 'localmost'),
-          path.join(home, '.gradle', 'caches'), path.join(home, '.gradle', 'wrapper')]) {
+        makeHome(home);
+        for (const dir of [path.join(home, '.gradle', 'caches'), path.join(home, '.gradle', 'wrapper')]) {
           fs.mkdirSync(dir, { recursive: true });
         }
-        for (const [file, content] of Object.entries(credentials)) {
+        for (const [file, content] of Object.entries({ ...credentials, ...linkedCredentials })) {
           fs.mkdirSync(path.dirname(path.join(home, file)), { recursive: true });
           fs.writeFileSync(path.join(home, file), content);
         }
+        for (const [link, target] of Object.entries(links)) fs.symlinkSync(target, path.join(home, link));
         fs.writeFileSync(path.join(home, 'notes.txt'), 'notes');
       });
 
-      /** A runner for shell commands in the job at `instance`, its profile built with `home` as the home directory. */
-      const underGrant = (filesystemPolicy: RunnerProfileOptions['filesystemPolicy']) => {
+      /**
+       * A runner for shell commands in the job at `at`'s sandbox, its profile
+       * built with `at` - by default `home` - as the home directory.
+       */
+      const underGrant = (filesystemPolicy: RunnerProfileOptions['filesystemPolicy'], at: string = home) => {
         const savedConfig = process.env.LOCALMOST_CONFIG_DIR;
         const getPath = jest.mocked(app.getPath);
         const previousUserData = app.getPath('userData');
-        jest.mocked(os.homedir).mockReturnValue(home);
-        process.env.LOCALMOST_CONFIG_DIR = path.join(home, '.localmost');
-        getPath.mockReturnValue(path.join(home, 'Library', 'Application Support', 'localmost'));
+        jest.mocked(os.homedir).mockReturnValue(at);
+        process.env.LOCALMOST_CONFIG_DIR = path.join(at, '.localmost');
+        getPath.mockReturnValue(path.join(at, 'Library', 'Application Support', 'localmost'));
         let profile: string;
         try {
-          profile = generateSandboxProfile({ instanceDir: instance, filesystemPolicy });
+          profile = generateSandboxProfile({ instanceDir: instanceIn(at), filesystemPolicy });
         } finally {
           jest.mocked(os.homedir).mockImplementation(realHomedir);
           if (savedConfig === undefined) delete process.env.LOCALMOST_CONFIG_DIR;
@@ -507,7 +529,7 @@ if (!isMacOS) {
         }
         const profilePath = path.join(base, `${probeName()}.sb`);
         fs.writeFileSync(profilePath, profile);
-        const env = { PATH: '/usr/bin:/bin', HOME: home, TMPDIR: path.join(instance, '_temp') };
+        const env = { PATH: '/usr/bin:/bin', HOME: at, TMPDIR: path.join(instanceIn(at), '_temp') };
         return (command: string) => shell(command, profilePath, env);
       };
 
@@ -526,8 +548,11 @@ if (!isMacOS) {
       };
 
       afterAll(() => {
-        for (const [file, content] of Object.entries(credentials)) {
+        for (const [file, content] of Object.entries({ ...credentials, ...linkedCredentials })) {
           expect(fs.readFileSync(path.join(home, file), 'utf-8')).toBe(content);
+        }
+        for (const [link, target] of Object.entries(links)) {
+          expect(fs.readlinkSync(path.join(home, link))).toBe(target);
         }
       });
 
@@ -577,6 +602,55 @@ if (!isMacOS) {
         }
         // Nor written in place: an authorized key or an SSH config is a way in.
         expect(canCreate(run, path.join(home, '.ssh', 'authorized_keys'))).toBe(false);
+      });
+
+      it('a write grant cannot reach a credential linked into place, by the path the link resolves to', () => {
+        // Dotfile managers link ~/.aws to ~/dotfiles/aws, and a single file
+        // such as ~/.m2/settings-security.xml the same way. seatbelt matches
+        // the path a link resolves to, so a floor written as ~/.aws alone
+        // held nothing there: the job read the credential through the link.
+        const run = underGrant({ level: 'strict', read: ['~'], write: ['~'] });
+        // The grant is in force beside them, so each refusal below is the floor's doing.
+        expect(canCreateUnder(run, path.join(home, 'dotfiles', 'other'))).toBe(true);
+        for (const file of ['.aws/credentials', 'dotfiles/aws/credentials', '.m2/settings-security.xml',
+          'dotfiles/m2/settings-security.xml']) {
+          expect(run(`/bin/cat '${path.join(home, file)}'`).stdout).not.toContain('SECRET');
+        }
+        for (const [from, to, shown] of [
+          ['dotfiles/aws/credentials', 'dotfiles/aws/renamed', ''],
+          ['dotfiles/aws', 'dotfiles/aws-renamed', 'credentials'],
+          ['dotfiles', 'dotfiles-renamed', path.join('aws', 'credentials')],
+          ['.aws', '.aws-renamed', 'credentials'],
+          ['dotfiles/m2/settings-security.xml', 'dotfiles/m2/renamed', ''],
+          ['dotfiles/m2', 'dotfiles/m2-renamed', 'settings-security.xml'],
+          ['.m2/settings-security.xml', '.m2/renamed', ''],
+        ]) {
+          expectNoRenameIntoView(run, from, to, shown);
+        }
+      });
+
+      it('a write grant cannot create a missing directory above a credential, which the user creates instead', () => {
+        // Missing, ~/.gradle is still closed as a node: a link a job planted
+        // there would carry the gradle.properties your own Gradle writes later
+        // wherever the link points. So a grant of ~/.gradle writes in it only
+        // once it exists.
+        const fresh = path.join(base, 'fresh-home');
+        makeHome(fresh);
+        const gradle = underGrant({ level: 'strict', read: ['~/.gradle'], write: ['~/.gradle'] }, fresh);
+        const whole = underGrant({ level: 'strict', read: ['~'], write: ['~'] }, fresh);
+        expect(canCreateUnder(whole, path.join(fresh, 'elsewhere'))).toBe(true);
+        expect(gradle(`/bin/mkdir -p '${path.join(fresh, '.gradle', 'caches')}'`).ok).toBe(false);
+        for (const dir of ['.gradle', '.m2', '.cargo', '.nuget']) {
+          const target = path.join(fresh, dir);
+          expect(whole(`/bin/mkdir '${target}'`).ok).toBe(false);
+          expect(whole(`/bin/ln -s '${path.join(fresh, 'elsewhere')}' '${target}'`).ok).toBe(false);
+          const planted = fs.lstatSync(target, { throwIfNoEntry: false });
+          fs.rmSync(target, { recursive: true, force: true });
+          expect(planted).toBeUndefined();
+        }
+        // Once the user has made it, the grant writes in it.
+        fs.mkdirSync(path.join(fresh, '.gradle'));
+        expect(canCreateUnder(gradle, path.join(fresh, '.gradle', 'caches'))).toBe(true);
       });
     });
 

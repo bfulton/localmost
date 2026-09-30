@@ -15,6 +15,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import { SandboxPolicyLevel } from '../shared/types';
 import {
+  developerCredentialFilters,
   developerCredentialPaths,
   expandPath,
   neverReachableAncestors,
@@ -446,14 +447,12 @@ export function generateSandboxProfile({
     ? `(deny file-write*\n${appDirAncestors.map((node) => `  (literal "${node.replace(/"/g, '\\"')}")`).join('\n')})`
     : ';; Both app directories sit at the root: nothing above them to rename';
   // The credentials a developer machine keeps: the same list a localmost test
-  // step never reaches. The credential files kept inside the package-manager
-  // caches are subtracted by name, since the caches themselves have to be
-  // readable for builds to work.
+  // step never reaches, as written and by the path a link there resolves to.
+  // The credential files kept inside the package-manager caches are
+  // subtracted by name, since the caches themselves have to be readable for
+  // builds to work.
   const credentials = developerCredentialPaths();
-  const credentialsDenied = [
-    ...credentials.subpaths.map((dir) => `  (subpath "${escapeForProfile(dir)}")`),
-    ...credentials.literals.map((file) => `  (literal "${escapeForProfile(file)}")`),
-  ].join('\n');
+  const credentialsDenied = developerCredentialFilters().map((filter) => `  ${filter}`).join('\n');
   const credentialAncestors = neverReachableAncestors([...credentials.subpaths, ...credentials.literals]);
   const credentialAncestorsDenied = credentialAncestors.length
     ? `(deny file-write*\n${credentialAncestors.map((node) => `  ${node}`).join('\n')})`

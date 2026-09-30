@@ -660,6 +660,44 @@ if (!isMacOS) {
         expect(renamesIntoView(profile, path.join(home, from), path.join(home, to), shown)).toBe(false);
       }
     });
+
+    it('a write grant of ~ cannot reach a credential linked into place, by the path the link resolves to', () => {
+      // Dotfile managers link ~/.aws to ~/dotfiles/aws, and a single file
+      // such as ~/.cargo/credentials.toml the same way. seatbelt matches the
+      // path a link resolves to, so a deny of ~/.aws alone held nothing there.
+      const dotfiles = path.join(home, 'dotfiles');
+      fs.mkdirSync(path.join(dotfiles, 'aws'), { recursive: true });
+      fs.mkdirSync(path.join(dotfiles, 'cargo'), { recursive: true });
+      fs.writeFileSync(path.join(dotfiles, 'aws', 'credentials'), 'aws\n');
+      fs.writeFileSync(path.join(dotfiles, 'cargo', 'credentials.toml'), 'cargo\n');
+      fs.symlinkSync(path.join('dotfiles', 'aws'), path.join(home, '.aws'));
+      fs.symlinkSync(path.join('..', 'dotfiles', 'cargo', 'credentials.toml'), path.join(home, '.cargo', 'credentials.toml'));
+      const profile = generateSandboxProfile({
+        workDir,
+        proxyPort: 1,
+        policy: { filesystem: { read: [...MACOS_BASELINE_READ_PATHS, '~'], write: ['~'] } },
+      });
+      // The grant is in force beside them, so each refusal below is the floor's doing.
+      expect(run(profile, ['/bin/mkdir', '-p', path.join(dotfiles, 'other', 'built')])).toBe(true);
+      for (const file of [
+        path.join('.aws', 'credentials'),
+        path.join('dotfiles', 'aws', 'credentials'),
+        path.join('.cargo', 'credentials.toml'),
+        path.join('dotfiles', 'cargo', 'credentials.toml'),
+      ]) {
+        expect([file, run(profile, ['/bin/cat', path.join(home, file)])]).toEqual([file, false]);
+      }
+      for (const [from, to, shown] of [
+        [path.join('dotfiles', 'aws', 'credentials'), path.join('dotfiles', 'aws', 'renamed'), ''],
+        [path.join('dotfiles', 'aws'), path.join('dotfiles', 'aws-renamed'), 'credentials'],
+        ['dotfiles', 'dotfiles-renamed', path.join('aws', 'credentials')],
+        ['.aws', '.aws-renamed', 'credentials'],
+        [path.join('dotfiles', 'cargo', 'credentials.toml'), path.join('dotfiles', 'cargo', 'renamed'), ''],
+      ]) {
+        expect([from, renamesIntoView(profile, path.join(home, from), path.join(home, to), shown)]).toEqual([from, false]);
+      }
+      expect(fs.readFileSync(path.join(home, '.aws', 'credentials'), 'utf-8')).toBe('aws\n');
+    });
   });
 } else {
   describe('test-mode network confinement through the ambient profile', () => {
