@@ -16,6 +16,7 @@ import * as path from 'path';
 import { DockerPolicy, DockerMount, DockerNetworkPolicy, MountMode } from '../../shared/docker-policy';
 import { asciiEscaped, isPlainAscii } from '../../shared/json-keys';
 import type { ApprovedBind, PullRequest } from './docker-backend';
+import { digestHex } from '../vm/paths';
 import {
   DockerRequest, DockerAction, classifyDockerRequest, containerIdFrom, imageRefFrom, mediaTypeOf, networkIdFrom,
 } from './docker-request';
@@ -742,6 +743,9 @@ function evaluatePull(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
   return ALLOW;
 }
 
+/** The platforms a pull may ask for: what the VM runs, natively or through Rosetta (contract §6.2). */
+const PULL_PLATFORM = /^linux\/(?:arm64|amd64)(?:\/v[0-9])?$/;
+
 /** A repository path by distribution/reference's grammar: lower-case components, slash-separated. */
 const REPOSITORY_PATH = /^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:\/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*$/;
 
@@ -764,6 +768,10 @@ export function pullRequestOf(query: Record<string, string>): PullRequest | stri
   if (at !== -1) {
     digest = name.slice(at + 1);
     name = name.slice(0, at);
+    // `name:tag@digest`: the digest names the image, and the docker CLI
+    // ignores the tag, as the daemon does.
+    const colon = name.lastIndexOf(':');
+    if (colon > name.lastIndexOf('/')) name = name.slice(0, colon);
   } else {
     const colon = name.lastIndexOf(':');
     if (colon > name.lastIndexOf('/')) {
@@ -784,8 +792,20 @@ export function pullRequestOf(query: Record<string, string>): PullRequest | stri
   if (!REPOSITORY_PATH.test(name)) return `"${asciiEscaped(fromImage)}" is not an image name localmost can pull`;
   if (tag !== undefined && !TAG.test(tag)) return `pull tag "${asciiEscaped(tag)}" is not a tag`;
   if (digest !== undefined && !DIGEST.test(digest)) return `pull digest "${asciiEscaped(digest)}" is not a digest`;
+  // A digest the job chose is outside input, and the Mac-side store builds
+  // paths from it: only the one form contract §1 allows goes on.
+  if (digest !== undefined && digestHex(digest) === null) {
+    return `only sha256 digests can be pulled, not "${asciiEscaped(digest.slice(0, 100))}"`;
+  }
   if (tag === undefined && digest === undefined) tag = 'latest';
-  const platform = queryValue(query, 'platform');
+  const requestedPlatform = queryValue(query, 'platform');
+  let platform: string | undefined;
+  if (requestedPlatform) {
+    platform = requestedPlatform.toLowerCase();
+    if (!PULL_PLATFORM.test(platform)) {
+      return `localmost's Docker VM runs linux/arm64 and linux/amd64 images, not "${asciiEscaped(requestedPlatform.slice(0, 64))}"`;
+    }
+  }
   return {
     registry,
     repositoryPath: name,

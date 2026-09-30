@@ -946,7 +946,12 @@ builds) with loading disabled, and adds a root for each `modprobe` failure in
   forwarded. The filter answers `200 application/json` and streams
   `worker.pull()` progress, one JSON object per line. A failure after the
   headers is sent as `{"errorDetail":{"message":…},"error":…}`. A job's own
-  `X-Registry-Auth` header is dropped.
+  `X-Registry-Auth` header is dropped. Before `worker.pull()`, the filter
+  refuses with 400 a digest that is not `^sha256:[0-9a-f]{64}$` ("only sha256
+  digests can be pulled"; §1: a digest the job chose is outside input) and a
+  `?platform=` that is not `linux/arm64` or `linux/amd64` with an optional
+  `/v<digit>` variant, case-insensitive (§6.2). A tag written before a digest
+  (`name:tag@sha256:…`) is ignored, as the docker CLI ignores it.
 - **Create.** On an allowed create:
   1. If the network is routable (the default bridge, `bridge`, or a network the
      job created with `internal: false`), merge `worker.containerProxyEnv()`

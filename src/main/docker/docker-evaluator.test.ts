@@ -9,7 +9,7 @@ import { describe, it, expect } from '@jest/globals';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { evaluateDockerRequest, DockerEvalContext } from './docker-evaluator';
+import { evaluateDockerRequest, DockerEvalContext, pullRequestOf } from './docker-evaluator';
 import { parseDockerRequest, DockerRequest } from './docker-request';
 import { DockerPolicy, mergeDockerPolicy, parseDockerPolicyHint } from '../../shared/docker-policy';
 
@@ -1364,5 +1364,53 @@ describe('the binds an allowed create approves for the VM', () => {
     const verdict = create({ Binds: ['/Users/me/.ssh:/ssh'] });
     expect(verdict.allowed).toBe(false);
     expect(verdict.approvedBinds).toBeUndefined();
+  });
+});
+
+describe('pullRequestOf: what the worker pulls on the Mac', () => {
+  const hex = 'a'.repeat(64);
+
+  it('reads a name, a tag and a digest as the daemon does', () => {
+    expect(pullRequestOf({ fromImage: 'postgres', tag: '16' })).toEqual({ registry: 'docker.io', repositoryPath: 'library/postgres', tag: '16' });
+    expect(pullRequestOf({ fromImage: `ghcr.io/owner/app@sha256:${hex}` })).toEqual({
+      registry: 'ghcr.io', repositoryPath: 'owner/app', digest: `sha256:${hex}`,
+    });
+    expect(pullRequestOf({ fromImage: 'alpine', tag: `sha256:${hex}` })).toEqual({
+      registry: 'docker.io', repositoryPath: 'library/alpine', digest: `sha256:${hex}`,
+    });
+  });
+
+  it('ignores a tag written before a digest, as the docker CLI does', () => {
+    expect(pullRequestOf({ fromImage: `alpine:3.20@sha256:${hex}` })).toEqual({
+      registry: 'docker.io', repositoryPath: 'library/alpine', digest: `sha256:${hex}`,
+    });
+    expect(pullRequestOf({ fromImage: `localhost:5000/team/app:1@sha256:${hex}` })).toEqual({
+      registry: 'localhost:5000', repositoryPath: 'team/app', digest: `sha256:${hex}`,
+    });
+  });
+
+  it('refuses every digest but a lower-case sha256 one, from the name or the tag parameter', () => {
+    // A digest from the job is outside input that the Mac-side store builds
+    // paths from; only the one form contract §1 allows reaches it.
+    for (const digest of [`sha256:${'A'.repeat(64)}`, `sha512:${'a'.repeat(128)}`, `sha256:${'a'.repeat(32)}`, `sha256:${'a'.repeat(65)}`]) {
+      const queries: Array<Record<string, string>> = [{ fromImage: `alpine@${digest}` }, { fromImage: 'alpine', tag: digest }];
+      for (const query of queries) {
+        const result = pullRequestOf(query);
+        expect([digest, typeof result === 'string' && result.includes('only sha256 digests can be pulled')]).toEqual([digest, true]);
+      }
+    }
+  });
+
+  it('passes the platforms the VM runs, and refuses any other', () => {
+    for (const platform of ['linux/arm64', 'linux/amd64', 'linux/arm64/v8', 'Linux/AMD64']) {
+      expect(pullRequestOf({ fromImage: 'alpine', platform })).toMatchObject({ platform: platform.toLowerCase() });
+    }
+    expect(pullRequestOf({ fromImage: 'alpine', platform: '' })).not.toHaveProperty('platform');
+    for (const platform of ['windows/amd64', 'linux/riscv64', 'linux/arm64/v8/x', 'linux/arm64/../../x', 'linux/arm64\u001b[2J', 'x'.repeat(300)]) {
+      const result = pullRequestOf({ fromImage: 'alpine', platform });
+      expect([platform, typeof result === 'string' && result.startsWith("localmost's Docker VM runs linux/arm64 and linux/amd64 images, not ")]).toEqual([platform, true]);
+      expect((result as string).length).toBeLessThan(200);
+      expect(result).not.toContain('\u001b');
+    }
   });
 });
