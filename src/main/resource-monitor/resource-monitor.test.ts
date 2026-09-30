@@ -1,10 +1,10 @@
 import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 
-// Mock is-camera-on (ESM-only package)
-jest.mock('is-camera-on', () => ({
-  isCameraOnChanges: jest.fn(async function* () {
-    // Yield nothing - just end the generator
-  }),
+// Mock the camera helper; video-call-monitor.test.ts runs a real one
+const mockCameraWatch = { stop: jest.fn() };
+jest.mock('./camera-helper', () => ({
+  cameraHelperPath: jest.fn(() => '/Resources/is-camera-on'),
+  watchCamera: jest.fn(() => mockCameraWatch),
 }));
 
 // Mock electron
@@ -35,6 +35,7 @@ import { powerMonitor } from 'electron';
 import { ResourceMonitor } from './index';
 import { BatteryMonitor } from './battery-monitor';
 import { VideoCallMonitor } from './video-call-monitor';
+import { cameraHelperPath, watchCamera } from './camera-helper';
 
 describe('BatteryMonitor', () => {
   let monitor: BatteryMonitor;
@@ -116,6 +117,40 @@ describe('VideoCallMonitor', () => {
 
   it('should not recommend pause when camera not in use', () => {
     expect(monitor.shouldPause()).toBe(false);
+  });
+
+  it('should watch the helper and follow the camera state it reports', () => {
+    const handler = jest.fn();
+    monitor.on('state-changed', handler);
+    monitor.start();
+
+    expect(watchCamera).toHaveBeenCalledWith('/Resources/is-camera-on', expect.any(Function), expect.any(Function));
+    const onChange = (watchCamera as jest.Mock).mock.calls[0][1] as (isOn: boolean) => void;
+    onChange(true);
+    expect(monitor.getPauseReason()).toBe('Video call detected');
+    onChange(false);
+    expect(monitor.getPauseReason()).toBe('Video call ended recently');
+    jest.advanceTimersByTime(60_000);
+    expect(monitor.shouldPause()).toBe(false);
+    expect(handler).toHaveBeenCalledTimes(3);
+  });
+
+  it('should log and carry on when the helper cannot be found', () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    (cameraHelperPath as jest.Mock).mockImplementationOnce(() => {
+      throw new Error("Cannot find module 'is-camera-on'");
+    });
+
+    expect(() => monitor.start()).not.toThrow();
+    expect(warn).toHaveBeenCalledWith('Video call detection unavailable:', "Cannot find module 'is-camera-on'");
+    expect(watchCamera).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('should stop the helper when stopped', () => {
+    monitor.start();
+    monitor.stop();
+    expect(mockCameraWatch.stop).toHaveBeenCalledTimes(1);
   });
 
   it('should update grace period setting', () => {
