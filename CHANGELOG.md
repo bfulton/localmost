@@ -466,7 +466,11 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
 ### Changed
 - **Breaking**: localmost needs macOS 14 or later; 0.2.0 ran on macOS 12. The
   Docker VM is built on Virtualization.framework, and localmost supports it
-  from macOS 14 on. On macOS 12 or 13, stay on 0.2.0
+  from macOS 14 on. On macOS 12 or 13, stay on 0.2.0, and do not download
+  this update when 0.2.x offers it: 0.2.x compares only the version, since the
+  update feed names no minimum macOS version, and the update installs over
+  0.2.x and then will not open, because the app requires macOS 14. If it was
+  installed, reinstall 0.2.0 from its release
 - **Breaking**: Intel Macs are no longer supported. localmost is built for
   Apple silicon (arm64) only; 0.2.0 was the last release with an Intel
   build. On an Intel Mac, 0.2.x still reports this update as available, as
