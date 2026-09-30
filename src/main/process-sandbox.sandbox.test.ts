@@ -940,6 +940,8 @@ if (!isMacOS) {
     let nonce: string;
     let npm: string;
     let cli: string;
+    let helper: string;
+    let otherBinary: string;
     let profilePath: string;
 
     beforeAll(() => {
@@ -959,6 +961,18 @@ if (!isMacOS) {
       fs.mkdirSync(path.dirname(cli));
       fs.writeFileSync(cli, '#!/bin/sh\necho cli-ran\n', { mode: 0o755 });
       fs.writeFileSync(path.join(path.dirname(cli), 'beside'), 'not the cli');
+      // The helper, where the bundle keeps it beside docker-cli: a compiled
+      // binary, since seatbelt execs a Mach-O it cannot read but a shell
+      // cannot run a script it cannot read. echo, re-signed ad hoc, because a
+      // copy of a system binary is held to the system volume by its launch
+      // constraint. Another copy under a name the profile does not deny shows
+      // that the refusal is the helper rule's, not the read deny's.
+      helper = path.join(outside, 'localmost-vm');
+      otherBinary = path.join(outside, 'not-the-helper');
+      for (const binary of [helper, otherBinary]) {
+        fs.copyFileSync('/bin/echo', binary);
+        execFileSync('/usr/bin/codesign', ['--force', '--sign', '-', binary], { stdio: 'ignore' });
+      }
       const previous = process.env.LOCALMOST_CONFIG_DIR;
       process.env.LOCALMOST_CONFIG_DIR = data;
       try {
@@ -967,6 +981,7 @@ if (!isMacOS) {
           instanceDir: sandbox,
           shareDir: share,
           dockerCli: cli,
+          vmHelper: helper,
           filesystemPolicy: { level: 'strict', read: [], write: [npm] },
         }));
       } finally {
@@ -1069,6 +1084,19 @@ if (!isMacOS) {
     it('runs the bundled docker CLI, and reads nothing else beside it', () => {
       expect(run(sq(cli)).stdout).toBe('cli-ran');
       expect(refused(`cat ${sq(path.join(path.dirname(cli), 'beside'))}`)).toBe(true);
+    });
+
+    it('cannot run the Docker VM helper, by its path, a case variant, a link or a copy', () => {
+      // A binary it cannot read still runs: the refusals below are the helper rule's.
+      expect(refused(`cat ${sq(otherBinary)}`)).toBe(true);
+      expect(run(`${sq(otherBinary)} ran`)).toMatchObject({ ok: true, stdout: 'ran' });
+      expect(refused(`${sq(helper)} version`)).toBe(true);
+      expect(refused(`${sq(upperBase(helper))} version`)).toBe(true);
+      expect(refused(`ln -s ${sq(helper)} _temp/vm && _temp/vm version`)).toBe(true);
+      expect(refused(`ln ${sq(helper)} _temp/vm-hard`)).toBe(true);
+      expect(refused(`cp ${sq(helper)} _temp/vm-copy`)).toBe(true);
+      expect(fs.existsSync(path.join(sandbox, '_temp', 'vm-hard'))).toBe(false);
+      expect(fs.existsSync(path.join(sandbox, '_temp', 'vm-copy'))).toBe(false);
     });
 
     it('cannot connect to a unix socket under <data>/vm/jobs, and can to one in its own sandbox', async () => {

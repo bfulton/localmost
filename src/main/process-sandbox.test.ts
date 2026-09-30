@@ -430,6 +430,20 @@ describe('Process Sandbox', () => {
       expect(profile).not.toContain('(literal "/odd/"quoted"/docker")');
     });
 
+    it('refuses to run the Docker VM helper, after the rule that lets the job run everything else', () => {
+      const helper = '/Applications/localmost.app/Contents/Resources/localmost-vm';
+      const profile = profileWith({ shareDir, dockerCli, vmHelper: helper });
+      const runAnything = profile.indexOf('(allow process*)');
+      const deny = profile.indexOf(`(deny process-exec* (literal "${helper}"))`);
+      expect(runAnything).toBeGreaterThan(-1);
+      // Seatbelt takes the last rule that matches, so the deny must follow.
+      expect(deny).toBeGreaterThan(runAnything);
+      expect(profileWith({ vmHelper: '/odd/"quoted"/localmost-vm' })).toContain(
+        '(deny process-exec* (literal "/odd/\\"quoted\\"/localmost-vm"))'
+      );
+      expect(profileWith({})).not.toContain('(deny process-exec*');
+    });
+
     it('refuses a share that is not the work folder directly under the sandbox', () => {
       expect(() => profileWith({ shareDir: path.join(instanceDir, 'other') })).toThrow(/share/);
       expect(() => profileWith({ shareDir: path.join(instanceDir, 'x', '_work') })).toThrow(/share/);

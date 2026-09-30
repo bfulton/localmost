@@ -2891,13 +2891,14 @@ describe('RunnerManager', () => {
       expect(worker.prewarm).not.toHaveBeenCalled();
     });
 
-    it('gives the job the bundled CLI first on its PATH, an empty config of its own, and the share rules', async () => {
+    it('gives the job the bundled CLI first on its PATH, an empty config of its own, the share rules and the helper deny', async () => {
       const cli = '/Applications/localmost.app/Contents/Resources/docker-cli/docker';
       const manager = new RunnerManager({
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
         dockerCli: cli,
+        vmHelper: '/Applications/localmost.app/Contents/Resources/localmost-vm',
       });
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
@@ -2910,7 +2911,12 @@ describe('RunnerManager', () => {
       expect(env.PATH!.split(':')[0]).toBe('/Applications/localmost.app/Contents/Resources/docker-cli');
       expect(env.DOCKER_HOST).toBe('unix:///Users/test/.localmost/runner/sandbox/1/docker.sock');
       expect(env.DOCKER_BUILDKIT).toBe('0');
-      expect(options).toMatchObject({ shareDir: '/Users/test/.localmost/runner/sandbox/1/_work', dockerCli: cli });
+      expect(options).toMatchObject({
+        shareDir: '/Users/test/.localmost/runner/sandbox/1/_work',
+        dockerCli: cli,
+        // The helper, which the job's profile refuses to run.
+        vmHelper: '/Applications/localmost.app/Contents/Resources/localmost-vm',
+      });
     });
 
     it('boots a spare for the worker when dockerVm.prewarm is on', async () => {

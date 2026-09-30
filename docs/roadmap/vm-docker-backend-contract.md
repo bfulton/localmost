@@ -942,7 +942,7 @@ builds) with loading disabled, and adds a root for each `modprobe` failure in
 | `startInstance`, after `buildSandbox` | `shareNonce = writeShareNonce(sandboxDir)`, stored on the instance. |
 | `startDockerProxy` | `new DockerFilterProxy({ backend, worker: backend.forWorker({ slot, sandboxDir, sandboxId, shareNonce, spawnRepository, proxy, log }), … })`. Then, if `config.dockerVm.prewarm`, `worker.prewarm()`. |
 | Job env | Keep `DOCKER_HOST` and `DOCKER_BUILDKIT=0`. Add `DOCKER_CONFIG=<sandbox>/.docker`, an empty directory made by `buildSandbox`, so the CLI reads no operator config. Prepend `dirname(<docker-cli>)` to `PATH`. |
-| Profile | `spawnSandboxed(…, { shareDir: <sandbox>/_work, dockerCli: <docker-cli> })` |
+| Profile | `spawnSandboxed(…, { shareDir: <sandbox>/_work, dockerCli: <docker-cli>, vmHelper: <helper> })` |
 | `bindDockerSocket` (the claim) | Unchanged. `socket.bind()` now calls `worker.bind()`, which boots only on the first bind with grants (§5.1). It is reached from `onJobAcquired` → `applyPolicyForTarget` and again from `applyRepoPolicy` at the "Running job" line; `startInstance` can also reach a previous spawn's socket while its un-awaited `stopDockerProxy` is still running. vm-backend tests cover a double bind and a bind while stopping. |
 | `stopDockerProxy` (worker exit, reap, app stop) | Unchanged. `socket.stop()` now releases the VM. |
 | App start (`index.ts`) | `await vmManager.sweep()` before the pool's first spawn. |
@@ -966,12 +966,28 @@ socket rules:
 (allow file-read* (literal "<docker-cli>") (literal "<dirname of docker-cli>"))
 ```
 
-All three denies are new in `process-sandbox.ts`, which today re-allows the
+After `(allow process*)`, which lets the job run what it likes:
+
+```scheme
+;; The helper carries the virtualization entitlement: the job may not run it.
+(deny process-exec* (literal "<helper>"))
+```
+
+Seatbelt execs a Mach-O the profile cannot read, so the read deny on the
+bundle does not keep the job from running the helper; this rule does. A
+literal is enough: exec is matched on the path it resolves to (a link, `..`
+or a case variant of the name is refused too), and the job can neither read
+the helper to copy it nor hard-link it. Without the rule a job could boot VZ
+VMs of its own through the helper, outside the admission gate (they would
+have no share, since the job profile issues no extension).
+
+The three file denies are new in `process-sandbox.ts`, which today re-allows the
 whole sandbox subtree, its own node included. (The `localmost test` profile
 in `src/shared/sandbox-profile.ts` already denies its workspace node the
 same way.) The sandbox test checks them in the constructed and ambient modes,
 including `mv _WORK x`, `mv ../<SANDBOX in other case> x` and
-`renamex_np(RENAME_SWAP)`.
+`renamex_np(RENAME_SWAP)`, and the helper deny with a compiled stand-in at
+the helper's path (constructed) and the packaged helper (ambient).
 
 `<data>/vm` needs no rule. It is inside `<data>`, which is already denied in full.
 

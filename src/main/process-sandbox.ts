@@ -196,6 +196,11 @@ export interface RunnerProfileOptions {
   shareDir?: string;
   /** The bundled docker CLI, which the job reads and runs; nothing else of the bundle. */
   dockerCli?: string;
+  /**
+   * The Docker VM helper, which the job may not run by any path: it carries
+   * the virtualization entitlement, and would boot a VM of the job's choosing.
+   */
+  vmHelper?: string;
   /** This worker's target's tool cache, if it keeps one across jobs. */
   toolCacheDir?: string;
   /** This worker's target's package-manager cache; ignored under strict. */
@@ -254,6 +259,7 @@ export function generateSandboxProfile({
   dockerSocket,
   shareDir,
   dockerCli,
+  vmHelper,
   toolCacheDir: toolCache,
   packageCacheDir: packageCache,
   processMarker,
@@ -282,6 +288,18 @@ export function generateSandboxProfile({
     ].join('\n');
   })(dockerSocket);
   const dockerShareRules = shareRules(instanceDir, shareDir, dockerCli);
+  const vmHelperRule =
+    vmHelper === undefined
+      ? ''
+      : [
+          '',
+          ';; The Docker VM helper carries the virtualization entitlement: run by the',
+          ";; job, it would boot a VM of the job's choosing, outside the admission gate.",
+          ';; Seatbelt needs no read of a Mach-O to exec it, so the deny is on the exec,',
+          ';; and a literal is enough: the job can neither read nor link the helper,',
+          ';; and exec is matched on the path it resolves to.',
+          `(deny process-exec* (literal "${vmHelper.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"))`,
+        ].join('\n');
 
   const escapedDir = instanceDir.replace(/"/g, '\\"');
   const homeDir = os.homedir().replace(/"/g, '\\"');
@@ -706,7 +724,7 @@ ${dockerRules}${dockerShareRules}
 ;; Signals only to processes in this sandbox: the job's own children and its
 ;; own process group, which inherit it. Not the app, another worker's job or
 ;; anything else the user runs, which a bare (allow signal) let it kill.
-(allow signal (target same-sandbox))
+(allow signal (target same-sandbox))${vmHelperRule}
 
 ;; ------------------------------------------------------------
 ;; NETWORK ACCESS - Through this worker's proxy (runner contacts many services)
@@ -836,6 +854,8 @@ export interface SandboxOptions extends SpawnOptions {
   shareDir?: string;
   /** The bundled docker CLI the job runs; see RunnerProfileOptions.dockerCli. */
   dockerCli?: string;
+  /** The Docker VM helper the job may not run; see RunnerProfileOptions.vmHelper. */
+  vmHelper?: string;
   /**
    * The worker's target's own tool cache, kept across that target's jobs.
    * Absent means none: the runner keeps its tools in the job's work directory.
@@ -899,6 +919,7 @@ export function spawnSandboxed(
     dockerSocket,
     shareDir,
     dockerCli,
+    vmHelper,
     toolCacheDir,
     packageCacheDir,
     processMarker,
@@ -925,6 +946,7 @@ export function spawnSandboxed(
       dockerSocket,
       shareDir,
       dockerCli,
+      vmHelper,
       toolCacheDir,
       packageCacheDir,
       processMarker,

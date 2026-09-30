@@ -21,7 +21,7 @@ import { groupHasMembers, sweepInGrace, sweepProcessGroup } from './process-grou
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { GitHubClientError } from './github-client';
 import { RunnerDownloader } from './runner-downloader';
-import { dockerCliPath, DOCKER_CONFIG_DIR_NAME, SHARE_DIR_NAME } from './vm/paths';
+import { dockerCliPath, helperPath, DOCKER_CONFIG_DIR_NAME, SHARE_DIR_NAME } from './vm/paths';
 import type { WorkerCredentialFiles } from './worker-credentials';
 import type { BrokerJobTarget } from './broker-proxy-service';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
@@ -300,6 +300,8 @@ interface RunnerManagerOptions {
   getDockerVmConfig?: () => DockerVmConfig;
   /** The bundled docker CLI, first on the job's PATH. dockerCliPath() by default. */
   dockerCli?: string;
+  /** The Docker VM helper, which the job's profile refuses to run. helperPath() by default. */
+  vmHelper?: string;
 }
 
 /**
@@ -352,6 +354,7 @@ export class RunnerManager {
   private readonly dockerBackend: DockerBackend;
   private readonly getDockerVmConfig: () => DockerVmConfig;
   private readonly dockerCli: string;
+  private readonly vmHelper: string;
 
   // Flag to track intentional stops vs job completion restarts
   private stopping = false;
@@ -441,6 +444,7 @@ export class RunnerManager {
       options.getDockerVmConfig ??
       (() => resolveDockerVmConfig(undefined, { cores: os.cpus().length, memoryBytes: os.totalmem() }));
     this.dockerCli = options.dockerCli ?? dockerCliPath();
+    this.vmHelper = options.vmHelper ?? helperPath();
 
     this.downloader = new RunnerDownloader();
     this.configPath = getConfigPath();
@@ -1573,6 +1577,8 @@ export class RunnerManager {
           // The Docker VM's share: the job keeps its contents, not the node.
           shareDir: path.join(sandboxDir, SHARE_DIR_NAME),
           dockerCli: this.dockerCli,
+          // It carries the virtualization entitlement; only the app runs it.
+          vmHelper: this.vmHelper,
           toolCacheDir,
           packageCacheDir,
           processMarker,
