@@ -303,6 +303,28 @@ describe('auto-updater', () => {
 
       expect(mockAutoUpdater.checkForUpdates).toHaveBeenCalled();
     });
+
+    it('should leave no unhandled rejection when the automatic download fails', async () => {
+      // With autoDownload on, the check starts the download and returns its
+      // promise; electron-updater reports a failure through 'error' and also
+      // rejects that promise.
+      mockAutoUpdater.checkForUpdates.mockImplementation(async () => ({
+        downloadPromise: Promise.reject(new Error('download failed')),
+      }));
+      const unhandled = jest.fn();
+      process.on('unhandledRejection', unhandled);
+      try {
+        await checkForUpdates();
+        // Node reports an unobserved rejection after the microtask queue drains.
+        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => setImmediate(resolve));
+      } finally {
+        process.off('unhandledRejection', unhandled);
+        mockAutoUpdater.checkForUpdates.mockReset();
+      }
+
+      expect(unhandled).not.toHaveBeenCalled();
+    });
   });
 
   describe('downloadUpdate', () => {

@@ -87,7 +87,12 @@ export function initAutoUpdater(mainWindow: BrowserWindow): void {
  * Check for available updates.
  */
 export async function checkForUpdates(): Promise<void> {
-  await autoUpdater.checkForUpdates();
+  const result = await autoUpdater.checkForUpdates();
+  // With autoDownload on, a check that finds an update starts its download
+  // and returns that download's promise. A failed download is reported
+  // through the 'error' event above; observe the promise too, so the failure
+  // is not also logged as an unhandled rejection.
+  result?.downloadPromise?.catch(() => {});
 }
 
 /**
