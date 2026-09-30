@@ -40,11 +40,13 @@ import {
 } from '../shared/step-executor';
 import {
   findLocalmostrc,
+  LOCALMOSTRC_FILENAME,
   parseLocalmostrc,
   getEffectivePolicy,
   hostPatternProblem,
   LocalmostrcConfig,
   serializeLocalmostrc,
+  unreadLocalmostrcNote,
   writeLocalmostrc,
   LOCALMOSTRC_VERSION,
 } from '../shared/localmostrc';
@@ -279,10 +281,14 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     } else {
       console.log(`${colors.yellow}Warning:${colors.reset} Invalid .localmostrc: ${result.errors[0]?.message}`);
     }
-  } else if (!options.updaterc) {
-    console.log(`${colors.yellow}No .localmostrc found.${colors.reset} Run with --updaterc to generate.`);
-    console.log('Running in strict mode (no network access allowed).');
-    // policy stays undefined = empty allowlist
+  } else {
+    const unread = unreadLocalmostrcNote(cwd);
+    if (unread) console.log(`${colors.yellow}Warning:${colors.reset} ${unread}`);
+    if (!options.updaterc) {
+      console.log(`${colors.yellow}No .localmostrc found.${colors.reset} Run with --updaterc to generate.`);
+      console.log('Running in strict mode (no network access allowed).');
+      // policy stays undefined = empty allowlist
+    }
   }
   console.log();
 
@@ -1468,7 +1474,7 @@ export async function handleUpdateRc(
   // Named as the file it is, with any link in the path to the checkout
   // resolved: findLocalmostrc has refused anything at the name itself but a
   // regular file, and writeLocalmostrc will not follow one put there later.
-  const destination = existingPath ?? path.join(cwd, '.localmostrc');
+  const destination = path.join(cwd, LOCALMOSTRC_FILENAME);
   const resolved = path.join(fs.realpathSync(path.dirname(destination)), path.basename(destination));
   const approved = await confirmPolicyChange(resolved, additions, assumeYes);
   if (!approved) return;

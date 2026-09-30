@@ -16,7 +16,11 @@ That was:
 
 ## Solution
 
-Each repo declares its sandbox policy in `.localmostrc`:
+Each repo declares its sandbox policy in a file named `.localmostrc` at its root.
+That is the only name read, by the runner at a job's commit and by `localmost test`
+and `localmost policy` in a checkout alike: a `.localmostrc.yml` or
+`.localmostrc.yaml` is not a policy, and the CLI says so when it finds one.
+
 
 ```yaml
 # .localmostrc

@@ -274,6 +274,9 @@ to `decisions.log` beside the cache. A repository with no policy is never held
 for approval — it gets the baseline, which grants nothing extra. So does a
 commit whose `.localmostrc` was deleted: it is not held, and it runs on the
 baseline rather than under the policy approved for the repository before. The
+policy is the file named `.localmostrc` at the repository's root and no other:
+a `.localmostrc.yml` or `.localmostrc.yaml` is not read, by the runner or by
+`localmost test`, so it grants nothing and is never held for approval. The
 approved policy is applied only to a commit the runner checked before spawning
 its worker and found carrying exactly that policy; a job at any other commit,
 or one approved away since the check, runs on the baseline.

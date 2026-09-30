@@ -13,9 +13,11 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   findLocalmostrc,
+  LOCALMOSTRC_FILENAME,
   parseLocalmostrc,
   parseLocalmostrcContent,
   serializeLocalmostrc,
+  unreadLocalmostrcNote,
   writeLocalmostrc,
 } from './localmostrc';
 import { callInChild } from './test-utils/call-in-child';
@@ -37,14 +39,19 @@ afterEach(() => {
 });
 
 describe('findLocalmostrc', () => {
-  it('finds each of the names, the first one present winning', () => {
+  it('finds .localmostrc, the one name the runner fetches', () => {
+    expect(LOCALMOSTRC_FILENAME).toBe('.localmostrc');
     expect(findLocalmostrc(repo)).toBeNull();
-    fs.writeFileSync(path.join(repo, '.localmostrc.yaml'), 'version: 1\n');
-    expect(findLocalmostrc(repo)).toBe(path.join(repo, '.localmostrc.yaml'));
-    fs.writeFileSync(path.join(repo, '.localmostrc.yml'), 'version: 1\n');
-    expect(findLocalmostrc(repo)).toBe(path.join(repo, '.localmostrc.yml'));
     fs.writeFileSync(path.join(repo, '.localmostrc'), 'version: 1\n');
     expect(findLocalmostrc(repo)).toBe(path.join(repo, '.localmostrc'));
+  });
+
+  it.each(['.localmostrc.yml', '.localmostrc.yaml'])('takes %s for no policy, as the runner does', (name) => {
+    // The runner fetches only .localmostrc, so a job from this checkout runs
+    // on the baseline; testing it under the file's grants would pass a
+    // workflow the runner then fails.
+    fs.writeFileSync(path.join(repo, name), 'version: 1\n');
+    expect(findLocalmostrc(repo)).toBeNull();
   });
 
   it('refuses a dangling link, which reads as no file and would be written through', () => {
@@ -58,14 +65,30 @@ describe('findLocalmostrc', () => {
     expect(() => findLocalmostrc(repo)).toThrow(/not a regular file/);
   });
 
-  it('refuses a link under the later names too', () => {
+  it('neither follows nor refuses a link under a name it does not read', () => {
     fs.symlinkSync(path.join(outside, 'victim'), path.join(repo, '.localmostrc.yml'));
-    expect(() => findLocalmostrc(repo)).toThrow(/\.localmostrc\.yml is not a regular file/);
+    expect(findLocalmostrc(repo)).toBeNull();
   });
 
   it('refuses a directory', () => {
     fs.mkdirSync(path.join(repo, '.localmostrc'));
     expect(() => findLocalmostrc(repo)).toThrow(/not a regular file/);
+  });
+});
+
+describe('unreadLocalmostrcNote', () => {
+  it('names a .yml or .yaml file that is not read, and how to have it read', () => {
+    expect(unreadLocalmostrcNote(repo)).toBeNull();
+    fs.writeFileSync(path.join(repo, '.localmostrc.yaml'), 'version: 1\n');
+    expect(unreadLocalmostrcNote(repo)).toMatch(/^\.localmostrc\.yaml is not read: .*Rename it to \.localmostrc/);
+    fs.writeFileSync(path.join(repo, '.localmostrc.yml'), 'version: 1\n');
+    expect(unreadLocalmostrcNote(repo)).toMatch(/^\.localmostrc\.yml is not read/);
+  });
+
+  it('names a link there without following it', () => {
+    fs.symlinkSync(path.join(outside, 'victim'), path.join(repo, '.localmostrc.yml'));
+    expect(unreadLocalmostrcNote(repo)).toMatch(/^\.localmostrc\.yml is not read/);
+    expect(fs.existsSync(path.join(outside, 'victim'))).toBe(false);
   });
 });
 

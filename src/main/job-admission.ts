@@ -19,7 +19,7 @@
 import type { GitHubJobInfo } from './broker-proxy-service';
 import type { RunnerManager } from './runner-manager';
 import type { PolicyApprovalRequest, PolicyDecision } from './policy-cache';
-import type { LocalmostrcConfig } from '../shared/localmostrc';
+import { LOCALMOSTRC_FILENAME, type LocalmostrcConfig } from '../shared/localmostrc';
 
 export interface JobAdmissionDeps {
   findTarget: (targetId: string) => { id: string; displayName: string } | undefined;
@@ -193,7 +193,9 @@ export async function checkRepoPolicyApproval(
       return `cannot check ${repository} policy: no commit SHA for this job`;
     }
 
-    const content = await deps.getFileContent(accessToken, owner, repo, '.localmostrc', sha);
+    // By the one name the CLI reads too, so `localmost test` applies the
+    // policy jobs from this commit get.
+    const content = await deps.getFileContent(accessToken, owner, repo, LOCALMOSTRC_FILENAME, sha);
     const decision = deps.decidePolicyForJob(repository, content, sha, repositoryId);
 
     if (decision.action === 'allow') return null;

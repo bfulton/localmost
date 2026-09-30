@@ -406,13 +406,34 @@ describe('policy init', () => {
     expect(fs.readdirSync(dir)).toEqual(['.localmostrc']);
   });
 
-  it('replaces the policy under the name it has, rather than adding one beside it', () => {
+  it('creates .localmostrc beside a .localmostrc.yml, which is no policy, and leaves that file alone', () => {
+    // The runner reads only .localmostrc, so the .yml was never a policy a
+    // job got; the new file is the one both will read.
     fs.writeFileSync(path.join(dir, '.localmostrc.yml'), SENTINEL);
-    runPolicy('init', { force: true });
-    expect(parseLocalmostrcContent(fs.readFileSync(path.join(dir, '.localmostrc.yml'), 'utf-8')).config?.level)
-      .toBe('strict');
-    expect(fs.readdirSync(dir)).toEqual(['.localmostrc.yml']);
+    runPolicy('init', {});
+    expect(parseLocalmostrcContent(fs.readFileSync(rc(), 'utf-8')).config?.level).toBe('strict');
+    expect(fs.readFileSync(path.join(dir, '.localmostrc.yml'), 'utf-8')).toBe(SENTINEL);
+    expect(output.join('\n')).toMatch(/Created \.localmostrc$/m);
   });
+
+  it.each(['show', 'validate', 'diff', 'approve'])(
+    'policy %s says a .localmostrc.yml is not read, rather than only that there is no policy',
+    (subcommand) => {
+      fs.writeFileSync(path.join(dir, '.localmostrc.yml'), SENTINEL);
+      jest.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+        throw new Error(`exit ${code}`);
+      }) as never);
+      try {
+        runPolicy(subcommand, {});
+      } catch (err) {
+        // validate fails a checkout with no policy; the others just say so.
+        expect((err as Error).message).toBe('exit 1');
+      }
+      const text = output.join('\n');
+      expect(text).toMatch(/No \.localmostrc found/);
+      expect(text).toMatch(/\.localmostrc\.yml is not read: .*Rename it to \.localmostrc/);
+    }
+  );
 
   it.each([
     ['without --force', {}],

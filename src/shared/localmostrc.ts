@@ -89,7 +89,20 @@ export interface ParseResult {
 // Parsing
 // =============================================================================
 
-const LOCALMOSTRC_FILENAMES = ['.localmostrc', '.localmostrc.yml', '.localmostrc.yaml'];
+/**
+ * The name of a repository's policy file, at its root, and the only one. The
+ * runner fetches the file by this name at a job's commit, and the CLI reads
+ * and writes it by this name in a checkout, so both apply the same policy:
+ * `localmost test` under grants a real job never gets would pass a workflow
+ * the runner then fails.
+ */
+export const LOCALMOSTRC_FILENAME = '.localmostrc';
+
+/**
+ * Names the CLI once read as well. They are not policies: they are looked
+ * for only to tell a checkout holding one why its file is not in effect.
+ */
+const UNREAD_LOCALMOSTRC_NAMES = ['.localmostrc.yml', '.localmostrc.yaml'];
 
 /**
  * Why what is at a .localmostrc path is refused, or null when it is a regular
@@ -130,18 +143,32 @@ function lstatOrNull(filePath: string): fs.Stats | null {
 /**
  * Find the .localmostrc file in a repository.
  *
- * Throws when the first name present is anything but a regular file, rather
- * than skipping it: a link or device where the policy belongs is refused
+ * Throws when anything but a regular file is at the name, rather than
+ * skipping it: a link or device where the policy belongs is refused
  * outright, not read past or written through.
  */
 export function findLocalmostrc(repoRoot: string): string | null {
-  for (const filename of LOCALMOSTRC_FILENAMES) {
-    const filePath = path.join(repoRoot, filename);
-    const stat = lstatOrNull(filePath);
-    if (stat === null) continue;
-    const problem = notRegularFile(filePath, stat);
-    if (problem) throw new Error(problem);
-    return filePath;
+  const filePath = path.join(repoRoot, LOCALMOSTRC_FILENAME);
+  const stat = lstatOrNull(filePath);
+  if (stat === null) return null;
+  const problem = notRegularFile(filePath, stat);
+  if (problem) throw new Error(problem);
+  return filePath;
+}
+
+/**
+ * Why a repository with no .localmostrc may have been expected to have a
+ * policy: a file under a name localmost does not read, such as
+ * .localmostrc.yml. Null when there is none. The name is only looked at,
+ * never followed or read.
+ */
+export function unreadLocalmostrcNote(repoRoot: string): string | null {
+  for (const name of UNREAD_LOCALMOSTRC_NAMES) {
+    if (lstatOrNull(path.join(repoRoot, name)) === null) continue;
+    return (
+      `${name} is not read: localmost takes a repository's policy only from ${LOCALMOSTRC_FILENAME}, ` +
+      `for jobs and for localmost test alike. Rename it to ${LOCALMOSTRC_FILENAME} to use it.`
+    );
   }
   return null;
 }
