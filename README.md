@@ -257,6 +257,7 @@ Current release: **0.3.0 — Test Locally, Secure by Default**
 
 Future feature ideas:
 
+- **VM Docker backend** (in progress) - Run each Docker-using job's daemon in its own Linux VM that shares only the job's work folder and reaches the network only through the job's proxy, replacing Docker Desktop ([design](docs/roadmap/vm-docker-backend.md)).
 - **Fail a blocked job visibly** - a job refused by the filter is cancelled through the GitHub API before any worker starts, so it appears as cancelled rather than failing with a message explaining why.
 - **Roll discovery output up further** - `--updaterc` now drops paths already covered by a listed ancestor, which removes the bulk of the redundancy. It still records content-addressed cache paths (npm's `_cacache/content-v2/sha512/...`) verbatim, which differ per machine and per dependency change; those want rolling up to their cache directory.
 - **Show a full diff when `--updaterc` rewrites a policy** - it names the file and lists every grant it adds before asking, but it rewrites the whole file from the parsed policy, so the comments and formatting it drops are not shown.
@@ -267,8 +268,8 @@ Future feature ideas:
 - **Disk space monitoring** - Warn or pause when disk is low, auto-clean trash directories and caches.
 - **Linux and Windows host support** - Run self-hosted runners on non-Mac machines for projects that need them.
 - **Higher parallelism cap** - Parallelize proxy registration to support 16+ concurrent runners (currently capped at 8 due to serial registration time).
-- **Managed Docker VM** - Run the daemon behind the filtering socket in a VM whose only mount is the workspace, so a filter defect is contained, container egress is policed, and `privileged` becomes grantable.
-- **Ephemeral VM isolation** - Run each job in a fresh lightweight VM for stronger isolation between jobs.
+- **macOS VM jobs** - An opt-in per-repository isolation level that runs each job in a fresh macOS VM cloned from a golden image, with policy grants mapped to shares ([design](docs/roadmap/macos-vm-jobs.md)).
+- **Filtering VM network stack** - A userspace network stack for the Docker VM that enforces the job's hostname policy on traffic that ignores proxy settings ([design](docs/roadmap/vm-network-stack.md)).
 
 Bugs and quick improvements:
 
