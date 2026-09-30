@@ -8,9 +8,11 @@
  */
 
 /**
- * A user or organization login: letters, digits and single inner hyphens.
- * Underscore is admitted inside a name too, because a managed (EMU) user's
- * login is `handle_shortcode` and can own repositories.
+ * A user or organization login as GitHub issues one today: letters, digits
+ * and hyphens, never first or last. (GitHub also refuses a doubled hyphen;
+ * this admits one, which cannot carry a path either.) Underscore is admitted
+ * inside a name too, because a managed (EMU) user's login is
+ * `handle_shortcode` and can own repositories.
  */
 const OWNER_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$/;
 

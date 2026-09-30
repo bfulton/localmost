@@ -175,5 +175,23 @@ describe('runner IPC handlers', () => {
       expect(await handlers[IPC_CHANNELS.JOB_CANCEL]({}, 'o', 'my.repo', 42)).toEqual({ success: true });
       expect(mockGitHubAuth.cancelWorkflowRun).toHaveBeenCalledWith('tok', 'o', 'my.repo', 42);
     });
+
+    it("cancels a run whose owner is an older login, as GitHub's job record names it", async () => {
+      // The owner comes from the job GitHub ran, not from anything typed, and
+      // GitHub once issued logins with a trailing or doubled hyphen.
+      mockGitHubAuth.cancelWorkflowRun.mockResolvedValue(undefined);
+      for (const owner of ['o-', 'old--name', 'emu_user']) {
+        expect(await handlers[IPC_CHANNELS.JOB_CANCEL]({}, owner, 'r', 42)).toEqual({ success: true });
+        expect(mockGitHubAuth.cancelWorkflowRun).toHaveBeenLastCalledWith('tok', owner, 'r', 42);
+      }
+    });
+
+    it('still refuses an owner that could carry a path, a query or a dot segment', async () => {
+      for (const owner of ['o/../orgs', 'o/x', 'o?x', '.', 'o.x', '', 42]) {
+        const result = await handlers[IPC_CHANNELS.JOB_CANCEL]({}, owner, 'r', 42);
+        expect({ owner, success: result.success }).toEqual({ owner, success: false });
+      }
+      expect(mockGitHubAuth.cancelWorkflowRun).not.toHaveBeenCalled();
+    });
   });
 });
