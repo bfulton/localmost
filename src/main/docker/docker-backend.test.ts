@@ -150,3 +150,26 @@ describe("DesktopBackend's worker, the stage 2 interface over the operator's dae
       .rejects.toThrow('pull access denied for nope');
   });
 });
+
+describe("the e2e spec's native forwarder", () => {
+  const root = path.resolve(__dirname, '..', '..', '..');
+
+  /** Every file under a directory of the checkout, as paths relative to the checkout. */
+  const filesUnder = (dir: string): string[] =>
+    fs.readdirSync(path.join(root, dir), { withFileTypes: true }).flatMap((entry) => {
+      const rel = path.join(dir, entry.name);
+      if (entry.isDirectory()) return filesUnder(rel);
+      return entry.isFile() ? [rel] : [];
+    });
+
+  it('is imported by no module under src', () => {
+    // The Linux leg of test/e2e/docker.spec.ts forwards to a runner's native
+    // dockerd through it (owner decision 3). It is a second backend, so it
+    // must never be one the app can choose. Spelled in pieces, and checked to
+    // exist, so that neither this file nor a rename leaves the test passing
+    // on a name nothing has.
+    const forwarder = 'native-worker' + '-docker';
+    expect(fs.existsSync(path.join(root, 'test', 'e2e', 'support', `${forwarder}.ts`))).toBe(true);
+    expect(filesUnder('src').filter((rel) => fs.readFileSync(path.join(root, rel), 'utf-8').includes(forwarder))).toEqual([]);
+  });
+});

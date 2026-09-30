@@ -14,8 +14,9 @@
  *   Outside a job (a developer machine, a GitHub-hosted runner): this file
  *   serves the socket itself, the way RunnerManager does - at the root of a
  *   sandbox directory, bound on claim to the policy, forwarding to the
- *   operator's daemon through the desktop backend - and asserts on the
- *   proxy's own log as well as on the CLI.
+ *   operator's daemon through the desktop backend on the Mac, and off macOS
+ *   to the runner's native dockerd through a test-only worker (owner
+ *   decision 3) - and asserts on the proxy's own log as well as on the CLI.
  *
  *   Inside a localmost job: the runner already serves the job a filtering
  *   socket bound to this repository's approved .localmostrc, and DOCKER_HOST
@@ -32,10 +33,11 @@ import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { DesktopBackend } from '../../src/main/docker/docker-backend';
+import { DesktopBackend, DockerBackend } from '../../src/main/docker/docker-backend';
 import { DockerFilterProxy, DockerFilterProxyLogEntry } from '../../src/main/docker/docker-filter-proxy';
 import { resolveDockerEndpoint } from '../../src/shared/docker-access';
 import { DockerPolicy } from '../../src/shared/docker-policy';
+import { NATIVE_DAEMON_SOCKET, NativeDockerBackend } from './support/native-worker-docker';
 
 const IMAGE = 'alpine:3';
 
@@ -81,7 +83,16 @@ const daemonPaths = ['/var/run/docker.sock', path.join(os.homedir(), '.docker', 
 const insideJob =
   process.env.GITHUB_ACTIONS === 'true' && servedSocket !== undefined && !daemonPaths.includes(servedSocket);
 
-const endpoint = insideJob ? null : resolveDockerEndpoint();
+/** Off macOS, the runner's own daemon: where DOCKER_HOST points, if anywhere, else the usual socket. */
+const nativeSocket = servedSocket ?? NATIVE_DAEMON_SOCKET;
+
+const endpoint = insideJob
+  ? null
+  : process.platform === 'darwin'
+    ? resolveDockerEndpoint()
+    : fs.existsSync(nativeSocket)
+      ? { socketPath: nativeSocket }
+      : null;
 
 /** What is missing to run this for real, if anything. Reported as a failure, never a skip. */
 const missingReason = !dockerCli
@@ -92,7 +103,7 @@ const missingReason = !dockerCli
       : `DOCKER_HOST names ${servedSocket}, but nothing is served there. The runner serves a job its docker socket only once the repository's docker policy is approved.`
     : endpoint
       ? null
-      : 'no Docker daemon: resolveDockerEndpoint() found no daemon socket. Install and start Docker where these tests run.';
+      : 'no Docker daemon: found no daemon socket. Install and start Docker where these tests run.';
 
 interface Run {
   code: number | null;
@@ -137,7 +148,10 @@ test.describe('a job using docker through the filtering socket', () => {
       jobWorkspace = fs.mkdtempSync(path.join(process.cwd(), '.docker-e2e-'));
       workspace = fs.realpathSync.native(jobWorkspace);
     } else {
-      const backend = new DesktopBackend();
+      // No VM runs off macOS: there the worker forwards to the runner's own
+      // dockerd, and the app never chooses it (owner decision 3).
+      const backend: DockerBackend =
+        process.platform === 'darwin' ? new DesktopBackend() : new NativeDockerBackend(nativeSocket);
       // The checkout the backend roots mounts at, for the repository this
       // socket is bound to below: the runner lays it out as
       // _work/<repo>/<repo>, and declared paths resolve against it. Resolved
@@ -149,8 +163,8 @@ test.describe('a job using docker through the filtering socket', () => {
       socketPath = path.join(scratch, 'docker.sock');
       const captured: DockerFilterProxyLogEntry[] = [];
       logs = captured;
-      // The worker the runner would make for this socket; the desktop one
-      // forwards to the operator's daemon, and pulls through it.
+      // The worker the runner would make for this socket; each of these
+      // forwards to its daemon, and pulls through it.
       const worker = backend.forWorker({
         slot: 1,
         sandboxDir: scratch,
