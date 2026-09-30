@@ -227,6 +227,11 @@ describe('settings IPC handlers', () => {
         { level: 'repo', repoUrl: 'https://github.com/../x' },
         { level: 'repo', repoUrl: 'https://github.com/o/r/../../x' },
         { level: 'repo', repoUrl: 'https://evil.example/o/r' },
+        // The job link is this string as it is, so only GitHub's own form of
+        // it is kept, the one the setup wizard offers: no clone suffix, no
+        // trailing slash.
+        { level: 'repo', repoUrl: 'https://github.com/o/r.git' },
+        { level: 'repo', repoUrl: 'https://github.com/o/r/' },
       ]) {
         const result = handlers['settings:set']({}, { runnerConfig });
         expect({ runnerConfig, success: result.success }).toEqual({ runnerConfig, success: false });
@@ -236,6 +241,10 @@ describe('settings IPC handlers', () => {
       for (const runnerConfig of [
         { level: 'org', orgName: 'acme', repoUrl: '' },
         { level: 'repo', orgName: '', repoUrl: 'https://github.com/o/my.repo' },
+        // An owner only older accounts can have: the page sends the saved
+        // runnerConfig back with every change to it, so refusing this URL
+        // would refuse every later change to the runner's count or labels.
+        { level: 'repo', orgName: '', repoUrl: 'https://github.com/old-name-/r' },
       ]) {
         expect(handlers['settings:set']({}, { runnerConfig })).toEqual({ success: true });
         expect(saveConfig).toHaveBeenLastCalledWith({ runnerConfig });

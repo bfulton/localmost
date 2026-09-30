@@ -22,6 +22,9 @@ jest.mock('./app-state', () => ({
   getGitHubAuth: () => ({ refreshAccessToken: (t: string) => mockRefresh(t) }),
   getLogger: () => undefined,
 }));
+// What the tray was told the session is, each time it was asked to redraw.
+const trayRedraws: Array<boolean | undefined> = [];
+jest.mock('./tray-init', () => ({ updateTrayMenu: () => { trayRedraws.push(authState?.expired); } }));
 
 import { forceRefreshToken } from './auth-tokens';
 
@@ -31,6 +34,7 @@ describe('a refresh that can never succeed', () => {
     mockLoadConfig.mockReturnValue({});
     mockSaveConfig.mockReset();
     mockRefresh.mockReset();
+    trayRedraws.length = 0;
   });
 
   it('marks the session expired, so the app stops claiming to be signed in', async () => {
@@ -51,6 +55,19 @@ describe('a refresh that can never succeed', () => {
     expect(authState?.user.login).toBe('bfulton');
     // And it is persisted, or a restart would forget and claim health again.
     expect(mockSaveConfig).toHaveBeenCalled();
+  });
+
+  it('redraws the tray once the session is marked expired', async () => {
+    // The tray reads the auth state only when asked to redraw, and nothing
+    // asked it here: the menu went on showing the runner as connected, with
+    // Pause, until something unrelated redrew it.
+    mockRefresh.mockRejectedValue(
+      new Error('Failed to refresh token: The client_id and/or client_secret passed are incorrect.')
+    );
+
+    await forceRefreshToken();
+
+    expect(trayRedraws).toEqual([true]);
   });
 
   it('leaves a recoverable HTTP failure alone: a 500 is not proof of a spent token', async () => {

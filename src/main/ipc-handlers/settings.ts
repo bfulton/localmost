@@ -17,7 +17,7 @@ import { IPC_CHANNELS, SleepProtection, LogLevel } from '../../shared/types';
 import { store } from '../store';
 import { ThemeSetting } from '../store/types';
 import { MAX_RUNNER_COUNT } from '../../shared/constants';
-import { isGitHubLogin, isGitHubOwnerName, parseGitHubRepoUrl } from '../../shared/github-names';
+import { isGitHubLogin, isGitHubOwnerName, parseSavedGitHubRepoUrl } from '../../shared/github-names';
 import { isAllowedUsers, isFilterScope } from '../../shared/user-filter-config';
 
 const log = () => getLogger();
@@ -34,6 +34,17 @@ const isString = (value: unknown): boolean => typeof value === 'string';
 
 const isIntegerIn = (min: number, max: number) => (value: unknown): boolean =>
   Number.isInteger(value) && (value as number) >= min && (value as number) <= max;
+
+/**
+ * A repository's page as GitHub gives it, https://github.com/<owner>/<repo>
+ * and nothing more. The parser also reads a clone suffix and a trailing
+ * slash, but the saved string is the job link as it is, so it must already
+ * be GitHub's own form.
+ */
+const isSavedRepoUrl = (value: unknown): boolean => {
+  const parsed = parseSavedGitHubRepoUrl(value);
+  return parsed !== null && value === `https://github.com/${parsed.owner}/${parsed.repo}`;
+};
 
 /**
  * An object with only the named fields, each of the shape given. Fields
@@ -63,8 +74,10 @@ const SETTING_SHAPES: Record<SettableConfigKey, (value: unknown) => boolean> = {
     {
       level: oneOf('repo', 'org'),
       // With no targets saved these are the runner's owner and repo, and the
-      // URL is the job link, so they are GitHub names or empty.
-      repoUrl: (value) => value === '' || parseGitHubRepoUrl(value) !== null,
+      // URL is the job link, so they are GitHub names or empty. The URL is
+      // kept only in GitHub's own form, as the wizard offers it, and the page
+      // echoes the saved one back, older owner logins included.
+      repoUrl: (value) => value === '' || isSavedRepoUrl(value),
       orgName: (value) => value === '' || isGitHubOwnerName(value),
       runnerName: isString,
       labels: isString,

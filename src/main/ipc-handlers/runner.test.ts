@@ -77,6 +77,37 @@ describe('runner IPC handlers', () => {
       expect(mockGitHubAuth.getOrgRunnerRegistrationToken).not.toHaveBeenCalled();
     });
 
+    it('registers with the whole repository name, dots and all', async () => {
+      // The URL used to be cut at the repo name's first dot, so a runner for
+      // o/my.repo asked for - and registered with - o/my's token. Only the
+      // token request is of interest here; the rest of configuring is not.
+      mockGitHubAuth.getRunnerRegistrationToken.mockRejectedValue(new Error('stop here'));
+      for (const repoUrl of [
+        'https://github.com/o/my.repo',
+        'https://github.com/o/my.repo.git',
+        'https://github.com/o/my.repo/',
+      ]) {
+        mockGitHubAuth.getRunnerRegistrationToken.mockClear();
+        await handlers[IPC_CHANNELS.RUNNER_CONFIGURE]({}, { level: 'repo', repoUrl, runnerName: 'r', labels: [] });
+        expect({ repoUrl, calls: mockGitHubAuth.getRunnerRegistrationToken.mock.calls }).toEqual({
+          repoUrl,
+          calls: [['tok', 'o', 'my.repo']],
+        });
+      }
+    });
+
+    it('refuses a URL that only mentions github.com, or is on another host', async () => {
+      for (const repoUrl of [
+        'https://evil.example/github.com/o/r',
+        'https://github.com.evil.example/o/r',
+        'git@github.com:o/r.git',
+      ]) {
+        const result = await handlers[IPC_CHANNELS.RUNNER_CONFIGURE]({}, { level: 'repo', repoUrl, runnerName: 'r', labels: [] });
+        expect({ repoUrl, result }).toEqual({ repoUrl, result: { success: false, error: 'Invalid repository URL' } });
+      }
+      expect(mockGitHubAuth.getRunnerRegistrationToken).not.toHaveBeenCalled();
+    });
+
     it('refuses a runner name, labels or count that are not what configuration takes', async () => {
       const valid = { level: 'repo', repoUrl: 'https://github.com/o/r', runnerName: 'localmost.host', labels: ['self-hosted'] };
       for (const options of [

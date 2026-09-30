@@ -108,7 +108,11 @@ export const updateTrayMenu = (): void => {
   }
 
   const status: TrayStatusInfo = {
-    isAuthenticated: !!authState,
+    // An expired session keeps its auth state, login and all, so Settings can
+    // offer to reconnect as the right person. It cannot get a token, so it is
+    // not connected, and like a signed-out one it gets no Pause or Resume.
+    isAuthenticated: !!authState && !authState.expired,
+    isSessionExpired: !!authState?.expired,
     isConfigured: runnerManager?.isConfigured() ?? false,
     runnerStatus: effectiveStatus,
     isBusy: runnerStatus?.status === 'busy',

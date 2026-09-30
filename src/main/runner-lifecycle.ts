@@ -14,6 +14,7 @@ import {
 } from './app-state';
 import { AppConfig } from './config';
 import { DEFAULT_RUNNER_COUNT } from '../shared/constants';
+import { parseSavedGitHubRepoUrl } from '../shared/github-names';
 /** Delay before retry in milliseconds. */
 const RETRY_DELAY_MS = 2000;
 
@@ -76,20 +77,25 @@ const getRegistrationTargets = (config: AppConfig): RegistrationTarget[] => {
   }
 
   // Repo-level runner (check repoUrl regardless of level setting for robustness)
-  if (runnerConfig.repoUrl) {
-    const match = runnerConfig.repoUrl.match(/github\.com[\/:]([^\/]+)\/([^\/\.]+)/);
-    if (match) {
-      const [, owner, repo] = match;
-      return [{
-        type: 'repo',
-        owner,
-        repo,
-        displayName: `${owner}/${repo}`,
-      }];
-    }
-  }
+  const repoTarget = repoTargetFromUrl(runnerConfig.repoUrl);
+  return repoTarget ? [repoTarget] : [];
+};
 
-  return [];
+/**
+ * The repository a config from before targets names by its URL: GitHub's
+ * html_url for it, as the setup wizard saved it. A repo name keeps its dots,
+ * an owner may be an older login new accounts cannot take, and a URL that is
+ * not a repository on github.com names none.
+ */
+const repoTargetFromUrl = (repoUrl: string | undefined): RegistrationTarget | undefined => {
+  const parsed = repoUrl ? parseSavedGitHubRepoUrl(repoUrl) : null;
+  if (!parsed) return undefined;
+  return {
+    type: 'repo',
+    owner: parsed.owner,
+    repo: parsed.repo,
+    displayName: `${parsed.owner}/${parsed.repo}`,
+  };
 };
 
 /**
@@ -514,17 +520,8 @@ export const reRegisterRunner1 = async (
         owner: runnerConfig.orgName,
         displayName: runnerConfig.orgName,
       };
-    } else if (runnerConfig.repoUrl) {
-      const match = runnerConfig.repoUrl.match(/github\.com[\/:]([^\/]+)\/([^\/\.]+)/);
-      if (match) {
-        const [, owner, repo] = match;
-        registrationTarget = {
-          type: 'repo',
-          owner,
-          repo,
-          displayName: `${owner}/${repo}`,
-        };
-      }
+    } else {
+      registrationTarget = repoTargetFromUrl(runnerConfig.repoUrl);
     }
   }
 
