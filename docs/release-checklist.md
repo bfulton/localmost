@@ -31,7 +31,12 @@
   - `Notarize: true`
   - `Release build: true`
 - [ ] Test the DMG installs correctly
+- [ ] `codesign -d --entitlements -` on each of these (both arches, under `build/out/localmost-darwin-<arch>/localmost.app`) lists only the keys shown, and no `device.*`, `personal-information.*` or `app-sandbox` key:
+  - the app, and `Contents/Frameworks/localmost Helper (GPU).app`: only `com.apple.security.cs.allow-jit`
+  - `Contents/Frameworks/localmost Helper (Plugin).app`: only `com.apple.security.cs.allow-unsigned-executable-memory` and `com.apple.security.cs.disable-library-validation`
 - [ ] `node scripts/generate-latest-mac-yml.js`
+  - Needs both arches made; copies each arch's update zip to `build/out/make/localmost-X.Y.Z-<arch>-mac.zip`
+  - Verify `latest-mac.yml` lists both `-mac.zip` files and `path:` names a zip (the in-app updater installs only from a zip)
 
 ## Post-Build
 - [ ] Smoke test basic functionality through installed app:
@@ -50,6 +55,8 @@
   - Release notes: copy from CHANGELOG.md
   - Attach `build/out/make/localmost-X.Y.Z-arm64.dmg`
   - Attach `build/out/make/localmost-X.Y.Z-x64.dmg`
+  - Attach `build/out/make/localmost-X.Y.Z-arm64-mac.zip`
+  - Attach `build/out/make/localmost-X.Y.Z-x64-mac.zip`
   - Attach `build/out/make/latest-mac.yml`
 - [ ] Publish release
 - [ ] Bump the release version in [package.json](https://github.com/bfulton/localmost/edit/main/package.json)
