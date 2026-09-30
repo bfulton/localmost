@@ -495,6 +495,42 @@ describe('the runner template a sandbox is copied from', () => {
     expect(fs.existsSync(dir)).toBe(false);
   });
 
+  it('leaves a registration another downloader started alone when it sweeps', async () => {
+    // The app builds more than one downloader: the one that sweeps at
+    // startup is not the only one that makes staging directories.
+    const other = new RunnerDownloader();
+    const dir = await other.makeRegistrationDir();
+
+    await downloader.cleanupStaleConfiguration(() => undefined);
+
+    expect(fs.existsSync(dir)).toBe(true);
+    await downloader.removeRegistrationDir(dir);
+    expect(fs.existsSync(dir)).toBe(false);
+  });
+
+  it('stops counting the directory an integrity record was built in as in use once it is removed', async () => {
+    const pristine = path.join(root, 'pristine');
+    layOutRunner(pristine);
+    serveRelease(await tarballOf(pristine));
+    fs.rmSync(pristine, { recursive: true });
+    const mkdtemp = jest.spyOn(fs.promises, 'mkdtemp');
+    let made: string[];
+    try {
+      await build();
+      made = await Promise.all(mkdtemp.mock.results.map((result) => result.value as Promise<string>));
+    } finally {
+      mkdtemp.mockRestore();
+    }
+    const scratch = made.filter((dir) => path.basename(dir).startsWith('arc-staging-'));
+    expect(scratch).toHaveLength(1);
+    expect(fs.existsSync(scratch[0])).toBe(false);
+
+    // A quit leaving one of that name behind later is swept like any other.
+    write(path.join(scratch[0], 'tree', 'run.sh'), '#!/bin/bash\n');
+    await downloader.cleanupStaleConfiguration(() => undefined);
+    expect(fs.existsSync(scratch[0])).toBe(false);
+  });
+
   it('removes only a directory it made for a registration', async () => {
     const dir = await downloader.makeRegistrationDir();
     await downloader.removeRegistrationDir(dir);

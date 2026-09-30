@@ -32,6 +32,13 @@ const ARC_STAGING_PREFIX = 'arc-staging-';
 const REGISTRATION_PREFIX = 'temp-proxy-';
 
 /**
+ * Staging and registration directories still in use, which a sweep leaves
+ * alone. Shared by every RunnerDownloader, since the app builds more than one
+ * and the one that sweeps is not the only one that makes them.
+ */
+const scratchInUse = new Set<string>();
+
+/**
  * What a runner template held when it came from its release: each file's
  * sha256 and each symlink's target, by path relative to the template.
  */
@@ -75,8 +82,6 @@ export class RunnerDownloader {
   private selectedVersion: string | null = null;
   /** Records being built from a release download, so concurrent starts share one. */
   private manifestsInFlight: Map<string, Promise<ArcManifest>> = new Map();
-  /** Staging and registration directories still in use, which a sweep leaves alone. */
-  private readonly scratchInUse = new Set<string>();
 
   constructor() {
     this.baseDir = getRunnerDir();
@@ -155,7 +160,7 @@ export class RunnerDownloader {
 
   /** Remove a directory makeRegistrationDir made. Refuses any other path, since this deletes a whole tree. */
   async removeRegistrationDir(dir: string): Promise<void> {
-    if (!this.scratchInUse.has(dir) || !path.basename(dir).startsWith(REGISTRATION_PREFIX)) {
+    if (!scratchInUse.has(dir) || !path.basename(dir).startsWith(REGISTRATION_PREFIX)) {
       throw new Error(`Refusing to remove ${dir}: not a registration directory in ${this.baseDir}`);
     }
     await this.removeScratchDir(dir);
@@ -165,7 +170,7 @@ export class RunnerDownloader {
   private async makeScratchDir(prefix: string): Promise<string> {
     await fs.promises.mkdir(this.baseDir, { recursive: true });
     const dir = await fs.promises.mkdtemp(path.join(this.baseDir, prefix));
-    this.scratchInUse.add(dir);
+    scratchInUse.add(dir);
     return dir;
   }
 
@@ -173,7 +178,7 @@ export class RunnerDownloader {
     try {
       await fs.promises.rm(dir, { recursive: true, force: true });
     } finally {
-      this.scratchInUse.delete(dir);
+      scratchInUse.delete(dir);
     }
   }
 
@@ -354,7 +359,7 @@ export class RunnerDownloader {
       await this.writeArcManifest(version, manifest);
       return manifest;
     } finally {
-      await fs.promises.rm(scratch, { recursive: true, force: true });
+      await this.removeScratchDir(scratch);
     }
   }
 
@@ -986,8 +991,11 @@ export class RunnerDownloader {
     // A release download interrupted by a quit leaves its staging directory
     // behind, holding the tarball and a tree extracted from it; a
     // registration leaves a copy of the runner and the key config.sh made.
-    // Nothing is downloading or registering yet at startup, and one that is
-    // is left alone, so any found are leftovers.
+    // Nothing is downloading or registering yet at startup - this runs before
+    // the window's handlers are set up and before the saved sign-in that
+    // registering needs is loaded - so any found are leftovers. That order is
+    // what keeps a directory in use safe; skipping those marked in use is a
+    // backstop, since mkdtemp makes one before it can be marked.
     await this.cleanupStagingDirectories(log);
 
     await this.cleanupWorkDirectories(log);
@@ -1007,7 +1015,7 @@ export class RunnerDownloader {
     for (const entry of entries) {
       const kind = kinds.find(([prefix]) => entry.startsWith(prefix));
       const dir = path.join(this.baseDir, entry);
-      if (!kind || this.scratchInUse.has(dir)) continue;
+      if (!kind || scratchInUse.has(dir)) continue;
       log(`Removing ${kind[1]}: ${entry}`);
       await fs.promises.rm(dir, { recursive: true, force: true });
     }

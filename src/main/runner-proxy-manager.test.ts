@@ -367,6 +367,35 @@ describe('RunnerProxyManager', () => {
 
       expect(removeRegistrationDir.mock.calls).toEqual([['/mock/runner/dir/temp-proxy-Ab12Cd']]);
     });
+
+    it('keeps a registration that succeeded when its directory cannot be removed', async () => {
+      // GitHub has registered it and its credentials are copied out; the
+      // startup sweep removes the directory later.
+      removeRegistrationDir.mockRejectedValue(new Error('EPERM: operation not permitted'));
+
+      await expect(manager.registerInstance(createMockTarget(), 1)).resolves.toBeDefined();
+    });
+
+    it("reports config.sh's failure, not a failure to remove its directory after", async () => {
+      mockSpawn.mockImplementation(() => {
+        const { EventEmitter } = jest.requireActual('events') as typeof import('events');
+        const proc = new EventEmitter() as import('events').EventEmitter & { stdout: unknown; stderr: unknown };
+        proc.stdout = new EventEmitter();
+        proc.stderr = new EventEmitter();
+        setImmediate(() => proc.emit('close', 1));
+        return proc;
+      });
+      removeRegistrationDir.mockRejectedValue(new Error('EPERM: operation not permitted'));
+
+      await expect(manager.registerInstance(createMockTarget(), 1)).rejects.toThrow(/config\.sh failed/);
+    });
+
+    it("reports the runner's integrity failure, not a failure to remove its copy after", async () => {
+      copyVerifiedArc.mockRejectedValue(new Error('Runner v2.336.0 does not match its integrity record (changed: config.sh)'));
+      removeRegistrationDir.mockRejectedValue(new Error('EPERM: operation not permitted'));
+
+      await expect(manager.registerInstance(createMockTarget(), 1)).rejects.toThrow(/integrity record/);
+    });
   });
 
   describe('replaceExposedKeys', () => {

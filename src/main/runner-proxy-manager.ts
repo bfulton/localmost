@@ -314,7 +314,22 @@ export class RunnerProxyManager {
       return credentials;
     } finally {
       // It holds a copy of the runner and the registration's key
-      await runnerDownloader.removeRegistrationDir(sandboxDir);
+      await this.releaseRegistrationDir(sandboxDir);
+    }
+  }
+
+  /**
+   * Hand a registration's directory back to the downloader. A failure to
+   * remove it is logged, not thrown: it would otherwise replace the
+   * registration's own result - failing one GitHub has already made, or
+   * hiding why config.sh failed - and the startup sweep removes the directory
+   * later.
+   */
+  private async releaseRegistrationDir(dir: string): Promise<void> {
+    try {
+      await getRunnerDownloader()?.removeRegistrationDir(dir);
+    } catch (err) {
+      getLogger()?.warn(`[RunnerProxyManager] Could not remove ${dir}; it will be removed at the next start: ${(err as Error).message}`);
     }
   }
 
@@ -425,7 +440,7 @@ export class RunnerProxyManager {
    * is the downloader's checked copy - the same one every worker gets. The
    * downloader makes the directory, unique to this registration and only the
    * app's to open, and sweeps one a quit left behind; hand it back with
-   * removeRegistrationDir.
+   * releaseRegistrationDir.
    */
   private async buildTempSandbox(version: string): Promise<string> {
     const runnerDownloader = getRunnerDownloader();
@@ -446,7 +461,7 @@ export class RunnerProxyManager {
         else getLogger()?.info(`[RunnerProxyManager] ${message}`);
       });
     } catch (error) {
-      await runnerDownloader.removeRegistrationDir(tempDir);
+      await this.releaseRegistrationDir(tempDir);
       throw error;
     }
 
