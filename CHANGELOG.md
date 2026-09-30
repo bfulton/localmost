@@ -264,15 +264,17 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   denied to a runner job and a `localmost test` step for writes as well as
   reads, at every level and whatever the policy grants, and the directories
   above each are closed to writes, so none can be renamed out from under the
-  deny. They were denied to reads only, so a write grant that covered one let
-  a job rename it, or the directory it sits in, to a name the grants covered
-  and read it there: with write on `~/.gradle`,
-  `mv ~/.gradle/gradle.properties ~/.gradle/p2` printed the secret, which
-  every later `moderate` job could then read too, and with write on `~`,
-  `mv ~/.ssh ~/.sshx` exposed the SSH keys. Each is also denied by the path
-  it resolves to when the job starts, so one a dotfile manager links into
-  place (`~/.aws` linked to `~/dotfiles/aws`, say) is not read or renamed
-  through the link.
+  deny. A runner job was denied them for reads only, and neither profile
+  closed the directories above them to writes, so a write grant that covered
+  one let a job rename it, or the directory it sits in, to a name the grants
+  covered and read it there: with write on `~/.gradle`, renaming it with
+  `mv ~/.gradle/gradle.properties ~/.gradle/p2` let the job print it, and
+  every later `moderate` job could then read it too; with write on `~`,
+  `mv ~/.ssh ~/.sshx` exposed the SSH keys; and in a `localmost test` step a
+  write grant of `~/Library` renamed Application Support, and the app's
+  credential store with it. Each is also denied by the path it resolves to
+  when the job starts, so one a dotfile manager links into place (`~/.aws`
+  linked to `~/dotfiles/aws`, say) is not read or renamed through the link.
 - The same floor now names these files, where developer tools keep tokens and
   passwords in plain text: `~/.azure` (the Azure CLI's token cache),
   `~/.git-credentials`, `~/.pypirc`, `~/.gem/credentials` and
@@ -282,9 +284,9 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   `~/.cache/huggingface/token` and `stored_tokens`. A policy granting read of
   `~` read them all, and `moderate`, which reads `~/.local` and `~/.cache` as
   toolchain trees, read the RubyGems push key and the Hugging Face tokens with
-  no grant at all. The directories they sit in stay as granted: installed
-  gems, Terraform's plugin cache and the Hugging Face model cache are still
-  there for a job to use.
+  no grant at all. The directories they sit in are not denied: installed
+  gems, Terraform's plugin cache and `~/.cache/huggingface/hub` stay as the
+  level and policy grant them.
 - A job ends when its worker exits, not when a completion line is read. The
   runner prints the job's name, which the workflow spells, in that line, so a
   name carrying a newline and `Job b completed with result: Succeeded` closed
@@ -351,9 +353,9 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   following the command's link to the real script. It ran the `cli.js` in
   the link's own directory, `/usr/local/bin`, where none is installed, so
   every command failed with "Cannot find module", and one placed there would
-  have run instead; run as `sh localmost`, it ran a `cli.js` in the working
-  directory, as a cloned checkout has. The command runs with the `node` first
-  on `PATH`, so it needs Node.js.
+  have run instead; run as `sh localmost`, it ran `localmost/cli.js` under
+  the working directory. The command runs with the `node` first on `PATH`,
+  so it needs Node.js.
 - The app is signed with only the entitlements Electron needs: `cs.allow-jit`
   on the app, its main, GPU and renderer helpers and ShipIt, the plugin
   helper's two `cs.*` exceptions, and none on the camera helper. Releases
@@ -371,10 +373,10 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   helper, which ran on until the camera next changed.
 
 ### Fixed
-- In-app updates install. The update feed listed only the DMGs, and the
-  updater installs only from a zip, so every download failed with
-  `ERR_UPDATER_ZIP_FILE_NOT_FOUND`. Each release now ships a zip for each
-  architecture, listed in the feed ahead of the DMGs.
+- In-app updates find a zip to install. The update feed listed only the
+  DMGs, and the updater installs only from a zip, so every download failed
+  with `ERR_UPDATER_ZIP_FILE_NOT_FOUND`. Each release now ships a zip for
+  each architecture, listed in the feed ahead of the DMGs.
 - `localmost policy init --force` replaces an existing policy. The flag was
   read and ignored, while the refusal without it said to pass it.
 - The tray shows an expired GitHub session as "GitHub: Session expired,

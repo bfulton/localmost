@@ -619,7 +619,7 @@ localmost adds isolation layers that the stock GitHub Actions Runner lacks:
 | Network | Allowlisted hosts only (GitHub, npm, PyPI, etc.) via HTTP proxy |
 | Docker daemon | Through a filtering socket; only declared `pull`/`run`/`build` requests are forwarded |
 | Home directory | **Denied** — no access to `~/.ssh`, `~/.aws`, etc. |
-| Other applications | **Denied** — no access to `/Applications`, except Xcode (`/Applications/Xcode.app`) under `moderate`/`permissive` or when declared |
+| Other applications | **Denied** — no access to `/Applications`, except Xcode (`/Applications/Xcode.app`) under `moderate`/`permissive`, and what its approved policy declares |
 
 ### What Remains Accessible
 

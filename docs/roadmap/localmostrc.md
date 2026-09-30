@@ -126,7 +126,8 @@ shared:
                                  # included), ~/.aws and the rest stay denied
                                  # whatever is declared - see SECURITY.md
       - "~/.gitconfig"
-      - "/Applications/Xcode.app"  # Not on the strict floor
+                                 # Xcode is not on the strict floor
+      - "/Applications/Xcode.app"
     write:
       - "./build/**"
     deny:
