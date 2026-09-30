@@ -14,11 +14,12 @@ there. A package that needs to change the contract changes that file in its
 own branch and says so in its summary. The integration stage reconciles the
 changes.
 
-**Owner decisions still open** (the design's "Decisions for the owner"): what
-the per-repository cache may hold, `privileged`, and what the e2e docker
-spec's Linux leg runs. This plan follows the recommendation for each. If the
-owner chooses otherwise, the affected steps are marked *(decision 1)*,
-*(decision 2)* or *(decision 3)*.
+**Owner decisions** (the design's "Decisions for the owner"), each the
+recommended option: (1) images that needed registry credentials never enter
+the shared per-repository store or golden disk, only the job's own; (2)
+`privileged` stays refused; (3) the e2e docker spec's Linux leg runs on a
+test-only forwarder to the runner's native `dockerd`, under `test/`. The
+steps they shape are marked *(decision 1)*, *(decision 2)* and *(decision 3)*.
 
 **Spike code** (not in the repo; reuse freely):
 `~/.claude/jobs/676ade47/tmp/vm-design/`. It holds `vzprobe.swift` (a VZ

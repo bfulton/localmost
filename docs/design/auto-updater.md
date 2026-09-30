@@ -165,8 +165,8 @@ export function initAutoUpdater(mainWindow: BrowserWindow): void {
     repo: 'localmost',
   });
 
-  // Disable auto-download - let user decide
-  autoUpdater.autoDownload = false;
+  // Download as soon as an update is found; it installs on quit
+  autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
 
   // Event handlers
@@ -242,7 +242,7 @@ export const IpcChannels = {
 export interface UpdateSettings {
   autoCheck: boolean;           // Check on startup (default: true)
   checkInterval: number;        // Hours between checks (default: 24)
-  notifyOnly: boolean;          // Only notify, don't auto-download (default: true)
+  notifyOnly: boolean;          // Only notify, don't auto-download (default: false)
 }
 ```
 
