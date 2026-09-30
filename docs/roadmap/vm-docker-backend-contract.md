@@ -1104,12 +1104,17 @@ refused request but the three above.
     `NCPU` = `dockerVm.cpus` and `MemTotal` = `dockerVm.memoryMiB` in bytes,
     the two INFO_FIELDS that describe the VM's size rather than its software.
 
-  A filter test compares each synthesised answer, field by field, with the
-  forwarded and rewritten answer from a VM booted from the same manifest (a
-  recorded fixture from WP-A's smoke boot, saved as
-  `src/main/vm/testdata/forwarded-baseline.json` in the shape that file has
-  now; until then it holds a stand-in). The forwarded `MemTotal` is the
-  guest kernel's, a little under the configured size.
+  The forwarded answers get the same treatment: `Api-Version` clamped on
+  `/_ping` and on `/version` (header and body), and `/_ping`'s
+  `Builder-Version` rewritten to `1`, since dockerd 29 says `2`.
+
+  A test (vm-backend.test.ts) compares each synthesised answer, field by
+  field, with the forwarded and rewritten one: the filter relays dockerd's
+  own answers from the guest build's smoke boot, which `npm run build:guest
+  -- --write-fixture` records in `test/fixtures/vm-guest-daemon-answers.json`
+  together with the smoke VM's size, and the synthesised side uses the same
+  manifest fields and that size. The forwarded `MemTotal` is the guest
+  kernel's, a little under the configured size.
 - **Daemon answers are hostile input.** With guest root (a kernel bug, or
   `privileged` if it is ever granted), `dockerd`'s answers are the job's to
   choose, and Electron main is shared by every job. Every daemon answer the

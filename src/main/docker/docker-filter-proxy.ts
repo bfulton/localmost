@@ -1193,18 +1193,33 @@ export class DockerFilterProxy {
   }
 
   /** Write a whole answer read with readCapped, as the daemon's with its length. */
-  private writeWhole(upstreamRes: http.IncomingMessage, res: http.ServerResponse, status: number, body: Buffer): void {
-    const headers = { ...this.relayedHeaders(upstreamRes), 'content-length': String(body.length) };
+  private writeWhole(
+    upstreamRes: http.IncomingMessage,
+    res: http.ServerResponse,
+    status: number,
+    body: Buffer,
+    clampApiVersion = false
+  ): void {
+    const headers: http.OutgoingHttpHeaders = { ...this.relayedHeaders(upstreamRes), 'content-length': String(body.length) };
     delete headers['transfer-encoding'];
+    const advertised = headers['api-version'];
+    if (clampApiVersion && typeof advertised === 'string') headers['api-version'] = this.clampVersion(advertised);
     res.writeHead(status, headers);
     if (body.length > 0) res.write(body);
   }
 
-  /** The daemon's ping, with the API version clamped so the client negotiates down to ours. */
+  /**
+   * The daemon's ping, with the API version clamped so the client negotiates
+   * down to ours, and the classic builder advertised: dockerd 29 says
+   * `Builder-Version: 2`, which steers the CLI to BuildKit, which the filter
+   * refuses. The synthesised ping says 1 as well (contract §5.3), so a client
+   * sees the same answer before and after the VM is up.
+   */
   private relayPing(upstreamRes: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const headers = this.relayedHeaders(upstreamRes);
     const advertised = headers['api-version'];
     if (typeof advertised === 'string') headers['api-version'] = this.clampVersion(advertised);
+    if (headers['builder-version'] !== undefined) headers['builder-version'] = '1';
     res.writeHead(upstreamRes.statusCode ?? 502, headers);
     res.flushHeaders();
     upstreamRes.pipe(res, { end: false });
@@ -1302,7 +1317,7 @@ export class DockerFilterProxy {
     this.writeWhole(upstreamRes, res, status, raw);
   }
 
-  /** The daemon's /version, with ApiVersion clamped the same way. */
+  /** The daemon's /version, with ApiVersion, and its Api-Version header, clamped the same way. */
   private async relayVersion(upstreamRes: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const raw = await this.readCapped(upstreamRes);
     if (raw === null) {
@@ -1318,7 +1333,7 @@ export class DockerFilterProxy {
       this.writeRefusal(res, 502, 'docker daemon returned an unreadable version response');
       return;
     }
-    this.writeWhole(upstreamRes, res, upstreamRes.statusCode ?? 502, body);
+    this.writeWhole(upstreamRes, res, upstreamRes.statusCode ?? 502, body, true);
   }
 
   /**
@@ -1359,7 +1374,7 @@ export class DockerFilterProxy {
           return;
         }
         // The rewritten body is sent plain and whole, whatever the daemon's was.
-        const headers = { ...this.relayedHeaders(upstreamRes), 'content-length': String(body.length) };
+        const headers: http.OutgoingHttpHeaders = { ...this.relayedHeaders(upstreamRes), 'content-length': String(body.length) };
         delete headers['transfer-encoding'];
         delete headers['content-encoding'];
         res.writeHead(status, headers);

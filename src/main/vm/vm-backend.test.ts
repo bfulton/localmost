@@ -522,58 +522,111 @@ describe('VmBackend', () => {
       expect(worker().baseline('/_ping')).toMatchObject({ status: 503, body: { message: expect.stringMatching(/guest/) } });
     });
 
-    it('matches, through the filter, what a job sees forwarded from a VM booted from the same manifest', async () => {
+    it('matches, through the filter, what the guest smoke boot recorded dockerd answering', async () => {
       // A job's client must not be able to tell the two apart: the same
       // status, the headers it reads, and the same value in every field the
-      // synthesised answer has.
-      const recorded = JSON.parse(fs.readFileSync(path.join(__dirname, 'testdata', 'forwarded-baseline.json'), 'utf-8'));
-      const w = worker();
-      const proxy = new DockerFilterProxy({ backend: backend(), worker: w });
-      const sock = path.join(root, 'd.sock');
-      await proxy.start(sock);
-      try {
-        const get = (p: string) =>
-          new Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }>((resolve, reject) => {
-            const req = http.request({ socketPath: sock, path: p, agent: false }, (res) => {
-              let body = '';
-              res.on('data', (c: Buffer) => (body += c.toString()));
-              res.on('end', () => resolve({ status: res.statusCode!, headers: res.headers, body }));
-            });
-            req.on('error', reject);
-            req.end();
-          });
-        const ping = await get('/_ping');
-        expect(ping.status).toBe(recorded.ping.status);
-        expect(ping.body).toBe(recorded.ping.body);
-        for (const header of ['api-version', 'builder-version', 'ostype', 'docker-experimental', 'content-type', 'cache-control', 'pragma']) {
-          expect([header, ping.headers[header]]).toEqual([header, recorded.ping.headers[header]]);
+      // synthesised answer has. The recording is dockerd's own answers from
+      // the guest build's smoke boot (WP-A), replayed here by a stand-in
+      // daemon and relayed by the real filter, as a running VM's would be.
+      const recorded = JSON.parse(
+        fs.readFileSync(path.resolve(__dirname, '..', '..', '..', 'test', 'fixtures', 'vm-guest-daemon-answers.json'), 'utf-8')
+      );
+      writeGuest(path.join(root, 'guest'), { guestVersion: recorded.guestVersion, docker: recorded.docker, baseline: recorded.baseline });
+      const sized: DockerVmConfig = { ...config, cpus: recorded.vm.cpus, memoryMiB: recorded.vm.memoryMiB };
+      const synthesising = new VmBackend({
+        vmManager: manager,
+        guest: new GuestImage(path.join(root, 'guest')),
+        puller: puller as unknown as ImagePuller,
+        cacheDisks: { scheduleRefresh: () => {} },
+        config: () => sized,
+      }).forWorker({
+        slot: 3, sandboxDir, sandboxId: '3-abcdef012345', shareNonce: 'n'.repeat(32),
+        spawnRepository: 'Owner/Repo', proxy: () => ({ port: 50123, url: proxyUrl }), log: () => {},
+      });
+
+      const replay = http.createServer((req, res) => {
+        const p = (req.url ?? '').replace(/^\/v\d+\.\d+/, '');
+        const answer =
+          p === '/_ping' ? recorded.answers[req.method === 'HEAD' ? 'pingHead' : 'ping'] : p === '/version' ? recorded.answers.version : p === '/info' ? recorded.answers.info : null;
+        if (!answer) {
+          res.writeHead(404).end();
+          return;
         }
-        const version = await get('/v1.45/version');
-        expect(version.status).toBe(recorded.version.status);
+        const body = typeof answer.body === 'string' ? answer.body : JSON.stringify(answer.body);
+        const headers = { ...answer.headers };
+        delete headers['content-length'];
+        delete headers['transfer-encoding'];
+        res.writeHead(answer.status, headers);
+        res.end(req.method === 'HEAD' ? undefined : body);
+      });
+      const replaySock = path.join(root, 'r.sock');
+      await new Promise<void>((resolve) => replay.listen(replaySock, resolve));
+      // The same worker, but with a VM up behind it at the replaying daemon.
+      const forwarding = Object.assign(Object.create(synthesising) as WorkerDocker, {
+        endpoint: async () => ({ kind: 'ready' as const, socketPath: replaySock }),
+        running: () => true,
+      });
+
+      const serve = async (w: WorkerDocker, name: string) => {
+        const proxy = new DockerFilterProxy({ backend: backend(), worker: w });
+        const sock = path.join(root, `${name}.sock`);
+        await proxy.start(sock);
+        proxy.bind('Owner/Repo', {});
+        return { proxy, sock };
+      };
+      const get = (sock: string, p: string, method = 'GET') =>
+        new Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }>((resolve, reject) => {
+          const req = http.request({ socketPath: sock, path: p, method, agent: false }, (res) => {
+            let body = '';
+            res.on('data', (c: Buffer) => (body += c.toString()));
+            res.on('end', () => resolve({ status: res.statusCode!, headers: res.headers, body }));
+          });
+          req.on('error', reject);
+          req.end();
+        });
+
+      const synth = await serve(synthesising, 's');
+      const fwd = await serve(forwarding, 'f');
+      try {
+        for (const method of ['GET', 'HEAD']) {
+          const [mine, theirs] = [await get(synth.sock, '/_ping', method), await get(fwd.sock, '/_ping', method)];
+          expect([method, mine.status, mine.body]).toEqual([method, theirs.status, theirs.body]);
+          for (const header of ['api-version', 'builder-version', 'ostype', 'docker-experimental', 'content-type', 'cache-control', 'pragma']) {
+            expect([method, header, mine.headers[header]]).toEqual([method, header, theirs.headers[header]]);
+          }
+        }
+
+        const [version, forwardedVersion] = [await get(synth.sock, '/v1.45/version'), await get(fwd.sock, '/v1.45/version')];
+        expect(version.status).toBe(forwardedVersion.status);
         for (const header of ['api-version', 'ostype', 'docker-experimental', 'content-type']) {
-          expect([header, version.headers[header]]).toEqual([header, recorded.version.headers[header]]);
+          expect([header, version.headers[header]]).toEqual([header, forwardedVersion.headers[header]]);
         }
         const synthesisedVersion = JSON.parse(version.body) as Record<string, unknown>;
+        const relayedVersion = JSON.parse(forwardedVersion.body) as Record<string, unknown> & { Components: Array<{ Name: string; Version: string }> };
         for (const [field, value] of Object.entries(synthesisedVersion)) {
           if (field === 'Components') continue;
-          expect([field, value]).toEqual([field, recorded.version.body[field]]);
+          expect([field, value]).toEqual([field, relayedVersion[field]]);
         }
-        expect(synthesisedVersion.Components).toEqual([{ Name: 'Engine', Version: recorded.version.body.Components[0].Version }]);
-        const info = await get('/v1.45/info');
+        expect(synthesisedVersion.Components).toEqual([{ Name: 'Engine', Version: relayedVersion.Components[0].Version }]);
+
+        const [info, forwardedInfo] = [await get(synth.sock, '/v1.45/info'), await get(fwd.sock, '/v1.45/info')];
         const synthesisedInfo = JSON.parse(info.body) as Record<string, unknown>;
-        expect(Object.keys(synthesisedInfo).sort()).toEqual(Object.keys(recorded.info.body).sort());
+        const relayedInfo = JSON.parse(forwardedInfo.body) as Record<string, unknown> & { MemTotal: number };
+        expect(Object.keys(synthesisedInfo).sort()).toEqual(Object.keys(relayedInfo).sort());
         for (const [field, value] of Object.entries(synthesisedInfo)) {
           // The guest's own MemTotal is the configured size less what the kernel keeps.
           if (field === 'MemTotal') {
-            expect(value).toBeGreaterThanOrEqual(recorded.info.body.MemTotal);
-            expect(value).toBeLessThan(recorded.info.body.MemTotal * 1.05);
+            expect(value).toBeGreaterThanOrEqual(relayedInfo.MemTotal);
+            expect(value).toBeLessThan(relayedInfo.MemTotal * 1.05);
             continue;
           }
-          expect([field, value]).toEqual([field, recorded.info.body[field]]);
+          expect([field, value]).toEqual([field, relayedInfo[field]]);
         }
         expect(manager.vms).toHaveLength(0);
       } finally {
-        await proxy.stop();
+        await synth.proxy.stop();
+        await fwd.proxy.stop();
+        await new Promise<void>((resolve) => replay.close(() => resolve()));
       }
     });
   });
