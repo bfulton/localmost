@@ -37,6 +37,21 @@ const gone = async (pid: number): Promise<boolean> => {
   return !alive(pid);
 };
 
+/**
+ * A `ps` field of `pid`, asked again until `done` accepts it or ten seconds
+ * pass, and the last answer either way. What a process does once started -
+ * exec, setsid() - it does in its own time, which on a loaded machine can be
+ * well after its parent has reported it started.
+ */
+const psUntil = async (pid: number, field: string, done: (value: string) => boolean): Promise<string> => {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const value = (spawnSync('/bin/ps', ['-o', `${field}=`, '-p', String(pid)], { encoding: 'utf-8' }).stdout ?? '').trim();
+    if (done(value) || Date.now() >= deadline) return value;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+};
+
 /** Whether a profile can be constructed and applied here; see process-sandbox.sandbox.test.ts. */
 const canConstruct = (): boolean => {
   if (!isMacOS) return false;
@@ -127,10 +142,17 @@ if (!isMacOS) {
       const survivor = parseInt(job.stdout.trim(), 10);
       try {
         expect(job.status).toBe(0);
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        // Out of the job's group, and still running after the job. The job
+        // reports the survivor before it has necessarily called setsid(), so
+        // that is waited for; and the others are waited for until they run
+        // /bin/sleep, which sandbox-exec starts only once its profile is on.
+        const pgid = Number(await psUntil(survivor, 'pgid', (value) => Number(value) === survivor));
         expect(alive(survivor)).toBe(true);
-        const pgid = parseInt(execFileSync('/bin/ps', ['-o', 'pgid=', '-p', String(survivor)], { encoding: 'utf-8' }), 10);
-        expect(pgid).toBe(survivor);
+        expect({ survivor, pgid }).toEqual({ survivor, pgid: survivor });
+        for (const other of others) {
+          const command = await psUntil(other.pid!, 'comm', (value) => value === '/bin/sleep');
+          expect({ pid: other.pid, command }).toEqual({ pid: other.pid, command: '/bin/sleep' });
+        }
 
         const killed = await reapMarkedProcessesAsync(marker);
 
