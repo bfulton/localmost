@@ -1169,26 +1169,28 @@ A refresh does four things:
 const VM_HELPER = path.join(__dirname, 'build', 'localmost-vm');   // -> Resources/localmost-vm
 const GUEST_DIR = path.join(__dirname, 'build', 'guest');          // -> Resources/guest/
 const DOCKER_CLI_DIR = path.join(__dirname, 'build', 'docker-cli'); // -> Resources/docker-cli/docker
-// Exactly what Resources/guest may hold; prePackage fails on anything else.
-const GUEST_FILES = ['LICENSES.md', 'initramfs.cpio.gz', 'manifest.json', 'rootfs.erofs', 'vmlinux'];
 
 packagerConfig.extraResource.push(VM_HELPER, GUEST_DIR, DOCKER_CLI_DIR);
 packagerConfig.extendInfo = { LSMinimumSystemVersion: '14.0' };
+
+// The app's own Resources (/localmost.app/Contents/Resources), not a nested
+// helper app's, which also ends in .app/Contents/Resources.
+const APP_RESOURCES = path.join(path.sep + `${packagerConfig.name}.app`, 'Contents', 'Resources');
+const inAppResources = (filePath, ...p) => filePath.endsWith(path.join(APP_RESOURCES, ...p));
+
 // Passed as osxSign's `ignore` inside the existing `if (shouldSign)` block.
 // The guest is data for the VM, not macOS code. Without this, osx-sign signs
 // every file isbinaryfile flags (vmlinux, the initramfs, the erofs root) and
 // gives each an xattr signature carrying the app's entitlements.
-const ignoreGuest = (filePath) =>
-  filePath.includes(path.join('.app', 'Contents', 'Resources', 'guest') + path.sep);
+const ignoreGuest = (filePath) => filePath.includes(path.join(APP_RESOURCES, 'guest') + path.sep);
 
 function signOptionsForFile(filePath) {
   let plist = 'entitlements.plist';
-  const inResources = (...p) => filePath.endsWith(path.join('.app', 'Contents', 'Resources', ...p));
   if (filePath.includes('(Plugin).app')) {
     plist = 'entitlements.plugin.plist';
-  } else if (inResources(path.basename(CAMERA_HELPER)) || inResources('docker-cli', 'docker')) {
+  } else if (inAppResources(filePath, path.basename(CAMERA_HELPER)) || inAppResources(filePath, 'docker-cli', 'docker')) {
     plist = 'entitlements.none.plist';
-  } else if (inResources('localmost-vm')) {
+  } else if (inAppResources(filePath, 'localmost-vm')) {
     plist = 'entitlements.virtualization.plist';
   }
   return { hardenedRuntime: true, entitlements: path.join(__dirname, 'packaging', plist) };
@@ -1196,10 +1198,22 @@ function signOptionsForFile(filePath) {
 ```
 
 `hooks.generateAssets` runs `npm run build:native`, which is `build:helper`,
-`build:guest` and `fetch:docker-cli`, each cached. `hooks.prePackage` fails the
-build if `build/guest` holds anything but exactly `GUEST_FILES`, if
-`build/guest/manifest.json`'s hashes do not match its files, or if the
-helper or CLI is missing. A build never ships without its VM.
+`build:guest` and `fetch:docker-cli`, each cached. `hooks.prePackage` calls
+`checkVmResources({ helper, guestDir, dockerCliDir })` from
+`scripts/check-vm-resources.js`, which also holds the allowlist:
+
+```js
+// Exactly what Resources/guest may hold; prePackage fails on anything else.
+const GUEST_FILES = ['LICENSES.md', 'initramfs.cpio.gz', 'manifest.json', 'rootfs.erofs', 'vmlinux'];
+```
+
+It fails the build if `build/guest` is not a real directory holding exactly
+`GUEST_FILES` as regular files, if `build/guest/manifest.json` is not schema 1
+naming exactly `vmlinux`, `initramfs.cpio.gz` and `rootfs.erofs` with the
+sha256 and size of each file, if `build/docker-cli` holds anything but
+`docker`, or if the helper or the CLI is missing, is a link, is not
+executable, or is not a thin arm64 Mach-O executable. A build never ships
+without its VM.
 
 ### 7.3 Build scripts
 
@@ -1210,8 +1224,14 @@ helper or CLI is missing. A build never ships without its VM.
   re-signs it when there is an identity.
 - `fetch:docker-cli`: `scripts/docker-cli.lock.json` =
   `{ "version": "29.8.1", "url": "https://download.docker.com/mac/static/stable/aarch64/docker-29.8.1.tgz", "sha256": "5a8f5604d7673202b2af925229d15eb4bbb86f7f542e4ac8cd7aa3f14cfa0f8b", "member": "docker/docker" }`
-  is fetched, checked, and extracted to `build/docker-cli/docker`. *Verified:*
-  hash, member, and that it is a thin arm64 Mach-O that is linker-signed ad hoc.
+  is fetched, checked, and extracted to `build/docker-cli/docker` by
+  `scripts/fetch-docker-cli.mjs`. The tarball is checked in memory before
+  anything is written, and cached as `build/docker-cli-cache/<sha256>.tgz`.
+  Only the member is extracted, and only when it appears once, as a regular
+  file holding a thin arm64 Mach-O executable. The lock's `url` must be
+  `https://download.docker.com/mac/static/stable/aarch64/docker-<version>.tgz`.
+  *Verified:* hash, member, and that it is a thin arm64 Mach-O that is
+  linker-signed ad hoc.
 - Development runs find `<resources>` at the checkout's `build/`
   (`build/localmost-vm`, `build/guest`, `build/docker-cli`), whether Electron
   was launched on the checkout or on `build/dist/main.js` (§1), through
@@ -1227,9 +1247,11 @@ helper or CLI is missing. A build never ships without its VM.
 
 - `extraResource` includes the helper, `build/guest` and `build/docker-cli`.
 - `ignoreGuest` (osxSign's `ignore`) matches `Resources/guest/vmlinux` and nothing outside
-  `Resources/guest/`; `prePackage` refuses a `build/guest` with a sixth file.
+  the app's own `Resources/guest/` (checked against osx-sign's own walk of a
+  laid-out app); `prePackage` refuses a `build/guest` with a sixth file.
 - `signOptionsForFile` gives the virtualization plist to `Resources/localmost-vm`
-  and to nothing else, and gives `none` to `Resources/docker-cli/docker`.
+  and to nothing else, a nested helper app's `Resources/localmost-vm`
+  included, and gives `none` to `Resources/docker-cli/docker`.
 - `entitlements.virtualization.plist` has exactly one key.
 - `extendInfo.LSMinimumSystemVersion === '14.0'`, and the usage-description
   test's plist fixture says `14.0`.

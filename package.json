@@ -22,6 +22,7 @@
     "build": "npm run prebuild && cross-env NODE_ENV=production webpack --config webpack.config.js && npm run build:cli",
     "build:cli": "cross-env NODE_ENV=production webpack --config webpack.config.cli.js && chmod +x build/dist/cli.js",
     "build:dev": "cross-env NODE_ENV=development webpack --config webpack.config.js",
+    "build:native": "npm run build:helper && npm run build:guest && npm run fetch:docker-cli",
     "fetch:docker-cli": "node scripts/fetch-docker-cli.mjs",
     "watch": "cross-env NODE_ENV=development webpack --config webpack.config.js --watch",
     "package": "npm run build && electron-forge package --arch=arm64",

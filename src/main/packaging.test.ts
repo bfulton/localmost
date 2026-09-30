@@ -244,6 +244,7 @@ describe('the release update manifest', () => {
 describe('the arch the app is built for', () => {
   const savedEnv = { ...process.env };
   let hooks: { prePackage: (config: object, platform: string, arch: string) => Promise<void> };
+  let checkVmResources: jest.SpiedFunction<(paths: object) => void>;
 
   beforeEach(() => {
     // Load the config unsigned, without asking the keychain or git.
@@ -251,6 +252,10 @@ describe('the arch the app is built for', () => {
     process.env.RELEASE_BUILD = 'false';
     jest.spyOn(console, 'log').mockImplementation(() => {});
     jest.isolateModules(() => {
+      // The VM resources are checked on their own below; here they pass.
+      checkVmResources = jest
+        .spyOn(require(path.join(REPO, 'scripts', 'check-vm-resources.js')), 'checkVmResources')
+        .mockImplementation(() => {});
       hooks = require(path.join(REPO, 'forge.config.js')).hooks;
     });
   });
@@ -268,6 +273,294 @@ describe('the arch the app is built for', () => {
     await expect(hooks.prePackage({}, 'darwin', arch)).rejects.toThrow(
       `localmost is built for Apple silicon (arm64) only, not ${arch}`,
     );
+    expect(checkVmResources).not.toHaveBeenCalled();
+  });
+});
+
+describe('the Docker VM the app ships', () => {
+  // The helper, the guest image and the docker CLI, which build:native puts
+  // in build/ and packaging copies into Resources.
+  const BUILD = path.join(REPO, 'build');
+  const savedEnv = { ...process.env };
+  let config: {
+    packagerConfig: { extraResource: string[]; osxSign?: object };
+    hooks: {
+      generateAssets: (config: object, platform: string, arch: string) => Promise<void>;
+      prePackage: (config: object, platform: string, arch: string) => Promise<void>;
+    };
+  };
+  let checkVmResources: jest.SpiedFunction<(paths: object) => void>;
+
+  const load = (identity: string) => {
+    process.env.APPLE_IDENTITY = identity;
+    process.env.RELEASE_BUILD = 'false';
+    jest.isolateModules(() => {
+      checkVmResources = jest
+        .spyOn(require(path.join(REPO, 'scripts', 'check-vm-resources.js')), 'checkVmResources')
+        .mockImplementation(() => {});
+      config = require(path.join(REPO, 'forge.config.js'));
+    });
+  };
+
+  beforeEach(() => {
+    jest.spyOn(console, 'log').mockImplementation(() => {});
+    load('-');
+  });
+
+  afterEach(() => {
+    process.env = { ...savedEnv };
+    jest.restoreAllMocks();
+  });
+
+  it('copies the helper, the guest and the docker CLI into Resources', () => {
+    expect(config.packagerConfig.extraResource).toEqual(
+      expect.arrayContaining([
+        path.join(BUILD, 'localmost-vm'),
+        path.join(BUILD, 'guest'),
+        path.join(BUILD, 'docker-cli'),
+      ]),
+    );
+  });
+
+  it('puts each where the app looks for it, packaged and in development', () => {
+    // extraResource copies each path to Resources/<basename>.
+    const { extraResource } = config.packagerConfig;
+    const source = (name: string) => {
+      const found = extraResource.filter((file) => path.basename(file) === name);
+      expect(found).toHaveLength(1);
+      return found[0];
+    };
+    const { app } = require('electron');
+    const paths = require('./vm/paths');
+    const savedResourcesPath = process.resourcesPath;
+    const savedAppPath = app.getAppPath();
+    try {
+      app.isPackaged = true;
+      Object.defineProperty(process, 'resourcesPath', { value: '/R', configurable: true });
+      expect(paths.helperPath()).toBe(path.join('/R', path.basename(source('localmost-vm'))));
+      expect(paths.guestDir()).toBe(path.join('/R', path.basename(source('guest'))));
+      expect(paths.dockerCliPath()).toBe(path.join('/R', path.basename(source('docker-cli')), 'docker'));
+
+      // Unpackaged, `electron .` on the checkout runs what packaging copies.
+      app.isPackaged = false;
+      delete process.env.LOCALMOST_VM_HELPER;
+      app.getAppPath.mockReturnValue(REPO);
+      expect(paths.helperPath()).toBe(source('localmost-vm'));
+      expect(paths.guestDir()).toBe(source('guest'));
+      expect(paths.dockerCliPath()).toBe(path.join(source('docker-cli'), 'docker'));
+    } finally {
+      app.isPackaged = false;
+      app.getAppPath.mockReturnValue(savedAppPath);
+      Object.defineProperty(process, 'resourcesPath', { value: savedResourcesPath, configurable: true });
+    }
+  });
+
+  it('builds them before packaging, and fails when that fails', async () => {
+    const childProcess = require('child_process');
+    const spawnSync = jest.spyOn(childProcess, 'spawnSync').mockReturnValue({ status: 0 });
+
+    await expect(config.hooks.generateAssets({}, 'darwin', 'arm64')).resolves.toBeUndefined();
+    expect(spawnSync).toHaveBeenCalledWith('npm', ['run', 'build:native'], expect.objectContaining({ cwd: REPO }));
+    // What that script runs; each step keeps its own cache.
+    expect(require(path.join(REPO, 'package.json')).scripts['build:native']).toBe(
+      'npm run build:helper && npm run build:guest && npm run fetch:docker-cli',
+    );
+
+    spawnSync.mockReturnValue({ status: 1 });
+    await expect(config.hooks.generateAssets({}, 'darwin', 'arm64')).rejects.toThrow(/build:native/);
+    spawnSync.mockReturnValue({ status: null, error: new Error('spawn npm ENOENT') });
+    await expect(config.hooks.generateAssets({}, 'darwin', 'arm64')).rejects.toThrow(/ENOENT/);
+  });
+
+  it('checks the build/ copies before packaging them, and fails the build when they fail', async () => {
+    await config.hooks.prePackage({}, 'darwin', 'arm64');
+    expect(checkVmResources).toHaveBeenCalledWith({
+      helper: path.join(BUILD, 'localmost-vm'),
+      guestDir: path.join(BUILD, 'guest'),
+      dockerCliDir: path.join(BUILD, 'docker-cli'),
+    });
+
+    checkVmResources.mockImplementation(() => {
+      throw new Error('build/guest holds notes.txt');
+    });
+    await expect(config.hooks.prePackage({}, 'darwin', 'arm64')).rejects.toThrow('build/guest holds notes.txt');
+  });
+
+  it("leaves the guest image unsigned: it is the VM's data, not macOS code", async () => {
+    load('Apple Development: Test (TEAMID1234)');
+    const { createSignOpts } = require(path.join(REPO, 'node_modules', '@electron', 'packager', 'dist', 'mac'));
+    const { walkAsync } = require(path.join(REPO, 'node_modules', '@electron', 'osx-sign', 'dist', 'cjs', 'util'));
+    const { ignore } = createSignOpts(config.packagerConfig.osxSign, 'darwin', '/x.app', '0', true);
+    expect(typeof ignore).toBe('function');
+
+    // An app with a binary-looking file at each place to check, walked as
+    // osx-sign walks it for the files it would sign.
+    const scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ignore-guest-')));
+    try {
+      const app = path.join(scratch, 'localmost.app');
+      const binary = Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0, 0, 0, 1, 2, 3]);
+      const guest = [
+        'Contents/Resources/guest/vmlinux',
+        'Contents/Resources/guest/initramfs.cpio.gz',
+        'Contents/Resources/guest/rootfs.erofs',
+      ];
+      const others = [
+        'Contents/MacOS/localmost',
+        'Contents/Resources/localmost-vm',
+        'Contents/Resources/docker-cli/docker',
+        'Contents/Resources/guestbook',
+        'Contents/Resources/guest-tools/vzrun',
+        'Contents/Resources/other/guest/vmlinux',
+        'Contents/Frameworks/localmost Helper.app/Contents/Resources/guest/vmlinux',
+        'Contents/Frameworks/localmost Helper.app/Contents/MacOS/localmost Helper',
+      ];
+      for (const file of [...guest, ...others]) {
+        fs.mkdirSync(path.dirname(path.join(app, file)), { recursive: true });
+        fs.writeFileSync(path.join(app, file), binary);
+      }
+      const walked: string[] = await walkAsync(path.join(app, 'Contents'));
+      const rel = (list: string[]) => list.map((file) => path.relative(app, file)).sort();
+      // Without the rule, osx-sign would sign all three guest files.
+      expect(rel(walked)).toEqual(expect.arrayContaining(guest));
+
+      const signed = walked.filter((file) => !ignore(file));
+
+      expect(rel(signed)).toEqual([...others, 'Contents/Frameworks/localmost Helper.app'].sort());
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('the checks before the Docker VM is packaged', () => {
+  const { checkVmResources, GUEST_FILES } = require(path.join(REPO, 'scripts', 'check-vm-resources.js'));
+
+  // The header of a thin Mach-O executable for the given CPU (arm64 unless
+  // said otherwise).
+  const machO = (cpuType = 0x0100000c) => {
+    const header = Buffer.alloc(32);
+    header.writeUInt32LE(0xfeedfacf, 0);
+    header.writeUInt32LE(cpuType, 4);
+    header.writeUInt32LE(2, 12);
+    return header;
+  };
+  const INTEL = 0x01000007;
+  const sha256 = (data: Buffer) => crypto.createHash('sha256').update(data).digest('hex');
+
+  let scratch: string;
+  let paths: { helper: string; guestDir: string; dockerCliDir: string };
+  const ARTIFACTS: Record<string, Buffer> = {
+    vmlinux: Buffer.from('an arm64 Linux kernel image'),
+    'initramfs.cpio.gz': Buffer.from('an initramfs'),
+    'rootfs.erofs': Buffer.from('an erofs root'),
+  };
+
+  const manifestOf = (files: Record<string, Buffer>) =>
+    Object.fromEntries(Object.entries(files).map(([name, data]) => [name, { sha256: sha256(data), size: data.length }]));
+  const writeManifest = (artifacts: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+    fs.writeFileSync(
+      path.join(paths.guestDir, 'manifest.json'),
+      JSON.stringify({ schema: 1, guestVersion: '2026.10.0', artifacts, ...extra }),
+    );
+  const moveAsideAndLink = (file: string) => {
+    const aside = path.join(scratch, `real-${path.basename(file)}`);
+    fs.renameSync(file, aside);
+    fs.symlinkSync(aside, file);
+  };
+
+  // What build:native leaves in build/ when it succeeds.
+  beforeEach(() => {
+    scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'vm-resources-')));
+    paths = {
+      helper: path.join(scratch, 'localmost-vm'),
+      guestDir: path.join(scratch, 'guest'),
+      dockerCliDir: path.join(scratch, 'docker-cli'),
+    };
+    fs.writeFileSync(paths.helper, machO(), { mode: 0o755 });
+    fs.mkdirSync(paths.guestDir);
+    for (const [name, data] of Object.entries(ARTIFACTS)) {
+      fs.writeFileSync(path.join(paths.guestDir, name), data);
+    }
+    fs.writeFileSync(path.join(paths.guestDir, 'LICENSES.md'), '# Licenses\n');
+    writeManifest(manifestOf(ARTIFACTS));
+    fs.mkdirSync(paths.dockerCliDir);
+    fs.writeFileSync(path.join(paths.dockerCliDir, 'docker'), machO(), { mode: 0o755 });
+  });
+
+  afterEach(() => {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  });
+
+  it('allows exactly the five guest files', () => {
+    expect(GUEST_FILES).toEqual(['LICENSES.md', 'initramfs.cpio.gz', 'manifest.json', 'rootfs.erofs', 'vmlinux']);
+  });
+
+  it('passes what a successful build:native leaves', () => {
+    expect(() => checkVmResources(paths)).not.toThrow();
+  });
+
+  it.each<[string, () => void, RegExp]>([
+    ['a sixth file', () => fs.writeFileSync(path.join(paths.guestDir, 'notes.txt'), 'x'), /notes\.txt/],
+    ["Finder's .DS_Store", () => fs.writeFileSync(path.join(paths.guestDir, '.DS_Store'), 'x'), /\.DS_Store/],
+    ['a directory', () => fs.mkdirSync(path.join(paths.guestDir, 'extra')), /extra/],
+    ['a missing file', () => fs.rmSync(path.join(paths.guestDir, 'LICENSES.md')), /LICENSES\.md/],
+    ['a link in place of a file', () => moveAsideAndLink(path.join(paths.guestDir, 'vmlinux')), /vmlinux.*regular file/],
+    ['a link in place of the directory', () => moveAsideAndLink(paths.guestDir), /guest.*directory/],
+    [
+      'an artifact that differs from the manifest',
+      () => fs.appendFileSync(path.join(paths.guestDir, 'rootfs.erofs'), '!'),
+      /rootfs\.erofs/,
+    ],
+    [
+      'a manifest missing an artifact',
+      () => writeManifest(manifestOf({ vmlinux: ARTIFACTS.vmlinux, 'rootfs.erofs': ARTIFACTS['rootfs.erofs'] })),
+      /initramfs\.cpio\.gz/,
+    ],
+    [
+      'a manifest naming another artifact',
+      () => writeManifest({ ...manifestOf(ARTIFACTS), 'extra.img': { sha256: sha256(Buffer.alloc(0)), size: 0 } }),
+      /extra\.img/,
+    ],
+    [
+      'a manifest with a malformed hash',
+      () => writeManifest({ ...manifestOf(ARTIFACTS), vmlinux: { sha256: 'abc', size: ARTIFACTS.vmlinux.length } }),
+      /vmlinux/,
+    ],
+    [
+      'a manifest with the right hash but the wrong size',
+      () => writeManifest({ ...manifestOf(ARTIFACTS), vmlinux: { sha256: sha256(ARTIFACTS.vmlinux), size: 1 } }),
+      /vmlinux/,
+    ],
+    ['a manifest of another schema', () => writeManifest(manifestOf(ARTIFACTS), { schema: 2 }), /schema/],
+    ['an unreadable manifest', () => fs.writeFileSync(path.join(paths.guestDir, 'manifest.json'), '{'), /manifest\.json/],
+  ])('refuses a build/guest with %s', (_what, change, error) => {
+    change();
+    expect(() => checkVmResources(paths)).toThrow(error);
+  });
+
+  it.each<[string, () => void, RegExp]>([
+    ['missing', () => fs.rmSync(paths.helper), /localmost-vm/],
+    ['not executable', () => fs.chmodSync(paths.helper, 0o644), /localmost-vm.*executable/],
+    ['built for Intel', () => fs.writeFileSync(paths.helper, machO(INTEL)), /localmost-vm.*arm64/],
+    ['a link', () => moveAsideAndLink(paths.helper), /localmost-vm.*regular file/],
+  ])('refuses a helper that is %s', (_what, change, error) => {
+    change();
+    expect(() => checkVmResources(paths)).toThrow(error);
+  });
+
+  it.each<[string, () => void, RegExp]>([
+    ['missing', () => fs.rmSync(path.join(paths.dockerCliDir, 'docker')), /docker/],
+    ['not executable', () => fs.chmodSync(path.join(paths.dockerCliDir, 'docker'), 0o644), /docker.*executable/],
+    ['built for Intel', () => fs.writeFileSync(path.join(paths.dockerCliDir, 'docker'), machO(INTEL)), /docker.*arm64/],
+    ['beside another file', () => fs.writeFileSync(path.join(paths.dockerCliDir, 'docker-compose'), 'x'), /docker-compose/],
+  ])('refuses a docker CLI that is %s', (_what, change, error) => {
+    change();
+    expect(() => checkVmResources(paths)).toThrow(error);
+  });
+
+  it('names the command that builds them', () => {
+    fs.rmSync(paths.guestDir, { recursive: true });
+    expect(() => checkVmResources(paths)).toThrow(/npm run build:native/);
   });
 });
 
@@ -287,6 +580,7 @@ describe('the entitlements the app is signed with', () => {
     'com.apple.security.cs.allow-unsigned-executable-memory': true,
     'com.apple.security.cs.disable-library-validation': true,
   };
+  const VIRTUALIZATION = { 'com.apple.security.virtualization': true };
   const EXPECTED: Array<[string, string, Record<string, boolean>]> = [
     ['the app', APP, JIT],
     ['the main helper', path.join(FRAMEWORKS, 'localmost Helper.app'), JIT],
@@ -302,6 +596,10 @@ describe('the entitlements the app is signed with', () => {
     ['the Electron framework', path.join(FRAMEWORKS, 'Electron Framework.framework'), JIT],
     // A Swift program that reads camera state; no JIT, no camera access.
     ['the camera helper', path.join(APP, 'Contents', 'Resources', 'is-camera-on'), {}],
+    // The Docker VM helper: Virtualization.framework, and nothing else.
+    ['the VM helper', path.join(APP, 'Contents', 'Resources', 'localmost-vm'), VIRTUALIZATION],
+    // The docker CLI jobs run, a Go program: no exception at all.
+    ['the docker CLI', path.join(APP, 'Contents', 'Resources', 'docker-cli', 'docker'), {}],
   ];
 
   type SignOptions = {
@@ -335,10 +633,43 @@ describe('the entitlements the app is signed with', () => {
     const entitlements = readPlist(options!.entitlements!);
     expect(entitlements).toEqual(expected);
     // Stated outright: no device or personal information access, and never
-    // the App Sandbox, which would stop the app running sandbox-exec.
+    // the App Sandbox, which would stop the app running sandbox-exec. The
+    // one key outside the hardened-runtime exceptions is the VM helper's.
     for (const key of Object.keys(entitlements)) {
-      expect(key).toMatch(/^com\.apple\.security\.cs\./);
+      expect(key).toMatch(
+        expected === VIRTUALIZATION ? /^com\.apple\.security\.virtualization$/ : /^com\.apple\.security\.cs\./,
+      );
     }
+  });
+
+  it('gives Virtualization.framework to the VM helper in Resources and to nothing else', () => {
+    const virtualization = path.join(REPO, 'packaging', 'entitlements.virtualization.plist');
+    const plistFor = (file: string) => path.resolve(osxSign.optionsForFile!(file)!.entitlements!);
+    expect(plistFor(path.join(APP, 'Contents', 'Resources', 'localmost-vm'))).toBe(virtualization);
+
+    const elsewhere = [
+      ...EXPECTED.filter(([what]) => what !== 'the VM helper').map(([, file]) => file),
+      // The same name anywhere but the app's own Resources.
+      path.join(APP, 'Contents', 'MacOS', 'localmost-vm'),
+      path.join(APP, 'Contents', 'Resources', 'guest', 'localmost-vm'),
+      path.join(APP, 'Contents', 'Resources', 'docker-cli', 'localmost-vm'),
+      path.join(FRAMEWORKS, 'localmost Helper.app', 'Contents', 'Resources', 'localmost-vm'),
+      path.join(FRAMEWORKS, 'localmost Helper.app', 'Contents', 'MacOS', 'localmost-vm'),
+      path.join(FRAMEWORKS, 'Electron Framework.framework', 'Resources', 'localmost-vm'),
+      // And names that merely contain it.
+      path.join(APP, 'Contents', 'Resources', 'localmost-vm-old'),
+      path.join(APP, 'Contents', 'Resources', 'not-localmost-vm'),
+    ];
+    for (const file of elsewhere) {
+      expect([file, plistFor(file)]).not.toEqual([file, virtualization]);
+    }
+  });
+
+  it('grants the VM helper exactly one entitlement', () => {
+    const file = path.join(REPO, 'packaging', 'entitlements.virtualization.plist');
+    expect(readPlist(file)).toEqual({ 'com.apple.security.virtualization': true });
+    // plutil drops duplicates; the file itself names the key once.
+    expect(fs.readFileSync(file, 'utf-8').match(/<key>/g)).toHaveLength(1);
   });
 
   it('fails the build when signing fails, rather than shipping it unsigned', () => {
