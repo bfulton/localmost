@@ -199,12 +199,21 @@ func raiseFileLimit() {
 
 /// Dials 127.0.0.1:<port>, the worker's proxy. This is the helper's only TCP
 /// connection; its seatbelt profile allows no other.
-func connectLoopback(port: Int) throws -> Int32 {
-    let fd = socket(AF_INET, SOCK_STREAM, 0)
-    guard fd >= 0 else {
-        throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+///
+/// The connect is non-blocking and finished by a write source on `queue`,
+/// so no thread waits on it: a proxy whose backlog is full would otherwise
+/// hold a thread for each of up to 256 relays until TCP gave up. After
+/// `timeoutMs` it is abandoned with ETIMEDOUT. `done` runs once, on `queue`,
+/// and owns the connected fd.
+func dialLoopback(port: Int, queue: DispatchQueue, timeoutMs: Int, _ done: @escaping (Result<Int32, POSIXError>) -> Void) {
+    func fail(_ code: Int32) {
+        let error = POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        queue.async { done(.failure(error)) }
     }
+    let fd = socket(AF_INET, SOCK_STREAM, 0)
+    guard fd >= 0 else { return fail(errno) }
     _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
+    _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
     noSigPipe(fd)
     var addr = sockaddr_in()
     addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -214,12 +223,41 @@ func connectLoopback(port: Int) throws -> Int32 {
     let rc = withUnsafePointer(to: &addr) {
         $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
     }
-    guard rc == 0 else {
+    if rc == 0 {
+        return queue.async { done(.success(fd)) }
+    }
+    guard errno == EINPROGRESS else {
         let e = errno
         Darwin.close(fd)
-        throw NSError(domain: NSPOSIXErrorDomain, code: Int(e))
+        return fail(e)
     }
-    return fd
+
+    // The outcome is settled once, on `queue`; the fd is closed or handed
+    // over only after the source watching it has been cancelled.
+    var outcome: Int32?
+    let source = DispatchSource.makeWriteSource(fileDescriptor: fd, queue: queue)
+    func settle(_ code: Int32) {
+        guard outcome == nil else { return }
+        outcome = code
+        source.cancel()
+    }
+    source.setEventHandler {
+        var err: Int32 = 0
+        var len = socklen_t(MemoryLayout<Int32>.size)
+        if getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0 { err = errno }
+        settle(err)
+    }
+    source.setCancelHandler {
+        let code = outcome ?? ECANCELED
+        if code == 0 {
+            done(.success(fd))
+        } else {
+            Darwin.close(fd)
+            done(.failure(POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)))
+        }
+    }
+    source.activate()
+    queue.asyncAfter(deadline: .now() + .milliseconds(timeoutMs)) { settle(ETIMEDOUT) }
 }
 
 /// Writes to a closed peer fail with EPIPE instead of raising SIGPIPE.

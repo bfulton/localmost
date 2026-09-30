@@ -194,19 +194,81 @@ final class FileLimitTests: XCTestCase {
     }
 }
 
+/// The relay's dial to the proxy: never a blocked thread, and never longer
+/// than its timeout.
 final class LoopbackTests: XCTestCase {
+    private let queue = DispatchQueue(label: "test dial")
+
+    private func dial(_ port: Int, timeoutMs: Int = 5000) -> Result<Int32, POSIXError> {
+        let done = expectation(description: "dialled")
+        var result: Result<Int32, POSIXError>?
+        dialLoopback(port: port, queue: queue, timeoutMs: timeoutMs) {
+            dispatchPrecondition(condition: .onQueue(self.queue))
+            result = $0
+            done.fulfill()
+        }
+        wait(for: [done], timeout: Double(timeoutMs) / 1000 + 5)
+        return result ?? .failure(POSIXError(.EIO))
+    }
+
     func testConnectsToALoopbackListener() throws {
         let server = try TCPServer()
         defer { server.close() }
-        let fd = try connectLoopback(port: server.port)
-        Darwin.close(fd)
+        let fd = try dial(server.port).get()
+        defer { Darwin.close(fd) }
+        let peer = server.accept()
+        defer { Darwin.close(peer) }
+        XCTAssertTrue(writeFully(fd, Data("hi".utf8)))
+        XCTAssertEqual(readFully(peer, 2), Data("hi".utf8))
     }
 
     func testAPortWithNoListenerFails() throws {
         let server = try TCPServer()
         let port = server.port
         server.close()
-        XCTAssertThrowsError(try connectLoopback(port: port))
+        XCTAssertThrowsError(try dial(port).get())
+    }
+
+    func testAProxyThatNeverAcceptsTimesOutWithoutBlockingTheCaller() throws {
+        // A listener that never accepts, with its backlog full: the next
+        // connect's SYN is dropped, and it would wait for TCP's own timeout.
+        let server = try TCPServer(backlog: 1)
+        defer { server.close() }
+        var clients: [Int32] = []
+        defer { clients.forEach { Darwin.close($0) } }
+        var pending = false
+        for _ in 0..<64 where !pending {
+            let fd = socket(AF_INET, SOCK_STREAM, 0)
+            clients.append(fd)
+            _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+            var addr = sockaddr_in()
+            addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+            addr.sin_port = in_port_t(UInt16(server.port).bigEndian)
+            _ = withUnsafePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+            }
+            var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+            pending = poll(&pfd, 1, 300) == 0
+        }
+        XCTAssertTrue(pending, "the backlog filled")
+        guard pending else { return }
+
+        let started = Date()
+        let done = expectation(description: "gave up")
+        var result: Result<Int32, POSIXError>?
+        dialLoopback(port: server.port, queue: queue, timeoutMs: 500) {
+            result = $0
+            done.fulfill()
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 0.2, "the call itself returns at once")
+        wait(for: [done], timeout: 10)
+        guard case .failure(let error)? = result else {
+            return XCTFail("the dial did not fail: \(String(describing: result))")
+        }
+        XCTAssertEqual(error.code, .ETIMEDOUT)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
     }
 }
 
@@ -278,7 +340,7 @@ final class TCPServer {
     let fd: Int32
     let port: Int
 
-    init() throws {
+    init(backlog: Int32 = 16) throws {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         self.fd = fd
         var addr = sockaddr_in()
@@ -289,7 +351,7 @@ final class TCPServer {
         var len = socklen_t(MemoryLayout<sockaddr_in>.size)
         let ok = withUnsafeMutablePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, len) == 0 && listen(fd, 16) == 0 && getsockname(fd, $0, &len) == 0
+                bind(fd, $0, len) == 0 && listen(fd, backlog) == 0 && getsockname(fd, $0, &len) == 0
             }
         }
         guard ok else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }

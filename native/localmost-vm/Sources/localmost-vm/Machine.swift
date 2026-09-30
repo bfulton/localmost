@@ -3,9 +3,9 @@
 // connection to vsock 3128 is relayed to 127.0.0.1:<proxy-port>.
 //
 // VZ runs on the main queue. Nothing here blocks it: the vsock listener's
-// delegate only counts and returns, and every connect and copy happens on
-// another queue. (The spike's first listener deadlocked by reading inside
-// shouldAcceptNewConnection.)
+// delegate only counts and returns, every copy happens on another queue,
+// and no connect holds a thread while it waits. (The spike's first listener
+// deadlocked by reading inside shouldAcceptNewConnection.)
 
 import Foundation
 import Virtualization
@@ -21,6 +21,10 @@ enum GuestPort {
 /// The most relay connections at once (§2.3).
 let maxRelayConnections = 256
 
+/// How long a relay waits for the proxy to take its connection. The proxy is
+/// on loopback, so a connect that takes this long is not going to finish.
+let relayDialTimeoutMs = 5000
+
 final class VZMachine: NSObject, Machine, VZVirtualMachineDelegate, VZVirtioSocketListenerDelegate {
     var onStop: ((MachineStopCause) -> Void)?
 
@@ -31,6 +35,8 @@ final class VZMachine: NSObject, Machine, VZVirtualMachineDelegate, VZVirtioSock
     private var relayListener: VZVirtioSocketListener?
     private let relayLock = NSLock()
     private var relays = 0
+    /// Where the relay dials finish. Nothing on it blocks.
+    private let dialQueue = DispatchQueue(label: "localmost-vm relay dial")
 
     /// `proxyPort` is the worker's proxy in job mode, and nil in refresh
     /// mode, which listens on no vsock port at all.
@@ -130,16 +136,16 @@ final class VZMachine: NSObject, Machine, VZVirtualMachineDelegate, VZVirtioSock
         guard let port = proxyPort, connection.destinationPort == GuestPort.relay, takeRelaySlot() else {
             return false
         }
-        DispatchQueue.global().async { [weak self] in
-            let vsockEnd = Relay.End(fd: connection.fileDescriptor, close: { DispatchQueue.main.async { connection.close() } })
-            do {
-                let tcp = try connectLoopback(port: port)
+        let vsockEnd = Relay.End(fd: connection.fileDescriptor, close: { DispatchQueue.main.async { connection.close() } })
+        dialLoopback(port: port, queue: dialQueue, timeoutMs: relayDialTimeoutMs) { [weak self] result in
+            switch result {
+            case .success(let tcp):
                 let relay = Relay(vsockEnd, Relay.End(fd: tcp, close: {
                     Darwin.close(tcp)
                     self?.releaseRelaySlot()
                 }), label: "relay")
                 relay.start()
-            } catch {
+            case .failure(let error):
                 self?.log("warn", "relay to 127.0.0.1:\(port) failed: \(describe(error))")
                 vsockEnd.close()
                 self?.releaseRelaySlot()
