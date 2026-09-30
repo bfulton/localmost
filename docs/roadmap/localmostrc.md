@@ -146,14 +146,14 @@ shared:
   docker:
     pull:
       registries:
-        - docker.io
+        - docker.io              # Pulled on the Mac, from it and wherever it redirects
     run:
       images:
         - "postgres:16"
       mounts:
         - path: ./               # Workspace paths only, resolved through symlinks
           mode: ro               # ro | rw
-      network: bridge
+      network: bridge            # Routable: out through the job's proxy only
     build:
       context: ./
 
@@ -354,9 +354,14 @@ Add to .localmostrc under workflows.build? [y/n]
 `docker:` does not open the daemon socket. Each worker gets a unix socket of its
 own, served by localmost outside the sandbox, and `DOCKER_HOST` points the job at
 it. A filtering proxy behind that socket parses every Docker API request, checks
-it against the approved policy, and forwards only what is permitted to the daemon
-localmost resolved from the operator's own Docker configuration. Colima and
-Podman work without the repository naming a path.
+it against the approved policy, and forwards only what is permitted to a Linux
+VM of the job's own. The VM boots when a job whose policy has a `docker:`
+section is claimed, sees no directory of the Mac but the job's work folder,
+which holds the checkout (and Apple's Rosetta runtime, for amd64 images), and
+is discarded, with every container, network, volume and built image in it,
+when the job ends. localmost never uses the operator's
+Docker Desktop, Colima or Podman for jobs, and the job's `docker` is a CLI
+bundled with the app.
 
 Actions are CLI-shaped, so a policy reads the way a workflow author thinks:
 
@@ -391,13 +396,46 @@ There is no key at any level for `--pid=host`, `--network=host`, `--device`,
 mounting the daemon socket into a container, or the other host-reaching
 container settings; what cannot be named cannot be requested. `privileged` is
 the one exception, because docker-in-docker and qemu emulation need it. It
-exists in the grammar and is rejected at approval time unless the daemon runs in
-a managed VM, which localmost does not yet provide (stage 2 of the design). At
-stage 1 it is a policy that cannot be satisfied, and the error says why.
+exists in the grammar and is rejected at validation, with an error saying why:
+a privileged container reaches the Docker VM's kernel, and with it everything
+the VM holds, so running the daemon in a VM does not make it safe to grant.
 
-Registry credentials never enter the sandbox. The proxy attaches authentication
-to a pull on the job's behalf, so a private registry needs only its name under
-`pull.registries`; the job never reads `~/.docker/config.json`.
+**Networks.** The VM has no network card. A container's only way out is the
+job's own proxy, so `routable` - the default bridge, `network: bridge`, or a
+network declared with `internal: false` - means *through the job's proxy,
+subject to its network allowlist*: a routable container reaches the hosts the
+job's `network.allow` grants, loopback as its `network.loopback` declares, and
+the local broker's port, which the proxy always opens and the broker's
+per-worker key guards. localmost injects `HTTP_PROXY`, `HTTPS_PROXY`,
+`http_proxy`, `https_proxy` and `NO_PROXY` into every routable container and,
+as build args, into every build, keeping any value the job set. Traffic that
+ignores those settings - plain TCP to an outside database, `git` over ssh, UDP,
+DNS lookups of outside names - has no route and fails at once. The injected
+`NO_PROXY` covers only `localhost`, `127.0.0.1` and `::1`, so a job that talks
+from one container to another by service name over HTTP adds the name to
+`NO_PROXY` itself. `internal: true` means no egress at all.
+
+**Pulls.** A pull happens on the Mac, not in the VM: localmost fetches the
+image, checks every digest, and loads it into the job's VM. Registry
+credentials never enter the sandbox or the VM. localmost reads the operator's
+`~/.docker/config.json` and credential helpers itself, so a private registry
+needs only its name under `pull.registries`, and the job never reads that file.
+A credential helper named by `credsStore` or `credHelpers` must be in
+`/opt/homebrew/bin`, `/usr/local/bin` or Docker.app's bundled `bin`; one that is
+missing or fails fails the pull with a message naming the config key, rather
+than pulling anonymously. Only public https registries can be pulled from: a
+registry that resolves to a LAN, link-local or loopback address, or that serves
+plain http, is refused even when listed. A registry commonly redirects its
+downloads to a CDN, and localmost follows https redirects to any public host,
+so listing a registry under `pull.registries` also grants fetching from
+wherever that registry redirects, outside the job's `network.allow`. The
+approval text says so.
+
+**Builds.** The builder runs inside the VM, which has no route to a registry, so
+it cannot pull a `FROM` image itself. A job pulls its base images with `docker
+pull` first, which `pull.registries` must allow, and then builds. A build that
+fails because it tried to fetch a base image gets a line in the job log naming
+this rule.
 
 `docker:` is allowed in `shared:` and under `workflows:`, and the two compose
 additively like the rest of the policy. The socket is bound to the merged policy
@@ -416,7 +454,8 @@ reports sockets a run reached, but writes no socket declaration; the only socket
 a job is handed is the one localmost serves.
 
 The design, including what the filter does and does not contain, is in
-[docs/superpowers/specs/2026-09-05-docker-isolation-design.md](../superpowers/specs/2026-09-05-docker-isolation-design.md).
+[docs/superpowers/specs/2026-09-05-docker-isolation-design.md](../superpowers/specs/2026-09-05-docker-isolation-design.md),
+and the Docker VM behind it in [vm-docker-backend.md](vm-docker-backend.md).
 
 ## When a denial does not look like one
 
@@ -443,11 +482,11 @@ which makes a run independent of whose machine it happened on.
 permits binding localhost, and a denied bind returns `EPERM` (errno 1) whatever
 else was wrong with it. So `Operation not permitted` on an address that does
 not exist on this host looks like a policy problem when it is a topology one.
-On macOS, Docker Desktop runs the daemon in a Linux VM: a bridge network's
-gateway is an interface *inside* that VM, and binding it from the host fails
-with `EADDRNOTAVAIL` (errno 49) with no sandbox involved at all. A host process
-cannot join a container network there. The portable arrangement is a container
-with a foot in both networks - see `run.networks` above.
+localmost runs each job's Docker daemon in a Linux VM of its own: a bridge
+network's gateway is an interface *inside* that VM, and binding it from the
+host fails with `EADDRNOTAVAIL` (errno 49) with no sandbox involved at all. A
+host process cannot join a container network there. The portable arrangement
+is a container with a foot in both networks - see `run.networks` above.
 
 **Connecting to loopback is refused unless declared.** A job may bind
 localhost, but it connects directly only to its worker's own proxy there, the
