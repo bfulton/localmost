@@ -70,6 +70,14 @@ func dataDiskPath(dataDir: String, vmId: String, mode: Mode) -> String {
     }
 }
 
+/// The share as checked: its path, and which directory was found there.
+struct CheckedShare: Equatable {
+    let path: String
+    let device: dev_t
+    let inode: ino_t
+    let fsid: [Int32]
+}
+
 /// The share for a job VM, `<data>/runner/sandbox/<sandboxId>/_work`, after
 /// the checks of §2.1. `dataDir` is the real `<data>` from HelperPaths.
 ///
@@ -80,7 +88,7 @@ func dataDiskPath(dataDir: String, vmId: String, mode: Mode) -> String {
 ///   itself a mount point: nothing (a DMG, FUSE or SMB mount, which the job
 ///   profile's path rules do not see) is mounted over `_work`, the sandbox,
 ///   or any directory between them and `<data>`.
-func validateShare(dataDir: String, sandboxId: String, sameDeviceAs reference: String) throws -> String {
+func validateShare(dataDir: String, sandboxId: String, sameDeviceAs reference: String) throws -> CheckedShare {
     guard isSlotId(sandboxId) else {
         throw HelperError(.share, "sandbox id \(quoted(sandboxId)) is not <slot>-<12 hex>")
     }
@@ -116,7 +124,16 @@ func validateShare(dataDir: String, sandboxId: String, sameDeviceAs reference: S
     guard shareFs.mountedOn != share else {
         throw HelperError(.share, "something is mounted over the share \(share)")
     }
-    return share
+    return CheckedShare(path: share, device: shareFs.device, inode: shareFs.inode, fsid: shareFs.fsid)
+}
+
+/// The checks again, right before start: every check of validateShare, and
+/// the directory must be the one `first` found, not merely one at its path.
+func recheckShare(_ first: CheckedShare, dataDir: String, sandboxId: String, sameDeviceAs reference: String) throws {
+    let again = try validateShare(dataDir: dataDir, sandboxId: sandboxId, sameDeviceAs: reference)
+    guard again == first else {
+        throw HelperError(.share, "the share \(first.path) was replaced since it was checked")
+    }
 }
 
 /// The most manifest.json may be. It lists the guest's packages; a real one is
@@ -225,13 +242,13 @@ struct RealDirectory {
         self.path = String(cString: buf)
     }
 
-    /// The device, filesystem id and mount point of what was opened.
-    func filesystem() -> (device: dev_t, fsid: [Int32], mountedOn: String)? {
+    /// The device, inode, filesystem id and mount point of what was opened.
+    func filesystem() -> (device: dev_t, inode: ino_t, fsid: [Int32], mountedOn: String)? {
         var st = stat()
         var fs = statfs()
         guard fstat(fd, &st) == 0, fstatfs(fd, &fs) == 0 else { return nil }
         let mountedOn = withUnsafeBytes(of: &fs.f_mntonname) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
-        return (st.st_dev, [fs.f_fsid.val.0, fs.f_fsid.val.1], mountedOn)
+        return (st.st_dev, st.st_ino, [fs.f_fsid.val.0, fs.f_fsid.val.1], mountedOn)
     }
 
     func close() {

@@ -31,8 +31,7 @@ final class ShareTests: XCTestCase {
 
     func testTheSandboxesOwnWorkDirectoryPasses() throws {
         let share = try validateShare(dataDir: data, sandboxId: sid, sameDeviceAs: vmDir)
-        XCTAssertEqual(share, try realPath(sandbox) + "/_work")
-        XCTAssertTrue(share.hasPrefix("/private/"), "the share is the real path, not the /var link: \(share)")
+        XCTAssertEqual(share.path, try realPath(sandbox) + "/_work")
     }
 
     func testAWorkDirectoryThatIsALinkIsRefused() throws {
@@ -95,9 +94,10 @@ final class ShareTests: XCTestCase {
     }
 
     func testADataDirectoryThatIsNotRealIsRefused() throws {
-        // HelperPaths passes the real <data>; a path through /var, a link to
-        // /private/var, resolves elsewhere and is not taken on trust.
-        XCTAssertThrowsError(try validateShare(dataDir: tmp.sub("data"), sandboxId: sid, sameDeviceAs: vmDir)) {
+        // HelperPaths passes the real <data>; a path through a link resolves
+        // elsewhere and is not taken on trust.
+        try tmp.symlink("link", to: data)
+        XCTAssertThrowsError(try validateShare(dataDir: tmp.real + "/link", sandboxId: sid, sameDeviceAs: vmDir)) {
             XCTAssertEqual(($0 as? HelperError)?.code, .share)
         }
     }
@@ -134,6 +134,46 @@ final class ShareTests: XCTestCase {
         let mount = try DiskImage(tmp, mountOn: sandbox + "/_work")
         defer { mount.detach() }
         assertRefused("a disk image is mounted over _work")
+    }
+
+    func testADiskImageMountedOverWorkIsRefusedOnItsOwnDevice() throws {
+        // The VM directory is inside the image too, so the device and the
+        // filesystem match: only the mount-point check sees the mount.
+        let mount = try DiskImage(tmp, mountOn: sandbox + "/_work")
+        defer { mount.detach() }
+        let inside = try tmp.mkdir("data/runner/sandbox/\(sid)/_work/jobs/3-0123456789ab")
+        XCTAssertThrowsError(try validateShare(dataDir: data, sandboxId: sid, sameDeviceAs: try realPath(inside))) {
+            XCTAssertEqual(($0 as? HelperError)?.code, .share)
+            XCTAssertTrue(($0 as? HelperError)?.message.contains("mounted over the share") ?? false, "\($0)")
+        }
+    }
+
+    // The check right before start: the share must be the very directory
+    // checked first, not merely one at the same path.
+
+    func testTheShareUnchangedPassesTheRecheck() throws {
+        let first = try validateShare(dataDir: data, sandboxId: sid, sameDeviceAs: vmDir)
+        XCTAssertNoThrow(try recheckShare(first, dataDir: data, sandboxId: sid, sameDeviceAs: vmDir))
+    }
+
+    func testAWorkDirectoryReplacedBetweenTheChecksIsRefused() throws {
+        let first = try validateShare(dataDir: data, sandboxId: sid, sameDeviceAs: vmDir)
+        // Kept, so that its inode is not reused by the new directory.
+        try FileManager.default.moveItem(atPath: sandbox + "/_work", toPath: sandbox + "/_old")
+        try tmp.mkdir("data/runner/sandbox/\(sid)/_work")
+        XCTAssertNoThrow(try validateShare(dataDir: data, sandboxId: sid, sameDeviceAs: vmDir), "the new _work passes on its own")
+        XCTAssertThrowsError(try recheckShare(first, dataDir: data, sandboxId: sid, sameDeviceAs: vmDir)) {
+            XCTAssertEqual(($0 as? HelperError)?.code, .share)
+        }
+    }
+
+    func testADiskImageMountedOverWorkBetweenTheChecksIsRefused() throws {
+        let first = try validateShare(dataDir: data, sandboxId: sid, sameDeviceAs: vmDir)
+        let mount = try DiskImage(tmp, mountOn: sandbox + "/_work")
+        defer { mount.detach() }
+        XCTAssertThrowsError(try recheckShare(first, dataDir: data, sandboxId: sid, sameDeviceAs: vmDir)) {
+            XCTAssertEqual(($0 as? HelperError)?.code, .share)
+        }
     }
 
     func testADiskImageMountedOverTheSandboxIsRefused() throws {

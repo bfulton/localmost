@@ -48,7 +48,7 @@ final class Helper {
     func run() -> Never {
         let paths: HelperPaths
         let guest: GuestArtifacts
-        var share: String?
+        var share: CheckedShare?
         let rosetta: RosettaPlan
         let configuration: VZVirtualMachineConfiguration
         do {
@@ -67,7 +67,7 @@ final class Helper {
             if case .job = args.mode { job = true } else { job = false }
             rosetta = rosettaPlan(args.rosetta, job: job, vzRosettaAvailability)
             configuration = try makeConfiguration(
-                VMSpec(mode: args.mode, guest: guest, dataDisk: paths.dataDisk, share: share, cpus: args.cpus, memoryMiB: args.memoryMiB),
+                VMSpec(mode: args.mode, guest: guest, dataDisk: paths.dataDisk, share: share?.path, cpus: args.cpus, memoryMiB: args.memoryMiB),
                 console: pipe.fileHandleForWriting,
                 rosetta: rosetta.share ? try rosettaDevice() : nil
             )
@@ -107,11 +107,8 @@ final class Helper {
         watch()
         controller.begin(dockerSocket: paths.dockerSocket, agentSocket: paths.agentSocket) {
             // Right before start: the share must still be the directory checked above.
-            if case .job(let sandboxId, _) = args.mode {
-                let again = try validateShare(dataDir: paths.dataDir, sandboxId: sandboxId, sameDeviceAs: paths.vmDir)
-                guard again == share else {
-                    throw HelperError(.share, "the share moved from \(share ?? "") to \(again)")
-                }
+            if case .job(let sandboxId, _) = args.mode, let share = share {
+                try recheckShare(share, dataDir: paths.dataDir, sandboxId: sandboxId, sameDeviceAs: paths.vmDir)
             }
         }
         dispatchMain()
