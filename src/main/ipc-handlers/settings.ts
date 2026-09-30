@@ -17,7 +17,7 @@ import { IPC_CHANNELS, SleepProtection, LogLevel } from '../../shared/types';
 import { store } from '../store';
 import { ThemeSetting } from '../store/types';
 import { MAX_RUNNER_COUNT } from '../../shared/constants';
-import { isGitHubLogin, isGitHubOwnerName, parseSavedGitHubRepoUrl } from '../../shared/github-names';
+import { isGitHubLogin, parseSavedGitHubRepoUrl } from '../../shared/github-names';
 import { isAllowedUsers, isFilterScope } from '../../shared/user-filter-config';
 
 const log = () => getLogger();
@@ -76,9 +76,10 @@ const SETTING_SHAPES: Record<SettableConfigKey, (value: unknown) => boolean> = {
       // With no targets saved these are the runner's owner and repo, and the
       // URL is the job link, so they are GitHub names or empty. The URL is
       // kept only in GitHub's own form, as the wizard offers it, and the page
-      // echoes the saved one back, older owner logins included.
+      // echoes the saved one back, older owner logins included - an
+      // organization's name too.
       repoUrl: (value) => value === '' || isSavedRepoUrl(value),
-      orgName: (value) => value === '' || isGitHubOwnerName(value),
+      orgName: (value) => value === '' || isGitHubLogin(value),
       runnerName: isString,
       labels: isString,
       runnerCount: isIntegerIn(1, MAX_RUNNER_COUNT),

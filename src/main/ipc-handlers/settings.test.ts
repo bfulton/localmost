@@ -245,6 +245,8 @@ describe('settings IPC handlers', () => {
         // runnerConfig back with every change to it, so refusing this URL
         // would refuse every later change to the runner's count or labels.
         { level: 'repo', orgName: '', repoUrl: 'https://github.com/old-name-/r' },
+        // And an organization of that age, for the same reason.
+        { level: 'org', orgName: 'old-org-', repoUrl: '' },
       ]) {
         expect(handlers['settings:set']({}, { runnerConfig })).toEqual({ success: true });
         expect(saveConfig).toHaveBeenLastCalledWith({ runnerConfig });
