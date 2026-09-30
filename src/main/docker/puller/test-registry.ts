@@ -245,6 +245,8 @@ export interface RegistrySwitches {
   basicChallenge?: boolean;
   /** Hold every blob response after its headers until this resolves. */
   holdBlobs?: Promise<void>;
+  /** Blobs whose first response is cut off halfway, as a dropped connection would. */
+  dropBlobsOnce?: Set<string>;
 }
 
 function tokenFor(user: string | null, scope: string): string {
@@ -543,6 +545,10 @@ export class TestRegistry {
     }
     if (this.switches.oversizeBlobs?.has(digest)) bytes = Buffer.concat([blob, Buffer.alloc(4096, 1)]);
     res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(bytes.length) });
+    if (this.switches.dropBlobsOnce?.delete(digest)) {
+      res.write(bytes.subarray(0, Math.floor(bytes.length / 2)), () => res.socket?.destroy());
+      return;
+    }
     const hold = this.switches.holdBlobs;
     if (hold) {
       res.flushHeaders();

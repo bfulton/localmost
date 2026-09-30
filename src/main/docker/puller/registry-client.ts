@@ -32,7 +32,14 @@ import { cleanText } from './clean-text';
 
 /** A pull failed; the message is for the job's log and the operator. */
 export class PullError extends Error {
-  constructor(message: string) {
+  /**
+   * @param transient a dropped connection or a 5xx, which the puller retries
+   *   once; never a refusal or a mismatch.
+   */
+  constructor(
+    message: string,
+    readonly transient = false
+  ) {
     super(message);
     this.name = 'PullError';
   }
@@ -290,7 +297,7 @@ export function readBody(res: http.IncomingMessage, max: number, what: string): 
     });
     res.on('end', () => resolve(Buffer.concat(chunks)));
     res.on('error', (error) => reject(toPullError(error, what)));
-    res.on('aborted', () => reject(new PullError(`the connection closed while reading a ${what}`)));
+    res.on('aborted', () => reject(new PullError(`the connection closed while reading a ${what}`, true)));
   });
 }
 
@@ -305,7 +312,7 @@ function toPullError(error: unknown, what: string): PullError {
   if (error instanceof PullError) return error;
   const e = error as NodeJS.ErrnoException;
   if (e?.name === 'AbortError' || e?.code === 'ABORT_ERR') return new PullError('the pull was cancelled');
-  return new PullError(`could not fetch the ${what}: ${cleanText(e?.message ?? String(error), 200)}`);
+  return new PullError(`could not fetch the ${what}: ${cleanText(e?.message ?? String(error), 200)}`, true);
 }
 
 /** The registry's own words for an error answer: `code: message`, as the docker CLI prints them. */
@@ -494,7 +501,7 @@ export class RegistryClient {
         resolve
       );
       req.on('error', (error) => reject(toPullError(error, `answer from ${url.host}`)));
-      req.on('timeout', () => req.destroy(new PullError(`${url.host} stopped answering`)));
+      req.on('timeout', () => req.destroy(new PullError(`${url.host} stopped answering`, true)));
       req.end(body);
     });
   }
@@ -653,7 +660,7 @@ export class RegistrySession {
         what === 'manifest' ? `manifest for ${ref} not found${text ? `: ${text}` : ''}` : `blob ${reference} of ${this.registry}/${this.repositoryPath} not found`
       );
     }
-    return new PullError(`${this.registry} answered ${status} for the ${what} of ${ref}${text ? `: ${text}` : ''}`);
+    return new PullError(`${this.registry} answered ${status} for the ${what} of ${ref}${text ? `: ${text}` : ''}`, status >= 500);
   }
 
   /**
