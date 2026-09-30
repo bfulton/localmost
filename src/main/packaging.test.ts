@@ -227,6 +227,8 @@ describe('the entitlements the app is signed with', () => {
     ],
     ['ShipIt', path.join(FRAMEWORKS, 'Squirrel.framework', 'Versions', 'A', 'Resources', 'ShipIt'), JIT],
     ['the Electron framework', path.join(FRAMEWORKS, 'Electron Framework.framework'), JIT],
+    // A Swift program that reads camera state; no JIT, no camera access.
+    ['the camera helper', path.join(APP, 'Contents', 'Resources', 'is-camera-on'), {}],
   ];
 
   type SignOptions = {
@@ -273,5 +275,39 @@ describe('the entitlements the app is signed with', () => {
       .map((name) => path.join(REPO, 'packaging', name));
 
     expect(shipped.sort()).toEqual([...used].sort());
+  });
+});
+
+describe('the camera helper the app ships', () => {
+  // osx-sign signs every Mach-O it finds in the bundle, Resources included,
+  // with the per-file options checked above.
+  const savedEnv = { ...process.env };
+  let extraResource: string[];
+
+  beforeEach(() => {
+    process.env.APPLE_IDENTITY = '-';
+    process.env.RELEASE_BUILD = 'false';
+    jest.spyOn(console, 'log').mockImplementation(() => {});
+    jest.isolateModules(() => {
+      extraResource = require(path.join(REPO, 'forge.config.js')).packagerConfig.extraResource;
+    });
+  });
+
+  afterEach(() => {
+    process.env = { ...savedEnv };
+    jest.restoreAllMocks();
+  });
+
+  it('copies the is-camera-on helper into Resources, under the name the app runs', () => {
+    const { CAMERA_HELPER_NAME } = require('./resource-monitor/camera-helper');
+    const helper = path.join(path.dirname(require.resolve('is-camera-on')), CAMERA_HELPER_NAME);
+
+    // extraResource copies each path to Resources/<basename>.
+    const shipped = extraResource.filter((file) => path.basename(file) === CAMERA_HELPER_NAME);
+    expect(shipped.map((file) => fs.realpathSync(file))).toEqual([fs.realpathSync(helper)]);
+    // A universal Mach-O, executable.
+    const magic = fs.readFileSync(helper).subarray(0, 4).toString('hex');
+    expect(magic).toBe('cafebabe');
+    expect(fs.statSync(helper).mode & 0o111).not.toBe(0);
   });
 });

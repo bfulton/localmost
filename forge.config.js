@@ -65,6 +65,11 @@ console.log(`Signing: ${shouldSign ? signingIdentity : 'disabled'}`);
 console.log(`Notarize: ${shouldNotarize}`);
 console.log(`Release build: ${isReleaseBuild()}`);
 
+// The camera helper the app runs to tell when the camera is on. It comes
+// from the is-camera-on package; the app runs it from Resources, where it is
+// signed with the app (see src/main/resource-monitor/camera-helper.ts).
+const CAMERA_HELPER = path.join(path.dirname(require.resolve('is-camera-on')), 'is-camera-on');
+
 // Languages to keep (English only for now)
 const keepLanguages = ['en', 'en-US', 'en-GB'];
 
@@ -82,6 +87,7 @@ const packagerConfig = {
     path.join(__dirname, 'build', 'dist', 'cli.js'),
     path.join(__dirname, 'scripts', 'localmost-cli'),
     path.join(__dirname, 'packaging', 'app-update.yml'),
+    CAMERA_HELPER,
   ],
   // Only the built app code, package.json and LICENSE go in the bundle.
   // build/ also holds forge's own output, so allow only build/dist within it.
@@ -96,9 +102,15 @@ const packagerConfig = {
 // entitlements and hardened runtime only from optionsForFile; without it,
 // it signs the app with its own defaults, which grant camera, microphone,
 // USB, Bluetooth, printing and location. The plugin helper keeps what
-// Chromium gives its own; everything else gets only JIT.
+// Chromium gives its own; the camera helper, a Swift program, needs nothing;
+// everything else gets only JIT.
 function signOptionsForFile(filePath) {
-  const plist = filePath.includes('(Plugin).app') ? 'entitlements.plugin.plist' : 'entitlements.plist';
+  let plist = 'entitlements.plist';
+  if (filePath.includes('(Plugin).app')) {
+    plist = 'entitlements.plugin.plist';
+  } else if (filePath.endsWith(path.join('.app', 'Contents', 'Resources', path.basename(CAMERA_HELPER)))) {
+    plist = 'entitlements.none.plist';
+  }
   return {
     hardenedRuntime: true,
     entitlements: path.join(__dirname, 'packaging', plist),

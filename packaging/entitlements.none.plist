@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    For executables that need no hardened-runtime exception: the camera
+    helper in Resources, which only reads CoreMediaIO device properties.
+    osx-sign always passes an entitlements file, and falls back to its own
+    defaults (camera, microphone and more) without one, so this names none.
+  -->
+</dict>
+</plist>

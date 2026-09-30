@@ -753,7 +753,7 @@ Code signing is required for distribution to prevent tampering warnings and esta
 - "Developer ID Application" certificate for distribution outside App Store
 - "Developer ID Installer" certificate if distributing PKG installers
 
-**Entitlements**: The app and every helper are signed with the hardened runtime and only the exceptions Electron needs. The app, its main, GPU and renderer helpers and Squirrel's ShipIt carry `com.apple.security.cs.allow-jit` (`packaging/entitlements.plist`); the plugin helper carries `cs.allow-unsigned-executable-memory` and `cs.disable-library-validation`, as Chromium's does (`packaging/entitlements.plugin.plist`). No device or personal information entitlement - camera, microphone, USB, Bluetooth, printing, location - and not the App Sandbox, under which the app could not run jobs under `sandbox-exec`. @electron/osx-sign reads entitlements only from `optionsForFile`; given none, it signs with its own defaults, which grant the device and location entitlements, and releases through 0.2.0 carried them.
+**Entitlements**: The app and every helper are signed with the hardened runtime and only the exceptions Electron needs. The app, its main, GPU and renderer helpers and Squirrel's ShipIt carry `com.apple.security.cs.allow-jit` (`packaging/entitlements.plist`); the plugin helper carries `cs.allow-unsigned-executable-memory` and `cs.disable-library-validation`, as Chromium's does (`packaging/entitlements.plugin.plist`); the camera helper in Resources (`is-camera-on`, which only reads CoreMediaIO's is-running-somewhere property of each camera to pause during video calls) carries none (`packaging/entitlements.none.plist`). No device or personal information entitlement - camera, microphone, USB, Bluetooth, printing, location - and not the App Sandbox, under which the app could not run jobs under `sandbox-exec`. @electron/osx-sign reads entitlements only from `optionsForFile`; given none, it signs with its own defaults, which grant the device and location entitlements, and releases through 0.2.0 carried them.
 
 **Forge config for signing and notarization:**
 ```js
@@ -764,7 +764,9 @@ packagerConfig: {
       hardenedRuntime: true,
       entitlements: filePath.includes('(Plugin).app')
         ? 'packaging/entitlements.plugin.plist'
-        : 'packaging/entitlements.plist',
+        : filePath.endsWith('.app/Contents/Resources/is-camera-on')
+          ? 'packaging/entitlements.none.plist'
+          : 'packaging/entitlements.plist',
     }),
   },
   osxNotarize: {
