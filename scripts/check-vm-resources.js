@@ -24,18 +24,24 @@ const BUILD_HINT = 'run `npm run build:native` (outside any localmost job)';
 // The first four fields of a thin 64-bit Mach-O header, little-endian.
 const MH_MAGIC_64 = 0xfeedfacf;
 const CPU_TYPE_ARM64 = 0x0100000c;
+// Plain arm64. The subtype's top byte holds capability bits, so compare the
+// rest: arm64e (2) is refused, since a stock Mac does not run third-party
+// arm64e code.
+const CPU_SUBTYPE_ARM64_ALL = 0;
+const CPU_SUBTYPE_MASK = 0x00ffffff;
 const MH_EXECUTE = 2;
 
 /**
  * Throw unless `bytes` begins a thin arm64 Mach-O executable: not a
- * universal file, not Intel, not a library or a script. `what` names the
- * file in the message.
+ * universal file, not Intel or arm64e, not a library or a script. `what`
+ * names the file in the message.
  */
 function checkArm64Executable(bytes, what) {
   const ok =
     bytes.length >= 16 &&
     bytes.readUInt32LE(0) === MH_MAGIC_64 &&
     bytes.readUInt32LE(4) === CPU_TYPE_ARM64 &&
+    (bytes.readUInt32LE(8) & CPU_SUBTYPE_MASK) === CPU_SUBTYPE_ARM64_ALL &&
     bytes.readUInt32LE(12) === MH_EXECUTE;
   if (!ok) {
     throw new Error(`${what} is not a thin arm64 Mach-O executable`);

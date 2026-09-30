@@ -473,16 +473,20 @@ describe('the Docker VM the app ships', () => {
 describe('the checks before the Docker VM is packaged', () => {
   const { checkVmResources, GUEST_FILES } = require(path.join(REPO, 'scripts', 'check-vm-resources.js'));
 
-  // The header of a thin Mach-O executable for the given CPU (arm64 unless
-  // said otherwise).
-  const machO = (cpuType = 0x0100000c) => {
+  // The header of a thin Mach-O executable for the given CPU and subtype
+  // (arm64, CPU_SUBTYPE_ARM64_ALL, unless said otherwise).
+  const machO = (cpuType = 0x0100000c, cpuSubtype = 0) => {
     const header = Buffer.alloc(32);
     header.writeUInt32LE(0xfeedfacf, 0);
     header.writeUInt32LE(cpuType, 4);
+    header.writeUInt32LE(cpuSubtype, 8);
     header.writeUInt32LE(2, 12);
     return header;
   };
   const INTEL = 0x01000007;
+  // arm64e with the pointer-authentication ABI bit, as Apple's toolchain
+  // writes it: third-party arm64e code does not run on a stock Mac.
+  const ARM64E = [0x0100000c, 0x80000002] as const;
   const sha256 = (data: Buffer) => crypto.createHash('sha256').update(data).digest('hex');
 
   let scratch: string;
@@ -580,6 +584,7 @@ describe('the checks before the Docker VM is packaged', () => {
     ['missing', () => fs.rmSync(paths.helper), /localmost-vm/],
     ['not executable', () => fs.chmodSync(paths.helper, 0o644), /localmost-vm.*executable/],
     ['built for Intel', () => fs.writeFileSync(paths.helper, machO(INTEL)), /localmost-vm.*arm64/],
+    ['built for arm64e', () => fs.writeFileSync(paths.helper, machO(...ARM64E)), /localmost-vm.*arm64/],
     ['a link', () => moveAsideAndLink(paths.helper), /localmost-vm.*regular file/],
   ])('refuses a helper that is %s', (_what, change, error) => {
     change();
@@ -590,6 +595,7 @@ describe('the checks before the Docker VM is packaged', () => {
     ['missing', () => fs.rmSync(path.join(paths.dockerCliDir, 'docker')), /docker/],
     ['not executable', () => fs.chmodSync(path.join(paths.dockerCliDir, 'docker'), 0o644), /docker.*executable/],
     ['built for Intel', () => fs.writeFileSync(path.join(paths.dockerCliDir, 'docker'), machO(INTEL)), /docker.*arm64/],
+    ['built for arm64e', () => fs.writeFileSync(path.join(paths.dockerCliDir, 'docker'), machO(...ARM64E)), /docker.*arm64/],
     ['beside another file', () => fs.writeFileSync(path.join(paths.dockerCliDir, 'docker-compose'), 'x'), /docker-compose/],
   ])('refuses a docker CLI that is %s', (_what, change, error) => {
     change();

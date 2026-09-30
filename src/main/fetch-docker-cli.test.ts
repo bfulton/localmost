@@ -19,11 +19,11 @@ const LOCK = path.join(REPO, 'scripts', 'docker-cli.lock.json');
 
 // The first bytes of a thin arm64 Mach-O executable: MH_MAGIC_64,
 // CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL, MH_EXECUTE.
-const machO = (cpuType: number, fileType = 2, magic = 0xfeedfacf) => {
+const machO = (cpuType: number, fileType = 2, magic = 0xfeedfacf, cpuSubtype = 0) => {
   const header = Buffer.alloc(32);
   header.writeUInt32LE(magic, 0);
   header.writeUInt32LE(cpuType, 4);
-  header.writeUInt32LE(0, 8);
+  header.writeUInt32LE(cpuSubtype, 8);
   header.writeUInt32LE(fileType, 12);
   return Buffer.concat([header, Buffer.from('the docker cli')]);
 };
@@ -202,6 +202,8 @@ describe('fetching the bundled docker CLI', () => {
     ['a member that appears twice', DEFAULT_FILES, ['docker/docker', 'docker/docker'], /more than once/],
     ['an Intel binary', { 'docker/docker': machO(X86_64) }, undefined, /arm64/],
     ['a universal binary', { 'docker/docker': machO(ARM64, 2, 0xbebafeca) }, undefined, /arm64/],
+    // With the pointer-authentication ABI bit, as Apple's toolchain writes it.
+    ['an arm64e binary', { 'docker/docker': machO(ARM64, 2, 0xfeedfacf, 0x80000002) }, undefined, /arm64/],
     ['a library rather than an executable', { 'docker/docker': machO(ARM64, 6) }, undefined, /arm64/],
     ['a script', { 'docker/docker': Buffer.from('#!/bin/sh\necho docker\n') }, undefined, /arm64/],
   ])('refuses %s and writes no CLI', (_what, files, entries, error) => {

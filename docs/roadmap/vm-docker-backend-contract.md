@@ -1262,6 +1262,9 @@ without its VM.
 - The generated `latest-mac.yml`, run through electron-updater's own
   `checkIfUpdateSupported` with `os.release()` stubbed, is refused on Darwin
   21 and 22 (macOS 12 and 13) and offered on Darwin 23 and later.
+- The helper and the CLI checks refuse an arm64e Mach-O (a subtype other
+  than `CPU_SUBTYPE_ARM64_ALL`), as well as Intel, universal and non-executable
+  files.
 - The "ships no entitlements file the signing does not use" test still passes.
 
 ## 8. Fakes for parallel work
