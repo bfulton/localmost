@@ -2,24 +2,14 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <!-- App Sandbox: Restrict app capabilities for defense in depth -->
-  <key>com.apple.security.app-sandbox</key>
+  <!--
+    The app, its main, GPU and renderer helpers and Squirrel's ShipIt are
+    signed with the hardened runtime and only this: V8 needs to map JIT
+    code. No device or personal information access - the app records,
+    locates and prints nothing. Never the App Sandbox: the app runs each
+    job under sandbox-exec, which a sandboxed process cannot.
+  -->
+  <key>com.apple.security.cs.allow-jit</key>
   <true/>
-
-  <!-- Network: Outbound connections for GitHub API -->
-  <key>com.apple.security.network.client</key>
-  <true/>
-
-  <!-- File Access: Read/write to user-selected files -->
-  <key>com.apple.security.files.user-selected.read-write</key>
-  <true/>
-
-  <!-- Hardened Runtime: Deny dangerous capabilities -->
-  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-  <false/>
-  <key>com.apple.security.cs.disable-library-validation</key>
-  <false/>
-  <key>com.apple.security.cs.allow-dyld-environment-variables</key>
-  <false/>
 </dict>
 </plist>

@@ -92,14 +92,24 @@ const packagerConfig = {
   ],
 };
 
+// Entitlements for each file osx-sign signs. @electron/osx-sign reads
+// entitlements and hardened runtime only from optionsForFile; without it,
+// it signs the app with its own defaults, which grant camera, microphone,
+// USB, Bluetooth, printing and location. The plugin helper keeps what
+// Chromium gives its own; everything else gets only JIT.
+function signOptionsForFile(filePath) {
+  const plist = filePath.includes('(Plugin).app') ? 'entitlements.plugin.plist' : 'entitlements.plist';
+  return {
+    hardenedRuntime: true,
+    entitlements: path.join(__dirname, 'packaging', plist),
+  };
+}
+
 // Override with signing config if credentials are available
 if (shouldSign) {
   packagerConfig.osxSign = {
     identity: signingIdentity,
-    hardenedRuntime: true,
-    entitlements: path.join(__dirname, 'packaging', 'entitlements.plist'),
-    'entitlements-inherit': path.join(__dirname, 'packaging', 'entitlements.inherit.plist'),
-    'gatekeeper-assess': false,
+    optionsForFile: signOptionsForFile,
   };
 
   // Only notarize if signing is enabled and notarize credentials are available

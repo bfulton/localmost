@@ -216,7 +216,7 @@ to run unconfirmed outside a terminal. Every subcommand accepts `--json`.
 
 From the app menu: **localmost → Install Command Line Tool...**
 
-This creates a symlink in `/usr/local/bin` so you can use `localmost` from any terminal. You'll be prompted for your administrator password.
+This creates a symlink in `/usr/local/bin` so you can use `localmost` from any terminal. You'll be prompted for your administrator password. The command runs with the `node` first on your `PATH`, so it needs Node.js installed.
 
 For development builds, use `npm link` instead.
 
