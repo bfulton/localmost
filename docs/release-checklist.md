@@ -19,8 +19,9 @@
   export APPLE_APP_SPECIFIC_PASSWORD="xxxx-xxxx-xxxx-xxxx"
   export APPLE_TEAM_ID="XXXXXXXXXX"
   ```
-- [ ] Build the Docker VM's guest on this Mac, outside any localmost job (the guest build boots a VM, which a job's sandbox cannot, and no CI job can do it): `npm run build:guest -- --verify-reproducible`
-  - It builds the guest twice and fails unless both are byte-identical, then smoke-boots it: the smoke boot must pass, and `build/guest/manifest.json` must carry the `baseline` and `docker` it recorded
+- [ ] Build the Docker VM's guest on this Mac, outside any localmost job (the guest build boots a VM, which a job's sandbox cannot, and no CI job can do it): `npm run build:guest -- --force --verify-reproducible`
+  - `--force` builds past the cache, so the smoke boot runs (a cache hit skips it): it must pass, and `build/guest/manifest.json` must carry the `docker` versions and the `baseline` it recorded
+  - `--verify-reproducible` then builds the artifacts a second time from scratch and fails unless both builds are byte-identical
   - `ls build/guest` shows exactly `LICENSES.md`, `initramfs.cpio.gz`, `manifest.json`, `rootfs.erofs` and `vmlinux`
 - [ ] `rm -rf build/out/make`
 - [ ] `npm run make` (Apple silicon only: the script passes `--arch=arm64`, and the build refuses any other arch)
@@ -37,6 +38,7 @@
   - `Contents/Resources/docker-cli/docker` and `Contents/Resources/is-camera-on`: none
 - [ ] `xattr -l` on each file in `Contents/Resources/guest` lists no `com.apple.cs.*` attribute: the guest is the VM's data, and signing leaves it alone
 - [ ] `plutil -extract LSMinimumSystemVersion raw` on the app's `Contents/Info.plist` prints `14.0`
+- [ ] The app itself carries the docker CLI's Apache-2.0 LICENSE and NOTICE: Apache-2.0 §4(a) and (d) want them with the distribution, and the tarball `scripts/docker-cli.lock.json` pins holds only the binary. Where in the app they go is not decided yet (the owner's or WP-G's call); it cannot be `Contents/Resources/docker-cli/`, which prePackage keeps to `docker` alone because jobs can read it. Do not publish until this is settled and this line names the file to check
 - [ ] `plutil -p` on the app's `Contents/Info.plist` and on each `Contents/Frameworks/localmost Helper*.app/Contents/Info.plist` shows no `UsageDescription` key, and `codesign --verify --deep --strict --verbose=2` on the app passes (the plist is edited before signing, so the signature must cover it)
 - [ ] `node scripts/generate-latest-mac-yml.js`
   - Needs the arm64 build made, and nothing else in `build/out/make` (it refuses an Intel, universal or other version's DMG or zip); copies the update zip to `build/out/make/localmost-X.Y.Z-arm64-mac.zip`

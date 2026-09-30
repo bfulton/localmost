@@ -244,6 +244,12 @@ npm test
 npm run make
 ```
 
+Packaging the app (`npm run make`, and `npm run test:e2e`, which packages it
+first) runs `npm run build:native` to build the Docker VM's helper and guest
+and fetch the docker CLI. That needs Xcode's Swift and Go, and the guest build
+boots a VM, so run it on the Mac itself, not inside a localmost job. `npm test`
+needs none of this.
+
 ## Roadmap
 
 Current release: **0.3.0 — Test Locally, Secure by Default**
