@@ -1359,10 +1359,14 @@ helper or CLI is missing. A build never ships without its VM.
   `stop` or SIGTERM exits with the scripted code. The script's shape is in
   the fake's header: per op `answer`, `error`, `delayMs`, `raw` or `close`,
   and under `helper` the helper's own behaviour (`exitAfterListening`,
-  `stdout`, `rosetta`, `agentAfterMs`, `guestExitAfterMs`, `stopExitCode`,
-  `stopDelayMs`, `ignoreSigterm`). It reads the share's nonce from the share
-  for `configure`, as the guest does, and writes what it is told (a stop's
-  grace, `set-time`, `approve-binds`) to stderr as `info` lines. It binds its
+  `stdout`, `rosetta`, `agentAfterMs`, `stopExitCode`, `stopDelayMs`,
+  `ignoreSigterm`). SIGUSR2 is the guest powering off by itself (`stopped`
+  reason `guest`), when a test chooses, rather than after a delay. A refresh
+  VM's `configure` answers the self-test as §3.4 step 7 says (rules only).
+  It reads the share's nonce from the share for `configure`, as the guest
+  does, and writes what it is told (a stop's grace, `set-time`,
+  `approve-binds`, an agent connection turned away before `agentAfterMs`) to
+  stderr as log lines. It binds its
   sockets by name in the VM's directory, its working directory, so a long
   `<data>` cannot overflow a socket path on its side. The mount-point check
   of §2.1 needs `statfs`, which Node lacks; the fake checks the two devices

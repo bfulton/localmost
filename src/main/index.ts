@@ -187,6 +187,11 @@ let memoryPressureMonitor: MemoryPressureMonitor | null = null;
  * Until the Mac-side puller and the cache disks (work package D) are merged:
  * a pull is refused with a message, and every job's data disk starts blank.
  * The integration replaces both with the real ImagePuller and CacheDisks.
+ *
+ * So a build from before that integration, which also has no packaged
+ * helper or guest (work package F), gives every docker job a 503 or a
+ * refused pull: it must not be installed on a runner that serves docker
+ * jobs, the owner's CI runner included.
  */
 const pullerUntilMerged: ImagePuller = {
   pull: async () => {
