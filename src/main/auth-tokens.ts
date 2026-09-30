@@ -9,6 +9,7 @@ import {
   getGitHubAuth,
   getLogger,
 } from './app-state';
+import { updateTrayMenu } from './tray-init';
 
 /** Retry delays in milliseconds for exponential backoff. */
 const RETRY_DELAYS_MS = [1000, 2000, 4000];
@@ -161,6 +162,9 @@ export const forceRefreshToken = async (
         const config = loadConfig();
         config.auth = expiredState;
         saveConfig(config);
+        // The tray reads the session only when redrawn, and would go on
+        // showing it connected, with Pause, until something else redrew it.
+        updateTrayMenu();
         return null;
       }
 
@@ -258,13 +262,4 @@ export const cancelJobsOnOurRunners = async (runningJobs: RunningJob[]): Promise
     await new Promise(resolve => setTimeout(resolve, 3000));
     logger?.info('Done waiting for cancellations');
   }
-};
-
-/**
- * Extract owner/repo from a GitHub URL.
- */
-export const parseRepoUrl = (url: string): { owner: string; repo: string } | null => {
-  const match = url.match(/github\.com[\/:]([^\/]+)\/([^\/\.]+)/);
-  if (!match) return null;
-  return { owner: match[1], repo: match[2] };
 };

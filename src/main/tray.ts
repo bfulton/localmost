@@ -21,6 +21,8 @@ export interface TrayCallbacks {
  */
 export interface TrayStatusInfo {
   isAuthenticated: boolean;
+  /** Signed in once, but the session is spent and needs signing in again. */
+  isSessionExpired?: boolean;
   isConfigured: boolean;
   runnerStatus?: RunnerState['status'];
   isBusy: boolean;
@@ -408,7 +410,10 @@ export class TrayManager {
    */
   private getStatusLabel(status: TrayStatusInfo): string {
     if (!status.isAuthenticated) {
-      return 'GitHub: Not connected';
+      // Settings shows the same account as "Session expired" beside Reconnect.
+      return status.isSessionExpired
+        ? 'GitHub: Session expired, reconnect in Settings'
+        : 'GitHub: Not connected';
     }
     if (!status.isConfigured) {
       return 'Runner: Not configured';

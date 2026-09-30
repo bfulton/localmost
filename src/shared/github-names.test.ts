@@ -27,6 +27,15 @@ describe('isGitHubRepoName', () => {
       expect({ name, ok: isGitHubRepoName(name) }).toEqual({ name, ok: false });
     }
   });
+
+  it('refuses a name ending in .git, which GitHub strips from any name it is given', () => {
+    // So a ".git" at the end of a URL is always the clone suffix, never part
+    // of the name, and a parser can drop it without losing a repository.
+    for (const name of ['r.git', 'my.repo.git', '.git']) {
+      expect({ name, ok: isGitHubRepoName(name) }).toEqual({ name, ok: false });
+    }
+    expect(isGitHubRepoName('r.github')).toBe(true);
+  });
 });
 
 describe('isGitHubLogin', () => {
@@ -46,6 +55,17 @@ describe('isGitHubLogin', () => {
 describe('parseGitHubRepoUrl', () => {
   it('reads the owner and repo of a repository page on github.com', () => {
     expect(parseGitHubRepoUrl('https://github.com/bfulton/my.repo')).toEqual({ owner: 'bfulton', repo: 'my.repo' });
+    expect(parseGitHubRepoUrl('https://github.com/o/.github')).toEqual({ owner: 'o', repo: '.github' });
+  });
+
+  it('takes off the clone suffix and a trailing slash, as a pasted link has them', () => {
+    for (const url of [
+      'https://github.com/o/my.repo.git',
+      'https://github.com/o/my.repo/',
+      'https://github.com/o/my.repo.git/',
+    ]) {
+      expect({ url, parsed: parseGitHubRepoUrl(url) }).toEqual({ url, parsed: { owner: 'o', repo: 'my.repo' } });
+    }
   });
 
   it('refuses any other URL, and names GitHub would not issue', () => {
@@ -54,8 +74,22 @@ describe('parseGitHubRepoUrl', () => {
       'https://github.com/o/..',
       'https://github.com/o/r/../../x',
       'https://github.com/o/r?x',
+      'https://github.com/o/r#x',
+      'https://github.com/o/r/tree/main',
+      'https://github.com/o/r//',
+      'https://github.com/o/.git',
+      'https://github.com/o/r.git.git',
       'https://evil.example/github.com/o/r',
+      'https://github.com.evil.example/o/r',
+      'https://evil.example/?u=https://github.com/o/r',
+      'https://user@github.com/o/r',
+      ' https://github.com/o/r',
+      'https://github.com/o/r\n',
       'http://github.com/o/r',
+      // Remotes a checkout has, which no caller of this is ever handed.
+      'git@github.com:o/r.git',
+      'ssh://git@github.com/o/r.git',
+      'o/r',
       'https://github.com/o',
       '',
       7,

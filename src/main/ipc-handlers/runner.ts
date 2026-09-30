@@ -33,7 +33,7 @@ import {
   SetupState,
 } from '../../shared/types';
 import { DEFAULT_RUNNER_COUNT, MAX_RUNNER_COUNT, MIN_JOB_HISTORY, MAX_JOB_HISTORY } from '../../shared/constants';
-import { isGitHubOwnerName, isGitHubRepoName } from '../../shared/github-names';
+import { isGitHubOwnerName, isGitHubRepoName, parseGitHubRepoUrl } from '../../shared/github-names';
 
 /**
  * A runner release number. It becomes the arc directory a download creates,
@@ -242,14 +242,13 @@ export const registerRunnerHandlers = (): void => {
         if (!options.repoUrl) {
           throw new Error('Repository URL is required');
         }
-        const match = options.repoUrl.match(/github\.com[\/:]([^\/]+)\/([^\/\.]+)/);
-        if (!match) {
+        // The whole URL, as the setup wizard offers it: owner and repo are
+        // GitHub names, and a repo name keeps its dots.
+        const parsed = parseGitHubRepoUrl(options.repoUrl);
+        if (!parsed) {
           throw new Error('Invalid repository URL');
         }
-        [, owner, repo] = match;
-        if (!isGitHubOwnerName(owner) || !isGitHubRepoName(repo)) {
-          throw new Error('Invalid repository URL');
-        }
+        ({ owner, repo } = parsed);
         logger()?.info(`Getting registration token for ${owner}/${repo}...`);
         registrationToken = await githubAuth.getRunnerRegistrationToken(accessToken, owner, repo);
         configUrl = `https://github.com/${owner}/${repo}`;
