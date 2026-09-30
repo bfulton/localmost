@@ -229,10 +229,11 @@ describe('the release update manifest', () => {
     ['an Intel zip', `zip/darwin/x64/localmost-darwin-x64-${version}.zip`],
     ['an Intel update zip', `localmost-${version}-x64-mac.zip`],
     ['a universal DMG', `localmost-${version}-universal.dmg`],
-  ])('refuses a make directory holding %s, so no Intel build is published', (_what, file) => {
+    ["an older release's DMG", 'localmost-0.2.0-arm64.dmg'],
+  ])('refuses a make directory holding %s, so only this build is published', (_what, file) => {
     make('arm64');
     fs.mkdirSync(path.dirname(path.join(makeDir, file)), { recursive: true });
-    fs.writeFileSync(path.join(makeDir, file), 'intel');
+    fs.writeFileSync(path.join(makeDir, file), 'another build');
 
     expect(generate).toThrow(new RegExp(file.replace(/[.]/g, '\\.')));
     expect(fs.existsSync(path.join(makeDir, 'latest-mac.yml'))).toBe(false);
@@ -241,9 +242,23 @@ describe('the release update manifest', () => {
 });
 
 describe('the arch the app is built for', () => {
-  // Loading the config reads the keychain's signing identities, as the
-  // build does; the hook itself touches nothing.
-  const { hooks } = require(path.join(REPO, 'forge.config.js'));
+  const savedEnv = { ...process.env };
+  let hooks: { prePackage: (config: object, platform: string, arch: string) => Promise<void> };
+
+  beforeEach(() => {
+    // Load the config unsigned, without asking the keychain or git.
+    process.env.APPLE_IDENTITY = '-';
+    process.env.RELEASE_BUILD = 'false';
+    jest.spyOn(console, 'log').mockImplementation(() => {});
+    jest.isolateModules(() => {
+      hooks = require(path.join(REPO, 'forge.config.js')).hooks;
+    });
+  });
+
+  afterEach(() => {
+    process.env = { ...savedEnv };
+    jest.restoreAllMocks();
+  });
 
   it('packages for Apple silicon', async () => {
     await expect(hooks.prePackage({}, 'darwin', 'arm64')).resolves.toBeUndefined();

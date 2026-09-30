@@ -94,7 +94,7 @@ Release: v0.3.0
 └── release-notes.md
 ```
 
-localmost is built for Apple silicon (arm64) only; 0.2.x was the last
+localmost is built for Apple silicon (arm64) only; 0.2.0 was the last
 release with Intel (x64) builds. The DMG is for first installs.
 electron-updater's `MacUpdater` installs only from a zip: it keeps the
 listed files of the Mac's own arch and downloads the zip among them, or

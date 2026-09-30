@@ -265,6 +265,10 @@ describe('the runner template a sandbox is copied from', () => {
   let logged: string[];
   const savedConfigDir = process.env.LOCALMOST_CONFIG_DIR;
   const mockFetch = global.fetch as jest.MockedFunction<typeof fetch>;
+  // The downloader fetches only the arm64 runner and refuses on any other
+  // arch; run as an Apple silicon Mac whatever the host.
+  const realArch = process.arch;
+  const runningOn = (arch: string) => Object.defineProperty(process, 'arch', { value: arch });
 
   const write = (file: string, content: string, mode = 0o644) => {
     fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -315,6 +319,7 @@ describe('the runner template a sandbox is copied from', () => {
   };
 
   beforeEach(() => {
+    runningOn('arm64');
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'lm-arc-'));
     process.env.LOCALMOST_CONFIG_DIR = root;
     arc = path.join(root, 'runner', 'arc', `v${version}`);
@@ -325,6 +330,7 @@ describe('the runner template a sandbox is copied from', () => {
   });
 
   afterEach(() => {
+    runningOn(realArch);
     if (savedConfigDir === undefined) delete process.env.LOCALMOST_CONFIG_DIR;
     else process.env.LOCALMOST_CONFIG_DIR = savedConfigDir;
     fs.rmSync(root, { recursive: true, force: true });
