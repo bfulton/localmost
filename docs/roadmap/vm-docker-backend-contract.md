@@ -78,20 +78,38 @@ localmost-vm version             # prints {"helper":"<semver>","contract":1} and
 The helper derives every path it uses from these arguments. Nothing on its
 command line is a path the job chose.
 
-- Share (job mode): `S = realpath(<data>/runner/sandbox/<sandboxId>) + "/_work"`.
-  It requires that `lstat(S)` is a directory and not a link, that
-  `realpath(S) == S`, that `S` starts with `realpath(<data>/runner/sandbox) + "/"`,
-  that `st_dev(S) == st_dev(<sandbox>)`, and that `S` is not a mount point
-  (`statfs(S).f_mntonname != S`). The last two refuse a DMG, FUSE or SMB
-  mount placed over `_work`, which seatbelt's path rules do not see. The
-  helper runs the checks right before `start`, and Electron runs the same
-  checks before the spawn. If any check fails: `E_SHARE`.
+- `<data>` is resolved once, from the VM's own directory: the helper opens
+  `<data>/vm/jobs/<vmId>` with `O_DIRECTORY|O_NOFOLLOW`, reads its real path
+  with `F_GETPATH`, and requires it to end in `/vm/jobs/<vmId>`; what is
+  before that is the real `<data>`. Otherwise: `E_ARGS`. It never walks
+  `<data>`'s parents with `realpath(3)`: under the §2.5 profile that fails,
+  because the profile grants no metadata reads above the paths below.
+- Share (job mode): `S = <real data>/runner/sandbox/<sandboxId>/_work`.
+  The helper opens `S` with `O_DIRECTORY|O_NOFOLLOW` (so it is a directory
+  and not a link), and requires that its real path (`F_GETPATH`) is exactly
+  `S` (so no link at the sandbox, at `runner/sandbox`, or anywhere below
+  `<data>` moved it), that it is on the same filesystem as `<data>/vm/jobs/<vmId>`
+  (`st_dev` and `f_fsid` equal), and that it is not itself a mount point
+  (`f_mntonname != S`). The last two refuse a DMG, FUSE or SMB mount placed
+  over `_work`, over the sandbox, or over any directory between them and
+  `<data>`, which seatbelt's path rules do not see. Every check is made on
+  descriptors of paths the §2.5 profile grants, so it needs no rule of its
+  own. The helper runs the checks before it builds the VM and again right
+  before `start`; Electron runs the §2.1 checks before the spawn. If any
+  check fails: `E_SHARE`. *Verified (WP-B):* a DMG mounted over `_work`
+  gives `E_SHARE` before `start` under the profile.
 - Data disk: `<data>/vm/jobs/<vmId>/data.img` in job mode, or
   `<data>/vm/cache/<repoKey>/data.img.new` in refresh mode. Electron prepares it
   (clone or new sparse file) before the spawn. If it is missing: `E_DISK`.
 - Guest: `<resources>/guest/{vmlinux,initramfs.cpio.gz,rootfs.erofs}`. The
-  helper checks each file's size against `manifest.json` (Electron checks the
+  helper checks each file's size against `manifest.json` (`schema` 1,
+  `artifacts.<name>.size`; the manifest is read with `O_NOFOLLOW` and capped
+  at 1 MiB), and that each is a regular file, not a link (Electron checks the
   hashes, §5.4). On a mismatch: `E_GUEST_IMAGE`.
+- `helper.pid`: the helper writes its pid and a newline to
+  `<data>/vm/jobs/<vmId>/helper.pid` (mode 0600, `O_NOFOLLOW`) as soon as the
+  VM directory has been checked, before any other check, so that the
+  startup sweep finds a helper that got that far.
 
 ### 2.2 The VM it builds
 
@@ -132,21 +150,33 @@ stderr carries free-form log lines of the form `<level> <message>`, where level
 is one of `debug`, `info`, `warn`, `error`. Electron logs them under the VM id.
 A line on stdout that is not a valid event makes Electron kill the helper.
 
-**Events (helper → Electron)**
+**Events (helper → Electron)** are named by an `event` field, for example
+`{"v":1,"event":"listening","dockerSocket":"…","agentSocket":"…"}`. An answer
+to a command has an `id` and no `event`.
 
 | Event | When | Fields |
 |---|---|---|
 | `listening` | Both unix sockets bound, before `start` | `dockerSocket`, `agentSocket` |
-| `started` | `VZVirtualMachine.start` succeeded | `pid` (the helper's own pid; the VZ XPC process is not observable), `rosetta`: `installed`, `notInstalled`, `notSupported` or `off`, and `startMs` (milliseconds since exec) |
-| `stopped` | The VM stopped. The helper exits right after. | `reason`: `guest` (guest powered off), `requested` or `error`; `code`, `message` when `error`; `synced`: true once `F_FULLFSYNC` of the data disk succeeded after a `guest` stop in refresh mode |
+| `started` | `VZVirtualMachine.start` succeeded | `pid` (the helper's own pid; the VZ XPC process is not observable), `rosetta`: `installed`, `notInstalled`, `notSupported` or `off`, and `startMs` (milliseconds since exec). `off` whenever the Rosetta share was not asked for: `--rosetta off`, and every refresh VM, which has no shares. |
+| `stopped` | The helper is ending. It exits right after, with the code of the table below. It is always the last line on stdout, including for a failure before `listening` (bad arguments, a guest of the wrong size, a refused share), so that Electron reads why from it. | `reason`: `guest` (guest powered off), `requested` or `error`; `code`, `message` when `error` (the message at most 2 KiB); `synced`, a boolean on every `stopped`: true only once `F_FULLFSYNC` of the data disk succeeded after a `guest` stop in refresh mode |
 
-**Commands (Electron → helper)**. Each has an integer `id` and is answered
-with `{"v":1,"id":<id>,"ok":true}` or with
-`{"v":1,"id":<id>,"ok":false,"code":"…","message":"…"}`.
+The order is `listening`, `started`, `stopped`; a failure ends it early with
+`stopped`. A stop requested before `started` is carried out, with no grace,
+once the VM has started.
+
+**Commands (Electron → helper)** are named by an `op` field, as the agent's
+requests are, for example `{"v":1,"id":7,"op":"stop","graceMs":0}`. Each has
+an integer `id` and is answered with `{"v":1,"id":<id>,"ok":true}` or with
+`{"v":1,"id":<id>,"ok":false,"code":"…","message":"…"}`. The answer to
+`stop` comes as soon as the stop is under way, before `stopped`. A command
+the helper cannot carry out (an unknown `op`, a `v` other than 1, a
+`graceMs` out of range) is answered with code `E_PROTO` and changes nothing.
+A line that is not a JSON object with an integer `id`, or is over 64 KiB, is
+logged on stderr and dropped, since there is no id to answer.
 
 | Command | Fields | Effect |
 |---|---|---|
-| `stop` | `graceMs` (0–60000) | If `graceMs > 0`: `requestStop()`, then wait for the guest to stop, up to `graceMs`. Then `stop()`, which forces it. `stopped` follows. |
+| `stop` | `graceMs` (0–60000) | If `graceMs > 0`: `requestStop()`, then wait for the guest to stop, up to `graceMs`. Then `stop()`, which forces it. `stopped` follows, with reason `requested` even when the guest powered off in the grace. A later `stop` with `graceMs: 0` cuts the grace short. |
 | `ping` | – | Answers with `"state": "starting"`, `"running"` or `"stopping"`. |
 
 **Signals.** SIGTERM or SIGINT is `stop` with `graceMs: 0`, then exit. SIGKILL
@@ -156,7 +186,10 @@ leaves the VM to VZ, which stops it within about 2 s (R27, verified).
 kqueue `EVFILT_PROC`/`NOTE_EXIT`. If that process exits, or stdin reaches EOF,
 the helper acts as on `stop` with `graceMs: 0`, then exits. If `getppid()` is
 already 1 at start, it exits with `E_ARGS`. This is what makes a crash or
-SIGKILL of Electron main stop every VM.
+SIGKILL of Electron main stop every VM. *Verified (WP-B, under the §2.5
+profile):* SIGKILL of the helper, SIGKILL of its parent (with stdin still
+open, so kqueue alone saw it), and closing its stdin each left no helper and
+no VZ XPC process within 60 ms.
 
 **Exit codes and error codes**
 
@@ -200,6 +233,10 @@ escaped as the job profile escapes its paths.
     (subpath "<S>")))
 (allow generic-issue-extension (extension-class "com.apple.virtualization.extension.fuse"))
 (allow network-outbound (remote ip "localhost:<proxy-port>"))
+;; job mode with --rosetta auto: VZ asks the helper for this one extension
+;; when it shares Rosetta. A generic extension of the Rosetta class only,
+;; never a file-issue-extension.
+(allow generic-issue-extension (extension-class "com.apple.virtualization.extension.rosetta-directory-share"))
 ;; refresh mode, instead of the job-mode rules above: its one disk, and no
 ;; share, so no extension rule at all.
 (allow file-read* file-write* (literal "<data>/vm/cache/<repoKey>/data.img.new"))
@@ -220,10 +257,32 @@ EPERM. *Verified (review probe):* the same profile *without* the
 the share in the guest fails with "Operation not permitted". So that rule is
 what the EPERM rests on, and a profile without it gives a VM whose share does
 not work. A read-write data disk in a granted directory attached without any
-extension rule. *Not verified:* the erofs root disk under the profile, which
-the spike never attached; WP-B confirms it. Rosetta may need its own read or
-extension rule; WP-B adds exactly what `sandbox-exec` tracing shows and
-nothing more, and never a broader `file-issue-extension`.
+extension rule.
+
+*Verified (WP-B, the real helper under exactly these rules, macOS 26.6.2,
+M2):* job and refresh VMs boot; the erofs root attaches read-only as `vda`
+and the data disk as `vdb`; `agent.sock` reaches the guest's port 1025 and
+`docker.sock` answers `/_ping`; a file in the granted `_work` is readable in
+the guest, and without the `file-issue-extension` rule it is not ("Operation
+not permitted"; the VM still starts, as it does when that rule names another
+directory). The helper, not VZ, is the first to refuse a link at `_work` or
+an ungranted share: its own open of `S` fails, with `E_SHARE`, before
+`start`. When `_work` is swapped for a link to an ungranted directory right
+after `listening`, past the helper's last check, `start` fails with EPERM
+(`E_VZ_START`, "a directory sharing device configuration is invalid" over
+`NSPOSIXErrorDomain 1`) in 11 of 12 runs; in the twelfth VZ had already
+resolved the real directory, and every read through the link failed in the
+guest. The relay reaches `127.0.0.1:<proxy-port>`; a helper told to dial
+another port is refused by seatbelt (EPERM) and closes the guest's
+connection. The same holds with the helper signed by an Apple Development
+identity with the hardened runtime. Rosetta: sharing it works under these
+rules, but `sandbox-exec` tracing shows one denial,
+`generic-issue-extension com.apple.virtualization.extension.rosetta-directory-share`,
+which is exactly the Rosetta rule above; with it the denial is gone and an
+x86-64 static binary still runs in the guest. The only other denials are
+Foundation's reads of `~/.CFUserTextEncoding`, the helper's own directory
+and the global preferences, and a `mach-task-name` lookup of the VZ XPC
+process; none is needed, and none is granted.
 
 ## 3. The guest
 
@@ -1206,8 +1265,13 @@ helper or CLI is missing. A build never ships without its VM.
 - `build:helper`: `swift build -c release --arch arm64 --package-path native/localmost-vm`,
   copied to `build/localmost-vm` (so that development and packaged builds
   both find it at `<resources>/localmost-vm`), then ad-hoc signed with
-  `entitlements.virtualization.plist` so that development runs work. osx-sign
-  re-signs it when there is an identity.
+  `entitlements.virtualization.plist` and the hardened runtime so that
+  development runs work. osx-sign re-signs it when there is an identity.
+  `scripts/build-helper.mjs` builds under `build/swift/`, and skips the copy
+  and signing when the binary and the entitlements are unchanged since the
+  last signing (`build/localmost-vm.stamp`). It needs WP-F's
+  `packaging/entitlements.virtualization.plist` and fails naming it when it
+  is missing.
 - `fetch:docker-cli`: `scripts/docker-cli.lock.json` =
   `{ "version": "29.8.1", "url": "https://download.docker.com/mac/static/stable/aarch64/docker-29.8.1.tgz", "sha256": "5a8f5604d7673202b2af925229d15eb4bbb86f7f542e4ac8cd7aa3f14cfa0f8b", "member": "docker/docker" }`
   is fetched, checked, and extracted to `build/docker-cli/docker`. *Verified:*
