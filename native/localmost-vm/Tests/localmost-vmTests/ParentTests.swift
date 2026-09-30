@@ -45,6 +45,19 @@ final class ParentTests: XCTestCase {
         withExtendedLifetime(watch) {}
     }
 
+    func testAParentLostBeforeTheWatchIsSeenAtOnce() throws {
+        // The recorded pid is still alive, so kqueue will never report it,
+        // but the helper has already been reparented to launchd: only the
+        // check made once the watch is in place sees that.
+        let other = try child()
+        defer { other.terminate() }
+        let gone = expectation(description: "loss seen")
+        let watch = ParentWatch(pid: other.processIdentifier, queue: .main, stillThere: { false }) { gone.fulfill() }
+        watch.start()
+        wait(for: [gone], timeout: 10)
+        withExtendedLifetime(watch) {}
+    }
+
     func testTheWatchFiresOnce() throws {
         let parent = try child()
         let gone = expectation(description: "exit seen")
