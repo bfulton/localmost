@@ -25,11 +25,11 @@ const DAEMON_JSON = {
 
 /**
  * Empty directories the root needs as mount points and state directories.
- * Users and Volumes are the share's mount roots: the agent mounts a tmpfs
- * on one and the share below it (guest/internal/share MountRoots).
+ * Users, Volumes and private are the share's mount roots: the agent mounts
+ * a tmpfs on one and the share below it (guest/internal/share MountRoots).
  */
 const ROOT_DIRS = [
-  'dev', 'proc', 'sys', 'run', 'tmp', 'mnt', 'root', 'Users', 'Volumes',
+  'dev', 'proc', 'sys', 'run', 'tmp', 'mnt', 'root', 'Users', 'Volumes', 'private',
   'etc/docker', 'etc/localmost', 'usr/libexec/localmost',
   'var/lib/docker', 'var/lib/containerd', 'var/log', 'var/tmp',
 ];

@@ -9,6 +9,9 @@ func TestValidMountPaths(t *testing.T) {
 	for p, want := range map[string]string{
 		"/Users/me/.localmost/runner/sandbox/3-0123456789ab/_work":          "Users",
 		"/Volumes/Data/home/.localmost/runner/sandbox/1-aaaaaaaaaaaa/_work": "Volumes",
+		// os.tmpdir() and /tmp resolve under /private, where the e2e
+		// launcher puts LOCALMOST_CONFIG_DIR.
+		"/private/var/folders/45/x/T/lm-e2e/runner/sandbox/1-aaaaaaaaaaaa/_work": "private",
 	} {
 		top, err := CheckMountPath(p)
 		if err != nil || top != want {

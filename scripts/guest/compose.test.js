@@ -123,7 +123,7 @@ describe('composeRootfs', () => {
     const names = entries.map((e) => e.name);
     expect(names).toContain('usr/lib/xtables/libxt_DSCP.so');
     expect(names).toContain('usr/lib/xtables/libxt_dscp.so');
-    for (const d of ['dev', 'proc', 'sys', 'run', 'tmp', 'var/lib/docker', 'var/lib/containerd', 'etc/docker', 'Users', 'Volumes']) {
+    for (const d of ['dev', 'proc', 'sys', 'run', 'tmp', 'var/lib/docker', 'var/lib/containerd', 'etc/docker', 'Users', 'Volumes', 'private']) {
       expect(entries.find((e) => e.name === d)?.type).toBe('dir');
     }
   });

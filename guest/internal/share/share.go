@@ -16,9 +16,12 @@ const MaxPathLen = 1024
 // The read-only root has each as an empty directory, which is only ever a
 // mount point for the tmpfs; every other top-level name is refused, so the
 // tmpfs can never hide a directory the guest uses (/usr, /var, /etc, ...).
-// They are where a Mac's home directories live: /Users, and /Volumes for a
-// home on another volume.
-var MountRoots = []string{"Users", "Volumes"}
+// They are where a Mac's home directories live, /Users, and /Volumes for a
+// home on another volume, and /private, where the Mac's temporary
+// directories resolve (os.tmpdir() and /tmp, where the e2e tests keep
+// their data directory). The Linux root has no /private, so covering it
+// hides nothing.
+var MountRoots = []string{"Users", "Volumes", "private"}
 
 // CheckMountPath refuses a mount path that is not absolute and normalised
 // (no ".", "..", empty component, trailing "/" or NUL), is longer than
