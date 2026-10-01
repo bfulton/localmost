@@ -218,7 +218,7 @@ const oneOf = (...allowed: string[]) => (v: unknown): boolean => isUnset(v) || a
  * the grammar applies to itself: what cannot be named cannot be requested.
  *
  * These are the keys an ordinary `docker run` sends. Each is either inert
- * (resource limits, logging, removal on exit) or gated below.
+ * (resource limits, removal on exit) or gated below.
  */
 const HOST_CONFIG_KNOWN: ReadonlySet<string> = new Set([
   // Gated below by value, or checked by the mount and network logic.
@@ -226,16 +226,16 @@ const HOST_CONFIG_KNOWN: ReadonlySet<string> = new Set([
   'pidmode', 'ipcmode', 'utsmode', 'usernsmode', 'cgroupnsmode', 'cgroupparent', 'cgroup',
   'devices', 'devicerequests', 'devicecgrouprules', 'securityopt', 'capadd', 'sysctls', 'runtime',
   'isolation', 'maskedpaths', 'readonlypaths', 'volumesfrom', 'extrahosts', 'groupadd', 'links',
-  'volumedriver', 'restartpolicy',
+  'volumedriver', 'restartpolicy', 'logconfig', 'annotations',
   // Inert: they bound the container, they do not widen it. Dropping capabilities
   // and setting resource limits or DNS search only ever restricts.
-  'capdrop', 'autoremove', 'logconfig', 'consolesize', 'readonlyrootfs', 'init',
+  'capdrop', 'autoremove', 'consolesize', 'readonlyrootfs', 'init',
   'oomscoreadj', 'oomkilldisable', 'shmsize', 'memory', 'memoryswap', 'memoryreservation',
   'memoryswappiness', 'kernelmemory', 'nanocpus', 'cpushares', 'cpuperiod', 'cpuquota',
   'cpurealtimeperiod', 'cpurealtimeruntime', 'cpusetcpus', 'cpusetmems', 'cpucount', 'cpupercent',
   'blkioweight', 'blkioweightdevice', 'blkiodevicereadbps', 'blkiodevicewritebps',
   'blkiodevicereadiops', 'blkiodevicewriteiops', 'pidslimit', 'dns', 'dnsoptions', 'dnssearch',
-  'annotations', 'tmpfs', 'ulimits', 'iomaximumbandwidth', 'iomaximumiops',
+  'tmpfs', 'ulimits', 'iomaximumbandwidth', 'iomaximumiops',
 ]);
 
 /** The fields of a RestartPolicy; anything else is a shape the filter cannot read. */
@@ -247,6 +247,31 @@ const isNoRestart = (v: unknown): boolean => {
   if (!isPlainObject(v)) return false;
   if (Object.keys(v).some((key) => !RESTART_POLICY_KNOWN.has(key.toLowerCase()))) return false;
   return valuesFor(v, 'Name').every((name) => isEmptyString(name) || name === 'no');
+};
+
+/**
+ * The log drivers that write to the VM's own disk. Every other driver - syslog,
+ * gelf, fluentd, splunk and the plugins - is run by dockerd in the guest's root
+ * network namespace and connects out from there, where the relay rule scoped
+ * to container interfaces does not apply. An internal network container's
+ * stdout reached the worker's proxy port that way.
+ */
+const LOG_DRIVERS: ReadonlySet<string> = new Set(['', 'json-file', 'local', 'none']);
+/** The local drivers' own options. Another driver's address option is refused with it. */
+const LOG_OPTIONS: ReadonlySet<string> = new Set(['max-size', 'max-file', 'compress', 'mode', 'max-buffer-size']);
+const LOG_CONFIG_KNOWN: ReadonlySet<string> = new Set(['type', 'config']);
+
+/** Is a LogConfig one that keeps the container's output on the VM's disk? */
+const isLocalLogging = (v: unknown): boolean => {
+  if (isUnset(v)) return true;
+  if (!isPlainObject(v)) return false;
+  if (Object.keys(v).some((key) => !LOG_CONFIG_KNOWN.has(key.toLowerCase()))) return false;
+  if (!valuesFor(v, 'Type').every((type) => isUnset(type) || (typeof type === 'string' && LOG_DRIVERS.has(type)))) {
+    return false;
+  }
+  // Options are a map[string]string the driver reads by exact key.
+  return valuesFor(v, 'Config').every((config) => isUnset(config) || (isPlainObject(config) &&
+    Object.entries(config).every(([key, value]) => LOG_OPTIONS.has(key) && typeof value === 'string')));
 };
 
 const HOST_CONFIG_GATES: ReadonlyArray<{ key: string; permitted: (v: unknown) => boolean; flag: string }> = [
@@ -289,6 +314,11 @@ const HOST_CONFIG_GATES: ReadonlyArray<{ key: string; permitted: (v: unknown) =>
   // container outlives the job and the removal that runs when it ends. The
   // CLI sends "no", or "" from older versions, when --restart is not given.
   { key: 'RestartPolicy', permitted: isNoRestart, flag: '--restart' },
+  { key: 'LogConfig', permitted: isLocalLogging, flag: '--log-driver/--log-opt' },
+  // OCI annotations reach runc and the containerd shim as an extension
+  // channel: org.systemd.property.* sets unit properties under the systemd
+  // cgroup driver, for one. The CLI sends none unless --annotation is given.
+  { key: 'Annotations', permitted: isEmptyObject, flag: '--annotation' },
 ];
 
 /** Bind options that do not change what the mount reaches. */
@@ -827,8 +857,15 @@ export function pullRequestOf(query: Record<string, string>): PullRequest | stri
 const BUILD_PARAMS_KNOWN: ReadonlySet<string> = new Set([
   't', 'dockerfile', 'q', 'nocache', 'rm', 'forcerm', 'pull', 'buildargs', 'labels', 'target',
   'shmsize', 'memory', 'memswap', 'cpushares', 'cpusetcpus', 'cpuperiod', 'cpuquota', 'squash',
-  'platform', 'version', 'buildid', 'session',
+  'platform', 'version', 'buildid',
 ]);
+
+/**
+ * The builder versions a build may ask for: the classic builder's, or none.
+ * `version=2` selects dockerd's BuildKit builder on a plain tar context, with
+ * no /session or /grpc call for the "buildkit" refusal to catch.
+ */
+const CLASSIC_BUILDER_VERSIONS: ReadonlySet<string> = new Set(['', '1']);
 
 /** Keys a network create may carry freely: they name the network or are inert. */
 const NETWORK_CREATE_KNOWN: ReadonlySet<string> = new Set(['name', 'internal', 'checkduplicate', 'labels', 'driver']);
@@ -971,6 +1008,12 @@ function evaluateBuild(req: DockerRequest, policy: DockerPolicy): DockerVerdict 
     if (name === 'networkmode') continue;
     if (!BUILD_PARAMS_KNOWN.has(name)) {
       return deny(`build parameter "${key}" is not one the localmost docker socket understands, so it cannot be forwarded`);
+    }
+    if (name === 'version' && !CLASSIC_BUILDER_VERSIONS.has(req.query[key])) {
+      return deny(
+        `build version "${asciiEscaped(req.query[key].slice(0, 16))}" selects BuildKit, which cannot be filtered; ` +
+          'jobs are pinned to the classic builder (version 1)'
+      );
     }
   }
 

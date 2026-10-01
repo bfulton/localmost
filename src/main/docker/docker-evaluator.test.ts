@@ -610,6 +610,45 @@ describe('HostConfig is an allowlist, not a blocklist', () => {
     expect(create({ RestartPolicy: {} }).allowed).toBe(true);
   });
 
+  it('refuses a log driver that sends the container output anywhere but the VM disk', () => {
+    // dockerd runs the log driver in the guest's root network namespace, where
+    // the interface-scoped relay rule does not apply: with syslog or gelf
+    // pointed at the relay address, an internal network container's stdout
+    // reached the worker's proxy port.
+    for (const type of ['syslog', 'gelf', 'fluentd', 'splunk', 'journald', 'awslogs', 'gcplogs', 'logentries', 'vendor/plugin:latest']) {
+      expect([type, create({ LogConfig: { Type: type, Config: {} } }).allowed]).toEqual([type, false]);
+    }
+    // A local driver given another driver's address option.
+    expect(create({ LogConfig: { Type: 'json-file', Config: { 'syslog-address': 'tcp://198.18.0.1:3128' } } }).allowed).toBe(false);
+    expect(create({ LogConfig: { Type: '', Config: { 'gelf-address': 'tcp://198.18.0.1:3128' } } }).allowed).toBe(false);
+    // Any casing of the keys the daemon decodes case-insensitively.
+    expect(create({ logconfig: { Type: 'syslog' } }).allowed).toBe(false);
+    expect(create({ LogConfig: { type: 'gelf' } }).allowed).toBe(false);
+    expect(create({ LogConfig: { Type: 'json-file', config: { 'fluentd-address': 'x' } } }).allowed).toBe(false);
+    // Shapes the filter cannot read.
+    expect(create({ LogConfig: 'syslog' }).allowed).toBe(false);
+    expect(create({ LogConfig: { Type: 'json-file', Config: { 'max-size': 10 } } }).allowed).toBe(false);
+    expect(create({ LogConfig: { Type: 'json-file', SomeFutureKey: 'x' } }).allowed).toBe(false);
+    // The local drivers, with their own options, and what the CLI sends bare.
+    for (const type of ['', 'json-file', 'local', 'none']) {
+      expect([type, create({ LogConfig: { Type: type, Config: {} } }).allowed]).toEqual([type, true]);
+    }
+    expect(create({
+      LogConfig: { Type: 'json-file', Config: { 'max-size': '10m', 'max-file': '3', compress: 'true', mode: 'non-blocking', 'max-buffer-size': '4m' } },
+    }).allowed).toBe(true);
+    expect(create({ LogConfig: null }).allowed).toBe(true);
+    expect(create({ LogConfig: { Type: '', Config: null } }).allowed).toBe(true);
+  });
+
+  it('refuses OCI annotations, which reach runc and the shim as an extension channel', () => {
+    // org.systemd.property.* sets unit properties under the systemd cgroup
+    // driver, for one. The CLI sends none unless --annotation is given.
+    expect(create({ Annotations: { 'org.systemd.property.x': 'y' } }).allowed).toBe(false);
+    expect(create({ annotations: { a: 'b' } }).allowed).toBe(false);
+    expect(create({ Annotations: {} }).allowed).toBe(true);
+    expect(create({ Annotations: null }).allowed).toBe(true);
+  });
+
   it('still permits the keys a plain docker run actually sends', () => {
     expect(create({}).allowed).toBe(true);
     expect(create({ AutoRemove: true, NetworkMode: 'bridge', Binds: [], RestartPolicy: { Name: '', MaximumRetryCount: 0 }, LogConfig: { Type: '', Config: {} }, ConsoleSize: [0, 0] }).allowed).toBe(true);
@@ -643,6 +682,25 @@ describe('build query parameters', () => {
     for (const qs of ['?remote=https%3A%2F%2Fevil%2Fctx', '?extrahosts=evil%3A1.2.3.4', '?cachefrom=%5B%22other%3Alatest%22%5D', '?ulimits=x', '?securityopt=seccomp%3Dunconfined', '?outputs=type%3Dlocal%2Cdest%3D%2Ftmp']) {
       expect([qs, build(qs).allowed]).toEqual([qs, false]);
     }
+  });
+
+  it('keeps a build on the classic builder: a version that selects BuildKit is refused', () => {
+    // POST /build?version=2 with a plain tar context runs dockerd's BuildKit
+    // builder with no /session or /grpc call, so the "buildkit" refusal never
+    // fires; the version itself has to be held to the classic builder's.
+    for (const qs of ['?version=2', '?t=bk%3A1&version=2', '?VERSION=2', '?Version=2', '?version=3', '?version=%201']) {
+      const v = build(qs);
+      expect([qs, v.allowed]).toEqual([qs, false]);
+      expect(v.reason).toMatch(/classic builder/);
+    }
+    expect(build('?version=1').allowed).toBe(true);
+    expect(build('?version=').allowed).toBe(true);
+    expect(build('?t=app').allowed).toBe(true);
+  });
+
+  it('refuses a BuildKit session id, which the classic builder never sends', () => {
+    expect(build('?session=abc123').allowed).toBe(false);
+    expect(build('?t=app&Session=abc123').allowed).toBe(false);
   });
 
   it('permits the parameters an ordinary docker build sends', () => {
