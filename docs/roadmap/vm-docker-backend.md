@@ -474,8 +474,8 @@ experiment. "V-spike" means verified in this design's spike on 2026-09-30.
 | S1 | A job cannot give a container the user's home or any Mac path outside its own `_work` (G-A). | (a) The VM has exactly one read-write share, `_work`, created by localmost (R1). (b) Profile node denies make it unswappable (rule 3); job code may run before `Start()`, and until then (b) and (c) are the only layers. (c) The helper checks the share (not a link, not a mount point, same device as the sandbox, and the sandbox the same device as `runner/sandbox`), and its profile's `file-issue-extension` rule, scoped to `(subpath "<S>")`, lets VZ's service reach only that real path, so a swap resolved at `Start()` fails. (d) A rename after `Start()` fails closed. (e) Symlinks planted on the host resolve in the guest, never on the Mac: Apple's virtiofs server does not follow a link on the Mac side, and this is the only layer when the guest still holds a directory's inode from before the swap (below). (f) The VZ XPC service is itself sandboxed to the shared paths. (g) The nonce tripwire detects a failure of both (b) and (c). | (a), (d), (e), (f): V (register §1). (e) again, V, WP-A acceptance: when the source directory is replaced by a link on the Mac after the guest last looked it up, the guest's virtiofs dentry is stale, `--mount` and a restart bind the old directory's inode, and the container starts. `mountinfo` shows the bind at the old root; the directory lists as empty and reading a file in it fails with ENOENT or ELOOP ("Symbolic link loop"). Neither `nosymfollow` nor `lm-bindpin` sees a link here (the guest never resolves one), so what stops the link's target being served is the Mac-side server, which resolves the stale inode by its path and refuses to follow the link. It is Apple's code, not localmost's, and a change in it would reopen this path; the acceptance checks it on every run. (c): V-spike, with the scoped `file-issue-extension` rule present. A share path swapped for a link outside the grant failed `Start()` with EPERM, and an ungranted directory was refused the same way. A review probe confirmed that without that rule the VM starts but the guest cannot read the share, so the EPERM comes from that rule. The mount-point check: Build, WP-B. (b), (g): Build, WP-C sandbox test. |
 | S2 | A container cannot reach guest `/`, the guest `docker.sock` or `/proc` by swapping a bind source (R2). | `nosymfollow` on the share, plus `lm-bindpin`, which clears it only on approved binds and refuses an approved bind that is not a share mount. When the swap is made on the Mac after the guest looked the source up, a third layer is what holds: see S1(e). | V-spike on the shipped kernel (Alpine 6.18.54) with `dockerd` 29.5.3 and `runc` 1.4.3. `create` with a bind, swap the source for a link to `/`, `start` failed. A bind of a planted link to `/Users/...` failed. A child bind inherited `nosymfollow` (inner link: ELOOP). `mount_setattr` clearing only `NOSYMFOLLOW` restored inner links and kept `ro,nosuid,nodev`. V, WP-A acceptance, for links to `/`, `/run` and `/var/lib/docker` each: `-v` then swap, and a container that plants the link through an rw bind and restarts, never start: dockerd's `stat` hits ELOOP under `nosymfollow`, and its `mkdir` of the source then fails EEXIST. `--mount` then swap, and start then swap then restart, do start, on a stale mount (see S1(e)). With `nosymfollow` removed from the share on purpose, `lm-bindpin` refused the ones that never start (a link to `/` because `/` carries the share as a submount; `/run` and `/var/lib/docker` because they are not share mounts). Without both, `/run` and `/var/lib/docker` reached the container, which the acceptance's G-A checks detect. |
 | S3 | Containers of different jobs cannot reach each other, and a job cannot join another job's network. | Separate VMs. No NIC. vsock has no guest-to-guest path. Network names exist only inside one VM. | vsock CID 3 gives ENODEV (R7, V). Live cross-job test: Build, integration stage. |
-| S4 | Container egress goes only through the job's proxy, under the job's policy. | No NIC. The relay goes only to that worker's `ProxyServer`, which checks the per-worker token. The guest firewall rejects everything else sent to the guest root namespace from bridges. | No route and no DNS without a NIC (R7, V). V-spike: a default-bridge container reached a listener on `198.18.0.1:3128`. An `internal` network container got "Network unreachable". Relay end to end: Build, WP-A with WP-B. |
-| S5 | An `internal` network container reaches nothing outside its network. | No default route. The guest's INPUT chain accepts the relay address only from the bridges of routable networks, which the agent tracks from Docker's network events, and rejects everything else. A container can forge the route away: `NET_RAW` is in Docker's default capabilities, so it can send a frame to its gateway's MAC addressed to `198.18.0.1`, and Linux's weak-host model would deliver it to `lm0`. The interface match is what stops that. The backstop is the proxy token, which is injected only into routable containers. | V-spike: no route to the relay, and it *did* reach a `0.0.0.0` listener on its gateway (R8 confirmed). The spike tested routing only, not forged frames. The interface-scoped rule and the forged-route probe: Build, WP-A self-test and live test 6. |
+| S4 | Container egress goes only through the job's proxy, under the job's policy. | No NIC. The relay goes only to that worker's `ProxyServer`, which checks the per-worker token. The guest firewall rejects everything else sent to the guest root namespace from bridges, and `LOCALMOST-NOROUTE` resets anything routed toward the outside world at once (contract §3.6). The helper's vsock 3128 listener accepts any guest process, so what keeps containers off it is Docker's default seccomp profile, which refuses `socket(AF_VSOCK)`; the filter keeps that profile on every container by gating `SecurityOpt` to empty and refusing `privileged`. | No route and no DNS without a NIC (R7, V). V-spike: a default-bridge container reached a listener on `198.18.0.1:3128`. An `internal` network container got "Network unreachable". Relay end to end: V, integration run. Immediate reset of a direct connect: V, WP-A acceptance and the final integration run (every probe refused in 0 ms; it took 1 s to 3 s, or hung, before `LOCALMOST-NOROUTE`). `AF_VSOCK` refused: V, WP-A acceptance step "AF_VSOCK from a container is refused" (EPERM from the default bridge and an internal network), run on every acceptance, so a guest or `dockerd` change that weakens the profile is caught. |
+| S5 | An `internal` network container reaches nothing outside its network. | No default route. The guest's INPUT chain accepts the relay address only from the bridges of routable networks, which the agent tracks from Docker's network events, and rejects everything else. A container can forge the route away: `NET_RAW` is in Docker's default capabilities, so it can send a frame to its gateway's MAC addressed to `198.18.0.1`, and Linux's weak-host model would deliver it to `lm0`. The interface match is what stops that. What `dockerd` itself sends on a container's behalf comes from the guest's root namespace and arrives on `lo`, which the INPUT chain accepts, so the filter allows only settings that make `dockerd` send nothing: `LogConfig` is limited to the local drivers (`json-file`, `local`, `none`) and their own options, since syslog, gelf, fluentd and the rest connect out from there, and `Annotations` must be empty. Docker's default seccomp profile keeps the container off the relay's vsock port, as in S4. The backstop is the proxy token, which is injected only into routable containers. | V-spike: no route to the relay, and it *did* reach a `0.0.0.0` listener on its gateway (R8 confirmed). The spike tested routing only, not forged frames. The interface-scoped rule and the forged-route probe: V, WP-A self-test and acceptance. The log-driver path: found by the integration review, live (an internal container with `--log-driver syslog` or `gelf` aimed at `198.18.0.1:3128` had its stdout delivered to the worker's proxy port); the filter now refuses it, V, final integration run through the real filter. |
 | S6 | Registry credentials never enter the VM. | Pulls run on the Mac. Only the image archive crosses into the VM. | V-spike: `docker load` of an archive built on the Mac worked, and the image id equalled the config digest. The puller: Build, WP-D. |
 | S7 | One job cannot poison another's images. It *can* use every image in its repository's cache, including images its own workflow's policy never allowed. | The cache is per repository. The golden disk is written only by the refresh VM from verified blobs, and is rebuilt from blank on a schedule. Job disks are clones and are discarded. There are no tags on the golden disk. What the cache exposes: any job of the repository can run a cached image through `docker build` with `FROM <ref>@sha256:…` (the classic builder uses a local image without pulling, and the filter does not read the Dockerfile), through `run.images: ['*']` with an image id, or, with guest root, by reading `/dev/vdb`. So an image that the registry would not serve anonymously never enters the shared store or the golden disk (owner decision 1, below). | Design (R14). Build, WP-D. The residual in the refresh VM is listed below. |
 | S8 | Guest root is worth no more than the job already has, plus the public images in its repository's cache. | One VM per job holds only this job's share (including the runner's `_work/_temp` and `_work/_actions`, which the job can already write), this job's proxy token, this job's pulls, and its repository's cache of public images. Guest root cannot load a kernel module or kexec a new kernel: after loading its module allowlist, `lm-init` sets `kernel.modules_disabled=1` and `kernel.kexec_load_disabled=1` (the kernel has `MODULE_SIG` but not `MODULE_SIG_FORCE`, so without this any module would load). | R3. The residual is the VZ/virtiofs attack surface (R22), and a guest kernel exploit, below. |
@@ -503,8 +503,12 @@ What this backend does **not** contain, stated as plainly as `SECURITY.md` must:
 - **Hard links the job itself makes** inside `_work` to files it can already
   write (R23). Seatbelt refuses `link()` on a file the job cannot write, so this
   adds nothing.
-- **Hostname policy for traffic that ignores `HTTP_PROXY`.** That traffic has no
-  route at all. It fails, it is not filtered. See the network stack backlog item.
+- **Hostname policy for traffic that ignores `HTTP_PROXY`.** That traffic is
+  reset by the guest's firewall. It fails, it is not filtered. See the network
+  stack backlog item. One wrinkle: a name lookup from a musl-based image
+  (Alpine) still takes about 5 s to fail. Its resolver ignores the ICMP that
+  refuses its query on an unconnected socket and waits out its own timeout;
+  a lookup that `nslookup` makes, or one from glibc, fails at once.
 
 ## Edge cases
 
@@ -849,7 +853,45 @@ packages pinned in the contract:
   and the disk was promoted; the next job's VM was cloned from it and its
   pull of the same image reported it already in the VM.
 
+- In the final review pass (2026-09-30, same Mac, outside any job), after
+  the review's fixes: the guest rebuilt reproducibly with
+  `LOCALMOST-NOROUTE`, and every WP-A acceptance step passed, including the
+  new one (five connects in a row to `1.1.1.1:443` from the default bridge
+  and from the guest each refused, ECONNREFUSED, in about 100 ms with the
+  run) and embedded DNS by service name on a user-defined network. A guest
+  built without the default route failed configure with `E_SELFTEST`
+  (`outsideRejected: false`). The integration harness ran again through
+  the real manager, backend and filter, 15 of 15: every direct-egress probe
+  (`1.1.1.1:443`, the Mac's LAN address, other relay ports, the gateway,
+  `wget http://1.1.1.1/`) failed in 0 ms; `--log-driver syslog` and `gelf`
+  aimed at the relay, a `syslog-address` on the local driver and an
+  `--annotation` were refused by the filter, `--log-driver json-file
+  --log-opt max-size=1m` ran; and a raw `POST /build?version=2` got 403.
+  `test/e2e/docker.spec.ts` passed 10 of 10 in its Mac VM mode.
+
 Not yet verified, and owned by work packages:
+- Anything that runs in CI or in the installed app. Each needs a build of
+  this branch installed while the runner is idle (CI's localmost legs run
+  `/Applications/localmost.app`, not the tree), then a push, then the checks
+  watched and only the failed ones rerun (the owner):
+  - the install itself, and the startup sweep's log line on relaunch;
+  - the **Docker Access** workflow's `docker-localmost` job through the VM;
+  - the new ambient assertions in the `*.sandbox.test.ts` suites, on the
+    self-hosted leg;
+  - the `ubuntu-latest` leg of `test/e2e/docker.spec.ts`, over the test-only
+    forwarder to the runner's native `dockerd` (owner decision 3);
+  - the new `native` job in `ci.yaml` (`swift build`/`swift test`, `go test`
+    and `GOOS=linux go vet` on `macos-latest`) and the ubuntu leg's `go test`
+    step, which have never run;
+  - a raw connect that ignores the proxy settings failing at once, and
+    embedded DNS by name, inside a real job (both verified outside one).
+- The **Docker VM escape** workflow (see Test strategy) is not written:
+  neither `.github/workflows/vm-escape.yaml`, its `.localmostrc` section, nor
+  the `test/fixtures/rawsyn` probe it needs. Its G-A, egress, forged-route
+  and cross-job checks have run only outside a job, in WP-A's acceptance and
+  the integration harness. Writing it is the next step; it cannot run until
+  the owner approves its `.localmostrc` section. Until then the README keeps
+  the roadmap entry at "(in progress)".
 - `docker load` of a real registry image with zstd layers, and a private
   GHCR image with the operator's osxkeychain credentials (the owner).
 - The helper when signed with Developer ID and the hardened runtime and
@@ -910,8 +952,9 @@ Not yet verified, and owned by work packages:
   runs against the kernel config at build time.
 - **Live VM tests** (self-hosted, against the installed app). The repo's
   **Docker Access** workflow (`docker-localmost`) exercises pull, run and a
-  read-only workspace mount through the VM. A new **Docker VM escape**
-  workflow runs the **G-A regression suite** as a job: the create, swap, start
+  read-only workspace mount through the VM. A **Docker VM escape** workflow,
+  planned and not yet written (see Not yet verified), is to run the **G-A
+  regression suite** as a job: the create, swap, start
   attack with links to `$HOME` and `/`; a container with a writable mount
   that swaps another container's bind source before that container starts,
   and swaps its own and restarts; renaming `_work`; cross-job reach (two
@@ -919,7 +962,8 @@ Not yet verified, and owned by work packages:
   the other's, and joining the other's network by name); egress with and
   without the injected proxy; and a forged-route probe from an internal
   network. Its `.localmostrc` section must be approved by the owner before it
-  can run. The install-while-idle rule applies: CI's localmost legs run the
+  can run. Until it exists, these checks run outside a job, in WP-A's
+  acceptance harness and the integration harness. The install-while-idle rule applies: CI's localmost legs run the
   installed app, not the tree.
 - **The e2e docker suite** (`test/e2e/docker.spec.ts`, Playwright). It builds
   the filter in-process; it never packages or launches the app. On the Mac,

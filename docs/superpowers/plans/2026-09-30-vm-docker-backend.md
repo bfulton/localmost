@@ -831,7 +831,16 @@ localmost legs, and reinstalling mid-leg fails the job).
   6. a container on the internal network cannot reach `198.18.0.1:3128`,
      neither by a TCP connect nor by a raw-socket SYN sent to its gateway's
      MAC (a static probe, `test/fixtures/rawsyn`, built for linux/arm64 and
-     loaded as a scratch image).
+     loaded as a scratch image);
+  7. the same probe's `socket(AF_VSOCK)` fails with EPERM, from the default
+     bridge and from the internal network: Docker's default seccomp profile
+     is what keeps containers off the helper's vsock 3128 listener (design
+     S4, S5), so a guest or `dockerd` change that weakens it must fail here
+     (WP-A's acceptance already checks it outside a job);
+  8. `docker run --log-driver syslog --log-opt
+     syslog-address=tcp://198.18.0.1:3128` is refused by the filter, and the
+     job's proxy sees nothing: a log driver connects out from the guest's
+     root namespace, where the relay rule does not apply.
 - [ ] **Cross-job, live:** run `vm-escape` twice at once (a matrix of two).
   Both VMs run identical Docker networks, so their containers likely hold the
   same addresses (`172.17.0.2`, …); reaching "the other leg's IP" would reach
