@@ -1432,13 +1432,19 @@ remaining references' blobs plus their estimate on the golden disk (each
 distinct uncompressed layer once) fit, then every blob no remaining reference
 holds is deleted, except blobs a pull in progress has pinned.
 
-**Which store.** When the pull's session holds the operator's credentials
-for the registry (sent yet or not: a manifest and config read from a store
-send nothing, and the layers would then be fetched with them), or when the
-index, manifest or config was read from the job's own store (which only a
-private image puts there), then once the manifest and config are resolved and
-before any layer is fetched, the puller asks the registry anonymously for the
-same manifest digest (a token exchange with no credentials, then a `HEAD`).
+**Which store.** When the index, manifest or config was read from the job's
+own store, the image stays in the job store, without asking: only a private
+image puts them there, and the job store answers for any registry and
+repository that names their digest, so a second pull of that digest through
+another repository (whose registry may answer anything) could otherwise
+carry a private config into the shared store. Otherwise, when the pull's
+session holds the operator's credentials for the registry (sent yet or not:
+a manifest and config read from the public store send nothing, and the
+layers would then be fetched with them), then once the manifest and config
+are resolved and before any layer is fetched, the puller asks the registry
+anonymously for the same manifest digest: a token exchange with no
+credentials, then a `GET` whose bytes must hash to that digest. A status
+alone is not evidence, since a registry can answer `200` to anything.
 Asking before the layers, not after, lets them stream straight into the store
 they belong to; the digest asked about is the same either way. A pull with
 neither fetched everything anonymously and is public without asking.

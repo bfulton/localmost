@@ -535,8 +535,9 @@ describe('which store (owner decision 1)', () => {
     expect(notePulled).not.toHaveBeenCalled();
     expect(daemon.loads).toHaveLength(1);
     // The anonymous probe carried no credentials: its token was asked for
-    // with no Authorization, and stands for no user.
-    const probes = registry.requestsTo(REGISTRY_HOST, `/v2/${IMAGE}/manifests/${image.manifestDigest}`).filter((r) => r.method === 'HEAD');
+    // with no Authorization, and stands for no user. It is a GET, whose
+    // bytes are hashed: a status alone is not evidence.
+    const probes = registry.requestsTo(REGISTRY_HOST, `/v2/${IMAGE}/manifests/${image.manifestDigest}`).filter((r) => r.method === 'GET');
     expect(probes.length).toBeGreaterThan(0);
     for (const probe of probes) expect(bearerUser(probe.headers.authorization)).toBeNull();
     expect(probes.some((probe) => probe.headers.authorization?.startsWith('Bearer '))).toBe(true);
@@ -557,6 +558,65 @@ describe('which store (owner decision 1)', () => {
     const again = await pull(puller(), { request: { tag: undefined, digest: image.manifestDigest } });
     expect(again.source).toBe('store');
     expect(publicBlobs()).toEqual([]);
+    expect(fs.existsSync(refsJsonPath(dataDir, REPO_KEY))).toBe(false);
+    expect(notePulled).not.toHaveBeenCalled();
+  });
+
+  it('does not take a 200 to an anonymous HEAD as the registry serving the image', async () => {
+    // A registry may answer 200 to every HEAD; only the manifest's bytes,
+    // fetched anonymously and hashed, show that it serves the image.
+    registry.users.set('me', 'pw');
+    registry.setPrivate(IMAGE);
+    registry.switches.headAnswersEverything = true;
+    credentials = { kind: 'basic', username: 'me', password: 'pw' };
+    const image = buildImage();
+    registry.putImage(IMAGE, image, 'v1');
+    await pull(puller());
+    expect(publicBlobs()).toEqual([]);
+    expect(fs.existsSync(refsJsonPath(dataDir, REPO_KEY))).toBe(false);
+    expect(notePulled).not.toHaveBeenCalled();
+  });
+
+  it('never promotes a private image that another repository names by its digest', async () => {
+    // A private image, pulled with the operator's credentials, is in the job
+    // store. The job then pulls its manifest digest from another repository, on a registry that
+    // answers 200 to every HEAD: nothing need be fetched, and the manifest
+    // and config would be read from the job store.
+    registry.users.set('me', 'pw');
+    registry.setPrivate(IMAGE);
+    credentials = { kind: 'basic', username: 'me', password: 'pw' };
+    const image = buildImage();
+    registry.putImage(IMAGE, image, 'v1');
+    await pull(puller());
+    credentials = undefined;
+    registry.switches.headAnswersEverything = true;
+    daemon.images.clear();
+    await pull(puller(), { request: { registry: REGISTRY_HOST, repositoryPath: 'evil/x', tag: undefined, digest: image.manifestDigest } });
+    // And by a tag whose HEAD names that digest.
+    registry.switches.contentDigestHeader = image.manifestDigest;
+    await pull(puller(), { request: { registry: REGISTRY_HOST, repositoryPath: 'evil/x', tag: 'latest' } });
+    expect(publicBlobs()).toEqual([]);
+    expect(fs.existsSync(refsJsonPath(dataDir, REPO_KEY))).toBe(false);
+    expect(notePulled).not.toHaveBeenCalled();
+  });
+
+  it('never promotes a config read from the job store, even when another repository serves the manifest itself', async () => {
+    // The manifest and the layers are public somewhere, but the config, with
+    // its ENV, came from the private pull. The anonymous check passes for
+    // the manifest; the config must still stay in the job store.
+    registry.users.set('me', 'pw');
+    registry.setPrivate(IMAGE);
+    credentials = { kind: 'basic', username: 'me', password: 'pw' };
+    const image = buildImage();
+    registry.putImage(IMAGE, image, 'v1');
+    await pull(puller());
+    credentials = undefined;
+    registry.putManifest('evil/x', image.manifest, MEDIA.ociManifest);
+    for (const [digest, bytes] of image.blobs) if (digest !== image.configDigest) registry.putBlob('evil/x', bytes);
+    daemon.images.clear();
+    await pull(puller(), { request: { registry: REGISTRY_HOST, repositoryPath: 'evil/x', tag: undefined, digest: image.manifestDigest } });
+    expect(publicBlobs()).not.toContain(image.configDigest.slice(7));
+    expect(publicBlobs()).not.toContain(image.manifestDigest.slice(7));
     expect(fs.existsSync(refsJsonPath(dataDir, REPO_KEY))).toBe(false);
     expect(notePulled).not.toHaveBeenCalled();
   });

@@ -942,7 +942,8 @@ chose the recommendation in each case, and the design is written against it.
    operator's credentials, a narrower one could use it. The options:
    - **(a) Recommended: keep images that needed credentials out of the shared
      cache.** After a pull, the puller asks the registry anonymously for the
-     same manifest digest (a token exchange and a `HEAD`). If the registry
+     same manifest digest (a token exchange and a `GET` whose bytes must hash
+     to it; contract §6.3 has the rule in full). If the registry
      serves it, the image is public and is cached. If not, its blobs go to a
      store private to the job (`<data>/vm/jobs/<vmId>/blobs`) and are deleted
      with the VM. Private images are then downloaded every job, and public

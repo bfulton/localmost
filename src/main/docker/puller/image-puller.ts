@@ -19,11 +19,11 @@
  * 6. For a public image only, record it in refs.json for the repository's
  *    cache disk.
  *
- * "Public" is owner decision 1 (§6.3 "Which store"): whenever the pull holds
- * the operator's credentials, or read anything from the job's own store, the
- * image is public only if the registry also serves its manifest anonymously.
- * Otherwise its blobs go to the job's own store, in the VM's directory, and go
- * with the VM.
+ * "Public" is owner decision 1 (§6.3 "Which store"): an image whose manifest
+ * or config was read from the job's own store never is, and whenever the pull
+ * holds the operator's credentials the image is public only if the registry
+ * also serves its manifest anonymously, bytes and all. Otherwise its blobs go
+ * to the job's own store, in the VM's directory, and go with the VM.
  *
  * Every pull runs in Electron main, so one VM runs at most three at once and
  * all VMs together eight; the rest wait their turn.
@@ -444,17 +444,20 @@ export class VmImagePuller implements ImagePuller {
     const imageConfig = parseConfig(config.bytes, resolved.layers.length, ref);
     const platform = this.checkConfigPlatform(resolved, imageConfig, opts.rosetta, ref);
 
-    // Which store (owner decision 1, §6.3): public only when the registry
-    // serves the manifest anonymously, asked whenever the answer could be
-    // no. That is whenever the session holds the operator's credentials,
-    // sent yet or not (a manifest and config read from a store send
-    // nothing, and the layers would then be fetched with them), and whenever
-    // anything came from the job's own store, which only a private image
-    // puts there. A pull with neither fetched everything anonymously.
-    const mustAsk =
-      session.hasCredentials || session.usedCredentials || resolved.fromJobStore || config.from === jobStore;
-    let isPublic = true;
-    if (mustAsk) {
+    // Which store (owner decision 1, §6.3). Never public when the manifest
+    // or the config came from the job's own store: only a private pull puts
+    // them there, and the job store answers for any registry and repository
+    // that names their digest, so a second pull through another one could
+    // otherwise carry a private config into the shared store. Otherwise
+    // public only when the registry serves the manifest anonymously, asked
+    // whenever the answer could be no: whenever the session holds the
+    // operator's credentials, sent yet or not (a manifest and config read
+    // from the public store send nothing, and the layers would then be
+    // fetched with them). A pull with neither fetched everything anonymously.
+    const fromJobStore = resolved.fromJobStore || config.from === jobStore;
+    const mustAsk = session.hasCredentials || session.usedCredentials;
+    let isPublic = !fromJobStore;
+    if (isPublic && mustAsk) {
       try {
         const anonymous = await this.options.client.open({ registry, repositoryPath }, 'anonymous', signal);
         isPublic = await anonymous.serves(resolved.manifestDigest);

@@ -726,12 +726,22 @@ export class RegistrySession {
     return { digest: checkDigest(header, this.describe(reference)) };
   }
 
-  /** Whether the registry serves a manifest to this session: a HEAD answering 200. */
-  async serves(reference: string): Promise<boolean> {
-    this.checkReference(reference);
-    const res = await this.api('HEAD', `manifests/${reference}`, ACCEPT);
-    drain(res);
-    return res.statusCode === 200;
+  /**
+   * Whether the registry serves this session the manifest with this digest:
+   * a GET whose bytes hash to it. A status alone is not evidence, since a
+   * registry can answer 200 to anything, and which store an image goes to
+   * rests on this answer (owner decision 1).
+   */
+  async serves(digest: string): Promise<boolean> {
+    this.checkReference(digest);
+    if (!digest.startsWith('sha256:')) throw new PullError(`${cleanText(digest, 100)} is not a manifest digest`);
+    const res = await this.api('GET', `manifests/${digest}`, ACCEPT);
+    if (res.statusCode !== 200) {
+      drain(res);
+      return false;
+    }
+    const bytes = await readBody(res, MAX_MANIFEST_BYTES, 'manifest');
+    return `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}` === digest;
   }
 
   async manifest(reference: string): Promise<FetchedManifest> {

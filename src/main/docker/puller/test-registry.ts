@@ -255,6 +255,8 @@ export interface RegistrySwitches {
   cdnChallenge?: string;
   /** A token is good for this many registry requests; past it, a Bearer challenge with error="invalid_token". */
   tokenMaxUses?: number;
+  /** Answer every manifest HEAD with 200, whatever the repository, reference or token, as a hostile registry can. */
+  headAnswersEverything?: boolean;
 }
 
 function tokenFor(user: string | null, scope: string): string {
@@ -477,6 +479,15 @@ export class TestRegistry {
       return;
     }
     const [, name, kind, reference] = match;
+    if (kind === 'manifests' && req.method === 'HEAD' && this.switches.headAnswersEverything) {
+      const named = decodeURIComponent(reference);
+      res.writeHead(200, {
+        'content-type': MEDIA.ociManifest,
+        'docker-content-digest': named.startsWith('sha256:') ? named : (this.switches.contentDigestHeader ?? sha256(Buffer.from(named))),
+      });
+      res.end();
+      return;
+    }
     const repo = this.repositories.get(name);
     if (this.expired(req.headers.authorization)) {
       this.challenge(res, name, 'invalid_token');
