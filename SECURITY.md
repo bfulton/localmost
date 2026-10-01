@@ -491,8 +491,12 @@ every vsock port and the proxy token: the VM's kernel, not only its root user.
 It would also bypass `internal:` networks and the bind hook below. Nothing
 here contains a privileged container, which is why none is granted.
 
-**The Docker VM.** By default a VM is booted only when a job whose bound
-policy has a `docker:` section is claimed. With the opt-in `dockerVm.prewarm`,
+**The Docker VM.** By default a VM is booted only for a job whose bound
+policy has a `docker:` section, and only at that job's first Docker request
+the filter permits beyond the baseline it answers itself; a job that never
+makes one has no VM. Job code has run by then, which is why the share is
+made, and made unswappable, when the sandbox is built, before any job process
+(below). With the opt-in `dockerVm.prewarm`,
 one spare is booted when an idle worker is spawned, before any claim; it holds
 only that worker's sandbox, whose job has not started, and at the claim it is
 stopped unless the job's policy has a `docker:` section and the job is for the
@@ -594,18 +598,21 @@ starts, and a VM that fails the check is torn down. Behind the firewall, the
 proxy token is the backstop: only routable containers are given it.
 
 **Registry credentials never enter the sandbox or the VM.** A pull is not
-forwarded to the daemon. localmost pulls on the Mac: it reads the operator's
-`~/.docker/config.json`, credential helpers and `credsStore` itself, takes
-credentials to the registry's token exchange there, fetches the image, and
-loads it into the VM over the Docker API as an archive. `X-Registry-Auth` and
+forwarded to the daemon. localmost pulls on the Mac, anonymously first. Only
+when the registry refuses an anonymous request does it read the operator's
+`~/.docker/config.json`, credential helpers and `credsStore` itself, once per
+registry for the job, and take the credentials to the registry's token
+exchange there; a registry that serves the image anonymously never has its
+credential helper run. It fetches the image and loads it into the VM over
+the Docker API as an archive. `X-Registry-Auth` and
 `X-Registry-Config` are stripped from every forwarded request, and a job's own
 is dropped. Credentials are sent only to the registry's own origin and to a
 token service that passed the screening below, never on a redirect.
 Credential helpers are run only from `/opt/homebrew/bin`, `/usr/local/bin` and
 `/Applications/Docker.app/Contents/Resources/bin`, never looked up on
-`PATH`. A configured helper that is missing, or fails for any reason but
-"credentials not found", fails the pull with a message naming the helper and
-the config key, rather than letting it go ahead anonymously.
+`PATH`. When the registry wants credentials, a configured helper that is
+missing, or fails for any reason but "credentials not found", fails the pull
+with a message naming the helper and the config key.
 
 **What a pull reaches.** The puller speaks only https, to registries on public
 addresses: a registry whose name resolves to a loopback, link-local or private
@@ -639,10 +646,12 @@ through `docker build` with `FROM <ref>@sha256:…` (the classic builder uses a
 local image without pulling, and the filter does not read the Dockerfile),
 through `run.images: ['*']` with an image id, or, with root in the VM, by
 reading the raw disk. So an image that needed credentials never enters the
-cache: after a pull, localmost asks the registry anonymously for the same
-manifest digest, and an image the registry will not serve that way is kept
-only for the job that pulled it, in its VM's directory, and deleted with the
-VM.
+cache: an image whose pull never needed them is public, and its layers are
+fetched anonymously too; one that did is cached only if the registry then
+serves its manifest digest anonymously, and its layers are again fetched
+without the credentials. An image the registry will not serve that way, or
+one of whose layers it will not, is kept only for the job that pulled it, in
+its VM's directory, and deleted with the VM.
 
 **Root in the VM is worth little more than the job.** A kernel exploit from a
 container gives root in the VM. The VM holds only this job's share (the
@@ -701,7 +710,8 @@ the same prominence as a change to `level:`. Default is off: a repository that
 declares nothing under `docker:` has only the baseline of `/_ping`,
 `/version`, `/info` and reads about its own containers, none of which change
 anything, and no VM boots for its jobs (a pre-warmed spare, if one is enabled,
-is stopped at the claim): until a VM is running, localmost answers those three
+is stopped at the claim); nor, for a repository that does declare some, does
+one boot until its job asks for more than these: until a VM is running, localmost answers those three
 from the guest image's manifest. They would otherwise describe the daemon's
 host: its name, data directory, proxy and registry configuration and labels,
 so a running VM's `/info` is rewritten to keep only what clients use to start

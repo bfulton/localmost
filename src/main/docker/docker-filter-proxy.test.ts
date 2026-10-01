@@ -60,6 +60,8 @@ interface WorkerCalls {
   pulls: PullRequest[];
   approvals: Array<{ containerId: string; binds: ApprovedBind[] }>;
   releases: number;
+  /** Each time the filter asked for the daemon: how long it would wait, and whether the VM may boot for it. */
+  endpoints: Array<{ timeoutMs: number; boot: boolean }>;
 }
 
 /** A backend and the worker it hands the socket, as the filter is built with them. */
@@ -79,13 +81,16 @@ const backendWith = (
   supportsPrivileged = false,
   overrides: Partial<WorkerDocker> & { disposable?: boolean; workspaceMountRoot?: (sandboxDir: string) => string } = {}
 ): Fixture => {
-  const calls: WorkerCalls = { binds: [], pulls: [], approvals: [], releases: 0 };
+  const calls: WorkerCalls = { binds: [], pulls: [], approvals: [], releases: 0, endpoints: [] };
   const { disposable = false, workspaceMountRoot, ...workerOverrides } = overrides;
   const worker: WorkerDocker = {
     bind: (repository, policy) => calls.binds.push({ repository, policy }),
     prewarm: () => {},
     dropSpare: () => {},
-    endpoint: async () => (endpoint ? { kind: 'ready', socketPath: endpoint } : { kind: 'none', reason: 'no Docker daemon is available to this job' }),
+    endpoint: async (timeoutMs, options) => {
+      calls.endpoints.push({ timeoutMs, boot: options?.boot ?? false });
+      return endpoint ? { kind: 'ready', socketPath: endpoint } : { kind: 'none', reason: 'no Docker daemon is available to this job' };
+    },
     running: () => endpoint !== null,
     baseline: () => ({ status: 503, headers: { 'Content-Type': 'application/json' }, body: { message: 'no Docker daemon is available to this job' } }),
     pull: async (req, onProgress) => {
@@ -1657,7 +1662,7 @@ describe('containers a job leaves behind', () => {
     const dir = tmp();
     const sock = path.join(dir, 'docker.sock');
     const daemon = await lifetimeDaemon(dir, sock);
-    const { proxy } = await startProxy(dir, { backend: backendWith(daemon.sock) });
+    const { proxy, calls } = await startProxy(dir, { backend: backendWith(daemon.sock) });
     proxy.bind('owner/repo', policy);
 
     expect((await request(sock, 'POST', '/v1.45/containers/create?name=db', { Image: 'alpine:3' })).status).toBe(201);
@@ -1681,6 +1686,9 @@ describe('containers a job leaves behind', () => {
     expect(sweep.slice(2)).toEqual([`DELETE /networks/${NET1_ID}`]);
     // The socket was already gone, so the job could not start another meanwhile.
     expect(daemon.socketPresent.slice(before)).toEqual([false, false, false]);
+    // The job's requests may boot the VM; the removal only uses one already there.
+    expect(calls.endpoints.slice(0, -1).every((e) => e.boot)).toBe(true);
+    expect(calls.endpoints.at(-1)).toEqual({ timeoutMs: 0, boot: false });
   });
 
   it('logs what it could not remove, and still stops', async () => {
@@ -2298,10 +2306,10 @@ describe('the worker behind the socket', () => {
       const daemon = await vmDaemon(dir);
       let ready!: () => void;
       const booted = new Promise<void>((resolve) => (ready = resolve));
-      const waits: number[] = [];
+      const waits: Array<[number, boolean | undefined]> = [];
       const fixture = backendWith(daemon.sock, false, {
-        endpoint: async (timeoutMs) => {
-          waits.push(timeoutMs);
+        endpoint: async (timeoutMs, options) => {
+          waits.push([timeoutMs, options?.boot]);
           await booted;
           return { kind: 'ready', socketPath: daemon.sock };
         },
@@ -2313,7 +2321,8 @@ describe('the worker behind the socket', () => {
       expect(daemon.seen).toHaveLength(0);
       ready();
       expect((await pending).status).toBe(201);
-      expect(waits).toEqual([45_000]);
+      // The job's first request that needs the daemon is what boots the VM.
+      expect(waits).toEqual([[45_000, true]]);
     });
 
     it("answers 503 with the worker's reason when there is no VM, and says so once at warn", async () => {

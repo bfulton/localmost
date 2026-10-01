@@ -859,11 +859,11 @@ check.
 | `src/main/vm/types.ts` | new | Declarations only: `VmRequest`, `VmState`, `VmHandle`, `VmError`, `VmManager` (below), `AgentClient` (§3.4, below), `ImagePuller` (§6.4), `CacheDisks` and `StartRefreshVm` (§6.5). The implementations import them from here, so that no two of them import each other. |
 | `src/main/vm/paths.ts` | new | Every path in §1, each built only from an id checked against its §1 form (a malformed one throws): `vmDir()`, `vmJobFiles()`, `imageStoreDir()`, `refsJsonPath()`, `cacheFiles()`, `sandboxDirOf()` and `sandboxFiles()`, which take `<data>` as an argument, already realpathed by the caller (`sandboxFiles(<data>, sandboxId)` is built on `sandboxDirOf()`, never from a directory the caller hands over, because the share is what the helper profile grants). Also the §1 regexes, `repoKeyOf()`, `newVmId(slot)`, `vmIdSlot()`, `digestHex()` (§6.3), `blobPath()` (§6.3, with its second layer `placeBlob()` exported only for its test), `getVmResourcesDir()` (§1), `guestDir()`, `helperPath()` (with the `LOCALMOST_VM_HELPER` rule of §7.3) and `dockerCliPath()`; and the names `SHARE_DIR_NAME` (`_work`), `SHARE_NONCE_FILE` and `DOCKER_CONFIG_DIR_NAME` (`.docker`), which `buildSandbox`, the job profile and runner-manager share. |
 | `src/main/resource-monitor/memory-pressure-monitor.ts` | new | Polls `sysctl -n kern.memorystatus_vm_pressure_level` every 5 s with async `execFile` (1 → `normal`, 2 → `warn`, 4 → `critical`; anything else → `warn`), and calls `vmManager.onMemoryPressure(level)` on a change. |
-| `src/main/docker/puller/registry-client.ts` | new | Registry v2 client: token auth, manifests, blobs, redirects, screened DNS. |
+| `src/main/docker/puller/registry-client.ts` | new | Registry v2 client: token auth (anonymous first, the operator's credentials only on a refusal, §6.1), manifests, blobs, redirects, screened DNS. |
 | `src/main/docker/puller/image-store.ts` | new | The per-repository blob store and `refs.json`. |
 | `src/main/docker/puller/docker-archive.ts` | new | The `docker save`-shaped tar stream for `POST /images/load`. |
 | `src/main/docker/puller/image-puller.ts` | new | `ImagePuller` (§6.4). |
-| `src/main/docker/registry-auth.ts` | changed | Adds `resolveRegistryCredentials(registry): Promise<RegistryCredentials \| undefined>` for the puller, where `RegistryCredentials` is `{ kind: 'basic', username, password }` or `{ kind: 'identity-token', token }`. The sync `resolveRegistryAuth`, which built the X-Registry-Auth header `DesktopBackend`'s filter attached, is deleted with its tests (at integration), and a test keeps the name out of `src` and `test`. The new function is async. It looks helpers up only in `/opt/homebrew/bin`, `/usr/local/bin` and `/Applications/Docker.app/Contents/Resources/bin`, never `PATH`, and runs them with async `execFile` (10 s timeout). Throws `RegistryAuthError` when a configured helper is missing or fails other than "not found", with the design's message naming the helper and the config key (`credsStore` or `credHelpers.<registry>`) and how the helper ended (exit status, signal, timeout, or an answer over 64 KiB). What the helper printed never goes into that error, which reaches the job's log: it goes, cleaned, to the `log` option, and `index.ts` passes `resolveRegistryCredentials(r, { log: (m) => logger.warn(m) })`. |
+| `src/main/docker/registry-auth.ts` | changed | Adds `resolveRegistryCredentials(registry): Promise<RegistryCredentials \| undefined>` for the puller, where `RegistryCredentials` is `{ kind: 'basic', username, password }` or `{ kind: 'identity-token', token }`. The sync `resolveRegistryAuth`, which built the X-Registry-Auth header `DesktopBackend`'s filter attached, is deleted with its tests (at integration), and a test keeps the name out of `src` and `test`. The new function is async. It looks helpers up only in `/opt/homebrew/bin`, `/usr/local/bin` and `/Applications/Docker.app/Contents/Resources/bin`, never `PATH`, and runs them with async `execFile` (10 s timeout). Throws `RegistryAuthError` when a configured helper is missing or fails other than "not found", with the design's message naming the helper and the config key (`credsStore` or `credHelpers.<registry>`) and how the helper ended (exit status, signal, timeout, or an answer over 64 KiB). What the helper printed never goes into that error, which reaches the job's log: it goes, cleaned, to the `log` option, and `index.ts` passes `resolveRegistryCredentials(r, { log: (m) => logger.warn(m) })`. The registry client calls it only when a registry refuses an anonymous request, once per registry per job (§6.1). |
 | `src/main/docker/docker-filter-proxy.ts` | changed | §5.3. |
 | `src/main/docker/docker-evaluator.ts` | changed | Parses and normalises bind destinations from `Binds` and `Mounts` (§3.7 "Bind matching"; today `MountRequest` has only `source` and `mode`), refuses a relative or duplicate destination, and returns `approvedBinds` on an allowed create. |
 | `src/shared/docker-policy.ts` | changed | `UNFILTERED_EGRESS` becomes `PROXIED_EGRESS` = `egress through this job's proxy, subject to its network allowlist`. `hasDockerGrants(policy)` is exported. The approval text for `pull.registries` adds `and fetching from wherever that registry redirects (any public https host)`. The `privileged: true` refusal no longer says "this build does not have a managed VM backend"; it says `privileged containers are not granted: they reach the Docker VM's kernel`. |
@@ -920,18 +920,20 @@ export interface PullRequest {
 
 export interface WorkerDocker {
   /**
-   * At the claim, with the bound policy. Idempotent: runner-manager calls it
-   * at least twice per job (onJobAcquired, then the "Running job" line), and
-   * possibly on a previous spawn's socket that is still stopping.
-   *  - The first bind with hasDockerGrants(policy), while no VM exists and
-   *    release() has not been called: adopts the spare if it was booted for
-   *    this repository, otherwise stops the spare and boots a VM.
-   *  - Any later bind for the same repository: replaces the policy only and
-   *    never boots.
+   * At the claim, with the bound policy. Boots nothing: the VM boots at the
+   * job's first request that needs the daemon (endpoint with `boot`).
+   * Idempotent: runner-manager calls it at least twice per job
+   * (onJobAcquired, then the "Running job" line), and possibly on a previous
+   * spawn's socket that is still stopping.
+   *  - The first bind with hasDockerGrants(policy), while release() has not
+   *    been called: records the repository the VM is for, and adopts the
+   *    spare if it was booted for this repository, or else stops the spare.
+   *  - Any later bind for the same repository: replaces the policy only.
    *  - A later bind without grants: replaces the policy (the filter then
-   *    refuses everything but the baseline) and leaves a running VM alone.
-   *  - A bind for a different repository than the VM was booted for: stops
-   *    the VM and never boots another; the socket stays closed, as today.
+   *    refuses everything but the baseline, and no request boots a VM) and
+   *    leaves a running VM alone.
+   *  - A bind for a different repository than the first: stops the VM, if
+   *    one is running, and never boots another; the socket stays closed.
    *  - Any bind after release() has started: records nothing, boots nothing.
    */
   bind(repository: string, policy: DockerPolicy): void;
@@ -943,8 +945,14 @@ export interface WorkerDocker {
    * The filter's staysClosed(reason) calls it.
    */
   dropSpare(reason: string): void;
-  /** The VM's docker.sock once ready. Waits while it boots, up to timeoutMs. */
-  endpoint(timeoutMs: number): Promise<EndpointState>;
+  /**
+   * The VM's docker.sock once ready. Waits while it boots, up to timeoutMs.
+   * With `boot`, a request that needs the daemon: the first one boots the
+   * bound job's VM, exactly once, and every one waits for it, then gets the
+   * same answer, the boot's failure included. Without, only a VM that is
+   * already there counts (the stop's removal of the job's containers).
+   */
+  endpoint(timeoutMs: number, options?: { boot?: boolean }): Promise<EndpointState>;
   /** A VM is ready right now: the baseline is forwarded, not synthesised. */
   running(): boolean;
   /** The synthesised answers of §5.3 "Baseline". */
@@ -960,7 +968,11 @@ export interface WorkerDocker {
   approveBinds(containerId: string, binds: ApprovedBind[]): Promise<void>;
   /** HTTP(S)_PROXY, http(s)_proxy and NO_PROXY for routable containers and builds; {} when no VM. */
   containerProxyEnv(): Record<string, string>;
-  /** Worker exit: stop the VM, delete its directory, schedule a cache refresh. Idempotent. */
+  /**
+   * Worker exit: stop the VM, delete its directory, have the puller forget
+   * the job, schedule a cache refresh. Idempotent. A no-op for a job whose VM
+   * never booted, and no request boots one once it has begun.
+   */
   release(): Promise<void>;
 }
 ```
@@ -999,7 +1011,7 @@ export interface VmHandle {
 export interface VmManager {
   sweep(): Promise<void>;
   start(req: VmRequest): VmHandle;       // admission-gated; never blocks the caller
-  /** Make a live spare an ordinary job VM (VmBackend adopts it at the claim); false if it is gone. */
+  /** Make a live spare an ordinary job VM (VmBackend adopts it at the claim, booted already); false if it is gone. */
   claimSpare(vmId: string): boolean;
   onResume(): void;
   onMemoryPressure(level: 'normal' | 'warn' | 'critical'): void;
@@ -1104,10 +1116,17 @@ refused request but the three above.
 
 - **Options.** `backend: DockerBackend` stays. Add `worker: WorkerDocker`.
   Remove `attachRegistryAuth`.
-- **`bind()`** calls `worker.bind()` after recording the policy.
-- **Endpoint.** Every use of `backend.resolveEndpoint()` becomes
-  `await worker.endpoint(bootTimeoutMs)`. If it answers `none`, the request
-  gets 503 with the reason, and the first such answer is also logged at warn.
+- **`bind()`** calls `worker.bind()` after recording the policy. Nothing
+  boots at the bind.
+- **Endpoint.** A permitted request that needs the daemon (anything but the
+  baseline below, and including an upgraded attach) awaits
+  `worker.endpoint(bootTimeoutMs, { boot: true })`: the job's first such
+  request boots its VM, and it and every request that comes while the VM
+  boots wait for it. A request the filter refuses never asks. The stop's
+  removal of the job's containers asks `worker.endpoint(0)`, which boots
+  nothing. If it answers `none`, the request gets 503 with the reason (the
+  boot's failure, for every request that waited on it), and the first such
+  answer is also logged at warn.
 - **Baseline.** When `!worker.running()`, `/_ping`, `/version` and `/info` are
   answered from `worker.baseline()`. Otherwise they are forwarded, and `/info`
   is rewritten as today. The synthesised answers, from the guest manifest
@@ -1225,7 +1244,7 @@ refused request but the three above.
 | `startDockerProxy` | `new DockerFilterProxy({ backend, worker: backend.forWorker({ slot, sandboxDir, sandboxId, shareNonce, spawnRepository, proxy, log }), … })`. Then, if `config.dockerVm.prewarm`, `worker.prewarm()`. |
 | Job env | Keep `DOCKER_HOST` and `DOCKER_BUILDKIT=0`. Add `DOCKER_CONFIG=<sandbox>/.docker`, an empty directory made by `buildSandbox`, so the CLI reads no operator config. Prepend `dirname(<docker-cli>)` to `PATH`. |
 | Profile | `spawnSandboxed(…, { shareDir: <sandbox>/_work, dockerCli: <docker-cli>, vmHelper: <helper> })` |
-| `bindDockerSocket` (the claim) | `socket.bind()` now calls `worker.bind()`, which boots only on the first bind with grants (§5.1). Where the socket stays closed (the claim is not for the spawn repository, or the policy drifted), `socket.staysClosed(reason)` calls `worker.dropSpare(reason)`, so a spare that no job of this worker will use is stopped at the claim, not at the worker's exit. It is reached from `onJobAcquired` → `applyPolicyForTarget` and again from `applyRepoPolicy` at the "Running job" line; `startInstance` can also reach a previous spawn's socket while its un-awaited `stopDockerProxy` is still running. vm-backend tests cover a double bind and a bind while stopping. |
+| `bindDockerSocket` (the claim) | `socket.bind()` now calls `worker.bind()`, which records the repository and policy and boots nothing: the VM boots at the job's first request that needs the daemon (§5.1, §5.3), so a job that never makes one has no VM, no helper and no disk. Where the socket stays closed (the claim is not for the spawn repository, or the policy drifted), `socket.staysClosed(reason)` calls `worker.dropSpare(reason)`, so a spare that no job of this worker will use is stopped at the claim, not at the worker's exit. It is reached from `onJobAcquired` → `applyPolicyForTarget` and again from `applyRepoPolicy` at the "Running job" line; `startInstance` can also reach a previous spawn's socket while its un-awaited `stopDockerProxy` is still running. vm-backend tests cover a double bind, a bind while stopping, a job that never asks for the daemon, and concurrent first requests. |
 | `stopDockerProxy` (worker exit, reap, app stop) | Unchanged. `socket.stop()` now releases the VM. |
 | App start (`index.ts`) | `await vmManager.sweep()` before the pool's first spawn. |
 | App quit | `await vmManager.shutdownAll()`: every helper is stopped with `graceMs: 0` and awaited, 10 s at most. |
@@ -1319,9 +1338,26 @@ design's "Registries on the LAN, loopback or plain HTTP"). `docker.io` maps to
 `registry-1.docker.io`, with `library/` for single-name images. The
 `Accept` header lists OCI index and manifest types and Docker manifest-list
 and schema2 types. Schema1 is refused. Auth is the
-`WWW-Authenticate: Bearer realm=…,service=…,scope=…` token exchange, using
-basic credentials from `resolveRegistryCredentials` when there are any, under the
-rules below.
+`WWW-Authenticate: Bearer realm=…,service=…,scope=…` token exchange (or a
+registry's own `Basic` challenge), under the rules below.
+
+**Anonymous first.** Every request goes without the operator's credentials
+first: a bearer challenge is answered with an anonymous token request. The
+credentials are asked for (`resolveRegistryCredentials`) only when the
+registry refuses: a 401 from its own origin that the anonymous answer did not
+cure, for a manifest or a blob, or a token service that answers an anonymous
+token request 401 or 403. Then the challenge is answered once more, with
+them. They are asked for at most once per registry per job: the puller keeps
+what one job's sessions were given, an answer and a failure alike, keyed by
+registry (`CredentialMemo`), and forgets it when the job's VM is released.
+So a registry that serves everything anonymously never has its credential
+helper run, and a helper that is missing, hangs or fails is an error only for
+an image that needed it (`RegistryAuthError`, naming the helper and the
+config key, as §5.1 says). A session records whether it sent the
+credentials (`usedCredentials`), which §6.3 "Which store" reads. A session
+can be told to refuse them (`refuseCredentials()`): a refusal that only they
+would answer then fails with `CredentialsRequiredError`, and nothing is
+asked for or sent; an `anonymous` session always does.
 
 **Redirects.** Followed (CDN blob hosts) only to `https:` URLs, at most 5
 hops, each hop screened. Electron main follows them, so any registry in
@@ -1347,9 +1383,11 @@ job's `network.allow`; the approval text and `SECURITY.md` say so.
   (`<host> (where the registry redirected) answered 401; localmost answers
   only the registry's own challenge`), whatever challenge it carries, and no
   credentials are sent anywhere.
-- Each request answers at most one challenge, so a token that expires during
-  a pull (Docker Hub's last 300 s) is renewed and the request retried once; a
-  second 401 is the answer.
+- Each request answers at most one challenge with what the session already
+  has, so a token that expires during a pull (Docker Hub's last 300 s) is
+  renewed and the request retried once, and at most one more with the
+  operator's credentials, the first time the session needs them; a 401 after
+  that is the answer.
 - `RegistryClientOptions.connectTo` and `ca` exist for the mock registry
   only, and the client refuses them when `app.isPackaged`. Production passes
   neither.
@@ -1437,17 +1475,23 @@ own store, the image stays in the job store, without asking: only a private
 image puts them there, and the job store answers for any registry and
 repository that names their digest, so a second pull of that digest through
 another repository (whose registry may answer anything) could otherwise
-carry a private config into the shared store. Otherwise, when the pull's
-session holds the operator's credentials for the registry (sent yet or not:
-a manifest and config read from the public store send nothing, and the
-layers would then be fetched with them), then once the manifest and config
-are resolved and before any layer is fetched, the puller asks the registry
-anonymously for the same manifest digest: a token exchange with no
-credentials, then a `GET` whose bytes must hash to that digest. A status
-alone is not evidence, since a registry can answer `200` to anything.
-Asking before the layers, not after, lets them stream straight into the store
-they belong to; the digest asked about is the same either way. A pull with
-neither fetched everything anonymously and is public without asking.
+carry a private config into the shared store. Otherwise, when a refusal had
+the pull's session ask for the operator's credentials and it got some (sent
+yet or not), then once the manifest and config are resolved and before any
+layer is fetched, the puller asks the registry anonymously for the same
+manifest digest: a token exchange with no credentials, then a `GET` whose
+bytes must hash to that digest. A status alone is not evidence, since a
+registry can answer `200` to anything. Asking before the layers, not after,
+lets them stream straight into the store they belong to; the digest asked
+about is the same either way. A pull with neither has fetched everything so
+far anonymously (§6.1) and is public without asking. A public image's layers
+are fetched anonymously too: with the anonymous session that asked, or with
+the pull's own session told to refuse credentials. A layer the registry then
+refuses (`CredentialsRequiredError`) makes the image need credentials after
+all: it becomes private, the session may use the credentials again, and the
+layers are fetched once more into the job store (what was already fetched
+anonymously stays in the public store, unrecorded, until the next refresh
+drops it). So every blob in the public store was served anonymously.
 If the registry serves it, the image is public:
 its blobs go to `<data>/vm/images/<repoKey>` and it becomes eligible for the
 golden disk. If not, its blobs go to `<data>/vm/jobs/<vmId>/blobs` and are
@@ -1469,6 +1513,8 @@ export interface ImagePuller {
     onProgress(p: DockerProgress): void;
     signal: AbortSignal;
   }): Promise<{ manifestDigest: string; configDigest: string; platform: string; source: 'registry' | 'store' | 'vm' }>;
+  /** The job of the VM with this docker.sock has ended: its pull totals and the credentials its pulls were given go. */
+  forget(dockerSocketPath: string): void;
 }
 ```
 

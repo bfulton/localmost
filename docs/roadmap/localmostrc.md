@@ -355,8 +355,10 @@ Add to .localmostrc under workflows.build? [y/n]
 own, served by localmost outside the sandbox, and `DOCKER_HOST` points the job at
 it. A filtering proxy behind that socket parses every Docker API request, checks
 it against the approved policy, and forwards only what is permitted to a Linux
-VM of the job's own. The VM boots when a job whose policy has a `docker:`
-section is claimed (or, with the opt-in `dockerVm.prewarm`, as a spare when an
+VM of the job's own. The VM boots at the first Docker request, beyond
+`/_ping`, `/version` and `/info`, of a job whose policy has a `docker:`
+section, so a job that never runs `docker` has none (or, with the opt-in
+`dockerVm.prewarm`, as a spare when an
 idle worker is spawned, stopped at the claim unless that job uses it). It sees
 no directory of the Mac but the job's work folder, which holds the checkout,
 and Apple's Rosetta runtime for amd64 images, and it is discarded, with every

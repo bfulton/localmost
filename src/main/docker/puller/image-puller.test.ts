@@ -9,7 +9,7 @@ import { imageStoreDir, refsJsonPath, repoKeyOf, vmJobFiles } from '../../vm/pat
 import type { RosettaState } from '../../vm/types';
 import { ImagePullerOptions, PullLimits, VmImagePuller, choosePlatform, parsePlatformRequest } from './image-puller';
 import { RegistryClient, PullError } from './registry-client';
-import type { RegistryCredentials } from '../registry-auth';
+import { RegistryAuthError, resolveRegistryCredentials, type RegistryCredentials } from '../registry-auth';
 import { OVERSIZED } from './daemon-api';
 import { ImageStore } from './image-store';
 import { TestDaemon } from './test-daemon';
@@ -633,6 +633,112 @@ describe('which store (owner decision 1)', () => {
     const again = await pull(puller(), { request: { tag: undefined, digest: image.manifestDigest } });
     expect(again.source).toBe('store');
     expect(publicBlobs()).toEqual([]);
+    expect(fs.existsSync(refsJsonPath(dataDir, REPO_KEY))).toBe(false);
+    expect(notePulled).not.toHaveBeenCalled();
+  });
+});
+
+describe("the operator's credentials, asked for only when the registry wants them", () => {
+  let helperDir: string;
+  let calls: string;
+
+  beforeEach(() => {
+    helperDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'image-puller-helper-')));
+    calls = path.join(helperDir, 'calls');
+  });
+
+  afterEach(() => {
+    fs.rmSync(helperDir, { recursive: true, force: true });
+  });
+
+  /** `credsStore: <name>`, whose helper notes each run and then does `body`, through the real resolver. */
+  function credsStore(name: string, body: string): Partial<ImagePullerOptions> {
+    fs.writeFileSync(path.join(helperDir, `docker-credential-${name}`), `#!/bin/sh\necho run >> '${calls}'\n${body}\n`, { mode: 0o755 });
+    return {
+      client: new RegistryClient({
+        lookup: registry.lookup,
+        connectTo: registry.connectTo,
+        ca: registry.ca,
+        credentials: (r) =>
+          resolveRegistryCredentials(r, { readConfig: async () => ({ credsStore: name }), helperDirs: [helperDir], timeoutMs: 2000 }),
+      }),
+    };
+  }
+  const helperRuns = () => (fs.existsSync(calls) ? fs.readFileSync(calls, 'utf-8').split('\n').filter(Boolean).length : 0);
+  const answers = 'echo \'{"Username":"me","Secret":"pw"}\'';
+
+  it.each([
+    ['hangs', 'sleep 30'],
+    ['fails', 'echo broken >&2; exit 3'],
+  ])('pulls a public image without running a helper that %s', async (name, body) => {
+    const image = buildImage();
+    registry.putImage(IMAGE, image, 'v1');
+    await expect(pull(puller(credsStore(name, body)))).resolves.toMatchObject({ source: 'registry', configDigest: image.configDigest });
+    expect(helperRuns()).toBe(0);
+    expect(notePulled).toHaveBeenCalledWith(REPO_KEY, image.configDigest);
+    for (const token of registry.requestsTo(AUTH_HOST)) expect(token.headers.authorization).toBeUndefined();
+  });
+
+  it('runs the helper once for an image the registry refuses anonymously, and keeps the image for the job alone', async () => {
+    registry.users.set('me', 'pw');
+    registry.setPrivate(IMAGE);
+    const image = buildImage();
+    registry.putImage(IMAGE, image, 'v1');
+    await expect(pull(puller(credsStore('works', answers)))).resolves.toMatchObject({ source: 'registry' });
+    expect(helperRuns()).toBe(1);
+    // It needed credentials, so it is per-job (owner decision 1).
+    expect(publicBlobs()).toEqual([]);
+    expect(jobBlobs().length).toBeGreaterThan(0);
+    expect(fs.existsSync(refsJsonPath(dataDir, REPO_KEY))).toBe(false);
+    expect(notePulled).not.toHaveBeenCalled();
+    // Anonymous first; the credentials only after the registry refused.
+    const tokens = registry.requestsTo(AUTH_HOST).map((t) => t.headers.authorization);
+    expect(tokens[0]).toBeUndefined();
+    expect(tokens.indexOf(`Basic ${Buffer.from('me:pw').toString('base64')}`)).toBeGreaterThan(0);
+  });
+
+  it('fails loudly, naming the config key, when the helper fails for an image that needs it', async () => {
+    registry.setPrivate(IMAGE);
+    registry.putImage(IMAGE, buildImage(), 'v1');
+    const attempt = pull(puller(credsStore('fails', 'echo broken >&2; exit 3')));
+    await expect(attempt).rejects.toBeInstanceOf(RegistryAuthError);
+    await expect(attempt).rejects.toThrow(
+      'the Docker credential helper `docker-credential-fails` (from `credsStore` in ~/.docker/config.json) failed: it exited with status 3'
+    );
+    expect(helperRuns()).toBe(1);
+    expect(daemon.loads).toHaveLength(0);
+  });
+
+  it("runs the helper once per registry for a job's pulls, and again for another job's", async () => {
+    registry.users.set('me', 'pw');
+    registry.setPrivate(IMAGE);
+    registry.putImage(IMAGE, buildImage(), 'v1');
+    registry.putImage(IMAGE, buildImage(), 'v2');
+    const p = puller(credsStore('works', answers));
+    await pull(p);
+    await pull(p, { request: { tag: 'v2' } });
+    expect(helperRuns()).toBe(1);
+    await pull(p, { socket: vmJobFiles(dataDir, '4-0123456789ac').dockerSocket });
+    expect(helperRuns()).toBe(2);
+    // A job that has ended is forgotten, its credentials with it.
+    p.forget(vmJobFiles(dataDir, VM_ID).dockerSocket);
+    daemon.images.clear();
+    await pull(p);
+    expect(helperRuns()).toBe(3);
+  });
+
+  it('keeps an image in the job store when one of its layers needs the credentials the manifest did not', async () => {
+    // The manifest and config come anonymously, so the image looks public
+    // until a layer is refused: it goes to the job store, fetched with the
+    // credentials, and nothing of it is recorded for the shared cache.
+    registry.users.set('me', 'pw');
+    const image = buildImage();
+    registry.putImage(IMAGE, image, 'v1');
+    registry.switches.privateBlobs = new Set([layerOf(image)]);
+    await expect(pull(puller(credsStore('works', answers)))).resolves.toMatchObject({ source: 'registry' });
+    expect(helperRuns()).toBe(1);
+    expect(publicBlobs()).not.toContain(layerOf(image).slice(7));
+    expect(jobBlobs()).toContain(layerOf(image).slice(7));
     expect(fs.existsSync(refsJsonPath(dataDir, REPO_KEY))).toBe(false);
     expect(notePulled).not.toHaveBeenCalled();
   });

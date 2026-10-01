@@ -3,7 +3,8 @@
  * DefaultVmManager, against the helper, guest and CLI that
  * `npm run build:native` leaves in build/, as index.ts builds them from
  * Resources. The helper runs under its own seatbelt profile, a real VM boots
- * at the claim, and a pull is made on the Mac by the real puller.
+ * at the job's first Docker request, and a pull is made on the Mac by the
+ * real puller.
  *
  * Two parts are stand-ins. The cache disks: every VM starts on a blank data
  * disk and no refresh VM runs, so nothing boots that the spec did not claim

@@ -87,18 +87,20 @@ export interface PullRequest {
 /** One worker's daemon: made by DockerBackend.forWorker, released when the worker exits. */
 export interface WorkerDocker {
   /**
-   * At the claim, with the bound policy. Idempotent: runner-manager calls it
-   * at least twice per job (onJobAcquired, then the "Running job" line), and
-   * possibly on a previous spawn's socket that is still stopping.
-   *  - The first bind with hasDockerGrants(policy), while no VM exists and
-   *    release() has not been called: adopts the spare if it was booted for
-   *    this repository, otherwise stops the spare and boots a VM.
-   *  - Any later bind for the same repository: replaces the policy only and
-   *    never boots.
+   * At the claim, with the bound policy. Boots nothing: the VM boots at the
+   * job's first request that needs the daemon (endpoint with `boot`).
+   * Idempotent: runner-manager calls it at least twice per job
+   * (onJobAcquired, then the "Running job" line), and possibly on a previous
+   * spawn's socket that is still stopping.
+   *  - The first bind with hasDockerGrants(policy), while release() has not
+   *    been called: records the repository the VM is for, and adopts the
+   *    spare if it was booted for this repository, or else stops the spare.
+   *  - Any later bind for the same repository: replaces the policy only.
    *  - A later bind without grants: replaces the policy (the filter then
-   *    refuses everything but the baseline) and leaves a running VM alone.
-   *  - A bind for a different repository than the VM was booted for: stops
-   *    the VM and never boots another; the socket stays closed, as today.
+   *    refuses everything but the baseline, and no request boots a VM) and
+   *    leaves a running VM alone.
+   *  - A bind for a different repository than the first: stops the VM, if
+   *    one is running, and never boots another; the socket stays closed.
    *  - Any bind after release() has started: records nothing, boots nothing.
    */
   bind(repository: string, policy: DockerPolicy): void;
@@ -109,8 +111,14 @@ export interface WorkerDocker {
    * than the spawn's): the spare, if any, is of no use and is stopped.
    */
   dropSpare(reason: string): void;
-  /** The VM's docker.sock once ready. Waits while it boots, up to timeoutMs. */
-  endpoint(timeoutMs: number): Promise<EndpointState>;
+  /**
+   * The VM's docker.sock once ready. Waits while it boots, up to timeoutMs.
+   * With `boot`, a request that needs the daemon: the first one boots the
+   * bound job's VM, exactly once, and every one waits for it, then gets the
+   * same answer, the boot's failure included. Without, only a VM that is
+   * already there counts.
+   */
+  endpoint(timeoutMs: number, options?: { boot?: boolean }): Promise<EndpointState>;
   /** A VM is ready right now: the baseline is forwarded, not synthesised. */
   running(): boolean;
   /** The synthesised answers of contract §5.3 "Baseline". */

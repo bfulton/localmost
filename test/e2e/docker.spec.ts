@@ -21,10 +21,11 @@
  *   RunnerManager does - in a worker's sandbox, bound on claim to the policy
  *   - over the app's own backend: VmBackend and VmManager, with the helper,
  *   guest and docker CLI that `npm run build:native` leaves in build/. A
- *   real VM boots at the claim, and the job's pulls are made on the Mac. It
- *   asserts on the proxy's and the worker's log as well as on the CLI, and
- *   on the VM: none for a job whose policy has no docker section, one booted
- *   at the claim for this one, and its directory gone when the job ends.
+ *   real VM boots at the job's first Docker request beyond the baseline, and
+ *   the job's pulls are made on the Mac. It asserts on the proxy's and the
+ *   worker's log as well as on the CLI, and on the VM: none for a job whose
+ *   policy has no docker section, none at the claim for this one and one at
+ *   its first such request, and its directory gone when the job ends.
  *
  *   Off macOS (the ubuntu-latest CI leg), where no VM runs: the same, over a
  *   test-only worker that forwards to the runner's native dockerd and pulls
@@ -145,7 +146,7 @@ interface Run {
 }
 
 test.describe('a job using docker through the filtering socket', () => {
-  // A real VM boots at the claim, and the first pull fetches from a registry.
+  // A real VM boots at the job's first Docker request, and the first pull fetches from a registry.
   test.describe.configure({ timeout: mode === 'vm' ? 180_000 : 60_000 });
 
   // First, and never skipped: the suite runs against real Docker or it fails
@@ -164,7 +165,7 @@ test.describe('a job using docker through the filtering socket', () => {
   const nonce = `hello-${process.pid}-${Date.now()}`;
   const network = `localmost-e2e-${process.pid}`;
 
-  /** The Mac mode's VMs; and how many the backend had asked for just before and just after the claim. */
+  /** The Mac mode's VMs; and how many the backend had asked for just before and just after the claim (none). */
   let vms: VmHarness | undefined;
   let startedBeforeClaim = -1;
   let startedAtClaim = -1;
@@ -290,8 +291,8 @@ test.describe('a job using docker through the filtering socket', () => {
   const mark = (): number => logs?.length ?? 0;
   const logsSince = (at: number): DockerFilterProxyLogEntry[] => (logs ?? []).slice(at);
 
-  /** The VM booted for this job at the claim. */
-  const claimedVm = (): VmHandle => vms!.started[0];
+  /** The VM this job's first Docker request booted. */
+  const jobVm = (): VmHandle => vms!.started[0];
 
   // The VM's own checks, where this process boots the VM. Inside a job the
   // VM is the installed app's, which this process cannot see; off macOS
@@ -325,11 +326,19 @@ test.describe('a job using docker through the filtering socket', () => {
       }
     });
 
-    test("boots the job's own VM at the claim, and none before it", async () => {
-      expect([startedBeforeClaim, startedAtClaim]).toEqual([0, 1]);
-      const vm = claimedVm();
+    test("boots no VM at the claim, and the job's own at its first Docker request beyond the baseline", async () => {
+      expect([startedBeforeClaim, startedAtClaim]).toEqual([0, 0]);
+      // What every client asks first is answered from the guest's manifest.
+      const version = await docker('version', '--format', '{{.Server.Os}}');
+      expect(version.code, version.stderr).toBe(0);
+      expect(vms!.started).toHaveLength(0);
+      // The first request that needs the daemon boots the VM and waits for
+      // it; the daemon then answers that the image is not there yet.
+      await docker('image', 'inspect', IMAGE);
+      expect(vms!.started).toHaveLength(1);
+      const vm = jobVm();
       expect(vm.vmId).toMatch(/^1-[0-9a-f]{12}$/);
-      expect(logs!.some((l) => l.message === `Docker VM ${vm.vmId} booting for ${REPOSITORY} at the claim`)).toBe(true);
+      expect(logs!.some((l) => l.message === `Docker VM ${vm.vmId} booting for ${REPOSITORY}: the job's first Docker request`)).toBe(true);
       const ready = await vm.ready();
       expect(ready.docker.apiVersion).toMatch(/^1\.\d+$/);
       expect(fs.existsSync(vms!.vmDir(vm))).toBe(true);
@@ -363,7 +372,7 @@ test.describe('a job using docker through the filtering socket', () => {
       // Made on the Mac, where the credentials are, and loaded into this job's VM.
       const pulled = new RegExp(
         String.raw`^pulled docker\.io/library/alpine:3 \(sha256:[0-9a-f]{64}, linux/arm64[^)]*\) on the Mac; (loaded into|already in) VM ` +
-          claimedVm().vmId +
+          jobVm().vmId +
           '$'
       );
       expect(logsSince(at).filter((l) => pulled.test(l.message))).toHaveLength(1);
@@ -484,7 +493,7 @@ test.describe('a job using docker through the filtering socket', () => {
   if (mode === 'vm') {
     // Last: the job ends, as a worker's exit ends it, and its VM goes with it.
     test("releases the job's VM when the job ends, and its directory goes with it", async () => {
-      const vm = claimedVm();
+      const vm = jobVm();
       const at = mark();
 
       await proxy!.stop();
