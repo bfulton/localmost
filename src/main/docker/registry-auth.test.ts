@@ -175,6 +175,29 @@ describe('resolveRegistryCredentials', () => {
     ).rejects.toThrow('did not answer within');
   });
 
+  it("names Docker Desktop as the fix when its helper hangs, which it does while Docker Desktop is not running", async () => {
+    // Still a failure, not an anonymous pull: the operator chose the helper.
+    helper(scratch, 'desktop', 'exec sleep 30');
+    await expect(
+      resolveRegistryCredentials('docker.io', {
+        readConfig: async () => ({ credsStore: 'desktop' }),
+        helperDirs: [scratch],
+        timeoutMs: 200,
+      })
+    ).rejects.toThrow(
+      '`credsStore: desktop` did not answer within 1 s: docker-credential-desktop answers only while Docker Desktop is running. ' +
+        'Start Docker Desktop, or remove `credsStore` from ~/.docker/config.json'
+    );
+    // From credHelpers too.
+    await expect(
+      resolveRegistryCredentials('ghcr.io', {
+        readConfig: async () => ({ credHelpers: { 'ghcr.io': 'desktop' } }),
+        helperDirs: [scratch],
+        timeoutMs: 200,
+      })
+    ).rejects.toThrow('Start Docker Desktop, or remove `credHelpers.ghcr.io` from ~/.docker/config.json');
+  });
+
   it('strips control characters from what a failing helper printed before it is logged', async () => {
     helper(scratch, 'noisy', 'printf "bad\\033[31m red\\007"; exit 3');
     const log = jest.fn<(message: string) => void>();

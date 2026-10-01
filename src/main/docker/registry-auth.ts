@@ -240,8 +240,18 @@ export async function resolveRegistryCredentials(
       // job's log (where this error goes) only the helper, the key and how
       // it ended.
       deps.log(`${file} (from \`${key}\`) failed: ${cleanText(result.output, 2000)}`);
+      const seconds = Math.max(1, Math.round(deps.timeoutMs / 1000));
+      if (result.timedOut && helper === 'desktop') {
+        // Docker Desktop's helper hangs while Docker Desktop is installed but
+        // not running, which is the likely first-run failure for someone who
+        // has moved to localmost; the generic "fix it" would not say how.
+        throw new RegistryAuthError(
+          `\`${key}: desktop\` did not answer within ${seconds} s: ` +
+            `${file} answers only while Docker Desktop is running. Start Docker Desktop, or remove \`${key}\` from ${CONFIG_FILE}`
+        );
+      }
       const why = result.timedOut
-        ? `it did not answer within ${Math.max(1, Math.round(deps.timeoutMs / 1000))} s`
+        ? `it did not answer within ${seconds} s`
         : result.tooLarge
           ? `its answer was larger than ${HELPER_OUTPUT_MAX / 1024} KiB`
           : result.code !== null
