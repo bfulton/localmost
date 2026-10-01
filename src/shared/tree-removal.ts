@@ -51,11 +51,11 @@ const REMOVAL_BATCH = 32;
  * Moving the tree aside stops only the writers seatbelt confines. A container
  * a job or step started writes the workspace it bind-mounts through its
  * Docker VM's virtiofs share, whose server is not under the job's profile,
- * and may keep writing the tree wherever it is. A walk by path, as fs.rm's is, loses to such a writer: it
- * finds a directory, the writer swaps it for a link, and the walk goes
- * through the link and deletes what it points to. So this never uses a path
- * more than one level below the directory the tree was moved into, which
- * only the app writes. Each directory it lists is an entry there that lstat
+ * and may keep writing the tree wherever it is. A walk by path, as fs.rm's
+ * is, loses to such a writer: it finds a directory, the writer swaps it for
+ * a link, and the walk goes through the link and deletes what it points to.
+ * So this never uses a path more than one level below the directory the
+ * tree was moved into, which only the app writes. Each directory it lists is an entry there that lstat
  * found a directory, and each entry in it is unlinked, or, when it is a
  * directory, removed if empty or else moved up there to be listed in turn.
  * None of unlink, rmdir and rename follows a link at the path it is given.

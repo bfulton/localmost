@@ -372,17 +372,21 @@ export class DockerFilterProxy {
   }
 
   /**
-   * Stop serving, then remove what the job created through this socket.
+   * Stop serving, then let go of everything the job created through this
+   * socket, and release the worker's Docker VM.
    *
    * A container outlives the process that started it: `docker run -d` returns
-   * at once, and the container keeps its unfiltered egress and its route to
-   * the host long after the job has ended. So the containers go with the
-   * socket - forced, since a running one is the case that matters, and with
-   * their anonymous volumes - and then the networks the job created. The
-   * socket closes first, so the job cannot create another during the sweep. A
-   * create still in flight then may reach the daemon, but its answer, and so
-   * its id, is lost with the job's connection, and its start, which needs
-   * this socket too, cannot happen: that container is created and never runs.
+   * at once, and the container keeps running, with its proxy settings and the
+   * job's token, after the job has ended. The socket closes first, so the job
+   * cannot create another. With a disposable backend - the VM backend, whose
+   * release() stops the VM and deletes its disk - nothing more is needed: the
+   * containers and networks go with the VM. With one that is not, the
+   * containers are removed - forced, since a running one is the case that
+   * matters, and with their anonymous volumes - and then the networks the job
+   * created. A create still in flight may reach the daemon, but its answer,
+   * and so its id, is lost with the job's connection, and its start, which
+   * needs this socket too, cannot happen: that container is created and never
+   * runs.
    *
    * A removal that fails is asked for once more, then logged, and the stop
    * still completes. A second call while one is in progress waits for the

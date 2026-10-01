@@ -27,7 +27,6 @@ export type ProgressCallback = (progress: DownloadProgress) => void;
 /** The only files buildSandbox takes from an instance's config directory. */
 const SANDBOX_CONFIG_FILES = ['.runner'];
 
-
 /** Where a runner release is downloaded and extracted before it is used. */
 const ARC_STAGING_PREFIX = 'arc-staging-';
 /** Where registration runs config.sh: a copy of the runner, and the key it makes. */
