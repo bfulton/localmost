@@ -38,6 +38,13 @@ const makeWorkspace = (name: string, metadata: Record<string, unknown>) => {
 };
 
 describe('workspace creation', () => {
+  // Every workspace is listed by several runs of git, and most of these
+  // build their checkout with git too. Each run is a
+  // process of its own, found through xcrun, which on a loaded machine - CI
+  // runs this suite inside a job, beside other jobs - takes seconds, the
+  // first of a job longest while xcrun fills its cache.
+  const WORKSPACE_TIMEOUT_MS = 60_000;
+
   it('keeps workspaces private to the user, however the directory was left', async () => {
     // A workspace is a copy of the checkout, and holds the step scripts that
     // expanded ${{ secrets.X }}. The CLI runs with the shell's umask.
@@ -51,7 +58,7 @@ describe('workspace creation', () => {
     expect(fs.statSync(getWorkspacesDir()).mode & 0o777).toBe(0o700);
     expect(fs.statSync(ws.path).mode & 0o777).toBe(0o700);
     expect(fs.readFileSync(path.join(ws.path, 'README'), 'utf-8')).toBe('hi\n');
-  });
+  }, WORKSPACE_TIMEOUT_MS);
 
   /** A checkout that is a git repository, with the given files. */
   const gitCheckout = (files: Record<string, string>): string => {
@@ -101,7 +108,7 @@ describe('workspace creation', () => {
       expect(fs.readlinkSync(path.join(ws.path, 'link'))).toBe(outside);
       expect(fs.existsSync(path.join(ws.path, 'pipe'))).toBe(false);
     }
-  });
+  }, WORKSPACE_TIMEOUT_MS);
 
   it('never reads the checkout\'s .gitignore as rsync filter rules', async () => {
     // To git a line that is only "!" is nothing; to rsync's --exclude-from
@@ -131,7 +138,7 @@ describe('workspace creation', () => {
     const all = await createWorkspace({ sourceDir: source, respectGitignore: false });
     expect(tree(all.path)).toEqual(expect.arrayContaining(['secret.env', 'a.txt', 'nested/n.txt']));
     expect(tree(all.path).filter((p) => /(^|\/)(\.git|node_modules)(\/|$)/.test(p))).toEqual([]);
-  });
+  }, WORKSPACE_TIMEOUT_MS);
 
   it('applies a checkout\'s .gitignore as git does when the checkout is not a repository', async () => {
     const source = path.join(appData, 'plain');
@@ -144,7 +151,7 @@ describe('workspace creation', () => {
     const ws = await createWorkspace({ sourceDir: source });
 
     expect(tree(ws.path).sort()).toEqual(['.gitignore', '.localmost-workspace.json', 'kept.txt']);
-  });
+  }, WORKSPACE_TIMEOUT_MS);
 
   it('refuses to create a workspace whose ignore rules it cannot read, rather than copy what they exclude', async () => {
     const source = path.join(appData, 'plain');
@@ -157,7 +164,7 @@ describe('workspace creation', () => {
     });
 
     await expect(createWorkspace({ sourceDir: source })).rejects.toThrow(/--no-ignore/);
-  });
+  }, WORKSPACE_TIMEOUT_MS);
 
   it('writes its metadata into the workspace, never through a link the checkout put at its name', async () => {
     // The checkout is copied first, its links as links; the metadata was
@@ -175,7 +182,7 @@ describe('workspace creation', () => {
       expect(fs.lstatSync(path.join(ws.path, '.localmost-workspace.json')).isFile()).toBe(true);
       expect(JSON.parse(fs.readFileSync(path.join(ws.path, '.localmost-workspace.json'), 'utf-8')).id).toBe(ws.id);
     }
-  });
+  }, WORKSPACE_TIMEOUT_MS);
 
   it.each([
     ['in another case', '.LOCALMOST-WORKSPACE.JSON'],
@@ -207,7 +214,7 @@ describe('workspace creation', () => {
         '.localmost-workspace.json',
       ]);
     }
-  });
+  }, WORKSPACE_TIMEOUT_MS);
 
   it.each([
     ['a file in another case', '.LOCALMOST-WORKSPACE.JSON', 'file'],
@@ -237,7 +244,7 @@ describe('workspace creation', () => {
       expect(JSON.parse(fs.readFileSync(metadata, 'utf-8')).id).toBe(ws.id);
       expect(fs.readdirSync(ws.path).sort()).toEqual(['.localmost-workspace.json', 'a.txt']);
     }
-  });
+  }, WORKSPACE_TIMEOUT_MS);
 
   it('never writes its metadata through a link already at its name, even in a directory at its own id', async () => {
     // The metadata is written into the workspace directory before anything
@@ -259,7 +266,7 @@ describe('workspace creation', () => {
 
     expect(fs.readFileSync(victim, 'utf-8')).toBe('the user\'s\n');
     expect(fs.existsSync(path.join(taken, 'a.txt'))).toBe(false);
-  });
+  }, WORKSPACE_TIMEOUT_MS);
 
   it('never copies through a directory of the checkout replaced by a link, however the workspace is listed', async () => {
     // A committed config/f, whose config is now a link to a directory
@@ -301,7 +308,7 @@ describe('workspace creation', () => {
         expect(files(ws.path).filter((file) => fs.readFileSync(file, 'utf-8').includes('SECRET'))).toEqual([]);
       }
     }
-  }, 15000);
+  }, WORKSPACE_TIMEOUT_MS);
 
   it('copies a staged checkout\'s links as links, never what they point to', async () => {
     // A tracked link to a file of the user's put that file's contents in
@@ -317,7 +324,7 @@ describe('workspace creation', () => {
     expect(fs.readlinkSync(path.join(ws.path, 'key'))).toBe(secret);
     expect(fs.readFileSync(path.join(ws.path, 'a.txt'), 'utf-8')).toBe('a\n');
     expect(fs.statSync(path.join(ws.path, 'a.txt')).nlink).toBe(1);
-  });
+  }, WORKSPACE_TIMEOUT_MS);
 
   /** Git in a test repository, as a user with a name, its chatter kept out. */
   const git = (cwd: string, ...args: string[]): void => {
@@ -351,7 +358,7 @@ describe('workspace creation', () => {
     // The submodule's directory is there, and empty, as a checkout without
     // submodules leaves it.
     expect(tree(ws.path).sort()).toEqual(['.localmost-workspace.json', 'a.txt', 'nested/']);
-  });
+  }, WORKSPACE_TIMEOUT_MS);
 
   it('applies the checkout\'s ignore rules, and a nested repository\'s own, inside a nested repository or submodule', async () => {
     // A directory git lists - a submodule, a repository nested untracked, a
@@ -388,7 +395,7 @@ describe('workspace creation', () => {
         'un/u.txt',
       ].sort()
     );
-  });
+  }, WORKSPACE_TIMEOUT_MS);
 
   it('copies the files git lists whatever Unicode form or case their names have on disk', async () => {
     // Git on a Mac lists names precomposed, and in the case its index holds;
@@ -412,7 +419,7 @@ describe('workspace creation', () => {
       ['.localmost-workspace.json', 'café.txt', 'readme.md', 'résumé/', 'résumé/f.txt', 'src/', 'src/a.ts'].map(fold).sort()
     );
     expect(fs.readFileSync(path.join(ws.path, 'src', 'a.ts'), 'utf-8')).toBe('a\n');
-  });
+  }, WORKSPACE_TIMEOUT_MS);
 
   it('lists a checkout that a repository around it ignores by the checkout\'s own rules', async () => {
     // A home directory kept as a dotfiles repository that ignores
@@ -430,7 +437,7 @@ describe('workspace creation', () => {
     const ws = await createWorkspace({ sourceDir: source });
 
     expect(tree(ws.path).sort()).toEqual(['.gitignore', '.localmost-workspace.json', 'a.txt']);
-  });
+  }, WORKSPACE_TIMEOUT_MS);
 });
 
 describe('workspace cleanup', () => {

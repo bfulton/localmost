@@ -20,6 +20,12 @@ describe('resolveRegistryCredentials', () => {
   let scratch: string;
   let savedPath: string | undefined;
 
+  // The tests that run a helper run it for real, a shell script, and the
+  // code waits up to its own ten seconds for the answer: on a loaded machine
+  // - CI runs this suite inside a job, beside other jobs - starting one takes
+  // seconds, and jest's default five would give up first.
+  const HELPER_TIMEOUT_MS = 30_000;
+
   /** A credential helper as a shell script: `docker-credential-<name>` in `dir`. */
   function helper(dir: string, name: string, body: string): string {
     const file = path.join(dir, `docker-credential-${name}`);
@@ -57,7 +63,7 @@ describe('resolveRegistryCredentials', () => {
         'was not found in /opt/homebrew/bin, /usr/local/bin or /Applications/Docker.app/Contents/Resources/bin; ' +
         'install it, or remove `credsStore` from ~/.docker/config.json'
     );
-  });
+  }, HELPER_TIMEOUT_MS);
 
   it('names the per-registry key when a credHelpers helper is missing', async () => {
     const attempt = resolveRegistryCredentials('ghcr.io', {
@@ -78,14 +84,14 @@ describe('resolveRegistryCredentials', () => {
     await expect(pending).resolves.toEqual({ kind: 'basic', username: 'me', password: 's3cret' });
     expect(childProcess.execFileSync).not.toHaveBeenCalled();
     expect(childProcess.spawnSync).not.toHaveBeenCalled();
-  });
+  }, HELPER_TIMEOUT_MS);
 
   it('sends the key docker writes the default registry under', async () => {
     helper(scratch, 'echo', 'read url; printf \'{"Username":"%s","Secret":"x"}\' "$url"');
     await expect(
       resolveRegistryCredentials('docker.io', { readConfig: async () => ({ credsStore: 'echo' }), helperDirs: [scratch] })
     ).resolves.toEqual({ kind: 'basic', username: 'https://index.docker.io/v1/', password: 'x' });
-  });
+  }, HELPER_TIMEOUT_MS);
 
   it('takes the first of the fixed directories that has the helper', async () => {
     const first = path.join(scratch, 'a');
@@ -96,21 +102,21 @@ describe('resolveRegistryCredentials', () => {
     await expect(
       resolveRegistryCredentials('quay.io', { readConfig: async () => ({ credsStore: 'x' }), helperDirs: [first, second] })
     ).resolves.toEqual({ kind: 'basic', username: 'second', password: 's' });
-  });
+  }, HELPER_TIMEOUT_MS);
 
   it('carries an identity token as a token', async () => {
     helper(scratch, 'tok', 'echo \'{"Username":"<token>","Secret":"refresh"}\'');
     await expect(
       resolveRegistryCredentials('quay.io', { readConfig: async () => ({ credsStore: 'tok' }), helperDirs: [scratch] })
     ).resolves.toEqual({ kind: 'identity-token', token: 'refresh' });
-  });
+  }, HELPER_TIMEOUT_MS);
 
   it("treats a helper's `credentials not found` as an anonymous pull", async () => {
     helper(scratch, 'none', 'echo "credentials not found in native keychain"; exit 1');
     await expect(
       resolveRegistryCredentials('quay.io', { readConfig: async () => ({ credsStore: 'none' }), helperDirs: [scratch] })
     ).resolves.toBeUndefined();
-  });
+  }, HELPER_TIMEOUT_MS);
 
   it('still uses an inline auths entry when the helper has nothing', async () => {
     helper(scratch, 'none', 'echo "credentials not found in native keychain"; exit 1');
@@ -120,7 +126,7 @@ describe('resolveRegistryCredentials', () => {
         helperDirs: [scratch],
       })
     ).resolves.toEqual({ kind: 'basic', username: 'u', password: 'p' });
-  });
+  }, HELPER_TIMEOUT_MS);
 
   it('fails loudly, naming the helper, the key and its exit status, on any other helper failure', async () => {
     helper(scratch, 'broken', "echo 'error getting credentials - err: exit status 1, out: `keychain locked`'; exit 1");
@@ -137,7 +143,7 @@ describe('resolveRegistryCredentials', () => {
     );
     // What the helper printed is the operator's: the app log has it, the job's log (this error) does not.
     expect(log).toHaveBeenCalledWith(expect.stringContaining('keychain locked'));
-  });
+  }, HELPER_TIMEOUT_MS);
 
   it('never runs a directory, or a file that is not executable, that is named like the helper', async () => {
     fs.mkdirSync(path.join(scratch, 'docker-credential-adir'));
@@ -155,14 +161,14 @@ describe('resolveRegistryCredentials', () => {
     await expect(
       resolveRegistryCredentials('quay.io', { readConfig: async () => ({ credsStore: 'huge' }), helperDirs: [scratch] })
     ).rejects.toThrow('`docker-credential-huge` (from `credsStore` in ~/.docker/config.json) failed: its answer was larger than 64 KiB');
-  });
+  }, HELPER_TIMEOUT_MS);
 
   it('fails loudly when the helper exits 0 without a readable answer', async () => {
     helper(scratch, 'garbled', 'echo "not json"');
     await expect(
       resolveRegistryCredentials('quay.io', { readConfig: async () => ({ credsStore: 'garbled' }), helperDirs: [scratch] })
     ).rejects.toThrow('`docker-credential-garbled` (from `credsStore` in ~/.docker/config.json) failed');
-  });
+  }, HELPER_TIMEOUT_MS);
 
   it('fails loudly when the helper hangs', async () => {
     helper(scratch, 'slow', 'exec sleep 30');
@@ -212,7 +218,7 @@ describe('resolveRegistryCredentials', () => {
     expect(log).toHaveBeenCalledTimes(1);
     expect(log.mock.calls[0][0]).toContain('bad');
     expect(log.mock.calls[0][0]).not.toMatch(/[\x00-\x1f\x7f]/);
-  });
+  }, HELPER_TIMEOUT_MS);
 
   it('refuses a helper name that is not a plain file name', async () => {
     await expect(

@@ -117,6 +117,12 @@ const bystander = (profile?: string): ChildProcess => {
   return spawn('/usr/bin/sandbox-exec', ['-f', profilePath, '/bin/sleep', '60'], { stdio: 'ignore' });
 };
 
+// Everything below runs real processes - sandbox-exec, tar under it, the
+// python3 sweep over every process on the machine - and waits for them. On a
+// loaded machine (CI runs this suite inside a job, beside other jobs) each
+// takes seconds to start, not milliseconds.
+const REAL_PROCESS_TIMEOUT_MS = 60_000;
+
 if (canConstruct()) {
   describe('what a step leaves running', () => {
     const withReads = (): ExecutionContext => ({ ...ctx(), policy: { filesystem: { read: MACOS_BASELINE_READ_PATHS } } });
@@ -174,7 +180,7 @@ if (canConstruct()) {
       expect(result.outputs['cache-hit']).toBe('true');
       expect(fs.readFileSync(path.join(workDir, 'deps', 'lib', 'index.js'), 'utf-8')).toBe('module.exports = 42;\n');
       expect(fs.lstatSync(path.join(workDir, 'deps', 'escape')).isSymbolicLink()).toBe(true);
-    });
+    }, REAL_PROCESS_TIMEOUT_MS);
 
     it('cannot restore through a link a step left in the workspace', async () => {
       await run({ uses: 'actions/cache/save@v4', with: { key: 'deps-2', path: 'deps' } });
@@ -186,14 +192,14 @@ if (canConstruct()) {
       await run({ uses: 'actions/cache@v4', with: { key: 'deps-2', path: 'deps' } });
 
       expect(fs.readdirSync(secret)).toEqual(['token']);
-    });
+    }, REAL_PROCESS_TIMEOUT_MS);
   });
 } else {
   describe('the cache intercept inside a localmost job', () => {
     it('saves nothing rather than copying without a sandbox', async () => {
       await run({ uses: 'actions/cache/save@v4', with: { key: 'deps-1', path: 'deps' } });
       expect(archives()).toEqual([]);
-    });
+    }, REAL_PROCESS_TIMEOUT_MS);
   });
 
   describe('reaping inside a localmost job', () => {
@@ -211,6 +217,6 @@ if (canConstruct()) {
       } finally {
         other.kill('SIGKILL');
       }
-    });
+    }, REAL_PROCESS_TIMEOUT_MS);
   });
 }

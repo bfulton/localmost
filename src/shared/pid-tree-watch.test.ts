@@ -57,5 +57,9 @@ describe('PidTreeWatcher', () => {
       process.kill(childPid, 'SIGKILL');
       root.kill('SIGKILL');
     }
-  });
+    // A shell, its child and python3 started for real, and up to the ten
+    // seconds above for the watcher to report: python3 is found through
+    // xcrun, which on a loaded machine - CI runs this suite inside a job -
+    // takes seconds before the watcher's first line.
+  }, 30_000);
 });

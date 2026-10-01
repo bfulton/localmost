@@ -147,6 +147,31 @@ describe('confirmCheckoutGrants', () => {
 describe('runTest on a checkout that grants itself more than its workspace', () => {
   const originalCwd = process.cwd();
 
+  // runTest does what a real run does around its step: git for the
+  // checkout's identity before it asks anything, a copy of the checkout as
+  // the workspace, a real proxy, and at the end a python3 sweep for what the
+  // step left running. Each is a process of its own, which on a loaded
+  // machine - CI runs this suite inside a job, beside other jobs - takes
+  // seconds rather than milliseconds.
+  const RUN_TIMEOUT_MS = 60_000;
+
+  /**
+   * Run `run` with `impl` standing in for spawn, then put the real spawn back
+   * - unless a later test has put its own stand-in in since. A run whose test
+   * timed out still finishes in the background, and putting the real spawn
+   * back then took the next test's stand-in from under its run: that run's
+   * step went to the real sandbox-exec, which a job refuses, and the run
+   * failed for a reason that was never its own.
+   */
+  const withSpawn = async <T,>(impl: typeof actualSpawn, run: () => Promise<T>): Promise<T> => {
+    spawnMock.mockImplementation(impl);
+    try {
+      return await run();
+    } finally {
+      if (spawnMock.getMockImplementation() === impl) spawnMock.mockImplementation(actualSpawn);
+    }
+  };
+
   beforeEach(() => {
     fs.mkdirSync(path.join(checkout, '.github', 'workflows'), { recursive: true });
     fs.writeFileSync(
@@ -170,13 +195,13 @@ describe('runTest on a checkout that grants itself more than its workspace', () 
     // Jest's stdin is not a terminal, and --yes was not passed.
     await expect(runTest({})).rejects.toThrow(/--yes/);
     expect(fs.existsSync(path.join(scratch, 'appdata', 'workspaces'))).toBe(false);
-  });
+  }, RUN_TIMEOUT_MS);
 
   it('does not open loopback to a checkout without confirmation', async () => {
     fs.writeFileSync(path.join(checkout, '.localmostrc'), 'version: 1\nshared:\n  network:\n    loopback: true\n');
     await expect(runTest({})).rejects.toThrow(/--yes/);
     expect(fs.existsSync(path.join(scratch, 'appdata', 'workspaces'))).toBe(false);
-  });
+  }, RUN_TIMEOUT_MS);
 
   it('runs the steps with the loopback grant the user confirmed', async () => {
     fs.writeFileSync(
@@ -184,7 +209,7 @@ describe('runTest on a checkout that grants itself more than its workspace', () 
       'version: 1\nshared:\n  network:\n    loopback:\n      - 5432\n'
     );
     const profiles: string[] = [];
-    spawnMock.mockImplementation(((command: string, args: string[], options: childProcess.SpawnOptions) => {
+    const result = await withSpawn(((command: string, args: string[], options: childProcess.SpawnOptions) => {
       if (command !== '/usr/bin/sandbox-exec') return actualSpawn(command, args, options);
       profiles.push(fs.readFileSync(args[args.indexOf('-f') + 1], 'utf-8'));
       const child = new EventEmitter() as childProcess.ChildProcess;
@@ -196,15 +221,11 @@ describe('runTest on a checkout that grants itself more than its workspace', () 
         child.emit('close', 0, null);
       });
       return child;
-    }) as never);
-    try {
-      expect((await runTest({ assumeYes: true })).success).toBe(true);
-    } finally {
-      spawnMock.mockImplementation(actualSpawn);
-    }
+    }) as never, () => runTest({ assumeYes: true }));
+    expect(result.success).toBe(true);
     expect(profiles).toHaveLength(1);
     expect(profiles[0]).toContain('(allow network-outbound (remote ip "localhost:5432"))');
-  });
+  }, RUN_TIMEOUT_MS);
 
   /**
    * Run the checkout's workflow with a step that asks the run's proxy for
@@ -212,7 +233,7 @@ describe('runTest on a checkout that grants itself more than its workspace', () 
    */
   const proxyAnswers = async (targets: string[], options: Parameters<typeof runTest>[0]): Promise<string[]> => {
     const answers: string[] = [];
-    spawnMock.mockImplementation(((command: string, args: string[], spawnOptions: childProcess.SpawnOptions) => {
+    const result = await withSpawn(((command: string, args: string[], spawnOptions: childProcess.SpawnOptions) => {
       if (command !== '/usr/bin/sandbox-exec') return actualSpawn(command, args, spawnOptions);
       const proxyUrl = new URL(String(spawnOptions.env?.HTTPS_PROXY));
       const auth = `Basic ${Buffer.from(`${proxyUrl.username}:${proxyUrl.password}`).toString('base64')}`;
@@ -235,12 +256,8 @@ describe('runTest on a checkout that grants itself more than its workspace', () 
         child.emit('close', 0, null);
       })();
       return child;
-    }) as never);
-    try {
-      expect((await runTest(options)).success).toBe(true);
-    } finally {
-      spawnMock.mockImplementation(actualSpawn);
-    }
+    }) as never, () => runTest(options));
+    expect(result.success).toBe(true);
     return answers;
   };
 
@@ -257,7 +274,7 @@ describe('runTest on a checkout that grants itself more than its workspace', () 
     expect(refusals).toHaveLength(2);
     expect(refusals[0]).toMatch(/^HTTP\/1\.1 403[\s\S]*'bad\.example\.com' is denied by the policy/);
     expect(refusals[1]).toMatch(/^HTTP\/1\.1 403[\s\S]*'ok\.example\.com' on port 22 is not in the allowlist/);
-  });
+  }, RUN_TIMEOUT_MS);
 
   it('applies no deny list under --updaterc, which observes every host', async () => {
     // Discovery records what a workflow reaches so it can be declared, and a
@@ -268,10 +285,10 @@ describe('runTest on a checkout that grants itself more than its workspace', () 
     expect(answers).toHaveLength(1);
     expect(answers[0]).toMatch(/^HTTP\/1\.1 403[\s\S]*does not resolve to a routable address/);
     expect(answers[0]).not.toMatch(/denied by the policy/);
-  });
+  }, RUN_TIMEOUT_MS);
 
   it('does not run discovery, which reads the whole disk, without confirmation', async () => {
     await expect(runTest({ updaterc: true })).rejects.toThrow(/--yes/);
     expect(fs.existsSync(path.join(scratch, 'appdata', 'workspaces'))).toBe(false);
-  });
+  }, RUN_TIMEOUT_MS);
 });

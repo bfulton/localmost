@@ -30,6 +30,13 @@ let events: string[];
 const originalCwd = process.cwd();
 const savedConfigDir = process.env.LOCALMOST_CONFIG_DIR;
 
+// The steps and the reaper are stood in for, but the rest of a run is real:
+// git for the checkout's identity and its listing, and a copy of it as the
+// workspace, each a process of its own. On a loaded machine - CI runs this
+// suite inside a job, beside other jobs - that takes seconds, the first git
+// of a job longest, while xcrun fills the cache it looks git up through.
+const RUN_TIMEOUT_MS = 60_000;
+
 function writeWorkflow(name: string, content: string): void {
   fs.writeFileSync(path.join(checkout, '.github', 'workflows', name), content);
 }
@@ -112,7 +119,7 @@ describe('runTest reaping at the end of each job', () => {
     expect((await runTest({ assumeYes: true })).success).toBe(true);
     // Nothing a job left running is there when the next job's first step starts.
     expect(events).toEqual(['first-1', 'first-2', 'reap', 'one-1', 'reap', 'two-1', 'reap', 'reap']);
-  });
+  }, RUN_TIMEOUT_MS);
 
   it('reaps after a job whose step failed or threw, before anything else runs', async () => {
     writeWorkflow(
@@ -140,7 +147,7 @@ describe('runTest reaping at the end of each job', () => {
     await expect(runTest({ assumeYes: true })).rejects.toThrow('throws-1 threw');
     // The job's own reap, then the run's on the way out.
     expect(events).toEqual(['fails-1', 'reap', 'throws-1', 'reap', 'reap']);
-  });
+  }, RUN_TIMEOUT_MS);
 
   it('reaps after a called job whose step threw', async () => {
     writeWorkflow(
@@ -164,5 +171,5 @@ describe('runTest reaping at the end of each job', () => {
 
     await expect(runTest({ assumeYes: true })).rejects.toThrow('throws-1 threw');
     expect(events).toEqual(['throws-1', 'reap', 'reap']);
-  });
+  }, RUN_TIMEOUT_MS);
 });

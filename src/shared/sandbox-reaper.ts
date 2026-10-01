@@ -78,11 +78,22 @@ const reapArgs = (marker: ProcessMarker): string[] => ['-I', '-S', '-c', REAP_SC
 /**
  * Kill whatever runs under `marker`, however it got out of its process
  * group, and wait for the sweep. Returns false if the sweep could not run.
- * For `localmost test`, run from a terminal, where python3 is expected.
+ * For `localmost test`, run from a terminal or inside a job.
+ *
+ * With the developer tools' python3 by its own path, as the app's sweep
+ * runs, not /usr/bin/python3. That shim first asks xcrun where the tools
+ * are, through a cache in the per-user temp directory, and the sweep runs
+ * with none of the caller's environment - not the xcrun_db a job points
+ * that cache into its own temp with. A job's profile denies the per-user
+ * temp directory, so inside a localmost job every sweep had xcrun look the
+ * tools up from nothing: two seconds on an idle machine, past the sweep's
+ * own timeout on a loaded one, and a sweep that timed out found nothing.
  */
 export function reapMarkedProcesses(marker: ProcessMarker): boolean {
+  const python = developerPythonSync();
+  if (!python) return false;
   try {
-    execFileSync('/usr/bin/python3', reapArgs(marker), {
+    execFileSync(python, reapArgs(marker), {
       env: { PATH: '/usr/bin:/bin' },
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: REAP_TIMEOUT_MS,
@@ -92,6 +103,31 @@ export function reapMarkedProcesses(marker: ProcessMarker): boolean {
     return false;
   }
 }
+
+/** The python3 under the developer directory xcode-select printed, if it is there. */
+function pythonIn(developerDir: string): string | null {
+  const python = path.join(developerDir.trim(), 'usr', 'bin', 'python3');
+  return path.isAbsolute(python) && fs.existsSync(python) ? python : null;
+}
+
+/**
+ * developerPython, for the blocking sweep: looked up once per process, as
+ * `localmost test` sweeps at the end of every job it runs.
+ */
+function developerPythonSync(): string | null {
+  if (developerPythonFound === undefined) {
+    try {
+      developerPythonFound = pythonIn(
+        execFileSync('/usr/bin/xcode-select', ['-p'], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 })
+      );
+    } catch {
+      developerPythonFound = null;
+    }
+  }
+  return developerPythonFound;
+}
+
+let developerPythonFound: string | null | undefined;
 
 /**
  * The developer tools' python3, by its own path, or null without them.
@@ -116,8 +152,7 @@ function lookUpDeveloperPython(): Promise<string | null> {
   return new Promise((resolve) => {
     execFile('/usr/bin/xcode-select', ['-p'], { encoding: 'utf-8', timeout: 5000 }, (err, stdout) => {
       if (err) return resolve(null);
-      const python = path.join(String(stdout).trim(), 'usr', 'bin', 'python3');
-      resolve(path.isAbsolute(python) && fs.existsSync(python) ? python : null);
+      resolve(pythonIn(String(stdout)));
     });
   });
 }
