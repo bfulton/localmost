@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 import * as http from 'http';
 import { app } from 'electron';
 import {
+  CredentialsRequiredError,
   PullError,
   RegistryClient,
   RegistryClientOptions,
@@ -10,7 +11,7 @@ import {
   registryOrigin,
   readBody,
 } from './registry-client';
-import type { RegistryCredentials } from '../registry-auth';
+import { RegistryAuthError, type RegistryCredentials } from '../registry-auth';
 import {
   AUTH_HOST,
   CDN_HOST,
@@ -90,7 +91,9 @@ describe('the token flow', () => {
       repositoryPath: REPO,
     });
     await session.manifest('v1');
-    const [token] = registry.requestsTo(AUTH_HOST);
+    // Anonymous first, then, refused, with the credentials.
+    const [anonymous, token] = registry.requestsTo(AUTH_HOST);
+    expect(anonymous.headers.authorization).toBeUndefined();
     expect(token.headers.authorization).toBe(`Basic ${Buffer.from('me:s3cret').toString('base64')}`);
     for (const request of registry.requestsTo(REGISTRY_HOST)) {
       expect(request.headers.authorization ?? '').not.toMatch(/^Basic /);
@@ -107,9 +110,121 @@ describe('the token flow', () => {
       repositoryPath: REPO,
     });
     await expect(session.manifest('v1')).resolves.toBeTruthy();
-    const [token] = registry.requestsTo(AUTH_HOST);
+    const [anonymous, token] = registry.requestsTo(AUTH_HOST);
+    expect(anonymous.method).toBe('GET');
     expect(token.method).toBe('POST');
     expect(token.headers.authorization).toBeUndefined();
+  });
+
+  it('asks for the credentials only when the registry refuses, and once for the session', async () => {
+    const asked: string[] = [];
+    const operator = client({
+      credentials: async (r) => {
+        asked.push(r);
+        return { kind: 'basic', username: 'me', password: 'pw' };
+      },
+    });
+    const image = buildImage();
+    registry.putImage(REPO, image, 'v1');
+    const open = await operator.open({ registry: REGISTRY_HOST, repositoryPath: REPO });
+    await open.manifest('v1');
+    await blobText(await open.blob(image.configDigest));
+    expect(asked).toEqual([]);
+    expect(open.usedCredentials).toBe(false);
+
+    registry.users.set('me', 'pw');
+    registry.setPrivate(REPO);
+    const memo = new Map();
+    const closed = await operator.open({ registry: REGISTRY_HOST, repositoryPath: REPO }, 'operator', undefined, memo);
+    await closed.manifest('v1');
+    await blobText(await closed.blob(image.configDigest));
+    expect(asked).toEqual([REGISTRY_HOST]);
+    expect(closed.usedCredentials).toBe(true);
+    // A second session sharing the memo, as one job's pulls do, asks nothing more.
+    const again = await operator.open({ registry: REGISTRY_HOST, repositoryPath: REPO }, 'operator', undefined, memo);
+    await again.manifest('v1');
+    expect(asked).toEqual([REGISTRY_HOST]);
+  });
+
+  it('asks once for requests that are refused together, and every one of them waits for the answer', async () => {
+    let asked = 0;
+    let answer!: () => void;
+    const answered = new Promise<void>((resolve) => (answer = resolve));
+    registry.users.set('me', 'pw');
+    registry.setPrivate(REPO);
+    const image = buildImage();
+    registry.putImage(REPO, image, 'v1');
+    const session = await client({
+      credentials: async () => {
+        asked++;
+        await answered;
+        return { kind: 'basic', username: 'me', password: 'pw' };
+      },
+    }).open({ registry: REGISTRY_HOST, repositoryPath: REPO });
+    const both = Promise.all([session.manifest('v1'), session.blob(image.configDigest).then(blobText)]);
+    for (let i = 0; i < 500 && asked === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    // Let the other request reach its refusal too before the helper answers.
+    await new Promise((r) => setTimeout(r, 100));
+    answer();
+    const [manifest, config] = await both;
+    expect(manifest.digest).toBe(image.manifestDigest);
+    expect(config).toEqual(image.config);
+    expect(asked).toBe(1);
+  });
+
+  it('says that the registry refused an anonymous pull when the helper it then asks fails', async () => {
+    registry.setPrivate(REPO);
+    registry.putImage(REPO, buildImage(), 'v1');
+    const session = await client({
+      credentials: async () => {
+        throw new RegistryAuthError('the Docker credential helper `docker-credential-x` (from `credsStore` in ~/.docker/config.json) failed');
+      },
+    }).open({ registry: REGISTRY_HOST, repositoryPath: REPO });
+    const attempt = session.manifest('v1');
+    await expect(attempt).rejects.toBeInstanceOf(RegistryAuthError);
+    await expect(attempt).rejects.toThrow(
+      `${REGISTRY_HOST} refused an anonymous pull of ${REPO} (private, or no such repository), so localmost asked for credentials: ` +
+        'the Docker credential helper `docker-credential-x` (from `credsStore` in ~/.docker/config.json) failed'
+    );
+  });
+
+  it('asks for the credentials when the token service gives no anonymous tokens', async () => {
+    registry.users.set('me', 'pw');
+    registry.switches.anonymousTokensRefused = true;
+    registry.putImage(REPO, buildImage(), 'v1');
+    const session = await client(withCredentials({ kind: 'basic', username: 'me', password: 'pw' })).open({
+      registry: REGISTRY_HOST,
+      repositoryPath: REPO,
+    });
+    await expect(session.manifest('v1')).resolves.toBeTruthy();
+    expect(registry.requestsTo(AUTH_HOST).map((t) => t.headers.authorization)).toEqual([
+      undefined,
+      `Basic ${Buffer.from('me:pw').toString('base64')}`,
+    ]);
+    // Without credentials, the refusal is the answer.
+    const anonymous = await client().open({ registry: REGISTRY_HOST, repositoryPath: REPO });
+    await expect(anonymous.manifest('v1')).rejects.toThrow(`${REGISTRY_HOST}'s token service refused an anonymous token`);
+  });
+
+  it('refuses, while credentials are refused, what only they would fetch, and asks for none', async () => {
+    let asked = 0;
+    registry.users.set('me', 'pw');
+    registry.setPrivate(REPO);
+    const image = buildImage();
+    registry.putImage(REPO, image, 'v1');
+    const session = await client({
+      credentials: async () => {
+        asked++;
+        return { kind: 'basic', username: 'me', password: 'pw' };
+      },
+    }).open({ registry: REGISTRY_HOST, repositoryPath: REPO });
+    session.refuseCredentials();
+    await expect(session.blob(image.configDigest)).rejects.toBeInstanceOf(CredentialsRequiredError);
+    expect(asked).toBe(0);
+    session.allowCredentials();
+    await expect(blobText(await session.blob(image.configDigest))).resolves.toEqual(image.config);
+    expect(asked).toBe(1);
+    expect(() => session.refuseCredentials()).toThrow("already sent the operator's credentials");
   });
 
   it('answers a private repository without credentials as Docker does', async () => {
@@ -247,9 +362,10 @@ describe('an expired token', () => {
     });
     await session.manifest('v1');
     await expect(blobText(await session.blob(image.configDigest))).resolves.toEqual(image.config);
-    const tokens = registry.requestsTo(AUTH_HOST);
-    expect(tokens).toHaveLength(2);
-    for (const token of tokens) expect(token.headers.authorization).toBe(`Basic ${Buffer.from('me:pw').toString('base64')}`);
+    // An anonymous token, refused; one with the credentials; and its renewal, with them too.
+    const tokens = registry.requestsTo(AUTH_HOST).map((t) => t.headers.authorization);
+    const basic = `Basic ${Buffer.from('me:pw').toString('base64')}`;
+    expect(tokens).toEqual([undefined, basic, basic]);
   });
 
   it('is renewed at most once for one request: a second 401 is the answer', async () => {

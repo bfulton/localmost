@@ -19,11 +19,16 @@
  * 6. For a public image only, record it in refs.json for the repository's
  *    cache disk.
  *
- * "Public" is owner decision 1 (§6.3 "Which store"): an image whose manifest
- * or config was read from the job's own store never is, and whenever the pull
- * holds the operator's credentials the image is public only if the registry
- * also serves its manifest anonymously, bytes and all. Otherwise its blobs go
- * to the job's own store, in the VM's directory, and go with the VM.
+ * Every request goes anonymously first; the operator's credentials are asked
+ * for only when the registry refuses one, and then once per registry for the
+ * job (§6.1). "Public" is owner decision 1 (§6.3 "Which store"): an image
+ * whose manifest or config was read from the job's own store never is;
+ * whenever the pull holds the operator's credentials the image is public only
+ * if the registry also serves its index, manifest and config anonymously,
+ * bytes and all; and a public image's layers are fetched anonymously too, so
+ * that one the registry refuses makes the image the job's after all. A
+ * private image's blobs go to the job's own store, in the VM's directory, and
+ * go with the VM.
  *
  * Every pull runs in Electron main, so one VM runs at most three at once and
  * all VMs together eight; the rest wait their turn.
@@ -37,6 +42,7 @@ import * as zlib from 'zlib';
 import type { DockerProgress } from '../docker-backend';
 import { imageStoreDir, repoKeyOf, VM_ID_RE, vmJobFiles } from '../../vm/paths';
 import type { CacheDisks, ImagePuller, ImagePullOptions, ImagePullResult, RosettaState } from '../../vm/types';
+import { RegistryAuthError } from '../registry-auth';
 import { cleanText } from './clean-text';
 import { DaemonConnector, hasImage, loadImage, tagImage } from './daemon-api';
 import { dockerArchive, measureLayer, ArchiveLayer, LayerVerifyError } from './docker-archive';
@@ -44,6 +50,8 @@ import { DigestMismatchError, ImageStore, StoreLayer } from './image-store';
 import {
   checkDigest,
   ContentDescriptor,
+  CredentialMemo,
+  CredentialsRequiredError,
   isTag,
   LAYER_TYPES,
   MAX_MANIFEST_BYTES,
@@ -311,7 +319,14 @@ interface ResolvedImage {
  */
 function transferError(error: unknown, signal: AbortSignal, what: string): Error {
   if (signal.aborted) return new PullError('the pull was cancelled');
-  if (error instanceof PullError || error instanceof DigestMismatchError || error instanceof LayerVerifyError) return error;
+  if (
+    error instanceof PullError ||
+    error instanceof RegistryAuthError ||
+    error instanceof DigestMismatchError ||
+    error instanceof LayerVerifyError
+  ) {
+    return error;
+  }
   return new PullError(`the transfer of ${what} broke off: ${cleanText((error as Error)?.message ?? String(error), 200)}`, true);
 }
 
@@ -335,8 +350,14 @@ function decompressorFor(mediaType: string): Transform {
   return new PassThrough();
 }
 
+/** What one job's pulls share: the bytes they fetched, and the operator's credentials, asked for once per registry. */
+interface JobState {
+  pulled: number;
+  credentials: CredentialMemo;
+}
+
 export class VmImagePuller implements ImagePuller {
-  private readonly jobs = new Map<string, { pulled: number }>();
+  private readonly jobs = new Map<string, JobState>();
   /** Each store's first sweep, which every pull on it waits for: repository stores, and (bounded) VM stores. */
   private readonly repositorySweeps = new Map<string, Promise<void>>();
   private readonly vmSweeps = new Map<string, Promise<void>>();
@@ -361,10 +382,10 @@ export class VmImagePuller implements ImagePuller {
     return dir;
   }
 
-  private jobTotal(vmDir: string): { pulled: number } {
+  private job(vmDir: string): JobState {
     let job = this.jobs.get(vmDir);
     if (!job) {
-      job = { pulled: 0 };
+      job = { pulled: 0, credentials: new Map() };
       this.jobs.set(vmDir, job);
       if (this.jobs.size > MAX_JOBS_TRACKED) this.jobs.delete(this.jobs.keys().next().value!);
     }
@@ -401,6 +422,11 @@ export class VmImagePuller implements ImagePuller {
     }
   }
 
+  /** The job has ended: its pull total, and the credentials its pulls were given, go. */
+  forget(dockerSocketPath: string): void {
+    this.jobs.delete(path.dirname(dockerSocketPath));
+  }
+
   async pull(opts: ImagePullOptions): Promise<ImagePullResult> {
     opts.signal.throwIfAborted();
     const vmDir = this.vmDirOf(opts.dockerSocketPath);
@@ -435,11 +461,14 @@ export class VmImagePuller implements ImagePuller {
     const progress = (p: DockerProgress) => opts.onProgress(p);
     progress({ status: `Pulling from ${repositoryPath}`, id: tag ?? request.digest! });
 
-    const session = await this.options.client.open({ registry, repositoryPath }, 'operator', signal);
+    // Anonymous until the registry refuses: the operator's credentials are
+    // asked for only then, once per registry for the whole job.
+    const job = this.job(vmDir);
+    const session = await this.options.client.open({ registry, repositoryPath }, 'operator', signal, job.credentials);
     const resolved = await this.resolve(session, publicStore, jobStore, reference, ref, requested, opts.rosetta);
 
     // The config: from a store, or fetched (small, in memory, verified).
-    const budget = new Budget(limits, this.jobTotal(vmDir), ref);
+    const budget = new Budget(limits, job, ref);
     const config = await this.smallBlob(session, [publicStore, jobStore], resolved.config, MAX_CONFIG_BYTES, budget, ref, signal);
     const imageConfig = parseConfig(config.bytes, resolved.layers.length, ref);
     const platform = this.checkConfigPlatform(resolved, imageConfig, opts.rosetta, ref);
@@ -449,26 +478,38 @@ export class VmImagePuller implements ImagePuller {
     // them there, and the job store answers for any registry and repository
     // that names their digest, so a second pull through another one could
     // otherwise carry a private config into the shared store. Otherwise
-    // public only when the registry serves the manifest anonymously, asked
-    // whenever the answer could be no: whenever the session holds the
-    // operator's credentials, sent yet or not (a manifest and config read
-    // from the public store send nothing, and the layers would then be
-    // fetched with them). A pull with neither fetched everything anonymously.
+    // public only when the registry serves anonymously everything the shared
+    // store would keep that the pull may have fetched with the credentials -
+    // the index, the manifest and the config - asked whenever the answer
+    // could be no: whenever a refusal had the session ask for the operator's
+    // credentials and it got some, sent yet or not. A pull with neither has
+    // fetched everything so far anonymously, and fetches its layers the same
+    // way.
     const fromJobStore = resolved.fromJobStore || config.from === jobStore;
     const mustAsk = session.hasCredentials || session.usedCredentials;
     let isPublic = !fromJobStore;
+    // The session the layers are fetched with: for a public image, one that
+    // never sends the operator's credentials, so that everything the shared
+    // store holds was served anonymously.
+    let layerSession = session;
     if (isPublic && mustAsk) {
       try {
         const anonymous = await this.options.client.open({ registry, repositoryPath }, 'anonymous', signal);
-        isPublic = await anonymous.serves(resolved.manifestDigest);
+        isPublic =
+          (await anonymous.serves(resolved.manifestDigest)) &&
+          (resolved.indexDigest === undefined || (await anonymous.serves(resolved.indexDigest))) &&
+          (await anonymous.servesBlob(resolved.config.digest, MAX_CONFIG_BYTES));
+        if (isPublic) layerSession = anonymous;
       } catch (error) {
         if (signal.aborted) throw new PullError('the pull was cancelled');
         this.log('debug', `anonymous check of ${ref} failed, so it is kept for this job only: ${(error as Error).message}`);
         isPublic = false;
       }
+    } else if (isPublic) {
+      session.refuseCredentials();
     }
-    const target = isPublic ? publicStore : jobStore;
-    const sources = isPublic ? [publicStore] : [jobStore, publicStore];
+    let target = isPublic ? publicStore : jobStore;
+    let sources = isPublic ? [publicStore] : [jobStore, publicStore];
 
     const layerIds = resolved.layers.map((l) => l.digest.slice(7, 19));
     const release = [publicStore.pin(this.blobsFor(resolved)), jobStore.pin(this.blobsFor(resolved))];
@@ -484,7 +525,7 @@ export class VmImagePuller implements ImagePuller {
         // A stored layer that fails its check again (as it is measured, or as
         // the archive streams) is deleted from both stores, and the pull runs
         // once more, which fetches it from the registry (§6.3).
-        for (let attempt = 0; ; attempt++) {
+        for (let refetched = false; ; ) {
           try {
             layers = [];
             for (const [i, layer] of resolved.layers.entries()) {
@@ -501,7 +542,7 @@ export class VmImagePuller implements ImagePuller {
                   (await measureLayer(this.archiveSource(store, layer, diffId), this.expansionLimit(layer.size, limits)));
               } else {
                 progress({ status: 'Pulling fs layer', id });
-                uncompressedSize = await this.fetchLayer(session, target, layer, diffId, budget, limits, ref, id, progress, signal);
+                uncompressedSize = await this.fetchLayer(layerSession, target, layer, diffId, budget, limits, ref, id, progress, signal);
                 store = target;
                 fetched = true;
               }
@@ -518,11 +559,24 @@ export class VmImagePuller implements ImagePuller {
             }
             break;
           } catch (error) {
+            if (error instanceof CredentialsRequiredError && isPublic && !signal.aborted) {
+              // A layer the registry serves only with the operator's
+              // credentials: the image needed them after all, so it is the
+              // job's alone. What came anonymously stays where it is.
+              this.log('debug', `a layer of ${ref} needs credentials, so it is kept for this job only`);
+              isPublic = false;
+              target = jobStore;
+              sources = [jobStore, publicStore];
+              session.allowCredentials();
+              layerSession = session;
+              continue;
+            }
             if (!(error instanceof LayerVerifyError)) throw error;
             await publicStore.remove(error.digest).catch(() => undefined);
             await jobStore.remove(error.digest).catch(() => undefined);
             known.delete(error.digest);
-            if (attempt > 0 || signal.aborted) throw error;
+            if (refetched || signal.aborted) throw error;
+            refetched = true;
             this.log('warn', `${error.message}; deleted, and fetched again`);
           }
         }

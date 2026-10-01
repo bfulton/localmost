@@ -24,7 +24,9 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   (`ro`/`rw`), network mode and build context each covers. The job is never
   handed a daemon socket: each worker gets a socket localmost owns, and only
   declared requests are forwarded, to a Linux VM of that job's own, which
-  localmost boots when a job whose policy has a `docker:` section is claimed
+  localmost boots at the first Docker request, beyond `/_ping`, `/version`
+  and `/info`, of a job whose policy has a `docker:` section, so a job that
+  never runs `docker` has no VM
   (or, with the opt-in `dockerVm.prewarm`, as a spare when an idle worker is
   spawned, stopped at the claim unless that job uses it) and discards, with
   every container, network, volume and built image in it, when the job ends.
@@ -501,17 +503,19 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   - Listing a registry in `pull.registries` also grants localmost fetching
     from wherever that registry redirects (any public https host), outside the
     job's `network.allow`; the approval text says so
-  - Credential helpers named by `credsStore` or `credHelpers` are looked up
-    only in `/opt/homebrew/bin`, `/usr/local/bin` and Docker.app's bundled
-    `bin`, not on `PATH`. A missing or failing helper fails the pull, naming
-    the config key, where it used to pull anonymously. With `credsStore:
-    desktop` configured, every pull, public images included, needs Docker
-    Desktop running: its helper does not answer while Docker Desktop is
-    installed but not running, and the pull fails after 10 s saying so. With
-    Docker Desktop removed, every pull fails until `~/.docker/config.json` is
-    edited
-  - An image the registry would not serve anonymously is pulled again by
-    every job; it is never cached for the repository
+  - Pulls are anonymous first: a credential helper runs only when the
+    registry refuses an anonymous request, once per registry per job, so a
+    public image is pulled whatever state the helper is in. Credential
+    helpers named by `credsStore` or `credHelpers` are looked up only in
+    `/opt/homebrew/bin`, `/usr/local/bin` and Docker.app's bundled `bin`, not
+    on `PATH`. When the registry wants credentials, a missing or failing
+    helper fails the pull, naming the config key, where it used to pull
+    anonymously; the error first says the registry refused an anonymous pull,
+    which Docker Hub also does for a repository that does not exist. With `credsStore: desktop` configured, a private image
+    needs Docker Desktop's helper to answer (it hangs while Docker Desktop is
+    installed but not running, and the pull fails after 10 s saying so)
+  - An image that needed credentials is pulled again by every job; it is
+    never cached for the repository
   - `chown` inside a container on a workspace bind does not persist; keep data
     directories on volumes
   - `--log-driver` other than `json-file`, `local` or `none` (and another

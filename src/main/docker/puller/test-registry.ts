@@ -257,6 +257,12 @@ export interface RegistrySwitches {
   tokenMaxUses?: number;
   /** Answer every manifest HEAD with 200, whatever the repository, reference or token, as a hostile registry can. */
   headAnswersEverything?: boolean;
+  /** Blobs of a public repository that only a token standing for a user is served. */
+  privateBlobs?: Set<string>;
+  /** Manifests of a public repository, by tag or digest, that only a token standing for a user is served. */
+  privateManifests?: Set<string>;
+  /** The token service answers a request with no credentials 401, as some registries' do. */
+  anonymousTokensRefused?: boolean;
 }
 
 function tokenFor(user: string | null, scope: string): string {
@@ -440,6 +446,10 @@ export class TestRegistry {
         user = name;
       }
     }
+    if (user === null && this.switches.anonymousTokensRefused) {
+      this.send(res, 401, { errors: [{ code: 'UNAUTHORIZED', message: 'authentication required' }] });
+      return;
+    }
     this.send(res, 200, { token: tokenFor(user, scope), expires_in: 300 });
   }
 
@@ -494,7 +504,10 @@ export class TestRegistry {
       return;
     }
     const open = kind === 'blobs' && this.switches.openBlobs && repo !== undefined;
-    if (!repo || (!open && !this.authorized(req, repo, name))) {
+    const needsUser =
+      (kind === 'blobs' ? this.switches.privateBlobs : this.switches.privateManifests)?.has(decodeURIComponent(reference)) &&
+      !readToken(req.headers.authorization)?.user;
+    if (!repo || needsUser || (!open && !this.authorized(req, repo, name))) {
       if (req.headers.authorization) {
         this.send(res, 401, {
           errors: [{ code: 'UNAUTHORIZED', message: 'authentication required', detail: [{ Type: 'repository', Name: name, Action: 'pull' }] }],

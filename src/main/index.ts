@@ -259,9 +259,10 @@ app.whenReady().then(async () => {
   const contributorCache = new ContributorCache(githubAuth, (msg) => logger?.debug(msg));
 
   // The per-job Docker VMs (docs/roadmap/vm-docker-backend.md). One is
-  // booted at the claim of a job whose policy grants Docker, and goes with
-  // its worker. Every path is the app's own: <data>, realpathed once, and
-  // the helper, guest and CLI in Resources (or the checkout's build/).
+  // booted at the first Docker request, beyond the baseline, of a job whose
+  // policy grants Docker, and goes with its worker. Every path is the app's
+  // own: <data>, realpathed once, and the helper, guest and CLI in Resources
+  // (or the checkout's build/).
   // Read from config.yaml at each worker spawn, and cached in between.
   const dockerVmConfigSource = new DockerVmConfigSource({
     read: () => loadConfig().dockerVm,
@@ -306,9 +307,10 @@ app.whenReady().then(async () => {
   // Before any worker exists: whatever an earlier run left - a helper still
   // running, a VM's directory, an unfinished refresh disk - goes first.
   await vmManager.sweep().catch((err: Error) => logger?.warn(`[docker-vm] Startup sweep failed: ${err.message}`));
-  // Pulls run here, on the Mac, with the operator's credentials, which never
-  // enter a VM (§6). What a failing credential helper printed goes to the
-  // app log only.
+  // Pulls run here, on the Mac, anonymously until a registry refuses; only
+  // then are the operator's credentials asked for, once per registry per
+  // job, and they never enter a VM (§6). What a failing credential helper
+  // printed goes to the app log only.
   const puller = new VmImagePuller({
     dataDir,
     client: new RegistryClient({

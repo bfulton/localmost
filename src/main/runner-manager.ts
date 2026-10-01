@@ -1171,8 +1171,9 @@ export class RunnerManager {
     const spawnContext = this.pendingTargetContext.get(String(instanceNum));
     const log = (entry: { level: 'debug' | 'info' | 'warn'; message: string }) =>
       this.log(entry.level, `[docker ${instanceNum}] ${entry.message}`);
-    // The worker's daemon: its own Docker VM, booted at the claim when the
-    // claimed job's policy grants Docker (contract §5.4).
+    // The worker's daemon: its own Docker VM, booted at the job's first
+    // Docker request that needs one, when the claimed job's policy grants
+    // Docker (contract §5.4).
     const worker = this.dockerBackend.forWorker({
       slot: instanceNum,
       sandboxDir,

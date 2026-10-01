@@ -9,7 +9,7 @@ import { imageStoreDir, refsJsonPath, repoKeyOf, vmJobFiles } from '../../vm/pat
 import type { RosettaState } from '../../vm/types';
 import { ImagePullerOptions, PullLimits, VmImagePuller, choosePlatform, parsePlatformRequest } from './image-puller';
 import { RegistryClient, PullError } from './registry-client';
-import type { RegistryCredentials } from '../registry-auth';
+import { RegistryAuthError, resolveRegistryCredentials, type RegistryCredentials } from '../registry-auth';
 import { OVERSIZED } from './daemon-api';
 import { ImageStore } from './image-store';
 import { TestDaemon } from './test-daemon';
@@ -635,6 +635,190 @@ describe('which store (owner decision 1)', () => {
     expect(publicBlobs()).toEqual([]);
     expect(fs.existsSync(refsJsonPath(dataDir, REPO_KEY))).toBe(false);
     expect(notePulled).not.toHaveBeenCalled();
+  });
+});
+
+describe("the operator's credentials, asked for only when the registry wants them", () => {
+  let helperDir: string;
+  let calls: string;
+
+  beforeEach(() => {
+    helperDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'image-puller-helper-')));
+    calls = path.join(helperDir, 'calls');
+  });
+
+  afterEach(() => {
+    fs.rmSync(helperDir, { recursive: true, force: true });
+  });
+
+  /** `credsStore: <name>`, whose helper notes each run and then does `body`, through the real resolver. */
+  function credsStore(name: string, body: string): Partial<ImagePullerOptions> {
+    fs.writeFileSync(path.join(helperDir, `docker-credential-${name}`), `#!/bin/sh\necho run >> '${calls}'\n${body}\n`, { mode: 0o755 });
+    return {
+      client: new RegistryClient({
+        lookup: registry.lookup,
+        connectTo: registry.connectTo,
+        ca: registry.ca,
+        credentials: (r) =>
+          resolveRegistryCredentials(r, { readConfig: async () => ({ credsStore: name }), helperDirs: [helperDir], timeoutMs: 2000 }),
+      }),
+    };
+  }
+  const helperRuns = () => (fs.existsSync(calls) ? fs.readFileSync(calls, 'utf-8').split('\n').filter(Boolean).length : 0);
+  const answers = 'echo \'{"Username":"me","Secret":"pw"}\'';
+
+  it.each([
+    ['hangs', 'sleep 30'],
+    ['fails', 'echo broken >&2; exit 3'],
+  ])('pulls a public image without running a helper that %s', async (name, body) => {
+    const image = buildImage();
+    registry.putImage(IMAGE, image, 'v1');
+    await expect(pull(puller(credsStore(name, body)))).resolves.toMatchObject({ source: 'registry', configDigest: image.configDigest });
+    expect(helperRuns()).toBe(0);
+    expect(notePulled).toHaveBeenCalledWith(REPO_KEY, image.configDigest);
+    for (const token of registry.requestsTo(AUTH_HOST)) expect(token.headers.authorization).toBeUndefined();
+  });
+
+  it('runs the helper once for an image the registry refuses anonymously, and keeps the image for the job alone', async () => {
+    registry.users.set('me', 'pw');
+    registry.setPrivate(IMAGE);
+    const image = buildImage();
+    registry.putImage(IMAGE, image, 'v1');
+    await expect(pull(puller(credsStore('works', answers)))).resolves.toMatchObject({ source: 'registry' });
+    expect(helperRuns()).toBe(1);
+    // It needed credentials, so it is per-job (owner decision 1).
+    expect(publicBlobs()).toEqual([]);
+    expect(jobBlobs().length).toBeGreaterThan(0);
+    expect(fs.existsSync(refsJsonPath(dataDir, REPO_KEY))).toBe(false);
+    expect(notePulled).not.toHaveBeenCalled();
+    // Anonymous first; the credentials only after the registry refused.
+    const tokens = registry.requestsTo(AUTH_HOST).map((t) => t.headers.authorization);
+    expect(tokens[0]).toBeUndefined();
+    expect(tokens.indexOf(`Basic ${Buffer.from('me:pw').toString('base64')}`)).toBeGreaterThan(0);
+  });
+
+  it('fails loudly, naming the config key, when the helper fails for an image that needs it', async () => {
+    registry.setPrivate(IMAGE);
+    registry.putImage(IMAGE, buildImage(), 'v1');
+    const attempt = pull(puller(credsStore('fails', 'echo broken >&2; exit 3')));
+    await expect(attempt).rejects.toBeInstanceOf(RegistryAuthError);
+    await expect(attempt).rejects.toThrow(
+      'the Docker credential helper `docker-credential-fails` (from `credsStore` in ~/.docker/config.json) failed: it exited with status 3'
+    );
+    expect(helperRuns()).toBe(1);
+    expect(daemon.loads).toHaveLength(0);
+  });
+
+  it("runs the helper once per registry for a job's pulls, and again for another job's", async () => {
+    registry.users.set('me', 'pw');
+    registry.setPrivate(IMAGE);
+    registry.putImage(IMAGE, buildImage(), 'v1');
+    registry.putImage(IMAGE, buildImage(), 'v2');
+    const p = puller(credsStore('works', answers));
+    await pull(p);
+    await pull(p, { request: { tag: 'v2' } });
+    expect(helperRuns()).toBe(1);
+    await pull(p, { socket: vmJobFiles(dataDir, '4-0123456789ac').dockerSocket });
+    expect(helperRuns()).toBe(2);
+    // A job that has ended is forgotten, its credentials with it.
+    p.forget(vmJobFiles(dataDir, VM_ID).dockerSocket);
+    daemon.images.clear();
+    await pull(p);
+    expect(helperRuns()).toBe(3);
+  });
+
+  it('keeps an image in the job store when one of its layers needs the credentials the manifest did not', async () => {
+    // The manifest and config come anonymously, so the image looks public
+    // until a layer is refused: it goes to the job store, fetched with the
+    // credentials, and nothing of it is recorded for the shared cache.
+    registry.users.set('me', 'pw');
+    const image = buildImage();
+    registry.putImage(IMAGE, image, 'v1');
+    registry.switches.privateBlobs = new Set([layerOf(image)]);
+    await expect(pull(puller(credsStore('works', answers)))).resolves.toMatchObject({ source: 'registry' });
+    expect(helperRuns()).toBe(1);
+    expect(publicBlobs()).not.toContain(layerOf(image).slice(7));
+    expect(jobBlobs()).toContain(layerOf(image).slice(7));
+    expect(fs.existsSync(refsJsonPath(dataDir, REPO_KEY))).toBe(false);
+    expect(notePulled).not.toHaveBeenCalled();
+  });
+
+  it('names the anonymous refusal that had it ask, before the failure of the helper', async () => {
+    // Docker Hub answers a repository that does not exist 401, as it does a
+    // private one: the job is told why the helper ran at all.
+    registry.putImage(IMAGE, buildImage(), 'v1');
+    const attempt = pull(puller(credsStore('fails', 'echo broken >&2; exit 3')), { request: { repositoryPath: 'team/typo' } });
+    await expect(attempt).rejects.toBeInstanceOf(RegistryAuthError);
+    await expect(attempt).rejects.toThrow(
+      `${REGISTRY_HOST} refused an anonymous pull of team/typo (private, or no such repository), so localmost asked for credentials: ` +
+        'the Docker credential helper `docker-credential-fails` (from `credsStore` in ~/.docker/config.json) failed'
+    );
+  });
+
+  describe('when the manifest needed them but the registry also serves it anonymously', () => {
+    /** The tag is served only with credentials; its manifest, by digest, to anyone. */
+    function tagNeedsCredentials(image: ReturnType<typeof buildImage>): void {
+      registry.users.set('me', 'pw');
+      registry.putImage(IMAGE, image, 'v1');
+      registry.switches.privateManifests = new Set(['v1']);
+    }
+    const layerRequests = (image: ReturnType<typeof buildImage>) =>
+      blobRequests().filter((r) => r.path.endsWith(`/blobs/${layerOf(image)}`));
+
+    it('fetches the layers anonymously into the shared store', async () => {
+      const image = buildImage();
+      tagNeedsCredentials(image);
+      await expect(pull(puller(credsStore('works', answers)))).resolves.toMatchObject({ source: 'registry' });
+      expect(helperRuns()).toBe(1);
+      expect(publicBlobs()).toContain(layerOf(image).slice(7));
+      expect(notePulled).toHaveBeenCalledWith(REPO_KEY, image.configDigest);
+      expect(layerRequests(image).length).toBeGreaterThan(0);
+      for (const request of layerRequests(image)) {
+        expect(request.headers.authorization ?? '').not.toMatch(/^Basic /);
+        expect(bearerUser(request.headers.authorization)).toBeNull();
+      }
+    });
+
+    it('keeps the image for the job when a layer is served only with the credentials', async () => {
+      const image = buildImage();
+      tagNeedsCredentials(image);
+      registry.switches.privateBlobs = new Set([layerOf(image)]);
+      await expect(pull(puller(credsStore('works', answers)))).resolves.toMatchObject({ source: 'registry' });
+      expect(helperRuns()).toBe(1);
+      expect(publicBlobs()).not.toContain(layerOf(image).slice(7));
+      expect(jobBlobs()).toContain(layerOf(image).slice(7));
+      expect(fs.existsSync(refsJsonPath(dataDir, REPO_KEY))).toBe(false);
+      expect(notePulled).not.toHaveBeenCalled();
+      // The one that needed them was fetched with them, in the end.
+      expect(layerRequests(image).some((r) => bearerUser(r.headers.authorization) === 'me')).toBe(true);
+    });
+
+    it('keeps the image for the job when its config is served only with the credentials', async () => {
+      const image = buildImage();
+      registry.users.set('me', 'pw');
+      registry.putImage(IMAGE, image, 'v1');
+      registry.switches.privateBlobs = new Set([image.configDigest]);
+      await expect(pull(puller(credsStore('works', answers)))).resolves.toMatchObject({ source: 'registry' });
+      expect(helperRuns()).toBe(1);
+      expect(publicBlobs()).toEqual([]);
+      expect(jobBlobs()).toContain(image.configDigest.slice(7));
+      expect(fs.existsSync(refsJsonPath(dataDir, REPO_KEY))).toBe(false);
+      expect(notePulled).not.toHaveBeenCalled();
+    });
+
+    it('keeps the image for the job when its index is served only with the credentials', async () => {
+      const image = buildImage();
+      const index = buildIndex([{ image, platform: { os: 'linux', architecture: 'arm64' } }]);
+      registry.users.set('me', 'pw');
+      registry.putIndex(IMAGE, index, [image], 'v1');
+      registry.switches.privateManifests = new Set(['v1', index.digest]);
+      await expect(pull(puller(credsStore('works', answers)))).resolves.toMatchObject({ source: 'registry' });
+      expect(helperRuns()).toBe(1);
+      expect(publicBlobs()).toEqual([]);
+      expect(jobBlobs()).toContain(index.digest.slice(7));
+      expect(fs.existsSync(refsJsonPath(dataDir, REPO_KEY))).toBe(false);
+      expect(notePulled).not.toHaveBeenCalled();
+    });
   });
 });
 

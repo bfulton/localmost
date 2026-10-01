@@ -313,8 +313,8 @@ export class DockerFilterProxy {
     this.repository = repository;
     this.policy = policy;
     this.onLog({ level: 'info', message: `docker socket bound to ${repository}` });
-    // The worker decides whether this is the bind that boots its VM: the
-    // first one with grants does, and no other (contract §5.1).
+    // The worker records what its VM is for; the VM boots at the job's first
+    // request that needs the daemon, not here (contract §5.1).
     this.worker.bind(repository, policy);
   }
 
@@ -441,7 +441,7 @@ export class DockerFilterProxy {
     this.forgetOwned();
     if (containers.length === 0 && networks.length === 0) return;
 
-    // Now or never: nothing is waited for at stop.
+    // Now or never: nothing is waited for at stop, and nothing boots for it.
     const state = await this.worker.endpoint(0);
     const endpoint = state.kind === 'ready' ? { socketPath: state.socketPath } : null;
     if (!endpoint) {
@@ -759,14 +759,15 @@ export class DockerFilterProxy {
 
   /**
    * Where a permitted request goes: the worker's daemon once it is ready,
-   * waited for up to the boot timeout. Null, with a 503 written, when there
-   * is none - the VM failed, never booted, or did not boot in time - and the
-   * first such answer is also logged at warn.
+   * waited for up to the boot timeout. The job's first such request boots
+   * the VM; the baseline, answered without one, never does. Null, with a 503
+   * written, when there is none - the VM failed, cannot boot, or did not boot
+   * in time - and the first such answer is also logged at warn.
    */
   private async endpointOr503(res: http.ServerResponse): Promise<string | null> {
     let state;
     try {
-      state = await this.worker.endpoint(this.bootTimeoutMs);
+      state = await this.worker.endpoint(this.bootTimeoutMs, { boot: true });
     } catch (err) {
       state = { kind: 'none' as const, reason: (err as Error).message };
     }
@@ -1440,7 +1441,7 @@ export class DockerFilterProxy {
     // The client's bytes wait in the socket while the VM boots.
     client.pause();
     this.worker
-      .endpoint(this.bootTimeoutMs)
+      .endpoint(this.bootTimeoutMs, { boot: true })
       .catch((err: Error) => ({ kind: 'none' as const, reason: err.message }))
       .then((state) => {
         if (state.kind !== 'ready') {

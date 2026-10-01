@@ -208,6 +208,8 @@ export interface ImagePullResult {
 /** Pulls on the Mac, verifies, and loads into the job's VM (§6.4). */
 export interface ImagePuller {
   pull(opts: ImagePullOptions): Promise<ImagePullResult>;
+  /** The job of the VM with this docker.sock has ended: what its pulls shared, credentials included, goes. */
+  forget(dockerSocketPath: string): void;
 }
 
 /** The per-repository golden data disks (§6.5). */

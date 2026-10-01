@@ -102,11 +102,30 @@ class FakeManager implements VmManager {
 
 const grants: DockerPolicy = { run: { images: ['alpine:3'] }, pull: { registries: ['docker.io'] } };
 
+/** A request over a unix socket, and its whole answer. */
+const get = (sock: string, p: string, method = 'GET', json?: unknown) =>
+  new Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }>((resolve, reject) => {
+    const headers = json === undefined ? {} : { 'content-type': 'application/json' };
+    const req = http.request({ socketPath: sock, path: p, method, headers, agent: false }, (res) => {
+      let body = '';
+      res.on('data', (c: Buffer) => (body += c.toString()));
+      res.on('end', () => resolve({ status: res.statusCode!, headers: res.headers, body }));
+    });
+    req.on('error', reject);
+    req.end(json === undefined ? undefined : JSON.stringify(json));
+  });
+
+/** Until `condition` holds; the bound only matters when it never does. */
+async function until(condition: () => boolean): Promise<void> {
+  for (let i = 0; i < 300 && !condition(); i++) await new Promise((r) => setTimeout(r, 10));
+  expect(condition()).toBe(true);
+}
+
 describe('VmBackend', () => {
   let root: string;
   let sandboxDir: string;
   let manager: FakeManager;
-  let puller: { pull: jest.Mock };
+  let puller: { pull: jest.Mock; forget: jest.Mock };
   let refreshes: string[];
   let logs: Array<{ level: string; message: string }>;
   let proxyUrl: string;
@@ -119,6 +138,7 @@ describe('VmBackend', () => {
     manager = new FakeManager();
     puller = {
       pull: jest.fn(async () => ({ manifestDigest: `sha256:${'a'.repeat(64)}`, configDigest: `sha256:${'b'.repeat(64)}`, platform: 'linux/arm64', source: 'registry' })),
+      forget: jest.fn(),
     };
     refreshes = [];
     logs = [];
@@ -156,18 +176,34 @@ describe('VmBackend', () => {
     expect(b.workspaceMountRoot('/s/3', 'owner/repo')).toBe('/s/3/_work/repo/repo');
   });
 
+  /** The job's first request that needs the daemon, as the filter makes it. */
+  const firstRequest = (w: WorkerDocker, timeoutMs = 10_000) => w.endpoint(timeoutMs, { boot: true });
+
+  /** A worker bound to `repository` whose VM booted, at a first request, and is ready. */
+  const readyWorker = async (repository = 'owner/repo', rosetta: VmReady['rosetta'] = 'ok'): Promise<WorkerDocker> => {
+    const w = worker();
+    w.bind(repository, grants);
+    const pending = firstRequest(w);
+    manager.vms.at(-1)!.becomeReady(rosetta);
+    await pending;
+    return w;
+  };
+
   describe('bind', () => {
-    it('never starts a VM for a policy with no docker grants', () => {
+    it('never starts a VM for a policy with no docker grants', async () => {
       const w = worker();
       w.bind('owner/repo', {});
       w.bind('owner/repo', { privileged: false });
+      expect(await firstRequest(w, 10)).toMatchObject({ kind: 'none', reason: expect.stringMatching(/grants no Docker actions/) });
       expect(manager.vms).toHaveLength(0);
       expect(w.running()).toBe(false);
     });
 
-    it('starts one for a grant, with everything the VM needs and nothing the job chose', () => {
+    it('boots nothing at the claim, and one VM at the first request, with everything it needs and nothing the job chose', async () => {
       const w = worker();
       w.bind('Owner/Repo', grants);
+      expect(manager.vms).toHaveLength(0);
+      void firstRequest(w, 10);
       expect(manager.vms).toHaveLength(1);
       expect(manager.vms[0].request).toEqual({
         mode: 'job',
@@ -179,25 +215,34 @@ describe('VmBackend', () => {
         repoKey: repoKeyOf('owner/repo'),
         proxyPort: 50123,
       });
-      expect(logs).toContainEqual({ level: 'info', message: `Docker VM ${manager.vms[0].vmId} booting for Owner/Repo at the claim` });
+      expect(logs).toContainEqual({ level: 'info', message: `Docker VM ${manager.vms[0].vmId} booting for Owner/Repo: the job's first Docker request` });
+      expect(logs.some((l) => /at the claim/.test(l.message))).toBe(false);
     });
 
-    it('starts one VM for a double bind of the same repository and policy', () => {
+    it('starts one VM for a double bind of the same repository and policy', async () => {
       const w = worker();
       w.bind('owner/repo', grants);
       w.bind('owner/repo', grants);
       w.bind('OWNER/REPO', grants);
+      void firstRequest(w, 10);
+      void firstRequest(w, 10);
       expect(manager.vms).toHaveLength(1);
     });
 
-    it('replaces only the policy on a later bind, grants or none, and leaves the VM running', () => {
-      const w = worker();
-      w.bind('owner/repo', grants);
-      manager.vms[0].becomeReady();
+    it('replaces only the policy on a later bind, grants or none, and leaves the VM running', async () => {
+      const w = await readyWorker();
       w.bind('owner/repo', { build: {} });
       w.bind('owner/repo', {});
       expect(manager.vms).toHaveLength(1);
       expect(manager.vms[0].stops).toEqual([]);
+    });
+
+    it('boots none for a later bind without grants that came before the first request', async () => {
+      const w = worker();
+      w.bind('owner/repo', grants);
+      w.bind('owner/repo', {});
+      expect(await firstRequest(w, 10)).toMatchObject({ kind: 'none', reason: expect.stringMatching(/grants no Docker actions/) });
+      expect(manager.vms).toHaveLength(0);
     });
 
     it('boots nothing once release has started, a bind while stopping included', async () => {
@@ -206,32 +251,132 @@ describe('VmBackend', () => {
       w.bind('owner/repo', grants);
       await releasing;
       w.bind('owner/repo', grants);
+      expect(await firstRequest(w, 10)).toEqual({ kind: 'none', reason: 'the job has ended' });
       expect(manager.vms).toHaveLength(0);
-      expect(await w.endpoint(10)).toEqual({ kind: 'none', reason: 'the job has ended' });
+    });
+
+    it('boots none at a request that came after release, though bound before it', async () => {
+      const w = worker();
+      w.bind('owner/repo', grants);
+      await w.release();
+      expect(await firstRequest(w, 10)).toEqual({ kind: 'none', reason: 'the job has ended' });
+      expect(manager.vms).toHaveLength(0);
     });
 
     it('stops the VM on a bind for another repository, and boots no other', async () => {
-      const w = worker();
-      w.bind('owner/repo', grants);
-      manager.vms[0].becomeReady();
+      const w = await readyWorker();
       w.bind('other/repo', grants);
       w.bind('other/repo', grants);
       expect(manager.vms).toHaveLength(1);
       expect(manager.vms[0].stops).toEqual(['bound to another repository']);
-      const endpoint = await w.endpoint(10);
+      // That VM's job state, the credentials its pulls were given with it, goes with it.
+      expect(puller.forget.mock.calls).toEqual([[manager.vms[0].dockerSocketPath]]);
+      const endpoint = await firstRequest(w, 10);
       expect(endpoint.kind).toBe('none');
+      expect(manager.vms).toHaveLength(1);
+    });
+
+    it('closes the socket on a bind for another repository before any VM booted, and boots none', async () => {
+      const w = worker();
+      w.bind('owner/repo', grants);
+      w.bind('other/repo', grants);
+      expect(await firstRequest(w, 10)).toMatchObject({ kind: 'none', reason: expect.stringMatching(/bound to other\/repo, not owner\/repo/) });
+      expect(manager.vms).toHaveLength(0);
     });
 
     it('never boots a VM for a sandbox id that is not one', async () => {
       const w = worker({ sandboxId: '../x' });
       w.bind('owner/repo', grants);
+      expect(await firstRequest(w, 10)).toMatchObject({ kind: 'none', reason: expect.stringMatching(/sandbox id/) });
       expect(manager.vms).toHaveLength(0);
-      expect(await w.endpoint(10)).toMatchObject({ kind: 'none', reason: expect.stringMatching(/sandbox id/) });
+    });
+  });
+
+  describe('a job that never asks for the daemon', () => {
+    it('has no VM: nothing starts for its claim, its baseline or its release, and the release is a no-op', async () => {
+      const w = worker();
+      w.bind('owner/repo', grants);
+      w.bind('owner/repo', grants);
+      expect(w.baseline('/_ping').status).toBe(200);
+      expect(w.baseline('/version').status).toBe(200);
+      expect(w.baseline('/info').status).toBe(200);
+      // Only a request that needs the daemon boots one; the socket's own cleanup does not.
+      expect(await w.endpoint(0)).toEqual({ kind: 'none', reason: "the job's Docker VM was never started" });
+      expect(w.containerProxyEnv()).toEqual({});
+      await w.release();
+      await w.release();
+      expect(manager.vms).toHaveLength(0);
+      expect(refreshes).toEqual([]);
+      expect(puller.forget).not.toHaveBeenCalled();
+      expect(logs.some((l) => /Docker VM .*(booting|released)/.test(l.message))).toBe(false);
+    });
+  });
+
+  describe('the first request', () => {
+    it('boots the VM once, however many requests arrive while it boots, and every one waits for it', async () => {
+      const w = worker();
+      w.bind('owner/repo', grants);
+      expect(manager.vms).toHaveLength(0);
+      const waiting = [firstRequest(w), firstRequest(w), firstRequest(w)];
+      expect(manager.vms).toHaveLength(1);
+      const vm = manager.vms[0];
+      vm.boot();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      vm.becomeReady();
+      expect(await Promise.all(waiting)).toEqual(Array(3).fill({ kind: 'ready', socketPath: vm.dockerSocketPath }));
+      expect(await firstRequest(w)).toEqual({ kind: 'ready', socketPath: vm.dockerSocketPath });
+      expect(manager.vms).toHaveLength(1);
+    });
+
+    it("gives the boot's failure to every request waiting on it, and to later ones, and never boots again", async () => {
+      const w = worker();
+      w.bind('owner/repo', grants);
+      expect(manager.vms).toHaveLength(0);
+      const waiting = [firstRequest(w), firstRequest(w)];
+      manager.vms[0].fail('disk', 'E_NO_DISK', 'not enough free disk for a Docker VM');
+      const reason = "the job's Docker VM failed to start (disk, E_NO_DISK): not enough free disk for a Docker VM";
+      expect(await Promise.all(waiting)).toEqual([{ kind: 'none', reason }, { kind: 'none', reason }]);
+      expect(await firstRequest(w)).toEqual({ kind: 'none', reason });
+      expect(manager.vms).toHaveLength(1);
+    });
+
+    it('gives every request the reason when the VM cannot even be started', async () => {
+      manager.start = () => {
+        throw new Error('the helper is missing');
+      };
+      const w = worker();
+      w.bind('owner/repo', grants);
+      const reason = "the job's Docker VM could not be started: the helper is missing";
+      expect(await Promise.all([firstRequest(w), firstRequest(w)])).toEqual([{ kind: 'none', reason }, { kind: 'none', reason }]);
+    });
+
+    it('through the filter: the baseline boots nothing, and the first request that needs the daemon boots the VM and gets its failure', async () => {
+      const w = worker();
+      const proxy = new DockerFilterProxy({ backend: backend(), worker: w, bootTimeoutMs: 5000 });
+      const sock = path.join(root, 'f.sock');
+      await proxy.start(sock);
+      try {
+        proxy.bind('owner/repo', grants);
+        for (const p of ['/_ping', '/v1.45/version', '/v1.45/info']) expect((await get(sock, p)).status).toBe(200);
+        // A request the filter refuses never reaches for a daemon.
+        expect((await get(sock, '/v1.45/containers/json')).status).toBe(403);
+        expect(manager.vms).toHaveLength(0);
+        const creates = [1, 2].map(() => get(sock, '/v1.45/containers/create', 'POST', { Image: 'alpine:3', HostConfig: { NetworkMode: 'none' } }));
+        await until(() => manager.vms.length === 1);
+        manager.vms[0].fail('agent', 'E_AGENT_TIMEOUT', 'the guest agent did not answer');
+        for (const answer of await Promise.all(creates)) {
+          expect(answer.status).toBe(503);
+          expect(JSON.parse(answer.body).message).toBe("the job's Docker VM failed to start (agent, E_AGENT_TIMEOUT): the guest agent did not answer");
+        }
+        expect(manager.vms).toHaveLength(1);
+      } finally {
+        await proxy.stop();
+      }
     });
   });
 
   describe('the spare', () => {
-    it('is booted for the spawn repository, and adopted by a claim for it', () => {
+    it('is booted for the spawn repository, and adopted by a claim for it', async () => {
       const w = worker();
       w.prewarm();
       w.prewarm();
@@ -241,14 +386,20 @@ describe('VmBackend', () => {
       expect(manager.vms).toHaveLength(1);
       expect(manager.claimed).toEqual([manager.vms[0].vmId]);
       expect(manager.vms[0].stops).toEqual([]);
+      // The first request uses it: nothing more boots.
+      manager.vms[0].becomeReady();
+      expect(await firstRequest(w)).toEqual({ kind: 'ready', socketPath: manager.vms[0].dockerSocketPath });
+      expect(manager.vms).toHaveLength(1);
     });
 
-    it('is stopped, and a VM booted, when the claim is for another repository', () => {
+    it('is stopped at the claim when that is for another repository, and a VM booted at the first request', async () => {
       const w = worker();
       w.prewarm();
       w.bind('someone/else', grants);
-      expect(manager.vms).toHaveLength(2);
+      expect(manager.vms).toHaveLength(1);
       expect(manager.vms[0].stops).toHaveLength(1);
+      void firstRequest(w, 10);
+      expect(manager.vms).toHaveLength(2);
       expect(manager.vms[1].request).toMatchObject({ repository: 'someone/else' });
       expect(manager.vms[1].request.spare).toBeUndefined();
     });
@@ -258,6 +409,17 @@ describe('VmBackend', () => {
       w.prewarm();
       w.bind('owner/repo', {});
       expect(manager.vms[0].stops).toHaveLength(1);
+    });
+
+    it('is not booted once the worker is bound, before its first request as after', async () => {
+      const w = worker();
+      w.bind('owner/repo', grants);
+      w.prewarm();
+      expect(manager.vms).toHaveLength(0);
+      void firstRequest(w, 10);
+      w.prewarm();
+      expect(manager.vms).toHaveLength(1);
+      expect(manager.vms[0].request.spare).toBeUndefined();
     });
 
     it('is not booted for a worker spawned for no repository', () => {
@@ -273,8 +435,9 @@ describe('VmBackend', () => {
       second.prewarm();
       expect(manager.vms).toHaveLength(1);
       expect(logs).toContainEqual({ level: 'debug', message: 'No spare Docker VM for this worker: there is already a spare Docker VM' });
-      // The second worker still boots its job's VM at the claim.
+      // The second worker still boots its job's VM, at the job's first request.
       second.bind('owner/repo', grants);
+      void firstRequest(second, 10);
       expect(manager.vms).toHaveLength(2);
       expect(manager.vms[1].request).toMatchObject({ slot: 4, repository: 'owner/repo' });
       expect(manager.vms[1].request.spare).toBeUndefined();
@@ -288,11 +451,13 @@ describe('VmBackend', () => {
       expect(manager.vms[0].stops).toEqual(['the claim is for someone/else, so the socket stays closed']);
     });
 
-    it('is replaced by a fresh boot when it was stopped before the claim', () => {
+    it('is replaced by a fresh boot, at the first request, when it was stopped before the claim', async () => {
       const w = worker();
       w.prewarm();
       manager.vms[0].status = 'stopped';
       w.bind('owner/repo', grants);
+      expect(manager.vms).toHaveLength(1);
+      void firstRequest(w, 10);
       expect(manager.vms).toHaveLength(2);
     });
   });
@@ -301,63 +466,69 @@ describe('VmBackend', () => {
     it('is the VM\'s docker.sock once ready, after waiting for it', async () => {
       const w = worker();
       w.bind('owner/repo', grants);
+      const waiting = firstRequest(w);
       const vm = manager.vms[0];
       vm.boot();
-      const waiting = w.endpoint(10_000);
       vm.becomeReady();
       expect(await waiting).toEqual({ kind: 'ready', socketPath: vm.dockerSocketPath });
       expect(w.running()).toBe(true);
+      // Once there, it is the endpoint without booting anything too.
+      expect(await w.endpoint(0)).toEqual({ kind: 'ready', socketPath: vm.dockerSocketPath });
     });
 
     it('is none with no capacity when the VM is still queued at the timeout', async () => {
       const w = worker();
       w.bind('owner/repo', grants);
-      expect(await w.endpoint(50)).toEqual({ kind: 'none', reason: 'no Docker VM capacity' });
+      expect(await firstRequest(w, 50)).toEqual({ kind: 'none', reason: 'no Docker VM capacity' });
     });
 
     it('is none when the VM is still booting at the timeout', async () => {
       const w = worker();
       w.bind('owner/repo', grants);
+      void firstRequest(w, 10);
       manager.vms[0].boot();
-      expect(await w.endpoint(50)).toEqual({ kind: 'none', reason: "the job's Docker VM did not start within 0s" });
+      expect(await firstRequest(w, 50)).toEqual({ kind: 'none', reason: "the job's Docker VM did not start within 0s" });
     });
 
     it('is none with the stage and code of a failed boot, and never retries', async () => {
       const w = worker();
       w.bind('owner/repo', grants);
+      const waiting = firstRequest(w, 1000);
       manager.vms[0].fail('nonce', 'E_NONCE', "the guest did not read the share's nonce back");
-      const endpoint = await w.endpoint(1000);
-      expect(endpoint).toEqual({
+      expect(await waiting).toEqual({
         kind: 'none',
         reason: "the job's Docker VM failed to start (nonce, E_NONCE): the guest did not read the share's nonce back",
       });
       w.bind('owner/repo', grants);
+      await firstRequest(w, 10);
       expect(manager.vms).toHaveLength(1);
     });
 
     it('is none for a VM that died once ready', async () => {
-      const w = worker();
-      w.bind('owner/repo', grants);
-      manager.vms[0].becomeReady();
+      const w = await readyWorker();
       manager.vms[0].failed = Object.assign(new Error("the job's Docker VM stopped unexpectedly"), { stage: 'running', code: 'E_HELPER_KILLED' }) as VmError;
       manager.vms[0].status = 'failed';
-      expect(await w.endpoint(10)).toEqual({ kind: 'none', reason: "the job's Docker VM stopped unexpectedly" });
+      expect(await firstRequest(w, 10)).toEqual({ kind: 'none', reason: "the job's Docker VM stopped unexpectedly" });
       expect(w.running()).toBe(false);
+      expect(manager.vms).toHaveLength(1);
     });
 
     it('is none, saying why, for a job with no grants', async () => {
       const w = worker();
       w.bind('owner/repo', {});
-      expect(await w.endpoint(10)).toMatchObject({ kind: 'none', reason: expect.stringMatching(/grants no Docker actions/) });
+      expect(await firstRequest(w, 10)).toMatchObject({ kind: 'none', reason: expect.stringMatching(/grants no Docker actions/) });
     });
   });
 
   describe('containerProxyEnv', () => {
-    it("is the worker's current proxy, at the relay address in the VM, and nothing without a VM", () => {
+    it("is the worker's current proxy, at the relay address in the VM, and nothing without a VM", async () => {
       const w = worker();
       expect(w.containerProxyEnv()).toEqual({});
       w.bind('owner/repo', grants);
+      expect(w.containerProxyEnv()).toEqual({});
+      const pending = firstRequest(w);
       manager.vms[0].becomeReady();
+      await pending;
       const relayed = 'http://localmost:token1@198.18.0.1:3128';
       expect(w.containerProxyEnv()).toEqual({
         HTTP_PROXY: relayed, HTTPS_PROXY: relayed, http_proxy: relayed, https_proxy: relayed,
@@ -371,10 +542,7 @@ describe('VmBackend', () => {
 
   describe('pull and approveBinds', () => {
     it("pulls into the VM with its Rosetta state, logging where the image came from", async () => {
-      const w = worker();
-      w.bind('Owner/Repo', grants);
-      manager.vms[0].becomeReady('absent');
-      await new Promise((resolve) => setImmediate(resolve));
+      const w = await readyWorker('Owner/Repo', 'absent');
       const progress = jest.fn();
       const signal = new AbortController().signal;
       await w.pull({ registry: 'docker.io', repositoryPath: 'library/alpine', tag: '3' }, progress, signal);
@@ -398,9 +566,7 @@ describe('VmBackend', () => {
     });
 
     it('remembers, for the job, the image each pull by digest resolved to, and nothing a tag pull resolved', async () => {
-      const w = worker();
-      w.bind('owner/repo', grants);
-      manager.vms[0].becomeReady();
+      const w = await readyWorker();
       const signal = new AbortController().signal;
       const digest = `sha256:${'c'.repeat(64)}`;
       const byDigest = { registry: 'docker.io', repositoryPath: 'library/alpine', digest };
@@ -417,19 +583,16 @@ describe('VmBackend', () => {
 
     it('records no image for a digest pull whose config digest is not one', async () => {
       puller.pull.mockImplementation(async () => ({ manifestDigest: `sha256:${'a'.repeat(64)}`, configDigest: 'sha256:../../x', platform: 'linux/arm64', source: 'registry' }));
-      const w = worker();
-      w.bind('owner/repo', grants);
-      manager.vms[0].becomeReady();
+      const w = await readyWorker();
       const byDigest = { registry: 'docker.io', repositoryPath: 'library/alpine', digest: `sha256:${'c'.repeat(64)}` };
       await w.pull(byDigest, () => {}, new AbortController().signal);
       expect(w.imageForDigest(byDigest)).toBeUndefined();
     });
 
     it("hands approvals to the VM's agent, and refuses them with no VM ready", async () => {
-      const w = worker();
-      await expect(w.approveBinds('f'.repeat(64), [])).rejects.toThrow(/not ready/);
-      w.bind('owner/repo', grants);
-      manager.vms[0].becomeReady();
+      const idle = worker();
+      await expect(idle.approveBinds('f'.repeat(64), [])).rejects.toThrow(/not ready/);
+      const w = await readyWorker();
       const binds = [{ source: '/s/_work/r/r/data', destination: '/data', readOnly: true }];
       await w.approveBinds('f'.repeat(64), binds);
       expect(manager.vms[0].agentClient.approveBinds).toHaveBeenCalledWith('f'.repeat(64), binds);
@@ -437,29 +600,35 @@ describe('VmBackend', () => {
   });
 
   describe('release', () => {
-    it('stops the VM once however often it is called, and schedules a refresh when something new was pulled', async () => {
-      const w = worker();
-      w.bind('Owner/Repo', grants);
-      manager.vms[0].becomeReady();
+    it('stops the VM once however often it is called, schedules a refresh when something new was pulled, and has the puller forget the job', async () => {
+      const w = await readyWorker('Owner/Repo');
       await w.pull({ registry: 'docker.io', repositoryPath: 'library/alpine', tag: '3' }, () => {}, new AbortController().signal);
       await Promise.all([w.release(), w.release()]);
       await w.release();
       expect(manager.vms[0].stops).toEqual(['the job ended']);
       expect(refreshes).toEqual([`${repoKeyOf('owner/repo')} Owner/Repo`]);
       expect(logs.map((l) => l.message)).toContain(`Docker VM ${manager.vms[0].vmId} released: the job ended`);
+      expect(puller.forget.mock.calls).toEqual([[manager.vms[0].dockerSocketPath]]);
     });
 
     it('schedules no refresh when every pull was already in the VM, or nothing was pulled', async () => {
       puller.pull.mockImplementation(async () => ({ manifestDigest: `sha256:${'c'.repeat(64)}`, configDigest: `sha256:${'d'.repeat(64)}`, platform: 'linux/arm64', source: 'vm' }));
-      const w = worker();
-      w.bind('owner/repo', grants);
-      manager.vms[0].becomeReady();
+      const w = await readyWorker();
       await w.pull({ registry: 'docker.io', repositoryPath: 'library/alpine', tag: '3' }, () => {}, new AbortController().signal);
       await w.release();
       const idle = worker();
       idle.bind('owner/repo', {});
       await idle.release();
       expect(refreshes).toEqual([]);
+    });
+
+    it('has the puller forget the job even when the VM fails to stop', async () => {
+      const w = await readyWorker();
+      manager.vms[0].stop = async () => {
+        throw new Error('the helper would not stop');
+      };
+      await expect(w.release()).rejects.toThrow('the helper would not stop');
+      expect(puller.forget.mock.calls).toEqual([[manager.vms[0].dockerSocketPath]]);
     });
 
     it('stops the spare too', async () => {
@@ -574,17 +743,6 @@ describe('VmBackend', () => {
         proxy.bind('Owner/Repo', {});
         return { proxy, sock };
       };
-      const get = (sock: string, p: string, method = 'GET') =>
-        new Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }>((resolve, reject) => {
-          const req = http.request({ socketPath: sock, path: p, method, agent: false }, (res) => {
-            let body = '';
-            res.on('data', (c: Buffer) => (body += c.toString()));
-            res.on('end', () => resolve({ status: res.statusCode!, headers: res.headers, body }));
-          });
-          req.on('error', reject);
-          req.end();
-        });
-
       const synth = await serve(synthesising, 's');
       const fwd = await serve(forwarding, 'f');
       try {

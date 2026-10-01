@@ -1,15 +1,18 @@
 /**
  * The VM Docker backend: one Linux VM per job whose policy grants Docker,
- * booted at the claim and discarded with the worker (contract §5.1; the
- * design's decisions 1-2).
+ * booted at the job's first Docker request that needs a daemon and discarded
+ * with the worker (contract §5.1; the design's decisions 1-2).
  *
- * Each worker's socket gets a VmWorker. It boots nothing until the claimed
- * job's policy is bound, and only if that policy grants a Docker action; a
- * repeated bind never boots a second VM (runner-manager binds at least twice
- * per job). Until a VM is ready the filter answers the baseline from the
- * guest's manifest, and requests wait for the VM up to the boot timeout. A
- * VM that fails is never retried for its job: the socket answers 503 with the
- * reason. Privileged stays refused (owner decision 2).
+ * Each worker's socket gets a VmWorker. The claim binds the job's repository
+ * and policy and boots nothing: most jobs never use Docker, and one VM per
+ * claimed job held memory and disk for every one of them. The first request
+ * the filter permits beyond the baseline it answers itself (/_ping, /version,
+ * /info, from the guest's manifest) boots the VM, once, only if the bound
+ * policy grants a Docker action; every request that comes while it boots
+ * waits for it, up to the boot timeout, and gets the same answer. A VM that
+ * fails is never retried for its job: the socket answers 503 with the reason.
+ * A job that never asks has no VM, no helper, and no disk. Privileged stays
+ * refused (owner decision 2).
  */
 
 import * as fs from 'fs';
@@ -79,8 +82,10 @@ class VmWorker implements WorkerDocker {
   private vm: VmHandle | null = null;
   private readyInfo: VmReady | null = null;
   private spare: VmHandle | null = null;
-  /** The repository the VM was booted for. */
-  private bootedFor: string | undefined;
+  /** The repository of the first bind with grants: the one the VM is, or will be, booted for. */
+  private boundFor: string | undefined;
+  /** Whether the latest bind's policy grants a Docker action; without, no request boots a VM. */
+  private grants = false;
   /** Why this worker has no VM, and never will: a bind for another repository, a bad sandbox. */
   private closed: string | null = null;
   private releasing: Promise<void> | null = null;
@@ -146,19 +151,25 @@ class VmWorker implements WorkerDocker {
 
   bind(repository: string, policy: DockerPolicy): void {
     if (this.releasing) return;
-    if (this.vm) {
-      if (!sameRepository(repository, this.bootedFor)) {
+    if (this.boundFor !== undefined) {
+      if (!this.closed && !sameRepository(repository, this.boundFor)) {
         // Not a path runner-manager takes - it binds only the repository the
         // worker was spawned for and claimed - so this is a mistake, and the
-        // VM, with that other repository's cache and share, goes.
-        this.closed = `the socket was bound to ${repository}, not ${this.bootedFor}, whose Docker VM it had`;
-        this.log('warn', `${this.closed}; stopping it`);
+        // VM, with that other repository's cache and share, goes, or never
+        // boots.
         const vm = this.vm;
+        this.closed = `the socket was bound to ${repository}, not ${this.boundFor}, ${vm ? 'whose Docker VM it had' : 'for which it was bound first'}`;
+        this.log('warn', vm ? `${this.closed}; stopping it` : this.closed);
         this.vm = null;
         this.readyInfo = null;
-        void vm.stop('bound to another repository');
+        if (vm) {
+          // Its pulls' totals and the credentials they were given go with it.
+          this.opts.puller.forget(vm.dockerSocketPath);
+          void vm.stop('bound to another repository');
+        }
       }
       // Otherwise only the policy changes, which the filter holds.
+      this.grants = hasDockerGrants(policy);
       return;
     }
     if (this.closed || !hasDockerGrants(policy)) {
@@ -176,14 +187,30 @@ class VmWorker implements WorkerDocker {
       this.log('info', `Docker VM ${spare.vmId} (the spare) is the job's, for ${repository}`);
     } else {
       if (spare) void spare.stop(`the claim is for ${repository}, not the repository it was booted for`);
-      this.vm = this.boot(repository);
-      if (this.vm) this.log('info', `Docker VM ${this.vm.vmId} booting for ${repository} at the claim`);
+      // Nothing boots here: the job's first request that needs the daemon does.
+      this.log('debug', `the job's Docker VM boots at its first Docker request, for ${repository}`);
     }
-    this.bootedFor = repository;
+    this.boundFor = repository;
+    this.grants = true;
+  }
+
+  /**
+   * The bound job's VM, booted now: the first request that needs the daemon.
+   * Synchronous up to the start, so requests that arrive together boot one.
+   */
+  private bootForFirstRequest(): VmHandle | null {
+    const repository = this.boundFor!;
+    const vm = this.boot(repository);
+    if (!vm) return null;
+    this.vm = vm;
+    this.log('info', `Docker VM ${vm.vmId} booting for ${repository}: the job's first Docker request`);
+    return vm;
   }
 
   prewarm(): void {
-    if (this.releasing || this.closed || this.vm || this.spare || !this.ctx.spawnRepository) return;
+    // Never once bound: a claimed job's VM is the spare it adopted, or the one
+    // its first request boots.
+    if (this.releasing || this.closed || this.vm || this.spare || this.boundFor !== undefined || !this.ctx.spawnRepository) return;
     try {
       // Not through boot(): a spare refused - there is one already, for
       // another worker - leaves this worker as it was, open for its claim.
@@ -207,11 +234,18 @@ class VmWorker implements WorkerDocker {
     return `the job's Docker VM failed to start (${failure.stage}, ${failure.code}): ${failure.message}`;
   }
 
-  async endpoint(timeoutMs: number): Promise<EndpointState> {
+  async endpoint(timeoutMs: number, options: { boot?: boolean } = {}): Promise<EndpointState> {
     if (this.releasing) return { kind: 'none', reason: 'the job has ended' };
     if (this.closed) return { kind: 'none', reason: this.closed };
-    const vm = this.vm;
-    if (!vm) return { kind: 'none', reason: "this job's docker policy grants no Docker actions, so it has no Docker VM" };
+    let vm = this.vm;
+    if (!vm) {
+      if (this.boundFor === undefined || !this.grants) {
+        return { kind: 'none', reason: "this job's docker policy grants no Docker actions, so it has no Docker VM" };
+      }
+      if (!options.boot) return { kind: 'none', reason: "the job's Docker VM was never started" };
+      vm = this.bootForFirstRequest();
+      if (!vm) return { kind: 'none', reason: this.closed ?? "the job's Docker VM could not be started" };
+    }
     switch (vm.state()) {
       case 'ready':
         return { kind: 'ready', socketPath: vm.dockerSocketPath };
@@ -304,10 +338,10 @@ class VmWorker implements WorkerDocker {
 
   async pull(req: PullRequest, onProgress: (p: DockerProgress) => void, signal: AbortSignal): Promise<void> {
     const vm = this.vm;
-    if (!vm || vm.state() !== 'ready' || !this.bootedFor) throw new Error("the job's Docker VM is not ready");
+    if (!vm || vm.state() !== 'ready' || !this.boundFor) throw new Error("the job's Docker VM is not ready");
     const ready = this.readyInfo ?? (await vm.ready());
     const result = await this.opts.puller.pull({
-      repository: this.bootedFor,
+      repository: this.boundFor,
       request: req,
       rosetta: ready.rosetta,
       dockerSocketPath: vm.dockerSocketPath,
@@ -363,17 +397,28 @@ class VmWorker implements WorkerDocker {
     };
   }
 
+  /**
+   * Worker exit. A job whose VM never booted - it made no Docker request -
+   * has nothing to stop, sweep or refresh: no helper ran and no VM directory
+   * or disk was made, and once this has started no request boots one.
+   */
   release(): Promise<void> {
     this.releasing ??= (async () => {
       const vm = this.vm;
       this.stopSpare('the worker exited');
       if (vm) {
-        await vm.stop('the job ended');
+        try {
+          await vm.stop('the job ended');
+        } finally {
+          // Its pulls' totals and the credentials they were given go with
+          // it, though it failed to stop.
+          this.opts.puller.forget(vm.dockerSocketPath);
+        }
         this.log('info', `Docker VM ${vm.vmId} released: the job ended`);
       }
       // What the job pulled from a registry is in the Mac's store; a refresh
       // loads it into the repository's cache disk for the next job.
-      if (this.pulledNew && this.bootedFor) this.opts.cacheDisks.scheduleRefresh(repoKeyOf(this.bootedFor), this.bootedFor);
+      if (this.pulledNew && this.boundFor) this.opts.cacheDisks.scheduleRefresh(repoKeyOf(this.boundFor), this.boundFor);
     })();
     return this.releasing;
   }

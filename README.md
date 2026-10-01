@@ -128,7 +128,7 @@ A repository opts in to container work by declaring `pull`, `run` and `build` ac
 - **Proxy settings are injected.** localmost sets `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, `https_proxy` and `NO_PROXY` in routable containers and as build args, keeping any value the job sets itself.
 - **Base images must be pulled before a build.** The builder in the VM cannot reach a registry, so `docker pull` the `FROM` images first.
 - **`pull.registries` includes the registry's redirects.** Pulls run on the Mac, so registry credentials never enter the VM, and localmost follows a registry's redirects (to its CDN, usually) to any public https host, outside the job's `network.allow`. Only public https registries can be pulled from.
-- **Credential helpers fail the pull, never fall back to anonymous.** With `credsStore: desktop` in `~/.docker/config.json`, Docker Desktop must be running for a pull to work, even of a public image: its helper does not answer otherwise. Start it, or remove `credsStore`.
+- **Pulls are anonymous until a registry asks for credentials.** Public images never run a credential helper. When a registry does ask, the helper `~/.docker/config.json` names (`credsStore` or `credHelpers`) must answer, or the pull fails naming the key: with `credsStore: desktop`, Docker Desktop's helper answers only while Docker Desktop is running. Start it, or change the key.
 
 The policy grammar is in [docs/roadmap/localmostrc.md](docs/roadmap/localmostrc.md#docker-access), and what the VM does and does not contain is under Docker Access in [SECURITY.md](SECURITY.md).
 

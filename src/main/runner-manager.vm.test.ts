@@ -191,7 +191,7 @@ describe('a docker job on the VM backend, through the runner', () => {
     fs.rmSync(data, { recursive: true, force: true });
   });
 
-  it('boots the VM at the claim, once, serves the job through it, and releases it when the worker exits', async () => {
+  it("boots the VM at the job's first Docker request, once, serves the job through it, and releases it when the worker exits", async () => {
     const pulls: string[] = [];
     const cacheDisks: CacheDisks = {
       prepareJobDisk: async (_repoKey, dest) => {
@@ -208,6 +208,7 @@ describe('a docker job on the VM backend, through the runner', () => {
         opts.onProgress({ status: 'Pulled' });
         return { manifestDigest: `sha256:${'1'.repeat(64)}`, configDigest: `sha256:${'2'.repeat(64)}`, platform: 'linux/arm64', source: 'registry' };
       },
+      forget: () => {},
     };
     const guest = new GuestImage(path.join(data, 'res', 'guest'));
     vmManager = new DefaultVmManager({
@@ -271,8 +272,13 @@ describe('a docker job on the VM backend, through the runner', () => {
     }
     expect(getRepoPolicy.mock.calls.length).toBeGreaterThan(claimLookups);
     await new Promise((resolve) => setImmediate(resolve));
+    // The claim boots nothing, and nor does the baseline every client asks first.
+    expect((await request(socket, 'GET', '/v1.45/version')).status).toBe(200);
+    expect(fs.existsSync(path.join(data, 'vm', 'jobs'))).toBe(false);
+    expect(logs.some((l) => /booting/.test(l.message))).toBe(false);
 
-    // The job's docker client: the create waits for the VM and goes through it.
+    // The job's docker client: the create, its first request that needs the
+    // daemon, boots the VM, waits for it and goes through it.
     const create = await request(socket, 'POST', '/v1.45/containers/create', { Image: 'alpine:3' });
     expect(create.status).toBe(201);
     expect(JSON.parse(create.body).Id).toBe(CID);
@@ -296,15 +302,84 @@ describe('a docker job on the VM backend, through the runner', () => {
     expect(fs.existsSync(path.join(data, 'vm', 'jobs', vmId))).toBe(false);
 
     const messages = logs.map((l) => l.message);
-    const boot = messages.findIndex((m) => m.includes(`Docker VM ${vmId} booting for owner/repo at the claim`));
+    const boot = messages.findIndex((m) => m.includes(`Docker VM ${vmId} booting for owner/repo: the job's first Docker request`));
     const ready = messages.findIndex((m) => m.startsWith(`Docker VM ${vmId} ready in `));
     const released = messages.findIndex((m) => m.includes(`Docker VM ${vmId} released: the job ended`));
     expect(boot).toBeGreaterThan(-1);
     expect(ready).toBeGreaterThan(boot);
     expect(released).toBeGreaterThan(ready);
     // One VM for the job, whatever the number of binds.
-    expect(messages.filter((m) => /booting for owner\/repo at the claim/.test(m))).toHaveLength(1);
+    expect(messages.filter((m) => /Docker VM .* booting/.test(m))).toHaveLength(1);
+    expect(messages.some((m) => /at the claim/.test(m))).toBe(false);
     expect(messages.some((m) => m.includes(`pulled docker.io/library/alpine:3 (sha256:${'1'.repeat(64)}, linux/arm64) on the Mac; loaded into VM ${vmId}`))).toBe(true);
+  }, 120_000);
+
+  it('starts no VM, helper or disk for a docker job that never asks for the daemon', async () => {
+    const helperSpawns: string[] = [];
+    const disks: string[] = [];
+    const guest = new GuestImage(path.join(data, 'res', 'guest'));
+    const cacheDisks: CacheDisks = {
+      prepareJobDisk: async (_repoKey, dest) => {
+        disks.push(dest);
+        fs.writeFileSync(dest, '', { flag: 'wx' });
+        return 'blank';
+      },
+      notePulled: () => {},
+      scheduleRefresh: () => {},
+      discard: async () => {},
+    };
+    vmManager = new DefaultVmManager({
+      dataDir: fs.realpathSync(data),
+      resources: path.join(data, 'res'),
+      helperPath,
+      guest,
+      config: () => config,
+      cacheDisks,
+      log: (level, message) => logs.push({ level, message, timestamp: '' } as LogEntry),
+      spawnHelper: () => (h, args, env) => {
+        helperSpawns.push(h);
+        return spawn(process.execPath, [h, ...args], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+      },
+      freeBytes: async () => 500 * 1024 ** 3,
+      excludeFromBackup: async () => {},
+    });
+    const backend = new VmBackend({
+      vmManager,
+      guest,
+      puller: { pull: async () => { throw new Error('unused'); }, forget: () => {} },
+      cacheDisks,
+      config: () => config,
+    });
+    const manager = new RunnerManager({
+      onLog: (entry) => logs.push(entry),
+      onStatusChange: () => {},
+      onJobHistoryUpdate: () => {},
+      dockerBackend: backend,
+      getDockerVmConfig: () => config,
+      getRepoPolicy: async () => ({
+        hosts: [], level: 'strict', readPaths: [], writePaths: [],
+        docker: { run: { images: ['alpine:3'] }, pull: { registries: ['docker.io'] } },
+      }),
+      getJobTarget: () => ({ targetDisplayName: 'owner/repo', repository: 'owner/repo', githubSha: 'abc123', githubWorkflow: 'CI' }),
+    });
+    const worker = createMockProcess(42000 + (process.pid % 1000));
+    jest.mocked(spawnSandboxed).mockReturnValue(worker);
+    await new RunnerManagerTestHelper(manager).spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubRepo: 'owner/repo', githubSha: 'abc123' });
+    const socket = jest.mocked(spawnSandboxed).mock.calls.at(-1)![2]!.dockerSocket as string;
+    const proxyOptions = jest.mocked(ProxyServer).mock.calls.at(-1)![0] as unknown as { onJobAcquired: (id: string) => Promise<void> };
+    await proxyOptions.onJobAcquired('job-1');
+    worker.stdout!.emit('data', Buffer.from('Running job: build\n'));
+    // The job's tools ask what the daemon is, and nothing more.
+    expect((await request(socket, 'GET', '/_ping')).status).toBe(200);
+    expect((await request(socket, 'GET', '/v1.45/version')).status).toBe(200);
+    expect((await request(socket, 'GET', '/v1.45/info')).status).toBe(200);
+    worker.emit('exit', 0, null);
+    await until(() => !fs.existsSync(socket), 'the socket to stop');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(helperSpawns).toEqual([]);
+    expect(disks).toEqual([]);
+    expect(fs.existsSync(path.join(data, 'vm', 'jobs'))).toBe(false);
+    expect(logs.some((l) => /Docker VM .*(booting|released)/.test(l.message))).toBe(false);
   }, 120_000);
 
   it('uses the spare only for a claim from the repository the worker was spawned for', async () => {
@@ -340,7 +415,7 @@ describe('a docker job on the VM backend, through the runner', () => {
     const backend = new VmBackend({
       vmManager,
       guest,
-      puller: { pull: async () => { throw new Error('unused'); } },
+      puller: { pull: async () => { throw new Error('unused'); }, forget: () => {} },
       cacheDisks: { scheduleRefresh: () => {} },
       config: () => config,
     });
