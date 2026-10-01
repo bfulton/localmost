@@ -260,8 +260,9 @@ app.whenReady().then(async () => {
 
   // The per-job Docker VMs (docs/roadmap/vm-docker-backend.md). One is
   // booted at the first Docker request, beyond the baseline, of a job whose
-  // policy grants Docker, and goes with its worker. Every path is the app's own: <data>, realpathed once, and
-  // the helper, guest and CLI in Resources (or the checkout's build/).
+  // policy grants Docker, and goes with its worker. Every path is the app's
+  // own: <data>, realpathed once, and the helper, guest and CLI in Resources
+  // (or the checkout's build/).
   // Read from config.yaml at each worker spawn, and cached in between.
   const dockerVmConfigSource = new DockerVmConfigSource({
     read: () => loadConfig().dockerVm,

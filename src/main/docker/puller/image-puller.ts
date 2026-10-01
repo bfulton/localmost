@@ -24,10 +24,11 @@
  * job (§6.1). "Public" is owner decision 1 (§6.3 "Which store"): an image
  * whose manifest or config was read from the job's own store never is;
  * whenever the pull holds the operator's credentials the image is public only
- * if the registry also serves its manifest anonymously, bytes and all; and a
- * public image's layers are fetched anonymously too, so that one the registry
- * refuses makes the image the job's after all. A private image's blobs go to
- * the job's own store, in the VM's directory, and go with the VM.
+ * if the registry also serves its index, manifest and config anonymously,
+ * bytes and all; and a public image's layers are fetched anonymously too, so
+ * that one the registry refuses makes the image the job's after all. A
+ * private image's blobs go to the job's own store, in the VM's directory, and
+ * go with the VM.
  *
  * Every pull runs in Electron main, so one VM runs at most three at once and
  * all VMs together eight; the rest wait their turn.
@@ -477,11 +478,13 @@ export class VmImagePuller implements ImagePuller {
     // them there, and the job store answers for any registry and repository
     // that names their digest, so a second pull through another one could
     // otherwise carry a private config into the shared store. Otherwise
-    // public only when the registry serves the manifest anonymously, asked
-    // whenever the answer could be no: whenever a refusal had the session
-    // ask for the operator's credentials and it got some, sent yet or not.
-    // A pull with neither has fetched everything so far anonymously, and
-    // fetches its layers the same way.
+    // public only when the registry serves anonymously everything the shared
+    // store would keep that the pull may have fetched with the credentials -
+    // the index, the manifest and the config - asked whenever the answer
+    // could be no: whenever a refusal had the session ask for the operator's
+    // credentials and it got some, sent yet or not. A pull with neither has
+    // fetched everything so far anonymously, and fetches its layers the same
+    // way.
     const fromJobStore = resolved.fromJobStore || config.from === jobStore;
     const mustAsk = session.hasCredentials || session.usedCredentials;
     let isPublic = !fromJobStore;
@@ -492,7 +495,10 @@ export class VmImagePuller implements ImagePuller {
     if (isPublic && mustAsk) {
       try {
         const anonymous = await this.options.client.open({ registry, repositoryPath }, 'anonymous', signal);
-        isPublic = await anonymous.serves(resolved.manifestDigest);
+        isPublic =
+          (await anonymous.serves(resolved.manifestDigest)) &&
+          (resolved.indexDigest === undefined || (await anonymous.serves(resolved.indexDigest))) &&
+          (await anonymous.servesBlob(resolved.config.digest, MAX_CONFIG_BYTES));
         if (isPublic) layerSession = anonymous;
       } catch (error) {
         if (signal.aborted) throw new PullError('the pull was cancelled');

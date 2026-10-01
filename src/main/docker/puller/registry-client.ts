@@ -36,7 +36,7 @@ import * as net from 'net';
 import { app } from 'electron';
 import { dnsLookup, HostLookup, isBlockedAddress, isLoopbackAddress, pinnedLookup } from '../../../shared/egress-screen';
 import { DIGEST_RE } from '../../vm/paths';
-import type { RegistryCredentials } from '../registry-auth';
+import { RegistryAuthError, type RegistryCredentials } from '../registry-auth';
 import { cleanText } from './clean-text';
 
 /** A pull failed; the message is for the job's log and the operator. */
@@ -579,7 +579,8 @@ export class RegistrySession {
   private authorization: string | undefined;
   /** The operator's credentials, once a refusal had them asked for. */
   private credentials: RegistryCredentials | undefined;
-  private credentialsAsked = false;
+  /** The one ask for them, which every request the registry refused meanwhile waits for. */
+  private asking: Promise<boolean> | undefined;
   /** While set, a refusal only the operator's credentials could answer is a CredentialsRequiredError. */
   private credentialsRefused = false;
   /** The registry's last challenge from its own origin, for a refusal that names none. */
@@ -616,12 +617,28 @@ export class RegistrySession {
     this.credentialsRefused = false;
   }
 
-  /** Whether a refusal can be answered with the operator's credentials, asked for now, once per session. */
-  private async escalate(): Promise<boolean> {
-    if (!this.askCredentials || this.credentialsRefused || this.credentialsAsked) return false;
-    this.credentialsAsked = true;
-    this.credentials = await this.askCredentials();
-    return this.credentials !== undefined;
+  /**
+   * Whether a refusal can be answered with the operator's credentials, asked
+   * for once per session: requests refused while the ask runs all wait for
+   * it. A helper that fails says that the registry's anonymous refusal is why
+   * it ran, since a repository that does not exist is refused the same way.
+   */
+  private escalate(): Promise<boolean> {
+    const ask = this.askCredentials;
+    if (!ask || this.credentialsRefused) return Promise.resolve(false);
+    this.asking ??= ask().then(
+      (credentials) => {
+        this.credentials = credentials;
+        return credentials !== undefined;
+      },
+      (error: unknown) => {
+        if (!(error instanceof RegistryAuthError)) throw error;
+        throw new RegistryAuthError(
+          `${this.registry} refused an anonymous pull of ${this.repositoryPath} (private, or no such repository), so localmost asked for credentials: ${error.message}`
+        );
+      }
+    );
+    return this.asking;
   }
 
   /** A refusal that only the operator's credentials could have answered. */
@@ -654,16 +671,16 @@ export class RegistrySession {
    * answered once per request with what the session has: the first time for
    * the session's token, and again whenever that token has expired. A 401
    * that this does not cure has the operator's credentials asked for, once
-   * per session, and is answered once more with them. A 401 from a redirect
-   * target is never answered, because its challenge names a realm the target
-   * chose (§6.1): it fails the request.
+   * per session, and is answered once more with them, once per request. A
+   * 401 from a redirect target is never answered, because its challenge
+   * names a realm the target chose (§6.1): it fails the request.
    */
   private async api(method: 'GET' | 'HEAD', apiPath: string, accept?: string): Promise<http.IncomingMessage> {
     const url = new URL(`/v2/${this.repositoryPath}/${apiPath}`, this.origin);
     const headers: Record<string, string> = accept ? { accept } : {};
     const describe = (target: URL, hop: number) =>
       hop === 0 ? `registry \`${this.registry}\`` : `\`${target.host}\` (where the registry redirected)`;
-    for (let answered = false; ; ) {
+    for (let answered = false, escalated = false; ; ) {
       const { res, url: from, hops } = await this.client.request(
         url,
         {
@@ -688,17 +705,21 @@ export class RegistrySession {
       if (!challenge) return res;
       this.challenge = challenge;
       if (!answered && this.canAnswer(challenge)) answered = true;
-      else if (!(await this.escalate())) return res;
+      else if (escalated || !(await this.escalate())) return res;
+      else escalated = true;
       drain(res);
       await this.authenticate(challenge);
     }
   }
 
   private async authenticate(challenge: Challenge): Promise<void> {
+    // What this request sends, which another request's ask for the
+    // credentials does not change while it runs.
+    const credentials = this.credentials;
     if (challenge.scheme === 'basic') {
-      if (this.credentials?.kind === 'basic') {
+      if (credentials?.kind === 'basic') {
         this.usedCredentials = true;
-        this.authorization = this.basicAuthorization(this.credentials);
+        this.authorization = this.basicAuthorization(credentials);
       }
       return;
     }
@@ -720,10 +741,10 @@ export class RegistrySession {
     const service = challenge.params.service;
     let answer: Answered;
     const describe = () => `the registry's token service ${realm.host}`;
-    if (this.credentials?.kind === 'identity-token') {
+    if (credentials?.kind === 'identity-token') {
       const form = new URLSearchParams({
         grant_type: 'refresh_token',
-        refresh_token: this.credentials.token,
+        refresh_token: credentials.token,
         client_id: 'localmost',
         scope,
         ...(service ? { service } : {}),
@@ -745,9 +766,9 @@ export class RegistrySession {
       if (service) url.searchParams.set('service', service);
       url.searchParams.set('scope', scope);
       let authorization: { origin: string; value: string } | undefined;
-      if (this.credentials?.kind === 'basic') {
+      if (credentials?.kind === 'basic') {
         this.usedCredentials = true;
-        authorization = { origin: url.origin, value: this.basicAuthorization(this.credentials) };
+        authorization = { origin: url.origin, value: this.basicAuthorization(credentials) };
       }
       answer = await this.client.request(url, { method: 'GET', authorization, redirects: 'refuse', signal: this.signal }, describe);
     }
@@ -755,7 +776,7 @@ export class RegistrySession {
     if (res.statusCode !== 200) {
       const status = res.statusCode ?? 0;
       const text = await registryErrorText(res);
-      if (this.credentials) {
+      if (credentials) {
         throw new PullError(`${this.registry} refused the credentials from ~/.docker/config.json${text ? `: ${text}` : ''}`);
       }
       // A token service that gives no anonymous tokens wants the operator's.
@@ -833,6 +854,22 @@ export class RegistrySession {
       return false;
     }
     const bytes = await readBody(res, MAX_MANIFEST_BYTES, 'manifest');
+    return `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}` === digest;
+  }
+
+  /**
+   * Whether the registry serves this session the blob with this digest, at
+   * most `max` bytes of it: a GET whose bytes hash to it, as for serves.
+   */
+  async servesBlob(digest: string, max: number): Promise<boolean> {
+    checkDigest(digest, this.describe(cleanText(digest, 100)));
+    if (!digest.startsWith('sha256:')) throw new PullError(`${cleanText(digest, 100)} is not a blob digest`);
+    const res = await this.api('GET', `blobs/${digest}`);
+    if (res.statusCode !== 200) {
+      drain(res);
+      return false;
+    }
+    const bytes = await readBody(res, max, 'blob');
     return `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}` === digest;
   }
 

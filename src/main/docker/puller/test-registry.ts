@@ -259,6 +259,8 @@ export interface RegistrySwitches {
   headAnswersEverything?: boolean;
   /** Blobs of a public repository that only a token standing for a user is served. */
   privateBlobs?: Set<string>;
+  /** Manifests of a public repository, by tag or digest, that only a token standing for a user is served. */
+  privateManifests?: Set<string>;
   /** The token service answers a request with no credentials 401, as some registries' do. */
   anonymousTokensRefused?: boolean;
 }
@@ -502,7 +504,9 @@ export class TestRegistry {
       return;
     }
     const open = kind === 'blobs' && this.switches.openBlobs && repo !== undefined;
-    const needsUser = kind === 'blobs' && this.switches.privateBlobs?.has(reference) && !readToken(req.headers.authorization)?.user;
+    const needsUser =
+      (kind === 'blobs' ? this.switches.privateBlobs : this.switches.privateManifests)?.has(decodeURIComponent(reference)) &&
+      !readToken(req.headers.authorization)?.user;
     if (!repo || needsUser || (!open && !this.authorized(req, repo, name))) {
       if (req.headers.authorization) {
         this.send(res, 401, {

@@ -269,6 +269,8 @@ describe('VmBackend', () => {
       w.bind('other/repo', grants);
       expect(manager.vms).toHaveLength(1);
       expect(manager.vms[0].stops).toEqual(['bound to another repository']);
+      // That VM's job state, the credentials its pulls were given with it, goes with it.
+      expect(puller.forget.mock.calls).toEqual([[manager.vms[0].dockerSocketPath]]);
       const endpoint = await firstRequest(w, 10);
       expect(endpoint.kind).toBe('none');
       expect(manager.vms).toHaveLength(1);
@@ -314,6 +316,7 @@ describe('VmBackend', () => {
     it('boots the VM once, however many requests arrive while it boots, and every one waits for it', async () => {
       const w = worker();
       w.bind('owner/repo', grants);
+      expect(manager.vms).toHaveLength(0);
       const waiting = [firstRequest(w), firstRequest(w), firstRequest(w)];
       expect(manager.vms).toHaveLength(1);
       const vm = manager.vms[0];
@@ -328,6 +331,7 @@ describe('VmBackend', () => {
     it("gives the boot's failure to every request waiting on it, and to later ones, and never boots again", async () => {
       const w = worker();
       w.bind('owner/repo', grants);
+      expect(manager.vms).toHaveLength(0);
       const waiting = [firstRequest(w), firstRequest(w)];
       manager.vms[0].fail('disk', 'E_NO_DISK', 'not enough free disk for a Docker VM');
       const reason = "the job's Docker VM failed to start (disk, E_NO_DISK): not enough free disk for a Docker VM";
@@ -616,6 +620,15 @@ describe('VmBackend', () => {
       idle.bind('owner/repo', {});
       await idle.release();
       expect(refreshes).toEqual([]);
+    });
+
+    it('has the puller forget the job even when the VM fails to stop', async () => {
+      const w = await readyWorker();
+      manager.vms[0].stop = async () => {
+        throw new Error('the helper would not stop');
+      };
+      await expect(w.release()).rejects.toThrow('the helper would not stop');
+      expect(puller.forget.mock.calls).toEqual([[manager.vms[0].dockerSocketPath]]);
     });
 
     it('stops the spare too', async () => {

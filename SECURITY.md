@@ -612,7 +612,9 @@ Credential helpers are run only from `/opt/homebrew/bin`, `/usr/local/bin` and
 `/Applications/Docker.app/Contents/Resources/bin`, never looked up on
 `PATH`. When the registry wants credentials, a configured helper that is
 missing, or fails for any reason but "credentials not found", fails the pull
-with a message naming the helper and the config key.
+with a message naming the helper and the config key, after saying that the
+registry refused an anonymous pull (which is also how Docker Hub answers a
+repository that does not exist).
 
 **What a pull reaches.** The puller speaks only https, to registries on public
 addresses: a registry whose name resolves to a loopback, link-local or private
@@ -648,10 +650,10 @@ through `run.images: ['*']` with an image id, or, with root in the VM, by
 reading the raw disk. So an image that needed credentials never enters the
 cache: an image whose pull never needed them is public, and its layers are
 fetched anonymously too; one that did is cached only if the registry then
-serves its manifest digest anonymously, and its layers are again fetched
-without the credentials. An image the registry will not serve that way, or
-one of whose layers it will not, is kept only for the job that pulled it, in
-its VM's directory, and deleted with the VM.
+serves its manifest, index and config digests anonymously, and its layers
+are again fetched without the credentials. An image the registry will not
+serve that way, or one of whose layers it will not, is kept only for the job
+that pulled it, in its VM's directory, and deleted with the VM.
 
 **Root in the VM is worth little more than the job.** A kernel exploit from a
 container gives root in the VM. The VM holds only this job's share (the
@@ -711,11 +713,12 @@ declares nothing under `docker:` has only the baseline of `/_ping`,
 `/version`, `/info` and reads about its own containers, none of which change
 anything, and no VM boots for its jobs (a pre-warmed spare, if one is enabled,
 is stopped at the claim); nor, for a repository that does declare some, does
-one boot until its job asks for more than these: until a VM is running, localmost answers those three
-from the guest image's manifest. They would otherwise describe the daemon's
-host: its name, data directory, proxy and registry configuration and labels,
-so a running VM's `/info` is rewritten to keep only what clients use to start
-- `ServerVersion`, `OSType`, `Architecture`, `OperatingSystem`,
+one boot until its job asks for more than these: until a VM is running,
+localmost answers those three from the guest image's manifest. They would
+otherwise describe the daemon's host: its name, data directory, proxy and
+registry configuration and labels, so a running VM's `/info` is rewritten to
+keep only what clients use to start - `ServerVersion`, `OSType`,
+`Architecture`, `OperatingSystem`,
 `KernelVersion`, `NCPU`, `MemTotal`, `Driver`, `CgroupVersion` and
 `SecurityOptions`. The filter's design is in
 `docs/superpowers/specs/2026-09-05-docker-isolation-design.md`, and the VM's,

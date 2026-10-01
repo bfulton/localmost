@@ -510,7 +510,8 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
     `/opt/homebrew/bin`, `/usr/local/bin` and Docker.app's bundled `bin`, not
     on `PATH`. When the registry wants credentials, a missing or failing
     helper fails the pull, naming the config key, where it used to pull
-    anonymously. With `credsStore: desktop` configured, a private image
+    anonymously; the error first says the registry refused an anonymous pull,
+    which Docker Hub also does for a repository that does not exist. With `credsStore: desktop` configured, a private image
     needs Docker Desktop's helper to answer (it hangs while Docker Desktop is
     installed but not running, and the pull fails after 10 s saying so)
   - An image that needed credentials is pulled again by every job; it is

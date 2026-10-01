@@ -742,6 +742,84 @@ describe("the operator's credentials, asked for only when the registry wants the
     expect(fs.existsSync(refsJsonPath(dataDir, REPO_KEY))).toBe(false);
     expect(notePulled).not.toHaveBeenCalled();
   });
+
+  it('names the anonymous refusal that had it ask, before the failure of the helper', async () => {
+    // Docker Hub answers a repository that does not exist 401, as it does a
+    // private one: the job is told why the helper ran at all.
+    registry.putImage(IMAGE, buildImage(), 'v1');
+    const attempt = pull(puller(credsStore('fails', 'echo broken >&2; exit 3')), { request: { repositoryPath: 'team/typo' } });
+    await expect(attempt).rejects.toBeInstanceOf(RegistryAuthError);
+    await expect(attempt).rejects.toThrow(
+      `${REGISTRY_HOST} refused an anonymous pull of team/typo (private, or no such repository), so localmost asked for credentials: ` +
+        'the Docker credential helper `docker-credential-fails` (from `credsStore` in ~/.docker/config.json) failed'
+    );
+  });
+
+  describe('when the manifest needed them but the registry also serves it anonymously', () => {
+    /** The tag is served only with credentials; its manifest, by digest, to anyone. */
+    function tagNeedsCredentials(image: ReturnType<typeof buildImage>): void {
+      registry.users.set('me', 'pw');
+      registry.putImage(IMAGE, image, 'v1');
+      registry.switches.privateManifests = new Set(['v1']);
+    }
+    const layerRequests = (image: ReturnType<typeof buildImage>) =>
+      blobRequests().filter((r) => r.path.endsWith(`/blobs/${layerOf(image)}`));
+
+    it('fetches the layers anonymously into the shared store', async () => {
+      const image = buildImage();
+      tagNeedsCredentials(image);
+      await expect(pull(puller(credsStore('works', answers)))).resolves.toMatchObject({ source: 'registry' });
+      expect(helperRuns()).toBe(1);
+      expect(publicBlobs()).toContain(layerOf(image).slice(7));
+      expect(notePulled).toHaveBeenCalledWith(REPO_KEY, image.configDigest);
+      expect(layerRequests(image).length).toBeGreaterThan(0);
+      for (const request of layerRequests(image)) {
+        expect(request.headers.authorization ?? '').not.toMatch(/^Basic /);
+        expect(bearerUser(request.headers.authorization)).toBeNull();
+      }
+    });
+
+    it('keeps the image for the job when a layer is served only with the credentials', async () => {
+      const image = buildImage();
+      tagNeedsCredentials(image);
+      registry.switches.privateBlobs = new Set([layerOf(image)]);
+      await expect(pull(puller(credsStore('works', answers)))).resolves.toMatchObject({ source: 'registry' });
+      expect(helperRuns()).toBe(1);
+      expect(publicBlobs()).not.toContain(layerOf(image).slice(7));
+      expect(jobBlobs()).toContain(layerOf(image).slice(7));
+      expect(fs.existsSync(refsJsonPath(dataDir, REPO_KEY))).toBe(false);
+      expect(notePulled).not.toHaveBeenCalled();
+      // The one that needed them was fetched with them, in the end.
+      expect(layerRequests(image).some((r) => bearerUser(r.headers.authorization) === 'me')).toBe(true);
+    });
+
+    it('keeps the image for the job when its config is served only with the credentials', async () => {
+      const image = buildImage();
+      registry.users.set('me', 'pw');
+      registry.putImage(IMAGE, image, 'v1');
+      registry.switches.privateBlobs = new Set([image.configDigest]);
+      await expect(pull(puller(credsStore('works', answers)))).resolves.toMatchObject({ source: 'registry' });
+      expect(helperRuns()).toBe(1);
+      expect(publicBlobs()).toEqual([]);
+      expect(jobBlobs()).toContain(image.configDigest.slice(7));
+      expect(fs.existsSync(refsJsonPath(dataDir, REPO_KEY))).toBe(false);
+      expect(notePulled).not.toHaveBeenCalled();
+    });
+
+    it('keeps the image for the job when its index is served only with the credentials', async () => {
+      const image = buildImage();
+      const index = buildIndex([{ image, platform: { os: 'linux', architecture: 'arm64' } }]);
+      registry.users.set('me', 'pw');
+      registry.putIndex(IMAGE, index, [image], 'v1');
+      registry.switches.privateManifests = new Set(['v1', index.digest]);
+      await expect(pull(puller(credsStore('works', answers)))).resolves.toMatchObject({ source: 'registry' });
+      expect(helperRuns()).toBe(1);
+      expect(publicBlobs()).toEqual([]);
+      expect(jobBlobs()).toContain(index.digest.slice(7));
+      expect(fs.existsSync(refsJsonPath(dataDir, REPO_KEY))).toBe(false);
+      expect(notePulled).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe('platform choice', () => {

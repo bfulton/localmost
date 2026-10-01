@@ -1346,18 +1346,23 @@ first: a bearer challenge is answered with an anonymous token request. The
 credentials are asked for (`resolveRegistryCredentials`) only when the
 registry refuses: a 401 from its own origin that the anonymous answer did not
 cure, for a manifest or a blob, or a token service that answers an anonymous
-token request 401 or 403. Then the challenge is answered once more, with
-them. They are asked for at most once per registry per job: the puller keeps
-what one job's sessions were given, an answer and a failure alike, keyed by
-registry (`CredentialMemo`), and forgets it when the job's VM is released.
-So a registry that serves everything anonymously never has its credential
-helper run, and a helper that is missing, hangs or fails is an error only for
-an image that needed it (`RegistryAuthError`, naming the helper and the
-config key, as §5.1 says). A session records whether it sent the
-credentials (`usedCredentials`), which §6.3 "Which store" reads. A session
-can be told to refuse them (`refuseCredentials()`): a refusal that only they
-would answer then fails with `CredentialsRequiredError`, and nothing is
-asked for or sent; an `anonymous` session always does.
+token request 401 or 403. Then the challenge is answered once more, with them.
+They are asked for at most once per registry per job: the puller keeps what
+one job's sessions were given, an answer and a failure alike, keyed by
+registry (`CredentialMemo`), and forgets it when the job's VM is released. So
+a registry that serves everything anonymously never has its credential helper
+run, and a helper that is missing, hangs or fails is an error only for an
+image that needed it (`RegistryAuthError`, naming the helper and the config
+key, as §5.1 says). That error first says why the helper ran: `<registry>
+refused an anonymous pull of <repository> (private, or no such repository), so
+localmost asked for credentials: …`, since Docker Hub refuses a repository
+that does not exist the way it refuses a private one. Requests of one session
+that are refused while the ask runs all wait for that one ask. A session
+records whether it sent the credentials (`usedCredentials`), which §6.3 "Which
+store" reads. A session can be told to refuse them (`refuseCredentials()`): a
+refusal that only they would answer then fails with
+`CredentialsRequiredError`, and nothing is asked for or sent; an `anonymous`
+session always does.
 
 **Redirects.** Followed (CDN blob hosts) only to `https:` URLs, at most 5
 hops, each hop screened. Electron main follows them, so any registry in
@@ -1474,31 +1479,35 @@ holds is deleted, except blobs a pull in progress has pinned.
 own store, the image stays in the job store, without asking: only a private
 image puts them there, and the job store answers for any registry and
 repository that names their digest, so a second pull of that digest through
-another repository (whose registry may answer anything) could otherwise
-carry a private config into the shared store. Otherwise, when a refusal had
-the pull's session ask for the operator's credentials and it got some (sent
-yet or not), then once the manifest and config are resolved and before any
-layer is fetched, the puller asks the registry anonymously for the same
-manifest digest: a token exchange with no credentials, then a `GET` whose
-bytes must hash to that digest. A status alone is not evidence, since a
-registry can answer `200` to anything. Asking before the layers, not after,
-lets them stream straight into the store they belong to; the digest asked
-about is the same either way. A pull with neither has fetched everything so
-far anonymously (§6.1) and is public without asking. A public image's layers
-are fetched anonymously too: with the anonymous session that asked, or with
-the pull's own session told to refuse credentials. A layer the registry then
-refuses (`CredentialsRequiredError`) makes the image need credentials after
-all: it becomes private, the session may use the credentials again, and the
-layers are fetched once more into the job store (what was already fetched
-anonymously stays in the public store, unrecorded, until the next refresh
-drops it). So every blob in the public store was served anonymously.
-If the registry serves it, the image is public:
-its blobs go to `<data>/vm/images/<repoKey>` and it becomes eligible for the
-golden disk. If not, its blobs go to `<data>/vm/jobs/<vmId>/blobs` and are
-deleted with the VM, it is not recorded in `refs.json` (which alone decides
-what a refresh loads, §6.5), and `notePulled` is not called. (This is option
-(a) of the design's owner decision 1, which the owner chose; option (b) would
-key the store by policy hash instead.)
+another repository (whose registry may answer anything) could otherwise carry
+a private config into the shared store. Otherwise, when a refusal had the
+pull's session ask for the operator's credentials and it got some (sent yet or
+not), then once the manifest and config are resolved and before any layer is
+fetched, the puller asks the registry anonymously for everything the public
+store would keep that the session may have fetched with them: the platform
+manifest, the index when there is one, and the config, each by its digest.
+Each is a token exchange with no credentials, then a `GET` whose bytes must
+hash to that digest. A status alone is not evidence, since a registry can
+answer `200` to anything. All three must be served, or the image is the job's.
+Asking before the layers, not after, lets them stream straight into the store
+they belong to; the digests asked about are the same either way. A pull with
+neither has fetched everything so far anonymously (§6.1) and is public without
+asking. A public image's layers are fetched anonymously too: with the
+anonymous session that asked, or with the pull's own session told to refuse
+credentials. A layer the registry then refuses (`CredentialsRequiredError`)
+makes the image need credentials after all: it becomes private, the session
+may use the credentials again, and the layers are fetched once more into the
+job store (what was already fetched anonymously stays in the public store,
+unrecorded, until the next refresh drops it). So every blob in the public
+store was served anonymously: the layers as they were fetched, and the index,
+manifest and config when they were fetched, or by the check above. If the
+registry serves them, the image is public: its blobs go to
+`<data>/vm/images/<repoKey>` and it becomes eligible for the golden disk. If
+not, its blobs go to `<data>/vm/jobs/<vmId>/blobs` and are deleted with the
+VM, it is not recorded in `refs.json` (which alone decides what a refresh
+loads, §6.5), and `notePulled` is not called. (This is option (a) of the
+design's owner decision 1, which the owner chose; option (b) would key the
+store by policy hash instead.)
 
 ### 6.4 `ImagePuller`
 

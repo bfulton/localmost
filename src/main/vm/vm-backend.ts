@@ -162,7 +162,11 @@ class VmWorker implements WorkerDocker {
         this.log('warn', vm ? `${this.closed}; stopping it` : this.closed);
         this.vm = null;
         this.readyInfo = null;
-        if (vm) void vm.stop('bound to another repository');
+        if (vm) {
+          // Its pulls' totals and the credentials they were given go with it.
+          this.opts.puller.forget(vm.dockerSocketPath);
+          void vm.stop('bound to another repository');
+        }
       }
       // Otherwise only the policy changes, which the filter holds.
       this.grants = hasDockerGrants(policy);
@@ -403,10 +407,14 @@ class VmWorker implements WorkerDocker {
       const vm = this.vm;
       this.stopSpare('the worker exited');
       if (vm) {
-        await vm.stop('the job ended');
+        try {
+          await vm.stop('the job ended');
+        } finally {
+          // Its pulls' totals and the credentials they were given go with
+          // it, though it failed to stop.
+          this.opts.puller.forget(vm.dockerSocketPath);
+        }
         this.log('info', `Docker VM ${vm.vmId} released: the job ended`);
-        // Its pulls' totals and the credentials they were given go with it.
-        this.opts.puller.forget(vm.dockerSocketPath);
       }
       // What the job pulled from a registry is in the Mac's store; a refresh
       // loads it into the repository's cache disk for the next job.
