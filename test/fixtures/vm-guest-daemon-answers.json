@@ -1,5 +1,5 @@
 {
-  "comment": "The daemon answers of the guest build smoke boot (scripts/guest/build-guest.js), forwarded unchanged from dockerd over vsock 2375: /_ping (GET and HEAD), /version and /info, with the Date header dropped. The filter test compares its synthesised baseline (contract 5.3) with these, field by field, after its /info rewrite. Recorded from guest 2026.10.0 with rootfs.erofs sha256 95e1441f13a94b264c24bef4fbbe0eefb8abf2d365a04f278339d2577c411613. Written by `npm run build:guest -- --write-fixture`; do not edit by hand.",
+  "comment": "The daemon answers of the guest build smoke boot (scripts/guest/build-guest.js), forwarded unchanged from dockerd over vsock 2375: /_ping (GET and HEAD), /version and /info, with the Date header dropped. The filter test compares its synthesised baseline (contract 5.3) with these, field by field, after its /info rewrite. Recorded from guest 2026.10.0 with rootfs.erofs sha256 c72eedf84f216da087edbbc1d9842efddecab75c71e61dcac32e321f8777978b. Written by `npm run build:guest -- --write-fixture`; do not edit by hand.",
   "guestVersion": "2026.10.0",
   "vm": {
     "cpus": 2,
@@ -134,7 +134,7 @@
         "transfer-encoding": "chunked"
       },
       "body": {
-        "ID": "89d3e998-054e-423b-9e3d-64695756f91a",
+        "ID": "6824605b-3226-4d33-a558-d78e64444168",
         "Containers": 0,
         "ContainersRunning": 0,
         "ContainersPaused": 0,
@@ -200,7 +200,7 @@
         "NFd": 24,
         "OomKillDisable": false,
         "NGoroutines": 50,
-        "SystemTime": "2026-09-30T22:25:10.077619958Z",
+        "SystemTime": "2026-10-01T03:17:06.957588833Z",
         "LoggingDriver": "json-file",
         "CgroupDriver": "cgroupfs",
         "CgroupVersion": "2",

@@ -10,7 +10,7 @@ import (
 )
 
 func TestReadyOnlyOnceEveryConfigureStepPassed(t *testing.T) {
-	failed := &agent.Selftest{Rules: true, InternalNoRelay: true, InternalForgedRejected: false, GatewayRejected: true, BridgeReachesRelay: true}
+	failed := &agent.Selftest{Rules: true, InternalNoRelay: true, InternalForgedRejected: false, GatewayRejected: true, BridgeReachesRelay: true, OutsideRejected: true}
 	cases := []struct {
 		name  string
 		fake  *agenttest.Fake
@@ -21,6 +21,10 @@ func TestReadyOnlyOnceEveryConfigureStepPassed(t *testing.T) {
 		{"dockerd did not start", &agenttest.Fake{DockerErr: errors.New("no ping")}, false},
 		// dockerd is running here, behind a firewall that failed its test.
 		{"the self-test failed", &agenttest.Fake{Selftest: failed}, false},
+		// Everything else passed, but a connection bound off the guest was not reset.
+		{"outbound traffic was not refused", &agenttest.Fake{Selftest: &agent.Selftest{
+			Rules: true, InternalNoRelay: true, InternalForgedRejected: true, GatewayRejected: true, BridgeReachesRelay: true,
+		}}, false},
 	}
 	for _, c := range cases {
 		a := agent.New(c.fake)

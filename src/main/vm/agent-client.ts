@@ -104,6 +104,7 @@ const readConfigure = (a: Record<string, unknown>, mode: 'job' | 'refresh'): Age
       internalForgedRejected: bool(selftest.internalForgedRejected, 'selftest.internalForgedRejected'),
       gatewayRejected: bool(selftest.gatewayRejected, 'selftest.gatewayRejected'),
       bridgeReachesRelay: bool(selftest.bridgeReachesRelay, 'selftest.bridgeReachesRelay'),
+      outsideRejected: bool(selftest.outsideRejected, 'selftest.outsideRejected'),
     },
   };
   if (mode === 'job') {

@@ -456,7 +456,7 @@ uses an answer to choose a host path.
 | op | Request fields | Answer fields | Timeout |
 |---|---|---|---|
 | `hello` | – | `agent` (semver), `guestVersion`, `kernel`, `agentProtocol`: 1 | 5 s |
-| `configure` | `vmId`, `mode`, `timeUnixMs`, `share`: `{ "tag": "work", "mountPath": <S>, "nonceFile": ".localmost-share" }` (job), `rosetta`: bool, `relay`: `{ "address": "198.18.0.1", "port": 3128, "vsockPort": 3128 }` (job) | `docker`: `{ version, apiVersion, minApiVersion }`, `disk`: `formatted`, `existing` or `corrupt`, `nonce` (≤ 64 chars, job), `rosetta`: `ok`, `absent` or `broken`, `selftest`: `{ rules, internalNoRelay, internalForgedRejected, gatewayRejected, bridgeReachesRelay }`, each a bool | 60 s |
+| `configure` | `vmId`, `mode`, `timeUnixMs`, `share`: `{ "tag": "work", "mountPath": <S>, "nonceFile": ".localmost-share" }` (job), `rosetta`: bool, `relay`: `{ "address": "198.18.0.1", "port": 3128, "vsockPort": 3128 }` (job) | `docker`: `{ version, apiVersion, minApiVersion }`, `disk`: `formatted`, `existing` or `corrupt`, `nonce` (≤ 64 chars, job), `rosetta`: `ok`, `absent` or `broken`, `selftest`: `{ rules, internalNoRelay, internalForgedRejected, gatewayRejected, bridgeReachesRelay, outsideRejected }`, each a bool | 60 s |
 | `approve-binds` | `container` (64 hex), `binds`: up to 64 × `{ source, destination, readOnly }` | – | 10 s |
 | `set-time` | `unixMs` | – | 10 s |
 | `status` | – | `dockerd`: `running` or `exited`, `uptimeMs` | 10 s |
@@ -538,7 +538,26 @@ iptables -A LOCALMOST-INPUT -d 198.18.0.1/32 -p tcp --dport 3128 -j LOCALMOST-RE
 iptables -A LOCALMOST-INPUT -p tcp -j REJECT --reject-with tcp-reset
 iptables -A LOCALMOST-INPUT -j REJECT --reject-with icmp-port-unreachable
 iptables -I INPUT 1 -j LOCALMOST-INPUT
+iptables -N LOCALMOST-NOROUTE
+iptables -A LOCALMOST-NOROUTE -o lm0 -p tcp -j REJECT --reject-with tcp-reset
+iptables -A LOCALMOST-NOROUTE -o lm0 -j REJECT --reject-with icmp-net-unreachable
+iptables -N DOCKER-USER
+iptables -A DOCKER-USER -j LOCALMOST-NOROUTE
+iptables -I OUTPUT 1 -j LOCALMOST-NOROUTE
 ```
+
+In a job VM the agent also adds `ip route add default dev lm0`, and `lm-init`
+sets `net.ipv4.icmp_ratelimit=0`. A job VM has no NIC, so this route goes
+nowhere: it exists so that a connection to anything off the guest is routed
+into the dummy `lm0` and reset by `LOCALMOST-NOROUTE`, from a container
+(through `FORWARD`, where `dockerd` evaluates `DOCKER-USER` first and keeps
+its rules) or from the guest itself (through `OUTPUT`). Without the route the
+kernel answers such a packet with its own unreachable, which it rate-limits,
+so a raw connect that ignored the proxy settings hung until its SYN timeout.
+*Verified*, WP-A acceptance after the integration review: five connects in a
+row to `1.1.1.1:443` from the default bridge and from the guest's namespace
+are each refused (ECONNREFUSED), in about 100 ms with the `docker run`; from
+an `internal` network the connect still fails with ENETUNREACH (no route).
 
 `LOCALMOST-RELAY` accepts the relay address only from the bridges of routable
 networks. It starts with `-A LOCALMOST-RELAY -i docker0 -j ACCEPT` (the
@@ -579,9 +598,12 @@ instead of timing out. *Verified:* with no listener on `198.18.0.1:53`,
 
 Self-test, using `iproute2` network namespaces, after `dockerd` is up:
 
-- `rules`: `iptables -S LOCALMOST-INPUT` equals, line for line, the golden
-  output in `guest/internal/firewall/testdata/localmost-input.txt`, and
-  `INPUT` starts with the jump. `iptables -S` prints rules in canonical form,
+- `rules`: `iptables -S LOCALMOST-INPUT` and `iptables -S LOCALMOST-NOROUTE`
+  equal, line for line, the golden output in
+  `guest/internal/firewall/testdata/localmost-input.txt` and
+  `localmost-noroute.txt`; `INPUT` starts with the jump to `LOCALMOST-INPUT`,
+  `OUTPUT` and `DOCKER-USER` with the jump to `LOCALMOST-NOROUTE`, and
+  `FORWARD` with `dockerd`'s jump to `DOCKER-USER`. `iptables -S` prints rules in canonical form,
   not as they were written. The expected form for iptables-nft 1.8 is below;
   WP-A replaces it with the verbatim capture from the pinned `iptables`
   package and checks the file in:
@@ -606,6 +628,10 @@ Self-test, using `iproute2` network namespaces, after `dockerd` is up:
 - `bridgeReachesRelay`: after the scratch bridge is added to
   `LOCALMOST-RELAY`, with a default route through that gateway, it connects to
   `198.18.0.1:3128`.
+- `outsideRejected`: that namespace, and then the guest's own, connecting to
+  `192.0.2.1:443` (TEST-NET-1, off the guest), each get a reset at once
+  (ECONNREFUSED). A timeout, or the kernel's rate-limited unreachable, fails
+  it: either means `LOCALMOST-NOROUTE` is not what refused the connection.
 
 The scratch bridge, its relay rule and the namespace are removed afterwards.
 *Verified behaviour that motivates this:* in the spike, a container on an

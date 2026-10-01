@@ -1,0 +1,3 @@
+-N LOCALMOST-NOROUTE
+-A LOCALMOST-NOROUTE -o lm0 -p tcp -j REJECT --reject-with tcp-reset
+-A LOCALMOST-NOROUTE -o lm0 -j REJECT --reject-with icmp-net-unreachable

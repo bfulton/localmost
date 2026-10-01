@@ -612,6 +612,24 @@ async function main() {
       return `default bridge ${bridge}, internal ${internal}`;
     });
 
+    await step('a direct connection off the guest is reset at once, from a container and from the guest itself (LOCALMOST-NOROUTE)', async () => {
+      // Without the default route into lm0 the kernel answers with its own
+      // rate-limited unreachable, and a connect hangs until its SYN timeout.
+      // Five in a row, so a rate limit would show.
+      const timed = async (args) => {
+        const t = Date.now();
+        const out = (await d(['run', '--rm', ...args, 'sh', '-c', 'for i in 1 2 3 4 5; do netprobe connect 1.1.1.1 443; done'])).stdout;
+        return { out: out.split('\n'), ms: Date.now() - t };
+      };
+      const bridge = await timed(['bb:arm']);
+      const guest = await timed(['--network', 'host', 'bb:arm']);
+      const internal = (await d(['run', '--rm', '--network', 'lmint', 'bb:arm', 'netprobe', 'connect', '1.1.1.1', '443'])).stdout;
+      if (bridge.out.length !== 5 || bridge.out.some((l) => l !== 'ECONNREFUSED')) throw new Error(`default bridge: ${bridge.out.join(' ')}`);
+      if (guest.out.length !== 5 || guest.out.some((l) => l !== 'ECONNREFUSED')) throw new Error(`guest: ${guest.out.join(' ')}`);
+      if (internal !== 'ENETUNREACH') throw new Error(`internal: ${internal}`);
+      return `default bridge ${bridge.out[0]} x5 (${bridge.ms} ms with the run), guest ${guest.out[0]} x5 (${guest.ms} ms), internal ${internal}`;
+    });
+
     await step('DNS for an external name fails in under 100 ms (timed in the container)', async () => {
       const r = await d(['run', '--rm', 'bb:arm', 'sh', '-c', 'time nslookup example.com'], { allowFail: true });
       const real = /real\s+(\d+)m\s*([\d.]+)s/.exec(r.stderr);

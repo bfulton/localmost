@@ -65,7 +65,7 @@ describe('UnixAgentClient', () => {
     disk: 'formatted',
     nonce: 'a'.repeat(32),
     rosetta: 'ok',
-    selftest: { rules: true, internalNoRelay: true, internalForgedRejected: true, gatewayRejected: true, bridgeReachesRelay: true },
+    selftest: { rules: true, internalNoRelay: true, internalForgedRejected: true, gatewayRejected: true, bridgeReachesRelay: true, outsideRejected: true },
   };
   const jobConfigure: AgentConfigureRequest = {
     vmId: '1-0123456789ab',

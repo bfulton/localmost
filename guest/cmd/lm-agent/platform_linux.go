@@ -169,6 +169,10 @@ func (p *platform) SetupNetwork(job bool) error {
 			{"link", "add", "lm0", "type", "dummy"},
 			{"addr", "add", "198.18.0.1/32", "dev", "lm0"},
 			{"link", "set", "lm0", "up"},
+			// Everything off the guest is routed into the dummy, so that
+			// LOCALMOST-NOROUTE resets it; with no route the kernel's own
+			// unreachable is rate-limited and a connect hangs.
+			{"route", "add", "default", "dev", "lm0"},
 		} {
 			if err := command("ip", s...); err != nil {
 				return err

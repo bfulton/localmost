@@ -61,6 +61,9 @@ var mounts = []mnt{
 var sysctls = [][2]string{
 	{"net/ipv4/ip_forward", "1"},
 	{"net/bridge/bridge-nf-call-iptables", "1"},
+	// The firewall's ICMP rejections are not rate-limited, so a UDP send
+	// that is refused fails at once every time, not only the first few.
+	{"net/ipv4/icmp_ratelimit", "0"},
 	{"kernel/dmesg_restrict", "1"},
 	{"kernel/panic_on_oops", "1"},
 	{"kernel/kexec_load_disabled", "1"},

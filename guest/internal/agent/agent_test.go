@@ -81,7 +81,7 @@ func TestConfigureRunsTheStepsInOrderAndAnswers(t *testing.T) {
 		t.Fatalf("answer %v", m)
 	}
 	st := m["selftest"].(map[string]any)
-	for _, k := range []string{"rules", "internalNoRelay", "internalForgedRejected", "gatewayRejected", "bridgeReachesRelay"} {
+	for _, k := range []string{"rules", "internalNoRelay", "internalForgedRejected", "gatewayRejected", "bridgeReachesRelay", "outsideRejected"} {
 		if st[k] != true {
 			t.Fatalf("selftest %v", st)
 		}
@@ -110,7 +110,7 @@ func TestConfigureStopsAtTheFirstFailureWithItsCode(t *testing.T) {
 		{"share mount", &agenttest.Fake{ShareErr: errors.New("virtiofs")}, "E_SHARE_MOUNT", []string{"clock", "disk", "share"}},
 		{"firewall", &agenttest.Fake{NetworkErr: errors.New("iptables")}, "E_SELFTEST", []string{"clock", "disk", "share", "rosetta", "network"}},
 		{"dockerd", &agenttest.Fake{DockerErr: errors.New("no ping")}, "E_DOCKERD", []string{"clock", "disk", "share", "rosetta", "network", "dockerd"}},
-		{"selftest", &agenttest.Fake{Selftest: &agent.Selftest{Rules: true, InternalNoRelay: true, InternalForgedRejected: false, GatewayRejected: true, BridgeReachesRelay: true}}, "E_SELFTEST", []string{"clock", "disk", "share", "rosetta", "network", "dockerd", "selftest"}},
+		{"selftest", &agenttest.Fake{Selftest: &agent.Selftest{Rules: true, InternalNoRelay: true, InternalForgedRejected: false, GatewayRejected: true, BridgeReachesRelay: true, OutsideRejected: true}}, "E_SELFTEST", []string{"clock", "disk", "share", "rosetta", "network", "dockerd", "selftest"}},
 	}
 	for _, c := range cases {
 		a := agent.New(c.fake)

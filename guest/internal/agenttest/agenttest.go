@@ -86,7 +86,7 @@ func (f *Fake) SelfTest(job bool) agent.Selftest {
 	if f.Selftest != nil {
 		return *f.Selftest
 	}
-	return agent.Selftest{Rules: true, InternalNoRelay: job, InternalForgedRejected: job, GatewayRejected: job, BridgeReachesRelay: job}
+	return agent.Selftest{Rules: true, InternalNoRelay: job, InternalForgedRejected: job, GatewayRejected: job, BridgeReachesRelay: job, OutsideRejected: job}
 }
 
 func (f *Fake) DockerdRunning() bool { return true }

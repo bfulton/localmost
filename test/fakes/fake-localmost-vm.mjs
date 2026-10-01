@@ -195,8 +195,8 @@ function answerAgent(connection, request) {
         rosetta: request.rosetta ? 'ok' : 'absent',
         // A refresh VM checks its rules alone and reports the rest as not run (§3.4).
         selftest: mode === 'job'
-          ? { rules: true, internalNoRelay: true, internalForgedRejected: true, gatewayRejected: true, bridgeReachesRelay: true }
-          : { rules: true, internalNoRelay: false, internalForgedRejected: false, gatewayRejected: false, bridgeReachesRelay: false },
+          ? { rules: true, internalNoRelay: true, internalForgedRejected: true, gatewayRejected: true, bridgeReachesRelay: true, outsideRejected: true }
+          : { rules: true, internalNoRelay: false, internalForgedRejected: false, gatewayRejected: false, bridgeReachesRelay: false, outsideRejected: false },
       };
       if (mode === 'job') {
         const fd = fs.openSync(path.join(request.share.mountPath, request.share.nonceFile), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);

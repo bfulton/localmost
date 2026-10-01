@@ -321,14 +321,21 @@ describe('DefaultVmManager', () => {
     });
 
     it('at configure: a firewall self-test that did not pass', async () => {
-      scripts.push({ configure: { answer: { selftest: { rules: true, internalNoRelay: true, internalForgedRejected: false, gatewayRejected: true, bridgeReachesRelay: true } } } });
+      scripts.push({ configure: { answer: { selftest: { rules: true, internalNoRelay: true, internalForgedRejected: false, gatewayRejected: true, bridgeReachesRelay: true, outsideRejected: true } } } });
       const vm = manager().start(jobRequest());
       await expectFailure(vm, 'configure', 'E_SELFTEST');
       expect(vm.failure()!.message).toContain('internalForgedRejected');
     });
 
+    it('at configure: a job whose connection off the guest was not reset at once', async () => {
+      scripts.push({ configure: { answer: { selftest: { rules: true, internalNoRelay: true, internalForgedRejected: true, gatewayRejected: true, bridgeReachesRelay: true, outsideRejected: false } } } });
+      const vm = manager().start(jobRequest());
+      await expectFailure(vm, 'configure', 'E_SELFTEST');
+      expect(vm.failure()!.message).toContain('outsideRejected');
+    });
+
     it('at configure: a refresh VM checks the firewall rules alone, which is all its self-test runs', async () => {
-      const notRun = { internalNoRelay: false, internalForgedRejected: false, gatewayRejected: false, bridgeReachesRelay: false };
+      const notRun = { internalNoRelay: false, internalForgedRejected: false, gatewayRejected: false, bridgeReachesRelay: false, outsideRejected: false };
       scripts.push({ configure: { answer: { selftest: { rules: true, ...notRun } } } });
       await expect(manager().start(refreshRequest()).ready()).resolves.toMatchObject({ docker: { version: '29.5.3' } });
       scripts.push({ configure: { answer: { selftest: { rules: false, ...notRun } } } });

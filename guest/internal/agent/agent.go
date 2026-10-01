@@ -38,6 +38,7 @@ type Selftest struct {
 	InternalForgedRejected bool `json:"internalForgedRejected"`
 	GatewayRejected        bool `json:"gatewayRejected"`
 	BridgeReachesRelay     bool `json:"bridgeReachesRelay"`
+	OutsideRejected        bool `json:"outsideRejected"`
 }
 
 // Passed reports whether every check ran and passed. In refresh mode only
@@ -46,7 +47,8 @@ func (s Selftest) Passed(job bool) bool {
 	if !job {
 		return s.Rules
 	}
-	return s.Rules && s.InternalNoRelay && s.InternalForgedRejected && s.GatewayRejected && s.BridgeReachesRelay
+	return s.Rules && s.InternalNoRelay && s.InternalForgedRejected && s.GatewayRejected && s.BridgeReachesRelay &&
+		s.OutsideRejected
 }
 
 // Disk states configure reports.

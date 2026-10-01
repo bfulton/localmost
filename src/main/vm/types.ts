@@ -156,6 +156,8 @@ export interface AgentConfigureResult {
     internalForgedRejected: boolean;
     gatewayRejected: boolean;
     bridgeReachesRelay: boolean;
+    /** A connection off the guest, forwarded or the guest's own, was reset at once. */
+    outsideRejected: boolean;
   };
 }
 

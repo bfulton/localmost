@@ -1,9 +1,10 @@
-// Package firewall is the guest's INPUT firewall (contract §3.6): the rules
+// Package firewall is the guest's firewall (contract §3.6): the rules
 // applied before dockerd starts, the golden form the self-test compares
 // against, and the LOCALMOST-RELAY chain kept in step with Docker's
 // network events. Only the bridges of routable networks may reach the
 // relay address; everything else sent to the guest's root namespace is
-// rejected at once.
+// rejected at once, and so is anything routed toward the outside world,
+// which the guest has no way to reach.
 package firewall
 
 import (
@@ -20,11 +21,25 @@ import (
 //go:embed testdata/localmost-input.txt
 var Golden string
 
+// NoRouteGolden is `iptables -S LOCALMOST-NOROUTE`, captured the same way.
+//
+//go:embed testdata/localmost-noroute.txt
+var NoRouteGolden string
+
 // BridgeNameOption is the network option that names a bridge's interface.
 const BridgeNameOption = "com.docker.network.bridge.name"
 
 // Rules returns the iptables argument lists applied, in order, before
 // dockerd starts. The last opens the relay to the default bridge.
+//
+// LOCALMOST-NOROUTE is for traffic bound off the guest. A job VM has no NIC,
+// only a default route into the dummy lm0, so a container's connection that
+// ignores the proxy settings is forwarded toward lm0 and reset here, at
+// once. Without the route the kernel answers with its own ICMP, which it
+// rate-limits, so a raw connect hung until its SYN timeout. dockerd keeps
+// DOCKER-USER's rules and evaluates that chain first in FORWARD, ahead of
+// the accept it adds for each bridge's outbound traffic; OUTPUT does the
+// same for the guest's own processes.
 func Rules() [][]string {
 	return [][]string{
 		{"-N", "LOCALMOST-RELAY"},
@@ -35,6 +50,12 @@ func Rules() [][]string {
 		{"-A", "LOCALMOST-INPUT", "-p", "tcp", "-j", "REJECT", "--reject-with", "tcp-reset"},
 		{"-A", "LOCALMOST-INPUT", "-j", "REJECT", "--reject-with", "icmp-port-unreachable"},
 		{"-I", "INPUT", "1", "-j", "LOCALMOST-INPUT"},
+		{"-N", "LOCALMOST-NOROUTE"},
+		{"-A", "LOCALMOST-NOROUTE", "-o", "lm0", "-p", "tcp", "-j", "REJECT", "--reject-with", "tcp-reset"},
+		{"-A", "LOCALMOST-NOROUTE", "-o", "lm0", "-j", "REJECT", "--reject-with", "icmp-net-unreachable"},
+		{"-N", "DOCKER-USER"},
+		{"-A", "DOCKER-USER", "-j", "LOCALMOST-NOROUTE"},
+		{"-I", "OUTPUT", "1", "-j", "LOCALMOST-NOROUTE"},
 		RelayRule("-A", "docker0"),
 	}
 }
@@ -55,26 +76,63 @@ func lines(s string) []string {
 	return out
 }
 
-// CheckRules compares `iptables -S LOCALMOST-INPUT` with the golden output,
-// line for line, and checks that `iptables -S INPUT` jumps to it first.
-func CheckRules(chainOut, inputOut string) error {
-	got, want := lines(chainOut), lines(Golden)
-	if len(got) != len(want) {
-		return fmt.Errorf("LOCALMOST-INPUT has %d lines, want %d", len(got), len(want))
+// sameLines compares an `iptables -S` listing with its golden form, line
+// for line.
+func sameLines(chain, got, want string) error {
+	g, w := lines(got), lines(want)
+	if len(g) != len(w) {
+		return fmt.Errorf("%s has %d lines, want %d", chain, len(g), len(w))
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			return fmt.Errorf("LOCALMOST-INPUT line %d is %q, want %q", i+1, got[i], want[i])
+	for i := range w {
+		if g[i] != w[i] {
+			return fmt.Errorf("%s line %d is %q, want %q", chain, i+1, g[i], w[i])
 		}
 	}
-	var rules []string
-	for _, l := range lines(inputOut) {
-		if strings.HasPrefix(l, "-A INPUT ") {
-			rules = append(rules, l)
+	return nil
+}
+
+// startsWith checks that the first rule of a chain's listing is want.
+func startsWith(chain, listing, want string) error {
+	for _, l := range lines(listing) {
+		if strings.HasPrefix(l, "-A "+chain+" ") {
+			if l != want {
+				break
+			}
+			return nil
 		}
 	}
-	if len(rules) == 0 || rules[0] != "-A INPUT -j LOCALMOST-INPUT" {
-		return fmt.Errorf("INPUT does not start with the jump to LOCALMOST-INPUT")
+	return fmt.Errorf("%s does not start with %q", chain, want)
+}
+
+// CheckRules reads each chain's `iptables -S` listing through list, once
+// dockerd is up, and checks it: LOCALMOST-INPUT and LOCALMOST-NOROUTE equal
+// their golden output, INPUT and OUTPUT jump to them first, and FORWARD
+// reaches LOCALMOST-NOROUTE through DOCKER-USER before any rule dockerd
+// added.
+func CheckRules(list func(chain string) (string, error)) error {
+	get := map[string]string{}
+	for _, chain := range []string{"LOCALMOST-INPUT", "INPUT", "LOCALMOST-NOROUTE", "OUTPUT", "DOCKER-USER", "FORWARD"} {
+		out, err := list(chain)
+		if err != nil {
+			return fmt.Errorf("iptables -S %s: %w", chain, err)
+		}
+		get[chain] = out
+	}
+	if err := sameLines("LOCALMOST-INPUT", get["LOCALMOST-INPUT"], Golden); err != nil {
+		return err
+	}
+	if err := sameLines("LOCALMOST-NOROUTE", get["LOCALMOST-NOROUTE"], NoRouteGolden); err != nil {
+		return err
+	}
+	for _, first := range [][2]string{
+		{"INPUT", "-A INPUT -j LOCALMOST-INPUT"},
+		{"OUTPUT", "-A OUTPUT -j LOCALMOST-NOROUTE"},
+		{"DOCKER-USER", "-A DOCKER-USER -j LOCALMOST-NOROUTE"},
+		{"FORWARD", "-A FORWARD -j DOCKER-USER"},
+	} {
+		if err := startsWith(first[0], get[first[0]], first[1]); err != nil {
+			return err
+		}
 	}
 	return nil
 }

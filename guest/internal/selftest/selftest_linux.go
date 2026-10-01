@@ -4,7 +4,8 @@
 // namespace once dockerd is up (contract §3.6): the rules are the golden
 // ones, a namespace on a bridge outside LOCALMOST-RELAY cannot reach the
 // relay by routing or by a forged route, cannot reach a 0.0.0.0 listener
-// on its gateway, and reaches the relay once its bridge is let in.
+// on its gateway, reaches the relay once its bridge is let in, and is
+// reset at once when it connects anywhere off the guest.
 package selftest
 
 import (
@@ -33,6 +34,8 @@ const (
 	Gateway = "100.127.254.1"
 	Client  = "100.127.254.2"
 	relayIP = "198.18.0.1"
+	// An address off the guest: TEST-NET-1, which nothing answers for.
+	outsideIP = "192.0.2.1"
 )
 
 // Run is the self-test. `ignore` makes the relay drop the probe's own
@@ -80,17 +83,22 @@ func Run(job bool, ignore func(ip string) (undo func()), logf func(string, ...an
 	err = connectIn(nsPath, relayIP, 3128)
 	st.BridgeReachesRelay = err == nil
 	logf("selftest: routable bridge to relay: %v", err)
+
+	// A connection that ignores the proxy settings is reset at once, both
+	// forwarded from a bridge and from the guest's own namespace: anything
+	// else (a timeout, or the kernel's rate-limited unreachable) means the
+	// LOCALMOST-NOROUTE path is not what refused it.
+	err = connectIn(nsPath, outsideIP, 443)
+	logf("selftest: routable bridge to %s: %v", outsideIP, err)
+	fromGuest := connectIn("/proc/self/ns/net", outsideIP, 443)
+	logf("selftest: guest to %s: %v", outsideIP, fromGuest)
+	st.OutsideRejected = errors.Is(err, unix.ECONNREFUSED) && errors.Is(fromGuest, unix.ECONNREFUSED)
 	return st
 }
 
 func checkRules(logf func(string, ...any)) bool {
-	chain, err1 := output("iptables", "-S", "LOCALMOST-INPUT")
-	input, err2 := output("iptables", "-S", "INPUT")
-	if err1 != nil || err2 != nil {
-		logf("selftest: iptables -S: %v %v", err1, err2)
-		return false
-	}
-	if err := firewall.CheckRules(chain, input); err != nil {
+	list := func(chain string) (string, error) { return output("iptables", "-S", chain) }
+	if err := firewall.CheckRules(list); err != nil {
 		logf("selftest: rules: %v", err)
 		return false
 	}
