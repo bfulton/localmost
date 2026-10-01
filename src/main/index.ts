@@ -298,6 +298,8 @@ app.whenReady().then(async () => {
     helperPath,
     guest: guestImage,
     config: dockerVmConfig,
+    // Read at each data disk, so a changed runner count is used at once.
+    runnerSlots: () => getRunnerManager()?.getRunnerCount() ?? 1,
     cacheDisks,
     log: vmLog,
   });

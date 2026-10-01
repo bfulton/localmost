@@ -89,6 +89,7 @@ export class VmHarness {
       helperPath: () => path.join(resources, HELPER_NAME),
       guest,
       config: () => config,
+      runnerSlots: () => 1,
       cacheDisks: blankDisks,
       log,
     });

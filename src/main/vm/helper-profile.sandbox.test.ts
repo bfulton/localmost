@@ -26,6 +26,7 @@ import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { buildHelperProfile, HelperProfileOptions } from './helper-profile';
+import { dockerOnPath } from '../test-utils/vm-fixtures';
 
 const isMacOS = process.platform === 'darwin';
 
@@ -249,12 +250,16 @@ if (!isMacOS) {
     });
 
     it('cannot run the helper, which carries the virtualization entitlement', () => {
-      // Found beside the bundled CLI, which the job's PATH starts with. The
-      // job profile denies its exec by path; the constructed form of this is
-      // in process-sandbox.sandbox.test.ts, with a compiled stand-in. Until
-      // packaging ships the helper there is nothing at the path to refuse.
-      const cliDir = (process.env.PATH ?? '').split(':')[0];
-      expect(path.basename(cliDir)).toBe('docker-cli');
+      // Found beside the bundled CLI, which the runner puts on the job's PATH
+      // ahead of any other docker (npm and jest, which run this, put
+      // node_modules/.bin in front of it). The job profile denies its exec by
+      // path; the constructed form of this is in process-sandbox.sandbox.test.ts,
+      // with a compiled stand-in. Until packaging ships the helper there is
+      // nothing at the path to refuse.
+      const { bundledDir, resolved } = dockerOnPath(process.env.PATH ?? '');
+      expect(bundledDir).toBeDefined();
+      const cliDir = bundledDir!;
+      expect(resolved).toBe(path.join(cliDir, 'docker'));
       const helper = path.join(path.dirname(cliDir), 'localmost-vm');
       const result = shell(`${sq(helper)} version`);
       expect(result.ok).toBe(false);

@@ -32,6 +32,7 @@ import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { generateSandboxProfile, RunnerProfileOptions } from './process-sandbox';
+import { dockerOnPath } from './test-utils/vm-fixtures';
 
 // The real home by default; one block below stands a directory of its own in
 // for it, since os.homedir() is what the profile is built from.
@@ -1484,10 +1485,15 @@ if (!isMacOS) {
       }
     });
 
-    it('runs the bundled docker CLI first on its PATH, and reads nothing else of the app bundle', () => {
-      const cliDir = (process.env.PATH ?? '').split(':')[0];
-      expect(path.basename(cliDir)).toBe('docker-cli');
-      expect(shell(`${sq(path.join(cliDir, 'docker'))} --version`).stdout).toMatch(/^Docker version /);
+    it('runs the bundled docker CLI, ahead of any other on its PATH, and reads nothing else of the app bundle', () => {
+      // Not necessarily first: npm and jest, which run this, put
+      // node_modules/.bin in front. No other docker may come before it.
+      const { bundledDir, resolved } = dockerOnPath(process.env.PATH ?? '');
+      expect(bundledDir).toBeDefined();
+      const cliDir = bundledDir!;
+      expect(resolved).toBe(path.join(cliDir, 'docker'));
+      expect(shell('command -v docker').stdout).toBe(path.join(cliDir, 'docker'));
+      expect(shell('docker --version').stdout).toMatch(/^Docker version /);
       expect(refused(`ls ${sq(path.dirname(cliDir))}`)).toBe(true);
     });
 

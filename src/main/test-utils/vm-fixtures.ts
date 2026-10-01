@@ -141,3 +141,28 @@ export function writeGuest(dir: string, overrides: Record<string, unknown> = {})
   fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(manifest));
   return manifest;
 }
+
+/**
+ * Where `docker` resolves on a PATH, as a shell's lookup finds it - the first
+ * directory holding an executable file of that name - and the bundled CLI's
+ * directory, `docker-cli`, on it. The runner puts the bundled directory first
+ * on a job's PATH, but what a job runs may put more in front of it (npm and
+ * jest put node_modules/.bin first), so what matters is not that it is first
+ * but that no other docker comes before it: then `resolved` is its `docker`.
+ */
+export function dockerOnPath(pathEnv: string): { bundledDir: string | undefined; resolved: string | undefined } {
+  const dirs = pathEnv.split(':').filter((dir) => dir !== '');
+  const isExecutableFile = (file: string): boolean => {
+    try {
+      fs.accessSync(file, fs.constants.X_OK);
+      return fs.statSync(file).isFile();
+    } catch {
+      return false;
+    }
+  };
+  const resolvedDir = dirs.find((dir) => isExecutableFile(path.join(dir, 'docker')));
+  return {
+    bundledDir: dirs.find((dir) => path.basename(dir) === 'docker-cli'),
+    resolved: resolvedDir === undefined ? undefined : path.join(resolvedDir, 'docker'),
+  };
+}

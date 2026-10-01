@@ -4,14 +4,14 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
-import { execFileSync, spawn } from 'child_process';
+import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { DockerVmConfig } from '../config';
 import { GuestImage } from './guest-image';
 import { DefaultVmManager, processExecutableOf, VmManagerOptions } from './vm-manager';
 import type { VmError, VmHandle, VmRequest } from './types';
-import { assertVmSocketsFit, FAKE_HELPER, fakeHelperSpawn, layOutVmData, shortTempDir, VmLayout } from '../test-utils/vm-fixtures';
+import { assertVmSocketsFit, dockerOnPath, FAKE_HELPER, fakeHelperSpawn, layOutVmData, shortTempDir, VmLayout } from '../test-utils/vm-fixtures';
 
 // Each test spawns real processes - the fake helper is a node - and these
 // suites also run inside a job's sandbox on a loaded CI machine: jest's 5 s
@@ -58,6 +58,44 @@ describe('the VM test fixtures', () => {
     expect(() => assertVmSocketsFit(`/${'x'.repeat(67)}`)).toThrow(/104 bytes, past the 103 a unix socket's path may have/);
     expect(() => assertVmSocketsFit(`/${'x'.repeat(66)}`)).not.toThrow();
   });
+
+  describe("find where docker resolves on a job's PATH", () => {
+    let root: string;
+    let bin: string;
+    let cli: string;
+    let other: string;
+
+    beforeEach(() => {
+      root = shortTempDir();
+      bin = path.join(root, 'node_modules', '.bin');
+      cli = path.join(root, 'Resources', 'docker-cli');
+      other = path.join(root, 'usr-local-bin');
+      for (const dir of [bin, cli, other]) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(bin, 'jest'), '', { mode: 0o755 });
+      fs.writeFileSync(path.join(cli, 'docker'), '', { mode: 0o755 });
+      fs.writeFileSync(path.join(other, 'docker'), '', { mode: 0o755 });
+    });
+
+    afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
+
+    it('resolves to the bundled CLI behind a directory with no docker, as npm puts node_modules/.bin first', () => {
+      expect(dockerOnPath(`${bin}:${cli}:${other}:/usr/bin`)).toEqual({ bundledDir: cli, resolved: path.join(cli, 'docker') });
+    });
+
+    it('resolves to another docker that comes before the bundled one', () => {
+      expect(dockerOnPath(`${other}:${cli}`)).toEqual({ bundledDir: cli, resolved: path.join(other, 'docker') });
+    });
+
+    it('has no bundled directory when the PATH has none', () => {
+      expect(dockerOnPath(`${bin}:${other}`)).toEqual({ bundledDir: undefined, resolved: path.join(other, 'docker') });
+    });
+
+    it('passes over a docker that is not an executable file, as the shell does', () => {
+      fs.chmodSync(path.join(other, 'docker'), 0o644);
+      fs.mkdirSync(path.join(bin, 'docker'));
+      expect(dockerOnPath(`${bin}:${other}:${cli}`).resolved).toBe(path.join(cli, 'docker'));
+    });
+  });
 });
 
 describe('DefaultVmManager', () => {
@@ -70,6 +108,7 @@ describe('DefaultVmManager', () => {
   let prepared: Array<{ repoKey: string; dest: string; sizeGiB: number }>;
   let discarded: Array<{ repoKey: string; reason: string }>;
   let managers: DefaultVmManager[];
+  let runnerSlots: number;
 
   beforeEach(() => {
     root = shortTempDir();
@@ -81,6 +120,7 @@ describe('DefaultVmManager', () => {
     prepared = [];
     discarded = [];
     managers = [];
+    runnerSlots = 1;
   });
 
   afterEach(async () => {
@@ -95,6 +135,7 @@ describe('DefaultVmManager', () => {
       helperPath: () => FAKE_HELPER,
       guest: new GuestImage(path.join(layout.resources, 'guest')),
       config: () => config,
+      runnerSlots: () => runnerSlots,
       cacheDisks: {
         prepareJobDisk: async (repoKey, dest, sizeGiB) => {
           prepared.push({ repoKey, dest, sizeGiB });
@@ -608,14 +649,76 @@ describe('DefaultVmManager', () => {
   });
 
   describe('disk space', () => {
-    it('gives a data disk the configured size, less what running VMs were promised', async () => {
+    it('gives a data disk its share, less what running VMs were promised and have not used', async () => {
       let allocated = 0;
       const m = manager({ freeBytes: async () => 100 * GiB, allocatedBytes: async () => allocated });
       await m.start(jobRequest()).ready();
       allocated = 10 * GiB;
       await m.start(jobRequest({ slot: 2 })).ready();
-      // 100 free - 20 floor - (64 promised - 10 used) = 26.
-      expect(prepared.map((p) => p.sizeGiB)).toEqual([64, 26]);
+      // One runner slot and a refresh, under maxRunning 2: (100 free - 20
+      // floor) / 2 = 40; then 80 - (40 promised - 10 used) = 50, all left
+      // to the one claimant still without a disk.
+      expect(prepared.map((p) => p.sizeGiB)).toEqual([40, 50]);
+    });
+
+    it('shares the free space between VMs booting at once, rather than giving the first nearly all of it', async () => {
+      // CI's first live run: 79 GiB free, four slots. The first VM was
+      // promised 59 GiB and the next two were refused.
+      config.maxRunning = 8;
+      runnerSlots = 4;
+      const m = manager({ freeBytes: async () => 79 * GiB, allocatedBytes: async () => 0 });
+      const vms = [1, 2, 3].map((slot) => m.start(jobRequest({ slot })));
+      await Promise.all(vms.map((vm) => vm.ready()));
+      // Four slots and a refresh share 59 GiB: about 12 each.
+      const sizes = prepared.map((p) => p.sizeGiB);
+      expect(sizes).toHaveLength(3);
+      for (const size of sizes) expect(size).toBeGreaterThanOrEqual(11);
+      expect(Math.max(...sizes) - Math.min(...sizes)).toBeLessThanOrEqual(1);
+      // And the fourth slot's VM still fits.
+      await m.start(jobRequest({ slot: 4 })).ready();
+      expect(prepared[3].sizeGiB).toBeGreaterThanOrEqual(11);
+    });
+
+    it('counts the spare, and never more VMs than maxRunning lets run', async () => {
+      config.maxRunning = 8;
+      config.prewarm = true;
+      runnerSlots = 1;
+      await manager({ freeBytes: async () => 80 * GiB, allocatedBytes: async () => 0 }).start(jobRequest()).ready();
+      // A slot, the spare and a refresh: 60 / 3.
+      config.maxRunning = 2;
+      config.prewarm = false;
+      runnerSlots = 4;
+      await manager({ freeBytes: async () => 80 * GiB, allocatedBytes: async () => 0 }).start(jobRequest({ slot: 2 })).ready();
+      // Four slots, but only two VMs can run at once: 60 / 2.
+      expect(prepared.map((p) => p.sizeGiB)).toEqual([20, 30]);
+    });
+
+    it("keeps a running cache refresh's share out of a job's", async () => {
+      config.maxRunning = 8;
+      runnerSlots = 1;
+      const m = manager({ freeBytes: async () => 79 * GiB, allocatedBytes: async () => 0 });
+      await m.start(refreshRequest()).ready();
+      await m.start(jobRequest()).ready();
+      // The refresh was set aside 59 / 2 = 29.5; the job gets what is left.
+      expect(prepared.map((p) => p.sizeGiB)).toEqual([29]);
+    });
+
+    it('gives the smallest disk when the share is under it, and refuses once that is not left above the floor', async () => {
+      config.maxRunning = 8;
+      runnerSlots = 4;
+      // A slow statfs, as on a busy disk: both boots read free space while
+      // the other's is still being read.
+      const slowFree = () => new Promise<number>((resolve) => setTimeout(() => resolve(35 * GiB), 100));
+      const m = manager({ freeBytes: slowFree, allocatedBytes: async () => 0 });
+      // Both at once: whichever is sized second must see what the first was
+      // promised. Either may reach its disk first.
+      const vms = [m.start(jobRequest()), m.start(jobRequest({ slot: 2 }))];
+      const outcomes = await Promise.all(vms.map((vm) => vm.ready().then(() => 'ready', (err: VmError) => err.code)));
+      expect(outcomes.sort()).toEqual(['E_NO_DISK', 'ready']);
+      // 15 GiB above the floor among five claimants is 3 each: under 8, so
+      // 8; then 7 GiB are left, and no second disk.
+      expect(prepared.map((p) => p.sizeGiB)).toEqual([8]);
+      expect(vms.find((vm) => vm.state() !== 'ready')!.failure()).toMatchObject({ stage: 'disk', code: 'E_NO_DISK' });
     });
 
     it('stops the VM whose disk grew most when free space falls under half the floor', async () => {
@@ -677,10 +780,17 @@ describe('DefaultVmManager', () => {
       const named = spawn('/bin/sleep', ['60'], { argv0: FAKE_HELPER });
       try {
         if (process.platform === 'darwin') {
-          // Until it has exec'd sleep, the child is a copy of this node.
-          const args = () => execFileSync('/bin/ps', ['-o', 'args=', '-p', String(named.pid)], { encoding: 'utf-8' }).trim();
-          await eventually(() => args() === `${FAKE_HELPER} 60`, 'the process to exec');
-          expect(await processExecutableOf(named.pid!)).toBe('/bin/sleep');
+          // Until it has exec'd sleep, the child is a copy of this node. Not
+          // waited for with ps: it is setuid, and a job's sandbox - where
+          // this suite also runs - refuses to exec it (EPERM).
+          await new Promise((resolve, reject) => named.once('spawn', resolve).once('error', reject));
+          const node = fs.realpathSync(process.execPath);
+          let executable = await processExecutableOf(named.pid!);
+          for (const deadline = Date.now() + 10_000; executable === node && Date.now() < deadline; ) {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            executable = await processExecutableOf(named.pid!);
+          }
+          expect(executable).toBe('/bin/sleep');
         } else {
           // Elsewhere nothing is swept: no process is ever taken for the helper.
           expect(await processExecutableOf(named.pid!)).toBeNull();

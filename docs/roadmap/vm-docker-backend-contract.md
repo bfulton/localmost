@@ -1290,7 +1290,7 @@ dockerVm:
   cpus: 4               # per VM; default min(4, physical cores)
   memoryMiB: 8192       # per VM; committed lazily, returned only when the VM stops
   maxRunning: 0         # 0 = auto: max(1, floor(physical RAM GiB / 8))
-  dataDiskGiB: 64       # most a VM's data disk may be; less when free space is short (below)
+  dataDiskGiB: 64       # most a VM's data disk may be; less when its share of free space is (below)
   bootTimeoutSec: 60    # how long a docker request waits for the job's VM
   cacheLimitGiB: 20     # per repository: golden disk and image store, LRU at refresh
   pullMaxGiB: 10        # compressed bytes one pull may fetch
@@ -1298,12 +1298,35 @@ dockerVm:
   minFreeGiB: 20        # free space on <data>'s volume under which boots and pulls are refused
 ```
 
-A new data disk's apparent size is `min(dataDiskGiB, free − minFreeGiB −
-headroom already promised to running VMs)`, where a running VM's promised
-headroom is its apparent size minus what it has allocated. Below 8 GiB the
-boot is refused with 503 `not enough free disk for a Docker VM`. `VmManager`
-checks free space every 10 s while VMs run; under `minFreeGiB / 2` it stops the
-VM whose disk grew most, with the reason `host disk nearly full`.
+A job VM's new data disk gets a fair share of the free space, not all of it:
+its apparent size is `min(dataDiskGiB, max(8 GiB, share))`, where
+
+```
+share = (free − minFreeGiB − headroom still promised to running VMs)
+        / (claimants − VMs already holding a disk)
+```
+
+The claimants are the VMs that may want a disk at once: one per runner slot,
+the spare when `prewarm` is on, and a cache refresh, but never more than
+`maxRunning`, as the gate admits no more. A running VM's promised headroom is
+what was set aside for it minus what its disk has allocated since. The sum
+and the new disk's share are taken in one turn of the event loop, so two
+boots sized at once never count the same space. A size that
+would reach into the floor or into that headroom is refused with 503 `not
+enough free disk for a Docker VM`; so is any boot with under 8 GiB left.
+
+A refresh VM's disk is made by `CacheDisks` at `dataDiskGiB` (§6.5), so that
+a job disk of that size can clone the golden disk, and is never refused here.
+It is set aside a share like any other claimant, for the cache it loads; a
+clone of the golden disk counts only what it allocates past the blocks it
+shares. A job disk whose share is under the golden disk's size cannot clone
+it (`prepareJobDisk` clones only a golden disk no larger than `sizeGiB`) and
+boots blank, so on a small volume `dataDiskGiB` set to about
+`(free − minFreeGiB) / claimants` keeps the cache in use.
+
+`VmManager` checks free space every 10 s while VMs run; under `minFreeGiB / 2`
+it stops the job VM whose disk grew most, with the reason `host disk nearly
+full`.
 
 All of these are optional. Out-of-range values are clamped and logged. No
 setting enables a fallback daemon.

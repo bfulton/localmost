@@ -70,6 +70,15 @@ jest.mock('./proxy-server', () => ({
   }),
 }));
 
+// The app's settings, empty: never the real config.yaml. config.ts fixes its
+// path when it is imported, before LOCALMOST_CONFIG_DIR is set below, so
+// without this the runner read the operator's own - which a job, where this
+// suite also runs, cannot read at all (EPERM).
+jest.mock('./config', () => ({
+  ...jest.requireActual<typeof import('./config')>('./config'),
+  loadConfig: jest.fn(() => ({})),
+}));
+
 jest.mock('../shared/sandbox-reaper', () => ({
   reapMarkedProcessesAsync: jest.fn(async () => []),
   developerPython: jest.fn(async () => null),
@@ -207,6 +216,7 @@ describe('a docker job on the VM backend, through the runner', () => {
       helperPath,
       guest,
       config: () => config,
+      runnerSlots: () => 1,
       cacheDisks,
       log: (level, message) => logs.push({ level, message, timestamp: '' } as LogEntry),
       // The helper the environment selected, run directly with this node.
@@ -306,6 +316,7 @@ describe('a docker job on the VM backend, through the runner', () => {
       helperPath,
       guest,
       config: () => config,
+      runnerSlots: () => 1,
       cacheDisks: {
         prepareJobDisk: async (_k, dest) => {
           fs.writeFileSync(dest, '');
