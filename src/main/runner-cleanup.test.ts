@@ -265,9 +265,11 @@ describe('marker-based orphan reaping', () => {
     expect(fs.existsSync(`${stem}.granted`)).toBe(false);
   });
 
-  it('drops a mark it could not sweep by, and half of one, rather than keep them for ever', async () => {
-    // Without the developer tools the sweep never runs; a mark kept for it
-    // would be kept for good, one for every job.
+  it('keeps a mark it could not sweep by for a later launch, and drops half of one', async () => {
+    // Without the developer tools the sweep cannot run here. What the job
+    // left under its profile is still running, and the mark is the only way
+    // a later launch - once the tools are there - can find it. A lone
+    // .withheld names nothing and goes.
     const stem = path.join(fs.realpathSync(pidDir), '1-feedface');
     fs.writeFileSync(`${stem}.granted`, '');
     fs.writeFileSync(`${stem}.withheld`, '');
@@ -282,8 +284,21 @@ describe('marker-based orphan reaping', () => {
 
     expect(reaped).toHaveLength(1);
     expect(result).toBe(false);
-    expect(fs.readdirSync(pidDir)).toEqual([]);
+    expect(fs.readdirSync(pidDir).sort()).toEqual(['1-feedface.granted', '1-feedface.withheld']);
     expect(logged.some((m) => m.includes('1-feedface'))).toBe(true);
+  });
+
+  it('drops a kept mark once a later launch has swept by it', async () => {
+    const stem = path.join(fs.realpathSync(pidDir), '1-feedface');
+    fs.writeFileSync(`${stem}.granted`, '');
+    fs.writeFileSync(`${stem}.withheld`, '');
+
+    await killOrphanedProcesses(sandboxBase, () => undefined, () => null, () => [], async () => null);
+    expect(fs.readdirSync(pidDir)).toHaveLength(2);
+    const result = await killOrphanedProcesses(sandboxBase, () => undefined, () => null, () => [], async () => []);
+
+    expect(result).toBe(false);
+    expect(fs.readdirSync(pidDir)).toEqual([]);
   });
 
   it('does not force-kill blind when the marker cannot be re-checked after the grace period', async () => {

@@ -463,15 +463,17 @@ export async function killOrphanedProcesses(
     // still runs under the profile carrying it, unreachable by pid, group or
     // marker descriptor. Last, because this sweep stops and kills without
     // warning, and the worker itself is owed the SIGTERM above. By real
-    // path, as seatbelt answers for those. Every mark goes afterwards, swept
-    // or not: this is its last chance, and one kept because the sweep cannot
-    // run here would be kept for good.
+    // path, as seatbelt answers for those. A mark swept by goes afterwards;
+    // one the sweep could not run against stays: a later launch, with the
+    // developer tools installed, is the only way left to reach what runs
+    // under it, and two empty files per job is what keeping it costs.
     let realPidDir = pidDir;
     try {
       realPidDir = fs.realpathSync(pidDir);
     } catch {
       // Swept as spelled.
     }
+    const swept = new Set<string>();
     for (const entry of entries) {
       const stem = /^(\d+-[0-9a-f]+)\.granted$/.exec(entry.name)?.[1];
       if (entry.isDirectory() || !stem) continue;
@@ -482,14 +484,22 @@ export async function killOrphanedProcesses(
       if (!fs.existsSync(marker.withheld)) continue;
       const killed = await reapMarked(marker);
       if (killed === null) {
-        log(`Could not look for processes left running under ${stem}'s profile; some may still be running`);
-      } else if (killed.length > 0) {
+        log(`Could not look for processes left running under ${stem}'s profile; its mark is kept for a launch that can`);
+        continue;
+      }
+      swept.add(stem);
+      if (killed.length > 0) {
         log(`Killed ${killed.join(', ')}, left running under ${stem}'s profile`);
         killedAny = true;
       }
     }
     for (const entry of entries) {
-      if (entry.isDirectory() || !/^\d+-[0-9a-f]+\.(granted|withheld)$/.test(entry.name)) continue;
+      const mark = /^(\d+-[0-9a-f]+)\.(granted|withheld)$/.exec(entry.name);
+      if (entry.isDirectory() || !mark) continue;
+      // Half of a mark names nothing and goes with the swept ones.
+      const whole =
+        fs.existsSync(path.join(pidDir, `${mark[1]}.granted`)) && fs.existsSync(path.join(pidDir, `${mark[1]}.withheld`));
+      if (whole && !swept.has(mark[1])) continue;
       await fs.promises.unlink(path.join(pidDir, entry.name)).catch(() => undefined);
     }
   } catch {
