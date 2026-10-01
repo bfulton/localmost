@@ -13,7 +13,13 @@ import { execFile } from 'child_process';
 
 export type MemoryPressure = 'normal' | 'warn' | 'critical';
 
-/** How often the level is read. */
+/**
+ * How often the level is read. It is read for the app's whole life, on a
+ * machine that never runs a Docker job too: the admission gate needs a
+ * current level at the moment a boot is asked for, which a monitor started
+ * only once VMs run could not give, and one sysctl every 5 s, off the main
+ * thread, costs little.
+ */
 const POLL_MS = 5000;
 
 /**
