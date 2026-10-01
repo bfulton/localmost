@@ -330,6 +330,7 @@ describe('a docker job on the VM backend, through the runner', () => {
     };
     vmManager = new DefaultVmManager({
       dataDir: fs.realpathSync(data),
+      runnerSlots: () => 1,
       resources: path.join(data, 'res'),
       helperPath,
       guest,
