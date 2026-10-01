@@ -1153,6 +1153,16 @@ if (!isMacOS) {
       intact();
     });
 
+    it('lists, stats and walks _work with the nonce in it, which only hides its contents', () => {
+      // Every job has the nonce, Docker or not, so a metadata deny would make
+      // ls -la, find and du of _work fail in all of them.
+      expect(run('ls -la@ _work >/dev/null && find _work >/dev/null && du -s _work >/dev/null && echo ok')).toMatchObject({ ok: true, stdout: 'ok', stderr: '' });
+      expect(run('stat -f %z _work/.localmost-share')).toMatchObject({ ok: true, stdout: '32' });
+      expect(run('test -f _work/.localmost-share && echo present')).toMatchObject({ ok: true, stdout: 'present' });
+      expect(refused('cat _work/.localmost-share')).toBe(true);
+      intact();
+    });
+
     it('runs the bundled docker CLI, and reads nothing else beside it', () => {
       expect(run(sq(cli)).stdout).toBe('cli-ran');
       expect(refused(`cat ${sq(path.join(path.dirname(cli), 'beside'))}`)).toBe(true);
@@ -1448,6 +1458,11 @@ if (!isMacOS) {
       expect(refused(swapCommand(sandbox, sandbox))).toBe(true);
       expect(refused(`touch ${sq(sandbox)}`)).toBe(true);
       expect(refused(`rmdir ${sq(sandbox)}`)).toBe(true);
+    });
+
+    it('lists, stats and walks _work with the nonce in it, which only hides its contents', () => {
+      expect(shell(`ls -la ${sq(share)} >/dev/null && find ${sq(share)} -maxdepth 1 >/dev/null && echo ok`)).toMatchObject({ ok: true, stdout: 'ok' });
+      expect(fs.statSync(nonce).isFile()).toBe(true);
     });
 
     it("can neither read nor replace the share's nonce, nor give it another name", () => {
