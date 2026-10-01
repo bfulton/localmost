@@ -17,7 +17,13 @@
 
 import * as crypto from 'crypto';
 import * as path from 'path';
-import { app } from 'electron';
+
+/**
+ * Electron's app, read only when a caller needs it: this module is also
+ * loaded where Electron is absent - the e2e docker spec inside a job, and
+ * tests - and must cost nothing there.
+ */
+const electronApp = (): Electron.App => (require('electron') as typeof import('electron')).app;
 
 /**
  * A worker's sandbox directory name, as buildSandbox makes it: `<slot>-<12 hex>`.
@@ -251,13 +257,13 @@ export function sandboxFiles(dataDir: string, sandboxId: string): SandboxFiles {
  * build/.
  */
 export function getVmResourcesDir(): string {
-  if (app.isPackaged) {
+  if (electronApp().isPackaged) {
     if (!process.resourcesPath) {
       throw new Error('the packaged app has no resources path');
     }
     return process.resourcesPath;
   }
-  const appPath = path.resolve(app.getAppPath());
+  const appPath = path.resolve(electronApp().getAppPath());
   const parent = path.dirname(appPath);
   if (path.basename(appPath) === 'dist' && path.basename(parent) === 'build') {
     return parent;
@@ -276,7 +282,7 @@ export function guestDir(): string {
  */
 export function helperPath(): string {
   const override = process.env[HELPER_OVERRIDE_ENV];
-  if (!app.isPackaged && override) {
+  if (!electronApp().isPackaged && override) {
     return requireAbsolute(override, HELPER_OVERRIDE_ENV);
   }
   return path.join(getVmResourcesDir(), HELPER_NAME);

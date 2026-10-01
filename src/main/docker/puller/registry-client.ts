@@ -33,11 +33,17 @@ import * as crypto from 'crypto';
 import * as http from 'http';
 import * as https from 'https';
 import * as net from 'net';
-import { app } from 'electron';
 import { dnsLookup, HostLookup, isBlockedAddress, isLoopbackAddress, pinnedLookup } from '../../../shared/egress-screen';
 import { DIGEST_RE } from '../../vm/paths';
 import { RegistryAuthError, type RegistryCredentials } from '../registry-auth';
 import { cleanText } from './clean-text';
+
+/**
+ * Electron's app, read only when a caller needs it: this module is also
+ * loaded where Electron is absent - the e2e docker spec inside a job, and
+ * tests - and must cost nothing there.
+ */
+const electronApp = (): Electron.App => (require('electron') as typeof import('electron')).app;
 
 /** A pull failed; the message is for the job's log and the operator. */
 export class PullError extends Error {
@@ -439,7 +445,7 @@ export class RegistryClient {
   constructor(private readonly options: RegistryClientOptions = {}) {
     // They undo the address screen and the TLS roots. Checked against
     // app.isPackaged, not NODE_ENV, which a packaged app's environment can set.
-    if (app.isPackaged && (options.connectTo !== undefined || options.ca !== undefined)) {
+    if (electronApp().isPackaged && (options.connectTo !== undefined || options.ca !== undefined)) {
       throw new Error('connectTo and ca are test-only options of the registry client');
     }
     this.lookup = options.lookup ?? dnsLookup;
