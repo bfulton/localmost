@@ -109,3 +109,73 @@ describe("the blocking sweep's python3, for localmost test", () => {
     expect(reapMarkedProcesses(marker(1))).toBe(false);
   });
 });
+
+describe('a lookup of the developer tools that ran out of time', () => {
+  // On a loaded machine xcode-select can outlast its own timeout. That says
+  // nothing about whether the tools are there, so it is not remembered: kept,
+  // it would have stopped every later sweep of the process from looking.
+  const freshReaper = (): typeof import('./sandbox-reaper') => {
+    let reaper: typeof import('./sandbox-reaper') | undefined;
+    jest.isolateModules(() => {
+      reaper = jest.requireActual<typeof import('./sandbox-reaper')>('./sandbox-reaper');
+    });
+    return reaper!;
+  };
+
+  let developerDir: string;
+  let python: string;
+
+  beforeEach(() => {
+    developerDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'localmost-developer-')));
+    python = path.join(developerDir, 'usr', 'bin', 'python3');
+    fs.mkdirSync(path.dirname(python), { recursive: true });
+    fs.writeFileSync(python, '');
+    mockExecFile.mockReset();
+    mockExecFileSync.mockReset();
+  });
+
+  afterEach(() => {
+    fs.rmSync(developerDir, { recursive: true, force: true });
+  });
+
+  it('is asked again by the next blocking sweep', () => {
+    let lookups = 0;
+    mockExecFileSync.mockImplementation((file: unknown) => {
+      if (file !== '/usr/bin/xcode-select') return '';
+      if (++lookups === 1) throw Object.assign(new Error('spawnSync /usr/bin/xcode-select ETIMEDOUT'), { code: 'ETIMEDOUT' });
+      return `${developerDir}\n`;
+    });
+    const { reapMarkedProcesses } = freshReaper();
+
+    expect(reapMarkedProcesses(marker(1))).toBe(false);
+    expect(reapMarkedProcesses(marker(2))).toBe(true);
+    expect(reapMarkedProcesses(marker(3))).toBe(true);
+
+    expect(mockExecFileSync.mock.calls.map((call) => call[0])).toEqual([
+      '/usr/bin/xcode-select',
+      '/usr/bin/xcode-select',
+      python,
+      python,
+    ]);
+  });
+
+  it("is asked again by the app's next sweep", async () => {
+    let lookups = 0;
+    mockExecFile.mockImplementation(
+      (file: string, _args: string[], _options: unknown, callback: (err: Error | null, stdout?: string) => void) => {
+        if (file !== '/usr/bin/xcode-select') return callback(null, '');
+        if (++lookups === 1) {
+          return callback(Object.assign(new Error('Command failed: /usr/bin/xcode-select -p'), { killed: true, signal: 'SIGTERM' }));
+        }
+        return callback(null, `${developerDir}\n`);
+      }
+    );
+    const { developerPython } = freshReaper();
+
+    expect(await developerPython()).toBeNull();
+    expect(await developerPython()).toBe(python);
+    expect(await developerPython()).toBe(python);
+
+    expect(mockExecFile.mock.calls.map((call) => call[0])).toEqual(['/usr/bin/xcode-select', '/usr/bin/xcode-select']);
+  });
+});

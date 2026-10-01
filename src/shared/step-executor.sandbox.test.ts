@@ -8,12 +8,13 @@
  * assertion is that the cache fails closed rather than copying unsandboxed.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
+import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
 import { ChildProcess, execFileSync, spawn, spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { executeStep, ExecutionContext, reapStepProcesses } from './step-executor';
+import * as reaper from './sandbox-reaper';
 import { generateSandboxProfile, MACOS_BASELINE_READ_PATHS } from './sandbox-profile';
 import type { WorkflowJob, WorkflowStep } from './workflow-parser';
 
@@ -208,13 +209,24 @@ if (canConstruct()) {
       // profile, which can read the app's data under the checkout. A step
       // cannot be started, but the reap that follows must still find nothing.
       const other = bystander();
+      const sweep = jest.spyOn(reaper, 'reapMarkedProcesses');
+      const errors = jest.spyOn(console, 'error');
       try {
         await executeStep({ run: 'true' }, ctx(), job);
         reapStepProcesses();
+        // The sweep looked, rather than gave up: one that could not run
+        // spares everything, and would pass what follows without having
+        // told the job's sandbox from a step's. It once ran out of time here
+        // on every loaded machine.
+        expect(sweep).toHaveBeenCalledTimes(1);
+        expect(sweep).toHaveReturnedWith(true);
+        expect(errors.mock.calls.flat().join('\n')).not.toMatch(/could not look for step processes/);
         await new Promise((resolve) => setTimeout(resolve, 200));
         expect(alive(other.pid!)).toBe(true);
         expect(alive(process.pid)).toBe(true);
       } finally {
+        sweep.mockRestore();
+        errors.mockRestore();
         other.kill('SIGKILL');
       }
     }, REAL_PROCESS_TIMEOUT_MS);

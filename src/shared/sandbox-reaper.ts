@@ -111,16 +111,29 @@ function pythonIn(developerDir: string): string | null {
 }
 
 /**
- * developerPython, for the blocking sweep: looked up once per process, as
- * `localmost test` sweeps at the end of every job it runs.
+ * Whether xcode-select was stopped for outlasting its timeout - on a loaded
+ * machine, not a Mac without the developer tools - so the answer is not
+ * remembered and the next caller asks again. Sync, a spawnSync ETIMEDOUT;
+ * async, the child killed.
  */
-function developerPythonSync(): string | null {
+function timedOut(err: unknown): boolean {
+  const { code, killed } = (err ?? {}) as { code?: unknown; killed?: unknown };
+  return code === 'ETIMEDOUT' || killed === true;
+}
+
+/**
+ * developerPython, for what blocks: looked up once per process, as
+ * `localmost test` sweeps at the end of every job it runs and starts a
+ * process-tree watcher beside every step of a discovery run.
+ */
+export function developerPythonSync(): string | null {
   if (developerPythonFound === undefined) {
     try {
       developerPythonFound = pythonIn(
         execFileSync('/usr/bin/xcode-select', ['-p'], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 })
       );
-    } catch {
+    } catch (err) {
+      if (timedOut(err)) return null;
       developerPythonFound = null;
     }
   }
@@ -139,20 +152,28 @@ let developerPythonFound: string | null | undefined;
  * Looked up once per app run: every finished job is swept, and a startup
  * sweeps every mark an earlier run left, which without the developer tools
  * can be thousands. Tools installed while the app runs are found at its
- * next start.
+ * next start. A lookup that ran out of time is not kept: it says nothing
+ * about the tools.
  */
 export function developerPython(): Promise<string | null> {
-  developerPythonLookup ??= lookUpDeveloperPython();
+  if (!developerPythonLookup) {
+    const lookup = lookUpDeveloperPython();
+    const found = lookup.then(({ python }) => python);
+    developerPythonLookup = found;
+    void lookup.then(({ timedOut: ranOut }) => {
+      if (ranOut && developerPythonLookup === found) developerPythonLookup = undefined;
+    });
+  }
   return developerPythonLookup;
 }
 
 let developerPythonLookup: Promise<string | null> | undefined;
 
-function lookUpDeveloperPython(): Promise<string | null> {
+function lookUpDeveloperPython(): Promise<{ python: string | null; timedOut: boolean }> {
   return new Promise((resolve) => {
     execFile('/usr/bin/xcode-select', ['-p'], { encoding: 'utf-8', timeout: 5000 }, (err, stdout) => {
-      if (err) return resolve(null);
-      resolve(pythonIn(String(stdout)));
+      if (err) return resolve({ python: null, timedOut: timedOut(err) });
+      resolve({ python: pythonIn(String(stdout)), timedOut: false });
     });
   });
 }

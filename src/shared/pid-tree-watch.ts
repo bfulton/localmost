@@ -6,6 +6,7 @@
  */
 
 import { spawn, ChildProcess } from 'child_process';
+import { developerPythonSync } from './sandbox-reaper';
 
 // Python script for pid_tree_watch (uses kqueue + libproc)
 const PID_TREE_WATCH_SCRIPT = `#!/usr/bin/env python3
@@ -85,8 +86,10 @@ class PidTreeWatcher:
             print(f"error: could not watch pid {root_pid}", file=sys.stderr)
             return 1
 
-        print(f"watching {root_pid}", flush=True)
+        # After the first look at the root's children, so that a reader that
+        # has this line has every child the root had when the watch began.
         self.watch_children(root_pid)
+        print(f"watching {root_pid}", flush=True)
 
         while self.watched_pids:
             try:
@@ -138,6 +141,12 @@ export class PidTreeWatcher {
   private process: ChildProcess | null = null;
   private collectedPids: Set<number> = new Set();
   private rootPid: number | null = null;
+  /** Output not yet ending in a newline: a line can arrive in pieces. */
+  private pending = '';
+  private settleWatching: (watching: boolean) => void = () => {};
+  private readonly watchingRoot = new Promise<boolean>((resolve) => {
+    this.settleWatching = resolve;
+  });
 
   /**
    * Start watching a process tree.
@@ -155,9 +164,18 @@ export class PidTreeWatcher {
     // Handed to python on its command line. It used to be written to
     // ~/.localmost/bin and run from there, which a job may not write: run
     // inside one, the write threw and every step of a discovery run failed.
-    this.process = spawn('/usr/bin/env', ['python3', '-c', PID_TREE_WATCH_SCRIPT, String(pid)], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    //
+    // The developer tools' python3 by its own path, not the /usr/bin/python3
+    // shim, which first asks xcrun where the tools are. Inside a job that
+    // lookup starts from nothing - the job's profile denies the per-user
+    // cache, and the job's own is empty until something fills it - and on a
+    // loaded machine took seconds, during which the step forked unwatched.
+    // Without the developer tools, whatever python3 is on PATH, as before.
+    const python = developerPythonSync();
+    const args = ['-c', PID_TREE_WATCH_SCRIPT, String(pid)];
+    this.process = python
+      ? spawn(python, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+      : spawn('/usr/bin/env', ['python3', ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
 
     // Without this listener a failed exec - no python3 on PATH -
     // emits an unhandled 'error' event and takes the process down. Discovery
@@ -165,10 +183,14 @@ export class PidTreeWatcher {
     this.process.on('error', (err: Error) => {
       console.error('[pid_tree_watch] failed to start:', err.message);
       this.process = null;
+      this.settleWatching(false);
     });
+    // On close, not exit: by then everything it printed has been read.
+    this.process.on('close', () => this.settleWatching(false));
 
     this.process.stdout?.on('data', (data: Buffer) => {
-      const lines = data.toString().split('\n');
+      const lines = (this.pending + data.toString()).split('\n');
+      this.pending = lines.pop() ?? '';
       for (const line of lines) {
         this.parseLine(line.trim());
       }
@@ -195,6 +217,7 @@ export class PidTreeWatcher {
     const watchMatch = line.match(/^watching (\d+)$/);
     if (watchMatch) {
       this.collectedPids.add(parseInt(watchMatch[1], 10));
+      this.settleWatching(true);
       return;
     }
 
@@ -222,9 +245,19 @@ export class PidTreeWatcher {
   }
 
   /**
+   * Resolves true once the helper watches the root and has collected the
+   * children it had then; false if the helper could not start, or exited or
+   * was stopped first. python3 can take seconds to start on a loaded machine.
+   */
+  watching(): Promise<boolean> {
+    return this.watchingRoot;
+  }
+
+  /**
    * Stop watching and return all collected PIDs.
    */
   stop(): Set<number> {
+    this.settleWatching(false);
     if (this.process) {
       this.process.kill();
       this.process = null;

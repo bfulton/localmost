@@ -18,6 +18,7 @@ import * as path from 'path';
 import * as childProcess from 'child_process';
 import { checkoutLoopback, confirmCheckoutGrants, grantsBeyondWorkspace, runTest } from './test';
 import { MACOS_BASELINE_READ_PATHS } from '../shared/sandbox-profile';
+import * as reaper from '../shared/sandbox-reaper';
 import type { LocalmostrcConfig } from '../shared/localmostrc';
 
 // Held so a test can stand in for a step's sandbox-exec and read the profile
@@ -172,6 +173,9 @@ describe('runTest on a checkout that grants itself more than its workspace', () 
     }
   };
 
+  let sweep: jest.SpiedFunction<typeof reaper.reapMarkedProcesses>;
+  let errors: jest.SpiedFunction<typeof console.error>;
+
   beforeEach(() => {
     fs.mkdirSync(path.join(checkout, '.github', 'workflows'), { recursive: true });
     fs.writeFileSync(
@@ -180,12 +184,27 @@ describe('runTest on a checkout that grants itself more than its workspace', () 
     );
     process.chdir(checkout);
     jest.spyOn(console, 'log').mockImplementation(() => {});
+    sweep = jest.spyOn(reaper, 'reapMarkedProcesses');
+    errors = jest.spyOn(console, 'error');
   });
 
   afterEach(() => {
     process.chdir(originalCwd);
     jest.mocked(console.log).mockRestore();
+    sweep.mockRestore();
+    errors.mockRestore();
   });
+
+  /**
+   * The sweep at the end of the run looked for what its steps left running,
+   * rather than gave up. It once ran out of time on every loaded machine
+   * inside a job, and a run whose sweep cannot look still succeeds.
+   */
+  const expectSwept = () => {
+    expect(sweep).toHaveBeenCalled();
+    for (const { value } of sweep.mock.results) expect(value).toBe(true);
+    expect(errors.mock.calls.flat().join('\n')).not.toMatch(/could not look for step processes/);
+  };
 
   it('does not apply a policy that writes outside the workspace without confirmation', async () => {
     fs.writeFileSync(
@@ -223,6 +242,7 @@ describe('runTest on a checkout that grants itself more than its workspace', () 
       return child;
     }) as never, () => runTest({ assumeYes: true }));
     expect(result.success).toBe(true);
+    expectSwept();
     expect(profiles).toHaveLength(1);
     expect(profiles[0]).toContain('(allow network-outbound (remote ip "localhost:5432"))');
   }, RUN_TIMEOUT_MS);
@@ -258,6 +278,7 @@ describe('runTest on a checkout that grants itself more than its workspace', () 
       return child;
     }) as never, () => runTest(options));
     expect(result.success).toBe(true);
+    expectSwept();
     return answers;
   };
 

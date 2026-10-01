@@ -46,20 +46,18 @@ describe('PidTreeWatcher', () => {
     const watcher = new PidTreeWatcher();
     try {
       expect(watcher.start(root.pid as number)).toBe(true);
-      // Seen by its fork, or by the watcher's first look at the root's children.
-      const deadline = Date.now() + 10_000;
-      while (!watcher.getPids().has(childPid) && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 20));
-      }
+      // The child was running before the watch began, so the watcher's first
+      // look at the root's children, which it reports before it says it is
+      // watching, has it: there is nothing to poll for.
+      expect(await watcher.watching()).toBe(true);
       expect([...watcher.getPids()]).toEqual(expect.arrayContaining([root.pid, childPid]));
     } finally {
       watcher.stop();
       process.kill(childPid, 'SIGKILL');
       root.kill('SIGKILL');
     }
-    // A shell, its child and python3 started for real, and up to the ten
-    // seconds above for the watcher to report: python3 is found through
-    // xcrun, which on a loaded machine - CI runs this suite inside a job -
-    // takes seconds before the watcher's first line.
-  }, 30_000);
+    // A shell, its child and python3 started for real, and the watcher's
+    // first line waited for. On a loaded machine - CI runs this suite inside
+    // a job, beside other jobs - python3 alone can take seconds to start.
+  }, 60_000);
 });
