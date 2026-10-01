@@ -124,10 +124,11 @@ This fallback-to-cloud design is intentional: if your Mac is asleep, offline, or
 
 A repository opts in to container work by declaring `pull`, `run` and `build` actions under `docker:` in its approved `.localmostrc`; anything unlisted is denied. Each job that does gets its own Linux VM, booted by localmost and discarded after the job, which sees none of your files but the job's work folder. Docker Desktop is not used. What that means for a policy:
 
-- **`routable` means through the job's proxy.** Containers on the default bridge, or on a network declared `internal: false`, reach only what the job's own network policy allows. Traffic that ignores the proxy settings has no route and fails.
+- **`routable` means through the job's proxy.** Containers on the default bridge, or on a network declared `internal: false`, reach only what the job's own network policy allows. Traffic that ignores the proxy settings is refused at once (a name lookup from an Alpine image takes its resolver's 5 s to fail).
 - **Proxy settings are injected.** localmost sets `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, `https_proxy` and `NO_PROXY` in routable containers and as build args, keeping any value the job sets itself.
 - **Base images must be pulled before a build.** The builder in the VM cannot reach a registry, so `docker pull` the `FROM` images first.
 - **`pull.registries` includes the registry's redirects.** Pulls run on the Mac, so registry credentials never enter the VM, and localmost follows a registry's redirects (to its CDN, usually) to any public https host, outside the job's `network.allow`. Only public https registries can be pulled from.
+- **Credential helpers fail the pull, never fall back to anonymous.** With `credsStore: desktop` in `~/.docker/config.json`, Docker Desktop must be running for a pull to work, even of a public image: its helper does not answer otherwise. Start it, or remove `credsStore`.
 
 The policy grammar is in [docs/roadmap/localmostrc.md](docs/roadmap/localmostrc.md#docker-access), and what the VM does and does not contain is under Docker Access in [SECURITY.md](SECURITY.md).
 

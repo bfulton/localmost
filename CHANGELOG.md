@@ -466,17 +466,17 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
 ### Changed
 - **Breaking**: localmost needs macOS 14 or later; 0.2.0 ran on macOS 12. The
   Docker VM is built on Virtualization.framework, and localmost supports it
-  from macOS 14 on. On macOS 12 or 13, stay on 0.2.0, and do not download
-  this update when 0.2.x offers it: 0.2.x compares only the version, since the
-  update feed names no minimum macOS version, and the update installs over
-  0.2.x and then will not open, because the app requires macOS 14. If it was
-  installed, reinstall 0.2.0 from its release
+  from macOS 14 on. On macOS 12 or 13, 0.2.x is not offered this update: the
+  update feed names macOS 14 as its minimum (`minimumSystemVersion`), and
+  the updater 0.2.0 shipped checks it, so stay on 0.2.0. An update
+  downloaded and installed by hand on macOS 12 or 13 will not open, because
+  the app requires macOS 14; reinstall 0.2.0 from its release
 - **Breaking**: Intel Macs are no longer supported. localmost is built for
   Apple silicon (arm64) only; 0.2.0 was the last release with an Intel
-  build. On an Intel Mac, 0.2.x still reports this update as available, as
-  that check compares only the version, but the update feed lists no Intel
-  file, so downloading it fails with "No files provided" and nothing is
-  installed
+  build. On an Intel Mac on macOS 14 or later, 0.2.x still reports this
+  update as available, as that check reads only the version and the minimum
+  macOS, but the update feed lists no Intel file, so downloading it fails
+  with "No files provided" and nothing is installed
 - **Updates download automatically**: the updater downloads a new release as
   soon as it finds one, and installs it when the app quits, as before; it
   used to wait to be asked to download. The app now ships a Linux kernel,
@@ -491,7 +491,9 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
     text says so. localmost injects `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`,
     `https_proxy` and `NO_PROXY` into routable containers and, as build args,
     into builds, keeping any value the job sets. Traffic that ignores them -
-    plain TCP, ssh, UDP, DNS lookups of outside names - has no route and fails
+    plain TCP, ssh, UDP, DNS lookups of outside names - is refused at once,
+    though a name lookup from a musl-based image (Alpine) waits out its
+    resolver's 5 s timeout first
   - A build cannot pull its `FROM` image: `docker pull` base images first
   - Registries on the LAN, on the Mac itself or served over plain http cannot
     be pulled from, even when listed in `pull.registries`; only public https
@@ -502,13 +504,24 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   - Credential helpers named by `credsStore` or `credHelpers` are looked up
     only in `/opt/homebrew/bin`, `/usr/local/bin` and Docker.app's bundled
     `bin`, not on `PATH`. A missing or failing helper fails the pull, naming
-    the config key, where it used to pull anonymously; with Docker Desktop
-    removed and `credsStore: desktop` still configured, every pull fails
-    until `~/.docker/config.json` is edited
+    the config key, where it used to pull anonymously. With `credsStore:
+    desktop` configured, every pull, public images included, needs Docker
+    Desktop running: its helper does not answer while Docker Desktop is
+    installed but not running, and the pull fails after 10 s saying so. With
+    Docker Desktop removed, every pull fails until `~/.docker/config.json` is
+    edited
   - An image the registry would not serve anonymously is pulled again by
     every job; it is never cached for the repository
   - `chown` inside a container on a workspace bind does not persist; keep data
     directories on volumes
+  - `--log-driver` other than `json-file`, `local` or `none` (and another
+    driver's `--log-opt`) and `--annotation` are refused: a log driver would
+    connect out from inside the VM on the container's behalf, around its
+    network rules. A build that asks the daemon for BuildKit
+    (`/build?version=2`) is refused too, as `DOCKER_BUILDKIT=1` already was
+  - Every job's `_work`, Docker or not, holds a `.localmost-share` file the job
+    can see but neither read nor change, so a `tar` of all of `_work` or an
+    `rm -rf _work/.*` fails on it; `ls`, `find`, `du` and `stat` are unaffected
 - **Breaking policy change**: `docker: socket | contexts | credentials`, accepted
   by pre-release 0.3.0 builds, is now a validation error naming the actions that
   replace it. Migrate by declaring what the job does: `socket` and `contexts`
