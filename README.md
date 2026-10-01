@@ -275,7 +275,6 @@ Current release: **0.3.0 — Test Locally, Secure by Default**
 
 Future feature ideas:
 
-- **VM Docker backend** (in progress) - Run each Docker-using job's daemon in its own Linux VM that shares only the job's work folder and reaches the network only through the job's proxy, replacing Docker Desktop ([design](docs/roadmap/vm-docker-backend.md)).
 - **Fail a blocked job visibly** - a job refused by the filter is cancelled through the GitHub API before any worker starts, so it appears as cancelled rather than failing with a message explaining why.
 - **Roll discovery output up further** - `--updaterc` now drops paths already covered by a listed ancestor, which removes the bulk of the redundancy. It still records content-addressed cache paths (npm's `_cacache/content-v2/sha512/...`) verbatim, which differ per machine and per dependency change; those want rolling up to their cache directory.
 - **Show a full diff when `--updaterc` rewrites a policy** - it names the file and lists every grant it adds before asking, but it rewrites the whole file from the parsed policy, so the comments and formatting it drops are not shown.
