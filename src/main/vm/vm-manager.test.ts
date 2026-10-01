@@ -649,7 +649,29 @@ describe('DefaultVmManager', () => {
   });
 
   describe('disk space', () => {
-    it('gives a data disk its share, less what running VMs were promised and have not used', async () => {
+    /** What each job VM's data disk was set aside, in GiB, in the order they were sized. */
+    const setAsideGiB = (): number[] =>
+      logs.flatMap((l) => {
+        const match = /^Docker VM \S+ data disk: \d+ GiB, (\d+) GiB of it set aside/.exec(l.message);
+        return match ? [Number(match[1])] : [];
+      });
+
+    const dataDiskOf = (vm: VmHandle): string => path.join(layout.data, 'vm', 'jobs', vm.vmId, 'data.img');
+
+    it("makes a lone job's disk dockerVm.dataDiskGiB, the golden disk's size, and sets aside its share of free space", async () => {
+      // 200 GiB free, four slots and a refresh: a share of 36 GiB. A disk of
+      // that size could not clone the 64 GiB golden disk (§6.5) and would
+      // boot blank; nor need a job running alone stop at 36 while the other
+      // slots sit idle.
+      config.maxRunning = 8;
+      runnerSlots = 4;
+      const m = manager({ freeBytes: async () => 200 * GiB, allocatedBytes: async () => 0 });
+      await m.start(jobRequest()).ready();
+      expect(prepared.map((p) => p.sizeGiB)).toEqual([64]);
+      expect(setAsideGiB()).toEqual([36]);
+    });
+
+    it('sets aside a share, less what running VMs were promised and have not used', async () => {
       let allocated = 0;
       const m = manager({ freeBytes: async () => 100 * GiB, allocatedBytes: async () => allocated });
       await m.start(jobRequest()).ready();
@@ -658,7 +680,8 @@ describe('DefaultVmManager', () => {
       // One runner slot and a refresh, under maxRunning 2: (100 free - 20
       // floor) / 2 = 40; then 80 - (40 promised - 10 used) = 50, all left
       // to the one claimant still without a disk.
-      expect(prepared.map((p) => p.sizeGiB)).toEqual([40, 50]);
+      expect(setAsideGiB()).toEqual([40, 50]);
+      expect(prepared.map((p) => p.sizeGiB)).toEqual([64, 64]);
     });
 
     it('shares the free space between VMs booting at once, rather than giving the first nearly all of it', async () => {
@@ -670,13 +693,14 @@ describe('DefaultVmManager', () => {
       const vms = [1, 2, 3].map((slot) => m.start(jobRequest({ slot })));
       await Promise.all(vms.map((vm) => vm.ready()));
       // Four slots and a refresh share 59 GiB: about 12 each.
-      const sizes = prepared.map((p) => p.sizeGiB);
-      expect(sizes).toHaveLength(3);
-      for (const size of sizes) expect(size).toBeGreaterThanOrEqual(11);
-      expect(Math.max(...sizes) - Math.min(...sizes)).toBeLessThanOrEqual(1);
+      const shares = setAsideGiB();
+      expect(shares).toHaveLength(3);
+      for (const share of shares) expect(share).toBeGreaterThanOrEqual(11);
+      expect(Math.max(...shares) - Math.min(...shares)).toBeLessThanOrEqual(1);
       // And the fourth slot's VM still fits.
       await m.start(jobRequest({ slot: 4 })).ready();
-      expect(prepared[3].sizeGiB).toBeGreaterThanOrEqual(11);
+      expect(setAsideGiB()[3]).toBeGreaterThanOrEqual(11);
+      expect(prepared.map((p) => p.sizeGiB)).toEqual([64, 64, 64, 64]);
     });
 
     it('counts the spare, and never more VMs than maxRunning lets run', async () => {
@@ -690,20 +714,84 @@ describe('DefaultVmManager', () => {
       runnerSlots = 4;
       await manager({ freeBytes: async () => 80 * GiB, allocatedBytes: async () => 0 }).start(jobRequest({ slot: 2 })).ready();
       // Four slots, but only two VMs can run at once: 60 / 2.
-      expect(prepared.map((p) => p.sizeGiB)).toEqual([20, 30]);
+      expect(setAsideGiB()).toEqual([20, 30]);
     });
 
-    it("keeps a running cache refresh's share out of a job's", async () => {
+    it('counts what a clone shares with the golden disk as already there, not as used', async () => {
+      // APFS counts a clone's shared blocks as allocated from the start, but
+      // they take no free space: only what the guest writes past them does.
+      const m = manager({
+        freeBytes: async () => 100 * GiB,
+        allocatedBytes: async (file) => (fs.existsSync(file) ? 15 * GiB : 0),
+      });
+      await m.start(jobRequest()).ready();
+      await m.start(jobRequest({ slot: 2 })).ready();
+      // (100 - 20) / 2 = 40, all of it still promised: 40 left for the second.
+      expect(setAsideGiB()).toEqual([40, 40]);
+    });
+
+    it('reads free space after the disks, so that a disk growing between the reads is not taken for free space', async () => {
+      let allocated = 0;
+      let growAfterNextRead = false;
+      const read = (value: () => number): number => {
+        const result = value();
+        if (growAfterNextRead) {
+          growAfterNextRead = false;
+          allocated += 10 * GiB;
+        }
+        return result;
+      };
+      const m = manager({
+        freeBytes: async () => read(() => 100 * GiB - allocated),
+        allocatedBytes: async () => read(() => allocated),
+      });
+      await m.start(jobRequest()).ready();
+      growAfterNextRead = true;
+      await m.start(jobRequest({ slot: 2 })).ready();
+      // The first disk, set aside 40, grows 10 GiB between the two reads: 90
+      // free, 70 above the floor, 30 still promised - 40 at most for the
+      // second. Free space read before the disks would be 100, with 10 of
+      // the 40 used: 50.
+      expect(setAsideGiB()[0]).toBe(40);
+      expect(setAsideGiB()[1]).toBeLessThanOrEqual(40);
+    });
+
+    it("keeps what a running cache refresh may load out of a job's share", async () => {
       config.maxRunning = 8;
       runnerSlots = 1;
       const m = manager({ freeBytes: async () => 79 * GiB, allocatedBytes: async () => 0 });
       await m.start(refreshRequest()).ready();
       await m.start(jobRequest()).ready();
-      // The refresh was set aside 59 / 2 = 29.5; the job gets what is left.
-      expect(prepared.map((p) => p.sizeGiB)).toEqual([29]);
+      // A refresh loads at most cacheLimitGiB, 20 of the 59 above the floor;
+      // the job's share is the 39 left.
+      expect(setAsideGiB()).toEqual([39]);
     });
 
-    it('gives the smallest disk when the share is under it, and refuses once that is not left above the floor', async () => {
+    it('sets a refresh aside only what it may add to the golden disk it cloned', async () => {
+      config.maxRunning = 8;
+      runnerSlots = 1;
+      const m = manager({
+        freeBytes: async () => 79 * GiB,
+        allocatedBytes: async (file) => (file.endsWith('data.img.new') ? 15 * GiB : 0),
+      });
+      await m.start(refreshRequest()).ready();
+      await m.start(jobRequest()).ready();
+      // 15 of the 20 GiB limit are on the clone already: 5 set aside, 54 left.
+      expect(setAsideGiB()).toEqual([54]);
+    });
+
+    it('sets a refresh aside less than it may load rather than leave a job under the smallest disk', async () => {
+      config.maxRunning = 8;
+      runnerSlots = 1;
+      const m = manager({ freeBytes: async () => 45 * GiB, allocatedBytes: async () => 0 });
+      await m.start(refreshRequest()).ready();
+      await m.start(jobRequest()).ready();
+      // 25 above the floor: the refresh is set aside 17 of its 20, so the
+      // job still has 8.
+      expect(setAsideGiB()).toEqual([8]);
+    });
+
+    it('sets aside the smallest disk when the share is under it, and refuses once that is not left above the floor', async () => {
       config.maxRunning = 8;
       runnerSlots = 4;
       // A slow statfs, as on a busy disk: both boots read free space while
@@ -717,7 +805,8 @@ describe('DefaultVmManager', () => {
       expect(outcomes.sort()).toEqual(['E_NO_DISK', 'ready']);
       // 15 GiB above the floor among five claimants is 3 each: under 8, so
       // 8; then 7 GiB are left, and no second disk.
-      expect(prepared.map((p) => p.sizeGiB)).toEqual([8]);
+      expect(setAsideGiB()).toEqual([8]);
+      expect(prepared.map((p) => p.sizeGiB)).toEqual([64]);
       expect(vms.find((vm) => vm.state() !== 'ready')!.failure()).toMatchObject({ stage: 'disk', code: 'E_NO_DISK' });
     });
 
@@ -728,13 +817,29 @@ describe('DefaultVmManager', () => {
       const small = m.start(jobRequest());
       const large = m.start(jobRequest({ slot: 2 }));
       await Promise.all([small.ready(), large.ready()]);
-      sizes.set(path.join(layout.data, 'vm', 'jobs', small.vmId, 'data.img'), 1 * GiB);
-      sizes.set(path.join(layout.data, 'vm', 'jobs', large.vmId, 'data.img'), 30 * GiB);
+      sizes.set(dataDiskOf(small), 1 * GiB);
+      sizes.set(dataDiskOf(large), 30 * GiB);
       free = 9 * GiB;
       await m.checkFreeSpace();
       expect(large.state()).toBe('failed');
       expect(large.failure()!.message).toBe('host disk nearly full');
       expect(small.state()).toBe('ready');
+    });
+
+    it('stops the VM that wrote most, not the clone that shares most with the golden disk', async () => {
+      let free = 500 * GiB;
+      const sizes = new Map<string, number>();
+      const m = manager({ freeBytes: async () => free, allocatedBytes: async (file) => sizes.get(file) ?? 0 });
+      const clone = m.start(jobRequest());
+      const blank = m.start(jobRequest({ slot: 2 }));
+      sizes.set(dataDiskOf(clone), 30 * GiB);
+      await Promise.all([clone.ready(), blank.ready()]);
+      sizes.set(dataDiskOf(clone), 31 * GiB);
+      sizes.set(dataDiskOf(blank), 5 * GiB);
+      free = 9 * GiB;
+      await m.checkFreeSpace();
+      expect(blank.state()).toBe('failed');
+      expect(clone.state()).toBe('ready');
     });
   });
 
@@ -784,9 +889,10 @@ describe('DefaultVmManager', () => {
           // waited for with ps: it is setuid, and a job's sandbox - where
           // this suite also runs - refuses to exec it (EPERM).
           await new Promise((resolve, reject) => named.once('spawn', resolve).once('error', reject));
-          const node = fs.realpathSync(process.execPath);
+          // Polled until it reads sleep: before that it reads node, or
+          // nothing when lsof times out on a loaded machine.
           let executable = await processExecutableOf(named.pid!);
-          for (const deadline = Date.now() + 10_000; executable === node && Date.now() < deadline; ) {
+          for (const deadline = Date.now() + 10_000; executable !== '/bin/sleep' && Date.now() < deadline; ) {
             await new Promise((resolve) => setTimeout(resolve, 20));
             executable = await processExecutableOf(named.pid!);
           }

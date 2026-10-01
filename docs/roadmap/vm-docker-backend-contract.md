@@ -1290,7 +1290,7 @@ dockerVm:
   cpus: 4               # per VM; default min(4, physical cores)
   memoryMiB: 8192       # per VM; committed lazily, returned only when the VM stops
   maxRunning: 0         # 0 = auto: max(1, floor(physical RAM GiB / 8))
-  dataDiskGiB: 64       # most a VM's data disk may be; less when its share of free space is (below)
+  dataDiskGiB: 64       # every VM's sparse data disk, and the most set aside for one (below)
   bootTimeoutSec: 60    # how long a docker request waits for the job's VM
   cacheLimitGiB: 20     # per repository: golden disk and image store, LRU at refresh
   pullMaxGiB: 10        # compressed bytes one pull may fetch
@@ -1298,8 +1298,12 @@ dockerVm:
   minFreeGiB: 20        # free space on <data>'s volume under which boots and pulls are refused
 ```
 
-A job VM's new data disk gets a fair share of the free space, not all of it:
-its apparent size is `min(dataDiskGiB, max(8 GiB, share))`, where
+A job VM's data disk is made at `dataDiskGiB`, the golden disk's size, so
+that it can always clone the golden disk (`prepareJobDisk` clones only a
+golden disk no larger than `sizeGiB`, §6.5). It is sparse: what it takes on
+the Mac is what the guest writes. What a boot reserves is a fair share of the
+free space, not the disk's size: `min(dataDiskGiB, max(8 GiB, share))` is set
+aside for it, where
 
 ```
 share = (free − minFreeGiB − headroom still promised to running VMs)
@@ -1309,24 +1313,30 @@ share = (free − minFreeGiB − headroom still promised to running VMs)
 The claimants are the VMs that may want a disk at once: one per runner slot,
 the spare when `prewarm` is on, and a cache refresh, but never more than
 `maxRunning`, as the gate admits no more. A running VM's promised headroom is
-what was set aside for it minus what its disk has allocated since. The sum
-and the new disk's share are taken in one turn of the event loop, so two
-boots sized at once never count the same space. A size that
-would reach into the floor or into that headroom is refused with 503 `not
-enough free disk for a Docker VM`; so is any boot with under 8 GiB left.
+what was set aside for it minus what its disk has allocated since it was made
+(for a clone, past the golden disk's blocks it shares, which take no free
+space); until a job's disk has been made and measured, its whole share counts.
+The disks are read before free space, so a disk that grows between the reads
+counts as used, not as free. The sum and the new disk's share are taken in
+one turn of the event loop, so two boots sized at once never count the same
+space. A boot with under 8 GiB above the floor and that headroom is refused
+with 503 `not enough free disk for a Docker VM`.
 
-A refresh VM's disk is made by `CacheDisks` at `dataDiskGiB` (§6.5), so that
-a job disk of that size can clone the golden disk, and is never refused here.
-It is set aside a share like any other claimant, for the cache it loads; a
-clone of the golden disk counts only what it allocates past the blocks it
-shares. A job disk whose share is under the golden disk's size cannot clone
-it (`prepareJobDisk` clones only a golden disk no larger than `sizeGiB`) and
-boots blank, so on a small volume `dataDiskGiB` set to about
-`(free − minFreeGiB) / claimants` keeps the cache in use.
+A share is a reservation, not a cap: a VM running alone may use more of its
+disk while the other claimants sit idle. One that writes into space the
+others were promised is what the free-space watch below stops; image pulls
+are refused under the floor on their own (§6.3).
+
+A refresh VM's disk is made by `CacheDisks` at `dataDiskGiB` too (§6.5), and
+is never refused here. What it writes is the cache it loads: at most
+`min(cacheLimitGiB, dataDiskGiB)`, less what its clone of the golden disk
+holds already. That much is set aside for it, as far as that leaves each other
+claimant still without a disk the 8 GiB minimum, and never less than its fair
+share.
 
 `VmManager` checks free space every 10 s while VMs run; under `minFreeGiB / 2`
-it stops the job VM whose disk grew most, with the reason `host disk nearly
-full`.
+it stops the job VM whose disk grew most (wrote most past what it was made
+with), with the reason `host disk nearly full`.
 
 All of these are optional. Out-of-range values are clamped and logged. No
 setting enables a fallback daemon.
@@ -1573,7 +1583,10 @@ its `docker.sock` where §1 puts it), or the refresh fails.
 
 `prepareJobDisk` clones only with a readable `meta.json` whose `dataFormat`
 is the guest's (a mismatch discards the golden disk), and only a golden disk
-no larger than `sizeGiB`; otherwise it makes a sparse file of `sizeGiB`. The
+no larger than `sizeGiB`; otherwise it makes a sparse file of `sizeGiB`.
+`VmManager` passes `dataDiskGiB`, the size the golden disk is built at, so a
+job clones whenever the golden disk is current; how much free space it may
+use is set aside separately (§5.6), not by `sizeGiB`. The
 destination must be a VM's `data.img` (§1) and must not exist. The clone is
 `clonefile(2)` through `/bin/cp -c`, because Node's `copyFile` cannot clone on
 macOS: its libuv answers `COPYFILE_FICLONE_FORCE` with `ENOSYS` and makes a

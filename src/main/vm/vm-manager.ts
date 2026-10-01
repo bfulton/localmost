@@ -174,9 +174,10 @@ class Vm implements VmHandle {
   /**
    * The free space set aside for this VM's data disk (§5.6): `file` may grow
    * by `promisedBytes` past the `baseBytes` it had allocated when it was set
-   * aside. Null until then.
+   * aside or, for a job's disk, once it was made (null until then). Null
+   * until it is set aside.
    */
-  disk: { file: string; promisedBytes: number; baseBytes: number } | null = null;
+  disk: { file: string; promisedBytes: number; baseBytes: number | null } | null = null;
   /** Whether the data disk is a clone of the repository's golden disk. */
   diskKind: 'clone' | 'blank' = 'blank';
   readonly abort = new AbortController();
@@ -434,6 +435,8 @@ export class DefaultVmManager implements VmManager {
         if (err instanceof Cancelled) throw err;
         throw vmError('disk', 'E_DISK', `could not prepare the VM's data disk: ${(err as Error).message}`);
       }
+      const baseBytes = await this.until(vm, this.allocatedBytes(vm.files.dataDisk));
+      if (vm.disk) vm.disk.baseBytes = baseBytes;
     }
 
     // The checks Electron makes before the helper makes them again (§2.1),
@@ -628,20 +631,25 @@ export class DefaultVmManager implements VmManager {
 
   /**
    * What free space a VM may have for its data disk (§5.6): what is above the
-   * floor and not still promised to a running VM, and the fair share of it -
-   * that divided among the claimants that do not hold a disk yet, this one
-   * among them. The sizes are read first; the sum and `set` then run in one
-   * turn, over every disk set aside by then, so two VMs sized at once never
-   * both count the same space. A disk set aside while the sizes were read
-   * counts as promised in full.
+   * floor and not still promised to a running VM, its fair share of that -
+   * divided among the claimants that do not hold a disk yet, this one among
+   * them - and how many others those are. The disks are read first and free
+   * space last, so a disk that grows in between counts as used, not as free.
+   * The sum and `set` then run in one turn, over every disk set aside by
+   * then, so two VMs sized at once never both count the same space. A disk
+   * set aside while the sizes were read, or not yet measured, counts as
+   * promised in full.
    */
-  private async setAside<T>(vm: Vm, config: DockerVmConfig, set: (room: { available: number; share: number }) => T): Promise<T> {
-    const free = await this.freeBytes(this.opts.dataDir);
+  private async setAside<T>(
+    vm: Vm,
+    config: DockerVmConfig,
+    set: (room: { available: number; share: number; others: number }) => T
+  ): Promise<T> {
     const grown = new Map<Vm, number>();
     for (const other of this.vms) {
-      if (other === vm || !other.disk) continue;
-      grown.set(other, (await this.allocatedBytes(other.disk.file)) - other.disk.baseBytes);
+      if (other !== vm && other.disk) grown.set(other, await this.grownBytes(other));
     }
+    const free = await this.freeBytes(this.opts.dataDir);
     let promised = 0;
     let holders = 0;
     for (const other of this.vms) {
@@ -650,38 +658,60 @@ export class DefaultVmManager implements VmManager {
       promised += Math.max(0, other.disk.promisedBytes - Math.max(0, grown.get(other) ?? 0));
     }
     const available = free - config.minFreeGiB * GiB - promised;
-    return set({ available, share: available / Math.max(1, this.claimants(config) - holders) });
+    const wanting = Math.max(1, this.claimants(config) - holders);
+    return set({ available, share: available / wanting, others: wanting - 1 });
   }
 
   /**
-   * A job VM's data disk's apparent size: its fair share, at most
-   * dockerVm.dataDiskGiB and at least 8 GiB - and never into the floor, nor
-   * into what running VMs were promised and have not yet used (§5.6).
+   * Set aside a job VM's share of free space - at most dockerVm.dataDiskGiB,
+   * at least 8 GiB, and never into the floor nor into what running VMs were
+   * promised and have not yet used - and give the size its disk is made at
+   * (§5.6). That is dockerVm.dataDiskGiB, not the share: the golden disk is
+   * that size, and CacheDisks clones it only into a disk no smaller (§6.5).
+   * A guest that writes past its share while the others need theirs is what
+   * the free-space watch stops.
    */
   private dataDiskGiB(vm: Vm, config: DockerVmConfig): Promise<number> {
     return this.setAside(vm, config, ({ available, share }) => {
-      const size = Math.min(config.dataDiskGiB * GiB, Math.max(share, MIN_DATA_DISK_BYTES));
-      if (size > available) throw vmError('disk', 'E_NO_DISK', 'not enough free disk for a Docker VM');
-      const sizeGiB = Math.floor(size / GiB);
-      vm.disk = { file: vm.files.dataDisk, promisedBytes: sizeGiB * GiB, baseBytes: 0 };
-      this.opts.log('debug', `Docker VM ${vm.vmId} data disk: ${sizeGiB} GiB of ${Math.floor(Math.max(0, available) / GiB)} GiB above the floor not promised to another VM`);
-      return sizeGiB;
+      if (available < MIN_DATA_DISK_BYTES) throw vmError('disk', 'E_NO_DISK', 'not enough free disk for a Docker VM');
+      const promisedGiB = Math.floor(Math.min(config.dataDiskGiB * GiB, Math.max(share, MIN_DATA_DISK_BYTES)) / GiB);
+      // Its base is measured once the disk is made: a clone starts with the
+      // golden disk's blocks allocated, though they take no free space.
+      vm.disk = { file: vm.files.dataDisk, promisedBytes: promisedGiB * GiB, baseBytes: null };
+      this.opts.log(
+        'debug',
+        `Docker VM ${vm.vmId} data disk: ${config.dataDiskGiB} GiB, ${promisedGiB} GiB of it set aside of ${Math.floor(available / GiB)} GiB above the floor not promised to another VM`
+      );
+      return config.dataDiskGiB;
     });
   }
 
   /**
    * A refresh VM's disk is CacheDisks', at dockerVm.dataDiskGiB so that a job
    * disk of that size can clone it, and is never refused here. What it writes
-   * is the cache it loads; a fair share is set aside for that, so job disks
-   * sized while it runs leave it room. A clone of the golden disk counts only
-   * what it allocates past the blocks it shares.
+   * is the cache it loads: at most cacheLimitGiB, less what a clone of the
+   * golden disk holds already. That is set aside, so job disks sized while it
+   * runs leave it room - as far as it leaves each other claimant the 8 GiB
+   * smallest disk, and never less than its fair share.
    */
   private async setAsideForRefresh(vm: Vm, config: DockerVmConfig): Promise<void> {
     const file = cacheFiles(this.opts.dataDir, vm.request.repoKey).refresh;
     const baseBytes = await this.allocatedBytes(file);
-    await this.setAside(vm, config, ({ share }) => {
-      vm.disk = { file, promisedBytes: Math.max(0, Math.min(config.dataDiskGiB * GiB, share)), baseBytes };
+    await this.setAside(vm, config, ({ available, share, others }) => {
+      const loads = Math.max(0, Math.min(config.cacheLimitGiB, config.dataDiskGiB) * GiB - baseBytes);
+      const promisedBytes = Math.max(0, Math.min(loads, Math.max(share, available - others * MIN_DATA_DISK_BYTES)));
+      vm.disk = { file, promisedBytes, baseBytes };
+      this.opts.log(
+        'debug',
+        `Docker VM ${vm.vmId} cache refresh: ${Math.floor(promisedBytes / GiB)} GiB set aside of ${Math.floor(available / GiB)} GiB above the floor not promised to another VM`
+      );
     });
+  }
+
+  /** What a VM's data disk has allocated past its base: 0 before that is measured. */
+  private async grownBytes(vm: Vm): Promise<number> {
+    if (!vm.disk || vm.disk.baseBytes === null) return 0;
+    return (await this.allocatedBytes(vm.disk.file)) - vm.disk.baseBytes;
   }
 
   /**
@@ -791,7 +821,10 @@ export class DefaultVmManager implements VmManager {
     this.diskWatch = null;
   }
 
-  /** Under half the floor, stop the job VM whose disk grew most (§5.6). */
+  /**
+   * Under half the floor, stop the job VM whose disk grew most (§5.6): wrote
+   * most past its base, not a clone holding most of the golden disk's blocks.
+   */
   async checkFreeSpace(): Promise<void> {
     const config = this.opts.config();
     let free: number;
@@ -804,7 +837,7 @@ export class DefaultVmManager implements VmManager {
     let largest: { vm: Vm; bytes: number } | null = null;
     for (const vm of this.vms) {
       if (vm.request.mode !== 'job' || (vm.status !== 'ready' && vm.status !== 'booting')) continue;
-      const bytes = await this.allocatedBytes(vm.files.dataDisk);
+      const bytes = await this.grownBytes(vm);
       if (!largest || bytes > largest.bytes) largest = { vm, bytes };
     }
     if (largest) await this.stopFailing(largest.vm, vmError('running', 'E_DISK_FULL', 'host disk nearly full'));

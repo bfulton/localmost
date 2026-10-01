@@ -108,7 +108,7 @@ export interface DockerVmConfig {
   memoryMiB: number;
   /** How many VMs may run at once; more wait at the admission gate. */
   maxRunning: number;
-  /** The most a VM's data disk may be; less when its share of the free space is. */
+  /** Every VM's sparse data disk, the golden disk's size; and the most free space set aside for one. */
   dataDiskGiB: number;
   /** How long a docker request waits for the job's VM. */
   bootTimeoutSec: number;

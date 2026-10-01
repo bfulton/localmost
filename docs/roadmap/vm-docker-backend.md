@@ -567,14 +567,16 @@ disk, both of which grow on the Mac's disk. Docker Desktop capped all of this
 with one fixed VM disk; here the caps are explicit (contract §5.6, §6.3): a
 byte limit per pull and per job enforced while blobs stream, a limit on how
 far a layer may expand when decompressed, and a free-space floor under which
-a boot or a pull is refused. A new data disk's apparent size is the smaller
-of `dockerVm.dataDiskGiB` and a fair share of the free space above the floor
-that no running VM has already been promised: that space divided among the
-VMs that may still want a disk (each runner slot, the spare, a cache refresh,
-at most `maxRunning`), so the first VM to boot does not take room the next
-ones need. While VMs run, `VmManager` watches free
-space; below half the floor it stops the VM whose disk grew most, with the
-reason "host disk nearly full". `cacheLimitGiB` still trims the cache at
+a boot or a pull is refused. Every data disk is a sparse
+`dockerVm.dataDiskGiB`, the golden disk's size, so a job can always clone the
+cache. What a boot sets aside is a fair share of the free space above the
+floor that no running VM has already been promised: that space divided among
+the VMs that may still want a disk (each runner slot, the spare, a cache
+refresh, at most `maxRunning`), so the first VM to boot does not take room
+the next ones need; a boot with under 8 GiB left is refused. A share is a
+reservation, not a cap, so a job running alone may use more. While VMs run,
+`VmManager` watches free space; below half the floor it stops the VM whose
+disk grew most, with the reason "host disk nearly full". `cacheLimitGiB` still trims the cache at
 refresh.
 
 **Rosetta absent or broken.** No Rosetta share. arm64 images work. amd64
