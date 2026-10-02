@@ -1,6 +1,8 @@
  
 import { jest } from '@jest/globals';
 import { EventEmitter } from 'events';
+import * as fs from 'fs';
+import * as path from 'path';
 import { FALLBACK_RUNNER_VERSION } from '../shared/constants';
 
 // Mock http module
@@ -45,7 +47,7 @@ jest.mock('./app-state', () => ({
   })),
 }));
 
-import { BrokerProxyService, extractGitHubJobInfo } from './broker-proxy-service';
+import { BrokerProxyService, extractGitHubJobInfo, LOCALLY_SERVED_PATHS, UPSTREAM_OPERATIONS } from './broker-proxy-service';
 import { getLogger } from './app-state';
 import type { Target } from '../shared/types';
 
@@ -1222,7 +1224,7 @@ describe('message routing', () => {
         const sessionId = await acquiredWorker();
         mockHttpsRequest.mockClear();
 
-        const res = await request('GET', `/runnerversion?${query(sessionId)}`);
+        const res = await request('POST', `/renewjob?${query(sessionId)}`, JSON.stringify(acquiredIds));
 
         expect(res.statusCode).toBe(403);
         expect(mockHttpsRequest).not.toHaveBeenCalled();
@@ -1232,7 +1234,7 @@ describe('message routing', () => {
         const sessionId = await acquiredWorker();
         mockHttpsRequest.mockClear();
 
-        const res = await request('GET', `/runnerversion?sessionId=${sessionId}&status=Online`);
+        const res = await request('POST', `/renewjob?sessionId=${sessionId}&status=Online`, JSON.stringify(acquiredIds));
 
         expect(res.statusCode).toBe(200);
         expect(mockHttpsRequest).toHaveBeenCalledTimes(1);
@@ -1277,6 +1279,140 @@ describe('message routing', () => {
           expect({ op, status: res.statusCode }).toEqual({ op, status: 403 });
         }
         expect(mockHttpsRequest).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('what it forwards upstream', () => {
+      // Every request the runner can send to its broker address, read from
+      // the runner's source; see the fixture's comment. Anything else sent
+      // there goes upstream on the runner's credentials only if it is one of
+      // these, so a job holding its worker's key cannot use the runner's
+      // token for whatever GitHub's broker or run service would answer.
+      interface RunnerOperation { method: string; path: string; served: 'local' | 'upstream'; source: string }
+      const fixture = JSON.parse(fs.readFileSync(
+        path.resolve(__dirname, '..', '..', 'test', 'fixtures', 'runner-broker-operations.json'), 'utf-8'
+      )) as { runnerVersion: string; operations: RunnerOperation[] };
+      const upstream = fixture.operations.filter(op => op.served === 'upstream');
+      const local = fixture.operations.filter(op => op.served === 'local');
+
+      it('lists the operations of the runner version localmost installs', () => {
+        // Moving to another runner version means reading its source again:
+        // a request it adds would be refused here, and one it drops should
+        // stop being forwarded. This fails until that has been done.
+        expect(fixture.runnerVersion).toBe(FALLBACK_RUNNER_VERSION);
+        for (const op of fixture.operations) expect(op.source).toMatch(/^src\/\S+\.cs:\d/);
+      });
+
+      it('forwards exactly the operations the runner sends upstream, and serves the rest here', () => {
+        expect(UPSTREAM_OPERATIONS.map(op => `${op.method} ${op.path}`).sort())
+          .toEqual(upstream.map(op => `${op.method} ${op.path}`).sort());
+        expect([...new Set(LOCALLY_SERVED_PATHS)].sort())
+          .toEqual([...new Set(local.map(op => op.path.toLowerCase()))].sort());
+      });
+
+      it.each(upstream.map(op => [op.method, op.path] as const))(
+        'forwards %s %s, with that method, to that operation', async (method, opPath) => {
+          const sessionId = await acquiredWorker();
+          mockHttpsRequest.mockClear();
+
+          const res = await request(method, `${opPath}?sessionId=${sessionId}`, JSON.stringify(acquiredIds));
+
+          expect(res.statusCode).toBe(200);
+          expect(mockHttpsRequest).toHaveBeenCalledTimes(1);
+          const options = mockHttpsRequest.mock.calls[0][0] as { method: string; path: string };
+          expect(options.method).toBe(method);
+          expect(options.path.split('?')[0]).toBe(opPath);
+        });
+
+      it.each(upstream.map(op => [op.method, op.path] as const))(
+        "sends %s %s for a delivered request id to the job's run service, under that name", async (method, opPath) => {
+          const sessionId = await acquiredWorker();
+          (internals as unknown as { jobRunServiceUrls: Map<string, string> }).jobRunServiceUrls
+            .set('req-1', 'https://run-actions-1-azure-eastus.actions.githubusercontent.com/123/');
+          mockHttpsRequest.mockClear();
+
+          const res = await request(method, `${opPath.toUpperCase()}/?sessionId=${sessionId}`,
+            JSON.stringify({ requestId: 'req-1', ...acquiredIds }));
+
+          expect(res.statusCode).toBe(200);
+          const options = mockHttpsRequest.mock.calls[0][0] as { hostname: string; method: string; path: string };
+          expect(options.hostname).toBe('run-actions-1-azure-eastus.actions.githubusercontent.com');
+          expect(options.method).toBe(method);
+          expect(options.path.split('?')[0]).toBe(`/123${opPath}`);
+        });
+
+      it.each(upstream.flatMap(op =>
+        ['GET', 'PUT', 'PATCH', 'DELETE', 'POST'].filter(m => m !== op.method).map(m => [m, op.path] as const)
+      ))('refuses %s %s, which the runner never sends', async (method, opPath) => {
+        const sessionId = await acquiredWorker();
+        mockHttpsRequest.mockClear();
+
+        const res = await request(method, `${opPath}?sessionId=${sessionId}`, JSON.stringify(acquiredIds));
+
+        expect(res.statusCode).toBe(403);
+        expect(mockHttpsRequest).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        ['GET', '/Message'],
+        ['GET', '/message/'],
+        ['GET', '/%6dessage'],
+        ['GET', '/x/..%2fmessage'],
+        ['POST', '/message'],
+        ['DELETE', '/Session'],
+        ['DELETE', '/session/'],
+        ['DELETE', '/x/..%2fsession'],
+        ['GET', '/session'],
+      ])('refuses %s %s from a worker holding its bound session', async (method, opPath) => {
+        // The target's own session, on the runner's token: polled, it takes
+        // messages before admission sees them; deleted, it takes the target
+        // offline. A dot segment encoded with its slash is resolved, or not,
+        // by upstream's router, so it is refused rather than reasoned about.
+        const sessionId = await acquiredWorker();
+        mockHttpsRequest.mockClear();
+
+        const res = await request(method, `${opPath}?sessionId=${sessionId}`, JSON.stringify(acquiredIds));
+
+        expect(res.statusCode).toBe(403);
+        expect(mockHttpsRequest).not.toHaveBeenCalled();
+      });
+
+      describe('a path the runner never sends', () => {
+        type Logger = Record<'info' | 'warn' | 'error' | 'debug', jest.Mock>;
+        let logger: Logger;
+        const original = jest.mocked(getLogger).getMockImplementation()!;
+
+        beforeEach(() => {
+          logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
+          jest.mocked(getLogger).mockImplementation(() => logger as unknown as ReturnType<typeof getLogger>);
+        });
+
+        afterEach(() => {
+          jest.mocked(getLogger).mockImplementation(original);
+        });
+
+        it.each([
+          ['GET', '/runnerversion'],
+          ['GET', '/_apis/connectionData'],
+          ['POST', '/timeline'],
+          ['POST', '/logs'],
+          ['POST', '/finishjob'],
+          ['POST', '/jobrequest'],
+          ['POST', '/completejob/x'],
+          ['POST', '/x/completejob'],
+          ['POST', '/x/..%2fcompletejob'],
+          ['GET', '/'],
+        ])('refuses %s %s and says so in the log', async (method, opPath) => {
+          const sessionId = await acquiredWorker();
+          mockHttpsRequest.mockClear();
+
+          const res = await request(method, `${opPath}?sessionId=${sessionId}`, JSON.stringify(acquiredIds));
+
+          expect(res.statusCode).toBe(403);
+          expect(mockHttpsRequest).not.toHaveBeenCalled();
+          const warned = logger.warn.mock.calls.map(call => String(call[0]));
+          expect(warned.some(line => line.includes(`${method} ${JSON.stringify(opPath)}`))).toBe(true);
+        });
       });
     });
 

@@ -215,13 +215,22 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   (`/Message`, `/message/`, `/%6dessage`, `DELETE /Session`) or sent with
   another method. They went to GitHub's broker on the runner's credentials with
   the target's own session, so a job could poll that session, taking jobs
-  before admission saw them, or delete it. Any other path that is not a job
-  operation is still forwarded upstream as it comes, on the runner's
-  credentials, with the target's session id in place of any session id it
-  carries. A query that also names the session id another way (`SessionId`,
-  `ſessionId`), or has any parameter name that is not plain ASCII, is refused
-  instead, since upstream could read that name beside or instead of the id put
-  in its place.
+  before admission saw them, or delete it. A query that also names the session
+  id another way (`SessionId`, `ſessionId`), or has any parameter name that is
+  not plain ASCII, is refused instead of forwarded, since upstream could read
+  that name beside or instead of the id put in its place.
+- The broker forwards upstream only the requests the runner itself sends
+  there, `POST completejob` and `POST renewjob`, and refuses anything else a
+  worker sends that it does not answer itself with 403 and a log line naming
+  the path. Any other path used to go to GitHub's broker as it came, on the
+  runner's credentials and with the target's session id, so a job holding its
+  worker's key could call whatever GitHub's broker answers as the runner,
+  including through a spelling only upstream's router resolves
+  (`/x/..%2fmessage`). The list was read from the runner's source (2.336.0,
+  checked against 2.337.0), each request cited in
+  `test/fixtures/runner-broker-operations.json`, and a test fails when
+  localmost's fallback runner version moves past it. Each operation now goes
+  upstream under its own name rather than the spelling sent.
 - The Docker filter refuses a request whose body has a key, at any depth, that
   is not plain ASCII, or whose query has such a parameter name. The daemon's Go
   decoder reads some other letters as ASCII ones: it took `HoſtConfig` (long s)

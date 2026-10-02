@@ -166,30 +166,40 @@ open, through the proxy and directly, because the runner reaches the local
 broker. What keeps a job from using that port is the broker's own
 authentication: each worker talks to it at an address carrying a key of its own
 (`http://127.0.0.1:<port>/w/<key>/`), and the broker answers each key only
-with its own worker's session and the jobs delivered to that worker. A job
-operation it sends upstream on the runner's credentials (renewing, finishing
-or completing a job) must name that worker's job and no other: any request id
-it carries must be one delivered to that worker, and any plan and job ids
-those of the job details it acquired. The operation is recognised however its
-path is spelled, in any case or percent-encoded, and its body must write each
-of those ids under its exact key (`planId`, not `PlanId`): the JSON decoders of
-.NET and Go read a key in any case, and Go's reads some other letters as ASCII
-ones (`requeſtId` as `requestId`), so a body that spells one otherwise, or has
-any key that is not plain ASCII, is refused. A path that decodes to anything
-but plain ASCII is refused too. The paths the broker answers itself (opening,
-polling and deleting a session, acknowledging a message, acquiring a job, and
-the worker's token endpoint) never go upstream: another spelling of one
-(`/Message`, `/message/`, `/%6dessage`), or another method on it, is refused.
-Any other path is not yet restricted: it is forwarded to GitHub's broker on
-the runner's credentials as it comes, with the target's upstream session id in
-place of any session id it carries. That id is put in under `sessionId`, so a
-query that also spells it another way (`SessionId`, or with a letter Go reads
-as an ASCII one), or has any parameter name that is not plain ASCII, is refused
-rather than forwarded: upstream could read that spelling beside or instead of
-the id put there.
-Forwarding only the paths the runner uses would close that; it is an open
-item. That key, not the closed port, is what keeps a job from acting as
-another worker, and from acting as the runner through the operations above.
+with its own worker's session and the jobs delivered to that worker. Of what
+a worker sends it, the broker forwards upstream on the runner's credentials
+only the requests the runner itself sends there: `POST completejob` and
+`POST renewjob`, its run-service client's job operations. Everything else the
+runner can send to its broker address (opening, polling and deleting a
+session, acknowledging a message, acquiring a job, and the worker's token
+endpoint) the broker answers itself, and any other method or path is refused
+with 403 and a log line naming it. The list was read from the source of
+runner 2.336.0, the version localmost falls back to, and checked against
+2.337.0; a test holds it to that fallback version, so moving to another means
+reading that version's requests again. A newer runner chosen in Settings that
+sent another request upstream would have it refused.
+Those two operations must name that worker's job and no other: any request id
+one carries must be one delivered to that worker, and its plan and job ids
+those of the job details it acquired. An operation is recognised however its
+path is spelled, in any case or percent-encoded, and goes upstream under its
+own name, not the spelling sent; its body must write each of those ids under
+its exact key (`planId`, not `PlanId`): the JSON decoders of .NET and Go read
+a key in any case, and Go's reads some other letters as ASCII ones
+(`requeſtId` as `requestId`), so a body that spells one otherwise, or has any
+key that is not plain ASCII, is refused. A path that decodes to anything but
+plain ASCII is refused too, and so is any spelling of a path the broker
+answers itself (`/Message`, `/message/`, `/%6dessage`), or another method on
+one. The target's upstream session id is put in place of
+the session id an operation carries, under `sessionId`, so a query that also
+spells it another way (`SessionId`, or with a letter Go reads as an ASCII
+one), or has any parameter name that is not plain ASCII, is refused rather
+than forwarded: upstream could read that spelling beside or instead of the id
+put there. The runner of those versions addresses `completejob` and
+`renewjob` to the job's own system connection, which the broker does not
+rewrite, so in practice they go to GitHub directly, on the job's own token,
+and nothing a worker sends is forwarded upstream at all. That key, not the
+closed port, is what keeps a job from acting as another worker, and from
+acting as the runner through the operations above.
 
 A repository declares one of three levels in its `.localmostrc` (`level:`; see
 Policy levels above), and one that declares none runs `strict`. Settings under
@@ -741,7 +751,7 @@ with the evidence for each claim above, in
 Each target's runner registrations live in `~/.localmost/runner/proxies/<target>/<n>/`: the runner's settings and the registration's RSA key. GitHub trusts that key to act as the runner: whoever holds it can open a session under the runner's name and receive the jobs routed to it, with their secrets. It therefore never enters a job's sandbox.
 
 - **The broker signs, not the worker.** The local broker makes every call to GitHub as the runner itself, with the registration's key, app-side. The runner's listener only ever talks to the broker, and the broker ignores the token a worker presents. The job's own operations (fetching actions, caches, artifacts, logs) go to GitHub with the token GitHub issues for that one job, not with anything of the runner's.
-- **The runner's token goes only to GitHub.** The broker acquires a job, on the runner's token, only from a run service at an https host under `actions.githubusercontent.com`. The job's operations are forwarded there or to GitHub's broker, and nowhere else. A job offered with any other run service is left unacquired.
+- **The runner's token goes only to GitHub.** The broker acquires a job, on the runner's token, only from a run service at an https host under `actions.githubusercontent.com`. The two job operations the broker forwards for a worker (`completejob` and `renewjob`) go there or to GitHub's broker, and nowhere else; it forwards no other request. A job offered with any other run service is left unacquired.
 - **Each worker start gets its own key.** The runner will not start without a key and a token endpoint, so each worker is given a new RSA key and a token endpoint on its own broker address. That endpoint issues a token only for an assertion signed with that key, and stops answering when the worker exits.
 - **So a copied key is worth nothing.** A job can read its worker's key, but the key works only at its own worker's endpoint, and the token it gets opens nothing. A job cannot use it to act as the runner, including while localmost is paused or quit. (What a running job can still send upstream through its own worker's broker address is described under Network Policy above.)
 - **Keys earlier versions exposed are replaced.** Before this, every job's sandbox held a copy of its runner's registration key, and those registrations are not ephemeral, so a key a job took then would still work. On the first start after upgrading, localmost registers each such runner again under the same name (`config.sh --replace`), which gives it a new key; GitHub stops honouring the old one. A registration that cannot be replaced at that start (offline, signed out) keeps its old key and is tried again at the next start. Removing and re-adding a target replaces its keys too.
