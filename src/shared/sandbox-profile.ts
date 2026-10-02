@@ -481,6 +481,11 @@ export function developerCredentialPaths(home: string = os.homedir()): { subpath
       // Azure CLI: its token cache and service principal secrets.
       `${home}/.azure`,
       `${home}/Library/Keychains`,
+      // Every app's preferences. cfprefsd serves a domain to a process that
+      // may read or write its plist here, whatever the profile's preference
+      // rules say, so a grant of ~ or ~/Library would otherwise read and
+      // write any app's settings through it.
+      `${home}/Library/Preferences`,
     ],
     literals: [
       `${home}/.netrc`,
@@ -838,8 +843,6 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push('(allow iokit*)');
   lines.push('(allow pseudo-tty)');
   lines.push('(allow user-preference-read)');
-  lines.push('(allow user-preference-write');
-  lines.push('  (preference-domain "com.apple.dt.Xcode"))');
   lines.push('');
 
   lines.push(...processMarkerRules(options.processMarker));
@@ -924,8 +927,6 @@ export function generateDiscoveryProfile(options: {
     '(allow iokit*)',
     '(allow pseudo-tty)',
     '(allow user-preference-read)',
-    '(allow user-preference-write',
-    '  (preference-domain "com.apple.dt.Xcode"))',
     '',
     ...processMarkerRules(options.processMarker),
   ];

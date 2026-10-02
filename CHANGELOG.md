@@ -107,6 +107,16 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   with `uv tool install` or `pipx` - fails with "Operation not permitted"
   until the repository declares its `~/.local/share/<tool>` under
   `filesystem.read`.
+- A job, a `localmost test` step and `--updaterc` no longer write the
+  `com.apple.dt.Xcode` preference domain. A workflow step that runs
+  `defaults write com.apple.dt.Xcode ...` (to skip macro fingerprint
+  validation, say) fails with "Could not write domain"; pass the setting to
+  `xcodebuild` instead, as `-skipMacroValidation`,
+  `-skipPackagePluginValidation`, `-skipPackageSignatureValidation` or
+  `-<key>=<value>`. `xcodebuild` and `swift build` themselves write no
+  preferences.
+- `~/Library/Preferences` is closed to reads and writes at every level,
+  whatever the policy grants.
 
 ### Security
 - Secret values are masked out of step output. A step that printed one - `set -x`,
@@ -418,6 +428,15 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   (`~/.local/share/uv/credentials/credentials.toml`), the SSH key into a
   Podman machine (`~/.local/share/containers/podman/machine/machine`) and
   atuin's sync key. They now read `~/.local/bin` and `~/.local/lib` only.
+- Every profile let a job, a `localmost test` step and `--updaterc` write the
+  `com.apple.dt.Xcode` preference domain, at every level: settings your own
+  Xcode loads outside any sandbox. No profile writes a preference domain now.
+  And a policy granting `~` or `~/Library` - or, under `--updaterc`, no
+  policy at all - reached every app's preferences through their plists,
+  which cfprefsd honours in place of the preference rules: write grants
+  could set any app's preferences, read grants read them. `~/Library/Preferences`
+  is now on the credential floor, read and write, with the directories above
+  it closed as nodes.
 
 ### Fixed
 - In-app updates find a zip to install. The update feed listed only the

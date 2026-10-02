@@ -54,6 +54,7 @@ const SENSITIVE_WRITE_PLACES: SensitivePlace[] = [
     path: '~/Library/Application Support',
     why: 'data and configuration your own apps load, outside the sandbox',
   },
+  { path: '~/Library/Preferences', why: `every app's preferences: ${REFUSED}` },
   { path: '/usr/local/bin', why: ON_PATH },
   { path: '/opt/homebrew/bin', why: ON_PATH },
   // Where pipx, uv and the like install, and where people keep their own.

@@ -278,6 +278,9 @@ describe('Sandbox Profile Generator', () => {
         '(literal "/Users/test/.yarnrc.yml")',
         '(literal "/Users/test/.cache/huggingface/token")',
         '(literal "/Users/test/.cache/huggingface/stored_tokens")',
+        // cfprefsd lets a process that can read or write a domain's plist
+        // read or write the domain, whatever the preference rules say.
+        '(subpath "/Users/test/Library/Preferences")',
       ]) {
         expect(forms[deny]).toContain(secret);
       }
@@ -866,13 +869,23 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).toContain('(allow pseudo-tty)');
     });
 
-    it('should allow Xcode preferences', () => {
-      const profile = generateSandboxProfile({
+    const everyProfile = () => [
+      generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT }),
+      generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, permissive: true }),
+      generateSandboxProfile({
         workDir: '/path/to/project',
         proxyPort: DEFAULT_PROXY_PORT,
-      });
+        policy: { filesystem: { read: ['~'], write: ['~'] } },
+      }),
+      generateDiscoveryProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, logFile: '' }),
+    ];
 
-      expect(profile).toContain('com.apple.dt.Xcode');
+    it('writes no preference domain, Xcode\'s included, in the enforcement or discovery profile', () => {
+      // A step that wrote com.apple.dt.Xcode changed settings your own Xcode
+      // loads outside any sandbox, and no build needs to.
+      for (const profile of everyProfile()) {
+        expect(profile).not.toContain('user-preference-write');
+      }
     });
   });
 
@@ -949,6 +962,8 @@ describe('Sandbox Profile Generator', () => {
           'kernel: (Sandbox) Sandbox: sh(101) deny(1) file-read-data /Users/test/.ssh/id_ed25519',
           'kernel: (Sandbox) Sandbox: sh(102) deny(1) file-write-create /Users/test/.localmost/runner/x',
           'kernel: (Sandbox) Sandbox: sh(103) allow file-read-data /Users/test/.aws/config',
+          // Read through cfprefsd when a profile reads the domain, never as a file.
+          'kernel: (Sandbox) Sandbox: sh(104) allow file-read-data /Users/test/Library/Preferences/com.apple.dt.Xcode.plist',
         ].join('\n'),
         '/work'
       );
@@ -1008,9 +1023,8 @@ describe('Sandbox Profile Generator', () => {
       expect(deny).toBeGreaterThan(forms.indexOf('(allow file-read* (with report))'));
       expect(forms[deny]).toContain('(subpath "/Users/test/.localmost")');
       expect(profile).toContain('(deny network-outbound (literal "/Users/test/.localmost/localmost.sock"))');
-      // Preferences are a persistence point too; the Xcode domain is the one
-      // the enforcement profile grants.
-      expect(forms).not.toContain('(allow user-preference-write)');
+      // Preferences are a persistence point too, and no profile writes them.
+      expect(profile).not.toContain('user-preference-write');
     });
 
     it('should identify as discovery profile', () => {

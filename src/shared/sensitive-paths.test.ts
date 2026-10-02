@@ -131,7 +131,14 @@ describe('isSensitiveWritePath', () => {
     // A grant on it, or in it, is said to do nothing rather than described
     // as what it would let a job do: no write to the keys or the commands
     // an SSH config runs.
-    for (const entry of ['~/.ssh', '~/.ssh/authorized_keys', '~/.config', '~/.config/gh']) {
+    for (const entry of [
+      '~/.ssh',
+      '~/.ssh/authorized_keys',
+      '~/.config',
+      '~/.config/gh',
+      '~/Library/Preferences',
+      '~/Library/Preferences/com.apple.dt.Xcode.plist',
+    ]) {
       expect([entry, sensitiveWriteReason(entry, HOME)]).toEqual([entry, expect.stringMatching(/refused .*whatever is granted/)]);
     }
     expect(sensitiveWriteReason('~/.ssh', HOME)).not.toMatch(/commands your SSH config runs/);

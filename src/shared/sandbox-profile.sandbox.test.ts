@@ -27,7 +27,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, jest } from '@jest/globals';
-import { ChildProcess, execFile, execFileSync, spawn } from 'child_process';
+import { ChildProcess, execFile, execFileSync, spawn, spawnSync } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as net from 'net';
@@ -41,6 +41,7 @@ import {
   DEFAULT_BROKER_PORT,
 } from './sandbox-profile';
 import { getWorkspacesDir, removeWorkspace } from './workspace';
+import { defaults, preferenceAllowed, removeThrowawayDomain, throwawayDomain } from './test-utils/preference-probe';
 
 // The real home by default; one block below stands a scratch directory in for
 // it, since os.homedir() is what the profiles are built from.
@@ -703,6 +704,64 @@ if (!isMacOS) {
       expect(fs.readFileSync(path.join(home, '.aws', 'credentials'), 'utf-8')).toBe('aws\n');
     });
   });
+
+  describe("test-mode access to the user's preferences through a constructed profile", () => {
+    // The real home: cfprefsd finds a user's plists by uid, whatever HOME
+    // says or the profile was built from, so a stand-in home would prove
+    // nothing. The one domain written is a throwaway no app owns, planted
+    // from outside the sandbox and removed after; Xcode's is only ever asked
+    // about (see preferenceAllowed).
+    const domain = throwawayDomain();
+    const plist = path.join(realHomedir(), 'Library', 'Preferences', `${domain}.plist`);
+    let scratch: string;
+    let workDir: string;
+
+    beforeAll(() => {
+      scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'localmost-prefs-')));
+      workDir = path.join(scratch, 'project');
+      fs.mkdirSync(workDir);
+      expect(defaults(['write', domain, 'planted', '-string', 'PLANTED']).ok).toBe(true);
+      expect(defaults(['read', domain, 'planted']).stdout).toBe('PLANTED');
+    });
+
+    afterAll(() => {
+      removeThrowawayDomain(domain);
+      fs.rmSync(scratch, { recursive: true, force: true });
+    });
+
+    /** The enforcement profile, bare and under grants that reach the plists, and the discovery profile, each written out. */
+    const profiles = (): Record<string, string> => {
+      const grants = ['~', '~/Library', '~/Library/Preferences'];
+      const texts: Record<string, string> = {
+        enforcement: generateSandboxProfile({ workDir, proxyPort: 1, policy: readable }),
+        'enforcement granted ~': generateSandboxProfile({
+          workDir,
+          proxyPort: 1,
+          policy: { filesystem: { read: [...MACOS_BASELINE_READ_PATHS, ...grants], write: grants } },
+        }),
+        discovery: generateDiscoveryProfile({ workDir, proxyPort: 1, logFile: '' }),
+      };
+      return Object.fromEntries(Object.entries(texts).map(([name, text]) => {
+        const profilePath = path.join(scratch, `${name.replace(/\W+/g, '-')}.sb`);
+        fs.writeFileSync(profilePath, text);
+        return [name, profilePath];
+      }));
+    };
+
+    it("writes no preference domain, Xcode's included, and reaches no plist through a grant of ~", () => {
+      // cfprefsd serves a domain to a process that may read (or write) its
+      // plist, whatever the preference rules say, and discovery reads
+      // everything: a filesystem grant there was a way around them.
+      for (const [name, profilePath] of Object.entries(profiles())) {
+        expect([name, preferenceAllowed('user-preference-write', 'com.apple.dt.Xcode', profilePath)]).toEqual([name, false]);
+        expect([name, defaults(['write', domain, 'job', '-string', 'JOB'], profilePath).ok]).toEqual([name, false]);
+        expect([name, defaults(['read', domain, 'job']).ok]).toEqual([name, false]);
+        const read = spawnSync('/usr/bin/sandbox-exec', ['-f', profilePath, '/bin/cat', plist], { encoding: 'utf-8', timeout: 15000 });
+        expect([name, read.stdout]).toEqual([name, '']);
+        expect([name, read.stderr]).toEqual([name, expect.stringContaining('Operation not permitted')]);
+      }
+    });
+  });
 } else {
   describe('test-mode network confinement through the ambient profile', () => {
     it('refuses a direct connection off the machine', async () => {
@@ -732,6 +791,10 @@ if (!isMacOS) {
         expect(profile).not.toContain('(subpath "/private/tmp")');
         expect(profile).toContain('(allow signal (target same-sandbox))');
         expect(profile).not.toContain('(allow signal)');
+        // Preferences: no domain written, and no plist reached as a file,
+        // which cfprefsd would honour instead.
+        expect(profile).not.toContain('user-preference-write');
+        expect(profile).toContain(`(subpath "${path.join(os.homedir(), 'Library', 'Preferences')}")`);
       }
     });
   });

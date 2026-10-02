@@ -587,6 +587,14 @@ hosts too. A runner job's filesystem likewise starts from a fixed floor the
 policy does not list - the operating system, `/Library/Developer` (the Command
 Line Tools, not Xcode) and its own caches - see SECURITY.md.
 
+Preferences are outside what a policy can grant. A job writes no preference
+domain, Xcode's included, and `~/Library/Preferences` stays closed to reads
+and writes whatever `filesystem` declares, since cfprefsd would serve any
+domain through a grant of its plist. A workflow that ran
+`defaults write com.apple.dt.Xcode <key> ...` passes the setting to
+`xcodebuild` instead, as a flag (`-skipMacroValidation`,
+`-skipPackagePluginValidation`) or as `-<key>=<value>` for that run.
+
 `env:` governs what a job inherits from the environment localmost itself was
 launched with, and nothing else. It never affects the variables the runner or
 the workflow sets: `GITHUB_TOKEN`, secrets and a step's `env:` reach the job as

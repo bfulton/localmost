@@ -614,6 +614,18 @@ describe('Process Sandbox', () => {
     });
   });
 
+  describe('preferences in the runner profile', () => {
+    it.each(['strict', 'moderate', 'permissive'] as const)(
+      'writes no preference domain under %s, Xcode\'s included',
+      (level) => {
+        // A job that wrote com.apple.dt.Xcode changed settings your own Xcode
+        // loads outside any sandbox, and no build needs to.
+        const profile = profileWith({ filesystemPolicy: { level, read: ['~'], write: ['~'] } });
+        expect(profile).not.toContain('user-preference-write');
+      }
+    );
+  });
+
   describe("the runner profile's filesystem floor", () => {
     it.each(['strict', 'moderate', 'permissive'] as const)(
       'keeps the credentials a developer machine holds closed to a write grant under %s, and the directories above them',
@@ -654,6 +666,10 @@ describe('Process Sandbox', () => {
           home('.yarnrc.yml'),
           home('.cache', 'huggingface', 'token'),
           home('.cache', 'huggingface', 'stored_tokens'),
+          // cfprefsd lets a process that can read or write a domain's plist
+          // read or write the domain, whatever the preference rules say.
+          home('Library', 'Preferences', 'com.apple.finder.plist'),
+          home('Library', 'Preferences', 'ByHost', 'com.apple.screensaver.0000.plist'),
         ]) {
           expect(readable(profile, credential)).toBe(false);
           expect(writable(profile, credential)).toBe(false);
@@ -664,7 +680,7 @@ describe('Process Sandbox', () => {
           home('.ssh'), home('Library', 'Keychains'), home('Library'), home('.m2'), home('.gradle'), home('.cargo'),
           home('.nuget'), home('.nuget', 'NuGet'), home('.azure'), home('.gem'), home('.terraform.d'), home('.local'),
           home('.local', 'share'), home('.local', 'share', 'gem'), home('.cache'), home('.cache', 'huggingface'),
-          homeDir, path.dirname(homeDir),
+          home('Library', 'Preferences'), homeDir, path.dirname(homeDir),
         ]) {
           expect(writable(profile, node)).toBe(false);
         }

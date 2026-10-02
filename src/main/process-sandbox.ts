@@ -818,8 +818,6 @@ ${allowDirectNetwork ? ';; Runner registration talks to GitHub directly: app-dri
 (allow iokit*)
 (allow pseudo-tty)
 (allow user-preference-read)
-(allow user-preference-write
-  (preference-domain "com.apple.dt.Xcode"))
 ${processMarkerRules(processMarker).join('\n')}
 `;
 }

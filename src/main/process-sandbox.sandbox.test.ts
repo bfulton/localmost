@@ -33,6 +33,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { generateSandboxProfile, RunnerProfileOptions } from './process-sandbox';
 import { dockerOnPath } from './test-utils/vm-fixtures';
+import { defaults, preferenceAllowed, removeThrowawayDomain, throwawayDomain } from '../shared/test-utils/preference-probe';
 
 // The real home by default; one block below stands a directory of its own in
 // for it, since os.homedir() is what the profile is built from.
@@ -801,6 +802,54 @@ if (!isMacOS) {
       );
     });
 
+    describe("the user's preferences", () => {
+      // The real home, unlike the blocks above: cfprefsd finds a user's
+      // plists by uid, whatever HOME says or the profile was built from, so a
+      // stand-in home would prove nothing. The one domain written is a
+      // throwaway no app owns, planted from outside the sandbox and removed
+      // after; Xcode's is only ever asked about (see preferenceAllowed).
+      const domain = throwawayDomain();
+      const plist = path.join(homeDir, 'Library', 'Preferences', `${domain}.plist`);
+
+      beforeAll(() => {
+        expect(defaults(['write', domain, 'planted', '-string', 'PLANTED']).ok).toBe(true);
+        expect(defaults(['read', domain, 'planted']).stdout).toBe('PLANTED');
+      });
+
+      afterAll(() => {
+        removeThrowawayDomain(domain);
+      });
+
+      it.each(['strict', 'moderate', 'permissive'] as const)(
+        "writes no preference domain under %s, Xcode's included",
+        (level) => {
+          // Your own Xcode loads com.apple.dt.Xcode outside any sandbox, and
+          // xcodebuild and swift build write none of it.
+          const profilePath = writeProfile({ filesystemPolicy: { level, read: [], write: [] } });
+          expect(preferenceAllowed('user-preference-write', 'com.apple.dt.Xcode', profilePath)).toBe(false);
+          expect(defaults(['write', domain, 'job', '-string', 'JOB'], profilePath).ok).toBe(false);
+          expect(defaults(['read', domain, 'job']).ok).toBe(false);
+        }
+      );
+
+      it('reaches no plist through a grant of ~ or ~/Library/Preferences, so cfprefsd serves no domain through one', () => {
+        // cfprefsd serves a domain to a process that may read (or write) its
+        // plist, whatever the preference rules say: a filesystem grant there
+        // was a way around them.
+        const grants = ['~', '~/Library', '~/Library/Preferences'];
+        const profilePath = writeProfile({ filesystemPolicy: { level: 'strict', read: grants, write: grants } });
+        const run = (command: string) => shell(command, profilePath, jobEnv());
+        // The grant is in force beside it, so each refusal below is the floor's doing.
+        expect(canCreate(run, path.join(homeDir, 'Library', 'Caches', probeName()))).toBe(true);
+        const read = run(`/bin/cat ${sq(plist)}`);
+        expect(read.stdout).not.toContain('PLANTED');
+        expect(read.stderr).toContain('Operation not permitted');
+        expect(defaults(['write', domain, 'job', '-string', 'JOB'], profilePath).ok).toBe(false);
+        expect(defaults(['read', domain, 'job']).ok).toBe(false);
+        expect(canCreate(run, path.join(homeDir, 'Library', 'Preferences', `${throwawayDomain()}.plist`))).toBe(false);
+      });
+    });
+
     it('refuses what a policy denies, read and write, inside what it grants', () => {
       const out = path.join(base, 'out');
       const secret = path.join(out, 'secret');
@@ -1420,6 +1469,14 @@ if (!isMacOS) {
       } finally {
         await new Promise((resolve) => server.close(resolve));
       }
+    });
+
+    it("writes no preference domain, Xcode's included", () => {
+      expect(preferenceAllowed('user-preference-write', 'com.apple.dt.Xcode')).toBe(false);
+      const domain = throwawayDomain();
+      const written = defaults(['write', domain, 'job', '-string', 'JOB']);
+      if (written.ok) removeThrowawayDomain(domain);
+      expect(written.ok).toBe(false);
     });
   });
 
