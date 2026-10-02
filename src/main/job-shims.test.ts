@@ -45,9 +45,13 @@ describe("a job's own bin directory", () => {
     expect(fs.readlinkSync(path.join(bin, 'docker'))).toBe(dockerCli);
   });
 
-  it.each([0o077, 0o022, 0o000])('is the user\'s alone, directories and shims, under umask %o', (umask) => {
-    // The app runs with umask 077, a development build or a test with its
-    // shell's; the modes are the same whichever it is.
+  // The app sets umask 077; a test, or anything else calling writeJobBin, has
+  // whatever umask its process has. The modes are the same whichever it is.
+  // 177 and 777 clear owner bits, so they are the cases that need the
+  // explicit chmod and fchmod: without them 177 leaves the shims unrunnable
+  // and 777 leaves the directories and shims mode 0000.
+  const umasks = [0o077, 0o022, 0o000, 0o177, 0o777].map((umask) => [umask.toString(8).padStart(3, '0'), umask] as const);
+  it.each(umasks)('is the user\'s alone, directories and shims, under umask %s', (_label, umask) => {
     expect(JOB_BIN_MODE).toBe(0o700);
     const previous = process.umask(umask);
     let bin: string;

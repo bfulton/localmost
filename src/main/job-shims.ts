@@ -122,8 +122,9 @@ export function xcodebuildShim(binDir: string): string {
  * The mode of the bin directory, the directory above it, and each shim:
  * the user's alone. Only the job runs them, as the user, and a job's
  * sandbox is the user's alone too. Set explicitly, not left to the umask -
- * the app runs with 077, a development build or a test with whatever its
- * shell has - so a job gets the same bin directory either way.
+ * the app sets umask 077; a test, or anything else calling writeJobBin, has
+ * whatever umask its process has - so a job gets the same bin directory
+ * either way.
  */
 export const JOB_BIN_MODE = 0o700;
 

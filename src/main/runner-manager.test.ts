@@ -89,7 +89,7 @@ import { DockerPolicy } from '../shared/docker-policy';
 import { spawnSandboxed } from './process-sandbox';
 import { DockerFilterProxy } from './docker/docker-filter-proxy';
 import { dockerCliPath } from './vm/paths';
-import { getRunnerDir } from './paths';
+import * as paths from './paths';
 import { NO_DAEMON_MESSAGE, noDockerBackend } from './docker/docker-backend';
 import type { DockerBackend, WorkerContext, WorkerDocker } from './docker/docker-backend';
 import type { DockerVmConfig } from './config';
@@ -1681,25 +1681,22 @@ describe('RunnerManager', () => {
       // inheriting another test's pid-file mocks or signalling a real pid.
       (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([] as never);
       (fs.writeFileSync as jest.Mock).mockClear();
-
-      await new RunnerManagerTestHelper(runnerManager).spawnForJob();
+      const runnerDir = jest.spyOn(paths, 'getRunnerDir').mockReturnValue('/Users/test/.localmost/runner');
+      try {
+        await new RunnerManagerTestHelper(runnerManager).spawnForJob();
+      } finally {
+        runnerDir.mockRestore();
+      }
 
       const write = (fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => String(f).endsWith('.pid'));
       expect(write).toBeDefined();
-      const pidFile = String(write![0]);
-      // In the app-owned pids directory, getRunnerDir()/pids...
-      const runnerDir = getRunnerDir();
-      expect(pidFile).toBe(path.join(runnerDir, 'pids', '1.pid'));
-      // ...and never in the job-writable sandbox: not in the one this spawn
-      // ran in, nor anywhere in the runner's sandbox directory. Judged
-      // against the data directory, not by a path's spelling: inside a
-      // localmost job the data directory is under the job's own home, and
-      // so under that job's sandbox.
-      const spawnedIn = String(mockSpawnSandboxed.mock.calls.at(-1)![2]!.cwd);
-      expect(spawnedIn).toBe('/Users/test/.localmost/runner/sandbox/1');
-      for (const sandboxDir of [spawnedIn, path.join(runnerDir, 'sandbox')]) {
-        expect([sandboxDir, path.relative(sandboxDir, pidFile).startsWith('..')]).toEqual([sandboxDir, true]);
-      }
+      // In the app-owned pids directory, getRunnerDir()/pids, which here
+      // shares the runner-paths mock's root with the sandbox this spawn ran
+      // in. Pinned exactly rather than by "not containing /sandbox/": inside
+      // a localmost job the real data directory is under the job's own home,
+      // and so under that job's sandbox.
+      expect(String(write![0])).toBe('/Users/test/.localmost/runner/pids/1.pid');
+      expect(String(mockSpawnSandboxed.mock.calls.at(-1)![2]!.cwd)).toBe('/Users/test/.localmost/runner/sandbox/1');
     });
 
     it('signals the whole process group of an orphan, not just its leader', async () => {

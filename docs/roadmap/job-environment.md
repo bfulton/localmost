@@ -102,9 +102,9 @@ whose sandbox is gone.
 `<sandbox>/localmost/bin` is first on the job's `PATH`. It holds `docker`, a
 link to the bundled CLI (whose directory used to be put on `PATH` itself), and
 two shims. The directory, `<sandbox>/localmost` above it and the shims are
-`0700`, set explicitly rather than left to the umask - the app's is `077`, a
-development build's or a test's whatever its shell has - since only the job,
-running as the user, runs them:
+`0700`, set explicitly rather than left to the umask - the app sets umask
+`077`; a test, or anything else calling `writeJobBin`, has whatever umask its
+process has - since only the job, running as the user, runs them:
 
 - `swift` adds `--disable-sandbox` right after `build`, `test` or `run`, and
   after `package`, whose own options go there, unless the job already gave it
