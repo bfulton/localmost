@@ -287,6 +287,7 @@ Future feature ideas:
 - **Higher parallelism cap** - Parallelize proxy registration to support 16+ concurrent runners (currently capped at 8 due to serial registration time).
 - **macOS VM jobs** - An opt-in per-repository isolation level that runs each job in a fresh macOS VM cloned from a golden image, with policy grants mapped to shares ([design](docs/roadmap/macos-vm-jobs.md)).
 - **Filtering VM network stack** - A userspace network stack for the Docker VM that enforces the job's hostname policy on traffic that ignores proxy settings ([design](docs/roadmap/vm-network-stack.md)).
+- **Dedicated runner user** - Run jobs as a macOS user account of their own, so tools that look the home up by uid, preferences and the keychain are the job's rather than yours ([design](docs/roadmap/job-environment.md#future-a-dedicated-runner-user)).
 
 Bugs and quick improvements:
 

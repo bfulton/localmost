@@ -404,6 +404,13 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   loopback services through `host.docker.internal`. The job's VM has no
   network card: containers reach the network only through the job's own proxy,
   under the same allowlist and loopback rules as the job.
+- A runner job's `HOME` was your home directory, so what it wrote through
+  `HOME` - where the policy granted it - landed in your tree, and tools found
+  your dotfiles there. Each job now runs with a home of its own in its
+  sandbox, gone with it, holding the per-job git config, an empty ssh config
+  (`GIT_SSH_COMMAND` points ssh at it) and links to what its policy grants in
+  your home, which reach no further than the grants
+  ([job-environment.md](docs/roadmap/job-environment.md)).
 
 ### Fixed
 - In-app updates find a zip to install. The update feed listed only the
@@ -563,6 +570,46 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   worker's job, the app itself - is now refused
 - CLI restructured with standalone commands that don't require the app
 - Improved help text with examples for all commands
+- **Breaking**: a runner job's `HOME` is a home of its own, not yours. A
+  workflow that read something of yours through `$HOME` reads it only where
+  its policy grants that path, which is linked into the job's home; a policy
+  that granted `~/.gitconfig` no longer gives git your configuration, since
+  the job's `.gitconfig` is the per-job one
+  - With its own home, `actions/checkout` no longer fails on a regular
+    `~/.gitconfig` - it copies `$HOME/.gitconfig`, now the per-job one - and
+    Yarn 2+ no longer finds `~/.yarnrc.yml` through `HOME` (it still finds it
+    walking up from a workspace under your home, and still cannot read it)
+- A job's environment carries what its tools need to work in the sandbox, each
+  of which can be turned off in the `jobEnvironment` section of `config.yaml`;
+  all are on by default ([job-environment.md](docs/roadmap/job-environment.md)):
+  - `perJobTempDir`: a directory of the job's own in the per-user temp
+    directory, named by `DIRHELPER_USER_DIR_SUFFIX`, made before the job and
+    removed after it, where Foundation's atomic writes - SwiftPM's,
+    xcodebuild's - stage; they failed with "You don't have permission".
+    Swift 6.4's default build system still fails at its link step; `swift
+    build --build-system native` works
+  - `toolShims`: `swift` and `xcodebuild` shims first on the job's `PATH` that
+    add `--disable-sandbox` and `-IDEPackageSupportDisableManifestSandbox=YES`,
+    since macOS will not nest SwiftPM's and Xcode's own sandbox in the job's,
+    and a manifest they had not compiled before failed with "sandbox_apply:
+    Operation not permitted"
+  - `javaToolOptions`: `JAVA_TOOL_OPTIONS` with `java.io.tmpdir` in the job's
+    temp, `java.net.preferIPv4Stack` and the job's proxy and its credentials,
+    for a JVM that could not make a temp file or connect to its own loopback
+    server and ignored the proxy; a workflow's own `JAVA_TOOL_OPTIONS`
+    replaces it
+  - `createMissingGrantedDirs`: a directory a write grant names under your
+    home that does not exist yet - `~/.gradle` on a Mac where Gradle never ran
+    - is created before the job, empty, one level at a time, never through a
+    link
+- The bundled `docker` CLI is linked in the job's own bin directory,
+  `<sandbox>/localmost/bin`, first on its `PATH`, rather than its directory in
+  the app bundle being put on `PATH`
+- A worker's sandbox is built by cloning the runner rather than copying it:
+  about 2 seconds and next to no disk for each spawn, instead of more than 3
+  seconds and nearly 500 MiB. The copy is still checked against the runner's
+  integrity record, and is now also refused if it holds a link out of it or
+  anything but files, directories and links
 
 ## [0.2.0] - 2025-12-26
 
