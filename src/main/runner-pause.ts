@@ -282,7 +282,9 @@ export const resumeRunner = (): Promise<ResumeOutcome> => oneAtATime(async () =>
       return 'starting';
     }
     // The start brings up the pool and, with nothing holding it, the
-    // heartbeat.
+    // heartbeat. Unlike the started case below, the override is applied
+    // before the pool is up: if the start then fails, the condition stays
+    // overridden until it clears, and a later start takes jobs despite it.
     getLogger()?.info('User resumed runner');
     liftPauses();
     notifyRenderer(false);
