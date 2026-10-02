@@ -13,6 +13,7 @@ import { bootLog } from '../../log-file';
 import { store, getState } from '../index';
 import { ConfigSlice, defaultConfigState } from '../types';
 import { AppConfig, CONFIG_VERSION, isConfigFromNewerBuild } from '../../config';
+import { resolveJobEnvironmentConfig, resolveResourcePauseConfig } from '../../../shared/job-preferences';
 
 // Debounce timer for persistence
 let persistTimer: NodeJS.Timeout | null = null;
@@ -44,6 +45,8 @@ const PERSISTED_CONFIG_KEYS: (keyof ConfigSlice)[] = [
   'sandboxPolicyLevel',
   'power',
   'notifications',
+  'resourcePause',
+  'jobEnvironment',
   'launchAtLogin',
   'hideOnStart',
   'runnerConfig',
@@ -185,6 +188,16 @@ export function loadPersistedConfig(): void {
         ...defaultConfigState.notifications,
         ...diskConfig.notifications,
       };
+    }
+
+    // What a resource pause does, and the job-environment conveniences: as
+    // the runner reads them at each pause and spawn, so a value it would
+    // take as absent loads as the default it uses instead.
+    if (diskConfig.resourcePause !== undefined) {
+      configUpdates.resourcePause = resolveResourcePauseConfig(diskConfig.resourcePause, (message) => bootLog('warn', message));
+    }
+    if (diskConfig.jobEnvironment !== undefined) {
+      configUpdates.jobEnvironment = resolveJobEnvironmentConfig(diskConfig.jobEnvironment, (message) => bootLog('warn', message));
     }
 
     // Runner config

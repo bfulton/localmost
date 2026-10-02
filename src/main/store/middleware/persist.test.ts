@@ -81,6 +81,80 @@ describe('savePersistedConfig auth preservation', () => {
   });
 });
 
+describe('the resource-pause and job-environment preferences', () => {
+  it('start at their defaults: running jobs finish, every convenience on', () => {
+    loadPersistedConfig();
+    expect(store.getState().config.resourcePause).toEqual({ runningJobs: 'finish' });
+    expect(store.getState().config.jobEnvironment).toEqual({
+      toolShims: true,
+      javaToolOptions: true,
+      perJobTempDir: true,
+      createMissingGrantedDirs: true,
+    });
+  });
+
+  it('load from config.yaml and persist back, so a save at quit keeps them', () => {
+    // The runner reads both sections from the file at each pause and each
+    // spawn, so a save that dropped them would quietly undo the setting.
+    fs.writeFileSync(
+      configPath,
+      [
+        'configVersion: 1',
+        'theme: auto',
+        'resourcePause:',
+        '  runningJobs: stop',
+        'jobEnvironment:',
+        '  toolShims: false',
+        '  perJobTempDir: false',
+        '',
+      ].join('\n')
+    );
+    loadPersistedConfig();
+
+    expect(store.getState().config.resourcePause).toEqual({ runningJobs: 'stop' });
+    expect(store.getState().config.jobEnvironment).toEqual({
+      toolShims: false,
+      javaToolOptions: true,
+      perJobTempDir: false,
+      createMissingGrantedDirs: true,
+    });
+
+    store.getState().setJobEnvironment({ ...store.getState().config.jobEnvironment, javaToolOptions: false });
+    savePersistedConfig();
+
+    const saved = yaml.load(fs.readFileSync(configPath, 'utf-8')) as AppConfig;
+    expect(saved.resourcePause).toEqual({ runningJobs: 'stop' });
+    expect(saved.jobEnvironment).toEqual({
+      toolShims: false,
+      javaToolOptions: false,
+      perJobTempDir: false,
+      createMissingGrantedDirs: true,
+    });
+
+    // And back again, as the next launch reads it.
+    store.setState({ config: { ...defaultConfigState } });
+    loadPersistedConfig();
+    expect(store.getState().config.resourcePause).toEqual({ runningJobs: 'stop' });
+    expect(store.getState().config.jobEnvironment.javaToolOptions).toBe(false);
+  });
+
+  it('take a value the runner would not as its default, as the runner does', () => {
+    fs.writeFileSync(
+      configPath,
+      'configVersion: 1\ntheme: auto\nresourcePause:\n  runningJobs: kill\njobEnvironment:\n  toolShims: "no"\n  javaToolOptions: false\n'
+    );
+    loadPersistedConfig();
+
+    expect(store.getState().config.resourcePause).toEqual({ runningJobs: 'finish' });
+    expect(store.getState().config.jobEnvironment).toEqual({
+      toolShims: true,
+      javaToolOptions: false,
+      perJobTempDir: true,
+      createMissingGrantedDirs: true,
+    });
+  });
+});
+
 describe('sections only config.yaml holds', () => {
   it('carries them forward when the store persists, as written', () => {
     // The store does not hold these: the Docker VM sizes, the update check

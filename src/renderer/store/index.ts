@@ -30,6 +30,8 @@ export const useToolCacheLocation = () => useStore((state) => state.config.toolC
 export const useUserFilter = () => useStore((state) => state.config.userFilter);
 export const usePower = () => useStore((state) => state.config.power);
 export const useNotifications = () => useStore((state) => state.config.notifications);
+export const useResourcePause = () => useStore((state) => state.config.resourcePause);
+export const useJobEnvironment = () => useStore((state) => state.config.jobEnvironment);
 export const useLaunchAtLogin = () => useStore((state) => state.config.launchAtLogin);
 export const useHideOnStart = () => useStore((state) => state.config.hideOnStart);
 export const useRunnerConfig = () => useStore((state) => state.config.runnerConfig);
@@ -94,6 +96,8 @@ export type StoreAction =
   | { type: 'setUserFilter'; payload: AppState['config']['userFilter'] }
   | { type: 'setPower'; payload: AppState['config']['power'] }
   | { type: 'setNotifications'; payload: AppState['config']['notifications'] }
+  | { type: 'setResourcePause'; payload: AppState['config']['resourcePause'] }
+  | { type: 'setJobEnvironment'; payload: AppState['config']['jobEnvironment'] }
   | { type: 'setLaunchAtLogin'; payload: boolean }
   | { type: 'setHideOnStart'; payload: boolean }
   | { type: 'updateRunnerConfig'; payload: Partial<AppState['config']['runnerConfig']> }

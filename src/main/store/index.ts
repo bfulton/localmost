@@ -35,6 +35,7 @@ import {
   GitHubRepo,
   GitHubOrg,
 } from '../../shared/types';
+import { ResourcePauseConfig, JobEnvironmentConfig } from '../../shared/job-preferences';
 
 // Create the store
 export const store = createStore<AppStore>()(
@@ -101,6 +102,14 @@ export const store = createStore<AppStore>()(
 
     setNotifications: (notifications: NotificationsConfig) => {
       set((state) => ({ config: { ...state.config, notifications } }));
+    },
+
+    setResourcePause: (resourcePause: ResourcePauseConfig) => {
+      set((state) => ({ config: { ...state.config, resourcePause } }));
+    },
+
+    setJobEnvironment: (jobEnvironment: JobEnvironmentConfig) => {
+      set((state) => ({ config: { ...state.config, jobEnvironment } }));
     },
 
     setLaunchAtLogin: (launchAtLogin: boolean) => {
