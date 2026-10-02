@@ -141,6 +141,15 @@ jest.mock('fs', () => ({
   mkdirSync: jest.fn(),
   openSync: jest.fn(() => 42),
   closeSync: jest.fn(),
+  // Nothing is there to be found but a job's home, the directory
+  // buildSandbox made, which is empty when it is filled.
+  lstatSync: jest.fn((p: string) => {
+    if (/\/sandbox\/[^/]+\/home$/.test(String(p))) return { isDirectory: () => true, isSymbolicLink: () => false };
+    throw Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' });
+  }),
+  // ...and, following links, everything a grant names in the real home.
+  statSync: jest.fn(() => ({ isDirectory: () => true })),
+  symlinkSync: jest.fn(),
   promises: {
     mkdir: jest.fn(),
     chmod: jest.fn(),
@@ -148,6 +157,7 @@ jest.mock('fs', () => ({
     rm: jest.fn().mockResolvedValue(undefined),
     readdir: jest.fn().mockResolvedValue([]),
     readFile: jest.fn().mockResolvedValue(''),
+    rename: jest.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -1839,14 +1849,105 @@ describe('RunnerManager', () => {
       const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
       expect(env.HTTPS_PROXY).toMatch(/^http:\/\/localmost:[0-9a-f]{48}@127\.0\.0\.1:/);
       expect(env.http_proxy).toBe(env.HTTPS_PROXY);
-      // A per-job global config in the sandbox, setting proxyAuthMethod=basic so
-      // git sends the proxy token preemptively; system config is skipped.
-      expect(env.GIT_CONFIG_GLOBAL).toMatch(/sandbox\/1\/\.localmost-gitconfig$/);
+      // A per-job global config, the job home's .gitconfig, setting
+      // proxyAuthMethod=basic so git sends the proxy token preemptively;
+      // system config is skipped.
+      expect(env.GIT_CONFIG_GLOBAL).toBe('/Users/test/.localmost/runner/sandbox/1/home/.gitconfig');
       expect(env.GIT_CONFIG_SYSTEM).toBe('/dev/null');
-      const gitCfgWrite = (fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => String(f).endsWith('.localmost-gitconfig'));
+      const gitCfgWrite = (fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => f === env.GIT_CONFIG_GLOBAL);
       expect(gitCfgWrite).toBeDefined();
       expect(String(gitCfgWrite![1])).toContain('proxyAuthMethod = basic');
+      // Written exclusively, never through something already at the name.
+      expect(gitCfgWrite![2]).toMatchObject({ flag: 'wx' });
     });
+
+    it("runs the job with a home of its own, and ssh pointed into it", async () => {
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(9913));
+
+      await new RunnerManagerTestHelper(runnerManager).spawnForJob();
+
+      const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+      const home = '/Users/test/.localmost/runner/sandbox/1/home';
+      expect(env.HOME).toBe(home);
+      expect(env.GIT_SSH_COMMAND).toBe(`ssh -F '${home}/.ssh/config' -o UserKnownHostsFile='${home}/.ssh/known_hosts'`);
+      expect(fs.mkdirSync).toHaveBeenCalledWith(`${home}/.ssh`, { mode: 0o700 });
+    });
+
+    it("links what the policy and the level grant under the real home into the job's home", async () => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({ hosts: [], level: 'moderate', readPaths: ['~/.swiftpm'], writePaths: ['~/.p3-write', '/opt/elsewhere'], docker: {} }),
+      });
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(9914));
+
+      await new RunnerManagerTestHelper(manager).spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
+
+      const home = '/Users/test/.localmost/runner/sandbox/1/home';
+      const links = (fs.symlinkSync as jest.Mock).mock.calls.map(([target, at]) => [String(at), String(target)]);
+      expect(links).toEqual(expect.arrayContaining([
+        [`${home}/.swiftpm`, path.join(os.homedir(), '.swiftpm')],
+        [`${home}/.p3-write`, path.join(os.homedir(), '.p3-write')],
+        // moderate's read grant on rustup's toolchains, which rustup finds through HOME.
+        [`${home}/.rustup`, path.join(os.homedir(), '.rustup')],
+        [`${home}/Library/Caches`, path.join(os.homedir(), 'Library', 'Caches')],
+      ]));
+      expect(links.some(([at]) => at.includes('elsewhere'))).toBe(false);
+    });
+  });
+
+  describe('a directory the policy grants that does not exist yet', () => {
+    const spawnWith = async (createMissingGrantedDirs: boolean) => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({ hosts: [], level: 'strict', readPaths: [], writePaths: ['~/.p3-missing/cache/', '~/.p3-missing-history'], docker: {} }),
+        getJobEnvironmentConfig: () => ({ toolShims: true, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs }),
+      });
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(9915));
+      await new RunnerManagerTestHelper(manager).spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
+      // In the real home; the job's home gets the directory the link sits in.
+      return (fs.mkdirSync as jest.Mock).mock.calls.filter(([dir]) => String(dir).startsWith(path.join(os.homedir(), '.p3-missing')));
+    };
+
+    it('is created before the job, one level at a time, by default', async () => {
+      // What a grant without a trailing / names may be a file, the job's to
+      // create; only the levels above it are made.
+      const created = await spawnWith(true);
+      expect(created).toEqual([
+        [path.join(os.homedir(), '.p3-missing'), { mode: 0o755 }],
+        [path.join(os.homedir(), '.p3-missing', 'cache'), { mode: 0o755 }],
+      ]);
+      expect(mockSpawnSandboxed).toHaveBeenCalled();
+    });
+
+    it('is left missing with the preference off', async () => {
+      expect(await spawnWith(false)).toEqual([]);
+    });
+
+    it('is not created in a credential location the job is denied anyway', async () => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({ hosts: [], level: 'strict', readPaths: [], writePaths: ['~/.ssh/p3-keys', '~/.config/p3'], docker: {} }),
+      });
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(9919));
+      await new RunnerManagerTestHelper(manager).spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
+      const inHome = (fs.mkdirSync as jest.Mock).mock.calls.filter(([dir]) =>
+        [path.join(os.homedir(), '.ssh'), path.join(os.homedir(), '.config')].some((root) => String(dir).startsWith(root))
+      );
+      expect(inHome).toEqual([]);
+    });
+  });
+
+  describe("a worker's temp", () => {
 
     it("points the caches tools keep in the shared per-user temp into the job's own temp", async () => {
       // The sandbox no longer grants the per-user temp and cache directories.
@@ -1864,6 +1965,105 @@ describe('RunnerManager', () => {
       expect(env.xcrun_db).toBe(`${jobTmp}/xcrun_db`);
       expect(env.CLANG_MODULE_CACHE_PATH).toBe(`${jobTmp}/clang-module-cache`);
       expect(env.TMPPREFIX).toBe(`${jobTmp}/zsh`);
+    });
+
+    describe("for the JVM's", () => {
+      const spawnWith = async (javaToolOptions: boolean) => {
+        const manager = new RunnerManager({
+          onLog: mockOnLog,
+          onStatusChange: mockOnStatusChange,
+          onJobHistoryUpdate: mockOnJobHistoryUpdate,
+          getJobEnvironmentConfig: () => ({ toolShims: true, javaToolOptions, perJobTempDir: true, createMissingGrantedDirs: true }),
+        });
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        mockSpawnSandboxed.mockReturnValue(createMockProcess(9918));
+        await new RunnerManagerTestHelper(manager).spawnForJob();
+        return mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+      };
+
+      it("sets JAVA_TOOL_OPTIONS: the job's temp, IPv4, and its proxy, by default", async () => {
+        // The JVM reads neither TMPDIR nor HTTPS_PROXY, and its dual-stack
+        // loopback connections are ones the sandbox cannot attribute.
+        const env = await spawnWith(true);
+        const options = env.JAVA_TOOL_OPTIONS!.split(' ');
+        expect(options).toEqual(expect.arrayContaining([
+          '-Djava.io.tmpdir=/Users/test/.localmost/runner/sandbox/1/_temp',
+          // The JVM's home is the job's: it takes user.home from the user database, not HOME.
+          '-Duser.home=/Users/test/.localmost/runner/sandbox/1/home',
+          '-Djava.net.preferIPv4Stack=true',
+          '-Dhttps.proxyHost=127.0.0.1',
+          '-Dhttps.proxyPort=12345',
+          '-Dhttps.proxyUser=localmost',
+        ]));
+        // The worker's own proxy token, the one in HTTPS_PROXY.
+        expect(env.HTTPS_PROXY).toContain(options.find((o) => o.startsWith('-Dhttps.proxyPassword='))!.split('=')[1]);
+      });
+
+      it('sets none with the preference off', async () => {
+        expect((await spawnWith(false)).JAVA_TOOL_OPTIONS).toBeUndefined();
+      });
+    });
+
+    describe('in the per-user temp directory', () => {
+      const T = '/var/folders/zz/zyxw_vut0000gn/T';
+      const sandboxDir = '/Users/test/.localmost/runner/sandbox/1-0123456789ab';
+      const managerWith = (perJobTempDir: boolean) => {
+        const manager = new RunnerManager({
+          onLog: mockOnLog,
+          onStatusChange: mockOnStatusChange,
+          onJobHistoryUpdate: mockOnJobHistoryUpdate,
+          getUserTempDir: () => T,
+          getJobEnvironmentConfig: () => ({ toolShims: true, javaToolOptions: true, perJobTempDir, createMissingGrantedDirs: true }),
+        });
+        const downloader = (manager as unknown as { downloader: { buildSandbox: jest.Mock } }).downloader;
+        downloader.buildSandbox.mockResolvedValue(sandboxDir);
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        return manager;
+      };
+
+      it("is a directory of the job's own, made before it, named by DIRHELPER_USER_DIR_SUFFIX and granted", async () => {
+        // Foundation ignores TMPDIR: NSTemporaryDirectory() and a sandboxed
+        // process's atomic writes - SwiftPM's, xcodebuild's - go to the
+        // per-user temp, which the sandbox does not grant. The suffix moves
+        // them to T/<suffix>, which the app makes and the profile grants.
+        mockSpawnSandboxed.mockReturnValue(createMockProcess(9916));
+
+        await new RunnerManagerTestHelper(managerWith(true)).spawnForJob();
+
+        const options = mockSpawnSandboxed.mock.calls.at(-1)![2]!;
+        const suffix = options.env!.DIRHELPER_USER_DIR_SUFFIX!;
+        expect(suffix).toMatch(/^localmost-[0-9a-f]{8}-1-0123456789ab$/);
+        expect(options.tempSuffixDir).toBe(`${T}/${suffix}`);
+        expect(fs.mkdirSync).toHaveBeenCalledWith(`${T}/${suffix}`, { mode: 0o700 });
+      });
+
+      it('is neither made nor named with the preference off', async () => {
+        mockSpawnSandboxed.mockReturnValue(createMockProcess(9917));
+
+        await new RunnerManagerTestHelper(managerWith(false)).spawnForJob();
+
+        const options = mockSpawnSandboxed.mock.calls.at(-1)![2]!;
+        expect(options.env!.DIRHELPER_USER_DIR_SUFFIX).toBeUndefined();
+        expect(options.tempSuffixDir).toBeUndefined();
+        expect((fs.mkdirSync as jest.Mock).mock.calls.some(([dir]) => String(dir).startsWith(T))).toBe(false);
+      });
+
+      it('is moved out of the per-user temp to be removed when the worker never starts', async () => {
+        mockSpawnSandboxed.mockImplementation(() => { throw new Error('spawn failed'); });
+        try {
+          const manager = managerWith(true);
+          (manager as unknown as { runnerVersion: string }).runnerVersion = '1.0.0';
+          await (manager as unknown as { startInstance(n: number): Promise<void> }).startInstance(1);
+          await settle();
+        } finally {
+          mockSpawnSandboxed.mockReset();
+        }
+
+        const [from, to] = (fs.promises.rename as jest.Mock).mock.calls.at(-1)! as [string, string];
+        expect(from).toMatch(new RegExp(`^${T}/localmost-[0-9a-f]{8}-1-0123456789ab$`));
+        expect(path.dirname(to)).toBe('/Users/test/.localmost/runner/sandbox');
+        expect(path.basename(to).startsWith(`.removing-${path.basename(from)}.`)).toBe(true);
+      });
     });
   });
 
@@ -2019,9 +2219,11 @@ describe('RunnerManager', () => {
         expect(env.SSH_AUTH_SOCK).toBeUndefined();
         expect(env.NODE_OPTIONS).toBeUndefined();
         // What the runner and a shell need to know who and where they are -
-        // with the bundled docker CLI's directory first on PATH.
-        expect(env.PATH).toBe(`${path.dirname(dockerCliPath())}:${process.env.PATH}`);
-        expect(env.HOME).toBe(process.env.HOME);
+        // with the job's own bin directory, the bundled docker CLI and the
+        // tool shims, first on PATH.
+        expect(env.PATH).toBe(`/Users/test/.localmost/runner/sandbox/1/localmost/bin:${process.env.PATH}`);
+        // HOME is the job's own, not the app's.
+        expect(env.HOME).toBe('/Users/test/.localmost/runner/sandbox/1/home');
         // And what the app sets for the runner itself.
         expect(env.ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT).toBe('true');
         expect(env.HTTPS_PROXY).toBeDefined();
@@ -2039,7 +2241,46 @@ describe('RunnerManager', () => {
         process.env.PATH = saved;
       }
       const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
-      expect(env.PATH).toBe(`${path.dirname(dockerCliPath())}:/usr/bin:/bin:/usr/sbin:/sbin`);
+      expect(env.PATH).toBe('/Users/test/.localmost/runner/sandbox/1/localmost/bin:/usr/bin:/bin:/usr/sbin:/sbin');
+    });
+
+    describe('the swift and xcodebuild shims in its bin directory', () => {
+      const bin = '/Users/test/.localmost/runner/sandbox/1/localmost/bin';
+      const shimsWritten = async (toolShims: boolean) => {
+        const manager = new RunnerManager({
+          onLog: mockOnLog,
+          onStatusChange: mockOnStatusChange,
+          onJobHistoryUpdate: mockOnJobHistoryUpdate,
+          getJobEnvironmentConfig: () => ({ toolShims, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true }),
+        });
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+        await new RunnerManagerTestHelper(manager).spawnForJob();
+        const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+        const written = (fs.writeFileSync as jest.Mock).mock.calls
+          .filter(([file]) => path.dirname(String(file)) === bin)
+          .map(([file, , options]) => [path.basename(String(file)), options]);
+        return { env, written };
+      };
+
+      it('are there by default', async () => {
+        // SwiftPM and Xcode run each package manifest under a sandbox of their
+        // own, which macOS refuses to start inside the job's; the shims add
+        // the argument that turns it off.
+        const { env, written } = await shimsWritten(true);
+        expect(written).toEqual([
+          ['swift', { flag: 'wx', mode: 0o755 }],
+          ['xcodebuild', { flag: 'wx', mode: 0o755 }],
+        ]);
+        expect(env.PATH!.split(':')[0]).toBe(bin);
+      });
+
+      it('are not with the preference off, and the docker CLI is still first on PATH', async () => {
+        const { env, written } = await shimsWritten(false);
+        expect(written).toEqual([]);
+        expect(env.PATH!.split(':')[0]).toBe(bin);
+        expect(fs.symlinkSync).toHaveBeenCalledWith(dockerCliPath(), `${bin}/docker`);
+      });
     });
 
     it("applies the repository's approved env policy", async () => {
@@ -2944,7 +3185,9 @@ describe('RunnerManager', () => {
       const [, , options] = mockSpawnSandboxed.mock.calls[mockSpawnSandboxed.mock.calls.length - 1];
       const env = options!.env as NodeJS.ProcessEnv;
       expect(env.DOCKER_CONFIG).toBe('/Users/test/.localmost/runner/sandbox/1/.docker');
-      expect(env.PATH!.split(':')[0]).toBe('/Applications/localmost.app/Contents/Resources/docker-cli');
+      // First on PATH, the job's bin directory, where the CLI is linked.
+      expect(env.PATH!.split(':')[0]).toBe('/Users/test/.localmost/runner/sandbox/1/localmost/bin');
+      expect(fs.symlinkSync).toHaveBeenCalledWith(cli, '/Users/test/.localmost/runner/sandbox/1/localmost/bin/docker');
       expect(env.DOCKER_HOST).toBe('unix:///Users/test/.localmost/runner/sandbox/1/docker.sock');
       expect(env.DOCKER_BUILDKIT).toBe('0');
       expect(options).toMatchObject({

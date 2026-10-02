@@ -94,6 +94,8 @@ export interface AppConfig {
   dockerVm?: Partial<Record<keyof DockerVmConfig, unknown>>;
   /** What a resource pause does; see ResourcePauseConfig and resolveResourcePauseConfig. */
   resourcePause?: Partial<Record<keyof ResourcePauseConfig, unknown>>;
+  /** What localmost adds to each job's environment; see resolveJobEnvironmentConfig. */
+  jobEnvironment?: Partial<Record<keyof JobEnvironmentConfig, unknown>>;
 }
 
 /**
@@ -133,6 +135,74 @@ export function resolveResourcePauseConfig(
   if (runningJobs !== undefined) {
     if (runningJobs === 'finish' || runningJobs === 'stop') resolved.runningJobs = runningJobs;
     else log(`resourcePause.runningJobs must be 'finish' or 'stop'; using '${DEFAULT_RESOURCE_PAUSE_CONFIG.runningJobs}'`);
+  }
+  return resolved;
+}
+
+/**
+ * The conveniences localmost adds to every job's environment, each of which
+ * can be turned off on its own. All are on by default. See
+ * docs/roadmap/job-environment.md. Read from config.yaml at each worker
+ * spawn; a change applies to workers spawned after it.
+ */
+export interface JobEnvironmentConfig {
+  /**
+   * `swift` and `xcodebuild` shims first on the job's PATH, which turn off
+   * SwiftPM's and Xcode's own manifest and plugin sandbox: the job already
+   * runs under one, and macOS refuses to nest them, so a package manifest
+   * the job has not compiled before fails to build without this. Off, the
+   * job calls the tools as they are. The bundled docker CLI is on PATH
+   * either way.
+   */
+  toolShims: boolean;
+  /**
+   * JAVA_TOOL_OPTIONS for the JVM: its temp directory in the job's own,
+   * IPv4 so its loopback connections are ones the sandbox can attribute, and
+   * the job's proxy with its credentials. A workflow that sets
+   * JAVA_TOOL_OPTIONS itself replaces this.
+   */
+  javaToolOptions: boolean;
+  /**
+   * A per-job directory in the per-user temp directory, named by
+   * DIRHELPER_USER_DIR_SUFFIX, so NSTemporaryDirectory() and Foundation's
+   * atomic writes - SwiftPM's and Xcode's among them - have a temp directory
+   * of the job's own, created before the job and removed after it. Off, the
+   * job has no such directory and those writes fail.
+   */
+  perJobTempDir: boolean;
+  /**
+   * Create, before the job, a directory its approved policy grants write on
+   * under the home directory when it does not exist yet - empty, one level
+   * at a time, never through a link. Off, a missing granted directory stays
+   * missing, and a job that cannot create it itself fails.
+   */
+  createMissingGrantedDirs: boolean;
+}
+
+/** Every job-environment convenience, on: the defaults. */
+const JOB_ENVIRONMENT_DEFAULTS: JobEnvironmentConfig = {
+  toolShims: true,
+  javaToolOptions: true,
+  perJobTempDir: true,
+  createMissingGrantedDirs: true,
+};
+
+/**
+ * The `jobEnvironment` section of config.yaml as used. Every key is optional
+ * and defaults on; a value that is not true or false is taken as absent,
+ * with a line through `log`, and keys it does not know are ignored.
+ */
+export function resolveJobEnvironmentConfig(
+  raw: AppConfig['jobEnvironment'] | undefined,
+  log: (message: string) => void = () => {}
+): JobEnvironmentConfig {
+  const section: Record<string, unknown> = typeof raw === 'object' && raw !== null ? raw : {};
+  const resolved: JobEnvironmentConfig = { ...JOB_ENVIRONMENT_DEFAULTS };
+  for (const key of Object.keys(JOB_ENVIRONMENT_DEFAULTS) as Array<keyof JobEnvironmentConfig>) {
+    const value = section[key];
+    if (value === undefined) continue;
+    if (typeof value === 'boolean') resolved[key] = value;
+    else log(`jobEnvironment.${key} must be true or false; using ${JOB_ENVIRONMENT_DEFAULTS[key]}`);
   }
   return resolved;
 }

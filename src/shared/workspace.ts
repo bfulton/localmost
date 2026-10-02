@@ -59,6 +59,16 @@ const DEFAULT_MAX_AGE_HOURS = 24;
 /** Each workspace's metadata, in the workspace's top directory. */
 const METADATA_FILE = '.localmost-workspace.json';
 
+/**
+ * The directories the app hands every step, in the workspace's top
+ * directory and never copied from the checkout: its HOME and its TMPDIR
+ * (see createStepHome in step-executor).
+ */
+const STEP_DIRS = ['.home', '.tmp'];
+
+/** A name as the default APFS volume compares it: in any case, and any Unicode form. */
+const folded = (name: string): string => name.normalize('NFD').toUpperCase().toLowerCase();
+
 // Default patterns to always exclude
 const DEFAULT_EXCLUDES = [
   '.git',
@@ -150,7 +160,15 @@ export async function createWorkspace(options: WorkspaceOptions): Promise<Worksp
   // wherever it pointed.
   fs.writeFileSync(path.join(workspacePath, METADATA_FILE), JSON.stringify(workspace, null, 2), { flag: 'wx' });
 
-  const isMetadata = (rel: string): boolean => rel === METADATA_FILE;
+  // The steps' home and temp are the app's to make, so the checkout's
+  // entries at their names - in any case the volume takes for them - are
+  // left out: `localmost test` fills the home unsandboxed before the first
+  // step, and a committed `.home` link had it write the git and ssh config
+  // wherever the link led. Only at the top: a `.home` deeper in is the
+  // checkout's own.
+  const isStepDir = (rel: string): boolean => STEP_DIRS.some((name) => folded(rel) === folded(name));
+
+  const isMetadata = (rel: string): boolean => rel === METADATA_FILE || isStepDir(rel);
   if (stagedOnly) {
     // For staged-only mode, use git to create the workspace
     await createStagedWorkspace(sourceDir, workspacePath, isMetadata);

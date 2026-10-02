@@ -3,10 +3,13 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { createWriteStream, createReadStream } from 'fs';
 import * as tar from 'tar';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { FALLBACK_RUNNER_VERSION } from '../shared/constants';
 import { spawnSandboxed } from './process-sandbox';
 import { getRunnerDir } from './paths';
 import { DOCKER_CONFIG_DIR_NAME, SHARE_DIR_NAME, SHARE_NONCE_FILE } from './vm/paths';
+import { JOB_HOME_DIR_NAME } from '../shared/job-home';
 import {
   killOrphanedProcesses,
   cleanupSandboxDirectories,
@@ -38,6 +41,8 @@ const REGISTRATION_PREFIX = 'temp-proxy-';
  * and the one that sweeps is not the only one that makes them.
  */
 const scratchInUse = new Set<string>();
+
+const execFileAsync = promisify(execFile);
 
 /**
  * What a runner template held when it came from its release: each file's
@@ -184,98 +189,60 @@ export class RunnerDownloader {
   }
 
   /**
-   * Recursively copy a directory.
-   * @param src Source directory path
-   * @param dest Destination directory path
-   * @param sandboxRoot Root directory for symlink validation (defaults to dest on first call)
+   * Clone a directory's contents into dest, which may already exist.
+   *
+   * `cp -c` clones each file with clonefile(2): the copy shares the
+   * template's blocks on the volume until either side writes, so a sandbox
+   * costs next to no disk and a fraction of the time a byte copy of the
+   * runner took - nearly 500 MiB for every spawn. Where the volume cannot
+   * clone, cp falls back to a plain copy by itself. Node's own copyFile
+   * cannot clone here: on macOS its clone flag copies, and the forcing one
+   * fails with ENOSYS. Links are copied as links, never followed.
    */
-  private async copyDir(src: string, dest: string, sandboxRoot?: string): Promise<void> {
-    // On first call, sandboxRoot is the destination directory
-    const root = sandboxRoot ?? dest;
-
+  private async cloneTree(src: string, dest: string): Promise<void> {
+    await fs.promises.mkdir(dest, { recursive: true });
     try {
-      await fs.promises.mkdir(dest, { recursive: true });
+      // "src/." copies what is in src, not src itself.
+      await execFileAsync('/bin/cp', ['-cR', `${src}/.`, dest], { timeout: 120_000 });
     } catch (err) {
-      const e = err as NodeJS.ErrnoException;
-      throw new Error(`mkdir failed for ${dest}: ${e.code} ${e.message} (syscall: ${e.syscall})`);
+      const e = err as Error & { stderr?: string };
+      throw new Error(`Could not copy ${src} to ${dest}: ${(e.stderr || e.message).trim()}`);
     }
+    await this.checkTreeEntries(dest);
+  }
 
-    const entries = await fs.promises.readdir(src, { withFileTypes: true });
-
-    for (const entry of entries) {
-      const srcPath = path.join(src, entry.name);
-      const destPath = path.join(dest, entry.name);
-
-      if (entry.isDirectory()) {
-        await this.copyDir(srcPath, destPath, root);
-      } else if (entry.isSymbolicLink()) {
-        const linkTarget = await fs.promises.readlink(srcPath);
-
-        // Security: Validate symlink target stays within sandbox
-        // Reject absolute symlinks - they could point anywhere
-        if (path.isAbsolute(linkTarget)) {
-          throw new Error(
-            `Security violation: Absolute symlink not allowed: ${srcPath} -> ${linkTarget}`
-          );
-        }
-
-        // Resolve the symlink target relative to the destination directory
-        const destDir = path.dirname(destPath);
-        const resolvedTarget = path.normalize(path.join(destDir, linkTarget));
-
-        // Verify the resolved path stays within the sandbox root
-        const normalizedRoot = path.normalize(root) + path.sep;
-        if (!resolvedTarget.startsWith(normalizedRoot) && resolvedTarget !== path.normalize(root)) {
-          throw new Error(
-            `Security violation: Symlink escapes sandbox: ${srcPath} -> ${linkTarget} (resolves to ${resolvedTarget})`
-          );
-        }
-
-        // Remove existing file/symlink at destination if present
-        try {
-          await fs.promises.unlink(destPath);
-        } catch (unlinkErr) {
-          // Expected: file doesn't exist yet. Unexpected: permission error
-          const code = (unlinkErr as NodeJS.ErrnoException).code;
-          if (code !== 'ENOENT') {
-            throw new Error(`Failed to remove existing file at ${destPath}: ${code}`);
+  /**
+   * Refuse a copied tree holding anything a runner release does not: a link
+   * that is absolute or leads out of the tree, or an entry that is not a
+   * file, a directory or a link. The integrity record lists the release's
+   * files and links, so this catches what it cannot see - a FIFO, say - and
+   * holds the links to the tree whatever the record says.
+   */
+  private async checkTreeEntries(root: string): Promise<void> {
+    const walk = async (dir: string): Promise<void> => {
+      for (const entry of await fs.promises.readdir(dir, { withFileTypes: true })) {
+        const entryPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(entryPath);
+        } else if (entry.isSymbolicLink()) {
+          const linkTarget = await fs.promises.readlink(entryPath);
+          // An absolute link could point anywhere.
+          if (path.isAbsolute(linkTarget)) {
+            throw new Error(`Security violation: Absolute symlink not allowed: ${entryPath} -> ${linkTarget}`);
           }
-        }
-        await fs.promises.symlink(linkTarget, destPath);
-      } else {
-        // Use lstat to check what we're dealing with before copying
-        let srcStats;
-        try {
-          srcStats = fs.lstatSync(srcPath);
-        } catch (lstatErr) {
-          // Source doesn't exist (broken symlink in directory listing?) - skip
-          // This is expected for dangling symlinks, so we only log unexpected errors
-          const code = (lstatErr as NodeJS.ErrnoException).code;
-          if (code !== 'ENOENT') {
-            throw new Error(`Failed to stat ${srcPath}: ${code}`);
+          const resolvedTarget = path.normalize(path.join(dir, linkTarget));
+          const normalizedRoot = path.normalize(root);
+          if (resolvedTarget !== normalizedRoot && !resolvedTarget.startsWith(normalizedRoot + path.sep)) {
+            throw new Error(
+              `Security violation: Symlink escapes sandbox: ${entryPath} -> ${linkTarget} (resolves to ${resolvedTarget})`
+            );
           }
-          continue;
-        }
-        if (!srcStats.isFile()) {
-          // Skip non-regular files (sockets, FIFOs, etc.)
-          continue;
-        }
-        // Ensure parent directory exists (belt-and-suspenders safety)
-        const destParent = path.dirname(destPath);
-        if (!fs.existsSync(destParent)) {
-          fs.mkdirSync(destParent, { recursive: true });
-        }
-        try {
-          fs.copyFileSync(srcPath, destPath);
-          if (srcStats.mode & 0o111) {
-            fs.chmodSync(destPath, srcStats.mode);
-          }
-        } catch (copyErr) {
-          const e = copyErr as NodeJS.ErrnoException;
-          throw new Error(`copyfile '${srcPath}' -> '${destPath}': ${e.code} ${e.message}`);
+        } else if (!entry.isFile()) {
+          throw new Error(`Not a file, directory or link: ${entryPath}`);
         }
       }
-    }
+    };
+    await walk(root);
   }
 
   /**
@@ -298,7 +265,7 @@ export class RunnerDownloader {
     const log = onLog || (() => {});
     const arcDir = this.getArcDir(version);
     const manifest = await this.ensureArcManifest(version, log);
-    await this.copyDir(arcDir, dest);
+    await this.cloneTree(arcDir, dest);
 
     const differences = await this.compareWithManifest(dest, manifest);
     if (differences.length > 0) {
@@ -400,7 +367,7 @@ export class RunnerDownloader {
     await fs.promises.rename(staging, file);
   }
 
-  /** The files and symlinks under a directory, by relative path. copyDir copies nothing else. */
+  /** The files and symlinks under a directory, by relative path; checkTreeEntries refuses anything else. */
   private async listTree(root: string): Promise<{ files: string[]; symlinks: string[] }> {
     const files: string[] = [];
     const symlinks: string[] = [];
@@ -495,6 +462,10 @@ export class RunnerDownloader {
       // DOCKER_CONFIG, so the job's CLI reads none of the operator's.
       await fs.promises.mkdir(path.join(sandboxDir, SHARE_DIR_NAME));
       await fs.promises.mkdir(path.join(sandboxDir, DOCKER_CONFIG_DIR_NAME), { mode: 0o700 });
+      // The job's HOME, beside them and not in the share: empty, the job's to
+      // write, and gone with the sandbox. Filled before the worker starts
+      // (see prepareJobHome).
+      await fs.promises.mkdir(path.join(sandboxDir, JOB_HOME_DIR_NAME), { mode: 0o700 });
 
       // Copy arc to sandbox
       log('info', `Copying arc to sandbox...`);

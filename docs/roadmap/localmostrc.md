@@ -130,7 +130,7 @@ shared:
     read:                        # Never a credential: ~/.ssh (known_hosts
                                  # included), ~/.aws and the rest stay denied
                                  # whatever is declared - see SECURITY.md
-      - "~/.gitconfig"
+      - "~/.cache/pre-commit"
                                  # Xcode is not on the strict floor
       - "/Applications/Xcode.app"
     write:
@@ -162,7 +162,6 @@ shared:
   env:
     allow:
       - DEVELOPER_DIR
-      - HOME
       - PATH
     deny:
       - AWS_*
@@ -229,6 +228,32 @@ Downloads, `~/Library`, `/Volumes`) ends the lookup there, and the rest is
 denied as written. A deny is absolute, `~`, or starts with `~/`; a relative one
 is a validation error, since the sandbox never matches it.
 
+### Paths in your home, and the job's own
+
+A runner job's `HOME` is a home of its own, `<sandbox>/home`, empty and gone
+with the job (`localmost test` uses the workspace's `.home` the same way). Each
+path a policy grants under your home, `read` or `write`, is linked into it at
+the same path - `~/.npm` as `<home>/.npm`, pointing at your `~/.npm` - so a
+tool that looks for it through `HOME` finds it, and the sandbox, which judges
+the path a link resolves to, lets it reach exactly what the grant does. A `*`
+in a granted path is matched against what is in your home when the job starts,
+and so is the rest: a path that is not there then is not linked, and its name
+is free for a tool to create in the job's home. A credential location is never
+linked, granted or not, and a granted directory that holds one - `~/.cache`
+with Hugging Face's token - is a directory of the job's own with a link to each
+of its other entries. Granting `~` itself links each entry of your home.
+Nothing else of your home is in the job's: its `.gitconfig` is the per-job git
+config, whatever the policy grants, so declaring `~/.gitconfig` no longer gives
+git your configuration.
+
+A `write` grant under your home whose directories do not exist yet has them
+created before the job, empty, since the job is not granted their parents. The
+path the grant names is created too only when it says it is a directory, with
+a trailing `/` or `/**` - `~/.cache/my-tool/` - since a grant can name a file
+(`~/.python_history`), which the job creates itself. See
+[job-environment.md](job-environment.md) for this and what else a job's
+environment carries.
+
 ### Loopback
 
 A job's sandbox connects directly to two loopback ports by default: its own
@@ -278,7 +303,7 @@ shared:
       - "registry.npmjs.org"
   filesystem:
     read:
-      - "~/.gitconfig"
+      - "~/.cache/pre-commit"
     write:
       - "./build/**"
 
@@ -520,8 +545,9 @@ choice, not the runner's, and a job that really does need Xcode should declare
 `/Applications/Xcode.app` and keep it.
 
 git also treats an unreadable `~/.gitconfig` as fatal rather than as "no
-configuration", so a job may want to skip the user and system config anyway -
-which makes a run independent of whose machine it happened on.
+configuration". A runner job never meets yours: its `HOME` is its own, and
+git's global config there is the per-job one, with the system config skipped
+- which also makes a run independent of whose machine it happened on.
 
 **A bind is refused before the address is checked.** The seatbelt profile
 permits binding localhost, and a denied bind returns `EPERM` (errno 1) whatever
@@ -645,12 +671,15 @@ domain through a grant of its plist. A workflow that ran
 launched with, and nothing else. It never affects the variables the runner or
 the workflow sets: `GITHUB_TOKEN`, secrets and a step's `env:` reach the job as
 usual whatever it says, and neither does it touch what localmost sets for the
-runner (the proxy, `TMPDIR`, `DOCKER_HOST`, the caches). The environment, like
-the filesystem, is fixed when a worker starts, before the workflow is known.
-`env: allow` therefore applies from `shared:` only, and every `env: deny`,
-shared or per workflow, applies to every job. Without an allow, a job inherits
-nothing from the app's environment beyond `PATH`, `HOME`, `USER`, `LOGNAME`,
-`SHELL`, `LANG`, `LC_*`, `TERM`, `TZ` and `__CF_USER_TEXT_ENCODING`.
+runner (the proxy, the job's own `HOME`, `TMPDIR`, `DIRHELPER_USER_DIR_SUFFIX`,
+`JAVA_TOOL_OPTIONS`, `GIT_SSH_COMMAND`, `DOCKER_HOST`, the job's bin directory
+at the front of `PATH`, the caches - see [job-environment.md](job-environment.md)).
+The environment, like the filesystem, is fixed when a worker starts, before the
+workflow is known. `env: allow` therefore applies from `shared:` only, and every
+`env: deny`, shared or per workflow, applies to every job. Without an allow, a
+job inherits nothing from the app's environment beyond `PATH`, `USER`,
+`LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TERM`, `TZ` and `__CF_USER_TEXT_ENCODING`
+(and `HOME`, which localmost then replaces with the job's own).
 
 **Loopback.** Without `network: loopback` a job reaches nothing on this Mac's
 loopback interface but its own proxy and the broker, directly and through the

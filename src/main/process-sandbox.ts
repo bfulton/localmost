@@ -8,7 +8,7 @@
  * - Using Node.js native APIs instead of shell commands where possible
  */
 
-import { spawn, execFileSync, ChildProcess, SpawnOptions } from 'child_process';
+import { spawn, ChildProcess, SpawnOptions } from 'child_process';
 import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
@@ -38,6 +38,8 @@ import {
   isAppSandboxed,
 } from './paths';
 import { SHARE_NONCE_FILE } from './vm/paths';
+import { levelToolchainPaths } from './worker-env';
+import { isJobTempDir, userTempDir } from './job-temp';
 
 /**
  * Allowed executable patterns within the runner directory.
@@ -123,44 +125,6 @@ function validateExecutablePath(executablePath: string): string {
  */
 export { DEFAULT_BROKER_PORT };
 
-/**
- * The per-user temp directory confstr hands out, once a lookup has answered.
- * A failed lookup is not remembered: it is tried again at the next spawn, so
- * one transient failure does not cost every later job its bare mktemp.
- */
-let userTempDir: string | undefined;
-/** Whether a failed lookup has been logged, so a lasting failure logs once. */
-let userTempDirFailureLogged = false;
-
-/**
- * Where macOS `mktemp` puts a file when it is given no template. It ignores
- * TMPDIR and asks confstr for the per-user temp directory instead, so pointing
- * TMPDIR into the sandbox does not move it. Only a /var/folders/<a>/<b>/T path
- * is accepted: the answer lands in a regex in the profile.
- */
-function darwinUserTempDir(onLog?: SandboxLogCallback): string | undefined {
-  if (userTempDir !== undefined) return userTempDir;
-  let failure: string;
-  try {
-    const answer = String(execFileSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf-8' }))
-      .trim()
-      .replace(/\/+$/, '')
-      .replace(/^\/private/, '');
-    if (/^\/var\/folders\/[A-Za-z0-9_+-]+\/[A-Za-z0-9_+-]+\/T$/.test(answer)) {
-      userTempDir = answer;
-      return userTempDir;
-    }
-    failure = `unexpected answer ${JSON.stringify(answer)}`;
-  } catch (err) {
-    failure = (err as Error).message;
-  }
-  if (!userTempDirFailureLogged && onLog) {
-    userTempDirFailureLogged = true;
-    onLog('error', `Per-user temp directory lookup failed, so jobs cannot use mktemp without a template: ${failure}`);
-  }
-  return undefined;
-}
-
 /** What a repository's approved policy contributes to the sandbox profile. */
 export interface SandboxFilesystemPolicy {
   /** The level the repository declared; strict when it declared none. */
@@ -209,6 +173,12 @@ export interface RunnerProfileOptions {
   toolCacheDir?: string;
   /** This worker's target's package-manager cache; ignored under strict. */
   packageCacheDir?: string;
+  /**
+   * This job's own directory in the per-user temp directory,
+   * `<T>/<DIRHELPER_USER_DIR_SUFFIX>`, which the app made for it (see
+   * job-temp.ts): granted, its node excepted.
+   */
+  tempSuffixDir?: string;
   /**
    * The mark every process of this spawn carries, whatever group it is in,
    * so what its job leaves running can be found when it is done.
@@ -274,6 +244,7 @@ export function generateSandboxProfile({
   vmHelper,
   toolCacheDir: toolCache,
   packageCacheDir: packageCache,
+  tempSuffixDir,
   processMarker,
   jobTempSuffix,
   onLog,
@@ -327,45 +298,7 @@ export function generateSandboxProfile({
   const runnerDir = getRunnerDir().replace(/"/g, '\\"');
   const userDataDir = getUserDataDir().replace(/"/g, '\\"');
 
-  // Toolchains and package-manager caches are a convenience for jobs, not
-  // something the runner needs. Under strict a repository declares what it
-  // wants; moderate and permissive can read them, which is the same split the
-  // network allowlists already use. Read only: these trees hold directories on
-  // the user's PATH and config their own tools load, so a job that could write
-  // them could plant code the user later runs outside any sandbox. The job's
-  // package managers write to its target's own directory instead.
-  //
-  // Of ~/.local, only bin and lib: the rest is where tools keep their state,
-  // tokens included - uv's index credentials, the SSH key into a Podman
-  // machine, atuin's sync key, all under ~/.local/share. The job's package
-  // managers keep their data in its own package cache (XDG_DATA_HOME), so no
-  // ~/.local/share/<tool> is read for them; a tool linked from ~/.local/bin
-  // into one, or a job that wants one for another reason, declares it. Those
-  // three secrets are on the floor (developerCredentialPaths), so declaring
-  // ~/.local/share/uv to run a uv tool does not read uv's credentials.
-  const toolchainPaths =
-    filesystemPolicy.level === 'strict'
-      ? []
-      : [
-          '/opt/homebrew',
-          '/usr/local',
-          '/Applications/Xcode.app',
-          '/Library/Developer',
-          `${homeDir}/.npm`,
-          `${homeDir}/.yarn`,
-          `${homeDir}/.pnpm-store`,
-          `${homeDir}/.cache`,
-          `${homeDir}/.cargo`,
-          `${homeDir}/.rustup`,
-          `${homeDir}/.gradle`,
-          `${homeDir}/.m2`,
-          `${homeDir}/.nuget`,
-          `${homeDir}/.dotnet`,
-          `${homeDir}/.local/bin`,
-          `${homeDir}/.local/lib`,
-          `${homeDir}/go`,
-          `${homeDir}/Library/Caches`,
-        ];
+  const toolchainPaths = levelToolchainPaths(filesystemPolicy.level, homeDir);
   // Policies are written with ~ for the user's home, the same as the CLI path
   // expands. Without this a declared "~/.npm" would name a directory called ~.
   // Backslash first, then quote, so a policy path (validated to carry neither,
@@ -520,7 +453,30 @@ export function generateSandboxProfile({
             ...jobTempDirFilters(dir, jobTempSuffix).map((filter, i, all) => `  ${filter}${i === all.length - 1 ? ')' : ''}`),
           ]),
     ].join('\n');
-  })(darwinUserTempDir(onLog));
+  })(userTempDir(onLog));
+  // The job's own directory in the per-user temp directory, where its
+  // DIRHELPER_USER_DIR_SUFFIX moves NSTemporaryDirectory(), java.io.tmpdir
+  // and the staging directory of a sandboxed process's atomic writes
+  // (TemporaryItems/NSIRD_*) - SwiftPM's and xcodebuild's among them, which
+  // failed with "You don't have permission" without it. The app made it for
+  // this job and removes it after; nothing else in the per-user temp is
+  // granted. Not the node itself: one the job removed would be made again
+  // by the system, marked so that nothing but the system can remove it.
+  // Both spellings, as /var is a symlink.
+  const tempSuffixRules = ((dir?: string): string => {
+    if (dir === undefined) return ';; No temp directory of its own in the per-user temp';
+    const userTemp = userTempDir(onLog);
+    if (!userTemp || !isJobTempDir(userTemp, dir)) {
+      throw new Error(`${dir} is not a job temp directory in the per-user temp directory, so it is not granted`);
+    }
+    const spellings = [dir, `/private${dir}`].map((p) => p.replace(/"/g, '\\"'));
+    return [
+      '(allow file-read* file-write*',
+      ...spellings.map((p, i) => `  (subpath "${p}")${i === spellings.length - 1 ? ')' : ''}`),
+      '(deny file-write*',
+      ...spellings.map((p, i) => `  (literal "${p}")${i === spellings.length - 1 ? ')' : ''}`),
+    ].join('\n');
+  })(tempSuffixDir);
   // This worker's target's own caches, when it keeps any across jobs. Never
   // one shared with another target: what a job leaves in a cache, the next
   // job to find it executes. The package cache is a moderate and permissive
@@ -620,6 +576,9 @@ ${ownCacheRules('file-ioctl')}
 ;; Only what mktemp itself creates, by the name it generated, and the job's own
 ;; suffixed directory when it has one:
 ${mktempRules}
+;; And this job's own directory there, named by DIRHELPER_USER_DIR_SUFFIX,
+;; for Foundation's temp directory and atomic writes; not its node:
+${tempSuffixRules}
 
 ;; No package-manager cache in the user's home. Under strict a repository
 ;; declares what it needs; moderate and permissive get their target's own
@@ -906,6 +865,8 @@ export interface SandboxOptions extends SpawnOptions {
    * strict, whatever is passed.
    */
   packageCacheDir?: string;
+  /** This job's own directory in the per-user temp; see RunnerProfileOptions.tempSuffixDir. */
+  tempSuffixDir?: string;
   /** This spawn's process marker, the last rules of its profile; see processMarkerRules. */
   processMarker?: ProcessMarker;
   /** The job's DIRHELPER_USER_DIR_SUFFIX; see RunnerProfileOptions.jobTempSuffix. */
@@ -963,6 +924,7 @@ export function spawnSandboxed(
     vmHelper,
     toolCacheDir,
     packageCacheDir,
+    tempSuffixDir,
     processMarker,
     jobTempSuffix,
     logPrefix,
@@ -991,6 +953,7 @@ export function spawnSandboxed(
       vmHelper,
       toolCacheDir,
       packageCacheDir,
+      tempSuffixDir,
       processMarker,
       jobTempSuffix,
       onLog,
