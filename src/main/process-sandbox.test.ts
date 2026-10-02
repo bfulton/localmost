@@ -615,6 +615,26 @@ describe('Process Sandbox', () => {
   });
 
   describe('preferences in the runner profile', () => {
+    // The domains xcodebuild, its build service, swift build and codesign
+    // read, and no other: cfprefsd serves a sandboxed process any domain its
+    // profile reads, so an unfiltered read handed a job every app's settings
+    // - licence keys and account names included - past the file floor.
+    const buildDomains = [
+      'kCFPreferencesAnyApplication',
+      'com.apple.dt.Xcode',
+      'com.apple.dt.xcodebuild',
+      'xcodebuild',
+      'com.apple.dt.XCBuild',
+      'com.apple.dt.SWBBuildService',
+      'org.swift.swift-build',
+      'swift-build',
+      'com.apple.CoreSimulator',
+      'com.apple.security',
+      'com.apple.security.codesign',
+    ];
+    const preferenceRules = (profile: string) =>
+      profile.split('\n').filter((line) => line.includes('user-preference') && !line.trim().startsWith(';;'));
+
     it.each(['strict', 'moderate', 'permissive'] as const)(
       'writes no preference domain under %s, Xcode\'s included',
       (level) => {
@@ -622,6 +642,16 @@ describe('Process Sandbox', () => {
         // loads outside any sandbox, and no build needs to.
         const profile = profileWith({ filesystemPolicy: { level, read: ['~'], write: ['~'] } });
         expect(profile).not.toContain('user-preference-write');
+      }
+    );
+
+    it.each(['strict', 'moderate', 'permissive'] as const)(
+      'reads only the build domains under %s, one rule each',
+      (level) => {
+        const profile = profileWith({ filesystemPolicy: { level, read: ['~'], write: ['~'] } });
+        expect(preferenceRules(profile)).toEqual(
+          buildDomains.map((domain) => `(allow user-preference-read (preference-domain "${domain}"))`)
+        );
       }
     );
   });

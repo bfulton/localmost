@@ -117,6 +117,13 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   preferences.
 - `~/Library/Preferences` is closed to reads and writes at every level,
   whatever the policy grants.
+- A job, a `localmost test` step and `--updaterc` read only the preference
+  domains a build reads: the global domain, `com.apple.dt.Xcode`,
+  `com.apple.dt.xcodebuild`, `xcodebuild`, `com.apple.dt.XCBuild`,
+  `com.apple.dt.SWBBuildService`, `org.swift.swift-build`, `swift-build`,
+  `com.apple.CoreSimulator`, `com.apple.security` and
+  `com.apple.security.codesign`. A tool that reads another domain finds it
+  empty.
 
 ### Security
 - Secret values are masked out of step output. A step that printed one - `set -x`,
@@ -437,6 +444,11 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   could set any app's preferences, read grants read them. `~/Library/Preferences`
   is now on the credential floor, read and write, with the directories above
   it closed as nodes.
+- Every profile read every preference domain through cfprefsd, at every
+  level, though the file floor kept a job out of `~/Library/Preferences`: a
+  `strict` job with no grants printed all of Finder's preferences, and the
+  licence and account keys other apps keep there. A job now reads only the
+  domains `xcodebuild`, `swift build` and codesign read.
 
 ### Fixed
 - In-app updates find a zip to install. The update feed listed only the

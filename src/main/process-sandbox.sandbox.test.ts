@@ -821,6 +821,24 @@ if (!isMacOS) {
       });
 
       it.each(['strict', 'moderate', 'permissive'] as const)(
+        "reads the global domain and the build domains under %s, and no other app's preferences",
+        (level) => {
+          // An unfiltered read handed a job every app's settings - licence
+          // keys and account names included - through cfprefsd, past the
+          // file floor that keeps it out of ~/Library/Preferences.
+          const profilePath = writeProfile({ filesystemPolicy: { level, read: [], write: [] } });
+          const locale = defaults(['read', '-g', 'AppleLocale']);
+          expect(locale.ok).toBe(true);
+          expect(defaults(['read', '-g', 'AppleLocale'], profilePath)).toEqual(locale);
+          expect(preferenceAllowed('user-preference-read', 'com.apple.dt.Xcode', profilePath)).toBe(true);
+          expect(defaults(['read', domain, 'planted'], profilePath).stdout).toBe('');
+          // Finder's own, which is there on any Mac a user has logged in to.
+          expect(defaults(['read', 'com.apple.finder']).ok).toBe(true);
+          expect(defaults(['read', 'com.apple.finder'], profilePath).ok).toBe(false);
+        }
+      );
+
+      it.each(['strict', 'moderate', 'permissive'] as const)(
         "writes no preference domain under %s, Xcode's included",
         (level) => {
           // Your own Xcode loads com.apple.dt.Xcode outside any sandbox, and
@@ -844,6 +862,7 @@ if (!isMacOS) {
         const read = run(`/bin/cat ${sq(plist)}`);
         expect(read.stdout).not.toContain('PLANTED');
         expect(read.stderr).toContain('Operation not permitted');
+        expect(defaults(['read', domain, 'planted'], profilePath).stdout).toBe('');
         expect(defaults(['write', domain, 'job', '-string', 'JOB'], profilePath).ok).toBe(false);
         expect(defaults(['read', domain, 'job']).ok).toBe(false);
         expect(canCreate(run, path.join(homeDir, 'Library', 'Preferences', `${throwawayDomain()}.plist`))).toBe(false);
@@ -1469,6 +1488,18 @@ if (!isMacOS) {
       } finally {
         await new Promise((resolve) => server.close(resolve));
       }
+    });
+
+    it("reads the global domain and the build domains, and no other app's preferences", () => {
+      expect(defaults(['read', '-g', 'AppleLocale']).ok).toBe(true);
+      expect(preferenceAllowed('user-preference-read', 'kCFPreferencesAnyApplication')).toBe(true);
+      expect(preferenceAllowed('user-preference-read', 'com.apple.dt.Xcode')).toBe(true);
+      expect(preferenceAllowed('user-preference-read', 'com.apple.finder')).toBe(false);
+      // Finder's own plist is there - metadata stays readable - so the
+      // refusal is the sandbox's, not a domain that does not exist.
+      const finder = path.join(os.userInfo().homedir, 'Library', 'Preferences', 'com.apple.finder.plist');
+      expect(fs.statSync(finder).size).toBeGreaterThan(0);
+      expect(defaults(['read', 'com.apple.finder']).ok).toBe(false);
     });
 
     it("writes no preference domain, Xcode's included", () => {

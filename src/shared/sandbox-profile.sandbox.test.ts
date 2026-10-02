@@ -748,6 +748,19 @@ if (!isMacOS) {
       }));
     };
 
+    it("reads the global domain and the build domains, and no other app's preferences", () => {
+      const locale = defaults(['read', '-g', 'AppleLocale']);
+      expect(locale.ok).toBe(true);
+      // Finder's own, which is there on any Mac a user has logged in to.
+      expect(defaults(['read', 'com.apple.finder']).ok).toBe(true);
+      for (const [name, profilePath] of Object.entries(profiles())) {
+        expect([name, defaults(['read', '-g', 'AppleLocale'], profilePath)]).toEqual([name, locale]);
+        expect([name, preferenceAllowed('user-preference-read', 'com.apple.dt.Xcode', profilePath)]).toEqual([name, true]);
+        expect([name, defaults(['read', domain, 'planted'], profilePath).stdout]).toEqual([name, '']);
+        expect([name, defaults(['read', 'com.apple.finder'], profilePath).ok]).toEqual([name, false]);
+      }
+    });
+
     it("writes no preference domain, Xcode's included, and reaches no plist through a grant of ~", () => {
       // cfprefsd serves a domain to a process that may read (or write) its
       // plist, whatever the preference rules say, and discovery reads
@@ -791,9 +804,12 @@ if (!isMacOS) {
         expect(profile).not.toContain('(subpath "/private/tmp")');
         expect(profile).toContain('(allow signal (target same-sandbox))');
         expect(profile).not.toContain('(allow signal)');
-        // Preferences: no domain written, and no plist reached as a file,
-        // which cfprefsd would honour instead.
+        // Preferences: no domain written, only the build domains read, and
+        // no plist reached as a file, which cfprefsd would honour instead.
         expect(profile).not.toContain('user-preference-write');
+        expect(profile).not.toContain('(allow user-preference-read)');
+        expect(profile).toContain('(allow user-preference-read (preference-domain "kCFPreferencesAnyApplication"))');
+        expect(profile).not.toContain('(preference-domain "com.apple.finder")');
         expect(profile).toContain(`(subpath "${path.join(os.homedir(), 'Library', 'Preferences')}")`);
       }
     });

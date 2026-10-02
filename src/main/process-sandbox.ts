@@ -23,6 +23,7 @@ import {
   policyDenyFilters,
   realPath,
   DEFAULT_BROKER_PORT,
+  preferenceRules,
   processMarkerRules,
   type ProcessMarker,
 } from '../shared/sandbox-profile';
@@ -817,7 +818,8 @@ ${allowDirectNetwork ? ';; Runner registration talks to GitHub directly: app-dri
 (allow sysctl*)
 (allow iokit*)
 (allow pseudo-tty)
-(allow user-preference-read)
+;; Preferences: the domains a build reads, and none written (see preferenceRules).
+${preferenceRules().join('\n')}
 ${processMarkerRules(processMarker).join('\n')}
 `;
 }

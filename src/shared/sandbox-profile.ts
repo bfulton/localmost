@@ -101,6 +101,45 @@ export function processMarkerRules(marker?: ProcessMarker): string[] {
   ];
 }
 
+/**
+ * The preference domains a job, a step and discovery read: those xcodebuild
+ * (build and test), its build service, swift build and codesign read, found
+ * by watching cfprefsd's requests during each with every write denied, and
+ * the global domain, which is kCFPreferencesAnyApplication to the sandbox.
+ * com.apple.dt.Xcode carries the developer accounts and provisioning teams
+ * signing needs.
+ */
+const BUILD_PREFERENCE_DOMAINS = [
+  'kCFPreferencesAnyApplication',
+  'com.apple.dt.Xcode',
+  'com.apple.dt.xcodebuild',
+  'xcodebuild',
+  'com.apple.dt.XCBuild',
+  'com.apple.dt.SWBBuildService',
+  'org.swift.swift-build',
+  'swift-build',
+  'com.apple.CoreSimulator',
+  'com.apple.security',
+  'com.apple.security.codesign',
+] as const;
+
+/**
+ * The preference rules every profile ends its system operations with: the
+ * build domains read, one rule each, and nothing written.
+ *
+ * cfprefsd serves a sandboxed process any domain its profile reads, so an
+ * unfiltered (allow user-preference-read) handed a job every app's settings -
+ * licence keys and account names among them - past the file floor that keeps
+ * it out of ~/Library/Preferences. No domain is written: Xcode's was, and
+ * your own Xcode loads it outside any sandbox, but no build needs to; a
+ * setting goes to xcodebuild as a flag or a -Key=Value override instead.
+ * The plists themselves stay on the floor (see developerCredentialPaths),
+ * since cfprefsd honours file access to one in place of these rules.
+ */
+export function preferenceRules(): string[] {
+  return BUILD_PREFERENCE_DOMAINS.map((domain) => `(allow user-preference-read (preference-domain "${domain}"))`);
+}
+
 // =============================================================================
 // Profile Generation
 // =============================================================================
@@ -484,7 +523,7 @@ export function developerCredentialPaths(home: string = os.homedir()): { subpath
       // Every app's preferences. cfprefsd serves a domain to a process that
       // may read or write its plist here, whatever the profile's preference
       // rules say, so a grant of ~ or ~/Library would otherwise read and
-      // write any app's settings through it.
+      // write any app's settings through it (see preferenceRules).
       `${home}/Library/Preferences`,
     ],
     literals: [
@@ -842,7 +881,7 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push('(allow sysctl*)');
   lines.push('(allow iokit*)');
   lines.push('(allow pseudo-tty)');
-  lines.push('(allow user-preference-read)');
+  lines.push(...preferenceRules());
   lines.push('');
 
   lines.push(...processMarkerRules(options.processMarker));
@@ -926,7 +965,7 @@ export function generateDiscoveryProfile(options: {
     '(allow sysctl*)',
     '(allow iokit*)',
     '(allow pseudo-tty)',
-    '(allow user-preference-read)',
+    ...preferenceRules(),
     '',
     ...processMarkerRules(options.processMarker),
   ];

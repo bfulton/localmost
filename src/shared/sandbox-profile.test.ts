@@ -869,6 +869,25 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).toContain('(allow pseudo-tty)');
     });
 
+    // The domains xcodebuild, its build service, swift build and codesign
+    // read, and no other: cfprefsd serves a sandboxed process any domain its
+    // profile reads, so an unfiltered read handed a step every app's
+    // settings past the file floor.
+    const buildDomains = [
+      'kCFPreferencesAnyApplication',
+      'com.apple.dt.Xcode',
+      'com.apple.dt.xcodebuild',
+      'xcodebuild',
+      'com.apple.dt.XCBuild',
+      'com.apple.dt.SWBBuildService',
+      'org.swift.swift-build',
+      'swift-build',
+      'com.apple.CoreSimulator',
+      'com.apple.security',
+      'com.apple.security.codesign',
+    ];
+    const preferenceRules = (profile: string) =>
+      profile.split('\n').filter((line) => line.includes('user-preference') && !line.trim().startsWith(';;'));
     const everyProfile = () => [
       generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT }),
       generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, permissive: true }),
@@ -885,6 +904,14 @@ describe('Sandbox Profile Generator', () => {
       // loads outside any sandbox, and no build needs to.
       for (const profile of everyProfile()) {
         expect(profile).not.toContain('user-preference-write');
+      }
+    });
+
+    it('reads only the build domains in the enforcement and discovery profiles, one rule each', () => {
+      for (const profile of everyProfile()) {
+        expect(preferenceRules(profile)).toEqual(
+          buildDomains.map((domain) => `(allow user-preference-read (preference-domain "${domain}"))`)
+        );
       }
     });
   });

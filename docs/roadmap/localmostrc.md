@@ -587,8 +587,10 @@ hosts too. A runner job's filesystem likewise starts from a fixed floor the
 policy does not list - the operating system, `/Library/Developer` (the Command
 Line Tools, not Xcode) and its own caches - see SECURITY.md.
 
-Preferences are outside what a policy can grant. A job writes no preference
-domain, Xcode's included, and `~/Library/Preferences` stays closed to reads
+Preferences are outside what a policy can grant. A job reads only the
+domains a build reads - the global domain and those of Xcode, `xcodebuild`,
+Swift Build, the simulator and codesign - and writes none, Xcode's
+included, and `~/Library/Preferences` stays closed to reads
 and writes whatever `filesystem` declares, since cfprefsd would serve any
 domain through a grant of its plist. A workflow that ran
 `defaults write com.apple.dt.Xcode <key> ...` passes the setting to
