@@ -411,6 +411,42 @@ describe('the resource-pause and job-environment preferences', () => {
     });
   });
 
+  it('says, beside the toggle, what a missing granted directory needs while creating them is off', async () => {
+    // Off, nothing creates a granted directory under the home that is not
+    // there, and the job finds out only at its first write: say so where the
+    // choice is made, and that the user must create it first.
+    const offHint = /must create it yourself before the job runs.*"Operation not permitted" at its first write there/;
+    const onHint = /created before each job that needs it/;
+    renderWithProviders(<SettingsPage onBack={jest.fn()} />);
+    const label = 'Create missing directories a policy grants';
+    await waitFor(() => expect(checkbox(label).checked).toBe(true));
+    const group = checkbox(label).closest('div') as HTMLElement;
+    expect(group).toHaveTextContent(onHint);
+    expect(group).not.toHaveTextContent(offHint);
+    expect(screen.queryByText(offHint)).not.toBeInTheDocument();
+
+    fireEvent.click(checkbox(label));
+    await waitFor(() => expect(checkbox(label).checked).toBe(false));
+    expect(group).toHaveTextContent(offHint);
+    expect(group).not.toHaveTextContent(onHint);
+
+    // Only beside its own toggle: turning another off says nothing of it.
+    fireEvent.click(checkbox(label));
+    await waitFor(() => expect(checkbox(label).checked).toBe(true));
+    fireEvent.click(checkbox('Set JAVA_TOOL_OPTIONS for JVMs'));
+    await waitFor(() => expect(checkbox('Set JAVA_TOOL_OPTIONS for JVMs').checked).toBe(false));
+    expect(screen.queryByText(offHint)).not.toBeInTheDocument();
+    expect(group).toHaveTextContent(onHint);
+  });
+
+  it('shows the off hint for a saved choice to leave missing granted directories alone', async () => {
+    mockLocalmost.settings.get.mockResolvedValue({ jobEnvironment: { createMissingGrantedDirs: false } });
+    renderWithProviders(<SettingsPage onBack={jest.fn()} />);
+
+    await waitFor(() => expect(checkbox('Create missing directories a policy grants').checked).toBe(false));
+    expect(screen.getByText(/must create it yourself before the job runs/)).toBeInTheDocument();
+  });
+
   it.each(CONVENIENCES)('shows %s as saved', async (key, label) => {
     mockLocalmost.settings.get.mockResolvedValue({ jobEnvironment: { [key]: false } });
     renderWithProviders(<SettingsPage onBack={jest.fn()} />);

@@ -30,6 +30,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { generateSandboxProfile, RunnerProfileOptions } from './process-sandbox';
+import { swiftDriverTempRules } from '../shared/sandbox-profile';
 import { createJobTempDir, removeJobTempDir, userTempDir } from './job-temp';
 import { writeJobBin } from './job-shims';
 import { javaToolOptions } from './worker-env';
@@ -143,9 +144,12 @@ if (!isMacOS) {
     });
 
     /** Write the runner profile for the stand-in sandbox, and return its path. */
-    const writeProfile = (options: Omit<RunnerProfileOptions, 'instanceDir'> = {}): string => {
+    const writeProfile = (
+      options: Omit<RunnerProfileOptions, 'instanceDir'> = {},
+      edit: (profile: string) => string = (profile) => profile
+    ): string => {
       const profilePath = path.join(base, `${randomBytes(4).toString('hex')}.sb`);
-      fs.writeFileSync(profilePath, generateSandboxProfile({ instanceDir: sandboxDir, ...options }));
+      fs.writeFileSync(profilePath, edit(generateSandboxProfile({ instanceDir: sandboxDir, ...options })));
       return profilePath;
     };
 
@@ -247,12 +251,15 @@ if (!isMacOS) {
           bin = writeJobBin(sandboxDir, { shims: true });
         });
 
-        /** `swift <args>` in the package as a job runs it, the job's bin directory first on PATH or not. */
-        const swift = (args: string, withShims: boolean) => {
-          const profilePath = writeProfile({
+        /** The runner profile a job building the package gets, edited by `edit` when given. */
+        const buildProfile = (edit?: (profile: string) => string) =>
+          writeProfile({
             tempSuffixDir: tempDir,
             filesystemPolicy: { level: 'strict', read: ['/Applications/Xcode.app'], write: [] },
-          });
+          }, edit);
+
+        /** `swift <args>` in the package as a job runs it, the job's bin directory first on PATH or not. */
+        const swift = (args: string, withShims: boolean, profilePath = buildProfile()) => {
           const env = {
             ...baseEnv(),
             PATH: withShims ? `${bin}:/usr/bin:/bin` : '/usr/bin:/bin',
@@ -273,15 +280,31 @@ if (!isMacOS) {
           expect(result).toMatchObject({ ok: true, stdout: expect.stringContaining('Name: hello') });
         }, 2 * SWIFT_TIMEOUT_MS);
 
-        it('builds the package through to a linked executable', () => {
-          // The native build system: the default one in Swift 6.4, Swift Build,
-          // starts its link step with the per-user temp directory as its temp,
-          // which the profile does not grant (docs/roadmap/job-environment.md).
-          const result = swift('build --build-system native', true);
-          expect(result.stdout + result.stderr).not.toMatch(/sandbox_apply/);
+        it("builds the package with Swift 6.4's default build system through to an executable that runs", () => {
+          // Swift Build runs its link step with the per-user temp directory
+          // itself as its temp, and swift-driver makes
+          // T/TemporaryDirectory.XXXXXX there. Without the rule granting
+          // names of that shape the link fails, though all before it builds.
+          const rule = swiftDriverTempRules(userTemp!).join('\n');
+          let removed = false;
+          const withoutRule = buildProfile((profile) => {
+            removed = profile.includes(rule);
+            return profile.replace(rule, ';; (removed)');
+          });
+          expect(removed).toBe(true);
+          const without = swift('build', true, withoutRule);
+          expect(without.ok).toBe(false);
+          expect(without.stderr).toMatch(/error: permissionDenied/);
+          expect(without.stderr).toMatch(/error: Ld \S+\/hello normal failed/);
+          expect(fs.existsSync(path.join(pkg, '.build', 'debug', 'hello'))).toBe(false);
+
+          const result = swift('build', true);
+          expect(result.stdout + result.stderr).not.toMatch(/sandbox_apply|permissionDenied/);
           expect(result).toMatchObject({ ok: true, stdout: expect.stringContaining('Build complete!') });
-          expect(fs.existsSync(path.join(pkg, '.build', 'debug', 'hello'))).toBe(true);
-        }, SWIFT_TIMEOUT_MS);
+          // And it runs, in the job.
+          const hello = run([path.join(pkg, '.build', 'debug', 'hello')], baseEnv(), buildProfile(), 30_000, pkg);
+          expect(hello).toMatchObject({ ok: true, stdout: 'hello' });
+        }, 3 * SWIFT_TIMEOUT_MS);
       });
 
       it('can neither remove nor rename the directory itself', () => {

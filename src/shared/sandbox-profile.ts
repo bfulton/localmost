@@ -520,6 +520,30 @@ function sharedTempRules(): string[] {
     '(allow file-write* file-read*',
     `  (regex #"^${escapeForRegex(`/private${dir}`)}${generated}")`,
     `  (regex #"^${escapeForRegex(dir)}${generated}"))`,
+    ';; And what swift-driver creates for Swift Build\'s link step, by the name mkdtemp generated',
+    ...swiftDriverTempRules(dir),
+  ];
+}
+
+/**
+ * The directories swift-driver makes for Swift Build's link step in the
+ * per-user temp directory `dir`: Swift Build runs that step with the per-user
+ * temp itself as its temp, whatever TMPDIR says, and swift-driver makes
+ * `TemporaryDirectory.XXXXXX` there with mkdtemp(3) - six random characters
+ * of its 62, as tools-support-core's withTemporaryDirectory asks - and puts
+ * the link's response and file lists inside. Without it a package linked
+ * only under `--build-system native`. Names of exactly that shape are
+ * granted, as bare mktemp's are, and the directory itself is not, so a job
+ * cannot list it to find another's. Both spellings, as /var is a symlink.
+ * The runner's profile carries the same rule (see process-sandbox).
+ */
+export function swiftDriverTempRules(dir: string): string[] {
+  const escapeForRegex = (value: string) => value.replace(/[.*+?^$()[\]{}|\\]/g, '\\$&');
+  const generated = `/TemporaryDirectory\\.${'[A-Za-z0-9]'.repeat(6)}(/|$)`;
+  return [
+    '(allow file-write* file-read*',
+    `  (regex #"^${escapeForRegex(`/private${dir}`)}${generated}")`,
+    `  (regex #"^${escapeForRegex(dir)}${generated}"))`,
   ];
 }
 

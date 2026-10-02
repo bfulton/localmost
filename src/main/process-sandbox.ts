@@ -26,6 +26,7 @@ import {
   DEFAULT_BROKER_PORT,
   preferenceRules,
   processMarkerRules,
+  swiftDriverTempRules,
   type ProcessMarker,
 } from '../shared/sandbox-profile';
 import {
@@ -419,6 +420,7 @@ export function generateSandboxProfile({
   // Names of exactly the shape mktemp generates are: ten random characters no
   // other process can guess, and without read on the directory itself a job
   // cannot list it to find one. Both spellings, as /var is a symlink.
+  const perUserTemp = userTempDir(onLog);
   const mktempRules = ((dir?: string): string => {
     if (!dir) return ';; Per-user temp directory unknown: mktemp without a template is not granted';
     const escapeForRegex = (value: string) => value.replace(/[.*+?^$()[\]{}|\\]/g, '\\$&');
@@ -428,7 +430,15 @@ export function generateSandboxProfile({
       `  (regex #"^${escapeForRegex(`/private${dir}`)}${generated}")`,
       `  (regex #"^${escapeForRegex(dir)}${generated}"))`,
     ].join('\n');
-  })(userTempDir(onLog));
+  })(perUserTemp);
+  // Swift Build runs its link step with the per-user temp directory itself as
+  // its temp, and swift-driver makes T/TemporaryDirectory.XXXXXX there with
+  // mkdtemp: granted by the generated name only, as mktemp's are.
+  const swiftDriverRules = ((dir?: string): string =>
+    dir
+      ? swiftDriverTempRules(dir).join('\n')
+      : ';; Per-user temp directory unknown: Swift Build\'s link step is not granted its temp'
+  )(perUserTemp);
   // The job's own directory in the per-user temp directory, where its
   // DIRHELPER_USER_DIR_SUFFIX moves NSTemporaryDirectory(), java.io.tmpdir
   // and the staging directory of a sandboxed process's atomic writes
@@ -550,6 +560,9 @@ ${ownCacheRules('file-ioctl')}
 ;; the caches tools would otherwise keep there are pointed into it too.
 ;; Only what mktemp itself creates, by the name it generated:
 ${mktempRules}
+;; And what swift-driver creates for Swift Build's link step, by the name
+;; mkdtemp generated:
+${swiftDriverRules}
 ;; And this job's own directory there, named by DIRHELPER_USER_DIR_SUFFIX,
 ;; for Foundation's temp directory and atomic writes; not its node:
 ${tempSuffixRules}

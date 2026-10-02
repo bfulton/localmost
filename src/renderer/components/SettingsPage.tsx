@@ -14,7 +14,13 @@ import shared from '../styles/shared.module.css';
  * The job-environment conveniences, in the order the page shows them: each
  * a checkbox, on by default. See docs/roadmap/job-environment.md.
  */
-const JOB_ENVIRONMENT_OPTIONS: ReadonlyArray<{ key: keyof JobEnvironmentConfig; label: string; hint: string }> = [
+const JOB_ENVIRONMENT_OPTIONS: ReadonlyArray<{
+  key: keyof JobEnvironmentConfig;
+  label: string;
+  hint: string;
+  /** What the current setting means for a job, where that is not said in the hint. */
+  stateHints?: { on: string; off: string };
+}> = [
   {
     key: 'toolShims',
     label: "Turn off SwiftPM's and Xcode's own sandbox",
@@ -44,7 +50,14 @@ const JOB_ENVIRONMENT_OPTIONS: ReadonlyArray<{ key: keyof JobEnvironmentConfig; 
     hint:
       'Before a job, creates a missing directory a write grant names under your home, which the job ' +
       'cannot create itself: empty, one level at a time, never through a link, never in a credential ' +
-      'location. Off, a job that needs one fails.',
+      'location.',
+    stateHints: {
+      on: 'On: a missing granted directory is created before each job that needs it.',
+      off:
+        'Off: a directory a policy grants under your home that does not exist stays missing, and you must ' +
+        'create it yourself before the job runs, or the job fails with "Operation not permitted" at its ' +
+        'first write there.',
+    },
   },
 ];
 
@@ -557,7 +570,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
             What localmost adds to each job&apos;s environment so common tools work in its sandbox. A change
             applies to jobs that start after it.
           </p>
-          {JOB_ENVIRONMENT_OPTIONS.map(({ key, label, hint }) => (
+          {JOB_ENVIRONMENT_OPTIONS.map(({ key, label, hint, stateHints }) => (
             <div key={key} className={shared.formGroup}>
               <label className={shared.toggleRow}>
                 <input
@@ -568,6 +581,9 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
                 <span>{label}</span>
               </label>
               <p className={shared.formHint}>{hint}</p>
+              {stateHints && (
+                <p className={shared.formHint}>{jobEnvironment[key] ? stateHints.on : stateHints.off}</p>
+              )}
             </div>
           ))}
         </section>

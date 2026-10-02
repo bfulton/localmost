@@ -254,7 +254,8 @@ above a credential location, which the job cannot create either (`~/.gradle`,
 on a Mac where Gradle never ran). Otherwise it is left to the job, since a
 grant can name a file (`~/.python_history`). This is the
 `jobEnvironment.createMissingGrantedDirs` preference, on by default; with it
-off, a missing directory stays missing. See
+off, a missing directory stays missing, and you create it before the job or
+the job fails with "Operation not permitted" at its first write there. See
 [job-environment.md](job-environment.md) for this and what else a job's
 environment carries.
 

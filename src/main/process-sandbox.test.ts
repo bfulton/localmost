@@ -812,6 +812,41 @@ describe('Process Sandbox', () => {
       expect(granted('/var/folders/zz/other_user00gn/T/tmp.AbC123xYz9')).toBe(false);
     });
 
+    it("lets swift-driver create its own TemporaryDirectory.XXXXXX in the per-user temp, by generated name only", () => {
+      // Swift Build runs its link step with the per-user temp directory as
+      // its temp, and swift-driver makes T/TemporaryDirectory.XXXXXX there
+      // with mkdtemp: six of mkdtemp's 62 characters, files inside.
+      const profile = profileWith({});
+      for (const dir of ['/var/folders/zz/zyxw_vut0000gn/T', '/private/var/folders/zz/zyxw_vut0000gn/T']) {
+        for (const p of [`${dir}/TemporaryDirectory.lr5gaP`, `${dir}/TemporaryDirectory.Zz09aA/hello.resp`]) {
+          expect([p, writable(profile, p), readable(profile, p)]).toEqual([p, true, true]);
+        }
+        for (const p of [
+          dir,
+          `${dir}/`,
+          `${dir}/xcrun_db`,
+          `${dir}/TemporaryDirectory.`,
+          `${dir}/TemporaryDirectory.lr5ga`,
+          `${dir}/TemporaryDirectory.lr5gaPx`,
+          `${dir}/TemporaryDirectory.lr5g_P`,
+          `${dir}/TemporaryDirectoryXlr5gaP`,
+          `${dir}/TemporaryFile.lr5gaP`,
+          `${dir}/TemporaryItems/NSIRD_x/f`,
+          `${dir}/x/TemporaryDirectory.lr5gaP`,
+        ]) {
+          expect([p, writable(profile, p), readable(profile, p)]).toEqual([p, false, false]);
+        }
+      }
+      expect(writable(profile, '/var/folders/zz/zyxw_vut0000gn/C/TemporaryDirectory.lr5gaP')).toBe(false);
+      expect(writable(profile, '/var/folders/zz/other_user00gn/T/TemporaryDirectory.lr5gaP')).toBe(false);
+      expect(writable(profile, '/private/tmp/TemporaryDirectory.lr5gaP')).toBe(false);
+      // The same rule whatever the level: a build needs it at every one.
+      for (const level of ['strict', 'moderate', 'permissive'] as const) {
+        const atLevel = profileWith({ filesystemPolicy: { level, read: [], write: [] } });
+        expect(writable(atLevel, '/private/var/folders/zz/zyxw_vut0000gn/T/TemporaryDirectory.lr5gaP/f')).toBe(true);
+      }
+    });
+
     it('refuses a clone of a directory, after every grant', () => {
       // clonefile(2) of a directory copies the tree beneath it without asking
       // about each file, so a policy-denied file, a credential inside a

@@ -97,6 +97,43 @@ const bareMktemp = (run: (command: string) => { ok: boolean; stdout: string }, f
   return { ok: result.ok, entry: result.stdout };
 };
 
+/** `count` characters of the alphabet mkdtemp fills a template's X's from. */
+const mkdtempChars = (count: number): string => {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  return [...crypto.randomBytes(count)].map((byte) => alphabet[byte % alphabet.length]).join('');
+};
+
+/**
+ * What a job may make in the per-user temp by the names swift-driver's mkdtemp
+ * generates for Swift Build's link step, T/TemporaryDirectory.XXXXXX, and by
+ * names a character off that shape. Each is made with mkdir (never -p) and a
+ * file inside, and removed afterwards only when it is exactly that new entry.
+ */
+const swiftDriverTempProbe = (run: (command: string) => { ok: boolean }) => {
+  const temp = userTempDir();
+  const attempt = (name: string): boolean => {
+    const dir = path.join(temp, name);
+    if (fs.existsSync(dir)) throw new Error(`${dir} already exists`);
+    const ok = run(`/bin/mkdir ${sq(dir)} && /usr/bin/touch ${sq(path.join(dir, 'link.resp'))}`).ok;
+    if (path.dirname(dir) === temp && /^Temporary[A-Za-z]+\.?[A-Za-z0-9_-]*$/.test(name) && fs.existsSync(dir)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+    return ok;
+  };
+  return {
+    generated: attempt(`TemporaryDirectory.${mkdtempChars(6)}`),
+    offShape: {
+      fiveChars: attempt(`TemporaryDirectory.${mkdtempChars(5)}`),
+      sevenChars: attempt(`TemporaryDirectory.${mkdtempChars(7)}`),
+      notInAlphabet: attempt(`TemporaryDirectory.${mkdtempChars(5)}_`),
+      otherPrefix: attempt(`TemporaryFile.${mkdtempChars(6)}`),
+      noDot: attempt(`TemporaryDirectoryX${mkdtempChars(6)}`),
+    },
+    // Nor can it list the per-user temp to find another job's.
+    listsTemp: run(`/bin/ls ${sq(temp)}`).ok,
+  };
+};
+
 /** A word for a shell command line, quoted so nothing in it is special. */
 const sq = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
 
@@ -296,6 +333,11 @@ if (!isMacOS) {
       expect(file.ok).toBe(true);
       expect(dir.ok).toBe(true);
       expect(fs.realpathSync(path.dirname(file.entry))).toBe(userTempDir());
+    });
+
+    it("lets a job make the TemporaryDirectory.XXXXXX Swift Build's link step makes there, and no name off its shape", () => {
+      const allOff = { fiveChars: false, sevenChars: false, notInAlphabet: false, otherPrefix: false, noDot: false };
+      expect(swiftDriverTempProbe(underProfile())).toEqual({ generated: true, offShape: allOff, listsTemp: false });
     });
 
     it('refuses the per-user temp itself, where the xcrun cache the user trusts lives', () => {
@@ -1772,6 +1814,11 @@ if (!isMacOS) {
     it('lets bare mktemp and mktemp -d create their entries in the per-user temp', () => {
       expect(bareMktemp(run, '').ok).toBe(true);
       expect(bareMktemp(run, '-d').ok).toBe(true);
+    });
+
+    it("lets the job make the TemporaryDirectory.XXXXXX Swift Build's link step makes there, and no name off its shape", () => {
+      const allOff = { fiveChars: false, sevenChars: false, notInAlphabet: false, otherPrefix: false, noDot: false };
+      expect(swiftDriverTempProbe(run)).toEqual({ generated: true, offShape: allOff, listsTemp: false });
     });
 
     it('refuses the per-user temp itself, where the xcrun cache the user trusts lives', () => {

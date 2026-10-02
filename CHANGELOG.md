@@ -727,9 +727,7 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   - `perJobTempDir`: a directory of the job's own in the per-user temp
     directory, named by `DIRHELPER_USER_DIR_SUFFIX`, made before the job and
     removed after it, where Foundation's atomic writes - SwiftPM's,
-    xcodebuild's - stage; they failed with "You don't have permission".
-    Swift 6.4's default build system still fails at its link step; `swift
-    build --build-system native` works
+    xcodebuild's - stage; they failed with "You don't have permission"
   - `toolShims`: `swift` and `xcodebuild` shims first on the job's `PATH` that
     add `--disable-sandbox` (to `build`, `test`, `run` and `package`, but not
     `swift package --version`) and `-IDEPackageSupportDisableManifestSandbox=YES`
@@ -752,7 +750,17 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
     itself too when the grant ends in `/` or `/**`, or is a directory above a
     credential the job cannot create either - `~/.gradle` on a Mac where Gradle
     never ran. A grant without the trailing `/` may name a file the job
-    creates itself
+    creates itself. While it is off, Settings says beside the toggle that a
+    granted directory under your home that does not exist must be created
+    first, or the job fails with "Operation not permitted" at its first write
+    there
+- A job may create the `T/TemporaryDirectory.XXXXXX` directories that Swift
+  6.4's default build system, Swift Build, has swift-driver make in the
+  per-user temp directory for its link step - by the name `mkdtemp` generates
+  only, as with a bare `mktemp`'s entries - in the runner's profile and a
+  `localmost test` step's. A plain `swift build` now links in a job; it failed
+  at its `Ld` step with `permissionDenied`, and a workflow had to pass
+  `--build-system native`
 - The bundled `docker` CLI is linked in the job's own bin directory,
   `<sandbox>/localmost/bin`, first on its `PATH`, rather than its directory in
   the app bundle being put on `PATH`

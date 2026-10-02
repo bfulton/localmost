@@ -219,6 +219,34 @@ describe('Sandbox Profile Generator', () => {
       }
     });
 
+    it("grants the TemporaryDirectory.XXXXXX swift-driver makes for Swift Build's link step, and no other name", () => {
+      // swift-driver makes it with mkdtemp in the per-user temp, which Swift
+      // Build hands its link step as its temp whatever TMPDIR says.
+      for (const profile of [
+        generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT }),
+        generateDiscoveryProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, logFile: '' }),
+      ]) {
+        const forms = topLevelForms(profile).filter((f) => f.includes('TemporaryDirectory'));
+        expect(forms).toHaveLength(1);
+        expect(forms[0].startsWith('(allow file-write* file-read*')).toBe(true);
+        const rules = [...forms[0].matchAll(/\(regex #"([^"]+)"\)/g)].map((m) => new RegExp(m[1]));
+        expect(rules).toHaveLength(2);
+        const temp = (rules[1].source.match(/^\^(.*)\\\/TemporaryDirectory/)?.[1] ?? '').replace(/\\(.)/g, '$1');
+        expect(temp).toMatch(/^\/var\/folders\/[^/]+\/[^/]+\/T$/);
+        const granted = (p: string) => rules.some((rule) => rule.test(p));
+        for (const dir of [temp, `/private${temp}`]) {
+          expect(granted(`${dir}/TemporaryDirectory.lr5gaP`)).toBe(true);
+          expect(granted(`${dir}/TemporaryDirectory.lr5gaP/hello.resp`)).toBe(true);
+          expect(granted(dir)).toBe(false);
+          expect(granted(`${dir}/TemporaryDirectory.lr5ga`)).toBe(false);
+          expect(granted(`${dir}/TemporaryDirectory.lr5gaPx`)).toBe(false);
+          expect(granted(`${dir}/TemporaryDirectory.lr5g-P`)).toBe(false);
+          expect(granted(`${dir}/TemporaryFile.lr5gaP`)).toBe(false);
+          expect(granted(`${dir}/xcrun_db`)).toBe(false);
+        }
+      }
+    });
+
     it('refuses a clone of a directory in every profile, after every allow', () => {
       // clonefile(2) of a directory copies the tree beneath it without asking
       // about each file, so a denied file inside came along readable.
