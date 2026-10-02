@@ -68,11 +68,6 @@ export interface SandboxProfileOptions {
   logFile?: string;
   /** The files that mark a process as running under this run's profiles; see processMarkerRules. */
   processMarker?: ProcessMarker;
-  /**
-   * The DIRHELPER_USER_DIR_SUFFIX the step runs with, whose directory in the
-   * per-user temp it reads and writes; see jobTempDirFilters. Absent, none.
-   */
-  jobTempSuffix?: string;
 }
 
 /**
@@ -513,11 +508,9 @@ function darwinUserTempDir(): string | undefined {
  * TMPDIR, and scripts call it that way constantly, so names of exactly the
  * shape it generates are granted: ten random characters no other process can
  * guess, and without read on the directory itself a step cannot list it to
- * find one. Both spellings, as /var is a symlink. And the step's own
- * suffixed directory there, when it has one (see jobTempDirFilters).
+ * find one. Both spellings, as /var is a symlink.
  */
-function sharedTempRules(jobTempSuffix?: string): string[] {
-  checkJobTempSuffix(jobTempSuffix);
+function sharedTempRules(): string[] {
   const dir = darwinUserTempDir();
   if (!dir) return [';; Per-user temp directory unknown: mktemp without a template is not granted'];
   const escapeForRegex = (value: string) => value.replace(/[.*+?^$()[\]{}|\\]/g, '\\$&');
@@ -527,66 +520,7 @@ function sharedTempRules(jobTempSuffix?: string): string[] {
     '(allow file-write* file-read*',
     `  (regex #"^${escapeForRegex(`/private${dir}`)}${generated}")`,
     `  (regex #"^${escapeForRegex(dir)}${generated}"))`,
-    ...(jobTempSuffix === undefined
-      ? []
-      : [
-          ";; ...and this step's own directory there, where Foundation stages its atomic writes",
-          '(allow file-read* file-write*',
-          ...jobTempDirFilters(dir, jobTempSuffix).map((filter, i, all) => `  ${filter}${i === all.length - 1 ? ')' : ''}`),
-        ]),
   ];
-}
-
-/**
- * What a DIRHELPER_USER_DIR_SUFFIX may be: a name localmost owns, with a
- * random body. It lands in a profile as a path component under the per-user
- * temp directory, and the job reads and writes everything beneath it, so it
- * must name nothing shared there: not the TemporaryItems every sandboxed
- * Foundation process of the user's stages through, not another app's
- * directory, and not a name of mktemp's shape, which every job is granted
- * and an earlier one could have made and filled. Lowercase hex, since the
- * volume matches names without regard to case.
- */
-const JOB_TEMP_SUFFIX = /^localmost-job-[0-9a-f]{16,64}$/;
-
-/** Throw unless `suffix` is absent or one of localmost's own (see JOB_TEMP_SUFFIX). */
-export function checkJobTempSuffix(suffix: string | undefined): void {
-  if (suffix !== undefined && !JOB_TEMP_SUFFIX.test(suffix)) {
-    throw new Error(
-      `The job's temp suffix must be localmost-job- and 16 to 64 lowercase hex digits, so it cannot be confined as intended: ${JSON.stringify(suffix)}`
-    );
-  }
-}
-
-/**
- * A job's own directory in the per-user temp, `<userTemp>/<suffix>`, in both
- * spellings, as (subpath ...) filters for a grant.
- *
- * With DIRHELPER_USER_DIR_SUFFIX in its environment a process's per-user
- * temp directory is T/<suffix>: NSTemporaryDirectory(), java.io.tmpdir and,
- * for a sandboxed process, the TemporaryItems directory Foundation stages
- * every atomic write in, whatever the destination. Without it a sandboxed
- * Foundation stages in the shared T/TemporaryItems, which a job is not
- * granted, and `write(to:atomically:)`, SwiftPM's manifests and xcodebuild
- * fail with "You don't have permission to save the file". The rest of T
- * stays closed: it is shared with every process the user runs.
- *
- * T/<suffix> outlives the job, whatever sweeps it. As macOS makes it, for a
- * process with the suffix set, it carries the same protection as T itself
- * (the sunlnk flag and com.apple.rootless), so it can never be removed; and
- * the TemporaryItems in it cannot be removed either, empty or not, sandboxed
- * or not, wherever under T it is. So a suffix per job leaves a directory per
- * job in the user's T. A suffix reused across jobs instead makes T/<suffix> a
- * channel from one job to the next, unless everything in it but
- * TemporaryItems is swept before each job - by lstat, never following a
- * link: anything in it can be a link the job planted, and the grant covers
- * the T/<suffix> node itself, so one the app made with mkdir (which carries
- * no such protection) the job can remove and replace with a link while
- * TemporaryItems is not yet in it.
- */
-export function jobTempDirFilters(userTemp: string, suffix: string): string[] {
-  checkJobTempSuffix(suffix);
-  return [`/private${userTemp}/${suffix}`, `${userTemp}/${suffix}`].map((dir) => `(subpath "${escapePath(dir)}")`);
 }
 
 /**
@@ -886,7 +820,7 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push(`  (subpath "${escapedWorkDir}"))`);
   lines.push('');
 
-  lines.push(...sharedTempRules(options.jobTempSuffix));
+  lines.push(...sharedTempRules());
   lines.push('');
 
   // No home directory cache is granted unless the policy declares it. Steps
@@ -1023,8 +957,6 @@ export function generateDiscoveryProfile(options: {
   proxyPort: number;
   logFile: string;  // Not used - reports go to system log, not a file
   processMarker?: ProcessMarker;
-  /** As SandboxProfileOptions.jobTempSuffix. */
-  jobTempSuffix?: string;
 }): string {
   const { workDir, proxyPort } = options;
   const escapedWorkDir = escapePath(workDir);
@@ -1050,7 +982,7 @@ export function generateDiscoveryProfile(options: {
     '(allow file-read* (with report))',
     '(allow file-write* (with report)',
     `  (subpath "${escapedWorkDir}"))`,
-    ...sharedTempRules(options.jobTempSuffix),
+    ...sharedTempRules(),
     '(allow file-write*',
     '  (literal "/dev/null")',
     '  (literal "/dev/random")',
