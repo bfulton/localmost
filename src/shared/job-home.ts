@@ -20,6 +20,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { developerCredentialPaths } from './sandbox-profile';
 
 /** The job's home inside a runner sandbox. */
 export const JOB_HOME_DIR_NAME = 'home';
@@ -59,18 +60,48 @@ const componentPattern = (component: string): RegExp =>
   new RegExp(`^${component.split('*').map((part) => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('[^/]*')}$`);
 
 /**
- * The paths a grant names under `realHome`, relative to it. A leading ~ is
- * the real home. A trailing `/**` grants the directory, as it does in the
- * profiles. A component with `*` in it is matched, within that one name,
- * against what is there now, so each existing match is a path of its own;
- * one with `**` in the middle stops the walk at the directory before it.
- * The home itself is no path: it cannot be linked into itself.
+ * A path as the default APFS volume compares it: case-insensitively, and
+ * insensitive to Unicode normalization. Over-folds a little (ı to i, say),
+ * which only ever matches more.
+ */
+const folded = (p: string): string => p.normalize('NFD').toUpperCase().toLowerCase();
+
+/**
+ * Whether `inner` is `outer` or lies beneath it, as the volume tells names
+ * apart: a grant of ~/.SSH/x is in ~/.ssh there. What this module does runs
+ * outside the sandbox, which closes the app's own directories and the
+ * credential locations in any capitalization; it must not reopen them.
+ */
+const withinFolded = (inner: string, outer: string): boolean => within(folded(inner), folded(outer));
+
+/**
+ * A grant as the absolute path it names, with no trailing `/` or `/**` -
+ * which grant the directory, as they do in the profiles - or undefined for a
+ * relative grant or one with `..` in it. A leading ~ is the real home.
+ */
+function expandGrant(grant: string, realHome: string): string | undefined {
+  const expanded = grant === '~' || grant.startsWith('~/') ? path.join(realHome, grant.slice(1)) : grant;
+  if (!path.isAbsolute(expanded) || expanded.split('/').includes('..')) return undefined;
+  return path.normalize(expanded).replace(/\/\*\*$/, '').replace(/(.)\/+$/, '$1');
+}
+
+/**
+ * The paths a grant names under `realHome`, relative to it. A component
+ * with `*` in it is matched, within that one name, against what is there
+ * now, so each existing match is a path of its own; one with `**` in the
+ * middle stops the walk at the directory before it. The home itself cannot
+ * be linked into itself, so a grant of it names each entry in it now.
  */
 export function homeRelativeGrants(grant: string, realHome: string = os.homedir()): string[] {
-  let expanded = grant === '~' || grant.startsWith('~/') ? path.join(realHome, grant.slice(1)) : grant;
-  if (!path.isAbsolute(expanded) || expanded.split('/').includes('..')) return [];
-  expanded = path.normalize(expanded).replace(/\/\*\*$/, '');
-  if (!within(expanded, realHome) || expanded === realHome) return [];
+  const expanded = expandGrant(grant, realHome);
+  if (expanded === undefined || !within(expanded, realHome)) return [];
+  if (expanded === realHome) {
+    try {
+      return fs.readdirSync(realHome);
+    } catch {
+      return [];
+    }
+  }
   const components = path.relative(realHome, expanded).split(path.sep);
   let found: string[] = [''];
   for (const component of components) {
@@ -104,18 +135,88 @@ export function homeRelativeGrants(grant: string, realHome: string = os.homedir(
  * leads into the real tree. Shorter paths go first for that reason, so a
  * grant of ~/.cache and one of ~/.cache/pip give one link, ~/.cache, not a
  * directory that hides the rest of it.
+ *
+ * What is not there when the job starts is not linked: a link to nothing
+ * reaches nothing, and kept a tool from making the directory in the job's
+ * home - its mkdir found the name taken. Nor is a credential the job is
+ * denied whatever it is granted (`deniedPaths`, the floor's credential
+ * locations by default), or anything in one: found through HOME it failed
+ * as the real path does, where without the link the tool goes on without
+ * it. A granted directory that holds one - ~/.cache holds Hugging Face's
+ * token, ~/.gradle the Gradle properties - is a directory of the job's own
+ * instead, holding a link to each of its entries but that one, and so on
+ * down to it. Nor, for a grant of the home, the directory the job's home is
+ * in.
  */
 export function linkHomeGrants(
   jobHome: string,
   grants: string[],
-  options: { realHome?: string; log?: JobHomeLog } = {}
+  options: { realHome?: string; deniedPaths?: string[]; log?: JobHomeLog } = {}
 ): string[] {
   const realHome = options.realHome ?? os.homedir();
   const log = options.log ?? (() => {});
+  const deniedPaths = options.deniedPaths ?? floorCredentialPaths(realHome);
   const relatives = [...new Set(grants.flatMap((grant) => homeRelativeGrants(grant, realHome)))]
     .sort((a, b) => a.split(path.sep).length - b.split(path.sep).length || (a < b ? -1 : 1));
   const linked: string[] = [];
+
+  // Why `rel` is not to be linked or entered, if it is not.
+  const unlinkable = (rel: string): string | undefined => {
+    const real = path.join(realHome, rel);
+    if (deniedPaths.some((denied) => withinFolded(real, denied))) return 'the job is denied it whatever it is granted';
+    if (withinFolded(jobHome, real)) return "the job's home is in it";
+    if (!existsFollowing(real)) return 'nothing is there';
+    return undefined;
+  };
+
+  // Link `rel`, whose directories on the way are the job's own, or make it
+  // a directory of links when it holds a denied credential that is there.
+  const place = (rel: string): void => {
+    const why = unlinkable(rel);
+    if (why) {
+      log('debug', `Not linking ~/${rel} into the job's home: ${why}`);
+      return;
+    }
+    const real = path.join(realHome, rel);
+    const target = path.join(jobHome, rel);
+    const depth = real.split(path.sep).length;
+    const holdsDenied = deniedPaths.some((denied) => {
+      if (!withinFolded(denied, real)) return false;
+      const next = denied.split(path.sep)[depth];
+      return next !== undefined && lstatOrUndefined(path.join(real, next)) !== undefined;
+    });
+    const stat = lstatOrUndefined(target);
+    if (!holdsDenied) {
+      if (stat) {
+        log('debug', `Not linking ~/${rel} into the job's home: something is already there`);
+        return;
+      }
+      fs.symlinkSync(real, target);
+      linked.push(rel);
+      return;
+    }
+    if (!stat) {
+      fs.mkdirSync(target, { mode: 0o700 });
+    } else if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      log('debug', `Not linking ~/${rel} into the job's home: something is already there`);
+      return;
+    }
+    let names: string[];
+    try {
+      names = fs.readdirSync(real);
+    } catch (err) {
+      log('warn', `Could not link what ~/${rel} holds into the job's home: ${(err as Error).message}`);
+      return;
+    }
+    for (const name of names.sort()) place(path.join(rel, name));
+  };
+
   for (const rel of relatives) {
+    const why = unlinkable(rel);
+    if (why) {
+      log('debug', `Not linking ~/${rel} into the job's home: ${why}`);
+      continue;
+    }
     const parts = rel.split(path.sep);
     let blocked = false;
     for (let i = 1; i < parts.length && !blocked; i++) {
@@ -131,15 +232,26 @@ export function linkHomeGrants(
       log('debug', `Not linking ~/${rel} into the job's home: a link above it already leads there`);
       continue;
     }
-    const target = path.join(jobHome, rel);
-    if (lstatOrUndefined(target)) {
-      log('debug', `Not linking ~/${rel} into the job's home: something is already there`);
-      continue;
-    }
-    fs.symlinkSync(path.join(realHome, rel), target);
-    linked.push(rel);
+    place(rel);
   }
   return linked;
+}
+
+/** The floor's credential locations under `realHome`, files and directories alike. */
+function floorCredentialPaths(realHome: string): string[] {
+  const { subpaths, literals } = developerCredentialPaths(realHome);
+  return [...subpaths, ...literals];
+}
+
+/** Whether anything is at `p`, following a link to it: a link to nothing is nothing. */
+function existsFollowing(p: string): boolean {
+  try {
+    fs.statSync(p);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code !== 'ENOENT' && code !== 'ENOTDIR' && code !== 'ELOOP';
+  }
 }
 
 /** lstat, or undefined where nothing is there. */
@@ -154,8 +266,17 @@ function lstatOrUndefined(p: string): fs.Stats | undefined {
 }
 
 /**
- * Create each directory a write grant names under the real home that does
- * not exist yet, and return the directories created.
+ * Create the directories a write grant needs under the real home that the
+ * job could not make itself, and return the directories created.
+ *
+ * A write grant is a seatbelt subpath, which lets the job create what it
+ * names but nothing above it. So each missing level above is made. What the
+ * grant names itself is made only when the grant says it is a directory -
+ * it ends in `/` or `/**` - or when the job could not make it either: a
+ * directory above a credential (~/.gradle, ~/.m2, ~/.cache), whose node the
+ * profile denies the job's writes. Otherwise it may name a file - a
+ * ~/.python_history made a directory broke the user's own python, outside
+ * any job, with EISDIR - and is the job's to create.
  *
  * One level at a time from the home down: each existing level is lstat'd
  * and must be a directory, not a link, or the grant is left alone - a link
@@ -168,7 +289,8 @@ function lstatOrUndefined(p: string): fs.Stats | undefined {
  * app uses - config.yaml, say - would break the app. Nor is one in any of
  * `deniedRoots`, the credential locations the job is denied whatever it is
  * granted: a ~/.ssh or ~/.aws made because a policy named a path in it
- * would serve the job nothing, and is the user's to make.
+ * would serve the job nothing, and is the user's to make. Both are compared
+ * as the volume compares names, in any capitalization.
  */
 export function createMissingGrantedDirs(
   writeGrants: string[],
@@ -180,25 +302,32 @@ export function createMissingGrantedDirs(
   const denied = (options.deniedRoots ?? []).map((root) => path.resolve(root));
   const created: string[] = [];
   for (const grant of writeGrants) {
-    let expanded = grant === '~' || grant.startsWith('~/') ? path.join(realHome, grant.slice(1)) : grant;
-    if (!path.isAbsolute(expanded) || expanded.split('/').includes('..')) continue;
-    expanded = path.normalize(expanded).replace(/\/\*\*$/, '');
-    if (expanded.includes('*') || !within(expanded, realHome) || expanded === realHome) continue;
-    if (excluded.some((root) => within(expanded, root) || within(root, expanded))) {
+    const expanded = expandGrant(grant, realHome);
+    if (expanded === undefined || expanded.includes('*') || !within(expanded, realHome) || expanded === realHome) continue;
+    if (excluded.some((root) => withinFolded(expanded, root) || withinFolded(root, expanded))) {
       log('debug', `Not creating ${expanded} for the job: it is in the app's own directories`);
       continue;
     }
-    if (denied.some((root) => within(expanded, root))) {
+    if (denied.some((root) => withinFolded(expanded, root))) {
       log('debug', `Not creating ${expanded} for the job: the job is denied it whatever it is granted`);
       continue;
     }
+    const namesDirectory = /\/(\*\*)?$/.test(grant) || denied.some((root) => withinFolded(root, expanded));
+    const parts = path.relative(realHome, expanded).split(path.sep);
     let node = realHome;
-    for (const part of path.relative(realHome, expanded).split(path.sep)) {
+    for (const [i, part] of parts.entries()) {
       node = path.join(node, part);
       const stat = lstatOrUndefined(node);
       if (stat?.isDirectory() && !stat.isSymbolicLink()) continue;
       if (stat) {
         log('warn', `Not creating ${expanded} for the job: ${node} is not a directory`);
+        break;
+      }
+      if (i === parts.length - 1 && !namesDirectory) {
+        log(
+          'debug',
+          `Not creating ${expanded} for the job: the grant may name a file, which the job can create; end it with / to have a directory made`
+        );
         break;
       }
       try {
@@ -217,14 +346,19 @@ export function createMissingGrantedDirs(
  * Fill a job's new, empty home: the hermetic git config as `.gitconfig`, an
  * empty `.ssh/config` for GIT_SSH_COMMAND, and a link for each path the
  * grants name under the real home (linkHomeGrants). Called before anything
- * of the job runs there; every file is created exclusively, so nothing put
- * at a name is written through. Throws on what it cannot do; the caller
- * decides what a job can run without.
+ * of the job runs there; the home must be a directory, not a link to one,
+ * and every file is created exclusively, so nothing put at a name is
+ * written through. Throws on what it cannot do; the caller decides what a
+ * job can run without.
  */
 export function prepareJobHome(
   jobHome: string,
   options: { grants: string[]; realHome?: string; log?: JobHomeLog }
 ): { gitConfig: string; linked: string[] } {
+  const home = lstatOrUndefined(jobHome);
+  if (!home?.isDirectory() || home.isSymbolicLink()) {
+    throw new Error(`The job's home ${jobHome} is not a directory of its own`);
+  }
   const gitConfig = path.join(jobHome, '.gitconfig');
   fs.writeFileSync(gitConfig, JOB_GIT_CONFIG, { flag: 'wx', mode: 0o644 });
   const ssh = path.join(jobHome, '.ssh');

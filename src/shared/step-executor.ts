@@ -155,6 +155,18 @@ export function ensureStepHome(workDir: string): string {
 }
 
 /**
+ * Make the workspace-local HOME before a run's first step, to be filled
+ * then (see prepareJobHome): new, the run's own, and private. A plain mkdir
+ * that refuses anything already at the name - the workspace copy leaves the
+ * checkout's `.home` out, and this holds should anything else put one there.
+ */
+export function createStepHome(workDir: string): string {
+  const dir = path.join(workDir, '.home');
+  fs.mkdirSync(dir, { mode: 0o700 });
+  return dir;
+}
+
+/**
  * Create a directory the app hands every step, directly in the workspace.
  *
  * mkdir without recursion, so a link a step left at the name is never

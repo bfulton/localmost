@@ -184,6 +184,34 @@ describe('workspace creation', () => {
     }
   }, WORKSPACE_TIMEOUT_MS);
 
+  it("copies no checkout entry at the steps' home or temp, which are the app's to make", async () => {
+    // `localmost test` fills the home before the first step, unsandboxed: a
+    // committed `.home` link had it write .gitconfig, .ssh/config and the
+    // grant links wherever the link led, and a committed `.home` holding a
+    // .gitconfig failed every run with EEXIST.
+    const victim = path.join(appData, 'victim');
+    fs.mkdirSync(victim);
+    const source = path.join(appData, 'steps-dirs');
+    fs.mkdirSync(source);
+    git(source, 'init', '-q');
+    fs.writeFileSync(path.join(source, 'a.txt'), 'a\n');
+    fs.symlinkSync(victim, path.join(source, '.home'));
+    fs.mkdirSync(path.join(source, '.TMP'));
+    fs.writeFileSync(path.join(source, '.TMP', 'planted'), 'x\n');
+    fs.mkdirSync(path.join(source, 'sub', '.home'), { recursive: true });
+    fs.writeFileSync(path.join(source, 'sub', '.home', '.gitconfig'), 'kept\n');
+    git(source, 'add', '-A');
+
+    for (const options of [{ respectGitignore: true }, { respectGitignore: false }, { stagedOnly: true }]) {
+      const ws = await createWorkspace({ sourceDir: source, ...options });
+
+      expect([options, fs.readdirSync(ws.path).sort()]).toEqual([options, ['.localmost-workspace.json', 'a.txt', 'sub']]);
+      // Only the workspace's top level is the app's; a `.home` deeper in is the checkout's own.
+      expect(fs.readFileSync(path.join(ws.path, 'sub', '.home', '.gitconfig'), 'utf-8')).toBe('kept\n');
+      expect(fs.readFileSync(path.join(ws.path, 'a.txt'), 'utf-8')).toBe('a\n');
+    }
+  }, WORKSPACE_TIMEOUT_MS);
+
   it.each([
     ['in another case', '.LOCALMOST-WORKSPACE.JSON'],
     ['with a long s, which APFS folds to s', '.localmoſt-workspace.json'],

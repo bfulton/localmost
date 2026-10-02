@@ -32,7 +32,7 @@ import {
   ReusableWorkflow,
 } from '../shared/workflow-parser';
 import {
-  ensureStepHome,
+  createStepHome,
   executeStep,
   reapStepProcesses,
   ExecutionContext,
@@ -364,11 +364,13 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   console.log(`Workspace: ${workspace.path}`);
   console.log();
 
-  // The steps' home, filled before any of them runs in the workspace: the
-  // hermetic git config, an empty ssh config, and a link for each path the
-  // confirmed policy grants under the real home, as the runner gives a job
-  // (see prepareJobHome). Discovery applies no policy, so links nothing.
-  prepareJobHome(ensureStepHome(workspace.path), {
+  // The steps' home, made new - never the checkout's `.home`, which the
+  // workspace copy leaves out - and filled before any of them runs in the
+  // workspace: the hermetic git config, an empty ssh config, and a link for
+  // each path the confirmed policy grants under the real home, as the
+  // runner gives a job (see prepareJobHome). Discovery applies no policy,
+  // so links nothing.
+  prepareJobHome(createStepHome(workspace.path), {
     grants: options.updaterc ? [] : [...(policy?.filesystem?.read ?? []), ...(policy?.filesystem?.write ?? [])],
   });
 

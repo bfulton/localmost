@@ -1339,11 +1339,16 @@ if (!isMacOS) {
         ['.yarnrc.yml', 'npmAuthToken: SECRET-yarn\n'],
         ['.aws/credentials', '[default]\naws_secret_access_key = SECRET-aws\n'],
         ['.granted/file', 'granted\n'],
+        ['.cache/huggingface/token', 'SECRET-hf\n'],
+        ['.cache/huggingface/hub/model', 'weights\n'],
+        ['.cache/pip/wheel', 'wheel\n'],
+        ['.gradle/gradle.properties', 'signing.password=SECRET-gradle\n'],
+        ['.gradle/caches/jar', 'jar\n'],
       ] as const) {
         fs.mkdirSync(path.dirname(path.join(home, rel)), { recursive: true });
         fs.writeFileSync(path.join(home, rel), content);
       }
-      prepareJobHome(jobHome, { grants: ['~/.granted', '~/.aws'], realHome: home });
+      prepareJobHome(jobHome, { grants: ['~/.granted', '~/.aws', '~/.yarnrc.yml', '~/.cache', '~/.gradle'], realHome: home });
     });
 
     afterAll(() => {
@@ -1378,7 +1383,7 @@ if (!isMacOS) {
       fs.rmSync(copy);
     });
 
-    it('does not find ~/.yarnrc.yml through HOME, which Yarn 2+ found and failed to parse', () => {
+    it('does not find ~/.yarnrc.yml through HOME, which Yarn 2+ found and failed to parse, granted or not', () => {
       const run = underProfile({ level: 'moderate', read: ['~/.yarnrc.yml'], write: [] });
       expect(run(`/bin/test -e "$HOME/.yarnrc.yml"`).ok).toBe(false);
       // Still there to be seen by its real path, and still not readable.
@@ -1390,11 +1395,29 @@ if (!isMacOS) {
       const run = underProfile({ level: 'strict', read: ['~/.granted', '~/.aws'], write: [] });
       expect(fs.lstatSync(path.join(jobHome, '.granted')).isSymbolicLink()).toBe(true);
       expect(run('/bin/cat "$HOME/.granted/file"')).toMatchObject({ ok: true, stdout: 'granted' });
-      // Linked, since the policy names it, but judged by the path the link
-      // resolves to: the floor's.
-      const credentials = run('/bin/cat "$HOME/.aws/credentials"');
+      // Not linked, though the policy names it: found through HOME, it
+      // failed as the real path does.
+      expect(run('/bin/test -e "$HOME/.aws"').ok).toBe(false);
+      const credentials = run(`/bin/cat ${sq(path.join(home, '.aws', 'credentials'))}`);
       expect(credentials.stdout).not.toContain('SECRET');
       expect([credentials.ok, credentials.stderr]).toEqual([false, expect.stringContaining('Operation not permitted')]);
+    });
+
+    it('finds no floor-denied credential through a granted directory, where Hugging Face and Gradle died on EPERM', () => {
+      // Linked whole, ~/.cache led huggingface_hub to its token and ~/.gradle
+      // the Gradle wrapper to gradle.properties, each denied: both crashed
+      // under the grant meant to help (L4, L5). The rest of each is there.
+      const run = underProfile({ level: 'strict', read: ['~/.cache', '~/.gradle'], write: [] });
+      expect(run('/bin/test -e "$HOME/.cache/huggingface/token"').ok).toBe(false);
+      expect(run('/bin/test -e "$HOME/.gradle/gradle.properties"').ok).toBe(false);
+      expect(run('/bin/cat "$HOME/.cache/huggingface/hub/model"')).toMatchObject({ ok: true, stdout: 'weights' });
+      expect(run('/bin/cat "$HOME/.cache/pip/wheel"')).toMatchObject({ ok: true, stdout: 'wheel' });
+      expect(run('/bin/cat "$HOME/.gradle/caches/jar"')).toMatchObject({ ok: true, stdout: 'jar' });
+      // The real paths stay denied.
+      for (const rel of ['.cache/huggingface/token', '.gradle/gradle.properties']) {
+        const result = run(`/bin/cat ${sq(path.join(home, rel))}`);
+        expect([rel, result.ok, result.stdout]).toEqual([rel, false, '']);
+      }
     });
 
     it('writes its own home', () => {

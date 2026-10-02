@@ -141,10 +141,14 @@ jest.mock('fs', () => ({
   mkdirSync: jest.fn(),
   openSync: jest.fn(() => 42),
   closeSync: jest.fn(),
-  // Nothing is there to be found: a job's home is empty when it is filled.
-  lstatSync: jest.fn(() => {
+  // Nothing is there to be found but a job's home, the directory
+  // buildSandbox made, which is empty when it is filled.
+  lstatSync: jest.fn((p: string) => {
+    if (/\/sandbox\/[^/]+\/home$/.test(String(p))) return { isDirectory: () => true, isSymbolicLink: () => false };
     throw Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' });
   }),
+  // ...and, following links, everything a grant names in the real home.
+  statSync: jest.fn(() => ({ isDirectory: () => true })),
   symlinkSync: jest.fn(),
   promises: {
     mkdir: jest.fn(),
@@ -1901,7 +1905,7 @@ describe('RunnerManager', () => {
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: [], level: 'strict', readPaths: [], writePaths: ['~/.p3-missing/cache'], docker: {} }),
+        getRepoPolicy: async () => ({ hosts: [], level: 'strict', readPaths: [], writePaths: ['~/.p3-missing/cache/', '~/.p3-missing-history'], docker: {} }),
         getJobEnvironmentConfig: () => ({ toolShims: true, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs }),
       });
       (fs.existsSync as jest.Mock).mockReturnValue(true);
@@ -1912,6 +1916,8 @@ describe('RunnerManager', () => {
     };
 
     it('is created before the job, one level at a time, by default', async () => {
+      // What a grant without a trailing / names may be a file, the job's to
+      // create; only the levels above it are made.
       const created = await spawnWith(true);
       expect(created).toEqual([
         [path.join(os.homedir(), '.p3-missing'), { mode: 0o755 }],
