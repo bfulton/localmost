@@ -26,7 +26,9 @@ import {
   DEFAULT_BROKER_PORT,
   preferenceRules,
   processMarkerRules,
-  swiftDriverTempRules,
+  generatedNameTempRules,
+  MKTEMP_TEMP_NAME,
+  SWIFT_DRIVER_TEMP_NAME,
   type ProcessMarker,
 } from '../shared/sandbox-profile';
 import {
@@ -421,24 +423,16 @@ export function generateSandboxProfile({
   // other process can guess, and without read on the directory itself a job
   // cannot list it to find one. Both spellings, as /var is a symlink.
   const perUserTemp = userTempDir(onLog);
-  const mktempRules = ((dir?: string): string => {
-    if (!dir) return ';; Per-user temp directory unknown: mktemp without a template is not granted';
-    const escapeForRegex = (value: string) => value.replace(/[.*+?^$()[\]{}|\\]/g, '\\$&');
-    const generated = `/tmp\\.${'[A-Za-z0-9]'.repeat(10)}(/|$)`;
-    return [
-      '(allow file-write* file-read*',
-      `  (regex #"^${escapeForRegex(`/private${dir}`)}${generated}")`,
-      `  (regex #"^${escapeForRegex(dir)}${generated}"))`,
-    ].join('\n');
-  })(perUserTemp);
+  const mktempRules = perUserTemp
+    ? generatedNameTempRules(perUserTemp, MKTEMP_TEMP_NAME).join('\n')
+    : ';; Per-user temp directory unknown: mktemp without a template is not granted';
   // Swift Build runs its link step with the per-user temp directory itself as
   // its temp, and swift-driver makes T/TemporaryDirectory.XXXXXX there with
-  // mkdtemp: granted by the generated name only, as mktemp's are.
-  const swiftDriverRules = ((dir?: string): string =>
-    dir
-      ? swiftDriverTempRules(dir).join('\n')
-      : ';; Per-user temp directory unknown: Swift Build\'s link step is not granted its temp'
-  )(perUserTemp);
+  // mkdtemp: granted by the generated name only, as mktemp's are. The user's
+  // own SwiftPM makes that name too (see SWIFT_DRIVER_TEMP_NAME).
+  const swiftDriverRules = perUserTemp
+    ? generatedNameTempRules(perUserTemp, SWIFT_DRIVER_TEMP_NAME).join('\n')
+    : ';; Per-user temp directory unknown: Swift Build\'s link step is not granted its temp';
   // The job's own directory in the per-user temp directory, where its
   // DIRHELPER_USER_DIR_SUFFIX moves NSTemporaryDirectory(), java.io.tmpdir
   // and the staging directory of a sandboxed process's atomic writes

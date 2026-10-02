@@ -29,7 +29,6 @@
 import { describe, it, expect, beforeAll, afterAll, jest } from '@jest/globals';
 import { ChildProcess, execFile, execFileSync, spawn, spawnSync } from 'child_process';
 import { promisify } from 'util';
-import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as net from 'net';
 import * as os from 'os';
@@ -43,6 +42,7 @@ import {
 } from './sandbox-profile';
 import { getWorkspacesDir, removeWorkspace } from './workspace';
 import { defaults, preferenceAllowed, removeThrowawayDomain, sweepStaleThrowawayDomains, throwawayDomain } from './test-utils/preference-probe';
+import { mkdtempChars, probeTempDirName } from './test-utils/temp-name-probe';
 
 // The real home by default; one block below stands a scratch directory in for
 // it, since os.homedir() is what the profiles are built from.
@@ -479,11 +479,13 @@ if (!isMacOS) {
         expect(run(profile, ['/bin/sh', '-c', 'd=$(/usr/bin/mktemp -d) && touch "$d/f" && rm -r "$d"'])).toBe(true);
         // Nor does Swift Build's link step, whose swift-driver makes
         // T/TemporaryDirectory.XXXXXX with mkdtemp; a name off that shape stays refused.
-        const chars = (n: number) => [...crypto.randomBytes(n)].map((b) => 'abcXYZ0189'[b % 10]).join('');
-        for (const [name, granted] of [[`TemporaryDirectory.${chars(6)}`, true], [`TemporaryDirectory.${chars(7)}`, false]] as const) {
-          const dir = path.join(userTemp, name);
-          const ok = run(profile, ['/bin/sh', '-c', `mkdir '${dir}' && touch '${dir}/link.resp'`]);
-          if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+        // A name already there may be the user's own, so probeTempDirName
+        // takes only a new one and removes only what its own mkdir made.
+        for (const [name, granted] of [
+          [`TemporaryDirectory.${mkdtempChars(6)}`, true],
+          [`TemporaryDirectory.${mkdtempChars(7)}`, false],
+        ] as const) {
+          const ok = probeTempDirName((command) => run(profile, ['/bin/sh', '-c', command]), userTemp, name);
           expect({ name, ok }).toEqual({ name, ok: granted });
         }
       }

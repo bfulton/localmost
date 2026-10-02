@@ -498,7 +498,7 @@ function darwinUserTempDir(): string | undefined {
 
 /**
  * What a step gets of the shared temp directories, as the runner's job does:
- * only the entries a bare `mktemp` creates.
+ * only the entries a bare `mktemp` and Swift Build's link step create.
  *
  * /tmp and the per-user /var/folders tree belong to every process the user
  * runs, and some of what lives there is trusted by their own tools - the
@@ -508,38 +508,54 @@ function darwinUserTempDir(): string | undefined {
  * TMPDIR, and scripts call it that way constantly, so names of exactly the
  * shape it generates are granted: ten random characters no other process can
  * guess, and without read on the directory itself a step cannot list it to
- * find one. Both spellings, as /var is a symlink.
+ * find one. Both spellings, as /var is a symlink. The directory swift-driver
+ * makes there for Swift Build's link step is granted the same way (see
+ * SWIFT_DRIVER_TEMP_NAME for what that exposes).
  */
 function sharedTempRules(): string[] {
   const dir = darwinUserTempDir();
   if (!dir) return [';; Per-user temp directory unknown: mktemp without a template is not granted'];
-  const escapeForRegex = (value: string) => value.replace(/[.*+?^$()[\]{}|\\]/g, '\\$&');
-  const generated = `/tmp\\.${'[A-Za-z0-9]'.repeat(10)}(/|$)`;
   return [
     ';; No shared temp directory; only what mktemp itself creates, by the name it generated',
-    '(allow file-write* file-read*',
-    `  (regex #"^${escapeForRegex(`/private${dir}`)}${generated}")`,
-    `  (regex #"^${escapeForRegex(dir)}${generated}"))`,
+    ...generatedNameTempRules(dir, MKTEMP_TEMP_NAME),
     ';; And what swift-driver creates for Swift Build\'s link step, by the name mkdtemp generated',
-    ...swiftDriverTempRules(dir),
+    ...generatedNameTempRules(dir, SWIFT_DRIVER_TEMP_NAME),
   ];
 }
 
 /**
- * The directories swift-driver makes for Swift Build's link step in the
- * per-user temp directory `dir`: Swift Build runs that step with the per-user
- * temp itself as its temp, whatever TMPDIR says, and swift-driver makes
- * `TemporaryDirectory.XXXXXX` there with mkdtemp(3) - six random characters
- * of its 62, as tools-support-core's withTemporaryDirectory asks - and puts
- * the link's response and file lists inside. Without it a package linked
- * only under `--build-system native`. Names of exactly that shape are
- * granted, as bare mktemp's are, and the directory itself is not, so a job
- * cannot list it to find another's. Both spellings, as /var is a symlink.
- * The runner's profile carries the same rule (see process-sandbox).
+ * The name bare `mktemp` and `mktemp -d` give their entry in the per-user
+ * temp directory, whatever TMPDIR says: `tmp.` and ten random characters.
+ * A regex source, for generatedNameTempRules.
  */
-export function swiftDriverTempRules(dir: string): string[] {
+export const MKTEMP_TEMP_NAME = `tmp\\.${'[A-Za-z0-9]'.repeat(10)}`;
+
+/**
+ * The name of the directory swift-driver makes for Swift Build's link step in
+ * the per-user temp directory: Swift Build runs that step with an environment
+ * of its own making, without TMPDIR or the job's DIRHELPER_USER_DIR_SUFFIX,
+ * so swift-driver's temp is the per-user temp itself, and it makes
+ * `TemporaryDirectory.XXXXXX` there with mkdtemp(3) - six random characters
+ * of its 62, as tools-support-core's withTemporaryDirectory asks - holding a
+ * `.keep-directory` marker and any response file or temporary output of the
+ * driver's. Without it a package linked only under `--build-system native`.
+ * The user's own unsandboxed SwiftPM and swift-driver make directories of
+ * this name too, and keep a manifest they are about to run in one: see
+ * Shared temp directories in SECURITY.md for what granting it exposes.
+ * A regex source, for generatedNameTempRules.
+ */
+export const SWIFT_DRIVER_TEMP_NAME = `TemporaryDirectory\\.${'[A-Za-z0-9]'.repeat(6)}`;
+
+/**
+ * Read and write on the entries of the per-user temp directory `dir` named
+ * exactly `name` (a regex source) and everything below them. The directory
+ * itself is not granted, so a job cannot list it to find a name; only one
+ * it makes up, or learns, is reachable. Both spellings, as /var is a symlink.
+ * The runner's profile carries the same rules (see process-sandbox).
+ */
+export function generatedNameTempRules(dir: string, name: string): string[] {
   const escapeForRegex = (value: string) => value.replace(/[.*+?^$()[\]{}|\\]/g, '\\$&');
-  const generated = `/TemporaryDirectory\\.${'[A-Za-z0-9]'.repeat(6)}(/|$)`;
+  const generated = `/${name}(/|$)`;
   return [
     '(allow file-write* file-read*',
     `  (regex #"^${escapeForRegex(`/private${dir}`)}${generated}")`,

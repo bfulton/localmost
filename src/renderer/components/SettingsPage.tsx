@@ -52,11 +52,11 @@ const JOB_ENVIRONMENT_OPTIONS: ReadonlyArray<{
       'cannot create itself: empty, one level at a time, never through a link, never in a credential ' +
       'location.',
     stateHints: {
-      on: 'On: a missing granted directory is created before each job that needs it.',
+      on: 'On: there is nothing to create yourself before a job.',
       off:
-        'Off: a directory a policy grants under your home that does not exist stays missing, and you must ' +
-        'create it yourself before the job runs, or the job fails with "Operation not permitted" at its ' +
-        'first write there.',
+        'Off: a directory a policy grants under your home, or one above it, that does not exist stays ' +
+        'missing, and you must create it yourself before the job runs, or the job fails with "Operation not ' +
+        'permitted" at its first write there.',
     },
   },
 ];

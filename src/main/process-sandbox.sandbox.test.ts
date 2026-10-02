@@ -36,6 +36,7 @@ import { JOB_GIT_CONFIG, prepareJobHome } from '../shared/job-home';
 import { dockerOnPath } from './test-utils/vm-fixtures';
 import { JOB_BIN_DIR } from './job-shims';
 import { defaults, preferenceAllowed, removeThrowawayDomain, sweepStaleThrowawayDomains, throwawayDomain } from '../shared/test-utils/preference-probe';
+import { mkdtempChars, probeTempDirName } from '../shared/test-utils/temp-name-probe';
 
 // The real home by default; one block below stands a directory of its own in
 // for it, since os.homedir() is what the profile is built from.
@@ -97,29 +98,15 @@ const bareMktemp = (run: (command: string) => { ok: boolean; stdout: string }, f
   return { ok: result.ok, entry: result.stdout };
 };
 
-/** `count` characters of the alphabet mkdtemp fills a template's X's from. */
-const mkdtempChars = (count: number): string => {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  return [...crypto.randomBytes(count)].map((byte) => alphabet[byte % alphabet.length]).join('');
-};
-
 /**
  * What a job may make in the per-user temp by the names swift-driver's mkdtemp
  * generates for Swift Build's link step, T/TemporaryDirectory.XXXXXX, and by
- * names a character off that shape. Each is made with mkdir (never -p) and a
- * file inside, and removed afterwards only when it is exactly that new entry.
+ * names a character off that shape. probeTempDirName takes only a new name
+ * and removes only what its own mkdir made.
  */
 const swiftDriverTempProbe = (run: (command: string) => { ok: boolean }) => {
   const temp = userTempDir();
-  const attempt = (name: string): boolean => {
-    const dir = path.join(temp, name);
-    if (fs.existsSync(dir)) throw new Error(`${dir} already exists`);
-    const ok = run(`/bin/mkdir ${sq(dir)} && /usr/bin/touch ${sq(path.join(dir, 'link.resp'))}`).ok;
-    if (path.dirname(dir) === temp && /^Temporary[A-Za-z]+\.?[A-Za-z0-9_-]*$/.test(name) && fs.existsSync(dir)) {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-    return ok;
-  };
+  const attempt = (name: string): boolean => probeTempDirName((command) => run(command).ok, temp, name);
   return {
     generated: attempt(`TemporaryDirectory.${mkdtempChars(6)}`),
     offShape: {

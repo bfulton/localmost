@@ -8,8 +8,10 @@ turned off on its own, in Settings (see [Preferences](#preferences)).
 
 > **Status:** implemented in 0.3.0, from the owner's decisions of 2026-10-01
 > and 2026-10-02 (items 9, 10, 11a, 11b, 12, 13, 14 and 15 of the open-items
-> walkthrough). The
-> dedicated runner user at the end is a future design item.
+> walkthrough). Whether to keep item 14's grant, now that what it exposes
+> to the user's own Swift builds is known, is open again (see
+> [Edge cases](#edge-cases)). The dedicated runner user at the end is a future
+> design item.
 
 ## Problem
 
@@ -98,17 +100,23 @@ directory, into it - and grants it in the job's profile by both spellings
 sandbox, when a spawn fails before its worker starts, and at startup for those
 whose sandbox is gone.
 
-Swift Build's link step does not use it. The swift-driver that Swift 6.4's
-default build system runs to link makes its temp directory in the per-user
-temp directory itself, whatever the job's `TMPDIR` and suffix say:
-`T/TemporaryDirectory.XXXXXX`, made with `mkdtemp(3)` - six random characters
-of `[A-Za-z0-9]`, as tools-support-core's `withTemporaryDirectory` asks -
-holding the link's response and file lists. So the profile grants names of
-exactly that shape there, by both spellings, as it grants bare `mktemp`'s
-`tmp.XXXXXXXXXX`, and nothing else in `T`, `T` itself included; a plain
-`swift build` builds and links, and no workflow needs `--build-system native`.
-The rule is part of the profile, at every level, not of the `perJobTempDir`
-preference, and a `localmost test` step's profile carries it too.
+Swift Build's link step does not use it. Swift 6.4's default build system
+starts the swift-driver that links with an environment of its own making,
+without the job's `TMPDIR` or suffix (only on Windows does it set a temp
+directory, `OBJROOT`), so the driver's temp directory is the per-user temp
+directory itself: `T/TemporaryDirectory.XXXXXX`, made with `mkdtemp(3)` - six
+random characters of `[A-Za-z0-9]`, as tools-support-core's
+`withTemporaryDirectory` asks - holding a `.keep-directory` marker and any
+response file or temporary output of the driver's. No build setting or
+variable in 6.4 changes that: `LD_ENVIRONMENT` is for the linked binary, and
+`SWIFT_EXEC` reaches the manifest compile but not the link. So the profile
+grants names of exactly that shape there, by both spellings, as it grants
+bare `mktemp`'s `tmp.XXXXXXXXXX`, and nothing else in `T`, `T` itself
+included; a plain `swift build` builds and links, and no workflow needs
+`--build-system native`. The rule is part of the profile, at every level, not
+of the `perJobTempDir` preference, and a `localmost test` step's profile
+carries it too. What it exposes to the user's own Swift builds is under
+[Edge cases](#edge-cases).
 
 ### A bin directory of the job's own
 
@@ -181,7 +189,7 @@ runner uses.
 | `toolShims` | `true` | No `swift`/`xcodebuild` shims; the job calls the tools as they are, and a manifest it has not compiled before fails. The docker link stays. |
 | `javaToolOptions` | `true` | No `JAVA_TOOL_OPTIONS`; the JVM's temp file, loopback and proxy fail as before. |
 | `perJobTempDir` | `true` | No `T/<suffix>`; Foundation's atomic writes fail as before. |
-| `createMissingGrantedDirs` | `true` | The missing directories above a write grant, and a directory it names, stay missing: the user creates one first, or the job fails with "Operation not permitted" at its first write there. Settings says so beside the toggle while it is off, and that one is created before each job that needs it while it is on. |
+| `createMissingGrantedDirs` | `true` | The missing directories above a write grant, and a directory it names, stay missing: the user creates one first, or the job fails with "Operation not permitted" at its first write there. Settings says so beside the toggle while it is off, and while it is on that there is nothing to create first. |
 
 The per-job home is not a preference: it is what closes G5 and G8, and an
 empty home is never less than the user's own was.
@@ -320,15 +328,44 @@ empty home is never less than the user's own was.
   for Gradle and clients that read them (Apache HttpClient with system
   properties). Maven reads its proxy from `settings.xml`.
 - **Swift Build's link-step directories are reachable by name**, as bare
-  `mktemp`'s entries are: seatbelt cannot tell which job made a
-  `TemporaryDirectory.XXXXXX`, so any job that learns another's name - a
-  concurrent job's, another repository's included - can read or change what is
-  in it while that link runs. No job can list `T` to find one, but a path in
-  it that reaches a command line - a response file the driver passes to the
-  linker, say - is there for any job to read in `ps`. Six random
-  characters are fewer than `mktemp`'s ten; neither is meant to be guessed. A
-  name of any other shape in `T` stays refused, `TemporaryFile.XXXXXX` and a
-  `TemporaryDirectory.` with five or seven characters among them.
+  `mktemp`'s entries are: seatbelt cannot tell which process made a
+  `TemporaryDirectory.XXXXXX`, so any job that learns one's name can read or
+  change what is in it. No job can list `T` to find one, but a path in one
+  that reaches a command line is there for any job to read in `ps`. Six
+  random characters are fewer than `mktemp`'s ten; neither is meant to be
+  guessed. A name of any other shape in `T` stays refused,
+  `TemporaryFile.XXXXXX` and a `TemporaryDirectory.` with five or seven
+  characters among them.
+- **The user's own SwiftPM uses the same name, for what it is about to run.**
+  This is where the grant differs from bare `mktemp`'s. With `TMPDIR` at the
+  per-user temp, as macOS sets it, the user's unsandboxed `swift build` or
+  package resolution - and Xcode's, through SwiftPM - compiles each manifest
+  to `T/TemporaryDirectory.XXXXXX/Package-1.o`, writes the compile's
+  `-vfsoverlay` file `vfs.yaml` in another, links the manifest executable,
+  `<package>-manifest`, in a third and runs it (seen with `swift package
+  describe -v --manifest-cache none`); every one of those paths is on a
+  swift-frontend or clang command line. A job that watches `ps` can race to
+  replace the executable, the object file or the overlay before SwiftPM uses
+  it, retrying on every build the user runs while it is running, and a win
+  runs the job's code as the user outside its sandbox, under at most
+  SwiftPM's manifest sandbox, which reads files. Bare `mktemp` exposes only
+  a user's script that passes a `tmp.*` path on a command line. Granting
+  only the directory's own node does not close it: the link step writes
+  `.keep-directory` inside, and a job can rename a directory it filled in
+  its workspace onto a granted name (both tried under a profile that granted
+  the node, created as a directory, and that one file). The user can move
+  SwiftPM's manifest directories out of `T` by setting their own `TMPDIR`;
+  Swift Build's link step in their builds stays in `T`.
+  Whether to keep the grant is open, among: keep it with this written down
+  (as now); drop it and have a workflow that builds Swift packages pass
+  `--build-system native` (the owner ruled out forcing that in the shim, but
+  a workflow may still choose it); make it a preference, off by default;
+  or wait for what removes the need - a Swift Build that gives its tasks a
+  temp directory on macOS as it does on Windows, a SwiftPM that passes
+  `SWIFT_EXEC` to Swift Build as a build setting (its main branch does, and
+  Swift Build's linker code prefers that `swiftc` as its link driver, so a
+  wrapper that starts it with the job's `TMPDIR` could serve; untried), or
+  the dedicated runner user below, whose `T` is its own.
 - **Package plugins under xcodebuild** run under Xcode's plugin sandbox, which
   `-IDEPackageSupportDisableManifestSandbox` does not cover.
 - **`localmost test`** gets the per-job home; the temp directory, the shims and

@@ -751,16 +751,20 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
     credential the job cannot create either - `~/.gradle` on a Mac where Gradle
     never ran. A grant without the trailing `/` may name a file the job
     creates itself. While it is off, Settings says beside the toggle that a
-    granted directory under your home that does not exist must be created
-    first, or the job fails with "Operation not permitted" at its first write
-    there
+    granted directory under your home, or one above it, that does not exist
+    must be created first, or the job fails with "Operation not permitted" at
+    its first write there
 - A job may create the `T/TemporaryDirectory.XXXXXX` directories that Swift
   6.4's default build system, Swift Build, has swift-driver make in the
   per-user temp directory for its link step - by the name `mkdtemp` generates
   only, as with a bare `mktemp`'s entries - in the runner's profile and a
   `localmost test` step's. A plain `swift build` now links in a job; it failed
   at its `Ld` step with `permissionDenied`, and a workflow had to pass
-  `--build-system native`
+  `--build-system native`. Your own SwiftPM and swift-driver keep the
+  manifest they are about to run, its object file and their response files
+  in directories of that name, and a job that reads their paths in `ps` can
+  try to replace one before it is used; see Shared temp directories in
+  SECURITY.md
 - The bundled `docker` CLI is linked in the job's own bin directory,
   `<sandbox>/localmost/bin`, first on its `PATH`, rather than its directory in
   the app bundle being put on `PATH`

@@ -30,7 +30,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { generateSandboxProfile, RunnerProfileOptions } from './process-sandbox';
-import { swiftDriverTempRules } from '../shared/sandbox-profile';
+import { generatedNameTempRules, SWIFT_DRIVER_TEMP_NAME } from '../shared/sandbox-profile';
 import { createJobTempDir, removeJobTempDir, userTempDir } from './job-temp';
 import { writeJobBin } from './job-shims';
 import { javaToolOptions } from './worker-env';
@@ -285,7 +285,7 @@ if (!isMacOS) {
           // itself as its temp, and swift-driver makes
           // T/TemporaryDirectory.XXXXXX there. Without the rule granting
           // names of that shape the link fails, though all before it builds.
-          const rule = swiftDriverTempRules(userTemp!).join('\n');
+          const rule = generatedNameTempRules(userTemp!, SWIFT_DRIVER_TEMP_NAME).join('\n');
           let removed = false;
           const withoutRule = buildProfile((profile) => {
             removed = profile.includes(rule);

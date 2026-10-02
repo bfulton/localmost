@@ -415,8 +415,8 @@ describe('the resource-pause and job-environment preferences', () => {
     // Off, nothing creates a granted directory under the home that is not
     // there, and the job finds out only at its first write: say so where the
     // choice is made, and that the user must create it first.
-    const offHint = /must create it yourself before the job runs.*"Operation not permitted" at its first write there/;
-    const onHint = /created before each job that needs it/;
+    const offHint = /under your home, or one above it, .*must create it yourself before the job runs.*"Operation not permitted" at its first write there/;
+    const onHint = /nothing to create yourself before a job/;
     renderWithProviders(<SettingsPage onBack={jest.fn()} />);
     const label = 'Create missing directories a policy grants';
     await waitFor(() => expect(checkbox(label).checked).toBe(true));
