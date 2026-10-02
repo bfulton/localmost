@@ -1,4 +1,4 @@
-import { inheritedWorkerEnv, spawnEnvPolicy } from './worker-env';
+import { inheritedWorkerEnv, javaToolOptions, spawnEnvPolicy } from './worker-env';
 
 describe('inheritedWorkerEnv', () => {
   const host: NodeJS.ProcessEnv = {
@@ -90,5 +90,49 @@ describe('spawnEnvPolicy', () => {
 
   it('is empty for a policy that says nothing about env', () => {
     expect(spawnEnvPolicy({ version: 1 })).toEqual({ allow: [], deny: [] });
+  });
+});
+
+describe('javaToolOptions', () => {
+  const token = 'a1'.repeat(24);
+  const proxyUrl = `http://localmost:${token}@127.0.0.1:51234`;
+
+  it("puts the JVM's temp in the job's, on IPv4, through the job's proxy with its credentials", () => {
+    // The JVM ignores TMPDIR and HTTPS_PROXY, and a dual-stack socket's
+    // loopback connection is one the sandbox cannot attribute to loopback.
+    expect(javaToolOptions({ tmpDir: '/Users/me/.localmost/runner/sandbox/1-ab/_temp', proxyUrl }).split(' ')).toEqual([
+      '-Djava.io.tmpdir=/Users/me/.localmost/runner/sandbox/1-ab/_temp',
+      '-Djava.net.preferIPv4Stack=true',
+      '-Dhttp.proxyHost=127.0.0.1',
+      '-Dhttp.proxyPort=51234',
+      '-Dhttps.proxyHost=127.0.0.1',
+      '-Dhttps.proxyPort=51234',
+      // Read by Gradle and by HTTP clients that take their proxy from the
+      // system properties; the JDK's own clients take credentials from an
+      // Authenticator, and Basic on a CONNECT tunnel only once these allow it.
+      '-Dhttp.proxyUser=localmost',
+      `-Dhttp.proxyPassword=${token}`,
+      '-Dhttps.proxyUser=localmost',
+      `-Dhttps.proxyPassword=${token}`,
+      '-Djdk.http.auth.tunneling.disabledSchemes=',
+      '-Djdk.http.auth.proxying.disabledSchemes=',
+    ]);
+  });
+
+  it('leaves out the proxy credentials for a proxy that takes none', () => {
+    const options = javaToolOptions({ tmpDir: '/t', proxyUrl: 'http://127.0.0.1:8080' });
+    expect(options).toContain('-Dhttps.proxyPort=8080');
+    expect(options).not.toContain('proxyUser');
+    expect(options).not.toContain('disabledSchemes');
+  });
+
+  it('leaves out a value it cannot pass whole, as the JVM splits these on whitespace', () => {
+    const options = javaToolOptions({ tmpDir: '/Users/Jane Doe/.localmost/runner/sandbox/1-ab/_temp', proxyUrl });
+    expect(options).not.toContain('java.io.tmpdir');
+    expect(options).toContain('-Djava.net.preferIPv4Stack=true');
+  });
+
+  it('leaves out the proxy for a URL it cannot read', () => {
+    expect(javaToolOptions({ tmpDir: '/t', proxyUrl: '' })).toBe('-Djava.io.tmpdir=/t -Djava.net.preferIPv4Stack=true');
   });
 });

@@ -1,7 +1,7 @@
 /**
  * What localmost adds to a job's environment, through seatbelt: a temp
- * directory of the job's own in the per-user temp directory, for Foundation,
- * and the swift shim that turns SwiftPM's own sandbox off.
+ * directory of the job's own in the per-user temp directory, for Foundation;
+ * the swift shim that turns SwiftPM's own sandbox off; and the JVM's options.
  *
  * The unit tests assert the variables a worker is given and the rules its
  * profile carries; they cannot show that macOS honours the one and seatbelt
@@ -30,6 +30,7 @@ import * as path from 'path';
 import { generateSandboxProfile, RunnerProfileOptions } from './process-sandbox';
 import { createJobTempDir, removeJobTempDir, userTempDir } from './job-temp';
 import { writeJobBin } from './job-shims';
+import { javaToolOptions } from './worker-env';
 
 const isMacOS = process.platform === 'darwin';
 
@@ -45,6 +46,36 @@ const ATOMIC_WRITE_SOURCE = [
   '} catch {',
   '  FileHandle.standardError.write("\\(error)\\n".data(using: .utf8)!)',
   '  exit(1)',
+  '}',
+  '',
+].join('\n');
+
+/**
+ * What a JVM in a job needs that the sandbox refused it: a temp file, and a
+ * loopback connection to a server of its own - each reported, not thrown -
+ * and the proxy it would use.
+ */
+const JAVA_PROBE_SOURCE = [
+  'import java.io.File;',
+  'import java.net.*;',
+  'public class Probe {',
+  '  public static void main(String[] args) {',
+  '    try {',
+  '      File f = File.createTempFile("probe", ".tmp");',
+  '      f.delete();',
+  '      System.out.println("tempfile ok " + f.getParent());',
+  '    } catch (Exception e) {',
+  '      System.out.println("tempfile failed " + e);',
+  '    }',
+  '    try (ServerSocket server = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"));',
+  '         Socket client = new Socket(InetAddress.getByName("127.0.0.1"), server.getLocalPort());',
+  '         Socket accepted = server.accept()) {',
+  '      System.out.println("loopback ok");',
+  '    } catch (Exception e) {',
+  '      System.out.println("loopback failed " + e);',
+  '    }',
+  '    System.out.println("proxy " + System.getProperty("https.proxyHost") + ":" + System.getProperty("https.proxyPort"));',
+  '  }',
   '}',
   '',
 ].join('\n');
@@ -116,6 +147,41 @@ if (!isMacOS) {
     };
 
     const baseEnv = (): NodeJS.ProcessEnv => ({ PATH: '/usr/bin:/bin', HOME: path.join(sandboxDir, 'home'), TMPDIR: jobTmp });
+
+    describe("the JVM's options", () => {
+      // The JDK installed on this machine, read-only, as a policy grants it.
+      let javaHome: string;
+      let probe: string;
+
+      beforeAll(() => {
+        javaHome = execFileSync('/usr/libexec/java_home', { encoding: 'utf-8', timeout: 30_000 }).trim();
+        probe = path.join(sandboxDir, '_work', 'Probe.java');
+        fs.writeFileSync(probe, JAVA_PROBE_SOURCE);
+      });
+
+      /** The probe, run from source as a job would run java, with the given environment. */
+      const java = (extraEnv: NodeJS.ProcessEnv) => {
+        const profilePath = writeProfile({
+          proxyPort: 51234,
+          filesystemPolicy: { level: 'strict', read: [path.resolve(javaHome, '..', '..')], write: [], loopback: true },
+        });
+        return run([path.join(javaHome, 'bin', 'java'), probe], { ...baseEnv(), ...extraEnv }, profilePath, SWIFT_TIMEOUT_MS, sandboxDir);
+      };
+
+      it('let it make a temp file and use loopback, which it cannot without them', () => {
+        const without = java({});
+        expect(without.stdout).toContain('tempfile failed');
+        expect(without.stdout).toContain('loopback failed');
+
+        const options = javaToolOptions({ tmpDir: jobTmp, proxyUrl: `http://localmost:${'ab'.repeat(24)}@127.0.0.1:51234` });
+        const result = java({ JAVA_TOOL_OPTIONS: options });
+        expect(result.stdout.split('\n')).toEqual([
+          `tempfile ok ${jobTmp}`,
+          'loopback ok',
+          'proxy 127.0.0.1:51234',
+        ]);
+      }, SWIFT_TIMEOUT_MS);
+    });
 
     describe("the job's own temp directory", () => {
       let tempDir: string;
@@ -240,6 +306,15 @@ if (!isMacOS) {
         fs.rmSync(pkg, { recursive: true, force: true });
       }
     }, SWIFT_TIMEOUT_MS);
+
+    it("gives the JVM its temp, IPv4 and its proxy (no JDK is readable here to run)", () => {
+      const options = (process.env.JAVA_TOOL_OPTIONS ?? '').split(' ');
+      expect(options).toEqual(expect.arrayContaining([
+        `-Djava.io.tmpdir=${os.tmpdir().replace(/\/$/, '')}`,
+        '-Djava.net.preferIPv4Stack=true',
+        `-Dhttps.proxyPort=${new URL(process.env.HTTPS_PROXY ?? '').port}`,
+      ]));
+    });
 
     it('has a temp directory of its own, where Foundation stages its atomic writes', () => {
       expect(process.env.DIRHELPER_USER_DIR_SUFFIX).toMatch(/^localmost-[0-9a-f]{8}-\d+-[0-9a-f]{12}$/);

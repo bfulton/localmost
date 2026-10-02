@@ -124,6 +124,58 @@ export function packageCacheEnv(dir: string): Record<string, string> {
 }
 
 /**
+ * JAVA_TOOL_OPTIONS for a job's JVMs, which read neither TMPDIR nor
+ * HTTPS_PROXY, and every JVM the job starts picks up.
+ *
+ * - java.io.tmpdir in the job's temp: the JVM's default is the per-user
+ *   temp directory, which the sandbox does not grant, so createTempFile
+ *   failed with "Operation not permitted".
+ * - IPv4 only: a dual-stack socket's connection to 127.0.0.1 is reported
+ *   with no host, so the sandbox cannot attribute it to loopback and denies
+ *   it - the same reason .NET is given DOTNET_SYSTEM_NET_DISABLEIPV6.
+ * - The job's proxy for http and https, and its credentials. The JDK's own
+ *   HTTP clients do not read http(s).proxyUser/Password - they ask an
+ *   Authenticator, which only the job's code can install - but Gradle and
+ *   clients that take their proxy from the system properties (Apache
+ *   HttpClient's) do. Basic is the proxy's scheme, which the JDK refuses on
+ *   a CONNECT tunnel unless jdk.http.auth.tunneling.disabledSchemes says
+ *   otherwise; set empty, an Authenticator the job installs works.
+ *
+ * The JVM splits JAVA_TOOL_OPTIONS on whitespace, so a value with any in it
+ * is left out rather than passed in pieces. The JVM prints the whole value
+ * to stderr as it starts ("Picked up JAVA_TOOL_OPTIONS"), proxy token
+ * included; the token is good only for this job's proxy, on loopback, and
+ * is replaced when the job ends. A workflow that sets JAVA_TOOL_OPTIONS
+ * itself replaces all of this.
+ */
+export function javaToolOptions(options: { tmpDir: string; proxyUrl: string }): string {
+  const whole = (value: string) => !/\s/.test(value);
+  const flags: string[] = [];
+  if (whole(options.tmpDir)) flags.push(`-Djava.io.tmpdir=${options.tmpDir}`);
+  flags.push('-Djava.net.preferIPv4Stack=true');
+  let proxy: URL | undefined;
+  try {
+    proxy = new URL(options.proxyUrl);
+  } catch {
+    proxy = undefined;
+  }
+  if (proxy && proxy.hostname && proxy.port) {
+    for (const scheme of ['http', 'https']) {
+      flags.push(`-D${scheme}.proxyHost=${proxy.hostname}`, `-D${scheme}.proxyPort=${proxy.port}`);
+    }
+    const user = decodeURIComponent(proxy.username);
+    const password = decodeURIComponent(proxy.password);
+    if (user && password && whole(user) && whole(password)) {
+      for (const scheme of ['http', 'https']) {
+        flags.push(`-D${scheme}.proxyUser=${user}`, `-D${scheme}.proxyPassword=${password}`);
+      }
+      flags.push('-Djdk.http.auth.tunneling.disabledSchemes=', '-Djdk.http.auth.proxying.disabledSchemes=');
+    }
+  }
+  return flags.join(' ');
+}
+
+/**
  * The toolchains and package-manager caches a level lets a job read.
  *
  * A convenience for jobs, not something the runner needs. Under strict a

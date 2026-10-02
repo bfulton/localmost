@@ -1945,6 +1945,41 @@ describe('RunnerManager', () => {
       expect(env.TMPPREFIX).toBe(`${jobTmp}/zsh`);
     });
 
+    describe("for the JVM's", () => {
+      const spawnWith = async (javaToolOptions: boolean) => {
+        const manager = new RunnerManager({
+          onLog: mockOnLog,
+          onStatusChange: mockOnStatusChange,
+          onJobHistoryUpdate: mockOnJobHistoryUpdate,
+          getJobEnvironmentConfig: () => ({ toolShims: true, javaToolOptions, perJobTempDir: true, createMissingGrantedDirs: true }),
+        });
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        mockSpawnSandboxed.mockReturnValue(createMockProcess(9918));
+        await new RunnerManagerTestHelper(manager).spawnForJob();
+        return mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+      };
+
+      it("sets JAVA_TOOL_OPTIONS: the job's temp, IPv4, and its proxy, by default", async () => {
+        // The JVM reads neither TMPDIR nor HTTPS_PROXY, and its dual-stack
+        // loopback connections are ones the sandbox cannot attribute.
+        const env = await spawnWith(true);
+        const options = env.JAVA_TOOL_OPTIONS!.split(' ');
+        expect(options).toEqual(expect.arrayContaining([
+          '-Djava.io.tmpdir=/Users/test/.localmost/runner/sandbox/1/_temp',
+          '-Djava.net.preferIPv4Stack=true',
+          '-Dhttps.proxyHost=127.0.0.1',
+          '-Dhttps.proxyPort=12345',
+          '-Dhttps.proxyUser=localmost',
+        ]));
+        // The worker's own proxy token, the one in HTTPS_PROXY.
+        expect(env.HTTPS_PROXY).toContain(options.find((o) => o.startsWith('-Dhttps.proxyPassword='))!.split('=')[1]);
+      });
+
+      it('sets none with the preference off', async () => {
+        expect((await spawnWith(false)).JAVA_TOOL_OPTIONS).toBeUndefined();
+      });
+    });
+
     describe('in the per-user temp directory', () => {
       const T = '/var/folders/zz/zyxw_vut0000gn/T';
       const sandboxDir = '/Users/test/.localmost/runner/sandbox/1-0123456789ab';

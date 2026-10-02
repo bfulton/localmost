@@ -14,7 +14,7 @@ import {
   SandboxPolicyLevel, RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
 import { SandboxFilesystemPolicy, spawnSandboxed } from './process-sandbox';
-import { inheritedWorkerEnv, levelToolchainPaths, packageCacheEnv } from './worker-env';
+import { inheritedWorkerEnv, javaToolOptions, levelToolchainPaths, packageCacheEnv } from './worker-env';
 import { DEFAULT_BROKER_PORT, type EnvPolicy, type ProcessMarker } from '../shared/sandbox-profile';
 import { developerPython, reapMarkedProcessesAsync } from '../shared/sandbox-reaper';
 import { groupHasMembers, sweepInGrace, sweepProcessGroup } from './process-group';
@@ -1608,6 +1608,13 @@ export class RunnerManager {
             this.log('warn', `No temp directory of its own for instance ${instanceNum}; Foundation's atomic writes will fail in its job: ${(err as Error).message}`);
           }
         }
+      }
+      // The JVM reads neither TMPDIR nor HTTPS_PROXY, and its dual-stack
+      // sockets reach loopback in a way the sandbox cannot attribute: its
+      // temp, IPv4 and the proxy are set where every JVM picks them up (see
+      // javaToolOptions). A workflow's own JAVA_TOOL_OPTIONS replaces it.
+      if (jobEnvironment.javaToolOptions) {
+        env.JAVA_TOOL_OPTIONS = javaToolOptions({ tmpDir: jobTmp, proxyUrl });
       }
 
       // A per-spawn marker file, held open by the worker and by what it starts
