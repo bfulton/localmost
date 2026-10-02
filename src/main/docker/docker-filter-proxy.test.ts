@@ -549,6 +549,19 @@ describe('DockerFilterProxy forwarding', () => {
     }
     expect(daemon.seen).toHaveLength(0);
 
+    // A build.tags glob wide enough to cover the run image does not let a
+    // build replace it: the run.images rule refuses these on its own.
+    proxy.bind('owner/repo', {
+      pull: { registries: ['docker.io'] },
+      run: { images: ['postgres:16'] },
+      build: { context: './', tags: ['myapp:*', '*:*'] },
+    });
+    for (const query of ['t=postgres%3A16', 't=Postgres', 't=postgres', 't=myapp%3Aci&t=postgres%3A16']) {
+      const reply = await request(sock, 'POST', `/v1.45/build?${query}`, 'tar', tar);
+      expect([query, reply.status, JSON.parse(reply.body).message]).toEqual([query, 403, expect.stringMatching(/run\.images/)]);
+    }
+    expect(daemon.seen).toHaveLength(0);
+
     // A declared tag, every one of a repeated t, and no tag at all go through.
     for (const query of ['t=myapp%3Aci', 't=myapp%3Aci&t=myapp%3Alatest', 'dockerfile=Dockerfile']) {
       expect([query, (await request(sock, 'POST', `/v1.45/build?${query}`, 'tar', tar)).status]).toEqual([query, 200]);
