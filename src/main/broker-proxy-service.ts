@@ -277,7 +277,30 @@ const MAX_FORWARD_BODY_BYTES = 8 * 1024 * 1024;
  * long-poll it, taking messages from admission, or to delete it - on the
  * runner's token.
  */
-const LOCALLY_SERVED_PATHS = ['/session', '/message', '/acknowledge', '/acquirejob', WORKER_TOKEN_PATH];
+export const LOCALLY_SERVED_PATHS = ['/session', '/message', '/acknowledge', '/acquirejob', WORKER_TOKEN_PATH];
+
+/**
+ * The only requests handleForward sends upstream, by method and by path as
+ * upstream routes it (decoded, lowercase, without empty segments); anything
+ * else a worker sends that is not served here is refused. They are what is
+ * left, once the paths above are taken out, of every request the runner can
+ * address to its broker address: its broker client's session, message and
+ * acknowledge requests, and its run-service client's acquirejob, completejob
+ * and renewjob. test/fixtures/runner-broker-operations.json lists each with
+ * where it is made in the runner's source, for the runner version a test
+ * holds it to.
+ *
+ * Both are job operations, and both name the job by plan and job ids, so each
+ * passes the job gate in handleForward before it goes. The runner (2.336.0,
+ * and 2.337.0 alike) sends them to the job's system connection, which this
+ * server does not rewrite, so in practice they leave the worker for GitHub
+ * directly.
+ * Forwarded here, they would still go only for the job the worker acquired.
+ */
+export const UPSTREAM_OPERATIONS: ReadonlyArray<{ method: string; path: string }> = [
+  { method: 'POST', path: '/completejob' },
+  { method: 'POST', path: '/renewjob' },
+];
 
 class RequestBodyTooLargeError extends Error {
   constructor() {
@@ -1478,7 +1501,8 @@ export class BrokerProxyService extends EventEmitter {
       } else if (method === 'POST' && url.pathname === WORKER_TOKEN_PATH) {
         await this.handleWorkerToken(req, res, key);
       } else {
-        // Forward all other requests (renewjob, finishjob, etc.)
+        // Everything else: forwarded if it is in UPSTREAM_OPERATIONS and
+        // names this worker's job, refused otherwise.
         await this.handleForward(req, res, url, key);
       }
     } catch (error) {
@@ -1644,7 +1668,7 @@ export class BrokerProxyService extends EventEmitter {
     }
     // By alias, not by value: jobs of one target commonly share a run-service
     // URL, so clearing every entry with this job's URL cut the routing of
-    // whichever other job was live, and its renew and finish went astray.
+    // whichever other job was live, and its renewjob and completejob went astray.
     for (const id of aliases) {
       this.acquiredJobDetails.delete(id);
       this.jobTargets.delete(id);
@@ -2138,6 +2162,51 @@ export class BrokerProxyService extends EventEmitter {
     url: URL,
     key: string
   ): Promise<void> {
+    // Whether a request may go upstream at all depends on its method and path
+    // alone, so that is settled first: anything else gets the same 403 and
+    // log line whatever state the worker's session or its target is in.
+    //
+    // The path's segments as upstream routes them: decoded and case folded.
+    // UPSTREAM_OPERATIONS and LOCALLY_SERVED_PATHS are matched against these,
+    // not the spelling sent, so a /CompleteJob or /%63ompletejob is the
+    // operation it names. A path that decodes to anything but printable ASCII
+    // is refused, as no runner path does: a router folding case beyond ASCII
+    // could read /completejo%C5%BF as completejob, or /%C5%BFession as session.
+    let routedSegments: string[] | undefined;
+    try {
+      const decoded = decodeURIComponent(url.pathname);
+      if (isPlainAscii(decoded)) routedSegments = decoded.toLowerCase().split('/').filter(Boolean);
+    } catch {
+      // Refused below, like a path that decodes to more than ASCII.
+    }
+    if (!routedSegments) {
+      req.resume();
+      log()?.warn(`[BrokerProxy] Refused to forward ${req.method} ${forLog(url.pathname)}: its path does not decode to ASCII`);
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Path does not decode to ASCII' }));
+      return;
+    }
+    const routedPath = `/${routedSegments.join('/')}`;
+    if (LOCALLY_SERVED_PATHS.includes(routedPath)) {
+      req.resume();
+      log()?.warn(`[BrokerProxy] Refused to forward ${req.method} ${forLog(url.pathname)}: it is a path served here, not upstream`);
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Path is served here, not upstream' }));
+      return;
+    }
+    // Only what the runner sends upstream goes there. Anything else used to be
+    // forwarded to GitHub's broker on the runner's token as it came, including
+    // spellings whose meaning is the upstream router's to decide, such as a
+    // dot segment encoded with its slash (/x/..%2fmessage).
+    const operation = UPSTREAM_OPERATIONS.find(op => op.method === req.method && op.path === routedPath);
+    if (!operation) {
+      req.resume();
+      log()?.warn(`[BrokerProxy] Refused to forward ${req.method} ${forLog(url.pathname)}: the runner sends no such request upstream`);
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not a request the runner sends upstream' }));
+      return;
+    }
+
     // Upstream calls go out on a target's runner credentials, so they are made
     // only for a worker bound to that target, and only about its own jobs.
     // There used to be a fallback to the first target with a session, which
@@ -2171,34 +2240,6 @@ export class BrokerProxyService extends EventEmitter {
       return;
     }
 
-    // The path's segments as upstream routes them: decoded and case folded.
-    // The job operation gate below matches these, not the spelling sent, so a
-    // /CompleteJob or /%63ompletejob is bound like the operation it names. A
-    // path that decodes to anything but printable ASCII is refused, as no
-    // runner path does: a router folding case beyond ASCII could read
-    // /fini%C5%BFhjob as finishjob, or /%C5%BFession as session.
-    let routedSegments: string[] | undefined;
-    try {
-      const decoded = decodeURIComponent(url.pathname);
-      if (isPlainAscii(decoded)) routedSegments = decoded.toLowerCase().split('/').filter(Boolean);
-    } catch {
-      // Refused below, like a path that decodes to more than ASCII.
-    }
-    if (!routedSegments) {
-      req.resume();
-      log()?.warn(`[BrokerProxy] Refused to forward ${req.method} ${forLog(url.pathname)}: its path does not decode to ASCII`);
-      res.writeHead(403, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Path does not decode to ASCII' }));
-      return;
-    }
-    if (LOCALLY_SERVED_PATHS.includes(`/${routedSegments.join('/')}`)) {
-      req.resume();
-      log()?.warn(`[BrokerProxy] Refused to forward ${req.method} ${forLog(url.pathname)}: it is a path served here, not upstream`);
-      res.writeHead(403, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Path is served here, not upstream' }));
-      return;
-    }
-
     // The upstream session id goes in place of the query's sessionId, found by
     // that exact name. Upstream reads query names whatever their case, and a
     // decoder folding past ASCII reads more (Go takes U+017F as s), so a
@@ -2228,108 +2269,85 @@ export class BrokerProxyService extends EventEmitter {
 
     const token = await this.getOAuthToken(targetState, instance);
 
-    // Determine upstream URL - job operations go to run_service_url, others to broker
-    let upstreamUrl: string;
-
-    // For job operations, try to use the run_service_url from the job message
-    // Note: /acknowledge goes to broker, NOT run_service_url (it's BrokerHttpClient.AcknowledgeRunnerRequestAsync)
+    // Every operation forwarded is a job operation, and goes upstream on the
+    // runner's token, so each must name only a job this worker was given.
+    // Every request id its body carries must have been delivered to it, and a
+    // plan or job id - which is how the runner's run-service client names a
+    // job to completejob and renewjob - must be the pair of the details it
+    // acquired. A delivered request id does not vouch for a pair beside it:
+    // the id is a small sequential number. One that names no job, or whose
+    // body cannot be read, is refused.
     //
-    // Every job operation goes upstream on the runner's token, so each must
-    // name only a job this worker was given. Every request id its body carries
-    // must have been delivered to it, and a plan or job id - which is how the
-    // runner's run-service client names a job to completejob and renewjob -
-    // must be the pair of the details it acquired. A delivered request id does
-    // not vouch for a pair beside it: the id is a small sequential number. One
-    // that names no job, or whose body cannot be read, is refused.
+    // It goes upstream under the name it was matched by, not the spelling
+    // sent: to the job's run_service_url when it names a delivered request id,
+    // else to the broker.
     //
-    // OPEN ITEM, routing only: an operation named by plan and job ids still
-    // goes to the broker, not the job's run_service_url, which is keyed by
-    // request id. Live jobs have so far sent neither operation through this
-    // server, so the route is left until it can be checked against one.
-    //
-    // OPEN ITEM, other paths: anything that is neither a job operation nor a
-    // spelling of a path served here (both matched on the decoded, lowercase,
-    // ASCII path; anything else refused above) is still forwarded on the
-    // runner's token as it comes, to serverUrlV2, with the target's upstream
-    // session id in place of any sessionId it carries. That includes spellings
-    // whose meaning depends on the upstream router, such as a dot segment
-    // encoded with its slash (/x/..%2fmessage), which is not resolved here.
-    // Forwarding only the paths the runner uses would close that, but changes
-    // what reaches upstream, so it waits on a decision rather than being made
-    // here.
-    const jobOperations = ['acquirejob', 'renewjob', 'finishjob', 'jobrequest', 'completejob'];
-    if (routedSegments.some(segment => jobOperations.some(op => segment.startsWith(op)))) {
-      const refuse = (reason: string) => {
-        log()?.warn(`[BrokerProxy] Refused ${url.pathname}: ${reason}`);
-        res.writeHead(403, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Job not delivered to this worker' }));
-      };
-      // Try to find run_service_url from request body or stored job info
-      let runServiceUrl: string | undefined;
-      let bodyJson: Record<string, unknown> | undefined;
-      try {
-        const parsed = JSON.parse(reqBody);
-        if (parsed && typeof parsed === 'object') bodyJson = parsed;
-      } catch {
-        // Not the parser's message: it quotes the body it could not parse.
-        log()?.info(`[BrokerProxy] Could not parse job operation body (${reqBody.length} bytes)`);
-      }
-      if (!bodyJson) {
-        refuse('its body names no job');
+    // OPEN ITEM, routing only: an operation named by plan and job ids alone,
+    // as the runner's are, still goes to the broker, not the job's
+    // run_service_url, which is keyed by request id. The runner sends both to
+    // the job's system connection instead (see UPSTREAM_OPERATIONS), so the
+    // route is left until a live job can check it.
+    const refuse = (reason: string) => {
+      log()?.warn(`[BrokerProxy] Refused ${url.pathname}: ${reason}`);
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Job not delivered to this worker' }));
+    };
+    let runServiceUrl: string | undefined;
+    let bodyJson: Record<string, unknown> | undefined;
+    try {
+      const parsed = JSON.parse(reqBody);
+      if (parsed && typeof parsed === 'object') bodyJson = parsed;
+    } catch {
+      // Not the parser's message: it quotes the body it could not parse.
+      log()?.info(`[BrokerProxy] Could not parse job operation body (${reqBody.length} bytes)`);
+    }
+    if (!bodyJson) {
+      refuse('its body names no job');
+      return;
+    }
+    const ambiguous = ambiguousJobKey(bodyJson);
+    if (ambiguous) {
+      refuse(`its body has a key ${forLog(ambiguous)}, which upstream may read as a job key this check does not`);
+      return;
+    }
+    // A request id under any of the keys the runner's clients have used
+    const body = bodyJson; // narrowed, for the callbacks below
+    const requestIds = JOB_REQUEST_ID_KEYS.map(key => body[key]).filter(Boolean);
+    const opJobId = requestIds[0];
+    const namesPlanJob = JOB_PAIR_KEYS.some(key => body[key] !== undefined && body[key] !== null && body[key] !== '');
+    // The id alone at info. The body carries the job's outputs and is job
+    // code's to write, so it goes to debug, encoded and cut short.
+    log()?.info(`[BrokerProxy] Job operation ${url.pathname} for ${opJobId ? forLog(opJobId) : 'no job id'}`);
+    log()?.debug(`[BrokerProxy] Job operation ${url.pathname} body: ${forLog(reqBody, 300)}`);
+    if (!opJobId && !namesPlanJob) {
+      refuse('its body names no job');
+      return;
+    }
+    const undelivered = requestIds.find(id => !this.deliveredToWorker.get(key)?.has(String(id)));
+    if (undelivered) {
+      refuse(`${forLog(undelivered)} was not delivered to this worker`);
+      return;
+    }
+    if (namesPlanJob) {
+      const planJob = planJobKey(bodyJson.planId, bodyJson.jobId);
+      if (!planJob || !this.acquiredByWorker.get(key)?.has(planJob)) {
+        refuse(`plan ${forLog(bodyJson.planId)}, job ${forLog(bodyJson.jobId)} is not the job this worker acquired`);
         return;
       }
-      const ambiguous = ambiguousJobKey(bodyJson);
-      if (ambiguous) {
-        refuse(`its body has a key ${forLog(ambiguous)}, which upstream may read as a job key this check does not`);
-        return;
-      }
-      // Try multiple ID fields - runner uses different ones for different operations
-      const body = bodyJson; // narrowed, for the callbacks below
-      const requestIds = JOB_REQUEST_ID_KEYS.map(key => body[key]).filter(Boolean);
-      const opJobId = requestIds[0];
-      const namesPlanJob = JOB_PAIR_KEYS.some(key => body[key] !== undefined && body[key] !== null && body[key] !== '');
-      // The id alone at info. The body carries the job's outputs and is job
-      // code's to write, so it goes to debug, encoded and cut short.
-      log()?.info(`[BrokerProxy] Job operation ${url.pathname} for ${opJobId ? forLog(opJobId) : 'no job id'}`);
-      log()?.debug(`[BrokerProxy] Job operation ${url.pathname} body: ${forLog(reqBody, 300)}`);
-      if (!opJobId && !namesPlanJob) {
-        refuse('its body names no job');
-        return;
-      }
-      const undelivered = requestIds.find(id => !this.deliveredToWorker.get(key)?.has(String(id)));
-      if (undelivered) {
-        refuse(`${forLog(undelivered)} was not delivered to this worker`);
-        return;
-      }
-      if (namesPlanJob) {
-        const planJob = planJobKey(bodyJson.planId, bodyJson.jobId);
-        if (!planJob || !this.acquiredByWorker.get(key)?.has(planJob)) {
-          refuse(`plan ${forLog(bodyJson.planId)}, job ${forLog(bodyJson.jobId)} is not the job this worker acquired`);
-          return;
-        }
-      }
-      if (opJobId) {
-        // Numeric on the wire; the map keys are strings, like the delivered
-        // check above. Without String() a renew/finish with a numeric id
-        // misses and gets sent to the broker instead of the job service.
-        runServiceUrl = this.jobRunServiceUrls.get(String(opJobId));
-        log()?.info(`[BrokerProxy] Found run_service_url for ${forLog(opJobId)}: ${runServiceUrl || 'not found'}`);
-      }
-
-      if (runServiceUrl) {
-        upstreamUrl = `${runServiceUrl}${url.pathname}?${upstreamParams.toString()}`;
-        log()?.info(`[BrokerProxy] Forward ${req.method} ${url.pathname} -> run_service_url`);
-      } else {
-        upstreamUrl = `${instance.runner.serverUrlV2}${url.pathname.slice(1)}?${upstreamParams.toString()}`;
-        log()?.info(`[BrokerProxy] Forward ${req.method} ${url.pathname} -> broker (no run_service_url found)`);
-      }
-    } else {
-      upstreamUrl = `${instance.runner.serverUrlV2}${url.pathname.slice(1)}?${upstreamParams.toString()}`;
-      log()?.debug(`[BrokerProxy] Forward ${req.method} ${url.pathname} -> broker`);
+    }
+    if (opJobId) {
+      // Numeric on the wire; the map keys are strings, like the delivered
+      // check above. Without String() a renewjob/completejob with a numeric
+      // id misses and gets sent to the broker instead of the job service.
+      runServiceUrl = this.jobRunServiceUrls.get(String(opJobId));
+      log()?.info(`[BrokerProxy] Found run_service_url for ${forLog(opJobId)}: ${runServiceUrl || 'not found'}`);
     }
 
+    const upstreamUrl = `${runServiceUrl ?? instance.runner.serverUrlV2}${operation.path.slice(1)}?${upstreamParams.toString()}`;
+    log()?.info(`[BrokerProxy] Forward ${operation.method} ${operation.path} -> ${runServiceUrl ? 'run_service_url' : 'broker (no run_service_url found)'}`);
+
     const response = await httpsRequest(upstreamUrl, {
-      method: req.method,
+      method: operation.method,
       headers: {
         'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
