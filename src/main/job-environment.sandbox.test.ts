@@ -288,9 +288,11 @@ if (!isMacOS) {
       });
     }, SWIFT_TIMEOUT_MS);
 
-    it("has its own bin directory first on PATH, whose swift shim lets SwiftPM compile a new manifest", () => {
+    it("has its own bin directory on PATH, whose swift shim lets SwiftPM compile a new manifest", () => {
+      // On PATH, though not necessarily first: setup-* actions put their
+      // toolchains in front of everything the runner started with.
       const sandboxDir = path.dirname(fs.realpathSync(os.tmpdir()));
-      expect((process.env.PATH ?? '').split(':')[0]).toBe(path.join(sandboxDir, 'localmost', 'bin'));
+      expect((process.env.PATH ?? '').split(':')).toContain(path.join(sandboxDir, 'localmost', 'bin'));
       const pkg = path.join(os.tmpdir(), `pkg${randomBytes(4).toString('hex')}`);
       fs.mkdirSync(path.join(pkg, 'Sources', 'hello'), { recursive: true });
       try {
