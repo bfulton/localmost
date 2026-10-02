@@ -165,15 +165,19 @@ function lstatOrUndefined(p: string): fs.Stats | undefined {
  * single directory to create, and is skipped, and so is one in, or above,
  * any of `excludeRoots`: the app's own directories, where a policy may name
  * a path the job is denied anyway, and where a directory made at a name the
- * app uses - config.yaml, say - would break the app.
+ * app uses - config.yaml, say - would break the app. Nor is one in any of
+ * `deniedRoots`, the credential locations the job is denied whatever it is
+ * granted: a ~/.ssh or ~/.aws made because a policy named a path in it
+ * would serve the job nothing, and is the user's to make.
  */
 export function createMissingGrantedDirs(
   writeGrants: string[],
-  options: { realHome?: string; excludeRoots?: string[]; log?: JobHomeLog } = {}
+  options: { realHome?: string; excludeRoots?: string[]; deniedRoots?: string[]; log?: JobHomeLog } = {}
 ): string[] {
   const realHome = options.realHome ?? os.homedir();
   const log = options.log ?? (() => {});
   const excluded = (options.excludeRoots ?? []).map((root) => path.resolve(root));
+  const denied = (options.deniedRoots ?? []).map((root) => path.resolve(root));
   const created: string[] = [];
   for (const grant of writeGrants) {
     let expanded = grant === '~' || grant.startsWith('~/') ? path.join(realHome, grant.slice(1)) : grant;
@@ -181,7 +185,11 @@ export function createMissingGrantedDirs(
     expanded = path.normalize(expanded).replace(/\/\*\*$/, '');
     if (expanded.includes('*') || !within(expanded, realHome) || expanded === realHome) continue;
     if (excluded.some((root) => within(expanded, root) || within(root, expanded))) {
-      log('debug', `Not creating  for the job: it is in the app's own directories`);
+      log('debug', `Not creating ${expanded} for the job: it is in the app's own directories`);
+      continue;
+    }
+    if (denied.some((root) => within(expanded, root))) {
+      log('debug', `Not creating ${expanded} for the job: the job is denied it whatever it is granted`);
       continue;
     }
     let node = realHome;

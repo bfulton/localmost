@@ -146,9 +146,26 @@ describe("a job's own home", () => {
       // directory made at a name the app uses - config.yaml - would break it.
       const appDir = path.join(realHome, '.localmost');
       fs.mkdirSync(appDir);
-      expect(createMissingGrantedDirs(['~/.localmost/config.yaml', '~/.localmost/runner/x'], { realHome, excludeRoots: [appDir] })).toEqual([]);
+      const logged: string[] = [];
+      expect(createMissingGrantedDirs(['~/.localmost/config.yaml', '~/.localmost/runner/x'], { realHome, excludeRoots: [appDir], log: (_l, m) => logged.push(m) })).toEqual([]);
       expect(fs.readdirSync(appDir)).toEqual([]);
+      expect(logged[0]).toBe(`Not creating ${path.join(appDir, 'config.yaml')} for the job: it is in the app's own directories`);
       expect(createMissingGrantedDirs(['~/.npm'], { realHome, excludeRoots: [appDir] })).toEqual([path.join(realHome, '.npm')]);
+    });
+
+    it('creates nothing in a credential location the job is denied anyway, and says why', () => {
+      const logged: string[] = [];
+      const deniedRoots = [path.join(realHome, '.ssh'), path.join(realHome, '.aws'), path.join(realHome, '.netrc')];
+      expect(createMissingGrantedDirs(['~/.ssh/keys', '~/.aws', '~/.netrc'], { realHome, deniedRoots, log: (_l, m) => logged.push(m) })).toEqual([]);
+      expect(fs.readdirSync(realHome)).toEqual([]);
+      expect(logged).toEqual([
+        `Not creating ${path.join(realHome, '.ssh', 'keys')} for the job: the job is denied it whatever it is granted`,
+        `Not creating ${path.join(realHome, '.aws')} for the job: the job is denied it whatever it is granted`,
+        `Not creating ${path.join(realHome, '.netrc')} for the job: the job is denied it whatever it is granted`,
+      ]);
+      // A directory that only holds a credential file is still made.
+      expect(createMissingGrantedDirs(['~/.gradle'], { realHome, deniedRoots: [path.join(realHome, '.gradle', 'gradle.properties')] }))
+        .toEqual([path.join(realHome, '.gradle')]);
     });
 
     it('creates nothing outside the home, for the home itself, or for a grant with * in it', () => {

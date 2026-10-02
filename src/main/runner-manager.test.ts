@@ -1923,6 +1923,22 @@ describe('RunnerManager', () => {
     it('is left missing with the preference off', async () => {
       expect(await spawnWith(false)).toEqual([]);
     });
+
+    it('is not created in a credential location the job is denied anyway', async () => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({ hosts: [], level: 'strict', readPaths: [], writePaths: ['~/.ssh/p3-keys', '~/.config/p3'], docker: {} }),
+      });
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(9919));
+      await new RunnerManagerTestHelper(manager).spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
+      const inHome = (fs.mkdirSync as jest.Mock).mock.calls.filter(([dir]) =>
+        [path.join(os.homedir(), '.ssh'), path.join(os.homedir(), '.config')].some((root) => String(dir).startsWith(root))
+      );
+      expect(inHome).toEqual([]);
+    });
   });
 
   describe("a worker's temp", () => {

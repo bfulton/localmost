@@ -15,7 +15,7 @@ import {
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
 import { SandboxFilesystemPolicy, spawnSandboxed } from './process-sandbox';
 import { inheritedWorkerEnv, javaToolOptions, levelToolchainPaths, packageCacheEnv } from './worker-env';
-import { DEFAULT_BROKER_PORT, type EnvPolicy, type ProcessMarker } from '../shared/sandbox-profile';
+import { DEFAULT_BROKER_PORT, developerCredentialPaths, type EnvPolicy, type ProcessMarker } from '../shared/sandbox-profile';
 import { developerPython, reapMarkedProcessesAsync } from '../shared/sandbox-reaper';
 import { groupHasMembers, sweepInGrace, sweepProcessGroup } from './process-group';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
@@ -1536,8 +1536,10 @@ export class RunnerManager {
         // A granted directory that does not exist yet, which a job that is
         // denied its parent could not create for itself.
         try {
+          const credentialPaths = developerCredentialPaths();
           const created = createMissingGrantedDirs(filesystemPolicy.write, {
             excludeRoots: [getAppDataDir(), getUserDataDir()],
+            deniedRoots: [...credentialPaths.subpaths, ...credentialPaths.literals],
             log: homeLog,
           });
           if (created.length > 0) this.log('info', `Created ${created.join(', ')}, granted to the job of instance ${instanceNum}`);

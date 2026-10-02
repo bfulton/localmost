@@ -199,7 +199,9 @@ empty home is never less than the user's own was.
   single directory, so none is created for it.
 - **A grant inside the app's own directories** gets no directory created, so
   a policy naming `~/.localmost/config.yaml` cannot turn the app's settings
-  file into a directory.
+  file into a directory. Nor does one inside a credential location the floor
+  denies (`~/.ssh`, `~/.aws`, `~/.config` and the rest): the job could not use
+  it, and a `~/.ssh` is the user's to make.
 - **A link or file already on the way** to a directory to create stops that
   grant, with a warning; nothing is created through a link. A job running
   concurrently with write on the parent could still swap a level for a link
