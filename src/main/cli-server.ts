@@ -11,7 +11,8 @@ import { app } from 'electron';
 import { getCliSocketPath } from './paths';
 import { getRunnerManager, getHeartbeatManager, getAuthState, getRunnerState, getResourceMonitor } from './app-state';
 import { pauseRunner, resumeRunner } from './runner-pause';
-import { getSnapshot, selectEffectivePauseState } from './runner-state-service';
+import { getSnapshot, isRunning as isRunnerStarted, isStarting as isRunnerStarting, selectEffectivePauseState } from './runner-state-service';
+import { resourcePauseOverriddenText } from '../shared/resource-pause-text';
 import { getTargetManager } from './target-manager';
 import { getRunnerProxyManager } from './runner-proxy-manager';
 import type { Target } from '../shared/types';
@@ -254,6 +255,7 @@ export class CliServer {
         const runnerState = getRunnerState();
         const pauseState = snapshot ? selectEffectivePauseState(snapshot) : { isPaused: false, reason: null };
         const runnerName = runnerManager?.getStatusDisplayName() || 'unknown';
+        const overridden = getResourceMonitor()?.getPauseState().overridden ?? null;
 
         return {
           success: true,
@@ -271,10 +273,14 @@ export class CliServer {
             authenticated: !!authState && !authState.expired,
             authExpired: !!authState?.expired,
             userName: authState?.user?.login,
+            // A pause is recorded whatever state the runner is in; the CLI
+            // shows it in place of the status only for the runner it holds.
+            runnerStarted: isRunnerStarted() || isRunnerStarting(),
             resourcePause: {
               isPaused: pauseState.isPaused,
               reason: pauseState.reason,
               conditions: [],
+              overridden,
             },
           },
         };
@@ -328,18 +334,16 @@ export class CliServer {
           if (outcome === 'not-started') {
             return { success: false, error: 'Runner is not started. Start it from the app.' };
           }
-          let message = outcome === 'already-running'
+          // A resume overrides the resource conditions holding, until each
+          // clears; say which, since one recurring then pauses it again.
+          const overridden = getResourceMonitor()?.getPauseState().overridden;
+          const message = outcome === 'already-running'
             ? 'Runner is already running'
             : outcome === 'starting'
               ? 'Runner is still starting, and is not paused'
-              : 'Runner resumed';
-          // Resuming lifts the pause, not the condition behind a resource
-          // pause, and new jobs wait on the condition.
-          const resourceMonitor = getResourceMonitor();
-          if (resourceMonitor?.shouldPause()) {
-            const reason = resourceMonitor.getPauseState().reason || 'a resource condition';
-            message += `, but it takes no new jobs until this clears: ${reason}`;
-          }
+              : overridden
+                ? resourcePauseOverriddenText(overridden)
+                : 'Runner resumed';
           return { success: true, command: 'resume', message };
         } catch (err) {
           return { success: false, error: `Failed to resume: ${(err as Error).message}` };

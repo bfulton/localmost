@@ -19,7 +19,14 @@ jest.mock('./encryption', () => ({
   decryptValue: (v: string) => v.replace(/^enc:/, ''),
 }));
 
-import { saveConfig, loadConfig, resolveDockerVmConfig, DockerVmConfigSource, SETTABLE_CONFIG_KEYS } from './config';
+import {
+  saveConfig,
+  loadConfig,
+  resolveDockerVmConfig,
+  resolveResourcePauseConfig,
+  DockerVmConfigSource,
+  SETTABLE_CONFIG_KEYS,
+} from './config';
 
 beforeEach(() => {
   if (fs.existsSync(configPath)) fs.rmSync(configPath);
@@ -211,5 +218,32 @@ describe('resolveDockerVmConfig', () => {
   it('is read from config.yaml', () => {
     saveConfig({ dockerVm: { cpus: 2, prewarm: true } });
     expect(resolveDockerVmConfig(loadConfig().dockerVm, host)).toMatchObject({ cpus: 2, prewarm: true });
+  });
+});
+
+describe('resolveResourcePauseConfig', () => {
+  it('lets running jobs finish by default', () => {
+    expect(resolveResourcePauseConfig(undefined)).toEqual({ runningJobs: 'finish' });
+    expect(resolveResourcePauseConfig({})).toEqual({ runningJobs: 'finish' });
+  });
+
+  it('keeps either choice as written', () => {
+    expect(resolveResourcePauseConfig({ runningJobs: 'stop' }).runningJobs).toBe('stop');
+    expect(resolveResourcePauseConfig({ runningJobs: 'finish' }).runningJobs).toBe('finish');
+  });
+
+  it('takes anything else as absent, and says so', () => {
+    const logged: string[] = [];
+    expect(resolveResourcePauseConfig({ runningJobs: 'kill' }, (m) => logged.push(m)).runningJobs).toBe('finish');
+    expect(resolveResourcePauseConfig({ runningJobs: true }, (m) => logged.push(m)).runningJobs).toBe('finish');
+    expect(logged).toEqual([
+      "resourcePause.runningJobs must be 'finish' or 'stop'; using 'finish'",
+      "resourcePause.runningJobs must be 'finish' or 'stop'; using 'finish'",
+    ]);
+  });
+
+  it('is read from config.yaml', () => {
+    saveConfig({ resourcePause: { runningJobs: 'stop' } });
+    expect(resolveResourcePauseConfig(loadConfig().resourcePause).runningJobs).toBe('stop');
   });
 });
