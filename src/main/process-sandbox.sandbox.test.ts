@@ -274,9 +274,11 @@ if (!isMacOS) {
       // A sandboxed Foundation stages write(to:atomically:) in TemporaryItems
       // under the per-user temp directory, whatever the destination; with
       // DIRHELPER_USER_DIR_SUFFIX set, under T/<suffix>. The suffix is fixed
-      // here, not per run: macOS refuses to remove a TemporaryItems directory
-      // once made, so a name per run would leave one behind every time.
-      const suffix = 'localmost-sandbox-test-atomic-write';
+      // here, not per run: T/<suffix> as macOS makes it is protected from
+      // removal as T is (sunlnk, com.apple.rootless), and the TemporaryItems
+      // in it cannot be removed either, so a name per run would leave one
+      // directory behind every time. Of the shape a job's own suffix has.
+      const suffix = 'localmost-job-0123456789abcdef';
       let writer: string;
 
       beforeAll(() => {
@@ -287,7 +289,10 @@ if (!isMacOS) {
         fs.writeFileSync(source, [
           'import Foundation',
           'let destination = URL(fileURLWithPath: CommandLine.arguments[1])',
-          'try! "atomic".write(to: destination, atomically: true, encoding: .utf8)',
+          // Not try!: a trap on the expected failures would leave a crash
+          // report in ~/Library/Logs/DiagnosticReports on every run.
+          'do { try "atomic".write(to: destination, atomically: true, encoding: .utf8) }',
+          'catch { FileHandle.standardError.write("\\(error)\\n".data(using: .utf8)!); exit(1) }',
           '',
         ].join('\n'));
         execFileSync('/usr/bin/xcrun', ['swiftc', '-o', writer, source], { stdio: 'ignore', timeout: 180000 });
@@ -325,7 +330,11 @@ if (!isMacOS) {
         // Nor with the suffix under a profile that grants no directory for it.
         const ungranted = atomicWrite(writeProfile(), { DIRHELPER_USER_DIR_SUFFIX: suffix });
         expect(ungranted.ok).toBe(false);
+        expect(ungranted.stderr).toMatch(/Code=513/);
         expect(ungranted.written).toBeUndefined();
+        // Each failure an error the writer reports, not a trap, which would
+        // leave a crash report behind.
+        for (const failed of [unsuffixed, ungranted]) expect(failed.stderr).not.toMatch(/Fatal error/);
       }, 90000);
     });
 

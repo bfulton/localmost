@@ -217,7 +217,8 @@ export interface RunnerProfileOptions {
    * The DIRHELPER_USER_DIR_SUFFIX the job runs with: its directory in the
    * per-user temp, T/<suffix>, is the job's to read and write, so a sandboxed
    * Foundation can stage its atomic writes there (see jobTempDirFilters).
-   * Absent, none. The rest of T is not granted either way.
+   * Absent, none. The rest of T is not granted either way. localmost-job- and
+   * random hex, or the profile is refused (see checkJobTempSuffix).
    */
   jobTempSuffix?: string;
   /** Optional log sink for notes such as a policy path being ignored. */
@@ -605,7 +606,8 @@ ${ownCacheRules('file-ioctl')}
 ;; No shared temp directory. /tmp and the per-user /var/folders tree belong to
 ;; every process the user runs; the job's TMPDIR is in its own sandbox, and
 ;; the caches tools would otherwise keep there are pointed into it too.
-;; Only what mktemp itself creates, by the name it generated:
+;; Only what mktemp itself creates, by the name it generated, and the job's own
+;; suffixed directory when it has one:
 ${mktempRules}
 
 ;; No package-manager cache in the user's home. Under strict a repository

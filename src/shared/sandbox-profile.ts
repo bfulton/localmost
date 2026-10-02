@@ -499,16 +499,23 @@ function sharedTempRules(jobTempSuffix?: string): string[] {
 }
 
 /**
- * What a DIRHELPER_USER_DIR_SUFFIX may be: one plain name, as it lands in a
- * profile as a path component under the per-user temp directory. Not `.` or
- * `..`, nor anything with a `/`, a quote or a space in it.
+ * What a DIRHELPER_USER_DIR_SUFFIX may be: a name localmost owns, with a
+ * random body. It lands in a profile as a path component under the per-user
+ * temp directory, and the job reads and writes everything beneath it, so it
+ * must name nothing shared there: not the TemporaryItems every sandboxed
+ * Foundation process of the user's stages through, not another app's
+ * directory, and not a name of mktemp's shape, which every job is granted
+ * and an earlier one could have made and filled. Lowercase hex, since the
+ * volume matches names without regard to case.
  */
-const JOB_TEMP_SUFFIX = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const JOB_TEMP_SUFFIX = /^localmost-job-[0-9a-f]{16,64}$/;
 
-/** Throw unless `suffix` is absent or one plain name (see JOB_TEMP_SUFFIX). */
+/** Throw unless `suffix` is absent or one of localmost's own (see JOB_TEMP_SUFFIX). */
 export function checkJobTempSuffix(suffix: string | undefined): void {
   if (suffix !== undefined && !JOB_TEMP_SUFFIX.test(suffix)) {
-    throw new Error(`The job's temp suffix must be one plain name, so it cannot be confined as intended: ${JSON.stringify(suffix)}`);
+    throw new Error(
+      `The job's temp suffix must be localmost-job- and 16 to 64 lowercase hex digits, so it cannot be confined as intended: ${JSON.stringify(suffix)}`
+    );
   }
 }
 
@@ -525,9 +532,18 @@ export function checkJobTempSuffix(suffix: string | undefined): void {
  * fail with "You don't have permission to save the file". The rest of T
  * stays closed: it is shared with every process the user runs.
  *
- * macOS refuses to remove a TemporaryItems directory anywhere under T once
- * it is there, empty or not and sandboxed or not, so T/<suffix> outlives the
- * job with an empty TemporaryItems in it, whatever sweeps it.
+ * T/<suffix> outlives the job, whatever sweeps it. As macOS makes it, for a
+ * process with the suffix set, it carries the same protection as T itself
+ * (the sunlnk flag and com.apple.rootless), so it can never be removed; and
+ * the TemporaryItems in it cannot be removed either, empty or not, sandboxed
+ * or not, wherever under T it is. So a suffix per job leaves a directory per
+ * job in the user's T. A suffix reused across jobs instead makes T/<suffix> a
+ * channel from one job to the next, unless everything in it but
+ * TemporaryItems is swept before each job - by lstat, never following a
+ * link: anything in it can be a link the job planted, and the grant covers
+ * the T/<suffix> node itself, so one the app made with mkdir (which carries
+ * no such protection) the job can remove and replace with a link while
+ * TemporaryItems is not yet in it.
  */
 export function jobTempDirFilters(userTemp: string, suffix: string): string[] {
   checkJobTempSuffix(suffix);

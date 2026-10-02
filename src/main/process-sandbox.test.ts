@@ -776,7 +776,7 @@ describe('Process Sandbox', () => {
       // T/<suffix>, and a sandboxed Foundation stages its atomic writes in
       // TemporaryItems there. The job gets that directory, read and write;
       // the rest of T, shared with every process the user runs, stays closed.
-      const suffix = 'localmost-job-3f9a';
+      const suffix = 'localmost-job-3f9a0c2e5b7d1846';
       const profile = profileWith({ jobTempSuffix: suffix });
       expect(profile).toContain(
         [
@@ -804,8 +804,18 @@ describe('Process Sandbox', () => {
       expect(profileWith({ jobTempSuffix: suffix }, () => { throw new Error('getconf: not found'); })).not.toContain(suffix);
     });
 
-    it.each(['', '.', '..', 'a/b', '../T', 'a"b', 'a b', '-x'])('refuses a temp suffix that is not one plain name: %j', (suffix) => {
-      // It lands in the profile as a path component under the shared T.
+    it.each([
+      '', '.', '..', 'a/b', '../T', 'a"b', 'a b', '-x',
+      // Names of shared state in T: the staging every sandboxed Foundation
+      // process of the user's writes through, another app's directory, and a
+      // name of mktemp's shape, which any earlier job could have made.
+      'TemporaryItems', 'com.apple.dt.xcodebuild', 'node-compile-cache', 'tmp.ABCDEFGHIJ',
+      // Not a random body of localmost's own.
+      'localmost-job-', 'localmost-job-3f9a', 'localmost-job-3F9A0C2E5B7D1846', 'localmost-job-3f9a0c2e5b7d184g',
+      'localmost-job-3f9a0c2e5b7d1846/..', `localmost-job-${'a'.repeat(65)}`,
+    ])("refuses a temp suffix that is not one of localmost's own: %j", (suffix) => {
+      // It lands in the profile as a path component under the shared T, and
+      // the job reads and writes everything beneath it.
       expect(() => profileWith({ jobTempSuffix: suffix })).toThrow(/temp suffix/);
     });
 

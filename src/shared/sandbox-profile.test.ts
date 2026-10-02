@@ -244,7 +244,7 @@ describe('Sandbox Profile Generator', () => {
       // which every process the user runs shares, stays closed.
       const userTemp = execFileSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf-8' })
         .trim().replace(/\/+$/, '').replace(/^\/private/, '');
-      const suffix = 'localmost-job-3f9a';
+      const suffix = 'localmost-job-3f9a0c2e5b7d1846';
       for (const profile of [
         generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, jobTempSuffix: suffix }),
         generateDiscoveryProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, logFile: '', jobTempSuffix: suffix }),
@@ -260,8 +260,18 @@ describe('Sandbox Profile Generator', () => {
         .not.toContain(`(subpath "${userTemp}/`);
     });
 
-    it.each(['', '.', '..', 'a/b', '../T', 'a"b', 'a b', '-x'])('refuses a temp suffix that is not one plain name: %j', (suffix) => {
-      // It lands in the profile as a path component under the shared T.
+    it.each([
+      '', '.', '..', 'a/b', '../T', 'a"b', 'a b', '-x',
+      // Names of shared state in T: the staging every sandboxed Foundation
+      // process of the user's writes through, another app's directory, and a
+      // name of mktemp's shape, which any earlier job could have made.
+      'TemporaryItems', 'com.apple.dt.xcodebuild', 'node-compile-cache', 'tmp.ABCDEFGHIJ',
+      // Not a random body of localmost's own.
+      'localmost-job-', 'localmost-job-3f9a', 'localmost-job-3F9A0C2E5B7D1846', 'localmost-job-3f9a0c2e5b7d184g',
+      'localmost-job-3f9a0c2e5b7d1846/..', `localmost-job-${'a'.repeat(65)}`,
+    ])("refuses a temp suffix that is not one of localmost's own: %j", (suffix) => {
+      // It lands in the profile as a path component under the shared T, and
+      // the job reads and writes everything beneath it.
       expect(() => generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, jobTempSuffix: suffix }))
         .toThrow(/temp suffix/);
     });
