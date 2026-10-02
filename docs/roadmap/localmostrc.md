@@ -199,15 +199,22 @@ workflows:
 | `~/.ssh/id_*` | `~/.ssh/id_rsa`, `~/.ssh/id_ed25519`, etc. |
 
 A `filesystem.deny` entry refuses reads and writes of that path and everything
-beneath it, even inside a granted path, and in a deny `*` matches any run of
-characters, `/` included. Each entry is denied as written and by its real path,
+beneath it, even inside a granted path. In a deny `*` matches any run of
+characters within one name, never a `/`, and may appear in any component:
+`~/out/sec*/key` covers `~/out/secA/key` but not `~/out/sec/A/key`, and `**` is
+no different from `*` (to deny everything beneath a directory, deny the
+directory). Each entry is denied as written and by its real path,
 so a deny of `/tmp/x`, `/etc/...` or a path through a symlink of your own covers
 where it leads. For a `*` entry the real path is taken up to the directory
 before the first `*`; a symlink past it, or a matched file that is itself a
 symlink, is not followed. The directories above a deny cannot be created,
 renamed or removed by the job, since renaming one would carry the denied path
-out from under it; for a `*` entry that means the directory before the first `*`
-and those above it, so a directory the `*` itself stands for can still be moved.
+out from under it. For a `*` entry that includes every directory a wildcard
+stands for: under a deny of `~/out/sec*/key` the job cannot rename `~/out/secA`,
+nor create, rename or move in anything under `~/out` whose name matches
+`sec*`, while it still writes inside `~/out/secA` and creates other names in
+`~/out`. A wildcard high in a path closes that many more names: under
+`~/*/key`, nothing can be created, renamed or removed directly in your home.
 The real path is looked up as far as it can be: a directory the app cannot look
 into, a symlink loop, or a folder macOS asks permission for (Desktop, Documents,
 Downloads, `~/Library`, `/Volumes`) ends the lookup there, and the rest is

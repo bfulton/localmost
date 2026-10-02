@@ -259,6 +259,45 @@ if (!isMacOS) {
       expect(canCreate(run, path.join(userTempDir(), probeName()))).toBe(false);
     });
 
+    it('closes the directories a wildcard in a deny stands for, and opens nothing else of them', () => {
+      // Granted the tree, a job could rename out/secA to out/z and read
+      // out/z/key from under a deny of out/sec*/key, or make out/secB and
+      // move a twin of the key in. * stands within one name, and every
+      // directory it matches is closed to writes as a node.
+      const tree = path.join(base, probeName());
+      const out = path.join(tree, 'out');
+      fs.mkdirSync(path.join(out, 'secA'), { recursive: true });
+      fs.mkdirSync(path.join(out, 'other'));
+      fs.writeFileSync(path.join(out, 'secA', 'key'), 'SECRET');
+      fs.writeFileSync(path.join(out, 'secA', 'other.txt'), 'plain');
+      try {
+        const run = underProfile({
+          filesystemPolicy: { level: 'strict', read: [tree], write: [tree], deny: [`${out}/sec*/key`] },
+        });
+        const at = (relative: string) => sq(path.join(out, relative));
+        // The key: neither readable, nor renamed or linked to another name.
+        expect(run(`/bin/cat ${at('secA/key')}`).ok).toBe(false);
+        expect(run(`/bin/mv ${at('secA/key')} ${at('secA/k2')}`).ok).toBe(false);
+        expect(run(`/bin/ln ${at('secA/key')} ${at('secA/hard')}`).ok).toBe(false);
+        // The directory the wildcard stands for, and the one above it.
+        expect(run(`/bin/mv ${at('secA')} ${at('z')}`).ok).toBe(false);
+        expect(run(`/bin/mv ${sq(out)} ${sq(path.join(tree, 'out2'))}`).ok).toBe(false);
+        // Nor a directory made or moved in under a name it matches.
+        expect(run(`/bin/mkdir ${at('secC')}`).ok).toBe(false);
+        expect(run(`/bin/mv ${at('other')} ${at('secB')}`).ok).toBe(false);
+        // Everything else stays as granted: inside the matched directory, and
+        // names the wildcard does not match.
+        expect(run(`/bin/cat ${at('secA/other.txt')}`).ok).toBe(true);
+        expect(run(`/usr/bin/touch ${at('secA/build.o')}`).ok).toBe(true);
+        expect(run(`/bin/mkdir ${at('plainB')}`).ok).toBe(true);
+        expect(run(`/bin/mkdir ${at('plainB/secD')}`).ok).toBe(true);
+        expect(fs.readFileSync(path.join(out, 'secA', 'key'), 'utf-8')).toBe('SECRET');
+        expect(fs.readdirSync(out).sort()).toEqual(['other', 'plainB', 'secA']);
+      } finally {
+        fs.rmSync(tree, { recursive: true, force: true });
+      }
+    });
+
     it("writes its target's package cache under moderate, and none of the user's toolchain trees", () => {
       const run = underProfile({ filesystemPolicy: { level: 'moderate', read: [], write: [] }, packageCacheDir });
       expect(canCreateUnder(run, packageCacheDir)).toBe(true);

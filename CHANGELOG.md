@@ -157,9 +157,10 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   runner job; it was written as a literal path and matched nothing. Every deny,
   in a runner job and in `localmost test`, is also applied by its real path, so
   one written through `/tmp`, `/etc`, `/var` or a symlink of your own holds
-  (for a `*` entry, up to the first `*`). The directories above a deny are
-  closed to writes, so a job granted one can no longer rename it and read the
-  denied path under the new name.
+  (for a `*` entry, up to the first `*`). The directories above a deny, and
+  for a `*` entry every directory a wildcard stands for, are closed to writes,
+  so a job granted one can no longer rename it and read the denied path under
+  the new name.
 - `.localmostrc` refuses a network entry that is not a host pattern - a URL such
   as `https://evil.com`, a path, a range such as `10.0.0.0/8`, surrounding
   spaces - and a relative `filesystem.deny` entry. Each was accepted and shown,
@@ -561,6 +562,15 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   children and the members of its process group that share it. Stopping or
   killing a process it did not start - a server or app you launched, another
   worker's job, the app itself - is now refused
+- **Breaking policy change**: in a `filesystem.deny` entry `*` matches within
+  one name and never a `/`, in a runner job and in `localmost test`; it used to
+  match any run of characters, so `~/out/*.pem` covered `~/out/a/b.pem` and now
+  covers only the `.pem` names directly in `~/out`. To reach deeper, write
+  each level (`~/out/*/*.pem`) or deny the directory. Every
+  directory a wildcard stands for is now closed to writes as a node, as the
+  directories above a deny already were: under a deny of `~/out/sec*/key` a job
+  cannot rename `~/out/secA`, nor create or rename anything in `~/out` whose
+  name matches `sec*`
 - CLI restructured with standalone commands that don't require the app
 - Improved help text with examples for all commands
 

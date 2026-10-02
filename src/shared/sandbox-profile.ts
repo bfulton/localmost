@@ -137,17 +137,22 @@ function escapePath(pathStr: string): string {
 /**
  * A policy path with `*` in it, as the body of a seatbelt (regex ...) rule.
  *
- * `*` matches anything, as it always has here; everything else is literal.
- * This used to swap `*` for `.*` and leave the rest as regex syntax, so the
- * dot in "~/.npm" matched any character and a `+` or `(` in a path changed
- * what the rule meant. Anchored at both ends, since seatbelt searches rather
- * than matches. Escaped again for the string literal it lands in, where a
- * backslash is itself an escape. With `subtree`, what lies beneath a match
- * matches too, as it does beneath a (subpath ...).
+ * Everything but `*` is literal. This used to swap `*` for `.*` and leave the
+ * rest as regex syntax, so the dot in "~/.npm" matched any character and a
+ * `+` or `(` in a path changed what the rule meant. Anchored at both ends,
+ * since seatbelt searches rather than matches. Escaped again for the string
+ * literal it lands in, where a backslash is itself an escape. With `subtree`,
+ * what lies beneath a match matches too, as it does beneath a (subpath ...).
+ *
+ * With `withinName`, as for a deny, `*` (or a run of them) matches within one
+ * path component and never a `/`, so each directory it stands for can be
+ * named and closed as a node (see policyDenyAncestors). Without it, as for a
+ * grant, `*` matches any run of characters.
  */
-function globToProfileRegex(expanded: string, subtree = false): string {
+function globToProfileRegex(expanded: string, { subtree = false, withinName = false } = {}): string {
   const literal = (part: string) => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
-  return escapePath(`^${expanded.split('*').map(literal).join('.*')}${subtree ? '(/|$)' : '$'}`);
+  const parts = withinName ? expanded.split(/\*+/) : expanded.split('*');
+  return escapePath(`^${parts.map(literal).join(withinName ? '[^/]*' : '.*')}${subtree ? '(/|$)' : '$'}`);
 }
 
 /**
@@ -254,36 +259,52 @@ function policyDenySpellings(entry: string): { spellings: string[]; glob: boolea
  * it, in each of its spellings (see policyDenySpellings). seatbelt matches
  * the real path, and /tmp, /etc and /var are symlinks into /private, so a
  * deny of /etc/ssl/private written alone held nothing against a grant of
- * /private/etc. A `*` entry is a (regex ...); written as a subpath it named a
- * file called "*.pem", which nothing is.
+ * /private/etc. A `*` entry is a (regex ...), its `*` matching within one
+ * name; written as a subpath it named a file called "*.pem", which nothing is.
  */
 export function policyDenyFilters(entry: string): string[] {
   const { spellings, glob } = policyDenySpellings(entry);
   return spellings.map((spelling) =>
-    glob ? `(regex "${globToProfileRegex(spelling, true)}")` : `(subpath "${escapePath(spelling)}")`
+    glob
+      ? `(regex "${globToProfileRegex(spelling, { subtree: true, withinName: true })}")`
+      : `(subpath "${escapePath(spelling)}")`
   );
 }
 
 /**
  * The directories above what a policy deny covers, in each of its spellings,
- * up to but not including /, as (literal ...) filters for a write deny. The
- * deny matches paths, so a job granted write on one of these could rename it
- * and read the denied path under the new name: out/a to out/b for a deny of
- * out/a/secret, out/g to out/h for out/g/*.pem. For a `*` entry these are the
- * directory before the first `*` and those above it; a directory the `*`
- * stands for is known only once a path matches, so it is not covered. Nodes,
- * not subtrees: what is in them stays as granted. Those not there yet too,
- * as for the app's directories, where a link planted now would carry the
+ * up to but not including /, as filters for a write deny. The deny matches
+ * paths, so a job granted write on one of these could rename it and read the
+ * denied path under the new name: out/a to out/b for a deny of out/a/secret,
+ * out/g to out/h for out/g/*.pem, out/secA to out/z for a key in out/sec*.
+ * The directories before the first `*` are (literal ...) filters. From the
+ * first `*` on, every component with a `*` and every directory between them
+ * and the denied name is an anchored (regex ...) matching each name it could
+ * be: a job can neither rename one nor create or move a directory in under a
+ * name that matches.
+ * Nodes, not subtrees: what is in them stays as granted. Those not there yet
+ * too, as for the app's directories, where a link planted now would carry the
  * denied path wherever it points.
  */
 export function policyDenyAncestors(entry: string): string[] {
   const { spellings, glob } = policyDenySpellings(entry);
   const nodes = new Set<string>();
+  const patterns = new Set<string>();
   for (const spelling of spellings) {
     const first = glob ? spelling.slice(0, spelling.lastIndexOf('/', spelling.indexOf('*'))) || '/' : path.dirname(spelling);
     for (let node = first; node !== path.dirname(node); node = path.dirname(node)) nodes.add(node);
+    if (!glob) continue;
+    const parts = spelling.split('/');
+    for (let i = parts.findIndex((part) => part.includes('*')); i < parts.length; i++) {
+      // A denied name with no `*` is a node of the deny itself, not above it.
+      if (i === parts.length - 1 && !parts[i].includes('*')) break;
+      patterns.add(globToProfileRegex(parts.slice(0, i + 1).join('/'), { withinName: true }));
+    }
   }
-  return [...nodes].map((node) => `(literal "${escapePath(node)}")`);
+  return [
+    ...[...nodes].map((node) => `(literal "${escapePath(node)}")`),
+    ...[...patterns].map((pattern) => `(regex "${pattern}")`),
+  ];
 }
 
 // Note: macOS sandbox-exec does NOT support hostname-based network filtering.

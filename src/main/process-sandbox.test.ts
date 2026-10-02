@@ -1261,7 +1261,6 @@ describe('Process Sandbox', () => {
       });
       expect(readable(profile, '/opt/out/server.pem')).toBe(false);
       expect(writable(profile, '/opt/out/server.pem')).toBe(false);
-      expect(readable(profile, '/opt/out/nested/client.pem')).toBe(false);
       expect(readable(profile, '/opt/out/keys-prod/id')).toBe(false);
       // What lies beneath a match too, as beneath a deny with no *.
       expect(readable(profile, '/opt/out/bundle.pem/key')).toBe(false);
@@ -1269,7 +1268,39 @@ describe('Process Sandbox', () => {
       expect(readable(profile, '/opt/out/serverXpem')).toBe(true);
       expect(writable(profile, '/opt/out/server.pem.txt')).toBe(true);
       expect(readable(profile, '/opt/out/keys')).toBe(true);
+      // Within one name: * never spans a /.
+      expect(readable(profile, '/opt/out/nested/client.pem')).toBe(true);
       expect(profile).not.toContain('(subpath "/opt/out/*.pem")');
+    });
+
+    it('closes the directories a wildcard in a deny stands for, so renaming one cannot carry it away', () => {
+      // Granted /opt/out, a job could rename out/secA to out/z and read
+      // out/z/key, or make out/secB and move the key's twin in. The nodes a
+      // wildcard component matches are closed to writes by an anchored
+      // pattern, as the literal directories above the first * are.
+      const profile = profileWith({
+        filesystemPolicy: {
+          level: 'strict',
+          read: ['/opt/out', '/opt/deep'],
+          write: ['/opt/out', '/opt/deep'],
+          deny: ['/opt/out/sec*/key', '/opt/deep/*/mid/k*'],
+        },
+      });
+      const nodes = profile.slice(profile.lastIndexOf('(deny file-write*'));
+      expect(nodes).toContain('(regex "^/opt/out/sec[^/]*$")');
+      expect(nodes).toContain('(literal "/opt/out")');
+      for (const node of ['/opt/out', '/opt', '/opt/out/secA', '/opt/out/sec', '/opt/deep/x', '/opt/deep/x/mid', '/opt/deep/x/mid/kA']) {
+        expect(writable(profile, node)).toBe(false);
+      }
+      expect(readable(profile, '/opt/out/secA/key')).toBe(false);
+      expect(writable(profile, '/opt/out/secA/key')).toBe(false);
+      // Nodes, not what is in them: the grant still writes beside the key,
+      // and names the wildcard does not match.
+      expect(writable(profile, '/opt/out/secA/build.o')).toBe(true);
+      expect(writable(profile, '/opt/out/plainB')).toBe(true);
+      expect(writable(profile, '/opt/out/plainB/secC')).toBe(true);
+      expect(writable(profile, '/opt/deep/x/other')).toBe(true);
+      expect(readable(profile, '/opt/out/secA/other.txt')).toBe(true);
     });
 
     it('denies a path reached through a symlink by its real path too', () => {
