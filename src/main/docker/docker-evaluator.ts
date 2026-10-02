@@ -148,7 +148,11 @@ const hints = {
     `docker:\n  run:\n    mounts:\n      - path: ${yamlString(relative)}\n        mode: ${mode}`,
   network: (mode: string) => `docker:\n  run:\n    network: ${yamlString(mode)}`,
   registry: (registry: string) => `docker:\n  pull:\n    registries:\n      - ${registry}`,
-  build: 'docker:\n  build:\n    context: "./"',
+  // A tagged build's hint names its tags too, so one --updaterc pass writes
+  // a policy that permits it rather than one that is refused for the tag.
+  build: (tags: string[]) =>
+    'docker:\n  build:\n    context: "./"' +
+    (tags.length ? `\n    tags:${tags.map((tag) => `\n      - ${yamlString(tag)}`).join('')}` : ''),
   buildTag: (tag: string) => `docker:\n  build:\n    tags:\n      - ${yamlString(tag)}`,
   privileged: 'docker:\n  privileged: true',
   network_declaration: (name: string, internal: boolean) =>
@@ -996,6 +1000,37 @@ function repositoryOf(normalized: string): string {
   return colon > name.lastIndexOf('/') ? name.slice(0, colon) : name;
 }
 
+/** The repositories run.images names, lowercased, as globs a tag's repository is matched against. */
+const runRepositoriesOf = (policy: DockerPolicy): string[] =>
+  (policy.run?.images ?? []).map((image) => repositoryOf(normalizeImage(image)).toLowerCase());
+
+/** Why a build tag is refused whatever build.tags says, or undefined when a build.tags entry could permit it. */
+function unpermittableTag(tag: string, runRepositories: string[]): string | undefined {
+  const shown = asciiEscaped(tag.slice(0, 256));
+  if (tag === '' || tag.includes('@')) {
+    return `build tag "${shown}" is not a name and tag; a build can be tagged only name[:tag]`;
+  }
+  if (carriesRegistryHost(tag)) {
+    return `build tag "${shown}" names a registry host; a build may tag its image only with a local name, ` +
+      'which no policy line can widen';
+  }
+  const repository = repositoryOf(normalizeImage(tag)).toLowerCase();
+  if (runRepositories.some((declaredRepository) => globMatches(declaredRepository, repository))) {
+    return `build tag "${shown}" names an image the repository docker policy runs (run.images); ` +
+      'a build may not replace it, whatever build.tags declares';
+  }
+  // Held to distribution/reference's grammar, as a pull's name is, so that
+  // a tag is matched against build.tags only in the spelling the daemon
+  // would give it.
+  const { remainder } = splitRegistry(tag);
+  const colon = remainder.lastIndexOf(':');
+  const hasTag = colon > remainder.lastIndexOf('/');
+  if (!REPOSITORY_PATH.test(hasTag ? remainder.slice(0, colon) : remainder) || (hasTag && !TAG.test(remainder.slice(colon + 1)))) {
+    return `build tag "${shown}" is not a name and tag; a build can be tagged only name[:tag]`;
+  }
+  return undefined;
+}
+
 /**
  * Judge every tag a build asks for (`t`, which repeats for `-t a -t b`).
  *
@@ -1023,37 +1058,13 @@ function judgeBuildTags(req: DockerRequest, policy: DockerPolicy): DockerVerdict
     return deny(`build parameter "${misspelled}" is not read as a tag by every daemon; spell it "t"`);
   }
   const declared = policy.build?.tags ?? [];
-  const runRepositories = (policy.run?.images ?? []).map((image) => repositoryOf(normalizeImage(image)).toLowerCase());
+  const runRepositories = runRepositoriesOf(policy);
   for (const tag of req.queryLists.t ?? []) {
-    const shown = asciiEscaped(tag.slice(0, 256));
-    if (tag === '' || tag.includes('@')) {
-      return deny(`build tag "${shown}" is not a name and tag; a build can be tagged only name[:tag]`);
-    }
-    if (carriesRegistryHost(tag)) {
+    const refused = unpermittableTag(tag, runRepositories);
+    if (refused !== undefined) return deny(refused);
+    if (!declared.some((entry) => globMatches(normalizeImage(entry), normalizeImage(tag)))) {
       return deny(
-        `build tag "${shown}" names a registry host; a build may tag its image only with a local name, ` +
-          'which no policy line can widen'
-      );
-    }
-    const wanted = normalizeImage(tag);
-    const repository = repositoryOf(wanted).toLowerCase();
-    if (runRepositories.some((declaredRepository) => globMatches(declaredRepository, repository))) {
-      return deny(
-        `build tag "${shown}" names an image the repository docker policy runs (run.images); ` +
-          'a build may not replace it, whatever build.tags declares'
-      );
-    }
-    // Held to distribution/reference's grammar, as a pull's name is, so that
-    // a tag is matched below only in the spelling the daemon would give it.
-    const { remainder } = splitRegistry(tag);
-    const colon = remainder.lastIndexOf(':');
-    const hasTag = colon > remainder.lastIndexOf('/');
-    if (!REPOSITORY_PATH.test(hasTag ? remainder.slice(0, colon) : remainder) || (hasTag && !TAG.test(remainder.slice(colon + 1)))) {
-      return deny(`build tag "${shown}" is not a name and tag; a build can be tagged only name[:tag]`);
-    }
-    if (!declared.some((entry) => globMatches(normalizeImage(entry), wanted))) {
-      return deny(
-        `build tag "${shown}" is not declared in the repository docker policy (build.tags)`,
+        `build tag "${asciiEscaped(tag.slice(0, 256))}" is not declared in the repository docker policy (build.tags)`,
         hints.buildTag(tag)
       );
     }
@@ -1062,7 +1073,13 @@ function judgeBuildTags(req: DockerRequest, policy: DockerPolicy): DockerVerdict
 }
 
 function evaluateBuild(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
-  if (!policy.build) return deny('the repository docker policy declares no build action', hints.build);
+  if (!policy.build) {
+    // The hint names each tag a build.tags entry could permit, so that the
+    // policy it writes does not refuse the same build again for its tags.
+    const runRepositories = runRepositoriesOf(policy);
+    const tags = [...new Set(req.queryLists.t ?? [])].filter((tag) => unpermittableTag(tag, runRepositories) === undefined);
+    return deny('the repository docker policy declares no build action', hints.build(tags));
+  }
   // The Engine API carries the context as a tar the client assembled from
   // inside its sandbox. A remote context would have the daemon fetch it
   // itself - from the network, or from its own filesystem - which is the

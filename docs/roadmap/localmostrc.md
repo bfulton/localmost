@@ -407,7 +407,13 @@ policy line for them:
 So an image a job builds cannot also be one it runs by name: declaring it in
 `run.images` makes the build's tag refused. A build with no tag needs no entry,
 and `t` spelled in any other case (`T=`) is refused, since one daemon ignores
-it and another reads it as a tag.
+it and another reads it as a tag. Validation also refuses an entry outside
+the reference grammar, reading each `*` as a letter - an uppercase name
+(`MyApp:*`, written `myapp:*`), a space, a non-ASCII character - since it
+would be listed for approval and match no tag the daemon accepts. A tagged
+build under a policy with no `build` action is denied with a hint that names
+its tags as well as the context, so one `--updaterc` pass writes a policy that
+permits it.
 
 A small baseline needs no declaration: `/_ping`, `/version`, `/info`, and reads
 about the job's own containers. Every client needs them to start, and none

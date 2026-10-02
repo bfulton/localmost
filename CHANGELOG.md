@@ -21,10 +21,10 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
 - **Opt-in container work through a filtering Docker socket, in a Linux VM
   per job**: an approved `.localmostrc` may declare the `pull`, `run` and
   `build` actions a job needs, with the registries, images, workspace mounts
-  (`ro`/`rw`), network mode and build context each covers. The job is never
-  handed a daemon socket: each worker gets a socket localmost owns, and only
-  declared requests are forwarded, to a Linux VM of that job's own, which
-  localmost boots at the first Docker request, beyond `/_ping`, `/version`
+  (`ro`/`rw`), network mode, build context and build tags each covers. The job
+  is never handed a daemon socket: each worker gets a socket localmost owns,
+  and only declared requests are forwarded, to a Linux VM of that job's own,
+  which localmost boots at the first Docker request, beyond `/_ping`, `/version`
   and `/info`, of a job whose policy has a `docker:` section, so a job that
   never runs `docker` has no VM
   (or, with the opt-in `dockerVm.prewarm`, as a spare when an idle worker is

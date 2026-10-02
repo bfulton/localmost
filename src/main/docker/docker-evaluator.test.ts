@@ -752,6 +752,23 @@ describe('build tags', () => {
     expect(v.policyHint).toBe('docker:\n  build:\n    tags:\n      - "app"');
   });
 
+  it('names the tags in the hint for a tagged build under a policy with no build action, so one pass permits it', () => {
+    const noBuild: DockerPolicy = { pull: { registries: ['docker.io'] }, run: { images: ['postgres:16'] } };
+    const qs = '?t=myapp%3Aci&t=tools%2Flint';
+    const v = build(qs, noBuild);
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/no build action/);
+    const hinted = parseDockerPolicyHint(v.policyHint ?? '');
+    expect(hinted).toEqual({ build: { context: './', tags: ['myapp:ci', 'tools/lint'] } });
+    expect(build(qs, mergeDockerPolicy(noBuild, hinted) ?? {}).allowed).toBe(true);
+
+    // A tag no policy line could permit is left out, as are ones outside the
+    // grammar; an untagged build is hinted as before.
+    const refused = build('?t=myapp%3Aci&t=postgres%3A16&t=ghcr.io%2Fx%2Fy&t=Bad%20Name', noBuild);
+    expect(parseDockerPolicyHint(refused.policyHint ?? '')).toEqual({ build: { context: './', tags: ['myapp:ci'] } });
+    expect(build('', noBuild).policyHint).toBe('docker:\n  build:\n    context: "./"');
+  });
+
   it('refuses a tag naming a run.images entry, however it is spelled, even when build.tags matches it', () => {
     const wide: DockerPolicy = { ...p, build: { tags: ['*:*', '*/*:*', '*'] } };
     for (const qs of [
