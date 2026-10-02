@@ -510,6 +510,7 @@ describe('pauseForResource', () => {
   it("stops the workers at once when set to 'stop'", async () => {
     startRunner();
     runner.isRunning.mockReturnValue(true);
+    resourceMonitor.shouldPause.mockReturnValue(true);
 
     await pauseForResource('Video call detected', 'stop');
 
@@ -520,15 +521,74 @@ describe('pauseForResource', () => {
 
   it("leaves an idle pool started when set to 'stop'", async () => {
     startRunner();
+    resourceMonitor.shouldPause.mockReturnValue(true);
 
     await pauseForResource('Video call detected', 'stop');
 
     expect(runner.stop).not.toHaveBeenCalled();
   });
 
+  it('does nothing when a resume queued ahead of it overrode its condition', async () => {
+    // The pause runs after whatever is ahead of it. A user resume there
+    // overrode the condition that queued it, so the monitor no longer
+    // paused and would send no should-resume - and the pause went on to set
+    // the flag and stop the heartbeat. The tray said paused, canAcceptJob
+    // took jobs, and it stayed that way until the user resumed again.
+    startRunner();
+    const clear = deferred();
+    heartbeat.clear.mockImplementationOnce(() => clear.promise);
+    const paused = pauseRunner();
+    const resumed = resumeRunner();
+    // A condition begins while those wait on GitHub.
+    resourceMonitor.shouldPause.mockReturnValue(true);
+    const resourcePaused = pauseForResource('Battery at 20%', 'finish');
+    clear.release();
+
+    expect(await paused).toBe('paused');
+    expect(await resumed).toBe('resumed');
+    await resourcePaused;
+
+    expect(resourceMonitor.overrideUntilClear).toHaveBeenCalledTimes(1);
+    expect(resourceMonitor.shouldPause()).toBe(false);
+    expect(selectEffectivePauseState(getSnapshot()!)).toEqual({ isPaused: false, reason: null });
+    expect(canAcceptJob({ resourceMonitor, runnerManager: runner })).toBe(true);
+    // The resume's heartbeat is the last word.
+    expect(heartbeat.stop).toHaveBeenCalledTimes(1);
+    expect(heartbeat.start).toHaveBeenCalledTimes(1);
+  });
+
+  it('does nothing when a resume starting the pool overrode its condition', async () => {
+    // As above, with the resume waiting on initialize() after a 'stop'
+    // pause left the pool down.
+    startRunner();
+    setUserPaused(true);
+    let initialized = false;
+    runner.isInitialized.mockImplementation(() => initialized);
+    const init = deferred();
+    runner.initialize.mockImplementationOnce(async () => {
+      await init.promise;
+      initialized = true;
+    });
+
+    const resumed = resumeRunner();
+    await Promise.resolve();
+    resourceMonitor.shouldPause.mockReturnValue(true);
+    const resourcePaused = pauseForResource('Video call detected', 'stop');
+    init.release();
+
+    expect(await resumed).toBe('resumed');
+    await resourcePaused;
+
+    expect(resourceMonitor.shouldPause()).toBe(false);
+    expect(isResourcePaused()).toBe(false);
+    expect(canAcceptJob({ resourceMonitor, runnerManager: runner })).toBe(true);
+    expect(heartbeat.stop).not.toHaveBeenCalled();
+  });
+
   it('leaves a runner the user paused as it is', async () => {
     startRunner();
     runner.isRunning.mockReturnValue(true);
+    resourceMonitor.shouldPause.mockReturnValue(true);
     await pauseRunner();
     jest.clearAllMocks();
 
@@ -543,8 +603,10 @@ describe('pauseForResource', () => {
 describe('resumeForResource', () => {
   it('lifts the pause, starts the pool a stop left down, and restarts the heartbeat', async () => {
     startRunner();
+    resourceMonitor.shouldPause.mockReturnValue(true);
     await pauseForResource('Battery at 20%', 'stop');
     runner.isInitialized.mockReturnValue(false);
+    resourceMonitor.shouldPause.mockReturnValue(false);
 
     await resumeForResource();
 
@@ -567,10 +629,35 @@ describe('resumeForResource', () => {
     expect(runner.initialize).not.toHaveBeenCalled();
   });
 
+  it('does nothing when the condition came back before it ran', async () => {
+    // The pause that came back is queued behind it. Lifting the pause and
+    // starting the heartbeat, for that pause to stop it again, routes a
+    // workflow or two here in between.
+    startRunner();
+    const clear = deferred();
+    heartbeat.clear.mockImplementationOnce(() => clear.promise);
+    resourceMonitor.shouldPause.mockReturnValue(true);
+    const paused = pauseForResource('Battery at 20%', 'finish');
+    // While that waits on GitHub the condition clears, then comes back.
+    resourceMonitor.shouldPause.mockReturnValue(false);
+    const resumed = resumeForResource();
+    resourceMonitor.shouldPause.mockReturnValue(true);
+    const pausedAgain = pauseForResource('Battery at 18%', 'finish');
+    clear.release();
+    await paused;
+    await resumed;
+    await pausedAgain;
+
+    expect(selectEffectivePauseState(getSnapshot()!)).toEqual({ isPaused: true, reason: 'Battery at 18%' });
+    expect(heartbeat.start).not.toHaveBeenCalled();
+  });
+
   it('leaves a runner the user paused paused', async () => {
     startRunner();
+    resourceMonitor.shouldPause.mockReturnValue(true);
     await pauseForResource('Battery at 20%', 'finish');
     await pauseRunner();
+    resourceMonitor.shouldPause.mockReturnValue(false);
     jest.clearAllMocks();
 
     await resumeForResource();

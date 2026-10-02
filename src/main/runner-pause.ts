@@ -169,12 +169,18 @@ export const pauseRunner = (): Promise<PauseOutcome> => oneAtATime(async () => {
  * workflows here. New jobs are held back by canAcceptJob, which asks the
  * monitor. The user's pause outranks this one: a runner they paused is left
  * as it is, and they decide when it resumes.
+ *
+ * It runs after whatever pause or resume is ahead of it, so it goes by what
+ * the monitor says when it runs, not when it was queued. A user resume
+ * ahead of it overrode the condition; pausing anyway left the runner shown
+ * paused, with no heartbeat, while canAcceptJob took jobs - and the monitor,
+ * no longer paused, would send no should-resume to undo it.
  */
 export const pauseForResource = (
   reason: string,
   runningJobs: ResourcePauseConfig['runningJobs']
 ): Promise<void> => oneAtATime(async () => {
-  if (isUserPaused()) return;
+  if (isUserPaused() || !getResourceMonitor()?.shouldPause()) return;
 
   getLogger()?.info(`Resource pause triggered: ${reason}`);
   // The state machine updates the tray and renderer through its subscription.
@@ -200,9 +206,11 @@ export const pauseForResource = (
 
 /**
  * The resource condition cleared: take jobs again, unless the user paused.
+ * Like the pause, it goes by the monitor when it runs: a condition that came
+ * back meanwhile has its pause queued behind this.
  */
 export const resumeForResource = (): Promise<void> => oneAtATime(async () => {
-  if (isUserPaused()) return;
+  if (isUserPaused() || getResourceMonitor()?.shouldPause()) return;
 
   getLogger()?.info('Resource pause cleared - resuming runner');
   setResourcePaused(false);
