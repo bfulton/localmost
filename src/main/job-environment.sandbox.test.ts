@@ -1,6 +1,7 @@
 /**
  * What localmost adds to a job's environment, through seatbelt: a temp
- * directory of the job's own in the per-user temp directory, for Foundation.
+ * directory of the job's own in the per-user temp directory, for Foundation,
+ * and the swift shim that turns SwiftPM's own sandbox off.
  *
  * The unit tests assert the variables a worker is given and the rules its
  * profile carries; they cannot show that macOS honours the one and seatbelt
@@ -28,6 +29,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { generateSandboxProfile, RunnerProfileOptions } from './process-sandbox';
 import { createJobTempDir, removeJobTempDir, userTempDir } from './job-temp';
+import { writeJobBin } from './job-shims';
 
 const isMacOS = process.platform === 'darwin';
 
@@ -47,10 +49,10 @@ const ATOMIC_WRITE_SOURCE = [
   '',
 ].join('\n');
 
-/** Run a program, under the profile at `profilePath` when given one. */
-const run = (argv: string[], env: NodeJS.ProcessEnv, profilePath?: string, timeout = 30_000) => {
+/** Run a program, under the profile at `profilePath` when given one, from `cwd` (the scratch directory by default). */
+const run = (argv: string[], env: NodeJS.ProcessEnv, profilePath?: string, timeout = 30_000, cwd = os.tmpdir()) => {
   const [command, ...args] = profilePath ? ['/usr/bin/sandbox-exec', '-f', profilePath, ...argv] : argv;
-  const result = spawnSync(command, args, { encoding: 'utf-8', timeout, env });
+  const result = spawnSync(command, args, { encoding: 'utf-8', timeout, env, cwd });
   return { ok: result.status === 0, stdout: (result.stdout ?? '').trim(), stderr: result.stderr ?? '' };
 };
 
@@ -139,6 +141,61 @@ if (!isMacOS) {
         expect(fs.readFileSync(out, 'utf-8')).toBe('hello');
       }, SWIFT_TIMEOUT_MS);
 
+      describe('with the swift shim', () => {
+        let pkg: string;
+        let bin: string;
+
+        beforeAll(() => {
+          // A package under a name never built before, so SwiftPM has no
+          // cached manifest for it and must compile Package.swift - the step
+          // that runs under SwiftPM's own sandbox.
+          pkg = path.join(sandboxDir, '_work', `pkg${randomBytes(4).toString('hex')}`);
+          fs.mkdirSync(path.join(pkg, 'Sources', 'hello'), { recursive: true });
+          fs.writeFileSync(
+            path.join(pkg, 'Package.swift'),
+            '// swift-tools-version:5.9\nimport PackageDescription\nlet package = Package(name: "hello", targets: [.executableTarget(name: "hello")])\n'
+          );
+          fs.writeFileSync(path.join(pkg, 'Sources', 'hello', 'main.swift'), 'print("hello")\n');
+          bin = writeJobBin(sandboxDir, { shims: true });
+        });
+
+        /** `swift <args>` in the package as a job runs it, the job's bin directory first on PATH or not. */
+        const swift = (args: string, withShims: boolean) => {
+          const profilePath = writeProfile({
+            tempSuffixDir: tempDir,
+            filesystemPolicy: { level: 'strict', read: ['/Applications/Xcode.app'], write: [] },
+          });
+          const env = {
+            ...baseEnv(),
+            PATH: withShims ? `${bin}:/usr/bin:/bin` : '/usr/bin:/bin',
+            DIRHELPER_USER_DIR_SUFFIX: path.basename(tempDir),
+            xcrun_db: path.join(jobTmp, 'xcrun_db'),
+            CLANG_MODULE_CACHE_PATH: path.join(jobTmp, 'clang-module-cache'),
+          };
+          return run(['/bin/sh', '-c', `swift ${args}`], env, profilePath, SWIFT_TIMEOUT_MS, pkg);
+        };
+
+        it('compiles a package manifest it has not compiled before, which fails without it', () => {
+          const without = swift('package describe', false);
+          expect(without.ok).toBe(false);
+          expect(without.stdout + without.stderr).toMatch(/sandbox_apply: Operation not permitted/);
+
+          const result = swift('package describe', true);
+          expect(result.stdout + result.stderr).not.toMatch(/sandbox_apply/);
+          expect(result).toMatchObject({ ok: true, stdout: expect.stringContaining('Name: hello') });
+        }, 2 * SWIFT_TIMEOUT_MS);
+
+        it('builds the package through to a linked executable', () => {
+          // The native build system: the default one in Swift 6.4, Swift Build,
+          // starts its link step with the per-user temp directory as its temp,
+          // which the profile does not grant (docs/roadmap/job-environment.md).
+          const result = swift('build --build-system native', true);
+          expect(result.stdout + result.stderr).not.toMatch(/sandbox_apply/);
+          expect(result).toMatchObject({ ok: true, stdout: expect.stringContaining('Build complete!') });
+          expect(fs.existsSync(path.join(pkg, '.build', 'debug', 'hello'))).toBe(true);
+        }, SWIFT_TIMEOUT_MS);
+      });
+
       it('can neither remove nor rename the directory itself', () => {
         const profilePath = writeProfile({ tempSuffixDir: tempDir });
         const env = { ...baseEnv(), DIRHELPER_USER_DIR_SUFFIX: path.basename(tempDir) };
@@ -163,6 +220,25 @@ if (!isMacOS) {
         timeout: SWIFT_TIMEOUT_MS,
         stdio: 'ignore',
       });
+    }, SWIFT_TIMEOUT_MS);
+
+    it("has its own bin directory first on PATH, whose swift shim lets SwiftPM compile a new manifest", () => {
+      const sandboxDir = path.dirname(fs.realpathSync(os.tmpdir()));
+      expect((process.env.PATH ?? '').split(':')[0]).toBe(path.join(sandboxDir, 'localmost', 'bin'));
+      const pkg = path.join(os.tmpdir(), `pkg${randomBytes(4).toString('hex')}`);
+      fs.mkdirSync(path.join(pkg, 'Sources', 'hello'), { recursive: true });
+      try {
+        fs.writeFileSync(
+          path.join(pkg, 'Package.swift'),
+          '// swift-tools-version:5.9\nimport PackageDescription\nlet package = Package(name: "hello", targets: [.executableTarget(name: "hello")])\n'
+        );
+        fs.writeFileSync(path.join(pkg, 'Sources', 'hello', 'main.swift'), 'print("hello")\n');
+        const result = run(['/bin/sh', '-c', 'swift package describe'], process.env, undefined, SWIFT_TIMEOUT_MS, pkg);
+        expect(result.stdout + result.stderr).not.toMatch(/sandbox_apply/);
+        expect(result).toMatchObject({ ok: true, stdout: expect.stringContaining('Name: hello') });
+      } finally {
+        fs.rmSync(pkg, { recursive: true, force: true });
+      }
     }, SWIFT_TIMEOUT_MS);
 
     it('has a temp directory of its own, where Foundation stages its atomic writes', () => {

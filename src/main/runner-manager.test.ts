@@ -2160,8 +2160,9 @@ describe('RunnerManager', () => {
         expect(env.SSH_AUTH_SOCK).toBeUndefined();
         expect(env.NODE_OPTIONS).toBeUndefined();
         // What the runner and a shell need to know who and where they are -
-        // with the bundled docker CLI's directory first on PATH.
-        expect(env.PATH).toBe(`${path.dirname(dockerCliPath())}:${process.env.PATH}`);
+        // with the job's own bin directory, the bundled docker CLI and the
+        // tool shims, first on PATH.
+        expect(env.PATH).toBe(`/Users/test/.localmost/runner/sandbox/1/localmost/bin:${process.env.PATH}`);
         // HOME is the job's own, not the app's.
         expect(env.HOME).toBe('/Users/test/.localmost/runner/sandbox/1/home');
         // And what the app sets for the runner itself.
@@ -2181,7 +2182,46 @@ describe('RunnerManager', () => {
         process.env.PATH = saved;
       }
       const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
-      expect(env.PATH).toBe(`${path.dirname(dockerCliPath())}:/usr/bin:/bin:/usr/sbin:/sbin`);
+      expect(env.PATH).toBe('/Users/test/.localmost/runner/sandbox/1/localmost/bin:/usr/bin:/bin:/usr/sbin:/sbin');
+    });
+
+    describe('the swift and xcodebuild shims in its bin directory', () => {
+      const bin = '/Users/test/.localmost/runner/sandbox/1/localmost/bin';
+      const shimsWritten = async (toolShims: boolean) => {
+        const manager = new RunnerManager({
+          onLog: mockOnLog,
+          onStatusChange: mockOnStatusChange,
+          onJobHistoryUpdate: mockOnJobHistoryUpdate,
+          getJobEnvironmentConfig: () => ({ toolShims, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true }),
+        });
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+        await new RunnerManagerTestHelper(manager).spawnForJob();
+        const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+        const written = (fs.writeFileSync as jest.Mock).mock.calls
+          .filter(([file]) => path.dirname(String(file)) === bin)
+          .map(([file, , options]) => [path.basename(String(file)), options]);
+        return { env, written };
+      };
+
+      it('are there by default', async () => {
+        // SwiftPM and Xcode run each package manifest under a sandbox of their
+        // own, which macOS refuses to start inside the job's; the shims add
+        // the argument that turns it off.
+        const { env, written } = await shimsWritten(true);
+        expect(written).toEqual([
+          ['swift', { flag: 'wx', mode: 0o755 }],
+          ['xcodebuild', { flag: 'wx', mode: 0o755 }],
+        ]);
+        expect(env.PATH!.split(':')[0]).toBe(bin);
+      });
+
+      it('are not with the preference off, and the docker CLI is still first on PATH', async () => {
+        const { env, written } = await shimsWritten(false);
+        expect(written).toEqual([]);
+        expect(env.PATH!.split(':')[0]).toBe(bin);
+        expect(fs.symlinkSync).toHaveBeenCalledWith(dockerCliPath(), `${bin}/docker`);
+      });
     });
 
     it("applies the repository's approved env policy", async () => {
@@ -3086,7 +3126,9 @@ describe('RunnerManager', () => {
       const [, , options] = mockSpawnSandboxed.mock.calls[mockSpawnSandboxed.mock.calls.length - 1];
       const env = options!.env as NodeJS.ProcessEnv;
       expect(env.DOCKER_CONFIG).toBe('/Users/test/.localmost/runner/sandbox/1/.docker');
-      expect(env.PATH!.split(':')[0]).toBe('/Applications/localmost.app/Contents/Resources/docker-cli');
+      // First on PATH, the job's bin directory, where the CLI is linked.
+      expect(env.PATH!.split(':')[0]).toBe('/Users/test/.localmost/runner/sandbox/1/localmost/bin');
+      expect(fs.symlinkSync).toHaveBeenCalledWith(cli, '/Users/test/.localmost/runner/sandbox/1/localmost/bin/docker');
       expect(env.DOCKER_HOST).toBe('unix:///Users/test/.localmost/runner/sandbox/1/docker.sock');
       expect(env.DOCKER_BUILDKIT).toBe('0');
       expect(options).toMatchObject({

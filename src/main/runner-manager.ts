@@ -34,6 +34,7 @@ import {
 } from './config';
 import { createMissingGrantedDirs, gitSshCommand, JOB_HOME_DIR_NAME, prepareJobHome } from '../shared/job-home';
 import { createJobTempDir, jobTempName, removeJobTempDir, userTempDir } from './job-temp';
+import { writeJobBin } from './job-shims';
 import { normalizeFilterConfig, isUserAllowed, areAllUsersAllowed, parseRepository } from './runner/user-filter';
 
 /**
@@ -319,7 +320,7 @@ interface RunnerManagerOptions {
    * gets a directory of its own. userTempDir() by default.
    */
   getUserTempDir?: () => string | undefined;
-  /** The bundled docker CLI, first on the job's PATH. dockerCliPath() by default. */
+  /** The bundled docker CLI, linked in the job's bin directory, first on its PATH. dockerCliPath() by default. */
   dockerCli?: string;
   /** The Docker VM helper, which the job's profile refuses to run. helperPath() by default. */
   vmHelper?: string;
@@ -1502,11 +1503,24 @@ export class RunnerManager {
       // being a property of any request the filter can see, so `build:` policy
       // would describe an endpoint a real `docker build` never calls.
       env.DOCKER_BUILDKIT = '0';
-      // The bundled CLI, first on PATH, reading an empty config of the job's
-      // own rather than the operator's ~/.docker.
+      // The bundled CLI, reading an empty config of the job's own rather
+      // than the operator's ~/.docker.
       env.DOCKER_CONFIG = path.join(sandboxDir, DOCKER_CONFIG_DIR_NAME);
-      // With no PATH of its own, the job still gets the system's after it.
-      env.PATH = `${path.dirname(this.dockerCli)}:${env.PATH || DEFAULT_SYSTEM_PATH}`;
+      // First on PATH, the job's own bin directory: the bundled CLI, linked,
+      // and the swift and xcodebuild shims that turn SwiftPM's and Xcode's
+      // own sandbox off, which macOS refuses to nest inside the job's (see
+      // job-shims.ts). Should it not be made, the CLI's own directory, as
+      // before. With no PATH of its own, the job still gets the system's
+      // after it.
+      const jobEnvironment = this.getJobEnvironmentConfig();
+      let binDir: string;
+      try {
+        binDir = writeJobBin(sandboxDir, { dockerCli: this.dockerCli, shims: jobEnvironment.toolShims });
+      } catch (err) {
+        this.log('warn', `No bin directory of its own for instance ${instanceNum}; its job has no swift or xcodebuild shims: ${(err as Error).message}`);
+        binDir = path.dirname(this.dockerCli);
+      }
+      env.PATH = `${binDir}:${env.PATH || DEFAULT_SYSTEM_PATH}`;
 
       // A home of the job's own: HOME is <sandbox>/home, empty, the job's to
       // write and gone with the sandbox, so tools look for their dotfiles
@@ -1516,7 +1530,6 @@ export class RunnerManager {
       // policy and the level grant under the real home is linked in at the
       // same path, so a tool finds it through HOME; the sandbox judges the
       // path a link resolves to, so the link reaches no more than the grant.
-      const jobEnvironment = this.getJobEnvironmentConfig();
       const jobHome = path.join(sandboxDir, JOB_HOME_DIR_NAME);
       const homeLog = (level: 'debug' | 'warn', message: string) => this.log(level, `[sandbox ${instanceNum}] ${message}`);
       if (jobEnvironment.createMissingGrantedDirs) {
