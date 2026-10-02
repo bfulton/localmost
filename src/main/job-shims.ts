@@ -23,10 +23,13 @@ export const JOB_BIN_DIR = path.join('localmost', 'bin');
 const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
 
 /**
- * The start of every shim: find the named tool on PATH, skipping the shim's
- * own directory wherever it is listed, and leave its path in $real, or fail
- * as a missing command does. PATH is split on ':' alone, with globbing off,
- * and an empty entry - the current directory - is skipped.
+ * The start of every shim: find the named tool on PATH, skipping the shim
+ * itself wherever PATH lists its directory, and leave its path in $real, or
+ * fail as a missing command does. The shim is known by the file, not by how
+ * PATH spells its directory: matched by spelling, a trailing slash or a
+ * route through `..` had it find itself and exec itself forever. PATH is
+ * split on ':' alone, with globbing off, and an empty entry - the current
+ * directory - is skipped.
  */
 const findReal = (binDir: string, tool: string): string[] => [
   '#!/bin/sh',
@@ -36,7 +39,7 @@ const findReal = (binDir: string, tool: string): string[] => [
   'old_ifs=$IFS',
   'IFS=:',
   'for dir in $PATH; do',
-  '  [ -n "$dir" ] && [ "$dir" != "$shim_dir" ] || continue',
+  `  [ -n "$dir" ] && ! [ "$dir/${tool}" -ef "$shim_dir/${tool}" ] || continue`,
   `  if [ -f "$dir/${tool}" ] && [ -x "$dir/${tool}" ]; then real="$dir/${tool}"; break; fi`,
   'done',
   'IFS=$old_ifs',
@@ -47,7 +50,9 @@ const findReal = (binDir: string, tool: string): string[] => [
 /**
  * `swift`: for build, test, run and package, `--disable-sandbox` right after
  * the subcommand - for package, that is where its own options go - unless
- * the job already gave it before a `--`. Everything else as it is.
+ * the job already gave it before a `--`. Everything else as it is, and so
+ * is `swift package --version`: package refuses --version after
+ * --disable-sandbox ("Unknown option"), where build, test and run take it.
  */
 export function swiftShim(binDir: string): string {
   return [
@@ -60,6 +65,7 @@ export function swiftShim(binDir: string): string {
     '    for arg in "$@"; do',
     '      [ "$arg" = "--" ] && break',
     '      [ "$arg" = "--disable-sandbox" ] && exec "$real" "$@"',
+    '      [ "$1" = package ] && [ "$arg" = "--version" ] && exec "$real" "$@"',
     '    done',
     '    sub=$1',
     '    shift',
@@ -72,8 +78,25 @@ export function swiftShim(binDir: string): string {
 }
 
 /**
- * `xcodebuild`: `-IDEPackageSupportDisableManifestSandbox=YES` at the end,
- * unless the job already set it either way.
+ * What makes an xcodebuild call one that resolves a project's packages, and
+ * so one that takes the setting: a build action, a query of the project, or
+ * a project, workspace, scheme or target named - a call with no action
+ * builds. A call with none of these, and one that makes an XCFramework, is
+ * left as it is: some modes refuse an argument they do not know, and
+ * `-create-xcframework` given the setting exits 70 with "invalid argument".
+ */
+const XCODEBUILD_RESOLVING_ARGS = [
+  'build', 'build-for-testing', 'test', 'test-without-building', 'archive', 'analyze',
+  'install', 'installsrc', 'clean', 'docbuild',
+  '-resolvePackageDependencies', '-list', '-showBuildSettings', '-showBuildSettingsForIndex',
+  '-showdestinations', '-showTestPlans',
+  '-project', '-workspace', '-scheme', '-target', '-alltargets',
+];
+
+/**
+ * `xcodebuild`: `-IDEPackageSupportDisableManifestSandbox=YES` at the end
+ * of a call that resolves packages (XCODEBUILD_RESOLVING_ARGS) or names
+ * nothing at all, unless the job already set it either way.
  */
 export function xcodebuildShim(binDir: string): string {
   return [
@@ -81,12 +104,16 @@ export function xcodebuildShim(binDir: string): string {
     '# localmost: Xcode\'s package manifest sandbox off. The job already runs under',
     '# one, and macOS refuses to start a sandbox inside another, so Xcode could not',
     '# resolve a package. Turn this off with jobEnvironment.toolShims: false.',
+    'resolves=',
+    '[ $# -eq 0 ] && resolves=1',
     'for arg in "$@"; do',
     '  case "$arg" in',
-    '    -IDEPackageSupportDisableManifestSandbox=*) exec "$real" "$@" ;;',
+    '    -IDEPackageSupportDisableManifestSandbox=*|-create-xcframework) exec "$real" "$@" ;;',
+    `    ${XCODEBUILD_RESOLVING_ARGS.join('|')}) resolves=1 ;;`,
     '  esac',
     'done',
-    'exec "$real" "$@" -IDEPackageSupportDisableManifestSandbox=YES',
+    '[ -n "$resolves" ] && exec "$real" "$@" -IDEPackageSupportDisableManifestSandbox=YES',
+    'exec "$real" "$@"',
     '',
   ].join('\n');
 }

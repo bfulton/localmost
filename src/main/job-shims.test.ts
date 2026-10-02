@@ -105,6 +105,28 @@ describe("a job's own bin directory", () => {
       expect(call(bin, 'swift', ['build'], [bin, bin, '', '/nonexistent', stubs]).argv).toEqual(['swift', 'build', '--disable-sandbox']);
     });
 
+    it('never takes itself for the next swift, however PATH spells its directory', () => {
+      // Matched by its spelling alone, a trailing slash or a route through
+      // .. had the shim find itself, and exec itself until the job timed out.
+      const bin = writeJobBin(sandbox, { dockerCli, shims: true });
+      const spellings = [`${bin}/`, `${bin}//`, path.join(bin, '..', 'bin') + '/.', `${path.dirname(bin)}/../localmost/bin`];
+      expect(call(bin, 'swift', ['build'], [bin, ...spellings, stubs]).argv).toEqual(['swift', 'build', '--disable-sandbox']);
+      const result = call(bin, 'swift', ['build'], [bin, ...spellings]);
+      expect([result.status, result.stderr]).toEqual([127, expect.stringContaining('swift: command not found')]);
+    });
+
+    it('passes swift package --version through: package takes no --version after --disable-sandbox', () => {
+      // `swift package --disable-sandbox --version` exits 64 with "Unknown
+      // option '--version'", wherever --version is; build, test and run take it.
+      const bin = writeJobBin(sandbox, { dockerCli, shims: true });
+      for (const args of [['package', '--version'], ['package', '--package-path', '.', '--version']]) {
+        expect(call(bin, 'swift', args)).toEqual({ status: 0, argv: ['swift', ...args], stderr: '' });
+      }
+      expect(call(bin, 'swift', ['package', 'resolve', '--', '--version']).argv).toEqual(
+        ['swift', 'package', '--disable-sandbox', 'resolve', '--', '--version']
+      );
+    });
+
     it('fails as a missing command does when there is no other swift on PATH', () => {
       const bin = writeJobBin(sandbox, { dockerCli, shims: true });
       const result = call(bin, 'swift', ['build'], [bin, '/nonexistent']);
@@ -119,6 +141,37 @@ describe("a job's own bin directory", () => {
       expect(call(bin, 'xcodebuild', ['-scheme', 'App', 'build']).argv).toEqual(
         ['xcodebuild', '-scheme', 'App', 'build', '-IDEPackageSupportDisableManifestSandbox=YES']
       );
+    });
+
+    it.each([
+      [[]],
+      [['-workspace', 'App.xcworkspace', '-scheme', 'App', '-destination', 'generic/platform=iOS']],
+      [['test', '-project', 'App.xcodeproj']],
+      [['archive', '-archivePath', 'build/App.xcarchive']],
+      [['analyze']],
+      [['build-for-testing']],
+      [['test-without-building']],
+      [['-resolvePackageDependencies']],
+      [['-list']],
+      [['-showBuildSettings', '-json']],
+      [['-showdestinations']],
+      [['-alltargets', 'clean']],
+    ])('adds it to xcodebuild %j, which resolves packages', (args) => {
+      const bin = writeJobBin(sandbox, { dockerCli, shims: true });
+      expect(call(bin, 'xcodebuild', args).argv).toEqual(['xcodebuild', ...args, '-IDEPackageSupportDisableManifestSandbox=YES']);
+    });
+
+    it.each([
+      // "error: invalid argument '-IDEPackageSupportDisableManifestSandbox=YES'", exit 70.
+      [['-create-xcframework', '-framework', 'build/A.framework', '-output', 'build/A.xcframework']],
+      [['-create-xcframework', '-library', 'test', '-output', 'build']],
+      [['-version']],
+      [['-showsdks', '-json']],
+      [['-exportArchive', '-archivePath', 'App.xcarchive', '-exportPath', 'out', '-exportOptionsPlist', 'o.plist']],
+      [['-checkFirstLaunchStatus']],
+    ])('passes xcodebuild %j through as it is: it resolves no package', (args) => {
+      const bin = writeJobBin(sandbox, { dockerCli, shims: true });
+      expect(call(bin, 'xcodebuild', args)).toEqual({ status: 0, argv: ['xcodebuild', ...args], stderr: '' });
     });
 
     it('leaves the setting alone when the job gives it, either way', () => {
