@@ -221,12 +221,23 @@ path a policy grants under your home, `read` or `write`, is linked into it at
 the same path - `~/.npm` as `<home>/.npm`, pointing at your `~/.npm` - so a
 tool that looks for it through `HOME` finds it, and the sandbox, which judges
 the path a link resolves to, lets it reach exactly what the grant does. A `*`
-in a granted path is matched against what is in your home when the job starts.
+in a granted path is matched against what is in your home when the job starts,
+and so is the rest: a path that is not there then is not linked, and its name
+is free for a tool to create in the job's home. A credential location is never
+linked, granted or not, and a granted directory that holds one - `~/.cache`
+with Hugging Face's token - is a directory of the job's own with a link to each
+of its other entries. Granting `~` itself links each entry of your home.
 Nothing else of your home is in the job's: its `.gitconfig` is the per-job git
 config, whatever the policy grants, so declaring `~/.gitconfig` no longer gives
-git your configuration. A directory a `write` grant names that does not exist
-yet is created before the job, empty (see [job-environment.md](job-environment.md)
-for this and what else a job's environment carries).
+git your configuration.
+
+A `write` grant under your home whose directories do not exist yet has them
+created before the job, empty, since the job is not granted their parents. The
+path the grant names is created too only when it says it is a directory, with
+a trailing `/` or `/**` - `~/.cache/my-tool/` - since a grant can name a file
+(`~/.python_history`), which the job creates itself. See
+[job-environment.md](job-environment.md) for this and what else a job's
+environment carries.
 
 ### Loopback
 

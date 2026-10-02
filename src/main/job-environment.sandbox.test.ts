@@ -18,7 +18,9 @@
  *                refuses a nested profile, so assert what that environment
  *                does.
  *
- * Neither mode skips. macOS only, because seatbelt is.
+ * Neither mode skips. macOS only, because seatbelt is. Constructed mode runs
+ * this Mac's own tools: Xcode's swift, and the JDK /usr/libexec/java_home
+ * finds, which a contributor's Mac needs installed - Xcode brings no Java.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';

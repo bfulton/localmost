@@ -579,6 +579,19 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
     `~/.gitconfig` - it copies `$HOME/.gitconfig`, now the per-job one - and
     Yarn 2+ no longer finds `~/.yarnrc.yml` through `HOME` (it still finds it
     walking up from a workspace under your home, and still cannot read it)
+  - Only what is there when the job starts is linked, and never a credential
+    location the floor denies, granted or not; a granted directory holding one
+    is a directory of the job's own with a link to each of its other entries,
+    so Hugging Face under a `~/.cache` grant and the Gradle wrapper under a
+    `~/.gradle` grant no longer find and fail on the denied token and
+    properties file. A grant of `~` links each entry of your home
+  - `GIT_SSH_COMMAND` points ssh at the job's home, and git gives it
+    precedence over `core.sshCommand`: a deploy key `actions/checkout` stores
+    there with `ssh-key` is not used by a later step's `git push` unless that
+    step runs `unset GIT_SSH_COMMAND` or sets `GIT_SSH_COMMAND` itself
+  - `localmost test` makes the steps' home new for each run: a `.home` or
+    `.tmp` the checkout commits at its top is no longer copied into the
+    workspace
 - A job's environment carries what its tools need to work in the sandbox, each
   of which can be turned off in the `jobEnvironment` section of `config.yaml`;
   all are on by default ([job-environment.md](docs/roadmap/job-environment.md)):
@@ -589,19 +602,28 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
     Swift 6.4's default build system still fails at its link step; `swift
     build --build-system native` works
   - `toolShims`: `swift` and `xcodebuild` shims first on the job's `PATH` that
-    add `--disable-sandbox` and `-IDEPackageSupportDisableManifestSandbox=YES`,
+    add `--disable-sandbox` (to `build`, `test`, `run` and `package`, but not
+    `swift package --version`) and `-IDEPackageSupportDisableManifestSandbox=YES`
+    (to an xcodebuild call that resolves packages, not `-create-xcframework`),
     since macOS will not nest SwiftPM's and Xcode's own sandbox in the job's,
     and a manifest they had not compiled before failed with "sandbox_apply:
-    Operation not permitted"
+    Operation not permitted". A tool called through `xcrun` or by its absolute
+    path bypasses them
   - `javaToolOptions`: `JAVA_TOOL_OPTIONS` with `java.io.tmpdir` in the job's
-    temp, `java.net.preferIPv4Stack` and the job's proxy and its credentials,
-    for a JVM that could not make a temp file or connect to its own loopback
-    server and ignored the proxy; a workflow's own `JAVA_TOOL_OPTIONS`
-    replaces it
-  - `createMissingGrantedDirs`: a directory a write grant names under your
-    home that does not exist yet - `~/.gradle` on a Mac where Gradle never ran
-    - is created before the job, empty, one level at a time, never through a
-    link
+    temp, `user.home` the job's home, `java.net.preferIPv4Stack` and the job's
+    proxy and its credentials, for a JVM that could not make a temp file or
+    connect to its own loopback server, looked in your home for Maven's and
+    Gradle's settings, and ignored the proxy; a workflow's own
+    `JAVA_TOOL_OPTIONS` replaces it. Every JVM prints it, proxy token
+    included, to the job's log; the token works only on this Mac's loopback,
+    for that job
+  - `createMissingGrantedDirs`: the missing directories above a path a write
+    grant names under your home, which the job cannot create, are created
+    before the job, empty, one level at a time, never through a link; the path
+    itself too when the grant ends in `/` or `/**`, or is a directory above a
+    credential the job cannot create either - `~/.gradle` on a Mac where Gradle
+    never ran. A grant without the trailing `/` may name a file the job
+    creates itself
 - The bundled `docker` CLI is linked in the job's own bin directory,
   `<sandbox>/localmost/bin`, first on its `PATH`, rather than its directory in
   the app bundle being put on `PATH`
