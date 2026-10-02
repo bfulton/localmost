@@ -1295,10 +1295,13 @@ describe('message routing', () => {
       const upstream = fixture.operations.filter(op => op.served === 'upstream');
       const local = fixture.operations.filter(op => op.served === 'local');
 
-      it('lists the operations of the runner version localmost installs', () => {
-        // Moving to another runner version means reading its source again:
-        // a request it adds would be refused here, and one it drops should
-        // stop being forwarded. This fails until that has been done.
+      it('lists the operations of the fallback runner version', () => {
+        // Moving the fallback version means reading its source again: a
+        // request it adds would be refused here, and one it drops should stop
+        // being forwarded. This fails until that has been done. It holds the
+        // list to the fallback only: by default localmost installs the newest
+        // runner release, which the fixture's alsoChecked records by hand, and
+        // a release that sends another request upstream has it refused.
         expect(fixture.runnerVersion).toBe(FALLBACK_RUNNER_VERSION);
         for (const op of fixture.operations) expect(op.source).toMatch(/^src\/\S+\.cs:\d/);
       });

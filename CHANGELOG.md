@@ -226,11 +226,13 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   runner's credentials and with the target's session id, so a job holding its
   worker's key could call whatever GitHub's broker answers as the runner,
   including through a spelling only upstream's router resolves
-  (`/x/..%2fmessage`). The list was read from the runner's source (2.336.0,
-  checked against 2.337.0), each request cited in
-  `test/fixtures/runner-broker-operations.json`, and a test fails when
-  localmost's fallback runner version moves past it. Each operation now goes
-  upstream under its own name rather than the spelling sent.
+  (`/x/..%2fmessage`). The list was read from the runner's source, each
+  request cited in `test/fixtures/runner-broker-operations.json`: from 2.336.0,
+  the fallback version, which a test pins the list to, and checked against
+  2.337.0, the newest release at the time. localmost installs the newest
+  release by default, so a later one that sends another request upstream has
+  it refused until the list is read again. Each operation now goes upstream
+  under its own name rather than the spelling sent.
 - The Docker filter refuses a request whose body has a key, at any depth, that
   is not plain ASCII, or whose query has such a parameter name. The daemon's Go
   decoder reads some other letters as ASCII ones: it took `HoſtConfig` (long s)

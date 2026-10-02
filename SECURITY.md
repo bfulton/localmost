@@ -173,11 +173,13 @@ only the requests the runner itself sends there: `POST completejob` and
 runner can send to its broker address (opening, polling and deleting a
 session, acknowledging a message, acquiring a job, and the worker's token
 endpoint) the broker answers itself, and any other method or path is refused
-with 403 and a log line naming it. The list was read from the source of
-runner 2.336.0, the version localmost falls back to, and checked against
-2.337.0; a test holds it to that fallback version, so moving to another means
-reading that version's requests again. A newer runner chosen in Settings that
-sent another request upstream would have it refused.
+with 403 and a log line naming it, whatever state the worker's session is in.
+localmost installs the newest runner
+release by default. The list was read from the source of runner 2.336.0, the
+version localmost falls back to, which a test holds it to, and checked against
+2.337.0, the newest release when it was written. A later release that sends
+another request upstream has it refused, failing closed, until the list is
+read again from that release's source.
 Those two operations must name that worker's job and no other: any request id
 one carries must be one delivered to that worker, and its plan and job ids
 those of the job details it acquired. An operation is recognised however its
