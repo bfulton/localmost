@@ -61,7 +61,7 @@ import {
 import { CliServer } from './cli-server';
 
 // Config and security
-import { loadConfig, DockerVmConfigSource, resolveResourcePauseConfig } from './config';
+import { loadConfig, DockerVmConfigSource } from './config';
 import { installSecurityHandlers } from './security';
 import { ensureAppDataDir, getAppDataDir } from './paths';
 
@@ -100,7 +100,7 @@ import { IPC_CHANNELS, SleepProtection, LogLevel, DEFAULT_POWER_CONFIG, DEFAULT_
 
 // Resource monitoring
 import { ResourceMonitor } from './resource-monitor';
-import { canAcceptJob, pauseForResource, resumeForResource, startHeartbeatUnlessPaused } from './runner-pause';
+import { canAcceptJob, startHeartbeatUnlessPaused, wireResourceMonitor } from './runner-pause';
 
 // State machine
 import {
@@ -556,20 +556,8 @@ app.whenReady().then(async () => {
   });
   setResourceMonitor(resourceMonitor);
 
-  // Handle resource-based pause/resume via state machine. The setting is
-  // read at each pause, so a change applies to the next one.
-  resourceMonitor.on('should-pause', (reason: string) => {
-    const { runningJobs } = resolveResourcePauseConfig(loadConfig().resourcePause, (message) => logger?.warn(message));
-    pauseForResource(reason, runningJobs).catch((err) => {
-      logger?.error(`Resource pause failed: ${(err as Error).message}`);
-    });
-  });
-
-  resourceMonitor.on('should-resume', () => {
-    resumeForResource().catch((err) => {
-      logger?.error(`Resource resume failed: ${(err as Error).message}`);
-    });
-  });
+  // Handle resource-based pause/resume via state machine.
+  wireResourceMonitor(resourceMonitor, () => loadConfig().resourcePause);
 
   // The tray shows what a manual resume overrode until its condition clears,
   // which changes no pause on the state machine.

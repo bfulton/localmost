@@ -22,7 +22,7 @@ import { IPC_CHANNELS } from '../shared/types';
 import type { RunnerManager } from './runner-manager';
 import type { ResourceMonitor } from './resource-monitor';
 import type { HeartbeatManager } from './heartbeat-manager';
-import type { ResourcePauseConfig } from './config';
+import { resolveResourcePauseConfig, type AppConfig, type ResourcePauseConfig } from './config';
 import {
   getAuthState,
   getEffectivePauseState,
@@ -235,6 +235,28 @@ export const resumeForResource = (): Promise<void> => oneAtATime(async () => {
     }
   }
 });
+
+/**
+ * Send the monitor's pause and resume here. resourcePause is read through
+ * `readResourcePause` at each pause, so a change to config.yaml applies to
+ * the next one.
+ */
+export const wireResourceMonitor = (
+  monitor: Pick<ResourceMonitor, 'on'>,
+  readResourcePause: () => AppConfig['resourcePause'] | undefined
+): void => {
+  monitor.on('should-pause', (reason: string) => {
+    const { runningJobs } = resolveResourcePauseConfig(readResourcePause(), (message) => getLogger()?.warn(message));
+    pauseForResource(reason, runningJobs).catch((err) => {
+      getLogger()?.error(`Resource pause failed: ${(err as Error).message}`);
+    });
+  });
+  monitor.on('should-resume', () => {
+    resumeForResource().catch((err) => {
+      getLogger()?.error(`Resource resume failed: ${(err as Error).message}`);
+    });
+  });
+};
 
 /**
  * Lift both pauses, and override the resource conditions holding now.

@@ -43,7 +43,9 @@ import {
   resumeForResource,
   resumeRunner,
   startHeartbeatUnlessPaused,
+  wireResourceMonitor,
 } from './runner-pause';
+import type { AppConfig } from './config';
 import { IPC_CHANNELS } from '../shared/types';
 import type { Target } from '../shared/types';
 
@@ -664,6 +666,49 @@ describe('resumeForResource', () => {
 
     expect(isUserPaused()).toBe(true);
     expect(heartbeat.start).not.toHaveBeenCalled();
+  });
+});
+
+describe('wireResourceMonitor', () => {
+  /** Let the handler a monitor event queued run to the end. */
+  const settle = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+  it("pauses with resourcePause.runningJobs as config.yaml has it at each pause, 'finish' when absent", async () => {
+    // index.ts read the setting and passed it on, with nothing to catch a
+    // hard-coded value or one read only at launch.
+    startRunner();
+    runner.isRunning.mockReturnValue(true);
+    let section: AppConfig['resourcePause'] | undefined = { runningJobs: 'stop' };
+    const events = new EventEmitter();
+    wireResourceMonitor(events as unknown as ResourceMonitor, () => section);
+
+    const pauseAndResume = async (): Promise<void> => {
+      resourceMonitor.shouldPause.mockReturnValue(true);
+      events.emit('should-pause', 'Battery at 20%');
+      await settle();
+      expect(isResourcePaused()).toBe(true);
+      resourceMonitor.shouldPause.mockReturnValue(false);
+      events.emit('should-resume');
+      await settle();
+      expect(isResourcePaused()).toBe(false);
+    };
+
+    await pauseAndResume();
+    expect(runner.stop).toHaveBeenCalledTimes(1);
+
+    section = { runningJobs: 'finish' };
+    await pauseAndResume();
+    expect(runner.stop).toHaveBeenCalledTimes(1);
+
+    section = undefined;
+    await pauseAndResume();
+    expect(runner.stop).toHaveBeenCalledTimes(1);
+
+    // A value it does not know is the default, and is logged.
+    section = { runningJobs: 'kill' };
+    await pauseAndResume();
+    expect(runner.stop).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('resourcePause.runningJobs'));
   });
 });
 
