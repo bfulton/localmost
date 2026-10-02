@@ -566,6 +566,11 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   children and the members of its process group that share it. Stopping or
   killing a process it did not start - a server or app you launched, another
   worker's job, the app itself - is now refused
+- A resource pause (on battery, in a video call) lets jobs already running
+  finish, as a pause from the tray or `localmost pause` does: it refuses new
+  jobs and stops the heartbeat. It used to stop the workers, failing their
+  jobs on GitHub. Set `resourcePause.runningJobs: stop` in
+  `~/.localmost/config.yaml` to keep that
 - CLI restructured with standalone commands that don't require the app
 - Improved help text with examples for all commands
 

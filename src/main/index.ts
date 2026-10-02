@@ -54,7 +54,6 @@ import {
   disableSleepProtection,
   getTrayManager,
   getLogger,
-  isUserPaused,
   getRunnerState,
 } from './app-state';
 
@@ -62,7 +61,7 @@ import {
 import { CliServer } from './cli-server';
 
 // Config and security
-import { loadConfig, DockerVmConfigSource } from './config';
+import { loadConfig, DockerVmConfigSource, resolveResourcePauseConfig } from './config';
 import { installSecurityHandlers } from './security';
 import { ensureAppDataDir, getAppDataDir } from './paths';
 
@@ -101,7 +100,7 @@ import { IPC_CHANNELS, SleepProtection, LogLevel, DEFAULT_POWER_CONFIG, DEFAULT_
 
 // Resource monitoring
 import { ResourceMonitor } from './resource-monitor';
-import { canAcceptJob, ensureRunnerInitialized, startHeartbeatUnlessPaused } from './runner-pause';
+import { canAcceptJob, pauseForResource, resumeForResource, startHeartbeatUnlessPaused } from './runner-pause';
 
 // State machine
 import {
@@ -557,62 +556,19 @@ app.whenReady().then(async () => {
   });
   setResourceMonitor(resourceMonitor);
 
-  // Handle resource-based pause/resume via state machine
-  resourceMonitor.on('should-pause', async (reason: string) => {
-    // Don't pause if user explicitly paused (they control when to resume)
-    if (isUserPaused()) return;
-
-    logger?.info(`Resource pause triggered: ${reason}`);
-
-    // Send event to state machine - it will update tray and renderer via subscription
-    sendRunnerEvent({ type: 'RESOURCE_PAUSE', reason });
-
-    const heartbeatManager = getHeartbeatManager();
-
-    // Stop heartbeat to signal unavailability
-    heartbeatManager?.stop();
-    await heartbeatManager?.clear();
-
-    // New jobs are held back by canAcceptJob, which asks the monitor. Unlike
-    // a user pause, this also stops the workers, and with them any job they
-    // are running: stop() signals each worker's process group, and a job cut
-    // off that way fails on GitHub. isRunning() is whether there are workers;
-    // an idle pool has none, and is left started. A stopped pool is started
-    // again on resume.
-    const runnerManager = getRunnerManager();
-    if (runnerManager?.isRunning()) {
-      await runnerManager.stop();
-    }
+  // Handle resource-based pause/resume via state machine. The setting is
+  // read at each pause, so a change applies to the next one.
+  resourceMonitor.on('should-pause', (reason: string) => {
+    const { runningJobs } = resolveResourcePauseConfig(loadConfig().resourcePause, (message) => logger?.warn(message));
+    pauseForResource(reason, runningJobs).catch((err) => {
+      logger?.error(`Resource pause failed: ${(err as Error).message}`);
+    });
   });
 
-  resourceMonitor.on('should-resume', async () => {
-    // Don't resume if user explicitly paused
-    if (isUserPaused()) return;
-
-    logger?.info('Resource pause cleared - resuming runner');
-
-    // Send event to state machine - it will update tray and renderer via subscription
-    sendRunnerEvent({ type: 'RESOURCE_RESUME' });
-
-    // The broker proxy will start accepting jobs via the canAcceptJob callback.
-    // Start the pool again if the pause stopped it, or the runner reads
-    // offline while it takes them.
-    try {
-      await ensureRunnerInitialized();
-    } catch (err) {
-      logger?.error(`Failed to restart runner: ${(err as Error).message}`);
-    }
-
-    // Restart heartbeat to signal availability
-    const heartbeatManager = getHeartbeatManager();
-    const authState = getAuthState();
-    if (heartbeatManager && authState?.accessToken) {
-      try {
-        await heartbeatManager.start();
-      } catch (err) {
-        logger?.error(`Failed to restart heartbeat: ${(err as Error).message}`);
-      }
-    }
+  resourceMonitor.on('should-resume', () => {
+    resumeForResource().catch((err) => {
+      logger?.error(`Resource resume failed: ${(err as Error).message}`);
+    });
   });
 
   // Note: state-changed event is now handled by the XState subscription above

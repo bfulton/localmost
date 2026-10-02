@@ -36,7 +36,9 @@ import {
 import {
   canAcceptJob,
   ensureRunnerInitialized,
+  pauseForResource,
   pauseRunner,
+  resumeForResource,
   resumeRunner,
   startHeartbeatUnlessPaused,
 } from './runner-pause';
@@ -53,6 +55,7 @@ const runner = {
   initialize: jest.fn(async () => {}),
   stop: jest.fn(async () => {}),
   hasAvailableSlot: jest.fn(() => true),
+  isRunning: jest.fn(() => false),
 };
 const resourceMonitor = { shouldPause: jest.fn(() => false) };
 const rendererSend = jest.fn();
@@ -76,6 +79,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   runner.isInitialized.mockReturnValue(true);
   runner.hasAvailableSlot.mockReturnValue(true);
+  runner.isRunning.mockReturnValue(false);
   resourceMonitor.shouldPause.mockReturnValue(false);
   setHeartbeatManager(heartbeat as unknown as HeartbeatManager);
   setRunnerManager(runner as unknown as RunnerManager);
@@ -424,6 +428,97 @@ describe('resumeRunner', () => {
     expect(await first).toBe('resumed');
     expect(await second).toBe('already-running');
     expect(runner.initialize).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('pauseForResource', () => {
+  it('lets a running job finish by default, and stops the heartbeat', async () => {
+    // A resource pause stopped the workers, and a job cut off that way
+    // fails on GitHub: a laptop unplugged for a moment failed the job it
+    // was running.
+    startRunner();
+    runner.isRunning.mockReturnValue(true);
+    resourceMonitor.shouldPause.mockReturnValue(true);
+
+    await pauseForResource('Battery at 20%', 'finish');
+
+    expect(runner.stop).not.toHaveBeenCalled();
+    expect(heartbeat.stop).toHaveBeenCalled();
+    expect(heartbeat.clear).toHaveBeenCalled();
+    expect(selectEffectivePauseState(getSnapshot()!)).toEqual({ isPaused: true, reason: 'Battery at 20%' });
+    expect(canAcceptJob({ resourceMonitor, runnerManager: runner })).toBe(false);
+  });
+
+  it("stops the workers at once when set to 'stop'", async () => {
+    startRunner();
+    runner.isRunning.mockReturnValue(true);
+
+    await pauseForResource('Video call detected', 'stop');
+
+    expect(runner.stop).toHaveBeenCalledTimes(1);
+    expect(heartbeat.stop).toHaveBeenCalled();
+    expect(isResourcePaused()).toBe(true);
+  });
+
+  it("leaves an idle pool started when set to 'stop'", async () => {
+    startRunner();
+
+    await pauseForResource('Video call detected', 'stop');
+
+    expect(runner.stop).not.toHaveBeenCalled();
+  });
+
+  it('leaves a runner the user paused as it is', async () => {
+    startRunner();
+    runner.isRunning.mockReturnValue(true);
+    await pauseRunner();
+    jest.clearAllMocks();
+
+    await pauseForResource('Battery at 20%', 'stop');
+
+    expect(runner.stop).not.toHaveBeenCalled();
+    expect(heartbeat.stop).not.toHaveBeenCalled();
+    expect(isResourcePaused()).toBe(false);
+  });
+});
+
+describe('resumeForResource', () => {
+  it('lifts the pause, starts the pool a stop left down, and restarts the heartbeat', async () => {
+    startRunner();
+    await pauseForResource('Battery at 20%', 'stop');
+    runner.isInitialized.mockReturnValue(false);
+
+    await resumeForResource();
+
+    expect(isResourcePaused()).toBe(false);
+    expect(selectIsPaused(getSnapshot()!)).toBe(false);
+    expect(runner.initialize).toHaveBeenCalledTimes(1);
+    expect(heartbeat.start).toHaveBeenCalledTimes(1);
+  });
+
+  it('starts no heartbeat for a runner that is not started', async () => {
+    // The monitor runs from launch; a condition clearing before the runner
+    // starts is recorded, and the start brings up the heartbeat itself.
+    initRunnerStateMachine();
+    setResourcePaused(true, 'Battery at 20%');
+
+    await resumeForResource();
+
+    expect(isResourcePaused()).toBe(false);
+    expect(heartbeat.start).not.toHaveBeenCalled();
+    expect(runner.initialize).not.toHaveBeenCalled();
+  });
+
+  it('leaves a runner the user paused paused', async () => {
+    startRunner();
+    await pauseForResource('Battery at 20%', 'finish');
+    await pauseRunner();
+    jest.clearAllMocks();
+
+    await resumeForResource();
+
+    expect(isUserPaused()).toBe(true);
+    expect(heartbeat.start).not.toHaveBeenCalled();
   });
 });
 

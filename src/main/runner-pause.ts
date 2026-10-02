@@ -11,12 +11,17 @@
  * broker acquiring jobs - canAcceptJob() refuses while it is set - and the
  * heartbeat that routes workflows here. Jobs already running are left to
  * finish.
+ *
+ * The resource monitor's pause, on battery or in a video call, comes through
+ * here too. It stops the same two things, and by default also leaves running
+ * jobs to finish; resourcePause.runningJobs set to 'stop' stops them.
  */
 
 import { IPC_CHANNELS } from '../shared/types';
 import type { RunnerManager } from './runner-manager';
 import type { ResourceMonitor } from './resource-monitor';
 import type { HeartbeatManager } from './heartbeat-manager';
+import type { ResourcePauseConfig } from './config';
 import {
   getAuthState,
   getEffectivePauseState,
@@ -68,10 +73,10 @@ const notifyRenderer = (isPaused: boolean): void => {
 };
 
 /**
- * One pause or resume at a time, in the order asked. A resume can wait on
- * initialize() between reading the pause and lifting it; a pause made in
- * that wait read the runner as still paused, did nothing, and was then
- * lifted by the resume.
+ * One pause or resume at a time, in the order asked, the resource monitor's
+ * among them. A resume can wait on initialize() between reading the pause
+ * and lifting it; a pause made in that wait read the runner as still
+ * paused, did nothing, and was then lifted by the resume.
  */
 let pending: Promise<unknown> = Promise.resolve();
 const oneAtATime = <T>(operation: () => Promise<T>): Promise<T> => {
@@ -153,6 +158,70 @@ export const pauseRunner = (): Promise<PauseOutcome> => oneAtATime(async () => {
 
   notifyRenderer(true);
   return 'paused';
+});
+
+/**
+ * A resource condition began to hold: refuse new jobs and stop routing
+ * workflows here. New jobs are held back by canAcceptJob, which asks the
+ * monitor. The user's pause outranks this one: a runner they paused is left
+ * as it is, and they decide when it resumes.
+ */
+export const pauseForResource = (
+  reason: string,
+  runningJobs: ResourcePauseConfig['runningJobs']
+): Promise<void> => oneAtATime(async () => {
+  if (isUserPaused()) return;
+
+  getLogger()?.info(`Resource pause triggered: ${reason}`);
+  // The state machine updates the tray and renderer through its subscription.
+  setResourcePaused(true, reason);
+
+  const heartbeatManager = getHeartbeatManager();
+  heartbeatManager?.stop();
+  await heartbeatManager?.clear();
+
+  // By default running jobs finish, as under the user's pause. Set to
+  // 'stop', this also stops the workers, and with them any job they are
+  // running: stop() signals each worker's process group, and a job cut off
+  // that way fails on GitHub. isRunning() is whether there are workers; an
+  // idle pool has none, and is left started. A stopped pool is started
+  // again on resume.
+  if (runningJobs !== 'stop') return;
+  const runnerManager = getRunnerManager();
+  if (runnerManager?.isRunning()) {
+    getLogger()?.info('Stopping running jobs for the resource pause (resourcePause.runningJobs: stop)');
+    await runnerManager.stop();
+  }
+});
+
+/**
+ * The resource condition cleared: take jobs again, unless the user paused.
+ */
+export const resumeForResource = (): Promise<void> => oneAtATime(async () => {
+  if (isUserPaused()) return;
+
+  getLogger()?.info('Resource pause cleared - resuming runner');
+  setResourcePaused(false);
+
+  // Start the pool again if the pause stopped it, or the runner reads
+  // offline while it takes jobs.
+  try {
+    await ensureRunnerInitialized();
+  } catch (err) {
+    getLogger()?.error(`Failed to restart runner: ${(err as Error).message}`);
+  }
+
+  // A runner that is not started yet starts its own heartbeat once it is
+  // up, now that nothing holds it.
+  if (!isRunnerStarted()) return;
+  const heartbeatManager = getHeartbeatManager();
+  if (heartbeatManager && getAuthState()?.accessToken) {
+    try {
+      await heartbeatManager.start();
+    } catch (err) {
+      getLogger()?.error(`Failed to restart heartbeat: ${(err as Error).message}`);
+    }
+  }
 });
 
 /**

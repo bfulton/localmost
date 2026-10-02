@@ -44,7 +44,7 @@ Features:
 - **Multi-runner parallelism** — run 1-8 concurrent jobs
 - **Network isolation** — runner traffic is proxied through an allowlist (GitHub, npm, PyPI, etc.)
 - **Filesystem sandboxing** — runner processes can only write to their working directory
-- **Resource-aware scheduling** — automatically pause runners when on battery or during video calls
+- **Resource-aware scheduling** — automatically pause runners when on battery or during video calls; jobs already running finish (set `resourcePause.runningJobs: stop` in `~/.localmost/config.yaml` to stop them instead)
 
 ## What It Is
 
