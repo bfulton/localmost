@@ -23,6 +23,7 @@ jest.mock('../config', () => ({
   SETTABLE_CONFIG_KEYS: [
     'runnerConfig', 'theme', 'launchAtLogin', 'hideOnStart', 'sleepProtection', 'logLevel',
     'runnerLogLevel', 'userFilter', 'maxConcurrentJobs', 'power', 'notifications',
+    'resourcePause', 'jobEnvironment',
   ],
 }));
 
@@ -278,6 +279,72 @@ describe('settings IPC handlers', () => {
 
       expect(saveConfig).toHaveBeenCalledWith({ theme: 'dark' });
       expect(store.getState().config.targets).toBe(before);
+    });
+
+    it('saves what a resource pause does to running jobs, and hands it to the store', () => {
+      (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({ theme: 'auto' } as any);
+
+      expect(handlers['settings:set']({}, { resourcePause: { runningJobs: 'stop' } })).toEqual({ success: true });
+      expect(saveConfig).toHaveBeenLastCalledWith({ theme: 'auto', resourcePause: { runningJobs: 'stop' } });
+      expect(store.getState().config.resourcePause).toEqual({ runningJobs: 'stop' });
+
+      expect(handlers['settings:set']({}, { resourcePause: { runningJobs: 'finish' } })).toEqual({ success: true });
+      expect(store.getState().config.resourcePause).toEqual({ runningJobs: 'finish' });
+    });
+
+    it('refuses a resource pause that is not finish or stop, or carries anything else', () => {
+      (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({} as any);
+      store.getState().setResourcePause({ runningJobs: 'finish' });
+
+      for (const resourcePause of [
+        { runningJobs: 'kill' },
+        { runningJobs: true },
+        {},
+        { runningJobs: 'stop', graceSeconds: 30 },
+        'stop',
+        null,
+      ]) {
+        const result = handlers['settings:set']({}, { resourcePause });
+        expect({ resourcePause, result }).toEqual({
+          resourcePause,
+          result: { success: false, error: 'Refused settings of the wrong shape: resourcePause' },
+        });
+      }
+      expect(saveConfig).not.toHaveBeenCalledWith(expect.objectContaining({ resourcePause: expect.anything() }));
+      expect(store.getState().config.resourcePause).toEqual({ runningJobs: 'finish' });
+    });
+
+    it('saves the job-environment conveniences, each on or off, and hands them to the store', () => {
+      (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({} as any);
+      const jobEnvironment = { toolShims: false, javaToolOptions: true, perJobTempDir: false, createMissingGrantedDirs: true };
+
+      expect(handlers['settings:set']({}, { jobEnvironment })).toEqual({ success: true });
+      expect(saveConfig).toHaveBeenLastCalledWith({ jobEnvironment });
+      expect(store.getState().config.jobEnvironment).toEqual(jobEnvironment);
+    });
+
+    it('refuses job-environment settings that miss one, add one, or are not true or false', () => {
+      (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({} as any);
+      const all = { toolShims: true, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true };
+      store.getState().setJobEnvironment(all);
+
+      for (const jobEnvironment of [
+        { toolShims: 'no', javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true },
+        { ...all, perJobTempDir: 0 },
+        { toolShims: true, javaToolOptions: true, perJobTempDir: true },
+        // Not a preference: the per-job home is not one to turn off.
+        { ...all, jobHome: false },
+        [true, true, true, true],
+        false,
+      ]) {
+        const result = handlers['settings:set']({}, { jobEnvironment });
+        expect({ jobEnvironment, result }).toEqual({
+          jobEnvironment,
+          result: { success: false, error: 'Refused settings of the wrong shape: jobEnvironment' },
+        });
+      }
+      expect(saveConfig).not.toHaveBeenCalledWith(expect.objectContaining({ jobEnvironment: expect.anything() }));
+      expect(store.getState().config.jobEnvironment).toEqual(all);
     });
 
     it('should merge with existing config', () => {

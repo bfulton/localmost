@@ -5,6 +5,7 @@ import { AppConfigProvider } from '../contexts/AppConfigContext';
 import { RunnerProvider } from '../contexts/RunnerContext';
 import { UpdateProvider } from '../contexts/UpdateContext';
 import { mockLocalmost } from '../../../test/setup-renderer';
+import { seedZubridge, resetZubridge } from '../../../test/zubridge-state';
 
 // Wrapper component that provides all required contexts
 const TestWrapper: React.FC<{ children: React.ReactNode }> = ({ children }) => (
@@ -307,5 +308,155 @@ describe('SettingsPage', () => {
       expect(screen.getByText('Runner log level')).toBeInTheDocument();
     });
     expect(screen.getByText(/runner's diagnostic trace/)).toHaveTextContent('~/.localmost/logs');
+  });
+});
+
+describe('the resource-pause and job-environment preferences', () => {
+  const ALL_ON = { toolShims: true, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true };
+  // Each convenience's control, by the label the page gives it.
+  const CONVENIENCES = [
+    ['toolShims', "Turn off SwiftPM's and Xcode's own sandbox"],
+    ['javaToolOptions', 'Set JAVA_TOOL_OPTIONS for JVMs'],
+    ['perJobTempDir', 'Give each job its own temp directory for Foundation'],
+    ['createMissingGrantedDirs', 'Create missing directories a policy grants'],
+  ] as const;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockLocalmost.github.getAuthStatus.mockResolvedValue({ isAuthenticated: false });
+    mockLocalmost.runner.isDownloaded.mockResolvedValue(false);
+    mockLocalmost.runner.isConfigured.mockResolvedValue(false);
+    mockLocalmost.runner.getVersion.mockResolvedValue({ version: null, url: null });
+    mockLocalmost.runner.getAvailableVersions.mockResolvedValue({ success: true, versions: [] });
+    mockLocalmost.settings.get.mockResolvedValue({});
+    mockLocalmost.settings.set.mockResolvedValue({ success: true });
+    mockLocalmost.runner.getStatus.mockResolvedValue({ status: 'offline' });
+    mockLocalmost.jobs.getHistory.mockResolvedValue([]);
+    mockLocalmost.network.isOnline.mockResolvedValue(true);
+  });
+
+  afterEach(() => resetZubridge());
+
+  const runningJobsSelect = () => screen.getByLabelText('Running jobs when a pause begins') as HTMLSelectElement;
+  const checkbox = (label: string) => screen.getByLabelText(label) as HTMLInputElement;
+
+  it('lets running jobs finish by default, and offers to stop them', async () => {
+    renderWithProviders(<SettingsPage onBack={jest.fn()} />);
+
+    await waitFor(() => expect(runningJobsSelect().value).toBe('finish'));
+    expect(Array.from(runningJobsSelect().options).map((o) => [o.value, o.text])).toEqual([
+      ['finish', 'Let them finish'],
+      ['stop', 'Stop them'],
+    ]);
+    // What stopping costs, said where it is chosen.
+    expect(screen.getByText(/their jobs fail on GitHub/)).toBeInTheDocument();
+
+    fireEvent.change(runningJobsSelect(), { target: { value: 'stop' } });
+    await waitFor(() => {
+      expect(mockLocalmost.settings.set).toHaveBeenCalledWith({ resourcePause: { runningJobs: 'stop' } });
+    });
+  });
+
+  it('shows the saved choice', async () => {
+    mockLocalmost.settings.get.mockResolvedValue({ resourcePause: { runningJobs: 'stop' } });
+    renderWithProviders(<SettingsPage onBack={jest.fn()} />);
+
+    await waitFor(() => expect(runningJobsSelect().value).toBe('stop'));
+  });
+
+  it('shows a saved value the runner would not use as the default it uses instead, and sends that', async () => {
+    // The runner takes a value that is not true or false as absent, so the
+    // shims are on; showing 0 as off would show the wrong thing, and sending
+    // it back with the next change would have the whole section refused.
+    mockLocalmost.settings.get.mockResolvedValue({
+      resourcePause: { runningJobs: 'kill' },
+      jobEnvironment: { toolShims: 0, javaToolOptions: false },
+    });
+    renderWithProviders(<SettingsPage onBack={jest.fn()} />);
+
+    await waitFor(() => expect(checkbox('Set JAVA_TOOL_OPTIONS for JVMs').checked).toBe(false));
+    expect(runningJobsSelect().value).toBe('finish');
+    expect(checkbox("Turn off SwiftPM's and Xcode's own sandbox").checked).toBe(true);
+
+    fireEvent.click(checkbox('Create missing directories a policy grants'));
+    await waitFor(() => {
+      expect(mockLocalmost.settings.set).toHaveBeenCalledWith({
+        jobEnvironment: { ...ALL_ON, javaToolOptions: false, createMissingGrantedDirs: false },
+      });
+    });
+  });
+
+  it('has every job-environment convenience on by default', async () => {
+    renderWithProviders(<SettingsPage onBack={jest.fn()} />);
+
+    await waitFor(() => expect(screen.getByText('Job Environment')).toBeInTheDocument());
+    for (const [, label] of CONVENIENCES) {
+      expect({ label, checked: checkbox(label).checked }).toEqual({ label, checked: true });
+    }
+  });
+
+  it.each(CONVENIENCES)('turns %s off on its own, and back on', async (key, label) => {
+    renderWithProviders(<SettingsPage onBack={jest.fn()} />);
+    await waitFor(() => expect(checkbox(label).checked).toBe(true));
+
+    fireEvent.click(checkbox(label));
+    await waitFor(() => {
+      expect(mockLocalmost.settings.set).toHaveBeenLastCalledWith({ jobEnvironment: { ...ALL_ON, [key]: false } });
+    });
+    await waitFor(() => expect(checkbox(label).checked).toBe(false));
+
+    fireEvent.click(checkbox(label));
+    await waitFor(() => {
+      expect(mockLocalmost.settings.set).toHaveBeenLastCalledWith({ jobEnvironment: ALL_ON });
+    });
+  });
+
+  it.each(CONVENIENCES)('shows %s as saved', async (key, label) => {
+    mockLocalmost.settings.get.mockResolvedValue({ jobEnvironment: { [key]: false } });
+    renderWithProviders(<SettingsPage onBack={jest.fn()} />);
+
+    await waitFor(() => expect(checkbox(label).checked).toBe(false));
+    for (const [otherKey, otherLabel] of CONVENIENCES) {
+      if (otherKey !== key) expect({ otherLabel, checked: checkbox(otherLabel).checked }).toEqual({ otherLabel, checked: true });
+    }
+  });
+
+  describe('with the store populated, as in the app', () => {
+    it('reads both from the store, not the settings file', async () => {
+      // The store branch is the one the app runs; settings:get is only the
+      // fallback until zubridge syncs.
+      seedZubridge({
+        config: {
+          resourcePause: { runningJobs: 'stop' },
+          jobEnvironment: { ...ALL_ON, perJobTempDir: false },
+        },
+      });
+      renderWithProviders(<SettingsPage onBack={jest.fn()} />);
+
+      await waitFor(() => expect(runningJobsSelect().value).toBe('stop'));
+      expect(checkbox('Give each job its own temp directory for Foundation').checked).toBe(false);
+      expect(checkbox('Set JAVA_TOOL_OPTIONS for JVMs').checked).toBe(true);
+    });
+
+    it('sends the change from the store value, keeping the others', async () => {
+      seedZubridge({ config: { jobEnvironment: { ...ALL_ON, toolShims: false } } });
+      renderWithProviders(<SettingsPage onBack={jest.fn()} />);
+      await waitFor(() => expect(checkbox('Create missing directories a policy grants').checked).toBe(true));
+
+      fireEvent.click(checkbox('Create missing directories a policy grants'));
+      await waitFor(() => {
+        expect(mockLocalmost.settings.set).toHaveBeenCalledWith({
+          jobEnvironment: { ...ALL_ON, toolShims: false, createMissingGrantedDirs: false },
+        });
+      });
+    });
+
+    it('shows the defaults while the store holds neither yet', async () => {
+      seedZubridge({ config: {} });
+      renderWithProviders(<SettingsPage onBack={jest.fn()} />);
+
+      await waitFor(() => expect(runningJobsSelect().value).toBe('finish'));
+      for (const [, label] of CONVENIENCES) expect(checkbox(label).checked).toBe(true);
+    });
   });
 });

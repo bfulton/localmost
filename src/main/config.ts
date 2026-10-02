@@ -8,7 +8,17 @@ import * as yaml from 'js-yaml';
 import { getAppDataDir, getConfigPath } from './paths';
 import { encryptValue, decryptValue } from './encryption';
 import { bootLog } from './log-file';
-import { GitHubUser, SleepProtection, LogLevel, UserFilterConfig, Target, PowerConfig, NotificationsConfig, UpdateSettings } from '../shared/types';
+import {
+  GitHubUser,
+  SleepProtection,
+  LogLevel,
+  UserFilterConfig,
+  Target,
+  PowerConfig,
+  NotificationsConfig,
+  UpdateSettings,
+} from '../shared/types';
+import type { ResourcePauseConfig, JobEnvironmentConfig } from '../shared/job-preferences';
 
 // Config paths - uses centralized path management
 const configDir = getAppDataDir();
@@ -48,6 +58,8 @@ export const SETTABLE_CONFIG_KEYS = [
   'maxConcurrentJobs',
   'power',  // Power settings (battery/video call pausing)
   'notifications',
+  'resourcePause',  // What a resource pause does to running jobs
+  'jobEnvironment',  // What localmost adds to each job's environment
 ] as const;
 
 export type SettableConfigKey = typeof SETTABLE_CONFIG_KEYS[number];
@@ -98,114 +110,16 @@ export interface AppConfig {
   jobEnvironment?: Partial<Record<keyof JobEnvironmentConfig, unknown>>;
 }
 
-/**
- * What a resource pause - the runner pausing itself on battery or during a
- * video call, as the `power` settings say - does, as used: every key
- * present.
- */
-export interface ResourcePauseConfig {
-  /**
-   * What happens to jobs already running when a resource condition pauses
-   * the runner. Either way no new job is taken, and the heartbeat that
-   * routes workflows here stops.
-   *
-   * - `'finish'` (default): running jobs carry on to the end.
-   * - `'stop'`: the workers are stopped at once, and their jobs fail on
-   *   GitHub.
-   */
-  runningJobs: 'finish' | 'stop';
-}
-
-export const DEFAULT_RESOURCE_PAUSE_CONFIG: ResourcePauseConfig = {
-  runningJobs: 'finish',
-};
-
-/**
- * The `resourcePause` section of config.yaml as the app uses it. Every key
- * is optional; a value that is not one of the key's choices is taken as
- * absent, with a line through `log`, and keys it does not know are ignored.
- */
-export function resolveResourcePauseConfig(
-  raw: AppConfig['resourcePause'] | undefined,
-  log: (message: string) => void = () => {}
-): ResourcePauseConfig {
-  const section: Record<string, unknown> = typeof raw === 'object' && raw !== null ? raw : {};
-  const resolved: ResourcePauseConfig = { ...DEFAULT_RESOURCE_PAUSE_CONFIG };
-  const { runningJobs } = section;
-  if (runningJobs !== undefined) {
-    if (runningJobs === 'finish' || runningJobs === 'stop') resolved.runningJobs = runningJobs;
-    else log(`resourcePause.runningJobs must be 'finish' or 'stop'; using '${DEFAULT_RESOURCE_PAUSE_CONFIG.runningJobs}'`);
-  }
-  return resolved;
-}
-
-/**
- * The conveniences localmost adds to every job's environment, each of which
- * can be turned off on its own. All are on by default. See
- * docs/roadmap/job-environment.md. Read from config.yaml at each worker
- * spawn; a change applies to workers spawned after it.
- */
-export interface JobEnvironmentConfig {
-  /**
-   * `swift` and `xcodebuild` shims first on the job's PATH, which turn off
-   * SwiftPM's and Xcode's own manifest and plugin sandbox: the job already
-   * runs under one, and macOS refuses to nest them, so a package manifest
-   * the job has not compiled before fails to build without this. Off, the
-   * job calls the tools as they are. The bundled docker CLI is on PATH
-   * either way.
-   */
-  toolShims: boolean;
-  /**
-   * JAVA_TOOL_OPTIONS for the JVM: its temp directory in the job's own,
-   * IPv4 so its loopback connections are ones the sandbox can attribute, and
-   * the job's proxy with its credentials. A workflow that sets
-   * JAVA_TOOL_OPTIONS itself replaces this.
-   */
-  javaToolOptions: boolean;
-  /**
-   * A per-job directory in the per-user temp directory, named by
-   * DIRHELPER_USER_DIR_SUFFIX, so NSTemporaryDirectory() and Foundation's
-   * atomic writes - SwiftPM's and Xcode's among them - have a temp directory
-   * of the job's own, created before the job and removed after it. Off, the
-   * job has no such directory and those writes fail.
-   */
-  perJobTempDir: boolean;
-  /**
-   * Create, before the job, a directory its approved policy grants write on
-   * under the home directory when it does not exist yet - empty, one level
-   * at a time, never through a link. Off, a missing granted directory stays
-   * missing, and a job that cannot create it itself fails.
-   */
-  createMissingGrantedDirs: boolean;
-}
-
-/** Every job-environment convenience, on: the defaults. */
-const JOB_ENVIRONMENT_DEFAULTS: JobEnvironmentConfig = {
-  toolShims: true,
-  javaToolOptions: true,
-  perJobTempDir: true,
-  createMissingGrantedDirs: true,
-};
-
-/**
- * The `jobEnvironment` section of config.yaml as used. Every key is optional
- * and defaults on; a value that is not true or false is taken as absent,
- * with a line through `log`, and keys it does not know are ignored.
- */
-export function resolveJobEnvironmentConfig(
-  raw: AppConfig['jobEnvironment'] | undefined,
-  log: (message: string) => void = () => {}
-): JobEnvironmentConfig {
-  const section: Record<string, unknown> = typeof raw === 'object' && raw !== null ? raw : {};
-  const resolved: JobEnvironmentConfig = { ...JOB_ENVIRONMENT_DEFAULTS };
-  for (const key of Object.keys(JOB_ENVIRONMENT_DEFAULTS) as Array<keyof JobEnvironmentConfig>) {
-    const value = section[key];
-    if (value === undefined) continue;
-    if (typeof value === 'boolean') resolved[key] = value;
-    else log(`jobEnvironment.${key} must be true or false; using ${JOB_ENVIRONMENT_DEFAULTS[key]}`);
-  }
-  return resolved;
-}
+// The resource-pause and job-environment preferences, with their defaults
+// and resolvers, live in shared/job-preferences, where the Settings page
+// reads them too.
+export {
+  DEFAULT_RESOURCE_PAUSE_CONFIG,
+  DEFAULT_JOB_ENVIRONMENT_CONFIG,
+  resolveResourcePauseConfig,
+  resolveJobEnvironmentConfig,
+} from '../shared/job-preferences';
+export type { ResourcePauseConfig, JobEnvironmentConfig } from '../shared/job-preferences';
 
 /**
  * The per-job Docker VMs, as used: every key present, in range. See

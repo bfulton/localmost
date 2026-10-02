@@ -20,6 +20,15 @@ import {
   DEFAULT_NOTIFICATIONS_CONFIG,
 } from '../../shared/types';
 import {
+  ResourcePauseConfig,
+  JobEnvironmentConfig,
+  PreferenceSection,
+  DEFAULT_RESOURCE_PAUSE_CONFIG,
+  DEFAULT_JOB_ENVIRONMENT_CONFIG,
+  resolveResourcePauseConfig,
+  resolveJobEnvironmentConfig,
+} from '../../shared/job-preferences';
+import {
   useStore,
 } from '../store';
 
@@ -79,6 +88,14 @@ interface AppConfigContextValue {
   setNotifyOnPause: (enabled: boolean) => Promise<void>;
   setNotifyOnJobEvents: (enabled: boolean) => Promise<void>;
 
+  // What a resource pause does to running jobs
+  resourcePause: ResourcePauseConfig;
+  setResourcePauseRunningJobs: (runningJobs: ResourcePauseConfig['runningJobs']) => Promise<void>;
+
+  // What localmost adds to each job's environment, each on or off
+  jobEnvironment: JobEnvironmentConfig;
+  setJobEnvironmentOption: (key: keyof JobEnvironmentConfig, enabled: boolean) => Promise<void>;
+
   // App state
   isOnline: boolean;
   isLoading: boolean;
@@ -114,6 +131,8 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
   const storeUserFilter = useStore((state) => state?.config?.userFilter ?? NO_USER_FILTER);
   const storePower = useStore((state) => state?.config?.power ?? DEFAULT_POWER_CONFIG);
   const storeNotifications = useStore((state) => state?.config?.notifications ?? DEFAULT_NOTIFICATIONS_CONFIG);
+  const storeResourcePause = useStore((state) => state?.config?.resourcePause ?? DEFAULT_RESOURCE_PAUSE_CONFIG);
+  const storeJobEnvironment = useStore((state) => state?.config?.jobEnvironment ?? DEFAULT_JOB_ENVIRONMENT_CONFIG);
   const storeIsOnline = useStore((state) => state?.ui?.isOnline ?? true);
   const storeIsLoading = useStore((state) => state?.ui?.isInitialLoading ?? true);
   const storeError = useStore((state) => state?.ui?.error ?? null);
@@ -141,6 +160,8 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     userFilter: UserFilterConfig;
     power: PowerConfig;
     notifications: NotificationsConfig;
+    resourcePause: ResourcePauseConfig;
+    jobEnvironment: JobEnvironmentConfig;
     isOnline: boolean;
     isLoading: boolean;
     error: string | null;
@@ -156,6 +177,8 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     userFilter: { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] },
     power: DEFAULT_POWER_CONFIG,
     notifications: DEFAULT_NOTIFICATIONS_CONFIG,
+    resourcePause: DEFAULT_RESOURCE_PAUSE_CONFIG,
+    jobEnvironment: DEFAULT_JOB_ENVIRONMENT_CONFIG,
     isOnline: true,
     isLoading: true,
     error: null,
@@ -173,6 +196,8 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
   const userFilter = isZubridgeReady ? storeUserFilter : fallbackState.userFilter;
   const power = isZubridgeReady ? storePower : fallbackState.power;
   const notifications = isZubridgeReady ? storeNotifications : fallbackState.notifications;
+  const resourcePause = isZubridgeReady ? storeResourcePause : fallbackState.resourcePause;
+  const jobEnvironment = isZubridgeReady ? storeJobEnvironment : fallbackState.jobEnvironment;
   const isOnline = isZubridgeReady ? storeIsOnline : fallbackState.isOnline;
   const isLoading = isZubridgeReady ? storeIsLoading : fallbackState.isLoading;
   const error = isZubridgeReady ? storeError : fallbackState.error;
@@ -232,6 +257,10 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
             : prev.userFilter,
           power: settings.power ? { ...DEFAULT_POWER_CONFIG, ...(settings.power as PowerConfig) } : prev.power,
           notifications: settings.notifications ? { ...DEFAULT_NOTIFICATIONS_CONFIG, ...(settings.notifications as NotificationsConfig) } : prev.notifications,
+          // Read as the runner reads config.yaml, so a value it would take as
+          // absent shows as the default it uses instead.
+          resourcePause: resolveResourcePauseConfig(settings.resourcePause as PreferenceSection<ResourcePauseConfig> | undefined),
+          jobEnvironment: resolveJobEnvironmentConfig(settings.jobEnvironment as PreferenceSection<JobEnvironmentConfig> | undefined),
           isLoading: false,
         }));
 
@@ -421,6 +450,27 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     }
   }, [notifications]);
 
+  const setResourcePauseRunningJobs = useCallback(async (runningJobs: ResourcePauseConfig['runningJobs']) => {
+    const newConfig = { ...resourcePause, runningJobs };
+    setFallbackState(prev => ({ ...prev, resourcePause: newConfig }));
+    try {
+      await window.localmost.settings.set({ resourcePause: newConfig });
+    } catch {
+      // Optimistic update handled by zubridge sync
+    }
+  }, [resourcePause]);
+
+  const setJobEnvironmentOption = useCallback(async (key: keyof JobEnvironmentConfig, enabled: boolean) => {
+    // Every key, each true or false: settings:set takes this section whole.
+    const newConfig = { ...jobEnvironment, [key]: enabled };
+    setFallbackState(prev => ({ ...prev, jobEnvironment: newConfig }));
+    try {
+      await window.localmost.settings.set({ jobEnvironment: newConfig });
+    } catch {
+      // Optimistic update handled by zubridge sync
+    }
+  }, [jobEnvironment]);
+
   const clearLogs = useCallback(() => {
     logsRef.current = [];
     setLogs([]);
@@ -456,6 +506,10 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     setNotifications,
     setNotifyOnPause,
     setNotifyOnJobEvents,
+    resourcePause,
+    setResourcePauseRunningJobs,
+    jobEnvironment,
+    setJobEnvironmentOption,
     isOnline,
     isLoading,
     error,

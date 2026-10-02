@@ -35,6 +35,7 @@ import {
   GitHubRepo,
   GitHubOrg,
 } from '../../shared/types';
+import { ResourcePauseConfig, JobEnvironmentConfig } from '../../shared/job-preferences';
 
 // Create the store
 export const store = createStore<AppStore>()(
@@ -101,6 +102,14 @@ export const store = createStore<AppStore>()(
 
     setNotifications: (notifications: NotificationsConfig) => {
       set((state) => ({ config: { ...state.config, notifications } }));
+    },
+
+    setResourcePause: (resourcePause: ResourcePauseConfig) => {
+      set((state) => ({ config: { ...state.config, resourcePause } }));
+    },
+
+    setJobEnvironment: (jobEnvironment: JobEnvironmentConfig) => {
+      set((state) => ({ config: { ...state.config, jobEnvironment } }));
     },
 
     setLaunchAtLogin: (launchAtLogin: boolean) => {
@@ -394,3 +403,22 @@ export const selectUI = (state: AppState) => state.ui;
 export const selectIsOnline = (state: AppState) => state.ui.isOnline;
 export const selectLogs = (state: AppState) => state.ui.logs;
 export const selectError = (state: AppState) => state.ui.error;
+
+// =============================================================================
+// What the runner reads
+// =============================================================================
+
+/**
+ * What a resource pause does, as Settings shows and sets it: read at each
+ * pause. The store owns it - loaded from config.yaml at launch, and written
+ * back at every save - so the runner reads it here, not from the file, and
+ * a hand edit made while the app runs can never take effect unseen and then
+ * be put back by the next save.
+ */
+export const runnerResourcePause = (): ResourcePauseConfig => store.getState().config.resourcePause;
+
+/**
+ * What localmost adds to each job's environment, as Settings shows and sets
+ * it: read at each worker spawn. From the store, as runnerResourcePause.
+ */
+export const runnerJobEnvironment = (): JobEnvironmentConfig => store.getState().config.jobEnvironment;

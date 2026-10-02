@@ -4,7 +4,7 @@ What localmost puts in a runner job's environment beyond what the runner
 itself needs: a home directory of the job's own, a directory of its own in the
 per-user temp directory, a bin directory with the bundled docker CLI and shims
 for `swift` and `xcodebuild`, and `JAVA_TOOL_OPTIONS`. Each convenience can be
-turned off on its own in `config.yaml`.
+turned off on its own, in Settings (see [Preferences](#preferences)).
 
 > **Status:** implemented in 0.3.0, from the owner's decisions of 2026-10-01
 > (items 9, 10, 11a, 11b, 12 and 13 of the open-items walkthrough). The
@@ -151,7 +151,14 @@ any job, with `EISDIR`.
 ## Preferences
 
 Each convenience is a key of the `jobEnvironment` section of `config.yaml`,
-read at every worker spawn. All default on.
+all on by default, set in the Job Environment section of Settings. The app
+reads the section at launch and holds it from then on: the runner takes it
+from there at every worker spawn, so a change made in Settings applies to jobs
+that start after it, and the page always shows the value the runner uses. The
+app writes its own values back to `config.yaml` at every save and at quit, so
+edit the file by hand only while the app is quit. A value in the file that is
+not true or false is taken as absent, logged, and shown as the default the
+runner uses.
 
 | Key | Default | Off means |
 |---|---|---|

@@ -827,54 +827,6 @@ describe('Process Sandbox', () => {
       expect(lines.slice(at + 1).filter((line) => /^\(allow (default|file\*|file-clone)/.test(line))).toEqual([]);
     });
 
-    it("grants the job's own suffixed directory in the per-user temp, in both spellings, and no more of it", () => {
-      // DIRHELPER_USER_DIR_SUFFIX moves a process's per-user temp directory to
-      // T/<suffix>, and a sandboxed Foundation stages its atomic writes in
-      // TemporaryItems there. The job gets that directory, read and write;
-      // the rest of T, shared with every process the user runs, stays closed.
-      const suffix = 'localmost-job-3f9a0c2e5b7d1846';
-      const profile = profileWith({ jobTempSuffix: suffix });
-      expect(profile).toContain(
-        [
-          '(allow file-read* file-write*',
-          `  (subpath "/private/var/folders/zz/zyxw_vut0000gn/T/${suffix}")`,
-          `  (subpath "/var/folders/zz/zyxw_vut0000gn/T/${suffix}"))`,
-        ].join('\n')
-      );
-      for (const dir of ['/var/folders/zz/zyxw_vut0000gn/T', '/private/var/folders/zz/zyxw_vut0000gn/T']) {
-        expect(writable(profile, `${dir}/${suffix}/TemporaryItems/NSIRD_aw_x/out.txt`)).toBe(true);
-        expect(readable(profile, `${dir}/${suffix}/TemporaryItems`)).toBe(true);
-        expect(writable(profile, `${dir}/TemporaryItems/NSIRD_aw_x`)).toBe(false);
-        expect(writable(profile, `${dir}/localmost-job-other/TemporaryItems`)).toBe(false);
-        expect(readable(profile, `${dir}/xcrun_db`)).toBe(false);
-        expect(writable(profile, `${dir}/${suffix}x`)).toBe(false);
-      }
-      // A deny the policy declares over it still holds: the grant comes first.
-      const denied = profileWith({
-        jobTempSuffix: suffix,
-        filesystemPolicy: { level: 'strict', read: [], write: [], deny: ['/private/var/folders/zz/zyxw_vut0000gn/T'] },
-      });
-      expect(writable(denied, `/private/var/folders/zz/zyxw_vut0000gn/T/${suffix}/f`)).toBe(false);
-      // None when the job has none, or when the per-user temp is unknown.
-      expect(profileWith({})).not.toContain('/T/localmost-');
-      expect(profileWith({ jobTempSuffix: suffix }, () => { throw new Error('getconf: not found'); })).not.toContain(suffix);
-    });
-
-    it.each([
-      '', '.', '..', 'a/b', '../T', 'a"b', 'a b', '-x',
-      // Names of shared state in T: the staging every sandboxed Foundation
-      // process of the user's writes through, another app's directory, and a
-      // name of mktemp's shape, which any earlier job could have made.
-      'TemporaryItems', 'com.apple.dt.xcodebuild', 'node-compile-cache', 'tmp.ABCDEFGHIJ',
-      // Not a random body of localmost's own.
-      'localmost-job-', 'localmost-job-3f9a', 'localmost-job-3F9A0C2E5B7D1846', 'localmost-job-3f9a0c2e5b7d184g',
-      'localmost-job-3f9a0c2e5b7d1846/..', `localmost-job-${'a'.repeat(65)}`,
-    ])("refuses a temp suffix that is not one of localmost's own: %j", (suffix) => {
-      // It lands in the profile as a path component under the shared T, and
-      // the job reads and writes everything beneath it.
-      expect(() => profileWith({ jobTempSuffix: suffix })).toThrow(/temp suffix/);
-    });
-
     it("grants the job's own directory in the per-user temp, by both spellings, but not the node itself", () => {
       // NSTemporaryDirectory(), java.io.tmpdir and a sandboxed process's
       // atomic writes go to T/<DIRHELPER_USER_DIR_SUFFIX>. The node stays the
@@ -893,6 +845,12 @@ describe('Process Sandbox', () => {
       for (const other of [`${T}/localmost-0123abcd-4-0123456789ab/x`, `${T}/TemporaryItems/NSIRD_x/f`, `${T}/xcrun_db`]) {
         expect([other, writable(profile, other), readable(profile, other)]).toEqual([other, false, false]);
       }
+      // A deny the policy declares over it still holds: the grant comes first.
+      const denied = profileWith({
+        tempSuffixDir: dir,
+        filesystemPolicy: { level: 'strict', read: [], write: [], deny: [`/private${T}`] },
+      });
+      expect(writable(denied, `/private${dir}/TemporaryItems/f`)).toBe(false);
       // Without one, nothing of it.
       expect(profileWith({})).not.toContain(`${T}/localmost-`);
     });

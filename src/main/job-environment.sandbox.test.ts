@@ -209,9 +209,24 @@ if (!isMacOS) {
         expect(without.stderr).toMatch(/permission|513/i);
 
         const env = { ...baseEnv(), DIRHELPER_USER_DIR_SUFFIX: path.basename(tempDir) };
-        const result = run([atomicWrite, out], env, writeProfile({ tempSuffixDir: tempDir }));
+        const granted = writeProfile({ tempSuffixDir: tempDir });
+        const before = Date.now() - 2000;
+        const result = run([atomicWrite, out], env, granted);
         expect(result).toMatchObject({ ok: true });
         expect(fs.readFileSync(out, 'utf-8')).toBe('hello');
+        // Staged in TemporaryItems in the job's directory, just now.
+        expect(fs.statSync(path.join(tempDir, 'TemporaryItems')).mtimeMs).toBeGreaterThanOrEqual(before);
+        fs.rmSync(out);
+
+        // The grant alone is not enough: without the suffix staging is in the
+        // shared T/TemporaryItems, which stays closed.
+        const unsuffixed = run([atomicWrite, out], baseEnv(), granted);
+        expect([unsuffixed.ok, fs.existsSync(out)]).toEqual([false, false]);
+        expect(unsuffixed.stderr).toMatch(/Code=513/);
+        // Nor the suffix alone, under a profile that does not grant its directory.
+        const ungranted = run([atomicWrite, out], env, writeProfile());
+        expect([ungranted.ok, fs.existsSync(out)]).toEqual([false, false]);
+        expect(ungranted.stderr).toMatch(/Code=513/);
       }, SWIFT_TIMEOUT_MS);
 
       describe('with the swift shim', () => {

@@ -2,7 +2,6 @@
  * Tests for Sandbox Profile Generator
  */
 
-import { execFileSync } from 'child_process';
 import * as path from 'path';
 import {
   generateSandboxProfile,
@@ -235,45 +234,6 @@ describe('Sandbox Profile Generator', () => {
         expect(forms.slice(at + 1).filter((form) => /^\(allow (default|file\*|file-clone)/.test(form))).toEqual([]);
         expect(forms.slice(0, at).some((form) => /^\(allow (default|file-read\*)/.test(form))).toBe(true);
       }
-    });
-
-    it("grants the job's own suffixed directory in the per-user temp, in both spellings, and no more of it", () => {
-      // DIRHELPER_USER_DIR_SUFFIX moves a process's per-user temp directory to
-      // T/<suffix>, and a sandboxed Foundation stages its atomic writes in
-      // TemporaryItems there. The job gets that directory; the rest of T,
-      // which every process the user runs shares, stays closed.
-      const userTemp = execFileSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf-8' })
-        .trim().replace(/\/+$/, '').replace(/^\/private/, '');
-      const suffix = 'localmost-job-3f9a0c2e5b7d1846';
-      for (const profile of [
-        generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, jobTempSuffix: suffix }),
-        generateDiscoveryProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, logFile: '', jobTempSuffix: suffix }),
-      ]) {
-        expect(topLevelForms(profile)).toContain(
-          `(allow file-read* file-write*\n  (subpath "/private${userTemp}/${suffix}")\n  (subpath "${userTemp}/${suffix}"))`
-        );
-        expect(profile).not.toContain(`(subpath "${userTemp}")`);
-        expect(profile).not.toContain(`(subpath "/private${userTemp}")`);
-      }
-      // None when the job has no suffix.
-      expect(generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT }))
-        .not.toContain(`(subpath "${userTemp}/`);
-    });
-
-    it.each([
-      '', '.', '..', 'a/b', '../T', 'a"b', 'a b', '-x',
-      // Names of shared state in T: the staging every sandboxed Foundation
-      // process of the user's writes through, another app's directory, and a
-      // name of mktemp's shape, which any earlier job could have made.
-      'TemporaryItems', 'com.apple.dt.xcodebuild', 'node-compile-cache', 'tmp.ABCDEFGHIJ',
-      // Not a random body of localmost's own.
-      'localmost-job-', 'localmost-job-3f9a', 'localmost-job-3F9A0C2E5B7D1846', 'localmost-job-3f9a0c2e5b7d184g',
-      'localmost-job-3f9a0c2e5b7d1846/..', `localmost-job-${'a'.repeat(65)}`,
-    ])("refuses a temp suffix that is not one of localmost's own: %j", (suffix) => {
-      // It lands in the profile as a path component under the shared T, and
-      // the job reads and writes everything beneath it.
-      expect(() => generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, jobTempSuffix: suffix }))
-        .toThrow(/temp suffix/);
     });
 
     it('grants no home directory cache that the policy has not declared, with or without a policy', () => {

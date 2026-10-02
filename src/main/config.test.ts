@@ -103,6 +103,11 @@ describe('SETTABLE_CONFIG_KEYS', () => {
   it('does not let the renderer set the Docker VM sizes, which config.yaml alone holds', () => {
     expect(SETTABLE_CONFIG_KEYS).not.toContain('dockerVm');
   });
+
+  it('lets the Settings page set what a resource pause does and the job-environment conveniences', () => {
+    expect(SETTABLE_CONFIG_KEYS).toContain('resourcePause');
+    expect(SETTABLE_CONFIG_KEYS).toContain('jobEnvironment');
+  });
 });
 
 describe('DockerVmConfigSource', () => {

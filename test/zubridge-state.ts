@@ -19,12 +19,14 @@ export interface ZubridgeSeed {
   deviceCode?: { userCode: string; verificationUri: string } | null;
   isDownloaded?: boolean;
   isConfigured?: boolean;
+  /** The config slice, or the part of it a test reads; empty by default. */
+  config?: Record<string, unknown>;
 }
 
 /** Put the store in the shape a running app has, with the given overrides. */
 export function seedZubridge(seed: ZubridgeSeed = {}): void {
   __setMockState({
-    config: {},
+    config: seed.config ?? {},
     auth: {
       user: seed.user === undefined ? null : seed.user,
       isAuthenticating: seed.isAuthenticating ?? false,
