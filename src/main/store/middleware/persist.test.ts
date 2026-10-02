@@ -81,6 +81,54 @@ describe('savePersistedConfig auth preservation', () => {
   });
 });
 
+describe('sections only config.yaml holds', () => {
+  it('carries them forward when the store persists, as written', () => {
+    // The store does not hold these: the Docker VM sizes, the update check
+    // and the OAuth client are read from the file. This writer rebuilt the
+    // file from the store alone on every config change and at quit, so a
+    // dockerVm section written by hand was gone the next time the app quit.
+    fs.writeFileSync(
+      configPath,
+      [
+        'configVersion: 1',
+        'theme: auto',
+        'githubClientId: Iv1.custom',
+        'updateSettings:',
+        '  autoCheck: false',
+        '  checkIntervalHours: 24',
+        'dockerVm:',
+        '  cpus: 2',
+        '  memoryMiB: 4096',
+        '  prewarm: maybe',
+        '',
+      ].join('\n')
+    );
+    loadPersistedConfig();
+
+    store.setState({ config: { ...store.getState().config, theme: 'dark' } });
+    savePersistedConfig();
+
+    const saved = yaml.load(fs.readFileSync(configPath, 'utf-8')) as AppConfig;
+    expect(saved.theme).toBe('dark');
+    expect(saved.githubClientId).toBe('Iv1.custom');
+    expect(saved.updateSettings).toEqual({ autoCheck: false, checkIntervalHours: 24 });
+    // Even a value the VM backend would refuse: the file is the user's, and
+    // resolveDockerVmConfig says what it makes of it.
+    expect(saved.dockerVm).toEqual({ cpus: 2, memoryMiB: 4096, prewarm: 'maybe' });
+  });
+
+  it('writes none of them where the file had none', () => {
+    fs.writeFileSync(configPath, 'configVersion: 1\ntheme: auto\n');
+    loadPersistedConfig();
+    savePersistedConfig();
+
+    const saved = yaml.load(fs.readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
+    expect(saved).not.toHaveProperty('dockerVm');
+    expect(saved).not.toHaveProperty('updateSettings');
+    expect(saved).not.toHaveProperty('githubClientId');
+  });
+});
+
 describe('the removed preserveWorkDir setting', () => {
   it('ignores a value an earlier build saved, and drops it at the next save', () => {
     // Not an error: the rest of the file loads as before, and the setting

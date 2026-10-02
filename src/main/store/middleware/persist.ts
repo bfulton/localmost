@@ -52,6 +52,17 @@ const PERSISTED_CONFIG_KEYS: (keyof ConfigSlice)[] = [
 ];
 
 /**
+ * Sections of config.yaml the store does not hold, which this writer carries
+ * forward from the file as they are: the Docker VM sizes (read with
+ * resolveDockerVmConfig at each worker spawn), the update check, and the
+ * OAuth client. Without them every save - on each config change, and at
+ * quit - rebuilt the file from the store alone and dropped what was written
+ * there by hand. An allowlist: a key an earlier build wrote and this one
+ * no longer knows (preserveWorkDir) still goes at the next save.
+ */
+const FILE_ONLY_CONFIG_KEYS = ['dockerVm', 'updateSettings', 'githubClientId'] as const satisfies ReadonlyArray<keyof AppConfig>;
+
+/**
  * Load persisted config from YAML file into the store.
  */
 export function loadPersistedConfig(): void {
@@ -263,11 +274,15 @@ export function savePersistedConfig(): void {
     }
 
     // Preserve auth from existing config file (auth is saved separately by auth module)
-    // We must read and preserve it to avoid overwriting encrypted tokens
+    // We must read and preserve it to avoid overwriting encrypted tokens, and
+    // the sections only the file holds with it
     if (fs.existsSync(configPath)) {
       try {
         const existingContent = fs.readFileSync(configPath, 'utf-8');
         const existingConfig = (yaml.load(existingContent, { schema: yaml.JSON_SCHEMA }) as AppConfig) || {};
+        for (const key of FILE_ONLY_CONFIG_KEYS) {
+          if (existingConfig[key] !== undefined) configToSave[key] = existingConfig[key];
+        }
         // Copy forward only the fields we intend to persist. Copying the
         // section verbatim would keep a legacy accessToken/expiresAt written by
         // an older build on disk forever, which is exactly what

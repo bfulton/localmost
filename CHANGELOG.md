@@ -495,6 +495,11 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   ([job-environment.md](docs/roadmap/job-environment.md)).
 
 ### Fixed
+- The `dockerVm`, `updateSettings` and `githubClientId` sections of
+  `~/.localmost/config.yaml` are kept when the app saves its settings. The
+  store's save rebuilt the file from the settings it holds, on every change
+  and at quit, so a section written there by hand - the Docker VM sizes, say -
+  was gone the next time the app quit.
 - In-app updates find a zip to install. The update feed listed only the
   DMGs, and the updater installs only from a zip, so every download failed
   with `ERR_UPDATER_ZIP_FILE_NOT_FOUND`. Each release now ships a zip,
