@@ -2,6 +2,7 @@
  * Tests for Sandbox Profile Generator
  */
 
+import { execFileSync } from 'child_process';
 import * as path from 'path';
 import {
   generateSandboxProfile,
@@ -217,6 +218,62 @@ describe('Sandbox Profile Generator', () => {
         const mktemp = topLevelForms(profile).find((f) => f.startsWith('(allow file-write* file-read*') && f.includes('(regex #"'));
         expect(mktemp).toMatch(/\/T\/tmp\\\.(\[A-Za-z0-9\]){10}/);
       }
+    });
+
+    it('refuses a clone of a directory in every profile, after every allow', () => {
+      // clonefile(2) of a directory copies the tree beneath it without asking
+      // about each file, so a denied file inside came along readable.
+      for (const profile of [
+        generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT }),
+        generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, permissive: true }),
+        generateDiscoveryProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, logFile: '' }),
+      ]) {
+        const forms = topLevelForms(profile);
+        const at = forms.indexOf('(deny file-clone (vnode-type DIRECTORY))');
+        expect(at).toBeGreaterThan(-1);
+        // Nothing after it could allow a clone again.
+        expect(forms.slice(at + 1).filter((form) => /^\(allow (default|file\*|file-clone)/.test(form))).toEqual([]);
+        expect(forms.slice(0, at).some((form) => /^\(allow (default|file-read\*)/.test(form))).toBe(true);
+      }
+    });
+
+    it("grants the job's own suffixed directory in the per-user temp, in both spellings, and no more of it", () => {
+      // DIRHELPER_USER_DIR_SUFFIX moves a process's per-user temp directory to
+      // T/<suffix>, and a sandboxed Foundation stages its atomic writes in
+      // TemporaryItems there. The job gets that directory; the rest of T,
+      // which every process the user runs shares, stays closed.
+      const userTemp = execFileSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf-8' })
+        .trim().replace(/\/+$/, '').replace(/^\/private/, '');
+      const suffix = 'localmost-job-3f9a0c2e5b7d1846';
+      for (const profile of [
+        generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, jobTempSuffix: suffix }),
+        generateDiscoveryProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, logFile: '', jobTempSuffix: suffix }),
+      ]) {
+        expect(topLevelForms(profile)).toContain(
+          `(allow file-read* file-write*\n  (subpath "/private${userTemp}/${suffix}")\n  (subpath "${userTemp}/${suffix}"))`
+        );
+        expect(profile).not.toContain(`(subpath "${userTemp}")`);
+        expect(profile).not.toContain(`(subpath "/private${userTemp}")`);
+      }
+      // None when the job has no suffix.
+      expect(generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT }))
+        .not.toContain(`(subpath "${userTemp}/`);
+    });
+
+    it.each([
+      '', '.', '..', 'a/b', '../T', 'a"b', 'a b', '-x',
+      // Names of shared state in T: the staging every sandboxed Foundation
+      // process of the user's writes through, another app's directory, and a
+      // name of mktemp's shape, which any earlier job could have made.
+      'TemporaryItems', 'com.apple.dt.xcodebuild', 'node-compile-cache', 'tmp.ABCDEFGHIJ',
+      // Not a random body of localmost's own.
+      'localmost-job-', 'localmost-job-3f9a', 'localmost-job-3F9A0C2E5B7D1846', 'localmost-job-3f9a0c2e5b7d184g',
+      'localmost-job-3f9a0c2e5b7d1846/..', `localmost-job-${'a'.repeat(65)}`,
+    ])("refuses a temp suffix that is not one of localmost's own: %j", (suffix) => {
+      // It lands in the profile as a path component under the shared T, and
+      // the job reads and writes everything beneath it.
+      expect(() => generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, jobTempSuffix: suffix }))
+        .toThrow(/temp suffix/);
     });
 
     it('grants no home directory cache that the policy has not declared, with or without a policy', () => {
@@ -551,7 +608,39 @@ describe('Sandbox Profile Generator', () => {
       expect(profile).toContain('(regex "^/opt/c\\\\+\\\\+/lib.*$")');
       expect(profile).toContain('(regex "^/Users/test/\\\\.npm/_cacache/.*$")');
       // A deny covers what lies beneath a match too, as a subpath deny does.
-      expect(profile).toContain('(deny file-read* (regex "^/Users/test/\\\\.ssh/id_.*(/|$)"))');
+      // In a deny, * stands within one name: it never spans a /.
+      expect(profile).toContain('(deny file-read* (regex "^/Users/test/\\\\.ssh/id_[^/]*(/|$)"))');
+    });
+
+    it('takes * in a deny within one name, in any component, and closes the directories it stands for', () => {
+      // The deny matches paths, so a job granted /opt/out could rename the
+      // directory out/secA to out/z and read out/z/key. The directories a
+      // wildcard stands for are closed to writes as nodes, by an anchored
+      // pattern, as the literal directories above the first * are.
+      const forms = topLevelForms(generateSandboxProfile({
+        workDir: '/path/to/project',
+        proxyPort: DEFAULT_PROXY_PORT,
+        policy: { filesystem: { write: ['/opt/out'], deny: ['/opt/out/sec*/key', '/opt/deep/*/mid/k*'] } },
+      }));
+      for (const operation of ['file-read*', 'file-write*']) {
+        expect(forms).toContain(`(deny ${operation} (regex "^/opt/out/sec[^/]*/key(/|$)"))`);
+        expect(forms).toContain(`(deny ${operation} (regex "^/opt/deep/[^/]*/mid/k[^/]*(/|$)"))`);
+      }
+      for (const node of [
+        '(literal "/opt/out")',
+        '(literal "/opt")',
+        '(regex "^/opt/out/sec[^/]*$")',
+        '(literal "/opt/deep")',
+        '(regex "^/opt/deep/[^/]*$")',
+        // A literal directory past a wildcard is one it stands above too.
+        '(regex "^/opt/deep/[^/]*/mid$")',
+        '(regex "^/opt/deep/[^/]*/mid/k[^/]*$")',
+      ]) {
+        expect(forms).toContain(`(deny file-write* ${node})`);
+      }
+      // Nodes, not what is in them: nothing past the denied name is a node.
+      expect(forms.join('\n')).not.toContain('(regex "^/opt/out/sec[^/]*/key$")');
+      expect(forms.join('\n')).not.toMatch(/\(deny file-write\* \(regex "[^"]*\.\*/);
     });
 
     it('denies a path reached through a symlink by its real path too', () => {
@@ -566,7 +655,7 @@ describe('Sandbox Profile Generator', () => {
         expect(forms).toContain(`(deny ${operation} (subpath "/tmp/localmost-deny/x"))`);
         expect(forms).toContain(`(deny ${operation} (subpath "/private/tmp/localmost-deny/x"))`);
         expect(forms).toContain(`(deny ${operation} (subpath "/private/etc/ssl/private"))`);
-        expect(forms).toContain(`(deny ${operation} (regex "^/private/tmp/localmost-deny/.*\\\\.pem(/|$)"))`);
+        expect(forms).toContain(`(deny ${operation} (regex "^/private/tmp/localmost-deny/[^/]*\\\\.pem(/|$)"))`);
       }
     });
 
@@ -615,7 +704,7 @@ describe('Sandbox Profile Generator', () => {
           expect(forms).toContain(`(deny file-read* (subpath "${spelling}/loop/secret"))`);
           expect(forms).toContain(`(deny file-write* (literal "${spelling}/locked/inner"))`);
         }
-        expect(forms).toContain(`(deny file-read* (regex "^${real.replace(/\./g, '\\\\.')}/locked/.*\\\\.pem(/|$)"))`);
+        expect(forms).toContain(`(deny file-read* (regex "^${real.replace(/\./g, '\\\\.')}/locked/[^/]*\\\\.pem(/|$)"))`);
       } finally {
         actualFs.chmodSync(path.join(real, 'locked'), 0o755);
         actualFs.rmSync(base, { recursive: true, force: true });

@@ -68,6 +68,11 @@ export interface SandboxProfileOptions {
   logFile?: string;
   /** The files that mark a process as running under this run's profiles; see processMarkerRules. */
   processMarker?: ProcessMarker;
+  /**
+   * The DIRHELPER_USER_DIR_SUFFIX the step runs with, whose directory in the
+   * per-user temp it reads and writes; see jobTempDirFilters. Absent, none.
+   */
+  jobTempSuffix?: string;
 }
 
 /**
@@ -140,6 +145,28 @@ export function preferenceRules(): string[] {
   return BUILD_PREFERENCE_DOMAINS.map((domain) => `(allow user-preference-read (preference-domain "${domain}"))`);
 }
 
+/**
+ * No clone of a directory, in every profile, after every allow.
+ *
+ * clonefile(2) and fclonefileat(2) of a directory copy the whole tree beneath
+ * it in one call without asking about each file in it: read on the directory
+ * and write where the clone lands are all seatbelt checks. So a job could
+ * clone a readable directory holding a denied file - a policy deny, a
+ * credential the floor closes inside a package cache a level reads, the
+ * share's nonce - into its own sandbox and read the copy there, under a name
+ * no deny covers. A file still clones (cp -c, an APFS copy), which asks for
+ * read on the file itself; cp -c -R and Foundation's copyItem clone file by
+ * file, so they still copy a tree, less what is denied.
+ */
+export function directoryCloneRules(): string[] {
+  return [
+    ';; No clone of a directory: clonefile(2) copies the tree beneath it without',
+    ';; asking about each file, so a denied file would come along, readable',
+    ';; under the new name. A file still clones, which asks for read on it.',
+    '(deny file-clone (vnode-type DIRECTORY))',
+  ];
+}
+
 // =============================================================================
 // Profile Generation
 // =============================================================================
@@ -176,17 +203,22 @@ function escapePath(pathStr: string): string {
 /**
  * A policy path with `*` in it, as the body of a seatbelt (regex ...) rule.
  *
- * `*` matches anything, as it always has here; everything else is literal.
- * This used to swap `*` for `.*` and leave the rest as regex syntax, so the
- * dot in "~/.npm" matched any character and a `+` or `(` in a path changed
- * what the rule meant. Anchored at both ends, since seatbelt searches rather
- * than matches. Escaped again for the string literal it lands in, where a
- * backslash is itself an escape. With `subtree`, what lies beneath a match
- * matches too, as it does beneath a (subpath ...).
+ * Everything but `*` is literal. This used to swap `*` for `.*` and leave the
+ * rest as regex syntax, so the dot in "~/.npm" matched any character and a
+ * `+` or `(` in a path changed what the rule meant. Anchored at both ends,
+ * since seatbelt searches rather than matches. Escaped again for the string
+ * literal it lands in, where a backslash is itself an escape. With `subtree`,
+ * what lies beneath a match matches too, as it does beneath a (subpath ...).
+ *
+ * With `withinName`, as for a deny, `*` (or a run of them) matches within one
+ * path component and never a `/`, so each directory it stands for can be
+ * named and closed as a node (see policyDenyAncestors). Without it, as for a
+ * grant, `*` matches any run of characters.
  */
-function globToProfileRegex(expanded: string, subtree = false): string {
+function globToProfileRegex(expanded: string, { subtree = false, withinName = false } = {}): string {
   const literal = (part: string) => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
-  return escapePath(`^${expanded.split('*').map(literal).join('.*')}${subtree ? '(/|$)' : '$'}`);
+  const parts = withinName ? expanded.split(/\*+/) : expanded.split('*');
+  return escapePath(`^${parts.map(literal).join(withinName ? '[^/]*' : '.*')}${subtree ? '(/|$)' : '$'}`);
 }
 
 /**
@@ -293,36 +325,52 @@ function policyDenySpellings(entry: string): { spellings: string[]; glob: boolea
  * it, in each of its spellings (see policyDenySpellings). seatbelt matches
  * the real path, and /tmp, /etc and /var are symlinks into /private, so a
  * deny of /etc/ssl/private written alone held nothing against a grant of
- * /private/etc. A `*` entry is a (regex ...); written as a subpath it named a
- * file called "*.pem", which nothing is.
+ * /private/etc. A `*` entry is a (regex ...), its `*` matching within one
+ * name; written as a subpath it named a file called "*.pem", which nothing is.
  */
 export function policyDenyFilters(entry: string): string[] {
   const { spellings, glob } = policyDenySpellings(entry);
   return spellings.map((spelling) =>
-    glob ? `(regex "${globToProfileRegex(spelling, true)}")` : `(subpath "${escapePath(spelling)}")`
+    glob
+      ? `(regex "${globToProfileRegex(spelling, { subtree: true, withinName: true })}")`
+      : `(subpath "${escapePath(spelling)}")`
   );
 }
 
 /**
  * The directories above what a policy deny covers, in each of its spellings,
- * up to but not including /, as (literal ...) filters for a write deny. The
- * deny matches paths, so a job granted write on one of these could rename it
- * and read the denied path under the new name: out/a to out/b for a deny of
- * out/a/secret, out/g to out/h for out/g/*.pem. For a `*` entry these are the
- * directory before the first `*` and those above it; a directory the `*`
- * stands for is known only once a path matches, so it is not covered. Nodes,
- * not subtrees: what is in them stays as granted. Those not there yet too,
- * as for the app's directories, where a link planted now would carry the
+ * up to but not including /, as filters for a write deny. The deny matches
+ * paths, so a job granted write on one of these could rename it and read the
+ * denied path under the new name: out/a to out/b for a deny of out/a/secret,
+ * out/g to out/h for out/g/*.pem, out/secA to out/z for a key in out/sec*.
+ * The directories before the first `*` are (literal ...) filters. From the
+ * first `*` on, every component with a `*` and every directory between them
+ * and the denied name is an anchored (regex ...) matching each name it could
+ * be: a job can neither rename one nor create or move a directory in under a
+ * name that matches.
+ * Nodes, not subtrees: what is in them stays as granted. Those not there yet
+ * too, as for the app's directories, where a link planted now would carry the
  * denied path wherever it points.
  */
 export function policyDenyAncestors(entry: string): string[] {
   const { spellings, glob } = policyDenySpellings(entry);
   const nodes = new Set<string>();
+  const patterns = new Set<string>();
   for (const spelling of spellings) {
     const first = glob ? spelling.slice(0, spelling.lastIndexOf('/', spelling.indexOf('*'))) || '/' : path.dirname(spelling);
     for (let node = first; node !== path.dirname(node); node = path.dirname(node)) nodes.add(node);
+    if (!glob) continue;
+    const parts = spelling.split('/');
+    for (let i = parts.findIndex((part) => part.includes('*')); i < parts.length; i++) {
+      // A denied name with no `*` is a node of the deny itself, not above it.
+      if (i === parts.length - 1 && !parts[i].includes('*')) break;
+      patterns.add(globToProfileRegex(parts.slice(0, i + 1).join('/'), { withinName: true }));
+    }
   }
-  return [...nodes].map((node) => `(literal "${escapePath(node)}")`);
+  return [
+    ...[...nodes].map((node) => `(literal "${escapePath(node)}")`),
+    ...[...patterns].map((pattern) => `(regex "${pattern}")`),
+  ];
 }
 
 // Note: macOS sandbox-exec does NOT support hostname-based network filtering.
@@ -465,9 +513,11 @@ function darwinUserTempDir(): string | undefined {
  * TMPDIR, and scripts call it that way constantly, so names of exactly the
  * shape it generates are granted: ten random characters no other process can
  * guess, and without read on the directory itself a step cannot list it to
- * find one. Both spellings, as /var is a symlink.
+ * find one. Both spellings, as /var is a symlink. And the step's own
+ * suffixed directory there, when it has one (see jobTempDirFilters).
  */
-function sharedTempRules(): string[] {
+function sharedTempRules(jobTempSuffix?: string): string[] {
+  checkJobTempSuffix(jobTempSuffix);
   const dir = darwinUserTempDir();
   if (!dir) return [';; Per-user temp directory unknown: mktemp without a template is not granted'];
   const escapeForRegex = (value: string) => value.replace(/[.*+?^$()[\]{}|\\]/g, '\\$&');
@@ -477,7 +527,66 @@ function sharedTempRules(): string[] {
     '(allow file-write* file-read*',
     `  (regex #"^${escapeForRegex(`/private${dir}`)}${generated}")`,
     `  (regex #"^${escapeForRegex(dir)}${generated}"))`,
+    ...(jobTempSuffix === undefined
+      ? []
+      : [
+          ";; ...and this step's own directory there, where Foundation stages its atomic writes",
+          '(allow file-read* file-write*',
+          ...jobTempDirFilters(dir, jobTempSuffix).map((filter, i, all) => `  ${filter}${i === all.length - 1 ? ')' : ''}`),
+        ]),
   ];
+}
+
+/**
+ * What a DIRHELPER_USER_DIR_SUFFIX may be: a name localmost owns, with a
+ * random body. It lands in a profile as a path component under the per-user
+ * temp directory, and the job reads and writes everything beneath it, so it
+ * must name nothing shared there: not the TemporaryItems every sandboxed
+ * Foundation process of the user's stages through, not another app's
+ * directory, and not a name of mktemp's shape, which every job is granted
+ * and an earlier one could have made and filled. Lowercase hex, since the
+ * volume matches names without regard to case.
+ */
+const JOB_TEMP_SUFFIX = /^localmost-job-[0-9a-f]{16,64}$/;
+
+/** Throw unless `suffix` is absent or one of localmost's own (see JOB_TEMP_SUFFIX). */
+export function checkJobTempSuffix(suffix: string | undefined): void {
+  if (suffix !== undefined && !JOB_TEMP_SUFFIX.test(suffix)) {
+    throw new Error(
+      `The job's temp suffix must be localmost-job- and 16 to 64 lowercase hex digits, so it cannot be confined as intended: ${JSON.stringify(suffix)}`
+    );
+  }
+}
+
+/**
+ * A job's own directory in the per-user temp, `<userTemp>/<suffix>`, in both
+ * spellings, as (subpath ...) filters for a grant.
+ *
+ * With DIRHELPER_USER_DIR_SUFFIX in its environment a process's per-user
+ * temp directory is T/<suffix>: NSTemporaryDirectory(), java.io.tmpdir and,
+ * for a sandboxed process, the TemporaryItems directory Foundation stages
+ * every atomic write in, whatever the destination. Without it a sandboxed
+ * Foundation stages in the shared T/TemporaryItems, which a job is not
+ * granted, and `write(to:atomically:)`, SwiftPM's manifests and xcodebuild
+ * fail with "You don't have permission to save the file". The rest of T
+ * stays closed: it is shared with every process the user runs.
+ *
+ * T/<suffix> outlives the job, whatever sweeps it. As macOS makes it, for a
+ * process with the suffix set, it carries the same protection as T itself
+ * (the sunlnk flag and com.apple.rootless), so it can never be removed; and
+ * the TemporaryItems in it cannot be removed either, empty or not, sandboxed
+ * or not, wherever under T it is. So a suffix per job leaves a directory per
+ * job in the user's T. A suffix reused across jobs instead makes T/<suffix> a
+ * channel from one job to the next, unless everything in it but
+ * TemporaryItems is swept before each job - by lstat, never following a
+ * link: anything in it can be a link the job planted, and the grant covers
+ * the T/<suffix> node itself, so one the app made with mkdir (which carries
+ * no such protection) the job can remove and replace with a link while
+ * TemporaryItems is not yet in it.
+ */
+export function jobTempDirFilters(userTemp: string, suffix: string): string[] {
+  checkJobTempSuffix(suffix);
+  return [`/private${userTemp}/${suffix}`, `${userTemp}/${suffix}`].map((dir) => `(subpath "${escapePath(dir)}")`);
 }
 
 /**
@@ -777,7 +886,7 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push(`  (subpath "${escapedWorkDir}"))`);
   lines.push('');
 
-  lines.push(...sharedTempRules());
+  lines.push(...sharedTempRules(options.jobTempSuffix));
   lines.push('');
 
   // No home directory cache is granted unless the policy declares it. Steps
@@ -891,6 +1000,9 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push(...preferenceRules());
   lines.push('');
 
+  lines.push(...directoryCloneRules());
+  lines.push('');
+
   lines.push(...processMarkerRules(options.processMarker));
 
   return lines.join('\n');
@@ -911,6 +1023,8 @@ export function generateDiscoveryProfile(options: {
   proxyPort: number;
   logFile: string;  // Not used - reports go to system log, not a file
   processMarker?: ProcessMarker;
+  /** As SandboxProfileOptions.jobTempSuffix. */
+  jobTempSuffix?: string;
 }): string {
   const { workDir, proxyPort } = options;
   const escapedWorkDir = escapePath(workDir);
@@ -936,7 +1050,7 @@ export function generateDiscoveryProfile(options: {
     '(allow file-read* (with report))',
     '(allow file-write* (with report)',
     `  (subpath "${escapedWorkDir}"))`,
-    ...sharedTempRules(),
+    ...sharedTempRules(options.jobTempSuffix),
     '(allow file-write*',
     '  (literal "/dev/null")',
     '  (literal "/dev/random")',
@@ -973,6 +1087,8 @@ export function generateDiscoveryProfile(options: {
     '(allow iokit*)',
     '(allow pseudo-tty)',
     ...preferenceRules(),
+    '',
+    ...directoryCloneRules(),
     '',
     ...processMarkerRules(options.processMarker),
   ];
