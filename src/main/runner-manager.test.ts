@@ -1988,6 +1988,8 @@ describe('RunnerManager', () => {
         const options = env.JAVA_TOOL_OPTIONS!.split(' ');
         expect(options).toEqual(expect.arrayContaining([
           '-Djava.io.tmpdir=/Users/test/.localmost/runner/sandbox/1/_temp',
+          // The JVM's home is the job's: it takes user.home from the user database, not HOME.
+          '-Duser.home=/Users/test/.localmost/runner/sandbox/1/home',
           '-Djava.net.preferIPv4Stack=true',
           '-Dhttps.proxyHost=127.0.0.1',
           '-Dhttps.proxyPort=12345',

@@ -130,6 +130,10 @@ export function packageCacheEnv(dir: string): Record<string, string> {
  * - java.io.tmpdir in the job's temp: the JVM's default is the per-user
  *   temp directory, which the sandbox does not grant, so createTempFile
  *   failed with "Operation not permitted".
+ * - user.home the job's home: the JVM takes it from the user database, not
+ *   HOME, so Maven (~/.m2/settings.xml), Gradle without GRADLE_USER_HOME,
+ *   sbt and Ivy looked in the real home, where the floor denies their
+ *   credential files, and failed on them.
  * - IPv4 only: a dual-stack socket's connection to 127.0.0.1 is reported
  *   with no host, so the sandbox cannot attribute it to loopback and denies
  *   it - the same reason .NET is given DOTNET_SYSTEM_NET_DISABLEIPV6.
@@ -148,10 +152,11 @@ export function packageCacheEnv(dir: string): Record<string, string> {
  * is replaced when the job ends. A workflow that sets JAVA_TOOL_OPTIONS
  * itself replaces all of this.
  */
-export function javaToolOptions(options: { tmpDir: string; proxyUrl: string }): string {
+export function javaToolOptions(options: { tmpDir: string; home: string; proxyUrl: string }): string {
   const whole = (value: string) => !/\s/.test(value);
   const flags: string[] = [];
   if (whole(options.tmpDir)) flags.push(`-Djava.io.tmpdir=${options.tmpDir}`);
+  if (whole(options.home)) flags.push(`-Duser.home=${options.home}`);
   flags.push('-Djava.net.preferIPv4Stack=true');
   let proxy: URL | undefined;
   try {

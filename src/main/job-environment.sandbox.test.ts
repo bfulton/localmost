@@ -75,6 +75,7 @@ const JAVA_PROBE_SOURCE = [
   '      System.out.println("loopback failed " + e);',
   '    }',
   '    System.out.println("proxy " + System.getProperty("https.proxyHost") + ":" + System.getProperty("https.proxyPort"));',
+  '    System.out.println("home " + System.getProperty("user.home"));',
   '  }',
   '}',
   '',
@@ -168,17 +169,21 @@ if (!isMacOS) {
         return run([path.join(javaHome, 'bin', 'java'), probe], { ...baseEnv(), ...extraEnv }, profilePath, SWIFT_TIMEOUT_MS, sandboxDir);
       };
 
-      it('let it make a temp file and use loopback, which it cannot without them', () => {
+      it("let it make a temp file, use loopback and take the job's home, which it does not without them", () => {
         const without = java({});
         expect(without.stdout).toContain('tempfile failed');
         expect(without.stdout).toContain('loopback failed');
+        // HOME is the job's, and the JVM still takes the user's from the user database.
+        expect(without.stdout).toContain(`home ${os.userInfo().homedir}`);
 
-        const options = javaToolOptions({ tmpDir: jobTmp, proxyUrl: `http://localmost:${'ab'.repeat(24)}@127.0.0.1:51234` });
+        const jobHome = baseEnv().HOME!;
+        const options = javaToolOptions({ tmpDir: jobTmp, home: jobHome, proxyUrl: `http://localmost:${'ab'.repeat(24)}@127.0.0.1:51234` });
         const result = java({ JAVA_TOOL_OPTIONS: options });
         expect(result.stdout.split('\n')).toEqual([
           `tempfile ok ${jobTmp}`,
           'loopback ok',
           'proxy 127.0.0.1:51234',
+          `home ${jobHome}`,
         ]);
       }, SWIFT_TIMEOUT_MS);
     });
@@ -309,10 +314,11 @@ if (!isMacOS) {
       }
     }, SWIFT_TIMEOUT_MS);
 
-    it("gives the JVM its temp, IPv4 and its proxy (no JDK is readable here to run)", () => {
+    it("gives the JVM its temp, its home, IPv4 and its proxy (no JDK is readable here to run)", () => {
       const options = (process.env.JAVA_TOOL_OPTIONS ?? '').split(' ');
       expect(options).toEqual(expect.arrayContaining([
         `-Djava.io.tmpdir=${os.tmpdir().replace(/\/$/, '')}`,
+        `-Duser.home=${process.env.HOME}`,
         '-Djava.net.preferIPv4Stack=true',
         `-Dhttps.proxyPort=${new URL(process.env.HTTPS_PROXY ?? '').port}`,
       ]));

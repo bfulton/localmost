@@ -96,12 +96,17 @@ describe('spawnEnvPolicy', () => {
 describe('javaToolOptions', () => {
   const token = 'a1'.repeat(24);
   const proxyUrl = `http://localmost:${token}@127.0.0.1:51234`;
+  const home = '/Users/me/.localmost/runner/sandbox/1-ab/home';
 
   it("puts the JVM's temp in the job's, on IPv4, through the job's proxy with its credentials", () => {
     // The JVM ignores TMPDIR and HTTPS_PROXY, and a dual-stack socket's
     // loopback connection is one the sandbox cannot attribute to loopback.
-    expect(javaToolOptions({ tmpDir: '/Users/me/.localmost/runner/sandbox/1-ab/_temp', proxyUrl }).split(' ')).toEqual([
+    expect(javaToolOptions({ tmpDir: '/Users/me/.localmost/runner/sandbox/1-ab/_temp', home, proxyUrl }).split(' ')).toEqual([
       '-Djava.io.tmpdir=/Users/me/.localmost/runner/sandbox/1-ab/_temp',
+      // The JVM takes user.home from the user database, not HOME: Maven,
+      // Gradle and sbt looked in the real home, where the floor denies
+      // their credential files, and failed on them.
+      `-Duser.home=${home}`,
       '-Djava.net.preferIPv4Stack=true',
       '-Dhttp.proxyHost=127.0.0.1',
       '-Dhttp.proxyPort=51234',
@@ -120,19 +125,24 @@ describe('javaToolOptions', () => {
   });
 
   it('leaves out the proxy credentials for a proxy that takes none', () => {
-    const options = javaToolOptions({ tmpDir: '/t', proxyUrl: 'http://127.0.0.1:8080' });
+    const options = javaToolOptions({ tmpDir: '/t', home: '/h', proxyUrl: 'http://127.0.0.1:8080' });
     expect(options).toContain('-Dhttps.proxyPort=8080');
     expect(options).not.toContain('proxyUser');
     expect(options).not.toContain('disabledSchemes');
   });
 
   it('leaves out a value it cannot pass whole, as the JVM splits these on whitespace', () => {
-    const options = javaToolOptions({ tmpDir: '/Users/Jane Doe/.localmost/runner/sandbox/1-ab/_temp', proxyUrl });
+    const options = javaToolOptions({
+      tmpDir: '/Users/Jane Doe/.localmost/runner/sandbox/1-ab/_temp',
+      home: '/Users/Jane Doe/.localmost/runner/sandbox/1-ab/home',
+      proxyUrl,
+    });
     expect(options).not.toContain('java.io.tmpdir');
+    expect(options).not.toContain('user.home');
     expect(options).toContain('-Djava.net.preferIPv4Stack=true');
   });
 
   it('leaves out the proxy for a URL it cannot read', () => {
-    expect(javaToolOptions({ tmpDir: '/t', proxyUrl: '' })).toBe('-Djava.io.tmpdir=/t -Djava.net.preferIPv4Stack=true');
+    expect(javaToolOptions({ tmpDir: '/t', home: '/h', proxyUrl: '' })).toBe('-Djava.io.tmpdir=/t -Duser.home=/h -Djava.net.preferIPv4Stack=true');
   });
 });

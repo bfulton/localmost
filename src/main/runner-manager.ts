@@ -1611,12 +1611,13 @@ export class RunnerManager {
           }
         }
       }
-      // The JVM reads neither TMPDIR nor HTTPS_PROXY, and its dual-stack
-      // sockets reach loopback in a way the sandbox cannot attribute: its
-      // temp, IPv4 and the proxy are set where every JVM picks them up (see
-      // javaToolOptions). A workflow's own JAVA_TOOL_OPTIONS replaces it.
+      // The JVM reads neither TMPDIR, HOME nor HTTPS_PROXY, and its
+      // dual-stack sockets reach loopback in a way the sandbox cannot
+      // attribute: its temp, home, IPv4 and the proxy are set where every
+      // JVM picks them up (see javaToolOptions). A workflow's own
+      // JAVA_TOOL_OPTIONS replaces it.
       if (jobEnvironment.javaToolOptions) {
-        env.JAVA_TOOL_OPTIONS = javaToolOptions({ tmpDir: jobTmp, proxyUrl });
+        env.JAVA_TOOL_OPTIONS = javaToolOptions({ tmpDir: jobTmp, home: jobHome, proxyUrl });
       }
 
       // A per-spawn marker file, held open by the worker and by what it starts
