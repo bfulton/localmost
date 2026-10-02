@@ -255,7 +255,8 @@ operating system - `/System`, `/bin`, `/sbin`, `/usr/bin`, `/usr/lib`,
 (the Command Line Tools and simulator support), and a few device files
 (`/dev/null`, `/dev/random` and the like); it can read and write its target's
 own tool cache when one is kept, and create files under the names `mktemp`
-generates in the per-user temp directory. Xcode itself
+generates in the per-user temp directory, and read and write the directory of
+its own there (see Shared temp directories above). Xcode itself
 (`/Applications/Xcode.app`, usually the active developer directory) is not on
 the floor: under `strict` a job that runs `xcodebuild` from it declares it.
 SwiftPM and Xcode run each package manifest under a sandbox of their own,
@@ -263,9 +264,9 @@ which macOS refuses to start inside the job's; the `swift` and `xcodebuild`
 shims first on the job's `PATH` add the argument that turns it off
 (`--disable-sandbox`, `-IDEPackageSupportDisableManifestSandbox=YES`), so the
 manifest runs under the job's sandbox alone (the `jobEnvironment.toolShims`
-preference, set in the Job Environment section of Settings and on by default). A tool called by its absolute path or through
-`xcrun` bypasses the shims, and a manifest it has not compiled before fails
-as it did.
+preference, set in the Job Environment section of Settings and on by
+default). A tool called by its absolute path or through `xcrun` bypasses the
+shims, and a manifest it has not compiled before fails as it did.
 Under `moderate` and `permissive` it can also read Homebrew, `/usr/local`,
 Xcode, the package-manager caches in your home and `~/.local/bin` and
 `~/.local/lib` (not the rest of `~/.local`), and write a package cache of its
@@ -878,6 +879,7 @@ localmost adds isolation layers that the stock GitHub Actions Runner lacks:
 | Network | Allowlisted hosts only (GitHub, npm, PyPI, etc.) via HTTP proxy |
 | Docker daemon | Through a filtering socket to a Linux VM of the job's own; only declared `pull`/`run`/`build` requests are forwarded |
 | Home directory | **Denied** — no access to `~/.ssh`, `~/.aws`, etc. |
+| Preferences | Reads only the domains a build reads (the global domain, Xcode's, `xcodebuild`'s, Swift Build's, the simulator's and codesign's); writes none, Xcode's included; `~/Library/Preferences` closed whatever the policy grants |
 | Other applications | **Denied** — no access to `/Applications`, except Xcode (`/Applications/Xcode.app`) under `moderate`/`permissive`, and what its approved policy declares |
 
 ### What Remains Accessible

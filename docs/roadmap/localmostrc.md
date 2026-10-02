@@ -249,8 +249,12 @@ git your configuration.
 A `write` grant under your home whose directories do not exist yet has them
 created before the job, empty, since the job is not granted their parents. The
 path the grant names is created too only when it says it is a directory, with
-a trailing `/` or `/**` - `~/.cache/my-tool/` - since a grant can name a file
-(`~/.python_history`), which the job creates itself. See
+a trailing `/` or `/**` - `~/.cache/my-tool/` - or when it is a directory
+above a credential location, which the job cannot create either (`~/.gradle`,
+on a Mac where Gradle never ran). Otherwise it is left to the job, since a
+grant can name a file (`~/.python_history`). This is the
+`jobEnvironment.createMissingGrantedDirs` preference, on by default; with it
+off, a missing directory stays missing. See
 [job-environment.md](job-environment.md) for this and what else a job's
 environment carries.
 
