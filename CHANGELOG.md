@@ -519,6 +519,13 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   answers "already paused" for an idle runner or kills a running job, and
   `localmost status` shows the pause. A pause made while the runner is still
   starting holds, and it comes up paused.
+- A resource pause (battery, video call) whose condition already holds when the
+  app launches, or arises before the runner is up, is shown in the tray and
+  `localmost status` with its reason, and the runner comes up paused, without
+  routing workflows here. It was dropped: the runner said it was listening
+  while every job was refused. For a runner that is not started, or whose
+  start failed, the tray and `localmost status` show its status, Offline or
+  Error, with the pause beside it, and the tray offers no Resume there.
 - An organization target's jobs get their repository's approved policy. The
   policy was looked up under the target's display name, the organization, which
   names no repository, so they ran with none of their grants.
@@ -661,6 +668,18 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   directories above a deny already were: under a deny of `~/out/sec*/key` a job
   cannot rename `~/out/secA`, nor create or rename anything in `~/out` whose
   name matches `sec*`
+- A resource pause (on battery, in a video call) lets jobs already running
+  finish, as a pause from the tray or `localmost pause` does: it refuses new
+  jobs and stops the heartbeat. It used to stop the workers, failing their
+  jobs on GitHub. Set `resourcePause.runningJobs: stop` in
+  `~/.localmost/config.yaml` to keep that
+- Resuming from the tray or with `localmost resume` while a resource condition
+  still holds overrides it: the runner takes jobs until the condition clears,
+  and pauses again if it recurs, or when another condition begins. The resume
+  says so - "Resumed (resource pause overridden until battery power clears)" -
+  and the tray and `localmost status` show it while it lasts. A resume used to
+  lift the pause in the tray while new jobs were still refused until the
+  condition cleared
 - CLI restructured with standalone commands that don't require the app
 - Improved help text with examples for all commands
 

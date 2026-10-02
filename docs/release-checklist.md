@@ -53,6 +53,9 @@
   - Add targets
   - Run job
   - With "Pause during video calls" on, turn a camera on (for example in FaceTime): runners pause, and resume about a minute after it is off. The Info.plist declares no camera usage, so also check that `~/Library/Logs/DiagnosticReports` has no new crash report for `is-camera-on` or localmost
+  - With "Pause when using battery" set to Always, quit, unplug, and launch: after the auto-start the tray shows `⏸ Battery at N%` (or the battery reason) and `localmost status` says `Paused (...)` with `Heartbeat: Inactive`. Plug in: the runner resumes and the heartbeat goes Active
+  - Unplug (or turn a camera on) while a job runs: by default the job runs to the end and new jobs stay queued on GitHub. Repeat with `resourcePause.runningJobs: stop` in `~/.localmost/config.yaml`: the job is stopped and fails on GitHub
+  - On battery while paused, Resume from the tray: the tray and `localmost status` show `Resumed (resource pause overridden until battery power clears)` and jobs are taken. Plug in: the line goes. Unplug again: the runner pauses again
   - Exit
   - Restart
   - Run job

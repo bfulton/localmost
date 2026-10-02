@@ -92,6 +92,49 @@ export interface AppConfig {
   notifications?: NotificationsConfig;
   /** The per-job Docker VMs; read from config.yaml only, see resolveDockerVmConfig. */
   dockerVm?: Partial<Record<keyof DockerVmConfig, unknown>>;
+  /** What a resource pause does; see ResourcePauseConfig and resolveResourcePauseConfig. */
+  resourcePause?: Partial<Record<keyof ResourcePauseConfig, unknown>>;
+}
+
+/**
+ * What a resource pause - the runner pausing itself on battery or during a
+ * video call, as the `power` settings say - does, as used: every key
+ * present.
+ */
+export interface ResourcePauseConfig {
+  /**
+   * What happens to jobs already running when a resource condition pauses
+   * the runner. Either way no new job is taken, and the heartbeat that
+   * routes workflows here stops.
+   *
+   * - `'finish'` (default): running jobs carry on to the end.
+   * - `'stop'`: the workers are stopped at once, and their jobs fail on
+   *   GitHub.
+   */
+  runningJobs: 'finish' | 'stop';
+}
+
+export const DEFAULT_RESOURCE_PAUSE_CONFIG: ResourcePauseConfig = {
+  runningJobs: 'finish',
+};
+
+/**
+ * The `resourcePause` section of config.yaml as the app uses it. Every key
+ * is optional; a value that is not one of the key's choices is taken as
+ * absent, with a line through `log`, and keys it does not know are ignored.
+ */
+export function resolveResourcePauseConfig(
+  raw: AppConfig['resourcePause'] | undefined,
+  log: (message: string) => void = () => {}
+): ResourcePauseConfig {
+  const section: Record<string, unknown> = typeof raw === 'object' && raw !== null ? raw : {};
+  const resolved: ResourcePauseConfig = { ...DEFAULT_RESOURCE_PAUSE_CONFIG };
+  const { runningJobs } = section;
+  if (runningJobs !== undefined) {
+    if (runningJobs === 'finish' || runningJobs === 'stop') resolved.runningJobs = runningJobs;
+    else log(`resourcePause.runningJobs must be 'finish' or 'stop'; using '${DEFAULT_RESOURCE_PAUSE_CONFIG.runningJobs}'`);
+  }
+  return resolved;
 }
 
 /**

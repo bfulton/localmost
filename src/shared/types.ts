@@ -576,4 +576,10 @@ export interface ResourcePauseState {
   reason: string | null;
   /** All active conditions */
   conditions: ResourceCondition[];
+  /**
+   * The conditions a manual resume overrode, still holding, named by kind
+   * ("battery power", "the video call"); null when there are none. They do
+   * not pause the runner again until they clear and recur.
+   */
+  overridden?: string | null;
 }
