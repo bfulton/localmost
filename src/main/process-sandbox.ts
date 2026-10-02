@@ -18,6 +18,7 @@ import {
   checkJobTempSuffix,
   developerCredentialFilters,
   developerCredentialPaths,
+  directoryCloneRules,
   expandPath,
   jobTempDirFilters,
   neverReachableAncestors,
@@ -836,6 +837,8 @@ ${allowDirectNetwork ? ';; Runner registration talks to GitHub directly: app-dri
 (allow user-preference-read)
 (allow user-preference-write
   (preference-domain "com.apple.dt.Xcode"))
+
+${directoryCloneRules().join('\n')}
 ${processMarkerRules(processMarker).join('\n')}
 `;
 }

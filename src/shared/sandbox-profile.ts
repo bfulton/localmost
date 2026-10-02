@@ -106,6 +106,28 @@ export function processMarkerRules(marker?: ProcessMarker): string[] {
   ];
 }
 
+/**
+ * No clone of a directory, in every profile, after every allow.
+ *
+ * clonefile(2) and fclonefileat(2) of a directory copy the whole tree beneath
+ * it in one call without asking about each file in it: read on the directory
+ * and write where the clone lands are all seatbelt checks. So a job could
+ * clone a readable directory holding a denied file - a policy deny, a
+ * credential the floor closes inside a package cache a level reads, the
+ * share's nonce - into its own sandbox and read the copy there, under a name
+ * no deny covers. A file still clones (cp -c, an APFS copy), which asks for
+ * read on the file itself; cp -c -R and Foundation's copyItem clone file by
+ * file, so they still copy a tree, less what is denied.
+ */
+export function directoryCloneRules(): string[] {
+  return [
+    ';; No clone of a directory: clonefile(2) copies the tree beneath it without',
+    ';; asking about each file, so a denied file would come along, readable',
+    ';; under the new name. A file still clones, which asks for read on it.',
+    '(deny file-clone (vnode-type DIRECTORY))',
+  ];
+}
+
 // =============================================================================
 // Profile Generation
 // =============================================================================
@@ -913,6 +935,9 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push('  (preference-domain "com.apple.dt.Xcode"))');
   lines.push('');
 
+  lines.push(...directoryCloneRules());
+  lines.push('');
+
   lines.push(...processMarkerRules(options.processMarker));
 
   return lines.join('\n');
@@ -999,6 +1024,8 @@ export function generateDiscoveryProfile(options: {
     '(allow user-preference-read)',
     '(allow user-preference-write',
     '  (preference-domain "com.apple.dt.Xcode"))',
+    '',
+    ...directoryCloneRules(),
     '',
     ...processMarkerRules(options.processMarker),
   ];

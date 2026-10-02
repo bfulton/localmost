@@ -756,6 +756,21 @@ describe('Process Sandbox', () => {
       expect(granted('/var/folders/zz/other_user00gn/T/tmp.AbC123xYz9')).toBe(false);
     });
 
+    it('refuses a clone of a directory, after every grant', () => {
+      // clonefile(2) of a directory copies the tree beneath it without asking
+      // about each file, so a policy-denied file, a credential inside a
+      // package cache the level reads or the share's nonce came along,
+      // readable in the job's sandbox under a name no deny covers.
+      const profile = profileWith({
+        filesystemPolicy: { level: 'moderate', read: ['/opt/out'], write: ['/opt/out'], deny: ['/opt/out/secret'] },
+      });
+      const lines = profile.split('\n');
+      const at = lines.indexOf('(deny file-clone (vnode-type DIRECTORY))');
+      expect(at).toBeGreaterThan(-1);
+      expect(at).toBeGreaterThan(lines.map((line) => line.startsWith('(allow file-write*')).lastIndexOf(true));
+      expect(lines.slice(at + 1).filter((line) => /^\(allow (default|file\*|file-clone)/.test(line))).toEqual([]);
+    });
+
     it("grants the job's own suffixed directory in the per-user temp, in both spellings, and no more of it", () => {
       // DIRHELPER_USER_DIR_SUFFIX moves a process's per-user temp directory to
       // T/<suffix>, and a sandboxed Foundation stages its atomic writes in

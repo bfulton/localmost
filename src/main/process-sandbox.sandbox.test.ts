@@ -105,6 +105,17 @@ const swapCommand = (from: string, to: string): string =>
   `/usr/bin/perl -e ${sq('my ($a, $b) = @ARGV; syscall(488, -2, $a, -2, $b, 2) == 0 or die "$!\\n"')} ${sq(from)} ${sq(to)}`;
 
 /**
+ * clonefileat(from, to, 0), by its syscall (462, with AT_FDCWD), through the
+ * system perl as swapCommand is; with `byDescriptor`, fclonefileat (517) of a
+ * descriptor opened on `from`. Exits nonzero with the errno's text. For a
+ * directory the kernel clones the whole tree beneath it in one call.
+ */
+const cloneCommand = (from: string, to: string, byDescriptor = false): string =>
+  byDescriptor
+    ? `/usr/bin/perl -MPOSIX -e ${sq('my ($a, $b) = @ARGV; my $fd = POSIX::open($a, O_RDONLY) // die "open: $!\\n"; syscall(517, $fd, -2, $b, 0) == 0 or die "$!\\n"')} ${sq(from)} ${sq(to)}`
+    : `/usr/bin/perl -e ${sq('my ($a, $b) = @ARGV; syscall(462, -2, $a, -2, $b, 0) == 0 or die "$!\\n"')} ${sq(from)} ${sq(to)}`;
+
+/**
  * chmod(2) of a path to the mode it already has, through the system perl:
  * chmod(1) skips the call when the mode would not change. Changes nothing
  * when it is allowed, so it probes a node's mode permission safely.
@@ -775,6 +786,34 @@ if (!isMacOS) {
         }
       });
 
+      it('cannot clone a package cache the level reads, to carry the credential files in it into the sandbox', () => {
+        // moderate reads ~/.m2, ~/.gradle, ~/.cargo, ~/.nuget, ~/.cache and
+        // ~/.local as toolchain trees, less the credential files inside. A
+        // clone of the directory copied the whole tree in one call, those
+        // files included, to a name in the job's sandbox no deny covers.
+        const run = underGrant({ level: 'moderate', read: [], write: [] });
+        const into = path.join(instanceIn(home), '_temp');
+        for (const dir of ['.m2', '.gradle', '.cargo', '.nuget', path.join('.nuget', 'NuGet'), '.cache', '.local']) {
+          for (const byDescriptor of [false, true]) {
+            const copy = path.join(into, probeName());
+            const result = run(`${cloneCommand(path.join(home, dir), copy, byDescriptor)} && /usr/bin/grep -r SECRET ${sq(copy)}`);
+            const cloned = fs.existsSync(copy);
+            fs.rmSync(copy, { recursive: true, force: true });
+            expect([dir, byDescriptor, result.stdout]).toEqual([dir, byDescriptor, '']);
+            expect([dir, byDescriptor, result.ok, cloned]).toEqual([dir, byDescriptor, false, false]);
+          }
+        }
+        // The level's read is in force, so each refusal above is the clone
+        // rule's: a file in the cache that is not a credential clones.
+        const readable = path.join(home, '.gradle', 'caches', 'readable.txt');
+        fs.writeFileSync(readable, 'cached');
+        const copy = path.join(into, probeName());
+        const result = run(`${cloneCommand(readable, copy)} && /bin/cat ${sq(copy)}`);
+        fs.rmSync(copy, { force: true });
+        fs.rmSync(readable);
+        expect(result).toMatchObject({ ok: true, stdout: 'cached' });
+      });
+
       it('a read grant on the home directory cannot read the credentials kept there, git and PyPI tokens included', () => {
         // ~/.git-credentials is where git's store helper keeps tokens in the
         // clear, and ~/.pypirc is where twine finds an upload token: a policy
@@ -922,6 +961,53 @@ if (!isMacOS) {
       // What the grant gives stays given: a new file beside the secret.
       expect(canCreate(run, path.join(out, 'a', probeName()))).toBe(true);
       expect(canCreate(run, path.join(out, 'g', probeName()))).toBe(true);
+    });
+
+    it('cannot clone a directory holding what a policy denies into its sandbox, and still clones a file', () => {
+      // clonefile(2) of a directory copies the whole tree beneath it without
+      // asking about each file: read on the directory and write where the
+      // clone lands carried a denied file into the job's sandbox, readable
+      // there under a name no deny covers. A glob deny and a literal one.
+      const tree = path.join(base, probeName());
+      const out = path.join(tree, 'out');
+      fs.mkdirSync(path.join(out, 'secA'), { recursive: true });
+      fs.mkdirSync(path.join(out, 'plain'));
+      fs.writeFileSync(path.join(out, 'secA', 'key'), 'SECRET');
+      fs.writeFileSync(path.join(out, 'plain', 'key'), 'SECRET');
+      fs.writeFileSync(path.join(out, 'visible.txt'), 'visible');
+      try {
+        const run = underProfile({
+          filesystemPolicy: { level: 'strict', read: [tree], write: [], deny: [`${out}/sec*/key`, path.join(out, 'plain', 'key')] },
+        });
+        for (const from of [out, path.join(out, 'secA'), path.join(out, 'plain')]) {
+          for (const byDescriptor of [false, true]) {
+            const copy = path.join(jobTmp, probeName());
+            const result = run(`${cloneCommand(from, copy, byDescriptor)} && /usr/bin/grep -r SECRET ${sq(copy)}`);
+            const cloned = fs.existsSync(copy);
+            fs.rmSync(copy, { recursive: true, force: true });
+            expect([from, byDescriptor, result.stdout]).toEqual([from, byDescriptor, '']);
+            expect([from, byDescriptor, result.ok, cloned]).toEqual([from, byDescriptor, false, false]);
+            expect(result.stderr).toContain('Operation not permitted');
+          }
+        }
+        // A readable file still clones, by path and by descriptor.
+        for (const byDescriptor of [false, true]) {
+          const copy = path.join(jobTmp, probeName());
+          const result = run(`${cloneCommand(path.join(out, 'visible.txt'), copy, byDescriptor)} && /bin/cat ${sq(copy)}`);
+          fs.rmSync(copy, { force: true });
+          expect(result).toMatchObject({ ok: true, stdout: 'visible' });
+        }
+        // cp -c -R clones file by file, so it copies the tree less the
+        // denied files, as cp -R does.
+        const copied = path.join(jobTmp, probeName());
+        run(`/bin/cp -c -R ${sq(out)} ${sq(copied)}`);
+        const visible = fs.existsSync(path.join(copied, 'visible.txt'));
+        const keys = ['secA', 'plain'].filter((dir) => fs.existsSync(path.join(copied, dir, 'key')));
+        fs.rmSync(copied, { recursive: true, force: true });
+        expect([visible, keys]).toEqual([true, []]);
+      } finally {
+        fs.rmSync(tree, { recursive: true, force: true });
+      }
     });
 
     it('refuses what a policy denies by a spelling that runs through a symlink', () => {
@@ -1249,6 +1335,28 @@ if (!isMacOS) {
       for (const name of ['_work/copy', '_work/linked', '_temp/linked', '_temp/cloned']) {
         expect([name, fs.existsSync(path.join(sandbox, name))]).toEqual([name, false]);
       }
+      intact();
+    });
+
+    it('cannot clone _work, which would give the nonce a name the deny does not cover', () => {
+      // clonefile(2) of a directory copies the whole tree beneath it without
+      // asking about each file, so a clone of _work carried a readable copy
+      // of the nonce into _temp.
+      for (const byDescriptor of [false, true]) {
+        const result = run(`${cloneCommand('_work', '_temp/w', byDescriptor)} && cat _temp/w/.localmost-share`);
+        const cloned = fs.existsSync(path.join(sandbox, '_temp', 'w'));
+        fs.rmSync(path.join(sandbox, '_temp', 'w'), { recursive: true, force: true });
+        expect([byDescriptor, result.stdout, cloned]).toEqual([byDescriptor, '', false]);
+        expect(result.ok).toBe(false);
+        expect(result.stderr).toContain('Operation not permitted');
+      }
+      // A file in it still clones, so the refusal is the directory's. Its
+      // own file: an earlier case empties the share with rm -rf _work.
+      fs.writeFileSync(path.join(share, 'built.txt'), 'built');
+      const file = run(`${cloneCommand('_work/built.txt', '_temp/built.txt')} && cat _temp/built.txt`);
+      fs.rmSync(path.join(sandbox, '_temp', 'built.txt'), { force: true });
+      fs.rmSync(path.join(share, 'built.txt'));
+      expect(file).toMatchObject({ ok: true, stdout: 'built' });
       intact();
     });
 

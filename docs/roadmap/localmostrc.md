@@ -215,6 +215,11 @@ nor create, rename or move in anything under `~/out` whose name matches
 `sec*`, while it still writes inside `~/out/secA` and creates other names in
 `~/out`. A wildcard high in a path closes that many more names: under
 `~/*/key`, nothing can be created, renamed or removed directly in your home.
+Nor can a job clone a directory: clonefile(2) copies the whole tree beneath a
+directory in one call without checking each file, so a clone of `~/out` would
+carry `~/out/secA/key` into the job's sandbox under a name no deny covers. A
+file still clones, and `cp -c -R` copies a tree file by file, less what is
+denied.
 The real path is looked up as far as it can be: a directory the app cannot look
 into, a symlink loop, or a folder macOS asks permission for (Desktop, Documents,
 Downloads, `~/Library`, `/Volumes`) ends the lookup there, and the rest is

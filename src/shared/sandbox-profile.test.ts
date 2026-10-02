@@ -220,6 +220,23 @@ describe('Sandbox Profile Generator', () => {
       }
     });
 
+    it('refuses a clone of a directory in every profile, after every allow', () => {
+      // clonefile(2) of a directory copies the tree beneath it without asking
+      // about each file, so a denied file inside came along readable.
+      for (const profile of [
+        generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT }),
+        generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, permissive: true }),
+        generateDiscoveryProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, logFile: '' }),
+      ]) {
+        const forms = topLevelForms(profile);
+        const at = forms.indexOf('(deny file-clone (vnode-type DIRECTORY))');
+        expect(at).toBeGreaterThan(-1);
+        // Nothing after it could allow a clone again.
+        expect(forms.slice(at + 1).filter((form) => /^\(allow (default|file\*|file-clone)/.test(form))).toEqual([]);
+        expect(forms.slice(0, at).some((form) => /^\(allow (default|file-read\*)/.test(form))).toBe(true);
+      }
+    });
+
     it("grants the job's own suffixed directory in the per-user temp, in both spellings, and no more of it", () => {
       // DIRHELPER_USER_DIR_SUFFIX moves a process's per-user temp directory to
       // T/<suffix>, and a sandboxed Foundation stages its atomic writes in

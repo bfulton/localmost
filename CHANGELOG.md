@@ -161,6 +161,13 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   for a `*` entry every directory a wildcard stands for, are closed to writes,
   so a job granted one can no longer rename it and read the denied path under
   the new name.
+- A job can no longer clone a directory, in a runner job or in `localmost
+  test`. clonefile(2) copies the whole tree beneath a directory in one call
+  without checking each file, so a job that could read a directory holding a
+  denied file - a policy deny, a credential file inside a package cache its
+  level reads (`~/.m2/settings.xml`), the Docker VM share's nonce - cloned it
+  into its sandbox and read the copy. A file still clones, and `cp -c -R` and
+  Foundation's `copyItem` copy a tree file by file, less what is denied.
 - `.localmostrc` refuses a network entry that is not a host pattern - a URL such
   as `https://evil.com`, a path, a range such as `10.0.0.0/8`, surrounding
   spaces - and a relative `filesystem.deny` entry. Each was accepted and shown,
