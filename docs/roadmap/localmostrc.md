@@ -156,6 +156,8 @@ shared:
       network: bridge            # Routable: out through the job's proxy only
     build:
       context: ./
+      tags:
+        - "myapp:*"              # Names a build may tag; never a run.images one
 
   env:
     allow:
@@ -372,7 +374,7 @@ Actions are CLI-shaped, so a policy reads the way a workflow author thinks:
 |---|---|---|
 | `pull` | image pulls | `registries` — the registry each pulled image comes from |
 | `run` | container create, start, attach, wait, kill, stop, remove and logs; creating a declared network; inspecting a declared image | `images` — the images a container may be created from, and the only images it may inspect; each entry is an anchored glob where `*` stops at `/`, so a content-addressed tag can be declared as `vk/grader:*` while `vk/*:*` reaches one level under `vk` and no further; a glob must say which tags it covers, since a tagless reference means `:latest` — `vk/*` is refused, `vk/*:*` accepted; `networks` — networks the job may create, each an anchored name glob plus whether it is `internal`; `mounts` — workspace paths a container may bind, each `ro` or `rw`; `network` — the container's network mode |
-| `build` | image builds, with the classic builder (jobs run with `DOCKER_BUILDKIT=0`, since a BuildKit build streams over a gRPC session the filter cannot inspect) | `context` — which directory the workflow builds from, for the reader and the approval diff |
+| `build` | image builds, with the classic builder (jobs run with `DOCKER_BUILDKIT=0`, since a BuildKit build streams over a gRPC session the filter cannot inspect) | `tags` — the names a build may tag its image with (`-t`), each an anchored glob matched as `run.images` entries are (`*` stops at `/`, and a glob must say which tags it covers: `myapp:*`, not `myapp*`); `context` — which directory the workflow builds from, for the reader and the approval diff |
 
 Conditions are checked against the request itself. Mount paths are resolved
 through symlinks and must stay inside the job workspace, so `../` traversal and
@@ -384,8 +386,28 @@ context reaches the daemon as a tar the client already assembled, so there is no
 path in the request to test. A local context is confined by the sandbox profile
 instead — the job can only read what the profile grants — and the filter refuses
 a *remote* context, which would have the daemon fetch it and skip the profile.
-Anything not listed is denied: an undeclared image, registry, mount or network
-mode, and every endpoint the proxy does not understand.
+Anything not listed is denied: an undeclared image, registry, mount, network
+mode or build tag, and every endpoint the proxy does not understand.
+
+`build.tags` is a check. A build's tag replaces any local image of that name,
+and a later `docker run` of the name uses it without a pull, so every `-t` a
+build carries (`docker build -t a -t b` sends both) must match an entry. Two
+kinds of tag are refused whatever `build.tags` says, and the denial offers no
+policy line for them:
+
+- a tag with a registry host - a first component, before a `/`, with a `.` or
+  `:` in it, an uppercase letter, or that is `localhost`
+  (`ghcr.io/o/app`, `localhost:5000/app`, `docker.io/library/app`). The image
+  was never fetched from there. Validation refuses such an entry too;
+- a tag in a repository `run.images` names, in any case, and with or without
+  a tag of its own: under `run.images: ["postgres:16"]` the tags `postgres:16`,
+  `postgres`, `Postgres:17` and `library/postgres:16` are all refused. What an
+  approver reads as the image the job runs stays that image.
+
+So an image a job builds cannot also be one it runs by name: declaring it in
+`run.images` makes the build's tag refused. A build with no tag needs no entry,
+and `t` spelled in any other case (`T=`) is refused, since one daemon ignores
+it and another reads it as a tag.
 
 A small baseline needs no declaration: `/_ping`, `/version`, `/info`, and reads
 about the job's own containers. Every client needs them to start, and none
@@ -438,7 +460,8 @@ approval text says so.
 it cannot pull a `FROM` image itself. A job pulls its base images with `docker
 pull` first, which `pull.registries` must allow, and then builds. A build that
 fails because it tried to fetch a base image gets a line in the job log naming
-this rule.
+this rule. The filter does not read the Dockerfile, so a `FROM` may name any
+image already in the VM, whatever `run.images` says.
 
 `docker:` is allowed in `shared:` and under `workflows:`, and the two compose
 additively like the rest of the policy. The socket is bound to the merged policy
