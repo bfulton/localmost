@@ -525,6 +525,11 @@ export function developerCredentialPaths(home: string = os.homedir()): { subpath
       // rules say, so a grant of ~ or ~/Library would otherwise read and
       // write any app's settings through it (see preferenceRules).
       `${home}/Library/Preferences`,
+      // Secrets kept inside a tool's ~/.local/share directory, which a
+      // policy declares when a command in ~/.local/bin links into it: uv's
+      // index credentials, and the SSH keys into Podman's machines.
+      `${home}/.local/share/uv/credentials`,
+      `${home}/.local/share/containers/podman/machine`,
     ],
     literals: [
       `${home}/.netrc`,
@@ -537,6 +542,8 @@ export function developerCredentialPaths(home: string = os.homedir()): { subpath
       // missing, where newer ones do.
       `${home}/.gem/credentials`,
       `${home}/.local/share/gem/credentials`,
+      // atuin's shell history sync key.
+      `${home}/.local/share/atuin/key`,
       // `terraform login`'s tokens, and the CLI configuration's credentials blocks.
       `${home}/.terraform.d/credentials.tfrc.json`,
       `${home}/.terraformrc`,

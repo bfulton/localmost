@@ -267,6 +267,12 @@ describe('Sandbox Profile Generator', () => {
         '(literal "/Users/test/.pypirc")',
         '(literal "/Users/test/.gem/credentials")',
         '(literal "/Users/test/.local/share/gem/credentials")',
+        // The secrets kept inside a tool's ~/.local/share directory, which a
+        // policy declares when a command in ~/.local/bin links into it: uv's
+        // index credentials, Podman's machine SSH key, atuin's sync key.
+        '(subpath "/Users/test/.local/share/uv/credentials")',
+        '(subpath "/Users/test/.local/share/containers/podman/machine")',
+        '(literal "/Users/test/.local/share/atuin/key")',
         '(literal "/Users/test/.terraform.d/credentials.tfrc.json")',
         '(literal "/Users/test/.terraformrc")',
         '(literal "/Users/test/.pgpass")',
@@ -315,6 +321,10 @@ describe('Sandbox Profile Generator', () => {
         '/Users/test/.local',
         '/Users/test/.local/share',
         '/Users/test/.local/share/gem',
+        '/Users/test/.local/share/uv',
+        '/Users/test/.local/share/containers',
+        '/Users/test/.local/share/containers/podman',
+        '/Users/test/.local/share/atuin',
         '/Users/test/.cache',
         '/Users/test/.cache/huggingface',
         '/Users/test',

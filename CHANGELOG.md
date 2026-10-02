@@ -102,11 +102,18 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
 
 ### Breaking
 - Under `moderate` and `permissive` a job reads only `~/.local/bin` and
-  `~/.local/lib` of `~/.local`, not `~/.local/share` or `~/.local/state`. A
-  command in `~/.local/bin` that links into `~/.local/share` - one installed
-  with `uv tool install` or `pipx` - fails with "Operation not permitted"
-  until the repository declares its `~/.local/share/<tool>` under
-  `filesystem.read`.
+  `~/.local/lib` of `~/.local`, not `~/.local/share`, `~/.local/state` or the
+  rest. A command in `~/.local/bin` that links elsewhere in `~/.local` fails
+  with "Operation not permitted" until the repository declares the directory
+  the link resolves into under `filesystem.read`: `~/.local/share/uv/tools`
+  for `uv tool install`, `~/.local/share/uv/python` for a uv-managed Python,
+  `~/.local/share/claude` for Claude's native installer,
+  `~/.local/share/mise` for mise, and `~/.local/pipx` or
+  `~/Library/Application Support/pipx` for pipx, depending on its version.
+- uv's index credentials (`~/.local/share/uv/credentials`), the SSH keys
+  into Podman's machines (`~/.local/share/containers/podman/machine`) and
+  atuin's sync key (`~/.local/share/atuin/key`) are closed to reads and
+  writes at every level, whatever the policy grants.
 - A job, a `localmost test` step and `--updaterc` no longer write the
   `com.apple.dt.Xcode` preference domain. A workflow step that runs
   `defaults write com.apple.dt.Xcode ...` (to skip macro fingerprint
@@ -434,7 +441,10 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   nothing printed uv's index credentials
   (`~/.local/share/uv/credentials/credentials.toml`), the SSH key into a
   Podman machine (`~/.local/share/containers/podman/machine/machine`) and
-  atuin's sync key. They now read `~/.local/bin` and `~/.local/lib` only.
+  atuin's sync key. They now read `~/.local/bin` and `~/.local/lib` only,
+  and those three secrets are on the credential floor, so a policy that
+  declares `~/.local/share/uv`, say, to run a tool linked into it does not
+  hand the job uv's credentials beside it.
 - Every profile let a job, a `localmost test` step and `--updaterc` write the
   `com.apple.dt.Xcode` preference domain, at every level: settings your own
   Xcode loads outside any sandbox. No profile writes a preference domain now.

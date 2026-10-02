@@ -602,6 +602,31 @@ if (!isMacOS) {
       }
     });
 
+    it('keeps the secrets tools keep in ~/.local/share unreadable when the policy declares that directory', () => {
+      // The way to run a command in ~/.local/bin that links into
+      // ~/.local/share is to declare where it resolves; declaring uv's or
+      // Podman's whole directory must not hand the step what they keep there.
+      const secrets = [
+        path.join('.local', 'share', 'uv', 'credentials', 'credentials.toml'),
+        path.join('.local', 'share', 'containers', 'podman', 'machine', 'machine'),
+        path.join('.local', 'share', 'atuin', 'key'),
+      ];
+      const tool = path.join('.local', 'share', 'uv', 'tools', 'ruff', 'bin', 'ruff');
+      for (const file of [...secrets, tool]) {
+        fs.mkdirSync(path.dirname(path.join(home, file)), { recursive: true });
+        fs.writeFileSync(path.join(home, file), 'planted\n');
+      }
+      const profile = generateSandboxProfile({
+        workDir,
+        proxyPort: 1,
+        policy: { filesystem: { read: [...MACOS_BASELINE_READ_PATHS, '~/.local/share'] } },
+      });
+      expect(run(profile, ['/bin/cat', path.join(home, tool)])).toBe(true);
+      for (const file of secrets) {
+        expect([file, run(profile, ['/bin/cat', path.join(home, file)])]).toEqual([file, false]);
+      }
+    });
+
     /**
      * Whether a step under `profile` can rename `from` to `to` and read
      * `shown` from under the new name. Undone from outside the sandbox should

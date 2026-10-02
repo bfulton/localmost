@@ -555,6 +555,11 @@ if (!isMacOS) {
         '.pypirc': 'SECRET-pypi',
         '.gem/credentials': 'SECRET-rubygems',
         '.local/share/gem/credentials': 'SECRET-rubygems-xdg',
+        // Kept inside a tool's ~/.local/share directory, which a policy
+        // declares when a command in ~/.local/bin links into it.
+        '.local/share/uv/credentials/credentials.toml': 'SECRET-uv',
+        '.local/share/containers/podman/machine/machine': 'SECRET-podman',
+        '.local/share/atuin/key': 'SECRET-atuin',
         '.terraform.d/credentials.tfrc.json': 'SECRET-terraform',
         '.azure/msal_token_cache.json': 'SECRET-azure',
         '.yarnrc.yml': 'SECRET-yarn',
@@ -714,6 +719,10 @@ if (!isMacOS) {
           ['.terraform.d', '.terraform.d-renamed', 'credentials.tfrc.json'],
           ['.local', '.local-renamed', path.join('share', 'gem', 'credentials')],
           [path.join('.local', 'share'), path.join('.local', 'share-renamed'), path.join('gem', 'credentials')],
+          [path.join('.local', 'share', 'uv'), path.join('.local', 'share', 'uv-renamed'), path.join('credentials', 'credentials.toml')],
+          [path.join('.local', 'share', 'containers', 'podman'), path.join('.local', 'share', 'containers', 'podman-renamed'),
+            path.join('machine', 'machine')],
+          [path.join('.local', 'share', 'atuin'), path.join('.local', 'share', 'atuin-renamed'), 'key'],
           ['.cache', '.cache-renamed', path.join('huggingface', 'token')],
           [path.join('.cache', 'huggingface'), path.join('.cache', 'huggingface-renamed'), 'token'],
         ]) {
@@ -772,28 +781,58 @@ if (!isMacOS) {
         expect(canCreateUnder(gradle, path.join(fresh, '.gradle', 'caches'))).toBe(true);
       });
 
+      /** What tools keep in ~/.local beside bin and lib that is no credential, and a job still has no business reading. */
+      const localData: Record<string, string> = {
+        '.local/share/fish/fish_history': 'HISTORY-fish',
+        '.local/state/tool/history': 'STATE-tool',
+      };
+      const plantLocal = () => {
+        const tool = path.join(home, '.local', 'bin', 'tool');
+        for (const [file, content] of Object.entries(localData)) {
+          fs.mkdirSync(path.dirname(path.join(home, file)), { recursive: true });
+          fs.writeFileSync(path.join(home, file), content);
+        }
+        fs.mkdirSync(path.dirname(tool), { recursive: true });
+        fs.writeFileSync(tool, '#!/bin/sh\necho tool-ran\n', { mode: 0o755 });
+        return tool;
+      };
+      const localSecrets = [
+        '.local/share/uv/credentials/credentials.toml',
+        '.local/share/containers/podman/machine/machine',
+        '.local/share/atuin/key',
+        '.local/share/gem/credentials',
+      ];
+
       it.each(['moderate', 'permissive'] as const)(
-        'reads and runs what is in ~/.local/bin under %s with no grant, and none of the tokens tools keep in ~/.local/share',
+        'reads and runs what is in ~/.local/bin under %s with no grant, and nothing tools keep elsewhere in ~/.local',
         (level) => {
           // ~/.local was read whole as a toolchain tree, and ~/.local/share
           // is where uv keeps its index credentials, Podman the SSH key into
-          // its machine and atuin its sync key: each was printed by a job
-          // that declared nothing.
-          const secrets: Record<string, string> = {
-            '.local/share/uv/credentials/credentials.toml': 'SECRET-uv',
-            '.local/share/containers/podman/machine/machine': 'SECRET-podman',
-            '.local/share/atuin/key': 'SECRET-atuin',
-          };
-          const tool = path.join(home, '.local', 'bin', 'tool');
-          for (const [file, content] of Object.entries(secrets)) {
-            fs.mkdirSync(path.dirname(path.join(home, file)), { recursive: true });
-            fs.writeFileSync(path.join(home, file), content);
-          }
-          fs.mkdirSync(path.dirname(tool), { recursive: true });
-          fs.writeFileSync(tool, '#!/bin/sh\necho tool-ran\n', { mode: 0o755 });
+          // its machine and atuin its sync key, and where shells keep their
+          // history: each was printed by a job that declared nothing.
+          const tool = plantLocal();
           const run = underGrant({ level, read: [], write: [] });
           expect(run(sq(tool)).stdout).toBe('tool-ran');
-          for (const file of Object.keys(secrets)) {
+          for (const file of [...localSecrets, ...Object.keys(localData)]) {
+            const result = run(`/bin/cat ${sq(path.join(home, file))}`);
+            expect([file, result.stdout]).toEqual([file, '']);
+            expect([file, result.stderr]).toEqual([file, expect.stringContaining('Operation not permitted')]);
+          }
+        }
+      );
+
+      it.each(['strict', 'moderate'] as const)(
+        'a read grant on ~/.local/share under %s reads what tools keep there, and none of their secrets',
+        (level) => {
+          // A command in ~/.local/bin that links into ~/.local/share runs once
+          // the repository declares where the link resolves. Declaring uv's or
+          // Podman's whole directory handed the job the credentials beside the
+          // tools, so those are on the floor with RubyGems'.
+          plantLocal();
+          const run = underGrant({ level, read: ['~/.local/share'], write: [] });
+          // The grant is in force, so each refusal below is the floor's doing.
+          expect(run(`/bin/cat ${sq(path.join(home, '.local/share/fish/fish_history'))}`).stdout).toBe('HISTORY-fish');
+          for (const file of localSecrets) {
             const result = run(`/bin/cat ${sq(path.join(home, file))}`);
             expect([file, result.stdout]).toEqual([file, '']);
             expect([file, result.stderr]).toEqual([file, expect.stringContaining('Operation not permitted')]);

@@ -685,6 +685,11 @@ describe('Process Sandbox', () => {
           home('.pypirc'),
           home('.gem', 'credentials'),
           home('.local', 'share', 'gem', 'credentials'),
+          // Inside a tool's ~/.local/share directory, which a policy declares
+          // when a command in ~/.local/bin links into it.
+          home('.local', 'share', 'uv', 'credentials', 'credentials.toml'),
+          home('.local', 'share', 'containers', 'podman', 'machine', 'machine'),
+          home('.local', 'share', 'atuin', 'key'),
           home('.terraform.d', 'credentials.tfrc.json'),
           home('.terraformrc'),
           home('.pgpass'),
@@ -709,7 +714,10 @@ describe('Process Sandbox', () => {
         for (const node of [
           home('.ssh'), home('Library', 'Keychains'), home('Library'), home('.m2'), home('.gradle'), home('.cargo'),
           home('.nuget'), home('.nuget', 'NuGet'), home('.azure'), home('.gem'), home('.terraform.d'), home('.local'),
-          home('.local', 'share'), home('.local', 'share', 'gem'), home('.cache'), home('.cache', 'huggingface'),
+          home('.local', 'share'), home('.local', 'share', 'gem'), home('.local', 'share', 'uv'),
+          home('.local', 'share', 'uv', 'credentials'), home('.local', 'share', 'containers', 'podman'),
+          home('.local', 'share', 'containers', 'podman', 'machine'), home('.local', 'share', 'atuin'),
+          home('.cache'), home('.cache', 'huggingface'),
           home('Library', 'Preferences'), homeDir, path.dirname(homeDir),
         ]) {
           expect(writable(profile, node)).toBe(false);
@@ -724,6 +732,8 @@ describe('Process Sandbox', () => {
           home('.gem', 'ruby', '3.4.0', 'gems'),
           home('.terraform.d', 'plugins', 'registry.terraform.io'),
           home('.local', 'share', 'other-tool'),
+          home('.local', 'share', 'uv', 'tools', 'ruff', 'bin', 'ruff'),
+          home('.local', 'share', 'atuin', 'history.db'),
           home('.cache', 'huggingface', 'hub', 'models--x'),
           home('Library', 'Caches', 'built'),
           home('project', 'built'),
@@ -902,6 +912,30 @@ describe('Process Sandbox', () => {
         // Read only, as every toolchain tree: ~/.local/bin is on your PATH.
         expect(writable(profile, home('.local', 'bin', 'tool'))).toBe(false);
         expect(writable(profile, home('.local', 'lib', 'tool.py'))).toBe(false);
+      }
+    );
+
+    it.each(['strict', 'moderate', 'permissive'] as const)(
+      'reads the share directory a policy declares under %s, and none of the secrets tools keep in it',
+      (level) => {
+        // A command in ~/.local/bin that links into ~/.local/share runs once
+        // the repository declares where the link resolves. Declaring uv's or
+        // Podman's whole directory - the obvious way to do it - handed the job
+        // uv's index credentials and Podman's machine key beside the tools.
+        const home = (...parts: string[]) => path.join(homeDir, ...parts);
+        const profile = profileWith({ filesystemPolicy: { level, read: ['~/.local/share'], write: [] } });
+        expect(readable(profile, home('.local', 'share', 'uv', 'tools', 'ruff', 'bin', 'ruff'))).toBe(true);
+        expect(readable(profile, home('.local', 'share', 'uv', 'python', 'cpython-3.12', 'bin', 'python3'))).toBe(true);
+        expect(readable(profile, home('.local', 'share', 'containers', 'storage', 'overlay'))).toBe(true);
+        for (const target of [
+          home('.local', 'share', 'uv', 'credentials', 'credentials.toml'),
+          home('.local', 'share', 'containers', 'podman', 'machine', 'machine'),
+          home('.local', 'share', 'containers', 'podman', 'machine', 'machine.pub'),
+          home('.local', 'share', 'atuin', 'key'),
+          home('.local', 'share', 'gem', 'credentials'),
+        ]) {
+          expect([target, readable(profile, target)]).toEqual([target, false]);
+        }
       }
     );
 

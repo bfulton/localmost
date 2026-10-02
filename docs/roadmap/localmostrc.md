@@ -557,10 +557,12 @@ anything; it adds to whatever the configured policy level already allows:
 - `moderate`: additionally GitHub Actions infrastructure, common registries and
   tool caches, read-only. Of `~/.local` that is `~/.local/bin` and
   `~/.local/lib` only: `~/.local/share` and `~/.local/state` are where tools
-  keep their state, tokens included (uv's index credentials, the SSH key into
-  a Podman machine), so a job that needs a `~/.local/share/<tool>` declares it
-  - one running a tool `uv tool install` or `pipx` linked into `~/.local/bin`,
-  say.
+  keep their state, tokens included. A job that runs a command linked from
+  `~/.local/bin` into the rest of `~/.local` declares the directory the link
+  resolves into, such as `~/.local/share/uv/tools` for `uv tool install`,
+  `~/.local/share/uv/python` for a uv-managed Python or `~/.local/share/mise`
+  for mise. uv's index credentials, the SSH keys into Podman's machines and
+  atuin's sync key stay closed whatever is declared.
 - `permissive`: no network restrictions.
 
 Under `strict` and `moderate` a host is reached on 443 through `CONNECT` and on

@@ -82,7 +82,8 @@ export function spawnEnvPolicy(config: LocalmostrcConfig): { allow: string[]; de
  * - which are not only caches: they hold directories on the user's PATH and
  * config their unsandboxed tools load. Each tool is pointed here instead, by
  * the variable it honours, and the user's trees stay readable so the
- * toolchains installed there still run. rustup has no entry: its toolchains
+ * toolchains installed there still run - of ~/.local, only bin and lib, the
+ * rest being where tools keep their state. rustup has no entry: its toolchains
  * are read from ~/.rustup where they are installed, and a job cannot add one.
  */
 export function packageCacheEnv(dir: string): Record<string, string> {

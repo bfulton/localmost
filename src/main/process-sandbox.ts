@@ -325,7 +325,9 @@ export function generateSandboxProfile({
   // machine, atuin's sync key, all under ~/.local/share. The job's package
   // managers keep their data in its own package cache (XDG_DATA_HOME), so no
   // ~/.local/share/<tool> is read for them; a tool linked from ~/.local/bin
-  // into one, or a job that wants one for another reason, declares it.
+  // into one, or a job that wants one for another reason, declares it. Those
+  // three secrets are on the floor (developerCredentialPaths), so declaring
+  // ~/.local/share/uv to run a uv tool does not read uv's credentials.
   const toolchainPaths =
     filesystemPolicy.level === 'strict'
       ? []
