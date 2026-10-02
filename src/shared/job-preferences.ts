@@ -31,9 +31,13 @@ export interface ResourcePauseConfig {
   runningJobs: 'finish' | 'stop';
 }
 
-export const DEFAULT_RESOURCE_PAUSE_CONFIG: ResourcePauseConfig = {
+/**
+ * Frozen: shared by reference into the store's defaults and the renderer's
+ * fallbacks, so a stray write cannot change the runner's default.
+ */
+export const DEFAULT_RESOURCE_PAUSE_CONFIG: Readonly<ResourcePauseConfig> = Object.freeze({
   runningJobs: 'finish',
-};
+});
 
 /**
  * The `resourcePause` section of config.yaml as the app uses it. Every key
@@ -96,13 +100,13 @@ export interface JobEnvironmentConfig {
   createMissingGrantedDirs: boolean;
 }
 
-/** Every job-environment convenience, on: the defaults. */
-export const DEFAULT_JOB_ENVIRONMENT_CONFIG: JobEnvironmentConfig = {
+/** Every job-environment convenience, on: the defaults. Frozen, as DEFAULT_RESOURCE_PAUSE_CONFIG. */
+export const DEFAULT_JOB_ENVIRONMENT_CONFIG: Readonly<JobEnvironmentConfig> = Object.freeze({
   toolShims: true,
   javaToolOptions: true,
   perJobTempDir: true,
   createMissingGrantedDirs: true,
-};
+});
 
 /**
  * The `jobEnvironment` section of config.yaml as used. Every key is optional
