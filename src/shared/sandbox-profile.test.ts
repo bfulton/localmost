@@ -2,6 +2,7 @@
  * Tests for Sandbox Profile Generator
  */
 
+import { execFileSync } from 'child_process';
 import * as path from 'path';
 import {
   generateSandboxProfile,
@@ -217,6 +218,35 @@ describe('Sandbox Profile Generator', () => {
         const mktemp = topLevelForms(profile).find((f) => f.startsWith('(allow file-write* file-read*') && f.includes('(regex #"'));
         expect(mktemp).toMatch(/\/T\/tmp\\\.(\[A-Za-z0-9\]){10}/);
       }
+    });
+
+    it("grants the job's own suffixed directory in the per-user temp, in both spellings, and no more of it", () => {
+      // DIRHELPER_USER_DIR_SUFFIX moves a process's per-user temp directory to
+      // T/<suffix>, and a sandboxed Foundation stages its atomic writes in
+      // TemporaryItems there. The job gets that directory; the rest of T,
+      // which every process the user runs shares, stays closed.
+      const userTemp = execFileSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf-8' })
+        .trim().replace(/\/+$/, '').replace(/^\/private/, '');
+      const suffix = 'localmost-job-3f9a';
+      for (const profile of [
+        generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, jobTempSuffix: suffix }),
+        generateDiscoveryProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, logFile: '', jobTempSuffix: suffix }),
+      ]) {
+        expect(topLevelForms(profile)).toContain(
+          `(allow file-read* file-write*\n  (subpath "/private${userTemp}/${suffix}")\n  (subpath "${userTemp}/${suffix}"))`
+        );
+        expect(profile).not.toContain(`(subpath "${userTemp}")`);
+        expect(profile).not.toContain(`(subpath "/private${userTemp}")`);
+      }
+      // None when the job has no suffix.
+      expect(generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT }))
+        .not.toContain(`(subpath "${userTemp}/`);
+    });
+
+    it.each(['', '.', '..', 'a/b', '../T', 'a"b', 'a b', '-x'])('refuses a temp suffix that is not one plain name: %j', (suffix) => {
+      // It lands in the profile as a path component under the shared T.
+      expect(() => generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, jobTempSuffix: suffix }))
+        .toThrow(/temp suffix/);
     });
 
     it('grants no home directory cache that the policy has not declared, with or without a policy', () => {

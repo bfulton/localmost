@@ -756,6 +756,44 @@ describe('Process Sandbox', () => {
       expect(granted('/var/folders/zz/other_user00gn/T/tmp.AbC123xYz9')).toBe(false);
     });
 
+    it("grants the job's own suffixed directory in the per-user temp, in both spellings, and no more of it", () => {
+      // DIRHELPER_USER_DIR_SUFFIX moves a process's per-user temp directory to
+      // T/<suffix>, and a sandboxed Foundation stages its atomic writes in
+      // TemporaryItems there. The job gets that directory, read and write;
+      // the rest of T, shared with every process the user runs, stays closed.
+      const suffix = 'localmost-job-3f9a';
+      const profile = profileWith({ jobTempSuffix: suffix });
+      expect(profile).toContain(
+        [
+          '(allow file-read* file-write*',
+          `  (subpath "/private/var/folders/zz/zyxw_vut0000gn/T/${suffix}")`,
+          `  (subpath "/var/folders/zz/zyxw_vut0000gn/T/${suffix}"))`,
+        ].join('\n')
+      );
+      for (const dir of ['/var/folders/zz/zyxw_vut0000gn/T', '/private/var/folders/zz/zyxw_vut0000gn/T']) {
+        expect(writable(profile, `${dir}/${suffix}/TemporaryItems/NSIRD_aw_x/out.txt`)).toBe(true);
+        expect(readable(profile, `${dir}/${suffix}/TemporaryItems`)).toBe(true);
+        expect(writable(profile, `${dir}/TemporaryItems/NSIRD_aw_x`)).toBe(false);
+        expect(writable(profile, `${dir}/localmost-job-other/TemporaryItems`)).toBe(false);
+        expect(readable(profile, `${dir}/xcrun_db`)).toBe(false);
+        expect(writable(profile, `${dir}/${suffix}x`)).toBe(false);
+      }
+      // A deny the policy declares over it still holds: the grant comes first.
+      const denied = profileWith({
+        jobTempSuffix: suffix,
+        filesystemPolicy: { level: 'strict', read: [], write: [], deny: ['/private/var/folders/zz/zyxw_vut0000gn/T'] },
+      });
+      expect(writable(denied, `/private/var/folders/zz/zyxw_vut0000gn/T/${suffix}/f`)).toBe(false);
+      // None when the job has none, or when the per-user temp is unknown.
+      expect(profileWith({})).not.toContain('/T/localmost-');
+      expect(profileWith({ jobTempSuffix: suffix }, () => { throw new Error('getconf: not found'); })).not.toContain(suffix);
+    });
+
+    it.each(['', '.', '..', 'a/b', '../T', 'a"b', 'a b', '-x'])('refuses a temp suffix that is not one plain name: %j', (suffix) => {
+      // It lands in the profile as a path component under the shared T.
+      expect(() => profileWith({ jobTempSuffix: suffix })).toThrow(/temp suffix/);
+    });
+
     it('grants nothing in the per-user temp when it cannot be looked up', () => {
       // Failing closed: mktemp without a template fails, nothing else changes.
       const failed = profileWith({}, () => { throw new Error('getconf: not found'); });

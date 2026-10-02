@@ -15,9 +15,11 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import { SandboxPolicyLevel } from '../shared/types';
 import {
+  checkJobTempSuffix,
   developerCredentialFilters,
   developerCredentialPaths,
   expandPath,
+  jobTempDirFilters,
   neverReachableAncestors,
   policyDenyAncestors,
   policyDenyFilters,
@@ -210,6 +212,13 @@ export interface RunnerProfileOptions {
    * so what its job leaves running can be found when it is done.
    */
   processMarker?: ProcessMarker;
+  /**
+   * The DIRHELPER_USER_DIR_SUFFIX the job runs with: its directory in the
+   * per-user temp, T/<suffix>, is the job's to read and write, so a sandboxed
+   * Foundation can stage its atomic writes there (see jobTempDirFilters).
+   * Absent, none. The rest of T is not granted either way.
+   */
+  jobTempSuffix?: string;
   /** Optional log sink for notes such as a policy path being ignored. */
   onLog?: SandboxLogCallback;
 }
@@ -263,8 +272,12 @@ export function generateSandboxProfile({
   toolCacheDir: toolCache,
   packageCacheDir: packageCache,
   processMarker,
+  jobTempSuffix,
   onLog,
 }: RunnerProfileOptions): string {
+  // The job's temp suffix lands in the profile as a path component: one that
+  // is not a plain name stops the spawn, whether or not T can be looked up.
+  checkJobTempSuffix(jobTempSuffix);
   // The worker's own docker socket, served by the app: every request on it is
   // checked against the repository policy before it reaches a daemon. Connect
   // and read, never write - the sandbox directory around it is writable, so
@@ -474,6 +487,10 @@ export function generateSandboxProfile({
   // Names of exactly the shape mktemp generates are: ten random characters no
   // other process can guess, and without read on the directory itself a job
   // cannot list it to find one. Both spellings, as /var is a symlink.
+  //
+  // The job's own suffixed directory there is granted whole, when it has one:
+  // with DIRHELPER_USER_DIR_SUFFIX set, a sandboxed Foundation stages every
+  // atomic write in T/<suffix>/TemporaryItems (see jobTempDirFilters).
   const mktempRules = ((dir?: string): string => {
     if (!dir) return ';; Per-user temp directory unknown: mktemp without a template is not granted';
     const escapeForRegex = (value: string) => value.replace(/[.*+?^$()[\]{}|\\]/g, '\\$&');
@@ -482,6 +499,13 @@ export function generateSandboxProfile({
       '(allow file-write* file-read*',
       `  (regex #"^${escapeForRegex(`/private${dir}`)}${generated}")`,
       `  (regex #"^${escapeForRegex(dir)}${generated}"))`,
+      ...(jobTempSuffix === undefined
+        ? [';; No suffixed temp directory of its own for this job']
+        : [
+            ";; This job's own directory there, where Foundation stages its atomic writes",
+            '(allow file-read* file-write*',
+            ...jobTempDirFilters(dir, jobTempSuffix).map((filter, i, all) => `  ${filter}${i === all.length - 1 ? ')' : ''}`),
+          ]),
     ].join('\n');
   })(darwinUserTempDir(onLog));
   // This worker's target's own caches, when it keeps any across jobs. Never
@@ -869,6 +893,8 @@ export interface SandboxOptions extends SpawnOptions {
   packageCacheDir?: string;
   /** This spawn's process marker, the last rules of its profile; see processMarkerRules. */
   processMarker?: ProcessMarker;
+  /** The job's DIRHELPER_USER_DIR_SUFFIX; see RunnerProfileOptions.jobTempSuffix. */
+  jobTempSuffix?: string;
   /** Log prefix for identifying this process (e.g., runner instance ID) */
   logPrefix?: string;
   /** Optional callback for logging sandbox events */
@@ -923,6 +949,7 @@ export function spawnSandboxed(
     toolCacheDir,
     packageCacheDir,
     processMarker,
+    jobTempSuffix,
     logPrefix,
     onLog,
     ...spawnOptions
@@ -950,6 +977,7 @@ export function spawnSandboxed(
       toolCacheDir,
       packageCacheDir,
       processMarker,
+      jobTempSuffix,
       onLog,
     });
 
