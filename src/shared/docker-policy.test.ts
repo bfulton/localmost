@@ -527,6 +527,20 @@ describe('build.tags', () => {
     }
   });
 
+  it('rejects an entry no tag the daemon accepts could match, naming the lowercase form when there is one', () => {
+    // The evaluator holds a tag to the reference grammar before it compares
+    // globs, so these entries would be listed as grants and match nothing.
+    expect(collect({ build: { tags: ['MyApp:*'] } }).join('\n')).toMatch(/build\.tags entry "MyApp:\*".*"myapp:\*"/);
+    expect(collect({ build: { tags: ['tools/MyApp:ci'] } }).join('\n')).toMatch(/"tools\/myapp:ci"/);
+    for (const entry of ['my app:*', 'Ü:*', 'myapp:.ci', 'myapp:*:*', '-app:*', 'app-:1', 'a..b:*', 'myapp:é']) {
+      expect([entry, collect({ build: { tags: [entry] } }).join('\n')]).toEqual([entry, expect.stringMatching(/build\.tags entry .*not a name/)]);
+    }
+    // A wildcard stands for name or tag characters, wherever they may go.
+    for (const entry of ['*:*', '*/*:*', 'my-*:*', 'tools/my_*_app:v*', 'myapp:*-ci', 'myapp-lower:ci', 'myapp:CI']) {
+      expect([entry, collect({ build: { tags: [entry] } })]).toEqual([entry, []]);
+    }
+  });
+
   it('rejects a tagless glob, as run.images does, naming the form that means what it looks like', () => {
     expect(collect({ build: { tags: ['myapp-*'] } }).join('\n')).toMatch(/myapp-\*:\*/);
     expect(collect({ build: { tags: ['myapp-*:*'] } })).toEqual([]);

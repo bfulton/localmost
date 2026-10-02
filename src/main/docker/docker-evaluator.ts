@@ -14,7 +14,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import {
-  DockerPolicy, DockerMount, DockerNetworkPolicy, MountMode, carriesRegistryHost, isRegistryHost,
+  DockerPolicy, DockerMount, DockerNetworkPolicy, MountMode, REPOSITORY_PATH, TAG, carriesRegistryHost, isRegistryHost,
 } from '../../shared/docker-policy';
 import { asciiEscaped, isPlainAscii } from '../../shared/json-keys';
 import type { ApprovedBind, PullRequest } from './docker-backend';
@@ -738,8 +738,6 @@ function queryValue(query: Record<string, string>, name: string): string | undef
   return key === undefined ? undefined : query[key];
 }
 
-/** A tag, by distribution/reference's grammar. */
-const TAG = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
 /** A digest, by distribution/reference's grammar: algorithm ":" hex. */
 const DIGEST = /^[A-Za-z][A-Za-z0-9]*(?:[-_+.][A-Za-z][A-Za-z0-9]*)*:[0-9a-fA-F]{32,}$/;
 
@@ -776,9 +774,6 @@ function evaluatePull(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
 
 /** The platforms a pull may ask for: what the VM runs, natively or through Rosetta (contract §6.2). */
 const PULL_PLATFORM = /^linux\/(?:arm64|amd64)(?:\/v[0-9])?$/;
-
-/** A repository path by distribution/reference's grammar: lower-case components, slash-separated. */
-const REPOSITORY_PATH = /^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:\/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*$/;
 
 /**
  * What an allowed pull asks for, read exactly as evaluatePull judged it: the

@@ -104,6 +104,31 @@ export const carriesRegistryHost = (reference: string): boolean => {
   return slash !== -1 && isRegistryHost(reference.slice(0, slash));
 };
 
+/** A tag, by distribution/reference's grammar. */
+export const TAG = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
+
+/** A repository path by distribution/reference's grammar: lower-case components, slash-separated. */
+export const REPOSITORY_PATH = /^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:\/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*$/;
+
+/** Split a local `name[:tag]` at its tag: the last `:` after the last `/`. */
+function splitNameTag(reference: string): { name: string; tag?: string } {
+  const colon = reference.lastIndexOf(':');
+  if (colon <= reference.lastIndexOf('/')) return { name: reference };
+  return { name: reference.slice(0, colon), tag: reference.slice(colon + 1) };
+}
+
+/**
+ * Whether a local `name[:tag]` with no registry host is in the reference
+ * grammar, reading each `*` as a name or tag character: the instance a glob
+ * matches when every `*` stands for one letter. A letter may stand wherever
+ * the grammar takes any character, so an entry that fails this matches no
+ * tag the daemon would accept.
+ */
+export function isLocalNameTag(reference: string): boolean {
+  const { name, tag } = splitNameTag(reference.replace(/\*/g, 'a'));
+  return REPOSITORY_PATH.test(name) && (tag === undefined || TAG.test(tag));
+}
+
 /**
  * A glob with no tag normalises to `:latest`, so `vk/*` means "any repository
  * here, but only its latest tag" - not what it looks like, and an approval diff
@@ -259,8 +284,9 @@ function validateBuild(value: unknown, path: string, push: (message: string) => 
 
 /**
  * build.tags entries. One the evaluator would refuse whatever the list says -
- * a registry host, or a digest, which the daemon will not tag with - is
- * refused here instead, so a policy never reads as granting what it cannot.
+ * a registry host, a digest, which the daemon will not tag with, or a name
+ * outside the reference grammar, which no tag it lets through could match -
+ * is refused here instead, so a policy never reads as granting what it cannot.
  * A tag naming a run.images entry is refused only when the build asks for
  * it: which entries collide depends on the merged policy, not on this block.
  */
@@ -282,6 +308,16 @@ function validateBuildTags(value: unknown, path: string, push: (message: string)
       push(
         `${path} entry "${tag}" globs a name but names no tag, which matches only ` +
           `its "latest" tag. Write "${tag}:*" for any tag, or name the tag you mean.`
+      );
+    } else if (!isLocalNameTag(tag)) {
+      // The evaluator holds a build's tag to this grammar before it compares
+      // globs, so such an entry would be listed as a grant and match nothing.
+      const { name, tag: suffix } = splitNameTag(tag);
+      const lowered = suffix === undefined ? name.toLowerCase() : `${name.toLowerCase()}:${suffix}`;
+      push(
+        `${path} entry "${tag}" is not a name the daemon tags with (lowercase letters, digits and ` +
+          `separators, then an optional :tag)` +
+          (lowered !== tag && isLocalNameTag(lowered) ? `. Write "${lowered}".` : '')
       );
     }
   });
