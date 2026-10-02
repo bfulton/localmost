@@ -164,19 +164,21 @@ describe('the sandbox a worker is built from', () => {
     expect(copyStarts).toHaveBeenCalledWith(sandbox, expect.anything());
   });
 
-  it("makes the work folder, the Docker VM's share, itself, and an empty DOCKER_CONFIG beside it", async () => {
+  it("makes the work folder, the Docker VM's share, itself, and an empty DOCKER_CONFIG and job home beside it", async () => {
     // The share must be the directory localmost made, before anything runs in
     // the sandbox: made by the runner, it would be whatever the job left at
-    // the name. The CLI's config directory is not in the share.
+    // the name. The CLI's config directory is not in the share, nor the job's
+    // home, which is HOME for the job and starts empty.
     await downloader.copyProxyCredentials(1, path.join(runnerDir, 'proxies', 'target-a'));
     const sandbox = await downloader.buildSandbox(1, version);
 
-    for (const name of ['_work', '.docker']) {
+    for (const name of ['_work', '.docker', 'home']) {
       const stat = fs.lstatSync(path.join(sandbox, name));
       expect([name, stat.isDirectory(), stat.isSymbolicLink()]).toEqual([name, true, false]);
       expect(fs.readdirSync(path.join(sandbox, name))).toEqual([]);
     }
     expect(fs.statSync(path.join(sandbox, '.docker')).mode & 0o777).toBe(0o700);
+    expect(fs.statSync(path.join(sandbox, 'home')).mode & 0o777).toBe(0o700);
   });
 
   it('makes both with a plain mkdir, which refuses a name that already exists, before copying the runner', async () => {
@@ -196,7 +198,7 @@ describe('the sandbox a worker is built from', () => {
 
     const sandbox = await downloader.buildSandbox(1, version);
 
-    for (const name of ['_work', '.docker']) {
+    for (const name of ['_work', '.docker', 'home']) {
       expect(made.filter((m) => m.dir === path.join(sandbox, name))).toEqual([
         { dir: path.join(sandbox, name), recursive: false, afterCopy: false },
       ]);

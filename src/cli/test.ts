@@ -32,12 +32,14 @@ import {
   ReusableWorkflow,
 } from '../shared/workflow-parser';
 import {
+  ensureStepHome,
   executeStep,
   reapStepProcesses,
   ExecutionContext,
   StepResult,
   StepStatus,
 } from '../shared/step-executor';
+import { prepareJobHome } from '../shared/job-home';
 import {
   findLocalmostrc,
   LOCALMOSTRC_FILENAME,
@@ -361,6 +363,14 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   });
   console.log(`Workspace: ${workspace.path}`);
   console.log();
+
+  // The steps' home, filled before any of them runs in the workspace: the
+  // hermetic git config, an empty ssh config, and a link for each path the
+  // confirmed policy grants under the real home, as the runner gives a job
+  // (see prepareJobHome). Discovery applies no policy, so links nothing.
+  prepareJobHome(ensureStepHome(workspace.path), {
+    grants: options.updaterc ? [] : [...(policy?.filesystem?.read ?? []), ...(policy?.filesystem?.write ?? [])],
+  });
 
   // Get git info for GITHUB_SHA and GITHUB_REF
   const gitInfo = getGitInfo(cwd);

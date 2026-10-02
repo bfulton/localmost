@@ -62,7 +62,7 @@ import {
 import { CliServer } from './cli-server';
 
 // Config and security
-import { loadConfig, DockerVmConfigSource } from './config';
+import { loadConfig, DockerVmConfigSource, resolveJobEnvironmentConfig } from './config';
 import { installSecurityHandlers } from './security';
 import { ensureAppDataDir, getAppDataDir } from './paths';
 
@@ -270,6 +270,16 @@ app.whenReady().then(async () => {
     log: (message) => logger?.warn(`[docker-vm] ${message}`),
   });
   const dockerVmConfig = () => dockerVmConfigSource.current();
+  // What each job's environment gets (docs/roadmap/job-environment.md), read
+  // from config.yaml at each worker spawn. A value it cannot use is reported
+  // once, not at every spawn.
+  const jobEnvironmentWarned = new Set<string>();
+  const jobEnvironmentConfig = () =>
+    resolveJobEnvironmentConfig(loadConfig().jobEnvironment, (message) => {
+      if (jobEnvironmentWarned.has(message)) return;
+      jobEnvironmentWarned.add(message);
+      logger?.warn(`[job-environment] ${message}`);
+    });
   const guestImage = new GuestImage(guestDir());
   const vmLog = (level: 'debug' | 'info' | 'warn' | 'error', message: string) => logger?.[level](`[docker-vm] ${message}`);
   const dataDir = fs.realpathSync(getAppDataDir());
@@ -395,6 +405,7 @@ app.whenReady().then(async () => {
     // the job sees is localmost's; the VM's is never handed over.
     dockerBackend,
     getDockerVmConfig: () => dockerVmConfigSource.refresh(),
+    getJobEnvironmentConfig: jobEnvironmentConfig,
     // Apply the policy that was approved, not whatever is in the repository
     // right now. A job only reaches this point once its policy has been
     // approved, and applying the approved copy means an unreviewed change

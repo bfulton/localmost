@@ -31,7 +31,8 @@ import * as fs from 'fs';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
-import { generateSandboxProfile, RunnerProfileOptions } from './process-sandbox';
+import { generateSandboxProfile, RunnerProfileOptions, SandboxFilesystemPolicy } from './process-sandbox';
+import { JOB_GIT_CONFIG, prepareJobHome } from '../shared/job-home';
 import { dockerOnPath } from './test-utils/vm-fixtures';
 
 // The real home by default; one block below stands a directory of its own in
@@ -43,7 +44,10 @@ jest.mock('os', () => {
 const realHomedir = jest.requireActual<typeof import('os')>('os').homedir;
 
 const isMacOS = process.platform === 'darwin';
-const homeDir = os.homedir();
+// The user's home by the user database: inside a localmost job HOME, and so
+// os.homedir(), is the job's own home, while the profile is built from the
+// app's, the real one.
+const homeDir = os.userInfo().homedir;
 
 /** A name no other process is using, for a probe that must not collide. */
 const probeName = () => `localmost-probe-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
@@ -1312,6 +1316,93 @@ if (!isMacOS) {
       expect(fs.readFileSync(config, 'utf-8')).toContain('SECRET-docker');
     });
   });
+
+  describe("a job's own home through a constructed seatbelt profile", () => {
+    // A stand-in for the user's home, holding what a developer's does: a
+    // regular ~/.gitconfig, a ~/.yarnrc.yml, credentials, and a cache a
+    // policy grants. The job's home is in its sandbox, filled as the runner
+    // fills it.
+    let root: string;
+    let home: string;
+    let sandbox: string;
+    let jobHome: string;
+
+    beforeAll(() => {
+      root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'h')));
+      home = path.join(root, 'u');
+      sandbox = path.join(root, 's');
+      jobHome = path.join(sandbox, 'home');
+      fs.mkdirSync(path.join(sandbox, '_temp'), { recursive: true });
+      fs.mkdirSync(jobHome, { mode: 0o700 });
+      for (const [rel, content] of [
+        ['.gitconfig', '[url "https://x-access-token:SECRET-git@github.com/"]\n\tinsteadOf = https://github.com/\n'],
+        ['.yarnrc.yml', 'npmAuthToken: SECRET-yarn\n'],
+        ['.aws/credentials', '[default]\naws_secret_access_key = SECRET-aws\n'],
+        ['.granted/file', 'granted\n'],
+      ] as const) {
+        fs.mkdirSync(path.dirname(path.join(home, rel)), { recursive: true });
+        fs.writeFileSync(path.join(home, rel), content);
+      }
+      prepareJobHome(jobHome, { grants: ['~/.granted', '~/.aws'], realHome: home });
+    });
+
+    afterAll(() => {
+      fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    /** A runner for shell commands under the profile, as a job with HOME its own. */
+    const underProfile = (filesystemPolicy: SandboxFilesystemPolicy) => {
+      jest.mocked(os.homedir).mockReturnValue(home);
+      let profile: string;
+      try {
+        profile = generateSandboxProfile({ instanceDir: sandbox, filesystemPolicy });
+      } finally {
+        jest.mocked(os.homedir).mockImplementation(realHomedir);
+      }
+      const profilePath = path.join(root, `${probeName()}.sb`);
+      fs.writeFileSync(profilePath, profile);
+      const env = { PATH: '/usr/bin:/bin', HOME: jobHome, TMPDIR: path.join(sandbox, '_temp') };
+      return (command: string) => shell(command, profilePath, env);
+    };
+
+    it("copies $HOME/.gitconfig, as actions/checkout does, where the user's own regular file broke it", () => {
+      const run = underProfile({ level: 'strict', read: [], write: [] });
+      const copy = path.join(sandbox, '_temp', 'gitconfig');
+      // The old failure, for contrast: the user's own, which the floor denies.
+      const real = run(`/bin/cp ${sq(path.join(home, '.gitconfig'))} ${sq(copy)}`);
+      expect([real.ok, real.stderr]).toEqual([false, expect.stringContaining('Operation not permitted')]);
+
+      const result = run(`/bin/cp "$HOME/.gitconfig" ${sq(copy)}`);
+      expect(result).toMatchObject({ ok: true });
+      expect(fs.readFileSync(copy, 'utf-8')).toBe(JOB_GIT_CONFIG);
+      fs.rmSync(copy);
+    });
+
+    it('does not find ~/.yarnrc.yml through HOME, which Yarn 2+ found and failed to parse', () => {
+      const run = underProfile({ level: 'moderate', read: ['~/.yarnrc.yml'], write: [] });
+      expect(run(`/bin/test -e "$HOME/.yarnrc.yml"`).ok).toBe(false);
+      // Still there to be seen by its real path, and still not readable.
+      expect(run(`/bin/test -e ${sq(path.join(home, '.yarnrc.yml'))}`).ok).toBe(true);
+      expect(run(`/bin/cat ${sq(path.join(home, '.yarnrc.yml'))}`).stdout).not.toContain('SECRET');
+    });
+
+    it('reaches a granted path through the link in its home, and nothing the floor denies through one', () => {
+      const run = underProfile({ level: 'strict', read: ['~/.granted', '~/.aws'], write: [] });
+      expect(fs.lstatSync(path.join(jobHome, '.granted')).isSymbolicLink()).toBe(true);
+      expect(run('/bin/cat "$HOME/.granted/file"')).toMatchObject({ ok: true, stdout: 'granted' });
+      // Linked, since the policy names it, but judged by the path the link
+      // resolves to: the floor's.
+      const credentials = run('/bin/cat "$HOME/.aws/credentials"');
+      expect(credentials.stdout).not.toContain('SECRET');
+      expect([credentials.ok, credentials.stderr]).toEqual([false, expect.stringContaining('Operation not permitted')]);
+    });
+
+    it('writes its own home', () => {
+      const run = underProfile({ level: 'strict', read: [], write: [] });
+      expect(canCreate(run, path.join(jobHome, '.npmrc'))).toBe(true);
+      expect(canCreateUnder(run, path.join(jobHome, 'Library', 'Caches'))).toBe(true);
+    });
+  });
 } else {
   describe("the runner profile's filesystem floor through the ambient seatbelt profile", () => {
     // Already inside a localmost job: the runner applied this repository's
@@ -1374,6 +1465,19 @@ if (!isMacOS) {
       const result = run(`/bin/ls '${path.join(runnerDir, 'arc')}'`);
       expect(result.ok).toBe(false);
       expect(result.stderr).toContain('Operation not permitted');
+    });
+
+    it("runs with a home of its own, whose .gitconfig is the hermetic one checkout can copy", () => {
+      // HOME is <sandbox>/home, beside this job's TMPDIR, <sandbox>/_temp.
+      const sandboxDir = path.dirname(fs.realpathSync(os.tmpdir()));
+      expect(fs.realpathSync(process.env.HOME ?? '')).toBe(path.join(sandboxDir, 'home'));
+      const copy = path.join(os.tmpdir(), probeName());
+      try {
+        expect(run(`/bin/cp "$HOME/.gitconfig" ${sq(copy)}`).ok).toBe(true);
+        expect(fs.readFileSync(copy, 'utf-8')).toBe(JOB_GIT_CONFIG);
+      } finally {
+        fs.rmSync(copy, { force: true });
+      }
     });
 
     it('signals its own children', () => {

@@ -141,6 +141,11 @@ jest.mock('fs', () => ({
   mkdirSync: jest.fn(),
   openSync: jest.fn(() => 42),
   closeSync: jest.fn(),
+  // Nothing is there to be found: a job's home is empty when it is filled.
+  lstatSync: jest.fn(() => {
+    throw Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' });
+  }),
+  symlinkSync: jest.fn(),
   promises: {
     mkdir: jest.fn(),
     chmod: jest.fn(),
@@ -1839,14 +1844,87 @@ describe('RunnerManager', () => {
       const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
       expect(env.HTTPS_PROXY).toMatch(/^http:\/\/localmost:[0-9a-f]{48}@127\.0\.0\.1:/);
       expect(env.http_proxy).toBe(env.HTTPS_PROXY);
-      // A per-job global config in the sandbox, setting proxyAuthMethod=basic so
-      // git sends the proxy token preemptively; system config is skipped.
-      expect(env.GIT_CONFIG_GLOBAL).toMatch(/sandbox\/1\/\.localmost-gitconfig$/);
+      // A per-job global config, the job home's .gitconfig, setting
+      // proxyAuthMethod=basic so git sends the proxy token preemptively;
+      // system config is skipped.
+      expect(env.GIT_CONFIG_GLOBAL).toBe('/Users/test/.localmost/runner/sandbox/1/home/.gitconfig');
       expect(env.GIT_CONFIG_SYSTEM).toBe('/dev/null');
-      const gitCfgWrite = (fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => String(f).endsWith('.localmost-gitconfig'));
+      const gitCfgWrite = (fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => f === env.GIT_CONFIG_GLOBAL);
       expect(gitCfgWrite).toBeDefined();
       expect(String(gitCfgWrite![1])).toContain('proxyAuthMethod = basic');
+      // Written exclusively, never through something already at the name.
+      expect(gitCfgWrite![2]).toMatchObject({ flag: 'wx' });
     });
+
+    it("runs the job with a home of its own, and ssh pointed into it", async () => {
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(9913));
+
+      await new RunnerManagerTestHelper(runnerManager).spawnForJob();
+
+      const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+      const home = '/Users/test/.localmost/runner/sandbox/1/home';
+      expect(env.HOME).toBe(home);
+      expect(env.GIT_SSH_COMMAND).toBe(`ssh -F '${home}/.ssh/config' -o UserKnownHostsFile='${home}/.ssh/known_hosts'`);
+      expect(fs.mkdirSync).toHaveBeenCalledWith(`${home}/.ssh`, { mode: 0o700 });
+    });
+
+    it("links what the policy and the level grant under the real home into the job's home", async () => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({ hosts: [], level: 'moderate', readPaths: ['~/.swiftpm'], writePaths: ['~/.p3-write', '/opt/elsewhere'], docker: {} }),
+      });
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(9914));
+
+      await new RunnerManagerTestHelper(manager).spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
+
+      const home = '/Users/test/.localmost/runner/sandbox/1/home';
+      const links = (fs.symlinkSync as jest.Mock).mock.calls.map(([target, at]) => [String(at), String(target)]);
+      expect(links).toEqual(expect.arrayContaining([
+        [`${home}/.swiftpm`, path.join(os.homedir(), '.swiftpm')],
+        [`${home}/.p3-write`, path.join(os.homedir(), '.p3-write')],
+        // moderate's read grant on rustup's toolchains, which rustup finds through HOME.
+        [`${home}/.rustup`, path.join(os.homedir(), '.rustup')],
+        [`${home}/Library/Caches`, path.join(os.homedir(), 'Library', 'Caches')],
+      ]));
+      expect(links.some(([at]) => at.includes('elsewhere'))).toBe(false);
+    });
+  });
+
+  describe('a directory the policy grants that does not exist yet', () => {
+    const spawnWith = async (createMissingGrantedDirs: boolean) => {
+      const manager = new RunnerManager({
+        onLog: mockOnLog,
+        onStatusChange: mockOnStatusChange,
+        onJobHistoryUpdate: mockOnJobHistoryUpdate,
+        getRepoPolicy: async () => ({ hosts: [], level: 'strict', readPaths: [], writePaths: ['~/.p3-missing/cache'], docker: {} }),
+        getJobEnvironmentConfig: () => ({ toolShims: true, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs }),
+      });
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      mockSpawnSandboxed.mockReturnValue(createMockProcess(9915));
+      await new RunnerManagerTestHelper(manager).spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
+      // In the real home; the job's home gets the directory the link sits in.
+      return (fs.mkdirSync as jest.Mock).mock.calls.filter(([dir]) => String(dir).startsWith(path.join(os.homedir(), '.p3-missing')));
+    };
+
+    it('is created before the job, one level at a time, by default', async () => {
+      const created = await spawnWith(true);
+      expect(created).toEqual([
+        [path.join(os.homedir(), '.p3-missing'), { mode: 0o755 }],
+        [path.join(os.homedir(), '.p3-missing', 'cache'), { mode: 0o755 }],
+      ]);
+      expect(mockSpawnSandboxed).toHaveBeenCalled();
+    });
+
+    it('is left missing with the preference off', async () => {
+      expect(await spawnWith(false)).toEqual([]);
+    });
+  });
+
+  describe("a worker's temp", () => {
 
     it("points the caches tools keep in the shared per-user temp into the job's own temp", async () => {
       // The sandbox no longer grants the per-user temp and cache directories.
@@ -2021,7 +2099,8 @@ describe('RunnerManager', () => {
         // What the runner and a shell need to know who and where they are -
         // with the bundled docker CLI's directory first on PATH.
         expect(env.PATH).toBe(`${path.dirname(dockerCliPath())}:${process.env.PATH}`);
-        expect(env.HOME).toBe(process.env.HOME);
+        // HOME is the job's own, not the app's.
+        expect(env.HOME).toBe('/Users/test/.localmost/runner/sandbox/1/home');
         // And what the app sets for the runner itself.
         expect(env.ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT).toBe('true');
         expect(env.HTTPS_PROXY).toBeDefined();

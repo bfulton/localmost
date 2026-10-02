@@ -23,6 +23,7 @@ import { reapMarkedProcesses } from './sandbox-reaper';
 import { parseActionRef, fetchAction, isInterceptedAction, readActionMetadata } from './action-fetcher';
 import { resolveWithin } from './contained-path';
 import { getAppDataDirWithoutElectron } from './paths';
+import { gitSshCommand } from './job-home';
 
 // =============================================================================
 // Types
@@ -215,6 +216,10 @@ export function buildStepEnvironment(
     // and sends every tool looking for dotfiles the sandbox denies - git dies
     // on ~/.gitconfig before it does anything.
     HOME: ensureStepHome(ctx.workDir),
+    // ssh finds its directory through the user database, not HOME, so git's
+    // ssh is pointed at the step's home, which the run filled before its
+    // first step (see prepareJobHome).
+    GIT_SSH_COMMAND: gitSshCommand(ensureStepHome(ctx.workDir)),
     USER: process.env.USER || '',
     SHELL: process.env.SHELL || '/bin/bash',
     TERM: process.env.TERM || 'xterm-256color',

@@ -19,7 +19,14 @@ jest.mock('./encryption', () => ({
   decryptValue: (v: string) => v.replace(/^enc:/, ''),
 }));
 
-import { saveConfig, loadConfig, resolveDockerVmConfig, DockerVmConfigSource, SETTABLE_CONFIG_KEYS } from './config';
+import {
+  saveConfig,
+  loadConfig,
+  resolveDockerVmConfig,
+  resolveJobEnvironmentConfig,
+  DockerVmConfigSource,
+  SETTABLE_CONFIG_KEYS,
+} from './config';
 
 beforeEach(() => {
   if (fs.existsSync(configPath)) fs.rmSync(configPath);
@@ -211,5 +218,48 @@ describe('resolveDockerVmConfig', () => {
   it('is read from config.yaml', () => {
     saveConfig({ dockerVm: { cpus: 2, prewarm: true } });
     expect(resolveDockerVmConfig(loadConfig().dockerVm, host)).toMatchObject({ cpus: 2, prewarm: true });
+  });
+});
+
+describe('resolveJobEnvironmentConfig', () => {
+  it('turns every job-environment convenience on by default', () => {
+    expect(resolveJobEnvironmentConfig(undefined)).toEqual({
+      toolShims: true,
+      javaToolOptions: true,
+      perJobTempDir: true,
+      createMissingGrantedDirs: true,
+    });
+    expect(resolveJobEnvironmentConfig({})).toEqual(resolveJobEnvironmentConfig(undefined));
+  });
+
+  it('turns each off on its own', () => {
+    for (const key of ['toolShims', 'javaToolOptions', 'perJobTempDir', 'createMissingGrantedDirs'] as const) {
+      const resolved = resolveJobEnvironmentConfig({ [key]: false });
+      expect(resolved[key]).toBe(false);
+      expect(Object.values(resolved).filter((on) => !on)).toHaveLength(1);
+    }
+  });
+
+  it('takes a value that is not true or false as absent, and says so', () => {
+    const logged: string[] = [];
+    const resolved = resolveJobEnvironmentConfig({ toolShims: 'no', perJobTempDir: 0 }, (m) => logged.push(m));
+    expect(resolved.toolShims).toBe(true);
+    expect(resolved.perJobTempDir).toBe(true);
+    expect(logged).toEqual([
+      'jobEnvironment.toolShims must be true or false; using true',
+      'jobEnvironment.perJobTempDir must be true or false; using true',
+    ]);
+  });
+
+  it('ignores keys it does not know, and a section that is not a mapping', () => {
+    expect(Object.keys(resolveJobEnvironmentConfig({ realHome: true } as never)).sort()).toEqual([
+      'createMissingGrantedDirs', 'javaToolOptions', 'perJobTempDir', 'toolShims',
+    ]);
+    expect(resolveJobEnvironmentConfig('off' as never)).toEqual(resolveJobEnvironmentConfig(undefined));
+  });
+
+  it('is read from config.yaml', () => {
+    saveConfig({ jobEnvironment: { javaToolOptions: false } });
+    expect(resolveJobEnvironmentConfig(loadConfig().jobEnvironment).javaToolOptions).toBe(false);
   });
 });

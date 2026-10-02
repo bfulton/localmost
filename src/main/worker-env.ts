@@ -3,8 +3,10 @@
  * sets for the runner itself.
  */
 
+import * as os from 'os';
 import * as path from 'path';
 import type { EnvPolicy } from '../shared/sandbox-profile';
+import type { SandboxPolicyLevel } from '../shared/types';
 import type { LocalmostrcConfig } from '../shared/localmostrc';
 
 /**
@@ -119,4 +121,39 @@ export function packageCacheEnv(dir: string): Record<string, string> {
     electron_config_cache: at('electron'),
     npm_config_devdir: at('node-gyp'),
   };
+}
+
+/**
+ * The toolchains and package-manager caches a level lets a job read.
+ *
+ * A convenience for jobs, not something the runner needs. Under strict a
+ * repository declares what it wants; moderate and permissive can read them,
+ * which is the same split the network allowlists already use. Read only:
+ * these trees hold directories on the user's PATH and config their own tools
+ * load, so a job that could write them could plant code the user later runs
+ * outside any sandbox. The job's package managers write to its target's own
+ * directory instead. `homeDir` is used as given, already escaped for the
+ * profile where that is where it goes.
+ */
+export function levelToolchainPaths(level: SandboxPolicyLevel, homeDir: string = os.homedir()): string[] {
+  if (level === 'strict') return [];
+  return [
+    '/opt/homebrew',
+    '/usr/local',
+    '/Applications/Xcode.app',
+    '/Library/Developer',
+    `${homeDir}/.npm`,
+    `${homeDir}/.yarn`,
+    `${homeDir}/.pnpm-store`,
+    `${homeDir}/.cache`,
+    `${homeDir}/.cargo`,
+    `${homeDir}/.rustup`,
+    `${homeDir}/.gradle`,
+    `${homeDir}/.m2`,
+    `${homeDir}/.nuget`,
+    `${homeDir}/.dotnet`,
+    `${homeDir}/.local`,
+    `${homeDir}/go`,
+    `${homeDir}/Library/Caches`,
+  ];
 }

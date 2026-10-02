@@ -34,6 +34,7 @@ import {
   isAppSandboxed,
 } from './paths';
 import { SHARE_NONCE_FILE } from './vm/paths';
+import { levelToolchainPaths } from './worker-env';
 
 /**
  * Allowed executable patterns within the runner directory.
@@ -311,35 +312,7 @@ export function generateSandboxProfile({
   const runnerDir = getRunnerDir().replace(/"/g, '\\"');
   const userDataDir = getUserDataDir().replace(/"/g, '\\"');
 
-  // Toolchains and package-manager caches are a convenience for jobs, not
-  // something the runner needs. Under strict a repository declares what it
-  // wants; moderate and permissive can read them, which is the same split the
-  // network allowlists already use. Read only: these trees hold directories on
-  // the user's PATH and config their own tools load, so a job that could write
-  // them could plant code the user later runs outside any sandbox. The job's
-  // package managers write to its target's own directory instead.
-  const toolchainPaths =
-    filesystemPolicy.level === 'strict'
-      ? []
-      : [
-          '/opt/homebrew',
-          '/usr/local',
-          '/Applications/Xcode.app',
-          '/Library/Developer',
-          `${homeDir}/.npm`,
-          `${homeDir}/.yarn`,
-          `${homeDir}/.pnpm-store`,
-          `${homeDir}/.cache`,
-          `${homeDir}/.cargo`,
-          `${homeDir}/.rustup`,
-          `${homeDir}/.gradle`,
-          `${homeDir}/.m2`,
-          `${homeDir}/.nuget`,
-          `${homeDir}/.dotnet`,
-          `${homeDir}/.local`,
-          `${homeDir}/go`,
-          `${homeDir}/Library/Caches`,
-        ];
+  const toolchainPaths = levelToolchainPaths(filesystemPolicy.level, homeDir);
   // Policies are written with ~ for the user's home, the same as the CLI path
   // expands. Without this a declared "~/.npm" would name a directory called ~.
   // Backslash first, then quote, so a policy path (validated to carry neither,

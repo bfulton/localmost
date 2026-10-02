@@ -9,6 +9,7 @@ import { FALLBACK_RUNNER_VERSION } from '../shared/constants';
 import { spawnSandboxed } from './process-sandbox';
 import { getRunnerDir } from './paths';
 import { DOCKER_CONFIG_DIR_NAME, SHARE_DIR_NAME, SHARE_NONCE_FILE } from './vm/paths';
+import { JOB_HOME_DIR_NAME } from '../shared/job-home';
 import {
   killOrphanedProcesses,
   cleanupSandboxDirectories,
@@ -461,6 +462,10 @@ export class RunnerDownloader {
       // DOCKER_CONFIG, so the job's CLI reads none of the operator's.
       await fs.promises.mkdir(path.join(sandboxDir, SHARE_DIR_NAME));
       await fs.promises.mkdir(path.join(sandboxDir, DOCKER_CONFIG_DIR_NAME), { mode: 0o700 });
+      // The job's HOME, beside them and not in the share: empty, the job's to
+      // write, and gone with the sandbox. Filled before the worker starts
+      // (see prepareJobHome).
+      await fs.promises.mkdir(path.join(sandboxDir, JOB_HOME_DIR_NAME), { mode: 0o700 });
 
       // Copy arc to sandbox
       log('info', `Copying arc to sandbox...`);
