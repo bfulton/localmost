@@ -12,11 +12,13 @@ jest.mock('https', () => ({
 import { BrokerProxyService } from './broker-proxy-service';
 import type { HeartbeatManager } from './heartbeat-manager';
 import type { RunnerManager } from './runner-manager';
+import type { ResourceMonitor } from './resource-monitor';
 import {
   setAuthState,
   setHeartbeatManager,
   setMainWindow,
   setResourcePaused,
+  setResourceMonitor,
   setRunnerManager,
   setUserPaused,
   setLogger,
@@ -57,7 +59,16 @@ const runner = {
   hasAvailableSlot: jest.fn(() => true),
   isRunning: jest.fn(() => false),
 };
-const resourceMonitor = { shouldPause: jest.fn(() => false) };
+// Overriding stops it recommending the pause, as the real monitor does
+// until the condition clears.
+const resourceMonitor = {
+  shouldPause: jest.fn(() => false),
+  overrideUntilClear: jest.fn((): string | null => {
+    if (!resourceMonitor.shouldPause()) return null;
+    resourceMonitor.shouldPause.mockReturnValue(false);
+    return 'Battery at 20%';
+  }),
+};
 const rendererSend = jest.fn();
 const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
 
@@ -83,6 +94,7 @@ beforeEach(() => {
   resourceMonitor.shouldPause.mockReturnValue(false);
   setHeartbeatManager(heartbeat as unknown as HeartbeatManager);
   setRunnerManager(runner as unknown as RunnerManager);
+  setResourceMonitor(resourceMonitor as unknown as ResourceMonitor);
   setAuthState({ accessToken: 'token', user: { login: 'someone' } } as never);
   setLogger(logger as unknown as Logger);
   setMainWindow({
@@ -95,6 +107,7 @@ afterEach(() => {
   stopRunnerStateMachine();
   setHeartbeatManager(null);
   setRunnerManager(null);
+  setResourceMonitor(null);
   setAuthState(null);
   setLogger(null);
   setMainWindow(null);
@@ -345,6 +358,51 @@ describe('resumeRunner', () => {
     await expect(resumeRunner()).rejects.toThrow('Could not determine runner version.');
     expect(isUserPaused()).toBe(true);
     expect(heartbeat.start).not.toHaveBeenCalled();
+  });
+
+  it('overrides a resource condition still holding, so the runner takes jobs until it clears', async () => {
+    // The resume lifted the pause in the tray, but canAcceptJob asked the
+    // monitor, which still said pause: the runner read resumed and took
+    // nothing until the condition cleared.
+    startRunner();
+    resourceMonitor.shouldPause.mockReturnValue(true);
+    await pauseForResource('Battery at 20%', 'finish');
+    expect(canAcceptJob({ resourceMonitor, runnerManager: runner })).toBe(false);
+
+    // A resume that cannot start the pool leaves the pause, and the
+    // condition, in force.
+    runner.isInitialized.mockReturnValue(false);
+    runner.initialize.mockRejectedValueOnce(new Error('Could not determine runner version.'));
+    await expect(resumeRunner()).rejects.toThrow('Could not determine runner version.');
+    expect(resourceMonitor.overrideUntilClear).not.toHaveBeenCalled();
+    expect(canAcceptJob({ resourceMonitor, runnerManager: runner })).toBe(false);
+
+    runner.isInitialized.mockReturnValue(true);
+    expect(await resumeRunner()).toBe('resumed');
+
+    expect(resourceMonitor.overrideUntilClear).toHaveBeenCalledTimes(1);
+    expect(canAcceptJob({ resourceMonitor, runnerManager: runner })).toBe(true);
+    expect(selectIsPaused(getSnapshot()!)).toBe(false);
+    expect(heartbeat.start).toHaveBeenCalledTimes(1);
+  });
+
+  it('overrides a resource pause made while starting, and the runner comes up taking jobs', async () => {
+    initRunnerStateMachine();
+    sendRunnerEvent({ type: 'START' });
+    runner.isInitialized.mockReturnValue(false);
+    resourceMonitor.shouldPause.mockReturnValue(true);
+    setResourcePaused(true, 'Battery at 20%');
+
+    expect(await resumeRunner()).toBe('resumed');
+    expect(resourceMonitor.overrideUntilClear).toHaveBeenCalledTimes(1);
+    expect(isResourcePaused()).toBe(false);
+    // The start brings up the pool and the heartbeat.
+    expect(runner.initialize).not.toHaveBeenCalled();
+    expect(heartbeat.start).not.toHaveBeenCalled();
+
+    sendRunnerEvent({ type: 'INITIALIZED' });
+    expect(selectIsPaused(getSnapshot()!)).toBe(false);
+    expect(canAcceptJob({ resourceMonitor, runnerManager: runner })).toBe(true);
   });
 
   it('says a started, unpaused runner is already running', async () => {

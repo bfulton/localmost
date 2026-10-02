@@ -3,6 +3,11 @@
  *
  * Monitors battery and video call state, and emits events when
  * the runner should pause or resume based on resource conditions.
+ *
+ * A manual resume while a condition holds overrides it: the monitor stops
+ * recommending the pause for the conditions holding then, and each pauses
+ * the runner again only once it has cleared and recurs. A condition that
+ * begins while another is overridden pauses as usual.
  */
 
 import { EventEmitter } from 'events';
@@ -40,6 +45,8 @@ export class ResourceMonitor extends EventEmitter {
   private isPaused = false;
   private pauseReason: string | null = null;
   private conditions: ResourceCondition[] = [];
+  /** Conditions a manual resume overrode, until each clears. */
+  private overridden = new Set<ResourceCondition['type']>();
   private started = false;
 
   constructor(config: Partial<ResourceMonitorConfig> = {}) {
@@ -113,24 +120,46 @@ export class ResourceMonitor extends EventEmitter {
    * Get current pause state.
    */
   getPauseState(): ResourcePauseState {
+    const overridden = this.conditions.filter((c) => c.active && this.overridden.has(c.type));
     return {
       isPaused: this.isPaused,
       reason: this.pauseReason,
       conditions: [...this.conditions],
+      overridden: overridden.length > 0 ? overridden.map((c) => c.reason).join(' and ') : null,
     };
   }
 
   /**
-   * Check if any resource condition recommends pausing.
+   * Check if any resource condition recommends pausing, other than those a
+   * manual resume overrode.
    */
   shouldPause(): boolean {
     return this.isPaused;
   }
 
   /**
+   * The user resumed while conditions hold: stop recommending the pause for
+   * them until each clears. Returns what was overridden, as
+   * getPauseState().overridden gives it, or null when nothing held. Emits no
+   * should-resume: the resume lifted the pause itself.
+   */
+  overrideUntilClear(): string | null {
+    const active = this.conditions.filter((c) => c.active);
+    if (active.length === 0) return null;
+    for (const condition of active) {
+      this.overridden.add(condition.type);
+    }
+    this.isPaused = false;
+    this.pauseReason = null;
+    this.emit('state-changed', this.getPauseState());
+    return this.getPauseState().overridden ?? null;
+  }
+
+  /**
    * Evaluate all conditions and determine if we should pause/resume.
    */
   private evaluateConditions(): void {
+    const overriddenBefore = this.getPauseState().overridden;
     const newConditions: ResourceCondition[] = [];
     const now = new Date().toISOString();
 
@@ -162,8 +191,16 @@ export class ResourceMonitor extends EventEmitter {
 
     this.conditions = newConditions;
 
-    // Determine if we should be paused (any active condition)
-    const activeConditions = newConditions.filter((c) => c.active);
+    // An override lasts until its condition clears, so its recurrence
+    // pauses again.
+    for (const type of [...this.overridden]) {
+      if (!newConditions.some((c) => c.type === type && c.active)) {
+        this.overridden.delete(type);
+      }
+    }
+
+    // Determine if we should be paused (any active condition not overridden)
+    const activeConditions = newConditions.filter((c) => c.active && !this.overridden.has(c.type));
     const shouldBePaused = activeConditions.length > 0;
 
     // Get the highest priority reason (battery > video-call)
@@ -198,6 +235,9 @@ export class ResourceMonitor extends EventEmitter {
         this.emit('should-resume');
         this.showNotification('Runner resumed', 'Resource constraints cleared');
       }
+    } else if (this.getPauseState().overridden !== overriddenBefore) {
+      // What is overridden is shown, and an override ending changes no pause.
+      this.emit('state-changed', this.getPauseState());
     }
   }
 

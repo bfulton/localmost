@@ -14,7 +14,8 @@
  *
  * The resource monitor's pause, on battery or in a video call, comes through
  * here too. It stops the same two things, and by default also leaves running
- * jobs to finish; resourcePause.runningJobs set to 'stop' stops them.
+ * jobs to finish; resourcePause.runningJobs set to 'stop' stops them. A
+ * resume lifts it and overrides the condition behind it until that clears.
  */
 
 import { IPC_CHANNELS } from '../shared/types';
@@ -29,6 +30,7 @@ import {
   getIsQuitting,
   getLogger,
   getMainWindow,
+  getResourceMonitor,
   getRunnerManager,
   isUserPaused,
   setResourcePaused,
@@ -55,6 +57,8 @@ export const canAcceptJob = ({ resourceMonitor, runnerManager }: CanAcceptJobDep
   if (isUserPaused()) {
     return false;
   }
+  // The monitor leaves out a condition a manual resume overrode, until it
+  // clears and recurs.
   if (resourceMonitor.shouldPause()) {
     return false;
   }
@@ -225,19 +229,32 @@ export const resumeForResource = (): Promise<void> => oneAtATime(async () => {
 });
 
 /**
+ * Lift both pauses, and override the resource conditions holding now.
+ */
+const liftPauses = (): void => {
+  const overridden = getResourceMonitor()?.overrideUntilClear() ?? null;
+  if (overridden) {
+    getLogger()?.info(`Resource pause overridden until this clears: ${overridden}`);
+  }
+  setUserPaused(false);
+  setResourcePaused(false);
+};
+
+/**
  * Take jobs again. Clears the resource pause as well as the user's, as the
- * tray always has. While a resource condition itself still holds, new jobs
- * are refused regardless: canAcceptJob asks the monitor, not the flag.
+ * tray always has, and overrides the resource conditions still holding: the
+ * runner takes jobs, canAcceptJob included, until each clears, and a
+ * condition that recurs after that, or a new one, pauses it again.
  */
 export const resumeRunner = (): Promise<ResumeOutcome> => oneAtATime(async () => {
   if (isRunnerStarting()) {
-    if (!isUserPaused()) {
+    if (!getEffectivePauseState().isPaused && !getResourceMonitor()?.shouldPause()) {
       return 'starting';
     }
     // The start brings up the pool and, with nothing holding it, the
     // heartbeat.
     getLogger()?.info('User resumed runner');
-    setUserPaused(false);
+    liftPauses();
     notifyRenderer(false);
     return 'resumed';
   }
@@ -245,7 +262,9 @@ export const resumeRunner = (): Promise<ResumeOutcome> => oneAtATime(async () =>
     getLogger()?.info('Resume ignored: the runner is not started');
     return 'not-started';
   }
-  const wasPaused = getEffectivePauseState().isPaused;
+  // A condition the monitor still holds counts, though the user paused first
+  // and the monitor's pause was never recorded.
+  const wasPaused = getEffectivePauseState().isPaused || !!getResourceMonitor()?.shouldPause();
   const runnerManager = getRunnerManager();
   if (!wasPaused && (!runnerManager || runnerManager.isInitialized())) {
     return 'already-running';
@@ -257,8 +276,7 @@ export const resumeRunner = (): Promise<ResumeOutcome> => oneAtATime(async () =>
   await ensureRunnerInitialized();
 
   if (wasPaused) {
-    setUserPaused(false);
-    setResourcePaused(false);
+    liftPauses();
 
     // Restart heartbeat to signal availability
     const heartbeatManager = getHeartbeatManager();

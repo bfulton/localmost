@@ -571,6 +571,13 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   jobs and stops the heartbeat. It used to stop the workers, failing their
   jobs on GitHub. Set `resourcePause.runningJobs: stop` in
   `~/.localmost/config.yaml` to keep that
+- Resuming from the tray or with `localmost resume` while a resource condition
+  still holds overrides it: the runner takes jobs until the condition clears,
+  and pauses again if it recurs, or when another condition begins. The resume
+  says so - "Resumed (resource pause overridden until Battery at 20% clears)" -
+  and the tray and `localmost status` show it while it lasts. A resume used to
+  lift the pause in the tray while new jobs were still refused until the
+  condition cleared
 - CLI restructured with standalone commands that don't require the app
 - Improved help text with examples for all commands
 

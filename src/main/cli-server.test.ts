@@ -29,6 +29,7 @@ const mockStop = jest.fn<() => Promise<void>>();
 const mockHeartbeatIsRunning = jest.fn<() => boolean>();
 const mockHeartbeatStop = jest.fn<() => void>();
 const mockResourceShouldPause = jest.fn<() => boolean>();
+const mockResourceOverridden = jest.fn<() => string | null>();
 
 jest.mock('./app-state', () => ({
   getRunnerState: () => mockGetStatus(),
@@ -49,7 +50,12 @@ jest.mock('./app-state', () => ({
   }),
   getResourceMonitor: () => ({
     shouldPause: mockResourceShouldPause,
-    getPauseState: () => ({ isPaused: mockResourceShouldPause(), reason: 'Battery at 20%', conditions: [] }),
+    getPauseState: () => ({
+      isPaused: mockResourceShouldPause(),
+      reason: 'Battery at 20%',
+      conditions: [],
+      overridden: mockResourceOverridden(),
+    }),
   }),
 }));
 
@@ -129,6 +135,7 @@ describe('CliServer', () => {
     mockSelectRunnerStatus.mockReset();
     mockSelectEffectivePauseState.mockReset();
     mockResourceShouldPause.mockReset();
+    mockResourceOverridden.mockReset();
     mockPauseRunner.mockReset();
     mockResumeRunner.mockReset();
 
@@ -142,6 +149,7 @@ describe('CliServer', () => {
     mockGetStatus.mockReturnValue({ status: 'listening' });
     mockSelectEffectivePauseState.mockReturnValue({ isPaused: false, reason: null });
     mockResourceShouldPause.mockReturnValue(false);
+    mockResourceOverridden.mockReturnValue(null);
     mockPauseRunner.mockResolvedValue('paused');
     mockResumeRunner.mockResolvedValue('resumed');
 
@@ -214,8 +222,22 @@ describe('CliServer', () => {
         authenticated: true,
         authExpired: false,
         userName: 'testuser',
-        resourcePause: { isPaused: false, reason: null, conditions: [] },
+        resourcePause: { isPaused: false, reason: null, conditions: [], overridden: null },
       },
+    });
+  });
+
+  it('reports a resource pause a resume overrode, until its condition clears', async () => {
+    mockResourceOverridden.mockReturnValue('Battery at 20%');
+    await server.start();
+
+    const response = await sendRequest({ command: 'status' });
+
+    expect((response as { data: { resourcePause: unknown } }).data.resourcePause).toEqual({
+      isPaused: false,
+      reason: null,
+      conditions: [],
+      overridden: 'Battery at 20%',
     });
   });
 
@@ -328,8 +350,13 @@ describe('CliServer', () => {
     });
   });
 
-  it('says when a resource condition still holds new jobs back after resuming', async () => {
-    mockResourceShouldPause.mockReturnValue(true);
+  it('says a resume overrode a resource pause, and until when', async () => {
+    // The resume used to leave the condition in force, and new jobs waiting
+    // on it; it overrides it now, until the condition clears.
+    mockResumeRunner.mockImplementation(async () => {
+      mockResourceOverridden.mockReturnValue('Battery at 20%');
+      return 'resumed';
+    });
 
     await server.start();
 
@@ -338,7 +365,7 @@ describe('CliServer', () => {
     expect(response).toEqual({
       success: true,
       command: 'resume',
-      message: 'Runner resumed, but it takes no new jobs until this clears: Battery at 20%',
+      message: 'Resumed (resource pause overridden until Battery at 20% clears)',
     });
   });
 

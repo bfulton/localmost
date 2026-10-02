@@ -1,6 +1,7 @@
 import { Tray, Menu, nativeImage } from 'electron';
 import { TRAY_ANIMATION_FRAMES, TRAY_ANIMATION_INTERVAL_MS } from '../shared/constants';
 import { RunnerState } from '../shared/types';
+import { resourcePauseOverriddenLine } from '../shared/resource-pause-text';
 import { getLogger } from './app-state';
 
 /**
@@ -29,6 +30,8 @@ export interface TrayStatusInfo {
   isSleepBlocked?: boolean;
   isPaused?: boolean;
   pauseReason?: string | null;
+  /** The resource conditions a manual resume overrode, while they hold. */
+  pauseOverridden?: string | null;
   isWindowVisible?: boolean;
 }
 
@@ -119,6 +122,20 @@ export class TrayManager {
         enabled: false,
       },
     ];
+
+    // A resume that overrode a resource pause, until its condition clears
+    const overriddenLine = resourcePauseOverriddenLine({
+      isPaused: !!status.isPaused,
+      reason: status.pauseReason ?? null,
+      conditions: [],
+      overridden: status.pauseOverridden,
+    });
+    if (status.isAuthenticated && status.isConfigured && overriddenLine) {
+      menuItems.push({
+        label: overriddenLine,
+        enabled: false,
+      });
+    }
 
     // Add sleep blocked indicator if active
     if (status.isSleepBlocked) {

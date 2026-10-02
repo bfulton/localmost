@@ -5,6 +5,8 @@ import { TrayManager } from './tray';
 type Auth = { user: { login: string }; accessToken?: string; expired?: boolean } | null;
 let authState: Auth = null;
 let trayManager: TrayManager | null = null;
+let pauseState: { isPaused: boolean; reason: string | null } = { isPaused: false, reason: null };
+let resourceOverridden: string | null = null;
 jest.mock('./app-state', () => ({
   getMainWindow: () => null,
   getTrayManager: () => trayManager,
@@ -13,7 +15,10 @@ jest.mock('./app-state', () => ({
   getAuthState: () => authState,
   getPowerSaveBlockerId: () => null,
   getBrokerProxyService: () => null,
-  getEffectivePauseState: () => ({ isPaused: false, reason: null }),
+  getEffectivePauseState: () => pauseState,
+  getResourceMonitor: () => ({
+    getPauseState: () => ({ isPaused: false, reason: null, conditions: [], overridden: resourceOverridden }),
+  }),
   getLogger: () => undefined,
 }));
 jest.mock('./log-file', () => ({ findAsset: jest.fn() }));
@@ -32,6 +37,8 @@ const menuLabels = (): string[] => {
 describe('updateTrayMenu', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    pauseState = { isPaused: false, reason: null };
+    resourceOverridden = null;
     // The tray's own icon; the animation frames are absent, which it allows.
     jest.mocked(nativeImage.createFromPath).mockReturnValue({ setTemplateImage: jest.fn() } as never);
     jest.mocked(Tray).mockImplementation(() => ({
@@ -86,5 +93,27 @@ describe('updateTrayMenu', () => {
     expect(labels[0]).toBe('GitHub: Session expired, reconnect in Settings');
     expect(labels).not.toContain('⏸  Pause');
     expect(labels).not.toContain('▶  Resume');
+  });
+
+  it('shows a resource pause a resume overrode, until its condition clears', () => {
+    authState = { user: { login: 'bfulton' }, accessToken: 'tok' };
+    resourceOverridden = 'Battery at 20%';
+
+    updateTrayMenu();
+
+    expect(menuLabels()).toEqual(expect.arrayContaining([
+      'Runner: Listening',
+      'Resumed (resource pause overridden until Battery at 20% clears)',
+      '⏸  Pause',
+    ]));
+
+    // Another condition that begins pauses the runner, and the pause is
+    // what the tray shows.
+    pauseState = { isPaused: true, reason: 'Video call detected' };
+    updateTrayMenu();
+
+    const labels = menuLabels();
+    expect(labels[0]).toBe('⏸ Video call detected');
+    expect(labels).not.toContain('Resumed (resource pause overridden until Battery at 20% clears)');
   });
 });

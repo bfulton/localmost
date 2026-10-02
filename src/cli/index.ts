@@ -20,6 +20,7 @@ import { isSocketLive } from './app-running';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import { getCliSocketPath } from '../shared/paths';
+import { resourcePauseOverriddenLine } from '../shared/resource-pause-text';
 import { runTest, parseTestArgs, printTestHelp } from './test';
 import { runPolicy, parsePolicyArgs, printPolicyHelp } from './policy';
 import { runEnv, parseEnvArgs, printEnvHelp } from './env';
@@ -156,6 +157,11 @@ function printStatus(response: StatusResponse): void {
 
   console.log(`Runner:    ${runnerIcon} ${runnerStatusText}`);
   console.log(`           ${runnerName}`);
+  // A resume that overrode a resource pause, until its condition clears.
+  const overriddenLine = resourcePauseOverriddenLine(resourcePause);
+  if (overriddenLine) {
+    console.log(`           ${overriddenLine}`);
+  }
 
   // Job status
   if (runner.status === 'busy' && runner.jobName) {

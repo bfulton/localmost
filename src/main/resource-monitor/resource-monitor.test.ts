@@ -213,3 +213,116 @@ describe('ResourceMonitor', () => {
     expect(true).toBe(true);
   });
 });
+
+describe('ResourceMonitor overridden by a manual resume', () => {
+  let monitor: ResourceMonitor;
+  let pauses: string[];
+  let resumes: number;
+
+  /** The handler the battery monitor registered for a power event. */
+  const powerHandler = (event: 'on-battery' | 'on-ac'): (() => void) => {
+    const calls = (powerMonitor.on as jest.Mock).mock.calls.filter((call) => call[0] === event);
+    return calls[calls.length - 1][1] as () => void;
+  };
+
+  /** What the camera helper reports, as the video call monitor hears it. */
+  const camera = (isOn: boolean): void => {
+    const calls = (watchCamera as jest.Mock).mock.calls;
+    (calls[calls.length - 1][1] as (isOn: boolean) => void)(isOn);
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useFakeTimers();
+    (powerMonitor.isOnBatteryPower as jest.Mock).mockReturnValue(true);
+    monitor = new ResourceMonitor({
+      pauseOnBattery: 'always',
+      pauseOnVideoCall: true,
+      videoCallGracePeriod: 0,
+      notifyOnPause: false,
+    });
+    pauses = [];
+    resumes = 0;
+    monitor.on('should-pause', (reason) => pauses.push(reason));
+    monitor.on('should-resume', () => { resumes += 1; });
+    monitor.start();
+  });
+
+  afterEach(() => {
+    monitor.stop();
+    jest.useRealTimers();
+    (powerMonitor.isOnBatteryPower as jest.Mock).mockReturnValue(false);
+  });
+
+  it('stops recommending the pause until the condition clears, then pauses again when it recurs', () => {
+    // A resume while the condition held lifted the pause in the tray, but
+    // canAcceptJob asked the monitor, which still said pause: the runner
+    // read resumed and took nothing until the condition cleared.
+    expect(pauses).toEqual(['Battery at 75%']);
+    expect(monitor.shouldPause()).toBe(true);
+
+    expect(monitor.overrideUntilClear()).toBe('Battery at 75%');
+    expect(monitor.shouldPause()).toBe(false);
+    expect(monitor.getPauseState()).toMatchObject({ isPaused: false, reason: null, overridden: 'Battery at 75%' });
+    // The resume lifted the pause itself; the monitor has nothing to say.
+    expect(resumes).toBe(0);
+
+    powerHandler('on-ac')();
+    expect(monitor.shouldPause()).toBe(false);
+    expect(monitor.getPauseState().overridden).toBeNull();
+    expect(resumes).toBe(0);
+
+    powerHandler('on-battery')();
+    expect(pauses).toEqual(['Battery at 75%', 'Battery at 75%']);
+    expect(monitor.shouldPause()).toBe(true);
+  });
+
+  it('says when an override ends, so the tray stops showing it', () => {
+    monitor.overrideUntilClear();
+    const states: Array<string | null | undefined> = [];
+    monitor.on('state-changed', (state) => states.push(state.overridden));
+
+    powerHandler('on-ac')();
+
+    expect(states).toEqual([null]);
+  });
+
+  it('pauses for a condition that begins while another is overridden', () => {
+    monitor.overrideUntilClear();
+
+    camera(true);
+
+    expect(pauses).toEqual(['Battery at 75%', 'Video call detected']);
+    expect(monitor.shouldPause()).toBe(true);
+    expect(monitor.getPauseState()).toMatchObject({ isPaused: true, reason: 'Video call detected', overridden: 'Battery at 75%' });
+  });
+
+  it('overrides every condition holding at the resume', () => {
+    camera(true);
+    expect(monitor.overrideUntilClear()).toBe('Battery at 75% and Video call detected');
+    expect(monitor.shouldPause()).toBe(false);
+
+    // One clearing leaves the other overridden: the call's grace period is
+    // still the call.
+    camera(false);
+    expect(monitor.shouldPause()).toBe(false);
+    jest.advanceTimersByTime(0);
+    expect(monitor.shouldPause()).toBe(false);
+    expect(monitor.getPauseState().overridden).toBe('Battery at 75%');
+
+    camera(true);
+    expect(monitor.shouldPause()).toBe(true);
+    expect(pauses).toEqual(['Battery at 75%', 'Video call detected']);
+  });
+
+  it('overrides nothing when no condition holds', () => {
+    powerHandler('on-ac')();
+    expect(resumes).toBe(1);
+
+    expect(monitor.overrideUntilClear()).toBeNull();
+
+    powerHandler('on-battery')();
+    expect(monitor.shouldPause()).toBe(true);
+    expect(pauses).toEqual(['Battery at 75%', 'Battery at 75%']);
+  });
+});

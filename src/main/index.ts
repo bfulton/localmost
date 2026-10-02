@@ -571,6 +571,10 @@ app.whenReady().then(async () => {
     });
   });
 
+  // The tray shows what a manual resume overrode until its condition clears,
+  // which changes no pause on the state machine.
+  resourceMonitor.on('state-changed', () => updateTrayMenu());
+
   // Note: state-changed event is now handled by the XState subscription above
   // which sends status updates to renderer and updates tray
 

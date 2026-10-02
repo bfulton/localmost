@@ -14,6 +14,7 @@ import {
   getBrokerProxyService,
   getEffectivePauseState,
   getLogger,
+  getResourceMonitor,
 } from './app-state';
 import { findAsset } from './log-file';
 import { confirmQuitIfBusy } from './window';
@@ -119,6 +120,7 @@ export const updateTrayMenu = (): void => {
     isSleepBlocked: powerSaveBlockerId !== null,
     isPaused: pauseState.isPaused,
     pauseReason: pauseState.reason,
+    pauseOverridden: getResourceMonitor()?.getPauseState().overridden ?? null,
     isWindowVisible: mainWindow?.isVisible() ?? false,
   };
   trayManager?.updateMenu(status);

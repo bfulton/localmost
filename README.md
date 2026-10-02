@@ -44,7 +44,7 @@ Features:
 - **Multi-runner parallelism** — run 1-8 concurrent jobs
 - **Network isolation** — runner traffic is proxied through an allowlist (GitHub, npm, PyPI, etc.)
 - **Filesystem sandboxing** — runner processes can only write to their working directory
-- **Resource-aware scheduling** — automatically pause runners when on battery or during video calls; jobs already running finish (set `resourcePause.runningJobs: stop` in `~/.localmost/config.yaml` to stop them instead)
+- **Resource-aware scheduling** — automatically pause runners when on battery or during video calls; jobs already running finish (set `resourcePause.runningJobs: stop` in `~/.localmost/config.yaml` to stop them instead), and resuming by hand overrides the pause until its condition clears
 
 ## What It Is
 
@@ -206,7 +206,7 @@ localmost status
 # Pause the runner (takes no new jobs; a running job finishes)
 localmost pause
 
-# Resume the runner
+# Resume the runner (overrides a battery or video call pause until it clears)
 localmost resume
 
 # View recent job history
