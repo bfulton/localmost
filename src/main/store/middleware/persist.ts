@@ -55,15 +55,50 @@ const PERSISTED_CONFIG_KEYS: (keyof ConfigSlice)[] = [
 ];
 
 /**
- * Sections of config.yaml the store does not hold, which this writer carries
- * forward from the file as they are: the Docker VM sizes (read with
- * resolveDockerVmConfig at each worker spawn), the update check, and the
- * OAuth client. Without them every save - on each config change, and at
- * quit - rebuilt the file from the store alone and dropped what was written
- * there by hand. An allowlist: a key an earlier build wrote and this one
- * no longer knows (preserveWorkDir) still goes at the next save.
+ * Who writes each key of config.yaml at a save:
+ *
+ * - `store`: the store, from its own value (PERSISTED_CONFIG_KEYS).
+ * - `file`: nobody; the file alone holds it, and this writer carries it
+ *   forward as written - the Docker VM sizes (read with resolveDockerVmConfig
+ *   at each worker spawn), the update check, and the OAuth client.
+ * - `auth`: the auth module, whose fields this writer copies forward.
+ * - `version`: this writer, stamping CONFIG_VERSION.
+ *
+ * Every key of AppConfig, and a key the store also holds can only be the
+ * store's, so a key added to AppConfig without saying who writes it fails to
+ * compile. dockerVm was added without telling this writer, and every save -
+ * on each config change, and at quit - rebuilt the file without it, dropping
+ * what was written there by hand. A key an earlier build wrote and AppConfig
+ * no longer has (preserveWorkDir) still goes at the next save.
  */
-const FILE_ONLY_CONFIG_KEYS = ['dockerVm', 'updateSettings', 'githubClientId'] as const satisfies ReadonlyArray<keyof AppConfig>;
+const CONFIG_KEY_OWNER: {
+  readonly [K in keyof AppConfig]-?: K extends keyof ConfigSlice ? 'store' : 'file' | 'auth' | 'version';
+} = {
+  configVersion: 'version',
+  githubClientId: 'file',
+  auth: 'auth',
+  runnerConfig: 'store',
+  theme: 'store',
+  launchAtLogin: 'store',
+  hideOnStart: 'store',
+  sleepProtection: 'store',
+  logLevel: 'store',
+  runnerLogLevel: 'store',
+  userFilter: 'store',
+  updateSettings: 'file',
+  targets: 'store',
+  maxConcurrentJobs: 'store',
+  power: 'store',
+  notifications: 'store',
+  dockerVm: 'file',
+  resourcePause: 'store',
+  jobEnvironment: 'store',
+};
+
+/** The sections of config.yaml only the file holds, carried forward at each save (see CONFIG_KEY_OWNER). */
+const FILE_ONLY_CONFIG_KEYS = (Object.keys(CONFIG_KEY_OWNER) as Array<keyof AppConfig>).filter(
+  (key) => CONFIG_KEY_OWNER[key] === 'file'
+);
 
 /**
  * Load persisted config from YAML file into the store.

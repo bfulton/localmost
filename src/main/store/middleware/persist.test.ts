@@ -18,7 +18,8 @@ import * as yaml from 'js-yaml';
 import { loadPersistedConfig, savePersistedConfig } from './persist';
 import { store, runnerJobEnvironment, runnerResourcePause } from '../index';
 import { defaultConfigState } from '../types';
-import type { AppConfig } from '../../config';
+import { CONFIG_VERSION, type AppConfig } from '../../config';
+import type { GitHubUser } from '../../../shared/types';
 
 const GOOD_CONFIG = `theme: auto
 hideOnStart: true
@@ -238,6 +239,66 @@ describe('sections only config.yaml holds', () => {
     expect(saved).not.toHaveProperty('dockerVm');
     expect(saved).not.toHaveProperty('updateSettings');
     expect(saved).not.toHaveProperty('githubClientId');
+  });
+});
+
+describe('every key of config.yaml', () => {
+  it('survives a load and a save, whichever part of the app owns it', () => {
+    // The store's save rebuilds the file from what it owns, plus what it is
+    // told the file alone holds. dockerVm was added to AppConfig without
+    // telling it, and every save dropped the section. Required<AppConfig>:
+    // tsc refuses this fixture until a key AppConfig gains is added here, and
+    // the save then has to keep it.
+    const full: Required<AppConfig> = {
+      configVersion: CONFIG_VERSION,
+      githubClientId: 'Iv1.custom',
+      auth: { refreshToken: 'enc:refresh', user: { login: 'octocat' } as GitHubUser, expired: true },
+      runnerConfig: {
+        level: 'org',
+        repoUrl: 'https://github.com/octocat/hello',
+        orgName: 'octo-org',
+        runnerName: 'mac',
+        labels: 'self-hosted,macOS',
+        runnerCount: 3,
+      },
+      theme: 'dark',
+      launchAtLogin: true,
+      hideOnStart: true,
+      sleepProtection: 'always',
+      logLevel: 'debug',
+      runnerLogLevel: 'warn',
+      userFilter: { scope: 'trigger', allowedUsers: 'allowlist', allowlist: [] },
+      updateSettings: { autoCheck: false, checkIntervalHours: 12 },
+      targets: [
+        {
+          id: 'abc123',
+          type: 'repo',
+          owner: 'octocat',
+          repo: 'hello',
+          displayName: 'octocat/hello',
+          url: 'https://github.com/octocat/hello',
+          proxyRunnerName: 'localmost.host.octocat-hello',
+          enabled: true,
+          addedAt: '2026-01-01T00:00:00.000Z',
+        },
+      ],
+      maxConcurrentJobs: 2,
+      power: { pauseOnBattery: 'always', pauseOnVideoCall: true, videoCallGracePeriod: 30 },
+      notifications: { notifyOnPause: true, notifyOnJobEvents: true },
+      dockerVm: { cpus: 2, memoryMiB: 4096 },
+      resourcePause: { runningJobs: 'stop' },
+      jobEnvironment: { toolShims: false, javaToolOptions: true, perJobTempDir: false, createMissingGrantedDirs: true },
+    };
+    fs.writeFileSync(configPath, yaml.dump(full));
+    loadPersistedConfig();
+
+    store.getState().setTheme('light');
+    savePersistedConfig();
+
+    const saved = yaml.load(fs.readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
+    for (const key of Object.keys(full) as Array<keyof AppConfig>) {
+      expect([key, saved[key]]).toEqual([key, key === 'theme' ? 'light' : full[key]]);
+    }
   });
 });
 
