@@ -567,6 +567,57 @@ if (!isMacOS) {
       expect(run(profile, ['/usr/bin/touch', path.join(out, 'g', 'built')])).toBe(true);
     });
 
+    it('cannot clone a directory holding what a deny or the floor closes into the workspace, and still clones a file', () => {
+      // clonefile(2) of a directory copies the whole tree beneath it without
+      // asking about each file: read on the directory and write where the
+      // clone lands carried a denied file into the workspace, readable there.
+      // fclonefileat of a descriptor on the directory the same.
+      const clone = (from: string, to: string, byDescriptor: boolean): string[] => byDescriptor
+        ? ['/usr/bin/perl', '-MPOSIX', '-e', 'my ($a, $b) = @ARGV; my $fd = POSIX::open($a, O_RDONLY) // die "open: $!\\n"; syscall(517, $fd, -2, $b, 0) == 0 or die "$!\\n"', from, to]
+        : ['/usr/bin/perl', '-e', 'my ($a, $b) = @ARGV; syscall(462, -2, $a, -2, $b, 0) == 0 or die "$!\\n"', from, to];
+      const held = path.join(home, 'clonable');
+      fs.mkdirSync(path.join(held, 'secA'), { recursive: true });
+      fs.mkdirSync(path.join(held, 'plain'));
+      fs.writeFileSync(path.join(held, 'secA', 'key'), 'key\n');
+      fs.writeFileSync(path.join(held, 'plain', 'key'), 'key\n');
+      fs.writeFileSync(path.join(held, 'visible.txt'), 'visible\n');
+      fs.mkdirSync(path.join(home, '.m2'), { recursive: true });
+      fs.writeFileSync(path.join(home, '.m2', 'settings.xml'), 'maven\n');
+      const enforcing = generateSandboxProfile({
+        workDir,
+        proxyPort: 1,
+        policy: {
+          filesystem: { read: [...MACOS_BASELINE_READ_PATHS, '~'], deny: [`${held}/sec*/key`, path.join(held, 'plain', 'key')] },
+        },
+      });
+      const discovery = generateDiscoveryProfile({ workDir, proxyPort: 1, logFile: '' });
+      for (const [profile, from] of [
+        [enforcing, held],
+        [enforcing, path.join(held, 'secA')],
+        [enforcing, path.join(held, 'plain')],
+        [enforcing, path.join(home, '.m2')],
+        [discovery, path.join(home, '.m2')],
+      ]) {
+        for (const byDescriptor of [false, true]) {
+          const copy = path.join(workDir, `clone-${byDescriptor}`);
+          const ok = run(profile, clone(from, copy, byDescriptor));
+          const cloned = fs.existsSync(copy);
+          fs.rmSync(copy, { recursive: true, force: true });
+          expect({ from, byDescriptor, ok, cloned }).toEqual({ from, byDescriptor, ok: false, cloned: false });
+        }
+      }
+      // A readable file still clones, by path and by descriptor.
+      for (const profile of [enforcing, discovery]) {
+        for (const byDescriptor of [false, true]) {
+          const copy = path.join(workDir, `clone-file-${byDescriptor}`);
+          const ok = run(profile, clone(path.join(held, 'visible.txt'), copy, byDescriptor));
+          const content = fs.existsSync(copy) ? fs.readFileSync(copy, 'utf-8') : undefined;
+          fs.rmSync(copy, { force: true });
+          expect({ byDescriptor, ok, content }).toEqual({ byDescriptor, ok: true, content: 'visible\n' });
+        }
+      }
+    });
+
     it('builds and applies a deny beneath what it cannot look up: an unsearchable directory, a symlink loop', () => {
       const out = path.join(home, 'unresolvable');
       fs.mkdirSync(path.join(out, 'locked', 'inner'), { recursive: true });

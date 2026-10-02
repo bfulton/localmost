@@ -106,6 +106,17 @@ const swapCommand = (from: string, to: string): string =>
   `/usr/bin/perl -e ${sq('my ($a, $b) = @ARGV; syscall(488, -2, $a, -2, $b, 2) == 0 or die "$!\\n"')} ${sq(from)} ${sq(to)}`;
 
 /**
+ * clonefileat(from, to, 0), by its syscall (462, with AT_FDCWD), through the
+ * system perl as swapCommand is; with `byDescriptor`, fclonefileat (517) of a
+ * descriptor opened on `from`. Exits nonzero with the errno's text. For a
+ * directory the kernel clones the whole tree beneath it in one call.
+ */
+const cloneCommand = (from: string, to: string, byDescriptor = false): string =>
+  byDescriptor
+    ? `/usr/bin/perl -MPOSIX -e ${sq('my ($a, $b) = @ARGV; my $fd = POSIX::open($a, O_RDONLY) // die "open: $!\\n"; syscall(517, $fd, -2, $b, 0) == 0 or die "$!\\n"')} ${sq(from)} ${sq(to)}`
+    : `/usr/bin/perl -e ${sq('my ($a, $b) = @ARGV; syscall(462, -2, $a, -2, $b, 0) == 0 or die "$!\\n"')} ${sq(from)} ${sq(to)}`;
+
+/**
  * chmod(2) of a path to the mode it already has, through the system perl:
  * chmod(1) skips the call when the mode would not change. Changes nothing
  * when it is allowed, so it probes a node's mode permission safely.
@@ -258,6 +269,128 @@ if (!isMacOS) {
       const run = underProfile();
       expect(canCreate(run, path.join(userTempDir(), 'xcrun_db'))).toBe(false);
       expect(canCreate(run, path.join(userTempDir(), probeName()))).toBe(false);
+    });
+
+    describe("Foundation's atomic writes, staged in the job's own suffixed temp directory", () => {
+      // A sandboxed Foundation stages write(to:atomically:) in TemporaryItems
+      // under the per-user temp directory, whatever the destination; with
+      // DIRHELPER_USER_DIR_SUFFIX set, under T/<suffix>. The suffix is fixed
+      // here, not per run: T/<suffix> as macOS makes it is protected from
+      // removal as T is (sunlnk, com.apple.rootless), and the TemporaryItems
+      // in it cannot be removed either, so a name per run would leave one
+      // directory behind every time. Of the shape a job's own suffix has.
+      const suffix = 'localmost-job-0123456789abcdef';
+      let writer: string;
+
+      beforeAll(() => {
+        // Five lines of Swift, compiled into the job's own sandbox so the
+        // profile lets it be loaded.
+        const source = path.join(jobTmp, 'atomic-write.swift');
+        writer = path.join(jobTmp, 'atomic-write');
+        fs.writeFileSync(source, [
+          'import Foundation',
+          'let destination = URL(fileURLWithPath: CommandLine.arguments[1])',
+          // Not try!: a trap on the expected failures would leave a crash
+          // report in ~/Library/Logs/DiagnosticReports on every run.
+          'do { try "atomic".write(to: destination, atomically: true, encoding: .utf8) }',
+          'catch { FileHandle.standardError.write("\\(error)\\n".data(using: .utf8)!); exit(1) }',
+          '',
+        ].join('\n'));
+        execFileSync('/usr/bin/xcrun', ['swiftc', '-o', writer, source], { stdio: 'ignore', timeout: 180000 });
+      }, 200000);
+
+      /** Run the writer under `profilePath` with `env` added, writing a new file in the job's sandbox. */
+      const atomicWrite = (profilePath: string, env: NodeJS.ProcessEnv) => {
+        const destination = path.join(jobTmp, `${probeName()}.txt`);
+        const result = spawnSync('/usr/bin/sandbox-exec', ['-f', profilePath, writer, destination], {
+          encoding: 'utf-8',
+          timeout: 30000,
+          env: { ...jobEnv(), ...env },
+        });
+        const written = fs.existsSync(destination) ? fs.readFileSync(destination, 'utf-8') : undefined;
+        fs.rmSync(destination, { force: true });
+        return { ok: result.status === 0, written, stderr: result.stderr };
+      };
+
+      it('succeeds with the suffix, staging under T/<suffix>/TemporaryItems, and fails without it', () => {
+        const staging = path.join(userTempDir(), suffix, 'TemporaryItems');
+        const granted = writeProfile({ jobTempSuffix: suffix });
+        const before = Date.now() - 2000;
+        const suffixed = atomicWrite(granted, { DIRHELPER_USER_DIR_SUFFIX: suffix });
+        expect(suffixed.stderr).not.toMatch(/permission/);
+        expect(suffixed.ok).toBe(true);
+        expect(suffixed.written).toBe('atomic');
+        // The staging item was made and removed in there, just now.
+        expect(fs.statSync(staging).mtimeMs).toBeGreaterThanOrEqual(before);
+        // Without the suffix staging is in the shared T/TemporaryItems, which
+        // stays closed: "You don't have permission to save the file".
+        const unsuffixed = atomicWrite(granted, {});
+        expect(unsuffixed.ok).toBe(false);
+        expect(unsuffixed.stderr).toMatch(/Code=513/);
+        expect(unsuffixed.written).toBeUndefined();
+        // Nor with the suffix under a profile that grants no directory for it.
+        const ungranted = atomicWrite(writeProfile(), { DIRHELPER_USER_DIR_SUFFIX: suffix });
+        expect(ungranted.ok).toBe(false);
+        expect(ungranted.stderr).toMatch(/Code=513/);
+        expect(ungranted.written).toBeUndefined();
+        // Each failure an error the writer reports, not a trap, which would
+        // leave a crash report behind.
+        for (const failed of [unsuffixed, ungranted]) expect(failed.stderr).not.toMatch(/Fatal error/);
+      }, 90000);
+    });
+
+    it('closes the directories a wildcard in a deny stands for, and opens nothing else of them', () => {
+      // Granted the tree, a job could rename out/secA to out/z and read
+      // out/z/key from under a deny of out/sec*/key, or make out/secB and
+      // move a twin of the key in. * stands within one name, and every
+      // directory it matches is closed to writes as a node.
+      const tree = path.join(base, probeName());
+      const out = path.join(tree, 'out');
+      fs.mkdirSync(path.join(out, 'secA'), { recursive: true });
+      fs.mkdirSync(path.join(out, 'other'));
+      fs.writeFileSync(path.join(out, 'secA', 'key'), 'SECRET');
+      fs.writeFileSync(path.join(out, 'secA', 'other.txt'), 'plain');
+      // A literal directory past a wildcard: deep/X/b carries deep/X/b/key.
+      const deep = path.join(tree, 'deep');
+      fs.mkdirSync(path.join(deep, 'X', 'b'), { recursive: true });
+      fs.writeFileSync(path.join(deep, 'X', 'b', 'key'), 'SECRET');
+      try {
+        const run = underProfile({
+          filesystemPolicy: { level: 'strict', read: [tree], write: [tree], deny: [`${out}/sec*/key`, `${deep}/*/b/key`] },
+        });
+        const at = (relative: string) => sq(path.join(out, relative));
+        const inDeep = (relative: string) => sq(path.join(deep, relative));
+        // The key: neither readable, nor renamed or linked to another name.
+        expect(run(`/bin/cat ${at('secA/key')}`).ok).toBe(false);
+        expect(run(`/bin/mv ${at('secA/key')} ${at('secA/k2')}`).ok).toBe(false);
+        expect(run(`/bin/ln ${at('secA/key')} ${at('secA/hard')}`).ok).toBe(false);
+        // The directory the wildcard stands for, and the one above it.
+        expect(run(`/bin/mv ${at('secA')} ${at('z')}`).ok).toBe(false);
+        expect(run(`/bin/mv ${sq(out)} ${sq(path.join(tree, 'out2'))}`).ok).toBe(false);
+        // Nor swapped atomically with a sibling, which renames both at once.
+        expect(run(swapCommand(path.join(out, 'secA'), path.join(out, 'other'))).ok).toBe(false);
+        // A literal directory between a wildcard and the denied name is one
+        // above it too: renamed, it would carry the key away.
+        expect(run(`/bin/cat ${inDeep('X/b/key')}`).ok).toBe(false);
+        expect(run(`/bin/mv ${inDeep('X/b')} ${inDeep('X/c')}`).ok).toBe(false);
+        expect(run(`/bin/mv ${inDeep('X')} ${inDeep('Y')}`).ok).toBe(false);
+        expect(run(`/usr/bin/touch ${inDeep('X/b/build.o')}`).ok).toBe(true);
+        expect(run(`/bin/mkdir ${inDeep('X/b2')}`).ok).toBe(true);
+        // Nor a directory made or moved in under a name it matches.
+        expect(run(`/bin/mkdir ${at('secC')}`).ok).toBe(false);
+        expect(run(`/bin/mv ${at('other')} ${at('secB')}`).ok).toBe(false);
+        // Everything else stays as granted: inside the matched directory, and
+        // names the wildcard does not match.
+        expect(run(`/bin/cat ${at('secA/other.txt')}`).ok).toBe(true);
+        expect(run(`/usr/bin/touch ${at('secA/build.o')}`).ok).toBe(true);
+        expect(run(`/bin/mkdir ${at('plainB')}`).ok).toBe(true);
+        expect(run(`/bin/mkdir ${at('plainB/secD')}`).ok).toBe(true);
+        expect(fs.readFileSync(path.join(out, 'secA', 'key'), 'utf-8')).toBe('SECRET');
+        expect(fs.readdirSync(out).sort()).toEqual(['other', 'plainB', 'secA']);
+        expect(fs.readFileSync(path.join(deep, 'X', 'b', 'key'), 'utf-8')).toBe('SECRET');
+      } finally {
+        fs.rmSync(tree, { recursive: true, force: true });
+      }
     });
 
     it("writes its target's package cache under moderate, and none of the user's toolchain trees", () => {
@@ -683,6 +816,34 @@ if (!isMacOS) {
         }
       });
 
+      it('cannot clone a package cache the level reads, to carry the credential files in it into the sandbox', () => {
+        // moderate reads ~/.m2, ~/.gradle, ~/.cargo, ~/.nuget, ~/.cache and
+        // ~/.local as toolchain trees, less the credential files inside. A
+        // clone of the directory copied the whole tree in one call, those
+        // files included, to a name in the job's sandbox no deny covers.
+        const run = underGrant({ level: 'moderate', read: [], write: [] });
+        const into = path.join(instanceIn(home), '_temp');
+        for (const dir of ['.m2', '.gradle', '.cargo', '.nuget', path.join('.nuget', 'NuGet'), '.cache', '.local']) {
+          for (const byDescriptor of [false, true]) {
+            const copy = path.join(into, probeName());
+            const result = run(`${cloneCommand(path.join(home, dir), copy, byDescriptor)} && /usr/bin/grep -r SECRET ${sq(copy)}`);
+            const cloned = fs.existsSync(copy);
+            fs.rmSync(copy, { recursive: true, force: true });
+            expect([dir, byDescriptor, result.stdout]).toEqual([dir, byDescriptor, '']);
+            expect([dir, byDescriptor, result.ok, cloned]).toEqual([dir, byDescriptor, false, false]);
+          }
+        }
+        // The level's read is in force, so each refusal above is the clone
+        // rule's: a file in the cache that is not a credential clones.
+        const readable = path.join(home, '.gradle', 'caches', 'readable.txt');
+        fs.writeFileSync(readable, 'cached');
+        const copy = path.join(into, probeName());
+        const result = run(`${cloneCommand(readable, copy)} && /bin/cat ${sq(copy)}`);
+        fs.rmSync(copy, { force: true });
+        fs.rmSync(readable);
+        expect(result).toMatchObject({ ok: true, stdout: 'cached' });
+      });
+
       it('a read grant on the home directory cannot read the credentials kept there, git and PyPI tokens included', () => {
         // ~/.git-credentials is where git's store helper keeps tokens in the
         // clear, and ~/.pypirc is where twine finds an upload token: a policy
@@ -961,6 +1122,53 @@ if (!isMacOS) {
       // What the grant gives stays given: a new file beside the secret.
       expect(canCreate(run, path.join(out, 'a', probeName()))).toBe(true);
       expect(canCreate(run, path.join(out, 'g', probeName()))).toBe(true);
+    });
+
+    it('cannot clone a directory holding what a policy denies into its sandbox, and still clones a file', () => {
+      // clonefile(2) of a directory copies the whole tree beneath it without
+      // asking about each file: read on the directory and write where the
+      // clone lands carried a denied file into the job's sandbox, readable
+      // there under a name no deny covers. A glob deny and a literal one.
+      const tree = path.join(base, probeName());
+      const out = path.join(tree, 'out');
+      fs.mkdirSync(path.join(out, 'secA'), { recursive: true });
+      fs.mkdirSync(path.join(out, 'plain'));
+      fs.writeFileSync(path.join(out, 'secA', 'key'), 'SECRET');
+      fs.writeFileSync(path.join(out, 'plain', 'key'), 'SECRET');
+      fs.writeFileSync(path.join(out, 'visible.txt'), 'visible');
+      try {
+        const run = underProfile({
+          filesystemPolicy: { level: 'strict', read: [tree], write: [], deny: [`${out}/sec*/key`, path.join(out, 'plain', 'key')] },
+        });
+        for (const from of [out, path.join(out, 'secA'), path.join(out, 'plain')]) {
+          for (const byDescriptor of [false, true]) {
+            const copy = path.join(jobTmp, probeName());
+            const result = run(`${cloneCommand(from, copy, byDescriptor)} && /usr/bin/grep -r SECRET ${sq(copy)}`);
+            const cloned = fs.existsSync(copy);
+            fs.rmSync(copy, { recursive: true, force: true });
+            expect([from, byDescriptor, result.stdout]).toEqual([from, byDescriptor, '']);
+            expect([from, byDescriptor, result.ok, cloned]).toEqual([from, byDescriptor, false, false]);
+            expect(result.stderr).toContain('Operation not permitted');
+          }
+        }
+        // A readable file still clones, by path and by descriptor.
+        for (const byDescriptor of [false, true]) {
+          const copy = path.join(jobTmp, probeName());
+          const result = run(`${cloneCommand(path.join(out, 'visible.txt'), copy, byDescriptor)} && /bin/cat ${sq(copy)}`);
+          fs.rmSync(copy, { force: true });
+          expect(result).toMatchObject({ ok: true, stdout: 'visible' });
+        }
+        // cp -c -R clones file by file, so it copies the tree less the
+        // denied files, as cp -R does.
+        const copied = path.join(jobTmp, probeName());
+        run(`/bin/cp -c -R ${sq(out)} ${sq(copied)}`);
+        const visible = fs.existsSync(path.join(copied, 'visible.txt'));
+        const keys = ['secA', 'plain'].filter((dir) => fs.existsSync(path.join(copied, dir, 'key')));
+        fs.rmSync(copied, { recursive: true, force: true });
+        expect([visible, keys]).toEqual([true, []]);
+      } finally {
+        fs.rmSync(tree, { recursive: true, force: true });
+      }
     });
 
     it('refuses what a policy denies by a spelling that runs through a symlink', () => {
@@ -1288,6 +1496,28 @@ if (!isMacOS) {
       for (const name of ['_work/copy', '_work/linked', '_temp/linked', '_temp/cloned']) {
         expect([name, fs.existsSync(path.join(sandbox, name))]).toEqual([name, false]);
       }
+      intact();
+    });
+
+    it('cannot clone _work, which would give the nonce a name the deny does not cover', () => {
+      // clonefile(2) of a directory copies the whole tree beneath it without
+      // asking about each file, so a clone of _work carried a readable copy
+      // of the nonce into _temp.
+      for (const byDescriptor of [false, true]) {
+        const result = run(`${cloneCommand('_work', '_temp/w', byDescriptor)} && cat _temp/w/.localmost-share`);
+        const cloned = fs.existsSync(path.join(sandbox, '_temp', 'w'));
+        fs.rmSync(path.join(sandbox, '_temp', 'w'), { recursive: true, force: true });
+        expect([byDescriptor, result.stdout, cloned]).toEqual([byDescriptor, '', false]);
+        expect(result.ok).toBe(false);
+        expect(result.stderr).toContain('Operation not permitted');
+      }
+      // A file in it still clones, so the refusal is the directory's. Its
+      // own file: an earlier case empties the share with rm -rf _work.
+      fs.writeFileSync(path.join(share, 'built.txt'), 'built');
+      const file = run(`${cloneCommand('_work/built.txt', '_temp/built.txt')} && cat _temp/built.txt`);
+      fs.rmSync(path.join(sandbox, '_temp', 'built.txt'), { force: true });
+      fs.rmSync(path.join(share, 'built.txt'));
+      expect(file).toMatchObject({ ok: true, stdout: 'built' });
       intact();
     });
 

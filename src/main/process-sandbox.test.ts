@@ -812,6 +812,69 @@ describe('Process Sandbox', () => {
       expect(granted('/var/folders/zz/other_user00gn/T/tmp.AbC123xYz9')).toBe(false);
     });
 
+    it('refuses a clone of a directory, after every grant', () => {
+      // clonefile(2) of a directory copies the tree beneath it without asking
+      // about each file, so a policy-denied file, a credential inside a
+      // package cache the level reads or the share's nonce came along,
+      // readable in the job's sandbox under a name no deny covers.
+      const profile = profileWith({
+        filesystemPolicy: { level: 'moderate', read: ['/opt/out'], write: ['/opt/out'], deny: ['/opt/out/secret'] },
+      });
+      const lines = profile.split('\n');
+      const at = lines.indexOf('(deny file-clone (vnode-type DIRECTORY))');
+      expect(at).toBeGreaterThan(-1);
+      expect(at).toBeGreaterThan(lines.map((line) => line.startsWith('(allow file-write*')).lastIndexOf(true));
+      expect(lines.slice(at + 1).filter((line) => /^\(allow (default|file\*|file-clone)/.test(line))).toEqual([]);
+    });
+
+    it("grants the job's own suffixed directory in the per-user temp, in both spellings, and no more of it", () => {
+      // DIRHELPER_USER_DIR_SUFFIX moves a process's per-user temp directory to
+      // T/<suffix>, and a sandboxed Foundation stages its atomic writes in
+      // TemporaryItems there. The job gets that directory, read and write;
+      // the rest of T, shared with every process the user runs, stays closed.
+      const suffix = 'localmost-job-3f9a0c2e5b7d1846';
+      const profile = profileWith({ jobTempSuffix: suffix });
+      expect(profile).toContain(
+        [
+          '(allow file-read* file-write*',
+          `  (subpath "/private/var/folders/zz/zyxw_vut0000gn/T/${suffix}")`,
+          `  (subpath "/var/folders/zz/zyxw_vut0000gn/T/${suffix}"))`,
+        ].join('\n')
+      );
+      for (const dir of ['/var/folders/zz/zyxw_vut0000gn/T', '/private/var/folders/zz/zyxw_vut0000gn/T']) {
+        expect(writable(profile, `${dir}/${suffix}/TemporaryItems/NSIRD_aw_x/out.txt`)).toBe(true);
+        expect(readable(profile, `${dir}/${suffix}/TemporaryItems`)).toBe(true);
+        expect(writable(profile, `${dir}/TemporaryItems/NSIRD_aw_x`)).toBe(false);
+        expect(writable(profile, `${dir}/localmost-job-other/TemporaryItems`)).toBe(false);
+        expect(readable(profile, `${dir}/xcrun_db`)).toBe(false);
+        expect(writable(profile, `${dir}/${suffix}x`)).toBe(false);
+      }
+      // A deny the policy declares over it still holds: the grant comes first.
+      const denied = profileWith({
+        jobTempSuffix: suffix,
+        filesystemPolicy: { level: 'strict', read: [], write: [], deny: ['/private/var/folders/zz/zyxw_vut0000gn/T'] },
+      });
+      expect(writable(denied, `/private/var/folders/zz/zyxw_vut0000gn/T/${suffix}/f`)).toBe(false);
+      // None when the job has none, or when the per-user temp is unknown.
+      expect(profileWith({})).not.toContain('/T/localmost-');
+      expect(profileWith({ jobTempSuffix: suffix }, () => { throw new Error('getconf: not found'); })).not.toContain(suffix);
+    });
+
+    it.each([
+      '', '.', '..', 'a/b', '../T', 'a"b', 'a b', '-x',
+      // Names of shared state in T: the staging every sandboxed Foundation
+      // process of the user's writes through, another app's directory, and a
+      // name of mktemp's shape, which any earlier job could have made.
+      'TemporaryItems', 'com.apple.dt.xcodebuild', 'node-compile-cache', 'tmp.ABCDEFGHIJ',
+      // Not a random body of localmost's own.
+      'localmost-job-', 'localmost-job-3f9a', 'localmost-job-3F9A0C2E5B7D1846', 'localmost-job-3f9a0c2e5b7d184g',
+      'localmost-job-3f9a0c2e5b7d1846/..', `localmost-job-${'a'.repeat(65)}`,
+    ])("refuses a temp suffix that is not one of localmost's own: %j", (suffix) => {
+      // It lands in the profile as a path component under the shared T, and
+      // the job reads and writes everything beneath it.
+      expect(() => profileWith({ jobTempSuffix: suffix })).toThrow(/temp suffix/);
+    });
+
     it('grants nothing in the per-user temp when it cannot be looked up', () => {
       // Failing closed: mktemp without a template fails, nothing else changes.
       const failed = profileWith({}, () => { throw new Error('getconf: not found'); });
@@ -1369,7 +1432,6 @@ describe('Process Sandbox', () => {
       });
       expect(readable(profile, '/opt/out/server.pem')).toBe(false);
       expect(writable(profile, '/opt/out/server.pem')).toBe(false);
-      expect(readable(profile, '/opt/out/nested/client.pem')).toBe(false);
       expect(readable(profile, '/opt/out/keys-prod/id')).toBe(false);
       // What lies beneath a match too, as beneath a deny with no *.
       expect(readable(profile, '/opt/out/bundle.pem/key')).toBe(false);
@@ -1377,7 +1439,39 @@ describe('Process Sandbox', () => {
       expect(readable(profile, '/opt/out/serverXpem')).toBe(true);
       expect(writable(profile, '/opt/out/server.pem.txt')).toBe(true);
       expect(readable(profile, '/opt/out/keys')).toBe(true);
+      // Within one name: * never spans a /.
+      expect(readable(profile, '/opt/out/nested/client.pem')).toBe(true);
       expect(profile).not.toContain('(subpath "/opt/out/*.pem")');
+    });
+
+    it('closes the directories a wildcard in a deny stands for, so renaming one cannot carry it away', () => {
+      // Granted /opt/out, a job could rename out/secA to out/z and read
+      // out/z/key, or make out/secB and move the key's twin in. The nodes a
+      // wildcard component matches are closed to writes by an anchored
+      // pattern, as the literal directories above the first * are.
+      const profile = profileWith({
+        filesystemPolicy: {
+          level: 'strict',
+          read: ['/opt/out', '/opt/deep'],
+          write: ['/opt/out', '/opt/deep'],
+          deny: ['/opt/out/sec*/key', '/opt/deep/*/mid/k*'],
+        },
+      });
+      const nodes = profile.slice(profile.lastIndexOf('(deny file-write*'));
+      expect(nodes).toContain('(regex "^/opt/out/sec[^/]*$")');
+      expect(nodes).toContain('(literal "/opt/out")');
+      for (const node of ['/opt/out', '/opt', '/opt/out/secA', '/opt/out/sec', '/opt/deep/x', '/opt/deep/x/mid', '/opt/deep/x/mid/kA']) {
+        expect(writable(profile, node)).toBe(false);
+      }
+      expect(readable(profile, '/opt/out/secA/key')).toBe(false);
+      expect(writable(profile, '/opt/out/secA/key')).toBe(false);
+      // Nodes, not what is in them: the grant still writes beside the key,
+      // and names the wildcard does not match.
+      expect(writable(profile, '/opt/out/secA/build.o')).toBe(true);
+      expect(writable(profile, '/opt/out/plainB')).toBe(true);
+      expect(writable(profile, '/opt/out/plainB/secC')).toBe(true);
+      expect(writable(profile, '/opt/deep/x/other')).toBe(true);
+      expect(readable(profile, '/opt/out/secA/other.txt')).toBe(true);
     });
 
     it('denies a path reached through a symlink by its real path too', () => {
