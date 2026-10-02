@@ -349,11 +349,16 @@ if (!isMacOS) {
       fs.mkdirSync(path.join(out, 'other'));
       fs.writeFileSync(path.join(out, 'secA', 'key'), 'SECRET');
       fs.writeFileSync(path.join(out, 'secA', 'other.txt'), 'plain');
+      // A literal directory past a wildcard: deep/X/b carries deep/X/b/key.
+      const deep = path.join(tree, 'deep');
+      fs.mkdirSync(path.join(deep, 'X', 'b'), { recursive: true });
+      fs.writeFileSync(path.join(deep, 'X', 'b', 'key'), 'SECRET');
       try {
         const run = underProfile({
-          filesystemPolicy: { level: 'strict', read: [tree], write: [tree], deny: [`${out}/sec*/key`] },
+          filesystemPolicy: { level: 'strict', read: [tree], write: [tree], deny: [`${out}/sec*/key`, `${deep}/*/b/key`] },
         });
         const at = (relative: string) => sq(path.join(out, relative));
+        const inDeep = (relative: string) => sq(path.join(deep, relative));
         // The key: neither readable, nor renamed or linked to another name.
         expect(run(`/bin/cat ${at('secA/key')}`).ok).toBe(false);
         expect(run(`/bin/mv ${at('secA/key')} ${at('secA/k2')}`).ok).toBe(false);
@@ -361,6 +366,15 @@ if (!isMacOS) {
         // The directory the wildcard stands for, and the one above it.
         expect(run(`/bin/mv ${at('secA')} ${at('z')}`).ok).toBe(false);
         expect(run(`/bin/mv ${sq(out)} ${sq(path.join(tree, 'out2'))}`).ok).toBe(false);
+        // Nor swapped atomically with a sibling, which renames both at once.
+        expect(run(swapCommand(path.join(out, 'secA'), path.join(out, 'other'))).ok).toBe(false);
+        // A literal directory between a wildcard and the denied name is one
+        // above it too: renamed, it would carry the key away.
+        expect(run(`/bin/cat ${inDeep('X/b/key')}`).ok).toBe(false);
+        expect(run(`/bin/mv ${inDeep('X/b')} ${inDeep('X/c')}`).ok).toBe(false);
+        expect(run(`/bin/mv ${inDeep('X')} ${inDeep('Y')}`).ok).toBe(false);
+        expect(run(`/usr/bin/touch ${inDeep('X/b/build.o')}`).ok).toBe(true);
+        expect(run(`/bin/mkdir ${inDeep('X/b2')}`).ok).toBe(true);
         // Nor a directory made or moved in under a name it matches.
         expect(run(`/bin/mkdir ${at('secC')}`).ok).toBe(false);
         expect(run(`/bin/mv ${at('other')} ${at('secB')}`).ok).toBe(false);
@@ -372,6 +386,7 @@ if (!isMacOS) {
         expect(run(`/bin/mkdir ${at('plainB/secD')}`).ok).toBe(true);
         expect(fs.readFileSync(path.join(out, 'secA', 'key'), 'utf-8')).toBe('SECRET');
         expect(fs.readdirSync(out).sort()).toEqual(['other', 'plainB', 'secA']);
+        expect(fs.readFileSync(path.join(deep, 'X', 'b', 'key'), 'utf-8')).toBe('SECRET');
       } finally {
         fs.rmSync(tree, { recursive: true, force: true });
       }

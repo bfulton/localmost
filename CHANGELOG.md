@@ -572,8 +572,11 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
 - **Breaking policy change**: in a `filesystem.deny` entry `*` matches within
   one name and never a `/`, in a runner job and in `localmost test`; it used to
   match any run of characters, so `~/out/*.pem` covered `~/out/a/b.pem` and now
-  covers only the `.pem` names directly in `~/out`. To reach deeper, write
-  each level (`~/out/*/*.pem`) or deny the directory. Every
+  covers only the `.pem` names directly in `~/out`. `**` in a deny now means
+  the same as `*`, one name, where it too used to reach any depth. To reach
+  deeper, write each level (`~/out/*/*.pem`) or deny the directory. An
+  approved policy is not prompted for again, so re-check any deny that relied
+  on `*` or `**` spanning directories. Every
   directory a wildcard stands for is now closed to writes as a node, as the
   directories above a deny already were: under a deny of `~/out/sec*/key` a job
   cannot rename `~/out/secA`, nor create or rename anything in `~/out` whose
