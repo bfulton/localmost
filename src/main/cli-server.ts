@@ -11,7 +11,7 @@ import { app } from 'electron';
 import { getCliSocketPath } from './paths';
 import { getRunnerManager, getHeartbeatManager, getAuthState, getRunnerState, getResourceMonitor } from './app-state';
 import { pauseRunner, resumeRunner } from './runner-pause';
-import { getSnapshot, selectEffectivePauseState } from './runner-state-service';
+import { getSnapshot, isRunning as isRunnerStarted, isStarting as isRunnerStarting, selectEffectivePauseState } from './runner-state-service';
 import { resourcePauseOverriddenText } from '../shared/resource-pause-text';
 import { getTargetManager } from './target-manager';
 import { getRunnerProxyManager } from './runner-proxy-manager';
@@ -273,6 +273,9 @@ export class CliServer {
             authenticated: !!authState && !authState.expired,
             authExpired: !!authState?.expired,
             userName: authState?.user?.login,
+            // A pause is recorded whatever state the runner is in; the CLI
+            // shows it in place of the status only for the runner it holds.
+            runnerStarted: isRunnerStarted() || isRunnerStarting(),
             resourcePause: {
               isPaused: pauseState.isPaused,
               reason: pauseState.reason,

@@ -71,11 +71,15 @@ jest.mock('./runner-pause', () => ({
 const mockSnapshot = { value: { running: 'listening' }, context: {} };
 const mockSelectRunnerStatus = jest.fn<() => { status: string }>();
 const mockSelectEffectivePauseState = jest.fn<() => { isPaused: boolean; reason: string | null }>();
+const mockMachineStarted = jest.fn<() => boolean>();
+const mockMachineStarting = jest.fn<() => boolean>();
 
 jest.mock('./runner-state-service', () => ({
   getSnapshot: () => mockSnapshot,
   selectRunnerStatus: () => mockSelectRunnerStatus(),
   selectEffectivePauseState: () => mockSelectEffectivePauseState(),
+  isRunning: () => mockMachineStarted(),
+  isStarting: () => mockMachineStarting(),
 }));
 
 // Mock target-manager
@@ -148,6 +152,8 @@ describe('CliServer', () => {
     mockSelectRunnerStatus.mockReturnValue({ status: 'listening' });
     mockGetStatus.mockReturnValue({ status: 'listening' });
     mockSelectEffectivePauseState.mockReturnValue({ isPaused: false, reason: null });
+    mockMachineStarted.mockReturnValue(true);
+    mockMachineStarting.mockReturnValue(false);
     mockResourceShouldPause.mockReturnValue(false);
     mockResourceOverridden.mockReturnValue(null);
     mockPauseRunner.mockResolvedValue('paused');
@@ -222,9 +228,25 @@ describe('CliServer', () => {
         authenticated: true,
         authExpired: false,
         userName: 'testuser',
+        runnerStarted: true,
         resourcePause: { isPaused: false, reason: null, conditions: [], overridden: null },
       },
     });
+  });
+
+  it('says whether the runner a pause holds is started, so a failed start is not shown as only paused', async () => {
+    // The monitor's pause is recorded in any state; read first, it hid a
+    // runner in error behind the pause.
+    mockSelectEffectivePauseState.mockReturnValue({ isPaused: true, reason: 'Battery at 20%' });
+    mockMachineStarted.mockReturnValue(false);
+    await server.start();
+
+    const notStarted = await sendRequest({ command: 'status' });
+    expect((notStarted as { data: { runnerStarted?: boolean } }).data.runnerStarted).toBe(false);
+
+    mockMachineStarting.mockReturnValue(true);
+    const starting = await sendRequest({ command: 'status' });
+    expect((starting as { data: { runnerStarted?: boolean } }).data.runnerStarted).toBe(true);
   });
 
   it('reports a resource pause a resume overrode, until its condition clears', async () => {

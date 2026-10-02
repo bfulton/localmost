@@ -16,3 +16,15 @@ export const resourcePauseOverriddenText = (overridden: string): string =>
  */
 export const resourcePauseOverriddenLine = (state: ResourcePauseState | undefined): string | null =>
   state && !state.isPaused && state.overridden ? resourcePauseOverriddenText(state.overridden) : null;
+
+/**
+ * Whether a pause is shown in place of the runner's status, as it is while
+ * the runner is started or starting: that is the runner it holds, and what
+ * Resume acts on. The monitor's pause is recorded in any state, and read
+ * first it hid a runner in error behind "Battery at 20%" until the Mac was
+ * plugged in; outside those states the status is shown, and the pause beside
+ * it. `runnerStarted` absent, from an app that does not say, counts as
+ * started.
+ */
+export const pauseReplacesStatus = (isPaused: boolean, runnerStarted: boolean | undefined): boolean =>
+  isPaused && runnerStarted !== false;

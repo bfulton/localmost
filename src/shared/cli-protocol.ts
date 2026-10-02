@@ -66,6 +66,13 @@ export interface StatusResponse {
     /** A stored session whose refresh token is spent: known user, no access. */
     authExpired?: boolean;
     userName?: string;
+    /**
+     * The runner is started or starting: what a pause holds, and what pause
+     * and resume act on. A pause is recorded in any state, and outside these
+     * it is shown beside the runner's status rather than in its place.
+     * Absent from an app before 0.3.0, which recorded a pause only here.
+     */
+    runnerStarted?: boolean;
     resourcePause?: ResourcePauseState;
   };
 }

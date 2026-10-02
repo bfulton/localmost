@@ -17,6 +17,7 @@ import {
   getResourceMonitor,
 } from './app-state';
 import { findAsset } from './log-file';
+import { isRunning as isRunnerStarted, isStarting as isRunnerStarting } from './runner-state-service';
 import { confirmQuitIfBusy } from './window';
 import { pauseRunner, resumeRunner } from './runner-pause';
 
@@ -120,6 +121,7 @@ export const updateTrayMenu = (): void => {
     isSleepBlocked: powerSaveBlockerId !== null,
     isPaused: pauseState.isPaused,
     pauseReason: pauseState.reason,
+    isRunnerStarted: isRunnerStarted() || isRunnerStarting(),
     pauseOverridden: getResourceMonitor()?.getPauseState().overridden ?? null,
     isWindowVisible: mainWindow?.isVisible() ?? false,
   };

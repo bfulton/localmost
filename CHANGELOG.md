@@ -441,7 +441,9 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   app launches, or arises before the runner is up, is shown in the tray and
   `localmost status` with its reason, and the runner comes up paused, without
   routing workflows here. It was dropped: the runner said it was listening
-  while every job was refused.
+  while every job was refused. For a runner that is not started, or whose
+  start failed, the tray and `localmost status` show its status, Offline or
+  Error, with the pause beside it, and the tray offers no Resume there.
 - An organization target's jobs get their repository's approved policy. The
   policy was looked up under the target's display name, the organization, which
   names no repository, so they ran with none of their grants.

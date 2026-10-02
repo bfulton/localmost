@@ -7,11 +7,13 @@ let authState: Auth = null;
 let trayManager: TrayManager | null = null;
 let pauseState: { isPaused: boolean; reason: string | null } = { isPaused: false, reason: null };
 let resourceOverridden: string | null = null;
+let runnerStatus = 'listening';
+let machineStarted = true;
 jest.mock('./app-state', () => ({
   getMainWindow: () => null,
   getTrayManager: () => trayManager,
   setTrayManager: jest.fn(),
-  getRunnerManager: () => ({ getStatus: () => ({ status: 'listening' }), isConfigured: () => true }),
+  getRunnerManager: () => ({ getStatus: () => ({ status: runnerStatus }), isConfigured: () => true }),
   getAuthState: () => authState,
   getPowerSaveBlockerId: () => null,
   getBrokerProxyService: () => null,
@@ -24,6 +26,7 @@ jest.mock('./app-state', () => ({
 jest.mock('./log-file', () => ({ findAsset: jest.fn() }));
 jest.mock('./window', () => ({ confirmQuitIfBusy: jest.fn() }));
 jest.mock('./runner-pause', () => ({ pauseRunner: jest.fn(), resumeRunner: jest.fn() }));
+jest.mock('./runner-state-service', () => ({ isRunning: () => machineStarted, isStarting: () => false }));
 
 import { updateTrayMenu } from './tray-init';
 
@@ -39,6 +42,8 @@ describe('updateTrayMenu', () => {
     jest.clearAllMocks();
     pauseState = { isPaused: false, reason: null };
     resourceOverridden = null;
+    runnerStatus = 'listening';
+    machineStarted = true;
     // The tray's own icon; the animation frames are absent, which it allows.
     jest.mocked(nativeImage.createFromPath).mockReturnValue({ setTemplateImage: jest.fn() } as never);
     jest.mocked(Tray).mockImplementation(() => ({
@@ -93,6 +98,35 @@ describe('updateTrayMenu', () => {
     expect(labels[0]).toBe('GitHub: Session expired, reconnect in Settings');
     expect(labels).not.toContain('⏸  Pause');
     expect(labels).not.toContain('▶  Resume');
+  });
+
+  it('shows a resource pause in place of the status of a started runner, with Resume', () => {
+    authState = { user: { login: 'bfulton' }, accessToken: 'tok' };
+    pauseState = { isPaused: true, reason: 'Battery at 20%' };
+
+    updateTrayMenu();
+
+    const labels = menuLabels();
+    expect(labels[0]).toBe('⏸ Battery at 20%');
+    expect(labels).toContain('▶  Resume');
+  });
+
+  it('shows a failed start as an error with its resource pause beside it, and offers no Resume', () => {
+    // The monitor's pause is recorded in any state, and the tray read it
+    // first: a start that failed on battery showed "Battery at 20%" and
+    // offered a Resume that answered "not started" and did nothing.
+    authState = { user: { login: 'bfulton' }, accessToken: 'tok' };
+    pauseState = { isPaused: true, reason: 'Battery at 20%' };
+    runnerStatus = 'error';
+    machineStarted = false;
+
+    updateTrayMenu();
+
+    const labels = menuLabels();
+    expect(labels[0]).toBe('Runner: Error');
+    expect(labels[1]).toBe('⏸ Battery at 20%');
+    expect(labels).not.toContain('▶  Resume');
+    expect(labels).not.toContain('⏸  Pause');
   });
 
   it('shows a resource pause a resume overrode, until its condition clears', () => {

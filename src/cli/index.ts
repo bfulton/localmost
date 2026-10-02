@@ -20,7 +20,7 @@ import { isSocketLive } from './app-running';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import { getCliSocketPath } from '../shared/paths';
-import { resourcePauseOverriddenLine } from '../shared/resource-pause-text';
+import { formatStatus, getStatusIcon } from './status';
 import { runTest, parseTestArgs, printTestHelp } from './test';
 import { runPolicy, parsePolicyArgs, printPolicyHelp } from './policy';
 import { runEnv, parseEnvArgs, printEnvHelp } from './env';
@@ -104,77 +104,10 @@ function formatTimestamp(isoString: string): string {
   return date.toLocaleString();
 }
 
-function getStatusIcon(status: string): string {
-  switch (status) {
-    case 'listening': return '\u2713'; // checkmark
-    case 'busy': return '\u25CF';    // filled circle
-    case 'starting': return '\u25CB'; // empty circle
-    case 'offline': return '\u25CB'; // empty circle
-    case 'shutting_down': return '\u25CB'; // empty circle
-    case 'error': return '\u2717';   // x mark
-    case 'completed': return '\u2713';
-    case 'failed': return '\u2717';
-    case 'cancelled': return '-';
-    default: return '?';
-  }
-}
-
 function printStatus(response: StatusResponse): void {
-  const { runner, runnerName, heartbeat, authenticated, authExpired, userName, resourcePause } = response.data;
-
-  console.log();
-
-  // GitHub status (matches Status Page order)
-  if (authenticated) {
-    console.log(`GitHub:    Connected as @${userName || 'unknown'}`);
-  } else if (authExpired) {
-    console.log(`GitHub:    Session expired for @${userName || 'unknown'}`);
-    console.log(`           Reconnect in the app: Settings > Reconnect`);
-  } else {
-    console.log(`GitHub:    Not connected`);
+  for (const line of formatStatus(response.data)) {
+    console.log(line);
   }
-
-  // Runner status
-  let runnerStatusText: string;
-  let runnerIcon: string;
-
-  if (resourcePause?.isPaused) {
-    runnerIcon = '\u23F8'; // pause symbol
-    runnerStatusText = `Paused (${resourcePause.reason || 'resource constraint'})`;
-  } else {
-    runnerIcon = getStatusIcon(runner.status);
-    // Capitalize status to match UI
-    const statusMap: Record<string, string> = {
-      'offline': 'Offline',
-      'starting': 'Starting',
-      'listening': 'Listening',
-      'busy': 'Running job',
-      'error': 'Error',
-      'shutting_down': 'Shutting down',
-    };
-    runnerStatusText = statusMap[runner.status] || runner.status;
-  }
-
-  console.log(`Runner:    ${runnerIcon} ${runnerStatusText}`);
-  console.log(`           ${runnerName}`);
-  // A resume that overrode a resource pause, until its condition clears.
-  const overriddenLine = resourcePauseOverriddenLine(resourcePause);
-  if (overriddenLine) {
-    console.log(`           ${overriddenLine}`);
-  }
-
-  // Job status
-  if (runner.status === 'busy' && runner.jobName) {
-    console.log(`Job:       Running`);
-    console.log(`           ${runner.jobName}`);
-  } else {
-    console.log(`Job:       Inactive`);
-  }
-
-  // Heartbeat status
-  console.log(`Heartbeat: ${heartbeat.isRunning ? 'Active' : 'Inactive'}`);
-
-  console.log();
 }
 
 function printJobs(response: JobsResponse): void {
