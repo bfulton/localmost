@@ -131,13 +131,13 @@ describe('updateTrayMenu', () => {
 
   it('shows a resource pause a resume overrode, until its condition clears', () => {
     authState = { user: { login: 'bfulton' }, accessToken: 'tok' };
-    resourceOverridden = 'Battery at 20%';
+    resourceOverridden = 'battery power';
 
     updateTrayMenu();
 
     expect(menuLabels()).toEqual(expect.arrayContaining([
       'Runner: Listening',
-      'Resumed (resource pause overridden until Battery at 20% clears)',
+      'Resumed (resource pause overridden until battery power clears)',
       '⏸  Pause',
     ]));
 
@@ -148,6 +148,6 @@ describe('updateTrayMenu', () => {
 
     const labels = menuLabels();
     expect(labels[0]).toBe('⏸ Video call detected');
-    expect(labels).not.toContain('Resumed (resource pause overridden until Battery at 20% clears)');
+    expect(labels).not.toContain('Resumed (resource pause overridden until battery power clears)');
   });
 });

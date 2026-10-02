@@ -250,7 +250,7 @@ describe('CliServer', () => {
   });
 
   it('reports a resource pause a resume overrode, until its condition clears', async () => {
-    mockResourceOverridden.mockReturnValue('Battery at 20%');
+    mockResourceOverridden.mockReturnValue('battery power');
     await server.start();
 
     const response = await sendRequest({ command: 'status' });
@@ -259,7 +259,7 @@ describe('CliServer', () => {
       isPaused: false,
       reason: null,
       conditions: [],
-      overridden: 'Battery at 20%',
+      overridden: 'battery power',
     });
   });
 
@@ -376,7 +376,7 @@ describe('CliServer', () => {
     // The resume used to leave the condition in force, and new jobs waiting
     // on it; it overrides it now, until the condition clears.
     mockResumeRunner.mockImplementation(async () => {
-      mockResourceOverridden.mockReturnValue('Battery at 20%');
+      mockResourceOverridden.mockReturnValue('battery power');
       return 'resumed';
     });
 
@@ -387,7 +387,7 @@ describe('CliServer', () => {
     expect(response).toEqual({
       success: true,
       command: 'resume',
-      message: 'Resumed (resource pause overridden until Battery at 20% clears)',
+      message: 'Resumed (resource pause overridden until battery power clears)',
     });
   });
 

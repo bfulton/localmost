@@ -1,10 +1,32 @@
 import { describe, it, expect } from '@jest/globals';
-import { resourcePauseOverriddenLine, resourcePauseOverriddenText } from './resource-pause-text';
+import {
+  resourceConditionsOverridden,
+  resourcePauseOverriddenLine,
+  resourcePauseOverriddenText,
+} from './resource-pause-text';
+
+describe('resourceConditionsOverridden', () => {
+  it('names the conditions by kind, not by their reason of the moment', () => {
+    // Built from the reasons, the line read "until Battery at 75% clears",
+    // the percentage moving under it, and "until Video call ended recently
+    // clears" through the call's grace period.
+    expect(resourceConditionsOverridden(['battery'])).toBe('battery power');
+    expect(resourceConditionsOverridden(['video-call'])).toBe('the video call');
+    expect(resourceConditionsOverridden(['battery', 'video-call'])).toBe('battery power and the video call');
+    expect(resourceConditionsOverridden([])).toBeNull();
+  });
+});
 
 describe('resourcePauseOverriddenText', () => {
   it('names the condition the resume overrode', () => {
-    expect(resourcePauseOverriddenText('Battery at 20%')).toBe(
-      'Resumed (resource pause overridden until Battery at 20% clears)'
+    expect(resourcePauseOverriddenText('battery power')).toBe(
+      'Resumed (resource pause overridden until battery power clears)'
+    );
+  });
+
+  it('says "clear" for two', () => {
+    expect(resourcePauseOverriddenText('battery power and the video call')).toBe(
+      'Resumed (resource pause overridden until battery power and the video call clear)'
     );
   });
 });
@@ -15,8 +37,8 @@ describe('resourcePauseOverriddenLine', () => {
       isPaused: false,
       reason: null,
       conditions: [],
-      overridden: 'Video call detected',
-    })).toBe('Resumed (resource pause overridden until Video call detected clears)');
+      overridden: 'the video call',
+    })).toBe('Resumed (resource pause overridden until the video call clears)');
   });
 
   it('gives way to a pause, and is absent with no override', () => {
@@ -26,7 +48,7 @@ describe('resourcePauseOverriddenLine', () => {
       isPaused: true,
       reason: 'Video call detected',
       conditions: [],
-      overridden: 'Battery at 20%',
+      overridden: 'battery power',
     })).toBeNull();
     expect(resourcePauseOverriddenLine({ isPaused: false, reason: null, conditions: [], overridden: null })).toBeNull();
     expect(resourcePauseOverriddenLine({ isPaused: false, reason: null, conditions: [] })).toBeNull();

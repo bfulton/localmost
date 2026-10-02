@@ -576,7 +576,7 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
 - Resuming from the tray or with `localmost resume` while a resource condition
   still holds overrides it: the runner takes jobs until the condition clears,
   and pauses again if it recurs, or when another condition begins. The resume
-  says so - "Resumed (resource pause overridden until Battery at 20% clears)" -
+  says so - "Resumed (resource pause overridden until battery power clears)" -
   and the tray and `localmost status` show it while it lasts. A resume used to
   lift the pause in the tray while new jobs were still refused until the
   condition cleared

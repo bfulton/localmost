@@ -20,6 +20,7 @@ import {
   ResourceCondition,
   ResourcePauseState,
 } from '../../shared/types';
+import { resourceConditionsOverridden } from '../../shared/resource-pause-text';
 
 /** Configuration for the ResourceMonitor */
 export interface ResourceMonitorConfig extends PowerConfig {
@@ -125,7 +126,7 @@ export class ResourceMonitor extends EventEmitter {
       isPaused: this.isPaused,
       reason: this.pauseReason,
       conditions: [...this.conditions],
-      overridden: overridden.length > 0 ? overridden.map((c) => c.reason).join(' and ') : null,
+      overridden: resourceConditionsOverridden(overridden.map((c) => c.type)),
     };
   }
 

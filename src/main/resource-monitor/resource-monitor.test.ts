@@ -261,9 +261,9 @@ describe('ResourceMonitor overridden by a manual resume', () => {
     expect(pauses).toEqual(['Battery at 75%']);
     expect(monitor.shouldPause()).toBe(true);
 
-    expect(monitor.overrideUntilClear()).toBe('Battery at 75%');
+    expect(monitor.overrideUntilClear()).toBe('battery power');
     expect(monitor.shouldPause()).toBe(false);
-    expect(monitor.getPauseState()).toMatchObject({ isPaused: false, reason: null, overridden: 'Battery at 75%' });
+    expect(monitor.getPauseState()).toMatchObject({ isPaused: false, reason: null, overridden: 'battery power' });
     // The resume lifted the pause itself; the monitor has nothing to say.
     expect(resumes).toBe(0);
 
@@ -294,12 +294,12 @@ describe('ResourceMonitor overridden by a manual resume', () => {
 
     expect(pauses).toEqual(['Battery at 75%', 'Video call detected']);
     expect(monitor.shouldPause()).toBe(true);
-    expect(monitor.getPauseState()).toMatchObject({ isPaused: true, reason: 'Video call detected', overridden: 'Battery at 75%' });
+    expect(monitor.getPauseState()).toMatchObject({ isPaused: true, reason: 'Video call detected', overridden: 'battery power' });
   });
 
   it('overrides every condition holding at the resume', () => {
     camera(true);
-    expect(monitor.overrideUntilClear()).toBe('Battery at 75% and Video call detected');
+    expect(monitor.overrideUntilClear()).toBe('battery power and the video call');
     expect(monitor.shouldPause()).toBe(false);
 
     // One clearing leaves the other overridden: the call's grace period is
@@ -308,7 +308,7 @@ describe('ResourceMonitor overridden by a manual resume', () => {
     expect(monitor.shouldPause()).toBe(false);
     jest.advanceTimersByTime(0);
     expect(monitor.shouldPause()).toBe(false);
-    expect(monitor.getPauseState().overridden).toBe('Battery at 75%');
+    expect(monitor.getPauseState().overridden).toBe('battery power');
 
     camera(true);
     expect(monitor.shouldPause()).toBe(true);
