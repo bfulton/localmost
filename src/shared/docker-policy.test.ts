@@ -503,3 +503,80 @@ describe('describeDockerGrants on pulls', () => {
     ]);
   });
 });
+
+describe('build.tags', () => {
+  const collect = (value: unknown, path = 'shared.docker') => {
+    const errs: string[] = [];
+    validateDockerPolicy(value, path, (m) => errs.push(m));
+    return errs;
+  };
+
+  it('accepts a list of name globs', () => {
+    expect(collect({ build: { context: './', tags: ['myapp:*', 'tools/*:ci', 'plain'] } })).toEqual([]);
+  });
+
+  it('rejects tags of the wrong shape, naming the path', () => {
+    expect(collect({ build: { tags: 'myapp:*' } }).join('\n')).toMatch(/shared\.docker\.build\.tags must be an array/);
+    expect(collect({ build: { tags: [7] } }).join('\n')).toMatch(/shared\.docker\.build\.tags\[0\] must be a string/);
+    expect(collect({ build: { tags: [''] } }).join('\n')).toMatch(/shared\.docker\.build\.tags\[0\] must be a non-empty/);
+  });
+
+  it('rejects an entry that carries a registry host or a digest, which no build may be tagged with', () => {
+    for (const entry of ['ghcr.io/x/y:*', 'localhost/app:1', 'localhost:5000/app:*', 'docker.io/library/app:1', 'Evil/app:1', 'app@sha256:abc']) {
+      expect([entry, collect({ build: { tags: [entry] } }).join('\n')]).toEqual([entry, expect.stringMatching(/build\.tags entry/)]);
+    }
+  });
+
+  it('rejects a tagless glob, as run.images does, naming the form that means what it looks like', () => {
+    expect(collect({ build: { tags: ['myapp-*'] } }).join('\n')).toMatch(/myapp-\*:\*/);
+    expect(collect({ build: { tags: ['myapp-*:*'] } })).toEqual([]);
+  });
+
+  it('composes shared and workflow tags additively, deduplicated, keeping the context', () => {
+    const merged = mergeDockerPolicy(
+      { build: { context: './', tags: ['myapp:*'] } },
+      { build: { tags: ['myapp:*', 'tools:ci'] } },
+    );
+    expect(merged?.build).toEqual({ context: './', tags: ['myapp:*', 'tools:ci'] });
+    expect(mergeDockerPolicy({ build: {} }, { build: {} })?.build).toEqual({});
+  });
+
+  it('shows each added or removed tag in the approval diff', () => {
+    const diffs = diffDockerPolicy(
+      { build: { tags: ['myapp:*'] } },
+      { build: { tags: ['tools:ci'] } },
+      'shared.docker',
+    );
+    expect(diffs).toEqual([
+      { path: 'shared.docker.build.tags', type: 'added', newValue: 'tools:ci' },
+      { path: 'shared.docker.build.tags', type: 'removed', oldValue: 'myapp:*' },
+    ]);
+    // A first tag is a grant on its own, even with the build block unchanged.
+    expect(diffDockerPolicy({ build: {} }, { build: { tags: ['myapp:*'] } }, 'shared.docker')).toEqual([
+      { path: 'shared.docker.build.tags', type: 'added', newValue: 'myapp:*' },
+    ]);
+  });
+
+  it('serializes tags in the documented shape, and reads them back', () => {
+    const lines = serializeDockerPolicy({ build: { context: './', tags: ['myapp:*'] } }, '');
+    expect(lines).toEqual(['docker:', '  build:', '    context: "./"', '    tags:', '      - "myapp:*"']);
+    const reparsed = parseLocalmostrcContent(`version: 1\nshared:\n  ${lines.join('\n  ')}\n`);
+    expect(reparsed.success).toBe(true);
+    expect(reparsed.config?.shared?.docker?.build).toEqual({ context: './', tags: ['myapp:*'] });
+    expect(serializeDockerPolicy({ build: { tags: ['a'] } }, '')).toEqual(['docker:', '  build:', '    tags:', '      - "a"']);
+  });
+
+  it('reads a build tag hint back into the policy it names', () => {
+    expect(parseDockerPolicyHint('docker:\n  build:\n    tags:\n      - "myapp:ci"')).toEqual({ build: { tags: ['myapp:ci'] } });
+    expect(parseDockerPolicyHint('docker:\n  build:\n    tags:\n      - "ghcr.io/x/y"')).toBeUndefined();
+  });
+
+  it('describes each tag for approval, saying which tags are refused whatever it declares', () => {
+    const grants = describeDockerGrants({ run: { images: ['postgres:16'] }, build: { context: './', tags: ['myapp:*', 'tools:ci'] } }, '');
+    expect(grants).toEqual(expect.arrayContaining([
+      expect.stringMatching(/^docker build: \.\/ \(RUN steps: /),
+      'docker build tag: myapp:* (never one run.images names or one with a registry host)',
+      'docker build tag: tools:ci (never one run.images names or one with a registry host)',
+    ]));
+  });
+});

@@ -45,9 +45,19 @@ export interface DockerPullPolicy {
   registries: string[];
 }
 
-/** Image builds, gated by where the build context resolves. */
+/** Image builds, gated by the tags they may give the image. */
 export interface DockerBuildPolicy {
+  /** Which directory the workflow builds from: documentation for the reader and the approval diff, not a check. */
   context?: string;
+  /**
+   * The names a build may tag its image with (`docker build -t`), each an
+   * anchored glob like `run.images`: `*` matches any run of characters within
+   * one path component of the name or within the tag. A build's tag replaces
+   * any local image of that name, so a tag is held to this list, and one that
+   * carries a registry host or names an image `run.images` declares is refused
+   * whatever the list says. An untagged build needs no entry.
+   */
+  tags?: string[];
 }
 
 export interface DockerPolicy {
@@ -78,6 +88,33 @@ const MOUNT_MODES: readonly MountMode[] = ['ro', 'rw'];
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/**
+ * Whether an image reference's first component names a registry host rather
+ * than a Docker Hub namespace. To distribution/reference (splitDockerDomain)
+ * that includes one with an uppercase letter: no Docker Hub namespace has
+ * one, so `LOCALHOST/x` and `Evil/x` are those hosts, not docker.io.
+ */
+export const isRegistryHost = (first: string): boolean =>
+  first.includes('.') || first.includes(':') || first === 'localhost' || first !== first.toLowerCase();
+
+/** Whether a reference names a registry host: a first component, before a `/`, that is one. */
+export const carriesRegistryHost = (reference: string): boolean => {
+  const slash = reference.indexOf('/');
+  return slash !== -1 && isRegistryHost(reference.slice(0, slash));
+};
+
+/**
+ * A glob with no tag normalises to `:latest`, so `vk/*` means "any repository
+ * here, but only its latest tag" - not what it looks like, and an approval diff
+ * cannot show the difference. Guessing `:*` instead would be the same guess the
+ * grammar refuses when it rejects `docker: true`, so say what to write instead.
+ */
+function tagless(glob: string): boolean {
+  if (!glob.includes('*')) return false;
+  const lastSegment = glob.slice(glob.lastIndexOf('/') + 1);
+  return !lastSegment.includes(':') && !lastSegment.includes('@');
+}
 
 /**
  * Validate a `docker:` block, reporting each problem through `push` under the
@@ -132,14 +169,7 @@ function validateRun(value: unknown, path: string, push: (message: string) => vo
     validateStringArray(value.images, `${path}.images`, push);
     if (Array.isArray(value.images)) {
       for (const image of value.images) {
-        if (typeof image !== 'string' || !image.includes('*')) continue;
-        // A reference with no tag normalises to :latest, so a tagless glob
-        // means "any repository here, but only its latest tag" - which is not
-        // what it looks like, and an approval diff cannot show the difference.
-        // Guessing :* instead would be the same guess this grammar refuses when
-        // it rejects `docker: true`, so say what to write instead.
-        const lastSegment = image.slice(image.lastIndexOf('/') + 1);
-        if (!lastSegment.includes(':') && !lastSegment.includes('@')) {
+        if (typeof image === 'string' && tagless(image)) {
           push(
             `${path}.images entry "${image}" globs a repository but names no tag, which matches only ` +
               `its "latest" tag. Write "${image}:*" for any tag, or name the tag you mean.`
@@ -224,6 +254,37 @@ function validateBuild(value: unknown, path: string, push: (message: string) => 
   if (value.context !== undefined && typeof value.context !== 'string') {
     push(`${path}.context must be a string`);
   }
+  if (value.tags !== undefined) validateBuildTags(value.tags, `${path}.tags`, push);
+}
+
+/**
+ * build.tags entries. One the evaluator would refuse whatever the list says -
+ * a registry host, or a digest, which the daemon will not tag with - is
+ * refused here instead, so a policy never reads as granting what it cannot.
+ * A tag naming a run.images entry is refused only when the build asks for
+ * it: which entries collide depends on the merged policy, not on this block.
+ */
+function validateBuildTags(value: unknown, path: string, push: (message: string) => void): void {
+  if (!Array.isArray(value)) {
+    push(`${path} must be an array`);
+    return;
+  }
+  value.forEach((tag, i) => {
+    if (typeof tag !== 'string') {
+      push(`${path}[${i}] must be a string`);
+    } else if (tag === '') {
+      push(`${path}[${i}] must be a non-empty name glob`);
+    } else if (carriesRegistryHost(tag)) {
+      push(`${path} entry "${tag}" names a registry host; a build may tag its image only with a local name`);
+    } else if (tag.includes('@')) {
+      push(`${path} entry "${tag}" carries a digest; a build is tagged name[:tag]`);
+    } else if (tagless(tag)) {
+      push(
+        `${path} entry "${tag}" globs a name but names no tag, which matches only ` +
+          `its "latest" tag. Write "${tag}:*" for any tag, or name the tag you mean.`
+      );
+    }
+  });
 }
 
 function validateStringArray(value: unknown, path: string, push: (message: string) => void): void {
@@ -297,8 +358,12 @@ function mergeNetworks(
 
 function mergeBuild(base?: DockerBuildPolicy, override?: DockerBuildPolicy): DockerBuildPolicy | undefined {
   if (!base && !override) return undefined;
+  const build: DockerBuildPolicy = {};
   const context = override?.context ?? base?.context;
-  return context !== undefined ? { context } : {};
+  if (context !== undefined) build.context = context;
+  const tags = mergeStrings(base?.tags, override?.tags);
+  if (tags) build.tags = tags;
+  return build;
 }
 
 /**
@@ -374,6 +439,7 @@ export function diffDockerPolicy(
   diffLists(oldP?.run?.networks?.map(networkKey), newP?.run?.networks?.map(networkKey), `${prefix}.run.networks`, diffs);
   diffScalar(oldP?.run?.network, newP?.run?.network, `${prefix}.run.network`, diffs);
   diffScalar(oldP?.build?.context, newP?.build?.context, `${prefix}.build.context`, diffs);
+  diffLists(oldP?.build?.tags, newP?.build?.tags, `${prefix}.build.tags`, diffs);
   // false grants nothing, the same as absent.
   diffScalar(oldP?.privileged ? 'true' : undefined, newP?.privileged ? 'true' : undefined, `${prefix}.privileged`, diffs);
 
@@ -452,11 +518,16 @@ export function serializeDockerPolicy(policy: DockerPolicy, indent: string): str
   }
 
   if (policy.build) {
-    if (policy.build.context === undefined) {
+    const { context, tags } = policy.build;
+    if (context === undefined && !tags?.length) {
       lines.push(`${i1}build: {}`);
     } else {
       lines.push(`${i1}build:`);
-      lines.push(`${i2}context: ${quote(policy.build.context)}`);
+      if (context !== undefined) lines.push(`${i2}context: ${quote(context)}`);
+      if (tags?.length) {
+        lines.push(`${i2}tags:`);
+        for (const tag of tags) lines.push(`${i3}- ${quote(tag)}`);
+      }
     }
   }
 
@@ -547,6 +618,12 @@ export function describeDockerGrants(docker: DockerPolicy | undefined, prefix: s
   if (docker.build) {
     const build = docker.build.context === undefined ? 'docker build' : `docker build: ${docker.build.context}`;
     grants.push(`${prefix}${build} (RUN steps: ${PROXIED_EGRESS})`);
+    // A tag replaces the local image of that name. The two refusals that hold
+    // whatever the list says are spelled out, since they are what keeps a
+    // declared tag from standing in for an image the job runs.
+    for (const tag of docker.build.tags ?? []) {
+      grants.push(`${prefix}docker build tag: ${tag} (never one run.images names or one with a registry host)`);
+    }
   }
   if (docker.privileged) grants.push(`${prefix}docker privileged`);
   return grants;

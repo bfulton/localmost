@@ -22,6 +22,7 @@ const everything = {
   docker: {
     pull: { registries: ['docker.io'] },
     run: { images: ['alpine:3'], mounts: [{ path: './', mode: 'ro' as const }], networks: [{ name: 'vk-*', internal: true }] },
+    build: { context: './docker', tags: ['myapp:*'] },
   },
   secrets: { require: ['DEPLOY_KEY'] },
 };
@@ -31,7 +32,7 @@ describe('describePolicy', () => {
     const text = describePolicy(everything).map((g) => `${g.group} ${g.marker} ${g.value} ${g.summary}`).join('\n');
     for (const value of [
       'github.com', 'evil.example', '/etc', '~/.npm', '~/.ssh',
-      'CI', 'AWS_SECRET_ACCESS_KEY', 'docker.io', 'alpine:3', 'vk-*', 'DEPLOY_KEY', 'permissive', '5432',
+      'CI', 'AWS_SECRET_ACCESS_KEY', 'docker.io', 'alpine:3', 'vk-*', './docker', 'myapp:*', 'DEPLOY_KEY', 'permissive', '5432',
     ]) {
       expect(text).toContain(value);
     }
