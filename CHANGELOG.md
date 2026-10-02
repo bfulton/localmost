@@ -684,8 +684,9 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   finish, as a pause from the tray or `localmost pause` does: it refuses new
   jobs and stops the heartbeat. It used to stop the workers, failing their
   jobs on GitHub. Choose "Stop them" for "Running jobs when a pause begins"
-  in the Power section of Settings (`resourcePause.runningJobs: stop` in
-  `~/.localmost/config.yaml`) to keep that
+  in the Power section of Settings (saved as `resourcePause.runningJobs: stop`
+  in `~/.localmost/config.yaml`, which the app reads at launch and writes back
+  at quit, so edit it only while the app is quit) to keep that
 - Resuming from the tray or with `localmost resume` while a resource condition
   still holds overrides it: the runner takes jobs until the condition clears,
   and pauses again if it recurs, or when another condition begins. The resume
@@ -718,9 +719,10 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
     `.tmp` the checkout commits at its top is no longer copied into the
     workspace
 - A job's environment carries what its tools need to work in the sandbox, each
-  of which can be turned off in the Job Environment section of Settings (the
-  `jobEnvironment` section of `config.yaml`), for jobs that start after the
-  change; all are on by default
+  of which can be turned off in the Job Environment section of Settings (saved
+  as the `jobEnvironment` section of `config.yaml`, which the app reads at
+  launch and writes back at quit, so edit it only while the app is quit), for
+  jobs that start after the change; all are on by default
   ([job-environment.md](docs/roadmap/job-environment.md)):
   - `perJobTempDir`: a directory of the job's own in the per-user temp
     directory, named by `DIRHELPER_USER_DIR_SUFFIX`, made before the job and

@@ -238,7 +238,7 @@ export const resumeForResource = (): Promise<void> => oneAtATime(async () => {
 
 /**
  * Send the monitor's pause and resume here. resourcePause is read through
- * `readResourcePause` at each pause, so a change to config.yaml applies to
+ * `readResourcePause` at each pause, so a change made in Settings applies to
  * the next one.
  */
 export const wireResourceMonitor = (

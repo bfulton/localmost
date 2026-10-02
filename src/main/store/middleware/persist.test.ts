@@ -16,7 +16,7 @@ jest.mock('../../log-file', () => ({
 
 import * as yaml from 'js-yaml';
 import { loadPersistedConfig, savePersistedConfig } from './persist';
-import { store } from '../index';
+import { store, runnerJobEnvironment, runnerResourcePause } from '../index';
 import { defaultConfigState } from '../types';
 import type { AppConfig } from '../../config';
 
@@ -94,8 +94,8 @@ describe('the resource-pause and job-environment preferences', () => {
   });
 
   it('load from config.yaml and persist back, so a save at quit keeps them', () => {
-    // The runner reads both sections from the file at each pause and each
-    // spawn, so a save that dropped them would quietly undo the setting.
+    // The store loads both sections from the file at launch, so a save that
+    // dropped them would quietly undo the setting at the next one.
     fs.writeFileSync(
       configPath,
       [
@@ -152,6 +152,44 @@ describe('the resource-pause and job-environment preferences', () => {
       perJobTempDir: true,
       createMissingGrantedDirs: true,
     });
+  });
+});
+
+describe("the runner's resource-pause and job-environment preferences", () => {
+  it('are the ones Settings shows, whatever is written to config.yaml while the app runs', () => {
+    // The store owns both sections: the page shows the store's value, and
+    // every save writes it back over the file. The runner read the file at
+    // each pause and spawn instead, so a hand edit made while the app ran
+    // took effect for the next job, the page went on showing the old value,
+    // and the next save put the old value back.
+    fs.writeFileSync(
+      configPath,
+      'configVersion: 1\ntheme: auto\nresourcePause:\n  runningJobs: stop\njobEnvironment:\n  toolShims: false\n'
+    );
+    loadPersistedConfig();
+    expect(runnerResourcePause()).toEqual({ runningJobs: 'stop' });
+    expect(runnerJobEnvironment()).toEqual({
+      toolShims: false,
+      javaToolOptions: true,
+      perJobTempDir: true,
+      createMissingGrantedDirs: true,
+    });
+
+    fs.writeFileSync(
+      configPath,
+      'configVersion: 1\ntheme: auto\nresourcePause:\n  runningJobs: finish\njobEnvironment:\n  toolShims: true\n  javaToolOptions: false\n'
+    );
+    expect(runnerResourcePause()).toEqual(store.getState().config.resourcePause);
+    expect(runnerResourcePause()).toEqual({ runningJobs: 'stop' });
+    expect(runnerJobEnvironment()).toEqual(store.getState().config.jobEnvironment);
+    expect(runnerJobEnvironment().toolShims).toBe(false);
+    expect(runnerJobEnvironment().javaToolOptions).toBe(true);
+
+    // A change made in Settings reaches the runner at once.
+    store.getState().setResourcePause({ runningJobs: 'finish' });
+    store.getState().setJobEnvironment({ ...store.getState().config.jobEnvironment, perJobTempDir: false });
+    expect(runnerResourcePause()).toEqual({ runningJobs: 'finish' });
+    expect(runnerJobEnvironment().perJobTempDir).toBe(false);
   });
 });
 

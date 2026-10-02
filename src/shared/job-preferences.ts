@@ -2,10 +2,11 @@
  * The runner's resource-pause and job-environment preferences: what each
  * holds, its default, and how a section of config.yaml is read into it.
  *
- * Shared by the main process, which reads config.yaml at each pause and each
- * worker spawn, and the renderer, whose Settings page shows and sets them, so
- * the page shows the value the runner uses - a value the runner would take as
- * absent shows as the default it uses instead.
+ * Shared by the main process, whose store loads them from config.yaml at
+ * launch and which the runner reads at each pause and each worker spawn, and
+ * the renderer, whose Settings page shows and sets them in that store, so the
+ * page shows the value the runner uses - a value the file holds that the
+ * runner would take as absent shows as the default it uses instead.
  */
 
 /** A section of config.yaml as written: any key, any value. */
@@ -15,7 +16,7 @@ export type PreferenceSection<T> = Partial<Record<keyof T, unknown>>;
  * What a resource pause - the runner pausing itself on battery or during a
  * video call, as the `power` settings say - does, as used: every key
  * present. The `resourcePause` section of config.yaml, set from the Power
- * section of Settings, and read at each pause.
+ * section of Settings, and read from the store at each pause.
  */
 export interface ResourcePauseConfig {
   /**
@@ -57,8 +58,9 @@ export function resolveResourcePauseConfig(
  * The conveniences localmost adds to every job's environment, each of which
  * can be turned off on its own. All are on by default. See
  * docs/roadmap/job-environment.md. The `jobEnvironment` section of
- * config.yaml, set from the Job Environment section of Settings, and read at
- * each worker spawn: a change applies to workers spawned after it.
+ * config.yaml, set from the Job Environment section of Settings, and read
+ * from the store at each worker spawn: a change applies to workers spawned
+ * after it.
  */
 export interface JobEnvironmentConfig {
   /**
