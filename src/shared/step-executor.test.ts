@@ -127,6 +127,11 @@ describe('buildStepEnvironment', () => {
     expect(env.HOME).toBe(path.join(workDir, '.home'));
     // Every step gets this HOME, so it has to exist by the time one runs.
     expect(fs.existsSync(env.HOME)).toBe(true);
+    // ssh finds its directory through the user database, not HOME, so git's
+    // ssh is pointed into it.
+    expect(env.GIT_SSH_COMMAND).toBe(
+      `ssh -F '${env.HOME}/.ssh/config' -o UserKnownHostsFile='${env.HOME}/.ssh/known_hosts'`
+    );
   });
 
   it('keeps the tool cache inside the workspace', () => {

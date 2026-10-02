@@ -14,8 +14,8 @@ import {
   SandboxPolicyLevel, RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
 import { SandboxFilesystemPolicy, spawnSandboxed } from './process-sandbox';
-import { inheritedWorkerEnv, packageCacheEnv } from './worker-env';
-import { DEFAULT_BROKER_PORT, type EnvPolicy, type ProcessMarker } from '../shared/sandbox-profile';
+import { inheritedWorkerEnv, javaToolOptions, levelToolchainPaths, packageCacheEnv } from './worker-env';
+import { DEFAULT_BROKER_PORT, developerCredentialPaths, type EnvPolicy, type ProcessMarker } from '../shared/sandbox-profile';
 import { developerPython, reapMarkedProcessesAsync } from '../shared/sandbox-reaper';
 import { groupHasMembers, sweepInGrace, sweepProcessGroup } from './process-group';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
@@ -24,8 +24,17 @@ import { RunnerDownloader } from './runner-downloader';
 import { dockerCliPath, helperPath, DOCKER_CONFIG_DIR_NAME, SHARE_DIR_NAME } from './vm/paths';
 import type { WorkerCredentialFiles } from './worker-credentials';
 import type { BrokerJobTarget } from './broker-proxy-service';
-import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
-import { loadConfig, resolveDockerVmConfig, type DockerVmConfig } from './config';
+import { getAppDataDir, getConfigPath, getJobHistoryPath, getRunnerDir, getUserDataDir } from './paths';
+import {
+  loadConfig,
+  resolveDockerVmConfig,
+  resolveJobEnvironmentConfig,
+  type DockerVmConfig,
+  type JobEnvironmentConfig,
+} from './config';
+import { createMissingGrantedDirs, gitSshCommand, JOB_HOME_DIR_NAME, prepareJobHome } from '../shared/job-home';
+import { createJobTempDir, jobTempName, removeJobTempDir, userTempDir } from './job-temp';
+import { writeJobBin } from './job-shims';
 import { normalizeFilterConfig, isUserAllowed, areAllUsersAllowed, parseRepository } from './runner/user-filter';
 
 /**
@@ -304,7 +313,14 @@ interface RunnerManagerOptions {
   dockerBackend?: DockerBackend;
   /** The dockerVm settings: the boot timeout and the spare, here. Read at each spawn. */
   getDockerVmConfig?: () => DockerVmConfig;
-  /** The bundled docker CLI, first on the job's PATH. dockerCliPath() by default. */
+  /** The jobEnvironment settings: which conveniences a job's environment gets. Read at each spawn. */
+  getJobEnvironmentConfig?: () => JobEnvironmentConfig;
+  /**
+   * The per-user temp directory, `/var/folders/<a>/<b>/T`, where each job
+   * gets a directory of its own. userTempDir() by default.
+   */
+  getUserTempDir?: () => string | undefined;
+  /** The bundled docker CLI, linked in the job's bin directory, first on its PATH. dockerCliPath() by default. */
   dockerCli?: string;
   /** The Docker VM helper, which the job's profile refuses to run. helperPath() by default. */
   vmHelper?: string;
@@ -359,6 +375,8 @@ export class RunnerManager {
   private dockerProxies: Map<number, DockerFilterProxy> = new Map();
   private readonly dockerBackend: DockerBackend;
   private readonly getDockerVmConfig: () => DockerVmConfig;
+  private readonly getJobEnvironmentConfig: () => JobEnvironmentConfig;
+  private readonly getUserTempDir: () => string | undefined;
   private readonly dockerCli: string;
   private readonly vmHelper: string;
 
@@ -449,6 +467,8 @@ export class RunnerManager {
     this.getDockerVmConfig =
       options.getDockerVmConfig ??
       (() => resolveDockerVmConfig(undefined, { cores: os.cpus().length, memoryBytes: os.totalmem() }));
+    this.getJobEnvironmentConfig = options.getJobEnvironmentConfig ?? (() => resolveJobEnvironmentConfig(undefined));
+    this.getUserTempDir = options.getUserTempDir ?? (() => userTempDir((_level, message) => this.log('error', message)));
     this.dockerCli = options.dockerCli ?? dockerCliPath();
     this.vmHelper = options.vmHelper ?? helperPath();
 
@@ -1483,30 +1503,70 @@ export class RunnerManager {
       // being a property of any request the filter can see, so `build:` policy
       // would describe an endpoint a real `docker build` never calls.
       env.DOCKER_BUILDKIT = '0';
-      // The bundled CLI, first on PATH, reading an empty config of the job's
-      // own rather than the operator's ~/.docker.
+      // The bundled CLI, reading an empty config of the job's own rather
+      // than the operator's ~/.docker.
       env.DOCKER_CONFIG = path.join(sandboxDir, DOCKER_CONFIG_DIR_NAME);
-      // With no PATH of its own, the job still gets the system's after it.
-      env.PATH = `${path.dirname(this.dockerCli)}:${env.PATH || DEFAULT_SYSTEM_PATH}`;
-
-      // Make git hermetic and able to authenticate to this worker's proxy.
-      // The sandbox does not grant the user's ~/.gitconfig, and git treats an
-      // unreadable global config as fatal, which sent checkout down a REST
-      // archive fallback. A per-job global config in the sandbox fixes that and
-      // sets http.proxyAuthMethod=basic so git sends the proxy token
-      // preemptively - without it git waits for a 407 challenge the proxy
-      // answers by closing the connection, and the fetch aborts. It also makes
-      // a run independent of whose machine it ran on.
-      const gitConfigPath = path.join(sandboxDir, '.localmost-gitconfig');
+      // First on PATH, the job's own bin directory: the bundled CLI, linked,
+      // and the swift and xcodebuild shims that turn SwiftPM's and Xcode's
+      // own sandbox off, which macOS refuses to nest inside the job's (see
+      // job-shims.ts). Should it not be made, the CLI's own directory, as
+      // before. With no PATH of its own, the job still gets the system's
+      // after it.
+      const jobEnvironment = this.getJobEnvironmentConfig();
+      let binDir: string;
       try {
-        fs.writeFileSync(gitConfigPath, '[http]\n\tproxyAuthMethod = basic\n');
-        env.GIT_CONFIG_GLOBAL = gitConfigPath;
+        binDir = writeJobBin(sandboxDir, { dockerCli: this.dockerCli, shims: jobEnvironment.toolShims });
       } catch (err) {
-        this.log('warn', `Could not write git config for instance ${instanceNum}: ${(err as Error).message}`);
+        this.log('warn', `No bin directory of its own for instance ${instanceNum}; its job has no swift or xcodebuild shims: ${(err as Error).message}`);
+        binDir = path.dirname(this.dockerCli);
+      }
+      env.PATH = `${binDir}:${env.PATH || DEFAULT_SYSTEM_PATH}`;
+
+      // A home of the job's own: HOME is <sandbox>/home, empty, the job's to
+      // write and gone with the sandbox, so tools look for their dotfiles
+      // there rather than in the user's home, where the sandbox denies most
+      // of what they would find - a regular ~/.gitconfig, which checkout
+      // copies from $HOME, made it fail at every level. What the approved
+      // policy and the level grant under the real home is linked in at the
+      // same path, so a tool finds it through HOME; the sandbox judges the
+      // path a link resolves to, so the link reaches no more than the grant.
+      const jobHome = path.join(sandboxDir, JOB_HOME_DIR_NAME);
+      const homeLog = (level: 'debug' | 'warn', message: string) => this.log(level, `[sandbox ${instanceNum}] ${message}`);
+      if (jobEnvironment.createMissingGrantedDirs) {
+        // A granted directory that does not exist yet, which a job that is
+        // denied its parent could not create for itself.
+        try {
+          const credentialPaths = developerCredentialPaths();
+          const created = createMissingGrantedDirs(filesystemPolicy.write, {
+            excludeRoots: [getAppDataDir(), getUserDataDir()],
+            deniedRoots: [...credentialPaths.subpaths, ...credentialPaths.literals],
+            log: homeLog,
+          });
+          if (created.length > 0) this.log('info', `Created ${created.join(', ')}, granted to the job of instance ${instanceNum}`);
+        } catch (err) {
+          this.log('warn', `Could not create the directories granted to instance ${instanceNum}: ${(err as Error).message}`);
+        }
+      }
+      env.HOME = jobHome;
+      // Git made hermetic and able to authenticate to this worker's proxy:
+      // the job's $HOME/.gitconfig is the per-job global config, nothing of
+      // the user's (see JOB_GIT_CONFIG), and the system config is skipped.
+      try {
+        const { gitConfig, linked } = prepareJobHome(jobHome, {
+          grants: [...filesystemPolicy.read, ...filesystemPolicy.write, ...levelToolchainPaths(filesystemPolicy.level)],
+          log: homeLog,
+        });
+        env.GIT_CONFIG_GLOBAL = gitConfig;
+        if (linked.length > 0) this.log('debug', `[sandbox ${instanceNum}] Linked into the job's home: ${linked.join(', ')}`);
+      } catch (err) {
+        this.log('warn', `Could not prepare the home of instance ${instanceNum}; its job runs with an empty one: ${(err as Error).message}`);
         env.GIT_CONFIG_GLOBAL = '/dev/null';
       }
       env.GIT_CONFIG_SYSTEM = '/dev/null';
       env.GIT_CONFIG_NOSYSTEM = '1';
+      // ssh finds its directory through the user database, not HOME, so git's
+      // ssh is pointed at the job's home explicitly.
+      env.GIT_SSH_COMMAND = gitSshCommand(jobHome);
 
       // Keep the job's temp inside its own sandbox. The default $TMPDIR is a
       // per-user directory shared with every other process the user runs, and
@@ -1533,6 +1593,32 @@ export class RunnerManager {
       env.xcrun_db = path.join(jobTmp, 'xcrun_db');
       env.CLANG_MODULE_CACHE_PATH = path.join(jobTmp, 'clang-module-cache');
       env.TMPPREFIX = path.join(jobTmp, 'zsh');
+      // Foundation ignores TMPDIR: NSTemporaryDirectory(), java.io.tmpdir and
+      // the staging directory of a sandboxed process's atomic writes - which
+      // SwiftPM and xcodebuild make all the time - are in the per-user temp
+      // directory. DIRHELPER_USER_DIR_SUFFIX moves them into a directory of
+      // the job's own there, made now, granted by its profile, and removed
+      // with its sandbox (see job-temp.ts).
+      let tempSuffixDir: string | undefined;
+      if (jobEnvironment.perJobTempDir) {
+        const userTemp = this.getUserTempDir();
+        if (userTemp) {
+          try {
+            tempSuffixDir = createJobTempDir(userTemp, sandboxDir);
+            env.DIRHELPER_USER_DIR_SUFFIX = path.basename(tempSuffixDir);
+          } catch (err) {
+            this.log('warn', `No temp directory of its own for instance ${instanceNum}; Foundation's atomic writes will fail in its job: ${(err as Error).message}`);
+          }
+        }
+      }
+      // The JVM reads neither TMPDIR, HOME nor HTTPS_PROXY, and its
+      // dual-stack sockets reach loopback in a way the sandbox cannot
+      // attribute: its temp, home, IPv4 and the proxy are set where every
+      // JVM picks them up (see javaToolOptions). A workflow's own
+      // JAVA_TOOL_OPTIONS replaces it.
+      if (jobEnvironment.javaToolOptions) {
+        env.JAVA_TOOL_OPTIONS = javaToolOptions({ tmpDir: jobTmp, home: jobHome, proxyUrl });
+      }
 
       // A per-spawn marker file, held open by the worker and by what it starts
       // through its bash and .NET layers (run.sh, Listener, Worker, `run:` step
@@ -1589,6 +1675,7 @@ export class RunnerManager {
           vmHelper: this.vmHelper,
           toolCacheDir,
           packageCacheDir,
+          tempSuffixDir,
           processMarker,
         });
       } finally {
@@ -1822,6 +1909,28 @@ export class RunnerManager {
     this.downloader.removeSandbox(sandboxDir).catch((err) =>
       this.log('warn', `Could not remove the sandbox of instance ${instanceNum}; the next startup will: ${(err as Error).message}`)
     );
+    void this.removeJobTemp(sandboxDir);
+  }
+
+  /**
+   * Remove a sandbox's job temp directory, if it has one: by name, derived
+   * from the sandbox, and only that (see removeJobTempDir). One that cannot
+   * be removed goes at the next startup.
+   */
+  private async removeJobTemp(sandboxDir: string): Promise<void> {
+    const userTemp = this.getUserTempDir();
+    if (!userTemp) return;
+    let dir: string;
+    try {
+      dir = path.join(userTemp, jobTempName(sandboxDir));
+    } catch {
+      return;
+    }
+    try {
+      await removeJobTempDir(userTemp, dir, path.dirname(sandboxDir));
+    } catch (err) {
+      this.log('warn', `Could not remove ${path.basename(dir)} from the per-user temp directory; the next startup will: ${(err as Error).message}`);
+    }
   }
 
   /**
@@ -2180,6 +2289,7 @@ export class RunnerManager {
     } catch (err) {
       this.log('warn', `Could not remove ${path.basename(sandboxDir)}; the next startup will: ${(err as Error).message}`);
     }
+    await this.removeJobTemp(sandboxDir);
   }
 
   /** Pids of the workers this manager is running now. */

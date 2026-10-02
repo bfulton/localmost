@@ -3,8 +3,10 @@
  * sets for the runner itself.
  */
 
+import * as os from 'os';
 import * as path from 'path';
 import type { EnvPolicy } from '../shared/sandbox-profile';
+import type { SandboxPolicyLevel } from '../shared/types';
 import type { LocalmostrcConfig } from '../shared/localmostrc';
 
 /**
@@ -120,4 +122,106 @@ export function packageCacheEnv(dir: string): Record<string, string> {
     electron_config_cache: at('electron'),
     npm_config_devdir: at('node-gyp'),
   };
+}
+
+/**
+ * JAVA_TOOL_OPTIONS for a job's JVMs, which read neither TMPDIR nor
+ * HTTPS_PROXY, and every JVM the job starts picks up.
+ *
+ * - java.io.tmpdir in the job's temp: the JVM's default is the per-user
+ *   temp directory, which the sandbox does not grant, so createTempFile
+ *   failed with "Operation not permitted".
+ * - user.home the job's home: the JVM takes it from the user database, not
+ *   HOME, so Maven (~/.m2/settings.xml), Gradle without GRADLE_USER_HOME,
+ *   sbt and Ivy looked in the real home, where the floor denies their
+ *   credential files, and failed on them.
+ * - IPv4 only: a dual-stack socket's connection to 127.0.0.1 is reported
+ *   with no host, so the sandbox cannot attribute it to loopback and denies
+ *   it - the same reason .NET is given DOTNET_SYSTEM_NET_DISABLEIPV6.
+ * - The job's proxy for http and https, and its credentials. The JDK's own
+ *   HTTP clients do not read http(s).proxyUser/Password - they ask an
+ *   Authenticator, which only the job's code can install - but Gradle and
+ *   clients that take their proxy from the system properties (Apache
+ *   HttpClient's) do. Basic is the proxy's scheme, which the JDK refuses on
+ *   a CONNECT tunnel unless jdk.http.auth.tunneling.disabledSchemes says
+ *   otherwise; set empty, an Authenticator the job installs works.
+ *
+ * The JVM splits JAVA_TOOL_OPTIONS on whitespace, so a value with any in it
+ * is left out rather than passed in pieces. The JVM prints the whole value
+ * to stderr as it starts ("Picked up JAVA_TOOL_OPTIONS"), proxy token
+ * included; the token is good only for this job's proxy, on loopback, and
+ * is replaced when the job ends. A workflow that sets JAVA_TOOL_OPTIONS
+ * itself replaces all of this.
+ */
+export function javaToolOptions(options: { tmpDir: string; home: string; proxyUrl: string }): string {
+  const whole = (value: string) => !/\s/.test(value);
+  const flags: string[] = [];
+  if (whole(options.tmpDir)) flags.push(`-Djava.io.tmpdir=${options.tmpDir}`);
+  if (whole(options.home)) flags.push(`-Duser.home=${options.home}`);
+  flags.push('-Djava.net.preferIPv4Stack=true');
+  let proxy: URL | undefined;
+  try {
+    proxy = new URL(options.proxyUrl);
+  } catch {
+    proxy = undefined;
+  }
+  if (proxy && proxy.hostname && proxy.port) {
+    for (const scheme of ['http', 'https']) {
+      flags.push(`-D${scheme}.proxyHost=${proxy.hostname}`, `-D${scheme}.proxyPort=${proxy.port}`);
+    }
+    const user = decodeURIComponent(proxy.username);
+    const password = decodeURIComponent(proxy.password);
+    if (user && password && whole(user) && whole(password)) {
+      for (const scheme of ['http', 'https']) {
+        flags.push(`-D${scheme}.proxyUser=${user}`, `-D${scheme}.proxyPassword=${password}`);
+      }
+      flags.push('-Djdk.http.auth.tunneling.disabledSchemes=', '-Djdk.http.auth.proxying.disabledSchemes=');
+    }
+  }
+  return flags.join(' ');
+}
+
+/**
+ * The toolchains and package-manager caches a level lets a job read.
+ *
+ * A convenience for jobs, not something the runner needs. Under strict a
+ * repository declares what it wants; moderate and permissive can read them,
+ * which is the same split the network allowlists already use. Read only:
+ * these trees hold directories on the user's PATH and config their own tools
+ * load, so a job that could write them could plant code the user later runs
+ * outside any sandbox. The job's package managers write to its target's own
+ * directory instead. `homeDir` is used as given, already escaped for the
+ * profile where that is where it goes.
+ *
+ * Of ~/.local, only bin and lib: the rest is where tools keep their state,
+ * tokens included - uv's index credentials, the SSH key into a Podman
+ * machine, atuin's sync key, all under ~/.local/share. The job's package
+ * managers keep their data in its own package cache (XDG_DATA_HOME), so no
+ * ~/.local/share/<tool> is read for them; a tool linked from ~/.local/bin
+ * into one, or a job that wants one for another reason, declares it. Those
+ * three secrets are on the floor (developerCredentialPaths), so declaring
+ * ~/.local/share/uv to run a uv tool does not read uv's credentials.
+ */
+export function levelToolchainPaths(level: SandboxPolicyLevel, homeDir: string = os.homedir()): string[] {
+  if (level === 'strict') return [];
+  return [
+    '/opt/homebrew',
+    '/usr/local',
+    '/Applications/Xcode.app',
+    '/Library/Developer',
+    `${homeDir}/.npm`,
+    `${homeDir}/.yarn`,
+    `${homeDir}/.pnpm-store`,
+    `${homeDir}/.cache`,
+    `${homeDir}/.cargo`,
+    `${homeDir}/.rustup`,
+    `${homeDir}/.gradle`,
+    `${homeDir}/.m2`,
+    `${homeDir}/.nuget`,
+    `${homeDir}/.dotnet`,
+    `${homeDir}/.local/bin`,
+    `${homeDir}/.local/lib`,
+    `${homeDir}/go`,
+    `${homeDir}/Library/Caches`,
+  ];
 }

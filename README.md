@@ -261,7 +261,9 @@ Packaging the app (`npm run make`, and `npm run test:e2e`, which packages it
 first) runs `npm run build:native` to build the Docker VM's helper and guest
 and fetch the docker CLI. That needs Xcode's Swift and Go, and the guest build
 boots a VM, so run it on the Mac itself, not inside a localmost job. `npm test`
-needs none of this.
+needs none of this, but outside a localmost job its sandbox tests run this
+Mac's own tools under a constructed profile: Xcode's Swift, and a JDK, which
+`/usr/libexec/java_home` must find.
 
 ## Roadmap
 
@@ -288,6 +290,7 @@ Future feature ideas:
 - **Higher parallelism cap** - Parallelize proxy registration to support 16+ concurrent runners (currently capped at 8 due to serial registration time).
 - **macOS VM jobs** - An opt-in per-repository isolation level that runs each job in a fresh macOS VM cloned from a golden image, with policy grants mapped to shares ([design](docs/roadmap/macos-vm-jobs.md)).
 - **Filtering VM network stack** - A userspace network stack for the Docker VM that enforces the job's hostname policy on traffic that ignores proxy settings ([design](docs/roadmap/vm-network-stack.md)).
+- **Dedicated runner user** - Run jobs as a macOS user account of their own, so tools that look the home up by uid, preferences and the keychain are the job's rather than yours ([design](docs/roadmap/job-environment.md#future-a-dedicated-runner-user)).
 
 Bugs and quick improvements:
 

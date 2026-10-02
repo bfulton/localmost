@@ -1,10 +1,33 @@
 import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
-import { createHash } from 'crypto';
+import { execFileSync } from 'child_process';
+import { createHash, randomBytes } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as tar from 'tar';
 import { RunnerDownloader } from './runner-downloader';
+import { developerPythonSync } from '../shared/sandbox-reaper';
+
+/**
+ * Where on the device each file's first byte is stored, by fcntl
+ * F_LOG2PHYS_EXT through the developer tools' python. Two files whose first
+ * blocks are one block share it: an APFS clone, not a copy.
+ */
+const deviceOffsets = (...files: string[]): number[] => {
+  const python = developerPythonSync();
+  expect(python).not.toBeNull();
+  const script = [
+    'import fcntl, os, struct, sys',
+    'for name in sys.argv[1:]:',
+    '    fd = os.open(name, os.O_RDONLY)',
+    // struct log2phys { u_int32_t flags; off_t contigbytes; off_t devoffset; }, packed to 4
+    "    out = fcntl.fcntl(fd, 65, struct.pack('=Iqq', 0, 1 << 20, 0))",
+    '    os.close(fd)',
+    "    print(struct.unpack('=Iqq', out)[2])",
+  ].join('\n');
+  const output = execFileSync(python!, ['-c', script, ...files], { encoding: 'utf-8', timeout: 30000, env: { PATH: '/usr/bin:/bin' } });
+  return output.trim().split('\n').map(Number);
+};
 
 /**
  * buildSandbox and copyProxyCredentials against a real directory tree: what a
@@ -115,19 +138,47 @@ describe('the sandbox a worker is built from', () => {
     }
   });
 
-  it("makes the work folder, the Docker VM's share, itself, and an empty DOCKER_CONFIG beside it", async () => {
+  it("copies the runner as a clone sharing the template's blocks, and still checks the copy", async () => {
+    // A byte copy of the runner - nearly 500 MiB - into every sandbox took
+    // seconds of every spawn and as much disk again for each running job. An
+    // APFS clone shares the template's blocks until one side writes. Where
+    // a file's first block lives on the device tells the two apart: a clone's
+    // is the template's, a copy's is new. Real content, flushed, so the file
+    // has blocks of its own to begin with.
+    const arcFile = path.join(runnerDir, 'arc', `v${version}`, 'bin', 'libcoreclr.dylib');
+    const fd = fs.openSync(arcFile, 'w', 0o755);
+    fs.writeSync(fd, randomBytes(1024 * 1024));
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    await downloader.recordArcManifest(version);
+    const copyStarts = jest.spyOn(downloader as unknown as { compareWithManifest: () => Promise<string[]> }, 'compareWithManifest');
+
+    const sandbox = await downloader.buildSandbox(1, version);
+
+    const sandboxFile = path.join(sandbox, 'bin', 'libcoreclr.dylib');
+    const [template, copy] = deviceOffsets(arcFile, sandboxFile);
+    expect(copy).toBe(template);
+    // Byte for byte the same, executable, and checked against the record.
+    expect(fs.readFileSync(sandboxFile).equals(fs.readFileSync(arcFile))).toBe(true);
+    expect(fs.statSync(sandboxFile).mode & 0o111).not.toBe(0);
+    expect(copyStarts).toHaveBeenCalledWith(sandbox, expect.anything());
+  });
+
+  it("makes the work folder, the Docker VM's share, itself, and an empty DOCKER_CONFIG and job home beside it", async () => {
     // The share must be the directory localmost made, before anything runs in
     // the sandbox: made by the runner, it would be whatever the job left at
-    // the name. The CLI's config directory is not in the share.
+    // the name. The CLI's config directory is not in the share, nor the job's
+    // home, which is HOME for the job and starts empty.
     await downloader.copyProxyCredentials(1, path.join(runnerDir, 'proxies', 'target-a'));
     const sandbox = await downloader.buildSandbox(1, version);
 
-    for (const name of ['_work', '.docker']) {
+    for (const name of ['_work', '.docker', 'home']) {
       const stat = fs.lstatSync(path.join(sandbox, name));
       expect([name, stat.isDirectory(), stat.isSymbolicLink()]).toEqual([name, true, false]);
       expect(fs.readdirSync(path.join(sandbox, name))).toEqual([]);
     }
     expect(fs.statSync(path.join(sandbox, '.docker')).mode & 0o777).toBe(0o700);
+    expect(fs.statSync(path.join(sandbox, 'home')).mode & 0o777).toBe(0o700);
   });
 
   it('makes both with a plain mkdir, which refuses a name that already exists, before copying the runner', async () => {
@@ -147,7 +198,7 @@ describe('the sandbox a worker is built from', () => {
 
     const sandbox = await downloader.buildSandbox(1, version);
 
-    for (const name of ['_work', '.docker']) {
+    for (const name of ['_work', '.docker', 'home']) {
       expect(made.filter((m) => m.dir === path.join(sandbox, name))).toEqual([
         { dir: path.join(sandbox, name), recursive: false, afterCopy: false },
       ]);
@@ -473,6 +524,20 @@ describe('the runner template a sandbox is copied from', () => {
 
     await expect(build()).rejects.toThrow(/does not match/);
     expect(logged.join('\n')).toMatch(/externals\/node24\/bin\/npx/);
+  });
+
+  it.each([
+    ['an absolute link', (dir: string) => fs.symlinkSync('/etc/passwd', path.join(dir, 'bin', 'passwd')), /Absolute symlink/],
+    ['a link out of the template', (dir: string) => fs.symlinkSync('../../../..', path.join(dir, 'bin', 'up')), /Symlink escapes/],
+    ['a FIFO', (dir: string) => execFileSync('/usr/bin/mkfifo', [path.join(dir, 'bin', 'pipe')]), /Not a file, directory or link/],
+  ])('refuses a template holding %s, even one recorded with it, and builds nothing', async (_name, plant, refusal) => {
+    // The record lists files and links; it cannot vouch for a link's
+    // destination or see a FIFO, so the copy is checked for those itself.
+    plant(arc);
+    await downloader.recordArcManifest(version);
+
+    await expect(build()).rejects.toThrow(refusal);
+    expect(fs.readdirSync(path.join(root, 'runner', 'sandbox'))).toEqual([]);
   });
 
   it('records the release, not what is on disk, for a template installed before records were kept', async () => {
