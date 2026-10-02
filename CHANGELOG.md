@@ -222,8 +222,9 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   directories (`/usr/local/bin`, `/opt/homebrew/bin`, `~/.local/bin`,
   `~/bin`) - with what a write there lets a job do: leave code that runs as
   you, outside the sandbox, after the job ends. Such grants are still allowed. A
-  write grant on `~/.ssh` or `~/.config` is marked as doing nothing, since the
-  sandbox refuses every write there whatever is granted.
+  write grant on `~/.ssh`, `~/.config` or `~/Library/Preferences` is marked
+  as doing nothing, since the sandbox refuses every write there whatever is
+  granted.
 - A job's Docker `/info` shows only the daemon's version, platform, kernel, CPU
   count, memory, storage driver, cgroup version and security options. In full
   it described the host: its name, the daemon's proxy URLs with any credentials
@@ -447,8 +448,8 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   hand the job uv's credentials beside it.
 - Every profile let a job, a `localmost test` step and `--updaterc` write the
   `com.apple.dt.Xcode` preference domain, at every level: settings your own
-  Xcode loads outside any sandbox. No profile writes a preference domain now.
-  And a policy granting `~` or `~/Library` - or, under `--updaterc`, no
+  Xcode loads outside any sandbox. None of them writes a preference domain
+  now. And a policy granting `~` or `~/Library` - or, under `--updaterc`, no
   policy at all - reached every app's preferences through their plists,
   which cfprefsd honours in place of the preference rules: write grants
   could set any app's preferences, read grants read them. `~/Library/Preferences`

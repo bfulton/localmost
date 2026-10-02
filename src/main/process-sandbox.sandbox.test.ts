@@ -33,7 +33,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { generateSandboxProfile, RunnerProfileOptions } from './process-sandbox';
 import { dockerOnPath } from './test-utils/vm-fixtures';
-import { defaults, preferenceAllowed, removeThrowawayDomain, throwawayDomain } from '../shared/test-utils/preference-probe';
+import { defaults, preferenceAllowed, removeThrowawayDomain, sweepStaleThrowawayDomains, throwawayDomain } from '../shared/test-utils/preference-probe';
 
 // The real home by default; one block below stands a directory of its own in
 // for it, since os.homedir() is what the profile is built from.
@@ -851,6 +851,7 @@ if (!isMacOS) {
       const plist = path.join(homeDir, 'Library', 'Preferences', `${domain}.plist`);
 
       beforeAll(() => {
+        sweepStaleThrowawayDomains();
         expect(defaults(['write', domain, 'planted', '-string', 'PLANTED']).ok).toBe(true);
         expect(defaults(['read', domain, 'planted']).stdout).toBe('PLANTED');
       });

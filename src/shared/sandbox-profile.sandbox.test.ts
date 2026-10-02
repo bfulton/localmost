@@ -41,7 +41,7 @@ import {
   DEFAULT_BROKER_PORT,
 } from './sandbox-profile';
 import { getWorkspacesDir, removeWorkspace } from './workspace';
-import { defaults, preferenceAllowed, removeThrowawayDomain, throwawayDomain } from './test-utils/preference-probe';
+import { defaults, preferenceAllowed, removeThrowawayDomain, sweepStaleThrowawayDomains, throwawayDomain } from './test-utils/preference-probe';
 
 // The real home by default; one block below stands a scratch directory in for
 // it, since os.homedir() is what the profiles are built from.
@@ -745,6 +745,7 @@ if (!isMacOS) {
       scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'localmost-prefs-')));
       workDir = path.join(scratch, 'project');
       fs.mkdirSync(workDir);
+      sweepStaleThrowawayDomains();
       expect(defaults(['write', domain, 'planted', '-string', 'PLANTED']).ok).toBe(true);
       expect(defaults(['read', domain, 'planted']).stdout).toBe('PLANTED');
     });

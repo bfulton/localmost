@@ -82,6 +82,38 @@ export const throwawayDomain = (): string =>
   `com.localmost.prefs-test-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
 
 const THROWAWAY = /^com\.localmost\.prefs-test-\d+-[0-9a-f]{8}$/;
+const THROWAWAY_PLIST = /^com\.localmost\.prefs-test-(\d+)-[0-9a-f]{8}\.plist$/;
+
+const preferencesDir = (): string => path.join(os.userInfo().homedir, 'Library', 'Preferences');
+
+/** Whether a process with this pid is running (EPERM: one is, of another user). */
+function isRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/**
+ * Remove the plists of throwaway domains whose run is no longer alive: a run
+ * killed or timed out between planting its domain and removing it leaves the
+ * plist behind, and nothing else would ever remove it. Only names of
+ * throwawayDomain's exact shape whose pid is neither this process nor any
+ * running one, and only plain files - never a directory, nor what a link
+ * points at. A run calls it before planting its own.
+ */
+export function sweepStaleThrowawayDomains(dir: string = preferencesDir()): void {
+  for (const name of fs.readdirSync(dir)) {
+    const match = THROWAWAY_PLIST.exec(name);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    if (pid === process.pid || isRunning(pid)) continue;
+    const plist = path.join(dir, name);
+    if (fs.lstatSync(plist, { throwIfNoEntry: false })?.isFile()) fs.unlinkSync(plist);
+  }
+}
 
 /**
  * Remove a domain throwawayDomain named, and its plist: `defaults delete`
@@ -91,7 +123,7 @@ const THROWAWAY = /^com\.localmost\.prefs-test-\d+-[0-9a-f]{8}$/;
 export function removeThrowawayDomain(domain: string): void {
   if (!THROWAWAY.test(domain)) throw new Error(`not a throwaway preference domain: ${domain}`);
   defaults(['delete', domain]);
-  const plist = path.join(os.userInfo().homedir, 'Library', 'Preferences', `${domain}.plist`);
+  const plist = path.join(preferencesDir(), `${domain}.plist`);
   if (fs.lstatSync(plist, { throwIfNoEntry: false })?.isFile()) fs.unlinkSync(plist);
 }
 

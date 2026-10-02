@@ -898,9 +898,11 @@ describe('Sandbox Profile Generator', () => {
     ];
     const preferenceRules = (profile: string) =>
       profile.split('\n').filter((line) => line.includes('user-preference') && !line.trim().startsWith(';;'));
+    // Not the permissive profile: it is (allow default), which allows every
+    // preference read and write whatever rules follow, so nothing asserted of
+    // its text would hold. No step or discovery run is given it.
     const everyProfile = () => [
       generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT }),
-      generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, permissive: true }),
       generateSandboxProfile({
         workDir: '/path/to/project',
         proxyPort: DEFAULT_PROXY_PORT,
