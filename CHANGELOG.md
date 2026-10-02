@@ -21,10 +21,10 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
 - **Opt-in container work through a filtering Docker socket, in a Linux VM
   per job**: an approved `.localmostrc` may declare the `pull`, `run` and
   `build` actions a job needs, with the registries, images, workspace mounts
-  (`ro`/`rw`), network mode and build context each covers. The job is never
-  handed a daemon socket: each worker gets a socket localmost owns, and only
-  declared requests are forwarded, to a Linux VM of that job's own, which
-  localmost boots at the first Docker request, beyond `/_ping`, `/version`
+  (`ro`/`rw`), network mode, build context and build tags each covers. The job
+  is never handed a daemon socket: each worker gets a socket localmost owns,
+  and only declared requests are forwarded, to a Linux VM of that job's own,
+  which localmost boots at the first Docker request, beyond `/_ping`, `/version`
   and `/info`, of a job whose policy has a `docker:` section, so a job that
   never runs `docker` has no VM
   (or, with the opt-in `dockerVm.prewarm`, as a spare when an idle worker is
@@ -298,6 +298,13 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   another image on the `docker.io` credential. A build's `t` tags may still
   repeat. `networkmode` on a build and `fromSrc` on a pull are judged in any
   case, as Podman reads them.
+- The Docker filter judges a build's tags. It read only the build's network and
+  key names, so under `run.images: [postgres:16]` a build tagged `postgres:16`
+  (or `ghcr.io/other/app`) was forwarded, replacing the local image every later
+  `docker run postgres:16` in the job used. Each tag must now match
+  `build.tags`, and one with a registry host or in a repository `run.images`
+  names is refused whatever `build.tags` says, as is `t` in another case, which
+  Podman reads as a tag and moby ignores.
 - An approved policy is bound to the repository's id as well as its name. A job
   from a different repository that now holds an approved name - the approved one
   deleted or renamed, and the name taken since - is refused until the policy is
@@ -599,6 +606,12 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   The proxy authenticates on the job's behalf, so the job no longer reads
   `~/.docker/config.json` and nothing under `~/.docker` is opened at any level.
   `localmost test --updaterc` writes the actions from a run's denials
+- **Breaking policy change**: a `docker build -t` tag must match a glob in the
+  new `build.tags`, so a policy whose `build:` declares none now has every
+  tagged build refused, with the line that would permit it logged. A tag with a
+  registry host, or in a repository `run.images` names, is refused whatever
+  `build.tags` says, so an image a job builds cannot also be run by name. An
+  untagged build is unaffected
 - **Breaking policy change**: under `strict` and `moderate`, a runner job's proxy
   reaches an allowed host only on its scheme's port: 443 through `CONNECT` and 80
   for plain HTTP. A job that reaches a host on any other port - a registry on

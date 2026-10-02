@@ -366,7 +366,7 @@ describe('DockerFilterProxy forwarding', () => {
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
     const { proxy, sock, calls } = await startProxy(dir, { backend: backendWith(daemon.sock) });
-    proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' }, pull: { registries: ['docker.io'] }, build: { context: './' } });
+    proxy.bind('owner/repo', { run: { images: ['postgres:16'], network: 'bridge' }, pull: { registries: ['docker.io'] }, build: { context: './', tags: ['app:*'] } });
 
     const form = { 'content-type': 'application/x-www-form-urlencoded' };
     const pulled = await request(sock, 'POST', '/v1.45/images/create?fromImage=postgres&tag=16', 'fromImage=evil.example.com%2Fx', form);
@@ -521,10 +521,52 @@ describe('DockerFilterProxy forwarding', () => {
     expect(calls.pulls).toHaveLength(0);
 
     // The one list a client repeats, a build's tags, still goes through.
-    proxy.bind('owner/repo', { build: { context: './' } });
+    proxy.bind('owner/repo', { build: { context: './', tags: ['app:*'] } });
     const built = await request(sock, 'POST', '/v1.45/build?t=app%3A1&t=app%3Alatest', 'tar', { 'content-type': 'application/x-tar' });
     expect(built.status).toBe(200);
     expect(daemon.seen).toHaveLength(1);
+  });
+
+  it('refuses a build tag that would replace a run image, carry a registry or go undeclared, without touching the daemon', async () => {
+    // A build's -t replaces the local image of that name, so a build tagged
+    // postgres:16 would be what every later `docker run postgres:16` runs.
+    const dir = tmp();
+    const daemon = await fakeDaemon(dir);
+    const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
+    proxy.bind('owner/repo', {
+      pull: { registries: ['docker.io'] },
+      run: { images: ['postgres:16'] },
+      build: { context: './', tags: ['myapp:*'] },
+    });
+    const tar = { 'content-type': 'application/x-tar' };
+
+    for (const query of [
+      't=postgres%3A16', 't=Postgres', 't=ghcr.io%2Fx%2Fy', 't=other%3A1',
+      't=myapp%3Aci&t=postgres%3A16', 'T=postgres%3A16', 'TAG=postgres%3A16', 't=myapp%3Aci&T=postgres%3A16',
+    ]) {
+      const reply = await request(sock, 'POST', `/v1.45/build?${query}`, 'tar', tar);
+      expect([query, reply.status]).toEqual([query, query.includes('&T=') ? 400 : 403]);
+    }
+    expect(daemon.seen).toHaveLength(0);
+
+    // A build.tags glob wide enough to cover the run image does not let a
+    // build replace it: the run.images rule refuses these on its own.
+    proxy.bind('owner/repo', {
+      pull: { registries: ['docker.io'] },
+      run: { images: ['postgres:16'] },
+      build: { context: './', tags: ['myapp:*', '*:*'] },
+    });
+    for (const query of ['t=postgres%3A16', 't=Postgres', 't=postgres', 't=myapp%3Aci&t=postgres%3A16']) {
+      const reply = await request(sock, 'POST', `/v1.45/build?${query}`, 'tar', tar);
+      expect([query, reply.status, JSON.parse(reply.body).message]).toEqual([query, 403, expect.stringMatching(/run\.images/)]);
+    }
+    expect(daemon.seen).toHaveLength(0);
+
+    // A declared tag, every one of a repeated t, and no tag at all go through.
+    for (const query of ['t=myapp%3Aci', 't=myapp%3Aci&t=myapp%3Alatest', 'dockerfile=Dockerfile']) {
+      expect([query, (await request(sock, 'POST', `/v1.45/build?${query}`, 'tar', tar)).status]).toEqual([query, 200]);
+    }
+    expect(daemon.seen).toHaveLength(3);
   });
 
   it('never pulls from a registry a pull tag would make of the image name', async () => {
@@ -591,7 +633,7 @@ describe('DockerFilterProxy forwarding', () => {
     const dir = tmp();
     const daemon = await fakeDaemon(dir);
     const { proxy, sock } = await startProxy(dir, { backend: backendWith(daemon.sock) });
-    proxy.bind('owner/repo', { build: { context: './' } });
+    proxy.bind('owner/repo', { build: { context: './', tags: ['app:*'] } });
 
     const tar = 'x'.repeat(3 * 1024 * 1024); // well over the JSON cap
     const reply = await request(sock, 'POST', '/v1.45/build?t=app', tar, { 'content-type': 'application/x-tar' });
@@ -629,7 +671,7 @@ describe('DockerFilterProxy forwarding', () => {
     servers.push(daemon);
     await new Promise<void>((r) => daemon.listen(sock, () => r()));
     const { proxy, sock: proxySock } = await startProxy(dir, { backend: backendWith(sock) });
-    proxy.bind('owner/repo', { build: { context: './' } });
+    proxy.bind('owner/repo', { build: { context: './', tags: ['app:*'] } });
 
     const tar = 'x'.repeat(6 * 1024 * 1024);
     const replies = await Promise.all([1, 2, 3].map(() =>
@@ -655,7 +697,7 @@ describe('DockerFilterProxy forwarding', () => {
     servers.push(daemon);
     await new Promise<void>((r) => daemon.listen(sock, () => r()));
     const { proxy, sock: proxySock } = await startProxy(dir, { backend: backendWith(sock) });
-    proxy.bind('owner/repo', { build: { context: './' } });
+    proxy.bind('owner/repo', { build: { context: './', tags: ['app:*'] } });
 
     const tar = 'x'.repeat(6 * 1024 * 1024);
     const replies = await Promise.all([1, 2, 3].map(() =>
@@ -1915,7 +1957,7 @@ describe('the worker behind the socket', () => {
 
   const policy: DockerPolicy = {
     run: { images: ['alpine:3'], mounts: [{ path: './', mode: 'rw' }], network: 'bridge', networks: [{ name: 'open-*', internal: false }, { name: 'vk-*', internal: true }] },
-    build: { context: './' },
+    build: { context: './', tags: ['app:*'] },
   };
 
   const envOf = (seen: Seen): string[] => (JSON.parse(seen.body.toString()) as { Env?: string[] }).Env ?? [];

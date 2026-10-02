@@ -46,10 +46,15 @@ export interface DockerRequest {
   apiVersion?: string;
   /**
    * The first value per key. A query that repeats a key is refused
-   * (targetError), save a list parameter the filter does not judge, so every
-   * key read here has one value.
+   * (targetError), save a list parameter (LIST_PARAMS), so every other key
+   * read here has one value.
    */
   query: Record<string, string>;
+  /**
+   * Every value of each list parameter the path takes, in order: a build's
+   * tags. A list is judged on all its values, since the daemon uses them all.
+   */
+  queryLists: Record<string, string[]>;
   /** The parsed JSON body when the content type is JSON; undefined otherwise. */
   body?: unknown;
   /** Set when the content type promised JSON and the body did not parse. */
@@ -92,9 +97,9 @@ export function mediaTypeOf(req: DockerRequest): string {
 /**
  * Query parameters a client sends once per value, by endpoint, and every
  * daemon reads as the whole list: a build's tags (`docker build -t a -t b`,
- * moby's r.Form["t"], Podman's []string field). The filter judges none of
- * them. Only the exact spelling repeats; another casing of it is still
- * refused, since moby would not read it at all.
+ * moby's r.Form["t"], Podman's []string field), so the evaluator judges
+ * every value (DockerRequest.queryLists). Only the exact spelling repeats;
+ * another casing of it is still refused, since moby would not read it at all.
  */
 const LIST_PARAMS: Readonly<Record<string, ReadonlySet<string>>> = {
   '/build': new Set(['t']),
@@ -139,7 +144,7 @@ export function parseDockerRequest(raw: DockerRequest['raw']): DockerRequest {
   // both are refusals rather than guesses.
   if (!raw.url.startsWith('/') || raw.url.startsWith('//')) {
     return {
-      method: raw.method, path: raw.url, query: {}, raw,
+      method: raw.method, path: raw.url, query: {}, queryLists: {}, raw,
       targetError: `request target "${raw.url}" is not a plain path; the localmost docker socket accepts origin-form targets only`,
     };
   }
@@ -148,7 +153,7 @@ export function parseDockerRequest(raw: DockerRequest['raw']): DockerRequest {
   // part of the target, so what was judged would not be what is forwarded.
   if (raw.url.includes('#')) {
     return {
-      method: raw.method, path: raw.url, query: {}, raw,
+      method: raw.method, path: raw.url, query: {}, queryLists: {}, raw,
       targetError: `request target "${raw.url}" carries a fragment; the localmost docker socket accepts origin-form targets only`,
     };
   }
@@ -160,7 +165,7 @@ export function parseDockerRequest(raw: DockerRequest['raw']): DockerRequest {
     url = new URL(raw.url, 'http://docker');
   } catch {
     return {
-      method: raw.method, path: raw.url, query: {}, raw,
+      method: raw.method, path: raw.url, query: {}, queryLists: {}, raw,
       targetError: `request target "${raw.url}" could not be parsed`,
     };
   }
@@ -176,7 +181,7 @@ export function parseDockerRequest(raw: DockerRequest['raw']): DockerRequest {
   const queryError = ambiguousQuery(raw.url, path, url.searchParams);
   if (queryError) {
     return {
-      method: raw.method, path, apiVersion, query: {}, raw,
+      method: raw.method, path, apiVersion, query: {}, queryLists: {}, raw,
       targetError: `request target "${raw.url}" ${queryError}; the localmost docker socket accepts only a query every daemon reads one way`,
     };
   }
@@ -186,7 +191,12 @@ export function parseDockerRequest(raw: DockerRequest['raw']): DockerRequest {
     if (!(key in query)) query[key] = url.searchParams.get(key)!;
   }
 
-  const req: DockerRequest = { method: raw.method, path, apiVersion, query, raw };
+  const queryLists: Record<string, string[]> = {};
+  for (const key of LIST_PARAMS[path] ?? []) {
+    if (url.searchParams.has(key)) queryLists[key] = url.searchParams.getAll(key);
+  }
+
+  const req: DockerRequest = { method: raw.method, path, apiVersion, query, queryLists, raw };
 
   if (isJsonContentType(headerValue(raw.headers, 'content-type')) && raw.body.length > 0) {
     try {
