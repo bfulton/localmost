@@ -460,8 +460,20 @@ What the filter refuses, each of which is an executable test against the proxy:
 - a restart policy other than `no` (`--restart=always`, `unless-stopped`,
   `on-failure`), with which the daemon brings a container back after it exits
   without any request the filter sees;
-- an image, registry, mount, network mode or build context the policy did not
-  declare;
+- an image, registry, mount or network mode the policy did not declare, and a
+  remote build context. A local build context is not checked against
+  `build.context`, which is documentation: the context reaches the daemon as a
+  tar the client assembled inside its sandbox, so the profile confines it;
+- a build tag (`-t`, every one when it repeats) that no `build.tags` glob
+  matches, and, whatever `build.tags` says, one that carries a registry host
+  (`ghcr.io/o/app`, `localhost:5000/app`, `docker.io/library/app`) or names a
+  repository `run.images` declares, in any case and with or without a tag
+  (`postgres`, `POSTGRES:17` under `postgres:16`). A build's tag replaces the
+  local image of that name, and a later `docker run` of it uses that image
+  without a pull, so a build tagged `postgres:16` would have run in place of
+  the image the approver read. `t` in another case (`T=`), which moby ignores
+  and Podman reads as a tag, is refused. The tag cannot outlive the job: its
+  VM, with every image built in it, is discarded when the job ends;
 - a request body with a key the daemon may read as another: two keys that
   differ only in case, which the daemon's Go decoder merges, or any key, at any
   depth, that is not plain ASCII, since that decoder also reads some other

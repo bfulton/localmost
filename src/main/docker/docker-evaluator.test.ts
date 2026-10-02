@@ -366,7 +366,7 @@ describe('the SECURITY.md escapes', () => {
 
   it('gates build on the build action and refuses a remote context', () => {
     expect(evaluateDockerRequest(mk('POST', '/v1.45/build?t=app'), ctx(runPolicy)).allowed).toBe(false);
-    const b = ctx({ build: { context: './' } });
+    const b = ctx({ build: { context: './', tags: ['app:*'] } });
     expect(evaluateDockerRequest(mk('POST', '/v1.45/build?t=app'), b).allowed).toBe(true);
     expect(evaluateDockerRequest(mk('POST', '/v1.45/build?t=app&remote=https%3A%2F%2Fexample.com%2Frepo.git'), b).allowed).toBe(false);
     expect(evaluateDockerRequest(mk('POST', '/v1.45/build?t=app&remote=%2Fetc'), b).allowed).toBe(false);
@@ -656,7 +656,7 @@ describe('HostConfig is an allowlist, not a blocklist', () => {
 });
 
 describe('build query parameters', () => {
-  const p = { run: { images: ['postgres:16'], network: 'bridge' }, build: { context: './' } };
+  const p = { run: { images: ['postgres:16'], network: 'bridge' }, build: { context: './', tags: ['app:*'] } };
   const build = (qs: string, policy: DockerPolicy = p) =>
     evaluateDockerRequest(mk('POST', `/v1.45/build${qs}`), ctx(policy));
 
@@ -705,6 +705,125 @@ describe('build query parameters', () => {
 
   it('permits the parameters an ordinary docker build sends', () => {
     expect(build('?t=app%3Alatest&dockerfile=Dockerfile&rm=1&buildargs=%7B%7D&labels=%7B%7D&shmsize=0&version=1').allowed).toBe(true);
+  });
+});
+
+describe('build tags', () => {
+  // A build's -t replaces a local tag of that name. A job that could tag its
+  // own image postgres:16 would have every later `docker run postgres:16` in
+  // the job run that instead of the image the approver read as postgres:16,
+  // so tags are held to build.tags, and some are refused whatever it says.
+  const p: DockerPolicy = {
+    pull: { registries: ['docker.io'] },
+    run: { images: ['postgres:16', 'vk/*:*'], network: 'bridge' },
+    build: { context: './', tags: ['myapp:*', 'tools/*:ci', 'plain'] },
+  };
+  const build = (qs: string, policy: DockerPolicy = p) =>
+    evaluateDockerRequest(mk('POST', `/v1.45/build${qs}`), ctx(policy));
+
+  it('permits a tag a declared build.tags glob matches', () => {
+    // A tagless name is :latest, as the daemon tags it.
+    for (const qs of ['?t=myapp', '?t=myapp%3Aci', '?t=myapp%3A1.2.3', '?t=tools%2Flint%3Aci', '?t=plain', '?t=plain%3Alatest']) {
+      expect([qs, build(qs).allowed]).toEqual([qs, true]);
+    }
+  });
+
+  it('permits an untagged build, which names no image', () => {
+    expect(build('').allowed).toBe(true);
+    expect(build('?dockerfile=Dockerfile&rm=1').allowed).toBe(true);
+    expect(build('', { build: {} }).allowed).toBe(true);
+  });
+
+  it('refuses a tag no build.tags entry matches, with the hint that would permit it', () => {
+    for (const qs of ['?t=other%3A1', '?t=myapp2%3Aci', '?t=tools%2Flint%3Alatest', '?t=tools%2Fa%2Fb%3Aci', '?t=plain%3A2']) {
+      const v = build(qs);
+      expect([qs, v.allowed]).toEqual([qs, false]);
+      expect(v.reason).toMatch(/build\.tags/);
+    }
+    const v = build('?t=other%3A1');
+    expect(v.policyHint).toBe('docker:\n  build:\n    tags:\n      - "other:1"');
+    expect(parseDockerPolicyHint(v.policyHint!)).toEqual({ build: { tags: ['other:1'] } });
+  });
+
+  it('refuses every tag when build.tags declares none', () => {
+    const v = build('?t=app', { build: { context: './' } });
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/build\.tags/);
+    expect(v.policyHint).toBe('docker:\n  build:\n    tags:\n      - "app"');
+  });
+
+  it('names the tags in the hint for a tagged build under a policy with no build action, so one pass permits it', () => {
+    const noBuild: DockerPolicy = { pull: { registries: ['docker.io'] }, run: { images: ['postgres:16'] } };
+    const qs = '?t=myapp%3Aci&t=tools%2Flint';
+    const v = build(qs, noBuild);
+    expect(v.allowed).toBe(false);
+    expect(v.reason).toMatch(/no build action/);
+    const hinted = parseDockerPolicyHint(v.policyHint ?? '');
+    expect(hinted).toEqual({ build: { context: './', tags: ['myapp:ci', 'tools/lint'] } });
+    expect(build(qs, mergeDockerPolicy(noBuild, hinted) ?? {}).allowed).toBe(true);
+
+    // A tag no policy line could permit is left out, as are ones outside the
+    // grammar; an untagged build is hinted as before.
+    const refused = build('?t=myapp%3Aci&t=postgres%3A16&t=ghcr.io%2Fx%2Fy&t=Bad%20Name', noBuild);
+    expect(parseDockerPolicyHint(refused.policyHint ?? '')).toEqual({ build: { context: './', tags: ['myapp:ci'] } });
+    expect(build('', noBuild).policyHint).toBe('docker:\n  build:\n    context: "./"');
+  });
+
+  it('refuses a tag naming a run.images entry, however it is spelled, even when build.tags matches it', () => {
+    const wide: DockerPolicy = { ...p, build: { tags: ['*:*', '*/*:*', '*'] } };
+    for (const qs of [
+      '?t=postgres%3A16', '?t=postgres', '?t=postgres%3Alatest', '?t=POSTGRES%3A16', '?t=Postgres',
+      '?t=library%2Fpostgres%3A16', '?t=vk%2Fgrader%3A1', '?t=vk%2FGrader',
+    ]) {
+      const v = build(qs, wide);
+      expect([qs, v.allowed]).toEqual([qs, false]);
+      expect(v.reason).toMatch(/run\.images/);
+      // No policy line can permit it, so none is offered.
+      expect(v.policyHint).toBeUndefined();
+    }
+    // Under run.images [postgres:16] and nothing else declared for build, the
+    // tag G4 planted is refused.
+    const g4: DockerPolicy = { pull: { registries: ['docker.io'] }, run: { images: ['postgres:16'] }, build: {} };
+    expect(build('?t=postgres%3A16', g4).allowed).toBe(false);
+  });
+
+  it('refuses a tag that carries a registry host, even when build.tags matches it', () => {
+    const wide: DockerPolicy = { build: { tags: ['*/*:*', '*/*/*:*', '*/*'] } };
+    for (const qs of [
+      '?t=ghcr.io%2Fx%2Fy', '?t=ghcr.io%2Fx%2Fy%3Alatest', '?t=docker.io%2Flibrary%2Fapp%3A1',
+      '?t=localhost%2Fapp%3A1', '?t=localhost%3A5000%2Fapp', '?t=registry%3A5000%2Fapp%3A1', '?t=LOCALHOST%2Fapp%3A1',
+      // An uppercase first component is a host to the daemon, as on a pull.
+      '?t=Evil%2Fapp%3A1',
+    ]) {
+      const v = build(qs, wide);
+      expect([qs, v.allowed]).toEqual([qs, false]);
+      expect(v.reason).toMatch(/registry/);
+      expect(v.policyHint).toBeUndefined();
+    }
+  });
+
+  it('refuses a tag that is not a name and tag', () => {
+    // Each of the last four matches myapp:* as text, but is not a reference
+    // the daemon reads the way the filter does, so it is refused before then.
+    for (const qs of [
+      '?t=', '?t=myapp%40sha256%3A' + 'a'.repeat(64), '?t=myapp%3Aci%40sha256%3A' + 'a'.repeat(64),
+      '?t=myapp%3A%3Aci', '?t=myapp%3Ac%20i', '?t=myapp%3A', '?t=myapp%3A' + 'x'.repeat(129),
+    ]) {
+      expect([qs, build(qs).allowed]).toEqual([qs, false]);
+    }
+  });
+
+  it('judges every tag of a build that repeats t, and refuses it when any one is not permitted', () => {
+    expect(build('?t=myapp%3Aci&t=myapp%3Alatest').allowed).toBe(true);
+    for (const qs of ['?t=myapp%3Aci&t=postgres%3A16', '?t=myapp%3Aci&t=ghcr.io%2Fx%2Fy', '?t=postgres%3A16&t=myapp%3Aci', '?t=myapp%3Aci&t=other']) {
+      expect([qs, build(qs).allowed]).toEqual([qs, false]);
+    }
+  });
+
+  it('refuses t in any other casing, which moby ignores and Podman reads as a tag', () => {
+    for (const qs of ['?T=postgres%3A16', '?T=myapp%3Aci', '?TAG=postgres%3A16', '?Tag=myapp%3Aci', '?t=myapp%3Aci&T=postgres%3A16']) {
+      expect([qs, build(qs).allowed]).toEqual([qs, false]);
+    }
   });
 });
 
@@ -916,7 +1035,7 @@ describe('inspecting the network the policy declares', () => {
 });
 
 describe('BuildKit endpoints', () => {
-  const p: DockerPolicy = { run: { images: ['alpine:3'], network: 'bridge' }, build: { context: './' } };
+  const p: DockerPolicy = { run: { images: ['alpine:3'], network: 'bridge' }, build: { context: './', tags: ['app:*'] } };
 
   it('refuses a BuildKit session, and says why rather than shrugging', () => {
     // A real `docker build` on a default install issues zero POST /build: it
@@ -1260,7 +1379,7 @@ describe('bodies the daemon reads as a form', () => {
       body: Buffer.from(body),
     });
   const p: DockerPolicy = {
-    run: { images: ['postgres:16'], network: 'bridge' }, pull: { registries: ['docker.io'] }, build: { context: './' },
+    run: { images: ['postgres:16'], network: 'bridge' }, pull: { registries: ['docker.io'] }, build: { context: './', tags: ['app:*'] },
   };
 
   it.each([

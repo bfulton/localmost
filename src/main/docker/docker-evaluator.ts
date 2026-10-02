@@ -13,7 +13,9 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { DockerPolicy, DockerMount, DockerNetworkPolicy, MountMode } from '../../shared/docker-policy';
+import {
+  DockerPolicy, DockerMount, DockerNetworkPolicy, MountMode, REPOSITORY_PATH, TAG, carriesRegistryHost, isRegistryHost,
+} from '../../shared/docker-policy';
 import { asciiEscaped, isPlainAscii } from '../../shared/json-keys';
 import type { ApprovedBind, PullRequest } from './docker-backend';
 import { digestHex } from '../vm/paths';
@@ -146,7 +148,12 @@ const hints = {
     `docker:\n  run:\n    mounts:\n      - path: ${yamlString(relative)}\n        mode: ${mode}`,
   network: (mode: string) => `docker:\n  run:\n    network: ${yamlString(mode)}`,
   registry: (registry: string) => `docker:\n  pull:\n    registries:\n      - ${registry}`,
-  build: 'docker:\n  build:\n    context: "./"',
+  // A tagged build's hint names its tags too, so one --updaterc pass writes
+  // a policy that permits it rather than one that is refused for the tag.
+  build: (tags: string[]) =>
+    'docker:\n  build:\n    context: "./"' +
+    (tags.length ? `\n    tags:${tags.map((tag) => `\n      - ${yamlString(tag)}`).join('')}` : ''),
+  buildTag: (tag: string) => `docker:\n  build:\n    tags:\n      - ${yamlString(tag)}`,
   privileged: 'docker:\n  privileged: true',
   network_declaration: (name: string, internal: boolean) =>
     `docker:\n  run:\n    networks:\n      - name: ${yamlString(name)}\n        internal: ${internal}`,
@@ -163,13 +170,10 @@ function splitRegistry(reference: string): { registry: string; remainder: string
   const slash = reference.indexOf('/');
   if (slash === -1) return { registry: DEFAULT_REGISTRY, remainder: reference };
   const first = reference.slice(0, slash);
-  // A first component is a registry only when it looks like a host, which to
-  // distribution/reference (splitDockerDomain) includes one with an uppercase
-  // letter: no Docker Hub namespace has one, so `LOCALHOST/x` and `Evil/x` are
-  // pulled from those hosts, not from docker.io.
-  if (!first.includes('.') && !first.includes(':') && first !== 'localhost' && first === first.toLowerCase()) {
-    return { registry: DEFAULT_REGISTRY, remainder: reference };
-  }
+  // A first component is a registry only when it looks like a host, which
+  // includes one with an uppercase letter (isRegistryHost): `LOCALHOST/x` and
+  // `Evil/x` are pulled from those hosts, not from docker.io.
+  if (!isRegistryHost(first)) return { registry: DEFAULT_REGISTRY, remainder: reference };
   const registry = first === 'index.docker.io' ? DEFAULT_REGISTRY : first;
   return { registry, remainder: reference.slice(slash + 1) };
 }
@@ -738,8 +742,6 @@ function queryValue(query: Record<string, string>, name: string): string | undef
   return key === undefined ? undefined : query[key];
 }
 
-/** A tag, by distribution/reference's grammar. */
-const TAG = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
 /** A digest, by distribution/reference's grammar: algorithm ":" hex. */
 const DIGEST = /^[A-Za-z][A-Za-z0-9]*(?:[-_+.][A-Za-z][A-Za-z0-9]*)*:[0-9a-fA-F]{32,}$/;
 
@@ -776,9 +778,6 @@ function evaluatePull(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
 
 /** The platforms a pull may ask for: what the VM runs, natively or through Rosetta (contract §6.2). */
 const PULL_PLATFORM = /^linux\/(?:arm64|amd64)(?:\/v[0-9])?$/;
-
-/** A repository path by distribution/reference's grammar: lower-case components, slash-separated. */
-const REPOSITORY_PATH = /^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:\/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*$/;
 
 /**
  * What an allowed pull asks for, read exactly as evaluatePull judged it: the
@@ -993,8 +992,94 @@ function evaluateOwnNetwork(req: DockerRequest, ctx: DockerEvalContext): DockerV
   return deny(`network "${id}" was not created through this job's docker socket`);
 }
 
+/** The repository part of a normalised reference: everything before its tag or digest. */
+function repositoryOf(normalized: string): string {
+  const at = normalized.indexOf('@');
+  const name = at === -1 ? normalized : normalized.slice(0, at);
+  const colon = name.lastIndexOf(':');
+  return colon > name.lastIndexOf('/') ? name.slice(0, colon) : name;
+}
+
+/** The repositories run.images names, lowercased, as globs a tag's repository is matched against. */
+const runRepositoriesOf = (policy: DockerPolicy): string[] =>
+  (policy.run?.images ?? []).map((image) => repositoryOf(normalizeImage(image)).toLowerCase());
+
+/** Why a build tag is refused whatever build.tags says, or undefined when a build.tags entry could permit it. */
+function unpermittableTag(tag: string, runRepositories: string[]): string | undefined {
+  const shown = asciiEscaped(tag.slice(0, 256));
+  if (tag === '' || tag.includes('@')) {
+    return `build tag "${shown}" is not a name and tag; a build can be tagged only name[:tag]`;
+  }
+  if (carriesRegistryHost(tag)) {
+    return `build tag "${shown}" names a registry host; a build may tag its image only with a local name, ` +
+      'which no policy line can widen';
+  }
+  const repository = repositoryOf(normalizeImage(tag)).toLowerCase();
+  if (runRepositories.some((declaredRepository) => globMatches(declaredRepository, repository))) {
+    return `build tag "${shown}" names an image the repository docker policy runs (run.images); ` +
+      'a build may not replace it, whatever build.tags declares';
+  }
+  // Held to distribution/reference's grammar, as a pull's name is, so that
+  // a tag is matched against build.tags only in the spelling the daemon
+  // would give it.
+  const { remainder } = splitRegistry(tag);
+  const colon = remainder.lastIndexOf(':');
+  const hasTag = colon > remainder.lastIndexOf('/');
+  if (!REPOSITORY_PATH.test(hasTag ? remainder.slice(0, colon) : remainder) || (hasTag && !TAG.test(remainder.slice(colon + 1)))) {
+    return `build tag "${shown}" is not a name and tag; a build can be tagged only name[:tag]`;
+  }
+  return undefined;
+}
+
+/**
+ * Judge every tag a build asks for (`t`, which repeats for `-t a -t b`).
+ *
+ * A build's tag replaces any local image of that name, and a later run of that
+ * name uses it without a pull. So a tag is held to build.tags, and two kinds
+ * are refused whatever build.tags says, with no hint, since no policy line
+ * can permit them:
+ *
+ * - a tag carrying a registry host: the image was never fetched from there,
+ *   and a later push or run by that name would take it for the registry's;
+ * - a tag in a repository run.images names, in any case and with or without a
+ *   tag: run.images is what an approver reads as "the image the job runs",
+ *   and a build tagged postgres:16 would be run in its place. Compared
+ *   case-insensitively because the comparison guards a name, not a lookup: a
+ *   spelling the daemon refuses costs nothing to refuse here too.
+ *
+ * A build with no tag names no image and needs no entry.
+ */
+function judgeBuildTags(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
+  // moby reads `t` by its exact name and ignores any other casing; Podman's
+  // decoder reads every casing as the tag list. One the filter does not read
+  // as a tag must not reach a daemon that does.
+  const misspelled = Object.keys(req.query).find((key) => key.toLowerCase() === 't' && key !== 't');
+  if (misspelled !== undefined) {
+    return deny(`build parameter "${misspelled}" is not read as a tag by every daemon; spell it "t"`);
+  }
+  const declared = policy.build?.tags ?? [];
+  const runRepositories = runRepositoriesOf(policy);
+  for (const tag of req.queryLists.t ?? []) {
+    const refused = unpermittableTag(tag, runRepositories);
+    if (refused !== undefined) return deny(refused);
+    if (!declared.some((entry) => globMatches(normalizeImage(entry), normalizeImage(tag)))) {
+      return deny(
+        `build tag "${asciiEscaped(tag.slice(0, 256))}" is not declared in the repository docker policy (build.tags)`,
+        hints.buildTag(tag)
+      );
+    }
+  }
+  return ALLOW;
+}
+
 function evaluateBuild(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
-  if (!policy.build) return deny('the repository docker policy declares no build action', hints.build);
+  if (!policy.build) {
+    // The hint names each tag a build.tags entry could permit, so that the
+    // policy it writes does not refuse the same build again for its tags.
+    const runRepositories = runRepositoriesOf(policy);
+    const tags = [...new Set(req.queryLists.t ?? [])].filter((tag) => unpermittableTag(tag, runRepositories) === undefined);
+    return deny('the repository docker policy declares no build action', hints.build(tags));
+  }
   // The Engine API carries the context as a tar the client assembled from
   // inside its sandbox. A remote context would have the daemon fetch it
   // itself - from the network, or from its own filesystem - which is the
@@ -1016,6 +1101,9 @@ function evaluateBuild(req: DockerRequest, policy: DockerPolicy): DockerVerdict 
       );
     }
   }
+
+  const tagged = judgeBuildTags(req, policy);
+  if (!tagged.allowed) return tagged;
 
   // A build runs containers, and its network is chosen here rather than in a
   // HostConfig - so the same rule the run path applies has to apply here too,
