@@ -1413,6 +1413,24 @@ describe('message routing', () => {
           const warned = logger.warn.mock.calls.map(call => String(call[0]));
           expect(warned.some(line => line.includes(`${method} ${JSON.stringify(opPath)}`))).toBe(true);
         });
+
+        it('refuses one the same way while the target has no upstream session', async () => {
+          // Whether a request may go upstream depends on its method and path
+          // alone, so the answer does not change while the target's session
+          // is being retried: still 403, and the log still says why.
+          const sessionId = await acquiredWorker();
+          for (const target of internals.targets.values()) {
+            for (const instance of target.instances.values()) instance.sessionId = undefined;
+          }
+          mockHttpsRequest.mockClear();
+
+          const res = await request('GET', `/runnerversion?sessionId=${sessionId}`);
+
+          expect(res.statusCode).toBe(403);
+          expect(mockHttpsRequest).not.toHaveBeenCalled();
+          const warned = logger.warn.mock.calls.map(call => String(call[0]));
+          expect(warned.some(line => line.includes('GET "/runnerversion": the runner sends no such request upstream'))).toBe(true);
+        });
       });
     });
 

@@ -1668,7 +1668,7 @@ export class BrokerProxyService extends EventEmitter {
     }
     // By alias, not by value: jobs of one target commonly share a run-service
     // URL, so clearing every entry with this job's URL cut the routing of
-    // whichever other job was live, and its renew and finish went astray.
+    // whichever other job was live, and its renewjob and completejob went astray.
     for (const id of aliases) {
       this.acquiredJobDetails.delete(id);
       this.jobTargets.delete(id);
@@ -2162,45 +2162,16 @@ export class BrokerProxyService extends EventEmitter {
     url: URL,
     key: string
   ): Promise<void> {
-    // Upstream calls go out on a target's runner credentials, so they are made
-    // only for a worker bound to that target, and only about its own jobs.
-    // There used to be a fallback to the first target with a session, which
-    // let any caller send requests upstream as the runner.
-    const worker = this.workerKeys.get(key)!;
-    const localSessionId = url.searchParams.get('sessionId');
-    const owned = [...this.localSessions.values()].filter(s => s.workerKey === key && s.targetId);
-    const localSession = localSessionId
-      ? owned.find(s => s.id === localSessionId)
-      : owned[owned.length - 1];
-    const targetState = localSession?.targetId ? this.targets.get(localSession.targetId) : undefined;
-    let instance: RunnerInstanceState | undefined;
-    if (targetState) {
-      const own = targetState.instances.get(worker.instanceNum);
-      instance = own?.sessionId
-        ? own
-        : [...targetState.instances.values()].find(inst => inst.sessionId);
-    }
-
-    if (!targetState) {
-      req.resume();
-      log()?.warn(`[BrokerProxy] Refused to forward ${req.method} ${url.pathname} for worker ${worker.instanceNum}: it holds no bound session`);
-      res.writeHead(403, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Worker holds no bound session' }));
-      return;
-    }
-
-    if (!targetState || !instance || !instance.sessionId) {
-      res.writeHead(503, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'No active target sessions' }));
-      return;
-    }
-
+    // Whether a request may go upstream at all depends on its method and path
+    // alone, so that is settled first: anything else gets the same 403 and
+    // log line whatever state the worker's session or its target is in.
+    //
     // The path's segments as upstream routes them: decoded and case folded.
-    // The job operation gate below matches these, not the spelling sent, so a
-    // /CompleteJob or /%63ompletejob is bound like the operation it names. A
-    // path that decodes to anything but printable ASCII is refused, as no
-    // runner path does: a router folding case beyond ASCII could read
-    // /fini%C5%BFhjob as finishjob, or /%C5%BFession as session.
+    // UPSTREAM_OPERATIONS and LOCALLY_SERVED_PATHS are matched against these,
+    // not the spelling sent, so a /CompleteJob or /%63ompletejob is the
+    // operation it names. A path that decodes to anything but printable ASCII
+    // is refused, as no runner path does: a router folding case beyond ASCII
+    // could read /completejo%C5%BF as completejob, or /%C5%BFession as session.
     let routedSegments: string[] | undefined;
     try {
       const decoded = decodeURIComponent(url.pathname);
@@ -2233,6 +2204,39 @@ export class BrokerProxyService extends EventEmitter {
       log()?.warn(`[BrokerProxy] Refused to forward ${req.method} ${forLog(url.pathname)}: the runner sends no such request upstream`);
       res.writeHead(403, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Not a request the runner sends upstream' }));
+      return;
+    }
+
+    // Upstream calls go out on a target's runner credentials, so they are made
+    // only for a worker bound to that target, and only about its own jobs.
+    // There used to be a fallback to the first target with a session, which
+    // let any caller send requests upstream as the runner.
+    const worker = this.workerKeys.get(key)!;
+    const localSessionId = url.searchParams.get('sessionId');
+    const owned = [...this.localSessions.values()].filter(s => s.workerKey === key && s.targetId);
+    const localSession = localSessionId
+      ? owned.find(s => s.id === localSessionId)
+      : owned[owned.length - 1];
+    const targetState = localSession?.targetId ? this.targets.get(localSession.targetId) : undefined;
+    let instance: RunnerInstanceState | undefined;
+    if (targetState) {
+      const own = targetState.instances.get(worker.instanceNum);
+      instance = own?.sessionId
+        ? own
+        : [...targetState.instances.values()].find(inst => inst.sessionId);
+    }
+
+    if (!targetState) {
+      req.resume();
+      log()?.warn(`[BrokerProxy] Refused to forward ${req.method} ${url.pathname} for worker ${worker.instanceNum}: it holds no bound session`);
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Worker holds no bound session' }));
+      return;
+    }
+
+    if (!targetState || !instance || !instance.sessionId) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'No active target sessions' }));
       return;
     }
 
@@ -2306,7 +2310,7 @@ export class BrokerProxyService extends EventEmitter {
       refuse(`its body has a key ${forLog(ambiguous)}, which upstream may read as a job key this check does not`);
       return;
     }
-    // Try multiple ID fields - runner uses different ones for different operations
+    // A request id under any of the keys the runner's clients have used
     const body = bodyJson; // narrowed, for the callbacks below
     const requestIds = JOB_REQUEST_ID_KEYS.map(key => body[key]).filter(Boolean);
     const opJobId = requestIds[0];
@@ -2333,8 +2337,8 @@ export class BrokerProxyService extends EventEmitter {
     }
     if (opJobId) {
       // Numeric on the wire; the map keys are strings, like the delivered
-      // check above. Without String() a renew/finish with a numeric id
-      // misses and gets sent to the broker instead of the job service.
+      // check above. Without String() a renewjob/completejob with a numeric
+      // id misses and gets sent to the broker instead of the job service.
       runServiceUrl = this.jobRunServiceUrls.get(String(opJobId));
       log()?.info(`[BrokerProxy] Found run_service_url for ${forLog(opJobId)}: ${runServiceUrl || 'not found'}`);
     }
