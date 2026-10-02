@@ -15,6 +15,7 @@
 ## Build & Packaging
 
 - This is a macOS-only Electron app; no need to support Windows or Linux
+- The app targets Apple silicon (arm64) only; no Intel (x64) or universal builds
 - Release builds: on `main` branch with clean working tree
 - Dev builds: on any branch or with uncommitted changes
 - Use `security find-identity` to detect signing identities from keychain

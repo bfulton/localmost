@@ -4,6 +4,7 @@ export const shell = {
 };
 
 export const app = {
+  isPackaged: false,
   getPath: jest.fn().mockReturnValue('/tmp/test'),
   getAppPath: jest.fn().mockReturnValue('/tmp/test'),
   whenReady: jest.fn().mockResolvedValue(undefined),

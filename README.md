@@ -44,11 +44,13 @@ Features:
 - **Multi-runner parallelism** — run 1-8 concurrent jobs
 - **Network isolation** — runner traffic is proxied through an allowlist (GitHub, npm, PyPI, etc.)
 - **Filesystem sandboxing** — runner processes can only write to their working directory
-- **Resource-aware scheduling** — automatically pause runners when on battery or during video calls
+- **Resource-aware scheduling** — automatically pause runners when on battery or during video calls; jobs already running finish (choose "Stop them" in the Power section of Settings to stop them instead), and resuming by hand overrides the pause until its condition clears
 
 ## What It Is
 
 localmost is a macOS app that manages GitHub's official [actions-runner](https://github.com/actions/runner) binary. It handles authentication, registration, runner process lifecycle, and automatic fallback — the tedious parts of self-hosted runners.
+
+**Requirements:** a Mac with Apple silicon, running macOS 14 or later. Intel Macs are not supported.
 
 **Security note:** Running CI jobs on your local machine has inherent risks—especially for public repos that accept external contributions. localmost sandboxes runner processes and restricts network access, but these are not VM-level isolation. See [SECURITY.md](SECURITY.md) for details on the threat model and recommendations.
 
@@ -59,7 +61,7 @@ localmost is a macOS app that manages GitHub's official [actions-runner](https:/
 - **Runner proxy** — maintains long-poll sessions with GitHub's broker to receive job assignments
 - **Runner pool** — 1-8 worker instances that execute jobs in sandboxed environments
 - **HTTP proxy** — allowlist-based network isolation for runner traffic (GitHub, npm, PyPI, etc.)
-- **Build cache** — persistent tool cache shared across job runs (Node.js, Python, etc.)
+- **Build cache** — persistent tool cache shared across job runs (Node.js, Python, etc.), one per repository or organization
 
 ## Workflow Integration
 
@@ -117,6 +119,19 @@ The check workflow uses a simple heartbeat mechanism:
 - On clean exit, localmost immediately marks the heartbeat stale so workflows fall back without waiting
 
 This fallback-to-cloud design is intentional: if your Mac is asleep, offline, or the heartbeat is stale for any reason, workflows continue running on GitHub-hosted runners rather than waiting or failing.
+
+## Docker in Jobs
+
+A repository opts in to container work by declaring `pull`, `run` and `build` actions under `docker:` in its approved `.localmostrc`; anything unlisted is denied. Each job that does gets its own Linux VM, booted by localmost and discarded after the job, which sees none of your files but the job's work folder. Docker Desktop is not used. What that means for a policy:
+
+- **`routable` means through the job's proxy.** Containers on the default bridge, or on a network declared `internal: false`, reach only what the job's own network policy allows. Traffic that ignores the proxy settings is refused at once (a name lookup from an Alpine image takes its resolver's 5 s to fail).
+- **Proxy settings are injected.** localmost sets `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, `https_proxy` and `NO_PROXY` in routable containers and as build args, keeping any value the job sets itself.
+- **Base images must be pulled before a build.** The builder in the VM cannot reach a registry, so `docker pull` the `FROM` images first.
+- **Build tags are declared.** A `docker build -t` tag must match a `build.tags` glob. A tag with a registry host, or in a repository `run.images` names, is refused whatever `build.tags` says, so a build cannot stand in for an image the job runs, and a built image cannot be run by name. An untagged build needs no entry.
+- **`pull.registries` includes the registry's redirects.** Pulls run on the Mac, so registry credentials never enter the VM, and localmost follows a registry's redirects (to its CDN, usually) to any public https host, outside the job's `network.allow`. Only public https registries can be pulled from.
+- **Pulls are anonymous until a registry asks for credentials.** Public images never run a credential helper. When a registry does ask, the helper `~/.docker/config.json` names (`credsStore` or `credHelpers`) must answer, or the pull fails naming the key: with `credsStore: desktop`, Docker Desktop's helper answers only while Docker Desktop is running. Start it, or change the key.
+
+The policy grammar is in [docs/roadmap/localmostrc.md](docs/roadmap/localmostrc.md#docker-access), and what the VM does and does not contain is under Docker Access in [SECURITY.md](SECURITY.md).
 
 ## GitHub App Permissions
 
@@ -189,10 +204,10 @@ localmost stop
 # Check runner status
 localmost status
 
-# Pause the runner (stops accepting new jobs)
+# Pause the runner (takes no new jobs; a running job finishes)
 localmost pause
 
-# Resume the runner
+# Resume the runner (overrides a battery or video call pause until it clears)
 localmost resume
 
 # View recent job history
@@ -216,7 +231,7 @@ to run unconfirmed outside a terminal. Every subcommand accepts `--json`.
 
 From the app menu: **localmost → Install Command Line Tool...**
 
-This creates a symlink in `/usr/local/bin` so you can use `localmost` from any terminal. You'll be prompted for your administrator password.
+This creates a symlink in `/usr/local/bin` so you can use `localmost` from any terminal. You'll be prompted for your administrator password. The command runs with the `node` first on your `PATH`, so it needs Node.js installed.
 
 For development builds, use `npm link` instead.
 
@@ -238,9 +253,17 @@ npm start
 # Run tests
 npm test
 
-# Build for macOS (creates .dmg)
+# Build for Apple silicon (creates .dmg)
 npm run make
 ```
+
+Packaging the app (`npm run make`, and `npm run test:e2e`, which packages it
+first) runs `npm run build:native` to build the Docker VM's helper and guest
+and fetch the docker CLI. That needs Xcode's Swift and Go, and the guest build
+boots a VM, so run it on the Mac itself, not inside a localmost job. `npm test`
+needs none of this, but outside a localmost job its sandbox tests run this
+Mac's own tools under a constructed profile: Xcode's Swift, and a JDK, which
+`/usr/libexec/java_home` must find.
 
 ## Roadmap
 
@@ -249,7 +272,7 @@ Current release: **0.3.0 — Test Locally, Secure by Default**
 - Declarative sandbox policies with `.localmostrc`
 - Sandbox policy levels (strict / moderate / permissive) declared per repository and enforced by the local proxy
 - Contributor-based job filtering for public repos
-- Repository policies require approval before the runner applies them
+- Repository policies require approval before the runner applies them, in the app or the CLI, bound to the exact policy shown and recorded in an audit log
 - Opt-in [container work through a filtering Docker socket](docs/superpowers/specs/2026-09-05-docker-isolation-design.md) declared per repo as `pull`, `run` and `build` actions; anything unlisted is denied, and registry credentials never enter the sandbox
 - Environment comparison with GitHub runners
 
@@ -257,17 +280,17 @@ Future feature ideas:
 
 - **Fail a blocked job visibly** - a job refused by the filter is cancelled through the GitHub API before any worker starts, so it appears as cancelled rather than failing with a message explaining why.
 - **Roll discovery output up further** - `--updaterc` now drops paths already covered by a listed ancestor, which removes the bulk of the redundancy. It still records content-addressed cache paths (npm's `_cacache/content-v2/sha512/...`) verbatim, which differ per machine and per dependency change; those want rolling up to their cache directory.
-- **Approve policies in the app** - approval is CLI-only today (`localmost policy diff`, `localmost policy approve`). The app refuses the job and logs the diff, but there is no UI to review and accept it, and no audit log of approvals.
-- **Show a diff when `--updaterc` rewrites a policy** - it writes directly, with no diff and no confirmation, so a discovery run can widen a checked-in policy without the change being obvious.
+- **Show a full diff when `--updaterc` rewrites a policy** - it names the file and lists every grant it adds before asking, but it rewrites the whole file from the parsed policy, so the comments and formatting it drops are not shown.
 - **Homebrew formula** - `npx localmost` works; `brew install localmost` does not exist.
 - **Quick actions** - Re-run failed job, cancel all jobs.
 - **Spotlight integration** - Check status or pause builds from Spotlight.
 - **Artifact inspector** - Browse uploaded artifacts without leaving the app.
-- **Disk space monitoring** - Warn or pause when disk is low, auto-clean old work dirs.
+- **Disk space monitoring** - Warn or pause when disk is low, auto-clean trash directories and caches.
 - **Linux and Windows host support** - Run self-hosted runners on non-Mac machines for projects that need them.
 - **Higher parallelism cap** - Parallelize proxy registration to support 16+ concurrent runners (currently capped at 8 due to serial registration time).
-- **Managed Docker VM** - Run the daemon behind the filtering socket in a VM whose only mount is the workspace, so a filter defect is contained, container egress is policed, and `privileged` becomes grantable.
-- **Ephemeral VM isolation** - Run each job in a fresh lightweight VM for stronger isolation between jobs.
+- **macOS VM jobs** - An opt-in per-repository isolation level that runs each job in a fresh macOS VM cloned from a golden image, with policy grants mapped to shares ([design](docs/roadmap/macos-vm-jobs.md)).
+- **Filtering VM network stack** - A userspace network stack for the Docker VM that enforces the job's hostname policy on traffic that ignores proxy settings ([design](docs/roadmap/vm-network-stack.md)).
+- **Dedicated runner user** - Run jobs as a macOS user account of their own, so tools that look the home up by uid, preferences and the keychain are the job's rather than yours ([design](docs/roadmap/job-environment.md#future-a-dedicated-runner-user)).
 
 Bugs and quick improvements:
 

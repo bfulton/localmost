@@ -1,3 +1,34 @@
-#!/bin/bash
+#!/bin/sh
 # localmost CLI wrapper
-exec /usr/bin/env node "${0%/*}/cli.js" "$@"
+#
+# The app installs this script as a link, /usr/local/bin/localmost, so $0 is
+# usually the link and not the script. cli.js sits beside the script, in the
+# app's Resources: follow the links to the script first. A relative target
+# is relative to the directory holding the link. A bare $0 is a name the
+# shell looked up as a script argument, in the working directory and then on
+# PATH ("sh localmost"): find it where the shell did.
+self=$0
+case $self in
+  */*) ;;
+  *)
+    if [ -e "./$self" ]; then
+      self=./$self
+    else
+      self=$(command -v -- "$self") || exit 1
+    fi
+    ;;
+esac
+hops=0
+while [ -L "$self" ]; do
+  hops=$((hops + 1))
+  if [ "$hops" -gt 32 ]; then
+    echo "localmost: $0: too many levels of symbolic links" >&2
+    exit 1
+  fi
+  target=$(/usr/bin/readlink "$self") || exit 1
+  case $target in
+    /*) self=$target ;;
+    *) self=${self%/*}/$target ;;
+  esac
+done
+exec /usr/bin/env node "${self%/*}/cli.js" "$@"

@@ -35,6 +35,7 @@ import {
   GitHubRepo,
   GitHubOrg,
 } from '../../shared/types';
+import { ResourcePauseConfig, JobEnvironmentConfig } from '../../shared/job-preferences';
 
 // Create the store
 export const store = createStore<AppStore>()(
@@ -83,10 +84,6 @@ export const store = createStore<AppStore>()(
       set((state) => ({ config: { ...state.config, sleepProtectionConsented: true } }));
     },
 
-    setPreserveWorkDir: (preserveWorkDir: 'never' | 'session' | 'always') => {
-      set((state) => ({ config: { ...state.config, preserveWorkDir } }));
-    },
-
     setToolCacheLocation: (toolCacheLocation: ToolCacheLocation) => {
       set((state) => ({ config: { ...state.config, toolCacheLocation } }));
     },
@@ -105,6 +102,14 @@ export const store = createStore<AppStore>()(
 
     setNotifications: (notifications: NotificationsConfig) => {
       set((state) => ({ config: { ...state.config, notifications } }));
+    },
+
+    setResourcePause: (resourcePause: ResourcePauseConfig) => {
+      set((state) => ({ config: { ...state.config, resourcePause } }));
+    },
+
+    setJobEnvironment: (jobEnvironment: JobEnvironmentConfig) => {
+      set((state) => ({ config: { ...state.config, jobEnvironment } }));
     },
 
     setLaunchAtLogin: (launchAtLogin: boolean) => {
@@ -137,13 +142,33 @@ export const store = createStore<AppStore>()(
     // ==========================================================================
 
     setUser: (user: GitHubUser | null) => {
-      set((state) => ({
-        auth: {
-          ...state.auth,
-          user,
-          isAuthenticated: user !== null,
-        },
-      }));
+      set((state) => {
+        // A write that changes nothing still costs: this store is bridged to
+        // the renderer, so a new object identity is a broadcast and a
+        // re-render for everything watching. The auth status handler calls
+        // this on every query, and rebuilding the auth object each time gave
+        // the renderer a fresh `user` to react to - an effect keyed on it
+        // queried again, and the pair spun across IPC for five days at 100%
+        // CPU without tripping React's update-depth guard, because every turn
+        // was asynchronous. Returning the same state ends that.
+        const current = state.auth.user;
+        const same =
+          current === user ||
+          (current != null &&
+            user != null &&
+            current.login === user.login &&
+            current.name === user.name &&
+            current.avatar_url === user.avatar_url);
+        if (same && state.auth.isAuthenticated === (user !== null)) return state;
+
+        return {
+          auth: {
+            ...state.auth,
+            user,
+            isAuthenticated: user !== null,
+          },
+        };
+      });
     },
 
     setIsAuthenticating: (isAuthenticating: boolean) => {
@@ -174,7 +199,18 @@ export const store = createStore<AppStore>()(
     // ==========================================================================
 
     setRunnerState: (runnerState: RunnerState) => {
-      set((state) => ({ runner: { ...state.runner, runnerState } }));
+      set((state) => {
+        // Every status change lands here, and many change nothing the store
+        // holds. A write is a broadcast to the renderer - see setUser.
+        const current = state.runner.runnerState;
+        const same =
+          current.status === runnerState.status &&
+          current.jobName === runnerState.jobName &&
+          current.repository === runnerState.repository &&
+          current.startedAt === runnerState.startedAt &&
+          current.error === runnerState.error;
+        return same ? state : { runner: { ...state.runner, runnerState } };
+      });
     },
 
     setIsDownloaded: (isDownloaded: boolean) => {
@@ -367,3 +403,22 @@ export const selectUI = (state: AppState) => state.ui;
 export const selectIsOnline = (state: AppState) => state.ui.isOnline;
 export const selectLogs = (state: AppState) => state.ui.logs;
 export const selectError = (state: AppState) => state.ui.error;
+
+// =============================================================================
+// What the runner reads
+// =============================================================================
+
+/**
+ * What a resource pause does, as Settings shows and sets it: read at each
+ * pause. The store owns it - loaded from config.yaml at launch, and written
+ * back at every save - so the runner reads it here, not from the file, and
+ * a hand edit made while the app runs can never take effect unseen and then
+ * be put back by the next save.
+ */
+export const runnerResourcePause = (): ResourcePauseConfig => store.getState().config.resourcePause;
+
+/**
+ * What localmost adds to each job's environment, as Settings shows and sets
+ * it: read at each worker spawn. From the store, as runnerResourcePause.
+ */
+export const runnerJobEnvironment = (): JobEnvironmentConfig => store.getState().config.jobEnvironment;

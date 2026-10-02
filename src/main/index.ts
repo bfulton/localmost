@@ -3,16 +3,28 @@
  * Orchestrates app lifecycle and initializes all modules.
  */
 
-import { app, BrowserWindow, Notification } from 'electron';
+import { app, BrowserWindow, Notification, powerMonitor } from 'electron';
+import * as fs from 'fs';
+import * as os from 'os';
 import * as nodePath from 'path';
 import { RunnerManager, JobEvent } from './runner-manager';
-import { DesktopBackend } from './docker/docker-backend';
+import { VmBackend } from './vm/vm-backend';
+import { DefaultVmManager } from './vm/vm-manager';
+import { GuestImage } from './vm/guest-image';
+import { getVmResourcesDir, guestDir, helperPath } from './vm/paths';
+import { CacheDisks } from './vm/cache-disks';
+import { VmImagePuller } from './docker/puller/image-puller';
+import { RegistryClient } from './docker/puller/registry-client';
+import { resolveRegistryCredentials } from './docker/registry-auth';
+import { MemoryPressureMonitor } from './resource-monitor/memory-pressure-monitor';
 import { GitHubAuth } from './github-auth';
 import { RunnerDownloader } from './runner-downloader';
 import { HeartbeatManager, toHeartbeatTarget } from './heartbeat-manager';
 import { BrokerProxyService } from './broker-proxy-service';
 import { TargetManager } from './target-manager';
 import { ContributorCache } from './contributor-cache';
+import { admitJob, buildAdmissionDeps, PolicyApprovalDeps } from './job-admission';
+import { repoPolicyRuntime } from './repo-policy';
 
 // State management
 import {
@@ -26,7 +38,6 @@ import {
   setTargetManager,
   setResourceMonitor,
   getRunnerManager,
-  getRunnerDownloader,
   getHeartbeatManager,
   getCliServer,
   getBrokerProxyService,
@@ -43,16 +54,17 @@ import {
   disableSleepProtection,
   getTrayManager,
   getLogger,
-  isUserPaused,
+  getRunnerState,
 } from './app-state';
 
 // CLI server
 import { CliServer } from './cli-server';
 
 // Config and security
-import { loadConfig } from './config';
+import { loadConfig, DockerVmConfigSource } from './config';
+import { sweepJobTempDirs, userTempDir } from './job-temp';
 import { installSecurityHandlers } from './security';
-import { ensureAppDataDir } from './paths';
+import { ensureAppDataDir, getAppDataDir } from './paths';
 
 // Logging
 import { initLogFile } from './log-file';
@@ -63,6 +75,7 @@ import { getValidAccessToken, forceRefreshToken, cancelJobsOnOurRunners } from '
 
 // Runner lifecycle
 import { reRegisterSingleInstance, configureSingleInstance, clearStaleRunnerRegistrations } from './runner-lifecycle';
+import { finishPendingSweeps } from './process-group';
 
 // UI
 import { createWindow, setDockIcon } from './window';
@@ -88,6 +101,7 @@ import { IPC_CHANNELS, SleepProtection, LogLevel, DEFAULT_POWER_CONFIG, DEFAULT_
 
 // Resource monitoring
 import { ResourceMonitor } from './resource-monitor';
+import { canAcceptJob, startHeartbeatUnlessPaused, wireResourceMonitor } from './runner-pause';
 
 // State machine
 import {
@@ -95,18 +109,16 @@ import {
   stopRunnerStateMachine,
   sendRunnerEvent,
   onStateChange,
-  selectRunnerStatus,
   selectEffectivePauseState,
 } from './runner-state-service';
 
 // Zustand store
 import { initStore, connectWindow, cleanupStore, store } from './store/init';
-import { getEffectivePolicy, effectivePolicyLevel } from '../shared/localmostrc';
-import { resolveRegistryAuth } from './docker/registry-auth';
+import { runnerJobEnvironment, runnerResourcePause } from './store';
 import {
   decidePolicyForJob,
   recordPendingPolicy,
-  getCachedPolicy,
+  getApprovedPolicyForCommit,
   formatApprovalRequest,
 } from './policy-cache';
 
@@ -159,47 +171,24 @@ if (!gotTheLock) {
 
 
 /**
- * Check whether a repository's .localmostrc has been approved for use.
- *
- * Returns a reason to refuse the job, or null to proceed. A repository with no
- * policy is never refused: it runs on the built-in baseline, which grants
- * nothing beyond what every job already gets.
+ * Check whether a repository's .localmostrc has been approved for use: see
+ * checkRepoPolicyApproval in job-admission.
  */
-async function checkRepoPolicyApproval(
-  owner: string,
-  repo: string,
-  sha?: string
-): Promise<string | null> {
-  const repository = `${owner}/${repo}`;
-  try {
-    const accessToken = await getValidAccessToken();
-    if (!accessToken) {
-      return `cannot check ${repository} policy: not authenticated`;
-    }
-    if (!sha) {
-      // Without a commit there is no way to know which policy would apply.
-      return `cannot check ${repository} policy: no commit SHA for this job`;
-    }
+const repoPolicyApproval: PolicyApprovalDeps = {
+  getAccessToken: getValidAccessToken,
+  getFileContent: (accessToken, owner, repo, filePath, ref) =>
+    (getGitHubAuth() || new GitHubAuth()).getFileContent(accessToken, owner, repo, filePath, ref),
+  decidePolicyForJob,
+  recordPendingPolicy,
+  announce: (request) => getLogger()?.warn(formatApprovalRequest(request)),
+};
 
-    const auth = getGitHubAuth() || new GitHubAuth();
-    const content = await auth.getFileContent(accessToken, owner, repo, '.localmostrc', sha);
-    const decision = decidePolicyForJob(repository, content);
+/** The per-job Docker VMs, and the monitor that holds their boots back under memory pressure. */
+let vmManager: DefaultVmManager | null = null;
+let memoryPressureMonitor: MemoryPressureMonitor | null = null;
 
-    if (decision.action === 'allow') return null;
-    if (decision.action === 'invalid') {
-      return `${repository} has a .localmostrc that could not be parsed: ${decision.reason}`;
-    }
-
-    recordPendingPolicy(repository, decision.request.newConfig);
-    getLogger()?.warn(formatApprovalRequest(decision.request));
-    return decision.request.isNewRepo
-      ? `${repository} has a .localmostrc that has not been approved. Review and approve it in Settings > Job Security, or run "localmost policy approve" in a clone of the repository.`
-      : `${repository} .localmostrc changed since it was approved. Review and approve it in Settings > Job Security, or run "localmost policy approve" in a clone of the repository.`;
-  } catch (err) {
-    // Fail closed: an unverifiable policy must not be applied silently.
-    return `could not verify ${repository} policy: ${(err as Error).message}`;
-  }
-}
+/** The per-repository golden data disks, and their refreshes (contract §6.5). */
+let cacheDisks: CacheDisks | null = null;
 
 app.whenReady().then(async () => {
   // Set restrictive umask so all files/directories are user-only (no group/world access)
@@ -241,8 +230,11 @@ app.whenReady().then(async () => {
 
     // Send runner status to renderer
     if (mainWindow && !mainWindow.isDestroyed() && !getIsQuitting()) {
-      const runnerStatus = selectRunnerStatus(snapshot);
-      mainWindow.webContents.send(IPC_CHANNELS.RUNNER_STATUS_UPDATE, runnerStatus);
+      // Machine transitions are a good moment to refresh the renderer, but
+      // the status comes from the runner: this channel has two producers,
+      // and one published a machine that is never told about jobs, blanking
+      // a running job whenever the other fired.
+      mainWindow.webContents.send(IPC_CHANNELS.RUNNER_STATUS_UPDATE, getRunnerState());
 
       // Also send pause state
       const pauseState = selectEffectivePauseState(snapshot);
@@ -267,14 +259,102 @@ app.whenReady().then(async () => {
   // Contributor cache for user filtering
   const contributorCache = new ContributorCache(githubAuth, (msg) => logger?.debug(msg));
 
+  // The per-job Docker VMs (docs/roadmap/vm-docker-backend.md). One is
+  // booted at the first Docker request, beyond the baseline, of a job whose
+  // policy grants Docker, and goes with its worker. Every path is the app's
+  // own: <data>, realpathed once, and the helper, guest and CLI in Resources
+  // (or the checkout's build/).
+  // Read from config.yaml at each worker spawn, and cached in between.
+  const dockerVmConfigSource = new DockerVmConfigSource({
+    read: () => loadConfig().dockerVm,
+    host: { cores: os.cpus().length, memoryBytes: os.totalmem() },
+    log: (message) => logger?.warn(`[docker-vm] ${message}`),
+  });
+  const dockerVmConfig = () => dockerVmConfigSource.current();
+  const guestImage = new GuestImage(guestDir());
+  const vmLog = (level: 'debug' | 'info' | 'warn' | 'error', message: string) => logger?.[level](`[docker-vm] ${message}`);
+  const dataDir = fs.realpathSync(getAppDataDir());
+  // A refresh VM is booted by the same manager as a job's, in slot 0, and
+  // queues behind every job boot; CacheDisks is handed only this function.
+  cacheDisks = new CacheDisks({
+    dataDir,
+    startRefreshVm: ({ repository, repoKey }) => {
+      if (!vmManager) throw new Error('the Docker VM manager is not running');
+      return vmManager.start({ mode: 'refresh', slot: 0, repository, repoKey });
+    },
+    guest: () => {
+      const manifest = guestImage.manifest();
+      return { guestVersion: manifest.guestVersion, dataFormat: manifest.dataFormat };
+    },
+    cacheLimitGiB: () => dockerVmConfig().cacheLimitGiB,
+    dataDiskGiB: () => dockerVmConfig().dataDiskGiB,
+    conditions: () => ({
+      onBattery: powerMonitor.isOnBatteryPower(),
+      memoryPressure: memoryPressureMonitor?.level() ?? 'normal',
+    }),
+    log: vmLog,
+  });
+  vmManager = new DefaultVmManager({
+    dataDir,
+    resources: getVmResourcesDir(),
+    helperPath,
+    guest: guestImage,
+    config: dockerVmConfig,
+    // Read at each data disk, so a changed runner count is used at once.
+    runnerSlots: () => getRunnerManager()?.getRunnerCount() ?? 1,
+    cacheDisks,
+    log: vmLog,
+  });
+  // Before any worker exists: whatever an earlier run left - a helper still
+  // running, a VM's directory, an unfinished refresh disk - goes first.
+  await vmManager.sweep().catch((err: Error) => logger?.warn(`[docker-vm] Startup sweep failed: ${err.message}`));
+  // Pulls run here, on the Mac, anonymously until a registry refuses; only
+  // then are the operator's credentials asked for, once per registry per
+  // job, and they never enter a VM (§6). What a failing credential helper
+  // printed goes to the app log only.
+  const puller = new VmImagePuller({
+    dataDir,
+    client: new RegistryClient({
+      credentials: (registry) => resolveRegistryCredentials(registry, { log: (m) => logger?.warn(`[docker-vm] ${m}`) }),
+    }),
+    cacheDisks,
+    limits: () => {
+      const { pullMaxGiB, jobPullMaxGiB, minFreeGiB } = dockerVmConfig();
+      return { pullMaxGiB, jobPullMaxGiB, minFreeGiB };
+    },
+    log: vmLog,
+  });
+  const dockerBackend = new VmBackend({
+    vmManager,
+    guest: guestImage,
+    puller,
+    cacheDisks,
+    config: dockerVmConfig,
+  });
+  // VZ has no Linux time sync, and a VM's clock stops while the Mac sleeps.
+  powerMonitor.on('resume', () => vmManager?.onResume());
+  memoryPressureMonitor = new MemoryPressureMonitor({
+    onChange: (level) => vmManager?.onMemoryPressure(level),
+    log: (level, message) => vmLog(level, message),
+  });
+  memoryPressureMonitor.start();
+
   const runnerManager = new RunnerManager({
     onLog: sendLog,
-    // Resolved here, in the app, where ~/.docker is readable. The job never
-    // sees a credential: the filtering socket attaches this to a pull the
-    // policy already permits, so naming a registry is the whole grant.
-    attachRegistryAuth: (registry: string) => resolveRegistryAuth(registry),
     onStatusChange: sendStatusUpdate,
     onJobHistoryUpdate: sendJobHistoryUpdate,
+    // Bind this job to the worker being spawned for it, by its slot (the
+    // worker key's target and instance). This expectation is the only way a
+    // session binds to a job: a worker nobody announced takes nothing.
+    onWorkerReservedForJob: (targetId: string, instanceNum: number, jobId?: string) =>
+      getBrokerProxyService()?.expectWorkerForJob(targetId, instanceNum, jobId),
+    onWorkerReservationCancelled: (targetId: string, instanceNum: number, jobId?: string) =>
+      getBrokerProxyService()?.forgetExpectedWorker(targetId, instanceNum, jobId),
+    issueBrokerUrl: (instanceNum: number, targetId?: string) =>
+      getBrokerProxyService()?.issueWorkerKey(instanceNum, targetId),
+    revokeBrokerUrl: (instanceNum: number) => getBrokerProxyService()?.revokeWorkerKey(instanceNum),
+    issueWorkerCredential: async (instanceNum: number) =>
+      getBrokerProxyService()?.issueWorkerCredential(instanceNum),
     onReregistrationNeeded: reRegisterSingleInstance,
     onConfigurationNeeded: configureSingleInstance,
     getRunnerLogLevel: () => getRunnerLogLevelSetting(),
@@ -309,43 +389,25 @@ app.whenReady().then(async () => {
       }
       return contributorCache.getAllAuthors(accessToken, owner, repo, sha);
     },
-    getJobTarget: (jobId: string) => brokerProxyService.getJobTarget(jobId),
-    // Stage 1: approved container requests go to the operator's own daemon.
-    // The socket the job sees is localmost's; the daemon's is never handed over.
-    dockerBackend: new DesktopBackend(),
-    getRepoPolicy: async (owner: string, repo: string, _sha: string, workflowName: string) => {
-      // Apply the policy that was approved, not whatever is in the repository
-      // right now. A job only reaches this point once its policy has been
-      // approved, and applying the approved copy means an unreviewed change
-      // cannot take effect through a race. That covers the level too: it is
-      // declared in the same file and approved with the rest of it.
-      const cached = getCachedPolicy(`${owner}/${repo}`);
-      if (!cached?.approved) {
-        return {
-          hosts: [],
-          level: 'strict' as const,
-          readPaths: [],
-          writePaths: [],
-          docker: {},
-        };
-      }
-      const policy = getEffectivePolicy(cached.config, workflowName);
-      return {
-        // Network is resolved per workflow and applied to the proxy per job.
-        hosts: policy.network?.allow || [],
-        level: effectivePolicyLevel(cached.config),
-        // Filesystem comes from the shared section only. The sandbox profile
-        // is built before the workflow is known and cannot change afterwards,
-        // so a per-workflow filesystem section could not be applied - and
-        // resolving it here would differ between spawn and claim and read as
-        // policy drift.
-        readPaths: cached.config.shared?.filesystem?.read || [],
-        writePaths: cached.config.shared?.filesystem?.write || [],
-        // Docker composes across shared and workflow: the socket is bound to
-        // the merged policy when the job is claimed, after the workflow is known.
-        docker: policy.docker ?? {},
-      };
-    },
+    getJobTarget: (instanceNum: number, jobId: string) => brokerProxyService.getJobTargetForWorker(instanceNum, jobId),
+    // The one loopback port every worker's proxy keeps open.
+    getBrokerPort: () => brokerProxyService.getPort(),
+    // Approved container requests go to the job's own Docker VM. The socket
+    // the job sees is localmost's; the VM's is never handed over.
+    dockerBackend,
+    getDockerVmConfig: () => dockerVmConfigSource.refresh(),
+    // What each job's environment gets (docs/roadmap/job-environment.md), as
+    // Settings shows it, at each worker spawn.
+    getJobEnvironmentConfig: runnerJobEnvironment,
+    // Apply the policy that was approved, not whatever is in the repository
+    // right now. A job only reaches this point once its policy has been
+    // approved, and applying the approved copy means an unreviewed change
+    // cannot take effect through a race. That covers the level too: it is
+    // declared in the same file and approved with the rest of it. Only a
+    // commit the pre-spawn check found carrying that policy gets it; one
+    // whose .localmostrc was deleted, or that was never checked, gets none.
+    getRepoPolicy: async (owner: string, repo: string, sha: string, workflowName: string) =>
+      repoPolicyRuntime(getApprovedPolicyForCommit(`${owner}/${repo}`, sha), workflowName),
     onJobEvent: (event: JobEvent) => {
       logger?.info(`Job event: ${event.type} ${event.jobName}`);
 
@@ -367,6 +429,11 @@ app.whenReady().then(async () => {
           // pressing cancel on GitHub.
           title = 'Job Refused';
           body = `${repoShort}: ${event.reason ?? 'blocked by policy'}`;
+        } else if (event.type === 'cancel-failed') {
+          // The run is still going on GitHub; say so rather than let a
+          // refusal read as the end of it.
+          title = 'Cancel Failed';
+          body = `${repoShort}: ${event.reason ?? 'the workflow run could not be cancelled'}`;
         } else if (event.type === 'started') {
           title = 'Job Started';
           body = `${event.jobName} on ${repoShort}`;
@@ -429,80 +496,20 @@ app.whenReady().then(async () => {
   }
 
   // Set capacity check callback - broker proxy will only acquire jobs when we have capacity AND not paused
-  brokerProxyService.setCanAcceptJobCallback(() => {
-    // Don't accept jobs if resource monitor says we should be paused
-    if (resourceMonitor.shouldPause()) {
-      return false;
-    }
-    return runnerManager.hasAvailableSlot();
+  brokerProxyService.setCanAcceptJobCallback(() => canAcceptJob({ resourceMonitor, runnerManager }));
+
+  // Wire up broker proxy to runner manager: when a job is received, decide
+  // whether it may run and spawn the worker for it.
+  const admission = buildAdmissionDeps(repoPolicyApproval, {
+    findTarget: (targetId: string) => targetManager.getTargets().find(t => t.id === targetId),
+    runnerManager,
+    broker: brokerProxyService,
+    log: (level, message) => getLogger()?.[level](message),
   });
-
-  // Wire up broker proxy to runner manager: when a job is received, spawn a worker
-  brokerProxyService.on('job-received', async (targetId: string, jobId: string, _registeredRunnerName: string, githubInfo) => {
-    getLogger()?.info(`[job-received event] targetId=${targetId}, jobId=${jobId}, runId=${githubInfo.githubRunId}, actor=${githubInfo.githubActor}, sha=${githubInfo.githubSha?.slice(0, 7)}`);
-    const target = targetManager.getTargets().find(t => t.id === targetId);
-    if (target) {
-      getLogger()?.info(`Spawning worker for job ${jobId} from ${target.displayName}...`);
-      // Construct actions URL directly from GitHub IDs
-      let actionsUrl: string | undefined;
-      if (githubInfo.githubRunId && githubInfo.githubJobId && githubInfo.githubRepo) {
-        actionsUrl = `https://github.com/${githubInfo.githubRepo}/actions/runs/${githubInfo.githubRunId}/job/${githubInfo.githubJobId}`;
-        getLogger()?.info(`Constructed actions URL: ${actionsUrl}`);
-      }
-      // Decide whether this job may run before any worker exists. Cancelling
-      // after a worker has started leaves untrusted steps executing for as long
-      // as the check takes.
-      const [owner, repo] = (githubInfo.githubRepo || target.displayName).split('/');
-      if (owner && repo && githubInfo.githubActor) {
-        const verdict = await runnerManager.evaluateJobFilter(
-          owner,
-          repo,
-          githubInfo.githubActor,
-          githubInfo.githubSha
-        );
-        if (!verdict.allowed) {
-          runnerManager.recordRefusedJob({
-            repository: target.displayName,
-            jobName: githubInfo.githubJobId ? `job ${githubInfo.githubJobId}` : jobId,
-            reason: verdict.reason,
-            actionsUrl,
-            githubRunId: githubInfo.githubRunId,
-          });
-          if (githubInfo.githubRunId) {
-            await runnerManager.cancelRun(owner, repo, githubInfo.githubRunId, verdict.reason);
-          }
-          return;
-        }
-
-        // A .localmostrc grants access beyond the baseline, so a new or
-        // changed one needs the machine owner's consent before it takes effect.
-        const policyReason = await checkRepoPolicyApproval(owner, repo, githubInfo.githubSha);
-        if (policyReason) {
-          runnerManager.recordRefusedJob({
-            repository: target.displayName,
-            jobName: githubInfo.githubJobId ? `job ${githubInfo.githubJobId}` : jobId,
-            reason: policyReason,
-            actionsUrl,
-            githubRunId: githubInfo.githubRunId,
-          });
-          if (githubInfo.githubRunId) {
-            await runnerManager.cancelRun(owner, repo, githubInfo.githubRunId, policyReason);
-          }
-          return;
-        }
-      }
-
-      runnerManager.setPendingTargetContext('next', targetId, target.displayName, actionsUrl, githubInfo.githubRunId, githubInfo.githubJobId, githubInfo.githubActor, githubInfo.githubSha, githubInfo.githubRef, githubInfo.githubWorkflow);
-
-      // Spawn a worker to handle this job
-      try {
-        await runnerManager.spawnWorkerForJob();
-      } catch (err) {
-        getLogger()?.error(`Failed to spawn worker for job ${jobId}: ${(err as Error).message}`);
-      }
-    } else {
-      getLogger()?.warn(`[job-received] Target not found for id: ${targetId}`);
-    }
+  brokerProxyService.on('job-received', (targetId: string, jobId: string, _registeredRunnerName: string, githubInfo) => {
+    admitJob(admission, targetId, jobId, githubInfo).catch((err) => {
+      getLogger()?.error(`Admission of job ${jobId} failed: ${(err as Error).message}`);
+    });
   });
 
   // Wire up broker proxy status updates to renderer
@@ -515,15 +522,16 @@ app.whenReady().then(async () => {
 
   // Clean up any stale/corrupt runner configuration
   // Must await to ensure orphaned runner processes are killed before starting new ones
-  // Only clean work dirs if preserveWorkDir is not 'always'
   try {
-    const cleanWorkDirs = config.preserveWorkDir !== 'always';
-    await runnerDownloader.cleanupStaleConfiguration(
-      (message) => logger?.info(message),
-      { cleanWorkDirs }
-    );
+    await runnerDownloader.cleanupStaleConfiguration((message) => logger?.info(message));
   } catch (err) {
-    logger?.warn(`Startup cleanup failed: ${(err as Error).message}. Will retry when runner starts.`);
+    logger?.warn(`Startup cleanup failed: ${(err as Error).message}. Leftovers stay until the next launch.`);
+  }
+  // The temp directories finished jobs left in the per-user temp directory,
+  // once their sandboxes are gone: this data directory's only, by name.
+  const userTemp = userTempDir((_level, message) => logger?.warn(message));
+  if (userTemp) {
+    await sweepJobTempDirs(userTemp, runnerDownloader.getSandboxBase(), (message) => logger?.info(message));
   }
 
   if (config.auth?.refreshToken) {
@@ -559,51 +567,13 @@ app.whenReady().then(async () => {
   });
   setResourceMonitor(resourceMonitor);
 
-  // Handle resource-based pause/resume via state machine
-  resourceMonitor.on('should-pause', async (reason: string) => {
-    // Don't pause if user explicitly paused (they control when to resume)
-    if (isUserPaused()) return;
+  // Handle resource-based pause/resume via state machine.
+  // What it does to running jobs is read at each pause, as Settings shows it.
+  wireResourceMonitor(resourceMonitor, runnerResourcePause);
 
-    logger?.info(`Resource pause triggered: ${reason}`);
-
-    // Send event to state machine - it will update tray and renderer via subscription
-    sendRunnerEvent({ type: 'RESOURCE_PAUSE', reason });
-
-    const runnerManager = getRunnerManager();
-    const heartbeatManager = getHeartbeatManager();
-
-    // Stop heartbeat to signal unavailability
-    heartbeatManager?.stop();
-    await heartbeatManager?.clear();
-
-    // Stop any running workers (gracefully - in-progress jobs will complete)
-    // The broker proxy will reject new jobs via the canAcceptJob callback
-    if (runnerManager?.isRunning()) {
-      await runnerManager.stop();
-    }
-  });
-
-  resourceMonitor.on('should-resume', async () => {
-    // Don't resume if user explicitly paused
-    if (isUserPaused()) return;
-
-    logger?.info('Resource pause cleared - resuming runner');
-
-    // Send event to state machine - it will update tray and renderer via subscription
-    sendRunnerEvent({ type: 'RESOURCE_RESUME' });
-
-    // Restart heartbeat to signal availability
-    // The broker proxy will start accepting jobs via the canAcceptJob callback
-    const heartbeatManager = getHeartbeatManager();
-    const authState = getAuthState();
-    if (heartbeatManager && authState?.accessToken) {
-      try {
-        await heartbeatManager.start();
-      } catch (err) {
-        logger?.error(`Failed to restart heartbeat: ${(err as Error).message}`);
-      }
-    }
-  });
+  // The tray shows what a manual resume overrode until its condition clears,
+  // which changes no pause on the state machine.
+  resourceMonitor.on('state-changed', () => updateTrayMenu());
 
   // Note: state-changed event is now handled by the XState subscription above
   // which sends status updates to renderer and updates tray
@@ -757,8 +727,8 @@ app.whenReady().then(async () => {
               },
             });
 
-            // Start the heartbeat
-            await heartbeatManager.start();
+            // Start the heartbeat, unless the user paused while it started
+            await startHeartbeatUnlessPaused(heartbeatManager);
           }
         }
       } catch (err) {
@@ -814,7 +784,6 @@ app.on('before-quit', async (event) => {
     const logger = getLogger();
     const heartbeatManager = getHeartbeatManager();
     const runnerManager = getRunnerManager();
-    const runnerDownloader = getRunnerDownloader();
     const brokerProxyService = getBrokerProxyService();
     const trayManager = getTrayManager();
     const mainWindow = getMainWindow();
@@ -841,13 +810,17 @@ app.on('before-quit', async (event) => {
         const runningJobs = runnerManager?.getJobHistory().filter(j => j.status === 'running') || [];
         await cancelJobsOnOurRunners(runningJobs);
         await runnerManager?.stop();
+        // stop() resolves as soon as the worker leaders exit. Any descendant
+        // that ignored SIGTERM is still waiting out a grace period on an
+        // unref'd timer that will not fire once we quit, so finish those now -
+        // after this point nothing is left to reap them.
+        finishPendingSweeps();
+        // Each worker's socket released its VM as it stopped; this stops what
+        // is left - a spare, a cache refresh - bounded at 10 s.
+        memoryPressureMonitor?.stop();
+        await Promise.all([cacheDisks?.shutdown(), vmManager?.shutdownAll()]);
       })(),
     ]);
-
-    // Clean up work directories (can be slow for large dirs)
-    if (runnerManager?.getPreserveWorkDir() !== 'always') {
-      await runnerDownloader?.cleanupWorkDirectories((msg) => logger?.info(msg));
-    }
 
     trayManager?.destroy();
     mainWindow?.destroy();
@@ -871,10 +844,8 @@ process.on('SIGINT', async () => {
   // Signal state machine that we're shutting down
   sendRunnerEvent({ type: 'STOP' });
 
-  const logger = getLogger();
   const heartbeatManager = getHeartbeatManager();
   const runnerManager = getRunnerManager();
-  const runnerDownloader = getRunnerDownloader();
   const brokerProxyService = getBrokerProxyService();
   const trayManager = getTrayManager();
   const mainWindow = getMainWindow();
@@ -897,13 +868,10 @@ process.on('SIGINT', async () => {
       const runningJobs = runnerManager?.getJobHistory().filter(j => j.status === 'running') || [];
       await cancelJobsOnOurRunners(runningJobs);
       await runnerManager?.stop();
+      memoryPressureMonitor?.stop();
+      await Promise.all([cacheDisks?.shutdown(), vmManager?.shutdownAll()]);
     })(),
   ]);
-
-  // Clean up work directories unless set to 'always' preserve
-  if (runnerManager?.getPreserveWorkDir() !== 'always') {
-    await runnerDownloader?.cleanupWorkDirectories((msg) => logger?.info(msg));
-  }
 
   trayManager?.destroy();
   mainWindow?.destroy();

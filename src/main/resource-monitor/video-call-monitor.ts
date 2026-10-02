@@ -1,11 +1,12 @@
 /**
  * VideoCallMonitor - Detects active video calls via camera usage.
  *
- * Uses the is-camera-on package for reliable native camera detection.
+ * Uses the is-camera-on helper for reliable native camera detection.
  * Implements a grace period before resuming after a call ends.
  */
 
 import { EventEmitter } from 'events';
+import { cameraHelperPath, watchCamera, type CameraWatch } from './camera-helper';
 
 export interface VideoCallState {
   isCameraInUse: boolean;
@@ -26,7 +27,7 @@ export class VideoCallMonitor extends EventEmitter {
   private gracePeriodTimer: NodeJS.Timeout | null = null;
   private gracePeriodSeconds: number;
   private started = false;
-  private abortController: AbortController | null = null;
+  private cameraWatch: CameraWatch | null = null;
 
   constructor(gracePeriodSeconds: number = 60) {
     super();
@@ -47,28 +48,12 @@ export class VideoCallMonitor extends EventEmitter {
     if (this.started) return;
     this.started = true;
 
-    this.abortController = new AbortController();
-    this.startCameraMonitoring();
-  }
-
-  /**
-   * Start async camera monitoring loop.
-   */
-  private async startCameraMonitoring(): Promise<void> {
+    // If the helper cannot be found or run (missing, non-macOS, etc.), log and continue without video detection
+    const unavailable = (error: Error) => console.warn('Video call detection unavailable:', error.message);
     try {
-      // Dynamic import for ESM package
-      const { isCameraOnChanges } = await import('is-camera-on');
-
-      for await (const isOn of isCameraOnChanges()) {
-        // Check if we've been stopped
-        if (!this.started || this.abortController?.signal.aborted) {
-          break;
-        }
-        this.handleCameraState(isOn);
-      }
+      this.cameraWatch = watchCamera(cameraHelperPath(), (isOn) => this.handleCameraState(isOn), unavailable);
     } catch (error) {
-      // If is-camera-on fails (non-macOS, etc.), log and continue without video detection
-      console.warn('Video call detection unavailable:', (error as Error).message);
+      unavailable(error as Error);
     }
   }
 
@@ -79,9 +64,9 @@ export class VideoCallMonitor extends EventEmitter {
     if (!this.started) return;
     this.started = false;
 
-    // Signal the async iterator to stop
-    this.abortController?.abort();
-    this.abortController = null;
+    // End the helper
+    this.cameraWatch?.stop();
+    this.cameraWatch = null;
 
     if (this.gracePeriodTimer) {
       clearTimeout(this.gracePeriodTimer);

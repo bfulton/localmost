@@ -7,13 +7,23 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
-import { spawn, SpawnOptions } from 'child_process';
+import * as crypto from 'crypto';
+import { spawn, ChildProcess, SpawnOptions } from 'child_process';
 import { WorkflowStep, WorkflowJob, MatrixCombination } from './workflow-parser';
-import { SandboxPolicy, generateSandboxProfile, generateDiscoveryProfile } from './sandbox-profile';
+import {
+  SandboxPolicy,
+  LoopbackGrant,
+  generateSandboxProfile,
+  generateDiscoveryProfile,
+  MACOS_BASELINE_READ_PATHS,
+  ProcessMarker,
+} from './sandbox-profile';
 import { PidTreeWatcher } from './pid-tree-watch';
+import { reapMarkedProcesses } from './sandbox-reaper';
 import { parseActionRef, fetchAction, isInterceptedAction, readActionMetadata } from './action-fetcher';
-import { getGitInfo } from './workspace';
+import { resolveWithin } from './contained-path';
+import { getAppDataDirWithoutElectron } from './paths';
+import { gitSshCommand } from './job-home';
 
 // =============================================================================
 // Types
@@ -49,8 +59,20 @@ export interface ExecutionContext {
   inputs?: Record<string, string | number | boolean>;
   /** Outputs from jobs this job depends on (needs context) */
   needs?: Record<string, Record<string, string>>;
+  /**
+   * Whose caches actions/cache reaches: the checkout the run was started in,
+   * and the repository and ref read from it, set before any workflow content
+   * is merged in. No scope, no cache.
+   */
+  cacheScope?: { sourceDir: string; repository: string; ref: string };
   /** Sandbox policy to enforce */
   policy?: SandboxPolicy;
+  /**
+   * Loopback ports a step may reach besides the proxy's: the checkout's
+   * shared network.loopback, once the user has confirmed it. Absent, only
+   * the proxy.
+   */
+  loopback?: LoopbackGrant;
   /** Whether running in permissive/discovery mode */
   permissive?: boolean;
   /** Log file for sandbox trace output (for discovery mode) */
@@ -129,11 +151,35 @@ export function createSecretMasker(secrets: Record<string, string>): {
  * environment needs the directory to exist - not just `run:` steps.
  */
 export function ensureStepHome(workDir: string): string {
-  const stepHome = path.join(workDir, '.home');
-  if (!fs.existsSync(stepHome)) {
-    fs.mkdirSync(stepHome, { recursive: true });
+  return ensureStepDir(workDir, '.home');
+}
+
+/**
+ * Make the workspace-local HOME before a run's first step, to be filled
+ * then (see prepareJobHome): new, the run's own, and private. A plain mkdir
+ * that refuses anything already at the name - the workspace copy leaves the
+ * checkout's `.home` out, and this holds should anything else put one there.
+ */
+export function createStepHome(workDir: string): string {
+  const dir = path.join(workDir, '.home');
+  fs.mkdirSync(dir, { mode: 0o700 });
+  return dir;
+}
+
+/**
+ * Create a directory the app hands every step, directly in the workspace.
+ *
+ * mkdir without recursion, so a link a step left at the name is never
+ * followed to create a directory somewhere else.
+ */
+function ensureStepDir(workDir: string, name: string): string {
+  const dir = path.join(workDir, name);
+  try {
+    fs.mkdirSync(dir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
   }
-  return stepHome;
+  return dir;
 }
 
 /**
@@ -154,6 +200,18 @@ export function maskSecrets(text: string, secrets: Record<string, string>): stri
   return masked;
 }
 
+/** The variables that point a step's temp files, and tools' temp caches, at `tmp`. */
+function stepTempEnvironment(tmp: string): Record<string, string> {
+  return {
+    TMPDIR: tmp,
+    TMP: tmp,
+    TEMP: tmp,
+    xcrun_db: path.join(tmp, 'xcrun_db'),
+    CLANG_MODULE_CACHE_PATH: path.join(tmp, 'clang-module-cache'),
+    TMPPREFIX: path.join(tmp, 'zsh'),
+  };
+}
+
 /**
  * Build the full environment for step execution.
  */
@@ -170,6 +228,10 @@ export function buildStepEnvironment(
     // and sends every tool looking for dotfiles the sandbox denies - git dies
     // on ~/.gitconfig before it does anything.
     HOME: ensureStepHome(ctx.workDir),
+    // ssh finds its directory through the user database, not HOME, so git's
+    // ssh is pointed at the step's home, which the run filled before its
+    // first step (see prepareJobHome).
+    GIT_SSH_COMMAND: gitSshCommand(ensureStepHome(ctx.workDir)),
     USER: process.env.USER || '',
     SHELL: process.env.SHELL || '/bin/bash',
     TERM: process.env.TERM || 'xterm-256color',
@@ -203,7 +265,19 @@ export function buildStepEnvironment(
     RUNNER_OS: 'macOS',
     RUNNER_ARCH: process.arch === 'arm64' ? 'ARM64' : 'X64',
     RUNNER_TEMP: path.join(ctx.workDir, '.runner-temp'),
-    RUNNER_TOOL_CACHE: path.join(os.homedir(), '.localmost', 'tool-cache'),
+    // Per run, like RUNNER_TEMP. A cache shared across runs is one a checkout
+    // can poison for the next, and the app's data directory, where it used to
+    // live, is closed to steps.
+    RUNNER_TOOL_CACHE: path.join(ctx.workDir, '.runner-tool-cache'),
+
+    // Temp, in the workspace: the sandbox grants no shared temp directory, as
+    // the runner grants a job none. Some tools ignore TMPDIR and keep state in
+    // the per-user temp and cache directories instead, each with a variable
+    // that moves it: xcrun cannot resolve a tool at all without a cache it can
+    // write, clang and swiftc keep their module cache there, and zsh puts
+    // here-documents under /tmp. Unix sockets are made here too, which is
+    // where the profile lets a step bind them.
+    ...stepTempEnvironment(ensureStepDir(ctx.workDir, '.tmp')),
 
     // ImageOS for setup-* actions
     ImageOS: 'macos14',
@@ -418,23 +492,22 @@ async function executeRunStep(
 ): Promise<StepResult> {
   const env = buildStepEnvironment(step, ctx, job);
   const shell = step.shell || job.defaults?.run?.shell || 'bash';
-  const workingDir =
-    step['working-directory'] ||
-    job.defaults?.run?.['working-directory'] ||
-    ctx.workDir;
+  // Relative to the workspace, as on GitHub, and never outside it. This is
+  // only where the step starts; its sandbox is rooted at the workspace either
+  // way.
+  const namedDir = step['working-directory'] || job.defaults?.run?.['working-directory'];
+  const workingDir = namedDir
+    ? resolveWithin(ctx.workDir, namedDir, 'working-directory')
+    : ctx.workDir;
 
   // Expand expressions in the script
   const script = expandExpression(step.run!, env, ctx);
 
-  // Create GITHUB_OUTPUT file
-  const outputFile = env.GITHUB_OUTPUT;
-  fs.writeFileSync(outputFile, '');
-
-  // Create temp script file
-  const scriptFile = path.join(ctx.workDir, `.step-${Date.now()}.sh`);
   // 0700, not 0755: expanding ${{ secrets.X }} puts the value in this file for
   // as long as the step runs, and another account should not be able to read it.
-  fs.writeFileSync(scriptFile, script, { mode: 0o700 });
+  const scriptFile = createStepFile(ctx.workDir, '.step', '.sh', script, 0o700);
+  const outputFile = createStepFile(ctx.workDir, '.github-output', '', '', 0o600);
+  env.GITHUB_OUTPUT = outputFile;
 
   ensureStepHome(ctx.workDir);
 
@@ -444,8 +517,10 @@ async function executeRunStep(
       [scriptFile],
       {
         cwd: workingDir,
+        workDir: ctx.workDir,
         env,
         proxyPort: ctx.proxyPort,
+        loopback: ctx.loopback,
         onOutput: ctx.onOutput,
         sandboxLogFile: ctx.sandboxLogFile,
         collectedPids: ctx.collectedPids,
@@ -455,11 +530,7 @@ async function executeRunStep(
       ctx.permissive
     );
 
-    // Parse outputs from GITHUB_OUTPUT file
-    const outputs = parseGitHubOutputFile(outputFile);
-
-    // Clean up
-    fs.unlinkSync(scriptFile);
+    const outputs = readStepOutputs(outputFile);
 
     return {
       name: stepName,
@@ -470,10 +541,10 @@ async function executeRunStep(
       error: result.exitCode !== 0 && result.stderr ? result.stderr : undefined,
     };
   } finally {
-    // Ensure cleanup
-    if (fs.existsSync(scriptFile)) {
-      fs.unlinkSync(scriptFile);
-    }
+    // rm, not unlink-if-exists: whatever the step left at these names is
+    // removed without being followed.
+    fs.rmSync(scriptFile, { force: true });
+    fs.rmSync(outputFile, { force: true });
   }
 }
 
@@ -519,7 +590,7 @@ async function executeLocalAction(
   job: WorkflowJob,
   stepName: string
 ): Promise<StepResult> {
-  const actionPath = path.join(ctx.workDir, step.uses!);
+  const actionPath = resolveWithin(ctx.workDir, step.uses!, 'Local action');
   return await executeActionFromPath(actionPath, step, ctx, job, stepName);
 }
 
@@ -558,10 +629,6 @@ async function executeActionFromPath(
     }
   }
 
-  // Create GITHUB_OUTPUT file
-  const outputFile = env.GITHUB_OUTPUT;
-  fs.writeFileSync(outputFile, '');
-
   // Execute based on action type
   const { using, main } = metadata.runs;
 
@@ -576,24 +643,37 @@ async function executeActionFromPath(
       throw new Error('Node action missing "main" entry point');
     }
 
-    const mainPath = path.join(actionPath, main);
-    const result = await runInSandbox(
-      'node',
-      [mainPath],
-      {
-        cwd: actionPath,
-        env,
-        proxyPort: ctx.proxyPort,
-        onOutput: ctx.onOutput,
-        sandboxLogFile: ctx.sandboxLogFile,
-        collectedPids: ctx.collectedPids,
-        secrets: ctx.secrets,
-      },
-      ctx.policy,
-      ctx.permissive
-    );
-
-    const outputs = parseGitHubOutputFile(outputFile);
+    // GitHub runs a node action from the workspace, not from its own
+    // directory. Its code is readable and nothing more: an action directory
+    // fetched into the app's cache is shared by every run that uses it.
+    const mainPath = resolveWithin(actionPath, main, 'Action entry point', 'the action');
+    const outputFile = createStepFile(ctx.workDir, '.github-output', '', '', 0o600);
+    env.GITHUB_OUTPUT = outputFile;
+    let result: SandboxResult;
+    let outputs: Record<string, string>;
+    try {
+      result = await runInSandbox(
+        'node',
+        [mainPath],
+        {
+          cwd: ctx.workDir,
+          workDir: ctx.workDir,
+          readOnlyPaths: [actionPath],
+          env,
+          proxyPort: ctx.proxyPort,
+          loopback: ctx.loopback,
+          onOutput: ctx.onOutput,
+          sandboxLogFile: ctx.sandboxLogFile,
+          collectedPids: ctx.collectedPids,
+          secrets: ctx.secrets,
+        },
+        ctx.policy,
+        ctx.permissive
+      );
+      outputs = readStepOutputs(outputFile);
+    } finally {
+      fs.rmSync(outputFile, { force: true });
+    }
 
     return {
       name: stepName,
@@ -703,13 +783,11 @@ async function executeInterceptedAction(
     return executeCheckoutIntercept(step, ctx, stepName);
   }
 
-  // actions/cache (restore and save variants)
+  // actions/cache/save saves; actions/cache and actions/cache/restore restore
+  if (uses.startsWith('actions/cache/save@')) {
+    return executeCacheSaveIntercept(step, ctx, stepName);
+  }
   if (uses.startsWith('actions/cache')) {
-    // actions/cache/save is for saving only
-    if (uses.includes('/save')) {
-      return executeCacheSaveIntercept(step, ctx, stepName);
-    }
-    // actions/cache/restore is for restore only, regular actions/cache does both
     return executeCacheIntercept(step, ctx, stepName);
   }
 
@@ -754,27 +832,16 @@ function executeCheckoutIntercept(
     };
   }
 
-  // Use local working tree
-  const gitInfo = getGitInfo(ctx.workDir);
-  if (gitInfo) {
-    ctx.workflowEnv.GITHUB_SHA = gitInfo.sha;
-    ctx.workflowEnv.GITHUB_REF = gitInfo.ref;
-  }
-
+  // Use the local working tree. GITHUB_SHA and GITHUB_REF were read from the
+  // checkout the run was started in, before any step ran. No git runs here:
+  // this is the workspace, outside any sandbox, and an earlier step can have
+  // left a .git whose config names a command - core.fsmonitor runs on status.
   ctx.onOutput?.('Using local working tree (checkout intercepted)', 'stdout');
 
-  // Handle submodules
+  // Submodules come with the working tree: the workspace is a copy of the
+  // checkout, initialized submodules included.
   if (step.with?.submodules === 'true' || step.with?.submodules === true) {
-    ctx.onOutput?.('Updating submodules...', 'stdout');
-    try {
-      const { execSync } = require('child_process');
-      execSync('git submodule update --init --recursive', {
-        cwd: ctx.workDir,
-        stdio: 'pipe',
-      });
-    } catch (err) {
-      ctx.onOutput?.(`Warning: Failed to update submodules: ${(err as Error).message}`, 'stderr');
-    }
+    ctx.onOutput?.('Submodules: using those already checked out in the working tree', 'stdout');
   }
 
   return {
@@ -786,10 +853,24 @@ function executeCheckoutIntercept(
 }
 
 /**
- * Get the local cache directory for workflow caches.
+ * Where a repository's caches for one ref live.
+ *
+ * Caches were one directory for everything `localmost test` ever ran, so a
+ * checkout under test could save a poisoned node_modules under a key the next
+ * repository - or the same repository's main branch - restored and ran. On
+ * GitHub a cache is scoped to its repository and branch; here it is scoped to
+ * the checkout on disk the run was started from, and to the repository and
+ * ref read from it. The repository and ref alone are claims: every checkout
+ * with no remote is local/repo, one that ships its own .git names any origin
+ * it likes, and the workflow's env used to override both. Where the checkout
+ * sits is chosen by the user. A hash names the directory, so no two scopes
+ * can share one. Undefined when the run gave no scope.
  */
-function getLocalCacheDir(): string {
-  return path.join(os.homedir(), '.localmost', 'workflow-cache');
+function getLocalCacheDir(ctx: ExecutionContext): string | undefined {
+  if (!ctx.cacheScope) return undefined;
+  const { sourceDir, repository, ref } = ctx.cacheScope;
+  const hash = crypto.createHash('sha256').update(JSON.stringify([sourceDir, repository, ref])).digest('hex').slice(0, 32);
+  return path.join(getAppDataDirWithoutElectron(), 'workflow-cache', hash);
 }
 
 /**
@@ -801,205 +882,211 @@ function sanitizeCacheKey(key: string): string {
 }
 
 /**
- * Intercept actions/cache - use local cache directory.
+ * The paths a cache step names, relative to the workspace, as tar members.
+ *
+ * A leading ~ is the step's HOME, which is in the workspace. Anything that
+ * lands outside the workspace is dropped with a note: the cache is copied by
+ * this process's own tools, and an absolute path used to have it copy the
+ * user's files into the cache, or write over them on restore.
  */
-function executeCacheIntercept(
+function cacheMembers(pathInput: string, ctx: ExecutionContext): string[] {
+  const home = path.join(ctx.workDir, '.home');
+  const members: string[] = [];
+  for (const raw of pathInput.split('\n').map((p) => p.trim()).filter(Boolean)) {
+    const expanded = raw === '~' || raw.startsWith('~/') ? path.join(home, raw.slice(1)) : raw;
+    const relative = path.relative(ctx.workDir, path.resolve(ctx.workDir, expanded));
+    if (relative === '' || relative.startsWith('..') || path.isAbsolute(relative)) {
+      ctx.onOutput?.(`  Skipped (outside the workspace): ${raw}`, 'stdout');
+      continue;
+    }
+    members.push(`./${relative}`);
+  }
+  return members;
+}
+
+/**
+ * Run tar under a sandbox profile rooted at the workspace.
+ *
+ * The workspace is the steps' to write, so the copy is made by a process the
+ * kernel confines to it rather than by this one: a symlink a step left in
+ * the workspace leads tar nowhere it could not already go. The archive
+ * travels over a pipe, so the cache directory itself is never in the profile.
+ */
+function runSandboxedTar(
+  args: string[],
+  ctx: ExecutionContext,
+  io: { stdinFile?: string; stdoutFile?: string }
+): Promise<{ exitCode: number; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const { profilePath, remove } = writeStepProfile(
+      generateSandboxProfile({
+        workDir: ctx.workDir,
+        proxyPort: ctx.proxyPort,
+        policy: { filesystem: { read: MACOS_BASELINE_READ_PATHS } },
+        processMarker: stepProcessMarker(),
+      })
+    );
+    const proc = spawn('/usr/bin/sandbox-exec', ['-f', profilePath, '/usr/bin/tar', ...args], {
+      cwd: ctx.workDir,
+      env: { PATH: '/usr/bin:/bin', LANG: 'en_US.UTF-8' },
+      shell: false,
+      detached: true,
+      stdio: [io.stdinFile ? 'pipe' : 'ignore', io.stdoutFile ? 'pipe' : 'ignore', 'pipe'],
+    });
+    trackStepProcessGroup(proc);
+
+    let stderr = '';
+    proc.stderr?.on('data', (d: Buffer) => (stderr += d.toString()));
+    const written = io.stdoutFile
+      ? new Promise<void>((done, fail) => {
+          const out = fs.createWriteStream(io.stdoutFile!, { flags: 'wx', mode: 0o600 });
+          out.on('finish', done);
+          out.on('error', fail);
+          proc.stdout?.pipe(out);
+        })
+      : Promise.resolve();
+    if (io.stdinFile && proc.stdin) {
+      // Either end can go first: tar may exit before reading everything, and
+      // a failed read has to end the input rather than leave tar waiting.
+      const input = fs.createReadStream(io.stdinFile);
+      input.on('error', () => proc.stdin?.destroy());
+      proc.stdin.on('error', () => input.destroy());
+      input.pipe(proc.stdin);
+    }
+
+    proc.on('error', (err) => {
+      remove();
+      reject(err);
+    });
+    proc.on('close', (code) => {
+      remove();
+      written.then(() => resolve({ exitCode: code ?? 1, stderr }), reject);
+    });
+  });
+}
+
+/**
+ * Intercept actions/cache and actions/cache/restore - restore from the local cache.
+ */
+async function executeCacheIntercept(
   step: WorkflowStep,
   ctx: ExecutionContext,
   stepName: string
-): StepResult {
+): Promise<StepResult> {
   const key = step.with?.key as string | undefined;
   const cachePath = step.with?.path as string | undefined;
   const restoreKeys = step.with?.['restore-keys'] as string | undefined;
+  const miss: StepResult = { name: stepName, status: 'success', duration: 0, outputs: { 'cache-hit': 'false' } };
 
   if (!key || !cachePath) {
     ctx.onOutput?.('Cache: missing key or path', 'stdout');
-    return {
-      name: stepName,
-      status: 'success',
-      duration: 0,
-      outputs: { 'cache-hit': 'false' },
-    };
+    return miss;
   }
 
   ctx.onOutput?.(`Cache (local): key=${key}, path=${cachePath}`, 'stdout');
 
-  const cacheDir = getLocalCacheDir();
-  const sanitizedKey = sanitizeCacheKey(key);
-  const cacheEntryDir = path.join(cacheDir, sanitizedKey);
-
-  // Check for exact match first
-  if (fs.existsSync(cacheEntryDir)) {
-    ctx.onOutput?.(`Cache hit: ${key}`, 'stdout');
-    return restoreCacheEntry(cacheEntryDir, cachePath, ctx, stepName, true);
+  const cacheDir = getLocalCacheDir(ctx);
+  if (!cacheDir) {
+    ctx.onOutput?.('Cache: no scope for this run, not restoring', 'stdout');
+    return miss;
   }
+  const exact = path.join(cacheDir, `${sanitizeCacheKey(key)}.tar`);
+  let archive: string | undefined = fs.existsSync(exact) ? exact : undefined;
 
-  // Check restore keys for prefix match
-  if (restoreKeys) {
-    const prefixes = restoreKeys.split('\n').map(k => k.trim()).filter(Boolean);
-    try {
-      if (!fs.existsSync(cacheDir)) {
-        fs.mkdirSync(cacheDir, { recursive: true });
+  // Restore keys match by prefix, newest first, as on GitHub.
+  if (!archive && restoreKeys && fs.existsSync(cacheDir)) {
+    const entries = fs.readdirSync(cacheDir)
+      .filter((name) => name.endsWith('.tar'))
+      .map((name) => ({ name, mtime: fs.statSync(path.join(cacheDir, name)).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+    for (const prefix of restoreKeys.split('\n').map((k) => k.trim()).filter(Boolean)) {
+      const match = entries.find((entry) => entry.name.startsWith(sanitizeCacheKey(prefix)));
+      if (match) {
+        ctx.onOutput?.(`Cache restored from key prefix: ${prefix}`, 'stdout');
+        archive = path.join(cacheDir, match.name);
+        break;
       }
-      const entries = fs.readdirSync(cacheDir);
-
-      for (const prefix of prefixes) {
-        const sanitizedPrefix = sanitizeCacheKey(prefix);
-        // Find entries that start with this prefix
-        const match = entries.find(entry => entry.startsWith(sanitizedPrefix));
-        if (match) {
-          ctx.onOutput?.(`Cache restored from key prefix: ${prefix}`, 'stdout');
-          return restoreCacheEntry(path.join(cacheDir, match), cachePath, ctx, stepName, false);
-        }
-      }
-    } catch (err) {
-      ctx.onOutput?.(`Cache lookup error: ${(err as Error).message}`, 'stderr');
     }
   }
 
-  ctx.onOutput?.('Cache miss', 'stdout');
-  return {
-    name: stepName,
-    status: 'success',
-    duration: 0,
-    outputs: { 'cache-hit': 'false' },
-  };
-}
+  if (!archive) {
+    ctx.onOutput?.('Cache miss', 'stdout');
+    return miss;
+  }
+  if (archive === exact) ctx.onOutput?.(`Cache hit: ${key}`, 'stdout');
 
-/**
- * Restore a cache entry to the workspace.
- */
-function restoreCacheEntry(
-  cacheEntryDir: string,
-  targetPath: string,
-  ctx: ExecutionContext,
-  stepName: string,
-  exactMatch: boolean
-): StepResult {
   try {
-    // Handle multiple paths separated by newlines
-    const paths = targetPath.split('\n').map(p => p.trim()).filter(Boolean);
-
-    for (const singlePath of paths) {
-      const absoluteTarget = path.isAbsolute(singlePath)
-        ? singlePath
-        : path.join(ctx.workDir, singlePath);
-
-      const cachedPath = path.join(cacheEntryDir, sanitizeCacheKey(singlePath));
-
-      if (fs.existsSync(cachedPath)) {
-        // Ensure parent directory exists
-        const parentDir = path.dirname(absoluteTarget);
-        if (!fs.existsSync(parentDir)) {
-          fs.mkdirSync(parentDir, { recursive: true });
-        }
-
-        // Copy cached files to target
-        copyDirRecursive(cachedPath, absoluteTarget);
-        ctx.onOutput?.(`  Restored: ${singlePath}`, 'stdout');
-      }
+    const result = await runSandboxedTar(['-x', '-f', '-', '-C', ctx.workDir], ctx, { stdinFile: archive });
+    if (result.exitCode !== 0) {
+      ctx.onOutput?.(`Cache restore error: ${result.stderr.trim()}`, 'stderr');
+      return miss;
     }
-
-    return {
-      name: stepName,
-      status: 'success',
-      duration: 0,
-      outputs: { 'cache-hit': exactMatch ? 'true' : 'false' },
-    };
   } catch (err) {
     ctx.onOutput?.(`Cache restore error: ${(err as Error).message}`, 'stderr');
-    return {
-      name: stepName,
-      status: 'success',
-      duration: 0,
-      outputs: { 'cache-hit': 'false' },
-    };
+    return miss;
   }
+  return { name: stepName, status: 'success', duration: 0, outputs: { 'cache-hit': archive === exact ? 'true' : 'false' } };
 }
 
 /**
- * Copy a directory recursively.
+ * Intercept actions/cache/save - save to the local cache.
  */
-function copyDirRecursive(src: string, dest: string): void {
-  const stat = fs.statSync(src);
-
-  if (stat.isDirectory()) {
-    if (!fs.existsSync(dest)) {
-      fs.mkdirSync(dest, { recursive: true });
-    }
-    for (const entry of fs.readdirSync(src)) {
-      copyDirRecursive(path.join(src, entry), path.join(dest, entry));
-    }
-  } else {
-    fs.copyFileSync(src, dest);
-  }
-}
-
-/**
- * Intercept actions/cache/save - save to local cache directory.
- */
-function executeCacheSaveIntercept(
+async function executeCacheSaveIntercept(
   step: WorkflowStep,
   ctx: ExecutionContext,
   stepName: string
-): StepResult {
+): Promise<StepResult> {
   const key = step.with?.key as string | undefined;
   const cachePath = step.with?.path as string | undefined;
+  // Cache save failure shouldn't fail the workflow
+  const done: StepResult = { name: stepName, status: 'success', duration: 0, outputs: {} };
 
   if (!key || !cachePath) {
     ctx.onOutput?.('Cache save: missing key or path', 'stdout');
-    return {
-      name: stepName,
-      status: 'success',
-      duration: 0,
-      outputs: {},
-    };
+    return done;
   }
 
   ctx.onOutput?.(`Cache save (local): key=${key}, path=${cachePath}`, 'stdout');
 
-  const cacheDir = getLocalCacheDir();
-  const sanitizedKey = sanitizeCacheKey(key);
-  const cacheEntryDir = path.join(cacheDir, sanitizedKey);
+  const cacheDir = getLocalCacheDir(ctx);
+  if (!cacheDir) {
+    ctx.onOutput?.('Cache save: no scope for this run, not saving', 'stdout');
+    return done;
+  }
 
+  const members = cacheMembers(cachePath, ctx).filter((member) => {
+    // Only a hint: tar runs confined to the workspace whatever is here.
+    const present = fs.existsSync(path.join(ctx.workDir, member));
+    if (!present) ctx.onOutput?.(`  Skipped (not found): ${member}`, 'stdout');
+    return present;
+  });
+  if (members.length === 0) return done;
+
+  const archive = path.join(cacheDir, `${sanitizeCacheKey(key)}.tar`);
+  // Entries are immutable once saved, as on GitHub.
+  if (fs.existsSync(archive)) {
+    ctx.onOutput?.(`Cache already saved for key: ${key}`, 'stdout');
+    return done;
+  }
+
+  fs.mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
+  const partial = path.join(cacheDir, `.partial-${crypto.randomBytes(8).toString('hex')}`);
   try {
-    // Handle multiple paths separated by newlines
-    const paths = cachePath.split('\n').map(p => p.trim()).filter(Boolean);
-
-    // Create cache entry directory
-    if (!fs.existsSync(cacheEntryDir)) {
-      fs.mkdirSync(cacheEntryDir, { recursive: true });
+    const result = await runSandboxedTar(['-c', '-f', '-', '-C', ctx.workDir, '--', ...members], ctx, {
+      stdoutFile: partial,
+    });
+    if (result.exitCode !== 0) {
+      ctx.onOutput?.(`Cache save error: ${result.stderr.trim()}`, 'stderr');
+      return done;
     }
-
-    for (const singlePath of paths) {
-      const absoluteSource = path.isAbsolute(singlePath)
-        ? singlePath
-        : path.join(ctx.workDir, singlePath);
-
-      if (fs.existsSync(absoluteSource)) {
-        const cachedPath = path.join(cacheEntryDir, sanitizeCacheKey(singlePath));
-        copyDirRecursive(absoluteSource, cachedPath);
-        ctx.onOutput?.(`  Saved: ${singlePath}`, 'stdout');
-      } else {
-        ctx.onOutput?.(`  Skipped (not found): ${singlePath}`, 'stdout');
-      }
-    }
-
-    return {
-      name: stepName,
-      status: 'success',
-      duration: 0,
-      outputs: {},
-    };
+    fs.renameSync(partial, archive);
+    for (const member of members) ctx.onOutput?.(`  Saved: ${member}`, 'stdout');
   } catch (err) {
     ctx.onOutput?.(`Cache save error: ${(err as Error).message}`, 'stderr');
-    return {
-      name: stepName,
-      status: 'success', // Cache save failure shouldn't fail the workflow
-      duration: 0,
-      outputs: {},
-    };
+  } finally {
+    fs.rmSync(partial, { force: true });
   }
+  return done;
 }
 
 /**
@@ -1060,15 +1147,143 @@ interface SandboxResult {
 }
 
 /**
+ * Write a step's profile where no step can reach it.
+ *
+ * The profile is what confines the step, so it must not live anywhere a step
+ * or a runner job can write. It used to go in os.tmpdir() under a name taken
+ * from the clock, written without O_EXCL and never removed: a sandboxed
+ * process could plant a symlink at the next name and have this write go
+ * through it, or swap a profile before sandbox-exec read it. It goes in the
+ * app's own data directory now, which the profiles deny, in a fresh private
+ * directory, created exclusively. Removed once the step is done unless
+ * LOCALMOST_KEEP_SANDBOX_PROFILES is set, as for the runner's profiles.
+ */
+function writeStepProfile(profile: string): { profilePath: string; remove: () => void } {
+  const base = path.join(getAppDataDirWithoutElectron(), 'test-sandbox-profiles');
+  fs.mkdirSync(base, { recursive: true, mode: 0o700 });
+  const dir = fs.mkdtempSync(path.join(base, 'step-'));
+  const profilePath = path.join(dir, 'profile.sb');
+  fs.writeFileSync(profilePath, profile, { encoding: 'utf-8', mode: 0o600, flag: 'wx' });
+  let removed = false;
+  return {
+    profilePath,
+    remove: () => {
+      if (removed || process.env.LOCALMOST_KEEP_SANDBOX_PROFILES) return;
+      removed = true;
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+/**
+ * The process groups this job's steps lead, by leader pid, and whether the
+ * leader has exited.
+ */
+const stepProcessGroups = new Map<number, boolean>();
+
+/** This job's process marker and the private directory holding it, once a step has needed one. */
+let jobMarker: (ProcessMarker & { dir: string }) | undefined;
+
+/**
+ * The marker every profile this job spawns under carries (see
+ * processMarkerRules), made the first time a step needs it.
+ *
+ * Two empty files with random names in a fresh private directory under the
+ * app data directory, which no step can reach. Real paths, as seatbelt
+ * matches those.
+ */
+function stepProcessMarker(): ProcessMarker {
+  if (!jobMarker) {
+    const base = path.join(getAppDataDirWithoutElectron(), 'test-sandbox-profiles');
+    fs.mkdirSync(base, { recursive: true, mode: 0o700 });
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(base, 'job-')));
+    const file = () => {
+      const name = path.join(dir, `mark-${crypto.randomBytes(8).toString('hex')}`);
+      fs.writeFileSync(name, '', { mode: 0o600, flag: 'wx' });
+      return name;
+    };
+    jobMarker = { dir, granted: file(), withheld: file() };
+  }
+  return { granted: jobMarker.granted, withheld: jobMarker.withheld };
+}
+
+/** Remember a step's process group, so reapStepProcesses can end it. */
+export function trackStepProcessGroup(proc: ChildProcess): void {
+  const pid = proc.pid;
+  if (!pid || pid <= 1) return;
+  stepProcessGroups.set(pid, false);
+  proc.once('exit', () => {
+    if (stepProcessGroups.has(pid)) stepProcessGroups.set(pid, true);
+  });
+}
+
+/**
+ * Kill whatever this job's steps left running.
+ *
+ * A step can background a process that outlives it - reparented to launchd,
+ * nothing would ever end it - and one from an untrusted checkout keeps
+ * whatever the sandbox gave it for as long as it lives. Called when a job
+ * ends, as GitHub's runner cleans up orphans at the end of a job and not the
+ * end of a step, so a server one step starts is still there for the next.
+ *
+ * First by process group. A pid is never reused while it names a live
+ * process group, so while the group has members its leader's pid addresses
+ * exactly them. Once the leader has exited, a live process with that pid
+ * means the group emptied and the pid was reused: that group is someone
+ * else's, and is left alone.
+ *
+ * Then by sandbox, since a process can leave its group with setsid() and
+ * outlive the job with its sandbox intact - able to write the workspace, and
+ * to hold a loopback port a later run's tests connect to. Its sandbox is the
+ * one thing it cannot leave, and every profile this job spawned carries its
+ * marker.
+ */
+export function reapStepProcesses(): void {
+  for (const [pgid, leaderExited] of stepProcessGroups) {
+    if (leaderExited) {
+      try {
+        process.kill(pgid, 0);
+        continue;
+      } catch {
+        // No process has the pid, so whatever is left in the group is ours.
+      }
+    }
+    try {
+      process.kill(-pgid, 'SIGKILL');
+    } catch {
+      // Already empty.
+    }
+  }
+  stepProcessGroups.clear();
+
+  if (jobMarker) {
+    const { dir, granted, withheld } = jobMarker;
+    if (!reapMarkedProcesses({ granted, withheld })) {
+      console.error('Warning: could not look for step processes that left their process group; some may still be running.');
+    }
+    // Removed either way; the next job makes its own.
+    jobMarker = undefined;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
  * Run a command in the sandbox.
  */
 async function runInSandbox(
   command: string,
   args: string[],
   options: {
+    /** Where the process starts; inside workDir. */
     cwd: string;
+    /** The workspace, which the profile is rooted at whatever cwd is. */
+    workDir: string;
+    /** Directories the step may read and never write, such as an action's code. */
+    readOnlyPaths?: string[];
     env: Record<string, string>;
     proxyPort: number;
+    /** Loopback ports beyond the proxy's; see ExecutionContext.loopback. */
+    loopback?: LoopbackGrant;
     onOutput?: (line: string, stream: 'stdout' | 'stderr') => void;
     sandboxLogFile?: string;
     collectedPids?: Set<number>;
@@ -1082,6 +1297,8 @@ async function runInSandbox(
     let spawnArgs: string[];
     let spawnCommand: string;
     let usedSandbox = false;
+    let profilePath = '';
+    let removeProfile = () => {};
 
     if (process.platform === 'darwin') {
       let profile: string;
@@ -1090,42 +1307,29 @@ async function runInSandbox(
       if (isDiscovery) {
         // Discovery mode: use special profile that logs all access
         profile = generateDiscoveryProfile({
-          workDir: options.cwd,
+          workDir: options.workDir,
+          readOnlyPaths: options.readOnlyPaths,
           proxyPort: options.proxyPort,
           logFile: options.sandboxLogFile ?? '',
+          processMarker: stepProcessMarker(),
         });
       } else {
-        // Strict mode: no policy provided and not permissive
-        // In strict mode, we block access to user caches (~/.npm, etc.)
-        const strictMode = !policy && !permissive;
-
         // Enforcement mode: apply sandbox with policy restrictions
         profile = generateSandboxProfile({
-          workDir: options.cwd,
+          workDir: options.workDir,
+          readOnlyPaths: options.readOnlyPaths,
           proxyPort: options.proxyPort,
+          loopback: options.loopback,
           policy: policy || {},  // Empty policy = no network allowlist
           permissive: false,
-          strictMode,
           logFile: options.sandboxLogFile,
+          processMarker: stepProcessMarker(),
         });
       }
 
-      // Write profile to temp file
-      const profilePath = path.join(os.tmpdir(), `localmost-sandbox-${Date.now()}.sb`);
-      fs.writeFileSync(profilePath, profile);
-
-      // Save a copy for inspection, but only when discovering: a normal run
-      // should not write into the workspace, which may be the user's checkout
-      // or an action's own directory. Keyed off discovery mode, not
-      // sandboxLogFile - the CLI sets that on every run, discovery or not.
-      if (isDiscovery) {
-        const debugProfilePath = path.join(options.cwd, '.debug', 'sandbox-profile.sb');
-        const debugDir = path.dirname(debugProfilePath);
-        if (!fs.existsSync(debugDir)) {
-          fs.mkdirSync(debugDir, { recursive: true });
-        }
-        fs.writeFileSync(debugProfilePath, profile);
-      }
+      const written = writeStepProfile(profile);
+      profilePath = written.profilePath;
+      removeProfile = written.remove;
 
       spawnCommand = '/usr/bin/sandbox-exec';
       usedSandbox = true;
@@ -1139,14 +1343,19 @@ async function runInSandbox(
     // it serves; test mode does not serve one yet, and the profile keeps the
     // daemon's own socket closed, so a job under localmost test runs without
     // Docker rather than with an unfiltered daemon.
+    //
+    // Detached, so the step leads a process group of its own and whatever it
+    // leaves running can be reaped when the job ends.
     const spawnOptions: SpawnOptions = {
       cwd: options.cwd,
       env: options.env,
       shell: false,
+      detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     };
 
     const proc = spawn(spawnCommand, spawnArgs, spawnOptions);
+    trackStepProcessGroup(proc);
     const stderrLines: string[] = [];
 
     // Track process tree using kqueue-based PidTreeWatcher for discovery mode
@@ -1194,6 +1403,8 @@ async function runInSandbox(
     proc.stderr?.on('data', (data: Buffer) => stderrSink.write(data.toString()));
 
     proc.on('close', (code) => {
+      removeProfile();
+
       // Release any output still held back for masking or an unterminated line.
       stdoutSink.end();
       stderrSink.end();
@@ -1227,6 +1438,7 @@ async function runInSandbox(
     });
 
     proc.on('error', (err) => {
+      removeProfile();
       if (pidWatcher) {
         pidWatcher.stop();
       }
@@ -1240,15 +1452,54 @@ async function runInSandbox(
 // =============================================================================
 
 /**
+ * Create a file the app hands a step, directly in the workspace, under a name
+ * no one could have guessed, and without following anything already there.
+ *
+ * The workspace is the step's to write, and something an earlier step left
+ * running is still there. The script used to go at .step-<ms>.sh and the
+ * output file at .github-output, both written with a plain writeFileSync: a
+ * symlink planted at either name had this unsandboxed process write the
+ * workflow's own script over any file of the user's, or truncate one. A
+ * random name and O_EXCL leave nothing to plant; the workspace directory
+ * itself is not the step's to replace.
+ */
+function createStepFile(workDir: string, prefix: string, suffix: string, content: string, mode: number): string {
+  const file = path.join(workDir, `${prefix}-${crypto.randomBytes(8).toString('hex')}${suffix}`);
+  fs.writeFileSync(file, content, { mode, flag: 'wx' });
+  return file;
+}
+
+/**
+ * Read a step's outputs back, refusing a file the step swapped for a link.
+ *
+ * The step can replace its output file with a symlink or a hard link to any
+ * file it cannot read itself - ~/.aws/credentials is name=value lines already
+ * - and this read happens outside the sandbox, with the result handed to the
+ * next step as ${{ steps.<id>.outputs.* }}. Opened without following a
+ * symlink or waiting on a FIFO, which would stop the run until a writer came,
+ * and read only if it is a regular file with no other name.
+ */
+function readStepOutputs(filePath: string): Record<string, string> {
+  let fd: number;
+  try {
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  } catch {
+    return {};
+  }
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.nlink !== 1) return {};
+    return parseGitHubOutput(fs.readFileSync(fd, 'utf-8'));
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
  * Parse the GITHUB_OUTPUT file format.
  * Format: name=value or name<<EOF\nvalue\nEOF
  */
-function parseGitHubOutputFile(filePath: string): Record<string, string> {
-  if (!fs.existsSync(filePath)) {
-    return {};
-  }
-
-  const content = fs.readFileSync(filePath, 'utf-8');
+function parseGitHubOutput(content: string): Record<string, string> {
   const outputs: Record<string, string> = {};
 
   const lines = content.split('\n');

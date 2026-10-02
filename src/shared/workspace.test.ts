@@ -3,11 +3,11 @@
  */
 
 import * as fs from 'fs';
+import * as path from 'path';
 import { execSync } from 'child_process';
 import {
   getWorkspacesDir,
   listWorkspaces,
-  removeWorkspace,
   cleanupWorkspaces,
   getWorkspacesTotalSize,
   getGitInfo,
@@ -16,7 +16,9 @@ import {
 } from './workspace';
 
 // Mock fs
-jest.mock('fs');
+// The automock leaves fs.promises out, as it is a getter; it is there to be
+// filled in, so the modules under test see it.
+jest.mock('fs', () => ({ ...jest.createMockFromModule<typeof import('fs')>('fs'), promises: {} }));
 // Mock child_process
 jest.mock('child_process');
 
@@ -27,6 +29,9 @@ describe('Workspace Management', () => {
   beforeEach(() => {
     jest.clearAllMocks();
   });
+
+  /** A workspace directory's entry, named as createWorkspace names one made at the given time. */
+  const madeAt = (ms: number, tail = 'abc123') => ({ name: `ws-${ms.toString(36)}-${tail}`, isDirectory: () => true });
 
   // ===========================================================================
   // getWorkspacesDir
@@ -54,29 +59,25 @@ describe('Workspace Management', () => {
       expect(result).toEqual([]);
     });
 
-    it('should list workspaces with metadata', () => {
-      mockFs.existsSync.mockImplementation((p) => {
-        const pathStr = String(p);
-        return pathStr.includes('workspaces') || pathStr.includes('.localmost-workspace.json');
-      });
+    it('lists each workspace by its name, newest first, and never reads its metadata', () => {
+      mockFs.existsSync.mockReturnValue(true);
+      const older = madeAt(Date.UTC(2024, 0, 1));
+      const newer = madeAt(Date.UTC(2024, 0, 2));
       (mockFs.readdirSync as jest.Mock).mockReturnValue([
+        older,
+        newer,
         { name: 'ws-abc123', isDirectory: () => true },
-        { name: 'ws-def456', isDirectory: () => true },
         { name: 'other-file', isDirectory: () => false },
       ]);
-      mockFs.readFileSync.mockReturnValue(
-        JSON.stringify({
-          id: 'ws-abc123',
-          path: '/path/to/ws-abc123',
-          sourceDir: '/repo',
-          createdAt: '2024-01-01T00:00:00.000Z',
-        })
-      );
 
       const result = listWorkspaces();
 
-      expect(result.length).toBeGreaterThan(0);
-      expect(result[0].id).toContain('ws-');
+      expect(result).toEqual([
+        { id: newer.name, path: path.join(getWorkspacesDir(), newer.name), createdAt: '2024-01-02T00:00:00.000Z' },
+        { id: older.name, path: path.join(getWorkspacesDir(), older.name), createdAt: '2024-01-01T00:00:00.000Z' },
+      ]);
+      expect(mockFs.openSync).not.toHaveBeenCalled();
+      expect(mockFs.readFileSync).not.toHaveBeenCalled();
     });
 
     it('should skip non-workspace directories', () => {
@@ -90,51 +91,6 @@ describe('Workspace Management', () => {
 
       expect(result).toEqual([]);
     });
-
-    it('should handle invalid metadata gracefully', () => {
-      mockFs.existsSync.mockReturnValue(true);
-      (mockFs.readdirSync as jest.Mock).mockReturnValue([
-        { name: 'ws-abc123', isDirectory: () => true },
-      ]);
-      mockFs.readFileSync.mockImplementation(() => {
-        throw new Error('Invalid JSON');
-      });
-      mockFs.statSync.mockReturnValue({
-        birthtime: new Date('2024-01-01'),
-      } as fs.Stats);
-
-      const result = listWorkspaces();
-
-      expect(result.length).toBe(1);
-      expect(result[0].id).toBe('ws-abc123');
-    });
-  });
-
-  // ===========================================================================
-  // removeWorkspace
-  // ===========================================================================
-
-  describe('removeWorkspace', () => {
-    it('should return false if workspace does not exist', () => {
-      mockFs.existsSync.mockReturnValue(false);
-
-      const result = removeWorkspace('ws-nonexistent');
-
-      expect(result).toBe(false);
-    });
-
-    it('should remove workspace directory', () => {
-      mockFs.existsSync.mockReturnValue(true);
-      mockFs.rmSync.mockImplementation(() => {});
-
-      const result = removeWorkspace('ws-test123');
-
-      expect(result).toBe(true);
-      expect(mockFs.rmSync).toHaveBeenCalledWith(
-        expect.stringContaining('ws-test123'),
-        { recursive: true, force: true }
-      );
-    });
   });
 
   // ===========================================================================
@@ -142,66 +98,50 @@ describe('Workspace Management', () => {
   // ===========================================================================
 
   describe('cleanupWorkspaces', () => {
-    it('should remove old workspaces', () => {
-      const oldDate = new Date(Date.now() - 48 * 60 * 60 * 1000); // 48 hours ago
-      const newDate = new Date();
+    // Which workspaces are chosen: each one is moved aside, the first step
+    // of removing it, by its own path. Removing it is on a real filesystem,
+    // in workspace.cleanup.test.ts. No earlier removal was left part done,
+    // and each one moved aside is gone by the time it is looked at.
+    const removalFs = () => {
+      const rename = jest.fn(async (_from: string, _to: string) => undefined);
+      jest.requireMock<{ promises: unknown }>('fs').promises = {
+        readdir: jest.fn(async () => []),
+        rename,
+        lstat: jest.fn(async () => {
+          throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+        }),
+      };
+      return { movedAside: () => rename.mock.calls.map(([from]) => from) };
+    };
+
+    it('should remove old workspaces', async () => {
+      const oldWs = madeAt(Date.now() - 48 * 60 * 60 * 1000); // 48 hours ago
+      const newWs = madeAt(Date.now());
 
       mockFs.existsSync.mockReturnValue(true);
-      (mockFs.readdirSync as jest.Mock).mockReturnValue([
-        { name: 'ws-old', isDirectory: () => true },
-        { name: 'ws-new', isDirectory: () => true },
-      ]);
-      mockFs.readFileSync.mockImplementation((p) => {
-        const pathStr = String(p);
-        if (pathStr.includes('ws-old')) {
-          return JSON.stringify({
-            id: 'ws-old',
-            path: '/path/ws-old',
-            sourceDir: '/repo',
-            createdAt: oldDate.toISOString(),
-          });
-        }
-        return JSON.stringify({
-          id: 'ws-new',
-          path: '/path/ws-new',
-          sourceDir: '/repo',
-          createdAt: newDate.toISOString(),
-        });
-      });
-      mockFs.rmSync.mockImplementation(() => {});
+      (mockFs.readdirSync as jest.Mock).mockReturnValue([oldWs, newWs]);
+      const { movedAside } = removalFs();
 
-      const result = cleanupWorkspaces({ maxAgeHours: 24 });
+      const result = await cleanupWorkspaces({ maxAgeHours: 24 });
 
       expect(result.removed).toBe(1);
       expect(result.kept).toBe(1);
+      expect(movedAside()).toEqual([path.join(getWorkspacesDir(), oldWs.name)]);
     });
 
-    it('should remove workspaces exceeding max count', () => {
+    it('should remove workspaces exceeding max count', async () => {
       const now = Date.now();
+      const entries = Array.from({ length: 15 }, (_, i) => madeAt(now - i * 1000, `a${i}`));
       mockFs.existsSync.mockReturnValue(true);
-      (mockFs.readdirSync as jest.Mock).mockReturnValue(
-        Array.from({ length: 15 }, (_, i) => ({
-          name: `ws-${i}`,
-          isDirectory: () => true,
-        }))
-      );
-      mockFs.readFileSync.mockImplementation((p) => {
-        const pathStr = String(p);
-        const match = pathStr.match(/ws-(\d+)/);
-        const idx = match ? parseInt(match[1]) : 0;
-        return JSON.stringify({
-          id: `ws-${idx}`,
-          path: `/path/ws-${idx}`,
-          sourceDir: '/repo',
-          createdAt: new Date(now - idx * 1000).toISOString(),
-        });
-      });
-      mockFs.rmSync.mockImplementation(() => {});
+      (mockFs.readdirSync as jest.Mock).mockReturnValue(entries);
+      const { movedAside } = removalFs();
 
-      const result = cleanupWorkspaces({ maxCount: 10, maxAgeHours: 9999 });
+      const result = await cleanupWorkspaces({ maxCount: 10, maxAgeHours: 9999 });
 
       expect(result.removed).toBe(5);
       expect(result.kept).toBe(10);
+      // The five oldest.
+      expect(movedAside()).toEqual(entries.slice(10).map(({ name }) => path.join(getWorkspacesDir(), name)));
     });
   });
 
@@ -346,6 +286,35 @@ describe('Workspace Management', () => {
       const result = getRepositoryFromDir('/repo');
 
       expect(result).toBe('owner/repo');
+    });
+
+    it('keeps a repository name that contains dots', () => {
+      // `localmost policy approve` keys the approval on this name, and
+      // "owner/my.repo" used to come back as nothing at all.
+      for (const url of [
+        'git@github.com:owner/my.repo.git',
+        'git@github.com:owner/my.repo',
+        'https://github.com/owner/my.repo.git',
+        'https://github.com/owner/my.repo',
+        'ssh://git@github.com/owner/my.repo.git',
+      ]) {
+        mockExecSync.mockReturnValue(`${url}\n`);
+        expect(getRepositoryFromDir('/repo')).toBe('owner/my.repo');
+      }
+      mockExecSync.mockReturnValue('https://github.com/owner/.github.git\n');
+      expect(getRepositoryFromDir('/repo')).toBe('owner/.github');
+    });
+
+    it('returns nothing for a remote that does not name one GitHub repository', () => {
+      for (const url of [
+        'https://github.com/owner/repo/extra.git',
+        'https://github.com.evil.example/owner/repo.git',
+        'https://github.com/owner/..',
+        'https://github.com/-owner/repo.git',
+      ]) {
+        mockExecSync.mockReturnValue(`${url}\n`);
+        expect(getRepositoryFromDir('/repo')).toBeNull();
+      }
     });
 
     it('should return null for non-GitHub remotes', () => {

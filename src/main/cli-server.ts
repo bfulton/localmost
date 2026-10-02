@@ -9,11 +9,14 @@ import * as net from 'net';
 import * as fs from 'fs';
 import { app } from 'electron';
 import { getCliSocketPath } from './paths';
-import { getRunnerManager, getHeartbeatManager, getAuthState } from './app-state';
-import { getSnapshot, selectRunnerStatus, selectEffectivePauseState } from './runner-state-service';
+import { getRunnerManager, getHeartbeatManager, getAuthState, getRunnerState, getResourceMonitor } from './app-state';
+import { pauseRunner, resumeRunner } from './runner-pause';
+import { getSnapshot, isRunning as isRunnerStarted, isStarting as isRunnerStarting, selectEffectivePauseState } from './runner-state-service';
+import { resourcePauseOverriddenText } from '../shared/resource-pause-text';
 import { getTargetManager } from './target-manager';
 import { getRunnerProxyManager } from './runner-proxy-manager';
 import type { Target } from '../shared/types';
+import { isGitHubOwnerName, isGitHubRepoName } from '../shared/github-names';
 import type {
   CliRequest,
   CliResponse,
@@ -46,6 +49,15 @@ export type {
  */
 const asName = (value: unknown): string | null =>
   typeof value === 'string' && value.trim() ? value.trim() : null;
+
+/** Longer than any request the CLI sends, by orders of magnitude. */
+const MAX_REQUEST_LINE_CHARS = 64 * 1024;
+
+/**
+ * Requests one connection may have waiting before the server stops reading
+ * it. The CLI sends one at a time; this is room for a script that pipelines.
+ */
+const MAX_QUEUED_REQUESTS = 32;
 
 /**
  * Describe a target for the CLI, including how many runner proxies are
@@ -148,29 +160,77 @@ export class CliServer {
    */
   private handleConnection(socket: net.Socket): void {
     let buffer = '';
+    // Requests on one connection run one at a time, in the order sent. Each
+    // data event used to start its own, so a pause still stopping the runner
+    // could be overtaken by the resume sent after it. While the queue is full
+    // the socket is not read, so a client sending faster than it is answered
+    // waits in its own buffers rather than growing ours.
+    const queue: string[] = [];
+    let draining = false;
+    let paused = false;
+    let refused = false;
+    // Decoded as one stream, so a character split across two reads survives.
+    socket.setEncoding('utf8');
 
-    socket.on('data', async (data) => {
-      buffer += data.toString();
+    const answer = async (line: string): Promise<void> => {
+      try {
+        const request = JSON.parse(line) as CliRequest;
+        const response = await this.handleCommand(request);
+        socket.write(JSON.stringify(response) + '\n');
+      } catch (parseError) {
+        const errorResponse: ErrorResponse = {
+          success: false,
+          error: `Invalid request: ${(parseError as Error).message}`,
+        };
+        socket.write(JSON.stringify(errorResponse) + '\n');
+      }
+    };
+
+    const drain = async (): Promise<void> => {
+      if (draining) return;
+      draining = true;
+      while (queue.length > 0 && !socket.destroyed) {
+        await answer(queue.shift()!);
+        if (paused && queue.length < MAX_QUEUED_REQUESTS) {
+          paused = false;
+          socket.resume();
+        }
+      }
+      queue.length = 0;
+      draining = false;
+    };
+
+    socket.on('data', (data: string) => {
+      if (refused) return;
+      buffer += data;
 
       // Try to parse complete JSON messages
       const lines = buffer.split('\n');
       buffer = lines.pop() || ''; // Keep incomplete line in buffer
 
-      for (const line of lines) {
-        if (!line.trim()) continue;
-
-        try {
-          const request = JSON.parse(line) as CliRequest;
-          const response = await this.handleCommand(request);
-          socket.write(JSON.stringify(response) + '\n');
-        } catch (parseError) {
-          const errorResponse: ErrorResponse = {
-            success: false,
-            error: `Invalid request: ${(parseError as Error).message}`,
-          };
-          socket.write(JSON.stringify(errorResponse) + '\n');
-        }
+      // A request is a line of JSON a few hundred bytes long. Buffering an
+      // unterminated one without limit let any client grow the app's memory
+      // until it was killed.
+      if (buffer.length > MAX_REQUEST_LINE_CHARS) {
+        refused = true;
+        buffer = '';
+        const errorResponse: ErrorResponse = { success: false, error: 'Invalid request: too large' };
+        // The rest of the upload is read and dropped rather than left unread,
+        // which would reset the connection before the client saw the answer;
+        // a client that keeps sending is cut off shortly after.
+        socket.end(JSON.stringify(errorResponse) + '\n');
+        setTimeout(() => socket.destroy(), 1000).unref();
+        return;
       }
+
+      for (const line of lines) {
+        if (line.trim()) queue.push(line);
+      }
+      if (queue.length >= MAX_QUEUED_REQUESTS && !paused) {
+        paused = true;
+        socket.pause();
+      }
+      void drain();
     });
 
     socket.on('error', (err) => {
@@ -190,11 +250,12 @@ export class CliServer {
 
     switch (request.command) {
       case 'status': {
-        // Use state machine for consistent status with UI
+        // Status from the runner; the machine is never told about jobs.
         const snapshot = getSnapshot();
-        const runnerState = snapshot ? selectRunnerStatus(snapshot) : { status: 'offline' as const };
+        const runnerState = getRunnerState();
         const pauseState = snapshot ? selectEffectivePauseState(snapshot) : { isPaused: false, reason: null };
         const runnerName = runnerManager?.getStatusDisplayName() || 'unknown';
+        const overridden = getResourceMonitor()?.getPauseState().overridden ?? null;
 
         return {
           success: true,
@@ -205,12 +266,21 @@ export class CliServer {
             heartbeat: {
               isRunning: heartbeatManager?.isRunning() || false,
             },
-            authenticated: !!authState,
+            // Authenticated means the app can act as this user. A session
+            // whose refresh token is spent cannot, so it is reported apart
+            // from "not connected at all" - the login is still known, and
+            // reconnecting is a different action from signing in fresh.
+            authenticated: !!authState && !authState.expired,
+            authExpired: !!authState?.expired,
             userName: authState?.user?.login,
+            // A pause is recorded whatever state the runner is in; the CLI
+            // shows it in place of the status only for the runner it holds.
+            runnerStarted: isRunnerStarted() || isRunnerStarting(),
             resourcePause: {
               isPaused: pauseState.isPaused,
               reason: pauseState.reason,
               conditions: [],
+              overridden,
             },
           },
         };
@@ -230,21 +300,20 @@ export class CliServer {
           return { success: false, error: 'Runner manager not initialized' };
         }
 
-        if (!runnerManager.isRunning()) {
-          return {
-            success: true,
-            command: 'pause',
-            message: 'Runner is already paused',
-          };
-        }
-
+        // The pause the tray sets. Whether the runner is paused is that flag,
+        // not whether it has workers: they are spawned per job, so an idle
+        // runner has none and this used to call it paused while it took jobs.
         try {
-          await runnerManager.stop();
-          heartbeatManager?.stop();
+          const outcome = await pauseRunner();
+          if (outcome === 'not-started') {
+            return { success: false, error: 'Runner is not started, so there is nothing to pause' };
+          }
           return {
             success: true,
             command: 'pause',
-            message: 'Runner paused successfully',
+            message: outcome === 'already-paused'
+              ? 'Runner is already paused'
+              : 'Runner paused: it takes no new jobs, and a job already running finishes',
           };
         } catch (err) {
           return { success: false, error: `Failed to pause: ${(err as Error).message}` };
@@ -256,27 +325,26 @@ export class CliServer {
           return { success: false, error: 'Runner manager not initialized' };
         }
 
-        if (runnerManager.isRunning()) {
-          return {
-            success: true,
-            command: 'resume',
-            message: 'Runner is already running',
-          };
-        }
-
         if (!runnerManager.isConfigured()) {
           return { success: false, error: 'Runner is not configured. Please complete setup in the app.' };
         }
 
         try {
-          await runnerManager.start();
-          // Note: heartbeat resume would require more setup (auth tokens, etc.)
-          // For now, CLI resume just starts the runner
-          return {
-            success: true,
-            command: 'resume',
-            message: 'Runner resumed successfully',
-          };
+          const outcome = await resumeRunner();
+          if (outcome === 'not-started') {
+            return { success: false, error: 'Runner is not started. Start it from the app.' };
+          }
+          // A resume overrides the resource conditions holding, until each
+          // clears; say which, since one recurring then pauses it again.
+          const overridden = getResourceMonitor()?.getPauseState().overridden;
+          const message = outcome === 'already-running'
+            ? 'Runner is already running'
+            : outcome === 'starting'
+              ? 'Runner is still starting, and is not paused'
+              : overridden
+                ? resourcePauseOverriddenText(overridden)
+                : 'Runner resumed';
+          return { success: true, command: 'resume', message };
         } catch (err) {
           return { success: false, error: `Failed to resume: ${(err as Error).message}` };
         }
@@ -302,10 +370,18 @@ export class CliServer {
         if (!ownerName) {
           return { success: false, error: 'Missing or invalid target owner' };
         }
+        // The names become GitHub API paths requested with the user's token;
+        // anything GitHub would not accept as a name is refused here.
+        if (!isGitHubOwnerName(ownerName)) {
+          return { success: false, error: `"${ownerName}" is not a valid GitHub user or organization name` };
+        }
 
         const repoName = asName(repo);
         if (type === 'repo' && !repoName) {
           return { success: false, error: 'Missing or invalid repo name for a repo target' };
+        }
+        if (type === 'repo' && !isGitHubRepoName(repoName)) {
+          return { success: false, error: `"${repoName}" is not a valid GitHub repository name` };
         }
 
         const result = await getTargetManager().addTargetAndAttach(

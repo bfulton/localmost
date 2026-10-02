@@ -10,6 +10,7 @@ const TestConsumer: React.FC = () => {
   return (
     <div>
       <span data-testid="user">{runner.user?.login || 'no-user'}</span>
+      <span data-testid="auth-expired">{String(runner.authExpired)}</span>
       <span data-testid="is-authenticating">{String(runner.isAuthenticating)}</span>
       <span data-testid="is-downloaded">{String(runner.isDownloaded)}</span>
       <span data-testid="is-configured">{String(runner.isConfigured)}</span>
@@ -105,6 +106,29 @@ describe('RunnerContext', () => {
       await waitFor(() => {
         expect(screen.getByTestId('user').textContent).toBe('testuser');
       });
+    });
+
+    it('reports an expired session without disturbing the user it already had', async () => {
+      // The invariant this protects: reporting expiry must not change what the
+      // app thinks its auth state is. Two attempts that did - withholding the
+      // user, flipping isAuthenticated - both ended in React #185, a blank
+      // "Something went wrong" screen five seconds after launch.
+      mockLocalmost.github.getAuthStatus.mockResolvedValue({
+        isAuthenticated: true,
+        expired: true,
+        user: { login: 'testuser', name: 'Test User', avatar_url: '' },
+      });
+
+      render(
+        <RunnerProvider>
+          <TestConsumer />
+        </RunnerProvider>
+      );
+
+      await waitFor(() => {
+        expect(screen.getByTestId('auth-expired').textContent).toBe('true');
+      });
+      expect(screen.getByTestId('user').textContent).toBe('testuser');
     });
 
     it('should load runner status on mount', async () => {

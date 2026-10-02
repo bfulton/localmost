@@ -52,6 +52,7 @@ contextBridge.exposeInMainWorld('localmost', {
     cancelAuth: () => ipcRenderer.invoke(IPC_CHANNELS.GITHUB_AUTH_CANCEL),
     getAuthStatus: () => ipcRenderer.invoke(IPC_CHANNELS.GITHUB_AUTH_STATUS),
     logout: () => ipcRenderer.invoke(IPC_CHANNELS.GITHUB_AUTH_LOGOUT),
+    reconnect: () => ipcRenderer.invoke(IPC_CHANNELS.GITHUB_AUTH_RECONNECT),
     getRepos: () => ipcRenderer.invoke(IPC_CHANNELS.GITHUB_GET_REPOS),
     getOrgs: () => ipcRenderer.invoke(IPC_CHANNELS.GITHUB_GET_ORGS),
     searchUsers: (query: string) => ipcRenderer.invoke(IPC_CHANNELS.GITHUB_SEARCH_USERS, query),
@@ -149,7 +150,8 @@ contextBridge.exposeInMainWorld('localmost', {
   // Targets (multi-target runner support)
   policy: {
     list: () => ipcRenderer.invoke(IPC_CHANNELS.POLICY_LIST),
-    approve: (repository: string) => ipcRenderer.invoke(IPC_CHANNELS.POLICY_APPROVE, repository),
+    approve: (repository: string, stamp: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.POLICY_APPROVE, repository, stamp),
     reject: (repository: string) => ipcRenderer.invoke(IPC_CHANNELS.POLICY_REJECT, repository),
   },
 
@@ -193,8 +195,10 @@ export interface LocalmostAPI {
     startAuth: () => Promise<{ success: boolean; user?: GitHubUser; error?: string }>;
     startDeviceFlow: () => Promise<{ success: boolean; user?: GitHubUser; error?: string }>;
     cancelAuth: () => Promise<{ success: boolean }>;
-    getAuthStatus: () => Promise<{ isAuthenticated: boolean; user?: GitHubUser }>;
+    getAuthStatus: () => Promise<{ isAuthenticated: boolean; expired?: boolean; user?: GitHubUser }>;
     logout: () => Promise<{ success: boolean }>;
+    /** Try to recover an expired session; false means the device flow is needed. */
+    reconnect: () => Promise<{ recovered: boolean }>;
     getRepos: () => Promise<{ success: boolean; repos?: GitHubRepo[]; error?: string }>;
     getOrgs: () => Promise<{ success: boolean; orgs?: GitHubOrg[]; error?: string }>;
     searchUsers: (query: string) => Promise<{ success: boolean; users?: GitHubUserSearchResult[]; error?: string }>;
@@ -247,7 +251,7 @@ export interface LocalmostAPI {
   };
   policy: {
     list: () => Promise<PolicySummary[]>;
-    approve: (repository: string) => Promise<Result>;
+    approve: (repository: string, stamp: string) => Promise<Result>;
     reject: (repository: string) => Promise<Result>;
   };
   targets: {

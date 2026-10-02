@@ -126,6 +126,36 @@ describe('runnerMachine', () => {
   });
 
   describe('pause state management', () => {
+    it('holds a pause made while starting, and comes up paused', () => {
+      // The broker is up and offered jobs before the runner is initialized,
+      // so a pause in that window has to hold.
+      const actor = createTestActor();
+
+      actor.send({ type: 'START' });
+      actor.send({ type: 'USER_PAUSE' });
+      expect(actor.getSnapshot().context.userPaused).toBe(true);
+
+      actor.send({ type: 'INITIALIZED' });
+      expect(actor.getSnapshot().value).toEqual({ running: 'paused' });
+
+      actor.send({ type: 'USER_RESUME' });
+      expect(actor.getSnapshot().value).toEqual({ running: 'listening' });
+
+      actor.stop();
+    });
+
+    it('comes up paused on a first listening instance too', () => {
+      const actor = createTestActor();
+
+      actor.send({ type: 'START' });
+      actor.send({ type: 'USER_PAUSE' });
+      actor.send({ type: 'INSTANCE_LISTENING', instanceNum: 1 });
+
+      expect(actor.getSnapshot().value).toEqual({ running: 'paused' });
+
+      actor.stop();
+    });
+
     it('should transition to paused on USER_PAUSE', () => {
       const actor = createTestActor();
 
@@ -214,6 +244,74 @@ describe('runnerMachine', () => {
       // Resume user second
       actor.send({ type: 'USER_RESUME' });
       expect(actor.getSnapshot().value).toEqual({ running: 'listening' });
+
+      actor.stop();
+    });
+  });
+
+  describe('a resource pause before the runner is running', () => {
+    // The resource monitor starts at launch, before the auto-start, and
+    // tells the machine about a condition already holding then. Only the
+    // running states took RESOURCE_PAUSE, so it was dropped: the runner came
+    // up listening, the tray and `localmost status` said so, and the monitor
+    // refused every job with nothing shown.
+    it('holds a pause that arrived while idle, and the runner comes up paused', () => {
+      const actor = createTestActor();
+
+      actor.send({ type: 'RESOURCE_PAUSE', reason: 'Battery at 20%' });
+      expect(actor.getSnapshot().value).toBe('idle');
+      expect(actor.getSnapshot().context.resourcePaused).toBe(true);
+      expect(actor.getSnapshot().context.resourcePauseReason).toBe('Battery at 20%');
+
+      actor.send({ type: 'START' });
+      actor.send({ type: 'INITIALIZED' });
+      expect(actor.getSnapshot().value).toEqual({ running: 'paused' });
+      expect(actor.getSnapshot().context.resourcePauseReason).toBe('Battery at 20%');
+
+      actor.stop();
+    });
+
+    it('holds a pause that arrived while starting', () => {
+      const actor = createTestActor();
+
+      actor.send({ type: 'START' });
+      actor.send({ type: 'RESOURCE_PAUSE', reason: 'Video call detected' });
+      actor.send({ type: 'INSTANCE_LISTENING', instanceNum: 1 });
+
+      expect(actor.getSnapshot().value).toEqual({ running: 'paused' });
+      expect(actor.getSnapshot().context.resourcePaused).toBe(true);
+
+      actor.stop();
+    });
+
+    it('lifts a pause whose condition cleared before the runner started', () => {
+      const actor = createTestActor();
+
+      actor.send({ type: 'RESOURCE_PAUSE', reason: 'Battery at 20%' });
+      expect(actor.getSnapshot().context.resourcePaused).toBe(true);
+      actor.send({ type: 'RESOURCE_RESUME' });
+      expect(actor.getSnapshot().context.resourcePaused).toBe(false);
+      expect(actor.getSnapshot().context.resourcePauseReason).toBeNull();
+
+      actor.send({ type: 'START' });
+      actor.send({ type: 'INITIALIZED' });
+      expect(actor.getSnapshot().value).toEqual({ running: 'listening' });
+
+      actor.stop();
+    });
+
+    it('holds a pause that arrived after a failed start, for the next start', () => {
+      const actor = createTestActor();
+
+      actor.send({ type: 'START' });
+      actor.send({ type: 'INSTANCE_ERROR', instanceNum: 1, error: 'boom' });
+      actor.send({ type: 'RESOURCE_PAUSE', reason: 'Battery at 20%' });
+      expect(actor.getSnapshot().value).toBe('error');
+      expect(actor.getSnapshot().context.resourcePaused).toBe(true);
+
+      actor.send({ type: 'START' });
+      actor.send({ type: 'INITIALIZED' });
+      expect(actor.getSnapshot().value).toEqual({ running: 'paused' });
 
       actor.stop();
     });

@@ -7,13 +7,23 @@ import {
   setMainWindow,
   getRunnerManager,
   getIsQuitting,
+  getLogger,
 } from './app-state';
+import { isAllowedExternalUrl, isAppEntryUrl } from './navigation';
 import { findAsset } from './log-file';
 import { BUILD_INFO } from '../shared/build-info';
 import { REPOSITORY_URL, PRIVACY_POLICY_URL } from '../shared/constants';
 
 declare const MAIN_WINDOW_WEBPACK_ENTRY: string;
 declare const MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY: string;
+
+const openExternalIfAllowed = (url: string): void => {
+  if (isAllowedExternalUrl(url)) {
+    shell.openExternal(url);
+  } else {
+    getLogger()?.warn(`Refusing to open ${url} externally: not a link the app makes`);
+  }
+};
 
 interface CreateWindowOptions {
   show?: boolean;
@@ -71,25 +81,24 @@ export const createWindow = (options: CreateWindowOptions = {}): void => {
     });
   }
 
-  // Open external links in default browser
+  // Open external links in default browser - only the ones the app itself
+  // links to. The renderer names the URL, so a renderer running someone
+  // else's script could otherwise hand the browser any page, or any scheme
+  // handler an http URL redirects to.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('http://') || url.startsWith('https://')) {
-      shell.openExternal(url);
-    }
+    openExternalIfAllowed(url);
     return { action: 'deny' };
   });
 
-  // Also handle navigation to external URLs
+  // The window never leaves the app's page: any page loaded here would run
+  // with the preload API, and so with every IPC channel. A link elsewhere
+  // goes to the browser under the same rule as above.
   mainWindow.webContents.on('will-navigate', (event, url) => {
-    // Allow navigation within the app
-    if (url.startsWith(MAIN_WINDOW_WEBPACK_ENTRY) || url.startsWith('file://')) {
+    if (isAppEntryUrl(url, MAIN_WINDOW_WEBPACK_ENTRY)) {
       return;
     }
-    // Open external URLs in default browser
-    if (url.startsWith('http://') || url.startsWith('https://')) {
-      event.preventDefault();
-      shell.openExternal(url);
-    }
+    event.preventDefault();
+    openExternalIfAllowed(url);
   });
 
   mainWindow.on('close', (event) => {

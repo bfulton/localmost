@@ -1,0 +1,6 @@
+-N LOCALMOST-INPUT
+-A LOCALMOST-INPUT -i lo -j ACCEPT
+-A LOCALMOST-INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A LOCALMOST-INPUT -d 198.18.0.1/32 -p tcp -m tcp --dport 3128 -j LOCALMOST-RELAY
+-A LOCALMOST-INPUT -p tcp -j REJECT --reject-with tcp-reset
+-A LOCALMOST-INPUT -j REJECT --reject-with icmp-port-unreachable

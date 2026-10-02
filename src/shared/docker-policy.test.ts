@@ -7,6 +7,8 @@ import {
   diffDockerPolicy,
   serializeDockerPolicy,
   parseDockerPolicyHint,
+  describeDockerGrants,
+  hasDockerGrants,
   DockerPolicy,
 } from './docker-policy';
 
@@ -16,6 +18,15 @@ describe('docker policy', () => {
     expect(isEmptyDockerPolicy({})).toBe(true);
     const granted: DockerPolicy = { run: { images: ['postgres:16'] } };
     expect(isEmptyDockerPolicy(granted)).toBe(false);
+  });
+
+  it('says a policy grants Docker actions exactly when it is not empty, which is what boots a VM', () => {
+    expect(hasDockerGrants(undefined)).toBe(false);
+    expect(hasDockerGrants({})).toBe(false);
+    expect(hasDockerGrants({ privileged: false })).toBe(false);
+    expect(hasDockerGrants({ pull: { registries: [] } })).toBe(true);
+    expect(hasDockerGrants({ run: {} })).toBe(true);
+    expect(hasDockerGrants({ build: {} })).toBe(true);
   });
 });
 
@@ -46,8 +57,8 @@ describe('validateDockerPolicy', () => {
   });
 
   it('accepts pull, build and run together', () => {
-    // privileged is deliberately absent: it is rejected until a managed VM
-    // backend exists, and has a case of its own below.
+    // privileged is deliberately absent: it is refused, and has a case of its
+    // own below.
     expect(collect({
       pull: { registries: ['docker.io', 'ghcr.io'] },
       run: { images: ['postgres:16'] },
@@ -352,11 +363,14 @@ describe('privileged at validation time', () => {
     return errs;
   };
 
-  it('rejects privileged: true, naming the backend it would require', () => {
+  it('rejects privileged: true, saying what a privileged container would reach', () => {
     // The design keeps privileged in the grammar so the gap stays honest, and
-    // rejects it until a managed VM can contain it. Accepting it here and
-    // refusing every request later reads as a broken policy, not a stage.
-    expect(collect({ privileged: true }).join('\n')).toMatch(/managed VM/i);
+    // the owner keeps it refused on the VM backend: a privileged container
+    // turns a guest kernel bug into a one-liner. Accepting it here and
+    // refusing every request later would read as a broken policy.
+    const message = collect({ privileged: true }).join('\n');
+    expect(message).toMatch(/privileged containers are not granted: they reach the Docker VM's kernel/);
+    expect(message).not.toMatch(/managed VM backend/i);
   });
 
   it('accepts privileged: false, which grants nothing', () => {
@@ -436,5 +450,147 @@ describe('a glob in run.images must say what tag it covers', () => {
 
   it('leaves exact references alone, tagless or not', () => {
     expect(collect({ run: { images: ['alpine', 'alpine:3', 'ghcr.io/o/app:1'] } })).toEqual([]);
+  });
+});
+
+describe('describeDockerGrants on container networks', () => {
+  // What an operator approving a routable network needs to read: a
+  // container's traffic leaves only through the job's own proxy, under the
+  // job's network allowlist, since the VM it runs in has no network card.
+  const proxied = /egress through this job's proxy, subject to its network allowlist/;
+
+  it("says a declared run.network egresses through the job's proxy, unless it is none", () => {
+    const grants = describeDockerGrants({ run: { network: 'bridge' } }, '');
+    expect(grants).toHaveLength(1);
+    expect(grants[0]).toMatch(/^docker network: bridge \(/);
+    expect(grants[0]).toMatch(proxied);
+    expect(grants[0]).not.toMatch(/unfiltered/);
+    // none has no network at all, so there is nothing to say.
+    expect(describeDockerGrants({ run: { network: 'none' } }, '')).toEqual(['docker network: none']);
+  });
+
+  it('says the same of a routable network the job may create, and not of an internal one', () => {
+    const grants = describeDockerGrants({
+      run: { networks: [{ name: 'open-*', internal: false }, { name: 'vk-*', internal: true }] },
+    }, '');
+    expect(grants).toHaveLength(2);
+    expect(grants[0]).toMatch(/^docker network create: open-\* \(routable/);
+    expect(grants[0]).toMatch(proxied);
+    expect(grants[1]).toBe('docker network create: vk-* (internal)');
+  });
+
+  it('says a build egresses through the proxy too, since its RUN steps default to the bridge', () => {
+    // The filter lets a build through with no network mode at all, whatever
+    // run.network says, and the classic builder then runs each step routable.
+    const withContext = describeDockerGrants({ build: { context: './' } }, '');
+    expect(withContext).toHaveLength(1);
+    expect(withContext[0]).toMatch(/^docker build: \.\/ \(RUN steps: /);
+    expect(withContext[0]).toMatch(proxied);
+    const bare = describeDockerGrants({ build: {} }, '');
+    expect(bare).toHaveLength(1);
+    expect(bare[0]).toMatch(/^docker build \(RUN steps: /);
+    expect(bare[0]).toMatch(proxied);
+  });
+});
+
+describe('describeDockerGrants on pulls', () => {
+  it('says a granted registry also sends localmost wherever that registry redirects', () => {
+    // localmost follows a registry's redirects to its CDN, outside the job's
+    // network allowlist, so granting the registry grants that too.
+    expect(describeDockerGrants({ pull: { registries: ['docker.io', 'ghcr.io'] } }, '')).toEqual([
+      'docker pull: docker.io, and fetching from wherever that registry redirects (any public https host)',
+      'docker pull: ghcr.io, and fetching from wherever that registry redirects (any public https host)',
+    ]);
+  });
+});
+
+describe('build.tags', () => {
+  const collect = (value: unknown, path = 'shared.docker') => {
+    const errs: string[] = [];
+    validateDockerPolicy(value, path, (m) => errs.push(m));
+    return errs;
+  };
+
+  it('accepts a list of name globs', () => {
+    expect(collect({ build: { context: './', tags: ['myapp:*', 'tools/*:ci', 'plain'] } })).toEqual([]);
+  });
+
+  it('rejects tags of the wrong shape, naming the path', () => {
+    expect(collect({ build: { tags: 'myapp:*' } }).join('\n')).toMatch(/shared\.docker\.build\.tags must be an array/);
+    expect(collect({ build: { tags: [7] } }).join('\n')).toMatch(/shared\.docker\.build\.tags\[0\] must be a string/);
+    expect(collect({ build: { tags: [''] } }).join('\n')).toMatch(/shared\.docker\.build\.tags\[0\] must be a non-empty/);
+  });
+
+  it('rejects an entry that carries a registry host or a digest, which no build may be tagged with', () => {
+    for (const entry of ['ghcr.io/x/y:*', 'localhost/app:1', 'localhost:5000/app:*', 'docker.io/library/app:1', 'Evil/app:1', 'app@sha256:abc']) {
+      expect([entry, collect({ build: { tags: [entry] } }).join('\n')]).toEqual([entry, expect.stringMatching(/build\.tags entry/)]);
+    }
+  });
+
+  it('rejects an entry no tag the daemon accepts could match, naming the lowercase form when there is one', () => {
+    // The evaluator holds a tag to the reference grammar before it compares
+    // globs, so these entries would be listed as grants and match nothing.
+    expect(collect({ build: { tags: ['MyApp:*'] } }).join('\n')).toMatch(/build\.tags entry "MyApp:\*".*"myapp:\*"/);
+    expect(collect({ build: { tags: ['tools/MyApp:ci'] } }).join('\n')).toMatch(/"tools\/myapp:ci"/);
+    for (const entry of ['my app:*', 'Ü:*', 'myapp:.ci', 'myapp:*:*', '-app:*', 'app-:1', 'a..b:*', 'myapp:é']) {
+      expect([entry, collect({ build: { tags: [entry] } }).join('\n')]).toEqual([entry, expect.stringMatching(/build\.tags entry .*not a name/)]);
+    }
+    // A wildcard stands for name or tag characters, wherever they may go.
+    for (const entry of ['*:*', '*/*:*', 'my-*:*', 'tools/my_*_app:v*', 'myapp:*-ci', 'myapp-lower:ci', 'myapp:CI']) {
+      expect([entry, collect({ build: { tags: [entry] } })]).toEqual([entry, []]);
+    }
+  });
+
+  it('rejects a tagless glob, as run.images does, naming the form that means what it looks like', () => {
+    expect(collect({ build: { tags: ['myapp-*'] } }).join('\n')).toMatch(/myapp-\*:\*/);
+    expect(collect({ build: { tags: ['myapp-*:*'] } })).toEqual([]);
+  });
+
+  it('composes shared and workflow tags additively, deduplicated, keeping the context', () => {
+    const merged = mergeDockerPolicy(
+      { build: { context: './', tags: ['myapp:*'] } },
+      { build: { tags: ['myapp:*', 'tools:ci'] } },
+    );
+    expect(merged?.build).toEqual({ context: './', tags: ['myapp:*', 'tools:ci'] });
+    expect(mergeDockerPolicy({ build: {} }, { build: {} })?.build).toEqual({});
+  });
+
+  it('shows each added or removed tag in the approval diff', () => {
+    const diffs = diffDockerPolicy(
+      { build: { tags: ['myapp:*'] } },
+      { build: { tags: ['tools:ci'] } },
+      'shared.docker',
+    );
+    expect(diffs).toEqual([
+      { path: 'shared.docker.build.tags', type: 'added', newValue: 'tools:ci' },
+      { path: 'shared.docker.build.tags', type: 'removed', oldValue: 'myapp:*' },
+    ]);
+    // A first tag is a grant on its own, even with the build block unchanged.
+    expect(diffDockerPolicy({ build: {} }, { build: { tags: ['myapp:*'] } }, 'shared.docker')).toEqual([
+      { path: 'shared.docker.build.tags', type: 'added', newValue: 'myapp:*' },
+    ]);
+  });
+
+  it('serializes tags in the documented shape, and reads them back', () => {
+    const lines = serializeDockerPolicy({ build: { context: './', tags: ['myapp:*'] } }, '');
+    expect(lines).toEqual(['docker:', '  build:', '    context: "./"', '    tags:', '      - "myapp:*"']);
+    const reparsed = parseLocalmostrcContent(`version: 1\nshared:\n  ${lines.join('\n  ')}\n`);
+    expect(reparsed.success).toBe(true);
+    expect(reparsed.config?.shared?.docker?.build).toEqual({ context: './', tags: ['myapp:*'] });
+    expect(serializeDockerPolicy({ build: { tags: ['a'] } }, '')).toEqual(['docker:', '  build:', '    tags:', '      - "a"']);
+  });
+
+  it('reads a build tag hint back into the policy it names', () => {
+    expect(parseDockerPolicyHint('docker:\n  build:\n    tags:\n      - "myapp:ci"')).toEqual({ build: { tags: ['myapp:ci'] } });
+    expect(parseDockerPolicyHint('docker:\n  build:\n    tags:\n      - "ghcr.io/x/y"')).toBeUndefined();
+  });
+
+  it('describes each tag for approval, saying which tags are refused whatever it declares', () => {
+    const grants = describeDockerGrants({ run: { images: ['postgres:16'] }, build: { context: './', tags: ['myapp:*', 'tools:ci'] } }, '');
+    expect(grants).toEqual(expect.arrayContaining([
+      expect.stringMatching(/^docker build: \.\/ \(RUN steps: /),
+      'docker build tag: myapp:* (never one run.images names or one with a registry host)',
+      'docker build tag: tools:ci (never one run.images names or one with a registry host)',
+    ]));
   });
 });

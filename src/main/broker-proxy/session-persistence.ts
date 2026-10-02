@@ -53,7 +53,7 @@ export class SessionPersistence {
     }
     sessions[targetId][instanceNum] = sessionId;
     try {
-      fs.writeFileSync(this.filePath, JSON.stringify(sessions, null, 2));
+      this.writeWhole(JSON.stringify(sessions, null, 2));
     } catch (err) {
       log()?.debug(`[SessionPersistence] Could not save session: ${(err as Error).message}`);
     }
@@ -74,10 +74,38 @@ export class SessionPersistence {
       if (Object.keys(sessions).length === 0) {
         fs.unlinkSync(this.filePath);
       } else {
-        fs.writeFileSync(this.filePath, JSON.stringify(sessions, null, 2));
+        this.writeWhole(JSON.stringify(sessions, null, 2));
       }
     } catch {
       // Ignore errors - file may not exist
+    }
+  }
+
+  /**
+   * Replace the file whole or not at all. A write that died partway - a full
+   * disk, a crash - left half a file, which load() cannot parse and reads as
+   * no sessions, so those the last run left upstream were never cleaned up.
+   * The rename within one directory is atomic; a failed write leaves the
+   * previous file as it was.
+   *
+   * The temporary name is fixed rather than per-process: the app holds a
+   * single-instance lock and writes synchronously, so nothing else writes it
+   * at the same time, and a file a crash left behind is overwritten by the
+   * next save instead of accumulating. It holds the same session ids, and one
+   * known name is one the runner profile can read-deny beside the real file.
+   */
+  private writeWhole(content: string): void {
+    const temp = `${this.filePath}.tmp`;
+    try {
+      fs.writeFileSync(temp, content);
+      fs.renameSync(temp, this.filePath);
+    } catch (err) {
+      try {
+        fs.unlinkSync(temp);
+      } catch {
+        // Never created, or already renamed into place
+      }
+      throw err;
     }
   }
 

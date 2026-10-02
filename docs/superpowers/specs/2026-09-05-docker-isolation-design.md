@@ -3,8 +3,13 @@
 A filtering Docker socket that localmost owns, so container work is subject to
 repository policy instead of escaping it.
 
-> **Status:** design. Supersedes the access model in
-> `docs/roadmap/docker-access.md`, which remains accurate for 0.3.0 as shipped.
+> **Status:** stage 1 implemented. Stage 2 is designed, and in progress, in
+> [VM Docker Backend — One Linux VM per Job](../../roadmap/vm-docker-backend.md):
+> an embedded Virtualization.framework helper runs one Linux VM per job, which
+> answers the first open question below. Unlike the progression table below,
+> stage 2 does not make `privileged` grantable: the owner decided it stays
+> refused. Supersedes the access model in `docs/roadmap/docker-access.md`, which
+> describes pre-release 0.3.0 builds.
 
 ## Problem
 
@@ -81,6 +86,32 @@ since nothing but the job connects, but the cost of preventing it is one rule.
 
 Socket paths are capped at 104 bytes on macOS and truncate rather than error, so
 the socket takes a short fixed name at the directory root.
+
+### Containers end with the socket
+
+The directory takes the socket with it, but not the containers made through it:
+`docker run -d` returns at once, and the container keeps running on the
+operator's daemon with egress no proxy filters. So the socket keeps a record of
+what the job created, and stopping it - which the worker's exit does - closes
+the socket first, then force-removes each of those containers with its
+anonymous volumes (`DELETE /containers/<id>?force=1&v=1`), then each network the
+job created. The removals name no API version, so the daemon serves them at its
+own: the socket's maxApiVersion is newer than some daemons it otherwise works
+with, and a daemon refuses a version newer than its own with a 400. They go a
+few at a time, however many the job left. A create already on its way to the
+daemon when the socket closes can still leave a container that is created but
+never started: its answer, and so its id, is lost with the job's connection. A
+removal the daemon refuses or does not answer is tried once more, then logged,
+and the stop completes anyway. The next worker in the slot, and the app
+quitting, wait for the sweep rather than racing it.
+
+The record is held in memory only. If localmost is killed before the worker
+exits, the job's containers keep running until something else removes them.
+
+A restart policy would undo that from the daemon's side, bringing a container
+back after it exits and after the daemon restarts. `HostConfig.RestartPolicy` is
+therefore gated to `no` or empty, what the CLI sends when `--restart` is not
+given.
 
 ### The profile gets simpler
 
@@ -221,8 +252,14 @@ escape to the stage that contains it.
 ### An always-on baseline
 
 `/_ping`, `/version`, `/info`, and reads about the job's own containers are
-permitted with no declaration. Every client needs them to start, and none reach
-the host.
+permitted with no declaration. Every client needs them to start. None changes
+anything, but `/info` in full describes the host: its name, the daemon's proxy
+URLs with any credentials in them, registry mirrors, labels, and how many
+containers and images the operator and other jobs have. The filter therefore
+answers `/info` with an allowlist of its fields - the daemon's version,
+platform, kernel, CPU count, memory, storage driver, cgroup version and
+security options, which clients use to decide how to talk to it - and withholds
+the rest, including any field a newer daemon adds.
 
 ### Credentials stop entering the sandbox
 
@@ -267,6 +304,8 @@ become executable tests run against the proxy:
 - `docker run -v ~/.ssh:/host-ssh` is refused.
 - Mounting the daemon socket into a container is refused.
 - `--privileged`, `--pid=host`, `--network=host`, `--device` are refused.
+- `--restart` with any policy but `no` is refused, and the containers a job
+  created are removed when its socket stops.
 - A `../` traversal and a symlinked workspace path that resolves outside the
   workspace are both refused.
 - An undeclared registry, an undeclared image, and an undeclared mount are
@@ -312,5 +351,14 @@ remains the whole of the access control.
 - Whether stage 2's VM is Lima/Colima shelled out to, or an embedded
   Virtualization.framework helper. Deferred deliberately: both sit behind
   `DockerBackend`, and the choice is better made with stage 1 usage in hand.
+  *Answered:* an embedded Virtualization.framework helper, `localmost-vm`,
+  running one VM per job ([the VM design](../../roadmap/vm-docker-backend.md)).
 - Per-container memory floor under a VM-per-container runtime, which stage 3
   would need in order to feed the existing resource-aware scheduler.
+- Removing a job's containers after localmost itself was killed. The socket's
+  record of what the job created lives in memory, so a crash leaves those
+  containers running. A likely shape: label each approved create with the
+  socket that made it (`dev.localmost.job=<uuid>`), and at startup remove the
+  labelled containers whose socket is gone. *Answered by stage 2:* the whole
+  daemon is the job's VM, each VM's helper stops it when localmost dies, and
+  the next launch removes what is left, so there is nothing to label.

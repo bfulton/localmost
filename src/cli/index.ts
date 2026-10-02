@@ -16,9 +16,11 @@
 
 import * as net from 'net';
 import * as fs from 'fs';
+import { isSocketLive } from './app-running';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import { getCliSocketPath } from '../shared/paths';
+import { formatStatus, getStatusIcon } from './status';
 import { runTest, parseTestArgs, printTestHelp } from './test';
 import { runPolicy, parsePolicyArgs, printPolicyHelp } from './policy';
 import { runEnv, parseEnvArgs, printEnvHelp } from './env';
@@ -31,6 +33,13 @@ import type {
   JobsResponse,
   ActionResponse,
 } from '../shared/cli-protocol';
+
+// Everything the CLI writes - approved policies, workspace copies, the
+// action cache - is the user's alone, as it is for the app, which sets the
+// same mask. A shell's usual 022 would leave it readable by every account on
+// the machine. Workflow steps run by `localmost test` inherit this, as a real
+// job does from the app.
+process.umask(0o077);
 
 const HELP_TEXT = `
 localmost - Run GitHub Actions locally
@@ -47,7 +56,7 @@ APP COMMANDS (requires running app):
   start     Start the localmost app
   stop      Stop the localmost app
   status    Show current runner status
-  pause     Pause the runner (stops accepting jobs)
+  pause     Pause the runner (takes no new jobs; running jobs finish)
   resume    Resume the runner (start accepting jobs)
   jobs      Show recent job history
   targets   Manage the repos/orgs this machine runs jobs for
@@ -95,69 +104,10 @@ function formatTimestamp(isoString: string): string {
   return date.toLocaleString();
 }
 
-function getStatusIcon(status: string): string {
-  switch (status) {
-    case 'listening': return '\u2713'; // checkmark
-    case 'busy': return '\u25CF';    // filled circle
-    case 'starting': return '\u25CB'; // empty circle
-    case 'offline': return '\u25CB'; // empty circle
-    case 'shutting_down': return '\u25CB'; // empty circle
-    case 'error': return '\u2717';   // x mark
-    case 'completed': return '\u2713';
-    case 'failed': return '\u2717';
-    case 'cancelled': return '-';
-    default: return '?';
-  }
-}
-
 function printStatus(response: StatusResponse): void {
-  const { runner, runnerName, heartbeat, authenticated, userName, resourcePause } = response.data;
-
-  console.log();
-
-  // GitHub status (matches Status Page order)
-  if (authenticated) {
-    console.log(`GitHub:    Connected as @${userName || 'unknown'}`);
-  } else {
-    console.log(`GitHub:    Not connected`);
+  for (const line of formatStatus(response.data)) {
+    console.log(line);
   }
-
-  // Runner status
-  let runnerStatusText: string;
-  let runnerIcon: string;
-
-  if (resourcePause?.isPaused) {
-    runnerIcon = '\u23F8'; // pause symbol
-    runnerStatusText = `Paused (${resourcePause.reason || 'resource constraint'})`;
-  } else {
-    runnerIcon = getStatusIcon(runner.status);
-    // Capitalize status to match UI
-    const statusMap: Record<string, string> = {
-      'offline': 'Offline',
-      'starting': 'Starting',
-      'listening': 'Listening',
-      'busy': 'Running job',
-      'error': 'Error',
-      'shutting_down': 'Shutting down',
-    };
-    runnerStatusText = statusMap[runner.status] || runner.status;
-  }
-
-  console.log(`Runner:    ${runnerIcon} ${runnerStatusText}`);
-  console.log(`           ${runnerName}`);
-
-  // Job status
-  if (runner.status === 'busy' && runner.jobName) {
-    console.log(`Job:       Running`);
-    console.log(`           ${runner.jobName}`);
-  } else {
-    console.log(`Job:       Inactive`);
-  }
-
-  // Heartbeat status
-  console.log(`Heartbeat: ${heartbeat.isRunning ? 'Active' : 'Inactive'}`);
-
-  console.log();
 }
 
 function printJobs(response: JobsResponse): void {
@@ -244,10 +194,14 @@ async function sendCommand(
 
 /**
  * Check if the app is running by testing socket connection.
+ *
+ * It used to check only that the socket file existed, which a force quit
+ * leaves behind - so `localmost start` reported "already running" forever
+ * afterwards with nothing running, and the only way out was knowing to delete
+ * the file. isSocketLive connects, and clears the file when nothing answers.
  */
-function isAppRunning(): boolean {
-  const socketPath = getCliSocketPath();
-  return fs.existsSync(socketPath);
+async function isAppRunning(): Promise<boolean> {
+  return isSocketLive(getCliSocketPath());
 }
 
 /**
@@ -318,7 +272,7 @@ function getDevCheckoutRoot(): string | null {
  * Start the localmost app.
  */
 async function startApp(): Promise<void> {
-  if (isAppRunning()) {
+  if (await isAppRunning()) {
     console.log('localmost is already running');
     return;
   }
@@ -369,7 +323,7 @@ async function startApp(): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, checkInterval));
     waited += checkInterval;
 
-    if (isAppRunning()) {
+    if (await isAppRunning()) {
       console.log('localmost started successfully');
       return;
     }
@@ -382,7 +336,7 @@ async function startApp(): Promise<void> {
  * Stop the localmost app.
  */
 async function stopApp(): Promise<void> {
-  if (!isAppRunning()) {
+  if (!await isAppRunning()) {
     console.log('localmost is not running');
     return;
   }
@@ -508,7 +462,7 @@ async function main(): Promise<void> {
       process.exit(1);
     }
 
-    if (!isAppRunning()) {
+    if (!await isAppRunning()) {
       console.error('Error: localmost app is not running (start it with "localmost start")');
       process.exit(1);
     }
@@ -528,7 +482,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  if (!isAppRunning()) {
+  if (!await isAppRunning()) {
     console.log('localmost app is not running');
     process.exit(0);
   }

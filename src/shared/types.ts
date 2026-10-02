@@ -166,6 +166,7 @@ export const IPC_CHANNELS = {
   GITHUB_AUTH_CANCEL: 'github:auth-cancel',
   GITHUB_DEVICE_CODE: 'github:device-code',
   GITHUB_AUTH_STATUS: 'github:auth-status',
+  GITHUB_AUTH_RECONNECT: 'github:auth-reconnect',
   GITHUB_AUTH_LOGOUT: 'github:auth-logout',
   GITHUB_GET_REPOS: 'github:get-repos',
   GITHUB_GET_ORGS: 'github:get-orgs',
@@ -261,8 +262,6 @@ export type SleepProtection = 'never' | 'when-busy' | 'always';
 /** Log level - controls what gets displayed/saved. Lower = more verbose */
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
-export type PreserveWorkDir = 'never' | 'session' | 'always';
-
 /** Tool cache location - controls where actions like setup-node cache downloaded tools */
 export type ToolCacheLocation = 'persistent' | 'per-sandbox';
 
@@ -284,8 +283,6 @@ export interface AppSettings {
   logLevel?: LogLevel;
   /** Minimum log level for runner output logs. Defaults to 'warn' */
   runnerLogLevel?: LogLevel;
-  /** Preserve workflow _work directory. Defaults to 'never' */
-  preserveWorkDir?: PreserveWorkDir;
   /** Tool cache location. Defaults to 'persistent' (shared across restarts) */
   toolCacheLocation?: ToolCacheLocation;
   /** Sandbox policy level for all sandbox restrictions. Defaults to 'strict' */
@@ -350,13 +347,26 @@ export interface GitHubUserSearchResult {
   name: string | null;
 }
 
-/** A repository policy the runner has recorded, for review in the app. */
+/**
+ * A repository policy the runner has recorded, for review in the app. A
+ * repository with both an approved policy and a pending one appears twice.
+ */
 export interface PolicySummary {
   repository: string;
   approved: boolean;
   cachedAt: string;
-  /** Human-readable summary of what the policy grants */
+  /** Human-readable summary of what the policy grants, level first */
   grants: string[];
+  /**
+   * For a pending policy that would replace an approved one: what it changes,
+   * one line each, e.g. "~ level: strict -> permissive".
+   */
+  changes?: string[];
+  /**
+   * sha256 of exactly this policy. Approving quotes it back, and is refused if
+   * the pending policy is no longer the one shown.
+   */
+  stamp: string;
 }
 
 // =============================================================================
@@ -566,4 +576,10 @@ export interface ResourcePauseState {
   reason: string | null;
   /** All active conditions */
   conditions: ResourceCondition[];
+  /**
+   * The conditions a manual resume overrode, still holding, named by kind
+   * ("battery power", "the video call"); null when there are none. They do
+   * not pause the runner again until they clear and recur.
+   */
+  overridden?: string | null;
 }

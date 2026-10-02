@@ -1,0 +1,72 @@
+{
+  "comment": "Every request the GitHub Actions runner can send to the address the local broker gives it, read from the runner's source at the tag below: what its listener and worker address to serverUrl/serverUrlV2 and to run_service_url (both the worker's broker address, written by runner-manager.ts and handleMessagePoll), and to the authorization URL of its .credentials (the worker's token endpoint, worker-credentials.ts). `served: local` is answered by the broker itself; `served: upstream` is forwarded on the runner's credentials, after the job gate. The broker forwards nothing else. broker-proxy-service.test.ts fails while runnerVersion is not FALLBACK_RUNNER_VERSION. That pins only the fallback: localmost installs the newest runner release by default, so check each newer release against this list too (see alsoChecked); one that sends another request upstream has it refused until the list is read again. Before changing either, read the new tag's src/Sdk/RSWebApi/RunServiceHttpClient.cs, src/Sdk/WebApi/WebApi/BrokerHttpClient.cs and their callers, and bring this list and UPSTREAM_OPERATIONS / LOCALLY_SERVED_PATHS in broker-proxy-service.ts up to date. Paths are relative to https://github.com/actions/runner/tree/<runnerCommit>/.",
+  "runnerVersion": "2.336.0",
+  "runnerCommit": "98aabcd429c4e8402406c56ce2d26387fed3b9ce",
+  "alsoChecked": "v2.337.0 (the newest release when this was read): RunServiceHttpClient.cs, RunServer.cs, BrokerServer.cs, BrokerMessageListener.cs, Runner.cs, Runner.Worker/JobRunner.cs and Runner.Listener/JobDispatcher.cs are byte-identical; BrokerHttpClient.cs differs but builds the same four requests.",
+  "operations": [
+    {
+      "method": "POST",
+      "path": "/session",
+      "served": "local",
+      "source": "src/Sdk/WebApi/WebApi/BrokerHttpClient.cs:147-156 CreateSessionAsync: new Uri(Client.BaseAddress, \"session\"), POST",
+      "caller": "src/Runner.Listener/BrokerMessageListener.cs:135, via src/Runner.Common/BrokerServer.cs CreateSessionAsync"
+    },
+    {
+      "method": "GET",
+      "path": "/message",
+      "served": "local",
+      "source": "src/Sdk/WebApi/WebApi/BrokerHttpClient.cs:59-105 GetRunnerMessageAsync: new Uri(Client.BaseAddress, \"message\"), GET",
+      "caller": "src/Runner.Listener/BrokerMessageListener.cs:296, via BrokerServer.GetRunnerMessageAsync"
+    },
+    {
+      "method": "DELETE",
+      "path": "/session",
+      "served": "local",
+      "source": "src/Sdk/WebApi/WebApi/BrokerHttpClient.cs:178-185 DeleteSessionAsync: new Uri(Client.BaseAddress, \"session\"), DELETE",
+      "caller": "src/Runner.Listener/BrokerMessageListener.cs:251, via BrokerServer.DeleteSessionAsync"
+    },
+    {
+      "method": "POST",
+      "path": "/acknowledge",
+      "served": "local",
+      "source": "src/Sdk/WebApi/WebApi/BrokerHttpClient.cs:196-241 AcknowledgeRunnerRequestAsync: new Uri(Client.BaseAddress, \"acknowledge\"), POST",
+      "caller": "src/Runner.Listener/BrokerMessageListener.cs:435, from src/Runner.Listener/Runner.cs:692-697 when the job message asks for an acknowledge"
+    },
+    {
+      "method": "POST",
+      "path": "/acquirejob",
+      "served": "local",
+      "source": "src/Sdk/RSWebApi/RunServiceHttpClient.cs:70-85 GetJobMessageAsync: new Uri(requestUri, \"acquirejob\"), POST",
+      "caller": "src/Runner.Listener/Runner.cs:729-735: RunServer connected to the job message's run_service_url"
+    },
+    {
+      "method": "POST",
+      "path": "/_apis/oauth2/token",
+      "served": "local",
+      "source": "src/Runner.Listener/Configuration/OAuthCredential.cs:25-48 GetVssCredentials: VssOAuthJwtBearerClientCredential posts to the authorizationUrl of .credentials",
+      "caller": "every connection the listener opens on its credentials (BrokerServer, RunServer)"
+    },
+    {
+      "method": "POST",
+      "path": "/completejob",
+      "served": "upstream",
+      "source": "src/Sdk/RSWebApi/RunServiceHttpClient.cs:123-152 CompleteJobAsync: new Uri(requestUri, \"completejob\"), POST, body names the job by planId and jobId",
+      "caller": "src/Runner.Worker/JobRunner.cs:290-332 and src/Runner.Listener/JobDispatcher.cs:1208-1219 ForceFailJob, on a RunServer connected (JobRunner.cs:67-70, JobDispatcher.cs:1244-1248) to the job's SystemVssConnection endpoint URL, which the broker does not rewrite: from this runner it goes to that URL, not through the broker"
+    },
+    {
+      "method": "POST",
+      "path": "/renewjob",
+      "served": "upstream",
+      "source": "src/Sdk/RSWebApi/RunServiceHttpClient.cs:184-197 RenewJobAsync: new Uri(requestUri, \"renewjob\"), POST, body names the job by planId and jobId",
+      "caller": "src/Runner.Listener/JobDispatcher.cs:738-760 RenewJobRequestAsync, on a RunServer connected to the job's SystemVssConnection endpoint URL, like completejob"
+    }
+  ],
+  "notThroughTheBroker": [
+    "All of this assumes the broker flow: src/Runner.Listener/Runner.cs:393-403 GetMessageListener uses BrokerMessageListener only when .runner has useV2Flow, which localmost passes through from the registration unchanged. Without it the listener's MessageListener opens a VssConnection to serverUrl, the broker address (_apis/connectionData, distributedtask pool sessions and messages); the broker refuses those, as GitHub's broker never served them",
+    "Timeline records, logs, step summaries and job telemetry: src/Runner.Common/JobServerQueue.cs:108-131 sends them to the results service at the job message's system.github.results_endpoint variable, and (for jobs that are not run-service jobs) to the job's SystemVssConnection endpoint",
+    "Action download info: src/Runner.Worker/ActionManager.cs:1068 LaunchServer.ResolveActionsDownloadInfoAsync, at the job message's system.github.launch_endpoint variable (src/Runner.Worker/JobRunner.cs:72-83)",
+    "ID tokens, artifacts and caches: requested by job code with the job's own token, at URLs in the job's environment",
+    "The pipelines RunnerServer (agent sessions, messages, job requests): src/Runner.Listener/BrokerMessageListener.cs:123-128 connects it only when serverUrl differs from serverUrlV2, and runner-manager.ts writes the broker address into both",
+    "IActionsRunServer at serverUrl: src/Runner.Listener/Runner.cs:713-722, only for a job message without a run_service_url, which the broker never delivers (processMessage acquires only jobs with one)"
+  ]
+}

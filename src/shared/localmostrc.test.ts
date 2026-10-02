@@ -2,10 +2,7 @@
  * Tests for .localmostrc Parser and Validator
  */
 
-import * as fs from 'fs';
 import {
-  findLocalmostrc,
-  parseLocalmostrc,
   parseLocalmostrcContent,
   effectivePolicyLevel,
   mergePolicies,
@@ -18,106 +15,11 @@ import {
 } from './localmostrc';
 import { SandboxPolicy } from './sandbox-profile';
 
-// Mock fs
-jest.mock('fs');
-
-const mockFs = fs as jest.Mocked<typeof fs>;
+// Finding and reading the file on disk: localmostrc.file.test.ts.
 
 describe('localmostrc', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-  });
-
-  // ===========================================================================
-  // findLocalmostrc
-  // ===========================================================================
-
-  describe('findLocalmostrc', () => {
-    it('should find .localmostrc file', () => {
-      mockFs.existsSync.mockImplementation((p) => p === '/repo/.localmostrc');
-
-      const result = findLocalmostrc('/repo');
-
-      expect(result).toBe('/repo/.localmostrc');
-    });
-
-    it('should find .localmostrc.yml file', () => {
-      mockFs.existsSync.mockImplementation((p) => p === '/repo/.localmostrc.yml');
-
-      const result = findLocalmostrc('/repo');
-
-      expect(result).toBe('/repo/.localmostrc.yml');
-    });
-
-    it('should find .localmostrc.yaml file', () => {
-      mockFs.existsSync.mockImplementation((p) => p === '/repo/.localmostrc.yaml');
-
-      const result = findLocalmostrc('/repo');
-
-      expect(result).toBe('/repo/.localmostrc.yaml');
-    });
-
-    it('should prefer .localmostrc over .localmostrc.yml', () => {
-      mockFs.existsSync.mockImplementation(
-        (p) => p === '/repo/.localmostrc' || p === '/repo/.localmostrc.yml'
-      );
-
-      const result = findLocalmostrc('/repo');
-
-      expect(result).toBe('/repo/.localmostrc');
-    });
-
-    it('should return null if no file found', () => {
-      mockFs.existsSync.mockReturnValue(false);
-
-      const result = findLocalmostrc('/repo');
-
-      expect(result).toBeNull();
-    });
-  });
-
-  // ===========================================================================
-  // parseLocalmostrc
-  // ===========================================================================
-
-  describe('parseLocalmostrc', () => {
-    it('should return error if file not found', () => {
-      mockFs.existsSync.mockReturnValue(false);
-
-      const result = parseLocalmostrc('/nonexistent.yml');
-
-      expect(result.success).toBe(false);
-      expect(result.errors[0].message).toContain('not found');
-    });
-
-    it('should return error if file cannot be read', () => {
-      mockFs.existsSync.mockReturnValue(true);
-      mockFs.readFileSync.mockImplementation(() => {
-        throw new Error('Permission denied');
-      });
-
-      const result = parseLocalmostrc('/unreadable.yml');
-
-      expect(result.success).toBe(false);
-      expect(result.errors[0].message).toContain('Failed to read');
-    });
-
-    it('should parse valid content from file', () => {
-      const content = `
-version: 1
-shared:
-  network:
-    allow:
-      - github.com
-`;
-      mockFs.existsSync.mockReturnValue(true);
-      mockFs.readFileSync.mockReturnValue(content);
-
-      const result = parseLocalmostrc('/test.yml');
-
-      expect(result.success).toBe(true);
-      expect(result.config?.version).toBe(1);
-    });
   });
 
   // ===========================================================================
@@ -293,6 +195,64 @@ shared:
 
       expect(result.success).toBe(false);
       expect(result.errors[0].message).toContain('must be a string');
+    });
+
+    it('rejects a filesystem path that would break out of the sandbox profile', () => {
+      // Filesystem paths are written into the sandbox-exec profile, a quoted
+      // DSL. A path carrying a quote and a newline could close the string and
+      // add its own rules - the user approves what the policy appears to say,
+      // not what it makes the sandbox enforce.
+      const content = [
+        'version: 1',
+        'shared:',
+        '  filesystem:',
+        '    read:',
+        '      - \'/tmp/x")\\n(allow default)\'',
+      ].join('\n');
+      const result = parseLocalmostrcContent(content);
+
+      expect(result.success).toBe(false);
+      expect(result.errors[0].message).toMatch(/must not contain/i);
+    });
+
+    it('rejects a filesystem path with .. traversal that could climb out of the workspace', () => {
+      // A relative workspace path is fine, but ".." could climb into the app's
+      // runner directory from the worker's own directory, past the filter.
+      const content = 'version: 1\nshared:\n  filesystem:\n    read:\n      - \'../../.localmost/runner/proxies\'';
+      const result = parseLocalmostrcContent(content);
+      expect(result.success).toBe(false);
+      expect(result.errors[0].message).toMatch(/must not contain "\.\."/);
+    });
+
+    it('still accepts a relative workspace path without traversal', () => {
+      const content = 'version: 1\nshared:\n  filesystem:\n    write:\n      - ./build\n      - ./Pods/';
+      const result = parseLocalmostrcContent(content);
+      expect(result.success).toBe(true);
+    });
+
+    it('refuses a relative filesystem deny, which the sandbox never applies', () => {
+      // seatbelt never matches a relative path against a real one, so the
+      // runner drops it and test mode matched nothing: the policy said a
+      // path was denied and nothing was.
+      for (const entry of ['./build/secret', 'secrets', '~other/x']) {
+        const r = parseLocalmostrcContent(`version: 1\nshared:\n  filesystem:\n    deny:\n      - '${entry}'`);
+        expect([entry, r.success]).toEqual([entry, false]);
+        expect(r.errors[0].message).toMatch(/shared\.filesystem\.deny\[0\] must be an absolute path or start with ~\//);
+      }
+      const w = parseLocalmostrcContent('version: 1\nworkflows:\n  ci:\n    filesystem:\n      deny:\n        - build');
+      expect(w.errors[0].message).toMatch(/workflows\.ci\.filesystem\.deny\[0\] must be an absolute path/);
+      for (const entry of ['/opt/secret', '~/.ssh/id_*', '~']) {
+        const r = parseLocalmostrcContent(`version: 1\nshared:\n  filesystem:\n    deny:\n      - '${entry}'`);
+        expect([entry, r.success]).toEqual([entry, true]);
+      }
+    });
+
+    it('rejects a backslash in a filesystem path', () => {
+      const content = 'version: 1\nshared:\n  filesystem:\n    write:\n      - \'/tmp/a\\\\b\'';
+      const result = parseLocalmostrcContent(content);
+
+      expect(result.success).toBe(false);
+      expect(result.errors[0].message).toMatch(/must not contain/i);
     });
 
     it('should error on invalid workflows type', () => {
@@ -723,6 +683,30 @@ workflows: just-a-string
   });
 });
 
+describe('top-level keys', () => {
+  it('rejects a key the grammar does not have, naming the ones it does', () => {
+    // A misspelt key was accepted and ignored, so "levle: strict" read as a
+    // decision about the level while leaving whatever else was declared -
+    // and a key a later version adds would be approved by an older one unseen.
+    const result = parseLocalmostrcContent('version: 1\nlevle: strict\nshared: {}\n');
+
+    expect(result.success).toBe(false);
+    expect(result.errors).toEqual([
+      expect.objectContaining({ message: expect.stringMatching(/"levle" is not a \.localmostrc key.*version, level, shared, workflows/) }),
+    ]);
+  });
+
+  it('rejects every unknown key, not just the first', () => {
+    const result = parseLocalmostrcContent('version: 1\nnetwork: {}\nsecrets: {}\n');
+    expect(result.errors.map((e) => e.message).join('\n')).toMatch(/"network"[\s\S]*"secrets"/);
+  });
+
+  it('accepts every key it does have', () => {
+    const result = parseLocalmostrcContent('version: 1\nlevel: strict\nshared: {}\nworkflows: {}\n');
+    expect(result.success).toBe(true);
+  });
+});
+
 describe('policy level', () => {
   const withLevel = (level: string) => `version: 1\nlevel: ${level}\n`;
 
@@ -794,6 +778,86 @@ describe('serializing a declared level', () => {
     const config = parseLocalmostrcContent('version: 1\n').config!;
 
     expect(serializeLocalmostrc(config)).not.toContain('level:');
+  });
+});
+
+describe('writing a policy back', () => {
+  // `localmost test --updaterc` parses the file, merges what it discovered
+  // and writes the whole policy back. Whatever the writer drops or garbles,
+  // the repository loses - silently, or on its next parse.
+  const roundTrip = (config: LocalmostrcConfig) => {
+    const reparsed = parseLocalmostrcContent(serializeLocalmostrc(config));
+    expect(reparsed.errors).toEqual([]);
+    return reparsed.config;
+  };
+
+  it.each([
+    ['every port', true],
+    ['a port list', [5432, 6379]],
+  ] as const)('keeps every key the grammar accepts, with loopback as %s', (_label, loopback) => {
+    const config: LocalmostrcConfig = {
+      version: 1,
+      level: 'moderate',
+      shared: {
+        network: { allow: ['github.com'], deny: ['tracker.example'], loopback: loopback as true | number[] },
+        filesystem: { read: ['/usr/local'], write: ['./build'], deny: ['~/.ssh'] },
+        env: { allow: ['NODE_OPTIONS'], deny: ['AWS_SECRET_ACCESS_KEY'] },
+        docker: { pull: { registries: ['docker.io'] } },
+      },
+      workflows: {
+        ci: {
+          network: { allow: ['registry.npmjs.org'], deny: ['ads.example'] },
+          filesystem: { read: ['/opt'], deny: ['/opt/secrets'] },
+          env: { allow: ['CI_FLAG'], deny: ['NPM_TOKEN'] },
+          docker: { build: { context: './' } },
+          secrets: { require: ['DEPLOY_KEY'] },
+        },
+      },
+    };
+
+    expect(roundTrip(config)).toEqual(config);
+  });
+
+  it('quotes env patterns and workflow names that YAML would read as something else', () => {
+    // `*` opens a YAML alias and `: ` a mapping, so unquoted either makes
+    // the rewritten file unparseable; `#` starts a comment. A name that
+    // reads as a number, bool, null or date parses, but as a different key,
+    // so its section would quietly stop applying to the workflow.
+    const config: LocalmostrcConfig = {
+      version: 1,
+      shared: { env: { allow: ['LC_*'], deny: ['*_TOKEN', '*'] } },
+      workflows: {
+        'Release: tag #1': { secrets: { require: ['NPM_TOKEN'] } },
+        'CI build': { env: { deny: ['*SECRET*'] } },
+        '1.0': { secrets: { require: ['A'] } },
+        '0x10': { secrets: { require: ['B'] } },
+        '1e3': { secrets: { require: ['C'] } },
+        True: { secrets: { require: ['D'] } },
+        true: { secrets: { require: ['E'] } },
+        NULL: { secrets: { require: ['F'] } },
+        '2024-01-01': { secrets: { require: ['G'] } },
+        'release-1.0': { secrets: { require: ['H'] } },
+      },
+    };
+
+    expect(roundTrip(config)).toEqual(config);
+  });
+
+  it('writes a section with nothing in it as one that parses back', () => {
+    // mergeDiscoveredAccess leaves `network: { allow: [] }` on a policy
+    // that had no network section and gained only paths, and starts a new
+    // policy with an empty entry for the workflow.
+    const config: LocalmostrcConfig = {
+      version: 1,
+      shared: { network: { allow: [] }, filesystem: { read: ['/usr'], write: [] } },
+      workflows: { ci: {} },
+    };
+
+    expect(roundTrip(config)).toEqual({
+      version: 1,
+      shared: { filesystem: { read: ['/usr'] } },
+      workflows: { ci: {} },
+    });
   });
 });
 
@@ -1017,6 +1081,38 @@ describe('a policy key the grammar does not know', () => {
     expect(ok.errors).toEqual([]);
     expect(ok.success).toBe(true);
   });
+
+  it('is refused inside a section too, and the message names the keys that section accepts', () => {
+    // `lookback: true` read as a loopback grant and did nothing; `denny:`
+    // read as a protection that did not exist. Both validated clean.
+    const cases: Array<[string, string, string[]]> = [
+      ['  network:\n    lookback: true\n', 'shared.network.lookback', ['allow', 'deny', 'loopback']],
+      ['  filesystem:\n    denny: ["~/.ssh"]\n', 'shared.filesystem.denny', ['read', 'write', 'deny']],
+      ['  env:\n    alow: ["CI"]\n', 'shared.env.alow', ['allow', 'deny']],
+    ];
+    for (const [body, where, accepted] of cases) {
+      const result = parse(body);
+      expect(result.success).toBe(false);
+      const message = result.errors.map((e) => e.message).join('\n');
+      expect(message).toContain(`${where} is not a policy key`);
+      expect(message).toContain(`Accepted keys: ${accepted.join(', ')}.`);
+    }
+  });
+
+  it('is refused under a workflow\'s secrets', () => {
+    const r = parseLocalmostrcContent('version: 1\nworkflows:\n  deploy:\n    secrets:\n      requires: ["KEY"]\n');
+    expect(r.success).toBe(false);
+    expect(r.errors.map((e) => e.message).join('\n')).toContain('workflows.deploy.secrets.requires is not a policy key');
+  });
+
+  it('still accepts every key a section knows', () => {
+    const ok = parse(
+      '  network:\n    allow: ["github.com"]\n    deny: ["evil.example"]\n    loopback: [5432]\n' +
+      '  filesystem:\n    read: ["/etc"]\n    write: ["~/.npm"]\n    deny: ["~/.ssh"]\n' +
+      '  env:\n    allow: ["CI"]\n    deny: ["AWS_*"]\n'
+    );
+    expect(ok.errors).toEqual([]);
+  });
 });
 
 describe('secrets is a workflow-scoped key', () => {
@@ -1031,5 +1127,148 @@ describe('secrets is a workflow-scoped key', () => {
     const r = parseLocalmostrcContent('version: 1\nshared:\n  secrets:\n    require: ["DEPLOY_KEY"]\n');
     expect(r.success).toBe(false);
     expect(r.errors.map((e) => e.message).join('\n')).toMatch(/shared\.secrets is not a policy key/);
+  });
+});
+
+describe('a network entry', () => {
+  const parsed = (list: 'allow' | 'deny', entry: string) =>
+    parseLocalmostrcContent(`version: 1\nshared:\n  network:\n    ${list}:\n      - ${JSON.stringify(entry)}\n`);
+
+  it('refuses a network entry that is not a host pattern', () => {
+    // Each read as some host no connection has - "https" with a port that is
+    // not one, a name with a space in it - so it allowed or denied nothing.
+    for (const entry of ['https://evil.com', ' evil.com', 'evil.com ', 'evil.com:ssh', '*', '*.', '.evil.com', '*.1.2.3.4', 'a b.com', 'evil..com', ':443', '']) {
+      for (const list of ['allow', 'deny'] as const) {
+        const r = parsed(list, entry);
+        expect([list, entry, r.success]).toEqual([list, entry, false]);
+        expect(r.errors[0].message).toMatch(new RegExp(`shared\\.network\\.${list}\\[0\\] must be a host`));
+      }
+    }
+    const w = parseLocalmostrcContent('version: 1\nworkflows:\n  ci:\n    network:\n      deny:\n        - "http://x.example"\n');
+    expect(w.errors[0].message).toMatch(/workflows\.ci\.network\.deny\[0\] must be a host/);
+  });
+
+  it('refuses a range or a URL with the grammar, not the host its prefix spells', () => {
+    // The spelling check reads a host the way a URL does, which ends it at the
+    // first of these; "10.0.0.0/8" came back as "write \"10.0.0.0\" instead",
+    // and a deny written that way denies one address rather than the range.
+    // A tab or line break is dropped the same way, so "evil.com\tx" was
+    // offered "evil.comx", a host the entry never named.
+    for (const entry of ['10.0.0.0/8', '2001:db8::/32', 'evil.com/path', 'evil.com?x=1', 'evil.com#top', 'evil.com\\x', 'evil.com\tx', 'evil.com\nx', 'evil.com\rx']) {
+      for (const list of ['allow', 'deny'] as const) {
+        const r = parsed(list, entry);
+        expect([list, entry, r.success]).toEqual([list, entry, false]);
+        expect(r.errors.map((e) => e.message)).toEqual([
+          `shared.network.${list}[0] must be a host, an IP address or *.domain, optionally with :port, and nothing else`,
+        ]);
+      }
+    }
+  });
+
+  it('refuses a host written in a spelling the proxy never compares, and says which one it does', () => {
+    // A request's host arrives in ASCII, with its address written out and no
+    // trailing dot; an allow entry spelled otherwise never matched one. The
+    // spelling offered keeps the entry's wildcard and port, so writing it in
+    // does not turn a wildcard into one host.
+    for (const [entry, suggestion] of [
+      ['bücher.example', 'xn--bcher-kva.example'],
+      ['0x7f.1', '127.0.0.1'],
+      ['0x7f.1:8080', '127.0.0.1:8080'],
+      ['*.bücher.example:8443', '*.xn--bcher-kva.example:8443'],
+      ['[2001:0db8:0:0:0:0:0:1]:8443', '[2001:db8::1]:8443'],
+      ['example.com.', 'example.com'],
+      ['*.example.com.:8080', '*.example.com:8080'],
+    ]) {
+      for (const list of ['allow', 'deny'] as const) {
+        const r = parsed(list, entry);
+        expect([list, entry, r.success]).toEqual([list, entry, false]);
+        expect(r.errors[0].message).toContain(`write "${suggestion}" instead`);
+      }
+    }
+  });
+
+  it('accepts a host, an address or a wildcard, with or without a port', () => {
+    for (const entry of [
+      'github.com',
+      'API.GitHub.com',
+      '*.github.com',
+      'registry.npmjs.org:8443',
+      '*.example.com:8080',
+      'my_host-1.internal',
+      '192.0.2.1',
+      '192.0.2.1:8080',
+      '2606:4700::1111',
+      '[2001:db8::1]:8443',
+      'localhost',
+    ]) {
+      for (const list of ['allow', 'deny'] as const) {
+        expect([list, entry, parsed(list, entry).success]).toEqual([list, entry, true]);
+      }
+    }
+  });
+});
+
+describe('network.loopback', () => {
+  const shared =(value: string) => parseLocalmostrcContent(`version: 1\nshared:\n  network:\n    loopback: ${value}\n`);
+  const messages = (value: string) => shared(value).errors.map((e) => e.message).join('\n');
+
+  it('accepts every port, or a list of ports, under shared:', () => {
+    expect(shared('true').config?.shared?.network?.loopback).toBe(true);
+    expect(shared('[5432, 6379]').config?.shared?.network?.loopback).toEqual([5432, 6379]);
+    expect(shared('[1, 65535]').success).toBe(true);
+  });
+
+  it('refuses anything but true or a list of distinct ports', () => {
+    for (const value of ['false', '"all"', '5432', '{}', '', '[0]', '[65536]', '[-1]', '[1.5]', '["5432"]', '[true]']) {
+      expect([value, shared(value).success]).toEqual([value, false]);
+      expect(messages(value)).toMatch(/shared\.network\.loopback/);
+    }
+    expect(messages('[5432, 5432]')).toMatch(/shared\.network\.loopback lists port 5432 twice/);
+  });
+
+  it('is refused per workflow, since the sandbox profile is fixed when the worker starts', () => {
+    const r = parseLocalmostrcContent('version: 1\nworkflows:\n  ci:\n    network:\n      loopback: true\n');
+    expect(r.success).toBe(false);
+    expect(r.errors.map((e) => e.message).join('\n')).toMatch(
+      /workflows\.ci\.network\.loopback is only accepted under shared\.network: the sandbox profile is fixed when the worker starts/
+    );
+  });
+
+  it('is a policy change, so a new grant is approved before it applies', () => {
+    const base: LocalmostrcConfig = { version: 1, shared: { network: { allow: ['github.com'] } } };
+    const withLoopback = (loopback: true | number[]): LocalmostrcConfig => ({
+      version: 1,
+      shared: { network: { allow: ['github.com'], loopback } },
+    });
+    expect(diffConfigs(base, withLoopback(true))).toEqual([
+      { path: 'shared.network.loopback', type: 'added', newValue: 'every port' },
+    ]);
+    expect(diffConfigs(withLoopback([5432]), withLoopback([5432, 6379]))).toEqual([
+      { path: 'shared.network.loopback', type: 'added', newValue: '6379' },
+    ]);
+    expect(diffConfigs(withLoopback([5432]), withLoopback(true))).toEqual([
+      { path: 'shared.network.loopback', type: 'added', newValue: 'every port' },
+      { path: 'shared.network.loopback', type: 'removed', oldValue: '5432' },
+    ]);
+    expect(diffConfigs(withLoopback([5432]), withLoopback([5432]))).toEqual([]);
+  });
+
+  it('survives serialization', () => {
+    for (const loopback of [true, [5432, 6379]] as const) {
+      const config: LocalmostrcConfig = { version: 1, shared: { network: { loopback: loopback as true | number[] } } };
+      const reparsed = parseLocalmostrcContent(serializeLocalmostrc(config));
+      expect(reparsed.config?.shared?.network?.loopback).toEqual(loopback);
+    }
+  });
+
+  it('carries into the effective policy of every workflow', () => {
+    const config: LocalmostrcConfig = {
+      version: 1,
+      shared: { network: { loopback: [5432] } },
+      workflows: { ci: { network: { allow: ['x.example'] } } },
+    };
+    expect(getEffectivePolicy(config, 'ci').network).toEqual(
+      expect.objectContaining({ allow: ['x.example'], loopback: [5432] })
+    );
   });
 });

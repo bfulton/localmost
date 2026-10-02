@@ -351,6 +351,15 @@ export const runnerMachine = setup({
   initial: 'idle',
   context: initialContext,
 
+  // The resource monitor runs from launch, whether or not the runner is, and
+  // says when a condition starts and stops holding. A state that does not
+  // take these itself records them, so a pause from before the runner is
+  // running is shown, and the runner comes up paused.
+  on: {
+    RESOURCE_PAUSE: { actions: 'setResourcePaused' },
+    RESOURCE_RESUME: { actions: 'clearResourcePaused' },
+  },
+
   states: {
     idle: {
       on: {
@@ -363,11 +372,18 @@ export const runnerMachine = setup({
 
     starting: {
       on: {
-        INITIALIZED: 'running',
-        INSTANCE_LISTENING: {
-          target: 'running',
-          actions: 'updateInstanceListening',
-        },
+        // The broker is up and offered jobs before the runner is, so a user
+        // pause holds from here, and the runner comes up paused.
+        INITIALIZED: [
+          { guard: 'isPaused', target: 'running.paused' },
+          { target: 'running' },
+        ],
+        INSTANCE_LISTENING: [
+          { guard: 'isPaused', target: 'running.paused', actions: 'updateInstanceListening' },
+          { target: 'running', actions: 'updateInstanceListening' },
+        ],
+        USER_PAUSE: { actions: 'setUserPaused' },
+        USER_RESUME: { actions: 'clearUserPaused' },
         INSTANCE_ERROR: {
           target: 'error',
           actions: ['updateInstanceError', 'setError'],

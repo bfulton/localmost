@@ -7,39 +7,21 @@
  * happens without leaving the app.
  */
 
-import { ipcMain } from 'electron';
+import { ipcMain } from './trusted-ipc';
 import { IPC_CHANNELS, PolicySummary, Result } from '../../shared/types';
 import {
   listCachedPolicies,
   approvePolicy,
-  removeCachedPolicy,
-  recordPolicyDecision,
+  rejectPolicy,
+  approvalStamp,
 } from '../policy-cache';
-import {
-  getRunnerManager, getLogger } from '../app-state';
-import { DockerPolicy } from '../../shared/docker-policy';
-import { describePolicy } from '../../shared/policy-describe';
+import { getRunnerManager, getLogger } from '../app-state';
+import { DescribablePolicy, PolicyScope, describePolicy } from '../../shared/policy-describe';
+import { LocalmostrcConfig, diffConfigs, formatPolicyDiff } from '../../shared/localmostrc';
+import { isValidRepository } from '../../shared/policy-store';
 
-/**
- * Describe what a policy grants, in the terms a reviewer cares about.
- */
-interface PolicySection {
-  network?: { allow?: string[] };
-  filesystem?: { read?: string[]; write?: string[] };
-  docker?: DockerPolicy;
-}
-
-/**
- * What a docker policy grants, in the reviewer's terms.
- *
- * Every action block is named even when it carries no conditions: `run: {}` is
- * a real grant - it permits creating and running containers - and an approval
- * screen that showed nothing for it would be asking consent for an invisible
- * capability.
- */
-
-function describeSection(section: PolicySection, prefix: string): string[] {
-  return describePolicy(section, prefix).map((grant) => grant.summary);
+function describeSection(section: DescribablePolicy, prefix: string, scope: PolicyScope): string[] {
+  return describePolicy(section, prefix, scope).map((grant) => grant.summary);
 }
 
 /**
@@ -47,50 +29,111 @@ function describeSection(section: PolicySection, prefix: string): string[] {
  *
  * Per-workflow sections are included: a policy can grant access under
  * `workflows:` that appears nowhere in `shared`, and approving what the UI
- * showed would otherwise approve more than was shown.
+ * showed would otherwise approve more than was shown. Each says any pull
+ * request can claim it: a `workflows:` key is only a workflow file's name,
+ * and a pull request can add a workflow file of any name.
  */
-export function summarizeGrants(config: {
-  shared?: PolicySection;
-  workflows?: Record<string, PolicySection>;
-}): string[] {
-  const grants = describeSection(config.shared || {}, '');
+export function summarizeGrants(
+  config: Pick<LocalmostrcConfig, 'level' | 'shared' | 'workflows'>
+): string[] {
+  // The level is declared once, at the top, and leads the list: it widens
+  // every section below it.
+  const grants = describeSection({ ...config.shared, level: config.level }, '', 'shared');
   for (const [workflow, section] of Object.entries(config.workflows || {})) {
-    grants.push(...describeSection(section || {}, `${workflow}: `));
+    grants.push(...describeSection(section || {}, `${workflow} (any pull request can claim this): `, 'workflow'));
   }
   return grants;
+}
+
+/**
+ * What the approval screen shows: each repository's pending policy, if any,
+ * and its approved one. A pending policy that would replace an approved one
+ * carries what it changes, the level included, since that is what the
+ * reviewer is being asked to agree to.
+ */
+export function listPolicySummaries(): PolicySummary[] {
+  const summaries: PolicySummary[] = [];
+  for (const entry of listCachedPolicies()) {
+    if (entry.pending) {
+      const summary: PolicySummary = {
+        repository: entry.repository,
+        approved: false,
+        cachedAt: entry.pending.at,
+        grants: summarizeGrants(entry.pending.config),
+        stamp: approvalStamp(entry.repository, entry.pending.config, entry.pending.repositoryId),
+      };
+      if (entry.approved) {
+        const changes: string[] = [];
+        // The approval is bound to the repository, not only its name: this
+        // one would move it to another repository that took the name.
+        const was = entry.approved.repositoryId;
+        const now = entry.pending.repositoryId;
+        if (was !== undefined && now !== undefined && was !== now) {
+          changes.push(
+            `~ repository id: ${was} -> ${now} (a different repository under this name: ` +
+              'the approved one was deleted and recreated, or renamed and its name taken)'
+          );
+        }
+        const diffs = diffConfigs(entry.approved.config, entry.pending.config);
+        if (diffs.length > 0) changes.push(...formatPolicyDiff(diffs).split('\n'));
+        summary.changes = changes;
+      }
+      summaries.push(summary);
+    }
+    if (entry.approved) {
+      summaries.push({
+        repository: entry.repository,
+        approved: true,
+        cachedAt: entry.approved.at,
+        grants: summarizeGrants(entry.approved.config),
+        stamp: approvalStamp(entry.repository, entry.approved.config),
+      });
+    }
+  }
+  return summaries;
 }
 
 export const registerPolicyHandlers = (): void => {
   const log = () => getLogger();
 
-  ipcMain.handle(IPC_CHANNELS.POLICY_LIST, (): PolicySummary[] => {
-    return listCachedPolicies().map(entry => ({
-      repository: entry.repository,
-      approved: entry.approved,
-      cachedAt: entry.cachedAt,
-      grants: summarizeGrants(entry.config),
-    }));
-  });
+  ipcMain.handle(IPC_CHANNELS.POLICY_LIST, (): PolicySummary[] => listPolicySummaries());
 
-  ipcMain.handle(IPC_CHANNELS.POLICY_APPROVE, async (_event, repository: string): Promise<Result> => {
-    try {
-      approvePolicy(repository);
-      recordPolicyDecision(repository, 'approved');
-      // Workers already running carry a sandbox profile built from the policy
-      // that was approved before this one; retire them so the next job for
-      // this repository runs under what was just approved.
-      await getRunnerManager()?.retireWorkersForRepository(repository);
-      log()?.info(`[Policy] Approved policy for ${repository}`);
-      return { success: true };
-    } catch (error) {
-      return { success: false, error: (error as Error).message };
+  ipcMain.handle(
+    IPC_CHANNELS.POLICY_APPROVE,
+    async (_event, repository: unknown, stamp: unknown): Promise<Result> => {
+      try {
+        if (!isValidRepository(repository)) {
+          return { success: false, error: 'Not a repository name' };
+        }
+        if (typeof stamp !== 'string' || !/^[0-9a-f]{64}$/.test(stamp)) {
+          return { success: false, error: `Approval for ${repository} did not say which policy it approves` };
+        }
+        // Refused unless the pending policy is still the one this stamp was
+        // shown with: another refused job may have replaced it since. The
+        // stamp binds the pending policy only - with the repository id it
+        // would bind the approval to - which is what gets approved and
+        // whose full grants the card lists. Its `changes` were computed
+        // against the approved policy at list time, and are not bound: if
+        // that moved in between, the grants list is still exact.
+        approvePolicy(repository, stamp);
+        // Workers already running carry a sandbox profile built from the policy
+        // that was approved before this one; retire them so the next job for
+        // this repository runs under what was just approved.
+        await getRunnerManager()?.retireWorkersForRepository(repository);
+        log()?.info(`[Policy] Approved policy for ${repository}`);
+        return { success: true };
+      } catch (error) {
+        return { success: false, error: (error as Error).message };
+      }
     }
-  });
+  );
 
-  ipcMain.handle(IPC_CHANNELS.POLICY_REJECT, (_event, repository: string): Result => {
+  ipcMain.handle(IPC_CHANNELS.POLICY_REJECT, (_event, repository: unknown): Result => {
     try {
-      removeCachedPolicy(repository);
-      recordPolicyDecision(repository, 'rejected');
+      if (!isValidRepository(repository)) {
+        return { success: false, error: 'Not a repository name' };
+      }
+      rejectPolicy(repository);
       log()?.info(`[Policy] Rejected policy for ${repository}`);
       return { success: true };
     } catch (error) {

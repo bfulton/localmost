@@ -7,6 +7,7 @@ jest.mock('fs', () => ({
   createReadStream: jest.fn(),
   promises: {
     mkdir: jest.fn(),
+    mkdtemp: jest.fn(),
     chmod: jest.fn(),
     unlink: jest.fn(),
     rm: jest.fn().mockResolvedValue(undefined),
@@ -25,6 +26,7 @@ jest.mock('./process-sandbox', () => ({
 }));
 
 import { RunnerDownloader } from './runner-downloader';
+import { spawnSandboxed } from './process-sandbox';
 import { FALLBACK_RUNNER_VERSION } from '../shared/constants';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -46,6 +48,29 @@ describe('RunnerDownloader', () => {
   describe('constructor', () => {
     it('should initialize with correct runner directory', () => {
       expect(downloader.getBaseDir()).toBe(mockRunnerDir);
+    });
+  });
+
+  describe('getToolCacheDir', () => {
+    it("is one per target, so one repository's job never finds another's tools", () => {
+      // A job can write its tool cache, and setup-* actions execute the
+      // highest matching version they find there. Shared, a job in one
+      // repository could plant a "node" another repository's job then runs.
+      const a = downloader.getToolCacheDir('26c43c63');
+      const b = downloader.getToolCacheDir('27ef7257');
+      expect(a).toBe(path.join(mockRunnerDir, 'caches', '26c43c63', 'tool-cache'));
+      expect(b).not.toBe(a);
+      expect(b.startsWith(a)).toBe(false);
+      expect(a.startsWith(b)).toBe(false);
+      // Not the old shared directory, which is left where it is.
+      expect(a).not.toBe(path.join(mockRunnerDir, 'tool-cache'));
+    });
+
+    it('refuses a target id that is not a plain name', () => {
+      // It becomes a path the sandbox grants write to.
+      for (const bad of ['', '..', '../proxies', 'a/b', 'x"y', '.']) {
+        expect(() => downloader.getToolCacheDir(bad)).toThrow();
+      }
     });
   });
 
@@ -168,12 +193,32 @@ describe('RunnerDownloader', () => {
     });
   });
 
-  describe('platform detection', () => {
-    // These are private methods but we can test them indirectly through download
-    it('should handle different platforms', () => {
-      // The download method uses getPlatform and getArch internally
-      // This is tested implicitly through the download URL construction
-      expect(downloader).toBeDefined();
+  describe('the release it downloads', () => {
+    const realArch = process.arch;
+    const runningOn = (arch: string) => Object.defineProperty(process, 'arch', { value: arch });
+
+    afterEach(() => runningOn(realArch));
+
+    it('fetches the Apple silicon (arm64) runner', async () => {
+      runningOn('arm64');
+      (fs.existsSync as jest.Mock).mockReturnValue(false);
+      (fs.promises.mkdtemp as jest.Mock).mockResolvedValue(path.join(mockRunnerDir, 'arc-staging-1'));
+      // A release whose notes carry no checksum: the error names the asset
+      // the download looked for.
+      mockFetch.mockResolvedValue({ ok: true, json: async () => ({ body: '' }) });
+
+      await expect(downloader.download(() => {})).rejects.toThrow('Checksum not found for osx-arm64 in release notes');
+    });
+
+    it.each(['x64', 'ia32'])('refuses to fetch a runner for %s, before touching the network or disk', async (arch) => {
+      runningOn(arch);
+      (fs.existsSync as jest.Mock).mockReturnValue(false);
+
+      await expect(downloader.download(() => {})).rejects.toThrow(
+        `localmost runs on Apple silicon (arm64) only, not ${arch}`,
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(fs.promises.mkdtemp).not.toHaveBeenCalled();
     });
   });
 
@@ -242,8 +287,76 @@ describe('RunnerDownloader', () => {
     });
   });
 
+  describe('configureInstance', () => {
+    it('hands config.sh the registration token in its environment, not its arguments', async () => {
+      // Any local user can read another process's arguments with ps.
+      const { EventEmitter } = jest.requireActual('events') as typeof import('events');
+      const sandboxDir = path.join(mockRunnerDir, 'sandbox', '1');
+      jest.spyOn(downloader, 'buildSandbox').mockResolvedValue(sandboxDir);
+      jest.spyOn(downloader, 'saveConfig').mockResolvedValue(undefined);
+      jest.spyOn(downloader, 'configureForBrokerProxy').mockResolvedValue(undefined);
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (spawnSandboxed as jest.Mock).mockImplementation(() => {
+        const proc = Object.assign(new EventEmitter(), { stdout: new EventEmitter(), stderr: new EventEmitter() });
+        setImmediate(() => proc.emit('close', 0));
+        return proc;
+      });
+
+      await downloader.configureInstance(1, '2.336.0', {
+        url: 'https://github.com/owner/repo',
+        token: 'REGISTRATION-TOKEN',
+        name: 'localmost.x.1',
+        labels: ['self-hosted'],
+      });
+
+      const [script, args, options] = (spawnSandboxed as jest.Mock).mock.calls[0] as [string, string[], { env: NodeJS.ProcessEnv }];
+      expect(script).toBe(path.join(sandboxDir, 'config.sh'));
+      expect(args.join(' ')).not.toContain('REGISTRATION-TOKEN');
+      expect(args).not.toContain('--token');
+      expect(options.env.ACTIONS_RUNNER_INPUT_TOKEN).toBe('REGISTRATION-TOKEN');
+      expect(args).toEqual(expect.arrayContaining(['--url', 'https://github.com/owner/repo', '--unattended']));
+    });
+
+    it.each([
+      ['succeeds', 0],
+      ['fails', 1],
+    ])('registers in a sandbox of its own, saves from it, and removes it when config.sh %s', async (_outcome, code) => {
+      // Built for this registration alone: a worker's leftover cannot reach
+      // it, and nothing of it is left for a later start of the slot.
+      const { EventEmitter } = jest.requireActual('events') as typeof import('events');
+      const sandboxDir = path.join(mockRunnerDir, 'sandbox', '1-0123456789ab');
+      jest.spyOn(downloader, 'buildSandbox').mockResolvedValue(sandboxDir);
+      const saveConfig = jest.spyOn(downloader, 'saveConfig').mockResolvedValue(undefined);
+      const removeSandbox = jest.spyOn(downloader, 'removeSandbox').mockResolvedValue(undefined);
+      jest.spyOn(downloader, 'configureForBrokerProxy').mockResolvedValue(undefined);
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (spawnSandboxed as jest.Mock).mockImplementation((_script: string, _args: string[], options: { cwd: string }) => {
+        expect(options.cwd).toBe(sandboxDir);
+        const proc = Object.assign(new EventEmitter(), { stdout: new EventEmitter(), stderr: new EventEmitter() });
+        setImmediate(() => proc.emit('close', code));
+        return proc;
+      });
+
+      const configured = downloader.configureInstance(1, '2.336.0', {
+        url: 'https://github.com/owner/repo',
+        token: 'REGISTRATION-TOKEN',
+        name: 'localmost.x.1',
+        labels: ['self-hosted'],
+      });
+
+      if (code === 0) {
+        await configured;
+        expect(saveConfig).toHaveBeenCalledWith(1, sandboxDir);
+      } else {
+        await expect(configured).rejects.toThrow(/Configuration failed/);
+        expect(saveConfig).not.toHaveBeenCalled();
+      }
+      expect(removeSandbox).toHaveBeenCalledWith(sandboxDir);
+    });
+  });
+
   describe('copyProxyCredentials', () => {
-    it('should copy credential files from instance subdirectory and modify .runner serverUrlV2', async () => {
+    it('should copy the .runner from the instance subdirectory and modify its serverUrlV2', async () => {
       // proxyBaseDir is the target directory, credentials are in proxyBaseDir/<instance>/
       const proxyBaseDir = '/path/to/proxy';
       const proxyInstanceDir = path.join(proxyBaseDir, '1');
@@ -269,20 +382,13 @@ describe('RunnerDownloader', () => {
       // Should create config directory
       expect(fs.promises.mkdir).toHaveBeenCalledWith(configDir, { recursive: true });
 
-      // Should copy all three credential files from instance subdirectory
-      expect(mockCopyFile).toHaveBeenCalledTimes(3);
+      // Only the .runner: the registration's key stays with the broker
+      expect(mockCopyFile).toHaveBeenCalledTimes(1);
       expect(mockCopyFile).toHaveBeenCalledWith(
         path.join(proxyInstanceDir, '.runner'),
         path.join(configDir, '.runner')
       );
-      expect(mockCopyFile).toHaveBeenCalledWith(
-        path.join(proxyInstanceDir, '.credentials'),
-        path.join(configDir, '.credentials')
-      );
-      expect(mockCopyFile).toHaveBeenCalledWith(
-        path.join(proxyInstanceDir, '.credentials_rsaparams'),
-        path.join(configDir, '.credentials_rsaparams')
-      );
+      expect(fs.promises.rm).toHaveBeenCalledWith(path.join(configDir, '.credentials_rsaparams'), { force: true });
 
       // Should modify .runner to point to localhost:8787
       expect(mockWriteFile).toHaveBeenCalledWith(

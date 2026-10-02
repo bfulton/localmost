@@ -2,6 +2,9 @@ const { FusesPlugin } = require('@electron-forge/plugin-fuses');
 const { FuseV1Options, FuseVersion } = require('@electron/fuses');
 const { execSync } = require('child_process');
 const path = require('path');
+const { afterCopyExtraResources: removeUsageDescriptions } = require('./scripts/remove-usage-descriptions');
+const vmResources = require('./scripts/check-vm-resources');
+const { MACOS_MINIMUM } = require('./scripts/macos-minimum');
 
 // Detect signing identities from keychain
 function getSigningIdentities() {
@@ -65,6 +68,19 @@ console.log(`Signing: ${shouldSign ? signingIdentity : 'disabled'}`);
 console.log(`Notarize: ${shouldNotarize}`);
 console.log(`Release build: ${isReleaseBuild()}`);
 
+// The camera helper the app runs to tell when the camera is on. It comes
+// from the is-camera-on package; the app runs it from Resources, where it is
+// signed with the app (see src/main/resource-monitor/camera-helper.ts).
+const CAMERA_HELPER = path.join(path.dirname(require.resolve('is-camera-on')), 'is-camera-on');
+
+// The Docker VM: the helper that runs one Linux VM per job, the guest it
+// boots, and the docker CLI jobs run. `npm run build:native` (generateAssets
+// below) puts them in build/, where development runs also find them
+// (src/main/vm/paths.ts); prePackage checks them before they are copied.
+const VM_HELPER = path.join(__dirname, 'build', 'localmost-vm'); // -> Resources/localmost-vm
+const GUEST_DIR = path.join(__dirname, 'build', 'guest'); // -> Resources/guest/
+const DOCKER_CLI_DIR = path.join(__dirname, 'build', 'docker-cli'); // -> Resources/docker-cli/docker
+
 // Languages to keep (English only for now)
 const keepLanguages = ['en', 'en-US', 'en-GB'];
 
@@ -82,7 +98,22 @@ const packagerConfig = {
     path.join(__dirname, 'build', 'dist', 'cli.js'),
     path.join(__dirname, 'scripts', 'localmost-cli'),
     path.join(__dirname, 'packaging', 'app-update.yml'),
+    CAMERA_HELPER,
+    VM_HELPER,
+    GUEST_DIR,
+    DOCKER_CLI_DIR,
   ],
+  // The VM backend needs macOS 14 (design decision 12); Electron's template
+  // says 12.0. The update manifest carries the same minimum
+  // (scripts/macos-minimum.js).
+  extendInfo: { LSMinimumSystemVersion: MACOS_MINIMUM },
+  // Electron's template declares camera, microphone, audio capture and
+  // Bluetooth usage the app has no entitlement for; extendInfo cannot remove
+  // a key, so this hook does. It is the last step before osx-sign, so the
+  // signature covers the edited Info.plist (see the script). Packager runs it
+  // only when extraResource above is set: without that list, it is skipped
+  // and the strings ship (src/main/packaging.test.ts checks both).
+  afterCopyExtraResources: [removeUsageDescriptions],
   // Only the built app code, package.json and LICENSE go in the bundle.
   // build/ also holds forge's own output, so allow only build/dist within it.
   ignore: [
@@ -92,14 +123,55 @@ const packagerConfig = {
   ],
 };
 
+// Entitlements for each file osx-sign signs. @electron/osx-sign reads
+// entitlements and hardened runtime only from optionsForFile; without it,
+// it signs the app with its own defaults, which grant camera, microphone,
+// USB, Bluetooth, printing and location. The plugin helper keeps what
+// Chromium gives its own; the camera helper, a Swift program, and the docker
+// CLI, a Go program, need nothing; the VM helper gets Virtualization.framework
+// and nothing else; everything else gets only JIT.
+function signOptionsForFile(filePath) {
+  let plist = 'entitlements.plist';
+  if (filePath.includes('(Plugin).app')) {
+    plist = 'entitlements.plugin.plist';
+  } else if (inAppResources(filePath, path.basename(CAMERA_HELPER)) || inAppResources(filePath, 'docker-cli', 'docker')) {
+    plist = 'entitlements.none.plist';
+  } else if (inAppResources(filePath, path.basename(VM_HELPER))) {
+    plist = 'entitlements.virtualization.plist';
+  }
+  return {
+    hardenedRuntime: true,
+    entitlements: path.join(__dirname, 'packaging', plist),
+  };
+}
+
+// The app's own Resources, <name>.app/Contents/Resources: not a nested
+// helper app's, which also ends in .app/Contents/Resources.
+const APP_RESOURCES = path.join(path.sep + `${packagerConfig.name}.app`, 'Contents', 'Resources');
+
+// Whether filePath is exactly Resources/<...parts> of the app.
+function inAppResources(filePath, ...parts) {
+  return filePath.endsWith(path.join(APP_RESOURCES, ...parts));
+}
+
+// Passed as osxSign's `ignore`. The guest is data for the VM, not macOS
+// code. Without this, osx-sign signs every file isbinaryfile flags
+// (vmlinux, the initramfs, the erofs root) and gives each an xattr signature
+// carrying the app's entitlements. The app's own signature still seals them
+// as resources.
+function ignoreGuest(filePath) {
+  return filePath.includes(path.join(APP_RESOURCES, path.basename(GUEST_DIR)) + path.sep);
+}
+
 // Override with signing config if credentials are available
 if (shouldSign) {
   packagerConfig.osxSign = {
     identity: signingIdentity,
-    hardenedRuntime: true,
-    entitlements: path.join(__dirname, 'packaging', 'entitlements.plist'),
-    'entitlements-inherit': path.join(__dirname, 'packaging', 'entitlements.inherit.plist'),
-    'gatekeeper-assess': false,
+    optionsForFile: signOptionsForFile,
+    ignore: ignoreGuest,
+    // Unset, @electron/packager takes this as true and only warns when
+    // signing fails, so the build would go on to ship unsigned code.
+    continueOnError: false,
   };
 
   // Only notarize if signing is enabled and notarize credentials are available
@@ -117,6 +189,30 @@ module.exports = {
   packagerConfig,
   rebuildConfig: {},
   hooks: {
+    // Build the helper and the guest and fetch the docker CLI into build/.
+    // Each step keeps its own cache. The guest build boots a VM, so it runs
+    // outside any localmost job (docs/release-checklist.md).
+    generateAssets: async () => {
+      const { spawnSync } = require('child_process');
+      const result = spawnSync('npm', ['run', 'build:native'], { cwd: __dirname, stdio: 'inherit' });
+      if (result.status !== 0) {
+        const why = result.error ? result.error.message : `exit status ${result.status}`;
+        throw new Error(`npm run build:native failed: ${why}`);
+      }
+    },
+    // localmost is built for Apple silicon only: refuse an Intel or
+    // universal build rather than make one. And never ship without the VM,
+    // or with anything beside it that was not meant to ship.
+    prePackage: async (config, platform, arch) => {
+      if (arch !== 'arm64') {
+        throw new Error(`localmost is built for Apple silicon (arm64) only, not ${arch}`);
+      }
+      vmResources.checkVmResources({
+        helper: VM_HELPER,
+        guestDir: GUEST_DIR,
+        dockerCliDir: DOCKER_CLI_DIR,
+      });
+    },
     postPackage: async (config, packageResult) => {
       const fs = require('fs');
 

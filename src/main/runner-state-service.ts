@@ -202,6 +202,13 @@ export function selectIsRunning(snapshot: SnapshotFrom<typeof runnerMachine>): b
 }
 
 /**
+ * Check if the runner is starting: the broker may be up, the runner is not.
+ */
+export function selectIsStarting(snapshot: SnapshotFrom<typeof runnerMachine>): boolean {
+  return snapshot.value === 'starting';
+}
+
+/**
  * Check if any instance is currently busy.
  */
 export function selectIsBusy(snapshot: SnapshotFrom<typeof runnerMachine>): boolean {
@@ -287,6 +294,14 @@ export function isResourcePaused(): boolean {
 export function isRunning(): boolean {
   const snapshot = getSnapshot();
   return snapshot ? selectIsRunning(snapshot) : false;
+}
+
+/**
+ * Check if runner is starting.
+ */
+export function isStarting(): boolean {
+  const snapshot = getSnapshot();
+  return snapshot ? selectIsStarting(snapshot) : false;
 }
 
 /**

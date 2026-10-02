@@ -10,6 +10,8 @@
  *   1/.runner, 1/.credentials, 1/.credentials_rsaparams  - Runner instance 1
  *   2/.runner, 2/.credentials, 2/.credentials_rsaparams  - Runner instance 2
  *   ...
+ *   <n>/.key-kept-from-jobs  - the key was made by a version that keeps it
+ *                              out of jobs' sandboxes
  */
 
 import * as fs from 'fs';
@@ -82,6 +84,14 @@ const getProxyBaseDir = (targetId: string): string => {
 const getProxyInstanceDir = (targetId: string, instanceNum: number): string => {
   return path.join(getProxyBaseDir(targetId), String(instanceNum));
 };
+
+/**
+ * Written beside a registration made by a version that never lets its key
+ * into a job's sandbox. Earlier versions copied .credentials_rsaparams into
+ * every job's sandbox, so a registration without this marker may have a key
+ * some job has taken.
+ */
+const KEY_KEPT_MARKER = '.key-kept-from-jobs';
 
 // ============================================================================
 // Runner Proxy Manager
@@ -288,6 +298,12 @@ export class RunnerProxyManager {
         JSON.stringify(runnerConfig, null, 2)
       );
 
+      await fs.promises.writeFile(
+        path.join(instanceDir, KEY_KEPT_MARKER),
+        'This registration\'s key has never been copied into a job\'s sandbox.\n',
+        { mode: 0o600 }
+      );
+
       log()?.info(`[RunnerProxyManager] Registered instance ${instanceNum} for ${target.displayName}`);
 
       // Load and return the credentials
@@ -297,8 +313,45 @@ export class RunnerProxyManager {
       }
       return credentials;
     } finally {
-      // Clean up temporary sandbox
-      await fs.promises.rm(sandboxDir, { recursive: true, force: true });
+      // It holds a copy of the runner and the registration's key
+      await this.releaseRegistrationDir(sandboxDir);
+    }
+  }
+
+  /**
+   * Hand a registration's directory back to the downloader. A failure to
+   * remove it is logged, not thrown: it would otherwise replace the
+   * registration's own result - failing one GitHub has already made, or
+   * hiding why config.sh failed - and the startup sweep removes the directory
+   * later.
+   */
+  private async releaseRegistrationDir(dir: string): Promise<void> {
+    try {
+      await getRunnerDownloader()?.removeRegistrationDir(dir);
+    } catch (err) {
+      getLogger()?.warn(`[RunnerProxyManager] Could not remove ${dir}; it will be removed at the next start: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * Give a new key to each of a target's registrations that earlier versions
+   * let into jobs' sandboxes. A job that read one could open sessions as that
+   * runner, and be handed its jobs, whenever localmost was not polling - so
+   * keeping new copies out does not help the keys already copied. Registering
+   * again with --replace gives the same runner name a new key, and GitHub
+   * stops honouring the old one. This happens once per registration; one that
+   * cannot be replaced now (offline, signed out) is tried at the next start.
+   */
+  async replaceExposedKeys(target: Target): Promise<void> {
+    const log = () => getLogger();
+    for (const { instanceNum } of this.loadAllCredentials(target.id)) {
+      if (fs.existsSync(path.join(getProxyInstanceDir(target.id, instanceNum), KEY_KEPT_MARKER))) continue;
+      log()?.info(`[RunnerProxyManager] Replacing the key of ${target.displayName} runner ${instanceNum}: earlier versions let jobs read it`);
+      try {
+        await this.registerInstance(target, instanceNum);
+      } catch (err) {
+        log()?.error(`[RunnerProxyManager] Could not replace the key of ${target.displayName} runner ${instanceNum}; trying again at the next start: ${(err as Error).message}`);
+      }
     }
   }
 
@@ -382,6 +435,12 @@ export class RunnerProxyManager {
 
   /**
    * Build a temporary sandbox directory with runner binaries.
+   *
+   * config.sh runs from here unsandboxed, holding a registration token, so it
+   * is the downloader's checked copy - the same one every worker gets. The
+   * downloader makes the directory, unique to this registration and only the
+   * app's to open, and sweeps one a quit left behind; hand it back with
+   * releaseRegistrationDir.
    */
   private async buildTempSandbox(version: string): Promise<string> {
     const runnerDownloader = getRunnerDownloader();
@@ -394,36 +453,19 @@ export class RunnerProxyManager {
       throw new Error(`Runner version ${version} not downloaded`);
     }
 
-    // Create temp sandbox
-    const tempDir = path.join(getRunnerDir(), 'temp-proxy-' + Date.now());
-    await fs.promises.mkdir(tempDir, { recursive: true });
+    const tempDir = await runnerDownloader.makeRegistrationDir();
 
-    // Copy arc contents to temp sandbox
-    await this.copyDir(arcDir, tempDir);
+    try {
+      await runnerDownloader.copyVerifiedArc(version, tempDir, (level, message) => {
+        if (level === 'error') getLogger()?.error(`[RunnerProxyManager] ${message}`);
+        else getLogger()?.info(`[RunnerProxyManager] ${message}`);
+      });
+    } catch (error) {
+      await this.releaseRegistrationDir(tempDir);
+      throw error;
+    }
 
     return tempDir;
-  }
-
-  /**
-   * Copy directory recursively.
-   */
-  private async copyDir(src: string, dest: string): Promise<void> {
-    await fs.promises.mkdir(dest, { recursive: true });
-    const entries = await fs.promises.readdir(src, { withFileTypes: true });
-
-    for (const entry of entries) {
-      const srcPath = path.join(src, entry.name);
-      const destPath = path.join(dest, entry.name);
-
-      if (entry.isDirectory()) {
-        await this.copyDir(srcPath, destPath);
-      } else {
-        await fs.promises.copyFile(srcPath, destPath);
-        // Preserve executable permissions
-        const stat = await fs.promises.stat(srcPath);
-        await fs.promises.chmod(destPath, stat.mode);
-      }
-    }
   }
 
   /**
@@ -442,7 +484,6 @@ export class RunnerProxyManager {
 
     const args = [
       '--url', options.url,
-      '--token', options.token,
       '--name', options.name,
       '--labels', options.labels.join(','),
       '--work', '_work',
@@ -454,6 +495,10 @@ export class RunnerProxyManager {
       const proc = spawn(configScript, args, {
         cwd: sandboxDir,
         stdio: ['ignore', 'pipe', 'pipe'],
+        // The runner reads any option from ACTIONS_RUNNER_INPUT_<NAME>, and
+        // drops the variable once read. Any local user can list a process's
+        // arguments; only this user can read its environment.
+        env: { ...process.env, ACTIONS_RUNNER_INPUT_TOKEN: options.token },
       });
 
       let stdout = '';

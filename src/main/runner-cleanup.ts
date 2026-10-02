@@ -4,8 +4,21 @@
  */
 
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
+import { execFile, execFileSync, spawn, ChildProcess } from 'child_process';
+import { promisify } from 'util';
+import { randomBytes } from 'crypto';
 import { shell } from 'electron';
+import type { ProcessMarker } from '../shared/sandbox-profile';
+import { reapMarkedProcessesAsync } from '../shared/sandbox-reaper';
+import { REMOVAL_PREFIX, moveAsideForRemoval, removeMovedAside } from '../shared/tree-removal';
+
+// Shared with the CLI, which removes a test workspace the same way.
+export { REMOVAL_PREFIX, moveAsideForRemoval, removeMovedAside };
+
+const execFileAsync = promisify(execFile);
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 export type CleanupLogger = (message: string) => void;
 export type LeveledLogger = (level: 'info' | 'error', message: string) => void;
@@ -31,28 +44,378 @@ export function validateChildPath(base: string, childName: string): string | nul
 }
 
 /**
- * Kill orphaned runner processes found in sandbox directories.
- * Must be called BEFORE deleting sandbox directories since PID files are inside them.
+ * The OS-reported start time of a process, or null if it is not running.
+ *
+ * A pid alone cannot be trusted after a crash: the OS can reuse it for an
+ * unrelated process before a sweep runs. Recording the start time at spawn and
+ * comparing it here tells a still-living worker from a stranger that inherited
+ * its pid, so a sweep never signals the wrong process.
+ *
+ * A failed lookup also reads as null here, which suits a caller deciding
+ * whether to signal at all: unknown is not a match.
+ */
+export function processStartTime(pid: number): string | null {
+  return lookUpStartTime(pid) ?? null;
+}
+
+/** A process's start time; null for no such process; undefined when the lookup failed. */
+export type StartTime = string | null | undefined;
+
+/**
+ * processStartTime, keeping "no such process" (null) apart from "ps failed"
+ * (undefined: timed out under load, or could not be spawned).
+ *
+ * An escalation to SIGKILL needs the difference. There, a pid seen to be
+ * free, or held by the same process, means the group is still the one that
+ * was sent SIGTERM; a failed lookup proves nothing either way.
+ */
+export function lookUpStartTime(pid: number): StartTime {
+  try {
+    const out = execFileSync('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf-8',
+      timeout: 5000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    return out === '' ? null : out;
+  } catch (err) {
+    return classifyPsFailure(err);
+  }
+}
+
+/**
+ * What a failed `ps -o lstart= -p <pid>` run means. The shapes are
+ * execFileSync's: a numeric `status` for an exit status, a string `code` for
+ * a spawn failure or timeout, `signal` for a run that was killed.
+ *
+ * ps exits 1 with nothing on either stream when no process has the pid;
+ * that is null. Anything else is unknown (undefined).
+ */
+export function classifyPsFailure(err: unknown): null | undefined {
+  const e = err as {
+    status?: number | null; signal?: string | null; code?: string;
+    stdout?: string | Buffer; stderr?: string | Buffer;
+  };
+  if (e.status !== 1 || e.signal || typeof e.code === 'string') return undefined;
+  const quiet = String(e.stdout ?? '').trim() === '' && String(e.stderr ?? '').trim() === '';
+  return quiet ? null : undefined;
+}
+
+/**
+ * Whether the SIGKILL that follows a SIGTERM to `pid`'s group may go out,
+ * given the leader's start time when the SIGTERM was sent and now.
+ *
+ * The OS never reuses a pid while a group with that id has members, so while
+ * the group is non-empty a pid nobody holds (null) still names it, and so
+ * does the same leader. Only a start time actually seen to differ from the
+ * one before - a process at the pid when there was none, or another one -
+ * means the id changed hands during the grace period. A lookup that failed
+ * on either side escalates, as before this check existed: sparing the group
+ * would leave a leader that ignored SIGTERM running with nothing to reap it.
+ */
+export function mayEscalate(before: StartTime, now: StartTime): boolean {
+  if (typeof now !== 'string' || before === undefined) return true;
+  return now === before;
+}
+
+/** Whether a process (pid) or a non-empty group (-pgid) exists to signal. Signal 0 delivers nothing. */
+function canSignal(target: number): boolean {
+  try {
+    process.kill(target, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const LSOF = '/usr/sbin/lsof';
+const LSOF_TIMEOUT_MS = 10_000;
+
+/** The pids in `lsof -t` output, minus the ones no sweep may ever signal. */
+function parseLsofPids(out: string): number[] {
+  const pids = new Set<number>();
+  for (const token of out.split(/\s+/)) {
+    if (!/^\d+$/.test(token)) continue;
+    const pid = Number(token);
+    if (pid > 1 && pid !== process.pid) pids.add(pid);
+  }
+  return [...pids];
+}
+
+/**
+ * What a failed lsof run means. The shapes are child_process.execFile's: a
+ * numeric `code` for a nonzero exit, a string `code` for a spawn failure,
+ * `killed`/`signal` for a timeout.
+ *
+ * A run that did not finish cannot vouch for what it did not print, so it is
+ * unknown (null) even with partial output. A finished run's output is the
+ * holders it found. Exit 1 with nothing on either stream is lsof's "nobody
+ * holds it"; with -w in force, anything on stderr is an error, not a warning,
+ * and any other status is unknown.
+ */
+export function classifyLsofFailure(err: unknown): number[] | null {
+  const e = err as {
+    code?: number | string | null; killed?: boolean; signal?: string | null;
+    stdout?: string | Buffer; stderr?: string | Buffer;
+  };
+  if (e.killed || e.signal || typeof e.code === 'string' || typeof e.code !== 'number') return null;
+  const stdout = String(e.stdout ?? '').trim();
+  const stderr = String(e.stderr ?? '').trim();
+  // With -w in force, stderr text is an error: some process could not be
+  // examined, so whatever was listed is not the whole answer.
+  if (stderr !== '') return null;
+  if (stdout !== '') return parseLsofPids(stdout);
+  return e.code === 1 ? [] : null;
+}
+
+async function runLsof(file: string): Promise<number[] | null> {
+  try {
+    // -n -P: no name lookups; -w: no warnings; -t: pids only.
+    const { stdout } = await execFileAsync(LSOF, ['-n', '-P', '-w', '-t', '--', file], {
+      encoding: 'utf-8',
+      timeout: LSOF_TIMEOUT_MS,
+    });
+    return parseLsofPids(stdout);
+  } catch (err) {
+    // Removed between the caller's existence check and this run: lsof
+    // reports a status error on stderr, which would otherwise read as unknown.
+    if (!fs.existsSync(file)) return [];
+    return classifyLsofFailure(err);
+  }
+}
+
+/** Have a child hold a probe file open and ask lsof who holds it. */
+async function probeLsofVisibility(): Promise<boolean> {
+  const probe = path.join(os.tmpdir(), `localmost-lsof-probe-${process.pid}-${randomBytes(4).toString('hex')}`);
+  let fd: number | undefined;
+  let child: ChildProcess | undefined;
+  try {
+    fs.writeFileSync(probe, '');
+    fd = fs.openSync(probe, 'r');
+    child = spawn('/bin/sleep', ['30'], { stdio: ['ignore', 'ignore', 'ignore', fd] });
+    child.on('error', () => undefined);
+    fs.closeSync(fd);
+    fd = undefined;
+    if (child.pid === undefined) return false;
+    const holders = await runLsof(probe);
+    return holders !== null && holders.includes(child.pid);
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* closed */ }
+    }
+    try { child?.kill('SIGKILL'); } catch { /* gone */ }
+    try { fs.unlinkSync(probe); } catch { /* gone */ }
+  }
+}
+
+let lsofTrusted: Promise<boolean> | undefined;
+
+/**
+ * Whether lsof here can see what other processes hold open. An lsof that
+ * cannot examine other processes answers "nobody" for everything - exit 1,
+ * no output, the same as a marker nobody holds - so until the probe has
+ * passed, every marker answer is unknown and every marker is kept. Only a
+ * pass is remembered: a probe that failed under load, or because spawn was
+ * refused, must not blind every sweep until the app restarts.
+ */
+export function lsofCanSeeOtherProcesses(probe: () => Promise<boolean> = probeLsofVisibility): Promise<boolean> {
+  if (!lsofTrusted) {
+    const attempt: Promise<boolean> = probe().then(
+      (ok) => {
+        if (!ok && lsofTrusted === attempt) lsofTrusted = undefined;
+        return ok;
+      },
+      () => {
+        if (lsofTrusted === attempt) lsofTrusted = undefined;
+        return false;
+      }
+    );
+    lsofTrusted = attempt;
+  }
+  return lsofTrusted;
+}
+
+let blindnessLogged = false;
+
+/**
+ * The pids currently holding a per-spawn marker file open: [] if none, or
+ * null if that could not be determined - which callers must treat as
+ * "unknown" and keep the marker for a later sweep, never as "nobody".
+ *
+ * Every worker is started with an open descriptor on a marker file unique to
+ * that spawn, passed as an extra inherited fd. Processes launched through the
+ * bash and .NET layers of the runner (run.sh, Runner.Listener, Runner.Worker,
+ * `run:` step shells and what they exec, the docker CLI) inherit it and hold
+ * it for as long as they live - even after the worker leader has exited and
+ * they have been reparented. `lsof` on the marker therefore names those
+ * survivors exactly, which a pid or pgid cannot once the leader is gone: a
+ * recycled pid would have to actually hold this specific inherited fd.
+ *
+ * Coverage limit: children spawned by Node (JS actions via libuv) or Python
+ * (subprocess) do not inherit it - both close inherited fds on spawn - so
+ * their grandchildren are reached only through the process-group path while
+ * the leader lives. The marker is a large improvement over pgid-only reaping,
+ * not full-tree coverage.
+ */
+export async function markerHolders(
+  markerPath: string,
+  log?: CleanupLogger,
+  trusted: () => Promise<boolean> = lsofCanSeeOtherProcesses
+): Promise<number[] | null> {
+  if (!fs.existsSync(markerPath)) return [];
+  if (!(await trusted())) {
+    if (!blindnessLogged) {
+      blindnessLogged = true;
+      log?.("lsof cannot see other processes' open files here; marker files are kept, not swept");
+    }
+    return null;
+  }
+  return runLsof(markerPath);
+}
+
+export interface OrphanSignalResult {
+  /** Whether anything was signalled at all. */
+  signalled: boolean;
+  /**
+   * Who still holds the marker afterwards: [] means the marker may be
+   * released; null means that could not be determined, so it must be kept.
+   */
+  remaining: number[] | null;
+}
+
+/**
+ * Terminate the holders of a marker: SIGTERM each, wait out the grace period,
+ * then SIGKILL whatever holds the marker at that point - not the original
+ * list, which kill(pid, 0) cannot tell from strangers that inherited freed
+ * pids during the grace period, and which misses a holder's fork. An unknown
+ * answer at either look means no SIGKILL and a kept marker: the next sweep
+ * starts over with the same reuse-proof handle.
+ */
+export async function signalOrphanPids(
+  pids: number[],
+  log: CleanupLogger,
+  graceMs: number,
+  stillHeld: () => Promise<number[] | null> | number[] | null
+): Promise<OrphanSignalResult> {
+  const signalable = (list: number[]): number[] => list.filter((pid) => pid > 1 && pid !== process.pid);
+  const targets = signalable(pids);
+  if (targets.length === 0) return { signalled: false, remaining: [] };
+  log(`Killing orphaned runner processes ${targets.join(', ')}`);
+  for (const pid of targets) {
+    try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
+  }
+  await sleep(graceMs);
+  const held = await stillHeld();
+  if (held === null) {
+    log('Could not re-check which orphans remain; keeping their marker for the next sweep');
+    return { signalled: true, remaining: null };
+  }
+  const toKill = signalable(held);
+  if (toKill.length === 0) return { signalled: true, remaining: [] };
+  for (const pid of toKill) {
+    log(`Force killing orphaned process ${pid}`);
+    try { process.kill(pid, 'SIGKILL'); } catch { /* exited meanwhile */ }
+  }
+  // SIGKILL cannot be refused, but teardown is not instant; look once more
+  // before calling the marker free.
+  await sleep(Math.min(graceMs, 500));
+  const remaining = await stillHeld();
+  if (remaining === null) {
+    log('Could not confirm the orphans are gone; keeping their marker for the next sweep');
+  } else if (remaining.length > 0) {
+    log(`Orphans ${remaining.join(', ')} still hold their marker after SIGKILL; keeping it for the next sweep`);
+  }
+  return { signalled: true, remaining };
+}
+
+/**
+ * Parse a pid record: line one is "<pid> <start time>", line two (optional) is
+ * the spawn's marker file path.
+ */
+export function parsePidRecord(raw: string): { pid: number | null; recordedStart: string; markerPath: string | null } {
+  const lines = raw.split('\n');
+  const first = (lines[0] ?? '').trim();
+  const sep = first.search(/\s/);
+  const pidStr = sep === -1 ? first : first.slice(0, sep);
+  const recordedStart = sep === -1 ? '' : first.slice(sep + 1).trim();
+  const markerPath = (lines[1] ?? '').trim() || null;
+  if (!/^\d+$/.test(pidStr)) return { pid: null, recordedStart, markerPath };
+  const pid = Number(pidStr);
+  return { pid: Number.isSafeInteger(pid) ? pid : null, recordedStart, markerPath };
+}
+
+/**
+ * Kill orphaned runner processes recorded by a previous run.
+ *
+ * Reads the app-owned pid directory (a sibling of the sandbox base), never a
+ * pid file inside a sandbox: the sandbox is writable by the job, so a pid file
+ * there is attacker-controlled and a job could make this signal any process.
+ * The app writes each worker's pid to `<runner>/pids/<instance>.pid`.
  */
 export async function killOrphanedProcesses(
   sandboxBase: string,
-  log: CleanupLogger
+  log: CleanupLogger,
+  startTimeOf: (pid: number) => StartTime = lookUpStartTime,
+  holdersOf: (markerPath: string) => Promise<number[] | null> | number[] | null = (p) => markerHolders(p, log),
+  reapMarked: (marker: ProcessMarker) => Promise<number[] | null> = reapMarkedProcessesAsync
 ): Promise<boolean> {
   let killedAny = false;
+  const pidDir = path.join(path.dirname(sandboxBase), 'pids');
 
   try {
-    const entries = await fs.promises.readdir(sandboxBase, { withFileTypes: true });
+    if (!fs.existsSync(pidDir)) return false;
+    const entries = await fs.promises.readdir(pidDir, { withFileTypes: true });
+
+    // Markers first. A marker names the surviving holders of one spawn's
+    // descriptor, leader or not, so this reaps a leaderless orphan group that
+    // the pid/start-time path below cannot verify. A marker left
+    // behind here means the app did not finalize that worker (it crashed), so
+    // every one is checked and then removed.
+    for (const entry of entries) {
+      if (entry.isDirectory() || !/^\d+-[0-9a-f]+\.mark$/.test(entry.name)) continue;
+      const markerPath = path.join(pidDir, entry.name);
+      const holders = await holdersOf(markerPath);
+      if (holders === null) {
+        // Unknown is not "nobody". The marker is the only reuse-proof handle
+        // on those survivors; keep it and let the next sweep try again.
+        log(`Could not check who holds ${entry.name}; keeping it for the next sweep`);
+        continue;
+      }
+      let remaining: number[] | null = holders;
+      if (holders.length > 0) {
+        const result = await signalOrphanPids(holders, log, 2000, () => holdersOf(markerPath));
+        killedAny = result.signalled || killedAny;
+        remaining = result.remaining;
+      }
+      // Only a marker nobody holds is safe to drop; signalOrphanPids has said
+      // why any other is being kept.
+      if (remaining !== null && remaining.length === 0) {
+        await fs.promises.unlink(markerPath).catch(() => undefined);
+      }
+    }
 
     for (const entry of entries) {
-      if (!entry.isDirectory() || entry.name.includes('.trash.')) continue;
+      if (entry.isDirectory() || !/^\d+\.pid$/.test(entry.name)) continue;
 
-      const pidFile = path.join(sandboxBase, entry.name, 'runner.pid');
+      const pidFile = path.join(pidDir, entry.name);
       if (!fs.existsSync(pidFile)) continue;
 
       try {
-        const pidStr = await fs.promises.readFile(pidFile, 'utf-8');
-        const pid = parseInt(pidStr.trim(), 10);
-        if (isNaN(pid)) continue;
+        const raw = await fs.promises.readFile(pidFile, 'utf-8');
+        // Line one is "<pid> <start time>". The pid must be digits only
+        // (parseInt would take '1234junk' as 1234), a safe integer, above 1
+        // (kill(-1) signals every process the user owns, kill(0) the whole
+        // group), and not this process.
+        const { pid, recordedStart } = parsePidRecord(raw);
+        if (pid === null || pid <= 1 || pid === process.pid) continue;
+        // Only signal a process whose start time still matches what was recorded
+        // at spawn. A missing record or a mismatch means the pid was reused (or
+        // predates this format); either way it is not our worker, so leave it.
+        if (recordedStart === '' || startTimeOf(pid) !== recordedStart) {
+          await fs.promises.unlink(pidFile).catch(() => undefined);
+          continue;
+        }
 
         // Check if process is running and kill it
         try {
@@ -67,25 +430,77 @@ export async function killOrphanedProcesses(
           }
           // Give it time to gracefully disconnect from GitHub
           await new Promise(resolve => setTimeout(resolve, 2000));
-          // Force kill if still alive
-          try {
-            process.kill(pid, 0);
+          // Force kill only the group that was verified above. The worker may
+          // have exited on SIGTERM and its pid been handed to a new process
+          // within the grace period, which a liveness probe cannot tell
+          // apart; the start time can, as it did before the SIGTERM. A worker
+          // gone with descendants still in its group is escalated too, by the
+          // same rule as the per-worker sweep (mayEscalate). Nothing left in
+          // the group or at the pid is the expected success case.
+          const now = startTimeOf(pid);
+          if (mayEscalate(recordedStart, now) && (canSignal(-pid) || canSignal(pid))) {
             log(`Force killing orphaned process ${pid}`);
             try {
               process.kill(-pid, 'SIGKILL');
             } catch {
               // Process group kill failed - fall back to single process
-              process.kill(pid, 'SIGKILL');
+              try { process.kill(pid, 'SIGKILL'); } catch { /* exited meanwhile */ }
             }
-          } catch {
-            // Process exited after SIGTERM - this is the expected success case
           }
+          // Otherwise it exited after SIGTERM - the expected success case.
         } catch {
           // Process not running (ESRCH) - already dead, nothing to do
         }
+        await fs.promises.unlink(pidFile).catch(() => undefined);
       } catch {
         // Couldn't read PID file - corrupted or permissions issue, skip
       }
+    }
+
+    // Profile marks last, for what the sweeps above could not reach. One
+    // left here belongs to a spawn that was never swept by it - the app quit
+    // or crashed first - and what that job left outside its process group
+    // still runs under the profile carrying it, unreachable by pid, group or
+    // marker descriptor. Last, because this sweep stops and kills without
+    // warning, and the worker itself is owed the SIGTERM above. By real
+    // path, as seatbelt answers for those. A mark swept by goes afterwards;
+    // one the sweep could not run against stays: a later launch, with the
+    // developer tools installed, is the only way left to reach what runs
+    // under it, and two empty files per job is what keeping it costs.
+    let realPidDir = pidDir;
+    try {
+      realPidDir = fs.realpathSync(pidDir);
+    } catch {
+      // Swept as spelled.
+    }
+    const swept = new Set<string>();
+    for (const entry of entries) {
+      const stem = /^(\d+-[0-9a-f]+)\.granted$/.exec(entry.name)?.[1];
+      if (entry.isDirectory() || !stem) continue;
+      const marker = {
+        granted: path.join(realPidDir, `${stem}.granted`),
+        withheld: path.join(realPidDir, `${stem}.withheld`),
+      };
+      if (!fs.existsSync(marker.withheld)) continue;
+      const killed = await reapMarked(marker);
+      if (killed === null) {
+        log(`Could not look for processes left running under ${stem}'s profile; its mark is kept for a launch that can`);
+        continue;
+      }
+      swept.add(stem);
+      if (killed.length > 0) {
+        log(`Killed ${killed.join(', ')}, left running under ${stem}'s profile`);
+        killedAny = true;
+      }
+    }
+    for (const entry of entries) {
+      const mark = /^(\d+-[0-9a-f]+)\.(granted|withheld)$/.exec(entry.name);
+      if (entry.isDirectory() || !mark) continue;
+      // Half of a mark names nothing and goes with the swept ones.
+      const whole =
+        fs.existsSync(path.join(pidDir, `${mark[1]}.granted`)) && fs.existsSync(path.join(pidDir, `${mark[1]}.withheld`));
+      if (whole && !swept.has(mark[1])) continue;
+      await fs.promises.unlink(path.join(pidDir, entry.name)).catch(() => undefined);
     }
   } catch {
     // Failed to scan sandbox directories - non-fatal, continue with cleanup
@@ -95,7 +510,9 @@ export async function killOrphanedProcesses(
 }
 
 /**
- * Clean up sandbox directories (both regular and trash directories).
+ * Clean up sandbox directories: each is moved out of its path and removed
+ * (see moveAsideForRemoval and removeMovedAside), and what an earlier run
+ * left part removed goes too.
  */
 export async function cleanupSandboxDirectories(
   sandboxBase: string,
@@ -113,13 +530,15 @@ export async function cleanupSandboxDirectories(
         continue;
       }
 
-      if (entry.name.includes('.trash.')) {
-        // Trash directories: try to remove (may have extended attributes blocking deletion)
+      // Already out of every job's reach: a removal an earlier run began, or
+      // trash an earlier version's sweep moved aside.
+      if (entry.name.startsWith(REMOVAL_PREFIX) || entry.name.includes('.trash.')) {
+        // Removed where they are (may have extended attributes blocking deletion)
         try {
-          await fs.promises.rm(dirPath, { recursive: true, force: true });
-          log(`Removed leftover trash: ${entry.name}`);
+          await removeMovedAside(dirPath);
+          log(`Removed leftover ${entry.name}`);
         } catch {
-          // fs.rm failed (likely due to macOS extended attributes on .app bundles)
+          // Removal failed (likely due to macOS extended attributes on .app bundles)
           // Fall back to moving to system Trash
           try {
             await shell.trashItem(dirPath);
@@ -129,27 +548,36 @@ export async function cleanupSandboxDirectories(
           }
         }
       } else {
-        // Regular sandbox directories: clean synchronously with timeout
+        // Regular sandbox directories: moved out of their path, never removed
+        // in it, then removed with a timeout
         log(`Removing sandbox: ${entry.name}`);
+        let aside: string | null;
         try {
-          const timeoutMs = 5000; // 5 seconds per directory
-          const rmPromise = fs.promises.rm(dirPath, { recursive: true, force: true });
-          const timeoutPromise = new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error('timeout')), timeoutMs)
-          );
-          await Promise.race([rmPromise, timeoutPromise]);
+          aside = await moveAsideForRemoval(dirPath);
         } catch {
-          // Deletion failed or timed out - rename to trash for background cleanup
-          const trashDir = `${dirPath}.trash.${Date.now()}`;
-          try {
-            await fs.promises.rename(dirPath, trashDir);
-            log(`Moved ${entry.name} to trash for background cleanup`);
-            fs.promises.rm(trashDir, { recursive: true, force: true }).catch(() => {
-              // Background cleanup failure is non-fatal
-            });
-          } catch {
-            log(`Warning: Could not clean ${entry.name}, will retry when runner starts`);
-          }
+          log(`Warning: Could not move ${entry.name} aside to remove it; it stays until the next launch`);
+          continue;
+        }
+        if (!aside) continue;
+        const timeoutMs = 5000; // 5 seconds per directory
+        let timer: NodeJS.Timeout | undefined;
+        const rmPromise = removeMovedAside(aside);
+        try {
+          await Promise.race([
+            rmPromise,
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+            }),
+          ]);
+        } catch {
+          // Deletion failed or timed out: one still going finishes in the
+          // background, and what is left goes at the next startup
+          rmPromise.catch(() => {
+            // Background cleanup failure is non-fatal
+          });
+          log(`Could not finish removing ${entry.name} yet; the rest goes in the background or at the next startup`);
+        } finally {
+          clearTimeout(timer);
         }
       }
     }
