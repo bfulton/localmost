@@ -22,6 +22,7 @@ import {
   setLogger,
   isUserPaused,
   isResourcePaused,
+  getEffectivePauseState,
 } from './app-state';
 import type { Logger } from './logger';
 import {
@@ -434,6 +435,26 @@ describe('startHeartbeatUnlessPaused', () => {
     sendRunnerEvent({ type: 'START' });
     await pauseRunner();
     sendRunnerEvent({ type: 'INITIALIZED' });
+
+    await startHeartbeatUnlessPaused(heartbeat as unknown as HeartbeatManager);
+    expect(heartbeat.start).not.toHaveBeenCalled();
+  });
+
+  it('shows a resource pause from before the start, and comes up paused without the heartbeat', async () => {
+    // The monitor evaluates at launch, before the auto-start. The machine
+    // dropped a pause sent while idle, so the tray and `localmost status`
+    // said Listening, and the start routed workflows to a runner the monitor
+    // refused jobs to.
+    initRunnerStateMachine();
+    setResourcePaused(true, 'Battery at 20%');
+
+    // What the tray and `localmost status` read.
+    expect(getEffectivePauseState()).toEqual({ isPaused: true, reason: 'Battery at 20%' });
+
+    sendRunnerEvent({ type: 'START' });
+    sendRunnerEvent({ type: 'INITIALIZED' });
+    expect(selectIsPaused(getSnapshot()!)).toBe(true);
+    expect(selectEffectivePauseState(getSnapshot()!)).toEqual({ isPaused: true, reason: 'Battery at 20%' });
 
     await startHeartbeatUnlessPaused(heartbeat as unknown as HeartbeatManager);
     expect(heartbeat.start).not.toHaveBeenCalled();

@@ -351,6 +351,15 @@ export const runnerMachine = setup({
   initial: 'idle',
   context: initialContext,
 
+  // The resource monitor runs from launch, whether or not the runner is, and
+  // says when a condition starts and stops holding. A state that does not
+  // take these itself records them, so a pause from before the runner is
+  // running is shown, and the runner comes up paused.
+  on: {
+    RESOURCE_PAUSE: { actions: 'setResourcePaused' },
+    RESOURCE_RESUME: { actions: 'clearResourcePaused' },
+  },
+
   states: {
     idle: {
       on: {
