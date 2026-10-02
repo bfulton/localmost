@@ -153,6 +153,7 @@ jest.mock('fs', () => ({
     rm: jest.fn().mockResolvedValue(undefined),
     readdir: jest.fn().mockResolvedValue([]),
     readFile: jest.fn().mockResolvedValue(''),
+    rename: jest.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -1942,6 +1943,68 @@ describe('RunnerManager', () => {
       expect(env.xcrun_db).toBe(`${jobTmp}/xcrun_db`);
       expect(env.CLANG_MODULE_CACHE_PATH).toBe(`${jobTmp}/clang-module-cache`);
       expect(env.TMPPREFIX).toBe(`${jobTmp}/zsh`);
+    });
+
+    describe('in the per-user temp directory', () => {
+      const T = '/var/folders/zz/zyxw_vut0000gn/T';
+      const sandboxDir = '/Users/test/.localmost/runner/sandbox/1-0123456789ab';
+      const managerWith = (perJobTempDir: boolean) => {
+        const manager = new RunnerManager({
+          onLog: mockOnLog,
+          onStatusChange: mockOnStatusChange,
+          onJobHistoryUpdate: mockOnJobHistoryUpdate,
+          getUserTempDir: () => T,
+          getJobEnvironmentConfig: () => ({ toolShims: true, javaToolOptions: true, perJobTempDir, createMissingGrantedDirs: true }),
+        });
+        const downloader = (manager as unknown as { downloader: { buildSandbox: jest.Mock } }).downloader;
+        downloader.buildSandbox.mockResolvedValue(sandboxDir);
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        return manager;
+      };
+
+      it("is a directory of the job's own, made before it, named by DIRHELPER_USER_DIR_SUFFIX and granted", async () => {
+        // Foundation ignores TMPDIR: NSTemporaryDirectory() and a sandboxed
+        // process's atomic writes - SwiftPM's, xcodebuild's - go to the
+        // per-user temp, which the sandbox does not grant. The suffix moves
+        // them to T/<suffix>, which the app makes and the profile grants.
+        mockSpawnSandboxed.mockReturnValue(createMockProcess(9916));
+
+        await new RunnerManagerTestHelper(managerWith(true)).spawnForJob();
+
+        const options = mockSpawnSandboxed.mock.calls.at(-1)![2]!;
+        const suffix = options.env!.DIRHELPER_USER_DIR_SUFFIX!;
+        expect(suffix).toMatch(/^localmost-[0-9a-f]{8}-1-0123456789ab$/);
+        expect(options.tempSuffixDir).toBe(`${T}/${suffix}`);
+        expect(fs.mkdirSync).toHaveBeenCalledWith(`${T}/${suffix}`, { mode: 0o700 });
+      });
+
+      it('is neither made nor named with the preference off', async () => {
+        mockSpawnSandboxed.mockReturnValue(createMockProcess(9917));
+
+        await new RunnerManagerTestHelper(managerWith(false)).spawnForJob();
+
+        const options = mockSpawnSandboxed.mock.calls.at(-1)![2]!;
+        expect(options.env!.DIRHELPER_USER_DIR_SUFFIX).toBeUndefined();
+        expect(options.tempSuffixDir).toBeUndefined();
+        expect((fs.mkdirSync as jest.Mock).mock.calls.some(([dir]) => String(dir).startsWith(T))).toBe(false);
+      });
+
+      it('is moved out of the per-user temp to be removed when the worker never starts', async () => {
+        mockSpawnSandboxed.mockImplementation(() => { throw new Error('spawn failed'); });
+        try {
+          const manager = managerWith(true);
+          (manager as unknown as { runnerVersion: string }).runnerVersion = '1.0.0';
+          await (manager as unknown as { startInstance(n: number): Promise<void> }).startInstance(1);
+          await settle();
+        } finally {
+          mockSpawnSandboxed.mockReset();
+        }
+
+        const [from, to] = (fs.promises.rename as jest.Mock).mock.calls.at(-1)! as [string, string];
+        expect(from).toMatch(new RegExp(`^${T}/localmost-[0-9a-f]{8}-1-0123456789ab$`));
+        expect(path.dirname(to)).toBe('/Users/test/.localmost/runner/sandbox');
+        expect(path.basename(to).startsWith(`.removing-${path.basename(from)}.`)).toBe(true);
+      });
     });
   });
 

@@ -33,6 +33,7 @@ import {
   type JobEnvironmentConfig,
 } from './config';
 import { createMissingGrantedDirs, gitSshCommand, JOB_HOME_DIR_NAME, prepareJobHome } from '../shared/job-home';
+import { createJobTempDir, jobTempName, removeJobTempDir, userTempDir } from './job-temp';
 import { normalizeFilterConfig, isUserAllowed, areAllUsersAllowed, parseRepository } from './runner/user-filter';
 
 /**
@@ -313,6 +314,11 @@ interface RunnerManagerOptions {
   getDockerVmConfig?: () => DockerVmConfig;
   /** The jobEnvironment settings: which conveniences a job's environment gets. Read at each spawn. */
   getJobEnvironmentConfig?: () => JobEnvironmentConfig;
+  /**
+   * The per-user temp directory, `/var/folders/<a>/<b>/T`, where each job
+   * gets a directory of its own. userTempDir() by default.
+   */
+  getUserTempDir?: () => string | undefined;
   /** The bundled docker CLI, first on the job's PATH. dockerCliPath() by default. */
   dockerCli?: string;
   /** The Docker VM helper, which the job's profile refuses to run. helperPath() by default. */
@@ -369,6 +375,7 @@ export class RunnerManager {
   private readonly dockerBackend: DockerBackend;
   private readonly getDockerVmConfig: () => DockerVmConfig;
   private readonly getJobEnvironmentConfig: () => JobEnvironmentConfig;
+  private readonly getUserTempDir: () => string | undefined;
   private readonly dockerCli: string;
   private readonly vmHelper: string;
 
@@ -460,6 +467,7 @@ export class RunnerManager {
       options.getDockerVmConfig ??
       (() => resolveDockerVmConfig(undefined, { cores: os.cpus().length, memoryBytes: os.totalmem() }));
     this.getJobEnvironmentConfig = options.getJobEnvironmentConfig ?? (() => resolveJobEnvironmentConfig(undefined));
+    this.getUserTempDir = options.getUserTempDir ?? (() => userTempDir((_level, message) => this.log('error', message)));
     this.dockerCli = options.dockerCli ?? dockerCliPath();
     this.vmHelper = options.vmHelper ?? helperPath();
 
@@ -1570,6 +1578,24 @@ export class RunnerManager {
       env.xcrun_db = path.join(jobTmp, 'xcrun_db');
       env.CLANG_MODULE_CACHE_PATH = path.join(jobTmp, 'clang-module-cache');
       env.TMPPREFIX = path.join(jobTmp, 'zsh');
+      // Foundation ignores TMPDIR: NSTemporaryDirectory(), java.io.tmpdir and
+      // the staging directory of a sandboxed process's atomic writes - which
+      // SwiftPM and xcodebuild make all the time - are in the per-user temp
+      // directory. DIRHELPER_USER_DIR_SUFFIX moves them into a directory of
+      // the job's own there, made now, granted by its profile, and removed
+      // with its sandbox (see job-temp.ts).
+      let tempSuffixDir: string | undefined;
+      if (jobEnvironment.perJobTempDir) {
+        const userTemp = this.getUserTempDir();
+        if (userTemp) {
+          try {
+            tempSuffixDir = createJobTempDir(userTemp, sandboxDir);
+            env.DIRHELPER_USER_DIR_SUFFIX = path.basename(tempSuffixDir);
+          } catch (err) {
+            this.log('warn', `No temp directory of its own for instance ${instanceNum}; Foundation's atomic writes will fail in its job: ${(err as Error).message}`);
+          }
+        }
+      }
 
       // A per-spawn marker file, held open by the worker and by what it starts
       // through its bash and .NET layers (run.sh, Listener, Worker, `run:` step
@@ -1626,6 +1652,7 @@ export class RunnerManager {
           vmHelper: this.vmHelper,
           toolCacheDir,
           packageCacheDir,
+          tempSuffixDir,
           processMarker,
         });
       } finally {
@@ -1859,6 +1886,28 @@ export class RunnerManager {
     this.downloader.removeSandbox(sandboxDir).catch((err) =>
       this.log('warn', `Could not remove the sandbox of instance ${instanceNum}; the next startup will: ${(err as Error).message}`)
     );
+    void this.removeJobTemp(sandboxDir);
+  }
+
+  /**
+   * Remove a sandbox's job temp directory, if it has one: by name, derived
+   * from the sandbox, and only that (see removeJobTempDir). One that cannot
+   * be removed goes at the next startup.
+   */
+  private async removeJobTemp(sandboxDir: string): Promise<void> {
+    const userTemp = this.getUserTempDir();
+    if (!userTemp) return;
+    let dir: string;
+    try {
+      dir = path.join(userTemp, jobTempName(sandboxDir));
+    } catch {
+      return;
+    }
+    try {
+      await removeJobTempDir(userTemp, dir, path.dirname(sandboxDir));
+    } catch (err) {
+      this.log('warn', `Could not remove ${path.basename(dir)} from the per-user temp directory; the next startup will: ${(err as Error).message}`);
+    }
   }
 
   /**
@@ -2217,6 +2266,7 @@ export class RunnerManager {
     } catch (err) {
       this.log('warn', `Could not remove ${path.basename(sandboxDir)}; the next startup will: ${(err as Error).message}`);
     }
+    await this.removeJobTemp(sandboxDir);
   }
 
   /** Pids of the workers this manager is running now. */

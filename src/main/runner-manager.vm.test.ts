@@ -79,6 +79,13 @@ jest.mock('./config', () => ({
   loadConfig: jest.fn(() => ({})),
 }));
 
+// No per-user temp directory: this suite's sandboxes are real directories,
+// and a job temp directory for one would be made in the operator's own T.
+jest.mock('./job-temp', () => ({
+  ...jest.requireActual<typeof import('./job-temp')>('./job-temp'),
+  userTempDir: jest.fn(() => undefined),
+}));
+
 jest.mock('../shared/sandbox-reaper', () => ({
   reapMarkedProcessesAsync: jest.fn(async () => []),
   developerPython: jest.fn(async () => null),

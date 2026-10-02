@@ -63,6 +63,7 @@ import { CliServer } from './cli-server';
 
 // Config and security
 import { loadConfig, DockerVmConfigSource, resolveJobEnvironmentConfig } from './config';
+import { sweepJobTempDirs, userTempDir } from './job-temp';
 import { installSecurityHandlers } from './security';
 import { ensureAppDataDir, getAppDataDir } from './paths';
 
@@ -533,6 +534,12 @@ app.whenReady().then(async () => {
     await runnerDownloader.cleanupStaleConfiguration((message) => logger?.info(message));
   } catch (err) {
     logger?.warn(`Startup cleanup failed: ${(err as Error).message}. Leftovers stay until the next launch.`);
+  }
+  // The temp directories finished jobs left in the per-user temp directory,
+  // once their sandboxes are gone: this data directory's only, by name.
+  const userTemp = userTempDir((_level, message) => logger?.warn(message));
+  if (userTemp) {
+    await sweepJobTempDirs(userTemp, runnerDownloader.getSandboxBase(), (message) => logger?.info(message));
   }
 
   if (config.auth?.refreshToken) {

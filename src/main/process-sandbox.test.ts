@@ -756,6 +756,44 @@ describe('Process Sandbox', () => {
       expect(granted('/var/folders/zz/other_user00gn/T/tmp.AbC123xYz9')).toBe(false);
     });
 
+    it("grants the job's own directory in the per-user temp, by both spellings, but not the node itself", () => {
+      // NSTemporaryDirectory(), java.io.tmpdir and a sandboxed process's
+      // atomic writes go to T/<DIRHELPER_USER_DIR_SUFFIX>. The node stays the
+      // app's: one the job removed would be made again by the system, marked
+      // so that nothing but the system can remove it.
+      const T = '/var/folders/zz/zyxw_vut0000gn/T';
+      const dir = `${T}/localmost-0123abcd-3-0123456789ab`;
+      const profile = profileWith({ tempSuffixDir: dir });
+      for (const spelling of [dir, `/private${dir}`]) {
+        expect(writable(profile, `${spelling}/TemporaryItems/NSIRD_swift-build_x/manifest.json`)).toBe(true);
+        expect(readable(profile, `${spelling}/TemporaryItems`)).toBe(true);
+        expect(readable(profile, spelling)).toBe(true);
+        expect(writable(profile, spelling)).toBe(false);
+      }
+      // Not another job's, nor the shared staging directory.
+      for (const other of [`${T}/localmost-0123abcd-4-0123456789ab/x`, `${T}/TemporaryItems/NSIRD_x/f`, `${T}/xcrun_db`]) {
+        expect([other, writable(profile, other), readable(profile, other)]).toEqual([other, false, false]);
+      }
+      // Without one, nothing of it.
+      expect(profileWith({})).not.toContain(`${T}/localmost-`);
+    });
+
+    it('refuses a temp directory that is not a job temp directory in the per-user temp', () => {
+      for (const dir of [
+        '/var/folders/zz/zyxw_vut0000gn/T',
+        '/var/folders/zz/zyxw_vut0000gn/T/TemporaryItems',
+        '/var/folders/zz/other_user00gn/T/localmost-0123abcd-3-0123456789ab',
+        '/Users/someone/T/localmost-0123abcd-3-0123456789ab',
+      ]) {
+        expect(() => profileWith({ tempSuffixDir: dir })).toThrow(/not a job temp directory/);
+      }
+      expect(() =>
+        profileWith({ tempSuffixDir: '/var/folders/zz/zyxw_vut0000gn/T/localmost-0123abcd-3-0123456789ab' }, () => {
+          throw new Error('getconf: not found');
+        })
+      ).toThrow(/not a job temp directory/);
+    });
+
     it('grants nothing in the per-user temp when it cannot be looked up', () => {
       // Failing closed: mktemp without a template fails, nothing else changes.
       const failed = profileWith({}, () => { throw new Error('getconf: not found'); });
