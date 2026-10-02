@@ -318,6 +318,13 @@ export function generateSandboxProfile({
   // the user's PATH and config their own tools load, so a job that could write
   // them could plant code the user later runs outside any sandbox. The job's
   // package managers write to its target's own directory instead.
+  //
+  // Of ~/.local, only bin and lib: the rest is where tools keep their state,
+  // tokens included - uv's index credentials, the SSH key into a Podman
+  // machine, atuin's sync key, all under ~/.local/share. The job's package
+  // managers keep their data in its own package cache (XDG_DATA_HOME), so no
+  // ~/.local/share/<tool> is read for them; a tool linked from ~/.local/bin
+  // into one, or a job that wants one for another reason, declares it.
   const toolchainPaths =
     filesystemPolicy.level === 'strict'
       ? []
@@ -336,7 +343,8 @@ export function generateSandboxProfile({
           `${homeDir}/.m2`,
           `${homeDir}/.nuget`,
           `${homeDir}/.dotnet`,
-          `${homeDir}/.local`,
+          `${homeDir}/.local/bin`,
+          `${homeDir}/.local/lib`,
           `${homeDir}/go`,
           `${homeDir}/Library/Caches`,
         ];

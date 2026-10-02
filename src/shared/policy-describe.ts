@@ -107,7 +107,7 @@ const MODERATE_WILDCARDS = MODERATE_NETWORK_ALLOWLIST.filter(
 // writable across jobs - so what one job leaves there, the next one runs.
 // The home trees themselves are never writable: some are on the user's PATH.
 const HOME_TOOLCHAIN_ACCESS =
-  'read access to toolchains in your home (~/.cargo, ~/.rustup, ~/.local, ~/go, ~/.dotnet, ~/.gradle, ~/.m2, ' +
+  'read access to toolchains in your home (~/.cargo, ~/.rustup, ~/.local/bin, ~/.local/lib, ~/go, ~/.dotnet, ~/.gradle, ~/.m2, ' +
   "~/Library/Caches), and a package-manager cache shared by this target's jobs, pull requests included, " +
   'when the tool cache is persistent';
 

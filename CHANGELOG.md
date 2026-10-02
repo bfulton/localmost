@@ -100,6 +100,14 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   the directories it kept under `~/.localmost/runner/work` are removed at the
   next start
 
+### Breaking
+- Under `moderate` and `permissive` a job reads only `~/.local/bin` and
+  `~/.local/lib` of `~/.local`, not `~/.local/share` or `~/.local/state`. A
+  command in `~/.local/bin` that links into `~/.local/share` - one installed
+  with `uv tool install` or `pipx` - fails with "Operation not permitted"
+  until the repository declares its `~/.local/share/<tool>` under
+  `filesystem.read`.
+
 ### Security
 - Secret values are masked out of step output. A step that printed one - `set -x`,
   a tool dumping its config - previously spilled it into the console and the log
@@ -404,6 +412,12 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
   loopback services through `host.docker.internal`. The job's VM has no
   network card: containers reach the network only through the job's own proxy,
   under the same allowlist and loopback rules as the job.
+- `moderate` and `permissive` read `~/.local` whole as a toolchain tree, and
+  with it the secrets tools keep under `~/.local/share`: a job that declared
+  nothing printed uv's index credentials
+  (`~/.local/share/uv/credentials/credentials.toml`), the SSH key into a
+  Podman machine (`~/.local/share/containers/podman/machine/machine`) and
+  atuin's sync key. They now read `~/.local/bin` and `~/.local/lib` only.
 
 ### Fixed
 - In-app updates find a zip to install. The update feed listed only the

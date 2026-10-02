@@ -94,9 +94,11 @@ describe('describePolicy', () => {
 
     for (const level of ['moderate', 'permissive'] as const) {
       const [grant] = describePolicy({ level });
-      for (const dir of ['~/.cargo', '~/.local', '~/go', '~/Library/Caches']) {
+      for (const dir of ['~/.cargo', '~/.local/bin', '~/.local/lib', '~/go', '~/Library/Caches']) {
         expect(grant.summary).toContain(dir);
       }
+      // Not ~/.local as a whole: tools keep their tokens in ~/.local/share.
+      expect(grant.summary).not.toMatch(/~\/\.local[,)]/);
       // Read, not write: the home trees hold directories on the user's PATH,
       // and a job's package managers are pointed at a cache of its own.
       expect(grant.summary).toMatch(/read access to toolchains/);

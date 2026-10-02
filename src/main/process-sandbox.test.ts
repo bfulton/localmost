@@ -831,6 +831,34 @@ describe('Process Sandbox', () => {
       }
     );
 
+    it.each(['moderate', 'permissive'] as const)(
+      'reads ~/.local/bin and ~/.local/lib under %s, and nothing else of ~/.local, where tools keep their tokens',
+      (level) => {
+        // ~/.local was a toolchain tree read whole, and ~/.local/share is
+        // where uv keeps its index credentials, Podman the SSH key into its
+        // machine and atuin its sync key. The job's package managers keep
+        // their data in its own package cache (XDG_DATA_HOME), so no share
+        // directory is read for them; a job that needs another declares it.
+        const home = (...parts: string[]) => path.join(homeDir, ...parts);
+        const profile = profileWith({ filesystemPolicy: { level, read: [], write: [] } });
+        expect(readable(profile, home('.local', 'bin', 'tool'))).toBe(true);
+        expect(readable(profile, home('.local', 'lib', 'python3.12', 'site-packages', 'tool.py'))).toBe(true);
+        for (const target of [
+          home('.local', 'share', 'uv', 'credentials', 'credentials.toml'),
+          home('.local', 'share', 'containers', 'podman', 'machine', 'machine'),
+          home('.local', 'share', 'atuin', 'key'),
+          home('.local', 'share', 'other-tool', 'data'),
+          home('.local', 'state', 'other-tool', 'history'),
+          home('.local', 'secret.txt'),
+        ]) {
+          expect([target, readable(profile, target)]).toEqual([target, false]);
+        }
+        // Read only, as every toolchain tree: ~/.local/bin is on your PATH.
+        expect(writable(profile, home('.local', 'bin', 'tool'))).toBe(false);
+        expect(writable(profile, home('.local', 'lib', 'tool.py'))).toBe(false);
+      }
+    );
+
     it('grants strict no package caches, even if handed one', () => {
       const packages = path.join(os.homedir(), '.localmost', 'runner', 'caches', 'aaaa1111', 'packages');
       const profile = profileWith({ filesystemPolicy: { level: 'strict', read: [], write: [] }, packageCacheDir: packages });

@@ -770,6 +770,35 @@ if (!isMacOS) {
         fs.mkdirSync(path.join(fresh, '.gradle'));
         expect(canCreateUnder(gradle, path.join(fresh, '.gradle', 'caches'))).toBe(true);
       });
+
+      it.each(['moderate', 'permissive'] as const)(
+        'reads and runs what is in ~/.local/bin under %s with no grant, and none of the tokens tools keep in ~/.local/share',
+        (level) => {
+          // ~/.local was read whole as a toolchain tree, and ~/.local/share
+          // is where uv keeps its index credentials, Podman the SSH key into
+          // its machine and atuin its sync key: each was printed by a job
+          // that declared nothing.
+          const secrets: Record<string, string> = {
+            '.local/share/uv/credentials/credentials.toml': 'SECRET-uv',
+            '.local/share/containers/podman/machine/machine': 'SECRET-podman',
+            '.local/share/atuin/key': 'SECRET-atuin',
+          };
+          const tool = path.join(home, '.local', 'bin', 'tool');
+          for (const [file, content] of Object.entries(secrets)) {
+            fs.mkdirSync(path.dirname(path.join(home, file)), { recursive: true });
+            fs.writeFileSync(path.join(home, file), content);
+          }
+          fs.mkdirSync(path.dirname(tool), { recursive: true });
+          fs.writeFileSync(tool, '#!/bin/sh\necho tool-ran\n', { mode: 0o755 });
+          const run = underGrant({ level, read: [], write: [] });
+          expect(run(sq(tool)).stdout).toBe('tool-ran');
+          for (const file of Object.keys(secrets)) {
+            const result = run(`/bin/cat ${sq(path.join(home, file))}`);
+            expect([file, result.stdout]).toEqual([file, '']);
+            expect([file, result.stderr]).toEqual([file, expect.stringContaining('Operation not permitted')]);
+          }
+        }
+      );
     });
 
     it('refuses what a policy denies, read and write, inside what it grants', () => {
