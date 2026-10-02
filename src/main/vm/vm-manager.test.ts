@@ -8,6 +8,7 @@ import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { DockerVmConfig } from '../config';
+import { writeJobBin } from '../job-shims';
 import { GuestImage } from './guest-image';
 import { DefaultVmManager, processExecutableOf, VmManagerOptions } from './vm-manager';
 import type { VmError, VmHandle, VmRequest } from './types';
@@ -64,6 +65,7 @@ describe('the VM test fixtures', () => {
     let bin: string;
     let cli: string;
     let other: string;
+    let jobBin: string;
 
     beforeEach(() => {
       root = shortTempDir();
@@ -74,26 +76,48 @@ describe('the VM test fixtures', () => {
       fs.writeFileSync(path.join(bin, 'jest'), '', { mode: 0o755 });
       fs.writeFileSync(path.join(cli, 'docker'), '', { mode: 0o755 });
       fs.writeFileSync(path.join(other, 'docker'), '', { mode: 0o755 });
+      // The job's own bin directory, as the runner makes it.
+      const sandbox = path.join(root, 'sandbox', '1-0123456789ab');
+      fs.mkdirSync(sandbox, { recursive: true });
+      jobBin = writeJobBin(sandbox, { dockerCli: path.join(cli, 'docker'), shims: true });
     });
 
     afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 
-    it('resolves to the bundled CLI behind a directory with no docker, as npm puts node_modules/.bin first', () => {
-      expect(dockerOnPath(`${bin}:${cli}:${other}:/usr/bin`)).toEqual({ bundledDir: cli, resolved: path.join(cli, 'docker') });
+    it("resolves to the job's bin directory's link to the bundled CLI, behind a directory with no docker, as npm puts node_modules/.bin first", () => {
+      expect(dockerOnPath(`${bin}:${jobBin}:${other}:/usr/bin`)).toEqual({
+        resolved: path.join(jobBin, 'docker'),
+        bundled: path.join(cli, 'docker'),
+      });
     });
 
-    it('resolves to another docker that comes before the bundled one', () => {
-      expect(dockerOnPath(`${other}:${cli}`)).toEqual({ bundledDir: cli, resolved: path.join(other, 'docker') });
+    it("resolves to the bundled CLI's own directory, where the runner could not make the job's bin directory", () => {
+      expect(dockerOnPath(`${bin}:${cli}:${other}:/usr/bin`)).toEqual({ resolved: path.join(cli, 'docker'), bundled: path.join(cli, 'docker') });
     });
 
-    it('has no bundled directory when the PATH has none', () => {
-      expect(dockerOnPath(`${bin}:${other}`)).toEqual({ bundledDir: undefined, resolved: path.join(other, 'docker') });
+    it('resolves to another docker that comes before the bundled one, which is then not what runs', () => {
+      expect(dockerOnPath(`${other}:${jobBin}`)).toEqual({ resolved: path.join(other, 'docker'), bundled: undefined });
+      expect(dockerOnPath(`${other}:${cli}`)).toEqual({ resolved: path.join(other, 'docker'), bundled: undefined });
+    });
+
+    it("takes no other link for the bundled CLI, wherever it leads, nor a job bin directory's docker that leads elsewhere", () => {
+      // Docker Desktop's /usr/local/bin/docker is a link like this one.
+      fs.rmSync(path.join(other, 'docker'));
+      fs.symlinkSync(path.join(cli, 'docker'), path.join(other, 'docker'));
+      expect(dockerOnPath(`${other}:${jobBin}`)).toEqual({ resolved: path.join(other, 'docker'), bundled: undefined });
+      fs.rmSync(path.join(jobBin, 'docker'));
+      fs.symlinkSync(path.join(bin, 'jest'), path.join(jobBin, 'docker'));
+      expect(dockerOnPath(`${jobBin}:${cli}`)).toEqual({ resolved: path.join(jobBin, 'docker'), bundled: undefined });
+    });
+
+    it('has nothing when the PATH has no docker', () => {
+      expect(dockerOnPath(`${bin}:/nonexistent`)).toEqual({ resolved: undefined, bundled: undefined });
     });
 
     it('passes over a docker that is not an executable file, as the shell does', () => {
       fs.chmodSync(path.join(other, 'docker'), 0o644);
       fs.mkdirSync(path.join(bin, 'docker'));
-      expect(dockerOnPath(`${bin}:${other}:${cli}`).resolved).toBe(path.join(cli, 'docker'));
+      expect(dockerOnPath(`${bin}:${other}:${jobBin}`).resolved).toBe(path.join(jobBin, 'docker'));
     });
   });
 });

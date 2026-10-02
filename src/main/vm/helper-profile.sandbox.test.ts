@@ -26,6 +26,7 @@ import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { buildHelperProfile, HelperProfileOptions } from './helper-profile';
+import { JOB_BIN_DIR } from '../job-shims';
 import { dockerOnPath } from '../test-utils/vm-fixtures';
 
 const isMacOS = process.platform === 'darwin';
@@ -250,17 +251,19 @@ if (!isMacOS) {
     });
 
     it('cannot run the helper, which carries the virtualization entitlement', () => {
-      // Found beside the bundled CLI, which the runner puts on the job's PATH
-      // ahead of any other docker (npm and jest, which run this, put
-      // node_modules/.bin in front of it). The job profile denies its exec by
-      // path; the constructed form of this is in process-sandbox.sandbox.test.ts,
+      // Found beside the bundled CLI's directory, in the bundle's Resources.
+      // The CLI is what the docker the job finds - the link in its own bin
+      // directory, <sandbox>/localmost/bin, ahead of any other docker on its
+      // PATH (npm and jest, which run this, put node_modules/.bin in front
+      // of it) - names. The job profile denies the helper's exec by path;
+      // the constructed form of this is in process-sandbox.sandbox.test.ts,
       // with a compiled stand-in. Until packaging ships the helper there is
       // nothing at the path to refuse.
-      const { bundledDir, resolved } = dockerOnPath(process.env.PATH ?? '');
-      expect(bundledDir).toBeDefined();
-      const cliDir = bundledDir!;
-      expect(resolved).toBe(path.join(cliDir, 'docker'));
-      const helper = path.join(path.dirname(cliDir), 'localmost-vm');
+      const { resolved, bundled } = dockerOnPath(process.env.PATH ?? '');
+      expect(resolved).toBeDefined();
+      expect(fs.realpathSync(path.dirname(resolved!))).toBe(path.join(sandbox, JOB_BIN_DIR));
+      expect(bundled).toBeDefined();
+      const helper = path.join(path.dirname(path.dirname(bundled!)), 'localmost-vm');
       const result = shell(`${sq(helper)} version`);
       expect(result.ok).toBe(false);
       expect(result.stderr.includes('Operation not permitted') || !fs.existsSync(helper)).toBe(true);

@@ -119,19 +119,44 @@ export function xcodebuildShim(binDir: string): string {
 }
 
 /**
+ * The mode of the bin directory, the directory above it, and each shim:
+ * the user's alone. Only the job runs them, as the user, and a job's
+ * sandbox is the user's alone too. Set explicitly, not left to the umask -
+ * the app runs with 077, a development build or a test with whatever its
+ * shell has - so a job gets the same bin directory either way.
+ */
+export const JOB_BIN_MODE = 0o700;
+
+/** Write `content` to a new file at `file`, exclusively, with exactly `mode`. */
+function writeNewFile(file: string, content: string, mode: number): void {
+  const fd = fs.openSync(file, 'wx', mode);
+  try {
+    fs.fchmodSync(fd, mode);
+    fs.writeFileSync(fd, content);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
  * Make a sandbox's bin directory and fill it: a link to the bundled docker
  * CLI, and the shims when `shims` is set. Made with plain mkdirs and
  * exclusive writes before anything runs in the sandbox, so nothing at a
- * name is followed. Returns the directory, for the front of PATH.
+ * name is followed, and each given JOB_BIN_MODE whatever the umask.
+ * Returns the directory, for the front of PATH.
  */
 export function writeJobBin(sandboxDir: string, options: { dockerCli?: string; shims: boolean }): string {
   const binDir = path.join(sandboxDir, JOB_BIN_DIR);
-  fs.mkdirSync(path.dirname(binDir), { mode: 0o755 });
-  fs.mkdirSync(binDir, { mode: 0o755 });
+  for (const dir of [path.dirname(binDir), binDir]) {
+    fs.mkdirSync(dir, { mode: JOB_BIN_MODE });
+    // Just made by this mkdir, which refuses a name already there, and
+    // nothing runs in the sandbox yet: the chmod reaches this directory.
+    fs.chmodSync(dir, JOB_BIN_MODE);
+  }
   if (options.dockerCli) fs.symlinkSync(options.dockerCli, path.join(binDir, 'docker'));
   if (options.shims) {
-    fs.writeFileSync(path.join(binDir, 'swift'), swiftShim(binDir), { flag: 'wx', mode: 0o755 });
-    fs.writeFileSync(path.join(binDir, 'xcodebuild'), xcodebuildShim(binDir), { flag: 'wx', mode: 0o755 });
+    writeNewFile(path.join(binDir, 'swift'), swiftShim(binDir), JOB_BIN_MODE);
+    writeNewFile(path.join(binDir, 'xcodebuild'), xcodebuildShim(binDir), JOB_BIN_MODE);
   }
   return binDir;
 }

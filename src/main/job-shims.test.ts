@@ -2,7 +2,7 @@ import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { JOB_BIN_DIR, writeJobBin } from './job-shims';
+import { JOB_BIN_DIR, JOB_BIN_MODE, writeJobBin } from './job-shims';
 
 describe("a job's own bin directory", () => {
   let root: string;
@@ -43,9 +43,24 @@ describe("a job's own bin directory", () => {
     expect(JOB_BIN_DIR).toBe(path.join('localmost', 'bin'));
     expect(fs.readdirSync(bin).sort()).toEqual(['docker', 'swift', 'xcodebuild']);
     expect(fs.readlinkSync(path.join(bin, 'docker'))).toBe(dockerCli);
-    for (const shim of ['swift', 'xcodebuild']) {
-      expect(fs.statSync(path.join(bin, shim)).mode & 0o777).toBe(0o755);
+  });
+
+  it.each([0o077, 0o022, 0o000])('is the user\'s alone, directories and shims, under umask %o', (umask) => {
+    // The app runs with umask 077, a development build or a test with its
+    // shell's; the modes are the same whichever it is.
+    expect(JOB_BIN_MODE).toBe(0o700);
+    const previous = process.umask(umask);
+    let bin: string;
+    try {
+      bin = writeJobBin(sandbox, { dockerCli, shims: true });
+    } finally {
+      process.umask(previous);
     }
+    const mode = (p: string) => fs.lstatSync(p).mode & 0o7777;
+    expect([path.dirname(bin), bin].map(mode)).toEqual([0o700, 0o700]);
+    expect(['swift', 'xcodebuild'].map((shim) => mode(path.join(bin, shim)))).toEqual([0o700, 0o700]);
+    // Runnable as it is, by the job.
+    expect(call(bin, 'swift', ['build'])).toEqual({ status: 0, argv: ['swift', 'build', '--disable-sandbox'], stderr: '' });
   });
 
   it('holds only the docker CLI with the shims turned off', () => {

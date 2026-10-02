@@ -34,6 +34,7 @@ import * as path from 'path';
 import { generateSandboxProfile, RunnerProfileOptions, SandboxFilesystemPolicy } from './process-sandbox';
 import { JOB_GIT_CONFIG, prepareJobHome } from '../shared/job-home';
 import { dockerOnPath } from './test-utils/vm-fixtures';
+import { JOB_BIN_DIR } from './job-shims';
 import { defaults, preferenceAllowed, removeThrowawayDomain, sweepStaleThrowawayDomains, throwawayDomain } from '../shared/test-utils/preference-probe';
 
 // The real home by default; one block below stands a directory of its own in
@@ -177,6 +178,34 @@ const serveSockets = async (socketPaths: string[], accepted: Map<string, number>
     throw failed.reason;
   }
   return listening;
+};
+
+/**
+ * The entries of a git config file, as `section[.subsection].key` and value,
+ * in order: section and key lowercased, as git compares them, a subsection
+ * as written. Only the plain form - `[section]` or `[section "sub"]`
+ * headers, one `key = value` (or bare `key`) a line, comments - which is all
+ * the app and `git config` write; anything else throws, so a file this does
+ * not understand fails a test rather than passing it.
+ */
+const gitConfigEntries = (content: string): Array<[string, string]> => {
+  const entries: Array<[string, string]> = [];
+  let section: string | undefined;
+  for (const raw of content.split('\n')) {
+    const line = raw.trim();
+    if (line === '' || line.startsWith('#') || line.startsWith(';')) continue;
+    const header = /^\[([A-Za-z0-9.-]+)(?:\s+"((?:[^"\\\n]|\\.)*)")?\]$/.exec(line);
+    if (header) {
+      section = header[1].toLowerCase() + (header[2] !== undefined ? `.${header[2].replace(/\\(.)/g, '$1')}` : '');
+      continue;
+    }
+    const entry = /^([A-Za-z][A-Za-z0-9-]*)\s*(?:=\s*(.*))?$/.exec(line);
+    if (!entry || section === undefined || /[\\"]/.test(entry[2] ?? '')) {
+      throw new Error(`not a git config line this reads: ${JSON.stringify(raw)}`);
+    }
+    entries.push([`${section}.${entry[1].toLowerCase()}`, entry[2] ?? 'true']);
+  }
+  return entries;
 };
 
 /** The case variant of a path's last component, on the case-insensitive volume. */
@@ -1794,11 +1823,35 @@ if (!isMacOS) {
       const sandboxDir = path.dirname(fs.realpathSync(os.tmpdir()));
       expect(fs.realpathSync(process.env.HOME ?? '')).toBe(path.join(sandboxDir, 'home'));
       const copy = path.join(os.tmpdir(), probeName());
+      let content: string;
       try {
         expect(run(`/bin/cp "$HOME/.gitconfig" ${sq(copy)}`).ok).toBe(true);
-        expect(fs.readFileSync(copy, 'utf-8')).toBe(JOB_GIT_CONFIG);
+        content = fs.readFileSync(copy, 'utf-8');
       } finally {
         fs.rmSync(copy, { force: true });
+      }
+      // What the app wrote, as it wrote it, first - and after it only what
+      // actions/checkout adds to the global config before the job's steps
+      // run: safe.directory for the workspace it checked out, in this job's
+      // own _work. An allowlist, so nothing of the user's config - a
+      // credential helper, a url.*.insteadOf, an include.path, a
+      // core.sshCommand - passes unnoticed.
+      expect(content.startsWith(JOB_GIT_CONFIG)).toBe(true);
+      const ours = gitConfigEntries(JOB_GIT_CONFIG);
+      expect(ours).toContainEqual(['http.proxyauthmethod', 'basic']);
+      const entries = gitConfigEntries(content);
+      expect(entries.slice(0, ours.length)).toEqual(ours);
+      const workspaces = path.join(sandboxDir, '_work');
+      // Resolved as sandboxDir was, where it is there; checkout names the
+      // workspace it made, so it is.
+      const resolved = (dir: string) => (fs.existsSync(dir) ? fs.realpathSync(dir) : path.resolve(dir));
+      const inWorkspaces = (dir: string) =>
+        path.isAbsolute(dir) && !path.relative(workspaces, resolved(dir)).split(path.sep).includes('..');
+      for (const [key, value] of entries.slice(ours.length)) {
+        expect([key, value, key === 'safe.directory' && inWorkspaces(value)]).toEqual([key, value, true]);
+      }
+      for (const [key] of entries) {
+        expect(key).not.toMatch(/^(credential\.|url\..*\.insteadof$|include\.path$|includeif\.|core\.sshcommand$)/);
       }
     });
 
@@ -1932,15 +1985,21 @@ if (!isMacOS) {
     });
 
     it('runs the bundled docker CLI, ahead of any other on its PATH, and reads nothing else of the app bundle', () => {
-      // Not necessarily first: npm and jest, which run this, put
-      // node_modules/.bin in front. No other docker may come before it.
-      const { bundledDir, resolved } = dockerOnPath(process.env.PATH ?? '');
-      expect(bundledDir).toBeDefined();
-      const cliDir = bundledDir!;
-      expect(resolved).toBe(path.join(cliDir, 'docker'));
-      expect(shell('command -v docker').stdout).toBe(path.join(cliDir, 'docker'));
+      // The docker the job finds is the link in its own bin directory,
+      // <sandbox>/localmost/bin, to the bundled CLI. Not necessarily first on
+      // PATH: npm and jest, which run this, put node_modules/.bin in front.
+      // No other docker may come before it.
+      const { resolved, bundled } = dockerOnPath(process.env.PATH ?? '');
+      expect(resolved).toBeDefined();
+      expect(fs.realpathSync(path.dirname(resolved!))).toBe(path.join(sandbox, JOB_BIN_DIR));
+      expect(fs.lstatSync(resolved!).isSymbolicLink()).toBe(true);
+      expect(bundled).toBeDefined();
+      expect(path.basename(path.dirname(bundled!))).toBe('docker-cli');
+      expect(shell('command -v docker').stdout).toBe(resolved);
       expect(shell('docker --version').stdout).toMatch(/^Docker version /);
-      expect(refused(`ls ${sq(path.dirname(cliDir))}`)).toBe(true);
+      // The CLI is all the job reads of the bundle: not the directory it is
+      // in, the bundle's Resources.
+      expect(refused(`ls ${sq(path.dirname(path.dirname(bundled!)))}`)).toBe(true);
     });
 
     it("cannot connect to a unix socket in the app's data directory, where the VM sockets live", () => {

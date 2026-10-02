@@ -8,6 +8,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { JOB_BIN_DIR } from '../job-shims';
 import { GUEST_ARTIFACTS } from '../vm/guest-image';
 
 /** test/fakes/fake-localmost-vm.mjs, the helper's stand-in (contract §8). */
@@ -144,13 +145,23 @@ export function writeGuest(dir: string, overrides: Record<string, unknown> = {})
 
 /**
  * Where `docker` resolves on a PATH, as a shell's lookup finds it - the first
- * directory holding an executable file of that name - and the bundled CLI's
- * directory, `docker-cli`, on it. The runner puts the bundled directory first
- * on a job's PATH, but what a job runs may put more in front of it (npm and
- * jest put node_modules/.bin first), so what matters is not that it is first
- * but that no other docker comes before it: then `resolved` is its `docker`.
+ * directory holding an executable file of that name - and the bundled CLI
+ * that is, if it is. The runner puts the job's own bin directory,
+ * `<sandbox>/localmost/bin`, first on a job's PATH, with `docker` there a
+ * link to the bundled CLI, `<Resources>/docker-cli/docker` (job-shims.ts);
+ * should it fail to make that directory, the CLI's own directory instead.
+ * What a job runs may put more in front of it (npm and jest put
+ * node_modules/.bin first), so what matters is not that it is first but
+ * that no other docker comes before it.
+ *
+ * `resolved` is the docker the lookup finds, spelled as it finds it.
+ * `bundled` is the bundled CLI when that docker is it: `resolved` itself in
+ * a `docker-cli` directory, or what the link at `resolved` names when it is
+ * the one in a job's bin directory and names a `docker` in a `docker-cli`
+ * directory. Only the link is read for that, never the bundle. Otherwise -
+ * another docker first, or none - `bundled` is undefined.
  */
-export function dockerOnPath(pathEnv: string): { bundledDir: string | undefined; resolved: string | undefined } {
+export function dockerOnPath(pathEnv: string): { resolved: string | undefined; bundled: string | undefined } {
   const dirs = pathEnv.split(':').filter((dir) => dir !== '');
   const isExecutableFile = (file: string): boolean => {
     try {
@@ -160,9 +171,18 @@ export function dockerOnPath(pathEnv: string): { bundledDir: string | undefined;
       return false;
     }
   };
+  const isBundledCli = (file: string): boolean =>
+    path.isAbsolute(file) && path.basename(file) === 'docker' && path.basename(path.dirname(file)) === 'docker-cli';
   const resolvedDir = dirs.find((dir) => isExecutableFile(path.join(dir, 'docker')));
-  return {
-    bundledDir: dirs.find((dir) => path.basename(dir) === 'docker-cli'),
-    resolved: resolvedDir === undefined ? undefined : path.join(resolvedDir, 'docker'),
-  };
+  if (resolvedDir === undefined) return { resolved: undefined, bundled: undefined };
+  const resolved = path.join(resolvedDir, 'docker');
+  if (isBundledCli(resolved)) return { resolved, bundled: resolved };
+  const inJobBin = path.normalize(resolvedDir).replace(/\/+$/, '').endsWith(`${path.sep}${JOB_BIN_DIR}`);
+  let target: string | undefined;
+  try {
+    target = fs.readlinkSync(resolved);
+  } catch {
+    target = undefined;
+  }
+  return { resolved, bundled: inJobBin && target !== undefined && isBundledCli(target) ? target : undefined };
 }

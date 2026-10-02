@@ -89,6 +89,7 @@ import { DockerPolicy } from '../shared/docker-policy';
 import { spawnSandboxed } from './process-sandbox';
 import { DockerFilterProxy } from './docker/docker-filter-proxy';
 import { dockerCliPath } from './vm/paths';
+import { getRunnerDir } from './paths';
 import { NO_DAEMON_MESSAGE, noDockerBackend } from './docker/docker-backend';
 import type { DockerBackend, WorkerContext, WorkerDocker } from './docker/docker-backend';
 import type { DockerVmConfig } from './config';
@@ -141,6 +142,8 @@ jest.mock('fs', () => ({
   mkdirSync: jest.fn(),
   openSync: jest.fn(() => 42),
   closeSync: jest.fn(),
+  chmodSync: jest.fn(),
+  fchmodSync: jest.fn(),
   // Nothing is there to be found but a job's home, the directory
   // buildSandbox made, which is empty when it is filled.
   lstatSync: jest.fn((p: string) => {
@@ -1683,10 +1686,20 @@ describe('RunnerManager', () => {
 
       const write = (fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => String(f).endsWith('.pid'));
       expect(write).toBeDefined();
-      // In the app-owned pids directory (getRunnerDir()/pids), never the
-      // job-writable sandbox.
-      expect(String(write![0])).toMatch(/\/\.localmost\/runner\/pids\/1\.pid$/);
-      expect(String(write![0])).not.toContain('/sandbox/');
+      const pidFile = String(write![0]);
+      // In the app-owned pids directory, getRunnerDir()/pids...
+      const runnerDir = getRunnerDir();
+      expect(pidFile).toBe(path.join(runnerDir, 'pids', '1.pid'));
+      // ...and never in the job-writable sandbox: not in the one this spawn
+      // ran in, nor anywhere in the runner's sandbox directory. Judged
+      // against the data directory, not by a path's spelling: inside a
+      // localmost job the data directory is under the job's own home, and
+      // so under that job's sandbox.
+      const spawnedIn = String(mockSpawnSandboxed.mock.calls.at(-1)![2]!.cwd);
+      expect(spawnedIn).toBe('/Users/test/.localmost/runner/sandbox/1');
+      for (const sandboxDir of [spawnedIn, path.join(runnerDir, 'sandbox')]) {
+        expect([sandboxDir, path.relative(sandboxDir, pidFile).startsWith('..')]).toEqual([sandboxDir, true]);
+      }
     });
 
     it('signals the whole process group of an orphan, not just its leader', async () => {
@@ -2257,9 +2270,11 @@ describe('RunnerManager', () => {
         mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
         await new RunnerManagerTestHelper(manager).spawnForJob();
         const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
-        const written = (fs.writeFileSync as jest.Mock).mock.calls
+        // Each shim a new file, opened exclusively and given its mode by
+        // descriptor, whatever the umask.
+        const written = (fs.openSync as jest.Mock).mock.calls
           .filter(([file]) => path.dirname(String(file)) === bin)
-          .map(([file, , options]) => [path.basename(String(file)), options]);
+          .map(([file, flag, mode]) => [path.basename(String(file)), flag, mode]);
         return { env, written };
       };
 
@@ -2269,9 +2284,11 @@ describe('RunnerManager', () => {
         // the argument that turns it off.
         const { env, written } = await shimsWritten(true);
         expect(written).toEqual([
-          ['swift', { flag: 'wx', mode: 0o755 }],
-          ['xcodebuild', { flag: 'wx', mode: 0o755 }],
+          ['swift', 'wx', 0o700],
+          ['xcodebuild', 'wx', 0o700],
         ]);
+        expect((fs.fchmodSync as jest.Mock).mock.calls).toEqual([[42, 0o700], [42, 0o700]]);
+        expect((fs.chmodSync as jest.Mock).mock.calls).toEqual([[path.dirname(bin), 0o700], [bin, 0o700]]);
         expect(env.PATH!.split(':')[0]).toBe(bin);
       });
 
