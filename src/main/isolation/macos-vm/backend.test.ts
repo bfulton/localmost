@@ -77,6 +77,7 @@ describe('MacVmBackend', () => {
       processExecutable: async () => null,
       helperPath: () => '/Applications/localmost.app/Contents/Resources/localmost-macvm',
       agentRetryMs: 20,
+      freeBytes: async () => 100 * 2 ** 30,
       ...overrides,
     });
     backends.push(b);
@@ -185,6 +186,23 @@ describe('MacVmBackend', () => {
     const exit = exitOf(worker);
     await signalled.b.signal(k, 'SIGTERM');
     expect(await exit).toEqual([null, 'SIGTERM']);
+  });
+
+  it("refuses to start a VM, and stops a running one, when the Mac's free disk falls below the reserve", async () => {
+    let free = 5 * 2 ** 30;
+    const low = backend({ agent: { jobHold: true } }, { freeBytes: async () => free, diskCheckMs: 20 });
+    await expect(low.b.prepare(job('a'))).rejects.toThrow(/5.0 GiB free.*at least 10.0 GiB/);
+    expect(vms()).toEqual([]);
+    expect(low.b.jobsRunning()).toBe(false);
+
+    free = 50 * 2 ** 30;
+    const j = job('b');
+    await low.b.prepare(j);
+    const worker = await low.b.spawnWorker(j, ['--once'], {});
+    const exit = exitOf(worker);
+    free = 9 * 2 ** 30;
+    expect(await exit).toEqual([null, 'SIGKILL']);
+    expect(low.logs.some((l) => /^warn .*9.0 GiB free.*stopping its VM/.test(l))).toBe(true);
   });
 
   it('refuses a second runner, or any arguments but --once', async () => {

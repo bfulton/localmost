@@ -39,6 +39,10 @@ export function createMacVmMode(opts: MacVmModeOptions): MacVmMode {
   const launch = launcher(opts.dataDir, opts.log);
   const helperExists = () => fs.existsSync(macVmHelperPath());
   let images: MacVmImageManager | null = null;
+  const freeBytes = async (dir: string) => {
+    const stats = await fs.promises.statfs(dir);
+    return stats.bavail * stats.bsize;
+  };
   // Memory bounds how many run at once; which slots a job may use is the
   // image's (the backend asks only for slots with a saved state, since a
   // slot without one has an identity no boot has proved).
@@ -58,6 +62,7 @@ export function createMacVmMode(opts: MacVmModeOptions): MacVmMode {
     log: opts.log,
     processExecutable: processExecutableOf,
     helperPath: macVmHelperPath,
+    freeBytes,
   });
   images = new MacVmImageManager({
     dataDir: opts.dataDir,
@@ -69,10 +74,7 @@ export function createMacVmMode(opts: MacVmModeOptions): MacVmMode {
     slots,
     runnerArc: opts.runnerArc,
     packRunner,
-    freeBytes: async (dir) => {
-      const stats = await fs.promises.statfs(dir);
-      return stats.bavail * stats.bsize;
-    },
+    freeBytes,
     imageInUse: (id) => backend.imageInUse(id),
     jobsRunning: () => backend.jobsRunning(),
     log: opts.log,

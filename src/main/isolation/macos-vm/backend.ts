@@ -37,6 +37,17 @@ import { sanitizeGuestText } from '../../vm/ndjson';
 /** The most one runner file may be (MacVMAgentCore.maxJobFileBytes). */
 const MAX_JOB_FILE_BYTES = 16 << 10;
 
+/**
+ * What stays free on the data volume while job VMs run. A job's disk is a
+ * clone of the golden disk's 100 GiB sparse length, so a job that writes
+ * without end would otherwise fill the operator's volume: below this a VM
+ * does not start, and a running one is stopped.
+ */
+export const JOB_DISK_RESERVE_BYTES = 10 * 2 ** 30;
+const DISK_CHECK_MS = 5000;
+
+const gib = (bytes: number) => `${(bytes / 2 ** 30).toFixed(1)} GiB`;
+
 export interface MacVmBackendDeps {
   dataDir: string;
   images: { ready(): ReadyImage | null; status(): { state: string; reason?: string } };
@@ -51,6 +62,9 @@ export interface MacVmBackendDeps {
   processExecutable: (pid: number) => Promise<string | null>;
   helperPath: () => string;
   kill?: (pid: number, signal: NodeJS.Signals) => void;
+  /** The bytes free to this user on the volume holding `dir`. */
+  freeBytes: (dir: string) => Promise<number>;
+  diskCheckMs?: number;
   /** How long the agent may take to answer after the VM starts: a cold boot logs in first. */
   agentReadyMs?: number;
   agentRetryMs?: number;
@@ -68,6 +82,7 @@ interface Job {
   worker: Worker | null;
   released: Promise<void> | null;
   abort: AbortController;
+  diskTimer: NodeJS.Timeout | null;
 }
 
 /**
@@ -142,13 +157,17 @@ export class MacVmBackend implements IsolationBackend {
     const image = this.deps.images.ready()!;
     const rec: Job = {
       key: job.key, job, imageId: image.imageId, slot: null, vmId: null, helper: null, agent: null, hello: null, worker: null,
-      released: null, abort: new AbortController(),
+      released: null, abort: new AbortController(), diskTimer: null,
     };
     this.jobs.set(job.key, rec);
     const onAbort = () => rec.abort.abort();
     signal?.addEventListener('abort', onAbort, { once: true });
     try {
       rec.slot = await this.deps.slots.acquire(`job ${job.key}`, image.slots, rec.abort.signal);
+      const free = await this.freeBytes();
+      if (free < JOB_DISK_RESERVE_BYTES) {
+        throw new Error(`the Mac has ${gib(free)} free, and a macOS VM job needs at least ${gib(JOB_DISK_RESERVE_BYTES)} to start`);
+      }
       rec.vmId = newMacVmId(rec.slot);
       const dir = vmDir(this.deps.dataDir, rec.vmId);
       fs.mkdirSync(dir, { mode: 0o700 });
@@ -168,6 +187,7 @@ export class MacVmBackend implements IsolationBackend {
         }
       });
       helper.start();
+      this.watchDisk(rec);
       const started = await this.raced(rec, new Promise<{ boot: string; restoreSkipped?: string }>((resolve) => helper.once('started', resolve)));
       this.deps.log('info', `macOS VM ${rec.vmId} for job ${job.key} started (${started.boot}${started.restoreSkipped ? `: ${started.restoreSkipped}` : ''})`);
       const { agent, hello } = await this.connectAgent(rec, agentSocket);
@@ -181,6 +201,33 @@ export class MacVmBackend implements IsolationBackend {
     } finally {
       signal?.removeEventListener('abort', onAbort);
     }
+  }
+
+  /** The data volume's free bytes; 0, so nothing starts, when they cannot be read. */
+  private freeBytes(): Promise<number> {
+    return this.deps.freeBytes(macVmLayout(this.deps.dataDir).root).catch(() => 0);
+  }
+
+  /**
+   * Stops the job's VM once the volume's free space falls below the
+   * reserve: the job ends with SIGKILL and its clone goes at release.
+   */
+  private watchDisk(rec: Job): void {
+    let checking = false;
+    rec.diskTimer = setInterval(() => {
+      if (checking || rec.released) return;
+      checking = true;
+      void this.freeBytes().then((free) => {
+        checking = false;
+        if (free >= JOB_DISK_RESERVE_BYTES || rec.released || !rec.diskTimer) return;
+        clearInterval(rec.diskTimer);
+        rec.diskTimer = null;
+        this.deps.log('warn', `macOS VM ${rec.vmId}: the Mac has ${gib(free)} free, under the ${gib(JOB_DISK_RESERVE_BYTES)} reserve; stopping its VM and ending job ${rec.key}`);
+        rec.abort.abort();
+        rec.worker?.end(null, 'SIGKILL');
+        if (rec.helper && !rec.helper.hasExited()) void rec.helper.stop(0);
+      });
+    }, this.deps.diskCheckMs ?? DISK_CHECK_MS);
   }
 
   /** Waits for `p`, failing as soon as the job is aborted or the helper exits. */
@@ -265,6 +312,8 @@ export class MacVmBackend implements IsolationBackend {
     const rec = this.jobs.get(job.key);
     if (!rec) return Promise.resolve();
     rec.released ??= (async () => {
+      if (rec.diskTimer) clearInterval(rec.diskTimer);
+      rec.diskTimer = null;
       rec.abort.abort();
       rec.agent?.close();
       if (rec.helper && !rec.helper.hasExited()) {
