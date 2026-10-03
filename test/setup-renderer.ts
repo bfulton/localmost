@@ -77,6 +77,14 @@ export interface MockLocalmost {
     getState: jest.Mock;
     onStateChange: jest.Mock;
   };
+  macosVm: {
+    getStatus: jest.Mock;
+    build: jest.Mock;
+    cancel: jest.Mock;
+    openGuidedSetup: jest.Mock;
+    remove: jest.Mock;
+    onStatusChange: jest.Mock;
+  };
 }
 
 // Extend Window interface for tests
@@ -162,6 +170,14 @@ const mockLocalmost: MockLocalmost = {
   resource: {
     getState: jest.fn().mockResolvedValue({ isPaused: false, reason: null, conditions: [] }),
     onStateChange: jest.fn().mockReturnValue(() => {}),
+  },
+  macosVm: {
+    getStatus: jest.fn().mockResolvedValue({ state: 'not-built', disk: { freeBytes: 0, neededBytes: 0 }, provisioning: 'guided', busy: false }),
+    build: jest.fn().mockResolvedValue({ success: true }),
+    cancel: jest.fn().mockResolvedValue({ success: true }),
+    openGuidedSetup: jest.fn().mockResolvedValue({ success: true }),
+    remove: jest.fn().mockResolvedValue({ success: true }),
+    onStatusChange: jest.fn().mockReturnValue(() => {}),
   },
 };
 

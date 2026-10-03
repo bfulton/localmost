@@ -63,6 +63,16 @@ export interface MacVmSetupStatus {
   busy: boolean;
 }
 
+/** What the setup component asks of the main process (the preload's macosVm). */
+export interface MacVmSetupApi {
+  getStatus: () => Promise<MacVmSetupStatus>;
+  build: () => Promise<{ success: boolean; error?: string }>;
+  cancel: () => Promise<{ success: boolean; error?: string }>;
+  openGuidedSetup: () => Promise<{ success: boolean; error?: string }>;
+  remove: () => Promise<{ success: boolean; error?: string }>;
+  onStatusChange: (callback: (status: MacVmSetupStatus) => void) => () => void;
+}
+
 /** The steps of the guided setup, with the account's values (MacVMCore/GuidedSetup.swift shows the same in the window). */
 export function guidedSetupSteps(account: { username: string; fullName: string; password: string }): string[] {
   return [
