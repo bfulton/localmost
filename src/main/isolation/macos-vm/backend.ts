@@ -70,15 +70,33 @@ interface Job {
   abort: AbortController;
 }
 
+/**
+ * A job's runner as the caller sees it. Its events wait until the turn after
+ * it is made, as a child process's do, so that a caller who attaches its
+ * listeners once spawnWorker resolves sees the first line too.
+ */
 class Worker extends EventEmitter implements WorkerHandle {
   private ended = false;
+  private queued: Array<() => void> | null = [];
   constructor(readonly pid: number) {
     super();
+    setImmediate(() => {
+      const queued = this.queued ?? [];
+      this.queued = null;
+      for (const deliver of queued) deliver();
+    });
+  }
+  private deliver(fn: () => void): void {
+    if (this.queued) this.queued.push(fn);
+    else fn();
+  }
+  output(stream: 'stdout' | 'stderr', line: string): void {
+    this.deliver(() => this.emit(stream, line));
   }
   end(code: number | null, signal: string | null): void {
     if (this.ended) return;
     this.ended = true;
-    this.emit('exit', code, signal);
+    this.deliver(() => this.emit('exit', code, signal));
   }
   get hasEnded(): boolean {
     return this.ended;
@@ -214,17 +232,25 @@ export class MacVmBackend implements IsolationBackend {
     const kept = Object.fromEntries(Object.entries(env).filter(([name]) => JOB_ENV_NAMES.has(name)));
     if (dropped.length > 0) this.deps.log('debug', `macOS VM ${rec.vmId}: the guest's runner does not get ${dropped.sort().join(', ')}`);
     const agent = rec.agent;
-    const pid = await agent.job({ runnerVersion: job.runnerVersion, files, env: kept, args: ['--once'] });
-    const worker = new Worker(pid);
-    rec.worker = worker;
-    agent.on('output', (stream: 'stdout' | 'stderr', line: string) => worker.emit(stream, line));
-    agent.on('exit', (code: number | null, signal: string | null) => worker.end(code, signal));
-    agent.on('closed', (err: MacAgentError) => {
-      if (worker.hasEnded) return;
+    // The job's output and even its exit can arrive in the read that brings
+    // the job's answer, before the await below resumes: they are held from
+    // the start and handed to the worker once it exists.
+    let worker: Worker | null = null;
+    const early: Array<(w: Worker) => void> = [];
+    const toWorker = (fn: (w: Worker) => void) => (worker ? fn(worker) : early.push(fn));
+    agent.on('output', (stream: 'stdout' | 'stderr', line: string) => toWorker((w) => w.output(stream, line)));
+    agent.on('exit', (code: number | null, signal: string | null) => toWorker((w) => w.end(code, signal)));
+    agent.on('closed', (err: MacAgentError) => toWorker((w) => {
+      if (w.hasEnded) return;
       this.deps.log('warn', `macOS VM ${rec.vmId}: lost the guest agent while job ${job.key} ran: ${sanitizeGuestText(err.message, 300)}`);
-      worker.end(null, 'SIGKILL');
-    });
-    return worker;
+      w.end(null, 'SIGKILL');
+    }));
+    const pid = await agent.job({ runnerVersion: job.runnerVersion, files, env: kept, args: ['--once'] });
+    const started = new Worker(pid);
+    worker = started;
+    rec.worker = started;
+    for (const fn of early.splice(0)) fn(started);
+    return started;
   }
 
   async signal(job: IsolationJob, signal: JobSignal): Promise<void> {

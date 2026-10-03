@@ -291,16 +291,20 @@ function serveAgent(conn, agent) {
           raw = { id: msg.id, bytes: msg.bytes, sha256: msg.sha256, version: msg.version };
           send({ id: msg.id, ok: true, send: true });
           break;
-        case 'job':
+        case 'job': {
+          // The answer, the job's output and its exit in one write, as a
+          // runner that prints and ends at once reaches the host in one read.
           jobStarted = true;
-          send({ id: msg.id, ok: true, pid: 4242 });
+          const lines = [{ id: msg.id, ok: true, pid: 4242 }];
           job = { running: true };
-          for (const data of agent.jobOutput ?? []) send({ event: 'output', stream: 'stdout', data });
+          for (const data of agent.jobOutput ?? []) lines.push({ event: 'output', stream: 'stdout', data });
           if (!agent.jobHold) {
             job.running = false;
-            send({ event: 'exit', code: agent.jobExitCode ?? 0, signal: null });
+            lines.push({ event: 'exit', code: agent.jobExitCode ?? 0, signal: null });
           }
+          conn.write(lines.map((body) => `${JSON.stringify({ v: 1, ...body })}\n`).join(''));
           break;
+        }
         case 'signal':
           send({ id: msg.id, ok: true });
           if (job?.running) {
