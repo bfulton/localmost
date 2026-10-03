@@ -350,10 +350,12 @@ describe('the Docker VM the app ships', () => {
     jest.restoreAllMocks();
   });
 
-  it('copies the helper, the guest and the docker CLI into Resources', () => {
+  it('copies the helpers, the guest agent, the guest and the docker CLI into Resources', () => {
     expect(config.packagerConfig.extraResource).toEqual(
       expect.arrayContaining([
         path.join(BUILD, 'localmost-vm'),
+        path.join(BUILD, 'localmost-macvm'),
+        path.join(BUILD, 'localmost-macvm-agent'),
         path.join(BUILD, 'guest'),
         path.join(BUILD, 'docker-cli'),
       ]),
@@ -370,6 +372,7 @@ describe('the Docker VM the app ships', () => {
     };
     const { app } = require('electron');
     const paths = require('./vm/paths');
+    const macVmPaths = require('./isolation/macos-vm/paths');
     const savedResourcesPath = process.resourcesPath;
     const savedAppPath = app.getAppPath();
     try {
@@ -378,6 +381,8 @@ describe('the Docker VM the app ships', () => {
       expect(paths.helperPath()).toBe(path.join('/R', path.basename(source('localmost-vm'))));
       expect(paths.guestDir()).toBe(path.join('/R', path.basename(source('guest'))));
       expect(paths.dockerCliPath()).toBe(path.join('/R', path.basename(source('docker-cli')), 'docker'));
+      expect(macVmPaths.macVmHelperPath()).toBe(path.join('/R', path.basename(source('localmost-macvm'))));
+      expect(macVmPaths.macVmAgentPath()).toBe(path.join('/R', path.basename(source('localmost-macvm-agent'))));
 
       // Unpackaged, `electron .` on the checkout runs what packaging copies.
       app.isPackaged = false;
@@ -386,6 +391,9 @@ describe('the Docker VM the app ships', () => {
       expect(paths.helperPath()).toBe(source('localmost-vm'));
       expect(paths.guestDir()).toBe(source('guest'));
       expect(paths.dockerCliPath()).toBe(path.join(source('docker-cli'), 'docker'));
+      delete process.env.LOCALMOST_MACVM_HELPER;
+      expect(macVmPaths.macVmHelperPath()).toBe(source('localmost-macvm'));
+      expect(macVmPaths.macVmAgentPath()).toBe(source('localmost-macvm-agent'));
     } finally {
       app.isPackaged = false;
       app.getAppPath.mockReturnValue(savedAppPath);
@@ -401,7 +409,7 @@ describe('the Docker VM the app ships', () => {
     expect(spawnSync).toHaveBeenCalledWith('npm', ['run', 'build:native'], expect.objectContaining({ cwd: REPO }));
     // What that script runs; each step keeps its own cache.
     expect(require(path.join(REPO, 'package.json')).scripts['build:native']).toBe(
-      'npm run build:helper && npm run build:guest && npm run fetch:docker-cli',
+      'npm run build:helper && npm run build:macvm && npm run build:guest && npm run fetch:docker-cli',
     );
 
     spawnSync.mockReturnValue({ status: 1 });
@@ -414,6 +422,8 @@ describe('the Docker VM the app ships', () => {
     await config.hooks.prePackage({}, 'darwin', 'arm64');
     expect(checkVmResources).toHaveBeenCalledWith({
       helper: path.join(BUILD, 'localmost-vm'),
+      macVmHelper: path.join(BUILD, 'localmost-macvm'),
+      macVmAgent: path.join(BUILD, 'localmost-macvm-agent'),
       guestDir: path.join(BUILD, 'guest'),
       dockerCliDir: path.join(BUILD, 'docker-cli'),
     });
@@ -445,6 +455,8 @@ describe('the Docker VM the app ships', () => {
       const others = [
         'Contents/MacOS/localmost',
         'Contents/Resources/localmost-vm',
+        'Contents/Resources/localmost-macvm',
+        'Contents/Resources/localmost-macvm-agent',
         'Contents/Resources/docker-cli/docker',
         'Contents/Resources/guestbook',
         'Contents/Resources/guest-tools/vzrun',
@@ -490,7 +502,7 @@ describe('the checks before the Docker VM is packaged', () => {
   const sha256 = (data: Buffer) => crypto.createHash('sha256').update(data).digest('hex');
 
   let scratch: string;
-  let paths: { helper: string; guestDir: string; dockerCliDir: string };
+  let paths: { helper: string; macVmHelper: string; macVmAgent: string; guestDir: string; dockerCliDir: string };
   const ARTIFACTS: Record<string, Buffer> = {
     vmlinux: Buffer.from('an arm64 Linux kernel image'),
     'initramfs.cpio.gz': Buffer.from('an initramfs'),
@@ -515,10 +527,14 @@ describe('the checks before the Docker VM is packaged', () => {
     scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'vm-resources-')));
     paths = {
       helper: path.join(scratch, 'localmost-vm'),
+      macVmHelper: path.join(scratch, 'localmost-macvm'),
+      macVmAgent: path.join(scratch, 'localmost-macvm-agent'),
       guestDir: path.join(scratch, 'guest'),
       dockerCliDir: path.join(scratch, 'docker-cli'),
     };
     fs.writeFileSync(paths.helper, machO(), { mode: 0o755 });
+    fs.writeFileSync(paths.macVmHelper, machO(), { mode: 0o755 });
+    fs.writeFileSync(paths.macVmAgent, machO(), { mode: 0o755 });
     fs.mkdirSync(paths.guestDir);
     for (const [name, data] of Object.entries(ARTIFACTS)) {
       fs.writeFileSync(path.join(paths.guestDir, name), data);
@@ -587,6 +603,18 @@ describe('the checks before the Docker VM is packaged', () => {
     ['built for arm64e', () => fs.writeFileSync(paths.helper, machO(...ARM64E)), /localmost-vm.*arm64/],
     ['a link', () => moveAsideAndLink(paths.helper), /localmost-vm.*regular file/],
   ])('refuses a helper that is %s', (_what, change, error) => {
+    change();
+    expect(() => checkVmResources(paths)).toThrow(error);
+  });
+
+  it.each<[string, string, () => void, RegExp]>([
+    ['macOS VM helper', 'missing', () => fs.rmSync(paths.macVmHelper), /localmost-macvm/],
+    ['macOS VM helper', 'built for Intel', () => fs.writeFileSync(paths.macVmHelper, machO(INTEL)), /localmost-macvm.*arm64/],
+    ['macOS VM helper', 'a link', () => moveAsideAndLink(paths.macVmHelper), /localmost-macvm.*regular file/],
+    ['guest agent', 'missing', () => fs.rmSync(paths.macVmAgent), /localmost-macvm-agent/],
+    ['guest agent', 'not executable', () => fs.chmodSync(paths.macVmAgent, 0o644), /localmost-macvm-agent.*executable/],
+    ['guest agent', 'built for arm64e', () => fs.writeFileSync(paths.macVmAgent, machO(...ARM64E)), /localmost-macvm-agent.*arm64/],
+  ])('refuses a %s that is %s', (_which, _what, change, error) => {
     change();
     expect(() => checkVmResources(paths)).toThrow(error);
   });
@@ -693,6 +721,10 @@ describe('the entitlements the app is signed with', () => {
     ['the camera helper', path.join(APP, 'Contents', 'Resources', 'is-camera-on'), {}],
     // The Docker VM helper: Virtualization.framework, and nothing else.
     ['the VM helper', path.join(APP, 'Contents', 'Resources', 'localmost-vm'), VIRTUALIZATION],
+    // The macOS VM helper: the same, and nothing else.
+    ['the macOS VM helper', path.join(APP, 'Contents', 'Resources', 'localmost-macvm'), VIRTUALIZATION],
+    // The agent the golden image's setup copies into the guest: no exception at all.
+    ['the macOS VM guest agent', path.join(APP, 'Contents', 'Resources', 'localmost-macvm-agent'), {}],
     // The docker CLI jobs run, a Go program: no exception at all.
     ['the docker CLI', path.join(APP, 'Contents', 'Resources', 'docker-cli', 'docker'), {}],
   ];
@@ -737,13 +769,18 @@ describe('the entitlements the app is signed with', () => {
     }
   });
 
-  it('gives Virtualization.framework to the VM helper in Resources and to nothing else', () => {
+  it('gives Virtualization.framework to the two VM helpers in Resources and to nothing else', () => {
     const virtualization = path.join(REPO, 'packaging', 'entitlements.virtualization.plist');
     const plistFor = (file: string) => path.resolve(osxSign.optionsForFile!(file)!.entitlements!);
     expect(plistFor(path.join(APP, 'Contents', 'Resources', 'localmost-vm'))).toBe(virtualization);
+    expect(plistFor(path.join(APP, 'Contents', 'Resources', 'localmost-macvm'))).toBe(virtualization);
 
     const elsewhere = [
-      ...EXPECTED.filter(([what]) => what !== 'the VM helper').map(([, file]) => file),
+      ...EXPECTED.filter(([what]) => what !== 'the VM helper' && what !== 'the macOS VM helper').map(([, file]) => file),
+      path.join(APP, 'Contents', 'MacOS', 'localmost-macvm'),
+      path.join(APP, 'Contents', 'Resources', 'guest', 'localmost-macvm'),
+      path.join(FRAMEWORKS, 'localmost Helper.app', 'Contents', 'Resources', 'localmost-macvm'),
+      path.join(APP, 'Contents', 'Resources', 'localmost-macvm-old'),
       // The same name anywhere but the app's own Resources.
       path.join(APP, 'Contents', 'MacOS', 'localmost-vm'),
       path.join(APP, 'Contents', 'Resources', 'guest', 'localmost-vm'),

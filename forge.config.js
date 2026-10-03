@@ -78,6 +78,12 @@ const CAMERA_HELPER = path.join(path.dirname(require.resolve('is-camera-on')), '
 // below) puts them in build/, where development runs also find them
 // (src/main/vm/paths.ts); prePackage checks them before they are copied.
 const VM_HELPER = path.join(__dirname, 'build', 'localmost-vm'); // -> Resources/localmost-vm
+// The macOS VM mode: the helper that builds the golden image and runs one
+// macOS VM per job, and the agent the image's setup copies into the guest
+// (src/main/isolation/macos-vm/paths.ts). Built by build:macvm, also part
+// of build:native.
+const MACVM_HELPER = path.join(__dirname, 'build', 'localmost-macvm'); // -> Resources/localmost-macvm
+const MACVM_AGENT = path.join(__dirname, 'build', 'localmost-macvm-agent'); // -> Resources/localmost-macvm-agent
 const GUEST_DIR = path.join(__dirname, 'build', 'guest'); // -> Resources/guest/
 const DOCKER_CLI_DIR = path.join(__dirname, 'build', 'docker-cli'); // -> Resources/docker-cli/docker
 
@@ -100,6 +106,8 @@ const packagerConfig = {
     path.join(__dirname, 'packaging', 'app-update.yml'),
     CAMERA_HELPER,
     VM_HELPER,
+    MACVM_HELPER,
+    MACVM_AGENT,
     GUEST_DIR,
     DOCKER_CLI_DIR,
   ],
@@ -127,16 +135,21 @@ const packagerConfig = {
 // entitlements and hardened runtime only from optionsForFile; without it,
 // it signs the app with its own defaults, which grant camera, microphone,
 // USB, Bluetooth, printing and location. The plugin helper keeps what
-// Chromium gives its own; the camera helper, a Swift program, and the docker
-// CLI, a Go program, need nothing; the VM helper gets Virtualization.framework
-// and nothing else; everything else gets only JIT.
+// Chromium gives its own; the camera helper, a Swift program, the docker
+// CLI, a Go program, and the macOS guest agent, which runs in the guest,
+// need nothing; the two VM helpers get Virtualization.framework and nothing
+// else; everything else gets only JIT.
 function signOptionsForFile(filePath) {
   let plist = 'entitlements.plist';
   if (filePath.includes('(Plugin).app')) {
     plist = 'entitlements.plugin.plist';
-  } else if (inAppResources(filePath, path.basename(CAMERA_HELPER)) || inAppResources(filePath, 'docker-cli', 'docker')) {
+  } else if (
+    inAppResources(filePath, path.basename(CAMERA_HELPER)) ||
+    inAppResources(filePath, 'docker-cli', 'docker') ||
+    inAppResources(filePath, path.basename(MACVM_AGENT))
+  ) {
     plist = 'entitlements.none.plist';
-  } else if (inAppResources(filePath, path.basename(VM_HELPER))) {
+  } else if (inAppResources(filePath, path.basename(VM_HELPER)) || inAppResources(filePath, path.basename(MACVM_HELPER))) {
     plist = 'entitlements.virtualization.plist';
   }
   return {
@@ -209,6 +222,8 @@ module.exports = {
       }
       vmResources.checkVmResources({
         helper: VM_HELPER,
+        macVmHelper: MACVM_HELPER,
+        macVmAgent: MACVM_AGENT,
         guestDir: GUEST_DIR,
         dockerCliDir: DOCKER_CLI_DIR,
       });

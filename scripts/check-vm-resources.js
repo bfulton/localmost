@@ -1,7 +1,8 @@
 /**
- * What the Docker VM backend puts in the app's Resources, and the checks the
- * build makes before it packages them: the helper (localmost-vm), the guest
- * image (guest/) and the docker CLI jobs run (docker-cli/docker). They come
+ * What the VM backends put in the app's Resources, and the checks the build
+ * makes before it packages them: the Docker VM helper (localmost-vm), the
+ * macOS VM helper and guest agent (localmost-macvm, localmost-macvm-agent),
+ * the guest image (guest/) and the docker CLI jobs run (docker-cli/docker). They come
  * from `npm run build:native` into build/. forge.config.js runs
  * checkVmResources in prePackage, so a build never ships without its VM, or
  * with anything beside it; scripts/fetch-docker-cli.mjs uses the Mach-O check
@@ -162,13 +163,15 @@ function checkGuestManifest(guestDir) {
 }
 
 /**
- * Throw unless build/ holds what the app's Resources must: the helper, the
- * guest (exactly GUEST_FILES, matching its manifest) and the docker CLI
- * (exactly `docker`). Each path is checked as found, never followed through
- * a link.
+ * Throw unless build/ holds what the app's Resources must: the Docker VM
+ * helper, the macOS VM helper and its guest agent, the guest (exactly
+ * GUEST_FILES, matching its manifest) and the docker CLI (exactly
+ * `docker`). Each path is checked as found, never followed through a link.
  */
-function checkVmResources({ helper, guestDir, dockerCliDir }) {
+function checkVmResources({ helper, macVmHelper, macVmAgent, guestDir, dockerCliDir }) {
   checkExecutable(helper, 'the VM helper localmost-vm');
+  checkExecutable(macVmHelper, 'the macOS VM helper localmost-macvm');
+  checkExecutable(macVmAgent, 'the macOS guest agent localmost-macvm-agent');
   checkDirectoryHolds(guestDir, GUEST_FILES, 'the guest directory');
   checkGuestManifest(guestDir);
   checkDirectoryHolds(dockerCliDir, DOCKER_CLI_FILES, 'the docker CLI directory');
