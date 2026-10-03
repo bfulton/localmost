@@ -1,37 +1,45 @@
-// A job VM's disk: APFS clones of the golden disk and auxiliary storage,
-// made by the helper into the VM's own directory, and the slot lock that
+// A VM's disk: APFS clones of a disk and its auxiliary storage - the golden
+// image's, or a slot's saved one - made by the helper into the VM's own
+// directory (a job VM's, or a slot's for save-state), and the slot lock that
 // keeps the Mac to two macOS VMs at once.
 
 import Darwin
 import Foundation
 
-/// The clones of one job VM.
+/// The clones of one VM.
 public struct VMClone: Equatable {
     public let disk: String
     public let aux: String
 }
 
 /// Clones disk.img and aux.img of a checked golden image into `vmDir`.
-///
-/// clonefile(2) shares every block with the golden file until the guest
-/// writes it, so a clone of a 100 GiB sparse disk is instant and costs
-/// nothing until the job writes. It never follows a link at either end,
-/// refuses to replace anything already at the name, and works only on one
-/// APFS volume: a VM directory on another volume fails here, not with a slow
-/// copy.
 public func cloneGolden(_ image: CheckedImage, into vmDir: String) throws -> VMClone {
+    try cloneDisks(from: image.dir, diskBytes: image.config.diskBytes, into: vmDir)
+}
+
+/// Clones disk.img and aux.img from `sourceDir` - the golden image's
+/// directory or one of its slots', already checked - into `vmDir`.
+///
+/// clonefile(2) shares every block with the source until the guest writes
+/// it, so a clone of a 100 GiB sparse disk is instant and costs nothing
+/// until the VM writes. It never follows a link at either end, refuses to
+/// replace anything already at the name, and works only on one APFS volume:
+/// a VM directory on another volume fails here, not with a slow copy.
+public func cloneDisks(from sourceDir: String, diskBytes: Int64, into vmDir: String) throws -> VMClone {
     let src: RealDirectory
     let dst: RealDirectory
     do {
-        src = try RealDirectory(image.dir)
+        src = try RealDirectory(sourceDir)
     } catch let e as POSIXError {
-        throw HelperError(.clone, "the image directory cannot be opened: \(e.message)")
+        throw HelperError(.clone, "\(sourceDir) cannot be opened: \(e.message)")
     }
     defer { src.close() }
+    guard src.path == sourceDir else {
+        throw HelperError(.clone, "\(sourceDir) resolves to \(src.path)")
+    }
     do {
         dst = try RealDirectory(vmDir)
     } catch let e as POSIXError {
-        src.close()
         throw HelperError(.clone, "the VM directory \(vmDir) cannot be opened: \(e.message)")
     }
     defer { dst.close() }
@@ -49,7 +57,8 @@ public func cloneGolden(_ image: CheckedImage, into vmDir: String) throws -> VMC
         }
         made.append(name)
     }
-    guard case .regular(let size) = entry(in: dst.fd, VMFile.disk), size == image.config.diskBytes else {
+    guard case .regular(let size) = entry(in: dst.fd, VMFile.disk), size == diskBytes else {
+        made.forEach { unlinkat(dst.fd, $0, 0) }
         throw HelperError(.clone, "the clone of disk.img is not the golden disk's length")
     }
     return VMClone(disk: vmDir + "/" + VMFile.disk, aux: vmDir + "/" + VMFile.aux)

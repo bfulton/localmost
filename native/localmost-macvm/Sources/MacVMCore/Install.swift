@@ -41,9 +41,15 @@ public struct InstallPlan: Equatable {
     public var disk: String
     public var aux: String
     public var hardwareModel: Data
-    public var machineIdentifier: Data
+    /// One per slot, slot 1's first.
+    public var machineIdentifiers: [Data]
+    /// The slot whose lock the install holds.
+    public var slot: Int
     public var cpus: Int
     public var memoryBytes: UInt64
+
+    /// The identity the installer VM presents: its slot's.
+    public var machineIdentifier: Data { machineIdentifiers[slot - macVMSlots.lowerBound] }
 }
 
 /// Virtualization.framework, as `install` uses it. Every callback is on the main queue.
@@ -123,7 +129,7 @@ public final class ImageInstall {
         do {
             let dir = try openImageDir()
             defer { dir.close() }
-            for name in [GoldenFile.config, GoldenFile.disk, GoldenFile.aux, GoldenFile.state, GoldenFile.stateStamp] {
+            for name in [GoldenFile.config, GoldenFile.disk, GoldenFile.aux] {
                 guard entry(in: dir.fd, name) == .missing else {
                     throw HelperError(.image, "\(imageDir) already holds \(name): install into a new image directory")
                 }
@@ -168,10 +174,12 @@ public final class ImageInstall {
                     "minMemoryBytes": NSNumber(value: info.minMemoryBytes)])
 
         let diskBytes = Int64(args.diskGiB) << 30
-        let machineIdentifier = layer.newMachineIdentifier()
+        // One identity per slot, slot 1's first; the installer VM presents the
+        // one of the slot whose lock it holds, as every VM does.
+        let machineIdentifiers = macVMSlots.map { _ in layer.newMachineIdentifier() }
         let plan = InstallPlan(
             ipsw: args.ipsw, disk: imageDir + "/" + GoldenFile.disk, aux: imageDir + "/" + GoldenFile.aux,
-            hardwareModel: model, machineIdentifier: machineIdentifier,
+            hardwareModel: model, machineIdentifiers: machineIdentifiers, slot: args.slot,
             cpus: max(installCpus, info.minCpus), memoryBytes: max(installMemoryBytes, info.minMemoryBytes)
         )
         do {
@@ -213,7 +221,7 @@ public final class ImageInstall {
         }
         let config = ImageConfig(
             imageId: args.imageId, build: info.build, os: info.os, hardwareModel: plan.hardwareModel,
-            machineIdentifier: plan.machineIdentifier, diskBytes: diskBytes, macAddress: newMACAddress(),
+            machineIdentifiers: plan.machineIdentifiers, diskBytes: diskBytes, macAddress: newMACAddress(),
             minCpus: info.minCpus, minMemoryBytes: info.minMemoryBytes
         )
         do {

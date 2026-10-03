@@ -1,7 +1,8 @@
 // The golden image as files: its config.json, which `install` writes last,
 // once macOS is on the disk; the check every command that boots it makes
-// first; and the saved state's stamp, which says which host and helper the
-// state was saved by and so whether it can be restored here.
+// first; each slot's saved state and its stamp, which says which host and
+// helper the state was saved by and so whether it can be restored here; and
+// how a job VM starts from all of that.
 
 import Darwin
 import Foundation
@@ -19,8 +20,12 @@ public struct ImageConfig: Codable, Equatable {
     public var os: String
     /// VZMacHardwareModel.dataRepresentation, base64.
     public var hardwareModel: String
-    /// VZMacMachineIdentifier.dataRepresentation, base64.
-    public var machineIdentifier: String
+    /// VZMacMachineIdentifier.dataRepresentation, base64, one per slot:
+    /// slot 1's first. Two VMs running at once with one identifier is
+    /// undefined behaviour in the guest (VZMacPlatformConfiguration.h), so
+    /// the two slots never share one. The install and the provisioning boot
+    /// present slot 1's.
+    public var machineIdentifiers: [String]
     /// The disk image's length in bytes. It is sparse: the space it uses is
     /// what macOS wrote.
     public var diskBytes: Int64
@@ -31,14 +36,14 @@ public struct ImageConfig: Codable, Equatable {
     public var minCpus: Int
     public var minMemoryBytes: UInt64
 
-    public init(imageId: String, build: String, os: String, hardwareModel: Data, machineIdentifier: Data,
+    public init(imageId: String, build: String, os: String, hardwareModel: Data, machineIdentifiers: [Data],
                 diskBytes: Int64, macAddress: String, minCpus: Int, minMemoryBytes: UInt64) {
         schema = ImageConfig.schemaVersion
         self.imageId = imageId
         self.build = build
         self.os = os
         self.hardwareModel = hardwareModel.base64EncodedString()
-        self.machineIdentifier = machineIdentifier.base64EncodedString()
+        self.machineIdentifiers = machineIdentifiers.map { $0.base64EncodedString() }
         self.diskBytes = diskBytes
         self.macAddress = macAddress
         self.minCpus = minCpus
@@ -46,7 +51,12 @@ public struct ImageConfig: Codable, Equatable {
     }
 
     public var hardwareModelData: Data? { Data(base64Encoded: hardwareModel) }
-    public var machineIdentifierData: Data? { Data(base64Encoded: machineIdentifier) }
+
+    /// The identity a VM in `slot` presents, or nil for a slot that is not 1 or 2.
+    public func machineIdentifierData(slot: Int) -> Data? {
+        guard macVMSlots.contains(slot), machineIdentifiers.count == macVMSlots.count else { return nil }
+        return Data(base64Encoded: machineIdentifiers[slot - macVMSlots.lowerBound])
+    }
 
     public func encoded() throws -> Data {
         let encoder = JSONEncoder()
@@ -69,8 +79,12 @@ public struct ImageConfig: Codable, Equatable {
         guard config.imageId == imageId else {
             throw HelperError(.image, "config.json is for image \(quoted(config.imageId)), not \(imageId)")
         }
-        guard config.hardwareModelData?.isEmpty == false, config.machineIdentifierData?.isEmpty == false else {
-            throw HelperError(.image, "config.json has no hardware model or machine identifier")
+        guard config.hardwareModelData?.isEmpty == false else {
+            throw HelperError(.image, "config.json has no hardware model")
+        }
+        let identifiers = macVMSlots.compactMap { config.machineIdentifierData(slot: $0) }.filter { !$0.isEmpty }
+        guard identifiers.count == macVMSlots.count, Set(identifiers).count == identifiers.count else {
+            throw HelperError(.image, "config.json must hold two different machine identifiers, one per slot")
         }
         guard config.diskBytes > 0, isMACAddress(config.macAddress), (1...cpuRange.upperBound).contains(config.minCpus),
               config.minMemoryBytes > 0
@@ -101,20 +115,36 @@ public func newMACAddress(_ random: () -> [UInt8] = { (0..<6).map { _ in UInt8.r
 /// The most config.json or state.json may be.
 let maxConfigBytes = 64 << 10
 
-/// A golden image whose files were checked: paths, config, and whether a
-/// saved state is there.
+/// One slot's saved state: the disk and auxiliary storage it was saved
+/// from, cloned from the golden image and booted with the slot's identity,
+/// the state itself, and its stamp. The three files go together: the state
+/// holds the guest's memory as it was over exactly that disk.
+public struct SlotState: Equatable {
+    public let dir: String
+    public let disk: String
+    public let aux: String
+    public let state: String
+    public let stamp: StateStamp
+}
+
+/// A golden image whose files were checked: paths, config, and which slots
+/// have a whole saved state.
 public struct CheckedImage {
     public let dir: String
     public let config: ImageConfig
     public let disk: String
     public let aux: String
-    /// The saved state and its stamp, when both are there and the stamp reads.
-    public let state: (path: String, stamp: StateStamp)?
+    public let states: [Int: SlotState]
+
+    /// `<image>/slot<n>`, which Electron makes and save-state fills.
+    public func slotDir(_ slot: Int) -> String { dir + "/" + slotDirName(slot) }
 }
+
+public func slotDirName(_ slot: Int) -> String { "slot\(slot)" }
 
 /// Checks a golden image: config.json reads and is for this id, disk.img
 /// and aux.img are regular files (not links) and the disk is the length the
-/// config says. A saved state counts only with a stamp that reads.
+/// config says. A slot's saved state counts only when it is whole.
 public func checkImage(_ imageDir: String, imageId: String) throws -> CheckedImage {
     let dir: RealDirectory
     do {
@@ -153,29 +183,49 @@ public func checkImage(_ imageDir: String, imageId: String) throws -> CheckedIma
     default:
         throw HelperError(.image, "aux.img is empty, a link or not a regular file")
     }
-    var state: (String, StateStamp)?
-    if case .regular = entry(in: dir.fd, GoldenFile.state),
-       let data = try? readSmallFile(in: dir.fd, GoldenFile.stateStamp, max: maxConfigBytes),
-       let stamp = try? JSONDecoder().decode(StateStamp.self, from: data)
-    {
-        state = (imageDir + "/" + GoldenFile.state, stamp)
+    var states: [Int: SlotState] = [:]
+    for slot in macVMSlots {
+        if let state = slotState(imageDir, slot: slot, diskBytes: config.diskBytes) {
+            states[slot] = state
+        }
     }
     return CheckedImage(dir: imageDir, config: config, disk: imageDir + "/" + GoldenFile.disk,
-                        aux: imageDir + "/" + GoldenFile.aux, state: state)
+                        aux: imageDir + "/" + GoldenFile.aux, states: states)
 }
 
-/// state.json beside a saved state: what saved it, and the shape of the VM
-/// it was saved from. VZ restores a state only into a configuration like the
-/// one it was saved from, and a host update can make it refuse one anyway,
-/// so a state is offered for restore only when all of this still holds.
+/// A slot's saved state when it is whole: the slot's own directory, not a
+/// link; its disk a regular file of the golden length; its aux storage and
+/// state regular files; and a stamp that reads and names this slot.
+func slotState(_ imageDir: String, slot: Int, diskBytes: Int64) -> SlotState? {
+    let path = imageDir + "/" + slotDirName(slot)
+    guard let dir = try? RealDirectory(path) else { return nil }
+    defer { dir.close() }
+    guard dir.path == path,
+          case .regular(let size) = entry(in: dir.fd, SlotFile.disk), size == diskBytes,
+          case .regular(let auxSize) = entry(in: dir.fd, SlotFile.aux), auxSize > 0,
+          case .regular = entry(in: dir.fd, SlotFile.state),
+          let data = try? readSmallFile(in: dir.fd, SlotFile.stateStamp, max: maxConfigBytes),
+          let stamp = try? JSONDecoder().decode(StateStamp.self, from: data), stamp.slot == slot
+    else { return nil }
+    return SlotState(dir: path, disk: path + "/" + SlotFile.disk, aux: path + "/" + SlotFile.aux,
+                     state: path + "/" + SlotFile.state, stamp: stamp)
+}
+
+/// state.json beside a slot's saved state: the slot, what saved it, and the
+/// shape of the VM it was saved from. VZ restores a state only into a
+/// configuration like the one it was saved from, and a host update can make
+/// it refuse one anyway, so a state is offered for restore only when all of
+/// this still holds.
 public struct StateStamp: Codable, Equatable {
+    public var slot: Int
     /// The host's macOS build when the state was saved (`kern.osversion`).
     public var hostBuild: String
     public var helperVersion: String
     public var cpus: Int
     public var memoryMiB: Int
 
-    public init(hostBuild: String, helperVersion: String, cpus: Int, memoryMiB: Int) {
+    public init(slot: Int, hostBuild: String, helperVersion: String, cpus: Int, memoryMiB: Int) {
+        self.slot = slot
         self.hostBuild = hostBuild
         self.helperVersion = helperVersion
         self.cpus = cpus
@@ -195,6 +245,35 @@ public func restoreRefusal(_ stamp: StateStamp, hostBuild: String, helperVersion
         return "it was saved with \(stamp.cpus) CPUs and \(stamp.memoryMiB) MiB, not \(cpus) and \(memoryMiB)"
     }
     return nil
+}
+
+/// How a job VM starts: which directory's disk.img and aux.img it clones,
+/// whether it restores a state over them, and the identity it presents.
+public struct JobStart: Equatable {
+    /// The golden image's directory, or its slot's when the slot's state is
+    /// restored: a state goes only with the disk it was saved from.
+    public let sourceDir: String
+    public let plan: StartPlan
+    public let machineIdentifier: Data
+    /// Why the run boots cold although it asked to restore.
+    public let restoreSkipped: String?
+}
+
+/// The start of a job VM in `slot`: its slot's saved state and disk when
+/// asked to restore and the state still fits this host and shape; otherwise
+/// the golden disk, cold. Either way with the slot's own identity.
+public func jobStart(_ image: CheckedImage, slot: Int, boot: BootMode, hostBuild: String, helperVersion: String,
+                     cpus: Int, memoryMiB: Int) -> JobStart {
+    let identifier = image.config.machineIdentifierData(slot: slot) ?? Data()
+    let cold = { (why: String?) in
+        JobStart(sourceDir: image.dir, plan: .cold, machineIdentifier: identifier, restoreSkipped: why)
+    }
+    guard boot == .restore else { return cold(nil) }
+    guard let state = image.states[slot] else { return cold("slot \(slot) has no saved state") }
+    if let why = restoreRefusal(state.stamp, hostBuild: hostBuild, helperVersion: helperVersion, cpus: cpus, memoryMiB: memoryMiB) {
+        return cold(why)
+    }
+    return JobStart(sourceDir: state.dir, plan: .restore(state.state), machineIdentifier: identifier, restoreSkipped: nil)
 }
 
 /// The host's macOS build, `kern.osversion`: `25G83`.

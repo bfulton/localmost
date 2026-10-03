@@ -37,10 +37,17 @@ final class PolicyTests: XCTestCase {
         XCTAssertThrowsError(try ProvisioningAccount(missing))
     }
 
-    func testJobsPresentTheGoldenIdentitySoTheStateRestores() {
-        XCTAssertEqual(jobMachineIdentity, .golden)
-        XCTAssertEqual(jobMachineIdentifier(golden: Data([1]), fresh: { XCTFail("not asked"); return Data() }), Data([1]))
-        XCTAssertEqual(jobMachineIdentifier(golden: Data([1]), fresh: { Data([2]) }, identity: .fresh), Data([2]))
+    func testEachSlotPresentsAnIdentityOfItsOwn() {
+        // Two VMs running at once with one machine identifier is undefined
+        // behaviour in the guest (VZMacPlatformConfiguration.h), so the two
+        // slots never share one; a slot's saved state is taken with its own.
+        let config = ImageConfig(imageId: "a1b2c3d4e5f6", build: "25G83", os: "26.6.2", hardwareModel: Data([1]),
+                                 machineIdentifiers: [Data([2]), Data([3])], diskBytes: 10, macAddress: "02:00:00:00:00:01",
+                                 minCpus: 2, minMemoryBytes: 1)
+        XCTAssertEqual(config.machineIdentifierData(slot: 1), Data([2]))
+        XCTAssertEqual(config.machineIdentifierData(slot: 2), Data([3]))
+        XCTAssertNil(config.machineIdentifierData(slot: 0))
+        XCTAssertNil(config.machineIdentifierData(slot: 3))
     }
 
     func testTheGuidedStepsCarryTheAccountsValues() throws {

@@ -2,19 +2,21 @@
 //
 //   <data>/macos-vm/ipsw/<name>.ipsw           restore images Electron downloaded
 //   <data>/macos-vm/images/<imageId>/          one golden image
-//       disk.img aux.img config.json           written by `install`
-//       state.vzvmsave state.json              written by `save-state`
+//       disk.img aux.img config.json           written by `install`, booted only by `provision`
+//       slot<1|2>/                             one slot's saved state, written by `save-state`:
+//           disk.img aux.img                   clones of the golden files, booted with the slot's identity
+//           state.vzvmsave state.json          the state saved over them, and its stamp
 //   <data>/macos-vm/vms/<vmId>/                one job VM
-//       disk.img aux.img                       the helper's clones of the golden files
+//       disk.img aux.img                       the helper's clones of the golden or slot files
 //       agent.sock helper.pid                  its socket and pid file
 //   <data>/macos-vm/slots/<1|2>.lock           held by whichever helper runs a VM in that slot
 //
-// Electron makes the image and VM directories before it spawns the helper;
-// the helper makes none of them and follows no link to them. Each is opened
-// with O_NOFOLLOW and its real path read back with F_GETPATH, never walked
-// with realpath(3): under the helper's deny-default profile a walk fails,
-// because it reads the metadata of `<data>`'s ancestors, which the profile
-// does not grant.
+// Electron makes the image, slot and VM directories before it spawns the
+// helper; the helper makes none of them and follows no link to them. Each is
+// opened with O_NOFOLLOW and its real path read back with F_GETPATH, never
+// walked with realpath(3): under the helper's deny-default profile a walk
+// fails, because it reads the metadata of `<data>`'s ancestors, which the
+// profile does not grant.
 
 import Darwin
 import Foundation
@@ -23,6 +25,12 @@ public enum GoldenFile {
     public static let disk = "disk.img"
     public static let aux = "aux.img"
     public static let config = "config.json"
+}
+
+/// A slot's saved state, in `<image>/slot<n>`.
+public enum SlotFile {
+    public static let disk = "disk.img"
+    public static let aux = "aux.img"
     public static let state = "state.vzvmsave"
     public static let stateStamp = "state.json"
 }

@@ -28,7 +28,7 @@ final class ImageTests: XCTestCase {
         let image = try checkImage(real, imageId: "a1b2c3d4e5f6")
         XCTAssertEqual(image.config.build, "25G83")
         XCTAssertEqual(image.disk, real + "/disk.img")
-        XCTAssertNil(image.state)
+        XCTAssertTrue(image.states.isEmpty)
     }
 
     func testThePathMustBeTheRealOne() throws {
@@ -70,18 +70,53 @@ final class ImageTests: XCTestCase {
         imageError({ _ = try checkImage(real, imageId: "a1b2c3d4e5f6") }, "aux.img is missing")
     }
 
-    func testASavedStateCountsOnlyWithAStamp() throws {
-        try makeImage(tmp, state: true)
+    func testEachSlotsSavedStateCountsOnlyWhenWhole() throws {
+        try makeImage(tmp, states: [1, 2])
         let real = tmp.real + "/data/macos-vm/images/a1b2c3d4e5f6"
-        XCTAssertEqual(try checkImage(real, imageId: "a1b2c3d4e5f6").state?.stamp.cpus, 4)
-        try FileManager.default.removeItem(atPath: real + "/state.json")
-        XCTAssertNil(try checkImage(real, imageId: "a1b2c3d4e5f6").state)
+        let both = try checkImage(real, imageId: "a1b2c3d4e5f6")
+        XCTAssertEqual(both.states.keys.sorted(), [1, 2])
+        XCTAssertEqual(both.states[2]?.dir, real + "/slot2")
+        XCTAssertEqual(both.states[2]?.disk, real + "/slot2/disk.img")
+        XCTAssertEqual(both.states[2]?.aux, real + "/slot2/aux.img")
+        XCTAssertEqual(both.states[2]?.state, real + "/slot2/state.vzvmsave")
+        XCTAssertEqual(both.states[2]?.stamp.cpus, 4)
+
+        // No stamp, no state.
+        try FileManager.default.removeItem(atPath: real + "/slot2/state.json")
+        XCTAssertEqual(try checkImage(real, imageId: "a1b2c3d4e5f6").states.keys.sorted(), [1])
+
+        // A stamp for the other slot: its state was taken with the other identity.
+        try JSONEncoder().encode(StateStamp(slot: 2, hostBuild: "25G83", helperVersion: "1.0.0", cpus: 4, memoryMiB: 6144))
+            .write(to: URL(fileURLWithPath: real + "/slot1/state.json"))
+        XCTAssertTrue(try checkImage(real, imageId: "a1b2c3d4e5f6").states.isEmpty)
+    }
+
+    func testASlotStateNeedsItsOwnDiskOfTheGoldenLength() throws {
+        try makeImage(tmp, states: [1])
+        let real = tmp.real + "/data/macos-vm/images/a1b2c3d4e5f6"
+        let fh = FileHandle(forWritingAtPath: real + "/slot1/disk.img")!
+        try fh.truncate(atOffset: 4096)
+        try fh.close()
+        XCTAssertTrue(try checkImage(real, imageId: "a1b2c3d4e5f6").states.isEmpty)
+
+        // A link at the slot's disk, even to a disk of the right length, is not its disk.
+        try FileManager.default.removeItem(atPath: real + "/slot1/disk.img")
+        try makeSparse(tmp.real + "/elsewhere.img", bytes: 1 << 20)
+        try FileManager.default.createSymbolicLink(atPath: real + "/slot1/disk.img", withDestinationPath: tmp.real + "/elsewhere.img")
+        XCTAssertTrue(try checkImage(real, imageId: "a1b2c3d4e5f6").states.isEmpty)
+
+        // Nor is a slot directory that is a link to another image's whole slot.
+        try FileManager.default.removeItem(atPath: real + "/slot1")
+        try makeImage(tmp, id: "ffffffffffff", states: [1])
+        try FileManager.default.createSymbolicLink(atPath: real + "/slot1",
+                                                   withDestinationPath: tmp.real + "/data/macos-vm/images/ffffffffffff/slot1")
+        XCTAssertTrue(try checkImage(real, imageId: "a1b2c3d4e5f6").states.isEmpty)
     }
 
     func testConfigRoundTripsAndRefusesBadFields() throws {
         let config = ImageConfig(imageId: "a1b2c3d4e5f6", build: "25G83", os: "26.6.2", hardwareModel: Data([1]),
-                                 machineIdentifier: Data([2]), diskBytes: 10, macAddress: "02:00:00:00:00:01", minCpus: 2,
-                                 minMemoryBytes: 1)
+                                 machineIdentifiers: [Data([2]), Data([3])], diskBytes: 10, macAddress: "02:00:00:00:00:01",
+                                 minCpus: 2, minMemoryBytes: 1)
         XCTAssertEqual(try ImageConfig.decode(try config.encoded(), imageId: "a1b2c3d4e5f6"), config)
         var bad = config
         bad.macAddress = "01:00:00:00:00:01"
@@ -92,6 +127,12 @@ final class ImageTests: XCTestCase {
         bad = config
         bad.hardwareModel = ""
         imageError({ _ = try ImageConfig.decode(try bad.encoded(), imageId: "a1b2c3d4e5f6") }, "hardware model")
+        bad = config
+        bad.machineIdentifiers = [config.machineIdentifiers[0]]
+        imageError({ _ = try ImageConfig.decode(try bad.encoded(), imageId: "a1b2c3d4e5f6") }, "two different machine identifiers")
+        bad = config
+        bad.machineIdentifiers = [config.machineIdentifiers[0], config.machineIdentifiers[0]]
+        imageError({ _ = try ImageConfig.decode(try bad.encoded(), imageId: "a1b2c3d4e5f6") }, "two different machine identifiers")
         imageError({ _ = try ImageConfig.decode(Data("[]".utf8), imageId: "a1b2c3d4e5f6") }, "not a golden image config")
     }
 
@@ -107,12 +148,46 @@ final class ImageTests: XCTestCase {
     }
 
     func testAStateRestoresOnlyWhereItWasSaved() {
-        let stamp = StateStamp(hostBuild: "25G83", helperVersion: "1.0.0", cpus: 4, memoryMiB: 6144)
+        let stamp = StateStamp(slot: 1, hostBuild: "25G83", helperVersion: "1.0.0", cpus: 4, memoryMiB: 6144)
         XCTAssertNil(restoreRefusal(stamp, hostBuild: "25G83", helperVersion: "1.0.0", cpus: 4, memoryMiB: 6144))
         XCTAssertNotNil(restoreRefusal(stamp, hostBuild: "25H12", helperVersion: "1.0.0", cpus: 4, memoryMiB: 6144))
         XCTAssertNotNil(restoreRefusal(stamp, hostBuild: "25G83", helperVersion: "1.0.1", cpus: 4, memoryMiB: 6144))
         XCTAssertNotNil(restoreRefusal(stamp, hostBuild: "25G83", helperVersion: "1.0.0", cpus: 6, memoryMiB: 6144))
         XCTAssertNotNil(restoreRefusal(stamp, hostBuild: "25G83", helperVersion: "1.0.0", cpus: 4, memoryMiB: 8192))
+    }
+
+    func testAJobRestoresItsSlotsStateOrBootsTheGoldenDiskCold() throws {
+        try makeImage(tmp, states: [1])
+        let real = tmp.real + "/data/macos-vm/images/a1b2c3d4e5f6"
+        let image = try checkImage(real, imageId: "a1b2c3d4e5f6")
+        func start(_ slot: Int, _ boot: BootMode, host: String = "25G83", cpus: Int = 4) -> JobStart {
+            jobStart(image, slot: slot, boot: boot, hostBuild: host, helperVersion: "1.0.0", cpus: cpus, memoryMiB: 6144)
+        }
+
+        // Its own slot's disk and state, together: the state was saved from that disk.
+        let restored = start(1, .restore)
+        XCTAssertEqual(restored.sourceDir, real + "/slot1")
+        XCTAssertEqual(restored.plan, .restore(real + "/slot1/state.vzvmsave"))
+        XCTAssertNil(restored.restoreSkipped)
+        XCTAssertEqual(restored.machineIdentifier, Data([4, 5, 6]))
+
+        // Slot 2 has no state: the golden disk, cold, with slot 2's identity.
+        let cold = start(2, .restore)
+        XCTAssertEqual(cold.sourceDir, real)
+        XCTAssertEqual(cold.plan, .cold)
+        XCTAssertEqual(cold.restoreSkipped, "slot 2 has no saved state")
+        XCTAssertEqual(cold.machineIdentifier, Data([7, 8, 9]))
+
+        // A state saved elsewhere or in another shape is not used, and says why.
+        XCTAssertEqual(start(1, .restore, host: "25H12").plan, .cold)
+        XCTAssertEqual(start(1, .restore, host: "25H12").sourceDir, real)
+        XCTAssertNotNil(start(1, .restore, host: "25H12").restoreSkipped)
+        XCTAssertNotNil(start(1, .restore, cpus: 6).restoreSkipped)
+
+        // Asked for cold: the golden disk, and nothing to explain.
+        XCTAssertEqual(start(1, .cold).sourceDir, real)
+        XCTAssertEqual(start(1, .cold).plan, .cold)
+        XCTAssertNil(start(1, .cold).restoreSkipped)
     }
 
     func testHostBuildIsRead() {
@@ -163,6 +238,18 @@ final class CloneTests: XCTestCase {
 
         removeClone(in: vm)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: vm), [])
+    }
+
+    func testARestoringJobClonesItsSlotsDisksNotTheGoldenOnes() throws {
+        try makeImage(tmp, states: [2])
+        let real = tmp.real + "/data/macos-vm/images/a1b2c3d4e5f6"
+        try Data("slot two".utf8).write(to: URL(fileURLWithPath: real + "/slot2/aux.img"))
+        let image = try checkImage(real, imageId: "a1b2c3d4e5f6")
+        try tmp.mkdir("data/macos-vm/vms/2-0123456789ab")
+        let vm = tmp.real + "/data/macos-vm/vms/2-0123456789ab"
+        let start = jobStart(image, slot: 2, boot: .restore, hostBuild: "25G83", helperVersion: "1.0.0", cpus: 4, memoryMiB: 6144)
+        let clone = try cloneDisks(from: start.sourceDir, diskBytes: image.config.diskBytes, into: vm)
+        XCTAssertEqual(FileManager.default.contents(atPath: clone.aux), Data("slot two".utf8))
     }
 
     func testCloneRefusesALinkedVMDirectoryAndNeverReplaces() throws {

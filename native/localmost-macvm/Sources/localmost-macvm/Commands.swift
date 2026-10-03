@@ -89,14 +89,16 @@ private final class VMTarget: Stoppable {
     }
 }
 
-/// Removes the golden image's saved state: any boot of the golden disk
-/// changes it, and the state no longer matches.
-private func discardState(_ imageDir: String) {
-    guard let dir = try? RealDirectory(imageDir) else { return }
+/// Removes a slot's saved state and the disks it was saved over, stamp
+/// first so that nothing half-removed ever reads as whole. A boot of the
+/// golden disk makes every slot's state stale, since each was cloned from it.
+private func discardSlotState(_ slotDir: String) {
+    guard let dir = try? RealDirectory(slotDir) else { return }
     defer { dir.close() }
-    unlinkat(dir.fd, GoldenFile.stateStamp, 0)
-    unlinkat(dir.fd, GoldenFile.state, 0)
-    unlinkat(dir.fd, GoldenFile.state + ".tmp", 0)
+    guard dir.path == slotDir else { return }
+    for name in [SlotFile.stateStamp, SlotFile.state, SlotFile.state + ".tmp", SlotFile.disk, SlotFile.aux] {
+        unlinkat(dir.fd, name, 0)
+    }
 }
 
 private func requireSize(cpus: Int, memoryMiB: Int, _ config: ImageConfig) throws {
@@ -123,8 +125,8 @@ func runProvision(_ args: ProvisionArgs, _ ph: ProcessHooks) -> Never {
         }
         let slot = try SlotLock(layout: layout, slot: args.slot)
         ph.cleanup.append { slot.release() }
-        discardState(imageDir)
-        guard let model = image.config.hardwareModelData, let identifier = image.config.machineIdentifierData else {
+        macVMSlots.forEach { discardSlotState(image.slotDir($0)) }
+        guard let model = image.config.hardwareModelData, let identifier = image.config.machineIdentifierData(slot: args.slot) else {
             throw HelperError(.image, "config.json has no hardware model or machine identifier")
         }
         let configuration = try makeConfiguration(MacSpec(
@@ -239,6 +241,11 @@ private func provisionGuided(_ configuration: VZVirtualMachineConfiguration, ima
 
 // MARK: - save-state
 
+/// Saves one slot's state: clones the golden disk and aux storage into the
+/// slot's directory, boots the clone cold with the slot's identity and no
+/// network, waits for the agent's ready hello, pauses and saves. The golden
+/// disk itself is never booted here, so each slot's state goes with a disk
+/// of its own and a save in one slot never invalidates the other's.
 func runSaveState(_ args: SaveStateArgs, _ ph: ProcessHooks) -> Never {
     do {
         try checkParent(getppid())
@@ -247,12 +254,18 @@ func runSaveState(_ args: SaveStateArgs, _ ph: ProcessHooks) -> Never {
         try requireSize(cpus: args.cpus, memoryMiB: args.memoryMiB, image.config)
         let slot = try SlotLock(layout: layout, slot: args.slot)
         ph.cleanup.append { slot.release() }
-        discardState(imageDir)
-        guard let model = image.config.hardwareModelData, let identifier = image.config.machineIdentifierData else {
+        let slotDir = image.slotDir(args.slot)
+        discardSlotState(slotDir)
+        let clone = try cloneDisks(from: image.dir, diskBytes: image.config.diskBytes, into: slotDir)
+        // Until the stamp is written, what is in the slot is not a state:
+        // any way out before then removes it.
+        var saved = false
+        ph.cleanup.append { if !saved { discardSlotState(slotDir) } }
+        guard let model = image.config.hardwareModelData, let identifier = image.config.machineIdentifierData(slot: args.slot) else {
             throw HelperError(.image, "config.json has no hardware model or machine identifier")
         }
         let configuration = try makeConfiguration(MacSpec(
-            purpose: .saveState, hardwareModel: model, machineIdentifier: identifier, aux: image.aux, disk: image.disk,
+            purpose: .saveState, hardwareModel: model, machineIdentifier: identifier, aux: clone.aux, disk: clone.disk,
             cpus: args.cpus, memoryBytes: UInt64(args.memoryMiB) << 20
         ))
         try validate(configuration)
@@ -264,8 +277,9 @@ func runSaveState(_ args: SaveStateArgs, _ ph: ProcessHooks) -> Never {
         let target = VMTarget(controller)
         ph.onOutputBroken = { target.parentGone() }
         let kept = watch(target, ppid: getppid())
-        let stamp = StateStamp(hostBuild: hostOSBuild(), helperVersion: helperVersion, cpus: args.cpus, memoryMiB: args.memoryMiB)
-        let tmp = imageDir + "/" + GoldenFile.state + ".tmp"
+        let stamp = StateStamp(slot: args.slot, hostBuild: hostOSBuild(), helperVersion: helperVersion, cpus: args.cpus,
+                               memoryMiB: args.memoryMiB)
+        let tmp = slotDir + "/" + SlotFile.state + ".tmp"
         let deadline = Date().addingTimeInterval(Double(agentReadyTimeoutMs) / 1000)
 
         func poll() {
@@ -273,14 +287,18 @@ func runSaveState(_ args: SaveStateArgs, _ ph: ProcessHooks) -> Never {
                 if let line = line, isReadyHello(line) {
                     ph.hooks.send(["event": "agentReady"])
                     controller.saveAndStop(to: tmp) {
-                        let dir = try RealDirectory(imageDir)
+                        let dir = try RealDirectory(slotDir)
                         defer { dir.close() }
-                        guard renameat(dir.fd, GoldenFile.state + ".tmp", dir.fd, GoldenFile.state) == 0 else {
+                        guard dir.path == slotDir else {
+                            throw HelperError(.state, "the slot directory resolves to \(dir.path)")
+                        }
+                        guard renameat(dir.fd, SlotFile.state + ".tmp", dir.fd, SlotFile.state) == 0 else {
                             throw HelperError(.state, "the saved state cannot be put in place: \(posixMessage())")
                         }
                         let encoder = JSONEncoder()
                         encoder.outputFormatting = [.sortedKeys]
-                        try writeFileAtomically(in: dir.fd, GoldenFile.stateStamp, try encoder.encode(stamp))
+                        try writeFileAtomically(in: dir.fd, SlotFile.stateStamp, try encoder.encode(stamp))
+                        saved = true
                     }
                     return
                 }
@@ -313,28 +331,26 @@ func runJob(_ args: RunArgs, _ ph: ProcessHooks) -> Never {
         let slot = try SlotLock(layout: layout, slot: args.slot)
         ph.cleanup.append { slot.release() }
         try writePidFile(vmDir + "/" + VMFile.pidFile)
-        let clone = try cloneGolden(image, into: vmDir)
+        let start = jobStart(image, slot: args.slot, boot: args.boot, hostBuild: hostOSBuild(), helperVersion: helperVersion,
+                             cpus: args.cpus, memoryMiB: args.memoryMiB)
+        let clone = try cloneDisks(from: start.sourceDir, diskBytes: image.config.diskBytes, into: vmDir)
         ph.cleanup.append { removeClone(in: vmDir) }
-        guard let model = image.config.hardwareModelData, let golden = image.config.machineIdentifierData else {
-            throw HelperError(.image, "config.json has no hardware model or machine identifier")
+        guard let model = image.config.hardwareModelData else {
+            throw HelperError(.image, "config.json has no hardware model")
         }
         let configuration = try makeConfiguration(MacSpec(
-            purpose: .job, hardwareModel: model,
-            machineIdentifier: jobMachineIdentifier(golden: golden, fresh: newMachineIdentifierData),
+            purpose: .job, hardwareModel: model, machineIdentifier: start.machineIdentifier,
             aux: clone.aux, disk: clone.disk, cpus: args.cpus, memoryBytes: UInt64(args.memoryMiB) << 20
         ))
         try validate(configuration)
 
-        var plan = StartPlan.cold
-        var refusal: String?
-        if args.boot == .restore {
-            if let state = image.state {
-                refusal = restoreRefusal(state.stamp, hostBuild: hostOSBuild(), helperVersion: helperVersion,
-                                         cpus: args.cpus, memoryMiB: args.memoryMiB) ?? saveRestoreRefusal(configuration)
-                if refusal == nil { plan = .restore(state.path) }
-            } else {
-                refusal = "the image has no saved state"
-            }
+        var plan = start.plan
+        var refusal = start.restoreSkipped
+        if case .restore = plan, let why = saveRestoreRefusal(configuration) {
+            // The slot's disk is already cloned; booted cold it recovers as
+            // after a power cut, which costs a slower boot, never the job.
+            plan = .cold
+            refusal = why
         }
         let machine = MacMachine(configuration: configuration,
                                  relays: [GuestPort.proxy: args.proxyPort, GuestPort.broker: args.brokerPort], log: logLine)
@@ -368,20 +384,21 @@ func runCheck(_ args: CheckArgs, _ hooks: Hooks) -> Never {
         guard let data = image.config.hardwareModelData, let model = VZMacHardwareModel(dataRepresentation: data) else {
             throw HelperError(.image, "the image's hardware model cannot be read")
         }
-        var extra: [String: Any] = [
+        var states: [String: Any] = [:]
+        for (slot, state) in image.states {
+            states[String(slot)] = [
+                "hostBuild": state.stamp.hostBuild, "cpus": state.stamp.cpus, "memoryMiB": state.stamp.memoryMiB,
+                "helperVersion": state.stamp.helperVersion,
+                "stateBytes": NSNumber(value: allocatedBytes(state.state)),
+            ] as [String: Any]
+        }
+        hooks.end(nil, reason: "done", extra: [
             "build": image.config.build, "os": image.config.os,
             "supported": model.isSupported,
             "diskBytes": NSNumber(value: image.config.diskBytes),
             "diskAllocatedBytes": NSNumber(value: allocatedBytes(image.disk)),
-        ]
-        if let state = image.state {
-            extra["state"] = [
-                "hostBuild": state.stamp.hostBuild, "cpus": state.stamp.cpus, "memoryMiB": state.stamp.memoryMiB,
-                "helperVersion": state.stamp.helperVersion,
-                "allocatedBytes": NSNumber(value: allocatedBytes(state.path)),
-            ] as [String: Any]
-        }
-        hooks.end(nil, reason: "done", extra: extra)
+            "states": states,
+        ])
     } catch let e as HelperError {
         hooks.end(e, reason: "error")
     } catch {

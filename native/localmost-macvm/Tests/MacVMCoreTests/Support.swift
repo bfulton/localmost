@@ -73,23 +73,34 @@ final class Recorder {
     func named(_ event: String) -> [[String: Any]] { events.filter { $0["event"] as? String == event } }
 }
 
-/// A golden image's files, as `install` leaves them.
-func makeImage(_ tmp: TempDir, id: String = "a1b2c3d4e5f6", diskBytes: Int64 = 1 << 20, state: Bool = false) throws -> String {
+/// A golden image's files, as `install` leaves them, with its two slot
+/// directories (Electron makes them), and a saved state in each slot of `states`.
+func makeImage(_ tmp: TempDir, id: String = "a1b2c3d4e5f6", diskBytes: Int64 = 1 << 20, states: [Int] = []) throws -> String {
     let dir = try tmp.mkdir("data/macos-vm/images/\(id)")
     let config = ImageConfig(imageId: id, build: "25G83", os: "26.6.2", hardwareModel: Data([1, 2, 3]),
-                             machineIdentifier: Data([4, 5, 6]), diskBytes: diskBytes, macAddress: "02:11:22:33:44:55",
-                             minCpus: 2, minMemoryBytes: 4 << 30)
+                             machineIdentifiers: [Data([4, 5, 6]), Data([7, 8, 9])], diskBytes: diskBytes,
+                             macAddress: "02:11:22:33:44:55", minCpus: 2, minMemoryBytes: 4 << 30)
     try tmp.write("data/macos-vm/images/\(id)/config.json", try config.encoded())
-    let disk = FileManager.default.createFile(atPath: dir + "/disk.img", contents: nil)
-    XCTAssertTrue(disk)
-    let fh = FileHandle(forWritingAtPath: dir + "/disk.img")!
-    try fh.truncate(atOffset: UInt64(diskBytes))
-    try fh.close()
+    try makeSparse(dir + "/disk.img", bytes: diskBytes)
     try tmp.write("data/macos-vm/images/\(id)/aux.img", Data(repeating: 7, count: 4096))
-    if state {
-        try tmp.write("data/macos-vm/images/\(id)/state.vzvmsave", Data(repeating: 9, count: 1024))
-        let stamp = StateStamp(hostBuild: "25G83", helperVersion: "1.0.0", cpus: 4, memoryMiB: 6144)
-        try tmp.write("data/macos-vm/images/\(id)/state.json", try JSONEncoder().encode(stamp))
+    for slot in macVMSlots {
+        try tmp.mkdir("data/macos-vm/images/\(id)/slot\(slot)")
+    }
+    for slot in states {
+        let s = "data/macos-vm/images/\(id)/slot\(slot)"
+        try makeSparse(tmp.sub(s + "/disk.img"), bytes: diskBytes)
+        try tmp.write(s + "/aux.img", Data(repeating: 7, count: 4096))
+        try tmp.write(s + "/state.vzvmsave", Data(repeating: 9, count: 1024))
+        let stamp = StateStamp(slot: slot, hostBuild: "25G83", helperVersion: "1.0.0", cpus: 4, memoryMiB: 6144)
+        try tmp.write(s + "/state.json", try JSONEncoder().encode(stamp))
     }
     return dir
+}
+
+/// A sparse file of `bytes`.
+func makeSparse(_ path: String, bytes: Int64) throws {
+    XCTAssertTrue(FileManager.default.createFile(atPath: path, contents: nil))
+    let fh = FileHandle(forWritingAtPath: path)!
+    try fh.truncate(atOffset: UInt64(bytes))
+    try fh.close()
 }

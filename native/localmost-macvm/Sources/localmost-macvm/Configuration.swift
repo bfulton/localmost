@@ -28,7 +28,7 @@ enum Purpose {
 struct MacSpec {
     var purpose: Purpose
     var hardwareModel: Data
-    /// The identifier this boot presents (see machineIdentifierFor).
+    /// The identifier this boot presents: that of the slot whose lock it holds.
     var machineIdentifier: Data
     var aux: String
     var disk: String
