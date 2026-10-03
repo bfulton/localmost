@@ -10,8 +10,10 @@ import {
   POLICY_SECTION_SUBKEYS,
   PolicyScope,
   WORKFLOW_POLICY_KEYS,
+  describeIsolation,
   loopbackValues,
 } from './policy-describe';
+import { IsolationDeclaration, IsolationType, isolationDeclarationProblems, isolationList } from './isolation';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as net from 'net';
@@ -39,6 +41,8 @@ export interface SecretsPolicy {
 
 export interface WorkflowPolicy extends SandboxPolicy {
   secrets?: SecretsPolicy;
+  /** The isolation types this workflow's jobs accept, in order; replaces the shared list. */
+  isolation?: IsolationDeclaration;
 }
 
 /** The network section as `shared:` may declare it. */
@@ -56,6 +60,14 @@ export interface SharedNetworkPolicy extends NetworkPolicy {
 /** What `shared:` may declare: a section, plus what only a whole worker can be given. */
 export interface SharedPolicy extends SandboxPolicy {
   network?: SharedNetworkPolicy;
+  /**
+   * The isolation types the repository's jobs accept, in the order to try:
+   * a job gets the first this Mac allows and this build can run, and is
+   * refused when none is. Absent means any (see isolation.ts). Unlike the
+   * filesystem it may be declared per workflow too, since it is chosen at
+   * admission, when the workflow is known.
+   */
+  isolation?: IsolationDeclaration;
 }
 
 export interface LocalmostrcConfig {
@@ -435,6 +447,13 @@ function validatePolicy(policy: unknown, path: string, errors: ParseError[], sco
   if (p.docker !== undefined) {
     validateDockerPolicy(p.docker, `${path}.docker`, (m) => errors.push({ message: m }));
   }
+
+  // The isolation types accepted, in order. Valid at both scopes: the type
+  // is chosen when the job is admitted, when its workflow is known. A type
+  // this build cannot run is accepted here and filtered out at admission.
+  if (p.isolation !== undefined) {
+    for (const message of isolationDeclarationProblems(p.isolation, `${path}.isolation`)) errors.push({ message });
+  }
 }
 
 function validateNetworkPolicy(policy: unknown, path: string, errors: ParseError[], scope: PolicyScope): void {
@@ -738,12 +757,16 @@ function mergeEnvPolicy(base?: EnvPolicy, override?: EnvPolicy): EnvPolicy | und
  * Merge two sandbox policies.
  * Override takes precedence, arrays are merged.
  */
-export function mergePolicies(base: SharedPolicy, override: SandboxPolicy): SharedPolicy {
+export function mergePolicies(base: SharedPolicy, override: SandboxPolicy & { isolation?: IsolationDeclaration }): SharedPolicy {
+  // Isolation is not merged: it is an order, and a workflow's list replaces
+  // the shared one whole.
+  const isolation = override.isolation ?? base.isolation;
   return {
     network: mergeNetworkPolicy(base.network, override.network),
     filesystem: mergeFilesystemPolicy(base.filesystem, override.filesystem),
     env: mergeEnvPolicy(base.env, override.env),
     docker: mergeDockerPolicy(base.docker, override.docker),
+    ...(isolation !== undefined ? { isolation } : {}),
   };
 }
 
@@ -756,6 +779,16 @@ export function getEffectivePolicy(config: LocalmostrcConfig, workflowName: stri
   const workflowPolicy = config.workflows?.[workflowName] || {};
 
   return mergePolicies(shared, workflowPolicy);
+}
+
+/**
+ * The isolation types a job of `workflowName` accepts, in the order to try:
+ * its workflow's list, else the shared one, else any. A repository with no
+ * policy, or a commit without its approved one, accepts any.
+ */
+export function effectiveIsolation(config: LocalmostrcConfig | null, workflowName: string | undefined): IsolationType[] {
+  const workflow = workflowName !== undefined ? config?.workflows?.[workflowName] : undefined;
+  return isolationList(workflow?.isolation ?? config?.shared?.isolation);
 }
 
 /**
@@ -870,6 +903,12 @@ function serializePolicy(policy: SharedPolicy, indent: string): string[] {
     ], indent));
   }
 
+  // As written: any, one type, or the list in its order.
+  if (policy.isolation !== undefined) {
+    const { isolation } = policy;
+    lines.push(`${indent}isolation: ${typeof isolation === 'string' ? quote(isolation) : `[${isolation.map(quote).join(', ')}]`}`);
+  }
+
   return lines;
 }
 
@@ -900,6 +939,14 @@ export function diffConfigs(oldConfig: LocalmostrcConfig, newConfig: Localmostrc
 
   // Compare shared policies
   diffPolicies(oldConfig.shared || {}, newConfig.shared || {}, 'shared', diffs);
+  // The shared isolation list, as one value: it is an order, so a list
+  // reordered is a change, and an absent one is any, so writing out any
+  // changes nothing a job can get.
+  const oldIsolation = describeIsolation(oldConfig.shared?.isolation);
+  const newIsolation = describeIsolation(newConfig.shared?.isolation);
+  if (oldIsolation !== newIsolation) {
+    diffs.push({ path: 'shared.isolation', type: 'changed', oldValue: oldIsolation, newValue: newIsolation });
+  }
 
   // Compare workflow policies
   const allWorkflows = new Set([
@@ -911,6 +958,14 @@ export function diffConfigs(oldConfig: LocalmostrcConfig, newConfig: Localmostrc
     const oldPolicy = oldConfig.workflows?.[workflow] || {};
     const newPolicy = newConfig.workflows?.[workflow] || {};
     diffPolicies(oldPolicy, newPolicy, `workflows.${workflow}`, diffs);
+    // A workflow's list replaces the shared one, and an absent one takes
+    // the shared one: added, removed, or changed as one value.
+    const path = `workflows.${workflow}.isolation`;
+    const was = oldPolicy.isolation === undefined ? undefined : describeIsolation(oldPolicy.isolation);
+    const now = newPolicy.isolation === undefined ? undefined : describeIsolation(newPolicy.isolation);
+    if (was === undefined && now !== undefined) diffs.push({ path, type: 'added', newValue: now });
+    else if (was !== undefined && now === undefined) diffs.push({ path, type: 'removed', oldValue: was });
+    else if (was !== now) diffs.push({ path, type: 'changed', oldValue: was, newValue: now });
   }
 
   return diffs;

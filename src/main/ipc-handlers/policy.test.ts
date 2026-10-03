@@ -194,6 +194,16 @@ describe('approving from the app', () => {
     expect(approved.grants).toEqual(['network: index.crates.io']);
   });
 
+  it('shows a change to the isolation list as a change to approve, and the list among the grants', async () => {
+    recordPendingPolicy(REPO, { version: 1, shared: { isolation: ['macos-vm', 'seatbelt'] } });
+    await approve(REPO, list()[0].stamp);
+    recordPendingPolicy(REPO, { version: 1, shared: { isolation: 'seatbelt' } });
+
+    const pending = list().find((s) => !s.approved)!;
+    expect(pending.changes).toEqual(['~ shared.isolation: macos-vm, seatbelt -> seatbelt']);
+    expect(pending.grants).toEqual([expect.stringMatching(/^isolation: seatbelt \(in this order/)]);
+  });
+
   it('says when a pending policy is for a different repository under the approved name', async () => {
     const config = { version: 1, shared: { network: { allow: ['index.crates.io'] } } };
     recordPendingPolicy(REPO, config, 1);

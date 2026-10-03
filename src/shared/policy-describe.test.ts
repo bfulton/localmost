@@ -25,6 +25,7 @@ const everything = {
     build: { context: './docker', tags: ['myapp:*'] },
   },
   secrets: { require: ['DEPLOY_KEY'] },
+  isolation: ['service-account', 'seatbelt'] as Array<'service-account' | 'seatbelt'>,
 };
 
 describe('describePolicy', () => {
@@ -33,6 +34,7 @@ describe('describePolicy', () => {
     for (const value of [
       'github.com', 'evil.example', '/etc', '~/.npm', '~/.ssh',
       'CI', 'AWS_SECRET_ACCESS_KEY', 'docker.io', 'alpine:3', 'vk-*', './docker', 'myapp:*', 'DEPLOY_KEY', 'permissive', '5432',
+      'service-account, seatbelt',
     ]) {
       expect(text).toContain(value);
     }
@@ -184,6 +186,22 @@ describe('describePolicy', () => {
 
   it('says nothing about loopback when none is granted', () => {
     expect(describePolicy({ network: { loopback: [] } })).toEqual([]);
+  });
+
+  it('shows the isolation list in its order, with what the order means', () => {
+    const [grant] = describePolicy({ isolation: ['macos-vm', 'seatbelt'] });
+    expect(grant.group).toBe('Isolation');
+    expect(grant.value).toBe('macos-vm, seatbelt');
+    expect(grant.summary).toBe(
+      'isolation: macos-vm, seatbelt (in this order, the first this Mac allows and can run; the job is refused if none is)'
+    );
+    expect(describePolicy({ isolation: 'any' })[0].value).toBe('any (macos-vm, service-account, seatbelt)');
+    expect(describePolicy({ isolation: 'seatbelt' })[0].value).toBe('seatbelt');
+  });
+
+  it("says a workflow's isolation list replaces the shared one", () => {
+    const [grant] = describePolicy({ isolation: 'seatbelt' }, 'ui: ', 'workflow');
+    expect(grant.summary).toMatch(/^ui: isolation: seatbelt \(replaces the shared list for this workflow; in this order/);
   });
 
   it('prefixes the flat summary, which is how a workflow scope is shown', () => {
