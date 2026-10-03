@@ -492,6 +492,8 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
   const setIsolationAllowed = useCallback(async (type: IsolationType, allowed: boolean) => {
     // Only types this build can run: settings:set refuses any other, and a
     // type a later build allowed in config.yaml allows nothing here anyway.
+    // So a change here drops such a type from config.yaml: a later build
+    // shows it off until it is turned on again (see resolveIsolationConfig).
     const available = availableIsolationTypes();
     const kept = isolation.allowed.filter((t: IsolationType) => t !== type && available.includes(t));
     const newConfig: IsolationConfig = { allowed: allowed ? [...kept, type] : kept };

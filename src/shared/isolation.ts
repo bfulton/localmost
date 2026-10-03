@@ -146,7 +146,9 @@ export const DEFAULT_ISOLATION_CONFIG: Readonly<{ allowed: readonly IsolationTyp
  * default; anything but a list is taken as absent, and an unknown or
  * repeated type in it is dropped, each with a line through `log`. A type
  * this build cannot run is kept: it allows nothing until the build can, and
- * a config a later build wrote survives a launch of this one.
+ * a config a later build wrote survives a launch of this one - until a
+ * change in Settings > Isolation, which rewrites the list to the types this
+ * build can run (settings:set accepts no others).
  */
 export function resolveIsolationConfig(
   raw: Partial<Record<keyof IsolationConfig, unknown>> | undefined,

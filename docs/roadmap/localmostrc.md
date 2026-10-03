@@ -336,11 +336,22 @@ cannot run is filtered out when a job is admitted. Under `shared:` it is every
 workflow's; under `workflows:` it replaces the shared list whole for that
 workflow (an order is not merged). Unlike the filesystem it is applied per
 workflow, because it is chosen at admission, when the job's workflow is known.
+A workflow's list is found by its workflow file name, as every `workflows:`
+key is; when GitHub does not send the workflow's path, the job's workflow
+`name:` is matched instead, and a job that matches no key gets the shared
+list - which can accept more than the workflow's own list, within the host's
+allowed set.
 
-**Absent means any.** A repository with no `isolation:` - or no
-`.localmostrc` at all, or a commit whose file is not the approved one - accepts
-`any`, which is `[macos-vm, service-account, seatbelt]`: the strongest
-separation this Mac allows and can run.
+**Absent means any.** A repository with no `isolation:`, or no
+`.localmostrc` at all, accepts `any`, which is `[macos-vm, service-account,
+seatbelt]`: the strongest separation this Mac allows and can run. So does a
+commit with no `.localmostrc` in a repository that has an approved policy:
+such a commit is admitted on the baseline, and for isolation the baseline is
+`any`. A pull request that deletes the file therefore drops the approved
+list - a repository that accepts only `macos-vm` has that pull request run
+under whatever this Mac allows - and only the host's allowed set bounds it
+(SECURITY.md, Isolation types). A commit whose file differs from the approved
+one is held for approval, not admitted.
 
 **Order and filtering.** This Mac allows a set of types (Settings > Isolation,
 the `isolation.allowed` section of `config.yaml`): `[seatbelt]` by default in

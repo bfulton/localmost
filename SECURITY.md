@@ -127,7 +127,13 @@ repository that lists only `macos-vm` is refused on one that does not. The
 list is part of the approved policy, its order included, so a change to it is
 a policy change to approve; and like every `workflows:` key, a workflow's
 list can be claimed by any pull request that names a workflow file after it -
-the allowed set is what bounds that too. See
+the allowed set is what bounds that too. It also bounds a commit with no
+`.localmostrc`: such a commit runs on the baseline, and for isolation the
+baseline is `any`, so a pull request that deletes the file drops the
+repository's approved list. Removing the file narrows every grant, but widens
+which isolation types the job accepts: a repository whose approved policy
+accepts only `macos-vm` has that pull request run under whatever this Mac
+allows. A type must be out of the allowed set to be kept from every job. See
 [localmostrc.md](docs/roadmap/localmostrc.md), Isolation.
 
 ### What localmost trusts (does NOT protect against)
