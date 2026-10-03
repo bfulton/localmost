@@ -14,6 +14,7 @@ import { store, getState } from '../index';
 import { ConfigSlice, defaultConfigState } from '../types';
 import { AppConfig, CONFIG_VERSION, isConfigFromNewerBuild } from '../../config';
 import { resolveJobEnvironmentConfig, resolveResourcePauseConfig } from '../../../shared/job-preferences';
+import { resolveIsolationConfig } from '../../../shared/isolation';
 
 // Debounce timer for persistence
 let persistTimer: NodeJS.Timeout | null = null;
@@ -47,6 +48,7 @@ const PERSISTED_CONFIG_KEYS: (keyof ConfigSlice)[] = [
   'notifications',
   'resourcePause',
   'jobEnvironment',
+  'isolation',
   'launchAtLogin',
   'hideOnStart',
   'runnerConfig',
@@ -93,6 +95,7 @@ const CONFIG_KEY_OWNER: {
   dockerVm: 'file',
   resourcePause: 'store',
   jobEnvironment: 'store',
+  isolation: 'store',
 };
 
 /** The sections of config.yaml only the file holds, carried forward at each save (see CONFIG_KEY_OWNER). */
@@ -233,6 +236,10 @@ export function loadPersistedConfig(): void {
     }
     if (diskConfig.jobEnvironment !== undefined) {
       configUpdates.jobEnvironment = resolveJobEnvironmentConfig(diskConfig.jobEnvironment, (message) => bootLog('warn', message));
+    }
+    // Which isolation types this Mac allows, as admission reads them.
+    if (diskConfig.isolation !== undefined) {
+      configUpdates.isolation = resolveIsolationConfig(diskConfig.isolation, (message) => bootLog('warn', message));
     }
 
     // Runner config

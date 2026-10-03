@@ -20,6 +20,7 @@ import { MAX_RUNNER_COUNT } from '../../shared/constants';
 import { isGitHubLogin, parseSavedGitHubRepoUrl } from '../../shared/github-names';
 import { isAllowedUsers, isFilterScope } from '../../shared/user-filter-config';
 import { DEFAULT_JOB_ENVIRONMENT_CONFIG, JobEnvironmentConfig, ResourcePauseConfig } from '../../shared/job-preferences';
+import { IsolationConfig, availableIsolationTypes, isIsolationType } from '../../shared/isolation';
 
 const log = () => getLogger();
 
@@ -118,6 +119,15 @@ const SETTING_SHAPES: Record<SettableConfigKey, (value: unknown) => boolean> = {
   jobEnvironment: isRecordOf(
     Object.fromEntries(Object.keys(DEFAULT_JOB_ENVIRONMENT_CONFIG).map((key) => [key, isBoolean]))
   ),
+  // Which isolation types this Mac allows: distinct types, each one this
+  // build can run and is set up for. One that is not cannot be turned on
+  // yet; when it can, turning it on starts its setup.
+  isolation: isRecordOf({
+    allowed: (value) =>
+      Array.isArray(value) &&
+      new Set(value).size === value.length &&
+      value.every((type) => isIsolationType(type) && availableIsolationTypes().includes(type)),
+  }),
 };
 
 /**
@@ -204,6 +214,10 @@ export const registerSettingsHandlers = (): void => {
     }
     if (sanitizedSettings.jobEnvironment !== undefined) {
       storeState.setJobEnvironment(sanitizedSettings.jobEnvironment as JobEnvironmentConfig);
+    }
+    // Read from the store at each admission.
+    if (sanitizedSettings.isolation !== undefined) {
+      storeState.setIsolation(sanitizedSettings.isolation as IsolationConfig);
     }
     if (sanitizedSettings.launchAtLogin !== undefined) {
       storeState.setLaunchAtLogin(sanitizedSettings.launchAtLogin);

@@ -19,6 +19,7 @@ import {
   UpdateSettings,
 } from '../shared/types';
 import type { ResourcePauseConfig, JobEnvironmentConfig } from '../shared/job-preferences';
+import type { IsolationConfig } from '../shared/isolation';
 
 // Config paths - uses centralized path management
 const configDir = getAppDataDir();
@@ -60,6 +61,7 @@ export const SETTABLE_CONFIG_KEYS = [
   'notifications',
   'resourcePause',  // What a resource pause does to running jobs
   'jobEnvironment',  // What localmost adds to each job's environment
+  'isolation',  // Which isolation types this Mac allows a job to get
 ] as const;
 
 export type SettableConfigKey = typeof SETTABLE_CONFIG_KEYS[number];
@@ -108,6 +110,16 @@ export interface AppConfig {
   resourcePause?: Partial<Record<keyof ResourcePauseConfig, unknown>>;
   /** What localmost adds to each job's environment; see resolveJobEnvironmentConfig. */
   jobEnvironment?: Partial<Record<keyof JobEnvironmentConfig, unknown>>;
+  /**
+   * Which isolation types this Mac allows a job to get: `allowed`, a list of
+   * `seatbelt`, `service-account`, `macos-vm`. Seatbelt alone by default in
+   * this build, the only type it can run; the VM alone from the build that
+   * ships the macOS VM type. A repository's .localmostrc orders the types it
+   * accepts, and a job gets the first that is both allowed here and
+   * available in this build, or is refused. See resolveIsolationConfig and
+   * docs/roadmap/localmostrc.md (Isolation).
+   */
+  isolation?: Partial<Record<keyof IsolationConfig, unknown>>;
 }
 
 // The resource-pause and job-environment preferences, with their defaults

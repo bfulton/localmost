@@ -16,7 +16,7 @@ jest.mock('../../log-file', () => ({
 
 import * as yaml from 'js-yaml';
 import { loadPersistedConfig, savePersistedConfig } from './persist';
-import { store, runnerJobEnvironment, runnerResourcePause } from '../index';
+import { store, runnerIsolation, runnerJobEnvironment, runnerResourcePause } from '../index';
 import { defaultConfigState } from '../types';
 import { CONFIG_VERSION, type AppConfig } from '../../config';
 import type { GitHubUser } from '../../../shared/types';
@@ -177,6 +177,31 @@ describe('the resource-pause and job-environment preferences', () => {
   });
 });
 
+describe('the isolation types this Mac allows', () => {
+  it('start at seatbelt alone, load from config.yaml, and persist back', () => {
+    loadPersistedConfig();
+    expect(store.getState().config.isolation).toEqual({ allowed: ['seatbelt'] });
+
+    fs.writeFileSync(configPath, 'configVersion: 1\ntheme: auto\nisolation:\n  allowed: []\n');
+    loadPersistedConfig();
+    expect(store.getState().config.isolation).toEqual({ allowed: [] });
+    expect(runnerIsolation()).toEqual({ allowed: [] });
+
+    store.getState().setIsolation({ allowed: ['seatbelt'] });
+    savePersistedConfig();
+    const saved = yaml.load(fs.readFileSync(configPath, 'utf-8')) as AppConfig;
+    expect(saved.isolation).toEqual({ allowed: ['seatbelt'] });
+  });
+
+  it('keep a type a later build can run, and drop one no build knows', () => {
+    // A config written by the build that ships the VM type survives a launch
+    // of this one; it allows nothing here, where the VM is not available.
+    fs.writeFileSync(configPath, 'configVersion: 1\ntheme: auto\nisolation:\n  allowed: [macos-vm, docker]\n');
+    loadPersistedConfig();
+    expect(store.getState().config.isolation).toEqual({ allowed: ['macos-vm'] });
+  });
+});
+
 describe("the runner's resource-pause and job-environment preferences", () => {
   it('are the ones Settings shows, whatever is written to config.yaml while the app runs', () => {
     // The store owns both sections: the page shows the store's value, and
@@ -310,6 +335,7 @@ describe('every key of config.yaml', () => {
       dockerVm: { cpus: 2, memoryMiB: 4096 },
       resourcePause: { runningJobs: 'stop' },
       jobEnvironment: { toolShims: false, javaToolOptions: true, perJobTempDir: false, createMissingGrantedDirs: true, swiftBuildLinkTemp: false },
+      isolation: { allowed: [] },
     };
     fs.writeFileSync(configPath, yaml.dump(full));
     loadPersistedConfig();

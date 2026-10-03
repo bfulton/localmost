@@ -540,3 +540,78 @@ describe('the resource-pause and job-environment preferences', () => {
     });
   });
 });
+
+describe('the Isolation section', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockLocalmost.github.getAuthStatus.mockResolvedValue({ isAuthenticated: false });
+    mockLocalmost.runner.isDownloaded.mockResolvedValue(false);
+    mockLocalmost.runner.isConfigured.mockResolvedValue(false);
+    mockLocalmost.runner.getVersion.mockResolvedValue({ version: null, url: null });
+    mockLocalmost.runner.getAvailableVersions.mockResolvedValue({ success: true, versions: [] });
+    mockLocalmost.settings.get.mockResolvedValue({});
+    mockLocalmost.settings.set.mockResolvedValue({ success: true });
+    mockLocalmost.runner.getStatus.mockResolvedValue({ status: 'offline' });
+    mockLocalmost.jobs.getHistory.mockResolvedValue([]);
+    mockLocalmost.network.isOnline.mockResolvedValue(true);
+  });
+
+  afterEach(() => resetZubridge());
+
+  const checkbox = (label: string) => screen.getByLabelText(label) as HTMLInputElement;
+  const group = (label: string) => checkbox(label).closest('div') as HTMLElement;
+
+  it('has a checkbox per type, seatbelt allowed by default and the others not available in this build', async () => {
+    renderWithProviders(<SettingsPage onBack={jest.fn()} />);
+    await waitFor(() => expect(screen.getByText('Isolation')).toBeInTheDocument());
+
+    expect(checkbox('Seatbelt sandbox').checked).toBe(true);
+    expect(checkbox('Seatbelt sandbox').disabled).toBe(false);
+    for (const label of ['Service account', 'macOS VM']) {
+      expect({ label, checked: checkbox(label).checked, disabled: checkbox(label).disabled }).toEqual({
+        label,
+        checked: false,
+        disabled: true,
+      });
+      expect(group(label)).toHaveTextContent('Not available in this build');
+    }
+    expect(group('Seatbelt sandbox')).not.toHaveTextContent('Not available in this build');
+    // The service account is headless: say so where it would be chosen.
+    expect(group('Service account')).toHaveTextContent(/Headless only/);
+  });
+
+  it("says this Mac's set is the guard, and the repository's list only orders it", async () => {
+    renderWithProviders(<SettingsPage onBack={jest.fn()} />);
+    await waitFor(() => expect(screen.getByText('Isolation')).toBeInTheDocument());
+
+    const section = screen.getByText('Isolation').closest('section') as HTMLElement;
+    expect(section).toHaveTextContent(/first type in its repository's isolation: list that is allowed here and available/);
+    expect(section).toHaveTextContent(/A job whose repository lists none of them is refused/);
+  });
+
+  it('turns seatbelt off and on, sending the allowed list', async () => {
+    renderWithProviders(<SettingsPage onBack={jest.fn()} />);
+    await waitFor(() => expect(checkbox('Seatbelt sandbox').checked).toBe(true));
+
+    fireEvent.click(checkbox('Seatbelt sandbox'));
+    await waitFor(() => expect(mockLocalmost.settings.set).toHaveBeenLastCalledWith({ isolation: { allowed: [] } }));
+    await waitFor(() => expect(checkbox('Seatbelt sandbox').checked).toBe(false));
+    // Nothing allowed: every job is refused, and the page says so.
+    expect(screen.getByText(/No type is allowed: every job is refused/)).toBeInTheDocument();
+
+    fireEvent.click(checkbox('Seatbelt sandbox'));
+    await waitFor(() => expect(mockLocalmost.settings.set).toHaveBeenLastCalledWith({ isolation: { allowed: ['seatbelt'] } }));
+  });
+
+  it('shows the saved set from the store, and sends only types this build can run', async () => {
+    // A config a later build wrote may allow the VM; it allows nothing here,
+    // and turning seatbelt on or off does not send it back.
+    seedZubridge({ config: { isolation: { allowed: ['macos-vm'] } } });
+    renderWithProviders(<SettingsPage onBack={jest.fn()} />);
+    await waitFor(() => expect(checkbox('Seatbelt sandbox').checked).toBe(false));
+    expect(checkbox('macOS VM').checked).toBe(false);
+
+    fireEvent.click(checkbox('Seatbelt sandbox'));
+    await waitFor(() => expect(mockLocalmost.settings.set).toHaveBeenLastCalledWith({ isolation: { allowed: ['seatbelt'] } }));
+  });
+});

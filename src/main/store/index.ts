@@ -36,6 +36,7 @@ import {
   GitHubOrg,
 } from '../../shared/types';
 import { ResourcePauseConfig, JobEnvironmentConfig } from '../../shared/job-preferences';
+import { IsolationConfig } from '../../shared/isolation';
 
 // Create the store
 export const store = createStore<AppStore>()(
@@ -110,6 +111,10 @@ export const store = createStore<AppStore>()(
 
     setJobEnvironment: (jobEnvironment: JobEnvironmentConfig) => {
       set((state) => ({ config: { ...state.config, jobEnvironment } }));
+    },
+
+    setIsolation: (isolation: IsolationConfig) => {
+      set((state) => ({ config: { ...state.config, isolation } }));
     },
 
     setLaunchAtLogin: (launchAtLogin: boolean) => {
@@ -422,3 +427,9 @@ export const runnerResourcePause = (): ResourcePauseConfig => store.getState().c
  * it: read at each worker spawn. From the store, as runnerResourcePause.
  */
 export const runnerJobEnvironment = (): JobEnvironmentConfig => store.getState().config.jobEnvironment;
+
+/**
+ * Which isolation types this Mac allows, as Settings shows and sets them:
+ * read at each job's admission. From the store, as runnerResourcePause.
+ */
+export const runnerIsolation = (): IsolationConfig => store.getState().config.isolation;

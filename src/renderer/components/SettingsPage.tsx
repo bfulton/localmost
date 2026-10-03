@@ -3,6 +3,7 @@ import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faXmark, faLightbulb, faMoon, faDesktop } from '@fortawesome/free-solid-svg-icons';
 import { SleepProtection, BatteryPauseThreshold, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../../shared/types';
 import { ResourcePauseConfig, JobEnvironmentConfig } from '../../shared/job-preferences';
+import { ISOLATION_DESCRIPTIONS, ISOLATION_TYPES, availableIsolationTypes } from '../../shared/isolation';
 import { GITHUB_APP_SETTINGS_URL, PRIVACY_POLICY_URL, REPOSITORY_URL } from '../../shared/constants';
 import { useAppConfig, useRunner, useUpdate } from '../contexts';
 import UserFilterSettings from './UserFilterSettings';
@@ -116,6 +117,8 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     setResourcePauseRunningJobs,
     jobEnvironment,
     setJobEnvironmentOption,
+    isolation,
+    setIsolationAllowed,
   } = useAppConfig();
 
   // Runner state from context
@@ -604,6 +607,39 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
               )}
             </div>
           ))}
+        </section>
+
+        {/* Isolation Section */}
+        <section id="isolation-section" className={styles.settingsSection} data-testid="settings-section">
+          <h3>Isolation</h3>
+          <p className={shared.formHint}>
+            How a job is kept from the rest of your Mac. A job runs under the first type in its repository&apos;s
+            isolation: list that is allowed here and available in this build; a repository that declares none
+            accepts any, the strongest first. A job whose repository lists none of them is refused, never run under
+            a type it did not list, and no repository&apos;s order reaches a type that is not allowed here.
+          </p>
+          {ISOLATION_TYPES.map((type) => {
+            const available = availableIsolationTypes().includes(type);
+            const { label, description } = ISOLATION_DESCRIPTIONS[type];
+            return (
+              <div key={type} className={shared.formGroup}>
+                <label className={shared.toggleRow}>
+                  <input
+                    type="checkbox"
+                    checked={available && isolation.allowed.includes(type)}
+                    disabled={!available}
+                    onChange={(e) => setIsolationAllowed(type, e.target.checked)}
+                  />
+                  <span>{label}</span>
+                </label>
+                <p className={shared.formHint}>{description}</p>
+                {!available && <p className={shared.formHint}>Not available in this build.</p>}
+              </div>
+            );
+          })}
+          {!isolation.allowed.some((type) => availableIsolationTypes().includes(type)) && (
+            <p className={shared.formHint}>No type is allowed: every job is refused.</p>
+          )}
         </section>
 
         {/* Power Section */}

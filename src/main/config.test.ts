@@ -108,6 +108,10 @@ describe('SETTABLE_CONFIG_KEYS', () => {
     expect(SETTABLE_CONFIG_KEYS).toContain('resourcePause');
     expect(SETTABLE_CONFIG_KEYS).toContain('jobEnvironment');
   });
+
+  it('lets the Settings page set which isolation types this Mac allows', () => {
+    expect(SETTABLE_CONFIG_KEYS).toContain('isolation');
+  });
 });
 
 describe('DockerVmConfigSource', () => {

@@ -23,7 +23,7 @@ jest.mock('../config', () => ({
   SETTABLE_CONFIG_KEYS: [
     'runnerConfig', 'theme', 'launchAtLogin', 'hideOnStart', 'sleepProtection', 'logLevel',
     'runnerLogLevel', 'userFilter', 'maxConcurrentJobs', 'power', 'notifications',
-    'resourcePause', 'jobEnvironment',
+    'resourcePause', 'jobEnvironment', 'isolation',
   ],
 }));
 
@@ -330,6 +330,42 @@ describe('settings IPC handlers', () => {
       expect(handlers['settings:set']({}, { jobEnvironment })).toEqual({ success: true });
       expect(saveConfig).toHaveBeenLastCalledWith({ jobEnvironment });
       expect(store.getState().config.jobEnvironment.swiftBuildLinkTemp).toBe(true);
+    });
+
+    it('saves which isolation types this Mac allows, none included, and hands them to the store', () => {
+      (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({} as any);
+      for (const isolation of [{ allowed: [] }, { allowed: ['seatbelt'] }]) {
+        expect(handlers['settings:set']({}, { isolation })).toEqual({ success: true });
+        expect(saveConfig).toHaveBeenLastCalledWith({ isolation });
+        expect(store.getState().config.isolation).toEqual(isolation);
+      }
+    });
+
+    it('refuses an isolation type this build cannot run, an unknown or repeated one, and any other shape', () => {
+      (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({} as any);
+      store.getState().setIsolation({ allowed: ['seatbelt'] });
+
+      for (const isolation of [
+        // Known, but not available in this build: it cannot be enabled yet.
+        { allowed: ['macos-vm'] },
+        { allowed: ['seatbelt', 'service-account'] },
+        { allowed: ['docker'] },
+        { allowed: ['seatbelt', 'seatbelt'] },
+        { allowed: 'seatbelt' },
+        { allowed: [1] },
+        {},
+        { allowed: ['seatbelt'], order: ['seatbelt'] },
+        ['seatbelt'],
+        null,
+      ]) {
+        const result = handlers['settings:set']({}, { isolation });
+        expect({ isolation, result }).toEqual({
+          isolation,
+          result: { success: false, error: 'Refused settings of the wrong shape: isolation' },
+        });
+      }
+      expect(saveConfig).not.toHaveBeenCalledWith(expect.objectContaining({ isolation: expect.anything() }));
+      expect(store.getState().config.isolation).toEqual({ allowed: ['seatbelt'] });
     });
 
     it('refuses job-environment settings that miss one, add one, or are not true or false', () => {

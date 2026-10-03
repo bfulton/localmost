@@ -29,6 +29,13 @@ import {
   resolveJobEnvironmentConfig,
 } from '../../shared/job-preferences';
 import {
+  IsolationConfig,
+  IsolationType,
+  DEFAULT_ISOLATION_CONFIG,
+  availableIsolationTypes,
+  resolveIsolationConfig,
+} from '../../shared/isolation';
+import {
   useStore,
 } from '../store';
 
@@ -38,6 +45,8 @@ import {
 // exceeded". The store is `{}` until main's first state arrives. (The old
 // inline literal was also the pre-normalization shape.)
 const NO_USER_FILTER: UserFilterConfig = { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] };
+// The same, for a store with no isolation section yet.
+const DEFAULT_ISOLATION: IsolationConfig = { allowed: [...DEFAULT_ISOLATION_CONFIG.allowed] };
 
 export type ThemeSetting = 'light' | 'dark' | 'auto';
 
@@ -96,6 +105,10 @@ interface AppConfigContextValue {
   jobEnvironment: JobEnvironmentConfig;
   setJobEnvironmentOption: (key: keyof JobEnvironmentConfig, enabled: boolean) => Promise<void>;
 
+  // Which isolation types this Mac allows a job to get
+  isolation: IsolationConfig;
+  setIsolationAllowed: (type: IsolationType, allowed: boolean) => Promise<void>;
+
   // App state
   isOnline: boolean;
   isLoading: boolean;
@@ -133,6 +146,7 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
   const storeNotifications = useStore((state) => state?.config?.notifications ?? DEFAULT_NOTIFICATIONS_CONFIG);
   const storeResourcePause = useStore((state) => state?.config?.resourcePause ?? DEFAULT_RESOURCE_PAUSE_CONFIG);
   const storeJobEnvironment = useStore((state) => state?.config?.jobEnvironment ?? DEFAULT_JOB_ENVIRONMENT_CONFIG);
+  const storeIsolation = useStore((state) => state?.config?.isolation ?? DEFAULT_ISOLATION);
   const storeIsOnline = useStore((state) => state?.ui?.isOnline ?? true);
   const storeIsLoading = useStore((state) => state?.ui?.isInitialLoading ?? true);
   const storeError = useStore((state) => state?.ui?.error ?? null);
@@ -162,6 +176,7 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     notifications: NotificationsConfig;
     resourcePause: ResourcePauseConfig;
     jobEnvironment: JobEnvironmentConfig;
+    isolation: IsolationConfig;
     isOnline: boolean;
     isLoading: boolean;
     error: string | null;
@@ -179,6 +194,7 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     notifications: DEFAULT_NOTIFICATIONS_CONFIG,
     resourcePause: DEFAULT_RESOURCE_PAUSE_CONFIG,
     jobEnvironment: DEFAULT_JOB_ENVIRONMENT_CONFIG,
+    isolation: DEFAULT_ISOLATION,
     isOnline: true,
     isLoading: true,
     error: null,
@@ -198,6 +214,7 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
   const notifications = isZubridgeReady ? storeNotifications : fallbackState.notifications;
   const resourcePause = isZubridgeReady ? storeResourcePause : fallbackState.resourcePause;
   const jobEnvironment = isZubridgeReady ? storeJobEnvironment : fallbackState.jobEnvironment;
+  const isolation = isZubridgeReady ? storeIsolation : fallbackState.isolation;
   const isOnline = isZubridgeReady ? storeIsOnline : fallbackState.isOnline;
   const isLoading = isZubridgeReady ? storeIsLoading : fallbackState.isLoading;
   const error = isZubridgeReady ? storeError : fallbackState.error;
@@ -261,6 +278,7 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
           // absent shows as the default it uses instead.
           resourcePause: resolveResourcePauseConfig(settings.resourcePause as PreferenceSection<ResourcePauseConfig> | undefined),
           jobEnvironment: resolveJobEnvironmentConfig(settings.jobEnvironment as PreferenceSection<JobEnvironmentConfig> | undefined),
+          isolation: resolveIsolationConfig(settings.isolation as Partial<Record<keyof IsolationConfig, unknown>> | undefined),
           isLoading: false,
         }));
 
@@ -471,6 +489,20 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     }
   }, [jobEnvironment]);
 
+  const setIsolationAllowed = useCallback(async (type: IsolationType, allowed: boolean) => {
+    // Only types this build can run: settings:set refuses any other, and a
+    // type a later build allowed in config.yaml allows nothing here anyway.
+    const available = availableIsolationTypes();
+    const kept = isolation.allowed.filter((t: IsolationType) => t !== type && available.includes(t));
+    const newConfig: IsolationConfig = { allowed: allowed ? [...kept, type] : kept };
+    setFallbackState(prev => ({ ...prev, isolation: newConfig }));
+    try {
+      await window.localmost.settings.set({ isolation: newConfig });
+    } catch {
+      // Optimistic update handled by zubridge sync
+    }
+  }, [isolation]);
+
   const clearLogs = useCallback(() => {
     logsRef.current = [];
     setLogs([]);
@@ -510,6 +542,8 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     setResourcePauseRunningJobs,
     jobEnvironment,
     setJobEnvironmentOption,
+    isolation,
+    setIsolationAllowed,
     isOnline,
     isLoading,
     error,

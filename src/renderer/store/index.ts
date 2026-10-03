@@ -32,6 +32,7 @@ export const usePower = () => useStore((state) => state.config.power);
 export const useNotifications = () => useStore((state) => state.config.notifications);
 export const useResourcePause = () => useStore((state) => state.config.resourcePause);
 export const useJobEnvironment = () => useStore((state) => state.config.jobEnvironment);
+export const useIsolation = () => useStore((state) => state.config.isolation);
 export const useLaunchAtLogin = () => useStore((state) => state.config.launchAtLogin);
 export const useHideOnStart = () => useStore((state) => state.config.hideOnStart);
 export const useRunnerConfig = () => useStore((state) => state.config.runnerConfig);
