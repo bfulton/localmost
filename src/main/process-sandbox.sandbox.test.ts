@@ -1342,6 +1342,7 @@ if (!isMacOS) {
     let npm: string;
     let cli: string;
     let helper: string;
+    let macVmHelper: string;
     let otherBinary: string;
     let profilePath: string;
 
@@ -1369,8 +1370,9 @@ if (!isMacOS) {
       // constraint. Another copy under a name the profile does not deny shows
       // that the refusal is the helper rule's, not the read deny's.
       helper = path.join(outside, 'localmost-vm');
+      macVmHelper = path.join(outside, 'localmost-macvm');
       otherBinary = path.join(outside, 'not-the-helper');
-      for (const binary of [helper, otherBinary]) {
+      for (const binary of [helper, macVmHelper, otherBinary]) {
         fs.copyFileSync('/bin/echo', binary);
         execFileSync('/usr/bin/codesign', ['--force', '--sign', '-', binary], { stdio: 'ignore' });
       }
@@ -1383,6 +1385,7 @@ if (!isMacOS) {
           shareDir: share,
           dockerCli: cli,
           vmHelper: helper,
+          macVmHelper,
           filesystemPolicy: { level: 'strict', read: [], write: [npm] },
         }));
       } finally {
@@ -1541,6 +1544,14 @@ if (!isMacOS) {
       expect(refused(`cp ${sq(helper)} _temp/vm-copy`)).toBe(true);
       expect(fs.existsSync(path.join(sandbox, '_temp', 'vm-hard'))).toBe(false);
       expect(fs.existsSync(path.join(sandbox, '_temp', 'vm-copy'))).toBe(false);
+    });
+
+    it('cannot run the macOS VM helper either, by its path, a link or a copy', () => {
+      expect(refused(`${sq(macVmHelper)} version`)).toBe(true);
+      expect(refused(`${sq(upperBase(macVmHelper))} version`)).toBe(true);
+      expect(refused(`ln -s ${sq(macVmHelper)} _temp/macvm && _temp/macvm version`)).toBe(true);
+      expect(refused(`cp ${sq(macVmHelper)} _temp/macvm-copy`)).toBe(true);
+      expect(fs.existsSync(path.join(sandbox, '_temp', 'macvm-copy'))).toBe(false);
     });
 
     it('cannot connect to a unix socket under <data>/vm/jobs, and can to one in its own sandbox', async () => {

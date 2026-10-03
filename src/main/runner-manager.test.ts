@@ -3190,6 +3190,7 @@ describe('RunnerManager', () => {
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
         dockerCli: cli,
         vmHelper: '/Applications/localmost.app/Contents/Resources/localmost-vm',
+        macVmHelper: '/Applications/localmost.app/Contents/Resources/localmost-macvm',
       });
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
@@ -3207,8 +3208,9 @@ describe('RunnerManager', () => {
       expect(options).toMatchObject({
         shareDir: '/Users/test/.localmost/runner/sandbox/1/_work',
         dockerCli: cli,
-        // The helper, which the job's profile refuses to run.
+        // The helpers, which the job's profile refuses to run.
         vmHelper: '/Applications/localmost.app/Contents/Resources/localmost-vm',
+        macVmHelper: '/Applications/localmost.app/Contents/Resources/localmost-macvm',
       });
     });
 

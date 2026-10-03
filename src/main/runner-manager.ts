@@ -22,6 +22,7 @@ import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { GitHubClientError } from './github-client';
 import { RunnerDownloader } from './runner-downloader';
 import { dockerCliPath, helperPath, DOCKER_CONFIG_DIR_NAME, SHARE_DIR_NAME } from './vm/paths';
+import { macVmHelperPath } from './isolation/macos-vm/paths';
 import type { WorkerCredentialFiles } from './worker-credentials';
 import type { BrokerJobTarget } from './broker-proxy-service';
 import { getAppDataDir, getConfigPath, getJobHistoryPath, getRunnerDir, getUserDataDir } from './paths';
@@ -324,6 +325,8 @@ interface RunnerManagerOptions {
   dockerCli?: string;
   /** The Docker VM helper, which the job's profile refuses to run. helperPath() by default. */
   vmHelper?: string;
+  /** The macOS VM helper, which the job's profile refuses to run too. macVmHelperPath() by default. */
+  macVmHelper?: string;
 }
 
 /**
@@ -379,6 +382,7 @@ export class RunnerManager {
   private readonly getUserTempDir: () => string | undefined;
   private readonly dockerCli: string;
   private readonly vmHelper: string;
+  private readonly macVmHelper: string;
 
   // Flag to track intentional stops vs job completion restarts
   private stopping = false;
@@ -471,6 +475,7 @@ export class RunnerManager {
     this.getUserTempDir = options.getUserTempDir ?? (() => userTempDir((_level, message) => this.log('error', message)));
     this.dockerCli = options.dockerCli ?? dockerCliPath();
     this.vmHelper = options.vmHelper ?? helperPath();
+    this.macVmHelper = options.macVmHelper ?? macVmHelperPath();
 
     this.downloader = new RunnerDownloader();
     this.configPath = getConfigPath();
@@ -1671,8 +1676,9 @@ export class RunnerManager {
           // The Docker VM's share: the job keeps its contents, not the node.
           shareDir: path.join(sandboxDir, SHARE_DIR_NAME),
           dockerCli: this.dockerCli,
-          // It carries the virtualization entitlement; only the app runs it.
+          // They carry the virtualization entitlement; only the app runs them.
           vmHelper: this.vmHelper,
+          macVmHelper: this.macVmHelper,
           toolCacheDir,
           packageCacheDir,
           tempSuffixDir,

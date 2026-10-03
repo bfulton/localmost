@@ -444,6 +444,19 @@ describe('Process Sandbox', () => {
       expect(profileWith({})).not.toContain('(deny process-exec*');
     });
 
+    it('refuses to run the macOS VM helper, which would give the job a VM with a network of its own', () => {
+      const vmHelper = '/Applications/localmost.app/Contents/Resources/localmost-vm';
+      const macVmHelper = '/Applications/localmost.app/Contents/Resources/localmost-macvm';
+      const profile = profileWith({ vmHelper, macVmHelper });
+      const runAnything = profile.indexOf('(allow process*)');
+      const deny = profile.indexOf(`(deny process-exec* (literal "${macVmHelper}"))`);
+      expect(deny).toBeGreaterThan(runAnything);
+      expect(profile).toContain(`(deny process-exec* (literal "${vmHelper}"))`);
+      expect(profileWith({ macVmHelper: '/odd/"quoted"/localmost-macvm' })).toContain(
+        '(deny process-exec* (literal "/odd/\\"quoted\\"/localmost-macvm"))'
+      );
+    });
+
     it('refuses a share that is not the work folder directly under the sandbox', () => {
       expect(() => profileWith({ shareDir: path.join(instanceDir, 'other') })).toThrow(/share/);
       expect(() => profileWith({ shareDir: path.join(instanceDir, 'x', '_work') })).toThrow(/share/);
