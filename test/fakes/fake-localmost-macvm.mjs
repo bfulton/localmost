@@ -19,6 +19,7 @@
  *   { "<command>": { "hang": true } }        never end on its own
  *   { "<command>": { "exitWithoutEnd": n } } exit with n and no end
  *   { "provision": { "guestStopsAfterMs": n } } the guest powers off n ms after starting
+ *   { "save-state": { "failSlot": n } }      that slot's save fails with E_STATE
  *   { "run": { "agentAfterMs": n } }         agent.sock connections are closed until then
  *   { "agent": { ... } }                     the guest agent, below
  * The agent's hello says `ready` and `runnerVersions` (default ["2.330.0"]);
@@ -167,6 +168,7 @@ async function play() {
       if (!has(imageDir)) return fail('E_IMAGE', 'no image');
       const slot = path.join(imageDir, `slot${args['--slot']}`);
       if (!has(slot)) return fail('E_CLONE', `${slot} cannot be opened`);
+      if (own.failSlot === Number(args['--slot'])) return fail('E_STATE', `slot ${args['--slot']} could not be saved`);
       emit({ event: 'started', pid: process.pid, boot: 'cold', startMs: 5 });
       await sleep(own.stepMs ?? 5);
       if (own.hang) return;
