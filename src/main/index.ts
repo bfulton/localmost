@@ -25,7 +25,6 @@ import { TargetManager } from './target-manager';
 import { ContributorCache } from './contributor-cache';
 import { admitJob, buildAdmissionDeps, PolicyApprovalDeps } from './job-admission';
 import { repoPolicyRuntime } from './repo-policy';
-import { effectiveIsolation } from '../shared/localmostrc';
 import { availableIsolationTypes } from '../shared/isolation';
 
 // State management
@@ -121,6 +120,7 @@ import {
   decidePolicyForJob,
   recordPendingPolicy,
   getApprovedPolicyForCommit,
+  approvedIsolationForCommit,
   formatApprovalRequest,
 } from './policy-cache';
 
@@ -510,8 +510,7 @@ app.whenReady().then(async () => {
     // the commit's, as getRepoPolicy applies it - that Settings allows and
     // this build can run (docs/roadmap/localmostrc.md, Isolation).
     isolation: {
-      accepted: (repository, sha, workflow) =>
-        effectiveIsolation(sha ? getApprovedPolicyForCommit(repository, sha) : null, workflow),
+      accepted: approvedIsolationForCommit,
       allowed: () => runnerIsolation().allowed,
       available: availableIsolationTypes,
     },

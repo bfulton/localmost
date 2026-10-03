@@ -20,8 +20,10 @@ import {
   getPolicyEntry,
   getApprovedPolicyForCommit,
   rejectPolicy,
+  approvedIsolationForCommit,
 } from './policy-cache';
 import { LocalmostrcConfig } from '../shared/localmostrc';
+import { DEFAULT_ISOLATION_CONFIG, availableIsolationTypes, selectIsolation } from '../shared/isolation';
 
 afterAll(() => {
   fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -290,6 +292,61 @@ describe('a commit without a .localmostrc runs on the baseline', () => {
     decidePolicyForJob(REPO, null, 'kept-sha');
 
     expect(getApprovedPolicyForCommit(REPO, 'kept-sha')).toBeNull();
+  });
+});
+
+describe('the isolation a job accepts', () => {
+  // What admission walks: the approved policy's list for the job's commit -
+  // never the repository's current file - with a workflow's list replacing
+  // the shared one, and any when the commit carries no approved policy.
+  const ISOLATED = [
+    'version: 1',
+    'shared:',
+    '  isolation: [macos-vm]',
+    'workflows:',
+    '  ui-tests:',
+    '    isolation: [seatbelt, macos-vm]',
+    '',
+  ].join('\n');
+  const approveIsolated = () => {
+    const first = decidePolicyForJob(REPO, ISOLATED, 'first-sha');
+    if (first.action !== 'needs-approval') throw new Error('expected approval request');
+    approve(first.request.newConfig);
+  };
+  const ANY = ['macos-vm', 'service-account', 'seatbelt'];
+
+  it("is the approved shared list for a commit the check found carrying it, and refused on this build's defaults", () => {
+    approveIsolated();
+    expect(decidePolicyForJob(REPO, ISOLATED, SHA)).toEqual({ action: 'allow', reason: 'unchanged' });
+
+    const accepted = approvedIsolationForCommit(REPO, SHA, 'build');
+    expect(accepted).toEqual(['macos-vm']);
+    expect(selectIsolation(accepted, DEFAULT_ISOLATION_CONFIG.allowed, availableIsolationTypes())).toEqual({
+      refusal: 'this repository accepts macos-vm; this Mac allows seatbelt; macos-vm is not available in this build',
+    });
+  });
+
+  it("is the workflow's list in place of the shared one", () => {
+    approveIsolated();
+    decidePolicyForJob(REPO, ISOLATED, SHA);
+
+    expect(approvedIsolationForCommit(REPO, SHA, 'ui-tests')).toEqual(['seatbelt', 'macos-vm']);
+  });
+
+  it('is any for a commit the check never covered, or a job with no commit', () => {
+    approveIsolated();
+
+    expect(approvedIsolationForCommit(REPO, 'unchecked-sha', 'build')).toEqual(ANY);
+    expect(approvedIsolationForCommit(REPO, undefined, 'build')).toEqual(ANY);
+  });
+
+  it('is any for a commit with no .localmostrc, even where an approved policy lists less', () => {
+    // Documented in SECURITY.md (Isolation types): the host's allowed set is
+    // what bounds such a commit.
+    approveIsolated();
+    expect(decidePolicyForJob(REPO, null, SHA)).toEqual({ action: 'allow', reason: 'narrowed' });
+
+    expect(approvedIsolationForCommit(REPO, SHA, 'build')).toEqual(ANY);
   });
 });
 

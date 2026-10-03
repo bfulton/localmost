@@ -14,7 +14,9 @@ import {
   diffConfigs,
   PolicyDiff,
   formatPolicyDiff,
+  effectiveIsolation,
 } from '../shared/localmostrc';
+import type { IsolationType } from '../shared/isolation';
 import {
   PolicyEntry,
   approvalStamp,
@@ -189,6 +191,22 @@ export function getApprovedPolicyForCommit(repository: string, sha: string): Loc
   if (!coveredBy) return null;
   const approved = getApprovedPolicy(repository);
   return approved && approvalStamp(repository, approved) === coveredBy ? approved : null;
+}
+
+/**
+ * The isolation types a job accepts, in the order to try, as admission
+ * walks them: the approved policy's list for the job's commit - its
+ * workflow's list, else the shared one - never the repository's current
+ * file. A job with no commit, or at a commit the check did not find carrying
+ * the approved policy (one with no .localmostrc among them), accepts any:
+ * there the host's allowed set alone bounds it (SECURITY.md, Isolation types).
+ */
+export function approvedIsolationForCommit(
+  repository: string,
+  sha: string | undefined,
+  workflow: string | undefined
+): IsolationType[] {
+  return effectiveIsolation(sha ? getApprovedPolicyForCommit(repository, sha) : null, workflow);
 }
 
 /**
