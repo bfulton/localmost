@@ -10,6 +10,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, and enforce least-privilege sandboxing.
 
 ### Added
+- **Isolation selection**: a `.localmostrc` may say which isolation types its jobs
+  accept, in the order to try - `isolation:` under `shared:` or per workflow (a
+  workflow's replaces the shared one), as a list of `seatbelt`,
+  `service-account` and `macos-vm`, one type, or `any`, the default when absent
+  (`[macos-vm, service-account, seatbelt]`). A job gets the first type in its
+  list that this Mac allows (the new Isolation section of Settings,
+  `isolation.allowed` in `config.yaml`, seatbelt alone by default) and this
+  build can run (seatbelt alone), chosen at admission; with none, the job is
+  refused like any other refused job, with a reason naming the repository's
+  list, what this Mac allows and what is not available - never run under a type
+  its repository did not list. The list is part of the approved policy and its
+  stamp, shown in the approval card and `localmost policy show`, and a change to
+  it, order included, is in the approval diff. An unknown or repeated type is a
+  validation error; one this build cannot run is accepted and filtered at
+  admission. The service-account and macOS VM types are designed
+  ([service-account-jobs.md](docs/roadmap/service-account-jobs.md),
+  [macos-vm-jobs.md](docs/roadmap/macos-vm-jobs.md)), not built, and Settings
+  shows them as not available in this build ([localmostrc.md](docs/roadmap/localmostrc.md), Isolation)
 - **Target management from the CLI**: `localmost targets` lists, adds, removes, enables, and disables targets
   - `localmost targets add <owner>/<repo>` registers runners without opening the app
   - `--org` for organization targets, `--json` on every subcommand for scripting

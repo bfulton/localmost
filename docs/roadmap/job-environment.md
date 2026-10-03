@@ -12,8 +12,10 @@ on.
 > 2026-10-02 and 2026-10-03 (items 9, 10, 11a, 11b, 12, 13, 14 and 15 of the
 > open-items walkthrough). Item 14's grant, once what it exposes to the
 > user's own Swift builds was known, became a preference, off by default
-> (2026-10-03; see [Edge cases](#edge-cases)). The dedicated runner user at
-> the end is a future design item.
+> (2026-10-03; see [Edge cases](#edge-cases)). The dedicated runner user once
+> sketched at the end is now the service-account isolation type
+> ([service-account-jobs.md](service-account-jobs.md)). This document is about
+> the seatbelt type, the only one built.
 
 ## Problem
 
@@ -381,8 +383,10 @@ empty home is never less than the user's own was.
   Short of it, a SwiftPM that passes `SWIFT_EXEC` to Swift Build as a build
   setting (its main branch does, and Swift Build's linker code prefers that
   `swiftc` as its link driver, so a wrapper that starts it with the job's
-  `TMPDIR` could serve; untried) is another way. The dedicated runner user
-  below, whose `T` is its own, would remove the exposure without either.
+  `TMPDIR` could serve; untried) is another way. The service-account and
+  macOS VM isolation types remove the exposure without either, and the
+  shared-temp exceptions with it, since each has a `T` of its own (see
+  [Other isolation types](#other-isolation-types)).
 - **Package plugins under xcodebuild** run under Xcode's plugin sandbox, which
   `-IDEPackageSupportDisableManifestSandbox` does not cover.
 - **`localmost test`** gets the per-job home; the temp directory, the shims and
@@ -395,15 +399,25 @@ empty home is never less than the user's own was.
   `/usr/libexec/java_home` finds, so a contributor running the suite outside a
   job needs a JDK installed (Xcode brings `swiftc`; nothing brings Java).
 
-## Future: a dedicated runner user
+## Other isolation types
 
 The limits above all come from a job running as the user: one uid, one user
-database entry, one set of preferences, one keychain, one set of TCC grants.
-A dedicated macOS user account for the runner - created once, with an
-administrator's approval at setup - would give jobs a real home of their own,
-their own preferences and keychain, and no reach into the user's files at the
-filesystem-permission level, beneath the sandbox. The costs to design for:
-the admin step, files a job produces being owned by another uid (artifacts,
-caches the user's own builds share), how the app hands work to and collects it
-from processes it no longer owns, and signing identities, which would have to
-be provisioned into that account's keychain.
+database entry, one set of preferences, one keychain, one set of TCC grants,
+one per-user temp directory. Two more isolation types, which a repository
+lists in its `.localmostrc` (`isolation:`) and the operator allows in
+Settings > Isolation ([localmostrc.md](localmostrc.md), Isolation), remove
+them; neither is built yet:
+
+- **`service-account`** - the job runs as a hidden `_localmost` user started
+  by a privileged helper installed once with an administrator's approval: its
+  own `/var/folders` temp, its own preferences, none of the user's keychain,
+  and TCC fails closed. Headless only: a user without an Aqua session cannot
+  reach the window server, so Electron, the Simulator, UI tests and Safari
+  fail in it. See [service-account-jobs.md](service-account-jobs.md).
+- **`macos-vm`** - the job runs in a fresh macOS VM cloned from a golden
+  image: full separation, its own window server included, at most two at
+  once, each waiting for its VM to boot. See [macos-vm-jobs.md](macos-vm-jobs.md).
+
+Both remove the shared-temp exceptions entirely: bare `mktemp`'s names and
+the Swift Build link-temp grant exist only because a seatbelt job's per-user
+temp directory is the user's.

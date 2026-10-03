@@ -3,7 +3,9 @@
 A checked-in file that explicitly declares what network, filesystem and container access a workflow needs.
 
 > **Status:** implemented in 0.3.0. This document describes the design; where the
-> shipped behaviour differs it is noted inline.
+> shipped behaviour differs it is noted inline. `isolation:` (see
+> [Isolation](#isolation)) is from the owner's decisions of 2026-10-03: the
+> grammar, approval and selection are built, and of the types only `seatbelt`.
 
 ## Problem
 
@@ -167,12 +169,20 @@ shared:
       - AWS_*
       - GITHUB_TOKEN             # Not inherited from localmost's own environment
 
+  # The isolation types the jobs accept, in the order to try; absent means
+  # any. A job gets the first this Mac allows and can run, or is refused. See
+  # "Isolation" below.
+  isolation: [macos-vm, service-account, seatbelt]
+
 # Per-workflow policies — merged with shared
 workflows:
   build:
     filesystem:
       write:
         - "./DerivedData/**"
+
+  ui-tests:
+    isolation: [macos-vm, seatbelt]  # Replaces shared's: needs a window server
 
   deploy:
     network:
@@ -291,6 +301,95 @@ approval diff and stamp like every other key. It governs the job's direct
 connections and its proxy alike: through the proxy a literal loopback address
 reaches the declared ports and the broker's, and nothing else - see
 SECURITY.md, Network Policy.
+
+### Isolation
+
+How a job is kept from the rest of the Mac. There are three isolation types:
+
+| Type | What a job gets |
+|---|---|
+| `seatbelt` | Runs as the user, under a seatbelt profile built from the approved policy, with a home and temp directory of its own ([job-environment.md](job-environment.md)). Needs no setup. Shares the per-user temp directory and the window server with the user. |
+| `service-account` | Runs as a hidden `_localmost` user started by a privileged helper: its own `/var/folders` temp, its own preferences, none of the user's keychain, and TCC prompts fail closed. Headless only. See [service-account-jobs.md](service-account-jobs.md). |
+| `macos-vm` | Runs in a fresh macOS VM cloned from a golden image: full separation, its own window server included. At most two at once, and each waits for its VM to boot. See [macos-vm-jobs.md](macos-vm-jobs.md). |
+
+This build can run `seatbelt` only; the other two are designed, not built.
+
+A repository says which types its jobs accept, in the order to try:
+
+```yaml
+shared:
+  isolation: [macos-vm, seatbelt]  # the VM when this Mac can, seatbelt otherwise
+  # isolation: seatbelt            # one type: shorthand for [seatbelt]
+  # isolation: any                 # the default: [macos-vm, service-account, seatbelt]
+
+workflows:
+  ui-tests:
+    isolation: [macos-vm, seatbelt]  # replaces shared's for this workflow
+```
+
+**Grammar.** `isolation:` is `any`, one type, or a list of types. Each entry
+is one of `seatbelt`, `service-account` and `macos-vm`; an unknown one, one
+listed twice, `any` inside a list and an empty list are validation errors,
+each with a message that names what is accepted. A type this build cannot run
+is accepted: the list says what the repository accepts, and what this Mac
+cannot run is filtered out when a job is admitted. Under `shared:` it is every
+workflow's; under `workflows:` it replaces the shared list whole for that
+workflow (an order is not merged). Unlike the filesystem it is applied per
+workflow, because it is chosen at admission, when the job's workflow is known.
+
+**Absent means any.** A repository with no `isolation:` - or no
+`.localmostrc` at all, or a commit whose file is not the approved one - accepts
+`any`, which is `[macos-vm, service-account, seatbelt]`: the strongest
+separation this Mac allows and can run.
+
+**Order and filtering.** This Mac allows a set of types (Settings > Isolation,
+the `isolation.allowed` section of `config.yaml`): `[seatbelt]` by default in
+this build, and `[macos-vm]` from the build that ships the VM type. This build
+can run, and has set up, a set of its own (`[seatbelt]` today). When the job
+is admitted - after its policy is approved and before any worker exists -
+localmost walks the repository's list in its order and takes the first type
+that is both allowed here and available. The repository's order decides
+among the types that pass; the host's allowed set decides which pass at all.
+So a repository's order cannot reach a type the owner has not allowed, and
+the owner's set cannot push a job onto a type its repository did not list.
+
+**Refusal.** When no type in the list passes, the job is refused, through the
+same path as a job the user filter or an unapproved policy refuses: dropped at
+the broker, recorded as refused in the job history with the reason, its run
+cancelled on GitHub, and a notification when job notifications are on. It is
+never run under a weaker type
+instead. The reason names all three sides, for example:
+
+```
+no isolation type this job accepts can run on this Mac: this repository
+accepts macos-vm; this Mac allows seatbelt; macos-vm is not available in
+this build
+```
+
+or, for `isolation: seatbelt` on a Mac that allows nothing: `... this
+repository accepts seatbelt; this Mac allows none; seatbelt is not allowed in
+Settings > Isolation`.
+
+**Approval.** `isolation:` is part of the approved policy like every other
+key: it is in the approval stamp, it appears in the approval card and
+`localmost policy show` with the order it means, and a change to it - order
+included, since `[macos-vm, seatbelt]` and `[seatbelt, macos-vm]` are
+different lists - is in the approval diff (`~ shared.isolation: macos-vm,
+seatbelt -> seatbelt`). Writing out `any` where nothing was declared changes
+nothing a job can get, and is not a change to approve. A workflow's list is
+shown added, removed or changed on its own line. As with every `workflows:`
+key, any pull request can claim a workflow's list by naming a workflow file
+after it; the host's allowed set is what bounds that.
+
+**GUI.** The service account has no Aqua session, so it cannot reach the
+window server: Electron, the Simulator, UI tests and Safari fail in it. A
+repository whose jobs need a GUI lists `seatbelt` or `macos-vm`, never
+`service-account` alone.
+
+**`localmost test`** runs every step under its own seatbelt test profile,
+whatever `isolation:` says: it is a preview the user starts on their own
+checkout, not a job a repository is given, and the CLI does not read the
+host's allowed set.
 
 ### Per-workflow policies
 

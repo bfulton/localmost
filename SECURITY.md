@@ -104,6 +104,32 @@ loosen its own sandbox without the machine owner agreeing to it.
 
 - **The app's own control plane**: A job cannot write the approval cache, the settings file, or reach the CLI control socket. Without this, a workflow could approve its own policy and the approval gate would mean nothing
 
+### Isolation types
+
+How a job is kept from the rest of the Mac is its isolation type: `seatbelt`
+(the job runs as you under the seatbelt profile this document describes),
+`service-account` (a hidden `_localmost` user of its own) or `macos-vm` (a
+fresh macOS VM). This build can run `seatbelt` only; the other two are
+designed ([service-account-jobs.md](docs/roadmap/service-account-jobs.md),
+[macos-vm-jobs.md](docs/roadmap/macos-vm-jobs.md)) and, once built, remove
+the shared-temp exceptions below entirely, since neither shares your
+per-user temp directory.
+
+The set of types this Mac allows - Settings > Isolation, `isolation.allowed`
+in `config.yaml`, `[seatbelt]` by default in this build - is what controls
+which isolation a job can get. A repository's `.localmostrc` lists, in order,
+the types it accepts (`isolation:`, `any` when absent); a job gets the first
+type in that list that is allowed here and available in this build, and is
+refused when there is none, never run under a type its repository did not
+list. A repository's order cannot override the allowed set: listing
+`seatbelt` first reaches seatbelt only on a Mac that allows it, and a
+repository that lists only `macos-vm` is refused on one that does not. The
+list is part of the approved policy, its order included, so a change to it is
+a policy change to approve; and like every `workflows:` key, a workflow's
+list can be claimed by any pull request that names a workflow file after it -
+the allowed set is what bounds that too. See
+[localmostrc.md](docs/roadmap/localmostrc.md), Isolation.
+
 ### What localmost trusts (does NOT protect against)
 
 - **GitHub's infrastructure**: OAuth, API responses, and runner binary distribution are trusted. If GitHub is compromised, localmost provides no additional protection.

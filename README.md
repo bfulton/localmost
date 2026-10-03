@@ -274,6 +274,7 @@ Current release: **0.3.0 — Test Locally, Secure by Default**
 - Contributor-based job filtering for public repos
 - Repository policies require approval before the runner applies them, in the app or the CLI, bound to the exact policy shown and recorded in an audit log
 - Opt-in [container work through a filtering Docker socket](docs/superpowers/specs/2026-09-05-docker-isolation-design.md) declared per repo as `pull`, `run` and `build` actions; anything unlisted is denied, and registry credentials never enter the sandbox
+- [Isolation selection](docs/roadmap/localmostrc.md#isolation): a repository lists the isolation types it accepts in order, and each job gets the first one this Mac allows and can run, or is refused (seatbelt is the only type built)
 - Environment comparison with GitHub runners
 
 Future feature ideas:
@@ -288,9 +289,9 @@ Future feature ideas:
 - **Disk space monitoring** - Warn or pause when disk is low, auto-clean trash directories and caches.
 - **Linux and Windows host support** - Run self-hosted runners on non-Mac machines for projects that need them.
 - **Higher parallelism cap** - Parallelize proxy registration to support 16+ concurrent runners (currently capped at 8 due to serial registration time).
-- **macOS VM jobs** - An opt-in per-repository isolation level that runs each job in a fresh macOS VM cloned from a golden image, with policy grants mapped to shares ([design](docs/roadmap/macos-vm-jobs.md)).
+- **macOS VM jobs** - The `macos-vm` isolation type: each job runs in a fresh macOS VM cloned from a golden image, with policy grants mapped to shares and a window server of its own ([design](docs/roadmap/macos-vm-jobs.md)).
 - **Filtering VM network stack** - A userspace network stack for the Docker VM that enforces the job's hostname policy on traffic that ignores proxy settings ([design](docs/roadmap/vm-network-stack.md)).
-- **Dedicated runner user** - Run jobs as a macOS user account of their own, so tools that look the home up by uid, preferences and the keychain are the job's rather than yours ([design](docs/roadmap/job-environment.md#future-a-dedicated-runner-user)).
+- **Service-account jobs** - The `service-account` isolation type: headless jobs run as a hidden `_localmost` user with its own temp directory, preferences and no access to your keychain ([design](docs/roadmap/service-account-jobs.md)).
 
 Bugs and quick improvements:
 
