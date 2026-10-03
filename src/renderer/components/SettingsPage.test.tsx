@@ -441,20 +441,22 @@ describe('the resource-pause and job-environment preferences', () => {
 
   describe("the Swift Build link-temp grant", () => {
     const label = 'Let Swift Build link in the shared temp directory';
+    // Both cases, beside the toggle whatever its state: the risk is read
+    // before it is taken, not only once the grant is on.
     const onHint =
-      /a job may create <T>\/TemporaryDirectory\.XXXXXX names in the shared per-user temp directory, which your own SwiftPM and Xcode also use for manifest executables, so a job could race to replace one before it runs/;
+      /On, a job may create <T>\/TemporaryDirectory\.XXXXXX names in that shared directory, which your own SwiftPM and Xcode also use for manifest executables, so a job could race to replace one before it runs\./;
     const offHint =
-      /Off \(the default\): Swift 6\.4's default build system fails to link inside a job\. A workflow can pass swift build --build-system native, or the repository can use the macOS VM isolation type once it is available/;
+      /Off \(the default\), Swift 6\.4's default build system fails to link inside a job; a workflow can pass swift build --build-system native, or the repository can use the macOS VM isolation type once it is available\./;
 
-    it('is off by default, and says beside it what off costs', async () => {
+    it('is off by default, and says beside it what turning it on would expose, and what off costs', async () => {
       renderWithProviders(<SettingsPage onBack={jest.fn()} />);
       await waitFor(() => expect(checkbox(label).checked).toBe(false));
       const group = checkbox(label).closest('div') as HTMLElement;
+      expect(group).toHaveTextContent(onHint);
       expect(group).toHaveTextContent(offHint);
-      expect(group).not.toHaveTextContent(onHint);
     });
 
-    it('turns on, sending every key, and says beside it what on exposes', async () => {
+    it('turns on, sending every key, and still says both cases', async () => {
       renderWithProviders(<SettingsPage onBack={jest.fn()} />);
       await waitFor(() => expect(checkbox(label).checked).toBe(false));
       const group = checkbox(label).closest('div') as HTMLElement;
@@ -465,7 +467,7 @@ describe('the resource-pause and job-environment preferences', () => {
       });
       await waitFor(() => expect(checkbox(label).checked).toBe(true));
       expect(group).toHaveTextContent(onHint);
-      expect(group).not.toHaveTextContent(offHint);
+      expect(group).toHaveTextContent(offHint);
 
       fireEvent.click(checkbox(label));
       await waitFor(() => {
@@ -478,7 +480,7 @@ describe('the resource-pause and job-environment preferences', () => {
       renderWithProviders(<SettingsPage onBack={jest.fn()} />);
 
       await waitFor(() => expect(checkbox(label).checked).toBe(true));
-      expect(screen.getByText(onHint)).toBeInTheDocument();
+      expect(checkbox(label).closest('div') as HTMLElement).toHaveTextContent(onHint);
       for (const [, other] of CONVENIENCES) expect(checkbox(other).checked).toBe(true);
     });
   });
@@ -585,8 +587,11 @@ describe('the Isolation section', () => {
     await waitFor(() => expect(screen.getByText('Isolation')).toBeInTheDocument());
 
     const section = screen.getByText('Isolation').closest('section') as HTMLElement;
-    expect(section).toHaveTextContent(/first type in its repository's isolation: list that is allowed here and available/);
-    expect(section).toHaveTextContent(/A job whose repository lists none of them is refused/);
+    expect(section).toHaveTextContent(
+      "Each job runs under the first type in its repository's isolation: list that is checked here and available in " +
+        'this build (a repository that declares none accepts any, strongest first). If none qualifies, the job is ' +
+        'refused, never run under a type its repository did not list.'
+    );
   });
 
   it('turns seatbelt off and on, sending the allowed list', async () => {

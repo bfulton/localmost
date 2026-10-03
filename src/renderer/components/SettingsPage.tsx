@@ -64,19 +64,15 @@ const JOB_ENVIRONMENT_OPTIONS: ReadonlyArray<{
   {
     key: 'swiftBuildLinkTemp',
     label: 'Let Swift Build link in the shared temp directory',
+    // Both cases, whatever the toggle's state: the risk of turning it on is
+    // read before it is taken.
     hint:
       'Swift 6.4\'s default build system links in a TemporaryDirectory.XXXXXX directory it makes in the ' +
-      'per-user temp directory, whatever the job\'s TMPDIR says. This grants a job names of exactly that shape there.',
-    stateHints: {
-      on:
-        'On: a job may create <T>/TemporaryDirectory.XXXXXX names in the shared per-user temp directory, which ' +
-        'your own SwiftPM and Xcode also use for manifest executables, so a job could race to replace one before ' +
-        'it runs.',
-      off:
-        'Off (the default): Swift 6.4\'s default build system fails to link inside a job. A workflow can pass ' +
-        'swift build --build-system native, or the repository can use the macOS VM isolation type once it is ' +
-        'available.',
-    },
+      'per-user temp directory, whatever the job\'s TMPDIR says. On, a job may create ' +
+      '<T>/TemporaryDirectory.XXXXXX names in that shared directory, which your own SwiftPM and Xcode also use ' +
+      'for manifest executables, so a job could race to replace one before it runs. Off (the default), Swift ' +
+      '6.4\'s default build system fails to link inside a job; a workflow can pass swift build --build-system ' +
+      'native, or the repository can use the macOS VM isolation type once it is available.',
   },
 ];
 
@@ -613,10 +609,10 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
         <section id="isolation-section" className={styles.settingsSection} data-testid="settings-section">
           <h3>Isolation</h3>
           <p className={shared.formHint}>
-            How a job is kept from the rest of your Mac. A job runs under the first type in its repository&apos;s
-            isolation: list that is allowed here and available in this build; a repository that declares none
-            accepts any, the strongest first. A job whose repository lists none of them is refused, never run under
-            a type it did not list, and no repository&apos;s order reaches a type that is not allowed here.
+            How a job is kept from the rest of your Mac. Each job runs under the first type in its
+            repository&apos;s isolation: list that is checked here and available in this build (a repository that
+            declares none accepts any, strongest first). If none qualifies, the job is refused, never run under a
+            type its repository did not list.
           </p>
           {ISOLATION_TYPES.map((type) => {
             const available = availableIsolationTypes().includes(type);
