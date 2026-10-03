@@ -1785,7 +1785,7 @@ describe('RunnerManager', () => {
       // a genuine failure path and withdrawing would be correct.
       (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
 
-      await manager.spawnWorkerForJob();
+      await manager.spawnWorkerForJob('seatbelt');
 
       expect(reserved).toHaveLength(1);
       expect(cancelled).toEqual([]);
@@ -1810,7 +1810,7 @@ describe('RunnerManager', () => {
       helper.stubCopyProxyCredentials(async () => undefined);
       (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
 
-      await manager.spawnWorkerForJob().catch(() => undefined);
+      await manager.spawnWorkerForJob('seatbelt').catch(() => undefined);
 
       expect(reserved).toHaveLength(1);
       expect(cancelled).toHaveLength(1);
@@ -2894,7 +2894,7 @@ describe('RunnerManager', () => {
       helper.stubStartInstance(async () => undefined);
       (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(false);
 
-      await manager.spawnWorkerForJob();
+      await manager.spawnWorkerForJob('seatbelt');
 
       expect(cancelled).toEqual([['t1', 1, 'req-1']]);
       expect(helper.pendingTargetContext('1')).toBeUndefined();
@@ -2912,7 +2912,7 @@ describe('RunnerManager', () => {
       });
       (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
 
-      await manager.spawnWorkerForJob();
+      await manager.spawnWorkerForJob('seatbelt');
 
       expect(cancelled).toEqual([['t1', 1, 'req-1']]);
       expect(helper.pendingTargetContext('1')).toBeUndefined();
@@ -3753,12 +3753,13 @@ describe('the job a worker claims through its proxy', () => {
 
 describe('spawning the worker for an admitted job', () => {
   function manager() {
+    const onLog = jest.fn();
     const m = new RunnerManager({
-      onLog: jest.fn(), onStatusChange: jest.fn(), onJobHistoryUpdate: jest.fn(),
+      onLog, onStatusChange: jest.fn(), onJobHistoryUpdate: jest.fn(),
     });
     const helper = new RunnerManagerTestHelper(m);
     helper.startedAt = new Date().toISOString();
-    return { m, helper };
+    return { m, helper, onLog };
   }
 
   it('says when no worker was started, and does not leave the job on offer', async () => {
@@ -3772,7 +3773,7 @@ describe('spawning the worker for an admitted job', () => {
       helper.setInstance(1, { name: 'runner-1', status: 'busy' });
       helper.setPendingTargetContext('next', { targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'req-1' });
 
-      const spawned = m.spawnWorkerForJob();
+      const spawned = m.spawnWorkerForJob('seatbelt');
       await jest.advanceTimersByTimeAsync(61_000);
 
       await expect(spawned).resolves.toBe(false);
@@ -3791,7 +3792,7 @@ describe('spawning the worker for an admitted job', () => {
     });
     (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
 
-    await expect(m.spawnWorkerForJob()).resolves.toBe(true);
+    await expect(m.spawnWorkerForJob('seatbelt')).resolves.toBe(true);
   });
 
   it('says when the worker could not be started', async () => {
@@ -3801,8 +3802,40 @@ describe('spawning the worker for an admitted job', () => {
     helper.stubStartInstance(async () => undefined);
     (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
 
-    await expect(m.spawnWorkerForJob()).resolves.toBe(false);
+    await expect(m.spawnWorkerForJob('seatbelt')).resolves.toBe(false);
   });
+
+  it('starts a seatbelt worker with the isolation it was chosen under in its context', async () => {
+    const { m, helper } = manager();
+    helper.setPendingTargetContext('next', { targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'req-1' });
+    helper.stubCopyProxyCredentials(async () => undefined);
+    let contextAtStart: unknown;
+    helper.stubStartInstance(async (n) => {
+      contextAtStart = helper.pendingTargetContext(String(n));
+      helper.setInstance(n, { name: `runner-${n}`, status: 'starting', process: createMockProcess(4243) });
+    });
+    (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
+
+    await expect(m.spawnWorkerForJob('seatbelt')).resolves.toBe(true);
+    expect(contextAtStart).toEqual(expect.objectContaining({ jobId: 'req-1', isolation: 'seatbelt' }));
+  });
+
+  it.each(['service-account', 'macos-vm'] as const)(
+    'starts no worker for %s, which has no implementation in this build, and leaves nothing on offer',
+    async (isolation) => {
+      const { m, helper, onLog } = manager();
+      helper.setPendingTargetContext('next', { targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'req-1' });
+      const started = jest.fn(async () => undefined);
+      helper.stubStartInstance(started);
+
+      await expect(m.spawnWorkerForJob(isolation)).resolves.toBe(false);
+      expect(started).not.toHaveBeenCalled();
+      expect(helper.pendingTargetContext('next')).toBeUndefined();
+      expect(onLog).toHaveBeenCalledWith(
+        expect.objectContaining({ level: 'error', message: expect.stringContaining(`${isolation} isolation has no implementation in this build`) })
+      );
+    }
+  );
 
   // The stub above is module-wide; later describes in this file have no
   // beforeEach of their own to reset it.

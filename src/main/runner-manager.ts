@@ -33,6 +33,7 @@ import {
   type JobEnvironmentConfig,
 } from './config';
 import { createMissingGrantedDirs, gitSshCommand, JOB_HOME_DIR_NAME, prepareJobHome } from '../shared/job-home';
+import type { IsolationType } from '../shared/isolation';
 import { createJobTempDir, jobTempName, removeJobTempDir, userTempDir } from './job-temp';
 import { writeJobBin } from './job-shims';
 import { normalizeFilterConfig, isUserAllowed, areAllUsersAllowed, parseRepository } from './runner/user-filter';
@@ -419,8 +420,9 @@ export class RunnerManager {
   // Keyed by slot number, or 'next' for the job admission is handing to spawnWorkerForJob
   // githubRepo is owner/repo as GitHub reports it: the name the policy was
   // approved and checked under, which for an organization target the display
-  // name is not.
-  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string; githubSha?: string; githubRef?: string; githubWorkflow?: string; jobId?: string; githubRepo?: string }> = new Map();
+  // name is not. isolation is the type admission chose for the job, set by
+  // spawnWorkerForJob on the slot's context.
+  private pendingTargetContext: Map<string, { targetId: string; targetDisplayName: string; actionsUrl?: string; githubRunId?: number; githubJobId?: number; githubActor?: string; githubSha?: string; githubRef?: string; githubWorkflow?: string; jobId?: string; githubRepo?: string; isolation?: IsolationType }> = new Map();
 
   /**
    * Validate that a child path stays within the expected base directory.
@@ -977,13 +979,27 @@ export class RunnerManager {
    * nothing else will ever run the job - only the worker spawned for a job
    * may take it - and the caller drops it at the broker.
    */
-  async spawnWorkerForJob(): Promise<boolean> {
+  async spawnWorkerForJob(isolation: IsolationType): Promise<boolean> {
     // Take the context before waiting for a slot. 'next' is a single shared
     // slot, so a job arriving during the wait would otherwise overwrite it and
     // this worker would start with another repository's context.
     const claimedContext = this.pendingTargetContext.get('next');
     if (claimedContext) {
       this.pendingTargetContext.delete('next');
+    }
+
+    // The isolation admission chose. Seatbelt is the only type with an
+    // implementation: the worker below runs under sandbox-exec. The service
+    // account and the macOS VM each start their worker their own way, and
+    // until they do, a job chosen for one is not run - never under seatbelt
+    // instead, which its repository may not have listed.
+    switch (isolation) {
+      case 'seatbelt':
+        break;
+      case 'service-account':
+      case 'macos-vm':
+        this.log('error', `${isolation} isolation has no implementation in this build; this job will not run`);
+        return false;
     }
 
     // Wait briefly for a slot rather than dropping the job. By this point the
@@ -1022,8 +1038,9 @@ export class RunnerManager {
     this.log('info', `Spawning worker ${instanceNum} for incoming job from ${targetContext.targetDisplayName}...`);
 
     // Keyed by instance so startInstance can install the policy for this job
-    // before the runner starts, and the job start reads it from here.
-    this.pendingTargetContext.set(String(instanceNum), targetContext);
+    // before the runner starts, and the job start reads it from here; with
+    // the isolation it runs under.
+    this.pendingTargetContext.set(String(instanceNum), { ...targetContext, isolation });
 
     // Copy proxy credentials to this instance's config before building sandbox
     const proxyDir = path.join(getRunnerDir(), 'proxies', targetContext.targetId);

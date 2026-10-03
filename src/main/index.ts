@@ -25,6 +25,8 @@ import { TargetManager } from './target-manager';
 import { ContributorCache } from './contributor-cache';
 import { admitJob, buildAdmissionDeps, PolicyApprovalDeps } from './job-admission';
 import { repoPolicyRuntime } from './repo-policy';
+import { effectiveIsolation } from '../shared/localmostrc';
+import { availableIsolationTypes } from '../shared/isolation';
 
 // State management
 import {
@@ -114,7 +116,7 @@ import {
 
 // Zustand store
 import { initStore, connectWindow, cleanupStore, store } from './store/init';
-import { runnerJobEnvironment, runnerResourcePause } from './store';
+import { runnerIsolation, runnerJobEnvironment, runnerResourcePause } from './store';
 import {
   decidePolicyForJob,
   recordPendingPolicy,
@@ -504,6 +506,15 @@ app.whenReady().then(async () => {
     findTarget: (targetId: string) => targetManager.getTargets().find(t => t.id === targetId),
     runnerManager,
     broker: brokerProxyService,
+    // The job's isolation: the first type in its approved policy's list -
+    // the commit's, as getRepoPolicy applies it - that Settings allows and
+    // this build can run (docs/roadmap/localmostrc.md, Isolation).
+    isolation: {
+      accepted: (repository, sha, workflow) =>
+        effectiveIsolation(sha ? getApprovedPolicyForCommit(repository, sha) : null, workflow),
+      allowed: () => runnerIsolation().allowed,
+      available: availableIsolationTypes,
+    },
     log: (level, message) => getLogger()?.[level](message),
   });
   brokerProxyService.on('job-received', (targetId: string, jobId: string, _registeredRunnerName: string, githubInfo) => {
