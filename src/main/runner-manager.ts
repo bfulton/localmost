@@ -992,7 +992,9 @@ export class RunnerManager {
     // implementation: the worker below runs under sandbox-exec. The service
     // account and the macOS VM each start their worker their own way, and
     // until they do, a job chosen for one is not run - never under seatbelt
-    // instead, which its repository may not have listed.
+    // instead, which its repository may not have listed. A type added to
+    // ISOLATION_TYPES without a case here fails to compile, and one that
+    // arrives anyway is not run either.
     switch (isolation) {
       case 'seatbelt':
         break;
@@ -1000,6 +1002,11 @@ export class RunnerManager {
       case 'macos-vm':
         this.log('error', `${isolation} isolation has no implementation in this build; this job will not run`);
         return false;
+      default: {
+        const unknown: never = isolation;
+        this.log('error', `unknown isolation type ${JSON.stringify(unknown)}; this job will not run`);
+        return false;
+      }
     }
 
     // Wait briefly for a slot rather than dropping the job. By this point the

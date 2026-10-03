@@ -93,6 +93,7 @@ import * as paths from './paths';
 import { NO_DAEMON_MESSAGE, noDockerBackend } from './docker/docker-backend';
 import type { DockerBackend, WorkerContext, WorkerDocker } from './docker/docker-backend';
 import type { DockerVmConfig } from './config';
+import type { IsolationType } from '../shared/isolation';
 
 const vmConfig: DockerVmConfig = {
   prewarm: false, cpus: 4, memoryMiB: 8192, maxRunning: 2, dataDiskGiB: 64, bootTimeoutSec: 60,
@@ -3836,6 +3837,21 @@ describe('spawning the worker for an admitted job', () => {
       );
     }
   );
+
+  it('starts no worker for a type it does not know, rather than running it under seatbelt', async () => {
+    // A type added to ISOLATION_TYPES without a case here fails to compile;
+    // this is what it does at runtime if one ever arrives anyway.
+    const { m, helper, onLog } = manager();
+    helper.setPendingTargetContext('next', { targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'req-1' });
+    const started = jest.fn(async () => undefined);
+    helper.stubStartInstance(started);
+
+    await expect(m.spawnWorkerForJob('linux-vm' as unknown as IsolationType)).resolves.toBe(false);
+    expect(started).not.toHaveBeenCalled();
+    expect(onLog).toHaveBeenCalledWith(
+      expect.objectContaining({ level: 'error', message: expect.stringContaining('unknown isolation type "linux-vm"') })
+    );
+  });
 
   // The stub above is module-wide; later describes in this file have no
   // beforeEach of their own to reset it.
