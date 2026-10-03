@@ -1916,7 +1916,7 @@ describe('RunnerManager', () => {
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
         getRepoPolicy: async () => ({ hosts: [], level: 'strict', readPaths: [], writePaths: ['~/.p3-missing/cache/', '~/.p3-missing-history'], docker: {} }),
-        getJobEnvironmentConfig: () => ({ toolShims: true, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs }),
+        getJobEnvironmentConfig: () => ({ toolShims: true, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs, swiftBuildLinkTemp: false }),
       });
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       mockSpawnSandboxed.mockReturnValue(createMockProcess(9915));
@@ -1983,7 +1983,7 @@ describe('RunnerManager', () => {
           onLog: mockOnLog,
           onStatusChange: mockOnStatusChange,
           onJobHistoryUpdate: mockOnJobHistoryUpdate,
-          getJobEnvironmentConfig: () => ({ toolShims: true, javaToolOptions, perJobTempDir: true, createMissingGrantedDirs: true }),
+          getJobEnvironmentConfig: () => ({ toolShims: true, javaToolOptions, perJobTempDir: true, createMissingGrantedDirs: true, swiftBuildLinkTemp: false }),
         });
         (fs.existsSync as jest.Mock).mockReturnValue(true);
         mockSpawnSandboxed.mockReturnValue(createMockProcess(9918));
@@ -2014,6 +2014,42 @@ describe('RunnerManager', () => {
       });
     });
 
+    describe("for Swift Build's link step", () => {
+      const spawnWith = async (swiftBuildLinkTemp?: boolean) => {
+        const manager = new RunnerManager({
+          onLog: mockOnLog,
+          onStatusChange: mockOnStatusChange,
+          onJobHistoryUpdate: mockOnJobHistoryUpdate,
+          ...(swiftBuildLinkTemp !== undefined
+            ? {
+                getJobEnvironmentConfig: () => ({
+                  toolShims: true,
+                  javaToolOptions: true,
+                  perJobTempDir: true,
+                  createMissingGrantedDirs: true,
+                  swiftBuildLinkTemp,
+                }),
+              }
+            : {}),
+        });
+        (fs.existsSync as jest.Mock).mockReturnValue(true);
+        mockSpawnSandboxed.mockReturnValue(createMockProcess(9919));
+        await new RunnerManagerTestHelper(manager).spawnForJob();
+        return mockSpawnSandboxed.mock.calls.at(-1)![2]!;
+      };
+
+      it('grants its temp in the per-user temp directory only with the preference on', async () => {
+        // The profile grants T/TemporaryDirectory.XXXXXX, a name the user's
+        // own SwiftPM keeps manifests it is about to run in, only when asked.
+        expect((await spawnWith(true)).swiftBuildLinkTemp).toBe(true);
+        expect((await spawnWith(false)).swiftBuildLinkTemp).toBe(false);
+      });
+
+      it('does not grant it by default', async () => {
+        expect((await spawnWith()).swiftBuildLinkTemp).toBe(false);
+      });
+    });
+
     describe('in the per-user temp directory', () => {
       const T = '/var/folders/zz/zyxw_vut0000gn/T';
       const sandboxDir = '/Users/test/.localmost/runner/sandbox/1-0123456789ab';
@@ -2023,7 +2059,7 @@ describe('RunnerManager', () => {
           onStatusChange: mockOnStatusChange,
           onJobHistoryUpdate: mockOnJobHistoryUpdate,
           getUserTempDir: () => T,
-          getJobEnvironmentConfig: () => ({ toolShims: true, javaToolOptions: true, perJobTempDir, createMissingGrantedDirs: true }),
+          getJobEnvironmentConfig: () => ({ toolShims: true, javaToolOptions: true, perJobTempDir, createMissingGrantedDirs: true, swiftBuildLinkTemp: false }),
         });
         const downloader = (manager as unknown as { downloader: { buildSandbox: jest.Mock } }).downloader;
         downloader.buildSandbox.mockResolvedValue(sandboxDir);
@@ -2261,7 +2297,7 @@ describe('RunnerManager', () => {
           onLog: mockOnLog,
           onStatusChange: mockOnStatusChange,
           onJobHistoryUpdate: mockOnJobHistoryUpdate,
-          getJobEnvironmentConfig: () => ({ toolShims, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true }),
+          getJobEnvironmentConfig: () => ({ toolShims, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true, swiftBuildLinkTemp: false }),
         });
         (fs.existsSync as jest.Mock).mockReturnValue(true);
         mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));

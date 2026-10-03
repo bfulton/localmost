@@ -255,22 +255,23 @@ describe('resolveResourcePauseConfig', () => {
 });
 
 describe('resolveJobEnvironmentConfig', () => {
-  it('turns every job-environment convenience on by default', () => {
+  it('turns every job-environment convenience on by default, and the Swift Build link-temp grant off', () => {
     expect(resolveJobEnvironmentConfig(undefined)).toEqual({
       toolShims: true,
       javaToolOptions: true,
       perJobTempDir: true,
       createMissingGrantedDirs: true,
+      swiftBuildLinkTemp: false,
     });
     expect(resolveJobEnvironmentConfig({})).toEqual(resolveJobEnvironmentConfig(undefined));
   });
 
-  it('turns each off on its own', () => {
+  it('turns each off on its own, and the link-temp grant on on its own', () => {
+    const defaults = resolveJobEnvironmentConfig(undefined);
     for (const key of ['toolShims', 'javaToolOptions', 'perJobTempDir', 'createMissingGrantedDirs'] as const) {
-      const resolved = resolveJobEnvironmentConfig({ [key]: false });
-      expect(resolved[key]).toBe(false);
-      expect(Object.values(resolved).filter((on) => !on)).toHaveLength(1);
+      expect(resolveJobEnvironmentConfig({ [key]: false })).toEqual({ ...defaults, [key]: false });
     }
+    expect(resolveJobEnvironmentConfig({ swiftBuildLinkTemp: true })).toEqual({ ...defaults, swiftBuildLinkTemp: true });
   });
 
   it('takes a value that is not true or false as absent, and says so', () => {
@@ -286,7 +287,7 @@ describe('resolveJobEnvironmentConfig', () => {
 
   it('ignores keys it does not know, and a section that is not a mapping', () => {
     expect(Object.keys(resolveJobEnvironmentConfig({ realHome: true } as never)).sort()).toEqual([
-      'createMissingGrantedDirs', 'javaToolOptions', 'perJobTempDir', 'toolShims',
+      'createMissingGrantedDirs', 'javaToolOptions', 'perJobTempDir', 'swiftBuildLinkTemp', 'toolShims',
     ]);
     expect(resolveJobEnvironmentConfig('off' as never)).toEqual(resolveJobEnvironmentConfig(undefined));
   });

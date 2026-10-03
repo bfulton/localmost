@@ -144,12 +144,9 @@ if (!isMacOS) {
     });
 
     /** Write the runner profile for the stand-in sandbox, and return its path. */
-    const writeProfile = (
-      options: Omit<RunnerProfileOptions, 'instanceDir'> = {},
-      edit: (profile: string) => string = (profile) => profile
-    ): string => {
+    const writeProfile = (options: Omit<RunnerProfileOptions, 'instanceDir'> = {}): string => {
       const profilePath = path.join(base, `${randomBytes(4).toString('hex')}.sb`);
-      fs.writeFileSync(profilePath, edit(generateSandboxProfile({ instanceDir: sandboxDir, ...options })));
+      fs.writeFileSync(profilePath, generateSandboxProfile({ instanceDir: sandboxDir, ...options }));
       return profilePath;
     };
 
@@ -251,12 +248,13 @@ if (!isMacOS) {
           bin = writeJobBin(sandboxDir, { shims: true });
         });
 
-        /** The runner profile a job building the package gets, edited by `edit` when given. */
-        const buildProfile = (edit?: (profile: string) => string) =>
+        /** The runner profile a job building the package gets, Swift Build's link temp granted or not (the default). */
+        const buildProfile = (swiftBuildLinkTemp?: boolean) =>
           writeProfile({
             tempSuffixDir: tempDir,
             filesystemPolicy: { level: 'strict', read: ['/Applications/Xcode.app'], write: [] },
-          }, edit);
+            ...(swiftBuildLinkTemp !== undefined ? { swiftBuildLinkTemp } : {}),
+          });
 
         /** `swift <args>` in the package as a job runs it, the job's bin directory first on PATH or not. */
         const swift = (args: string, withShims: boolean, profilePath = buildProfile()) => {
@@ -280,25 +278,24 @@ if (!isMacOS) {
           expect(result).toMatchObject({ ok: true, stdout: expect.stringContaining('Name: hello') });
         }, 2 * SWIFT_TIMEOUT_MS);
 
-        it("builds the package with Swift 6.4's default build system through to an executable that runs", () => {
+        it("builds the package with Swift 6.4's default build system, with the link-temp preference on, through to an executable that runs", () => {
           // Swift Build runs its link step with the per-user temp directory
           // itself as its temp, and swift-driver makes
-          // T/TemporaryDirectory.XXXXXX there. Without the rule granting
-          // names of that shape the link fails, though all before it builds.
+          // T/TemporaryDirectory.XXXXXX there. By default, the preference
+          // off, the profile has no rule granting names of that shape, and
+          // the link fails, though all before it builds.
           const rule = generatedNameTempRules(userTemp!, SWIFT_DRIVER_TEMP_NAME).join('\n');
-          let removed = false;
-          const withoutRule = buildProfile((profile) => {
-            removed = profile.includes(rule);
-            return profile.replace(rule, ';; (removed)');
-          });
-          expect(removed).toBe(true);
-          const without = swift('build', true, withoutRule);
+          const byDefault = buildProfile();
+          expect(fs.readFileSync(byDefault, 'utf-8')).not.toContain('TemporaryDirectory');
+          const without = swift('build', true, byDefault);
           expect(without.ok).toBe(false);
           expect(without.stderr).toMatch(/error: permissionDenied/);
           expect(without.stderr).toMatch(/error: Ld \S+\/hello normal failed/);
           expect(fs.existsSync(path.join(pkg, '.build', 'debug', 'hello'))).toBe(false);
 
-          const result = swift('build', true);
+          const granted = buildProfile(true);
+          expect(fs.readFileSync(granted, 'utf-8')).toContain(rule);
+          const result = swift('build', true, granted);
           expect(result.stdout + result.stderr).not.toMatch(/sandbox_apply|permissionDenied/);
           expect(result).toMatchObject({ ok: true, stdout: expect.stringContaining('Build complete!') });
           // And it runs, in the job.

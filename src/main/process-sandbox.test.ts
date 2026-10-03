@@ -812,11 +812,26 @@ describe('Process Sandbox', () => {
       expect(granted('/var/folders/zz/other_user00gn/T/tmp.AbC123xYz9')).toBe(false);
     });
 
-    it("lets swift-driver create its own TemporaryDirectory.XXXXXX in the per-user temp, by generated name only", () => {
+    it("grants no TemporaryDirectory.XXXXXX in the per-user temp unless the preference asks for it", () => {
+      // The user's own SwiftPM keeps a manifest it is about to run in a
+      // directory of that name, so the grant is off by default.
+      for (const profile of [profileWith({}), profileWith({ swiftBuildLinkTemp: false })]) {
+        expect(profile).not.toContain('TemporaryDirectory');
+        expect(profile).toContain(";; Swift Build's link step is not granted its temp");
+        for (const dir of ['/var/folders/zz/zyxw_vut0000gn/T', '/private/var/folders/zz/zyxw_vut0000gn/T']) {
+          const p = `${dir}/TemporaryDirectory.lr5gaP/hello.resp`;
+          expect([p, writable(profile, p), readable(profile, p)]).toEqual([p, false, false]);
+          // mktemp's names stay granted either way.
+          expect(writable(profile, `${dir}/tmp.AbC123xYz9`)).toBe(true);
+        }
+      }
+    });
+
+    it("lets swift-driver create its own TemporaryDirectory.XXXXXX in the per-user temp with the preference on, by generated name only", () => {
       // Swift Build runs its link step with the per-user temp directory as
       // its temp, and swift-driver makes T/TemporaryDirectory.XXXXXX there
       // with mkdtemp: six of mkdtemp's 62 characters, files inside.
-      const profile = profileWith({});
+      const profile = profileWith({ swiftBuildLinkTemp: true });
       for (const dir of ['/var/folders/zz/zyxw_vut0000gn/T', '/private/var/folders/zz/zyxw_vut0000gn/T']) {
         for (const p of [`${dir}/TemporaryDirectory.lr5gaP`, `${dir}/TemporaryDirectory.Zz09aA/hello.resp`]) {
           expect([p, writable(profile, p), readable(profile, p)]).toEqual([p, true, true]);
@@ -842,7 +857,7 @@ describe('Process Sandbox', () => {
       expect(writable(profile, '/private/tmp/TemporaryDirectory.lr5gaP')).toBe(false);
       // The same rule whatever the level: a build needs it at every one.
       for (const level of ['strict', 'moderate', 'permissive'] as const) {
-        const atLevel = profileWith({ filesystemPolicy: { level, read: [], write: [] } });
+        const atLevel = profileWith({ filesystemPolicy: { level, read: [], write: [] }, swiftBuildLinkTemp: true });
         expect(writable(atLevel, '/private/var/folders/zz/zyxw_vut0000gn/T/TemporaryDirectory.lr5gaP/f')).toBe(true);
       }
     });

@@ -322,9 +322,18 @@ if (!isMacOS) {
       expect(fs.realpathSync(path.dirname(file.entry))).toBe(userTempDir());
     });
 
-    it("lets a job make the TemporaryDirectory.XXXXXX Swift Build's link step makes there, and no name off its shape", () => {
+    it("lets a job make the TemporaryDirectory.XXXXXX Swift Build's link step makes there with the preference on, and no name off its shape", () => {
       const allOff = { fiveChars: false, sevenChars: false, notInAlphabet: false, otherPrefix: false, noDot: false };
-      expect(swiftDriverTempProbe(underProfile())).toEqual({ generated: true, offShape: allOff, listsTemp: false });
+      expect(swiftDriverTempProbe(underProfile({ swiftBuildLinkTemp: true }))).toEqual({
+        generated: true,
+        offShape: allOff,
+        listsTemp: false,
+      });
+    });
+
+    it('refuses a job that name too with the preference off, as by default', () => {
+      const allOff = { fiveChars: false, sevenChars: false, notInAlphabet: false, otherPrefix: false, noDot: false };
+      expect(swiftDriverTempProbe(underProfile())).toEqual({ generated: false, offShape: allOff, listsTemp: false });
     });
 
     it('refuses the per-user temp itself, where the xcrun cache the user trusts lives', () => {

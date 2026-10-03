@@ -316,22 +316,34 @@ describe('settings IPC handlers', () => {
 
     it('saves the job-environment conveniences, each on or off, and hands them to the store', () => {
       (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({} as any);
-      const jobEnvironment = { toolShims: false, javaToolOptions: true, perJobTempDir: false, createMissingGrantedDirs: true };
+      const jobEnvironment = { toolShims: false, javaToolOptions: true, perJobTempDir: false, createMissingGrantedDirs: true, swiftBuildLinkTemp: false };
 
       expect(handlers['settings:set']({}, { jobEnvironment })).toEqual({ success: true });
       expect(saveConfig).toHaveBeenLastCalledWith({ jobEnvironment });
       expect(store.getState().config.jobEnvironment).toEqual(jobEnvironment);
     });
 
+    it("saves the Swift Build link-temp grant turned on, and hands it to the store", () => {
+      (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({} as any);
+      const jobEnvironment = { toolShims: true, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true, swiftBuildLinkTemp: true };
+
+      expect(handlers['settings:set']({}, { jobEnvironment })).toEqual({ success: true });
+      expect(saveConfig).toHaveBeenLastCalledWith({ jobEnvironment });
+      expect(store.getState().config.jobEnvironment.swiftBuildLinkTemp).toBe(true);
+    });
+
     it('refuses job-environment settings that miss one, add one, or are not true or false', () => {
       (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({} as any);
-      const all = { toolShims: true, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true };
+      const all = { toolShims: true, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true, swiftBuildLinkTemp: false };
       store.getState().setJobEnvironment(all);
 
       for (const jobEnvironment of [
-        { toolShims: 'no', javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true },
+        { toolShims: 'no', javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true, swiftBuildLinkTemp: false },
         { ...all, perJobTempDir: 0 },
         { toolShims: true, javaToolOptions: true, perJobTempDir: true },
+        // Every key, the link-temp grant too: a page that left it out is not this one.
+        { toolShims: true, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true },
+        { ...all, swiftBuildLinkTemp: 'on' },
         // Not a preference: the per-job home is not one to turn off.
         { ...all, jobHome: false },
         [true, true, true, true],

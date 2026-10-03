@@ -477,10 +477,21 @@ if (!isMacOS) {
         // Scripts call mktemp with no template constantly, and it ignores TMPDIR.
         expect(run(profile, ['/bin/sh', '-c', 'f=$(/usr/bin/mktemp) && echo x > "$f" && rm "$f"'])).toBe(true);
         expect(run(profile, ['/bin/sh', '-c', 'd=$(/usr/bin/mktemp -d) && touch "$d/f" && rm -r "$d"'])).toBe(true);
-        // Nor does Swift Build's link step, whose swift-driver makes
-        // T/TemporaryDirectory.XXXXXX with mkdtemp; a name off that shape stays refused.
-        // A name already there may be the user's own, so probeTempDirName
-        // takes only a new one and removes only what its own mkdir made.
+        // Swift Build's link step is not granted its temp by default.
+        const ok = probeTempDirName((command) => run(profile, ['/bin/sh', '-c', command]), userTemp, `TemporaryDirectory.${mkdtempChars(6)}`);
+        expect(ok).toBe(false);
+      }
+    });
+
+    it("lets Swift Build's link step make its temp when asked, and no name off its shape", () => {
+      // swift-driver makes T/TemporaryDirectory.XXXXXX with mkdtemp. A name
+      // already there may be the user's own, so probeTempDirName takes only
+      // a new one and removes only what its own mkdir made.
+      const userTemp = execFileSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf-8' }).trim();
+      for (const profile of [
+        generateSandboxProfile({ workDir, proxyPort: 1, policy: readable, swiftBuildLinkTemp: true }),
+        generateDiscoveryProfile({ workDir, proxyPort: 1, logFile: '', swiftBuildLinkTemp: true }),
+      ]) {
         for (const [name, granted] of [
           [`TemporaryDirectory.${mkdtempChars(6)}`, true],
           [`TemporaryDirectory.${mkdtempChars(7)}`, false],

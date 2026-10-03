@@ -12,7 +12,8 @@ import shared from '../styles/shared.module.css';
 
 /**
  * The job-environment conveniences, in the order the page shows them: each
- * a checkbox, on by default. See docs/roadmap/job-environment.md.
+ * a checkbox, on by default but the Swift Build link-temp grant. See
+ * docs/roadmap/job-environment.md.
  */
 const JOB_ENVIRONMENT_OPTIONS: ReadonlyArray<{
   key: keyof JobEnvironmentConfig;
@@ -57,6 +58,23 @@ const JOB_ENVIRONMENT_OPTIONS: ReadonlyArray<{
         'Off: a directory a policy grants under your home, or one above it, that does not exist stays ' +
         'missing, and you must create it yourself before the job runs, or the job fails with "Operation not ' +
         'permitted" at its first write there.',
+    },
+  },
+  {
+    key: 'swiftBuildLinkTemp',
+    label: 'Let Swift Build link in the shared temp directory',
+    hint:
+      'Swift 6.4\'s default build system links in a TemporaryDirectory.XXXXXX directory it makes in the ' +
+      'per-user temp directory, whatever the job\'s TMPDIR says. This grants a job names of exactly that shape there.',
+    stateHints: {
+      on:
+        'On: a job may create <T>/TemporaryDirectory.XXXXXX names in the shared per-user temp directory, which ' +
+        'your own SwiftPM and Xcode also use for manifest executables, so a job could race to replace one before ' +
+        'it runs.',
+      off:
+        'Off (the default): Swift 6.4\'s default build system fails to link inside a job. A workflow can pass ' +
+        'swift build --build-system native, or the repository can use the macOS VM isolation type once it is ' +
+        'available.',
     },
   },
 ];

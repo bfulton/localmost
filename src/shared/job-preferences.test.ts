@@ -1,7 +1,8 @@
-import { describe, it, expect } from '@jest/globals';
+import { describe, it, expect, jest } from '@jest/globals';
 import {
   DEFAULT_JOB_ENVIRONMENT_CONFIG,
   DEFAULT_RESOURCE_PAUSE_CONFIG,
+  resolveJobEnvironmentConfig,
 } from './job-preferences';
 
 describe('the resource-pause and job-environment defaults', () => {
@@ -22,6 +23,18 @@ describe('the resource-pause and job-environment defaults', () => {
       javaToolOptions: true,
       perJobTempDir: true,
       createMissingGrantedDirs: true,
+      // Off: the one grant here that reaches what the user's own builds use.
+      swiftBuildLinkTemp: false,
     });
+  });
+});
+
+describe('resolveJobEnvironmentConfig', () => {
+  it('takes the Swift Build link-temp grant as off unless the file says true', () => {
+    expect(resolveJobEnvironmentConfig(undefined).swiftBuildLinkTemp).toBe(false);
+    expect(resolveJobEnvironmentConfig({ swiftBuildLinkTemp: true }).swiftBuildLinkTemp).toBe(true);
+    const log = jest.fn();
+    expect(resolveJobEnvironmentConfig({ swiftBuildLinkTemp: 'yes' }, log).swiftBuildLinkTemp).toBe(false);
+    expect(log).toHaveBeenCalledWith('jobEnvironment.swiftBuildLinkTemp must be true or false; using false');
   });
 });

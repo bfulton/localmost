@@ -719,11 +719,11 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
     `.tmp` the checkout commits at its top is no longer copied into the
     workspace
 - A job's environment carries what its tools need to work in the sandbox, each
-  of which can be turned off in the Job Environment section of Settings (saved
+  of which can be turned on or off in the Job Environment section of Settings (saved
   as the `jobEnvironment` section of `config.yaml`, which the app reads at
   launch and writes back at quit, so edit it only while the app is quit), for
-  jobs that start after the change; all are on by default
-  ([job-environment.md](docs/roadmap/job-environment.md)):
+  jobs that start after the change; all are on by default but
+  `swiftBuildLinkTemp` ([job-environment.md](docs/roadmap/job-environment.md)):
   - `perJobTempDir`: a directory of the job's own in the per-user temp
     directory, named by `DIRHELPER_USER_DIR_SUFFIX`, made before the job and
     removed after it, where Foundation's atomic writes - SwiftPM's,
@@ -754,17 +754,18 @@ Theme: Test Locally, Secure by Default. Catch workflow problems before pushing, 
     granted directory under your home, or one above it, that does not exist
     must be created first, or the job fails with "Operation not permitted" at
     its first write there
-- A job may create the `T/TemporaryDirectory.XXXXXX` directories that Swift
-  6.4's default build system, Swift Build, has swift-driver make in the
-  per-user temp directory for its link step - by the name `mkdtemp` generates
-  only, as with a bare `mktemp`'s entries - in the runner's profile and a
-  `localmost test` step's. A plain `swift build` now links in a job; it failed
-  at its `Ld` step with `permissionDenied`, and a workflow had to pass
-  `--build-system native`. Your own SwiftPM and swift-driver keep the
-  manifest they are about to run, its object file and their response files
-  in directories of that name, and a job that reads their paths in `ps` can
-  try to replace one before it is used; see Shared temp directories in
-  SECURITY.md
+  - `swiftBuildLinkTemp`, off by default: a job may create the
+    `T/TemporaryDirectory.XXXXXX` directories that Swift 6.4's default build
+    system, Swift Build, has swift-driver make in the per-user temp directory
+    for its link step - by the name `mkdtemp` generates only, as with a bare
+    `mktemp`'s entries - so a plain `swift build` links in a job. Off, it
+    fails at its `Ld` step with `permissionDenied`, and a workflow passes
+    `--build-system native`. It is off because your own SwiftPM and Xcode
+    keep the manifest executable they are about to run, its object file and
+    their response files in directories of that name, and a job that reads
+    their paths in `ps` could race to replace one before it is used; Settings
+    says so beside the toggle (see Shared temp directories in SECURITY.md). A
+    `localmost test` step never gets it: the CLI reads no app preferences
 - The bundled `docker` CLI is linked in the job's own bin directory,
   `<sandbox>/localmost/bin`, first on its `PATH`, rather than its directory in
   the app bundle being put on `PATH`

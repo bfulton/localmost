@@ -4,14 +4,16 @@ What localmost puts in a runner job's environment beyond what the runner
 itself needs: a home directory of the job's own, a directory of its own in the
 per-user temp directory, a bin directory with the bundled docker CLI and shims
 for `swift` and `xcodebuild`, and `JAVA_TOOL_OPTIONS`. Each convenience can be
-turned off on its own, in Settings (see [Preferences](#preferences)).
+turned off on its own, in Settings (see [Preferences](#preferences)), and so
+can one sandbox grant for Swift Build's link step, which is off unless turned
+on.
 
-> **Status:** implemented in 0.3.0, from the owner's decisions of 2026-10-01
-> and 2026-10-02 (items 9, 10, 11a, 11b, 12, 13, 14 and 15 of the open-items
-> walkthrough). Whether to keep item 14's grant, now that what it exposes
-> to the user's own Swift builds is known, is open again (see
-> [Edge cases](#edge-cases)). The dedicated runner user at the end is a future
-> design item.
+> **Status:** implemented in 0.3.0, from the owner's decisions of 2026-10-01,
+> 2026-10-02 and 2026-10-03 (items 9, 10, 11a, 11b, 12, 13, 14 and 15 of the
+> open-items walkthrough). Item 14's grant, once what it exposes to the
+> user's own Swift builds was known, became a preference, off by default
+> (2026-10-03; see [Edge cases](#edge-cases)). The dedicated runner user at
+> the end is a future design item.
 
 ## Problem
 
@@ -109,14 +111,20 @@ random characters of `[A-Za-z0-9]`, as tools-support-core's
 `withTemporaryDirectory` asks - holding a `.keep-directory` marker and any
 response file or temporary output of the driver's. No build setting or
 variable in 6.4 changes that: `LD_ENVIRONMENT` is for the linked binary, and
-`SWIFT_EXEC` reaches the manifest compile but not the link. So the profile
-grants names of exactly that shape there, by both spellings, as it grants
-bare `mktemp`'s `tmp.XXXXXXXXXX`, and nothing else in `T`, `T` itself
-included; a plain `swift build` builds and links, and no workflow needs
-`--build-system native`. The rule is part of the profile, at every level, not
-of the `perJobTempDir` preference, and a `localmost test` step's profile
-carries it too. What it exposes to the user's own Swift builds is under
-[Edge cases](#edge-cases).
+`SWIFT_EXEC` reaches the manifest compile but not the link. With the
+`swiftBuildLinkTemp` preference on, the profile grants names of exactly that
+shape there, by both spellings, as it grants bare `mktemp`'s
+`tmp.XXXXXXXXXX`, and nothing else in `T`, `T` itself included, at every
+level; a plain `swift build` then builds and links. The preference is off by
+default, for what the grant exposes to the user's own Swift builds (under
+[Edge cases](#edge-cases)): off, the profile carries no such rule, and a plain
+`swift build` compiles everything and fails at its link step (`error:
+permissionDenied`, `Ld ... normal failed`). A workflow can pass `swift build
+--build-system native`, whose link uses the job's `TMPDIR`, or the repository
+can use the macOS VM isolation type once it is available
+([macos-vm-jobs.md](macos-vm-jobs.md)), where no temp directory is shared. A
+`localmost test` step's profile never carries the rule: the CLI does not read
+the app's preferences, so test mode stays at the default.
 
 ### A bin directory of the job's own
 
@@ -175,7 +183,8 @@ any job, with `EISDIR`.
 ## Preferences
 
 Each convenience is a key of the `jobEnvironment` section of `config.yaml`,
-all on by default, set in the Job Environment section of Settings. The app
+all on by default, set in the Job Environment section of Settings, and so is
+the Swift Build link-temp grant, off by default. The app
 reads the section at launch and holds it from then on: the runner takes it
 from there at every worker spawn, so a change made in Settings applies to jobs
 that start after it, and the page always shows the value the runner uses. The
@@ -190,6 +199,7 @@ runner uses.
 | `javaToolOptions` | `true` | No `JAVA_TOOL_OPTIONS`; the JVM's temp file, loopback and proxy fail as before. |
 | `perJobTempDir` | `true` | No `T/<suffix>`; Foundation's atomic writes fail as before. |
 | `createMissingGrantedDirs` | `true` | The missing directories above a write grant, and a directory it names, stay missing: the user creates one first, or the job fails with "Operation not permitted" at its first write there. Settings says so beside the toggle while it is off, and while it is on that there is nothing to create first. |
+| `swiftBuildLinkTemp` | `false` | Off (the default), the profile does not grant `T/TemporaryDirectory.XXXXXX`, and Swift 6.4's default build system fails to link inside a job; a workflow can pass `swift build --build-system native`, or the repository can use the macOS VM isolation type once available. On, a job may create those names in the shared per-user temp, which the user's own SwiftPM and Xcode also use for manifest executables, so a job could race to replace one before it runs. Settings says which beside the toggle. |
 
 The per-job home is not a preference: it is what closes G5 and G8, and an
 empty home is never less than the user's own was.
@@ -356,21 +366,29 @@ empty home is never less than the user's own was.
   the node, created as a directory, and that one file). The user can move
   SwiftPM's manifest directories out of `T` by setting their own `TMPDIR`;
   Swift Build's link step in their builds stays in `T`.
-  Whether to keep the grant is open, among: keep it with this written down
-  (as now); drop it and have a workflow that builds Swift packages pass
-  `--build-system native` (the owner ruled out forcing that in the shim, but
-  a workflow may still choose it); make it a preference, off by default;
-  or wait for what removes the need - a Swift Build that gives its tasks a
-  temp directory on macOS as it does on Windows, a SwiftPM that passes
-  `SWIFT_EXEC` to Swift Build as a build setting (its main branch does, and
-  Swift Build's linker code prefers that `swiftc` as its link driver, so a
-  wrapper that starts it with the job's `TMPDIR` could serve; untried), or
-  the dedicated runner user below, whose `T` is its own.
+  So the grant is a preference, `jobEnvironment.swiftBuildLinkTemp`, off by
+  default (owner's decision, 2026-10-03), with what it exposes said beside
+  its toggle in Settings. The options weighed were: keep it on for every
+  job with this written down; drop it and have a workflow that builds Swift
+  packages pass `--build-system native` (the owner ruled out forcing that in
+  the shim, but a workflow may still choose it); the preference; or wait for
+  what removes the need. The clean resolution for the seatbelt tier is
+  upstream: a Swift Build that gives its task environments a temp directory
+  on macOS as it does on Windows - the build's object root, or the `TMPDIR`
+  it was started with - so the link step's swift-driver makes its directory
+  in the job's own temp, and no grant in `T` is needed at all. A patch to
+  swiftlang/swift-build doing that has been drafted, not yet submitted.
+  Short of it, a SwiftPM that passes `SWIFT_EXEC` to Swift Build as a build
+  setting (its main branch does, and Swift Build's linker code prefers that
+  `swiftc` as its link driver, so a wrapper that starts it with the job's
+  `TMPDIR` could serve; untried) is another way. The dedicated runner user
+  below, whose `T` is its own, would remove the exposure without either.
 - **Package plugins under xcodebuild** run under Xcode's plugin sandbox, which
   `-IDEPackageSupportDisableManifestSandbox` does not cover.
 - **`localmost test`** gets the per-job home; the temp directory, the shims and
   `JAVA_TOOL_OPTIONS` are the runner's, since the CLI does not read the app's
-  preferences.
+  preferences. For the same reason a test step's profile never grants Swift
+  Build's link temp, whatever `swiftBuildLinkTemp` says.
 - **Tests inside a job.** A test that wants the real home must ask the user
   database (`os.userInfo().homedir`): inside a job, `HOME` - and so
   `os.homedir()` - is the job's. The constructed JVM test runs the JDK

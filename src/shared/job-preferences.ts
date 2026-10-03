@@ -60,11 +60,13 @@ export function resolveResourcePauseConfig(
 
 /**
  * The conveniences localmost adds to every job's environment, each of which
- * can be turned off on its own. All are on by default. See
- * docs/roadmap/job-environment.md. The `jobEnvironment` section of
- * config.yaml, set from the Job Environment section of Settings, and read
- * from the store at each worker spawn: a change applies to workers spawned
- * after it.
+ * can be turned on or off on its own. All are on by default but
+ * swiftBuildLinkTemp, a sandbox grant that reaches what the user's own builds
+ * use, which is off. See docs/roadmap/job-environment.md. The
+ * `jobEnvironment` section of config.yaml, set from the Job Environment
+ * section of Settings, and read from the store at each worker spawn: a
+ * change applies to workers spawned after it. `localmost test` reads none
+ * of it: the CLI does not read the app's preferences.
  */
 export interface JobEnvironmentConfig {
   /**
@@ -98,20 +100,36 @@ export interface JobEnvironmentConfig {
    * missing, and a job that cannot create it itself fails.
    */
   createMissingGrantedDirs: boolean;
+  /**
+   * Grant the job `<T>/TemporaryDirectory.XXXXXX` names in the shared
+   * per-user temp directory, where swift-driver makes the directory Swift
+   * 6.4's default build system links in, whatever TMPDIR says. Off by
+   * default: the user's own SwiftPM and Xcode keep manifest executables
+   * they are about to run in directories of that name, so a job could race
+   * to replace one. Off, `swift build` fails at its link step in a job
+   * unless the workflow passes `--build-system native`. See
+   * SWIFT_DRIVER_TEMP_NAME and Shared temp directories in SECURITY.md.
+   */
+  swiftBuildLinkTemp: boolean;
 }
 
-/** Every job-environment convenience, on: the defaults. Frozen, as DEFAULT_RESOURCE_PAUSE_CONFIG. */
+/**
+ * The job-environment defaults: every convenience on, and the Swift Build
+ * link-temp grant off. Frozen, as DEFAULT_RESOURCE_PAUSE_CONFIG.
+ */
 export const DEFAULT_JOB_ENVIRONMENT_CONFIG: Readonly<JobEnvironmentConfig> = Object.freeze({
   toolShims: true,
   javaToolOptions: true,
   perJobTempDir: true,
   createMissingGrantedDirs: true,
+  swiftBuildLinkTemp: false,
 });
 
 /**
  * The `jobEnvironment` section of config.yaml as used. Every key is optional
- * and defaults on; a value that is not true or false is taken as absent,
- * with a line through `log`, and keys it does not know are ignored.
+ * and takes its default when absent; a value that is not true or false is
+ * taken as absent, with a line through `log`, and keys it does not know are
+ * ignored.
  */
 export function resolveJobEnvironmentConfig(
   raw: PreferenceSection<JobEnvironmentConfig> | undefined,

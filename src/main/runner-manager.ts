@@ -1676,6 +1676,9 @@ export class RunnerManager {
           toolCacheDir,
           packageCacheDir,
           tempSuffixDir,
+          // T/TemporaryDirectory.XXXXXX for Swift Build's link step, only
+          // when Settings turns it on: see JobEnvironmentConfig.
+          swiftBuildLinkTemp: jobEnvironment.swiftBuildLinkTemp,
           processMarker,
         });
       } finally {

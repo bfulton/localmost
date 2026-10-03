@@ -181,6 +181,12 @@ export interface RunnerProfileOptions {
    */
   tempSuffixDir?: string;
   /**
+   * Grant Swift Build's link step its temp, T/TemporaryDirectory.XXXXXX in
+   * the per-user temp directory (see SWIFT_DRIVER_TEMP_NAME): the
+   * jobEnvironment.swiftBuildLinkTemp preference. Off when absent.
+   */
+  swiftBuildLinkTemp?: boolean;
+  /**
    * The mark every process of this spawn carries, whatever group it is in,
    * so what its job leaves running can be found when it is done.
    */
@@ -238,6 +244,7 @@ export function generateSandboxProfile({
   toolCacheDir: toolCache,
   packageCacheDir: packageCache,
   tempSuffixDir,
+  swiftBuildLinkTemp = false,
   processMarker,
   onLog,
 }: RunnerProfileOptions): string {
@@ -428,11 +435,15 @@ export function generateSandboxProfile({
     : ';; Per-user temp directory unknown: mktemp without a template is not granted';
   // Swift Build runs its link step with the per-user temp directory itself as
   // its temp, and swift-driver makes T/TemporaryDirectory.XXXXXX there with
-  // mkdtemp: granted by the generated name only, as mktemp's are. The user's
-  // own SwiftPM makes that name too (see SWIFT_DRIVER_TEMP_NAME).
-  const swiftDriverRules = perUserTemp
-    ? generatedNameTempRules(perUserTemp, SWIFT_DRIVER_TEMP_NAME).join('\n')
-    : ';; Per-user temp directory unknown: Swift Build\'s link step is not granted its temp';
+  // mkdtemp: granted by the generated name only, as mktemp's are, and only
+  // when the preference asks. The user's own SwiftPM makes that name too and
+  // runs what it keeps there (see SWIFT_DRIVER_TEMP_NAME), so it is off by
+  // default.
+  const swiftDriverRules = !swiftBuildLinkTemp
+    ? ';; Swift Build\'s link step is not granted its temp (see SWIFT_DRIVER_TEMP_NAME)'
+    : perUserTemp
+      ? generatedNameTempRules(perUserTemp, SWIFT_DRIVER_TEMP_NAME).join('\n')
+      : ';; Per-user temp directory unknown: Swift Build\'s link step is not granted its temp';
   // The job's own directory in the per-user temp directory, where its
   // DIRHELPER_USER_DIR_SUFFIX moves NSTemporaryDirectory(), java.io.tmpdir
   // and the staging directory of a sandboxed process's atomic writes
@@ -554,8 +565,8 @@ ${ownCacheRules('file-ioctl')}
 ;; the caches tools would otherwise keep there are pointed into it too.
 ;; Only what mktemp itself creates, by the name it generated:
 ${mktempRules}
-;; And what swift-driver creates for Swift Build's link step, by the name
-;; mkdtemp generated:
+;; And, when the preference asks, what swift-driver creates for Swift Build's
+;; link step, by the name mkdtemp generated:
 ${swiftDriverRules}
 ;; And this job's own directory there, named by DIRHELPER_USER_DIR_SUFFIX,
 ;; for Foundation's temp directory and atomic writes; not its node:
@@ -848,6 +859,8 @@ export interface SandboxOptions extends SpawnOptions {
   packageCacheDir?: string;
   /** This job's own directory in the per-user temp; see RunnerProfileOptions.tempSuffixDir. */
   tempSuffixDir?: string;
+  /** Grant Swift Build's link step its temp; see RunnerProfileOptions.swiftBuildLinkTemp. */
+  swiftBuildLinkTemp?: boolean;
   /** This spawn's process marker, the last rules of its profile; see processMarkerRules. */
   processMarker?: ProcessMarker;
   /** Log prefix for identifying this process (e.g., runner instance ID) */
@@ -904,6 +917,7 @@ export function spawnSandboxed(
     toolCacheDir,
     packageCacheDir,
     tempSuffixDir,
+    swiftBuildLinkTemp,
     processMarker,
     logPrefix,
     onLog,
@@ -932,6 +946,7 @@ export function spawnSandboxed(
       toolCacheDir,
       packageCacheDir,
       tempSuffixDir,
+      swiftBuildLinkTemp,
       processMarker,
       onLog,
     });

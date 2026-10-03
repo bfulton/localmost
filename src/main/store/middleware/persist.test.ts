@@ -83,7 +83,7 @@ describe('savePersistedConfig auth preservation', () => {
 });
 
 describe('the resource-pause and job-environment preferences', () => {
-  it('start at their defaults: running jobs finish, every convenience on', () => {
+  it('start at their defaults: running jobs finish, every convenience on, the Swift Build link-temp grant off', () => {
     loadPersistedConfig();
     expect(store.getState().config.resourcePause).toEqual({ runningJobs: 'finish' });
     expect(store.getState().config.jobEnvironment).toEqual({
@@ -91,6 +91,7 @@ describe('the resource-pause and job-environment preferences', () => {
       javaToolOptions: true,
       perJobTempDir: true,
       createMissingGrantedDirs: true,
+      swiftBuildLinkTemp: false,
     });
   });
 
@@ -118,6 +119,7 @@ describe('the resource-pause and job-environment preferences', () => {
       javaToolOptions: true,
       perJobTempDir: false,
       createMissingGrantedDirs: true,
+      swiftBuildLinkTemp: false,
     });
 
     store.getState().setJobEnvironment({ ...store.getState().config.jobEnvironment, javaToolOptions: false });
@@ -130,6 +132,7 @@ describe('the resource-pause and job-environment preferences', () => {
       javaToolOptions: false,
       perJobTempDir: false,
       createMissingGrantedDirs: true,
+      swiftBuildLinkTemp: false,
     });
 
     // And back again, as the next launch reads it.
@@ -137,6 +140,23 @@ describe('the resource-pause and job-environment preferences', () => {
     loadPersistedConfig();
     expect(store.getState().config.resourcePause).toEqual({ runningJobs: 'stop' });
     expect(store.getState().config.jobEnvironment.javaToolOptions).toBe(false);
+  });
+
+  it("keep the Swift Build link-temp grant off unless the file turns it on, and persist it turned on", () => {
+    fs.writeFileSync(configPath, 'configVersion: 1\ntheme: auto\njobEnvironment:\n  swiftBuildLinkTemp: true\n');
+    loadPersistedConfig();
+    expect(store.getState().config.jobEnvironment.swiftBuildLinkTemp).toBe(true);
+    expect(runnerJobEnvironment().swiftBuildLinkTemp).toBe(true);
+
+    savePersistedConfig();
+    const saved = yaml.load(fs.readFileSync(configPath, 'utf-8')) as AppConfig;
+    expect(saved.jobEnvironment).toEqual(expect.objectContaining({ swiftBuildLinkTemp: true, toolShims: true }));
+
+    store.getState().setJobEnvironment({ ...store.getState().config.jobEnvironment, swiftBuildLinkTemp: false });
+    savePersistedConfig();
+    store.setState({ config: { ...defaultConfigState } });
+    loadPersistedConfig();
+    expect(store.getState().config.jobEnvironment.swiftBuildLinkTemp).toBe(false);
   });
 
   it('take a value the runner would not as its default, as the runner does', () => {
@@ -152,6 +172,7 @@ describe('the resource-pause and job-environment preferences', () => {
       javaToolOptions: false,
       perJobTempDir: true,
       createMissingGrantedDirs: true,
+      swiftBuildLinkTemp: false,
     });
   });
 });
@@ -174,6 +195,7 @@ describe("the runner's resource-pause and job-environment preferences", () => {
       javaToolOptions: true,
       perJobTempDir: true,
       createMissingGrantedDirs: true,
+      swiftBuildLinkTemp: false,
     });
 
     fs.writeFileSync(
@@ -287,7 +309,7 @@ describe('every key of config.yaml', () => {
       notifications: { notifyOnPause: true, notifyOnJobEvents: true },
       dockerVm: { cpus: 2, memoryMiB: 4096 },
       resourcePause: { runningJobs: 'stop' },
-      jobEnvironment: { toolShims: false, javaToolOptions: true, perJobTempDir: false, createMissingGrantedDirs: true },
+      jobEnvironment: { toolShims: false, javaToolOptions: true, perJobTempDir: false, createMissingGrantedDirs: true, swiftBuildLinkTemp: false },
     };
     fs.writeFileSync(configPath, yaml.dump(full));
     loadPersistedConfig();

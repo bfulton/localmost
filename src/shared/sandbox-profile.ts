@@ -68,6 +68,13 @@ export interface SandboxProfileOptions {
   logFile?: string;
   /** The files that mark a process as running under this run's profiles; see processMarkerRules. */
   processMarker?: ProcessMarker;
+  /**
+   * Grant Swift Build's link step its temp in the per-user temp directory
+   * (see SWIFT_DRIVER_TEMP_NAME). Off when absent. The runner's profile
+   * takes it from the jobEnvironment.swiftBuildLinkTemp preference;
+   * localmost test reads no app preferences and never passes it.
+   */
+  swiftBuildLinkTemp?: boolean;
 }
 
 /**
@@ -498,7 +505,8 @@ function darwinUserTempDir(): string | undefined {
 
 /**
  * What a step gets of the shared temp directories, as the runner's job does:
- * only the entries a bare `mktemp` and Swift Build's link step create.
+ * only the entries a bare `mktemp` creates, and those Swift Build's link step
+ * creates when `swiftBuildLinkTemp` asks for them.
  *
  * /tmp and the per-user /var/folders tree belong to every process the user
  * runs, and some of what lives there is trusted by their own tools - the
@@ -509,17 +517,21 @@ function darwinUserTempDir(): string | undefined {
  * shape it generates are granted: ten random characters no other process can
  * guess, and without read on the directory itself a step cannot list it to
  * find one. Both spellings, as /var is a symlink. The directory swift-driver
- * makes there for Swift Build's link step is granted the same way (see
- * SWIFT_DRIVER_TEMP_NAME for what that exposes).
+ * makes there for Swift Build's link step is granted the same way, but only
+ * when asked: see SWIFT_DRIVER_TEMP_NAME for what that exposes.
  */
-function sharedTempRules(): string[] {
+function sharedTempRules(swiftBuildLinkTemp = false): string[] {
   const dir = darwinUserTempDir();
   if (!dir) return [';; Per-user temp directory unknown: mktemp without a template is not granted'];
   return [
     ';; No shared temp directory; only what mktemp itself creates, by the name it generated',
     ...generatedNameTempRules(dir, MKTEMP_TEMP_NAME),
-    ';; And what swift-driver creates for Swift Build\'s link step, by the name mkdtemp generated',
-    ...generatedNameTempRules(dir, SWIFT_DRIVER_TEMP_NAME),
+    ...(swiftBuildLinkTemp
+      ? [
+          ';; And what swift-driver creates for Swift Build\'s link step, by the name mkdtemp generated',
+          ...generatedNameTempRules(dir, SWIFT_DRIVER_TEMP_NAME),
+        ]
+      : [';; Swift Build\'s link step is not granted its temp (see SWIFT_DRIVER_TEMP_NAME)']),
   ];
 }
 
@@ -538,10 +550,12 @@ export const MKTEMP_TEMP_NAME = `tmp\\.${'[A-Za-z0-9]'.repeat(10)}`;
  * `TemporaryDirectory.XXXXXX` there with mkdtemp(3) - six random characters
  * of its 62, as tools-support-core's withTemporaryDirectory asks - holding a
  * `.keep-directory` marker and any response file or temporary output of the
- * driver's. Without it a package linked only under `--build-system native`.
+ * driver's. Without it a package links only under `--build-system native`.
  * The user's own unsandboxed SwiftPM and swift-driver make directories of
  * this name too, and keep a manifest they are about to run in one: see
- * Shared temp directories in SECURITY.md for what granting it exposes.
+ * Shared temp directories in SECURITY.md for what granting it exposes. So
+ * it is granted only when the jobEnvironment.swiftBuildLinkTemp preference
+ * is on, which it is not by default.
  * A regex source, for generatedNameTempRules.
  */
 export const SWIFT_DRIVER_TEMP_NAME = `TemporaryDirectory\\.${'[A-Za-z0-9]'.repeat(6)}`;
@@ -860,7 +874,7 @@ export function generateSandboxProfile(options: SandboxProfileOptions): string {
   lines.push(`  (subpath "${escapedWorkDir}"))`);
   lines.push('');
 
-  lines.push(...sharedTempRules());
+  lines.push(...sharedTempRules(options.swiftBuildLinkTemp));
   lines.push('');
 
   // No home directory cache is granted unless the policy declares it. Steps
@@ -997,6 +1011,8 @@ export function generateDiscoveryProfile(options: {
   proxyPort: number;
   logFile: string;  // Not used - reports go to system log, not a file
   processMarker?: ProcessMarker;
+  /** See SandboxProfileOptions.swiftBuildLinkTemp. */
+  swiftBuildLinkTemp?: boolean;
 }): string {
   const { workDir, proxyPort } = options;
   const escapedWorkDir = escapePath(workDir);
@@ -1022,7 +1038,7 @@ export function generateDiscoveryProfile(options: {
     '(allow file-read* (with report))',
     '(allow file-write* (with report)',
     `  (subpath "${escapedWorkDir}"))`,
-    ...sharedTempRules(),
+    ...sharedTempRules(options.swiftBuildLinkTemp),
     '(allow file-write*',
     '  (literal "/dev/null")',
     '  (literal "/dev/random")',

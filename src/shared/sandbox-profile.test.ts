@@ -219,12 +219,29 @@ describe('Sandbox Profile Generator', () => {
       }
     });
 
-    it("grants the TemporaryDirectory.XXXXXX swift-driver makes for Swift Build's link step, and no other name", () => {
+    it("grants no TemporaryDirectory.XXXXXX for Swift Build's link step unless asked to", () => {
+      // The user's own SwiftPM keeps a manifest it is about to run in a
+      // directory of that name, so the grant is off by default, and
+      // localmost test, which reads no app preferences, never asks for it.
+      for (const profile of [
+        generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT }),
+        generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, swiftBuildLinkTemp: false }),
+        generateDiscoveryProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, logFile: '' }),
+        generateDiscoveryProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, logFile: '', swiftBuildLinkTemp: false }),
+      ]) {
+        expect(topLevelForms(profile).filter((f) => f.includes('TemporaryDirectory'))).toEqual([]);
+        expect(profile).toContain(";; Swift Build's link step is not granted its temp");
+        // mktemp's names stay granted either way.
+        expect(profile).toMatch(/\/T\/tmp\\\.(\[A-Za-z0-9\]){10}/);
+      }
+    });
+
+    it("grants the TemporaryDirectory.XXXXXX swift-driver makes for Swift Build's link step when asked, and no other name", () => {
       // swift-driver makes it with mkdtemp in the per-user temp, which Swift
       // Build hands its link step as its temp whatever TMPDIR says.
       for (const profile of [
-        generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT }),
-        generateDiscoveryProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, logFile: '' }),
+        generateSandboxProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, swiftBuildLinkTemp: true }),
+        generateDiscoveryProfile({ workDir: '/path/to/project', proxyPort: DEFAULT_PROXY_PORT, logFile: '', swiftBuildLinkTemp: true }),
       ]) {
         const forms = topLevelForms(profile).filter((f) => f.includes('TemporaryDirectory'));
         expect(forms).toHaveLength(1);

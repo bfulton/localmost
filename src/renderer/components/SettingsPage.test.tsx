@@ -312,7 +312,7 @@ describe('SettingsPage', () => {
 });
 
 describe('the resource-pause and job-environment preferences', () => {
-  const ALL_ON = { toolShims: true, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true };
+  const DEFAULTS = { toolShims: true, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true, swiftBuildLinkTemp: false };
   // Each convenience's control, by the label the page gives it.
   const CONVENIENCES = [
     ['toolShims', "Turn off SwiftPM's and Xcode's own sandbox"],
@@ -381,7 +381,7 @@ describe('the resource-pause and job-environment preferences', () => {
     fireEvent.click(checkbox('Create missing directories a policy grants'));
     await waitFor(() => {
       expect(mockLocalmost.settings.set).toHaveBeenCalledWith({
-        jobEnvironment: { ...ALL_ON, javaToolOptions: false, createMissingGrantedDirs: false },
+        jobEnvironment: { ...DEFAULTS, javaToolOptions: false, createMissingGrantedDirs: false },
       });
     });
   });
@@ -401,13 +401,13 @@ describe('the resource-pause and job-environment preferences', () => {
 
     fireEvent.click(checkbox(label));
     await waitFor(() => {
-      expect(mockLocalmost.settings.set).toHaveBeenLastCalledWith({ jobEnvironment: { ...ALL_ON, [key]: false } });
+      expect(mockLocalmost.settings.set).toHaveBeenLastCalledWith({ jobEnvironment: { ...DEFAULTS, [key]: false } });
     });
     await waitFor(() => expect(checkbox(label).checked).toBe(false));
 
     fireEvent.click(checkbox(label));
     await waitFor(() => {
-      expect(mockLocalmost.settings.set).toHaveBeenLastCalledWith({ jobEnvironment: ALL_ON });
+      expect(mockLocalmost.settings.set).toHaveBeenLastCalledWith({ jobEnvironment: DEFAULTS });
     });
   });
 
@@ -439,6 +439,50 @@ describe('the resource-pause and job-environment preferences', () => {
     expect(group).toHaveTextContent(onHint);
   });
 
+  describe("the Swift Build link-temp grant", () => {
+    const label = 'Let Swift Build link in the shared temp directory';
+    const onHint =
+      /a job may create <T>\/TemporaryDirectory\.XXXXXX names in the shared per-user temp directory, which your own SwiftPM and Xcode also use for manifest executables, so a job could race to replace one before it runs/;
+    const offHint =
+      /Off \(the default\): Swift 6\.4's default build system fails to link inside a job\. A workflow can pass swift build --build-system native, or the repository can use the macOS VM isolation type once it is available/;
+
+    it('is off by default, and says beside it what off costs', async () => {
+      renderWithProviders(<SettingsPage onBack={jest.fn()} />);
+      await waitFor(() => expect(checkbox(label).checked).toBe(false));
+      const group = checkbox(label).closest('div') as HTMLElement;
+      expect(group).toHaveTextContent(offHint);
+      expect(group).not.toHaveTextContent(onHint);
+    });
+
+    it('turns on, sending every key, and says beside it what on exposes', async () => {
+      renderWithProviders(<SettingsPage onBack={jest.fn()} />);
+      await waitFor(() => expect(checkbox(label).checked).toBe(false));
+      const group = checkbox(label).closest('div') as HTMLElement;
+
+      fireEvent.click(checkbox(label));
+      await waitFor(() => {
+        expect(mockLocalmost.settings.set).toHaveBeenLastCalledWith({ jobEnvironment: { ...DEFAULTS, swiftBuildLinkTemp: true } });
+      });
+      await waitFor(() => expect(checkbox(label).checked).toBe(true));
+      expect(group).toHaveTextContent(onHint);
+      expect(group).not.toHaveTextContent(offHint);
+
+      fireEvent.click(checkbox(label));
+      await waitFor(() => {
+        expect(mockLocalmost.settings.set).toHaveBeenLastCalledWith({ jobEnvironment: DEFAULTS });
+      });
+    });
+
+    it('shows a saved choice to turn it on', async () => {
+      mockLocalmost.settings.get.mockResolvedValue({ jobEnvironment: { swiftBuildLinkTemp: true } });
+      renderWithProviders(<SettingsPage onBack={jest.fn()} />);
+
+      await waitFor(() => expect(checkbox(label).checked).toBe(true));
+      expect(screen.getByText(onHint)).toBeInTheDocument();
+      for (const [, other] of CONVENIENCES) expect(checkbox(other).checked).toBe(true);
+    });
+  });
+
   it('shows the off hint for a saved choice to leave missing granted directories alone', async () => {
     mockLocalmost.settings.get.mockResolvedValue({ jobEnvironment: { createMissingGrantedDirs: false } });
     renderWithProviders(<SettingsPage onBack={jest.fn()} />);
@@ -464,7 +508,7 @@ describe('the resource-pause and job-environment preferences', () => {
       seedZubridge({
         config: {
           resourcePause: { runningJobs: 'stop' },
-          jobEnvironment: { ...ALL_ON, perJobTempDir: false },
+          jobEnvironment: { ...DEFAULTS, perJobTempDir: false },
         },
       });
       renderWithProviders(<SettingsPage onBack={jest.fn()} />);
@@ -475,14 +519,14 @@ describe('the resource-pause and job-environment preferences', () => {
     });
 
     it('sends the change from the store value, keeping the others', async () => {
-      seedZubridge({ config: { jobEnvironment: { ...ALL_ON, toolShims: false } } });
+      seedZubridge({ config: { jobEnvironment: { ...DEFAULTS, toolShims: false } } });
       renderWithProviders(<SettingsPage onBack={jest.fn()} />);
       await waitFor(() => expect(checkbox('Create missing directories a policy grants').checked).toBe(true));
 
       fireEvent.click(checkbox('Create missing directories a policy grants'));
       await waitFor(() => {
         expect(mockLocalmost.settings.set).toHaveBeenCalledWith({
-          jobEnvironment: { ...ALL_ON, toolShims: false, createMissingGrantedDirs: false },
+          jobEnvironment: { ...DEFAULTS, toolShims: false, createMissingGrantedDirs: false },
         });
       });
     });
