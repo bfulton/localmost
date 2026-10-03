@@ -372,7 +372,9 @@ Settings > Isolation`.
 
 **Approval.** `isolation:` is part of the approved policy like every other
 key: it is in the approval stamp, it appears in the approval card and
-`localmost policy show` with the order it means, and a change to it - order
+`localmost policy show` with the order it means - a policy that declares none
+is shown with `any`, marked as the default, since its jobs still get a type -
+and a change to it - order
 included, since `[macos-vm, seatbelt]` and `[seatbelt, macos-vm]` are
 different lists - is in the approval diff (`~ shared.isolation: macos-vm,
 seatbelt -> seatbelt`). Writing out `any` where nothing was declared changes

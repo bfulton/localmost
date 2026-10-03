@@ -231,10 +231,16 @@ export function describePolicy(policy: DescribablePolicy, prefix = '', scope: Po
   add('Secrets required', '+', 'secret', policy.secrets?.require);
 
   // Which isolation the job gets: the first of these this Mac allows and
-  // this build can run. Shown when declared; absent means any.
+  // this build can run. Absent in shared, it is any, and shown as such: the
+  // job still gets a type, and the reviewer is shown which. Absent in a
+  // workflow, the shared list applies, so there is nothing of its own to show.
   if (policy.isolation !== undefined) {
     add('Isolation', '~', 'isolation', [describeIsolation(policy.isolation)], {
       note: perWorkflow ? `replaces the shared list for this workflow; ${ISOLATION_ORDER}` : ISOLATION_ORDER,
+    });
+  } else if (!perWorkflow) {
+    add('Isolation', '~', 'isolation', [describeIsolation(undefined)], {
+      note: `not declared, so the default; ${ISOLATION_ORDER}`,
     });
   }
 

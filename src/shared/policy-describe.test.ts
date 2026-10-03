@@ -28,6 +28,11 @@ const everything = {
   isolation: ['service-account', 'seatbelt'] as Array<'service-account' | 'seatbelt'>,
 };
 
+// What a section declares, without the isolation default every shared scope
+// is shown with (tested on its own below).
+const declared = (grants: ReturnType<typeof describePolicy>) =>
+  grants.filter((g) => !(g.group === 'Isolation' && g.note?.startsWith('not declared')));
+
 describe('describePolicy', () => {
   it('names every value the policy declares, whatever key it sits under', () => {
     const text = describePolicy(everything).map((g) => `${g.group} ${g.marker} ${g.value} ${g.summary}`).join('\n');
@@ -111,7 +116,7 @@ describe('describePolicy', () => {
   });
 
   it('says nothing for strict, which is the baseline and grants nothing extra', () => {
-    expect(describePolicy({ level: 'strict' })).toEqual([]);
+    expect(declared(describePolicy({ level: 'strict' }))).toEqual([]);
   });
 
   it('keeps the workflow-only key out of the shared list, which is what validation scopes on', () => {
@@ -120,7 +125,7 @@ describe('describePolicy', () => {
   });
 
   it('describes nothing for an empty section', () => {
-    expect(describePolicy({})).toEqual([]);
+    expect(declared(describePolicy({}))).toEqual([]);
   });
 
   it('warns on a write to a place something outside the sandbox acts on', () => {
@@ -173,7 +178,7 @@ describe('describePolicy', () => {
 
   it('says nothing of scope for the same grants under shared:', () => {
     const grants = describePolicy({ filesystem: { write: ['./out'] }, env: { allow: ['CI'], deny: ['AWS_*'] } });
-    expect(grants.map((g) => g.summary)).toEqual(['write: ./out', 'env: CI', 'env denied: AWS_*']);
+    expect(declared(grants).map((g) => g.summary)).toEqual(['write: ./out', 'env: CI', 'env denied: AWS_*']);
   });
 
   it('shows a loopback grant with what it lets the job reach', () => {
@@ -185,7 +190,7 @@ describe('describePolicy', () => {
   });
 
   it('says nothing about loopback when none is granted', () => {
-    expect(describePolicy({ network: { loopback: [] } })).toEqual([]);
+    expect(declared(describePolicy({ network: { loopback: [] } }))).toEqual([]);
   });
 
   it('shows the isolation list in its order, with what the order means', () => {
@@ -197,6 +202,23 @@ describe('describePolicy', () => {
     );
     expect(describePolicy({ isolation: 'any' })[0].value).toBe('any (macos-vm, service-account, seatbelt)');
     expect(describePolicy({ isolation: 'seatbelt' })[0].value).toBe('seatbelt');
+  });
+
+  it('shows any for a shared scope that declares no isolation, and says it is the default', () => {
+    // The job still gets an isolation type: the reviewer is shown which.
+    const isolation = describePolicy({ network: { allow: ['github.com'] } }).filter((g) => g.group === 'Isolation');
+    expect(isolation).toEqual([
+      expect.objectContaining({
+        value: 'any (macos-vm, service-account, seatbelt)',
+        summary:
+          'isolation: any (macos-vm, service-account, seatbelt) (not declared, so the default; in this order, the ' +
+          'first this Mac allows and can run; the job is refused if none is)',
+      }),
+    ]);
+    // A workflow that declares none has the shared list: nothing to show.
+    expect(describePolicy({ network: { allow: ['github.com'] } }, 'ci: ', 'workflow').map((g) => g.group)).not.toContain(
+      'Isolation'
+    );
   });
 
   it("says a workflow's isolation list replaces the shared one", () => {

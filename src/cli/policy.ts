@@ -129,12 +129,11 @@ shared:
  * Print every section of a policy, the level with the shared one.
  */
 function printConfig(config: LocalmostrcConfig): void {
-  const level = config.level;
-  if (config.shared || level) {
-    console.log(`${colors.bold}Shared policy:${colors.reset}`);
-    printPolicy({ ...config.shared, level });
-    console.log();
-  }
+  // Always shown, declared or not: it holds the isolation every workflow
+  // without its own list gets, which is any when nothing is declared.
+  console.log(`${colors.bold}Shared policy:${colors.reset}`);
+  printPolicy({ ...config.shared, level: config.level });
+  console.log();
 
   if (config.workflows) {
     for (const [name, policy] of Object.entries(config.workflows)) {

@@ -27,6 +27,11 @@ afterAll(() => {
   fs.rmSync(tmpRoot, { recursive: true, force: true });
 });
 
+// A policy that declares no isolation is shown with the one its jobs get.
+const ANY_BY_DEFAULT =
+  'isolation: any (macos-vm, service-account, seatbelt) (not declared, so the default; in this order, the first ' +
+  'this Mac allows and can run; the job is refused if none is)';
+
 describe('summarizeGrants', () => {
   it('shows docker grants, which an operator is consenting to when they approve', () => {
     const grants = summarizeGrants({
@@ -55,7 +60,7 @@ describe('summarizeGrants', () => {
 
   it('still shows the non-docker grants', () => {
     const grants = summarizeGrants({ shared: { network: { allow: ['example.com'] }, filesystem: { write: ['~/.npm'] } } });
-    expect(grants).toEqual(['network: example.com', 'write: ~/.npm']);
+    expect(grants).toEqual(['network: example.com', 'write: ~/.npm', ANY_BY_DEFAULT]);
   });
 });
 
@@ -64,12 +69,13 @@ describe('per-workflow grants on the approval screen', () => {
     // A workflows: key is a file name, and a pull request can add a workflow
     // file of any name - so a per-workflow grant is not reserved for the
     // workflow the repository meant it for.
-    const [grant] = summarizeGrants({ workflows: { deploy: { network: { allow: ['x.com'] } } } });
+    const [isolation, grant] = summarizeGrants({ workflows: { deploy: { network: { allow: ['x.com'] } } } });
+    expect(isolation).toBe(ANY_BY_DEFAULT);
     expect(grant).toBe('deploy (any pull request can claim this): network: x.com');
   });
 
   it('says a per-workflow env allow is not applied', () => {
-    const [grant] = summarizeGrants({ workflows: { deploy: { env: { allow: ['FASTLANE_*'] } } } });
+    const [, grant] = summarizeGrants({ workflows: { deploy: { env: { allow: ['FASTLANE_*'] } } } });
     expect(grant).toMatch(/^deploy \(any pull request can claim this\): env: FASTLANE_\* \(not applied:/);
   });
 });
@@ -95,6 +101,7 @@ describe('the level on the approval screen', () => {
     // read "Grants nothing beyond the baseline" for level: permissive.
     expect(summarizeGrants({ version: 1, level: 'permissive' } as never)).toEqual([
       expect.stringMatching(/^level: permissive\b/),
+      ANY_BY_DEFAULT,
     ]);
   });
 
@@ -105,11 +112,15 @@ describe('the level on the approval screen', () => {
       workflows: { ci: { network: { allow: ['ci.example.com'] } } },
     } as never);
     expect(grants[0]).toMatch(/^level: moderate\b/);
-    expect(grants.slice(1)).toEqual(['network: example.com', 'ci (any pull request can claim this): network: ci.example.com']);
+    expect(grants.slice(1)).toEqual([
+      'network: example.com',
+      ANY_BY_DEFAULT,
+      'ci (any pull request can claim this): network: ci.example.com',
+    ]);
   });
 
   it('shows no level line for strict, which is the baseline', () => {
-    expect(summarizeGrants({ level: 'strict', shared: {} } as never)).toEqual([]);
+    expect(summarizeGrants({ level: 'strict', shared: {} } as never)).toEqual([ANY_BY_DEFAULT]);
   });
 });
 
@@ -191,7 +202,7 @@ describe('approving from the app', () => {
     const pending = summaries.find((s) => !s.approved)!;
     const approved = summaries.find((s) => s.approved)!;
     expect(pending.changes).toEqual(['~ level: strict -> permissive']);
-    expect(approved.grants).toEqual(['network: index.crates.io']);
+    expect(approved.grants).toEqual(['network: index.crates.io', ANY_BY_DEFAULT]);
   });
 
   it('shows a change to the isolation list as a change to approve, and the list among the grants', async () => {
