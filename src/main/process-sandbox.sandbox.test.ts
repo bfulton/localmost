@@ -1812,9 +1812,12 @@ if (!isMacOS) {
       expect(bareMktemp(run, '-d').ok).toBe(true);
     });
 
-    it("lets the job make the TemporaryDirectory.XXXXXX Swift Build's link step makes there, and no name off its shape", () => {
+    it("lets the job make no name off the shape of Swift Build's TemporaryDirectory.XXXXXX, nor list the per-user temp", () => {
+      // Whether it may make that name itself is the operator's preference,
+      // which a job cannot see; the constructed profile tests cover both.
       const allOff = { fiveChars: false, sevenChars: false, notInAlphabet: false, otherPrefix: false, noDot: false };
-      expect(swiftDriverTempProbe(run)).toEqual({ generated: true, offShape: allOff, listsTemp: false });
+      const { offShape, listsTemp } = swiftDriverTempProbe(run);
+      expect({ offShape, listsTemp }).toEqual({ offShape: allOff, listsTemp: false });
     });
 
     it('refuses the per-user temp itself, where the xcrun cache the user trusts lives', () => {
