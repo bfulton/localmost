@@ -1522,7 +1522,16 @@ export function parseTestArgs(args: string[]): TestOptions {
         throw new Error(`Invalid secrets mode: ${mode}. Use stub, prompt, or abort.`);
       }
       options.secretMode = mode;
-    } else if (!arg.startsWith('-')) {
+    } else if (arg === '--debug') {
+      throw new Error(
+        '--debug was removed: it saved the sandbox trace of the old filesystem discovery, ' +
+          'which a run in the macOS VM does not make. Use --verbose for the steps\' output.'
+      );
+    } else if (arg.startsWith('-')) {
+      // Ignored, a misspelt or removed flag ran the workflow without the
+      // option the user asked for.
+      throw new Error(`Unknown option for localmost test: ${arg}. See localmost test --help.`);
+    } else {
       options.workflow = arg;
     }
 

@@ -146,6 +146,15 @@ describe('CLI test command', () => {
       });
     });
 
+    it('refuses an option it does not know, rather than run without it', () => {
+      expect(() => parseTestArgs(['--verbsoe'])).toThrow('Unknown option for localmost test: --verbsoe');
+      expect(() => parseTestArgs(['build.yml', '-x'])).toThrow('Unknown option for localmost test: -x');
+    });
+
+    it('says --debug was removed', () => {
+      expect(() => parseTestArgs(['--debug'])).toThrow(/^--debug was removed/);
+    });
+
     it('handles workflow argument anywhere in args', () => {
       const result = parseTestArgs(['--verbose', 'build.yml', '--dry-run']);
       expect(result.workflow).toBe('build.yml');
