@@ -100,16 +100,35 @@ export async function packRunner(dir: string, dest: string): Promise<void> {
   fs.renameSync(tmp, dest);
 }
 
+/** How the host's runner of a version is packed for a guest, and checked as it is sent. */
+export interface RunnerPacking {
+  /** Packs the runner, from a copy checked against its integrity record, as a gzipped tarball at `dest`. */
+  pack(version: string, dest: string): Promise<void>;
+  /** Throws unless `bytes` hold exactly what the version's integrity record does. */
+  verify(version: string, bytes: Buffer): Promise<void>;
+}
+
 /**
  * The runner archive the guest is sent when it lacks the host's version:
- * packed once into `<data>/macos-vm/runner/<version>.tar.gz` and read back.
+ * packed once into `<data>/macos-vm/runner/<version>.tar.gz` and read back,
+ * and checked against the runner's integrity record each time, from the
+ * bytes that are sent: the file is kept between jobs, and one changed in
+ * the meantime is packed again rather than sent.
  */
-export async function runnerArchive(dataDir: string, version: string, arcDir: string): Promise<{ bytes: Buffer; sha256: string }> {
+export async function runnerArchive(dataDir: string, version: string, packing: RunnerPacking): Promise<{ bytes: Buffer; sha256: string }> {
   if (!/^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/.test(version)) throw new Error(`not a runner version: ${JSON.stringify(version)}`);
   const dir = path.join(macVmLayout(dataDir).root, 'runner');
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const file = path.join(dir, `${version}.tar.gz`);
-  if (!fs.existsSync(file)) await packRunner(arcDir, file);
-  const bytes = fs.readFileSync(file);
+  if (!fs.existsSync(file)) await packing.pack(version, file);
+  let bytes = fs.readFileSync(file);
+  try {
+    await packing.verify(version, bytes);
+  } catch {
+    fs.rmSync(file, { force: true });
+    await packing.pack(version, file);
+    bytes = fs.readFileSync(file);
+    await packing.verify(version, bytes);
+  }
   return { bytes, sha256: crypto.createHash('sha256').update(bytes).digest('hex') };
 }

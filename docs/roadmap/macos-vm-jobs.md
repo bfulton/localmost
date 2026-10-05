@@ -400,7 +400,10 @@ has proved.
 - **spawnWorker**: `--once` and nothing else. If the guest lacks the host's
   runner version, the host's runner is packed and uploaded (sha256-checked,
   at most 512 MiB) so the guest always runs the same version as the host's
-  arc. Then the job: the worker's three runner files (`.runner`,
+  arc. It is packed from a copy checked against the runner's integrity
+  record, and the packed file, kept between jobs, is checked against that
+  record again from the bytes about to be sent; one that no longer matches
+  is packed again. Then the job: the worker's three runner files (`.runner`,
   `.credentials`, `.credentials_rsaparams`, each a regular file read without
   following a link, at most 16 KiB) and its environment, each name held to
   `jobEnvNameAllowed`: the runner's own settings (proxy variables, locale,

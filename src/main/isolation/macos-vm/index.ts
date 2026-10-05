@@ -11,7 +11,7 @@ import * as fs from 'fs';
 import { MacVmBackend } from './backend';
 import { MacVmImageManager } from './golden-image';
 import { concurrentVmLimit, currentHost } from './host';
-import { helperHasProvisioning, launcher, packRunner, runnerArchive } from './launch';
+import { helperHasProvisioning, launcher, packRunner, runnerArchive, type RunnerPacking } from './launch';
 import { macVmAgentPath, macVmHelperPath } from './paths';
 import { MacVmSlots } from './slots';
 import { processExecutableOf } from '../../vm/vm-manager';
@@ -23,6 +23,8 @@ export interface MacVmModeOptions {
   dataDir: string;
   /** The host's runner: its version and arc directory, or null before one is downloaded. */
   runnerArc: () => { version: string; dir: string } | null;
+  /** How the host's runner is packed for a guest that lacks it, and checked each time it is sent. */
+  runnerPacking: RunnerPacking;
   log: (level: 'debug' | 'info' | 'warn' | 'error', message: string) => void;
 }
 
@@ -57,7 +59,7 @@ export function createMacVmMode(opts: MacVmModeOptions): MacVmMode {
     runnerArchive: async (version) => {
       const arc = opts.runnerArc();
       if (!arc || arc.version !== version) throw new Error(`runner ${version} is not this Mac's runner`);
-      return runnerArchive(opts.dataDir, version, arc.dir);
+      return runnerArchive(opts.dataDir, version, opts.runnerPacking);
     },
     log: opts.log,
     processExecutable: processExecutableOf,

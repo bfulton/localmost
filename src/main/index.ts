@@ -352,6 +352,10 @@ app.whenReady().then(async () => {
       const version = runnerDownloader.getInstalledVersion();
       return version ? { version, dir: runnerDownloader.getArcDir(version) } : null;
     },
+    runnerPacking: {
+      pack: (version, dest) => runnerDownloader.packVerifiedArc(version, dest),
+      verify: (version, bytes) => runnerDownloader.verifyRunnerArchive(version, bytes),
+    },
     log: (level, message) => logger?.[level](`[macos-vm] ${message}`),
   });
   const macVmBackend = macVm.backend;

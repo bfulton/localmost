@@ -539,6 +539,33 @@ describe('the runner template a sandbox is copied from', () => {
     expect(logged.join('\n')).toContain(`delete ${path.join(root, 'runner', 'arc')},`);
   });
 
+  it("packs the runner for a guest from a checked copy, and checks a packed runner's bytes against the record", async () => {
+    await downloader.recordArcManifest(version);
+    const packed = path.join(root, 'runner.tar.gz');
+    await downloader.packVerifiedArc(version, packed);
+    const bytes = fs.readFileSync(packed);
+    await expect(downloader.verifyRunnerArchive(version, bytes)).resolves.toBeUndefined();
+
+    // A packed runner changed while it was kept: a file changed, one added.
+    const tree = path.join(root, 'tampered');
+    fs.mkdirSync(tree);
+    await tar.x({ file: packed, cwd: tree });
+    fs.writeFileSync(path.join(tree, 'bin', 'Runner.Listener'), 'listener, and something else');
+    const changed = path.join(root, 'changed.tar.gz');
+    await tar.c({ gzip: true, cwd: tree, file: changed, portable: true }, ['.']);
+    await expect(downloader.verifyRunnerArchive(version, fs.readFileSync(changed))).rejects.toThrow(/does not match its integrity record \(changed: bin\/Runner\.Listener/);
+    fs.writeFileSync(path.join(tree, 'bin', 'Runner.Listener'), 'listener');
+    write(path.join(tree, '.env'), 'DYLD_INSERT_LIBRARIES=/tmp/x.dylib\n');
+    const added = path.join(root, 'added.tar.gz');
+    await tar.c({ gzip: true, cwd: tree, file: added, portable: true }, ['.']);
+    await expect(downloader.verifyRunnerArchive(version, fs.readFileSync(added))).rejects.toThrow(/added: \.env/);
+
+    // Never packed from a template that no longer matches its record.
+    fs.writeFileSync(path.join(arc, 'bin', 'Runner.Worker.dll'), 'worker, and something else');
+    await expect(downloader.packVerifiedArc(version, path.join(root, 'again.tar.gz'))).rejects.toThrow(/does not match/);
+    expect(fs.existsSync(path.join(root, 'again.tar.gz'))).toBe(false);
+  });
+
   it('refuses a file removed from the template', async () => {
     await downloader.recordArcManifest(version);
     fs.rmSync(path.join(arc, 'config.sh'));

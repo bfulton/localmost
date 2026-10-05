@@ -51,6 +51,69 @@ interface ArcManifest {
   symlinks: Map<string, string>;
 }
 
+/** How a tree's files and links differ from a record: every one added, missing or changed. */
+function differencesFromManifest(actual: ArcManifest, manifest: ArcManifest): string[] {
+  const differences: string[] = [];
+  for (const [file, hash] of actual.files) {
+    const expected = manifest.files.get(file);
+    if (expected === undefined) differences.push(`added: ${file}`);
+    else if (expected !== hash) differences.push(`changed: ${file}`);
+  }
+  for (const [link, target] of actual.symlinks) {
+    const expected = manifest.symlinks.get(link);
+    if (expected === undefined) differences.push(`added: ${link} -> ${target}`);
+    else if (expected !== target) differences.push(`changed: ${link} -> ${target} (was ${expected})`);
+  }
+  for (const file of manifest.files.keys()) {
+    if (!actual.files.has(file)) differences.push(`missing: ${file}`);
+  }
+  for (const link of manifest.symlinks.keys()) {
+    if (!actual.symlinks.has(link)) differences.push(`missing: ${link}`);
+  }
+  return differences;
+}
+
+/**
+ * What a packed runner holds, as a record: each file's sha256 and each
+ * link's target, by path relative to the tree, and any entry a runner
+ * release does not have - a device, a FIFO, a hard link.
+ */
+async function manifestOfTarball(bytes: Buffer): Promise<{ actual: ArcManifest; unexpected: string[] }> {
+  const files = new Map<string, string>();
+  const symlinks = new Map<string, string>();
+  const unexpected: string[] = [];
+  const hashing: Promise<void>[] = [];
+  await new Promise<void>((resolve, reject) => {
+    const parser = new tar.Parser({
+      onReadEntry: (entry) => {
+        const relative = entry.path.replace(/^\.\//, '').replace(/\/$/, '');
+        if (entry.type === 'Directory') {
+          entry.resume();
+        } else if (entry.type === 'SymbolicLink') {
+          symlinks.set(relative, entry.linkpath ?? '');
+          entry.resume();
+        } else if (entry.type === 'File' || entry.type === 'OldFile') {
+          const hash = crypto.createHash('sha256');
+          hashing.push(new Promise<void>((done, fail) => {
+            entry.on('data', (chunk: Buffer) => hash.update(chunk));
+            entry.on('end', () => { files.set(relative, hash.digest('hex')); done(); });
+            entry.on('error', fail);
+          }));
+        } else {
+          unexpected.push(`unexpected ${entry.type}: ${relative}`);
+          entry.resume();
+        }
+      },
+    });
+    parser.on('end', () => resolve());
+    parser.on('error', reject);
+    parser.on('warn', (_code: string, message: string) => reject(new Error(message)));
+    parser.end(bytes);
+  });
+  await Promise.all(hashing);
+  return { actual: { files, symlinks }, unexpected };
+}
+
 /** Run fn over items, at most limit at a time. */
 async function mapWithLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
   const results: R[] = new Array(items.length);
@@ -371,26 +434,43 @@ export class RunnerDownloader {
 
   /** How a directory differs from a record: every file added, missing or changed. */
   private async compareWithManifest(root: string, manifest: ArcManifest): Promise<string[]> {
-    const actual = await this.manifestOf(root);
-    const differences: string[] = [];
-    for (const [file, hash] of actual.files) {
-      const expected = manifest.files.get(file);
-      if (expected === undefined) differences.push(`added: ${file}`);
-      else if (expected !== hash) differences.push(`changed: ${file}`);
-    }
-    for (const [link, target] of actual.symlinks) {
-      const expected = manifest.symlinks.get(link);
-      if (expected === undefined) differences.push(`added: ${link} -> ${target}`);
-      else if (expected !== target) differences.push(`changed: ${link} -> ${target} (was ${expected})`);
-    }
-    for (const file of manifest.files.keys()) {
-      if (!actual.files.has(file)) differences.push(`missing: ${file}`);
-    }
-    for (const link of manifest.symlinks.keys()) {
-      if (!actual.symlinks.has(link)) differences.push(`missing: ${link}`);
-    }
-    return differences;
+    return differencesFromManifest(await this.manifestOf(root), manifest);
   }
+
+  /**
+   * Pack a version's runner, as the guest is sent it, into a gzipped tarball
+   * at `dest`: from a copy checked against the version's integrity record
+   * (copyVerifiedArc), never from arc/ as it stands.
+   */
+  async packVerifiedArc(version: string, dest: string): Promise<void> {
+    const scratch = await this.makeStagingDir();
+    try {
+      const tree = path.join(scratch, 'tree');
+      await this.copyVerifiedArc(version, tree);
+      const tmp = path.join(scratch, 'runner.tar.gz');
+      await tar.c({ gzip: true, cwd: tree, file: tmp, portable: true }, ['.']);
+      await fs.promises.rename(tmp, dest);
+    } finally {
+      await this.removeScratchDir(scratch);
+    }
+  }
+
+  /**
+   * Check a packed runner, as it is about to be sent to a guest, against its
+   * version's integrity record: every file's sha256 and every link's target,
+   * nothing missing and nothing else. A packed runner is kept between jobs,
+   * so it is checked each time it is sent, from the very bytes sent.
+   */
+  async verifyRunnerArchive(version: string, bytes: Buffer): Promise<void> {
+    const manifest = await this.ensureArcManifest(version, () => {});
+    const { actual, unexpected } = await manifestOfTarball(bytes);
+    const differences = [...unexpected, ...differencesFromManifest(actual, manifest)];
+    if (differences.length > 0) {
+      const more = differences.length > 1 ? `, and ${differences.length - 1} more` : '';
+      throw new Error(`The packed runner v${version} does not match its integrity record (${differences[0]}${more})`);
+    }
+  }
+
 
   /**
    * Build a sandbox for one start of an instance, by copying arc + config

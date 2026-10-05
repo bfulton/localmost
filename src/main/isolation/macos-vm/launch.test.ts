@@ -8,7 +8,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as tar from 'tar';
-import { profileOptions, runnerArchive } from './launch';
+import { packRunner, profileOptions, runnerArchive, type RunnerPacking } from './launch';
 import { buildMacVmProfile } from './helper-profile';
 import { shortTempDir } from '../../test-utils/vm-fixtures';
 
@@ -50,17 +50,48 @@ describe('runnerArchive', () => {
 
   afterEach(() => fs.rmSync(data, { recursive: true, force: true }));
 
+  /** Packs `arc` as it is, and counts; verify refuses whatever `bad` says. */
+  const packing = (bad: (bytes: Buffer) => boolean = () => false) => {
+    const calls = { pack: 0, verify: 0 };
+    const p: RunnerPacking = {
+      pack: async (_version, dest) => {
+        calls.pack++;
+        await packRunner(arc, dest);
+      },
+      verify: async (_version, bytes) => {
+        calls.verify++;
+        if (bad(bytes)) throw new Error('does not match its integrity record');
+      },
+    };
+    return { p, calls };
+  };
+
   it('packs the arc once per version, with relative entries, and hashes what it sends', async () => {
-    const first = await runnerArchive(data, '2.330.0', arc);
+    const { p, calls } = packing();
+    const first = await runnerArchive(data, '2.330.0', p);
     expect(first.sha256).toBe(crypto.createHash('sha256').update(first.bytes).digest('hex'));
     const archive = path.join(data, 'macos-vm', 'runner', '2.330.0.tar.gz');
     expect(fs.existsSync(archive)).toBe(true);
     const entries: string[] = [];
     await tar.t({ file: archive, onReadEntry: (e) => void entries.push(e.path) });
     expect(entries.sort()).toEqual(['./', './bin/', './bin/Runner.Listener', './run.sh']);
-    // Packed once: a later call reads the same archive back.
+    // Packed once: a later call reads the same archive back, checked again.
     fs.writeFileSync(path.join(arc, 'run.sh'), 'changed');
-    expect((await runnerArchive(data, '2.330.0', arc)).sha256).toBe(first.sha256);
-    await expect(runnerArchive(data, '../2.330.0', arc)).rejects.toThrow(/runner version/);
+    expect((await runnerArchive(data, '2.330.0', p)).sha256).toBe(first.sha256);
+    expect(calls).toEqual({ pack: 1, verify: 2 });
+    await expect(runnerArchive(data, '../2.330.0', p)).rejects.toThrow(/runner version/);
+  });
+
+  it('packs again, rather than send, a kept archive that no longer checks', async () => {
+    const archive = path.join(data, 'macos-vm', 'runner', '2.330.0.tar.gz');
+    await runnerArchive(data, '2.330.0', packing().p);
+    fs.writeFileSync(archive, 'tampered');
+    const { p, calls } = packing((bytes) => bytes.toString() === 'tampered');
+    const sent = await runnerArchive(data, '2.330.0', p);
+    expect(sent.bytes.toString()).not.toBe('tampered');
+    expect(calls).toEqual({ pack: 1, verify: 2 });
+
+    // One that does not check even freshly packed is not sent at all.
+    await expect(runnerArchive(data, '2.330.0', packing(() => true).p)).rejects.toThrow(/integrity record/);
   });
 });
