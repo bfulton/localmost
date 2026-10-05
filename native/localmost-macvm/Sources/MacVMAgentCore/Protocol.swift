@@ -50,13 +50,42 @@ public let maxJobFileBytes = 16 << 10
 /// The arguments a job's runner may be started with.
 public let allowedRunnerArgs: [[String]] = [["--once"]]
 
-/// The environment a job may set: these names, and nothing that changes
-/// how the loader, the shell or the runner's own code is found.
+/// The runner's own settings a job may carry, whatever the rules below say.
 public let jobEnvNames: Set<String> = [
     "ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT", "DOTNET_SYSTEM_NET_DISABLEIPV6",
     "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "no_proxy", "NO_PROXY",
     "LANG", "LC_ALL", "TZ", "RUNNER_DEBUG", "ACTIONS_RUNNER_DEBUG", "ACTIONS_STEP_DEBUG",
 ]
+
+/// Names no job may set: what the agent sets itself, and what changes how
+/// the shell starts.
+public let reservedJobEnvNames: Set<String> = [
+    "HOME", "USER", "LOGNAME", "SHELL", "PATH", "TMPDIR", "PWD", "OLDPWD",
+    "IFS", "ENV", "BASH_ENV", "ZDOTDIR", "SHELLOPTS", "BASHOPTS", "PS4", "CDPATH", "GLOBIGNORE", "PROMPT_COMMAND",
+    "NODE_OPTIONS", "NODE_PATH",
+]
+
+/// Prefixes no job's names may have: the loader's, .NET's (the runner is a
+/// .NET program), and the runner's, Actions' and GitHub's own settings.
+public let reservedJobEnvPrefixes: [String] = [
+    "DYLD_", "LD_", "DOTNET_", "COREHOST_", "COMPlus_", "CORECLR_", "RUNNER_", "ACTIONS_", "GITHUB_", "BASH_FUNC_",
+]
+
+/// Whether a job may set `name`: one of the runner's settings above, or any
+/// other the repository's approved env policy passed - a plain name of at
+/// most 128 characters, none of the reserved ones, and with none of their
+/// prefixes - since nothing a job sets may change how the loader, the shell
+/// or the runner's own code is found.
+public func jobEnvNameAllowed(_ name: String) -> Bool {
+    if jobEnvNames.contains(name) { return true }
+    let bytes = Array(name.utf8)
+    func letter(_ b: UInt8) -> Bool { (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) || b == 0x5F }
+    func digit(_ b: UInt8) -> Bool { b >= 0x30 && b <= 0x39 }
+    guard let first = bytes.first, bytes.count <= 128, letter(first), bytes.allSatisfy({ letter($0) || digit($0) }) else {
+        return false
+    }
+    return !reservedJobEnvNames.contains(name) && !reservedJobEnvPrefixes.contains(where: { name.hasPrefix($0) })
+}
 
 public struct ProtocolError: Error, Equatable {
     public let message: String
@@ -154,7 +183,7 @@ public func parseJob(_ o: [String: Any]) throws -> JobSpec {
     }
     var checkedEnv: [String: String] = [:]
     for (name, value) in env {
-        guard jobEnvNames.contains(name) else {
+        guard jobEnvNameAllowed(name) else {
             throw ProtocolError("env \(quoted(name)) is not one a job may set")
         }
         guard let text = value as? String, text.utf8.count <= 4096, !text.utf8.contains(0), !text.contains("\n") else {

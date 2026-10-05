@@ -57,12 +57,36 @@ export interface PrepareRequest {
 export const JOB_FILE_NAMES = ['.runner', '.credentials', '.credentials_rsaparams'] as const;
 export type JobFiles = Record<(typeof JOB_FILE_NAMES)[number], string>;
 
-/** The environment a job's runner may be given (MacVMAgentCore.jobEnvNames). */
+/** The runner's own settings a job may carry (MacVMAgentCore.jobEnvNames). */
 export const JOB_ENV_NAMES: ReadonlySet<string> = new Set([
   'ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT', 'DOTNET_SYSTEM_NET_DISABLEIPV6',
   'http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'no_proxy', 'NO_PROXY',
   'LANG', 'LC_ALL', 'TZ', 'RUNNER_DEBUG', 'ACTIONS_RUNNER_DEBUG', 'ACTIONS_STEP_DEBUG',
 ]);
+
+/** Names no job may set (MacVMAgentCore.reservedJobEnvNames). */
+const RESERVED_JOB_ENV_NAMES: ReadonlySet<string> = new Set([
+  'HOME', 'USER', 'LOGNAME', 'SHELL', 'PATH', 'TMPDIR', 'PWD', 'OLDPWD',
+  'IFS', 'ENV', 'BASH_ENV', 'ZDOTDIR', 'SHELLOPTS', 'BASHOPTS', 'PS4', 'CDPATH', 'GLOBIGNORE', 'PROMPT_COMMAND',
+  'NODE_OPTIONS', 'NODE_PATH',
+]);
+
+/** Prefixes no job's names may have (MacVMAgentCore.reservedJobEnvPrefixes). */
+const RESERVED_JOB_ENV_PREFIXES = ['DYLD_', 'LD_', 'DOTNET_', 'COREHOST_', 'COMPlus_', 'CORECLR_', 'RUNNER_', 'ACTIONS_', 'GITHUB_', 'BASH_FUNC_'];
+
+/**
+ * Whether a job's runner may be given `name` (MacVMAgentCore.jobEnvNameAllowed):
+ * one of the runner's settings, or any other name a repository's approved
+ * env policy passed - a plain name of at most 128 characters that is not
+ * reserved and has no reserved prefix, so nothing a job is given changes how
+ * the loader, the shell or the runner's own code is found. The agent holds
+ * every job to the same rule.
+ */
+export function jobEnvNameAllowed(name: string): boolean {
+  if (JOB_ENV_NAMES.has(name)) return true;
+  if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(name)) return false;
+  return !RESERVED_JOB_ENV_NAMES.has(name) && !RESERVED_JOB_ENV_PREFIXES.some((prefix) => name.startsWith(prefix));
+}
 
 export interface JobRequest {
   runnerVersion: string;

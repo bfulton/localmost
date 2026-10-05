@@ -8,7 +8,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as net from 'net';
 import * as path from 'path';
-import { MacAgentClient } from './agent-client';
+import { MacAgentClient, jobEnvNameAllowed } from './agent-client';
 import { shortTempDir } from '../../test-utils/vm-fixtures';
 
 const HELLO = { v: 1, event: 'hello', agent: '1.0.0', ready: true, os: '26.6.2', runnerVersions: ['2.330.0'] };
@@ -189,5 +189,32 @@ describe('MacAgentClient', () => {
     await expect(c.prepare({ timeMs: 1_790_000_000_000, entropy: crypto.randomBytes(32), proxyPort: 1, brokerPort: 2 })).rejects.toMatchObject({
       code: 'E_AGENT_TIMEOUT',
     });
+  });
+});
+
+describe('jobEnvNameAllowed', () => {
+  // The rule the agent holds every job to (MacVMAgentCore.jobEnvNameAllowed):
+  // what the backend sends past it the agent refuses, and the job with it.
+  it("allows the runner's settings, and a name a repository's env policy passes", () => {
+    for (const name of ['HTTPS_PROXY', 'ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT', 'RUNNER_DEBUG', 'LANG', 'DEVELOPER_DIR', 'FASTLANE_USER', '_FLAG']) {
+      expect([name, jobEnvNameAllowed(name)]).toEqual([name, true]);
+    }
+  });
+
+  it("refuses what the agent sets, and what reaches the loader, the shell or the runner's own code", () => {
+    for (const name of [
+      'PATH', 'HOME', 'USER', 'SHELL', 'TMPDIR', 'BASH_ENV', 'ENV', 'ZDOTDIR', 'IFS', 'NODE_OPTIONS',
+      'DYLD_INSERT_LIBRARIES', 'LD_PRELOAD', 'DOTNET_STARTUP_HOOKS', 'COMPlus_EnableDiagnostics',
+      'RUNNER_ALLOW_RUNASROOT', 'ACTIONS_RUNNER_HOOK_JOB_STARTED', 'GITHUB_TOKEN', 'BASH_FUNC_x%%',
+    ]) {
+      expect([name, jobEnvNameAllowed(name)]).toEqual([name, false]);
+    }
+  });
+
+  it('refuses anything but a plain name of at most 128 characters', () => {
+    for (const name of ['', '1ABC', 'A-B', 'A B', 'É', 'A=B', 'A'.repeat(129)]) {
+      expect([name, jobEnvNameAllowed(name)]).toEqual([name, false]);
+    }
+    expect(jobEnvNameAllowed('A'.repeat(128))).toBe(true);
   });
 });

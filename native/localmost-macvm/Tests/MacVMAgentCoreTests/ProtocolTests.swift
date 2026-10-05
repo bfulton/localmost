@@ -32,7 +32,13 @@ final class ProtocolTests: XCTestCase {
             ["runnerVersion": "2.330.0", "files": files, "env": env, "args": ["--once"]]
         }
         XCTAssertEqual(try parseJob(job(["HTTPS_PROXY": "http://a:b@127.0.0.1:1"])).env["HTTPS_PROXY"], "http://a:b@127.0.0.1:1")
-        for name in ["DYLD_INSERT_LIBRARIES", "PATH", "HOME", "BASH_ENV", "LD_PRELOAD", "NODE_OPTIONS", "RUNNER_ALLOW_RUNASROOT"] {
+        // What a repository's env policy passes, by name.
+        XCTAssertEqual(try parseJob(job(["DEVELOPER_DIR": "/Applications/Xcode.app", "_FLAG": "1"])).env.count, 2)
+        for name in [
+            "DYLD_INSERT_LIBRARIES", "PATH", "HOME", "BASH_ENV", "LD_PRELOAD", "NODE_OPTIONS", "RUNNER_ALLOW_RUNASROOT",
+            "DOTNET_STARTUP_HOOKS", "ACTIONS_RUNNER_HOOK_JOB_STARTED", "GITHUB_TOKEN", "BASH_FUNC_x%%", "1ABC", "A-B", "É", "",
+            String(repeating: "A", count: 129),
+        ] {
             refused(try parseJob(job([name: "x"])), "not one a job may set")
         }
         refused(try parseJob(job(["LANG": "a\nb"])), "one line")

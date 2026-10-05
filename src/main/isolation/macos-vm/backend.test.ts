@@ -107,7 +107,7 @@ describe('MacVmBackend', () => {
     expect(intel.b.available().reason).toMatch(/Apple silicon/);
   });
 
-  it("runs a job's runner in a fresh VM with only its three runner files and an allowlisted environment, then removes the VM", async () => {
+  it("runs a job's runner in a fresh VM with only its three runner files and the environment a job may set, then removes the VM", async () => {
     const { b } = backend({ agent: { jobOutput: ['Listening for Jobs', 'Job build completed with result: Succeeded'] } });
     const j = job('slot1-job7');
     await b.prepare(j);
@@ -119,7 +119,12 @@ describe('MacVmBackend', () => {
     expect(Buffer.from(prepared.entropy as string, 'base64')).toHaveLength(64);
     expect(Math.abs((prepared.timeMs as number) - Date.now())).toBeLessThan(10_000);
 
-    const env = { PATH: '/opt/homebrew/bin:/usr/bin', HOME: '/Users/me', HTTPS_PROXY: 'http://t:secret@127.0.0.1:51000', LANG: 'en_US.UTF-8', GITHUB_TOKEN: 'ghp_x' };
+    // DEVELOPER_DIR as a repository's env policy passes it; PATH, HOME and
+    // GITHUB_TOKEN are names no job may set.
+    const env = {
+      PATH: '/opt/homebrew/bin:/usr/bin', HOME: '/Users/me', HTTPS_PROXY: 'http://t:secret@127.0.0.1:51000', LANG: 'en_US.UTF-8',
+      GITHUB_TOKEN: 'ghp_x', DEVELOPER_DIR: '/Applications/Xcode.app/Contents/Developer',
+    };
     const worker = await b.spawnWorker(j, ['--once'], env);
     const lines: string[] = [];
     worker.on('stdout', (line) => lines.push(line));
@@ -127,7 +132,9 @@ describe('MacVmBackend', () => {
     expect(lines).toEqual(['Listening for Jobs', 'Job build completed with result: Succeeded']);
     const sent = agentLines().find((a) => a.op === 'job')!;
     expect(sent.files).toEqual({ '.runner': '{"serverUrlV2":"http://127.0.0.1:8787/k"}', '.credentials': '{"scheme":"OAuth"}', '.credentials_rsaparams': '{"d":"x"}' });
-    expect(sent.env).toEqual({ HTTPS_PROXY: 'http://t:secret@127.0.0.1:51000', LANG: 'en_US.UTF-8' });
+    expect(sent.env).toEqual({
+      HTTPS_PROXY: 'http://t:secret@127.0.0.1:51000', LANG: 'en_US.UTF-8', DEVELOPER_DIR: '/Applications/Xcode.app/Contents/Developer',
+    });
     expect(sent.args).toEqual(['--once']);
     expect(worker.pid).toBe(4242);
 

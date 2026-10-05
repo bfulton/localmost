@@ -10,8 +10,9 @@
  *                then the agent's hello and `prepare` (host time, entropy,
  *                the two loopback relays)
  *   spawnWorker  the runner uploaded if the guest lacks the host's version,
- *                then the job: the worker's three runner files and an
- *                allowlisted environment; its output and exit come back
+ *                then the job: the worker's three runner files and its
+ *                environment, less any name a job may not set
+ *                (jobEnvNameAllowed); its output and exit come back
  *   release      the helper stopped (VZ pulls the VM's plug), the VM
  *                directory removed, the slot freed
  *
@@ -25,7 +26,7 @@ import { EventEmitter } from 'events';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import { MacAgentClient, MacAgentError, JOB_ENV_NAMES, JOB_FILE_NAMES, type JobFiles, type MacAgentHello } from './agent-client';
+import { MacAgentClient, MacAgentError, JOB_FILE_NAMES, jobEnvNameAllowed, type JobFiles, type MacAgentHello } from './agent-client';
 import type { LaunchHelper, ReadyImage } from './golden-image';
 import type { MacVmHelper } from './helper-client';
 import { JOB_VM_CPUS, JOB_VM_MEMORY_MIB, hostRefusal, type HostInfo } from './host';
@@ -275,8 +276,8 @@ export class MacVmBackend implements IsolationBackend {
       await rec.agent.uploadRunner(job.runnerVersion, archive.bytes, archive.sha256);
     }
     const files = readJobFiles(job.sandboxDir);
-    const dropped = Object.keys(env).filter((name) => !JOB_ENV_NAMES.has(name));
-    const kept = Object.fromEntries(Object.entries(env).filter(([name]) => JOB_ENV_NAMES.has(name)));
+    const dropped = Object.keys(env).filter((name) => !jobEnvNameAllowed(name));
+    const kept = Object.fromEntries(Object.entries(env).filter(([name]) => jobEnvNameAllowed(name)));
     if (dropped.length > 0) this.deps.log('debug', `macOS VM ${rec.vmId}: the guest's runner does not get ${dropped.sort().join(', ')}`);
     const agent = rec.agent;
     // The job's output and even its exit can arrive in the read that brings
