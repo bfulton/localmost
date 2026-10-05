@@ -6,6 +6,7 @@ import {
   createSecretMasker,
   buildStepEnvironment,
   executeStep,
+  withoutReservedEnv,
   type ExecutionContext,
   type RunnerStep,
   type RunnerStepResult,
@@ -91,6 +92,50 @@ describe('buildStepEnvironment', () => {
     expect(env.RUNNER_TEMP).toBe(`${GUEST}/.runner-temp`);
     expect(env.RUNNER_TOOL_CACHE).toBe(`${GUEST}/.runner-tool-cache`);
     expect(env.GITHUB_ENV).toBe(`${GUEST}/.github-env`);
+  });
+
+  it("never lets a job's or a step's env replace a GITHUB_* or RUNNER_* default", () => {
+    // GitHub does not let them, and both are the checkout's to write: a job
+    // naming GITHUB_REPOSITORY would give its steps, and github.repository,
+    // another repository's identity.
+    const runCtx = {
+      ...ctx,
+      workflowEnv: { GITHUB_REPOSITORY: 'me/repo', GITHUB_SHA: 'abc123' },
+      jobEnv: { GITHUB_JOB: 'build', GITHUB_REPOSITORY: 'victim/repo', RUNNER_TEMP: '/tmp', JOB_ONLY: 'j' },
+    };
+    const step = {
+      run: 'echo hi',
+      env: {
+        GITHUB_SHA: 'deadbeef',
+        GITHUB_WORKSPACE: '/Users/victim',
+        RUNNER_OS: 'Linux',
+        GITHUB_TOKEN: 'from-the-step',
+        SEEN_REPOSITORY: '${{ github.repository }}',
+      },
+    };
+    const env = buildStepEnvironment(step as never, runCtx as never, job);
+
+    expect(env).toMatchObject({
+      GITHUB_REPOSITORY: 'me/repo',
+      GITHUB_SHA: 'abc123',
+      GITHUB_JOB: 'build',
+      GITHUB_WORKSPACE: GUEST,
+      RUNNER_TEMP: `${GUEST}/.runner-temp`,
+      RUNNER_OS: 'macOS',
+      SEEN_REPOSITORY: 'me/repo',
+      // Names the run does not set stay the workflow's.
+      GITHUB_TOKEN: 'from-the-step',
+      JOB_ONLY: 'j',
+    });
+  });
+});
+
+describe('withoutReservedEnv', () => {
+  it("drops the run's GITHUB_* and RUNNER_* names, and keeps the rest", () => {
+    expect(
+      withoutReservedEnv({ GITHUB_REPOSITORY: 'victim/repo', GITHUB_RUN_ID: '1', RUNNER_NAME: 'x', GITHUB_TOKEN: 't', NODE_ENV: 'test' })
+    ).toEqual({ GITHUB_TOKEN: 't', NODE_ENV: 'test' });
+    expect(withoutReservedEnv(undefined)).toEqual({});
   });
 });
 

@@ -50,7 +50,7 @@ describe('buildWorkflowEnv', () => {
     // workflow is the checkout's to write: GITHUB_REPOSITORY and GITHUB_REF
     // spread after the defaults used to pick another repository's cache.
     const env = buildWorkflowEnv(
-      { GITHUB_REPOSITORY: 'victim/repo', GITHUB_REF: 'refs/heads/main', NODE_ENV: 'test' },
+      { GITHUB_REPOSITORY: 'victim/repo', GITHUB_REF: 'refs/heads/main', GITHUB_RUN_ID: '1', NODE_ENV: 'test' },
       { GITHUB_REPOSITORY: 'me/repo', GITHUB_REF: 'refs/heads/pr' },
       { HTTP_PROXY: 'http://proxy' }
     );

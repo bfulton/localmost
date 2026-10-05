@@ -39,6 +39,7 @@ import {
   StepResult,
   StepRunner,
   StepStatus,
+  withoutReservedEnv,
 } from '../shared/step-executor';
 import { dryRunRunner, openVmStepRunner } from './test-vm';
 import {
@@ -457,7 +458,7 @@ export async function runTest(options: TestOptions = {}, deps: TestDeps = {}): P
         jobId,
         job,
         matrix,
-        { ...context, matrix, jobEnv: { ...context.jobEnv, GITHUB_JOB: jobId, ...(job.env || {}) } },
+        { ...context, matrix, jobEnv: { ...context.jobEnv, ...withoutReservedEnv(job.env), GITHUB_JOB: jobId } },
         jobOutputs,
         options
       );
@@ -651,7 +652,7 @@ export function buildWorkflowEnv(
   defaults: Record<string, string>,
   runEnv: Record<string, string>
 ): Record<string, string> {
-  return { ...(declared || {}), ...defaults, ...runEnv };
+  return { ...withoutReservedEnv(declared), ...defaults, ...runEnv };
 }
 
 // =============================================================================
@@ -801,12 +802,12 @@ async function runReusableWorkflowJob(
       ...context,
       workflowEnv: {
         ...context.workflowEnv,
-        ...(reusableWorkflow.workflow.env || {}),
+        ...withoutReservedEnv(reusableWorkflow.workflow.env),
       },
       jobEnv: {
         ...context.jobEnv,
+        ...withoutReservedEnv(calledJob.env),
         GITHUB_JOB: calledJobId,
-        ...(calledJob.env || {}),
       },
       // Make inputs available as inputs.* context
       inputs,

@@ -17,6 +17,7 @@ import { confirmCheckoutGrants, grantsBeyondWorkspace, runTest, unprovidedGrants
 import { VmStepRunner } from './test-vm';
 import { FakeGuest } from './test-utils/fake-guest';
 import { GUEST_WORKSPACE } from '../main/isolation/macos-vm/agent-client';
+import { getRepositoryFromDir } from '../shared/workspace';
 import type { RunnerStep, StepRunner } from '../shared/step-executor';
 
 let scratch: string;
@@ -162,6 +163,32 @@ describe('runTest', () => {
     // The job's strays ended with it, and the VM with the run.
     expect(guest.signals).toEqual(['KILL']);
     expect(vm.closed()).toBe(true);
+  }, RUN_TIMEOUT_MS);
+
+  it("gives the VM's step the run's GITHUB_* values whatever the workflow, job or step env says", async () => {
+    // All three are the checkout's to write, and GitHub lets none of them
+    // replace a default: the step in the guest must see this checkout's
+    // repository and its own job's name.
+    fs.writeFileSync(
+      path.join(checkout, '.github', 'workflows', 'ci.yml'),
+      [
+        'name: CI', 'on: push',
+        'env:', '  GITHUB_RUN_ID: "1"', '  WORKFLOW_ONLY: w',
+        'jobs:', '  build:', '    runs-on: macos-latest',
+        '    env:', '      GITHUB_REPOSITORY: victim/repo', '      GITHUB_JOB: deploy', '      JOB_ONLY: j',
+        '    steps:', '      - run: "true"',
+        '        env:', '          GITHUB_REPOSITORY: victim/repo', '          RUNNER_NAME: other', '          GITHUB_TOKEN: from-the-step',
+        '',
+      ].join('\n')
+    );
+    const vm = fakeVm();
+    const result = await runTest({}, vm.deps);
+    expect(result.success).toBe(true);
+    const env = vm.guest().steps[0].env;
+    expect(env.GITHUB_REPOSITORY).toBe(getRepositoryFromDir(checkout) || 'local/repo');
+    expect(env.GITHUB_REPOSITORY).not.toBe('victim/repo');
+    expect(env.GITHUB_RUN_ID).not.toBe('1');
+    expect(env).toMatchObject({ GITHUB_JOB: 'build', RUNNER_NAME: 'localmost', GITHUB_TOKEN: 'from-the-step', WORKFLOW_ONLY: 'w', JOB_ONLY: 'j' });
   }, RUN_TIMEOUT_MS);
 
   it('does not run a checkout whose policy reaches the network without confirmation', async () => {

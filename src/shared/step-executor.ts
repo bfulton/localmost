@@ -173,20 +173,43 @@ export function maskSecrets(text: string, secrets: Record<string, string>): stri
 }
 
 /**
+ * The default GITHUB_* and RUNNER_* variables the run sets. GitHub does not
+ * let a workflow, job or step overwrite them, and here all three are the
+ * checkout's to write: an `env:` naming GITHUB_REPOSITORY would otherwise
+ * give a step, and ${{ github.repository }}, another repository's identity.
+ * Other GITHUB_* names, such as GITHUB_TOKEN, stay the workflow's to set.
+ */
+export const RESERVED_ENV_NAMES = [
+  'GITHUB_ACTIONS', 'GITHUB_WORKFLOW', 'GITHUB_RUN_ID', 'GITHUB_RUN_NUMBER', 'GITHUB_JOB', 'GITHUB_ACTION',
+  'GITHUB_ACTOR', 'GITHUB_REPOSITORY', 'GITHUB_EVENT_NAME', 'GITHUB_WORKSPACE', 'GITHUB_SHA', 'GITHUB_REF',
+  'GITHUB_HEAD_REF', 'GITHUB_BASE_REF', 'GITHUB_SERVER_URL', 'GITHUB_API_URL', 'GITHUB_GRAPHQL_URL',
+  'GITHUB_ENV', 'GITHUB_PATH', 'GITHUB_STEP_SUMMARY',
+  'RUNNER_NAME', 'RUNNER_OS', 'RUNNER_ARCH', 'RUNNER_TEMP', 'RUNNER_TOOL_CACHE',
+] as const;
+type ReservedEnvName = (typeof RESERVED_ENV_NAMES)[number];
+const RESERVED_ENV = new Set<string>(RESERVED_ENV_NAMES);
+
+/** `env` without the names the run reserves (RESERVED_ENV_NAMES): a workflow's or job's own `env:`. */
+export function withoutReservedEnv(env: Record<string, string> | undefined): Record<string, string> {
+  return Object.fromEntries(Object.entries(env || {}).filter(([name]) => !RESERVED_ENV.has(name)));
+}
+
+/**
  * Build the full environment for step execution.
  *
  * The runner adds its own HOME, PATH, user, shell and temp, which a step's
  * environment cannot replace: the guest's, not this machine's.
+ *
+ * The reserved variables are read from the run's own values in
+ * ctx.workflowEnv and ctx.jobEnv (which hold no workflow- or job-declared
+ * value for them) and set again after every merge, so no `env:` replaces one.
  */
 export function buildStepEnvironment(
   step: WorkflowStep,
   ctx: ExecutionContext,
   job: WorkflowJob
 ): Record<string, string> {
-  const env: Record<string, string> = {
-    TERM: process.env.TERM || 'xterm-256color',
-    LANG: process.env.LANG || 'en_US.UTF-8',
-
+  const reserved: Record<ReservedEnvName, string> = {
     // GitHub Actions standard variables
     GITHUB_ACTIONS: 'true',
     GITHUB_WORKFLOW: ctx.workflowEnv.GITHUB_WORKFLOW || 'local',
@@ -216,25 +239,27 @@ export function buildStepEnvironment(
     // Per run, in the workspace, which the run makes before its first step.
     RUNNER_TEMP: path.posix.join(ctx.workDir, RUNNER_TEMP_DIR),
     RUNNER_TOOL_CACHE: path.posix.join(ctx.workDir, RUNNER_TOOL_CACHE_DIR),
+  };
 
+  // Add job defaults if present
+  if (job.defaults?.run?.['working-directory']) {
+    reserved.GITHUB_WORKSPACE = path.posix.join(ctx.workDir, job.defaults.run['working-directory']);
+  }
+
+  const env: Record<string, string> = {
+    TERM: process.env.TERM || 'xterm-256color',
+    LANG: process.env.LANG || 'en_US.UTF-8',
+    ...reserved,
     // ImageOS for setup-* actions
     ImageOS: 'macos14',
   };
 
-  // Add workflow-level env
-  Object.assign(env, ctx.workflowEnv);
-
-  // Add job-level env
-  Object.assign(env, ctx.jobEnv);
-
-  // Add job defaults if present
-  if (job.defaults?.run?.['working-directory']) {
-    env.GITHUB_WORKSPACE = path.posix.join(ctx.workDir, job.defaults.run['working-directory']);
-  }
+  // Add workflow-level and job-level env
+  Object.assign(env, ctx.workflowEnv, ctx.jobEnv, reserved);
 
   // Add step-level env
   if (step.env) {
-    Object.assign(env, expandEnvValues(step.env, env, ctx));
+    Object.assign(env, expandEnvValues(step.env, env, ctx), reserved);
   }
 
   // Add matrix values
