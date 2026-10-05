@@ -93,11 +93,22 @@ export class SessionPersistence {
    * at the same time, and a file a crash left behind is overwritten by the
    * next save instead of accumulating. It holds the same session ids, and one
    * known name is one the runner profile can read-deny beside the real file.
+   *
+   * The ids are live broker sessions, so the file is the user's alone (0600)
+   * whatever the umask. The rename gives the real file the temporary file's
+   * mode, so that is the one set, and set again on a file a crash left behind,
+   * which opening for writing would not change.
    */
   private writeWhole(content: string): void {
     const temp = `${this.filePath}.tmp`;
     try {
-      fs.writeFileSync(temp, content);
+      const fd = fs.openSync(temp, 'w', 0o600);
+      try {
+        fs.fchmodSync(fd, 0o600);
+        fs.writeFileSync(fd, content);
+      } finally {
+        fs.closeSync(fd);
+      }
       fs.renameSync(temp, this.filePath);
     } catch (err) {
       try {

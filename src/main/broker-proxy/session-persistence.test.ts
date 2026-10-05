@@ -65,6 +65,24 @@ describe('SessionPersistence', () => {
     expect(new SessionPersistence().load()).toEqual({ 'target-a': { 1: 'session-1' } });
   });
 
+  it("keeps the saved sessions the user's alone, whatever the umask, and over a leftover", () => {
+    // The ids are live broker sessions. The rename gives the file the
+    // temporary file's mode, which the umask set: 0644 on a usual 022.
+    const leftover = path.join(mockRunnerDir, 'broker-sessions.json.tmp');
+    fs.writeFileSync(leftover, '{"half', { mode: 0o644 });
+    const umask = process.umask(0o022);
+    try {
+      const persistence = new SessionPersistence();
+      persistence.save('target-a', 1, 'session-1');
+      expect(fs.statSync(path.join(mockRunnerDir, 'broker-sessions.json')).mode & 0o777).toBe(0o600);
+      persistence.save('target-a', 2, 'session-2');
+      persistence.remove('target-a', 1);
+      expect(fs.statSync(path.join(mockRunnerDir, 'broker-sessions.json')).mode & 0o777).toBe(0o600);
+    } finally {
+      process.umask(umask);
+    }
+  });
+
   it('keeps the saved sessions whole when a removal fails partway', () => {
     const persistence = new SessionPersistence();
     persistence.save('target-a', 1, 'session-1');
