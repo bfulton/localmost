@@ -5,6 +5,10 @@
 // a version that is not there; one job per boot, ever - a VM is a job's,
 // and is thrown away after it; signals only to that job. A connection that
 // closes while its job runs kills the job: nobody is left to read it.
+//
+// A boot runs a runner job or a `localmost test` run, never both: the run
+// starts with its workspace upload, after prepare, and its steps come one
+// at a time on the connection that sent the workspace (see Steps.swift).
 
 import Foundation
 import MacVMCore
@@ -31,6 +35,15 @@ public protocol AgentSystem: AnyObject {
     /// `exit` its end, once.
     func startJob(_ spec: JobSpec, output: @escaping (String, String) -> Void, exit: @escaping (Int32?, String?) -> Void) throws -> Int32
     func signalJob(_ signal: JobSignal)
+    /// Unpacks a test run's upload, a tar whose bytes are handed over, into
+    /// testRoot/<dest> as the job user, after checking its sha256.
+    func putFiles(_ put: PutSpec, bytes: Data) throws
+    /// Starts one step as the job user. `output` gets its lines, `exit` its
+    /// end and what it wrote to GITHUB_OUTPUT, once.
+    func startStep(_ spec: StepSpec, output: @escaping (String, String) -> Void,
+                   exit: @escaping (Int32?, String?, String) -> Void) throws -> Int32
+    /// Signals every process group a step of this boot started.
+    func signalSteps(_ signal: JobSignal)
 }
 
 /// Whether a job has started in this boot. Shared by every connection: the
@@ -39,6 +52,7 @@ public final class BootState {
     private let lock = NSLock()
     private var _prepared = false
     private var _jobStarted = false
+    private var _testStarted = false
 
     public init() {}
 
@@ -48,10 +62,11 @@ public final class BootState {
         return _prepared
     }
 
+    /// Whether a job or a test run has reached this boot.
     public var jobStarted: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return _jobStarted
+        return _jobStarted || _testStarted
     }
 
     func markPrepared() -> Bool {
@@ -65,8 +80,16 @@ public final class BootState {
     func markJobStarted() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard !_jobStarted else { return false }
+        guard !_jobStarted, !_testStarted else { return false }
         _jobStarted = true
+        return true
+    }
+
+    func markTestStarted() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !_jobStarted, !_testStarted else { return false }
+        _testStarted = true
         return true
     }
 }
@@ -77,10 +100,19 @@ public final class AgentSession {
     private let send: (Data) -> Void
     private let queue = DispatchQueue(label: "localmost-macvm-agent session")
     private var reader = StreamReader()
+    private enum Upload {
+        case runner(RunnerUpload)
+        case put(PutSpec)
+    }
+
     /// The upload whose bytes are arriving, and its command id.
-    private var upload: (id: Int, spec: RunnerUpload)?
+    private var upload: (id: Int, what: Upload)?
     private var ownsJob = false
     private var jobRunning = false
+    /// This connection sent the test run's workspace; it has arrived; a step runs.
+    private var ownsTest = false
+    private var workspaceReady = false
+    private var stepRunning = false
     private var closed = false
 
     public init(system: AgentSystem, boot: BootState, send: @escaping (Data) -> Void) {
@@ -109,6 +141,9 @@ public final class AgentSession {
             self.closed = true
             if self.ownsJob, self.jobRunning {
                 self.system.signalJob(.KILL)
+            }
+            if self.ownsTest {
+                self.system.signalSteps(.KILL)
             }
         }
     }
@@ -158,7 +193,7 @@ public final class AgentSession {
                 guard !system.installedRunnerVersions().contains(u.version) else {
                     throw ProtocolError("runner \(u.version) is already installed")
                 }
-                upload = (id, u)
+                upload = (id, .runner(u))
                 reader.expectRaw(u.bytes)
                 reply(id, ["send": true])
             case "job":
@@ -183,8 +218,42 @@ public final class AgentSession {
                     }
                 })
                 reply(id, ["pid": Int(pid)])
+            case "put":
+                let p = try parsePut(object)
+                guard boot.prepared else { throw ProtocolError("prepare must come before a test run") }
+                guard !stepRunning else { throw ProtocolError("a step is running") }
+                if p.dest == "workspace" {
+                    guard !ownsTest else { throw ProtocolError("the workspace was already sent") }
+                    guard boot.markTestStarted() else { throw ProtocolError("a job already ran in this VM") }
+                    ownsTest = true
+                } else {
+                    guard ownsTest, workspaceReady else { throw ProtocolError("the workspace must come first") }
+                }
+                upload = (id, .put(p))
+                reader.expectRaw(p.bytes)
+                reply(id, ["send": true])
+            case "step":
+                let spec = try parseStep(object)
+                guard ownsTest, workspaceReady else { throw ProtocolError("the workspace must come before a step") }
+                guard !stepRunning else { throw ProtocolError("a step is already running") }
+                stepRunning = true
+                do {
+                    let pid = try system.startStep(spec, output: { [weak self] stream, data in
+                        self?.queue.async { self?.emit(["event": "output", "stream": stream, "data": data]) }
+                    }, exit: { [weak self] code, signal, outputs in
+                        self?.queue.async { self?.stepEnded(code: code, signal: signal, outputs: outputs) }
+                    })
+                    reply(id, ["pid": Int(pid)])
+                } catch {
+                    stepRunning = false
+                    throw error
+                }
             case "signal":
                 let signal = try parseSignal(object)
+                if ownsTest {
+                    system.signalSteps(signal)
+                    return reply(id)
+                }
                 guard ownsJob else { throw ProtocolError("this connection started no job") }
                 system.signalJob(signal)
                 reply(id)
@@ -199,16 +268,37 @@ public final class AgentSession {
     }
 
     private func finishUpload(_ bytes: Data) {
-        guard let (id, spec) = upload else { return }
+        guard let (id, what) = upload else { return }
         upload = nil
         do {
-            try system.installRunner(spec, bytes: bytes)
-            reply(id, ["installed": spec.version])
+            switch what {
+            case .runner(let spec):
+                try system.installRunner(spec, bytes: bytes)
+                reply(id, ["installed": spec.version])
+            case .put(let spec):
+                try system.putFiles(spec, bytes: bytes)
+                if spec.dest == "workspace" { workspaceReady = true }
+                reply(id, ["put": spec.dest])
+            }
         } catch let e as ProtocolError {
             refuse(id, e.message)
         } catch {
             refuse(id, describe(error))
         }
+    }
+
+    /// A step's exit, with its outputs if they fit one line; otherwise
+    /// without them, and an error that says so.
+    private func stepEnded(code: Int32?, signal: String?, outputs: String) {
+        stepRunning = false
+        var fields: [String: Any] = ["event": "exit", "outputs": outputs]
+        fields["code"] = code.map { Int($0) } ?? NSNull()
+        fields["signal"] = signal ?? NSNull()
+        if encodeLine(fields) == nil {
+            emit(["event": "error", "message": "the step's outputs were dropped: they do not fit one line"])
+            fields["outputs"] = ""
+        }
+        emit(fields)
     }
 
     private func reply(_ id: Int, _ fields: [String: Any] = [:]) {

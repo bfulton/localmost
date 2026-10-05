@@ -1,6 +1,7 @@
 // The guest, as the agent changes it: the clock, the entropy pool, the
-// loopback relays, the runner versions, and the one job's runner, started as
-// the job user in that user's login session.
+// loopback relays, the runner versions, and the one job's runner - or a test
+// run's uploads and steps - started as the job user in that user's login
+// session.
 
 import CryptoKit
 import Darwin
@@ -144,6 +145,94 @@ final class GuestSystem: AgentSystem {
         if signal == .KILL {
             killAllJobUserProcesses()
         }
+    }
+
+    // MARK: - A localmost test run
+
+    /// Each step's process group, by its leader's pid, and whether that leader has exited.
+    private var stepGroups: [Int32: Bool] = [:]
+
+    func putFiles(_ put: PutSpec, bytes: Data) throws {
+        let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        guard digest == put.sha256, bytes.count == put.bytes else {
+            throw ProtocolError("the upload's bytes do not match their sha256")
+        }
+        let (uid, gid) = try jobUserIDs()
+        let archive = try scratchFile(in: stepScratchDir, owner: 0, "put", contents: bytes, uid: uid, gid: gid, mode: 0o400)
+        defer { unlink(archive) }
+        // Made and unpacked by the job user, so nothing in the archive - an
+        // owner, a mode, a link to follow - can do what the job user cannot.
+        let dest = testRoot + "/" + put.dest
+        let dirs = put.dest == "workspace" ? [dest, jobUserHome + "/tmp"] : [dest]
+        try runChecked(execAsArgv(uid: uid, agent: agentInstallPath, dir: jobUserHome, program: "/bin/mkdir", args: ["-p"] + dirs))
+        try runChecked(execAsArgv(uid: uid, agent: agentInstallPath, dir: dest, program: "/usr/bin/tar", args: ["-x", "-f", archive]))
+    }
+
+    func startStep(_ spec: StepSpec, output: @escaping (String, String) -> Void,
+                   exit: @escaping (Int32?, String?, String) -> Void) throws -> Int32 {
+        let (uid, gid) = try jobUserIDs()
+        let nodes = { (version: String) in (try? FileManager.default.contentsOfDirectory(atPath: "\(runnerRoot)/\(version)/externals")) ?? [] }
+        guard let program = stepProgramPath(spec.program, runners: installedRunnerVersions(), nodes: nodes) else {
+            throw ProtocolError("no installed runner has a node to run the action with")
+        }
+        let outputs = try scratchFile(in: stepScratchDir, owner: 0, "output", contents: Data(), uid: uid, gid: gid, mode: 0o600)
+        var script: String?
+        do {
+            if let text = spec.script {
+                script = try scratchFile(in: stepScratchDir, owner: 0, "step", contents: Data(text.utf8), uid: uid, gid: gid, mode: 0o400)
+            }
+            let args = [script ?? testRoot + "/" + spec.entry!]
+            let env = stepEnvironment(spec, home: jobUserHome, outputs: outputs)
+            let argv = execAsArgv(uid: uid, agent: agentInstallPath, dir: testRoot + "/" + spec.cwd, program: program, args: args)
+            // The leader can exit before spawn returns its pid: both sides
+            // meet under the lock, whichever comes first.
+            var leader: Int32?
+            var exitedEarly = false
+            let job = try Job.spawn(argv: argv, env: env, uid: uid, output: output, exit: { [weak self] code, signal in
+                if let self = self {
+                    self.lock.lock()
+                    if let pid = leader {
+                        if self.stepGroups[pid] != nil { self.stepGroups[pid] = true }
+                    } else {
+                        exitedEarly = true
+                    }
+                    self.lock.unlock()
+                }
+                let text = readStepOutputs(outputs, onDropped: { output("stderr", $0) })
+                unlink(outputs)
+                if let script = script { unlink(script) }
+                exit(code, signal, text)
+            })
+            lock.lock()
+            leader = job.pid
+            stepGroups[job.pid] = exitedEarly
+            lock.unlock()
+            return job.pid
+        } catch {
+            unlink(outputs)
+            if let script = script { unlink(script) }
+            throw error
+        }
+    }
+
+    /// Signals every step's process group. A group whose leader has exited
+    /// and whose pid names a live process again is left alone: the group
+    /// emptied, and the pid is someone else's now. After a KILL the run's
+    /// groups are forgotten.
+    func signalSteps(_ signal: JobSignal) {
+        lock.lock()
+        let groups = stepGroups
+        if signal == .KILL { stepGroups = [:] }
+        lock.unlock()
+        for (pid, leaderExited) in groups {
+            if leaderExited, kill(pid, 0) == 0 { continue }
+            kill(-pid, signal.number)
+        }
+    }
+
+    private func jobUserIDs() throws -> (uid_t, gid_t) {
+        guard let pw = getpwnam(jobUser) else { throw ProtocolError("the job user \(jobUser) does not exist") }
+        return (pw.pointee.pw_uid, pw.pointee.pw_gid)
     }
 }
 

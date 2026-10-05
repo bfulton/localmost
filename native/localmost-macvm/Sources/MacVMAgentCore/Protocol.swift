@@ -10,6 +10,9 @@
 //   agent:    {"event":"exit","code":0}
 //   Electron: {"id":4,"op":"signal","signal":"TERM"}
 //
+// Instead of a job, a boot can run a `localmost test` run: `put` and `step`,
+// in Steps.swift.
+//
 // Every command is answered `{"id":n,"ok":true,...}` or `{"id":n,"ok":false,
 // "code":"...","message":"..."}`. The guest is the job's, so Electron treats
 // all of this as hostile input; the agent, for its part, takes commands only
