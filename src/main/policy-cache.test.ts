@@ -8,8 +8,9 @@ jest.mock('./paths', () => ({
   getAppDataDir: () => tmpRoot,
 }));
 
+const mockLogger = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() };
 jest.mock('./app-state', () => ({
-  getLogger: () => ({ debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() }),
+  getLogger: () => mockLogger,
 }));
 
 import {
@@ -50,6 +51,30 @@ beforeEach(() => {
 });
 
 describe('decidePolicyForJob', () => {
+
+  it("logs the keys a policy has that are ignored, once per repository and content", () => {
+    mockLogger.warn.mockClear();
+    const ignoring = `version: 1
+
+shared:
+  isolation: seatbelt
+  network:
+    loopback: true
+    allow:
+      - "index.crates.io"
+`;
+    decidePolicyForJob(REPO, ignoring, SHA);
+    decidePolicyForJob(REPO, ignoring, 'b'.repeat(40));
+    const warned = () => mockLogger.warn.mock.calls.map(([m]) => m as string).filter((m) => m.startsWith('.localmostrc for '));
+    expect(warned()).toEqual([
+      expect.stringMatching(/^\.localmostrc for owner\/repo: shared\.isolation is ignored: /),
+      expect.stringMatching(/^\.localmostrc for owner\/repo: shared\.network\.loopback is ignored: /),
+    ]);
+    // Another repository, or changed content, is said again.
+    decidePolicyForJob('owner/other', ignoring, SHA);
+    decidePolicyForJob(REPO, `${ignoring}\n# changed\n`, SHA);
+    expect(warned()).toHaveLength(6);
+  });
 
   it('allows a repository that has no policy at all', () => {
     // Nothing is being granted beyond the baseline, so there is nothing to

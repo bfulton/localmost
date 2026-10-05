@@ -7,6 +7,7 @@
  * is shared with the CLI in shared/policy-store.
  */
 
+import * as crypto from 'crypto';
 import * as path from 'path';
 import {
   LocalmostrcConfig,
@@ -257,6 +258,25 @@ function validRepositoryId(repository: string, repositoryId: number | undefined)
   return undefined;
 }
 
+/**
+ * The parse warnings already logged, by repository and the content's hash:
+ * every job reads the policy again, and the same ignored `isolation:` or
+ * `network.loopback` said at each would fill the log. Bounded; once full it
+ * starts over, and a warning may be said once more.
+ */
+const loggedWarnings = new Set<string>();
+const MAX_LOGGED_WARNINGS = 1000;
+
+/** Logs a policy's parse warnings (keys it ignores, a missing version) once per repository and content. */
+function logParseWarnings(repository: string, content: string, warnings: string[]): void {
+  if (warnings.length === 0) return;
+  const key = `${repository}\0${crypto.createHash('sha256').update(content).digest('hex')}`;
+  if (loggedWarnings.has(key)) return;
+  if (loggedWarnings.size >= MAX_LOGGED_WARNINGS) loggedWarnings.clear();
+  loggedWarnings.add(key);
+  for (const warning of warnings) log.warn(`.localmostrc for ${repository}: ${warning}`);
+}
+
 function decide(repository: string, localmostrcContent: string | null, repositoryId?: number): PolicyDecision {
   const approvedVersion = getPolicyEntry(repository)?.approved;
   const approved = approvedVersion?.config ?? null;
@@ -266,6 +286,7 @@ function decide(repository: string, localmostrcContent: string | null, repositor
   }
 
   const parseResult = parseLocalmostrcContent(localmostrcContent);
+  logParseWarnings(repository, localmostrcContent, parseResult.warnings);
   if (!parseResult.success || !parseResult.config) {
     // The repository has a policy; we just cannot read it. Running anyway would
     // mean deciding on a file nobody has reviewed, so hold the job instead.
