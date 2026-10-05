@@ -132,7 +132,7 @@ describe('runTest', () => {
           const root = path.join(scratch, 'guest');
           fs.mkdirSync(root);
           guest = new FakeGuest(root);
-          const runner = new VmStepRunner(guest, { onNote, onClose: () => (closed = true) });
+          const runner = new VmStepRunner(guest, { onNote, onClose: () => { closed = true; } });
           await runner.putWorkspace(hostWorkDir);
           return runner;
         },
