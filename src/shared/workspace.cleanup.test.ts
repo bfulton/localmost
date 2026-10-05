@@ -211,6 +211,22 @@ describe('workspace creation', () => {
     }
   }, WORKSPACE_TIMEOUT_MS);
 
+  /**
+   * Whether the volume these tests write on takes `name` for the metadata's
+   * name. A Mac's default APFS volume folds case and Unicode (a long s to
+   * s); the ext4 of CI's Linux leg folds neither, and there the checkout's
+   * entry is a file of its own, which must be copied as itself.
+   */
+  const volumeTakesForMetadata = (name: string): boolean => {
+    const probe = fs.mkdtempSync(path.join(appData, 'fold-probe-'));
+    try {
+      fs.writeFileSync(path.join(probe, '.localmost-workspace.json'), '');
+      return fs.existsSync(path.join(probe, name));
+    } finally {
+      fs.rmSync(probe, { recursive: true, force: true });
+    }
+  };
+
   it.each([
     ['in another case', '.LOCALMOST-WORKSPACE.JSON'],
     ['with a long s, which APFS folds to s', '.localmoſt-workspace.json'],
@@ -218,6 +234,7 @@ describe('workspace creation', () => {
     // The volume takes the name for the metadata's, which the exclude, by
     // the exact name, did not: the entry was copied first, and the metadata
     // write after it either failed the run or went through the link.
+    const folds = volumeTakesForMetadata(name);
     const victim = path.join(appData, 'victim');
     fs.writeFileSync(victim, 'the user\'s\n');
     const source = path.join(appData, 'folded');
@@ -235,11 +252,16 @@ describe('workspace creation', () => {
       const metadata = path.join(ws.path, '.localmost-workspace.json');
       expect(fs.lstatSync(metadata).isFile()).toBe(true);
       expect(JSON.parse(fs.readFileSync(metadata, 'utf-8')).id).toBe(ws.id);
-      // One entry, as the temp directory is on the Mac's default volume,
-      // which does not tell the two names apart.
-      expect(fs.readdirSync(ws.path).filter((entry) => entry.toLowerCase().endsWith('-workspace.json'))).toEqual([
-        '.localmost-workspace.json',
-      ]);
+      const named = fs.readdirSync(ws.path).filter((entry) => entry.toLowerCase().endsWith('-workspace.json'));
+      if (folds) {
+        // One entry: the volume does not tell the two names apart.
+        expect(named).toEqual(['.localmost-workspace.json']);
+      } else {
+        // Two names to the volume: the checkout's link is copied as itself,
+        // a link, beside the metadata.
+        expect(named.sort()).toEqual(['.localmost-workspace.json', name].sort());
+        expect(fs.readlinkSync(path.join(ws.path, name))).toBe(victim);
+      }
     }
   }, WORKSPACE_TIMEOUT_MS);
 
@@ -254,6 +276,7 @@ describe('workspace creation', () => {
     // so neither replaces the metadata nor puts anything in the workspace.
     // Each needs its own checkout, as the checkout's volume folds the names
     // too.
+    const folds = volumeTakesForMetadata(name);
     const source = path.join(appData, 'folded');
     fs.mkdirSync(source);
     git(source, 'init', '-q');
@@ -269,7 +292,13 @@ describe('workspace creation', () => {
       const metadata = path.join(ws.path, '.localmost-workspace.json');
       expect(fs.lstatSync(metadata).isFile()).toBe(true);
       expect(JSON.parse(fs.readFileSync(metadata, 'utf-8')).id).toBe(ws.id);
-      expect(fs.readdirSync(ws.path).sort()).toEqual(['.localmost-workspace.json', 'a.txt']);
+      if (folds) {
+        expect(fs.readdirSync(ws.path).sort()).toEqual(['.localmost-workspace.json', 'a.txt']);
+      } else {
+        // Two names to the volume: the checkout's entry is copied as itself.
+        expect(fs.readdirSync(ws.path).sort()).toEqual(['.localmost-workspace.json', 'a.txt', name].sort());
+        expect(JSON.parse(fs.readFileSync(path.join(ws.path, entry), 'utf-8')).id).toBe('forged');
+      }
     }
   }, WORKSPACE_TIMEOUT_MS);
 

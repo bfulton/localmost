@@ -108,8 +108,13 @@ describe('the installed localmost command', () => {
       const cwd = path.join(scratch, 'checkout');
       fs.mkdirSync(cwd);
       fs.writeFileSync(path.join(cwd, 'cli.js'), cliJs('decoy'));
+      // macOS's /bin/sh is bash in POSIX mode. Elsewhere /bin/sh may be
+      // another shell - Ubuntu's, on CI's Linux leg, is dash, which never
+      // searches PATH for a script - so there the shell a Mac's /bin/sh is
+      // stands in for it.
+      const [file, flags] = shell === '/bin/sh' && process.platform !== 'darwin' ? ['/bin/bash', ['--posix']] : [shell, []];
 
-      expect(run(shell, ['localmost', 'status'], cwd, [bin])).toEqual({ ran: 'bundled', args: ['status'] });
+      expect(run(file, [...flags, 'localmost', 'status'], cwd, [bin])).toEqual({ ran: 'bundled', args: ['status'] });
     },
   );
 
