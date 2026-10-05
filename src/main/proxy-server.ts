@@ -725,13 +725,11 @@ export class ProxyServer {
 
   /**
    * Get the proxy URL for environment variables
-   * Uses localhost to match sandbox-exec network rules
    */
   getProxyUrl(): string {
     // A literal address, not "localhost". The proxy binds 127.0.0.1 only, and
-    // the sandbox rule that confines a job to this proxy matches a direct
-    // connection to the loopback address; resolving the name first produced a
-    // connection the kernel could not attribute, and it was denied.
+    // the guest's relay listens on the same address and port; a name could
+    // resolve to ::1 first, where neither listens.
     if (this.authToken) {
       return `http://localmost:${this.authToken}@127.0.0.1:${this.port}`;
     }

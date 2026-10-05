@@ -6,7 +6,17 @@ import * as os from 'os';
 import * as path from 'path';
 import * as tar from 'tar';
 import { RunnerDownloader } from './runner-downloader';
-import { developerPythonSync } from '../shared/sandbox-reaper';
+
+/**
+ * The developer tools' python3, by its own path: not /usr/bin/python3, which
+ * without the tools is a stub that raises an install dialog.
+ */
+const developerPython = (): string => {
+  const dir = execFileSync('/usr/bin/xcode-select', ['-p'], { encoding: 'utf-8', timeout: 30000 }).trim();
+  const python = path.join(dir, 'usr', 'bin', 'python3');
+  expect(fs.existsSync(python)).toBe(true);
+  return python;
+};
 
 /**
  * Where on the device each file's first byte is stored, by fcntl
@@ -14,8 +24,7 @@ import { developerPythonSync } from '../shared/sandbox-reaper';
  * blocks are one block share it: an APFS clone, not a copy.
  */
 const deviceOffsets = (...files: string[]): number[] => {
-  const python = developerPythonSync();
-  expect(python).not.toBeNull();
+  const python = developerPython();
   const script = [
     'import fcntl, os, struct, sys',
     'for name in sys.argv[1:]:',
@@ -25,7 +34,7 @@ const deviceOffsets = (...files: string[]): number[] => {
     '    os.close(fd)',
     "    print(struct.unpack('=Iqq', out)[2])",
   ].join('\n');
-  const output = execFileSync(python!, ['-c', script, ...files], { encoding: 'utf-8', timeout: 30000, env: { PATH: '/usr/bin:/bin' } });
+  const output = execFileSync(python, ['-c', script, ...files], { encoding: 'utf-8', timeout: 30000, env: { PATH: '/usr/bin:/bin' } });
   return output.trim().split('\n').map(Number);
 };
 

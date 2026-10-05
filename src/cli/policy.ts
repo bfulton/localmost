@@ -1,7 +1,7 @@
 /**
  * CLI Policy Command
  *
- * Manage .localmostrc sandbox policies.
+ * Manage .localmostrc policies.
  *
  * Usage:
  *   localmost policy show              # Display current policy
@@ -34,7 +34,6 @@ import {
   readPolicyEntry,
   recordPolicyDecision,
 } from '../shared/policy-store';
-import { MACOS_BASELINE_READ_PATHS } from '../shared/sandbox-profile';
 
 // ANSI colors
 const colors = {
@@ -417,9 +416,9 @@ function handleInit(options: PolicyOptions): void {
     return;
   }
 
-  // Start from a policy that actually runs. Nothing is granted implicitly, so
-  // without the read paths a macOS process needs, the first step would die
-  // before executing anything.
+  // Start from a policy that runs: the hosts most workflows fetch from. The
+  // job's macOS VM supplies its own OS and toolchains, so no filesystem
+  // grant is needed to start.
   const template: LocalmostrcConfig = {
     version: LOCALMOSTRC_VERSION,
     // Declared rather than left implicit, so the level a repository runs at is
@@ -432,9 +431,6 @@ function handleInit(options: PolicyOptions): void {
           'github.com',
           'registry.npmjs.org',
         ],
-      },
-      filesystem: {
-        read: [...MACOS_BASELINE_READ_PATHS],
       },
     },
   };
@@ -536,7 +532,7 @@ export function parsePolicyArgs(args: string[]): {
  */
 export function printPolicyHelp(): void {
   console.log(`
-${colors.bold}localmost policy${colors.reset} - Manage sandbox policies
+${colors.bold}localmost policy${colors.reset} - Manage .localmostrc policies
 
 ${colors.bold}USAGE:${colors.reset}
   localmost policy <subcommand> [options]

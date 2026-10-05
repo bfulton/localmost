@@ -13,8 +13,7 @@ export * from './constants';
 export * from './workflow-parser';
 export * from './step-executor';
 
-// Sandbox and policy
-export * from './sandbox-profile';
+// Policy
 export * from './policy-types';
 export * from './localmostrc';
 

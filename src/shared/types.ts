@@ -369,8 +369,8 @@ export interface PolicySummary {
 // =============================================================================
 
 /**
- * Sandbox policy level controls what restrictions are enforced during job execution.
- * This affects network access, filesystem access, and all other sandbox-exec restrictions.
+ * A policy's level: how much a job's proxy allows beyond the hosts the
+ * policy lists.
  *
  * - strict: Only access explicitly listed in .localmostrc is allowed. Most secure option.
  * - moderate: GitHub Actions infrastructure, common registries, and standard tool caches are allowed by default.

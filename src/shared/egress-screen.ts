@@ -228,9 +228,9 @@ function isBlockedV4(addr: string): boolean {
   if (o.length !== 4 || o.some((n) => isNaN(n) || n < 0 || n > 255)) return true;
   const [a, b] = o;
   if (a === 0) return true; // this-network / 0.0.0.0 - resolves to local
-  // Loopback (127/8) is intentionally not blocked: the sandbox grants a job
-  // direct loopback access, and the broker (also on loopback) is reached this
-  // way, so screening it here changes nothing and would break control traffic.
+  // Loopback (127/8) is intentionally not blocked here: the broker is reached
+  // this way, and each proxy decides a literal loopback target itself - the
+  // runner's opens only the broker's port, localmost test's none.
   if (a === 10) return true; // private
   if (a === 172 && b >= 16 && b <= 31) return true; // private
   if (a === 192 && b === 168) return true; // private
@@ -256,8 +256,7 @@ export function isBlockedAddress(ip: string): boolean {
   if (v === 6) {
     const groups = expandV6ToGroups(addr);
     if (!groups) return true; // unparseable - refuse rather than allow
-    // Loopback (::1) stays reachable, like 127/8: the sandbox grants loopback
-    // directly and the broker rides it.
+    // Loopback (::1) is left to the caller, like 127/8.
     if (groups.every((g, i) => (i === 7 ? g === 1 : g === 0))) return false;
     // Top 96 bits zero, optionally with 0xffff in the sixth group: the
     // unspecified address, IPv4-mapped (::ffff:a.b.c.d in any notation,

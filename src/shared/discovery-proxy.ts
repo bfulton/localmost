@@ -58,9 +58,8 @@ export class DiscoveryProxy {
   private lookup: HostLookup;
   /**
    * Required in Proxy-Authorization, and handed to steps in the proxy URL.
-   * The proxy listens on loopback, which a runner job's sandbox allows when its
-   * policy grants loopback, so without it a job live while `localmost test`
-   * runs could use this proxy - under --updaterc, one with no allowlist at
+   * The proxy listens on this Mac's loopback, where without it any other
+   * local process could use it - under --updaterc, one with no allowlist at
    * all - and add hosts to what discovery writes into .localmostrc. New for
    * every run.
    */
@@ -133,9 +132,9 @@ export class DiscoveryProxy {
 
   /**
    * The addresses it is safe to dial for a host, or null. Loopback is refused
-   * even as a literal, unlike the runner's proxy: a step reaches the loopback
-   * ports its policy grants directly, and through this proxy it would reach
-   * the ones its sandbox denies, such as the broker's.
+   * even as a literal, unlike the runner's proxy, which opens the broker's
+   * port: a step reaches its own VM's loopback directly, and through this
+   * proxy it would reach this Mac's.
    */
   private screen(host: string): Promise<string[] | null> {
     return screenAddresses(host, this.lookup, { allowLiteralLoopback: false });

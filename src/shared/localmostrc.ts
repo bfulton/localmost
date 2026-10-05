@@ -628,12 +628,12 @@ function validateStringArray(value: unknown, path: string, errors: ParseError[])
 }
 
 /**
- * A filesystem path from a policy, which is written verbatim into the
- * sandbox-exec profile - a quoted DSL. A quote or backslash could close or
- * escape the string, and a control character (a newline especially) could add
- * a rule of its own. None occurs in a real macOS path, so they are refused
- * rather than escaped-and-hoped: the user approves what a policy says, and it
- * must not be able to enforce something else.
+ * A filesystem path from a policy, which names what a job's macOS VM is to
+ * be given once VM shares exist. A quote, a backslash or a control character
+ * (a newline especially) occurs in no real macOS path, and could change what
+ * the line it is written into says, so they are refused rather than
+ * escaped-and-hoped: the user approves what a policy says, and it must not
+ * be able to grant something else.
  */
 function validatePathArray(value: unknown, path: string, errors: ParseError[]): void {
   validateStringArray(value, path, errors);
@@ -645,10 +645,9 @@ function validatePathArray(value: unknown, path: string, errors: ParseError[]): 
       errors.push({ message: `${path}[${i}] must not contain quotes, backslashes or control characters` });
     }
     // No ".." traversal. A relative path is a legitimate workspace path
-    // (./build, ./Pods), emitted into the profile and resolved from the
-    // worker's own directory - but a ".." segment could climb out of the
-    // workspace into the app's runner directory (proxy credentials, pids,
-    // other sandboxes), which the resolved-against-main-cwd filter would miss.
+    // (./build, ./Pods), resolved from the worker's own directory - but a ".."
+    // segment could climb out of the workspace into the app's runner
+    // directory (proxy credentials, pids, other workers').
     if (entry.split('/').includes('..')) {
       errors.push({ message: `${path}[${i}] must not contain ".." path segments` });
     }
