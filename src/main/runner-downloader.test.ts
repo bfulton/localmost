@@ -20,13 +20,14 @@ jest.mock('tar', () => ({
   extract: jest.fn().mockResolvedValue(undefined),
 }));
 
-// Mock process-sandbox - use jest.fn() inside the factory to avoid hoisting issues
-jest.mock('./process-sandbox', () => ({
-  spawnSandboxed: jest.fn(),
+// config.sh is spawned directly, under no sandbox: registration runs no workflow code.
+jest.mock('child_process', () => ({
+  ...jest.requireActual<typeof import('child_process')>('child_process'),
+  spawn: jest.fn(),
 }));
 
+import { spawn } from 'child_process';
 import { RunnerDownloader } from './runner-downloader';
-import { spawnSandboxed } from './process-sandbox';
 import { FALLBACK_RUNNER_VERSION } from '../shared/constants';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -296,7 +297,7 @@ describe('RunnerDownloader', () => {
       jest.spyOn(downloader, 'saveConfig').mockResolvedValue(undefined);
       jest.spyOn(downloader, 'configureForBrokerProxy').mockResolvedValue(undefined);
       (fs.existsSync as jest.Mock).mockReturnValue(true);
-      (spawnSandboxed as jest.Mock).mockImplementation(() => {
+      (spawn as jest.Mock).mockImplementation(() => {
         const proc = Object.assign(new EventEmitter(), { stdout: new EventEmitter(), stderr: new EventEmitter() });
         setImmediate(() => proc.emit('close', 0));
         return proc;
@@ -309,8 +310,10 @@ describe('RunnerDownloader', () => {
         labels: ['self-hosted'],
       });
 
-      const [script, args, options] = (spawnSandboxed as jest.Mock).mock.calls[0] as [string, string[], { env: NodeJS.ProcessEnv }];
+      const [script, args, options] = (spawn as jest.Mock).mock.calls[0] as [string, string[], { env: NodeJS.ProcessEnv; shell?: boolean }];
+      // config.sh itself, here on the Mac: not through sandbox-exec, nor a shell.
       expect(script).toBe(path.join(sandboxDir, 'config.sh'));
+      expect(options.shell).toBe(false);
       expect(args.join(' ')).not.toContain('REGISTRATION-TOKEN');
       expect(args).not.toContain('--token');
       expect(options.env.ACTIONS_RUNNER_INPUT_TOKEN).toBe('REGISTRATION-TOKEN');
@@ -330,7 +333,7 @@ describe('RunnerDownloader', () => {
       const removeSandbox = jest.spyOn(downloader, 'removeSandbox').mockResolvedValue(undefined);
       jest.spyOn(downloader, 'configureForBrokerProxy').mockResolvedValue(undefined);
       (fs.existsSync as jest.Mock).mockReturnValue(true);
-      (spawnSandboxed as jest.Mock).mockImplementation((_script: string, _args: string[], options: { cwd: string }) => {
+      (spawn as jest.Mock).mockImplementation((_script: string, _args: string[], options: { cwd: string }) => {
         expect(options.cwd).toBe(sandboxDir);
         const proc = Object.assign(new EventEmitter(), { stdout: new EventEmitter(), stderr: new EventEmitter() });
         setImmediate(() => proc.emit('close', code));
@@ -352,6 +355,18 @@ describe('RunnerDownloader', () => {
         expect(saveConfig).not.toHaveBeenCalled();
       }
       expect(removeSandbox).toHaveBeenCalledWith(sandboxDir);
+    });
+
+    it('refuses to run a config.sh outside the sandbox directory', async () => {
+      jest.spyOn(downloader, 'buildSandbox').mockResolvedValue('/tmp/elsewhere/1-0123456789ab');
+      jest.spyOn(downloader, 'removeSandbox').mockResolvedValue(undefined);
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (spawn as jest.Mock).mockClear();
+
+      await expect(
+        downloader.configureInstance(1, '2.336.0', { url: 'https://github.com/owner/repo', token: 't', name: 'n', labels: [] })
+      ).rejects.toThrow(/not a sandbox in/);
+      expect(spawn).not.toHaveBeenCalled();
     });
   });
 

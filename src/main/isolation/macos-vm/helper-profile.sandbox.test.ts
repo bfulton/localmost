@@ -27,8 +27,6 @@ import * as os from 'os';
 import * as path from 'path';
 import { buildMacVmProfile, MacVmProfileOptions } from './helper-profile';
 import { MACVM_HELPER_NAME } from './paths';
-import { JOB_BIN_DIR } from '../../job-shims';
-import { dockerOnPath } from '../../test-utils/vm-fixtures';
 
 const isMacOS = process.platform === 'darwin';
 const sq = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
@@ -185,40 +183,13 @@ if (!isMacOS) {
     });
   });
 } else {
-  describe("the macOS VM helper's profiles, from inside a localmost job", () => {
-    // The job's TMPDIR is <data>/runner/sandbox/<id>/_temp.
-    const sandbox = path.dirname(fs.realpathSync(os.tmpdir()));
-    const data = path.dirname(path.dirname(path.dirname(sandbox)));
-    const shell = (command: string) => {
-      const result = spawnSync('/bin/sh', ['-c', command], { encoding: 'utf-8', timeout: 15000 });
-      return { ok: result.status === 0, stderr: result.stderr };
-    };
-
-    it('runs where the app lays a job out', () => {
-      expect(path.basename(path.dirname(sandbox))).toBe('sandbox');
-      expect(path.basename(path.dirname(path.dirname(sandbox)))).toBe('runner');
-    });
-
-    it("cannot list <data>/macos-vm, where the helper's profiles grant the images and VMs", () => {
-      // Made with the first image; a denied path whose parent is missing
-      // fails with ENOENT, not EPERM, so either is a refusal here.
-      const root = path.join(data, 'macos-vm');
-      const listing = shell(`/bin/ls ${sq(root)}`);
-      expect(listing.ok).toBe(false);
-      expect(listing.stderr.includes('Operation not permitted') || !fs.existsSync(root)).toBe(true);
-    });
-
-    it('cannot run the macOS VM helper, which carries the virtualization entitlement', () => {
-      // Beside the bundled docker CLI's directory, in the bundle's
-      // Resources; the job profile denies its exec by path.
-      const { resolved, bundled } = dockerOnPath(process.env.PATH ?? '');
-      expect(resolved).toBeDefined();
-      expect(fs.realpathSync(path.dirname(resolved!))).toBe(path.join(sandbox, JOB_BIN_DIR));
-      expect(bundled).toBeDefined();
-      const helper = path.join(path.dirname(path.dirname(bundled!)), MACVM_HELPER_NAME);
-      const result = shell(`${sq(helper)} version`);
-      expect(result.ok).toBe(false);
-      expect(result.stderr.includes('Operation not permitted') || !fs.existsSync(helper)).toBe(true);
+  describe("the macOS VM helper's profiles through seatbelt", () => {
+    // Seatbelt jobs are gone: a job runs in a macOS VM, under no sandbox of
+    // localmost's, as the Mac's own runs do. Where a profile cannot be
+    // constructed something else confines this process, and these tests
+    // have to say so rather than pass on nothing.
+    it('can construct a seatbelt profile here, as on the Mac and in a macOS VM job', () => {
+      expect(canConstruct()).toBe(true);
     });
   });
 }

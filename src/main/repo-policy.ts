@@ -6,9 +6,42 @@
  * an unreviewed change cannot take effect through a race.
  */
 
-import { getEffectivePolicy, effectivePolicyLevel, LocalmostrcConfig } from '../shared/localmostrc';
+import { createHash } from 'crypto';
+import { getEffectivePolicy, effectivePolicyLevel, LocalmostrcConfig, SharedPolicy } from '../shared/localmostrc';
 import { spawnEnvPolicy } from './worker-env';
 import type { RepoPolicyRuntime } from './runner-manager';
+
+/**
+ * The identity of an approved policy, as a worker started under it is
+ * compared with the one in force when it claims its job: its network (the
+ * level and every section's hosts), Docker, the filesystem grants a VM will
+ * be given and the environment a worker gets. Taken over every section,
+ * each workflow's included, so it does not depend on which workflow a job
+ * turns out to be: the spawn's stamp, taken before the workflow is known,
+ * differs from the claim's only when the approved policy itself changed.
+ * Secrets are left out: they grant nothing a worker holds.
+ */
+export function policyStamp(approved: LocalmostrcConfig | null): string {
+  const section = (policy: SharedPolicy | undefined) => ({
+    network: { allow: policy?.network?.allow ?? [], deny: policy?.network?.deny ?? [] },
+    docker: policy?.docker ?? {},
+    filesystem: {
+      read: policy?.filesystem?.read ?? [],
+      write: policy?.filesystem?.write ?? [],
+      deny: policy?.filesystem?.deny ?? [],
+    },
+  });
+  const workflows = Object.keys(approved?.workflows ?? {})
+    .sort()
+    .map((name) => [name, section(approved?.workflows?.[name])]);
+  const identity = {
+    level: effectivePolicyLevel(approved),
+    shared: section(approved?.shared),
+    workflows,
+    env: approved ? spawnEnvPolicy(approved) : { allow: [], deny: [] },
+  };
+  return createHash('sha256').update(JSON.stringify(identity)).digest('hex');
+}
 
 /**
  * The runtime policy for a job of `workflowName` under `approved`, or the
@@ -16,6 +49,7 @@ import type { RepoPolicyRuntime } from './runner-manager';
  * the job's commit.
  */
 export function repoPolicyRuntime(approved: LocalmostrcConfig | null, workflowName: string): RepoPolicyRuntime {
+  const stamp = policyStamp(approved);
   if (!approved) {
     return {
       hosts: [],
@@ -25,6 +59,7 @@ export function repoPolicyRuntime(approved: LocalmostrcConfig | null, workflowNa
       writePaths: [],
       denyPaths: [],
       docker: {},
+      stamp,
     };
   }
   const policy = getEffectivePolicy(approved, workflowName);
@@ -35,23 +70,20 @@ export function repoPolicyRuntime(approved: LocalmostrcConfig | null, workflowNa
     // Denied hosts the same way: shared and the workflow's, merged.
     deniedHosts: policy.network?.deny || [],
     level: effectivePolicyLevel(approved),
-    // Filesystem comes from the shared section only. The sandbox profile
-    // is built before the workflow is known and cannot change afterwards,
-    // so a per-workflow filesystem section could not be applied - and
-    // resolving it here would differ between spawn and claim and read as
-    // policy drift.
+    // Filesystem comes from the shared section only: what a worker is given
+    // is fixed when it starts, before the workflow is known. A macOS VM job
+    // is given none of it yet; the runner names what it leaves out.
     readPaths: approved.shared?.filesystem?.read || [],
     writePaths: approved.shared?.filesystem?.write || [],
     denyPaths: approved.shared?.filesystem?.deny || [],
-    // Loopback is part of the profile too, and only shared: may declare it.
-    // An empty list opens nothing, so it is no declaration, as an empty list
-    // is none above; kept, it would change the spawn stamp and retire workers
-    // for a policy that grants the same.
+    // Declared, and named in the log as not given: a VM job reaches only its
+    // proxy and the broker. An empty list declares nothing.
     ...(loopback === true || (Array.isArray(loopback) && loopback.length > 0) ? { loopback } : {}),
     // Docker composes across shared and workflow: the socket is bound to
     // the merged policy when the job is claimed, after the workflow is known.
     docker: policy.docker ?? {},
-    // Fixed at spawn like the filesystem: see spawnEnvPolicy.
+    // Fixed at spawn: see spawnEnvPolicy.
     env: spawnEnvPolicy(approved),
+    stamp,
   };
 }

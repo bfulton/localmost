@@ -6,20 +6,22 @@
 
 import { RunnerManager } from '../runner-manager';
 import type { RunnerStatus } from '../../shared/types';
-import { ChildProcess } from 'child_process';
+import type { IsolationJob, WorkerHandle } from '../isolation/macos-vm/types';
 
 /**
  * Internal runner instance state (mirrors private type).
  */
 interface RunnerInstance {
-  /** Hash of the approved policy this worker's profile was built from. */
+  /** The stamp of the approved policy this worker was started under. */
   policyStamp?: string;
-  markerPath?: string;
+  /** This spawn's job as the macOS VM backend knows it. */
+  job?: IsolationJob;
+  sandboxDir?: string;
   /** The job this worker claimed, as the broker reported it. */
   claimedJob?: { repository: string; sha: string; workflow: string };
   /** Set once the worker is finalized and its proxy closed. */
   policySealed?: boolean;
-  process: ChildProcess | null;
+  worker: WorkerHandle | null;
   status: RunnerStatus;
   currentJob: {
     name: string;
@@ -90,7 +92,7 @@ export class RunnerManagerTestHelper {
    */
   setInstance(num: number, instance: Partial<RunnerInstance>): void {
     const full: RunnerInstance = {
-      process: null,
+      worker: null,
       status: 'offline',
       currentJob: null,
       name: `runner-${num}`,
@@ -205,7 +207,7 @@ export class RunnerManagerTestHelper {
   /**
    * Bring the pool up and start the worker for one admitted job, as the app
    * does: initialize, then admission's hand-off through 'next' to
-   * spawnWorkerForJob. Resolves to whether a worker process was started.
+   * spawnWorkerForJob. Resolves to whether a worker was started.
    */
   async spawnForJob(
     context: Parameters<RunnerManagerTestHelper['setPendingTargetContext']>[1] = {
@@ -225,11 +227,6 @@ export class RunnerManagerTestHelper {
   async startWorkerWithoutJob(instanceNum = 1): Promise<void> {
     await this.manager.initialize();
     await this.manager.startInstance(instanceNum);
-  }
-
-  /** Run the stale-process sweep that startup performs. */
-  async killStaleProcesses(): Promise<void> {
-    await (this.manager as never as { killStaleProcesses(): Promise<void> }).killStaleProcesses();
   }
 
   /** Seed the target context recorded when an instance is spawned for a job. */

@@ -261,8 +261,6 @@ describe('every key of config.yaml', () => {
       notifications: { notifyOnPause: true, notifyOnJobEvents: true },
       dockerVm: { cpus: 2, memoryMiB: 4096 },
       resourcePause: { runningJobs: 'stop' },
-      jobEnvironment: { toolShims: false, javaToolOptions: true, perJobTempDir: false, createMissingGrantedDirs: true, swiftBuildLinkTemp: false },
-      isolation: { allowed: [] },
     };
     fs.writeFileSync(configPath, yaml.dump(full));
     loadPersistedConfig();

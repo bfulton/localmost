@@ -1,9 +1,9 @@
 /**
- * IPC for the macOS VM mode's setup component: the golden image's status,
- * and building, cancelling, opening the guided setup and removing it. Only
- * the app's own window may ask (trusted-ipc). Nothing the renderer sends is
- * a path or an id: each handler takes no argument, and acts on the one image
- * the manager keeps. The wiring step registers it with the mode's manager
+ * IPC for the macOS VM's setup component: the golden image's status, and
+ * building, cancelling, opening the guided setup and removing it. Only the
+ * app's own window may ask (trusted-ipc). Nothing the renderer sends is a
+ * path or an id: each handler takes no argument, and acts on the one image
+ * the manager keeps. index.ts registers it with the mode's manager
  * (src/main/isolation/macos-vm/index.ts).
  */
 

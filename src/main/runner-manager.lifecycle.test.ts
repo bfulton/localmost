@@ -1,15 +1,12 @@
 /**
- * Runner lifecycle: reading the runner's output, cancelling a run, keeping
- * the job history, and sweeping a previous session's workers.
+ * Runner lifecycle: reading the runner's output, cancelling a run, and
+ * keeping the job history.
  *
  * Kept apart from runner-manager.test.ts so the mocks here can model a
  * little more of fs (an in-memory history file, rename) without touching the
  * shared setup.
  */
 
-jest.mock('./process-sandbox', () => ({
-  spawnSandboxed: jest.fn(),
-}));
 
 jest.mock('./runner-downloader', () => ({
   RunnerDownloader: jest.fn().mockImplementation(() => ({
@@ -17,8 +14,6 @@ jest.mock('./runner-downloader', () => ({
     getArcDir: jest.fn().mockReturnValue('/Users/test/.localmost/runner/arc/v2.330.0'),
     getConfigDir: jest.fn().mockImplementation((instance: number) => `/Users/test/.localmost/runner/config/${instance}`),
     removeSandbox: jest.fn().mockResolvedValue(undefined),
-    getToolCacheDir: jest.fn().mockImplementation((targetId: string) => `/Users/test/.localmost/runner/caches/${targetId}/tool-cache`),
-    getTargetCacheDir: jest.fn().mockImplementation((targetId: string) => `/Users/test/.localmost/runner/caches/${targetId}`),
     writeShareNonce: jest.fn(() => "a".repeat(32)),
     buildSandbox: jest.fn().mockImplementation((instance: number) => Promise.resolve(`/Users/test/.localmost/runner/sandbox/${instance}`)),
     isDownloaded: jest.fn().mockReturnValue(true),
@@ -49,23 +44,6 @@ jest.mock('./proxy-server', () => ({
   })),
 }));
 
-// The sweep by profile mark runs python; stubbed, as nothing here runs sandboxed.
-jest.mock('../shared/sandbox-reaper', () => ({
-  reapMarkedProcessesAsync: jest.fn(async () => []),
-  developerPython: jest.fn(async () => null),
-}));
-
-// Start times: the one recorded at spawn is 'START'. mockLookUpStartTime is
-// what a lookup made at escalation time sees; mayEscalate is the real rule.
-const mockLookUpStartTime = jest.fn((_pid: number): string | null | undefined => 'START');
-jest.mock('./runner-cleanup', () => ({
-  processStartTime: jest.fn(() => 'START'),
-  lookUpStartTime: (pid: number) => mockLookUpStartTime(pid),
-  mayEscalate: jest.requireActual('./runner-cleanup').mayEscalate,
-  markerHolders: jest.fn(() => []),
-  signalOrphanPids: jest.fn(async () => ({ signalled: false, remaining: [] })),
-  parsePidRecord: jest.requireActual('./runner-cleanup').parsePidRecord,
-}));
 
 jest.mock('./docker/docker-filter-proxy', () => ({
   DockerFilterProxy: jest.fn().mockImplementation((options: unknown) => {
@@ -90,8 +68,6 @@ jest.mock('fs', () => ({
   unlinkSync: jest.fn(),
   readdirSync: jest.fn(() => []),
   mkdirSync: jest.fn(),
-  openSync: jest.fn(() => 42),
-  closeSync: jest.fn(),
   promises: {
     mkdir: jest.fn(),
     chmod: jest.fn(),
@@ -104,14 +80,18 @@ jest.mock('fs', () => ({
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { RunnerManager, JobEvent, lineReader, UNCLAIMED_WORKER_TIMEOUT_MS } from './runner-manager';
+import { RunnerManager, JobEvent, UNCLAIMED_WORKER_TIMEOUT_MS } from './runner-manager';
 import { ProxyServer } from './proxy-server';
-import { spawnSandboxed } from './process-sandbox';
 import { getJobHistoryPath } from './paths';
 import { GitHubClientError } from './github-client';
-import { createMockProcess, RunnerManagerTestHelper } from './test-utils';
+import { createMockWorker, fakeIsolation, type FakeIsolation, type MockWorker, RunnerManagerTestHelper } from './test-utils';
 
-const mockSpawnSandboxed = spawnSandboxed as jest.MockedFunction<typeof spawnSandboxed>;
+/** The macOS VM backend every manager here runs its workers on; a new one for each test. */
+let isolation: FakeIsolation;
+beforeEach(() => {
+  isolation = fakeIsolation();
+});
+
 
 /** Let fire-and-forget work (output parsing, the backstop) settle. */
 const settle = async (): Promise<void> => {
@@ -133,31 +113,19 @@ function fakeTimersFor(): void {
   });
 }
 
-/** Run to completion something that waits on (fake) timers along the way. */
-async function withTimers<T>(work: Promise<T>): Promise<T> {
-  let done = false;
-  const result = work.finally(() => {
-    done = true;
-  });
-  while (!done) await jest.advanceTimersByTimeAsync(1000);
-  return result;
-}
-
-/** Replace process.kill for the duration of a test, recording every call. */
-function stubKill(impl: (pid: number, sig?: string | number) => boolean = () => true) {
-  const calls: Array<[number, string | number | undefined]> = [];
-  const realKill = process.kill;
-  (process as unknown as { kill: unknown }).kill = ((pid: number, sig?: string | number) => {
-    calls.push([pid, sig]);
-    return impl(pid, sig);
-  }) as never;
-  return { calls, restore: () => { (process as unknown as { kill: unknown }).kill = realKill; } };
+/**
+ * What a worker hands over for `text`: one event per line, as the guest
+ * agent splits the runner's output on \n.
+ */
+function out(worker: MockWorker, text: string, stream: 'stdout' | 'stderr' = 'stdout'): void {
+  for (const line of text.split('\n')) if (line) worker.emit(stream, line);
 }
 
 function newManager(overrides: Partial<ConstructorParameters<typeof RunnerManager>[0]> = {}) {
   const events: JobEvent[] = [];
   const onLog = jest.fn();
   const manager = new RunnerManager({
+    isolation,
     onLog,
     onStatusChange: jest.fn(),
     onJobHistoryUpdate: jest.fn(),
@@ -169,8 +137,6 @@ function newManager(overrides: Partial<ConstructorParameters<typeof RunnerManage
 
 beforeEach(() => {
   jest.clearAllMocks();
-  mockLookUpStartTime.mockReset();
-  mockLookUpStartTime.mockImplementation(() => 'START');
   (fs.existsSync as jest.Mock).mockReturnValue(false);
   (fs.readFileSync as jest.Mock).mockReturnValue('{}');
   (fs.writeFileSync as jest.Mock).mockReset();
@@ -370,8 +336,8 @@ describe('reading a job start whatever its name holds', () => {
     const ctx = newManager({ onReregistrationNeeded });
     ctx.helper.runnerCount = 1;
     (fs.existsSync as jest.Mock).mockReturnValue(true);
-    const proc = createMockProcess(24680);
-    mockSpawnSandboxed.mockReturnValue(proc);
+    const proc = createMockWorker(24680);
+    isolation.spawnWorker.mockResolvedValue(proc);
     await ctx.helper.spawnForJob();
     ctx.helper.instances.get(1)!.status = 'listening';
     return { ...ctx, proc, onReregistrationNeeded };
@@ -381,15 +347,12 @@ describe('reading a job start whatever its name holds', () => {
     ['a CR', 'x\rz', 'x\rz'],
     ['U+2028', 'x\u2028z', 'x\u2028z'],
     ['U+2029', 'x\u2029z', 'x\u2029z'],
-    // Too long to read as a line; the runner never writes one that long, so
-    // before its job only the job's own start line can be.
-    ['70 KiB', 'x'.repeat(70 * 1024), expect.stringMatching(/too long/)],
   ])('a job whose name carries %s before a re-configure line is recorded and does not re-register', async (_label, name, recorded) => {
     // Only \n ends a line; any other separator the name holds is part of
     // the start line, and what follows the name's own \n is the job's.
     const { manager, helper, proc, events, onReregistrationNeeded } = await spawned();
 
-    proc.stdout!.emit('data', Buffer.from(`${TS}Running job: ${name}\n${REREGISTER}\n${TS}Runner connect error: y\n`));
+    out(proc, `${TS}Running job: ${name}\n${REREGISTER}\n${TS}Runner connect error: y\n`);
     await settle();
 
     const instance = helper.instances.get(1)!;
@@ -403,9 +366,9 @@ describe('reading a job start whatever its name holds', () => {
 
   it("closes a job whose name carries a CR with the result of the runner's completion line", async () => {
     const { manager, proc, events } = await spawned();
-    proc.stdout!.emit('data', Buffer.from(`${TS}Running job: x\rz\n`));
+    out(proc, `${TS}Running job: x\rz\n`);
 
-    proc.stdout!.emit('data', Buffer.from(`${TS}Job x\rz completed with result: Failed\n`));
+    out(proc, `${TS}Job x\rz completed with result: Failed\n`);
     proc.emit('exit', 0, null);
     await settle();
 
@@ -418,13 +381,11 @@ describe('reading a job start whatever its name holds', () => {
   it.each([
     // The completion line is split at the name's \n, and neither half is one.
     ['a \\n', 'x\nJob', 'x'],
-    // The completion line is as long as the start was, and skipped the same.
-    ['70 KiB', 'x'.repeat(70 * 1024), expect.stringMatching(/too long/)],
   ])('closes the job whose name carries %s when its worker exits, though its completion line went unread', async (_label, name, recorded) => {
     const { manager, proc, events } = await spawned();
 
-    proc.stdout!.emit('data', Buffer.from(`${TS}Running job: ${name}\n`));
-    proc.stdout!.emit('data', Buffer.from(`${TS}Job ${name} completed with result: Succeeded\n`));
+    out(proc, `${TS}Running job: ${name}\n`);
+    out(proc, `${TS}Job ${name} completed with result: Succeeded\n`);
     proc.emit('exit', 0, null);
     await settle();
 
@@ -448,8 +409,8 @@ describe('reading a job start whatever its name holds', () => {
     const ctx = newManager(getJobConclusion ? { getJobConclusion } : {});
     ctx.helper.runnerCount = 1;
     (fs.existsSync as jest.Mock).mockReturnValue(true);
-    const proc = createMockProcess(24695);
-    mockSpawnSandboxed.mockReturnValue(proc);
+    const proc = createMockWorker(24695);
+    isolation.spawnWorker.mockResolvedValue(proc);
     await ctx.helper.spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubJobId: 7 });
     ctx.helper.instances.get(1)!.status = 'listening';
     return { ...ctx, proc };
@@ -461,7 +422,7 @@ describe('reading a job start whatever its name holds', () => {
     const getJobConclusion = jest.fn(async () => conclusion);
     const { manager, helper, proc, events } = await spawnedWithLookup(getJobConclusion);
 
-    proc.stdout!.emit('data', Buffer.from(`${TS}Running job: ${name}\n`));
+    out(proc, `${TS}Running job: ${name}\n`);
     await settle();
 
     // Still the job's: busy, its slot held and Cancel offered.
@@ -473,7 +434,7 @@ describe('reading a job start whatever its name holds', () => {
     expect(manager.hasAvailableSlot()).toBe(false);
 
     // The runner's own line, split the same way, then the worker's exit.
-    proc.stdout!.emit('data', Buffer.from(`${TS}Job ${name} completed with result: Failed\n`));
+    out(proc, `${TS}Job ${name} completed with result: Failed\n`);
     await settle();
     expect(helper.instances.get(1)!.status).toBe('busy');
     conclusion = 'failure';
@@ -495,12 +456,12 @@ describe('reading a job start whatever its name holds', () => {
       for (const getJobConclusion of [undefined, jest.fn(async () => null)]) {
         const { manager, helper, proc, events } = await spawnedWithLookup(getJobConclusion);
 
-        proc.stdout!.emit('data', Buffer.from(`${TS}Running job: ${name}\n`));
+        out(proc, `${TS}Running job: ${name}\n`);
         await settle();
         expect(helper.instances.get(1)!.status).toBe('busy');
         expect(manager.getJobHistory().map((j) => j.status)).toEqual(['running']);
 
-        proc.stdout!.emit('data', Buffer.from(`${TS}Job ${name} completed with result: Failed\n`));
+        out(proc, `${TS}Job ${name} completed with result: Failed\n`);
         proc.emit('exit', 0, null);
         await settle();
 
@@ -518,7 +479,7 @@ describe('reading a job start whatever its name holds', () => {
     // crashed or was killed mid-job says the rest itself.
     const { manager, proc } = await spawnedWithLookup(jest.fn(async () => null));
 
-    proc.stdout!.emit('data', Buffer.from(`${TS}Running job: a\nJob a completed with result: Succeeded\n`));
+    out(proc, `${TS}Running job: a\nJob a completed with result: Succeeded\n`);
     await settle();
     proc.emit('exit', code, signal);
     await settle();
@@ -538,8 +499,8 @@ describe('reading a job start whatever its name holds', () => {
       const name = `a\nJob a completed with result: ${forged}\n`;
       const { manager, helper, proc, events } = await spawnedWithLookup(jest.fn(async () => conclusion));
 
-      proc.stdout!.emit('data', Buffer.from(`${TS}Running job: ${name}\n`));
-      proc.stdout!.emit('data', Buffer.from(`${TS}Job ${name} completed with result: ${conclusion === 'success' ? 'Succeeded' : 'Failed'}\n`));
+      out(proc, `${TS}Running job: ${name}\n`);
+      out(proc, `${TS}Job ${name} completed with result: ${conclusion === 'success' ? 'Succeeded' : 'Failed'}\n`);
       await settle();
       expect(helper.instances.get(1)!.currentJob!.runnerResult).toBe(forged === 'Succeeded' ? 'completed' : 'failed');
       proc.emit('exit', 0, null);
@@ -565,12 +526,12 @@ describe('reading a job start whatever its name holds', () => {
     const { manager, helper } = newManager({ getJobConclusion });
     helper.runnerCount = 1;
     (fs.existsSync as jest.Mock).mockReturnValue(true);
-    const worker = createMockProcess(24690);
-    mockSpawnSandboxed.mockReturnValue(worker);
+    const worker = createMockWorker(24690);
+    isolation.spawnWorker.mockResolvedValue(worker);
     await helper.spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubJobId: 7 });
     helper.instances.get(1)!.status = 'listening';
 
-    worker.stdout!.emit('data', Buffer.from(`${TS}Running job: build\n`));
+    out(worker, `${TS}Running job: build\n`);
     await settle();
     worker.emit('exit', code, signal);
     await settle();
@@ -582,17 +543,14 @@ describe('reading a job start whatever its name holds', () => {
   it('closes a job as cancelled when the pool is stopped under it, though its worker exits cleanly', async () => {
     // The Listener handles SIGTERM and exits 0: a clean exit here is the stop.
     const { manager, proc } = await spawned();
-    // Still running, as stop() reads it.
-    (proc as unknown as { exitCode: number | null }).exitCode = null;
-    const kill = stubKill();
     jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] });
     try {
-      proc.stdout!.emit('data', Buffer.from(`${TS}Running job: build\n`));
+      out(proc, `${TS}Running job: build\n`);
       await settle();
 
       const stopped = manager.stop();
       await settle();
-      expect(kill.calls).toContainEqual([-24680, 'SIGTERM']);
+      expect(isolation.signal).toHaveBeenCalledWith(expect.anything(), 'SIGTERM');
       proc.emit('exit', 0, null);
       await stopped;
       await settle();
@@ -601,7 +559,6 @@ describe('reading a job start whatever its name holds', () => {
     } finally {
       jest.clearAllTimers();
       jest.useRealTimers();
-      kill.restore();
     }
   });
 });
@@ -616,24 +573,18 @@ describe('a worker started with no job', () => {
     const { manager, helper } = newManager();
     helper.runnerCount = 1;
     (fs.existsSync as jest.Mock).mockReturnValue(true);
-    const proc = createMockProcess(24700);
-    mockSpawnSandboxed.mockReturnValue(proc);
-    const kill = stubKill(() => {
-      throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
-    });
-    try {
-      await helper.startWorkerWithoutJob(1);
-      proc.stdout!.emit('data', Buffer.from('2026-09-29 12:00:00Z: Listening for Jobs\n'));
-      await settle();
-      expect(manager.hasAvailableSlot()).toBe(false);
+    const proc = createMockWorker(24700);
+    isolation.spawnWorker.mockResolvedValue(proc);
+    await helper.startWorkerWithoutJob(1);
+    out(proc, '2026-09-29 12:00:00Z: Listening for Jobs\n');
+    await settle();
+    expect(manager.hasAvailableSlot()).toBe(false);
 
-      await jest.advanceTimersByTimeAsync(UNCLAIMED_WORKER_TIMEOUT_MS);
+    await jest.advanceTimersByTimeAsync(UNCLAIMED_WORKER_TIMEOUT_MS);
 
-      expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
-      expect(manager.hasAvailableSlot()).toBe(true);
-    } finally {
-      kill.restore();
-    }
+    // Its VM goes with the slot, the listener in it.
+    expect(isolation.release).toHaveBeenCalled();
+    expect(manager.hasAvailableSlot()).toBe(true);
   });
 });
 
@@ -662,160 +613,53 @@ describe("recording an organization target's job", () => {
   });
 });
 
-describe("splitting a worker's output into lines", () => {
+describe("a worker's output after its exit", () => {
   async function spawned() {
     const ctx = newManager();
     (fs.existsSync as jest.Mock).mockReturnValue(true);
-    const proc = createMockProcess(24680);
-    mockSpawnSandboxed.mockReturnValue(proc);
+    const proc = createMockWorker(24680);
+    isolation.spawnWorker.mockResolvedValue(proc);
     await ctx.helper.spawnForJob();
     ctx.helper.instances.get(1)!.status = 'listening';
     return { ...ctx, proc };
   }
   const started = (events: JobEvent[]) => events.filter((e) => e.type === 'started').map((e) => e.jobName);
 
-  it('parses a line split across chunks once, whole', async () => {
-    const { proc, events } = await spawned();
-
-    proc.stdout!.emit('data', Buffer.from('2026-09-29 12:00:00Z: Running jo'));
-    proc.stdout!.emit('data', Buffer.from('b: build\n'));
-    await settle();
-
-    expect(started(events)).toEqual(['build']);
-  });
-
-  it('does not read the tail of a split line as a line of its own', async () => {
-    // The job's own output, split by the pipe mid-line: the second chunk
-    // alone starts with the completion phrase, but the line does not.
-    const { helper, proc, events } = await spawned();
-    proc.stdout!.emit('data', Buffer.from('Running job: build\n'));
-    await settle();
-
-    proc.stdout!.emit('data', Buffer.from('step output: '));
-    proc.stdout!.emit('data', Buffer.from('Job build completed with result: Succeeded\n'));
-    await settle();
-
-    expect(helper.instances.get(1)!.currentJob).not.toBeNull();
-    expect(events.filter((e) => e.type === 'completed')).toEqual([]);
-  });
-
-  it('keeps stdout and stderr lines apart, decodes characters split across chunks, and reads a last unterminated line at end of stream', async () => {
-    const { proc, events } = await spawned();
-    const name = Buffer.from('Running job: bük');
-    // 'ü' is two bytes; split between them.
-    const cut = name.indexOf(0xc3) + 1;
-
-    proc.stdout!.emit('data', name.subarray(0, cut));
-    proc.stderr!.emit('data', Buffer.from('some warning\n'));
-    proc.stdout!.emit('data', name.subarray(cut));
-    await settle();
-    expect(started(events)).toEqual([]);
-
-    proc.stdout!.emit('end');
-    await settle();
-    expect(started(events)).toEqual(['bük']);
-  });
-
-  it('does not parse a line too long to be the runner\'s, nor its tail', async () => {
-    // Buffering to the next newline without bound would let a job that never
-    // prints one grow the app's memory for as long as it likes.
-    // (Before the job, a line this long is taken as its start: see "a job
-    // whose name carries 70 KiB".)
-    const { helper, proc, events } = await spawned();
-    proc.stdout!.emit('data', Buffer.from('Running job: build\n'));
-    await settle();
-
-    proc.stdout!.emit('data', Buffer.from('x'.repeat(70 * 1024)));
-    proc.stdout!.emit('data', Buffer.from('Job build completed with result: Failed\n'));
-    await settle();
-    expect(helper.instances.get(1)!.currentJob!.runnerResult).toBeUndefined();
-    expect(events.filter((e) => e.type === 'completed')).toEqual([]);
-
-    // The next line is read normally.
-    proc.stdout!.emit('data', Buffer.from('Job build completed with result: Failed\n'));
-    await settle();
-    expect(helper.instances.get(1)!.currentJob!.runnerResult).toBe('failed');
-    expect(started(events)).toEqual(['build']);
-  });
-
-  it('gives a line up as soon as it is too long, not when it finally ends', () => {
-    // What it holds is what it has not given up: a line that has passed the
-    // limit must be let go of then, however much more of it follows.
-    const lines: string[] = [];
-    const onSkipped = jest.fn();
-    const reader = lineReader((line) => lines.push(line), onSkipped);
-
-    reader.write('x'.repeat(40 * 1024));
-    expect(onSkipped).not.toHaveBeenCalled();
-    reader.write('x'.repeat(40 * 1024));
-    expect(onSkipped).toHaveBeenCalledTimes(1);
-    reader.write('x'.repeat(1024 * 1024));
-    reader.write('tail\nnext\n');
-
-    expect(onSkipped).toHaveBeenCalledTimes(1);
-    expect(lines).toEqual(['next']);
-  });
-
-  it("does not read an exited worker's last output against the worker that replaced it", async () => {
-    // A pipe's last data and its end can come after the process's exit, by
-    // which time a new spawn may hold the slot. The dead worker's line is
-    // not the new one's: read there, it would start a job on it.
+  it("is not read against the worker that replaced it", async () => {
+    // A worker's last lines can come after its exit, by which time a new
+    // spawn may hold the slot. The dead worker's line is not the new one's:
+    // read there, it would start a job on it.
     const { helper, proc, events } = await spawned();
     proc.emit('exit', 0, null);
     await settle();
-    const next = createMockProcess(24681);
-    mockSpawnSandboxed.mockReturnValue(next);
+    const next = createMockWorker(24681);
+    isolation.spawnWorker.mockResolvedValue(next);
     await helper.spawnForJob();
-    expect(helper.instances.get(1)!.process).toBe(next);
+    expect(helper.instances.get(1)!.worker).toBe(next);
     helper.instances.get(1)!.status = 'listening';
 
-    proc.stdout!.emit('data', Buffer.from('Running job: phantom'));
-    proc.stdout!.emit('end');
+    out(proc, 'Running job: phantom');
     await settle();
 
     expect(started(events)).toEqual([]);
     expect(helper.instances.get(1)!.currentJob).toBeNull();
 
     // The new worker's own output is read as ever.
-    next.stdout!.emit('data', Buffer.from('Running job: build\n'));
+    out(next, 'Running job: build\n');
     await settle();
     expect(started(events)).toEqual(['build']);
   });
 
-  it("does not take an exited worker's last over-long line as the start of the worker that replaced it", async () => {
-    // Taken there, the new worker would read as having its job: its deadline
-    // disarmed, its status no longer read, and its real start ignored.
-    const { manager, helper, proc, events } = await spawned();
-    proc.emit('exit', 0, null);
-    await settle();
-    const next = createMockProcess(24681);
-    mockSpawnSandboxed.mockReturnValue(next);
-    await helper.spawnForJob();
-    helper.instances.get(1)!.status = 'listening';
-
-    proc.stdout!.emit('data', Buffer.from('x'.repeat(70 * 1024)));
-    proc.stdout!.emit('end');
-    await settle();
-
-    const instance = helper.instances.get(1)!;
-    expect(instance.process).toBe(next);
-    expect(instance.currentJob).toBeNull();
-    expect(instance.status).toBe('listening');
-    expect(started(events)).toEqual([]);
-    expect((manager as never as { acquireDeadlines: Map<number, unknown> }).acquireDeadlines.has(1)).toBe(true);
-  });
-
-  it('takes an over-long line as the job start only on stdout, where the runner writes it', async () => {
+  it('keeps stdout and stderr apart, reading a start only where the runner writes it', async () => {
     const { helper, proc, events } = await spawned();
 
-    proc.stderr!.emit('data', Buffer.from(`${'x'.repeat(70 * 1024)}\n`));
+    out(proc, 'some warning', 'stderr');
     await settle();
     expect(helper.instances.get(1)!.currentJob).toBeNull();
-    expect(started(events)).toEqual([]);
 
-    proc.stdout!.emit('data', Buffer.from('Running job: build\n'));
+    out(proc, 'Running job: bük');
     await settle();
-    expect(started(events)).toEqual(['build']);
+    expect(started(events)).toEqual(['bük']);
   });
 });
 
@@ -931,8 +775,8 @@ describe('the job-start backstop', () => {
   ) {
     const ctx = newManager({ ...filterOverrides, cancelWorkflowRun, ...overrides });
     (fs.existsSync as jest.Mock).mockReturnValue(true);
-    const proc = createMockProcess(13579);
-    mockSpawnSandboxed.mockReturnValue(proc);
+    const proc = createMockWorker(13579);
+    isolation.spawnWorker.mockResolvedValue(proc);
     await ctx.helper.spawnForJob({
       targetId: 't1', targetDisplayName: 'owner/repo', githubRunId: 42, githubActor: 'stranger', ...context,
     } as never);
@@ -946,34 +790,29 @@ describe('the job-start backstop', () => {
     ['succeeds', 'exits cleanly', ok, [0, null]],
   ] as const)('stops the worker when the cancel %s; when it %s, the exit finalizes it', async (how, _exit, cancel, exitArgs) => {
     const { helper, manager, proc, events } = await claimed(cancel);
-    const kill = stubKill();
-    try {
-      proc.stdout!.emit('data', Buffer.from('Running job: build\n'));
-      await settle();
+    out(proc, 'Running job: build\n');
+    await settle();
 
-      expect(kill.calls).toContainEqual([-13579, 'SIGTERM']);
-      expect(entryOf(manager).error).toContain(refusal);
-      if (how === 'fails') {
-        expect(entryOf(manager).error).toContain('cancel failed: HTTP 500');
-        expect(events).toContainEqual(expect.objectContaining({ type: 'cancel-failed' }));
-      }
-
-      // The worker exits on the SIGTERM; its exit finalizes the slot as for
-      // any other exit, sealing its proxy.
-      const proxy = (ProxyServer as unknown as jest.Mock).mock.results.at(-1)!.value;
-      const rotations = proxy.rotateAuthToken.mock.calls.length;
-      proc.emit('exit', ...exitArgs);
-      await settle();
-      expect(proxy.rotateAuthToken.mock.calls.length).toBeGreaterThan(rotations);
-      expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith([]);
-
-      // Not left 'running' forever: the job was stopped.
-      expect(entryOf(manager).status).toBe('cancelled');
-      expect(helper.instances.get(1)?.currentJob ?? null).toBeNull();
-      if (exitArgs[0] === 0) expect(helper.instances.has(1)).toBe(false);
-    } finally {
-      kill.restore();
+    expect(isolation.signal).toHaveBeenCalledWith(expect.anything(), 'SIGTERM');
+    expect(entryOf(manager).error).toContain(refusal);
+    if (how === 'fails') {
+      expect(entryOf(manager).error).toContain('cancel failed: HTTP 500');
+      expect(events).toContainEqual(expect.objectContaining({ type: 'cancel-failed' }));
     }
+
+    // The worker exits on the SIGTERM; its exit finalizes the slot as for
+    // any other exit, sealing its proxy.
+    const proxy = (ProxyServer as unknown as jest.Mock).mock.results.at(-1)!.value;
+    const rotations = proxy.rotateAuthToken.mock.calls.length;
+    proc.emit('exit', ...exitArgs);
+    await settle();
+    expect(proxy.rotateAuthToken.mock.calls.length).toBeGreaterThan(rotations);
+    expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith([]);
+
+    // Not left 'running' forever: the job was stopped.
+    expect(entryOf(manager).status).toBe('cancelled');
+    expect(helper.instances.get(1)?.currentJob ?? null).toBeNull();
+    if (exitArgs[0] === 0) expect(helper.instances.has(1)).toBe(false);
   });
 
   it('stops the worker of a job with no run to cancel, and says the cancel could not be made', async () => {
@@ -981,22 +820,17 @@ describe('the job-start backstop', () => {
     // need one to judge it.
     const cancelWorkflowRun = jest.fn(ok);
     const { manager, proc, events } = await claimed(cancelWorkflowRun, { githubRunId: undefined });
-    const kill = stubKill();
-    try {
-      proc.stdout!.emit('data', Buffer.from('Running job: build\n'));
-      await settle();
+    out(proc, 'Running job: build\n');
+    await settle();
 
-      expect(kill.calls).toContainEqual([-13579, 'SIGTERM']);
-      expect(cancelWorkflowRun).not.toHaveBeenCalled();
-      expect(entryOf(manager).error).toBe(`${refusal}; cancel failed: no workflow run id`);
-      expect(events).toContainEqual(expect.objectContaining({ type: 'cancel-failed' }));
+    expect(isolation.signal).toHaveBeenCalledWith(expect.anything(), 'SIGTERM');
+    expect(cancelWorkflowRun).not.toHaveBeenCalled();
+    expect(entryOf(manager).error).toBe(`${refusal}; cancel failed: no workflow run id`);
+    expect(events).toContainEqual(expect.objectContaining({ type: 'cancel-failed' }));
 
-      proc.emit('exit', null, 'SIGTERM');
-      await settle();
-      expect(entryOf(manager).status).toBe('cancelled');
-    } finally {
-      kill.restore();
-    }
+    proc.emit('exit', null, 'SIGTERM');
+    await settle();
+    expect(entryOf(manager).status).toBe('cancelled');
   });
 
   it('keeps the job cancelled when its worker wrote a completion line and the lookup on exit is still out', async () => {
@@ -1006,25 +840,20 @@ describe('the job-start backstop', () => {
     let conclude: (conclusion: string | null) => void = () => undefined;
     const getJobConclusion = jest.fn(() => new Promise<string | null>((resolve) => { conclude = resolve; }));
     const { manager, proc, events } = await claimed(ok, { githubJobId: 7 }, { getJobConclusion });
-    const kill = stubKill();
-    try {
-      proc.stdout!.emit('data', Buffer.from('Running job: build\n'));
-      await settle();
-      proc.stdout!.emit('data', Buffer.from('Job build completed with result: Canceled\n'));
-      await settle();
-      proc.emit('exit', 0, null);
-      await settle();
-      expect(getJobConclusion).toHaveBeenCalled();
-      expect(entryOf(manager).status).toBe('cancelled');
+    out(proc, 'Running job: build\n');
+    await settle();
+    out(proc, 'Job build completed with result: Canceled\n');
+    await settle();
+    proc.emit('exit', 0, null);
+    await settle();
+    expect(getJobConclusion).toHaveBeenCalled();
+    expect(entryOf(manager).status).toBe('cancelled');
 
-      conclude('success');
-      await settle();
+    conclude('success');
+    await settle();
 
-      expect(entryOf(manager).status).toBe('cancelled');
-      expect(events.filter((e) => e.type === 'completed' && e.jobName === 'build')).toHaveLength(1);
-    } finally {
-      kill.restore();
-    }
+    expect(entryOf(manager).status).toBe('cancelled');
+    expect(events.filter((e) => e.type === 'completed' && e.jobName === 'build')).toHaveLength(1);
   });
 
   it('keeps the job cancelled when its worker exits with no completion line and the lookup on exit is still out', async () => {
@@ -1033,60 +862,45 @@ describe('the job-start backstop', () => {
     let conclude: (conclusion: string | null) => void = () => undefined;
     const getJobConclusion = jest.fn(() => new Promise<string | null>((resolve) => { conclude = resolve; }));
     const { manager, proc, events } = await claimed(ok, { githubJobId: 7 }, { getJobConclusion });
-    const kill = stubKill();
-    try {
-      proc.stdout!.emit('data', Buffer.from('Running job: build\n'));
-      await settle();
-      expect(kill.calls).toContainEqual([-13579, 'SIGTERM']);
-      proc.emit('exit', 0, null);
-      await settle();
-      expect(getJobConclusion).toHaveBeenCalled();
-      expect(entryOf(manager).status).toBe('cancelled');
+    out(proc, 'Running job: build\n');
+    await settle();
+    expect(isolation.signal).toHaveBeenCalledWith(expect.anything(), 'SIGTERM');
+    proc.emit('exit', 0, null);
+    await settle();
+    expect(getJobConclusion).toHaveBeenCalled();
+    expect(entryOf(manager).status).toBe('cancelled');
 
-      conclude('success');
-      await settle();
+    conclude('success');
+    await settle();
 
-      expect(entryOf(manager).status).toBe('cancelled');
-      expect(events.filter((e) => e.type === 'completed' && e.jobName === 'build')).toHaveLength(1);
-    } finally {
-      kill.restore();
-    }
+    expect(entryOf(manager).status).toBe('cancelled');
+    expect(events.filter((e) => e.type === 'completed' && e.jobName === 'build')).toHaveLength(1);
   });
 
   it('closes a refused job as cancelled even when it printed a completion line of its own first', async () => {
     // A step can print a whole line of its own; one that reads as the job's
     // end must not leave the refusal recorded as a success.
     const { manager, proc } = await claimed(ok);
-    const kill = stubKill();
-    try {
-      proc.stdout!.emit('data', Buffer.from('Running job: build\nJob build completed with result: Succeeded\n'));
-      await settle();
-      expect(kill.calls).toContainEqual([-13579, 'SIGTERM']);
-      proc.emit('exit', null, 'SIGTERM');
-      await settle();
+    out(proc, 'Running job: build\nJob build completed with result: Succeeded\n');
+    await settle();
+    expect(isolation.signal).toHaveBeenCalledWith(expect.anything(), 'SIGTERM');
+    proc.emit('exit', null, 'SIGTERM');
+    await settle();
 
-      expect(entryOf(manager)).toEqual(expect.objectContaining({ status: 'cancelled', error: refusal }));
-    } finally {
-      kill.restore();
-    }
+    expect(entryOf(manager)).toEqual(expect.objectContaining({ status: 'cancelled', error: refusal }));
   });
 
   it('does not stop a worker that replaced the refused one during the check, and still closes the refused job', async () => {
     const { helper, manager, proc } = await claimed(ok);
-    const kill = stubKill();
-    try {
-      // The start line sets the backstop going; it awaits the filter. While
-      // it does, the refused worker exits and a new spawn takes the slot.
-      proc.stdout!.emit('data', Buffer.from('Running job: build\n'));
-      helper.setInstance(1, { name: 'runner-1', status: 'busy', process: createMockProcess(97531) });
-      await settle();
+    // The start line sets the backstop going; it awaits the filter. While
+    // it does, the refused worker exits and a new spawn takes the slot.
+    out(proc, 'Running job: build\n');
+    helper.setInstance(1, { name: 'runner-1', status: 'busy', worker: createMockWorker(97531) });
+    await settle();
 
-      expect(kill.calls.filter(([, sig]) => sig !== 0)).toEqual([]);
-      // Its history says why it ended, and does not say it is still running.
-      expect(entryOf(manager)).toEqual(expect.objectContaining({ status: 'cancelled', error: refusal }));
-    } finally {
-      kill.restore();
-    }
+    expect(isolation.signal).not.toHaveBeenCalled();
+    // Its history says why it ended, and does not say it is still running.
+    expect(entryOf(manager)).toEqual(expect.objectContaining({ status: 'cancelled', error: refusal }));
   });
 });
 
@@ -1166,69 +980,5 @@ describe('saving the job history', () => {
     newManager();
 
     expect([...files.keys()].sort()).toEqual([...others].sort());
-  });
-});
-
-describe("sweeping a previous session's workers", () => {
-  fakeTimersFor();
-
-  function pidRecord(contents: string) {
-    (fs.existsSync as jest.Mock).mockReturnValue(true);
-    (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
-      { name: '1.pid', isFile: () => true, isDirectory: () => false },
-    ] as never);
-    (jest.mocked(fs.promises.readFile) as unknown as jest.Mock).mockResolvedValue(contents as never);
-  }
-  const killsOf = (calls: Array<[number, string | number | undefined]>) =>
-    calls.filter(([, sig]) => sig !== 0);
-
-  it('escalates to SIGKILL only while the pid still names the group it signalled', async () => {
-    // The start time seen at escalation, whether the leader is gone by then,
-    // and whether SIGKILL may go out.
-    const cases: Array<[string, string | null | undefined, boolean, boolean]> = [
-      // The worker exited on SIGTERM and its pid went to a new process: bare
-      // liveness says "still there", the start time says it is someone else.
-      ['the pid changed hands', 'LATER', false, false],
-      // Nobody at the pid, but the group it led still has members.
-      ['the leader exited, leaving its group', null, true, true],
-      ['the same leader ignored SIGTERM', 'START', false, true],
-      // Unknown is not a difference: as before the re-check existed.
-      ['the lookup failed', undefined, false, true],
-    ];
-    for (const [name, now, leaderGone, escalates] of cases) {
-      const { helper } = newManager();
-      pidRecord('4242 START\n');
-      mockLookUpStartTime.mockImplementation(() => now);
-      let termed = false;
-      const kill = stubKill((pid, sig) => {
-        if (sig === 'SIGTERM') termed = true;
-        if (termed && leaderGone && pid === 4242) throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
-        return true;
-      });
-      try {
-        await withTimers(helper.killStaleProcesses());
-      } finally {
-        kill.restore();
-      }
-
-      expect([name, killsOf(kill.calls)]).toEqual([
-        name,
-        escalates ? [[-4242, 'SIGTERM'], [-4242, 'SIGKILL']] : [[-4242, 'SIGTERM']],
-      ]);
-    }
-  });
-
-  it('applies the same rule to orphans found at startup', async () => {
-    const { manager } = newManager();
-    pidRecord('4242 START\n');
-    mockLookUpStartTime.mockImplementation(() => 'LATER');
-    const kill = stubKill();
-    try {
-      await withTimers((manager as unknown as { detectStaleRunnerProcesses(): Promise<void> }).detectStaleRunnerProcesses());
-    } finally {
-      kill.restore();
-    }
-
-    expect(killsOf(kill.calls)).toEqual([[4242, 'SIGTERM']]);
   });
 });

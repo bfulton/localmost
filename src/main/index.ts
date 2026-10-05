@@ -12,6 +12,7 @@ import { VmBackend } from './vm/vm-backend';
 import { DefaultVmManager } from './vm/vm-manager';
 import { GuestImage } from './vm/guest-image';
 import { getVmResourcesDir, guestDir, helperPath } from './vm/paths';
+import { createMacVmMode, type MacVmMode } from './isolation/macos-vm';
 import { CacheDisks } from './vm/cache-disks';
 import { VmImagePuller } from './docker/puller/image-puller';
 import { RegistryClient } from './docker/puller/registry-client';
@@ -62,7 +63,6 @@ import { CliServer } from './cli-server';
 
 // Config and security
 import { loadConfig, DockerVmConfigSource } from './config';
-import { sweepJobTempDirs, userTempDir } from './job-temp';
 import { installSecurityHandlers } from './security';
 import { ensureAppDataDir, getAppDataDir } from './paths';
 
@@ -75,7 +75,6 @@ import { getValidAccessToken, forceRefreshToken, cancelJobsOnOurRunners } from '
 
 // Runner lifecycle
 import { reRegisterSingleInstance, configureSingleInstance, clearStaleRunnerRegistrations } from './runner-lifecycle';
-import { finishPendingSweeps } from './process-group';
 
 // UI
 import { createWindow, setDockIcon } from './window';
@@ -84,6 +83,7 @@ import { initTray, updateTrayMenu } from './tray-init';
 
 // IPC handlers
 import { setupIpcHandlers } from './ipc-handlers';
+import { registerMacVmHandlers } from './ipc-handlers/macos-vm';
 import { sendTargetStatusUpdate } from './ipc-handlers/targets';
 
 // Auto-updater
@@ -190,6 +190,9 @@ let memoryPressureMonitor: MemoryPressureMonitor | null = null;
 
 /** The per-repository golden data disks, and their refreshes (contract §6.5). */
 let cacheDisks: CacheDisks | null = null;
+
+/** Where every job runs: the golden macOS image, and a VM cloned from it per job. */
+let macVm: MacVmMode | null = null;
 
 app.whenReady().then(async () => {
   // Set restrictive umask so all files/directories are user-only (no group/world access)
@@ -340,6 +343,19 @@ app.whenReady().then(async () => {
   });
   memoryPressureMonitor.start();
 
+  // Every job runs in a fresh macOS VM cloned from the golden image
+  // (docs/roadmap/macos-vm-jobs.md). Started below, once the runner manager
+  // listens for its status.
+  macVm = createMacVmMode({
+    dataDir,
+    runnerArc: () => {
+      const version = runnerDownloader.getInstalledVersion();
+      return version ? { version, dir: runnerDownloader.getArcDir(version) } : null;
+    },
+    log: (level, message) => logger?.[level](`[macos-vm] ${message}`),
+  });
+  const macVmBackend = macVm.backend;
+
   const runnerManager = new RunnerManager({
     onLog: sendLog,
     onStatusChange: sendStatusUpdate,
@@ -397,6 +413,7 @@ app.whenReady().then(async () => {
     // the job sees is localmost's; the VM's is never handed over.
     dockerBackend,
     getDockerVmConfig: () => dockerVmConfigSource.refresh(),
+    isolation: macVmBackend,
     // Apply the policy that was approved, not whatever is in the repository
     // right now. A job only reaches this point once its policy has been
     // approved, and applying the approved copy means an unreviewed change
@@ -450,6 +467,13 @@ app.whenReady().then(async () => {
     },
   });
   setRunnerManager(runnerManager);
+  // A golden image built, removed or failed changes whether the pool can
+  // take a job; its status says so at once.
+  macVm.images.on('status', () => runnerManager.refreshAvailability());
+  // The VMs and helpers an earlier run left go first, then the image is
+  // checked. Not awaited: until the check finds an image ready the backend
+  // is unavailable, so the pool takes no job before the sweep is done.
+  macVm.start().catch((err: Error) => logger?.warn(`[macos-vm] Startup failed: ${err.message}`));
 
   // Initialize heartbeat manager
   const heartbeatManager = new HeartbeatManager({
@@ -528,12 +552,6 @@ app.whenReady().then(async () => {
   } catch (err) {
     logger?.warn(`Startup cleanup failed: ${(err as Error).message}. Leftovers stay until the next launch.`);
   }
-  // The temp directories finished jobs left in the per-user temp directory,
-  // once their sandboxes are gone: this data directory's only, by name.
-  const userTemp = userTempDir((_level, message) => logger?.warn(message));
-  if (userTemp) {
-    await sweepJobTempDirs(userTemp, runnerDownloader.getSandboxBase(), (message) => logger?.info(message));
-  }
 
   if (config.auth?.refreshToken) {
     // Set initial auth state with refresh token (no access token yet)
@@ -597,6 +615,7 @@ app.whenReady().then(async () => {
   initTray();
   setDockIcon();
   setupIpcHandlers();
+  registerMacVmHandlers(macVm.images);
 
   // Connect window to Zustand store via zubridge
   const newMainWindow = getMainWindow();
@@ -811,11 +830,6 @@ app.on('before-quit', async (event) => {
         const runningJobs = runnerManager?.getJobHistory().filter(j => j.status === 'running') || [];
         await cancelJobsOnOurRunners(runningJobs);
         await runnerManager?.stop();
-        // stop() resolves as soon as the worker leaders exit. Any descendant
-        // that ignored SIGTERM is still waiting out a grace period on an
-        // unref'd timer that will not fire once we quit, so finish those now -
-        // after this point nothing is left to reap them.
-        finishPendingSweeps();
         // Each worker's socket released its VM as it stopped; this stops what
         // is left - a spare, a cache refresh - bounded at 10 s.
         memoryPressureMonitor?.stop();

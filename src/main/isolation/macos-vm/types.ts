@@ -1,12 +1,8 @@
 /**
- * The macOS VM isolation mode's interface with the rest of the app: the
- * backend the wiring step calls for a job admitted under `macos-vm`, and the
- * shapes it takes and returns. Declarations only. See
+ * The macOS VM's interface with the rest of the app: the backend the runner
+ * manager hands every job to, and the shapes it takes and returns. The VM is
+ * the only place a job runs. Declarations only. See
  * docs/roadmap/macos-vm-jobs.md.
- *
- * The shape is the one every isolation backend is meant to share
- * (type, available, prepare, spawnWorker, signal, release), so that the
- * wiring step can hoist it beside the other modes' without changing it.
  */
 
 import type { EventEmitter } from 'events';
@@ -18,7 +14,7 @@ export interface IsolationAvailability {
   reason?: string;
 }
 
-/** One job, as the wiring step hands it to a backend. */
+/** One job, as the runner manager hands it to the backend. */
 export interface IsolationJob {
   /**
    * Unique for the job's life: the runner slot and job id, say. A second

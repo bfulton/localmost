@@ -3,15 +3,12 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { createWriteStream, createReadStream } from 'fs';
 import * as tar from 'tar';
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import { FALLBACK_RUNNER_VERSION } from '../shared/constants';
-import { spawnSandboxed } from './process-sandbox';
 import { getRunnerDir } from './paths';
-import { DOCKER_CONFIG_DIR_NAME, SHARE_DIR_NAME, SHARE_NONCE_FILE } from './vm/paths';
-import { JOB_HOME_DIR_NAME } from '../shared/job-home';
+import { SHARE_DIR_NAME, SHARE_NONCE_FILE } from './vm/paths';
 import {
-  killOrphanedProcesses,
   cleanupSandboxDirectories,
   cleanupIncompleteConfigs,
   cleanupWorkDirectories as cleanupWorkDirs,
@@ -457,15 +454,8 @@ export class RunnerDownloader {
       // The runner's work folder, which is also the one directory a Docker VM
       // is shared (contract §1): made here, by the app, with a plain mkdir
       // that refuses a name already there, before anything runs in the
-      // sandbox. The worker's profile then denies the job the node itself,
-      // so it stays this directory. Beside it, not in the share, an empty
-      // DOCKER_CONFIG, so the job's CLI reads none of the operator's.
+      // sandbox.
       await fs.promises.mkdir(path.join(sandboxDir, SHARE_DIR_NAME));
-      await fs.promises.mkdir(path.join(sandboxDir, DOCKER_CONFIG_DIR_NAME), { mode: 0o700 });
-      // The job's HOME, beside them and not in the share: empty, the job's to
-      // write, and gone with the sandbox. Filled before the worker starts
-      // (see prepareJobHome).
-      await fs.promises.mkdir(path.join(sandboxDir, JOB_HOME_DIR_NAME), { mode: 0o700 });
 
       // Copy arc to sandbox
       log('info', `Copying arc to sandbox...`);
@@ -681,7 +671,12 @@ export class RunnerDownloader {
     await this.configureForBrokerProxy(instance, options.onLog);
   }
 
-  /** Register an instance by running config.sh in the sandbox built for it. */
+  /**
+   * Register an instance by running config.sh in the sandbox built for it,
+   * here on the Mac and under no sandbox: registration contacts GitHub with
+   * the user's token and runs no workflow code, and the copy it runs was
+   * checked against the release (copyVerifiedArc).
+   */
   private async runConfigScript(
     instance: number,
     sandboxDir: string,
@@ -689,6 +684,9 @@ export class RunnerDownloader {
     log: (level: 'info' | 'error', message: string) => void
   ): Promise<void> {
     const configScript = path.join(sandboxDir, 'config.sh');
+    if (path.dirname(sandboxDir) !== this.getSandboxBase()) {
+      throw new Error(`Refusing to register from ${sandboxDir}: not a sandbox in ${this.getSandboxBase()}`);
+    }
 
     if (!fs.existsSync(configScript)) {
       throw new Error(`Runner not properly downloaded. Missing config.sh in ${sandboxDir}`);
@@ -704,28 +702,26 @@ export class RunnerDownloader {
     ];
 
     await new Promise<void>((resolve, reject) => {
-      const config = spawnSandboxed(configScript, args, {
+      const config = spawn(configScript, args, {
         cwd: sandboxDir,
         stdio: ['ignore', 'pipe', 'pipe'],
+        shell: false,
         // The runner reads any option from ACTIONS_RUNNER_INPUT_<NAME>, and
         // drops the variable once read. Any local user can list a process's
         // arguments; only this user can read its environment.
         env: { ...process.env, ACTIONS_RUNNER_INPUT_TOKEN: options.token },
-        // Registration contacts GitHub with the user's token and runs no
-        // workflow code; there is no instance proxy at this point.
-        allowDirectNetwork: true,
       });
 
       let stdout = '';
       let stderr = '';
 
-      config.stdout?.on('data', (data) => {
+      config.stdout?.on('data', (data: Buffer) => {
         const text = data.toString().trim();
         stdout += text;
         if (text) log('info', text);
       });
 
-      config.stderr?.on('data', (data) => {
+      config.stderr?.on('data', (data: Buffer) => {
         const text = data.toString().trim();
         stderr += text;
         if (text) log('error', text);
@@ -971,14 +967,8 @@ export class RunnerDownloader {
     if (fs.existsSync(sandboxBase)) {
       log('Cleaning up stale sandbox directories...');
 
-      // Kill orphaned processes first (before deleting their PID files)
-      const killedAny = await killOrphanedProcesses(sandboxBase, log);
-      if (killedAny) {
-        log('Waiting for orphaned sessions to expire...');
-        await new Promise(resolve => setTimeout(resolve, 3000));
-      }
-
-      // Clean up sandbox directories
+      // Clean up sandbox directories. What ran from them ran in a macOS VM,
+      // which the VM backend's own startup sweep stops.
       await cleanupSandboxDirectories(sandboxBase, log);
     }
 

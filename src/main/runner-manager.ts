@@ -1,11 +1,7 @@
-import { ChildProcess } from 'child_process';
-import { processStartTime, lookUpStartTime, mayEscalate, markerHolders, signalOrphanPids, parsePidRecord } from './runner-cleanup';
-import { GRACE_MS } from './process-group';
 import * as path from 'path';
-import { createHash, randomBytes } from 'crypto';
+import { randomBytes } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
-import { StringDecoder } from 'string_decoder';
 import * as yaml from 'js-yaml';
 import type { DockerPolicy } from '../shared/docker-policy';
 import { DockerBackend, noDockerBackend } from './docker/docker-backend';
@@ -13,24 +9,17 @@ import { DockerFilterProxy } from './docker/docker-filter-proxy';
 import {
   SandboxPolicyLevel, RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
 import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
-import { SandboxFilesystemPolicy, spawnSandboxed } from './process-sandbox';
-import { inheritedWorkerEnv, javaToolOptions, levelToolchainPaths, packageCacheEnv } from './worker-env';
-import { DEFAULT_BROKER_PORT, developerCredentialPaths, type EnvPolicy, type ProcessMarker } from '../shared/sandbox-profile';
-import { developerPython, reapMarkedProcessesAsync } from '../shared/sandbox-reaper';
-import { groupHasMembers, sweepInGrace, sweepProcessGroup } from './process-group';
+import { vmWorkerEnv } from './worker-env';
+import { DEFAULT_BROKER_PORT, type EnvPolicy } from '../shared/sandbox-profile';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { GitHubClientError } from './github-client';
 import { RunnerDownloader } from './runner-downloader';
-import { dockerCliPath, helperPath, DOCKER_CONFIG_DIR_NAME, SHARE_DIR_NAME } from './vm/paths';
-import { macVmHelperPath } from './isolation/macos-vm/paths';
+import type { IsolationAvailability, IsolationBackend, IsolationJob, WorkerHandle } from './isolation/macos-vm/types';
+import { MAX_MAC_VMS } from './isolation/macos-vm/host';
 import type { WorkerCredentialFiles } from './worker-credentials';
 import type { BrokerJobTarget } from './broker-proxy-service';
-import { getAppDataDir, getConfigPath, getJobHistoryPath, getRunnerDir, getUserDataDir } from './paths';
+import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
 import { loadConfig, resolveDockerVmConfig, type DockerVmConfig } from './config';
-import { resolveJobEnvironmentConfig, type JobEnvironmentConfig } from '../shared/job-preferences';
-import { createMissingGrantedDirs, gitSshCommand, JOB_HOME_DIR_NAME, prepareJobHome } from '../shared/job-home';
-import { createJobTempDir, jobTempName, removeJobTempDir, userTempDir } from './job-temp';
-import { writeJobBin } from './job-shims';
 import { normalizeFilterConfig, isUserAllowed, areAllUsersAllowed, parseRepository } from './runner/user-filter';
 
 /**
@@ -40,18 +29,22 @@ import { normalizeFilterConfig, isUserAllowed, areAllUsersAllowed, parseReposito
  */
 const DOCKER_SOCKET_NAME = 'docker.sock';
 
-/** macOS's default PATH, for a job whose app was started with none. */
-const DEFAULT_SYSTEM_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
+/** How long a worker is given to stop on SIGTERM before its VM is stopped under it. */
+const STOP_GRACE_MS = 5000;
 
-/**
- * The longest line of worker output that is read as a line, in characters
- * (UTF-16 code units, as string length counts them). The runner's own status
- * lines are far shorter; anything longer is a job's output.
- */
-const MAX_OUTPUT_LINE = 64 * 1024;
-
-/** The name recorded for a job whose start line was over MAX_OUTPUT_LINE. */
-const OVERLONG_JOB_NAME = '(job name too long to read)';
+/** The backend a manager made without one has: it runs nothing, and says so. */
+const NO_ISOLATION: IsolationBackend = {
+  type: 'macos-vm',
+  available: () => ({ ok: false, reason: 'this runner was started without a macOS VM backend' }),
+  prepare: async () => {
+    throw new Error('this runner was started without a macOS VM backend');
+  },
+  spawnWorker: async () => {
+    throw new Error('this runner was started without a macOS VM backend');
+  },
+  signal: async () => undefined,
+  release: async () => undefined,
+};
 
 /** A job's history status from the conclusion GitHub gave it. */
 function statusForConclusion(conclusion: string): JobStatus {
@@ -68,55 +61,6 @@ function statusForRunnerResult(result: string): JobStatus {
 }
 
 /**
- * Split a worker's output stream into whole lines.
- *
- * A pipe hands over whatever was written, cut anywhere: a runner line can
- * arrive in two chunks, and splitting each chunk on its own read both halves
- * as lines - the real one missed, and the tail of a line a job printed read
- * as though it began a line. So the unfinished line is carried to the next
- * chunk (and read at end of stream), and bytes are decoded across chunks.
- * A line is given up as soon as it passes MAX_OUTPUT_LINE, and skipped to
- * its end, rather than buffered without bound: a job that never prints a
- * newline must not grow this process. onSkipped hears of each one once.
- */
-export function lineReader(
-  onLine: (line: string) => void,
-  onSkipped: () => void
-): { write(chunk: Buffer | string): void; end(): void } {
-  const decoder = new StringDecoder('utf8');
-  let pending = '';
-  /** Inside a line already given up, up to its newline. */
-  let skipping = false;
-  const feed = (text: string): void => {
-    let start = 0;
-    for (let nl = text.indexOf('\n'); nl !== -1; nl = text.indexOf('\n', start)) {
-      const piece = text.slice(start, nl);
-      start = nl + 1;
-      if (skipping) {
-        skipping = false;
-        continue;
-      }
-      const line = pending + piece;
-      pending = '';
-      if (line.length > MAX_OUTPUT_LINE) onSkipped();
-      else if (line) onLine(line);
-    }
-    if (skipping) return;
-    pending += text.slice(start);
-    if (pending.length > MAX_OUTPUT_LINE) {
-      skipping = true;
-      pending = '';
-      onSkipped();
-    }
-  };
-  return {
-    write: (chunk) => feed(typeof chunk === 'string' ? chunk : decoder.write(chunk)),
-    // The last line may have no newline; the stream's end finishes it.
-    end: () => feed(`${decoder.end()}\n`),
-  };
-}
-
-/**
  * Get the hostname without .local suffix (common on macOS).
  */
 function getCleanHostname(): string {
@@ -125,28 +69,27 @@ function getCleanHostname(): string {
 
 interface RunnerInstance {
   /**
-   * Hash of the approved policy this worker's sandbox profile was built from.
-   * The profile is fixed at spawn, so a worker whose stamp no longer matches
-   * the approved policy must not serve a job under it.
+   * The stamp of the approved policy this worker was started under (see
+   * policyStamp in repo-policy). Its environment is fixed when it starts, so
+   * a worker whose stamp no longer matches the approved policy must not
+   * serve a job under it.
    */
   policyStamp?: string;
-  /** This spawn's marker file, held open by the worker's tree; see createMarker. */
-  markerPath?: string;
   /**
-   * This spawn's own sandbox directory, which its profile grants and its
-   * docker socket lives in. No other spawn is ever built there; removed once
-   * nothing of its job is left running (see sweepFinishedSpawn).
+   * This spawn's own sandbox directory: its runner files, which its VM is
+   * given, and its docker socket. No other spawn is ever built there;
+   * removed once its VM is released (see releaseSpawn).
    */
   sandboxDir?: string;
-  /** The process group this spawn's worker leads, kept after its handle is cleared. */
-  groupId?: number;
   /**
    * The tripwire this spawn's sandbox holds in `_work/.localmost-share`,
    * written before the worker starts: its Docker VM must read it back.
    */
   shareNonce?: string;
-  /** The mark this spawn's profile carries; see createProcessMarker. */
-  processMarker?: ProcessMarker;
+  /** This spawn's job as the macOS VM backend knows it, from prepare until release. */
+  job?: IsolationJob;
+  /** Aborts a prepare still waiting for a VM slot or booting, once the slot is let go. */
+  preparing?: AbortController;
   /** Set when a claim found the approved policy had moved; the worker stays constrained. */
   policyDrifted?: boolean;
   /**
@@ -161,7 +104,8 @@ interface RunnerInstance {
    * still in flight from before then must not reopen it.
    */
   policySealed?: boolean;
-  process: ChildProcess | null;
+  /** The worker's runner, in its macOS VM, from its start until it exits. */
+  worker: WorkerHandle | null;
   status: RunnerStatus;
   currentJob: {
     name: string;
@@ -195,14 +139,6 @@ interface RunnerInstance {
   tookJob?: boolean;
 }
 
-/** What a finished spawn leaves behind, swept once its exit sweep has run. */
-interface FinishedSpawn {
-  markerPath?: string;
-  processMarker?: ProcessMarker;
-  sandboxDir?: string;
-  groupId?: number;
-}
-
 /** Job event types for notifications */
 export type JobEventType = 'started' | 'completed' | 'refused' | 'cancel-failed';
 
@@ -220,30 +156,39 @@ export interface JobEvent {
 export interface RepoPolicyRuntime {
   /** Hosts the policy declares, on top of runner infrastructure. */
   hosts: string[];
-  /** The level the policy asks for; strict when it declares none. */
+  /** The level the policy asks for, which widens what its proxy allows; strict when it declares none. */
   level: SandboxPolicyLevel;
-  /** Paths the policy declares readable, applied when the worker is spawned. */
+  /**
+   * Paths the policy declares readable. A macOS VM job is given none yet:
+   * they are named in the log when its worker starts (see logUnprovided).
+   */
   readPaths: string[];
-  /** Paths the policy declares writable, applied when the worker is spawned. */
+  /** Paths the policy declares writable; as readPaths. */
   writePaths: string[];
   /** The docker actions the policy declares, merged across shared and workflow; empty when it declares none. */
   docker: DockerPolicy;
   /**
-   * Which of the app's own environment variables a worker may inherit beyond
-   * the baseline, and which it may not; applied when the worker is spawned.
-   * Absent means the policy declares none.
+   * Which of the app's own environment variables a worker is given, and
+   * which it may not be; applied when the worker is spawned. Absent means
+   * the policy declares none.
    */
   env?: EnvPolicy;
   /** Hosts the policy denies, resolved per workflow like hosts; absent means none. */
   deniedHosts?: string[];
-  /** Paths the policy denies, applied when the worker is spawned; absent means none. */
+  /** Paths the policy denies. Nothing of the Mac's filesystem reaches a VM job, so nothing to apply. */
   denyPaths?: string[];
   /**
-   * Loopback the policy opens beyond the worker's own proxy: every port, or
-   * these ones. Applied to the profile at spawn and to the proxy per job;
-   * absent means none.
+   * Loopback the policy declares. A macOS VM job reaches only its own proxy
+   * and the broker, so this is never applied; it is named in the log when
+   * its worker starts.
    */
   loopback?: true | number[];
+  /**
+   * The identity of the approved policy a worker is started under, the same
+   * whichever workflow it is asked for (see policyStamp in repo-policy).
+   * Absent, nothing is compared.
+   */
+  stamp?: string;
 }
 
 /** The broker's record of a job a worker claimed. */
@@ -309,19 +254,11 @@ interface RunnerManagerOptions {
   dockerBackend?: DockerBackend;
   /** The dockerVm settings: the boot timeout and the spare, here. Read at each spawn. */
   getDockerVmConfig?: () => DockerVmConfig;
-  /** The jobEnvironment settings: which conveniences a job's environment gets. Read at each spawn. */
-  getJobEnvironmentConfig?: () => JobEnvironmentConfig;
   /**
-   * The per-user temp directory, `/var/folders/<a>/<b>/T`, where each job
-   * gets a directory of its own. userTempDir() by default.
+   * Where every job runs: a fresh macOS VM per job (createMacVmMode's
+   * backend). Without one the manager takes no job, and its status says why.
    */
-  getUserTempDir?: () => string | undefined;
-  /** The bundled docker CLI, linked in the job's bin directory, first on its PATH. dockerCliPath() by default. */
-  dockerCli?: string;
-  /** The Docker VM helper, which the job's profile refuses to run. helperPath() by default. */
-  vmHelper?: string;
-  /** The macOS VM helper, which the job's profile refuses to run too. macVmHelperPath() by default. */
-  macVmHelper?: string;
+  isolation?: IsolationBackend;
 }
 
 /**
@@ -373,11 +310,9 @@ export class RunnerManager {
   private dockerProxies: Map<number, DockerFilterProxy> = new Map();
   private readonly dockerBackend: DockerBackend;
   private readonly getDockerVmConfig: () => DockerVmConfig;
-  private readonly getJobEnvironmentConfig: () => JobEnvironmentConfig;
-  private readonly getUserTempDir: () => string | undefined;
-  private readonly dockerCli: string;
-  private readonly vmHelper: string;
-  private readonly macVmHelper: string;
+  private readonly isolation: IsolationBackend;
+  /** Why the last look found no job could get a VM, or null; each change is logged once. */
+  private vmUnavailableReason: string | null = null;
 
   // Flag to track intentional stops vs job completion restarts
   private stopping = false;
@@ -391,9 +326,6 @@ export class RunnerManager {
   // Current runner version
   private runnerVersion: string | null = null;
 
-  // Tool cache location: 'persistent' (shared) or 'per-sandbox' (rebuilt each time)
-  private toolCacheLocation: 'persistent' | 'per-sandbox' = 'persistent';
-
   // Track instances currently being started/rebuilt to prevent concurrent operations
   /** How long to wait for a worker slot before giving up on an acquired job. */
   private static readonly SLOT_WAIT_MS = 60_000;
@@ -405,11 +337,6 @@ export class RunnerManager {
    * uses as its own re-entry guard.
    */
   private reservedSlots: Set<number> = new Set();
-  /**
-   * The process group each slot's last worker led, once a sweep of it has
-   * had something to signal. See slotDraining.
-   */
-  private drainingGroups: Map<number, number> = new Map();
 
   // Path to job history file
   private readonly jobHistoryPath: string;
@@ -466,11 +393,7 @@ export class RunnerManager {
     this.getDockerVmConfig =
       options.getDockerVmConfig ??
       (() => resolveDockerVmConfig(undefined, { cores: os.cpus().length, memoryBytes: os.totalmem() }));
-    this.getJobEnvironmentConfig = options.getJobEnvironmentConfig ?? (() => resolveJobEnvironmentConfig(undefined));
-    this.getUserTempDir = options.getUserTempDir ?? (() => userTempDir((_level, message) => this.log('error', message)));
-    this.dockerCli = options.dockerCli ?? dockerCliPath();
-    this.vmHelper = options.vmHelper ?? helperPath();
-    this.macVmHelper = options.macVmHelper ?? macVmHelperPath();
+    this.isolation = options.isolation ?? NO_ISOLATION;
 
     this.downloader = new RunnerDownloader();
     this.configPath = getConfigPath();
@@ -576,33 +499,6 @@ export class RunnerManager {
     }
   }
 
-  /**
-   * Kill a process and all its children by killing the process group.
-   * Uses negative PID to kill the entire process group.
-   */
-  private killProcessGroup(proc: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): boolean {
-    if (!proc.pid) return false;
-
-    try {
-      // Kill the entire process group using negative PID
-      process.kill(-proc.pid, signal);
-      this.log('debug', `Sent ${signal} to process group -${proc.pid}`);
-      return true;
-    } catch (err) {
-      // Process group might not exist, fall back to regular kill
-      this.log('debug', `Process group kill failed, trying regular kill: ${(err as Error).message}`);
-    }
-
-    try {
-      proc.kill(signal);
-      return true;
-    } catch {
-      // Process already dead or permission denied - either way, nothing more to do
-      return false;
-    }
-  }
-
-
   setRunnerCount(count: number): void {
     this.runnerCount = Math.max(MIN_RUNNER_COUNT, Math.min(MAX_RUNNER_COUNT, count));
   }
@@ -675,10 +571,6 @@ export class RunnerManager {
         if (config && config.maxJobHistory) {
           this.maxJobHistory = Math.max(5, Math.min(50, config.maxJobHistory as number));
         }
-        if (config && typeof config.toolCacheLocation === 'string' &&
-            ['persistent', 'per-sandbox'].includes(config.toolCacheLocation)) {
-          this.toolCacheLocation = config.toolCacheLocation as 'persistent' | 'per-sandbox';
-        }
       }
 
       // Fall back to config directory's .runner file for name
@@ -737,6 +629,11 @@ export class RunnerManager {
       };
     }
     if (this.instances.size === 0) {
+      // Idle, and taking no job while no job can get a VM: offline, with why.
+      const availability = this.isolation.available();
+      if (!availability.ok) {
+        return { status: 'offline', startedAt: this.startedAt, error: unavailableMessage(availability) };
+      }
       return {
         status: 'listening',
         startedAt: this.startedAt,
@@ -798,8 +695,8 @@ export class RunnerManager {
 
   isRunning(): boolean {
     for (const [, instance] of this.instances) {
-      // Consider running if process is active OR status indicates active state
-      if (instance.process || instance.status === 'starting' || instance.status === 'listening' || instance.status === 'busy') {
+      // Consider running if a worker is active OR status indicates active state
+      if (instance.worker || instance.status === 'starting' || instance.status === 'listening' || instance.status === 'busy') {
         return true;
       }
     }
@@ -817,10 +714,6 @@ export class RunnerManager {
   isConfigured(): boolean {
     // In proxy-only mode, check for proxy credentials instead of individual worker configs
     return this.downloader.hasAnyProxyCredentials();
-  }
-
-  getToolCacheLocation(): 'persistent' | 'per-sandbox' {
-    return this.toolCacheLocation;
   }
 
   /**
@@ -859,17 +752,49 @@ export class RunnerManager {
       throw new Error('Could not determine runner version.');
     }
 
-    // Kill any stale runner processes
-    await this.killStaleProcesses();
-    await this.detectStaleRunnerProcesses();
-
     const displayName = this.getStatusDisplayName();
-    this.log('info', `Runner manager initialized (max ${this.runnerCount}, ${displayName})`);
+    this.log('info', `Runner manager initialized (max ${this.maxSlots()}, ${displayName})`);
 
     this.stopping = false;
 
-    // Don't start any instances - workers will be spawned on demand
-    this.updateStatus('listening');
+    // Don't start any instances - workers will be spawned on demand. Until
+    // the golden image is ready none can be, and the status says so.
+    this.vmReady();
+    this.updateAggregateStatus();
+  }
+
+  /**
+   * Look again at whether a job can get a VM, after the golden image's
+   * status changed: logs the change and publishes the status it makes.
+   */
+  refreshAvailability(): void {
+    this.vmReady();
+    if (this.startedAt && !this.stopping) this.updateAggregateStatus();
+  }
+
+  /**
+   * Whether a job can get a macOS VM now. Each change is logged once: a
+   * pool with no golden image refuses every capacity check, and saying so at
+   * each one would fill the log.
+   */
+  private vmReady(): boolean {
+    const availability = this.isolation.available();
+    const reason = availability.ok ? null : unavailableMessage(availability);
+    if (reason !== this.vmUnavailableReason) {
+      this.vmUnavailableReason = reason;
+      if (reason) this.log('warn', reason);
+      else this.log('info', 'A macOS VM can be started for a job; taking jobs');
+    }
+    return reason === null;
+  }
+
+  /**
+   * How many workers may run at once: the runner count, and never more than
+   * the two macOS VMs a Mac may run. A third job would only wait for a VM
+   * after GitHub had handed it over.
+   */
+  private maxSlots(): number {
+    return Math.min(this.runnerCount, MAX_MAC_VMS);
   }
 
   /**
@@ -877,7 +802,10 @@ export class RunnerManager {
    * Used by broker proxy to decide whether to acquire a job.
    */
   hasAvailableSlot(): boolean {
-    for (let i = 1; i <= this.runnerCount; i++) {
+    // No golden image, no job: the broker leaves it with GitHub rather than
+    // acquire one nothing can run.
+    if (!this.vmReady()) return false;
+    for (let i = 1; i <= this.maxSlots(); i++) {
       if (this.slotIsFree(i)) {
         return true;
       }
@@ -887,8 +815,7 @@ export class RunnerManager {
 
   /**
    * Whether a slot can be given to a new worker: nothing is running in it,
-   * whatever its status says, and nothing its last worker left is still
-   * waiting out a grace period.
+   * whatever its status says.
    *
    * A status of 'error' is not an exit. A worker whose status went to error
    * while it runs keeps its job, sandbox, proxy and broker key; a second one
@@ -896,32 +823,9 @@ export class RunnerManager {
    * leave the first one's exit to find the slot taken and skip its sweep.
    */
   private slotIsFree(instanceNum: number): boolean {
-    if (this.slotDraining(instanceNum)) return false;
     const instance = this.instances.get(instanceNum);
     if (!instance) return true;
-    return (instance.status === 'offline' || instance.status === 'error') && !instance.process;
-  }
-
-  /**
-   * Whether the process group a slot's last worker led was sent SIGTERM and
-   * still has members, and has not yet been sent SIGKILL. What is left there
-   * belongs to the last job and runs under its profile; the slot waits,
-   * a grace period at most, rather than start another job beside it.
-   */
-  private slotDraining(instanceNum: number): boolean {
-    const group = this.drainingGroups.get(instanceNum);
-    if (group === undefined) return false;
-    if (sweepInGrace(group) && groupHasMembers(group)) return true;
-    this.drainingGroups.delete(instanceNum);
-    return false;
-  }
-
-  /** Sweep a finished worker's process group, and hold its slot while the sweep is in its grace period. */
-  private sweepWorkerGroup(instanceNum: number, workerPid: number | undefined): void {
-    const signalled = sweepProcessGroup(workerPid, {
-      onLog: (message) => this.log('warn', `[instance ${instanceNum}] ${message}`),
-    });
-    if (signalled && workerPid) this.drainingGroups.set(instanceNum, workerPid);
+    return (instance.status === 'offline' || instance.status === 'error') && !instance.worker;
   }
 
   /**
@@ -937,7 +841,7 @@ export class RunnerManager {
    * and one of them would be acquired upstream and never run.
    */
   private reserveSlot(): number | null {
-    for (let i = 1; i <= this.runnerCount; i++) {
+    for (let i = 1; i <= this.maxSlots(); i++) {
       if (this.reservedSlots.has(i) || this.startingInstances.has(i)) continue;
       if (this.slotIsFree(i)) {
         this.reservedSlots.add(i);
@@ -984,6 +888,13 @@ export class RunnerManager {
     const claimedContext = this.pendingTargetContext.get('next');
     if (claimedContext) {
       this.pendingTargetContext.delete('next');
+    }
+
+    // Every job runs in a macOS VM; without a golden image there is none to
+    // start, and the job is given back rather than held for one.
+    if (!this.vmReady()) {
+      this.log('error', `This job will not run: ${this.vmUnavailableReason}`);
+      return false;
     }
 
     // Wait briefly for a slot rather than dropping the job. By this point the
@@ -1052,8 +963,8 @@ export class RunnerManager {
     try {
       await this.startInstance(instanceNum);
       // startInstance reports most failures by marking the instance and
-      // returning. A worker with no process never started.
-      if (!this.instances.get(instanceNum)?.process) {
+      // returning. A slot with no worker never started one.
+      if (!this.instances.get(instanceNum)?.worker) {
         this.abandonJobFor(instanceNum);
         return false;
       }
@@ -1078,11 +989,11 @@ export class RunnerManager {
       // Closed until a job is claimed. The level belongs to the repository's
       // policy now, and is installed when a worker announces which job it took.
       policyLevel: 'strict',
-      // Per-worker secret. Every worker's proxy is on loopback, which a job
-      // whose policy opens loopback can reach, so without this a job could
-      // route its traffic through another worker's proxy and take that
-      // repository's allowlist. The token rides in the proxy URL this worker
-      // is given.
+      // Per-worker secret. Every worker's proxy is on the Mac's loopback; a
+      // guest reaches only its own, through its relay, and the token keeps
+      // anything else that reaches one from routing its traffic through
+      // another worker's proxy and taking that repository's allowlist. It
+      // rides in the proxy URL this worker is given.
       authToken: randomBytes(24).toString('hex'),
       onJobAcquired: async (jobId: string) => {
         // The worker behind this proxy just claimed a job, and this is the
@@ -1254,7 +1165,7 @@ export class RunnerManager {
 
     // Never over a worker that is still running, whatever its status: its
     // job keeps the slot's proxy and broker key until it exits.
-    if (this.instances.get(instanceNum)?.process) {
+    if (this.instances.get(instanceNum)?.worker) {
       this.log('warn', `Instance ${instanceNum} still has a worker running; not starting another in its slot`);
       return;
     }
@@ -1265,7 +1176,7 @@ export class RunnerManager {
     // Set 'starting' status immediately so UI shows it during sandbox build
     const existingInstance = this.instances.get(instanceNum);
     const instance: RunnerInstance = {
-      process: null,
+      worker: null,
       status: 'starting',
       currentJob: null,
       name: instanceName,
@@ -1304,18 +1215,7 @@ export class RunnerManager {
     } catch (error) {
       this.log('error', `Cannot prepare the work folder of instance ${instanceNum}: ${(error as Error).message}`);
       instance.status = 'error';
-      this.discardSandbox(instanceNum, instance);
-      this.updateAggregateStatus();
-      this.startingInstances.delete(instanceNum);
-      return;
-    }
-
-    const runnerBinary = path.join(sandboxDir, 'run.sh');
-
-    if (!fs.existsSync(runnerBinary)) {
-      this.log('warn', `Runner binary not found for instance ${instanceNum}, skipping`);
-      instance.status = 'error';
-      this.discardSandbox(instanceNum, instance);
+      this.releaseSpawn(instanceNum, instance);
       this.updateAggregateStatus();
       this.startingInstances.delete(instanceNum);
       return;
@@ -1326,7 +1226,7 @@ export class RunnerManager {
     if (!fs.existsSync(runnerConfigFile)) {
       this.log('warn', `Runner instance ${instanceNum} not configured, skipping`);
       instance.status = 'error';
-      this.discardSandbox(instanceNum, instance);
+      this.releaseSpawn(instanceNum, instance);
       this.updateAggregateStatus();
       this.startingInstances.delete(instanceNum);
       return;
@@ -1372,7 +1272,7 @@ export class RunnerManager {
         this.log('error', `Cannot give instance ${instanceNum} its broker address: ${(error as Error).message}`);
         this.revokeBrokerUrl?.(instanceNum);
         instance.status = 'error';
-        this.discardSandbox(instanceNum, instance);
+        this.releaseSpawn(instanceNum, instance);
         this.updateAggregateStatus();
         this.startingInstances.delete(instanceNum);
         return;
@@ -1386,14 +1286,13 @@ export class RunnerManager {
         proxy = await this.startInstanceProxy(instanceNum);
       }
 
-      // Install the policy before the runner process exists. A reused proxy
-      // still holds the last job's hosts until this runs.
+      // Install the policy before the runner exists. A reused proxy still
+      // holds the last job's hosts until this runs.
       this.closeProxyPolicy(proxy);
       // Rotate the proxy token every start (finalizeInstance rotates at exit
-      // too). The proxy is reused across a slot's jobs, so without this a
-      // detached orphan of the previous job would keep a valid HTTP_PROXY
-      // credential and could reach this job's allowlist through the same
-      // proxy after its policy is replaced.
+      // too). The proxy is reused across a slot's jobs, so without this the
+      // previous job's credential would stay valid for this job's allowlist
+      // after its policy is replaced.
       proxy.rotateAuthToken(randomBytes(24).toString('hex'));
       const startupContext = this.pendingTargetContext.get(String(instanceNum));
       if (startupContext?.targetDisplayName && startupContext.githubSha) {
@@ -1406,392 +1305,88 @@ export class RunnerManager {
       }
 
       // A worker is credentialed for one repository and runs a single job, so
-      // the filesystem boundary and the environment can come from that
-      // repository's approved policy. Both are fixed at spawn, which is why a
-      // policy change must retire the workers built under the old one.
-      const startupContextForPolicy = this.pendingTargetContext.get(String(instanceNum));
-      const filesystemPolicy = await this.resolveFilesystemPolicy(startupContextForPolicy);
+      // its environment can come from that repository's approved policy. It
+      // is fixed at spawn, which is why a policy change must retire the
+      // workers started under the old one.
+      const spawnPolicy = await this.spawnPolicy(this.pendingTargetContext.get(String(instanceNum)));
+      if (spawnPolicy) this.logUnprovided(instanceNum, spawnPolicy);
 
-      const proxyUrl = proxy.getProxyUrl();
-      // Not the app's whole environment: launched from a shell, it carries
-      // every token and agent socket that shell had. A worker inherits the
-      // baseline a runner and a shell need, plus what the repository's env
-      // policy allows; everything set below is the app's and comes after, so
-      // no policy can replace it.
-      const env: NodeJS.ProcessEnv = {
-        ...inheritedWorkerEnv(process.env, filesystemPolicy.env),
-        ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT: 'true',
-      };
+      // The runner's own settings and this worker's proxy, which the guest
+      // reaches through its relay at the same address, and what the env
+      // policy allows of the app's environment - nothing else of it.
+      const env = vmWorkerEnv(process.env, spawnPolicy?.env, proxy.getProxyUrl());
 
-      // Set tool cache location based on setting
-      // 'persistent' = the worker's target's own directory, kept across that
-      //   target's jobs (fast subsequent jobs). Never shared between targets:
-      //   setup-* actions execute what they find there, so a shared cache let
-      //   one repository's job plant a toolchain another's would run.
-      // 'per-sandbox' = inside sandbox, rebuilt each time (clean but slow).
-      // A worker with no target gets none, and so no shared path either. The
-      // target is the one the policy above was resolved for, so the caches
-      // and the policy they are granted under always belong together.
-      const cacheTargetId = startupContextForPolicy?.targetId;
-      let toolCacheDir: string | undefined;
-      if (this.toolCacheLocation === 'persistent' && cacheTargetId) {
-        try {
-          toolCacheDir = this.downloader.getToolCacheDir(cacheTargetId);
-          fs.mkdirSync(toolCacheDir, { recursive: true, mode: 0o700 });
-          env.RUNNER_TOOL_CACHE = toolCacheDir;
-          env.AGENT_TOOLSDIRECTORY = toolCacheDir; // Some actions check this instead
-        } catch (err) {
-          this.log('warn', `No tool cache for instance ${instanceNum}; its tools stay in the job: ${(err as Error).message}`);
-          toolCacheDir = undefined;
-        }
-      }
-
-      // The sandbox confines the runner to this proxy, and that rule only
-      // matches when the kernel can attribute the connection to loopback. A
-      // dual-stack socket connecting to an IPv4-mapped address is reported
-      // with no host at all, so the connection is denied; IPv4-only keeps it
-      // attributable.
-      env.DOTNET_SYSTEM_NET_DISABLEIPV6 = '1';
-
-      env.http_proxy = proxyUrl;
-      env.https_proxy = proxyUrl;
-      env.HTTP_PROXY = proxyUrl;
-      env.HTTPS_PROXY = proxyUrl;
-
-      // Under moderate and permissive the job's package managers get a
-      // directory of their own, in place of the write access to the user's
-      // ~/.cargo, ~/go, ~/.gradle and the like those levels used to grant -
-      // trees that hold the user's PATH directories and tool config. Strict
-      // keeps exactly what the repository declares.
-      // Kept across jobs only where the tool cache is: the package cache holds
-      // what the target's next job executes (gradle init scripts, cargo's
-      // config and bin, GOPATH/bin), so with per-sandbox selected, or no
-      // target, it lives in the job's own sandbox and goes with it.
-      let packageCacheDir: string | undefined;
-      if (filesystemPolicy.level !== 'strict') {
-        if (this.toolCacheLocation === 'persistent' && cacheTargetId) {
-          try {
-            packageCacheDir = path.join(this.downloader.getTargetCacheDir(cacheTargetId), 'packages');
-            fs.mkdirSync(packageCacheDir, { recursive: true, mode: 0o700 });
-          } catch (err) {
-            this.log('warn', `No package cache for instance ${instanceNum}; its packages stay in the job: ${(err as Error).message}`);
-            packageCacheDir = undefined;
-          }
-        }
-        // The sandbox directory is already writable, and a new one for each start,
-        // so this needs no grant of its own.
-        Object.assign(env, packageCacheEnv(packageCacheDir ?? path.join(sandboxDir, '_packages')));
-      }
-
-      // The job's docker socket is one localmost serves, not the daemon's.
-      // It lives in this spawn's own sandbox directory, so its path is new
-      // with every job - an earlier job's leftover, whose profile granted the
-      // earlier path, cannot connect to it - and it goes with the sandbox.
+      // The worker's filtering docker socket, in its own sandbox directory,
+      // so its path is new with every job and it goes with the sandbox. No
+      // job reaches it yet: a job whose policy grants Docker is refused at
+      // admission until the relay into the VM exists.
       const dockerSocketPath = path.join(sandboxDir, DOCKER_SOCKET_NAME);
       const dockerSocket = await this.startDockerProxy(instanceNum, dockerSocketPath, sandboxDir, shareNonce);
-      // The last wait before the spawn. A stop() in the meantime finalized
-      // this instance and took its sandbox to be swept, as a finished
-      // spawn's; a worker started there now would lose it as it runs.
+      // A stop() in the meantime finalized this instance; a VM started for
+      // it now would run a job nothing is waiting for.
       if (instance.policySealed) {
         throw new Error('its slot was let go while it started');
       }
-      env.DOCKER_HOST = `unix://${dockerSocketPath}`;
-      // Pin the job to the classic builder. BuildKit - the default since
-      // Docker 23 - does not use POST /build at all: it negotiates a session
-      // and streams the build over gRPC, exporting host filesystem access to
-      // the daemon as it goes. "Which paths may this build read" then stops
-      // being a property of any request the filter can see, so `build:` policy
-      // would describe an endpoint a real `docker build` never calls.
-      env.DOCKER_BUILDKIT = '0';
-      // The bundled CLI, reading an empty config of the job's own rather
-      // than the operator's ~/.docker.
-      env.DOCKER_CONFIG = path.join(sandboxDir, DOCKER_CONFIG_DIR_NAME);
-      // First on PATH, the job's own bin directory: the bundled CLI, linked,
-      // and the swift and xcodebuild shims that turn SwiftPM's and Xcode's
-      // own sandbox off, which macOS refuses to nest inside the job's (see
-      // job-shims.ts). Should it not be made, the CLI's own directory, as
-      // before. With no PATH of its own, the job still gets the system's
-      // after it.
-      const jobEnvironment = this.getJobEnvironmentConfig();
-      let binDir: string;
-      try {
-        binDir = writeJobBin(sandboxDir, { dockerCli: this.dockerCli, shims: jobEnvironment.toolShims });
-      } catch (err) {
-        this.log('warn', `No bin directory of its own for instance ${instanceNum}; its job has no swift or xcodebuild shims: ${(err as Error).message}`);
-        binDir = path.dirname(this.dockerCli);
-      }
-      env.PATH = `${binDir}:${env.PATH || DEFAULT_SYSTEM_PATH}`;
 
-      // A home of the job's own: HOME is <sandbox>/home, empty, the job's to
-      // write and gone with the sandbox, so tools look for their dotfiles
-      // there rather than in the user's home, where the sandbox denies most
-      // of what they would find - a regular ~/.gitconfig, which checkout
-      // copies from $HOME, made it fail at every level. What the approved
-      // policy and the level grant under the real home is linked in at the
-      // same path, so a tool finds it through HOME; the sandbox judges the
-      // path a link resolves to, so the link reaches no more than the grant.
-      const jobHome = path.join(sandboxDir, JOB_HOME_DIR_NAME);
-      const homeLog = (level: 'debug' | 'warn', message: string) => this.log(level, `[sandbox ${instanceNum}] ${message}`);
-      if (jobEnvironment.createMissingGrantedDirs) {
-        // A granted directory that does not exist yet, which a job that is
-        // denied its parent could not create for itself.
-        try {
-          const credentialPaths = developerCredentialPaths();
-          const created = createMissingGrantedDirs(filesystemPolicy.write, {
-            excludeRoots: [getAppDataDir(), getUserDataDir()],
-            deniedRoots: [...credentialPaths.subpaths, ...credentialPaths.literals],
-            log: homeLog,
-          });
-          if (created.length > 0) this.log('info', `Created ${created.join(', ')}, granted to the job of instance ${instanceNum}`);
-        } catch (err) {
-          this.log('warn', `Could not create the directories granted to instance ${instanceNum}: ${(err as Error).message}`);
-        }
-      }
-      env.HOME = jobHome;
-      // Git made hermetic and able to authenticate to this worker's proxy:
-      // the job's $HOME/.gitconfig is the per-job global config, nothing of
-      // the user's (see JOB_GIT_CONFIG), and the system config is skipped.
-      try {
-        const { gitConfig, linked } = prepareJobHome(jobHome, {
-          grants: [...filesystemPolicy.read, ...filesystemPolicy.write, ...levelToolchainPaths(filesystemPolicy.level)],
-          log: homeLog,
-        });
-        env.GIT_CONFIG_GLOBAL = gitConfig;
-        if (linked.length > 0) this.log('debug', `[sandbox ${instanceNum}] Linked into the job's home: ${linked.join(', ')}`);
-      } catch (err) {
-        this.log('warn', `Could not prepare the home of instance ${instanceNum}; its job runs with an empty one: ${(err as Error).message}`);
-        env.GIT_CONFIG_GLOBAL = '/dev/null';
-      }
-      env.GIT_CONFIG_SYSTEM = '/dev/null';
-      env.GIT_CONFIG_NOSYSTEM = '1';
-      // ssh finds its directory through the user database, not HOME, so git's
-      // ssh is pointed at the job's home explicitly.
-      env.GIT_SSH_COMMAND = gitSshCommand(jobHome);
-
-      // Keep the job's temp inside its own sandbox. The default $TMPDIR is a
-      // per-user directory shared with every other process the user runs, and
-      // the sandbox can no longer reach unix sockets there - so a build tool
-      // or test suite that puts a socket under TMPDIR must find TMPDIR in a
-      // place it is allowed to use. The sandbox directory is that place.
-      const jobTmp = path.join(sandboxDir, '_temp');
-      try {
-        fs.mkdirSync(jobTmp, { recursive: true });
-      } catch (err) {
-        this.log('warn', `Could not create job temp dir for instance ${instanceNum}: ${(err as Error).message}`);
-      }
-      env.TMPDIR = jobTmp;
-      env.TMP = jobTmp;
-      env.TEMP = jobTmp;
-      env.RUNNER_TEMP = jobTmp;
-      // Some tools ignore TMPDIR and keep state in the per-user temp and cache
-      // directories, which the sandbox does not grant: those are shared with
-      // everything the user runs, and the xcrun cache and clang module cache
-      // there are trusted by the user's own compilers. Each of these has a
-      // variable that moves it into the job's temp. xcrun cannot resolve a
-      // tool at all without a cache it can write; zsh puts here-documents
-      // under /tmp.
-      env.xcrun_db = path.join(jobTmp, 'xcrun_db');
-      env.CLANG_MODULE_CACHE_PATH = path.join(jobTmp, 'clang-module-cache');
-      env.TMPPREFIX = path.join(jobTmp, 'zsh');
-      // Foundation ignores TMPDIR: NSTemporaryDirectory(), java.io.tmpdir and
-      // the staging directory of a sandboxed process's atomic writes - which
-      // SwiftPM and xcodebuild make all the time - are in the per-user temp
-      // directory. DIRHELPER_USER_DIR_SUFFIX moves them into a directory of
-      // the job's own there, made now, granted by its profile, and removed
-      // with its sandbox (see job-temp.ts).
-      let tempSuffixDir: string | undefined;
-      if (jobEnvironment.perJobTempDir) {
-        const userTemp = this.getUserTempDir();
-        if (userTemp) {
-          try {
-            tempSuffixDir = createJobTempDir(userTemp, sandboxDir);
-            env.DIRHELPER_USER_DIR_SUFFIX = path.basename(tempSuffixDir);
-          } catch (err) {
-            this.log('warn', `No temp directory of its own for instance ${instanceNum}; Foundation's atomic writes will fail in its job: ${(err as Error).message}`);
-          }
-        }
-      }
-      // The JVM reads neither TMPDIR, HOME nor HTTPS_PROXY, and its
-      // dual-stack sockets reach loopback in a way the sandbox cannot
-      // attribute: its temp, home, IPv4 and the proxy are set where every
-      // JVM picks them up (see javaToolOptions). A workflow's own
-      // JAVA_TOOL_OPTIONS replaces it.
-      if (jobEnvironment.javaToolOptions) {
-        env.JAVA_TOOL_OPTIONS = javaToolOptions({ tmpDir: jobTmp, home: jobHome, proxyUrl });
+      // The job's VM: a slot (waiting behind the two a Mac may run), a clone
+      // of the golden image restored or booted, its guest prepared. A stop
+      // while this waits aborts it (releaseSpawn).
+      const job: IsolationJob = {
+        key: `${instanceNum}-${path.basename(sandboxDir)}`,
+        proxyPort: proxy.getPort(),
+        brokerPort: this.brokerPort(),
+        sandboxDir,
+        runnerVersion: this.runnerVersion,
+      };
+      instance.job = job;
+      instance.preparing = new AbortController();
+      this.log('info', `Starting a macOS VM for instance ${instanceNum}...`);
+      await this.isolation.prepare(job, instance.preparing.signal);
+      instance.preparing = undefined;
+      if (instance.policySealed) {
+        throw new Error('its slot was let go while its VM started');
       }
 
-      // A per-spawn marker file, held open by the worker and by what it starts
-      // through its bash and .NET layers (run.sh, Listener, Worker, `run:` step
-      // shells and what they exec): those inherit the descriptor and keep it
-      // for as long as they live, even after the worker leader has exited. A
-      // later sweep can then find exactly this spawn's survivors with lsof -
-      // something a pid or pgid cannot do safely once the leader is gone, since
-      // either may have been reused. Passed as fd 3; the runner never touches
-      // it. Not inherited by children that Node or Python spawn (both close
-      // inherited fds), so those are reached only via the process group while
-      // the leader lives - see markerHolders.
-      let markerPath: string | undefined;
-      let markerFd: number | undefined;
-      try {
-        markerPath = this.createMarker(instanceNum);
-        instance.markerPath = markerPath;
-        markerFd = fs.openSync(markerPath, 'r');
-      } catch (err) {
-        // Bookkeeping, not a prerequisite: without a marker this spawn's
-        // stragglers are reachable only through its process group, as before.
-        this.log('warn', `Could not create marker for instance ${instanceNum}: ${(err as Error).message}`);
-      }
-
-      // The spawn's mark in its profile, which no process of the job can
-      // shed: every process the worker starts runs under that profile and
-      // cannot leave it, so the mark finds them all once the spawn is done -
-      // one that left the process group with setsid() and closed the marker
-      // descriptor included.
-      let processMarker: ProcessMarker | undefined;
-      try {
-        processMarker = this.createProcessMarker(instanceNum, markerPath);
-        instance.processMarker = processMarker;
-      } catch (err) {
-        this.log('warn', `Could not mark instance ${instanceNum}'s profile; what its job leaves outside its process group will not be found: ${(err as Error).message}`);
-      }
-
-      try {
-        instance.process = spawnSandboxed(runnerBinary, ['--once'], {
-          cwd: sandboxDir,
-          env,
-          stdio: markerFd !== undefined ? ['ignore', 'pipe', 'pipe', markerFd] : ['ignore', 'pipe', 'pipe'],
-          // Create a new process group so we can kill all child processes
-          detached: true,
-          filesystemPolicy,
-          // The loopback ports the profile always opens: the worker's own
-          // proxy, and the broker, which the runner dials directly.
-          proxyPort: proxy.getPort(),
-          brokerPort: this.brokerPort(),
-          dockerSocket: dockerSocketPath,
-          // The Docker VM's share: the job keeps its contents, not the node.
-          shareDir: path.join(sandboxDir, SHARE_DIR_NAME),
-          dockerCli: this.dockerCli,
-          // They carry the virtualization entitlement; only the app runs them.
-          vmHelper: this.vmHelper,
-          macVmHelper: this.macVmHelper,
-          toolCacheDir,
-          packageCacheDir,
-          tempSuffixDir,
-          // T/TemporaryDirectory.XXXXXX for Swift Build's link step, only
-          // when Settings turns it on: see JobEnvironmentConfig.
-          swiftBuildLinkTemp: jobEnvironment.swiftBuildLinkTemp,
-          processMarker,
-        });
-      } finally {
-        // The child holds its own copy; this process must not, or lsof would
-        // list the app itself as a member of every worker's tree.
-        if (markerFd !== undefined) {
-          try { fs.closeSync(markerFd); } catch { /* already closed */ }
-        }
-      }
-      instance.policyStamp = filesystemPolicy.stamp;
-      // Spawned detached, so the worker leads its own group, by its pid.
-      instance.groupId = instance.process.pid;
+      const worker = await this.isolation.spawnWorker(job, ['--once'], env);
+      instance.worker = worker;
+      instance.policyStamp = spawnPolicy?.stamp;
+      this.log('info', `Runner instance ${instanceNum} started in its macOS VM (guest pid ${worker.pid})`);
 
       // Don't set 'listening' until we see "Listening for Jobs". Until then
       // the instance stays 'starting', which keeps its slot from being
       // reserved for another job.
 
-      // Write the PID for orphan detection into a directory only the app can
-      // write. In the sandbox it was steerable: a job could drop any pid into
-      // its own runner.pid and have the startup sweep SIGKILL it.
-      if (instance.process.pid) {
-        try {
-          const pidDir = this.pidDir();
-          fs.mkdirSync(pidDir, { recursive: true });
-          // Line one "<pid> <start time>": the start time lets a later sweep
-          // tell this worker from a stranger that inherited its pid after a
-          // crash. Line two: the spawn's marker file, which names the tree's
-          // survivors even once the leader is gone.
-          const started = processStartTime(instance.process.pid);
-          const first = started ? `${instance.process.pid} ${started}` : instance.process.pid.toString();
-          fs.writeFileSync(path.join(pidDir, `${instanceNum}.pid`), markerPath ? `${first}\n${markerPath}\n` : `${first}\n`);
-        } catch (err) {
-          this.log('warn', `Could not write pid file for instance ${instanceNum}: ${(err as Error).message}`);
-        }
-      }
-
-      // Parsed only while this is the slot's worker. A pipe's last data and
-      // its end can come after the exit, when a new spawn may hold the slot;
-      // parseRunnerOutput reads the slot, and a dead worker's line read there
-      // could start a job on the new one. Still logged.
-      const worker = instance.process;
-      const isCurrent = () => this.instances.get(instanceNum) === instance && instance.process === worker;
-      // One reader per stream: a line is only ever continued on its own stream.
-      const skipped = (stream: string) => () =>
-        this.logInstanceOutput(instanceNum, 'debug', `(${stream}: skipped a line over ${MAX_OUTPUT_LINE} characters)`);
-      const stdout = lineReader((line) => {
+      // Parsed only while this is the slot's worker. Its last lines and its
+      // exit can come after the slot was let go, when a new spawn may hold
+      // it; parseRunnerOutput reads the slot, and a dead worker's line read
+      // there could start a job on the new one. Still logged. The agent
+      // hands over whole lines, each cut at 16 KiB.
+      const isCurrent = () => this.instances.get(instanceNum) === instance && instance.worker === worker;
+      worker.on('stdout', (line: string) => {
         if (isCurrent()) this.parseRunnerOutput(instanceNum, line);
         this.logInstanceOutput(instanceNum, 'debug', line);
-      }, () => {
-        // The runner never writes a line this long, so one skipped on stdout -
-        // where it writes a job's start - before the worker has its job is
-        // that job's start, with a name too long to read. Taken as anything
-        // else, the start went unread and the next line - the tail of the
-        // name, after a \n in it - was read as the runner's status.
-        if (isCurrent() && !instance.tookJob) this.recordJobStart(instanceNum, OVERLONG_JOB_NAME);
-        skipped('stdout')();
       });
-      instance.process.stdout?.on('data', (data: Buffer) => stdout.write(data));
-      instance.process.stdout?.on('end', () => stdout.end());
-
-      const stderr = lineReader((line) => {
+      worker.on('stderr', (line: string) => {
         if (isCurrent()) this.parseRunnerOutput(instanceNum, line); // Also parse stderr for status
         this.logInstanceOutput(instanceNum, 'error', line);
-      }, skipped('stderr'));
-      instance.process.stderr?.on('data', (data: Buffer) => stderr.write(data));
-      instance.process.stderr?.on('end', () => stderr.end());
-
-      instance.process.on('error', (error) => {
-        this.log('error', `Runner instance ${instanceNum} error: ${error.message}`);
-        instance.status = 'error';
-        this.updateStatus('error', error.message);
-        // A spawn that failed - EAGAIN with the process table full, EACCES -
-        // leaves a child with no pid that emits 'error' and never 'exit'.
-        // Nothing ran: discard the start and end it as an exit would, or the
-        // slot keeps a worker that does not exist, and takes no job again.
-        if (worker.pid === undefined && instance.process === worker) {
-          this.discardUnstartedSpawn(instanceNum, instance);
-          onExit(null, null);
-        }
       });
 
       let exited = false;
-      const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      const onExit = (code: number | null, signal: string | null): void => {
         if (exited) return;
         exited = true;
-        // Captured before the handle is cleared. A worker runs with --once, so
-        // by the time it exits its job is over and nothing of that job should
-        // still be running - but a cancelled job left its step's own process
-        // alive, reparented to launchd where nothing would reap it, burning two
-        // cores and writing to a full disk for over an hour after GitHub had
-        // marked the job cancelled. Swept here rather than in one of the
-        // branches below, because every one of them is a path where the job has
-        // ended.
-        const workerPid = instance.process?.pid;
-        instance.process = null;
+        instance.worker = null;
 
         // Only while this is still the slot's worker: a reaped or completed
         // worker's exit can land after the next worker was spawned into the
-        // slot, and by then the OS may have reused this pid as the replacement's
-        // group leader - sweeping -pid would kill the new worker. Everything
-        // that acts on the pid or the slot happens under this guard.
+        // slot. A worker let go before it exited had its VM released then.
         if (this.instances.get(instanceNum) === instance) {
-          // Reap the job's own descendants. A cancelled step can outlive the
-          // worker, reparented, burning CPU; the group sweep in process-group
-          // probes and signals the group, not just the leader.
-          this.sweepWorkerGroup(instanceNum, workerPid);
           // A job still current here is over, and this is where it is
           // closed: a completion line does not close it, being one the job
           // can write itself, and one can go unread besides - split by a \n
-          // in the name, skipped as too long, or never written by a worker
-          // that died mid-job. Left open, its history read 'running', with
-          // Cancel offered, until the app next started.
+          // in the name, or never written by a worker that died mid-job.
+          // Left open, its history read 'running', with Cancel offered,
+          // until the app next started.
           if (instance.currentJob) {
             const job = instance.currentJob;
             this.logSandboxSummary(instanceNum, job.name);
@@ -1799,6 +1394,8 @@ export class RunnerManager {
               this.log('debug', `Closing job ${job.id} on exit failed: ${(err as Error).message}`);
             });
           }
+          // The VM goes with its job, and whatever the job left running in
+          // it with the VM.
           this.finalizeInstance(instanceNum);
           if (this.acquireDeadlines.has(instanceNum)) {
             this.abandonJobFor(instanceNum);
@@ -1844,18 +1441,17 @@ export class RunnerManager {
           return;
         }
 
-        // A reaped worker handles SIGTERM gracefully and reports code 0 -
-        // after the reap freed its slot, and possibly after a job refilled it.
-        // Freeing the slot again would drop the replacement and seal its proxy.
+        // A reaped worker can report code 0 after the reap freed its slot,
+        // and possibly after a job refilled it. Freeing the slot again would
+        // drop the replacement and seal its proxy.
         if (this.instances.get(instanceNum) !== instance) return;
 
         instance.jobsCompleted++;
         this.log('info', `Runner instance ${instanceNum} completed job #${instance.jobsCompleted}`);
         this.releaseInstanceSlot(instanceNum);
       };
-      instance.process.on('exit', onExit);
+      worker.on('exit', onExit);
 
-      this.instances.set(instanceNum, instance);
       // Spawned for a specific job: if the broker never routes that job here,
       // this worker will long-poll forever and hold its slot. Give it a
       // deadline. One started with no pending target gets one too: only the
@@ -1865,10 +1461,16 @@ export class RunnerManager {
       // Successfully started - clear the starting flag
       this.startingInstances.delete(instanceNum);
     } catch (error) {
+      this.startingInstances.delete(instanceNum);
+      // Let go while it started - a stop, a reap - and finalized there: its
+      // slot is not this start's to mark any more.
+      if (this.instances.get(instanceNum) !== instance || instance.policySealed) {
+        this.log('info', `Runner instance ${instanceNum} did not start: ${(error as Error).message}`);
+        this.releaseSpawn(instanceNum, instance);
+        return;
+      }
       this.log('error', `Failed to start runner instance ${instanceNum}: ${(error as Error).message}`);
       instance.status = 'error';
-      this.instances.set(instanceNum, instance);
-      this.startingInstances.delete(instanceNum);
       await this.stopDockerProxy(instanceNum);
       // The proxy may already carry this job's policy, on a token given to a
       // runner that never came up. Close and rotate now, as finalizeInstance
@@ -1883,87 +1485,64 @@ export class RunnerManager {
       // in the (unstarted) runner config. Revoke it, or a valid credential
       // outlives a worker that never came up.
       this.revokeBrokerUrl?.(instanceNum);
-      if (!instance.process) this.discardUnstartedSpawn(instanceNum, instance);
+      if (!instance.worker) this.releaseSpawn(instanceNum, instance);
+      this.updateAggregateStatus();
     }
   }
 
   /**
-   * Nothing started, so nothing holds the marker or the profile mark, or uses
-   * the sandbox; remove them now.
+   * Let a spawn's VM go and remove its sandbox, once: a prepare still
+   * waiting for a slot or booting is aborted, the VM is stopped and its
+   * clone deleted - with whatever of the job still ran in it - and then the
+   * sandbox, which nothing reads once the VM is gone. Asynchronous; a
+   * failure is logged, and the next startup's sweeps remove what is left.
    */
-  private discardUnstartedSpawn(instanceNum: number, instance: RunnerInstance): void {
-    if (instance.markerPath) {
-      try { fs.unlinkSync(instance.markerPath); } catch { /* already gone */ }
-      instance.markerPath = undefined;
-    }
-    if (instance.processMarker) {
-      for (const file of [instance.processMarker.granted, instance.processMarker.withheld]) {
-        try { fs.unlinkSync(file); } catch { /* already gone */ }
-      }
-      instance.processMarker = undefined;
-    }
-    this.discardSandbox(instanceNum, instance);
-  }
-
-  /** Remove the sandbox of a start that never ran a worker in it. */
-  private discardSandbox(instanceNum: number, instance: RunnerInstance): void {
-    const sandboxDir = instance.sandboxDir;
-    if (!sandboxDir) return;
+  private releaseSpawn(instanceNum: number, instance: RunnerInstance): void {
+    instance.preparing?.abort();
+    instance.preparing = undefined;
+    const { job, sandboxDir } = instance;
+    instance.job = undefined;
     instance.sandboxDir = undefined;
-    this.downloader.removeSandbox(sandboxDir).catch((err) =>
-      this.log('warn', `Could not remove the sandbox of instance ${instanceNum}; the next startup will: ${(err as Error).message}`)
-    );
-    void this.removeJobTemp(sandboxDir);
+    if (!job && !sandboxDir) return;
+    void (async () => {
+      if (job) {
+        await this.isolation.release(job).catch((err: Error) =>
+          this.log('warn', `Could not release the macOS VM of instance ${instanceNum}; the next startup will: ${err.message}`)
+        );
+      }
+      if (sandboxDir) {
+        await this.downloader.removeSandbox(sandboxDir).catch((err: Error) =>
+          this.log('warn', `Could not remove ${path.basename(sandboxDir)}; the next startup will: ${err.message}`)
+        );
+      }
+    })();
   }
 
   /**
-   * Remove a sandbox's job temp directory, if it has one: by name, derived
-   * from the sandbox, and only that (see removeJobTempDir). One that cannot
-   * be removed goes at the next startup.
-   */
-  private async removeJobTemp(sandboxDir: string): Promise<void> {
-    const userTemp = this.getUserTempDir();
-    if (!userTemp) return;
-    let dir: string;
-    try {
-      dir = path.join(userTemp, jobTempName(sandboxDir));
-    } catch {
-      return;
-    }
-    try {
-      await removeJobTempDir(userTemp, dir, path.dirname(sandboxDir));
-    } catch (err) {
-      this.log('warn', `Could not remove ${path.basename(dir)} from the per-user temp directory; the next startup will: ${(err as Error).message}`);
-    }
-  }
-
-  /**
-   * Stop a single runner instance. Used for re-registration.
+   * Stop a single runner instance: SIGTERM to its runner, and its VM stopped
+   * under it if it has not exited within the grace. Used for re-registration
+   * and to retire a worker.
    */
   async stopInstance(instanceNum: number): Promise<void> {
     const instance = this.instances.get(instanceNum);
-    if (!instance?.process) {
+    const worker = instance?.worker;
+    const job = instance?.job;
+    if (!worker || !job) {
       return;
     }
 
-    const proc = instance.process;
-
     return new Promise<void>((resolve) => {
       const timeout = setTimeout(() => {
-        this.log('warn', `Force killing instance ${instanceNum} process group`);
-        this.killProcessGroup(proc, 'SIGKILL');
-        setTimeout(resolve, 500);
-      }, 5000);
+        this.log('warn', `Instance ${instanceNum} did not stop; stopping its macOS VM`);
+        void this.isolation.release(job).finally(resolve);
+      }, STOP_GRACE_MS);
 
-      proc.once('exit', () => {
+      worker.once('exit', () => {
         clearTimeout(timeout);
         resolve();
       });
 
-      if (!this.killProcessGroup(proc, 'SIGTERM')) {
-        clearTimeout(timeout);
-        resolve();
-      }
+      void this.isolation.signal(job, 'SIGTERM');
     });
   }
 
@@ -1984,40 +1563,8 @@ export class RunnerManager {
     this.log('info', `Stopping ${this.instances.size} runner instance${this.instances.size > 1 ? 's' : ''}...`);
 
     const stopPromises: Promise<void>[] = [];
-
     for (const [instanceNum, instance] of this.instances) {
-      if (instance.process) {
-        const proc = instance.process;
-
-        // Check if process is already dead (exitCode is set after exit)
-        if (proc.exitCode !== null || proc.killed) {
-          this.log('debug', `Instance ${instanceNum} process already exited`);
-          continue;
-        }
-
-        stopPromises.push(
-          new Promise<void>((resolve) => {
-            const timeout = setTimeout(() => {
-              this.log('warn', `Force killing instance ${instanceNum} process group`);
-              this.killProcessGroup(proc, 'SIGKILL');
-              // Give SIGKILL a moment to take effect
-              setTimeout(resolve, 500);
-            }, 5000);
-
-            proc.once('exit', () => {
-              clearTimeout(timeout);
-              resolve();
-            });
-
-            // Kill the entire process group (runner + any child processes)
-            if (!this.killProcessGroup(proc, 'SIGTERM')) {
-              // Process might already be dead
-              clearTimeout(timeout);
-              resolve();
-            }
-          })
-        );
-      }
+      if (instance.worker) stopPromises.push(this.stopInstance(instanceNum));
     }
 
     // Overall timeout to ensure stop() always completes
@@ -2057,9 +1604,10 @@ export class RunnerManager {
     for (const instanceNum of [...this.acquireDeadlines.keys()]) {
       this.disarmAcquireDeadline(instanceNum);
     }
-    // Revoke keys and drop pid files before the map is cleared, or a late exit
-    // event finds its instance already gone and skips this - leaving a stopped
-    // worker's broker credential valid and its pid record stale.
+    // Revoke keys and release VMs before the map is cleared, or a late exit
+    // event finds its instance already gone and skips this - leaving a
+    // stopped worker's broker credential valid and its VM running. A worker
+    // still starting has its VM's prepare aborted here.
     for (const instanceNum of this.instances.keys()) {
       this.finalizeInstance(instanceNum);
     }
@@ -2148,27 +1696,19 @@ export class RunnerManager {
         status: 'failed',
       });
     }
-    // The whole group, not just the leader. A --once listener that ignores or
-    // is slow to handle SIGTERM leaves descendants behind, and the slot is
-    // released immediately below, so nothing comes back to look for them - the
-    // same leak that left a cancelled benchmark running for over an hour.
-    // The slot is not given to another job while they wait out the grace.
-    const workerPid = instance.process?.pid;
-    instance.process?.kill('SIGTERM');
-    this.sweepWorkerGroup(instanceNum, workerPid);
     this.abandonJobFor(instanceNum);
     // A --once worker that never acquired a job never exits, so the exit
     // handler's cleanup would not run; releaseInstanceSlot finalizes the
-    // instance (key, pid file, marker) itself.
+    // instance itself, which stops its VM with the listener in it.
     this.releaseInstanceSlot(instanceNum);
   }
 
   /**
-   * Release a slot's per-worker resources: its broker key and pid file, and
-   * in time its marker and sandbox. Called whenever an instance is finished
-   * with - a worker exit, a reap, or stop() clearing the pool - so a stopped
-   * or gone worker never leaves a usable /w/ credential or a stale pid record
-   * behind. `finished` is the instance when the slot no longer holds it.
+   * Release a slot's per-worker resources: its broker key, its proxy's
+   * policy and token, and its VM and sandbox. Called whenever an instance is
+   * finished with - a worker exit, a reap, or stop() clearing the pool - so a
+   * stopped or gone worker never leaves a usable /w/ credential or a running
+   * VM behind. `finished` is the instance when the slot no longer holds it.
    * Idempotent.
    */
   private finalizeInstance(instanceNum: number, finished?: RunnerInstance): void {
@@ -2176,8 +1716,7 @@ export class RunnerManager {
     // The proxy is the other credential a finished worker leaves behind: its
     // token and the job's hosts would stay live until the slot is next
     // started, which may be never. Close the policy, drop every connection
-    // and rotate now, so a survivor of this job has no network the moment
-    // the job is over. startInstance rotates again for its own worker;
+    // and rotate now. startInstance rotates again for its own worker;
     // nothing legitimate holds this token in between.
     const proxy = this.proxyServers.get(instanceNum);
     const instance = finished ?? this.instances.get(instanceNum);
@@ -2188,201 +1727,7 @@ export class RunnerManager {
       this.closeProxyPolicy(proxy);
       proxy.rotateAuthToken(randomBytes(24).toString('hex'));
     }
-    const pidFile = path.join(this.pidDir(), `${instanceNum}.pid`);
-    let markerPath = instance?.markerPath;
-    if (!markerPath) {
-      try {
-        const recorded = parsePidRecord(fs.readFileSync(pidFile, 'utf-8')).markerPath;
-        // The record is app-owned, but a marker is only ever one of ours.
-        if (recorded && this.isMarkerPath(recorded)) markerPath = recorded;
-      } catch {
-        // No record, or no marker in it.
-      }
-    }
-    try {
-      fs.unlinkSync(pidFile);
-    } catch {
-      // Already gone, or never written.
-    }
-    // Ownership ends here, whichever path got here first: the exit handler
-    // and releaseInstanceSlot both finalize a clean exit, and a later sweep
-    // must see this marker as a finished spawn's, not a running worker's.
-    if (instance && markerPath && instance.markerPath === markerPath) instance.markerPath = undefined;
-    const sandboxDir = instance?.sandboxDir;
-    const processMarker = instance?.processMarker;
-    if (instance) {
-      instance.sandboxDir = undefined;
-      instance.processMarker = undefined;
-    }
-    this.settleSpawn({ markerPath, processMarker, sandboxDir, groupId: instance?.groupId });
-  }
-
-  /**
-   * How long after a worker is finalized before what it leaves is swept: past
-   * the exit sweep's own SIGKILL, so what still holds its marker then has
-   * left the process group.
-   */
-  private static readonly MARKER_SETTLE_MS = GRACE_MS + 2000;
-  /** Spawns with a settle sweep pending, so a second finalize of the same exit does not arm another. */
-  private readonly settlingSpawns = new Set<string>();
-
-  /**
-   * Sweep what a finished worker leaves once the exit sweep's escalation has
-   * run. Unref'd: it must not keep the app alive; if the app quits first,
-   * the marker and the sandbox survive to the startup sweep.
-   */
-  private settleSpawn(spawn: FinishedSpawn): void {
-    const key = spawn.markerPath ?? spawn.processMarker?.granted ?? spawn.sandboxDir;
-    if (!key || this.settlingSpawns.has(key)) return;
-    this.settlingSpawns.add(key);
-    const timer = setTimeout(() => {
-      this.settlingSpawns.delete(key);
-      this.sweepFinishedSpawn(spawn).catch((err) =>
-        this.log('warn', `Sweep of a finished worker failed: ${(err as Error).message}`)
-      );
-    }, RunnerManager.MARKER_SETTLE_MS);
-    timer.unref();
-  }
-
-  /**
-   * First whatever still runs under the spawn's profile mark is killed:
-   * after the exit sweep's SIGKILL, that is what left the process group. Then
-   * whatever still holds its marker, signalled by exact pid - which the mark
-   * has already reached when it could look, and covers when it could not.
-   * Then its sandbox goes, once its process group is empty: a sandbox
-   * something of the job still runs in is left to the startup sweep rather
-   * than pulled out from under it. The group is asked by its leader's pid,
-   * so a group that emptied and whose pid now leads another keeps the
-   * sandbox until then too; that costs only disk.
-   */
-  private async sweepFinishedSpawn({ markerPath, processMarker, sandboxDir, groupId }: FinishedSpawn): Promise<void> {
-    if (processMarker) {
-      const killed = await reapMarkedProcessesAsync(processMarker);
-      let keep = false;
-      if (killed === null) {
-        // Without the developer tools the startup sweep cannot look either;
-        // kept, the mark would only pile up, two files for every job.
-        keep = (await developerPython()) !== null;
-        this.log('warn', keep
-          ? `Could not look for what a finished job left outside its process group; ${path.basename(processMarker.granted)} is kept for the next startup's sweep`
-          : 'Could not look for what a finished job left outside its process group: that needs the developer tools');
-      } else if (killed.length > 0) {
-        this.log('warn', `Killed ${killed.join(', ')}, left running outside its process group by a finished job`);
-      }
-      if (!keep) {
-        for (const file of [processMarker.granted, processMarker.withheld]) {
-          await fs.promises.unlink(file).catch(() => undefined);
-        }
-      }
-    }
-    if (markerPath) {
-      try {
-        const outcome = await this.sweepMarker(markerPath, 2000);
-        if (outcome === 'kept') this.log('info', `${path.basename(markerPath)} kept for the next sweep`);
-      } catch (err) {
-        this.log('warn', `Sweep of ${path.basename(markerPath)} failed: ${(err as Error).message}`);
-      }
-    }
-    if (!sandboxDir) return;
-    if (groupId !== undefined && groupHasMembers(groupId)) {
-      this.log('warn', `Process group ${groupId} is still running; its sandbox is left for the next startup to remove`);
-      return;
-    }
-    try {
-      await this.downloader.removeSandbox(sandboxDir);
-    } catch (err) {
-      this.log('warn', `Could not remove ${path.basename(sandboxDir)}; the next startup will: ${(err as Error).message}`);
-    }
-    await this.removeJobTemp(sandboxDir);
-  }
-
-  /** Pids of the workers this manager is running now. */
-  private livePids(): Set<number> {
-    const pids = new Set<number>();
-    for (const instance of this.instances.values()) {
-      if (instance.process?.pid) pids.add(instance.process.pid);
-    }
-    return pids;
-  }
-
-  /** Whether a worker this manager is running now owns the marker. */
-  private ownsMarker(markerPath: string): boolean {
-    for (const instance of this.instances.values()) {
-      if (instance.process?.pid && instance.markerPath === markerPath) return true;
-    }
-    return false;
-  }
-
-  /** Whether a path is one of this manager's marker files, by location and name. */
-  private isMarkerPath(p: string): boolean {
-    return path.dirname(p) === this.pidDir() && /^\d+-[0-9a-f]+\.mark$/.test(path.basename(p));
-  }
-
-  /**
-   * Reap whatever still holds a finished spawn's marker, then remove the
-   * marker once nothing does. A marker a running worker owns, or whose
-   * holders include a running worker, is left entirely alone - no signal, no
-   * unlink: its holders are that job's Listener, Worker and steps, and the
-   * marker is how a later sweep would find them if the app died. A marker
-   * whose holders cannot be determined, or that is still held after the
-   * escalation, is kept: it is the one reuse-proof handle a later sweep has
-   * on those survivors.
-   */
-  private async sweepMarker(markerPath: string, graceMs: number): Promise<'released' | 'kept' | 'owned'> {
-    if (this.ownsMarker(markerPath)) return 'owned';
-    const holders = await markerHolders(markerPath, (m) => this.log('warn', m));
-    if (holders === null) return 'kept';
-    // Decided after the wait, not before it: a worker that spawned meanwhile
-    // is live, and a pid it holds is not ours to signal.
-    if (this.ownsMarker(markerPath) || holders.some((pid) => this.livePids().has(pid))) return 'owned';
-    let remaining: number[] | null = holders;
-    if (holders.length > 0) {
-      const result = await signalOrphanPids(holders, (m) => this.log('info', m), graceMs, () => markerHolders(markerPath));
-      remaining = result.remaining;
-    }
-    if (remaining !== null && remaining.length === 0) {
-      await fs.promises.unlink(markerPath).catch(() => undefined);
-      return 'released';
-    }
-    return 'kept';
-  }
-
-  /**
-   * Create this spawn's marker file and return its path. Nothing else is
-   * touched: the nonce makes each marker unique, and deletion belongs to
-   * finalizeInstance (once nothing holds it) and to the startup sweeps, which
-   * are the only ones that can tell a crash leftover with live survivors from
-   * an empty file.
-   */
-  private createMarker(instanceNum: number): string {
-    const pidDir = this.pidDir();
-    fs.mkdirSync(pidDir, { recursive: true });
-    const markerPath = path.join(pidDir, `${instanceNum}-${randomBytes(8).toString('hex')}.mark`);
-    fs.writeFileSync(markerPath, '');
-    return markerPath;
-  }
-
-  /**
-   * Create the two files this spawn's profile reads one of and not the other
-   * (processMarkerRules), named for its marker file when it has one. They sit
-   * in the pid directory, which no job can write, and no other profile tells
-   * them apart. Removed once the finished spawn has been swept by them; the
-   * startup sweep takes any a crash or a failed sweep left.
-   */
-  private createProcessMarker(instanceNum: number, markerPath?: string): ProcessMarker {
-    let pidDir = this.pidDir();
-    fs.mkdirSync(pidDir, { recursive: true });
-    // Seatbelt matches real paths, and the sweep asks about these.
-    try {
-      pidDir = fs.realpathSync(pidDir);
-    } catch {
-      // Kept as spelled.
-    }
-    const stem = markerPath ? path.basename(markerPath, '.mark') : `${instanceNum}-${randomBytes(8).toString('hex')}`;
-    const marker = { granted: path.join(pidDir, `${stem}.granted`), withheld: path.join(pidDir, `${stem}.withheld`) };
-    fs.writeFileSync(marker.granted, '', { mode: 0o600, flag: 'wx' });
-    fs.writeFileSync(marker.withheld, '', { mode: 0o600, flag: 'wx' });
-    return marker;
+    if (instance) this.releaseSpawn(instanceNum, instance);
   }
 
   private releaseInstanceSlot(instanceNum: number): void {
@@ -2401,10 +1746,9 @@ export class RunnerManager {
     // Freeing the slot is the one point every finished worker passes through:
     // a clean exit and the reap of a worker that never took its job both end
     // here, and the reaped worker never exits on its own. Finalize here -
-    // revoke the broker key, drop the pid file, settle the marker and the
-    // sandbox - or a finished worker's URL stays usable and its records
-    // linger until the slot is reused. Idempotent with the exit handler's own
-    // call.
+    // revoke the broker key, stop the VM, remove the sandbox - or a finished
+    // worker's URL stays usable and its VM runs on until the slot is reused.
+    // Idempotent with the exit handler's own call.
     this.finalizeInstance(instanceNum, instance);
     this.updateAggregateStatus();
   }
@@ -2520,7 +1864,7 @@ export class RunnerManager {
     instanceNum: number,
     job: NonNullable<RunnerInstance['currentJob']>,
     code: number | null,
-    signal: NodeJS.Signals | null
+    signal: string | null
   ): Promise<void> {
     let status: JobStatus =
       signal !== null || this.stopping ? 'cancelled' : code === 0 ? (job.runnerResult ?? 'completed') : 'failed';
@@ -2683,48 +2027,9 @@ export class RunnerManager {
    * instance that never reached that line would keep the previous job's hosts.
    */
   /**
-   * Identity of the half of a policy that is baked into the sandbox profile.
-   *
-   * Hosts are deliberately excluded: they are resolved per workflow and
-   * applied to the proxy on every job, so including them made a repository
-   * with a per-workflow network section look like it had drifted and its jobs
-   * were refused. Only what the profile fixed at spawn belongs here.
-   */
-  private stampFor(
-    policy: Pick<RepoPolicyRuntime, 'level' | 'readPaths' | 'writePaths' | 'env' | 'denyPaths' | 'loopback'>
-  ): string {
-    // The env policy is fixed at spawn like the profile, so it is part of
-    // what a worker was built under; so are the denied paths and the
-    // loopback ports, which the profile holds too. The denied hosts are not:
-    // like the allowed ones they are resolved per workflow and applied to
-    // the proxy on every claim. Nor is docker, for the same reason: it merges
-    // shared with the claimed workflow's section and the socket is bound to
-    // it per claim. The spawn stamp is taken before the workflow is known, so
-    // stamping it made every claim of a workflow with its own docker section
-    // read as drift.
-    const fixedAtSpawn: unknown[] = [
-      policy.level,
-      policy.readPaths,
-      policy.writePaths,
-      policy.env,
-      policy.denyPaths ?? [],
-      policy.loopback ?? null,
-    ];
-    return createHash('sha256')
-      .update(JSON.stringify(fixedAtSpawn))
-      .digest('hex');
-  }
-
-  /**
-   * The filesystem boundary for a worker about to be spawned.
-   *
-   * Falls back to strict with nothing declared, which is what a repository
-   * with no approved policy gets: the runner's own floor and nothing else.
-   */
-  /**
    * Retire the workers a repository's policy change has made stale.
    *
-   * A worker's sandbox profile is fixed at spawn, so one built under the old
+   * A worker's environment is fixed at spawn, so one started under the old
    * policy would run the next job under it. Idle workers are stopped now;
    * a busy worker keeps the job it already claimed, which was validated
    * against the policy in force when it claimed it, and exits after it anyway.
@@ -2761,37 +2066,39 @@ export class RunnerManager {
     }
   }
 
-  private async resolveFilesystemPolicy(
+  /**
+   * The approved policy for the job a worker is about to be spawned for, as
+   * its spawn reads it: before the workflow is known. Null - nothing beyond
+   * the baseline, and no stamp to compare - when the job has no context, no
+   * commit, or its policy cannot be read; the baseline is the safe state to
+   * run under, so there is nothing to detect drift from.
+   */
+  private async spawnPolicy(
     context?: { targetDisplayName: string; githubSha?: string; githubRepo?: string }
-  ): Promise<SandboxFilesystemPolicy & { env?: EnvPolicy; stamp?: string }> {
-    // No stamp rather than a sentinel: a sentinel is truthy, so it would fail
-    // the drift check against every real hash and the worker would refuse
-    // every job. The profile it got is the closed one, which is the safe
-    // state to run under, so there is nothing to detect drift from.
-    const closed = {
-      level: 'strict' as SandboxPolicyLevel,
-      read: [],
-      write: [],
-      stamp: undefined,
-    };
-    if (!context?.targetDisplayName || !context.githubSha || !this.getRepoPolicy) return closed;
-
+  ): Promise<RepoPolicyRuntime | null> {
+    if (!context?.targetDisplayName || !context.githubSha || !this.getRepoPolicy) return null;
     const repoInfo = parseRepository(this.policyRepository(context));
-    if (!repoInfo) return closed;
-
+    if (!repoInfo) return null;
     try {
-      const policy = await this.getRepoPolicy(repoInfo.owner, repoInfo.repo, context.githubSha, '');
-      return {
-        level: policy.level,
-        read: policy.readPaths,
-        write: policy.writePaths,
-        deny: policy.denyPaths ?? [],
-        ...(policy.loopback !== undefined ? { loopback: policy.loopback } : {}),
-        env: policy.env,
-        stamp: this.stampFor(policy),
-      };
+      return await this.getRepoPolicy(repoInfo.owner, repoInfo.repo, context.githubSha, '');
     } catch {
-      return closed;
+      return null;
+    }
+  }
+
+  /**
+   * Say, as a worker starts, what of its approved policy a macOS VM job is
+   * not given: filesystem grants, which wait for VM shares, and loopback,
+   * since the guest reaches only its proxy and the broker. A deny needs
+   * nothing: no path of the Mac reaches the guest.
+   */
+  private logUnprovided(instanceNum: number, policy: RepoPolicyRuntime): void {
+    const grants = [...policy.readPaths.map((p) => `read ${p}`), ...policy.writePaths.map((p) => `write ${p}`)];
+    if (grants.length > 0) {
+      this.log('warn', `[instance ${instanceNum}] Filesystem grants are not provided in the macOS VM yet; this job runs without: ${grants.join(', ')}`);
+    }
+    if (policy.loopback !== undefined) {
+      this.log('warn', `[instance ${instanceNum}] network.loopback is ignored: a macOS VM job reaches only its proxy and the broker`);
     }
   }
 
@@ -2848,11 +2155,11 @@ export class RunnerManager {
     if (!proxy) return;
     const { hosts, level } = policy;
 
-    // The filesystem half of the policy is baked into the sandbox profile at
-    // spawn and cannot be changed now. If the approved policy has moved since,
-    // this worker would run the job under the old boundary - so it is refused
-    // rather than run. Approving through the app retires workers eagerly; this
-    // also covers approving through the CLI, which writes the cache directly.
+    // The worker's environment was fixed at spawn and cannot be changed now.
+    // If the approved policy has moved since, this worker would run the job
+    // under the old one - so it is constrained rather than run as approved.
+    // Approving through the app retires workers eagerly; this also covers
+    // approving through the CLI, which writes the cache directly.
     if (instance.policyDrifted) {
       this.log(
         'debug',
@@ -2861,12 +2168,10 @@ export class RunnerManager {
       return;
     }
 
-    const currentStamp = this.stampFor(policy);
-    if (isClaim && instance.policyStamp && instance.policyStamp !== currentStamp) {
-      // The filesystem half is fixed in this worker's profile and cannot be
-      // updated, so the job runs under the boundary that was approved when the
-      // worker started. That boundary was approved by the machine owner, just
-      // not most recently. Network is cut back to runner infrastructure and the
+    if (isClaim && instance.policyStamp && instance.policyStamp !== policy.stamp) {
+      // What was fixed at spawn cannot be updated, so the job runs under what
+      // was approved when the worker started. That was approved by the
+      // machine owner, just not most recently. Network is cut back to runner infrastructure and the
       // worker is retired so nothing further lands on it - this constrains the
       // job rather than refusing it, which the proxy cannot do on its own.
       // The docker socket stays as it was born, closed: nothing on this path
@@ -2889,7 +2194,6 @@ export class RunnerManager {
 
     proxy.setPolicyAllowedHosts(hosts);
     proxy.setPolicyDeniedHosts(policy.deniedHosts ?? []);
-    proxy.setLoopbackPolicy(this.brokerPort(), policy.loopback);
     proxy.setPolicyLevel(level);
     this.bindDockerSocket(instanceNum, repository, policy.docker);
     if (hosts.length > 0 || level !== 'strict') {
@@ -3172,8 +2476,8 @@ export class RunnerManager {
     const instance = this.instances.get(instanceNum);
     if (!instance?.currentJob) return;
     // The worker the job is running on. A --once worker runs one job, so while
-    // this process holds the slot, it is this job's.
-    const worker = instance.process;
+    // it holds the slot, it is this job's.
+    const worker = instance.worker;
     const job = instance.currentJob;
 
     // No actor is a verdict for evaluateJobFilter, not a reason to skip it,
@@ -3210,7 +2514,7 @@ export class RunnerManager {
     // check began with - if the slot has a new one, that one is not this
     // job's. GitHub shows a job stopped this way as lost rather than
     // cancelled when the cancel has not landed first.
-    const stop = worker && this.instances.get(instanceNum) === instance && instance.process === worker
+    const stop = worker && this.instances.get(instanceNum) === instance && instance.worker === worker
       ? this.stopInstance(instanceNum)
       : Promise.resolve();
     await Promise.all([
@@ -3309,201 +2613,9 @@ export class RunnerManager {
     this.onStatusChange(state);
   }
 
-  /** Where worker pids are recorded, outside anything a job can write. */
-  private pidDir(): string {
-    return path.join(getRunnerDir(), 'pids');
-  }
+}
 
-  /**
-   * A pid worth signalling: a positive integer, not this process, and not one
-   * this manager is currently running. Rejects 0 and negatives outright -
-   * process.kill(-1) would signal every process the user owns and kill(0) the
-   * whole group, so a stale or planted file must never reach them.
-   */
-  private sweepablePid(raw: string, live: Set<number>): number | null {
-    // Line one is "<pid> <start time>"; line two, if present, the marker path,
-    // which the marker sweep handles separately. Digits-only pid: parseInt
-    // would take '1234junk' as 1234.
-    const { pid, recordedStart } = parsePidRecord(raw);
-    if (pid === null || pid <= 1 || pid === process.pid || live.has(pid)) return null;
-    // The pid must still belong to the process this app recorded. A missing
-    // record or a start-time mismatch means the pid was reused, so it is not
-    // ours to signal.
-    if (recordedStart === '' || processStartTime(pid) !== recordedStart) return null;
-    return pid;
-  }
-
-  /** Marker files left in the pid directory by spawns that were never finalized. */
-  private async readMarkers(): Promise<string[]> {
-    const pidDir = this.pidDir();
-    if (!fs.existsSync(pidDir)) return [];
-    const entries = await fs.promises.readdir(pidDir, { withFileTypes: true });
-    if (!Array.isArray(entries)) return [];
-    return entries
-      .filter((entry) => !entry.isDirectory() && /^\d+-[0-9a-f]+\.mark$/.test(entry.name))
-      .map((entry) => path.join(pidDir, entry.name));
-  }
-
-  /** The pid files this manager wrote, as [absolute path, pid string]. */
-  private async readPidFiles(): Promise<Array<[string, string]>> {
-    const pidDir = this.pidDir();
-    if (!fs.existsSync(pidDir)) return [];
-    const entries = await fs.promises.readdir(pidDir, { withFileTypes: true });
-    if (!Array.isArray(entries)) return [];
-    const out: Array<[string, string]> = [];
-    for (const entry of entries) {
-      if (entry.isDirectory() || !/^\d+\.pid$/.test(entry.name)) continue;
-      const file = path.join(pidDir, entry.name);
-      try {
-        out.push([file, await fs.promises.readFile(file, 'utf-8')]);
-      } catch {
-        // Unreadable: skip, and leave the file for a later pass.
-      }
-    }
-    return out;
-  }
-
-  /**
-   * Signal a worker's whole process group, falling back to the leader alone if
-   * the group is gone. Workers spawn detached, so the leader pid is the group
-   * id and a negative pid reaches every descendant.
-   */
-  private signalGroupOrLeader(pid: number, signal: NodeJS.Signals): void {
-    try {
-      process.kill(-pid, signal);
-    } catch {
-      try {
-        process.kill(pid, signal);
-      } catch {
-        // Already gone.
-      }
-    }
-  }
-
-  private async killStaleProcesses(): Promise<void> {
-    // Processes this manager is running right now. A sweep that trusts a pid
-    // file alone will kill a runner spawned seconds earlier: seen live, where
-    // auto-start brought instance 1 up as pid 5748 and this killed it one
-    // second later, leaving the pool empty and the runner Offline for eight
-    // hours while heartbeats carried on as though nothing were wrong.
-    // Markers first: each names the surviving holders of one spawn's
-    // descriptor, leader alive or not, so a leaderless orphan group - which
-    // the pid/start-time path below cannot verify - is reaped here. Ownership is
-    // decided per marker at the moment it is examined, never from a snapshot
-    // taken before an await: the broker is already accepting jobs while this
-    // runs, so a worker can spawn at any wait.
-    const kept: string[] = [];
-    for (const markerPath of await this.readMarkers()) {
-      if ((await this.sweepMarker(markerPath, 1000)) === 'kept') kept.push(path.basename(markerPath));
-    }
-    if (kept.length > 0) {
-      this.log('warn', `Kept ${kept.length} marker file(s) for the next sweep: ${kept.join(', ')}`);
-    }
-
-    for (const [pidFile, contents] of await this.readPidFiles()) {
-      // Liveness is read now, for the same reason.
-      const live = this.livePids();
-      const pid = this.sweepablePid(contents, live);
-      if (pid === null) {
-        // Either not ours to kill, or a value we refuse to signal. Drop the
-        // file if it names nothing runnable; keep it if it is a live worker.
-        if (!live.has(parseInt(contents.trim(), 10))) {
-          await fs.promises.unlink(pidFile).catch(() => undefined);
-        }
-        continue;
-      }
-      // sweepablePid matched it against the record, so this is the start
-      // time the SIGTERM below goes to.
-      const { recordedStart } = parsePidRecord(contents);
-      try {
-        process.kill(pid, 0);
-        this.log('info', `Killing stale runner process group ${pid}`);
-        // Negative pid: a worker is spawned detached as its own group leader,
-        // so this reaches its descendants too - a crashed worker's children,
-        // reparented to launchd, are the orphans this sweep exists for.
-        this.signalGroupOrLeader(pid, 'SIGTERM');
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-        // Liveness alone cannot tell the worker from a process that took its
-        // pid after it exited on the SIGTERM; the start time can, as it did
-        // before the SIGTERM. A leader gone with descendants left in its
-        // group is still escalated (mayEscalate, as in runner-cleanup).
-        if (!mayEscalate(recordedStart, lookUpStartTime(pid))) {
-          this.log('info', `Stale runner ${pid} exited; its pid now belongs to another process, which is left alone`);
-        } else {
-          try {
-            // Probe the group, not just the leader: a leader can exit while a
-            // descendant ignores SIGTERM, and kill(pid, 0) on the dead leader
-            // would skip the SIGKILL the descendant still needs.
-            process.kill(-pid, 0);
-            this.signalGroupOrLeader(pid, 'SIGKILL');
-          } catch {
-            try {
-              // Group gone, but the leader itself may linger; escalate to it.
-              process.kill(pid, 0);
-              this.signalGroupOrLeader(pid, 'SIGKILL');
-            } catch {
-              // Everything exited after SIGTERM - the expected success case.
-            }
-          }
-        }
-      } catch {
-        // Process doesn't exist (ESRCH) - already dead
-      }
-      await fs.promises.unlink(pidFile).catch(() => undefined);
-    }
-  }
-
-  private async detectStaleRunnerProcesses(): Promise<void> {
-    const orphanedPids: number[] = [];
-    const recordedStarts = new Map<number, string>();
-    try {
-      for (const [pidFile, contents] of await this.readPidFiles()) {
-        // Liveness is read now, not from a snapshot taken before the await.
-        const live = this.livePids();
-        const pid = this.sweepablePid(contents, live);
-        if (pid === null) {
-          if (!live.has(parseInt(contents.trim(), 10))) {
-            await fs.promises.unlink(pidFile).catch(() => undefined);
-          }
-          continue;
-        }
-        try {
-          process.kill(pid, 0);
-          orphanedPids.push(pid);
-          recordedStarts.set(pid, parsePidRecord(contents).recordedStart);
-        } catch {
-          await fs.promises.unlink(pidFile).catch(() => undefined);
-        }
-      }
-
-      if (orphanedPids.length > 0) {
-        this.log('warn', `Found ${orphanedPids.length} orphaned runner process(es): ${orphanedPids.join(', ')}`);
-
-        for (const pid of orphanedPids) {
-          // Verified above, but that was before an await; a worker may have
-          // spawned since.
-          if (this.livePids().has(pid)) continue;
-          try {
-            this.log('info', `Killing orphaned process ${pid}`);
-            process.kill(pid, 'SIGTERM');
-
-            await new Promise((resolve) => setTimeout(resolve, 1000));
-            // Only the process that was sent SIGTERM: one that took its pid
-            // since has another start time.
-            if (!mayEscalate(recordedStarts.get(pid), lookUpStartTime(pid))) continue;
-            try {
-              process.kill(pid, 0);
-              process.kill(pid, 'SIGKILL');
-            } catch {
-              // Process exited after SIGTERM - expected success case
-            }
-          } catch {
-            // Process doesn't exist or permission denied - continue with next
-          }
-        }
-      }
-    } catch {
-      // Error scanning sandbox directories - non-fatal
-    }
-  }
+/** Why no job is taken, for the log and the runner's status. */
+function unavailableMessage(availability: IsolationAvailability): string {
+  return `Taking no jobs: ${availability.reason ?? 'no macOS VM can be started'}`;
 }

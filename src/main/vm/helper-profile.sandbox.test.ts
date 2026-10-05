@@ -26,8 +26,6 @@ import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { buildHelperProfile, HelperProfileOptions } from './helper-profile';
-import { JOB_BIN_DIR } from '../job-shims';
-import { dockerOnPath } from '../test-utils/vm-fixtures';
 
 const isMacOS = process.platform === 'darwin';
 
@@ -212,65 +210,13 @@ if (!isMacOS) {
     });
   });
 } else {
-  describe("the helper's profile, from inside a localmost job", () => {
-    // The job's TMPDIR is <data>/runner/sandbox/<id>/_temp.
-    const sandbox = path.dirname(fs.realpathSync(os.tmpdir()));
-    const data = path.dirname(path.dirname(path.dirname(sandbox)));
-    const shell = (command: string) => {
-      const result = spawnSync('/bin/sh', ['-c', command], { encoding: 'utf-8', timeout: 15000 });
-      return { ok: result.status === 0, stderr: result.stderr };
-    };
-
-    it('runs where the app lays a job out', () => {
-      expect(path.basename(path.dirname(sandbox))).toBe('sandbox');
-      expect(path.basename(path.dirname(path.dirname(sandbox)))).toBe('runner');
-    });
-
-    it("cannot list or write the app's data directory, where the helper's profile grants the VM directories", () => {
-      // <data>/vm is made at the first VM boot, and a denied path whose parent
-      // is missing fails with ENOENT, not EPERM. So the refusals that count
-      // are on what is certainly there while a job runs: a write in <data>,
-      // and a listing of runner/arc, the template every worker is copied
-      // from. (Not <data>, runner or runner/sandbox, which the job profile
-      // gives back as nodes on the way down to the job's own sandbox.)
-      // <data>/vm is under the same deny, when it exists.
-      const probe = path.join(data, `localmost-probe-${process.pid}`);
-      const write = shell(`/usr/bin/touch ${sq(probe)}`);
-      fs.rmSync(probe, { force: true });
-      expect(write.ok).toBe(false);
-      expect(write.stderr).toContain('Operation not permitted');
-      const template = path.join(data, 'runner', 'arc');
-      expect(fs.existsSync(template)).toBe(true);
-      const listing = shell(`/bin/ls ${sq(template)}`);
-      expect(listing.ok).toBe(false);
-      expect(listing.stderr).toContain('Operation not permitted');
-      const vm = path.join(data, 'vm');
-      const vmListing = shell(`/bin/ls ${sq(vm)}`);
-      expect(vmListing.ok).toBe(false);
-      expect(vmListing.stderr.includes('Operation not permitted') || !fs.existsSync(vm)).toBe(true);
-    });
-
-    it('cannot run the helper, which carries the virtualization entitlement', () => {
-      // Found beside the bundled CLI's directory, in the bundle's Resources.
-      // The CLI is what the docker the job finds - the link in its own bin
-      // directory, <sandbox>/localmost/bin, ahead of any other docker on its
-      // PATH (npm and jest, which run this, put node_modules/.bin in front
-      // of it) - names. The job profile denies the helper's exec by path;
-      // the constructed form of this is in process-sandbox.sandbox.test.ts,
-      // with a compiled stand-in. Until packaging ships the helper there is
-      // nothing at the path to refuse.
-      const { resolved, bundled } = dockerOnPath(process.env.PATH ?? '');
-      expect(resolved).toBeDefined();
-      expect(fs.realpathSync(path.dirname(resolved!))).toBe(path.join(sandbox, JOB_BIN_DIR));
-      expect(bundled).toBeDefined();
-      const helper = path.join(path.dirname(path.dirname(bundled!)), 'localmost-vm');
-      const result = shell(`${sq(helper)} version`);
-      expect(result.ok).toBe(false);
-      expect(result.stderr.includes('Operation not permitted') || !fs.existsSync(helper)).toBe(true);
-    });
-
-    it('cannot put itself under a profile of its own', () => {
-      expect(shell("/usr/bin/sandbox-exec -p '(version 1)(allow default)' /usr/bin/true").ok).toBe(false);
+  describe("the helper's profile through seatbelt", () => {
+    // Seatbelt jobs are gone: a job runs in a macOS VM, under no sandbox of
+    // localmost's, as the Mac's own runs do. Where a profile cannot be
+    // constructed something else confines this process, and these tests
+    // have to say so rather than pass on nothing.
+    it('can construct a seatbelt profile here, as on the Mac and in a macOS VM job', () => {
+      expect(canConstruct()).toBe(true);
     });
   });
 }

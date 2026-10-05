@@ -1,10 +1,10 @@
 /**
- * The macOS VM isolation mode, put together: the golden image's manager,
- * the job backend and the slot queue they share, with the real helper, its
- * profiles and the host's runner. The wiring step creates one at app start,
- * calls start() before the pool takes jobs, registers the setup IPC with
- * its manager (ipc-handlers/macos-vm.ts), and hands the backend jobs whose
- * isolation is `macos-vm`. See docs/roadmap/macos-vm-jobs.md.
+ * The macOS VM, put together: the golden image's manager, the job backend
+ * and the slot queue they share, with the real helper, its profiles and the
+ * host's runner. index.ts creates one at app start, starts it, registers the
+ * setup IPC with its manager (ipc-handlers/macos-vm.ts), and gives the
+ * runner manager its backend, which runs every job. See
+ * docs/roadmap/macos-vm-jobs.md.
  */
 
 import * as fs from 'fs';

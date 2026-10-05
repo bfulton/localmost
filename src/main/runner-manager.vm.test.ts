@@ -6,17 +6,15 @@
  * HelperClient and AgentClient, the sandbox on disk with its share and nonce.
  * The helper is the fake, selected by LOCALMOST_VM_HELPER as an unpackaged
  * run selects it, and spawned directly rather than under sandbox-exec. Behind
- * it, a mock daemon. The worker is a mock process, and the job's docker
- * client is this test, speaking to the socket the worker was given.
+ * it, a mock daemon. The worker's macOS VM is the fake backend, and the job's
+ * docker client is this test, speaking to the socket in the worker's sandbox,
+ * where the relay into the VM will reach it.
  *
  * The sandbox is handed to the runner by a path relative to the test's
  * working directory: a job's own TMPDIR, deep in its sandbox, leaves too few
  * of a unix socket path's 104 bytes for <data>/runner/sandbox/<id>/docker.sock.
  */
 
-jest.mock('./process-sandbox', () => ({
-  spawnSandboxed: jest.fn(),
-}));
 
 // A sandbox of its own for every start, laid out as buildSandbox lays one out.
 jest.mock('./runner-downloader', () => {
@@ -25,8 +23,6 @@ jest.mock('./runner-downloader', () => {
   const crypto = jest.requireActual<typeof import('crypto')>('crypto');
   return {
     RunnerDownloader: jest.fn().mockImplementation(() => ({
-      getToolCacheDir: jest.fn((t: string) => path.join('runner', 'caches', t, 'tool-cache')),
-      getTargetCacheDir: jest.fn((t: string) => path.join('runner', 'caches', t)),
       getConfigDir: jest.fn((i: number) => path.join('runner', 'config', String(i))),
       buildSandbox: jest.fn(async (instance: number) => {
         const sandbox = path.join('runner', 'sandbox', `${instance}-${crypto.randomBytes(6).toString('hex')}`);
@@ -79,26 +75,6 @@ jest.mock('./config', () => ({
   loadConfig: jest.fn(() => ({})),
 }));
 
-// No per-user temp directory: this suite's sandboxes are real directories,
-// and a job temp directory for one would be made in the operator's own T.
-jest.mock('./job-temp', () => ({
-  ...jest.requireActual<typeof import('./job-temp')>('./job-temp'),
-  userTempDir: jest.fn(() => undefined),
-}));
-
-jest.mock('../shared/sandbox-reaper', () => ({
-  reapMarkedProcessesAsync: jest.fn(async () => []),
-  developerPython: jest.fn(async () => null),
-}));
-
-jest.mock('./runner-cleanup', () => ({
-  processStartTime: jest.fn(() => 'START'),
-  lookUpStartTime: jest.fn(() => 'START'),
-  mayEscalate: jest.requireActual('./runner-cleanup').mayEscalate,
-  markerHolders: jest.fn(async () => []),
-  signalOrphanPids: jest.fn(async () => ({ signalled: false, remaining: [] })),
-  parsePidRecord: jest.requireActual('./runner-cleanup').parsePidRecord,
-}));
 
 import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 import { spawn } from 'child_process';
@@ -107,7 +83,6 @@ import * as http from 'http';
 import * as path from 'path';
 import { RunnerManager, RepoPolicyRuntime } from './runner-manager';
 import { ProxyServer } from './proxy-server';
-import { spawnSandboxed } from './process-sandbox';
 import { GuestImage } from './vm/guest-image';
 import { helperPath, HELPER_OVERRIDE_ENV } from './vm/paths';
 import { DefaultVmManager } from './vm/vm-manager';
@@ -115,8 +90,14 @@ import { VmBackend } from './vm/vm-backend';
 import type { DockerVmConfig } from './config';
 import type { CacheDisks, ImagePuller, VmHandle } from './vm/types';
 import type { LogEntry } from '../shared/types';
-import { createMockProcess, RunnerManagerTestHelper } from './test-utils';
+import { createMockWorker, fakeIsolation, type FakeIsolation, RunnerManagerTestHelper } from './test-utils';
 import { assertVmSocketsFit, FAKE_HELPER, shortTempDir, writeGuest } from './test-utils/vm-fixtures';
+
+/** The macOS VM backend every manager here runs its workers on; a new one for each test. */
+let isolation: FakeIsolation;
+beforeEach(() => {
+  isolation = fakeIsolation();
+});
 
 const config: DockerVmConfig = {
   prewarm: false, cpus: 1, memoryMiB: 1024, maxRunning: 2, dataDiskGiB: 64, bootTimeoutSec: 30,
@@ -242,6 +223,7 @@ describe('a docker job on the VM backend, through the runner', () => {
       docker: { run: { images: ['alpine:3'], network: 'bridge' }, pull: { registries: ['docker.io'] } },
     }));
     const manager = new RunnerManager({
+      isolation,
       onLog: (entry) => logs.push(entry),
       onStatusChange: () => {},
       onJobHistoryUpdate: () => {},
@@ -251,15 +233,13 @@ describe('a docker job on the VM backend, through the runner', () => {
       getJobTarget: () => ({ targetDisplayName: 'owner/repo', repository: 'owner/repo', githubSha: 'abc123', githubWorkflow: 'CI' }),
     });
     const helper = new RunnerManagerTestHelper(manager);
-    const worker = createMockProcess(40000 + (process.pid % 1000));
-    jest.mocked(spawnSandboxed).mockReturnValue(worker);
+    const worker = createMockWorker(40000 + (process.pid % 1000));
+    isolation.spawnWorker.mockResolvedValue(worker);
 
     expect(helperPath()).toBe(FAKE_HELPER);
     await helper.spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubRepo: 'owner/repo', githubSha: 'abc123' });
-    const options = jest.mocked(spawnSandboxed).mock.calls[0][2]!;
-    const socket = options.dockerSocket as string;
-    const env = options.env as NodeJS.ProcessEnv;
-    expect(env.DOCKER_HOST).toBe(`unix://${socket}`);
+    const [job] = isolation.spawnWorker.mock.calls[0];
+    const socket = path.join(job.sandboxDir, 'docker.sock');
 
     // Before the claim the socket answers the baseline, and nothing boots.
     const earlyPing = await request(socket, 'GET', '/_ping');
@@ -271,7 +251,7 @@ describe('a docker job on the VM backend, through the runner', () => {
     await proxyOptions.onJobAcquired('job-1');
     // And again at the "Running job" line, as every job does.
     const claimLookups = getRepoPolicy.mock.calls.length;
-    worker.stdout!.emit('data', Buffer.from('Running job: build\n'));
+    worker.emit('stdout', 'Running job: build');
     // That second application is fire-and-forget; wait for it, however loaded the machine.
     const policyDeadline = Date.now() + 20_000;
     while (getRepoPolicy.mock.calls.length <= claimLookups && Date.now() < policyDeadline) {
@@ -359,6 +339,7 @@ describe('a docker job on the VM backend, through the runner', () => {
       config: () => config,
     });
     const manager = new RunnerManager({
+      isolation,
       onLog: (entry) => logs.push(entry),
       onStatusChange: () => {},
       onJobHistoryUpdate: () => {},
@@ -370,13 +351,13 @@ describe('a docker job on the VM backend, through the runner', () => {
       }),
       getJobTarget: () => ({ targetDisplayName: 'owner/repo', repository: 'owner/repo', githubSha: 'abc123', githubWorkflow: 'CI' }),
     });
-    const worker = createMockProcess(42000 + (process.pid % 1000));
-    jest.mocked(spawnSandboxed).mockReturnValue(worker);
+    const worker = createMockWorker(42000 + (process.pid % 1000));
+    isolation.spawnWorker.mockResolvedValue(worker);
     await new RunnerManagerTestHelper(manager).spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubRepo: 'owner/repo', githubSha: 'abc123' });
-    const socket = jest.mocked(spawnSandboxed).mock.calls.at(-1)![2]!.dockerSocket as string;
+    const socket = path.join(isolation.spawnWorker.mock.calls.at(-1)![0].sandboxDir, 'docker.sock');
     const proxyOptions = jest.mocked(ProxyServer).mock.calls.at(-1)![0] as unknown as { onJobAcquired: (id: string) => Promise<void> };
     await proxyOptions.onJobAcquired('job-1');
-    worker.stdout!.emit('data', Buffer.from('Running job: build\n'));
+    worker.emit('stdout', 'Running job: build');
     // The job's tools ask what the daemon is, and nothing more.
     expect((await request(socket, 'GET', '/_ping')).status).toBe(200);
     expect((await request(socket, 'GET', '/v1.45/version')).status).toBe(200);
@@ -429,6 +410,7 @@ describe('a docker job on the VM backend, through the runner', () => {
     });
     const run = async (claimed: string) => {
       const manager = new RunnerManager({
+        isolation,
         onLog: (entry) => logs.push(entry),
         onStatusChange: () => {},
         onJobHistoryUpdate: () => {},
@@ -437,15 +419,15 @@ describe('a docker job on the VM backend, through the runner', () => {
         getRepoPolicy: async () => ({ hosts: [], level: 'strict', readPaths: [], writePaths: [], docker: { run: { images: ['alpine:3'] } } }),
         getJobTarget: () => ({ targetDisplayName: claimed, repository: claimed, githubSha: 'abc123', githubWorkflow: 'CI' }),
       });
-      const worker = createMockProcess(41000 + started.length);
-      jest.mocked(spawnSandboxed).mockReturnValue(worker);
+      const worker = createMockWorker(41000 + started.length);
+      isolation.spawnWorker.mockResolvedValue(worker);
       await new RunnerManagerTestHelper(manager).spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubRepo: 'owner/repo', githubSha: 'abc123' });
       const proxyOptions = jest.mocked(ProxyServer).mock.calls.at(-1)![0] as unknown as { onJobAcquired: (id: string) => Promise<void> };
       await proxyOptions.onJobAcquired('job');
       return worker;
     };
     /** The worker exits, and with it its socket and VM. */
-    const exit = async (worker: ReturnType<typeof createMockProcess>) => {
+    const exit = async (worker: ReturnType<typeof createMockWorker>) => {
       worker.emit('exit', 0, null);
       const jobs = path.join(data, 'vm', 'jobs');
       const deadline = Date.now() + 30_000;

@@ -1,19 +1,14 @@
 /**
  * How a repository's approved policy reaches a worker: its proxy (hosts,
- * denied hosts, loopback, level), its sandbox profile (paths, denied paths,
- * loopback, the proxy's port) and its docker socket - for the job the worker
- * actually claimed, under the name GitHub gives the repository, and never
- * for a worker that has since finished.
+ * denied hosts, level), its environment and its docker socket - for the job
+ * the worker actually claimed, under the name GitHub gives the repository,
+ * and never for a worker that has since finished. Loopback a policy declares
+ * is not given: a macOS VM job reaches only its proxy and the broker.
  */
 
-jest.mock('./process-sandbox', () => ({
-  spawnSandboxed: jest.fn(),
-}));
 
 jest.mock('./runner-downloader', () => ({
   RunnerDownloader: jest.fn().mockImplementation(() => ({
-    getToolCacheDir: jest.fn().mockImplementation((targetId: string) => `/Users/test/.localmost/runner/caches/${targetId}/tool-cache`),
-    getTargetCacheDir: jest.fn().mockImplementation((targetId: string) => `/Users/test/.localmost/runner/caches/${targetId}`),
     writeShareNonce: jest.fn(() => "a".repeat(32)),
     buildSandbox: jest.fn().mockImplementation((instance: number) => Promise.resolve(`/Users/test/.localmost/runner/sandbox/${instance}`)),
     removeSandbox: jest.fn().mockResolvedValue(undefined),
@@ -39,20 +34,6 @@ jest.mock('./proxy-server', () => ({
   })),
 }));
 
-// The sweep by profile mark runs python; stubbed, as nothing here runs sandboxed.
-jest.mock('../shared/sandbox-reaper', () => ({
-  reapMarkedProcessesAsync: jest.fn(async () => []),
-  developerPython: jest.fn(async () => null),
-}));
-
-jest.mock('./runner-cleanup', () => ({
-  processStartTime: jest.fn(() => 'START'),
-  lookUpStartTime: jest.fn(() => 'START'),
-  mayEscalate: jest.requireActual('./runner-cleanup').mayEscalate,
-  markerHolders: jest.fn(() => []),
-  signalOrphanPids: jest.fn(async () => ({ signalled: true, remaining: [] })),
-  parsePidRecord: jest.requireActual('./runner-cleanup').parsePidRecord,
-}));
 
 jest.mock('./docker/docker-filter-proxy', () => ({
   DockerFilterProxy: jest.fn().mockImplementation(() => ({
@@ -68,8 +49,6 @@ jest.mock('fs', () => ({
   writeFileSync: jest.fn(),
   unlinkSync: jest.fn(),
   mkdirSync: jest.fn(),
-  openSync: jest.fn(() => 42),
-  closeSync: jest.fn(),
   promises: {
     mkdir: jest.fn(),
     chmod: jest.fn(),
@@ -85,10 +64,14 @@ import { RunnerManager, RepoPolicyRuntime } from './runner-manager';
 import { repoPolicyRuntime } from './repo-policy';
 import type { LocalmostrcConfig } from '../shared/localmostrc';
 import { ProxyServer } from './proxy-server';
-import { spawnSandboxed } from './process-sandbox';
-import { createMockProcess, RunnerManagerTestHelper } from './test-utils';
+import { createMockWorker, fakeIsolation, type FakeIsolation, RunnerManagerTestHelper } from './test-utils';
 
-const mockSpawnSandboxed = spawnSandboxed as jest.MockedFunction<typeof spawnSandboxed>;
+/** The macOS VM backend every manager here runs its workers on; a new one for each test. */
+let isolation: FakeIsolation;
+beforeEach(() => {
+  isolation = fakeIsolation();
+});
+
 
 const BROKER_PORT = 9100;
 
@@ -125,6 +108,7 @@ const fakeSocket = () => ({ bind: jest.fn(), stop: jest.fn().mockResolvedValue(u
 
 function managerWith(options: Partial<ConstructorParameters<typeof RunnerManager>[0]> = {}) {
   const manager = new RunnerManager({
+    isolation,
     onLog: jest.fn(),
     onStatusChange: jest.fn(),
     onJobHistoryUpdate: jest.fn(),
@@ -155,8 +139,8 @@ beforeEach(() => {
   (fs.readFileSync as jest.Mock).mockReturnValue('{}');
 });
 
-describe("a claimed job's denied hosts and loopback on its proxy", () => {
-  it('installs them with the hosts, and loopback with the real broker port', async () => {
+describe("a claimed job's denied hosts on its proxy", () => {
+  it('installs them with the hosts, and keeps loopback to the broker whatever the policy declares', async () => {
     const { helper } = managerWith({
       getRepoPolicy: async () => policy({ hosts: ['ok.example'], deniedHosts: ['bad.example'], loopback: [5432] }),
     });
@@ -169,7 +153,7 @@ describe("a claimed job's denied hosts and loopback on its proxy", () => {
 
     expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith(['ok.example']);
     expect(proxy.setPolicyDeniedHosts).toHaveBeenLastCalledWith(['bad.example']);
-    expect(proxy.setLoopbackPolicy).toHaveBeenLastCalledWith(BROKER_PORT, [5432]);
+    expect(proxy.setLoopbackPolicy).not.toHaveBeenCalledWith(BROKER_PORT, [5432]);
   });
 
   it('closes them when the worker is finished, so the next job on the slot starts without them', async () => {
@@ -266,24 +250,39 @@ describe("a claimed job's denied hosts and loopback on its proxy", () => {
   });
 });
 
-describe("a spawned worker's profile", () => {
+describe("a spawned worker", () => {
   const spawn = async (runtime: RepoPolicyRuntime, context: Record<string, unknown> = {}) => {
     const getRepoPolicy = jest.fn(async (..._args: unknown[]) => runtime);
     const { manager, helper } = managerWith({ getRepoPolicy: getRepoPolicy as never });
     (fs.existsSync as jest.Mock).mockReturnValue(true);
-    mockSpawnSandboxed.mockReturnValue(createMockProcess(4242));
+    isolation.spawnWorker.mockResolvedValue(createMockWorker(4242));
     await helper.spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234', ...context });
-    return { manager, helper, getRepoPolicy, options: mockSpawnSandboxed.mock.calls.at(-1)![2]! };
+    const [job, , env] = isolation.spawnWorker.mock.calls.at(-1)!;
+    return { manager, helper, getRepoPolicy, job, env };
   };
 
-  it("is given this worker's proxy port, or its job would reach nothing on loopback", async () => {
-    const { options } = await spawn(policy());
-    expect(options.proxyPort).toBe(12345);
+  it("is given this worker's proxy port and the broker's, the guest's two ways out", async () => {
+    const { job } = await spawn(policy());
+    expect(job.proxyPort).toBe(12345);
+    expect(job.brokerPort).toBe(BROKER_PORT);
   });
 
-  it('carries the denied paths and the loopback grant the policy declares', async () => {
-    const { options } = await spawn(policy({ denyPaths: ['~/secret'], loopback: [5432] }));
-    expect(options.filesystemPolicy).toMatchObject({ deny: ['~/secret'], loopback: [5432] });
+  it("is given what the env policy allows of the app's environment, and nothing it denies", async () => {
+    process.env.LOCALMOST_TEST_ALLOWED = 'yes';
+    process.env.LOCALMOST_TEST_DENIED = 'no';
+    try {
+      const { env } = await spawn(policy({ env: { allow: ['LOCALMOST_TEST_*'], deny: ['LOCALMOST_TEST_DENIED'] } }));
+      expect(env.LOCALMOST_TEST_ALLOWED).toBe('yes');
+      expect(env).not.toHaveProperty('LOCALMOST_TEST_DENIED');
+    } finally {
+      delete process.env.LOCALMOST_TEST_ALLOWED;
+      delete process.env.LOCALMOST_TEST_DENIED;
+    }
+  });
+
+  it('is stamped with the stamp of the policy it was started under', async () => {
+    const { helper } = await spawn(policy({ stamp: 'spawn-stamp' }));
+    expect(helper.instances.get(1)!.policyStamp).toBe('spawn-stamp');
   });
 
   it('closes the proxy it is reusing, loopback and denies included, before the runner exists', async () => {
@@ -291,7 +290,7 @@ describe("a spawned worker's profile", () => {
     const proxy = jest.mocked(ProxyServer).mock.results.at(-1)!.value as FakeProxy;
     expect(proxy.setPolicyDeniedHosts).toHaveBeenCalledWith([]);
     expect(proxy.setLoopbackPolicy).toHaveBeenCalledWith(BROKER_PORT, undefined);
-    expect(proxy.setLoopbackPolicy.mock.invocationCallOrder[0]).toBeLessThan(mockSpawnSandboxed.mock.invocationCallOrder[0]);
+    expect(proxy.setLoopbackPolicy.mock.invocationCallOrder[0]).toBeLessThan(isolation.spawnWorker.mock.invocationCallOrder[0]);
   });
 
   it("clears the last job's hosts, denies and loopback from a reused proxy before the runner exists", async () => {
@@ -302,7 +301,7 @@ describe("a spawned worker's profile", () => {
     const { proxy, held } = holdingProxy({ hosts: ['stale.example'], denied: ['bad.example'], loopback: [5432], level: 'permissive', token: 'last-job' });
     let atSpawn: typeof held | undefined;
     (fs.existsSync as jest.Mock).mockReturnValue(true);
-    mockSpawnSandboxed.mockImplementation(() => { atSpawn = { ...held }; return createMockProcess(4242) as never; });
+    isolation.spawnWorker.mockImplementation(async () => { atSpawn = { ...held }; return createMockWorker(4242); });
     await manager.initialize();
     const helper = new RunnerManagerTestHelper(manager);
     helper.setProxy(1, proxy);
@@ -323,7 +322,7 @@ describe("a spawned worker's profile", () => {
     const { proxy, held } = holdingProxy({ hosts: [], denied: [], loopback: undefined, level: 'strict', token: 'last-job' });
     let atSpawn: typeof held | undefined;
     (fs.existsSync as jest.Mock).mockReturnValue(true);
-    mockSpawnSandboxed.mockImplementation(() => { atSpawn = { ...held }; throw new Error('sandbox-exec missing'); });
+    isolation.spawnWorker.mockImplementation(async () => { atSpawn = { ...held }; throw new Error('the guest agent refused the job'); });
     await manager.initialize();
     const helper = new RunnerManagerTestHelper(manager);
     helper.setProxy(1, proxy);
@@ -331,7 +330,7 @@ describe("a spawned worker's profile", () => {
 
     await manager.startInstance(1);
 
-    expect(atSpawn).toMatchObject({ hosts: ['ok.example'], denied: ['bad.example'], loopback: [5432] });
+    expect(atSpawn).toMatchObject({ hosts: ['ok.example'], denied: ['bad.example'], level: 'permissive' });
     expect(held).toMatchObject({ hosts: [], denied: [], loopback: undefined, level: 'strict' });
     expect(held.token).not.toBe(atSpawn!.token);
   });
@@ -342,32 +341,32 @@ describe("a spawned worker's profile", () => {
   });
 });
 
-describe('the stamp a worker is built under', () => {
-  const stampFor = (manager: RunnerManager, runtime: RepoPolicyRuntime): string =>
-    (manager as unknown as { stampFor(p: RepoPolicyRuntime): string }).stampFor(runtime);
-
-  it('moves when the denied paths or the loopback grant move', () => {
-    const { manager } = managerWith();
-    const base = stampFor(manager, policy());
-    expect(stampFor(manager, policy({ denyPaths: ['~/secret'] }))).not.toBe(base);
-    expect(stampFor(manager, policy({ loopback: true }))).not.toBe(base);
-    expect(stampFor(manager, policy({ loopback: [5432] }))).not.toBe(stampFor(manager, policy({ loopback: [5433] })));
-    // Declaring an empty deny list is declaring none.
-    expect(stampFor(manager, policy({ denyPaths: [] }))).toBe(base);
-  });
-
-  it('refuses a claim whose approved deny list changed since the worker was built', async () => {
+describe('the stamp a worker is started under', () => {
+  it('refuses a claim whose approved policy changed since the worker started', async () => {
     const { manager, helper } = managerWith({
-      getRepoPolicy: async () => policy({ hosts: ['ok.example'], denyPaths: ['~/secret'] }),
+      getRepoPolicy: async () => policy({ hosts: ['ok.example'], stamp: 'now' }),
     });
     const proxy = fakeProxy();
     helper.setProxy(1, proxy);
-    helper.setInstance(1, { name: 'runner-1', status: 'listening', policyStamp: stampFor(manager, policy({ hosts: ['ok.example'] })) });
+    helper.setInstance(1, { name: 'runner-1', status: 'listening', policyStamp: 'at-spawn' });
     jest.spyOn(manager, 'stopInstance').mockResolvedValue(undefined as never);
 
     await helper.applyPolicyOnClaim(1, 'owner/repo', 'abc1234');
 
     expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith([]);
+  });
+
+  it('applies a claim whose approved policy is the one the worker started under', async () => {
+    const { helper } = managerWith({
+      getRepoPolicy: async () => policy({ hosts: ['ok.example'], stamp: 'same' }),
+    });
+    const proxy = fakeProxy();
+    helper.setProxy(1, proxy);
+    helper.setInstance(1, { name: 'runner-1', status: 'listening', policyStamp: 'same' });
+
+    await helper.applyPolicyOnClaim(1, 'owner/repo', 'abc1234');
+
+    expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith(['ok.example']);
   });
 });
 
@@ -405,10 +404,9 @@ describe('the job a policy is resolved for', () => {
       getRepoPolicy: async (_o, _r, _s, workflow) => repoPolicyRuntime(approved, workflow),
       getJobTarget: () => ({ targetDisplayName: 'owner/repo', githubSha: 'abc1234', githubWorkflow: 'CI', repository: 'owner/repo' }),
     });
-    const stampFor = (manager as unknown as { stampFor(p: RepoPolicyRuntime): string }).stampFor.bind(manager);
     const socket = fakeSocket();
     helper.setDockerProxy(1, socket);
-    helper.setInstance(1, { name: 'runner-1', status: 'listening', policyStamp: stampFor(repoPolicyRuntime(approved, '')) });
+    helper.setInstance(1, { name: 'runner-1', status: 'listening', policyStamp: repoPolicyRuntime(approved, '').stamp });
     helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234', githubRepo: 'owner/repo' });
     const { onJobAcquired, proxy } = await realProxyFor(helper, 1);
     const stopInstance = jest.spyOn(manager, 'stopInstance').mockResolvedValue(undefined as never);

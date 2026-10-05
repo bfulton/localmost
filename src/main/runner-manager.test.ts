@@ -1,7 +1,3 @@
-// Mock process-sandbox - define inside factory to avoid hoisting issues
-jest.mock('./process-sandbox', () => ({
-  spawnSandboxed: jest.fn(),
-}));
 
 // Mock runner-downloader to avoid tar dependency issues
 jest.mock('./runner-downloader', () => ({
@@ -10,8 +6,6 @@ jest.mock('./runner-downloader', () => ({
     getArcDir: jest.fn().mockReturnValue('/Users/test/.localmost/runner/arc/v2.330.0'),
     getConfigDir: jest.fn().mockImplementation((instance: number) => `/Users/test/.localmost/runner/config/${instance}`),
     removeSandbox: jest.fn().mockResolvedValue(undefined),
-    getToolCacheDir: jest.fn().mockImplementation((targetId: string) => `/Users/test/.localmost/runner/caches/${targetId}/tool-cache`),
-    getTargetCacheDir: jest.fn().mockImplementation((targetId: string) => `/Users/test/.localmost/runner/caches/${targetId}`),
     writeShareNonce: jest.fn(() => "a".repeat(32)),
     buildSandbox: jest.fn().mockImplementation((instance: number) => Promise.resolve(`/Users/test/.localmost/runner/sandbox/${instance}`)),
     isDownloaded: jest.fn().mockReturnValue(true),
@@ -39,24 +33,6 @@ jest.mock('./proxy-server', () => ({
   })),
 }));
 
-// The sweep by profile mark runs python; stubbed, as nothing here runs sandboxed.
-jest.mock('../shared/sandbox-reaper', () => ({
-  reapMarkedProcessesAsync: jest.fn(async () => []),
-  developerPython: jest.fn(async () => null),
-}));
-
-// Mock process-identity verification so tests can supply a matching start time,
-// and the marker helpers so no real lsof runs. parsePidRecord is the real one.
-const mockMarkerHolders = jest.fn((_p: string): number[] | null => []);
-const mockSignalOrphanPids = jest.fn(async (..._args: unknown[]): Promise<{ signalled: boolean; remaining: number[] | null }> => ({ signalled: true, remaining: [] }));
-jest.mock('./runner-cleanup', () => ({
-  processStartTime: jest.fn(() => 'START'),
-  lookUpStartTime: jest.fn(() => 'START'),
-  mayEscalate: jest.requireActual('./runner-cleanup').mayEscalate,
-  markerHolders: (p: string) => mockMarkerHolders(p),
-  signalOrphanPids: (...args: unknown[]) => mockSignalOrphanPids(...args),
-  parsePidRecord: jest.requireActual('./runner-cleanup').parsePidRecord,
-}));
 
 // Mock the filtering docker socket. A real one binds a unix socket inside the
 // sandbox directory, which does not exist under the mocked fs. The stub keeps
@@ -81,25 +57,28 @@ jest.mock('./docker/docker-filter-proxy', () => ({
 import { RunnerManager, UNCLAIMED_WORKER_TIMEOUT_MS, JobEvent } from './runner-manager';
 import * as fs from 'fs';
 import * as path from 'path';
-import { GRACE_MS } from './process-group';
 import { ProxyServer } from './proxy-server';
 import * as os from 'os';
 import { LogEntry, RunnerState, JobHistoryEntry } from '../shared/types';
 import { DockerPolicy } from '../shared/docker-policy';
-import { spawnSandboxed } from './process-sandbox';
+import type { LocalmostrcConfig } from '../shared/localmostrc';
+import { repoPolicyRuntime } from './repo-policy';
 import { DockerFilterProxy } from './docker/docker-filter-proxy';
-import { dockerCliPath } from './vm/paths';
-import * as paths from './paths';
 import { NO_DAEMON_MESSAGE, noDockerBackend } from './docker/docker-backend';
 import type { DockerBackend, WorkerContext, WorkerDocker } from './docker/docker-backend';
 import type { DockerVmConfig } from './config';
-import type { IsolationType } from '../shared/isolation';
 
 const vmConfig: DockerVmConfig = {
   prewarm: false, cpus: 4, memoryMiB: 8192, maxRunning: 2, dataDiskGiB: 64, bootTimeoutSec: 60,
   cacheLimitGiB: 20, pullMaxGiB: 10, jobPullMaxGiB: 30, minFreeGiB: 20,
 };
-import { createMockProcess, RunnerManagerTestHelper } from './test-utils';
+import { createMockWorker, fakeIsolation, type FakeIsolation, RunnerManagerTestHelper } from './test-utils';
+
+/** The macOS VM backend every manager here runs its workers on; a new one for each test. */
+let isolation: FakeIsolation;
+beforeEach(() => {
+  isolation = fakeIsolation();
+});
 
 /** Stands in for the broker making a worker its per-start key. */
 const perStartCredential = async () => ({
@@ -110,8 +89,6 @@ const perStartCredential = async () => ({
   rsaParams: { d: 'D', dp: 'DP', dq: 'DQ', exponent: 'AQAB', inverseQ: 'IQ', modulus: 'N', p: 'P', q: 'Q' },
 });
 
-// Get the mocked function
-const mockSpawnSandboxed = spawnSandboxed as jest.MockedFunction<typeof spawnSandboxed>;
 
 /** What the mocked DockerFilterProxy hands back: the manager's view of a worker's socket. */
 interface DockerSocketStub {
@@ -141,19 +118,6 @@ jest.mock('fs', () => ({
   writeFileSync: jest.fn(),
   unlinkSync: jest.fn(),
   mkdirSync: jest.fn(),
-  openSync: jest.fn(() => 42),
-  closeSync: jest.fn(),
-  chmodSync: jest.fn(),
-  fchmodSync: jest.fn(),
-  // Nothing is there to be found but a job's home, the directory
-  // buildSandbox made, which is empty when it is filled.
-  lstatSync: jest.fn((p: string) => {
-    if (/\/sandbox\/[^/]+\/home$/.test(String(p))) return { isDirectory: () => true, isSymbolicLink: () => false };
-    throw Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' });
-  }),
-  // ...and, following links, everything a grant names in the real home.
-  statSync: jest.fn(() => ({ isDirectory: () => true })),
-  symlinkSync: jest.fn(),
   promises: {
     mkdir: jest.fn(),
     chmod: jest.fn(),
@@ -175,12 +139,6 @@ describe('RunnerManager', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    // clearAllMocks keeps implementations; a test that failed mid-way must
-    // not leak its marker holders into the next one.
-    mockMarkerHolders.mockReset();
-    mockMarkerHolders.mockImplementation(() => []);
-    mockSignalOrphanPids.mockReset();
-    mockSignalOrphanPids.mockImplementation(async () => ({ signalled: true, remaining: [] }));
 
     mockOnLog = jest.fn();
     mockOnStatusChange = jest.fn();
@@ -191,6 +149,7 @@ describe('RunnerManager', () => {
     (fs.readFileSync as jest.Mock).mockReturnValue('{}');
 
     runnerManager = new RunnerManager({
+      isolation,
       onLog: mockOnLog,
       onStatusChange: mockOnStatusChange,
       onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -209,6 +168,7 @@ describe('RunnerManager', () => {
 
       // Create new manager to test config loading
       new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -305,6 +265,7 @@ describe('RunnerManager', () => {
       const { RunnerManager: RM } = require('./runner-manager');
       const onStatusChange = jest.fn();
       const manager = new RM({
+        isolation,
         onLog: mockOnLog,
         onStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -314,35 +275,13 @@ describe('RunnerManager', () => {
       expect(onStatusChange).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'offline' }));
     });
 
-    it('should warn if binary not found in sandbox', async () => {
-      // Mock sandbox exists but run.sh doesn't
-      (fs.existsSync as jest.Mock).mockImplementation((p: string) => {
-        if (p.includes('run.sh')) return false;
-        if (p.includes('.runner')) return true;
-        if (p.includes('/proxies/')) return true;
-        if (p === mockConfigPath) return true;
-        return false;
-      });
-
-      const started = await new RunnerManagerTestHelper(runnerManager).spawnForJob();
-
-      // Should log a warning about missing binary, and report no worker
-      expect(started).toBe(false);
-      expect(mockOnLog).toHaveBeenCalledWith(
-        expect.objectContaining({
-          level: 'warn',
-          message: expect.stringContaining('Runner binary not found'),
-        })
-      );
-    });
-
     it('should start runner process when configured', async () => {
       // Mock file existence checks
       (fs.existsSync as jest.Mock).mockReturnValue(true);
 
       // Create mock process
-      const mockProcess = createMockProcess(12345);
-      mockSpawnSandboxed.mockReturnValue(mockProcess);
+      const mockProcess = createMockWorker(12345);
+      isolation.spawnWorker.mockResolvedValue(mockProcess);
 
       const started = await new RunnerManagerTestHelper(runnerManager).spawnForJob();
 
@@ -354,15 +293,15 @@ describe('RunnerManager', () => {
         })
       );
 
-      // Verify sandboxed spawn was called
-      expect(mockSpawnSandboxed).toHaveBeenCalled();
+      // Its runner was started in its VM.
+      expect(isolation.spawnWorker).toHaveBeenCalled();
     });
 
     it('does nothing when initialized again while a worker is running', async () => {
       (fs.existsSync as jest.Mock).mockReturnValue(true);
 
-      const mockProcess = createMockProcess(12346);
-      mockSpawnSandboxed.mockReturnValue(mockProcess);
+      const mockProcess = createMockWorker(12346);
+      isolation.spawnWorker.mockResolvedValue(mockProcess);
 
       await new RunnerManagerTestHelper(runnerManager).spawnForJob();
 
@@ -374,7 +313,7 @@ describe('RunnerManager', () => {
           message: expect.stringContaining('already running'),
         })
       );
-      expect(mockSpawnSandboxed).toHaveBeenCalledTimes(1);
+      expect(isolation.spawnWorker).toHaveBeenCalledTimes(1);
       expect(runnerManager.isRunning()).toBe(true);
     });
   });
@@ -399,6 +338,7 @@ describe('RunnerManager', () => {
   runnerName: my-runner`);
 
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -457,6 +397,7 @@ describe('RunnerManager', () => {
   describe('user filtering', () => {
     it('should allow all users when filter scope is everyone', () => {
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -470,6 +411,7 @@ describe('RunnerManager', () => {
 
     it('should allow all users when no filter is set', () => {
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -482,6 +424,7 @@ describe('RunnerManager', () => {
 
     it('should only allow current user when trigger scope with just-me', () => {
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -497,6 +440,7 @@ describe('RunnerManager', () => {
 
     it('should only allow users in allowlist when trigger scope with allowlist', () => {
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -519,6 +463,7 @@ describe('RunnerManager', () => {
 
     it('should block users when just-me but no current user is known', () => {
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -534,6 +479,7 @@ describe('RunnerManager', () => {
 
     it('blocks users when the filter config has an unrecognized allowedUsers', () => {
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -549,6 +495,7 @@ describe('RunnerManager', () => {
 
     it('blocks users when the filter config has an unrecognized scope', () => {
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -563,6 +510,7 @@ describe('RunnerManager', () => {
 
     it('should handle empty allowlist', () => {
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -581,6 +529,7 @@ describe('RunnerManager', () => {
     it('reports the target repository, not "unknown", when a spawned worker starts its job', async () => {
       const events: JobEvent[] = [];
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -621,6 +570,7 @@ describe('RunnerManager', () => {
     function setup(overrides: Record<string, unknown>) {
       const cancelWorkflowRun = jest.fn().mockResolvedValue(undefined);
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -699,6 +649,7 @@ describe('RunnerManager', () => {
       // likes: the job ends with its worker's exit, which looks it up once.
       const getJobConclusion = jest.fn(async () => 'success');
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -729,6 +680,7 @@ describe('RunnerManager', () => {
   describe('evaluateJobFilter', () => {
     function manager(opts: Record<string, unknown>) {
       return new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -812,6 +764,7 @@ describe('RunnerManager', () => {
     it('applies the hosts a repo declares to that instance proxy', async () => {
       const setPolicyAllowedHosts = jest.fn();
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -843,6 +796,7 @@ describe('RunnerManager', () => {
       // the policy lookup or a per-workflow section never fires.
       const seen: string[] = [];
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -876,6 +830,7 @@ describe('RunnerManager', () => {
       const setPolicyAllowedHosts = jest.fn();
       const getRepoPolicy = jest.fn().mockResolvedValue({ hosts: [], level: 'strict', readPaths: [], writePaths: [], docker: {} } as never);
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -906,6 +861,7 @@ describe('RunnerManager', () => {
       // every job sets the policy for its own target before the runner starts.
       const setPolicyAllowedHosts = jest.fn();
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -946,6 +902,7 @@ describe('RunnerManager', () => {
       // spawned, and the job ran with no hosts - three runs failed this way.
       const setPolicyAllowedHosts = jest.fn();
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -975,11 +932,12 @@ describe('RunnerManager', () => {
     });
 
     it('runs the job when a worker was never stamped', async () => {
-      // An unstamped worker got the closed profile, which is the safe one to
-      // run under. A truthy sentinel here failed the drift check against every
+      // An unstamped worker was started with no policy, which is the safe
+      // state to run under. A truthy sentinel here failed the drift check against every
       // real hash, so such a worker refused every job.
       const setPolicyAllowedHosts = jest.fn();
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -1017,6 +975,7 @@ describe('RunnerManager', () => {
       // stopped a worker whose job GitHub had already handed out, and the run
       // then failed on timeout with no steps - the 601s failure this avoids.
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -1057,6 +1016,7 @@ describe('RunnerManager', () => {
       // the job that retireWorkersForRepository promises to leave alone.
       const setPolicyAllowedHosts = jest.fn();
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -1090,41 +1050,28 @@ describe('RunnerManager', () => {
     });
 
     it('does not read a per-workflow host list as policy drift', async () => {
-      // Hosts are resolved per workflow and applied per job; the profile is
-      // not. Including them in the stamp made any repository with a workflows:
-      // network section look like it had drifted, and its jobs were refused.
+      // Hosts are resolved per workflow and applied per job. The stamp is
+      // taken over the whole approved policy, so the spawn's - before the
+      // workflow is known - matches the claim's for any workflow.
+      const approved: LocalmostrcConfig = {
+        version: 1,
+        shared: { filesystem: { read: ['~/.npm'] } },
+        workflows: { build: { network: { allow: ['build-only.example'] } } },
+      };
       const setPolicyAllowedHosts = jest.fn();
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async (_o: string, _r: string, _s: string, workflowName: string) => ({
-          hosts: workflowName === 'build' ? ['build-only.example'] : [],
-          level: 'strict' as const,
-          readPaths: ['~/.npm'],
-          writePaths: ['~/.npm'],
-          docker: {},
-        }),
+        getRepoPolicy: async (_o: string, _r: string, _s: string, workflowName: string) => repoPolicyRuntime(approved, workflowName),
       });
       const helper = new RunnerManagerTestHelper(manager);
-      const stamped = manager as unknown as {
-        stampFor(p: {
-          level: string;
-          readPaths: string[];
-          writePaths: string[];
-          docker: DockerPolicy;
-        }): string;
-      };
       helper.setInstance(1, {
         name: 'runner-1',
         claimedJob: { repository: 'owner/repo', sha: 'abc1234', workflow: 'build' },
         // Stamped at spawn, where the workflow name is not yet known.
-        policyStamp: stamped.stampFor({
-          level: 'strict',
-          readPaths: ['~/.npm'],
-          writePaths: ['~/.npm'],
-          docker: {},
-        }),
+        policyStamp: repoPolicyRuntime(approved, '').stamp,
         currentJob: {
           name: 'build',
           repository: 'owner/repo',
@@ -1144,6 +1091,7 @@ describe('RunnerManager', () => {
     it('constrains a claim when the policy changed after the worker started', async () => {
       const setPolicyAllowedHosts = jest.fn();
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -1172,7 +1120,7 @@ describe('RunnerManager', () => {
 
       await helper.applyPolicyOnClaim(1, 'owner/repo', 'abc1234');
 
-      // The filesystem half is fixed in the profile, so the declared hosts are
+      // What the worker was started with is fixed, so the declared hosts are
       // withheld and the job is left with runner infrastructure only.
       expect(setPolicyAllowedHosts).toHaveBeenLastCalledWith([]);
     });
@@ -1182,6 +1130,7 @@ describe('RunnerManager', () => {
       // proxy started could belong to whichever repo happened to run first.
       const setPolicyLevel = jest.fn();
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -1211,6 +1160,7 @@ describe('RunnerManager', () => {
       const setPolicyAllowedHosts = jest.fn();
       const setPolicyLevel = jest.fn();
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -1240,6 +1190,7 @@ describe('RunnerManager', () => {
     it('records the refusal and its reason where the user will see it', () => {
       const onJobEvent = jest.fn();
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -1272,6 +1223,7 @@ describe('RunnerManager', () => {
   describe('slot reservation', () => {
     function managerWith(count: number) {
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -1325,6 +1277,7 @@ describe('RunnerManager', () => {
   describe('slot release after a job', () => {
     function busyManager() {
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -1361,403 +1314,6 @@ describe('RunnerManager', () => {
     });
   });
 
-  describe('killing stale runner processes', () => {
-    it('never kills a worker this manager is currently running', async () => {
-      // Seen live: auto-start spawned instance 1 as pid 5748, the stale-process
-      // sweep read that pid out of the sandbox it had just written, killed it a
-      // second later, and the pool never came back - the runner sat Offline for
-      // eight hours while heartbeats carried on as if nothing were wrong.
-      const manager = new RunnerManager({
-        onLog: mockOnLog,
-        onStatusChange: mockOnStatusChange,
-        onJobHistoryUpdate: mockOnJobHistoryUpdate,
-      });
-      const helper = new RunnerManagerTestHelper(manager);
-      helper.setInstance(1, {
-        name: 'runner-1',
-        status: 'listening',
-        currentJob: null,
-        process: { pid: 5748, kill: jest.fn() } as never,
-      });
-
-      const killed: number[] = [];
-      const realKill = process.kill;
-      (process as unknown as { kill: unknown }).kill = ((pid: number, sig?: unknown) => {
-        // Signal 0 is the liveness probe; anything else is an actual kill.
-        if (sig !== 0) killed.push(pid);
-        return true;
-      }) as never;
-      try {
-        (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
-        (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
-          { name: '1.pid', isFile: () => true, isDirectory: () => false },
-        ] as never);
-        (jest.mocked(fs.promises.readFile) as unknown as jest.Mock).mockResolvedValue('5748 START' as never);
-
-        await helper.killStaleProcesses();
-      } finally {
-        (process as unknown as { kill: unknown }).kill = realKill;
-      }
-
-      // The only record is the live worker's; the group signal would show as -5748.
-      expect(killed).toEqual([]);
-    });
-
-    it('decides a pid record is live at signal time, not from a snapshot taken before reading it', async () => {
-      // The worker spawns while the sweep is reading the pid directory, and
-      // its fresh record is what the sweep then examines.
-      const helper = new RunnerManagerTestHelper(runnerManager);
-      const killed: Array<[number, unknown]> = [];
-      const realKill = process.kill;
-      (process as unknown as { kill: unknown }).kill = ((pid: number, sig?: unknown) => {
-        if (sig !== 0) killed.push([pid, sig]);
-        return true;
-      }) as never;
-      try {
-        (fs.existsSync as jest.Mock).mockReturnValue(true);
-        (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
-          { name: '1.pid', isFile: () => true, isDirectory: () => false },
-        ] as never);
-        (jest.mocked(fs.promises.readFile) as unknown as jest.Mock).mockImplementation(async () => {
-          helper.setInstance(1, { name: 'runner-1', status: 'starting', process: { pid: 5748, kill: jest.fn() } as never });
-          return '5748 START';
-        });
-
-        await helper.killStaleProcesses();
-      } finally {
-        (process as unknown as { kill: unknown }).kill = realKill;
-        (jest.mocked(fs.promises.readFile) as unknown as jest.Mock).mockReset();
-        (jest.mocked(fs.promises.readFile) as unknown as jest.Mock).mockResolvedValue('' as never);
-      }
-
-      expect(killed).toEqual([]);
-    });
-
-    it('decides a marker is owned at signal time, not from a snapshot taken before lsof', async () => {
-      const helper = new RunnerManagerTestHelper(runnerManager);
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
-        { name: '1-cafef00d.mark', isFile: () => true, isDirectory: () => false },
-      ] as never);
-      const unlink = jest.mocked(fs.promises.unlink) as unknown as jest.Mock;
-      unlink.mockResolvedValue(undefined as never);
-      unlink.mockClear();
-      // The worker spawns while lsof is running on its (already listed) marker.
-      mockMarkerHolders.mockImplementation((p: string) => {
-        helper.setInstance(1, { name: 'runner-1', status: 'busy', process: { pid: 5001, kill: jest.fn() } as never, markerPath: p });
-        return [5001, 5002, 5003];
-      });
-
-      await helper.killStaleProcesses();
-
-      expect(mockSignalOrphanPids).not.toHaveBeenCalled();
-      expect(unlink.mock.calls.some(([f]) => String(f).endsWith('1-cafef00d.mark'))).toBe(false);
-    });
-
-    it('hands the worker a per-spawn marker fd and records the marker in its pid file', async () => {
-      // Descendants inherit fd 3 and hold it for life, so a later sweep can
-      // find exactly this spawn's survivors with lsof - even once the leader
-      // (whose pid/pgid may be reused) is gone.
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([] as never);
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(7777));
-      (fs.writeFileSync as jest.Mock).mockClear();
-
-      await new RunnerManagerTestHelper(runnerManager).spawnForJob();
-
-      const opts = mockSpawnSandboxed.mock.calls.at(-1)![2]!;
-      expect(opts.stdio).toEqual(['ignore', 'pipe', 'pipe', 42]);
-      // The app closes its own copy; only the worker's tree holds the marker.
-      expect(fs.closeSync).toHaveBeenCalledWith(42);
-      const marker = (fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => /\/pids\/1-[0-9a-f]+\.mark$/.test(String(f)));
-      expect(marker).toBeDefined();
-      expect(fs.openSync).toHaveBeenCalledWith(marker![0], 'r');
-      const record = (fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => String(f).endsWith('/pids/1.pid'));
-      expect(String(record![1])).toMatch(/^7777 START\n.*\/pids\/1-[0-9a-f]+\.mark\n$/);
-      // A previous spawn's marker may still be held; nothing removes it here.
-      expect((fs.unlinkSync as jest.Mock).mock.calls.some(([f]) => String(f).endsWith('.mark'))).toBe(false);
-    });
-
-    it('starts the worker without a marker when the marker cannot be created', async () => {
-      // Bookkeeping must not disable the runner: the spawn goes ahead with
-      // process-group coverage only, and says so.
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([] as never);
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(7778));
-      (fs.writeFileSync as jest.Mock).mockImplementation((f: unknown) => {
-        if (String(f).endsWith('.mark')) throw new Error('EACCES: permission denied');
-      });
-      try {
-        await new RunnerManagerTestHelper(runnerManager).spawnForJob();
-
-        const opts = mockSpawnSandboxed.mock.calls.at(-1)![2]!;
-        expect(opts.stdio).toEqual(['ignore', 'pipe', 'pipe']);
-        const record = (fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => String(f).endsWith('/pids/1.pid'));
-        expect(String(record![1])).toBe('7778 START\n');
-        expect(mockOnLog).toHaveBeenCalledWith(expect.objectContaining({
-          level: 'warn', message: expect.stringContaining('Could not create marker'),
-        }));
-      } finally {
-        (fs.writeFileSync as jest.Mock).mockReset();
-      }
-    });
-
-    it('reaps a leaderless orphan group through its marker, by exact surviving pids', async () => {
-      // The leader is gone (no start time to verify) but two descendants still
-      // hold the marker. The pid/start-time path would leave them; the marker
-      // path signals precisely those pids.
-      const helper = new RunnerManagerTestHelper(runnerManager);
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
-        { name: '1-deadbeef.mark', isFile: () => true, isDirectory: () => false },
-      ] as never);
-      (jest.mocked(fs.promises.unlink) as unknown as jest.Mock).mockResolvedValue(undefined as never);
-      mockMarkerHolders.mockReturnValue([5001, 5002]);
-      mockSignalOrphanPids.mockClear();
-
-      await helper.killStaleProcesses();
-
-      expect(mockSignalOrphanPids).toHaveBeenCalledWith([5001, 5002], expect.any(Function), 1000, expect.any(Function));
-      // Escalation re-checks the marker itself, not bare liveness: the
-      // callback handed over reads this marker's holders afresh.
-      const recheck = mockSignalOrphanPids.mock.calls[0][3] as () => Promise<number[] | null>;
-      mockMarkerHolders.mockClear();
-      mockMarkerHolders.mockReturnValue([5002]);
-      expect(await recheck()).toEqual([5002]);
-      expect(mockMarkerHolders).toHaveBeenCalledWith(expect.stringMatching(/1-deadbeef\.mark$/));
-      // The marker is consumed once nothing holds it.
-      expect((jest.mocked(fs.promises.unlink) as unknown as jest.Mock).mock.calls.some(([f]) => String(f).endsWith('1-deadbeef.mark'))).toBe(true);
-      mockMarkerHolders.mockReturnValue([]);
-    });
-
-    it.each([
-      ['a holder survived', [5002] as number[] | null],
-      ['the re-check was unavailable', null as number[] | null],
-    ])('keeps a swept marker when %s', async (_why, remaining) => {
-      const helper = new RunnerManagerTestHelper(runnerManager);
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
-        { name: '1-deadbeef.mark', isFile: () => true, isDirectory: () => false },
-      ] as never);
-      const unlink = jest.mocked(fs.promises.unlink) as unknown as jest.Mock;
-      unlink.mockResolvedValue(undefined as never);
-      unlink.mockClear();
-      mockMarkerHolders.mockReturnValue([5001, 5002]);
-      mockSignalOrphanPids.mockResolvedValueOnce({ signalled: true, remaining });
-
-      await helper.killStaleProcesses();
-
-      expect(unlink.mock.calls.some(([f]) => String(f).endsWith('1-deadbeef.mark'))).toBe(false);
-      expect(mockOnLog).toHaveBeenCalledWith(expect.objectContaining({
-        level: 'warn', message: expect.stringContaining('1-deadbeef.mark'),
-      }));
-      mockMarkerHolders.mockReturnValue([]);
-    });
-
-    it("sweeps the marker of a worker that has exited but is still in the map", async () => {
-      // A worker that exited with an error stays in the map as 'error' with no
-      // process. Its marker is a finished spawn's: whatever still holds it is
-      // a straggler, and the next Start must not mistake it for live.
-      const helper = new RunnerManagerTestHelper(runnerManager);
-      const marker = path.join((runnerManager as unknown as { pidDir(): string }).pidDir(), '1-0badf00d.mark');
-      helper.setInstance(1, { name: 'runner-1', status: 'error', process: null, markerPath: marker });
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
-        { name: '1-0badf00d.mark', isFile: () => true, isDirectory: () => false },
-      ] as never);
-      (jest.mocked(fs.promises.unlink) as unknown as jest.Mock).mockResolvedValue(undefined as never);
-      mockMarkerHolders.mockReturnValue([7001]);
-      mockSignalOrphanPids.mockClear();
-
-      await helper.killStaleProcesses();
-
-      expect(mockSignalOrphanPids).toHaveBeenCalledTimes(1);
-      expect(mockSignalOrphanPids.mock.calls[0][0]).toEqual([7001]);
-      mockMarkerHolders.mockReturnValue([]);
-    });
-
-    it("leaves a live worker's marker alone: no lsof, no signal, no unlink", async () => {
-      // A marker belongs to a spawn, not a pid. Instance 1 is running now and
-      // its whole tree - Listener, Worker, a step's shell - holds
-      // 1-cafef00d.mark. Reaping "the holders other than the leader" would
-      // kill the live job's steps, and removing the marker would blind the
-      // sweep that runs if the app dies. A marker nobody owns is still swept.
-      const helper = new RunnerManagerTestHelper(runnerManager);
-      const liveMarker = path.join((runnerManager as unknown as { pidDir(): string }).pidDir(), '1-cafef00d.mark');
-      helper.setInstance(1, { name: 'runner-1', status: 'busy', process: { pid: 5001, kill: jest.fn() } as never, markerPath: liveMarker });
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
-        { name: '1-cafef00d.mark', isFile: () => true, isDirectory: () => false },
-        { name: '2-0badf00d.mark', isFile: () => true, isDirectory: () => false },
-      ] as never);
-      const unlink = jest.mocked(fs.promises.unlink) as unknown as jest.Mock;
-      unlink.mockResolvedValue(undefined as never);
-      unlink.mockClear();
-      mockMarkerHolders.mockClear();
-      mockMarkerHolders.mockImplementation((p) => (p === liveMarker ? [5001, 5002, 5003] : [6001]));
-      mockSignalOrphanPids.mockClear();
-
-      await helper.killStaleProcesses();
-
-      expect(mockMarkerHolders).not.toHaveBeenCalledWith(liveMarker);
-      expect(mockMarkerHolders).toHaveBeenCalledWith(expect.stringMatching(/2-0badf00d\.mark$/));
-      expect(mockSignalOrphanPids).toHaveBeenCalledTimes(1);
-      expect(mockSignalOrphanPids.mock.calls[0][0]).toEqual([6001]);
-      const unlinked = unlink.mock.calls.map(([f]) => String(f));
-      expect(unlinked).not.toContain(liveMarker);
-      expect(unlinked.some((f) => f.endsWith('2-0badf00d.mark'))).toBe(true);
-      mockMarkerHolders.mockReset();
-      mockMarkerHolders.mockImplementation(() => []);
-    });
-
-    it('skips a marker it did not record whose holders include a live worker', async () => {
-      // Belt and braces for a worker this manager has but whose marker it never
-      // recorded: its tree is still not ours to touch, and the marker stays.
-      const helper = new RunnerManagerTestHelper(runnerManager);
-      helper.setInstance(1, { name: 'runner-1', status: 'listening', process: { pid: 5001, kill: jest.fn() } as never });
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
-        { name: '2-cafef00d.mark', isFile: () => true, isDirectory: () => false },
-      ] as never);
-      const unlink = jest.mocked(fs.promises.unlink) as unknown as jest.Mock;
-      unlink.mockResolvedValue(undefined as never);
-      unlink.mockClear();
-      mockMarkerHolders.mockReturnValue([5001, 5002]);
-      mockSignalOrphanPids.mockClear();
-
-      await helper.killStaleProcesses();
-
-      expect(mockSignalOrphanPids).not.toHaveBeenCalled();
-      expect(unlink.mock.calls.some(([f]) => String(f).endsWith('2-cafef00d.mark'))).toBe(false);
-      mockMarkerHolders.mockReturnValue([]);
-    });
-
-    it('keeps a marker whose holders it could not determine', async () => {
-      // lsof failing is "unknown", never "nobody": signal nothing, keep the
-      // marker for the next sweep, say so.
-      const helper = new RunnerManagerTestHelper(runnerManager);
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
-        { name: '3-feedface.mark', isFile: () => true, isDirectory: () => false },
-      ] as never);
-      const unlink = jest.mocked(fs.promises.unlink) as unknown as jest.Mock;
-      unlink.mockResolvedValue(undefined as never);
-      unlink.mockClear();
-      mockMarkerHolders.mockReturnValue(null);
-      mockSignalOrphanPids.mockClear();
-
-      await helper.killStaleProcesses();
-
-      expect(mockSignalOrphanPids).not.toHaveBeenCalled();
-      expect(unlink.mock.calls.some(([f]) => String(f).endsWith('3-feedface.mark'))).toBe(false);
-      expect(mockOnLog).toHaveBeenCalledWith(expect.objectContaining({
-        level: 'warn', message: expect.stringContaining('3-feedface.mark'),
-      }));
-      mockMarkerHolders.mockReturnValue([]);
-    });
-
-    it('does not re-run the stale sweep when initialize is called while workers are live', async () => {
-      // initialize() runs the sweep, and a Start click overlapping auto-start
-      // must not sweep the workers auto-start just brought up.
-      const helper = new RunnerManagerTestHelper(runnerManager);
-      helper.setInstance(1, { name: 'runner-1', status: 'busy', process: { pid: 5001, kill: jest.fn() } as never });
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockClear();
-      mockOnStatusChange.mockClear();
-
-      await runnerManager.initialize();
-
-      expect(mockOnLog).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('already running') }));
-      expect(mockOnStatusChange).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'starting' }));
-      expect(fs.promises.readdir).not.toHaveBeenCalled();
-    });
-
-    it('reads pids from the app-owned pids directory, never the job-writable sandbox', async () => {
-      // The pid a job writes into its own sandbox used to steer this sweep: a
-      // job could drop any pid there and have the app SIGKILL it on the next
-      // start. The authoritative pid file lives where the job cannot write.
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(4321));
-      // The startup sweep is not what this test exercises; keep it from
-      // inheriting another test's pid-file mocks or signalling a real pid.
-      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([] as never);
-      (fs.writeFileSync as jest.Mock).mockClear();
-      const runnerDir = jest.spyOn(paths, 'getRunnerDir').mockReturnValue('/Users/test/.localmost/runner');
-      try {
-        await new RunnerManagerTestHelper(runnerManager).spawnForJob();
-      } finally {
-        runnerDir.mockRestore();
-      }
-
-      const write = (fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => String(f).endsWith('.pid'));
-      expect(write).toBeDefined();
-      // In the app-owned pids directory, getRunnerDir()/pids, which here
-      // shares the runner-paths mock's root with the sandbox this spawn ran
-      // in. Pinned exactly rather than by "not containing /sandbox/": inside
-      // a localmost job the real data directory is under the job's own home,
-      // and so under that job's sandbox.
-      expect(String(write![0])).toBe('/Users/test/.localmost/runner/pids/1.pid');
-      expect(String(mockSpawnSandboxed.mock.calls.at(-1)![2]!.cwd)).toBe('/Users/test/.localmost/runner/sandbox/1');
-    });
-
-    it('signals the whole process group of an orphan, not just its leader', async () => {
-      // A crashed worker leaves descendants in its detached group. Signalling
-      // only the leader pid strands them; the sweep targets the group.
-      const helper = new RunnerManagerTestHelper(runnerManager);
-      const signals: Array<[number, unknown]> = [];
-      const realKill = process.kill;
-      (process as unknown as { kill: unknown }).kill = ((pid: number, sig?: unknown) => {
-        signals.push([pid, sig]);
-        return true;
-      }) as never;
-      try {
-        (fs.existsSync as jest.Mock).mockReturnValue(true);
-        (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
-          { name: '1.pid', isFile: () => true, isDirectory: () => false },
-        ] as never);
-        (jest.mocked(fs.promises.readFile) as unknown as jest.Mock).mockResolvedValue('4242 START' as never);
-        (jest.mocked(fs.promises.unlink) as unknown as jest.Mock).mockResolvedValue(undefined as never);
-
-        await helper.killStaleProcesses();
-      } finally {
-        (process as unknown as { kill: unknown }).kill = realKill;
-      }
-
-      // SIGTERM went to the group (negative pid), not only the leader.
-      expect(signals).toContainEqual([-4242, 'SIGTERM']);
-    });
-
-    it('refuses to signal pid 1 or lower, whatever a stale file says', async () => {
-      // parseInt('-1') is -1, and process.kill(-1) signals every process the
-      // user owns; kill(0) signals the whole group. A pid file naming either
-      // must be ignored, not obeyed.
-      const helper = new RunnerManagerTestHelper(runnerManager);
-      const killed: number[] = [];
-      const realKill = process.kill;
-      (process as unknown as { kill: unknown }).kill = ((pid: number, sig?: unknown) => {
-        if (sig !== 0) killed.push(pid);
-        return true;
-      }) as never;
-      try {
-        (fs.existsSync as jest.Mock).mockReturnValue(true);
-        (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
-          { name: '1.pid', isFile: () => true, isDirectory: () => false },
-          { name: '2.pid', isFile: () => true, isDirectory: () => false },
-        ] as never);
-        (jest.mocked(fs.promises.readFile) as unknown as jest.Mock)
-          .mockResolvedValueOnce('-1' as never)
-          .mockResolvedValueOnce('0' as never);
-        (jest.mocked(fs.promises.unlink) as unknown as jest.Mock).mockResolvedValue(undefined as never);
-
-        await helper.killStaleProcesses();
-      } finally {
-        (process as unknown as { kill: unknown }).kill = realKill;
-      }
-
-      expect(killed).toEqual([]);
-    });
-  });
-
   describe('announcing which worker a job belongs to', () => {
     it('keeps the announcement when the worker starts', async () => {
       // The withdrawal was added for the case where the spawn fails, and put in
@@ -1769,6 +1325,7 @@ describe('RunnerManager', () => {
       const reserved: Array<[string, number]> = [];
       const cancelled: Array<[string, number]> = [];
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -1779,14 +1336,14 @@ describe('RunnerManager', () => {
       helper.startedAt = new Date().toISOString();
       helper.setPendingTargetContext('next', { targetId: 't1', targetDisplayName: 'owner/repo' });
       helper.stubStartInstance(async (n) => {
-        helper.setInstance(n, { name: `runner-${n}`, status: 'starting', process: createMockProcess(4242) });
+        helper.setInstance(n, { name: `runner-${n}`, status: 'starting', worker: createMockWorker(4242) });
       });
       helper.stubCopyProxyCredentials(async () => undefined);
       // The proxy credentials directory has to look present, or the spawn takes
       // a genuine failure path and withdrawing would be correct.
       (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
 
-      await manager.spawnWorkerForJob('seatbelt');
+      await manager.spawnWorkerForJob();
 
       expect(reserved).toHaveLength(1);
       expect(cancelled).toEqual([]);
@@ -1796,6 +1353,7 @@ describe('RunnerManager', () => {
       const reserved: Array<[string, number]> = [];
       const cancelled: Array<[string, number]> = [];
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -1811,17 +1369,18 @@ describe('RunnerManager', () => {
       helper.stubCopyProxyCredentials(async () => undefined);
       (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
 
-      await manager.spawnWorkerForJob('seatbelt').catch(() => undefined);
+      await manager.spawnWorkerForJob().catch(() => undefined);
 
       expect(reserved).toHaveLength(1);
       expect(cancelled).toHaveLength(1);
     });
   });
 
-  describe("a worker's own proxy and git environment", () => {
+  describe("a worker's own proxy", () => {
     it('revokes the broker key when startInstance fails after issuing it', async () => {
       const revoked: number[] = [];
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -1831,411 +1390,29 @@ describe('RunnerManager', () => {
       });
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       (fs.readFileSync as jest.Mock).mockReturnValue('{}');
-      // startInstance needs a version, and issues the key before spawning.
+      // startInstance needs a version, and issues the key before its VM starts.
       (manager as unknown as { runnerVersion: string }).runnerVersion = '1.0.0';
-      // Spawn throws after the key is issued and written into the config.
-      mockSpawnSandboxed.mockImplementation(() => { throw new Error('spawn failed'); });
+      // The runner cannot be started after the key is issued and written into the config.
+      isolation.spawnWorker.mockRejectedValue(new Error('the guest agent refused the job'));
 
-      const unlinked: string[] = [];
-      (fs.unlinkSync as jest.Mock).mockImplementation((f: unknown) => { unlinked.push(String(f)); });
-
-      await (manager as unknown as { startInstance(n: number): Promise<void> }).startInstance(1);
+      await manager.startInstance(1);
 
       expect(revoked).toContain(1);
-      // Nothing started, so nothing holds the marker; it goes now rather than
-      // lingering for a sweep.
-      expect(unlinked.some((f) => /\/pids\/1-[0-9a-f]+\.mark$/.test(f))).toBe(true);
-      mockSpawnSandboxed.mockReset();
+      // Its VM goes now, nothing having started in it.
+      expect(isolation.release).toHaveBeenCalledTimes(1);
     });
 
-    it('hands the runner a proxy URL with a per-worker token and a hermetic git config', async () => {
-      // The proxy token isolates each worker on shared loopback; the /dev/null
-      // git config keeps checkout from falling back to a client that chokes on
-      // the credentialed proxy URL, and makes the run machine-independent.
+    it('hands the runner a proxy URL with a per-worker token', async () => {
+      // The proxy token isolates each worker on shared loopback.
       (fs.existsSync as jest.Mock).mockReturnValue(true);
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(9911));
+      isolation.spawnWorker.mockResolvedValue(createMockWorker(9911));
 
       await new RunnerManagerTestHelper(runnerManager).spawnForJob();
 
-      const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+      const env = isolation.spawnWorker.mock.calls.at(-1)![2];
       expect(env.HTTPS_PROXY).toMatch(/^http:\/\/localmost:[0-9a-f]{48}@127\.0\.0\.1:/);
       expect(env.http_proxy).toBe(env.HTTPS_PROXY);
-      // A per-job global config, the job home's .gitconfig, setting
-      // proxyAuthMethod=basic so git sends the proxy token preemptively;
-      // system config is skipped.
-      expect(env.GIT_CONFIG_GLOBAL).toBe('/Users/test/.localmost/runner/sandbox/1/home/.gitconfig');
-      expect(env.GIT_CONFIG_SYSTEM).toBe('/dev/null');
-      const gitCfgWrite = (fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => f === env.GIT_CONFIG_GLOBAL);
-      expect(gitCfgWrite).toBeDefined();
-      expect(String(gitCfgWrite![1])).toContain('proxyAuthMethod = basic');
-      // Written exclusively, never through something already at the name.
-      expect(gitCfgWrite![2]).toMatchObject({ flag: 'wx' });
     });
-
-    it("runs the job with a home of its own, and ssh pointed into it", async () => {
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(9913));
-
-      await new RunnerManagerTestHelper(runnerManager).spawnForJob();
-
-      const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
-      const home = '/Users/test/.localmost/runner/sandbox/1/home';
-      expect(env.HOME).toBe(home);
-      expect(env.GIT_SSH_COMMAND).toBe(`ssh -F '${home}/.ssh/config' -o UserKnownHostsFile='${home}/.ssh/known_hosts'`);
-      expect(fs.mkdirSync).toHaveBeenCalledWith(`${home}/.ssh`, { mode: 0o700 });
-    });
-
-    it("links what the policy and the level grant under the real home into the job's home", async () => {
-      const manager = new RunnerManager({
-        onLog: mockOnLog,
-        onStatusChange: mockOnStatusChange,
-        onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: [], level: 'moderate', readPaths: ['~/.swiftpm'], writePaths: ['~/.p3-write', '/opt/elsewhere'], docker: {} }),
-      });
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(9914));
-
-      await new RunnerManagerTestHelper(manager).spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
-
-      const home = '/Users/test/.localmost/runner/sandbox/1/home';
-      const links = (fs.symlinkSync as jest.Mock).mock.calls.map(([target, at]) => [String(at), String(target)]);
-      expect(links).toEqual(expect.arrayContaining([
-        [`${home}/.swiftpm`, path.join(os.homedir(), '.swiftpm')],
-        [`${home}/.p3-write`, path.join(os.homedir(), '.p3-write')],
-        // moderate's read grant on rustup's toolchains, which rustup finds through HOME.
-        [`${home}/.rustup`, path.join(os.homedir(), '.rustup')],
-        [`${home}/Library/Caches`, path.join(os.homedir(), 'Library', 'Caches')],
-      ]));
-      expect(links.some(([at]) => at.includes('elsewhere'))).toBe(false);
-    });
-  });
-
-  describe('a directory the policy grants that does not exist yet', () => {
-    const spawnWith = async (createMissingGrantedDirs: boolean) => {
-      const manager = new RunnerManager({
-        onLog: mockOnLog,
-        onStatusChange: mockOnStatusChange,
-        onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: [], level: 'strict', readPaths: [], writePaths: ['~/.p3-missing/cache/', '~/.p3-missing-history'], docker: {} }),
-        getJobEnvironmentConfig: () => ({ toolShims: true, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs, swiftBuildLinkTemp: false }),
-      });
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(9915));
-      await new RunnerManagerTestHelper(manager).spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
-      // In the real home; the job's home gets the directory the link sits in.
-      return (fs.mkdirSync as jest.Mock).mock.calls.filter(([dir]) => String(dir).startsWith(path.join(os.homedir(), '.p3-missing')));
-    };
-
-    it('is created before the job, one level at a time, by default', async () => {
-      // What a grant without a trailing / names may be a file, the job's to
-      // create; only the levels above it are made.
-      const created = await spawnWith(true);
-      expect(created).toEqual([
-        [path.join(os.homedir(), '.p3-missing'), { mode: 0o755 }],
-        [path.join(os.homedir(), '.p3-missing', 'cache'), { mode: 0o755 }],
-      ]);
-      expect(mockSpawnSandboxed).toHaveBeenCalled();
-    });
-
-    it('is left missing with the preference off', async () => {
-      expect(await spawnWith(false)).toEqual([]);
-    });
-
-    it('is not created in a credential location the job is denied anyway', async () => {
-      const manager = new RunnerManager({
-        onLog: mockOnLog,
-        onStatusChange: mockOnStatusChange,
-        onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: [], level: 'strict', readPaths: [], writePaths: ['~/.ssh/p3-keys', '~/.config/p3'], docker: {} }),
-      });
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(9919));
-      await new RunnerManagerTestHelper(manager).spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
-      const inHome = (fs.mkdirSync as jest.Mock).mock.calls.filter(([dir]) =>
-        [path.join(os.homedir(), '.ssh'), path.join(os.homedir(), '.config')].some((root) => String(dir).startsWith(root))
-      );
-      expect(inHome).toEqual([]);
-    });
-  });
-
-  describe("a worker's temp", () => {
-
-    it("points the caches tools keep in the shared per-user temp into the job's own temp", async () => {
-      // The sandbox no longer grants the per-user temp and cache directories.
-      // xcrun keeps its lookup cache there and fails without one it can
-      // write; clang and swiftc keep their module cache there; zsh puts here-
-      // documents in /tmp. Each has a variable that moves it.
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(9912));
-
-      await new RunnerManagerTestHelper(runnerManager).spawnForJob();
-
-      const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
-      const jobTmp = '/Users/test/.localmost/runner/sandbox/1/_temp';
-      expect(env.TMPDIR).toBe(jobTmp);
-      expect(env.xcrun_db).toBe(`${jobTmp}/xcrun_db`);
-      expect(env.CLANG_MODULE_CACHE_PATH).toBe(`${jobTmp}/clang-module-cache`);
-      expect(env.TMPPREFIX).toBe(`${jobTmp}/zsh`);
-    });
-
-    describe("for the JVM's", () => {
-      const spawnWith = async (javaToolOptions: boolean) => {
-        const manager = new RunnerManager({
-          onLog: mockOnLog,
-          onStatusChange: mockOnStatusChange,
-          onJobHistoryUpdate: mockOnJobHistoryUpdate,
-          getJobEnvironmentConfig: () => ({ toolShims: true, javaToolOptions, perJobTempDir: true, createMissingGrantedDirs: true, swiftBuildLinkTemp: false }),
-        });
-        (fs.existsSync as jest.Mock).mockReturnValue(true);
-        mockSpawnSandboxed.mockReturnValue(createMockProcess(9918));
-        await new RunnerManagerTestHelper(manager).spawnForJob();
-        return mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
-      };
-
-      it("sets JAVA_TOOL_OPTIONS: the job's temp, IPv4, and its proxy, by default", async () => {
-        // The JVM reads neither TMPDIR nor HTTPS_PROXY, and its dual-stack
-        // loopback connections are ones the sandbox cannot attribute.
-        const env = await spawnWith(true);
-        const options = env.JAVA_TOOL_OPTIONS!.split(' ');
-        expect(options).toEqual(expect.arrayContaining([
-          '-Djava.io.tmpdir=/Users/test/.localmost/runner/sandbox/1/_temp',
-          // The JVM's home is the job's: it takes user.home from the user database, not HOME.
-          '-Duser.home=/Users/test/.localmost/runner/sandbox/1/home',
-          '-Djava.net.preferIPv4Stack=true',
-          '-Dhttps.proxyHost=127.0.0.1',
-          '-Dhttps.proxyPort=12345',
-          '-Dhttps.proxyUser=localmost',
-        ]));
-        // The worker's own proxy token, the one in HTTPS_PROXY.
-        expect(env.HTTPS_PROXY).toContain(options.find((o) => o.startsWith('-Dhttps.proxyPassword='))!.split('=')[1]);
-      });
-
-      it('sets none with the preference off', async () => {
-        expect((await spawnWith(false)).JAVA_TOOL_OPTIONS).toBeUndefined();
-      });
-    });
-
-    describe("for Swift Build's link step", () => {
-      const spawnWith = async (swiftBuildLinkTemp?: boolean) => {
-        const manager = new RunnerManager({
-          onLog: mockOnLog,
-          onStatusChange: mockOnStatusChange,
-          onJobHistoryUpdate: mockOnJobHistoryUpdate,
-          ...(swiftBuildLinkTemp !== undefined
-            ? {
-                getJobEnvironmentConfig: () => ({
-                  toolShims: true,
-                  javaToolOptions: true,
-                  perJobTempDir: true,
-                  createMissingGrantedDirs: true,
-                  swiftBuildLinkTemp,
-                }),
-              }
-            : {}),
-        });
-        (fs.existsSync as jest.Mock).mockReturnValue(true);
-        mockSpawnSandboxed.mockReturnValue(createMockProcess(9919));
-        await new RunnerManagerTestHelper(manager).spawnForJob();
-        return mockSpawnSandboxed.mock.calls.at(-1)![2]!;
-      };
-
-      it('grants its temp in the per-user temp directory only with the preference on', async () => {
-        // The profile grants T/TemporaryDirectory.XXXXXX, a name the user's
-        // own SwiftPM keeps manifests it is about to run in, only when asked.
-        expect((await spawnWith(true)).swiftBuildLinkTemp).toBe(true);
-        expect((await spawnWith(false)).swiftBuildLinkTemp).toBe(false);
-      });
-
-      it('does not grant it by default', async () => {
-        expect((await spawnWith()).swiftBuildLinkTemp).toBe(false);
-      });
-    });
-
-    describe('in the per-user temp directory', () => {
-      const T = '/var/folders/zz/zyxw_vut0000gn/T';
-      const sandboxDir = '/Users/test/.localmost/runner/sandbox/1-0123456789ab';
-      const managerWith = (perJobTempDir: boolean) => {
-        const manager = new RunnerManager({
-          onLog: mockOnLog,
-          onStatusChange: mockOnStatusChange,
-          onJobHistoryUpdate: mockOnJobHistoryUpdate,
-          getUserTempDir: () => T,
-          getJobEnvironmentConfig: () => ({ toolShims: true, javaToolOptions: true, perJobTempDir, createMissingGrantedDirs: true, swiftBuildLinkTemp: false }),
-        });
-        const downloader = (manager as unknown as { downloader: { buildSandbox: jest.Mock } }).downloader;
-        downloader.buildSandbox.mockResolvedValue(sandboxDir);
-        (fs.existsSync as jest.Mock).mockReturnValue(true);
-        return manager;
-      };
-
-      it("is a directory of the job's own, made before it, named by DIRHELPER_USER_DIR_SUFFIX and granted", async () => {
-        // Foundation ignores TMPDIR: NSTemporaryDirectory() and a sandboxed
-        // process's atomic writes - SwiftPM's, xcodebuild's - go to the
-        // per-user temp, which the sandbox does not grant. The suffix moves
-        // them to T/<suffix>, which the app makes and the profile grants.
-        mockSpawnSandboxed.mockReturnValue(createMockProcess(9916));
-
-        await new RunnerManagerTestHelper(managerWith(true)).spawnForJob();
-
-        const options = mockSpawnSandboxed.mock.calls.at(-1)![2]!;
-        const suffix = options.env!.DIRHELPER_USER_DIR_SUFFIX!;
-        expect(suffix).toMatch(/^localmost-[0-9a-f]{8}-1-0123456789ab$/);
-        expect(options.tempSuffixDir).toBe(`${T}/${suffix}`);
-        expect(fs.mkdirSync).toHaveBeenCalledWith(`${T}/${suffix}`, { mode: 0o700 });
-      });
-
-      it('is neither made nor named with the preference off', async () => {
-        mockSpawnSandboxed.mockReturnValue(createMockProcess(9917));
-
-        await new RunnerManagerTestHelper(managerWith(false)).spawnForJob();
-
-        const options = mockSpawnSandboxed.mock.calls.at(-1)![2]!;
-        expect(options.env!.DIRHELPER_USER_DIR_SUFFIX).toBeUndefined();
-        expect(options.tempSuffixDir).toBeUndefined();
-        expect((fs.mkdirSync as jest.Mock).mock.calls.some(([dir]) => String(dir).startsWith(T))).toBe(false);
-      });
-
-      it('is moved out of the per-user temp to be removed when the worker never starts', async () => {
-        mockSpawnSandboxed.mockImplementation(() => { throw new Error('spawn failed'); });
-        try {
-          const manager = managerWith(true);
-          (manager as unknown as { runnerVersion: string }).runnerVersion = '1.0.0';
-          await (manager as unknown as { startInstance(n: number): Promise<void> }).startInstance(1);
-          await settle();
-        } finally {
-          mockSpawnSandboxed.mockReset();
-        }
-
-        const [from, to] = (fs.promises.rename as jest.Mock).mock.calls.at(-1)! as [string, string];
-        expect(from).toMatch(new RegExp(`^${T}/localmost-[0-9a-f]{8}-1-0123456789ab$`));
-        expect(path.dirname(to)).toBe('/Users/test/.localmost/runner/sandbox');
-        expect(path.basename(to).startsWith(`.removing-${path.basename(from)}.`)).toBe(true);
-      });
-    });
-  });
-
-  describe("a worker's tool cache", () => {
-    const spawnFor = async (targetId?: string): Promise<NonNullable<Parameters<typeof spawnSandboxed>[2]>> => {
-      const helper = new RunnerManagerTestHelper(runnerManager);
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
-      // A worker is only ever spawned for a job, so the no-target case is the
-      // bare start a re-registration restart makes.
-      if (targetId) await helper.spawnForJob({ targetId, targetDisplayName: 'owner/repo' });
-      else await helper.startWorkerWithoutJob();
-      return mockSpawnSandboxed.mock.calls.at(-1)![2]!;
-    };
-
-    it("is the worker's own target's, in the env and in the profile", async () => {
-      // setup-* actions execute what they find in the tool cache. One cache
-      // per target means a job can only ever find tools its own repository's
-      // jobs put there.
-      const options = await spawnFor('t1');
-      const cache = '/Users/test/.localmost/runner/caches/t1/tool-cache';
-      expect(options.env?.RUNNER_TOOL_CACHE).toBe(cache);
-      expect(options.env?.AGENT_TOOLSDIRECTORY).toBe(cache);
-      expect(options).toHaveProperty('toolCacheDir', cache);
-      expect(fs.mkdirSync).toHaveBeenCalledWith(cache, expect.objectContaining({ recursive: true }));
-    });
-
-    it('is not shared between targets', async () => {
-      const first = await spawnFor('t1');
-      await runnerManager.stop();
-      const second = await spawnFor('t2');
-      expect(second.toolCacheDir).toBe('/Users/test/.localmost/runner/caches/t2/tool-cache');
-      expect(second.toolCacheDir).not.toBe(first.toolCacheDir);
-    });
-
-    it('is absent with per-sandbox selected, leaving the runner its own work directory', async () => {
-      (runnerManager as unknown as { toolCacheLocation: string }).toolCacheLocation = 'per-sandbox';
-      const options = await spawnFor('t1');
-      expect(options.env?.RUNNER_TOOL_CACHE).toBeUndefined();
-      expect(options.env?.AGENT_TOOLSDIRECTORY).toBeUndefined();
-      expect(options.toolCacheDir).toBeUndefined();
-    });
-
-    it('is absent for a worker spawned without a target', async () => {
-      // No target, no cache to give it: nothing shared is writable instead.
-      const options = await spawnFor();
-      expect(options.env?.RUNNER_TOOL_CACHE).toBeUndefined();
-      expect(options.toolCacheDir).toBeUndefined();
-    });
-  });
-
-  describe("a worker's package caches", () => {
-    const spawnAt = async (
-      level: 'strict' | 'moderate' | 'permissive',
-      toolCacheLocation: 'persistent' | 'per-sandbox' = 'persistent'
-    ) => {
-      const manager = new RunnerManager({
-        onLog: mockOnLog,
-        onStatusChange: mockOnStatusChange,
-        onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        getRepoPolicy: async () => ({ hosts: [], level, readPaths: [], writePaths: [], docker: {} }),
-      });
-      (manager as unknown as { toolCacheLocation: string }).toolCacheLocation = toolCacheLocation;
-      const helper = new RunnerManagerTestHelper(manager);
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
-      await helper.spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
-      return mockSpawnSandboxed.mock.calls.at(-1)![2]!;
-    };
-    const packages = '/Users/test/.localmost/runner/caches/t1/packages';
-
-    it.each(['moderate', 'permissive'] as const)(
-      "point the package managers at the target's own directory under %s, not the user's home",
-      async (level) => {
-        // moderate used to grant write on ~/.cargo, ~/go, ~/.gradle and the
-        // like, which hold the user's PATH directories and tool config. The
-        // tools are moved rather than the grant kept.
-        const options = await spawnAt(level);
-        expect(options).toHaveProperty('packageCacheDir', packages);
-        expect(fs.mkdirSync).toHaveBeenCalledWith(packages, expect.objectContaining({ recursive: true }));
-        const env = options.env!;
-        for (const key of [
-          'npm_config_cache', 'YARN_CACHE_FOLDER', 'YARN_GLOBAL_FOLDER', 'npm_config_store_dir',
-          'XDG_CACHE_HOME', 'XDG_DATA_HOME', 'CARGO_HOME', 'GRADLE_USER_HOME', 'GOPATH', 'GOCACHE',
-          'PIP_CACHE_DIR', 'NUGET_PACKAGES', 'NUGET_HTTP_CACHE_PATH', 'DOTNET_CLI_HOME',
-          'electron_config_cache', 'npm_config_devdir',
-        ]) {
-          expect(env[key]).toMatch(new RegExp(`^${packages}/`));
-        }
-        expect(env.MAVEN_OPTS).toBe(`-Dmaven.repo.local=${packages}/m2/repository`);
-        // Maven 3.9 and later also read MAVEN_ARGS, which a workflow setting
-        // MAVEN_OPTS for its JVM flags (-Xmx and the like) leaves alone.
-        expect(env.MAVEN_ARGS).toBe(`-Dmaven.repo.local=${packages}/m2/repository`);
-        // The installed toolchains are still found where the user put them.
-        expect(env.RUSTUP_HOME).toBeUndefined();
-      }
-    );
-
-    it('are not given under strict, which keeps what the repository declares', async () => {
-      const options = await spawnAt('strict');
-      expect(options.packageCacheDir).toBeUndefined();
-      expect(options.env?.CARGO_HOME).toBeUndefined();
-      expect(options.env?.GRADLE_USER_HOME).toBeUndefined();
-    });
-
-    it.each(['moderate', 'permissive'] as const)(
-      "stay inside the job's own sandbox under %s with per-sandbox selected",
-      async (level) => {
-        // The package cache holds what the target's next job executes -
-        // gradle init scripts, cargo's config and bin, GOPATH/bin - so one
-        // kept across jobs would let a pull request's job plant code its
-        // default branch's next job runs with that branch's secrets.
-        // per-sandbox promises no cache outside the job at all.
-        const options = await spawnAt(level, 'per-sandbox');
-        expect(options.packageCacheDir).toBeUndefined();
-        const inSandbox = '/Users/test/.localmost/runner/sandbox/1/_packages';
-        const env = options.env!;
-        for (const key of ['CARGO_HOME', 'GRADLE_USER_HOME', 'GOPATH', 'npm_config_cache', 'XDG_CACHE_HOME']) {
-          expect(env[key]).toMatch(new RegExp(`^${inSandbox}/`));
-        }
-        expect(env.MAVEN_OPTS).toBe(`-Dmaven.repo.local=${inSandbox}/m2/repository`);
-        const created = (fs.mkdirSync as jest.Mock).mock.calls.map(([dir]) => String(dir));
-        expect(created.filter((dir) => dir.includes('/runner/caches/'))).toEqual([]);
-      }
-    );
   });
 
   describe("a worker's environment", () => {
@@ -2254,89 +1431,30 @@ describe('RunnerManager', () => {
 
     it("does not carry the app's own environment into the job", async () => {
       // Launched from a shell, the app inherits every token and agent socket
-      // that shell had. None of it is the job's.
+      // that shell had. None of it is the job's, and the guest has its own
+      // PATH and HOME.
       await withHostEnv({ FOO_SECRET: 'hunter2', SSH_AUTH_SOCK: '/tmp/agent.sock', NODE_OPTIONS: '--inspect' }, async () => {
         (fs.existsSync as jest.Mock).mockReturnValue(true);
-        mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+        isolation.spawnWorker.mockResolvedValue(createMockWorker(12345));
 
         await new RunnerManagerTestHelper(runnerManager).spawnForJob();
 
-        const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+        const env = isolation.spawnWorker.mock.calls.at(-1)![2];
         expect(env.FOO_SECRET).toBeUndefined();
         expect(env.SSH_AUTH_SOCK).toBeUndefined();
         expect(env.NODE_OPTIONS).toBeUndefined();
-        // What the runner and a shell need to know who and where they are -
-        // with the job's own bin directory, the bundled docker CLI and the
-        // tool shims, first on PATH.
-        expect(env.PATH).toBe(`/Users/test/.localmost/runner/sandbox/1/localmost/bin:${process.env.PATH}`);
-        // HOME is the job's own, not the app's.
-        expect(env.HOME).toBe('/Users/test/.localmost/runner/sandbox/1/home');
-        // And what the app sets for the runner itself.
+        expect(env.PATH).toBeUndefined();
+        expect(env.HOME).toBeUndefined();
+        // What the app sets for the runner itself.
         expect(env.ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT).toBe('true');
         expect(env.HTTPS_PROXY).toBeDefined();
-      });
-    });
-
-    it('gives the job the system PATH after the bundled CLI when the app has no PATH of its own', async () => {
-      const saved = process.env.PATH;
-      delete process.env.PATH;
-      try {
-        (fs.existsSync as jest.Mock).mockReturnValue(true);
-        mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
-        await new RunnerManagerTestHelper(runnerManager).spawnForJob();
-      } finally {
-        process.env.PATH = saved;
-      }
-      const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
-      expect(env.PATH).toBe('/Users/test/.localmost/runner/sandbox/1/localmost/bin:/usr/bin:/bin:/usr/sbin:/sbin');
-    });
-
-    describe('the swift and xcodebuild shims in its bin directory', () => {
-      const bin = '/Users/test/.localmost/runner/sandbox/1/localmost/bin';
-      const shimsWritten = async (toolShims: boolean) => {
-        const manager = new RunnerManager({
-          onLog: mockOnLog,
-          onStatusChange: mockOnStatusChange,
-          onJobHistoryUpdate: mockOnJobHistoryUpdate,
-          getJobEnvironmentConfig: () => ({ toolShims, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true, swiftBuildLinkTemp: false }),
-        });
-        (fs.existsSync as jest.Mock).mockReturnValue(true);
-        mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
-        await new RunnerManagerTestHelper(manager).spawnForJob();
-        const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
-        // Each shim a new file, opened exclusively and given its mode by
-        // descriptor, whatever the umask.
-        const written = (fs.openSync as jest.Mock).mock.calls
-          .filter(([file]) => path.dirname(String(file)) === bin)
-          .map(([file, flag, mode]) => [path.basename(String(file)), flag, mode]);
-        return { env, written };
-      };
-
-      it('are there by default', async () => {
-        // SwiftPM and Xcode run each package manifest under a sandbox of their
-        // own, which macOS refuses to start inside the job's; the shims add
-        // the argument that turns it off.
-        const { env, written } = await shimsWritten(true);
-        expect(written).toEqual([
-          ['swift', 'wx', 0o700],
-          ['xcodebuild', 'wx', 0o700],
-        ]);
-        expect((fs.fchmodSync as jest.Mock).mock.calls).toEqual([[42, 0o700], [42, 0o700]]);
-        expect((fs.chmodSync as jest.Mock).mock.calls).toEqual([[path.dirname(bin), 0o700], [bin, 0o700]]);
-        expect(env.PATH!.split(':')[0]).toBe(bin);
-      });
-
-      it('are not with the preference off, and the docker CLI is still first on PATH', async () => {
-        const { env, written } = await shimsWritten(false);
-        expect(written).toEqual([]);
-        expect(env.PATH!.split(':')[0]).toBe(bin);
-        expect(fs.symlinkSync).toHaveBeenCalledWith(dockerCliPath(), `${bin}/docker`);
       });
     });
 
     it("applies the repository's approved env policy", async () => {
       await withHostEnv({ DEVELOPER_DIR: '/Applications/Xcode-beta.app', FOO_SECRET: 'hunter2', LANG: 'C' }, async () => {
         const manager = new RunnerManager({
+          isolation,
           onLog: mockOnLog,
           onStatusChange: mockOnStatusChange,
           onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -2347,11 +1465,11 @@ describe('RunnerManager', () => {
         });
         const helper = new RunnerManagerTestHelper(manager);
         (fs.existsSync as jest.Mock).mockReturnValue(true);
-        mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+        isolation.spawnWorker.mockResolvedValue(createMockWorker(12345));
 
         await helper.spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
 
-        const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+        const env = isolation.spawnWorker.mock.calls.at(-1)![2];
         expect(env.DEVELOPER_DIR).toBe('/Applications/Xcode-beta.app');
         expect(env.LANG).toBeUndefined();
         expect(env.FOO_SECRET).toBeUndefined();
@@ -2359,8 +1477,9 @@ describe('RunnerManager', () => {
     });
 
     it('cannot use the env policy to replace what the app sets for the runner', async () => {
-      await withHostEnv({ HTTPS_PROXY: 'http://evil.example:1', TMPDIR: '/tmp' }, async () => {
+      await withHostEnv({ HTTPS_PROXY: 'http://evil.example:1' }, async () => {
         const manager = new RunnerManager({
+          isolation,
           onLog: mockOnLog,
           onStatusChange: mockOnStatusChange,
           onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -2371,23 +1490,13 @@ describe('RunnerManager', () => {
         });
         const helper = new RunnerManagerTestHelper(manager);
         (fs.existsSync as jest.Mock).mockReturnValue(true);
-        mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+        isolation.spawnWorker.mockResolvedValue(createMockWorker(12345));
 
         await helper.spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
 
-        const env = mockSpawnSandboxed.mock.calls.at(-1)![2]!.env!;
+        const env = isolation.spawnWorker.mock.calls.at(-1)![2];
         expect(env.HTTPS_PROXY).toMatch(/^http:\/\/localmost:/);
-        expect(env.TMPDIR).toBe('/Users/test/.localmost/runner/sandbox/1/_temp');
       });
-    });
-
-    it('counts a change to the env policy as a policy change', () => {
-      // The environment is fixed at spawn like the profile, so a worker built
-      // under the old env policy must be recognised as stale.
-      const stamped = runnerManager as unknown as { stampFor(p: object): string };
-      const base = { level: 'strict', readPaths: [], writePaths: [], docker: {} };
-      expect(stamped.stampFor({ ...base, env: { allow: ['DEVELOPER_DIR'], deny: [] } }))
-        .not.toBe(stamped.stampFor({ ...base, env: { allow: [], deny: [] } }));
     });
   });
 
@@ -2397,6 +1506,7 @@ describe('RunnerManager', () => {
       // in the sandbox's own .runner, which is the one the runner reads.
       const issued: Array<[number, string | undefined]> = [];
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -2409,7 +1519,7 @@ describe('RunnerManager', () => {
       const helper = new RunnerManagerTestHelper(manager);
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       (fs.readFileSync as jest.Mock).mockReturnValue(JSON.stringify({ agentName: 'r1', serverUrlV2: 'http://localhost:8787/' }));
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+      isolation.spawnWorker.mockResolvedValue(createMockWorker(12345));
 
       await helper.spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo' });
 
@@ -2433,6 +1543,7 @@ describe('RunnerManager', () => {
       };
       const asked: number[] = [];
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -2448,7 +1559,7 @@ describe('RunnerManager', () => {
         serverUrl: 'https://pipelinesghubeus2.actions.githubusercontent.com/abc/',
         serverUrlV2: 'http://localhost:8787/',
       }));
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+      isolation.spawnWorker.mockResolvedValue(createMockWorker(12345));
 
       await new RunnerManagerTestHelper(manager).spawnForJob();
 
@@ -2468,12 +1579,13 @@ describe('RunnerManager', () => {
       // Both files are written before the runner exists to read them.
       const order = (fs.writeFileSync as jest.Mock).mock.invocationCallOrder;
       const rsaIndex = (fs.writeFileSync as jest.Mock).mock.calls.indexOf(rsaParams!);
-      expect(order[rsaIndex]).toBeLessThan(mockSpawnSandboxed.mock.invocationCallOrder[0]);
+      expect(order[rsaIndex]).toBeLessThan(isolation.spawnWorker.mock.invocationCallOrder[0]);
     });
 
     it('does not start a worker the broker could not make a key for', async () => {
       const revoked: number[] = [];
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -2484,303 +1596,65 @@ describe('RunnerManager', () => {
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       (fs.readFileSync as jest.Mock).mockReturnValue('{}');
       (manager as unknown as { runnerVersion: string }).runnerVersion = '1.0.0';
-      mockSpawnSandboxed.mockReset();
+      isolation.spawnWorker.mockReset();
 
       await (manager as unknown as { startInstance(n: number): Promise<void> }).startInstance(1);
 
-      expect(mockSpawnSandboxed).not.toHaveBeenCalled();
+      expect(isolation.spawnWorker).not.toHaveBeenCalled();
       expect(revoked).toContain(1);
     });
 
-    it('revokes the key and drops the pid file when the slot is released on job completion', () => {
+    it('revokes the key and releases the VM when the slot is released on job completion', () => {
       const revoked: number[] = [];
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
         revokeBrokerUrl: (n) => revoked.push(n),
       });
       const helper = new RunnerManagerTestHelper(manager);
-      helper.setInstance(1, { name: 'runner-1', status: 'busy' });
-      const unlinked: string[] = [];
-      (fs.unlinkSync as jest.Mock).mockImplementation((f: unknown) => { unlinked.push(String(f)); });
+      const job = { key: '1-1-aaaa', proxyPort: 1, brokerPort: 2, sandboxDir: '/Users/test/.localmost/runner/sandbox/1-aaaa', runnerVersion: '2.330.0' };
+      helper.setInstance(1, { name: 'runner-1', status: 'busy', job });
 
       helper.releaseInstanceSlot(1);
 
       expect(revoked).toContain(1);
-      expect(unlinked.some((f) => f.endsWith('/pids/1.pid'))).toBe(true);
+      expect(isolation.release).toHaveBeenCalledWith(job);
     });
 
-    // Marker settling: the pid record goes at once; the marker is swept only
-    // after the exit sweep's SIGKILL has had its turn, so whatever still holds
-    // it then has escaped the process group and is signalled by exact pid.
-    const SETTLE_MS = GRACE_MS + 2000;
-    const managerWithMarkers = () => {
-      const manager = new RunnerManager({
-        onLog: mockOnLog,
-        onStatusChange: mockOnStatusChange,
-        onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        revokeBrokerUrl: () => undefined,
-      });
-      const helper = new RunnerManagerTestHelper(manager);
-      const pidDir = (manager as unknown as { pidDir(): string }).pidDir();
-      const unlink = jest.mocked(fs.promises.unlink) as unknown as jest.Mock;
-      unlink.mockResolvedValue(undefined as never);
-      unlink.mockClear();
-      const unlinked = () => unlink.mock.calls.map(([f]) => String(f));
-      return { manager, helper, pidDir, unlinked };
-    };
-
-    it("removes a finalized instance's marker once nothing holds it", async () => {
-      jest.useFakeTimers();
-      try {
-        const { helper, pidDir, unlinked } = managerWithMarkers();
-        const marker = path.join(pidDir, '1-abcd.mark');
-        helper.setInstance(1, { name: 'runner-1', status: 'busy', markerPath: marker });
-        (fs.readFileSync as jest.Mock).mockReturnValue('4242 START\n');
-        mockMarkerHolders.mockReturnValue([]);
-        mockSignalOrphanPids.mockClear();
-
-        helper.releaseInstanceSlot(1);
-
-        expect((fs.unlinkSync as jest.Mock).mock.calls.some(([f]) => String(f).endsWith('/pids/1.pid'))).toBe(true);
-        // Never removed with the record: its tree may still hold it.
-        expect((fs.unlinkSync as jest.Mock).mock.calls.some(([f]) => String(f).endsWith('.mark'))).toBe(false);
-        await jest.advanceTimersByTimeAsync(SETTLE_MS - 1);
-        expect(unlinked()).not.toContain(marker);
-        await jest.advanceTimersByTimeAsync(1);
-        expect(unlinked()).toContain(marker);
-        expect(mockSignalOrphanPids).not.toHaveBeenCalled();
-      } finally {
-        jest.useRealTimers();
-        (fs.readFileSync as jest.Mock).mockReturnValue('{}');
-      }
-    });
-
-    it("reaps what still holds a finalized instance's marker, found through its pid record", async () => {
-      jest.useFakeTimers();
-      try {
-        const { helper, pidDir, unlinked } = managerWithMarkers();
-        const marker = path.join(pidDir, '1-abcd.mark');
-        // No instance-recorded marker: the pid record still names it.
-        helper.setInstance(1, { name: 'runner-1', status: 'busy' });
-        (fs.readFileSync as jest.Mock).mockReturnValue(`4242 START\n${marker}\n`);
-        mockMarkerHolders.mockClear();
-        mockMarkerHolders.mockReturnValue([7001]);
-        mockSignalOrphanPids.mockClear();
-
-        helper.releaseInstanceSlot(1);
-        await jest.advanceTimersByTimeAsync(SETTLE_MS);
-
-        expect(mockMarkerHolders).toHaveBeenCalledWith(marker);
-        expect(mockSignalOrphanPids).toHaveBeenCalledTimes(1);
-        expect(mockSignalOrphanPids.mock.calls[0][0]).toEqual([7001]);
-        // The mock reports nothing remaining, so the marker is released.
-        expect(unlinked()).toContain(marker);
-      } finally {
-        jest.useRealTimers();
-        mockMarkerHolders.mockReturnValue([]);
-        (fs.readFileSync as jest.Mock).mockReturnValue('{}');
-      }
-    });
-
-    it("keeps a finalized instance's marker while a straggler survives", async () => {
-      jest.useFakeTimers();
-      try {
-        const { helper, pidDir, unlinked } = managerWithMarkers();
-        const marker = path.join(pidDir, '1-abcd.mark');
-        helper.setInstance(1, { name: 'runner-1', status: 'busy', markerPath: marker });
-        (fs.readFileSync as jest.Mock).mockReturnValue('4242 START\n');
-        mockMarkerHolders.mockReturnValue([7001]);
-        mockSignalOrphanPids.mockResolvedValueOnce({ signalled: true, remaining: [7001] });
-
-        helper.releaseInstanceSlot(1);
-        await jest.advanceTimersByTimeAsync(SETTLE_MS);
-
-        expect(unlinked()).not.toContain(marker);
-        expect(mockOnLog).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('1-abcd.mark kept') }));
-      } finally {
-        jest.useRealTimers();
-        mockMarkerHolders.mockReturnValue([]);
-        (fs.readFileSync as jest.Mock).mockReturnValue('{}');
-      }
-    });
-
-    it('ignores a marker path in a pid record that is not one of its own', async () => {
-      jest.useFakeTimers();
-      try {
-        const { helper } = managerWithMarkers();
-        helper.setInstance(1, { name: 'runner-1', status: 'busy' });
-        (fs.readFileSync as jest.Mock).mockReturnValue('4242 START\n/tmp/somewhere/1-abcd.mark\n');
-        mockMarkerHolders.mockClear();
-
-        helper.releaseInstanceSlot(1);
-        await jest.advanceTimersByTimeAsync(SETTLE_MS);
-
-        expect(mockMarkerHolders).not.toHaveBeenCalled();
-      } finally {
-        jest.useRealTimers();
-        (fs.readFileSync as jest.Mock).mockReturnValue('{}');
-      }
-    });
-
-    it('sweeps a marker once when the same exit is finalized twice', async () => {
-      // A clean exit is finalized by the exit handler and again by
-      // releaseInstanceSlot; ownership ends at the first, and one sweep runs.
-      jest.useFakeTimers();
-      try {
-        const { manager, helper, pidDir } = managerWithMarkers();
-        const marker = path.join(pidDir, '1-abcd.mark');
-        helper.setInstance(1, { name: 'runner-1', status: 'busy', markerPath: marker });
-        // The second finalize no longer has the instance's marker, but the
-        // record still names it; the pending settle is what stops a repeat.
-        (fs.readFileSync as jest.Mock).mockReturnValue(`4242 START\n${marker}\n`);
-        mockMarkerHolders.mockClear();
-        mockMarkerHolders.mockReturnValue([]);
-
-        (manager as unknown as { finalizeInstance(n: number): void }).finalizeInstance(1);
-        helper.releaseInstanceSlot(1);
-        await jest.advanceTimersByTimeAsync(SETTLE_MS);
-
-        expect(mockMarkerHolders).toHaveBeenCalledTimes(1);
-        expect(mockMarkerHolders).toHaveBeenCalledWith(marker);
-      } finally {
-        jest.useRealTimers();
-        (fs.readFileSync as jest.Mock).mockReturnValue('{}');
-      }
-    });
-
-    it('reports a settle sweep that throws instead of dropping it', async () => {
-      jest.useFakeTimers();
-      try {
-        const { helper, pidDir } = managerWithMarkers();
-        const marker = path.join(pidDir, '1-abcd.mark');
-        helper.setInstance(1, { name: 'runner-1', status: 'busy', markerPath: marker });
-        (fs.readFileSync as jest.Mock).mockReturnValue('4242 START\n');
-        mockMarkerHolders.mockImplementationOnce(() => { throw new Error('lsof exploded'); });
-
-        helper.releaseInstanceSlot(1);
-        await jest.advanceTimersByTimeAsync(SETTLE_MS);
-
-        expect(mockOnLog).toHaveBeenCalledWith(expect.objectContaining({
-          level: 'warn', message: expect.stringContaining('Sweep of 1-abcd.mark failed: lsof exploded'),
-        }));
-      } finally {
-        jest.useRealTimers();
-        (fs.readFileSync as jest.Mock).mockReturnValue('{}');
-      }
-    });
-
-    it("settles the marker of a worker that exits with an error", async () => {
-      // The error-exit path finalizes only through the exit handler; the
-      // marker written at spawn is what gets swept. The exit also runs the
-      // real process-group sweep, which must not reach a real pid.
-      jest.useFakeTimers();
-      const realKill = process.kill;
-      (process as unknown as { kill: unknown }).kill = (() => true) as never;
-      try {
-        (fs.existsSync as jest.Mock).mockReturnValue(true);
-        (fs.readFileSync as jest.Mock).mockReturnValue('{}');
-        (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([] as never);
-        const proc = createMockProcess(12346);
-        mockSpawnSandboxed.mockReturnValue(proc);
-        (fs.writeFileSync as jest.Mock).mockClear();
-        const unlink = jest.mocked(fs.promises.unlink) as unknown as jest.Mock;
-        unlink.mockResolvedValue(undefined as never);
-        unlink.mockClear();
-        mockMarkerHolders.mockClear();
-        mockMarkerHolders.mockReturnValue([]);
-        await new RunnerManagerTestHelper(runnerManager).spawnForJob();
-        const marker = String((fs.writeFileSync as jest.Mock).mock.calls.find(([f]) => /\/pids\/1-[0-9a-f]+\.mark$/.test(String(f)))![0]);
-
-        proc.emit('exit', 1, null);
-        await jest.advanceTimersByTimeAsync(SETTLE_MS);
-
-        expect(mockMarkerHolders).toHaveBeenCalledWith(marker);
-        expect(unlink.mock.calls.map(([f]) => String(f))).toContain(marker);
-      } finally {
-        (process as unknown as { kill: unknown }).kill = realKill;
-        jest.useRealTimers();
-      }
-    });
-
-    it('keeps a worker that spawns while initialize() is still sweeping', async () => {
-      // The broker is already handing out jobs during the sweep. The previous
-      // pool's records are dropped before it, so this worker is not dropped
-      // with them.
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      (jest.mocked(fs.promises.readdir) as unknown as jest.Mock).mockResolvedValue([
-        { name: '9-deadbeef.mark', isFile: () => true, isDirectory: () => false },
-      ] as never);
-      let answer!: (holders: number[]) => void;
-      mockMarkerHolders.mockImplementationOnce((() => new Promise<number[]>((resolve) => { answer = resolve; })) as unknown as () => number[]);
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(6001));
-
-      const running = runnerManager.initialize();
-      await settle();
-      await (runnerManager as unknown as { startInstance(n: number): Promise<void> }).startInstance(1);
-      answer([]);
-      await running;
-
-      expect(runnerManager.isRunning()).toBe(true);
-      expect(mockSpawnSandboxed).toHaveBeenCalledTimes(1);
-      const pool = (runnerManager as unknown as { instances: Map<number, { process: { pid: number } | null }> }).instances;
-      expect(pool.get(1)?.process?.pid).toBe(6001);
-    });
-
-    it('revokes keys and drops pid files for every instance when stop clears the pool', async () => {
+    it('revokes keys and releases VMs for every instance when stop clears the pool', async () => {
       const revoked: number[] = [];
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
         revokeBrokerUrl: (n) => revoked.push(n),
       });
       const helper = new RunnerManagerTestHelper(manager);
-      // Already-exited processes, so stop() skips the kill loop and reaches the
-      // finalize loop; a late exit would otherwise find the map cleared.
-      const pidDir = (manager as unknown as { pidDir(): string }).pidDir();
-      const held = path.join(pidDir, '1-aaaa.mark');
-      const free = path.join(pidDir, '2-bbbb.mark');
-      helper.setInstance(1, { name: 'runner-1', status: 'listening', process: { exitCode: 0, killed: true } as never, markerPath: held });
-      helper.setInstance(2, { name: 'runner-2', status: 'busy', process: { exitCode: 0, killed: true } as never, markerPath: free });
-      const unlinked: string[] = [];
-      (fs.unlinkSync as jest.Mock).mockImplementation((f: unknown) => { unlinked.push(String(f)); });
-      const unlink = jest.mocked(fs.promises.unlink) as unknown as jest.Mock;
-      unlink.mockResolvedValue(undefined as never);
-      unlink.mockClear();
-      mockMarkerHolders.mockImplementation((p) => (p === held ? [7001] : []));
-      mockSignalOrphanPids.mockResolvedValueOnce({ signalled: true, remaining: [7001] });
-      jest.useFakeTimers();
-      try {
-        await manager.stop();
+      const jobOf = (n: number) => ({ key: `${n}-x`, proxyPort: 1, brokerPort: 2, sandboxDir: `/Users/test/.localmost/runner/sandbox/${n}-x`, runnerVersion: '2.330.0' });
+      // Listening, with no worker left to stop: stop() goes straight to the
+      // finalize loop, which a late exit would otherwise find cleared.
+      helper.setInstance(1, { name: 'runner-1', status: 'listening', job: jobOf(1) });
+      helper.setInstance(2, { name: 'runner-2', status: 'busy', job: jobOf(2) });
 
-        expect(revoked).toEqual(expect.arrayContaining([1, 2]));
-        expect(unlinked.filter((f) => /\/pids\/[12]\.pid$/.test(f)).length).toBeGreaterThanOrEqual(2);
-        // Markers are not unlinked with the records; each is swept once its
-        // tree has had the exit grace, and a held one stays.
-        expect(unlinked.some((f) => f.endsWith('.mark'))).toBe(false);
-        expect(unlink.mock.calls.map(([f]) => String(f))).not.toContain(free);
-        await jest.advanceTimersByTimeAsync(GRACE_MS + 2000);
-        const swept = unlink.mock.calls.map(([f]) => String(f));
-        expect(swept).toContain(free);
-        expect(swept).not.toContain(held);
-      } finally {
-        jest.useRealTimers();
-        mockMarkerHolders.mockReset();
-        mockMarkerHolders.mockImplementation(() => []);
-      }
+      await manager.stop();
+
+      expect(revoked).toEqual(expect.arrayContaining([1, 2]));
+      expect(isolation.release).toHaveBeenCalledWith(jobOf(1));
+      expect(isolation.release).toHaveBeenCalledWith(jobOf(2));
     });
 
     it('seals the proxy when the worker exits, not only when the slot restarts', async () => {
       // A finished worker's proxy token and allowed hosts otherwise stay live
       // until the slot is next started, which may be never - an orphan that
       // escaped reaping would keep the job's network for as long as it liked.
-      const manager = new RunnerManager({ onLog: mockOnLog, onStatusChange: mockOnStatusChange, onJobHistoryUpdate: mockOnJobHistoryUpdate });
+      const manager = new RunnerManager({ isolation, onLog: mockOnLog, onStatusChange: mockOnStatusChange, onJobHistoryUpdate: mockOnJobHistoryUpdate });
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       (fs.readFileSync as jest.Mock).mockReturnValue('{}');
-      const proc = createMockProcess(12345);
-      mockSpawnSandboxed.mockReturnValue(proc);
+      const proc = createMockWorker(12345);
+      isolation.spawnWorker.mockResolvedValue(proc);
       jest.useFakeTimers();
       try {
         await new RunnerManagerTestHelper(manager).spawnForJob();
@@ -2803,25 +1677,25 @@ describe('RunnerManager', () => {
       // A reaped worker handles SIGTERM gracefully and reports code 0 - after
       // the reap freed its slot, and possibly after a job refilled it. That
       // exit must not free the replacement's slot or seal its proxy.
-      const manager = new RunnerManager({ onLog: mockOnLog, onStatusChange: mockOnStatusChange, onJobHistoryUpdate: mockOnJobHistoryUpdate });
+      const manager = new RunnerManager({ isolation, onLog: mockOnLog, onStatusChange: mockOnStatusChange, onJobHistoryUpdate: mockOnJobHistoryUpdate });
       const helper = new RunnerManagerTestHelper(manager);
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       (fs.readFileSync as jest.Mock).mockReturnValue('{}');
-      const proc = createMockProcess(12345);
-      mockSpawnSandboxed.mockReturnValue(proc);
+      const proc = createMockWorker(12345);
+      isolation.spawnWorker.mockResolvedValue(proc);
       jest.useFakeTimers();
       try {
         await helper.spawnForJob();
         const proxy = (ProxyServer as unknown as jest.Mock).mock.results.at(-1)!.value;
         helper.releaseInstanceSlot(1); // the reap
-        helper.setInstance(1, { name: 'runner-1', status: 'busy', process: { pid: 6002, kill: jest.fn() } as never });
+        helper.setInstance(1, { name: 'runner-1', status: 'busy', worker: { pid: 6002, kill: jest.fn() } as never });
         const rotations = proxy.rotateAuthToken.mock.calls.length;
 
         proc.emit('exit', 0, null);
         await jest.advanceTimersByTimeAsync(0);
 
-        const pool = (manager as unknown as { instances: Map<number, { process: { pid: number } | null }> }).instances;
-        expect(pool.get(1)?.process?.pid).toBe(6002);
+        const pool = (manager as unknown as { instances: Map<number, { worker: { pid: number } | null }> }).instances;
+        expect(pool.get(1)?.worker?.pid).toBe(6002);
         expect(proxy.rotateAuthToken.mock.calls.length).toBe(rotations);
       } finally {
         jest.useRealTimers();
@@ -2831,6 +1705,7 @@ describe('RunnerManager', () => {
     it('is revoked when the worker exits', async () => {
       const revoked: number[] = [];
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -2840,13 +1715,13 @@ describe('RunnerManager', () => {
       });
       (fs.existsSync as jest.Mock).mockReturnValue(true);
       (fs.readFileSync as jest.Mock).mockReturnValue('{}');
-      const proc = createMockProcess(12345);
-      mockSpawnSandboxed.mockReturnValue(proc);
+      const proc = createMockWorker(12345);
+      isolation.spawnWorker.mockResolvedValue(proc);
       // The exit arms a marker settle timer; keep it from firing in a later test.
       jest.useFakeTimers();
       try {
         await new RunnerManagerTestHelper(manager).spawnForJob();
-        expect(mockSpawnSandboxed).toHaveBeenCalled();
+        expect(isolation.spawnWorker).toHaveBeenCalled();
 
         proc.emit('exit', 0, null);
         await jest.advanceTimersByTimeAsync(0);
@@ -2864,6 +1739,7 @@ describe('RunnerManager', () => {
     function recordingManager() {
       const cancelled: Array<[string, number, string | undefined]> = [];
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -2895,7 +1771,7 @@ describe('RunnerManager', () => {
       helper.stubStartInstance(async () => undefined);
       (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(false);
 
-      await manager.spawnWorkerForJob('seatbelt');
+      await manager.spawnWorkerForJob();
 
       expect(cancelled).toEqual([['t1', 1, 'req-1']]);
       expect(helper.pendingTargetContext('1')).toBeUndefined();
@@ -2909,11 +1785,11 @@ describe('RunnerManager', () => {
       helper.setPendingTargetContext('next', context);
       helper.stubCopyProxyCredentials(async () => undefined);
       helper.stubStartInstance(async (n) => {
-        helper.setInstance(n, { name: `runner-${n}`, status: 'error', process: null });
+        helper.setInstance(n, { name: `runner-${n}`, status: 'error', worker: null });
       });
       (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
 
-      await manager.spawnWorkerForJob('seatbelt');
+      await manager.spawnWorkerForJob();
 
       expect(cancelled).toEqual([['t1', 1, 'req-1']]);
       expect(helper.pendingTargetContext('1')).toBeUndefined();
@@ -2922,8 +1798,8 @@ describe('RunnerManager', () => {
     it('forgets the job when the worker exits before taking it', async () => {
       const { helper, cancelled } = recordingManager();
       (fs.existsSync as jest.Mock).mockReturnValue(true);
-      const proc = createMockProcess(12345);
-      mockSpawnSandboxed.mockReturnValue(proc);
+      const proc = createMockWorker(12345);
+      isolation.spawnWorker.mockResolvedValue(proc);
       await helper.spawnForJob(context);
 
       proc.emit('exit', 1, null);
@@ -2938,11 +1814,11 @@ describe('RunnerManager', () => {
       // exit can land after the next worker has been spawned into the slot.
       const { helper, cancelled } = recordingManager();
       (fs.existsSync as jest.Mock).mockReturnValue(true);
-      const proc = createMockProcess(12345);
-      mockSpawnSandboxed.mockReturnValue(proc);
+      const proc = createMockWorker(12345);
+      isolation.spawnWorker.mockResolvedValue(proc);
       await helper.spawnForJob(context);
       const next = { targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'req-2' };
-      helper.setInstance(1, { name: 'runner-1', status: 'starting', process: createMockProcess(777) });
+      helper.setInstance(1, { name: 'runner-1', status: 'starting', worker: createMockWorker(777) });
       helper.setPendingTargetContext('1', next);
 
       proc.emit('exit', 1, null);
@@ -2956,6 +1832,7 @@ describe('RunnerManager', () => {
   describe('reaping a worker that never acquired a job', () => {
     function idlePool() {
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -2967,12 +1844,14 @@ describe('RunnerManager', () => {
       return { manager, helper };
     }
 
-    it('removes the reaped worker\'s pid file so a later sweep cannot act on it', () => {
+    it("releases the reaped worker's VM, with the listener in it, since it never exits on its own", () => {
       const { helper } = idlePool();
-      const unlinked: string[] = [];
-      (fs.unlinkSync as jest.Mock).mockImplementation((f: unknown) => { unlinked.push(String(f)); });
+      const job = { key: '1-x', proxyPort: 1, brokerPort: 2, sandboxDir: '/Users/test/.localmost/runner/sandbox/1-x', runnerVersion: '2.330.0' };
+      helper.setInstance(1, { name: 'runner-1', status: 'listening', currentJob: null, job, worker: createMockWorker(77) });
+
       helper.reapUnclaimedWorker(1);
-      expect(unlinked.some((f) => f.endsWith('/pids/1.pid'))).toBe(true);
+
+      expect(isolation.release).toHaveBeenCalledWith(job);
     });
 
     it('frees the slot of a worker that never acquired a job', () => {
@@ -2993,6 +1872,7 @@ describe('RunnerManager', () => {
     it("revokes the reaped worker's broker key, since it never exits to trigger the exit handler", () => {
       const revoked: number[] = [];
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -3124,9 +2004,9 @@ describe('RunnerManager', () => {
     const noHosts = { hosts: [], level: 'strict' as const, readPaths: [], writePaths: [] };
     const runPolicy: DockerPolicy = { run: { images: ['postgres:16'] } };
 
-    it('starts a default-deny docker socket for a spawned worker and points DOCKER_HOST at it', async () => {
+    it('starts a default-deny docker socket for a spawned worker in its sandbox, before its VM', async () => {
       (fs.existsSync as jest.Mock).mockReturnValue(true);
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+      isolation.spawnWorker.mockResolvedValue(createMockWorker(12345));
 
       await new RunnerManagerTestHelper(runnerManager).spawnForJob();
 
@@ -3136,23 +2016,10 @@ describe('RunnerManager', () => {
       expect(socket.start).toHaveBeenCalledWith(socketPath);
       // Born denying everything: nothing is bound until a job is claimed.
       expect(socket.boundRepository()).toBeUndefined();
-      // Listening before the runner exists, so the job's first request finds it.
-      expect(socket.start.mock.invocationCallOrder[0]).toBeLessThan(mockSpawnSandboxed.mock.invocationCallOrder[0]);
-      const options = mockSpawnSandboxed.mock.calls[0][2]!;
-      expect(options.env?.DOCKER_HOST).toBe(`unix://${socketPath}`);
-      // BuildKit, the default builder since Docker 23, streams a build over a
-      // gRPC session the filter cannot inspect. The classic builder is the one
-      // `build:` policy actually describes, so the job is pinned to it.
-      expect(options.env?.DOCKER_BUILDKIT).toBe('0');
-      // The job's temp is inside its own sandbox, not the user's shared
-      // $TMPDIR: the sandbox can no longer reach unix sockets in the shared
-      // temp, so a socket bound under TMPDIR has to land somewhere it may use.
-      const socketDir = '/Users/test/.localmost/runner/sandbox/1';
-      expect(options.env?.TMPDIR).toBe(`${socketDir}/_temp`);
-      expect(options.env?.RUNNER_TEMP).toBe(`${socketDir}/_temp`);
-      // The profile grants this socket by name; the daemon's is no longer handed over.
-      expect(options).toHaveProperty('dockerSocket', socketPath);
-      expect(options).not.toHaveProperty('dockerGrants');
+      // Listening before the VM exists, as the relay into it will need it.
+      expect(socket.start.mock.invocationCallOrder[0]).toBeLessThan(isolation.prepare.mock.invocationCallOrder[0]);
+      // No job reaches it yet: the guest's environment names no docker host.
+      expect(isolation.spawnWorker.mock.calls[0][2]).not.toHaveProperty('DOCKER_HOST');
     });
 
     it("builds each worker's docker socket on its own worker of the backend, with the §5.4 context", async () => {
@@ -3169,15 +2036,15 @@ describe('RunnerManager', () => {
         },
       };
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
         dockerBackend,
-        dockerCli: '/Applications/localmost.app/Contents/Resources/docker-cli/docker',
         getDockerVmConfig: () => ({ ...vmConfig, bootTimeoutSec: 45 }),
       });
       (fs.existsSync as jest.Mock).mockReturnValue(true);
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+      isolation.spawnWorker.mockResolvedValue(createMockWorker(12345));
 
       await new RunnerManagerTestHelper(manager).spawnForJob({ targetId: 't1', targetDisplayName: 'Owner/Repo' });
 
@@ -3203,12 +2070,13 @@ describe('RunnerManager', () => {
     it('serves a worker no daemon at all when the runner was given no backend', async () => {
       // Never a fallback to the operator's own daemon (owner decision 3).
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
       });
       (fs.existsSync as jest.Mock).mockReturnValue(true);
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+      isolation.spawnWorker.mockResolvedValue(createMockWorker(12345));
 
       await new RunnerManagerTestHelper(manager).spawnForJob({ targetId: 't1', targetDisplayName: 'Owner/Repo' });
 
@@ -3219,41 +2087,10 @@ describe('RunnerManager', () => {
       expect(await worker.endpoint(1000)).toEqual({ kind: 'none', reason: NO_DAEMON_MESSAGE });
     });
 
-    it('gives the job the bundled CLI first on its PATH, an empty config of its own, the share rules and the helper deny', async () => {
-      const cli = '/Applications/localmost.app/Contents/Resources/docker-cli/docker';
-      const manager = new RunnerManager({
-        onLog: mockOnLog,
-        onStatusChange: mockOnStatusChange,
-        onJobHistoryUpdate: mockOnJobHistoryUpdate,
-        dockerCli: cli,
-        vmHelper: '/Applications/localmost.app/Contents/Resources/localmost-vm',
-        macVmHelper: '/Applications/localmost.app/Contents/Resources/localmost-macvm',
-      });
-      (fs.existsSync as jest.Mock).mockReturnValue(true);
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
-
-      await new RunnerManagerTestHelper(manager).spawnForJob();
-
-      const [, , options] = mockSpawnSandboxed.mock.calls[mockSpawnSandboxed.mock.calls.length - 1];
-      const env = options!.env as NodeJS.ProcessEnv;
-      expect(env.DOCKER_CONFIG).toBe('/Users/test/.localmost/runner/sandbox/1/.docker');
-      // First on PATH, the job's bin directory, where the CLI is linked.
-      expect(env.PATH!.split(':')[0]).toBe('/Users/test/.localmost/runner/sandbox/1/localmost/bin');
-      expect(fs.symlinkSync).toHaveBeenCalledWith(cli, '/Users/test/.localmost/runner/sandbox/1/localmost/bin/docker');
-      expect(env.DOCKER_HOST).toBe('unix:///Users/test/.localmost/runner/sandbox/1/docker.sock');
-      expect(env.DOCKER_BUILDKIT).toBe('0');
-      expect(options).toMatchObject({
-        shareDir: '/Users/test/.localmost/runner/sandbox/1/_work',
-        dockerCli: cli,
-        // The helpers, which the job's profile refuses to run.
-        vmHelper: '/Applications/localmost.app/Contents/Resources/localmost-vm',
-        macVmHelper: '/Applications/localmost.app/Contents/Resources/localmost-macvm',
-      });
-    });
-
     it('boots a spare for the worker when dockerVm.prewarm is on', async () => {
       const worker = { prewarm: jest.fn() } as unknown as WorkerDocker;
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -3261,22 +2098,22 @@ describe('RunnerManager', () => {
         getDockerVmConfig: () => ({ ...vmConfig, prewarm: true }),
       });
       (fs.existsSync as jest.Mock).mockReturnValue(true);
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+      isolation.spawnWorker.mockResolvedValue(createMockWorker(12345));
       await new RunnerManagerTestHelper(manager).spawnForJob();
       expect(worker.prewarm).toHaveBeenCalledTimes(1);
     });
 
     it('starts no worker whose share nonce cannot be written', async () => {
-      const manager = new RunnerManager({ onLog: mockOnLog, onStatusChange: mockOnStatusChange, onJobHistoryUpdate: mockOnJobHistoryUpdate });
+      const manager = new RunnerManager({ isolation, onLog: mockOnLog, onStatusChange: mockOnStatusChange, onJobHistoryUpdate: mockOnJobHistoryUpdate });
       const helper = new RunnerManagerTestHelper(manager);
       (fs.existsSync as jest.Mock).mockReturnValue(true);
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+      isolation.spawnWorker.mockResolvedValue(createMockWorker(12345));
       (manager as unknown as { downloader: { writeShareNonce: jest.Mock } }).downloader.writeShareNonce.mockImplementationOnce(() => {
         throw new Error("EEXIST: file already exists, open '_work/.localmost-share'");
       });
-      mockSpawnSandboxed.mockClear();
+      isolation.spawnWorker.mockClear();
       await helper.spawnForJob();
-      expect(mockSpawnSandboxed).not.toHaveBeenCalled();
+      expect(isolation.spawnWorker).not.toHaveBeenCalled();
       expect(mockOnLog).toHaveBeenCalledWith(
         expect.objectContaining({ level: 'error', message: expect.stringMatching(/work folder of instance 1: EEXIST/) })
       );
@@ -3286,7 +2123,7 @@ describe('RunnerManager', () => {
       // The socket warns when no daemon is behind it and logs each denial
       // with its policy hint; neither is any use unless it reaches the log.
       (fs.existsSync as jest.Mock).mockReturnValue(true);
-      mockSpawnSandboxed.mockReturnValue(createMockProcess(12345));
+      isolation.spawnWorker.mockResolvedValue(createMockWorker(12345));
       await new RunnerManagerTestHelper(runnerManager).spawnForJob();
       const socket = dockerSocketOf(new RunnerManagerTestHelper(runnerManager), 1);
 
@@ -3299,6 +2136,7 @@ describe('RunnerManager', () => {
 
     it('binds the socket to the claimed repository with its per-workflow docker policy once the job runs', async () => {
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -3328,6 +2166,7 @@ describe('RunnerManager', () => {
 
     it('binds on claim only when the claimed repository is the one the worker was spawned for', async () => {
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -3366,6 +2205,7 @@ describe('RunnerManager', () => {
       // spawned for, which is the one whose grants must not be inherited. The
       // refusal at claim has to hold when that line arrives.
       const manager = new RunnerManager({
+        isolation,
         onLog: mockOnLog,
         onStatusChange: mockOnStatusChange,
         onJobHistoryUpdate: mockOnJobHistoryUpdate,
@@ -3390,8 +2230,8 @@ describe('RunnerManager', () => {
 
     it('stops the docker socket when the worker exits', async () => {
       (fs.existsSync as jest.Mock).mockReturnValue(true);
-      const proc = createMockProcess(12345);
-      mockSpawnSandboxed.mockReturnValue(proc);
+      const proc = createMockWorker(12345);
+      isolation.spawnWorker.mockResolvedValue(proc);
       const helper = new RunnerManagerTestHelper(runnerManager);
       await helper.spawnForJob();
       const socket = dockerSocketOf(helper, 1);
@@ -3408,22 +2248,23 @@ describe('RunnerManager', () => {
       // The next worker's socket binds the same path, so it waits; the app
       // quitting waits the same way, rather than leaving them running.
       (fs.existsSync as jest.Mock).mockReturnValue(true);
-      mockSpawnSandboxed.mockReturnValueOnce(createMockProcess(12345)).mockReturnValueOnce(createMockProcess(12346));
+      const firstWorker = createMockWorker(12345);
+      isolation.spawnWorker.mockResolvedValueOnce(firstWorker).mockResolvedValueOnce(createMockWorker(12346));
       const helper = new RunnerManagerTestHelper(runnerManager);
       await helper.startWorkerWithoutJob(1);
       const first = dockerSocketOf(helper, 1);
       let finishRemoval: () => void = () => {};
       first.stop.mockReturnValue(new Promise<void>((resolve) => { finishRemoval = resolve; }));
 
-      (mockSpawnSandboxed.mock.results[0].value as ReturnType<typeof createMockProcess>).emit('exit', 0, null);
+      firstWorker.emit('exit', 0, null);
       await settle();
       const respawn = runnerManager.startInstance(1);
       await settle();
-      expect(mockSpawnSandboxed).toHaveBeenCalledTimes(1);
+      expect(isolation.spawnWorker).toHaveBeenCalledTimes(1);
 
       finishRemoval();
       await respawn;
-      expect(mockSpawnSandboxed).toHaveBeenCalledTimes(2);
+      expect(isolation.spawnWorker).toHaveBeenCalledTimes(2);
       expect(dockerSocketOf(helper, 1)).not.toBe(first);
     });
 
@@ -3431,16 +2272,15 @@ describe('RunnerManager', () => {
       // Quitting the app goes through stop(). Were it to finish first, a job's
       // `--restart` or detached containers would be left on the daemon with
       // nothing left to remove them.
-      const realKill = process.kill;
       afterEach(() => {
-        (process as unknown as { kill: unknown }).kill = realKill;
+        jest.useRealTimers();
       });
 
       /** Start a worker whose socket's removal stays pending until the returned function is called. */
-      const workerWithSlowRemoval = async (): Promise<{ proc: ReturnType<typeof createMockProcess>; socket: DockerSocketStub; finishRemoval: () => void }> => {
+      const workerWithSlowRemoval = async (): Promise<{ proc: ReturnType<typeof createMockWorker>; socket: DockerSocketStub; finishRemoval: () => void }> => {
         (fs.existsSync as jest.Mock).mockReturnValue(true);
-        const proc = createMockProcess(12345);
-        mockSpawnSandboxed.mockReturnValue(proc);
+        const proc = createMockWorker(12345);
+        isolation.spawnWorker.mockResolvedValue(proc);
         const helper = new RunnerManagerTestHelper(runnerManager);
         await helper.spawnForJob();
         const socket = dockerSocketOf(helper, 1);
@@ -3463,18 +2303,12 @@ describe('RunnerManager', () => {
 
       it('when the worker exits on the stop', async () => {
         const { proc, socket, finishRemoval } = await workerWithSlowRemoval();
-        // A live worker, which exits on the group's SIGTERM; its group is then
-        // empty, so the sweep that follows sends nothing more.
-        Object.defineProperty(proc, 'exitCode', { value: null, writable: true });
+        // A live worker, whose runner exits on the SIGTERM sent into its VM.
         let exited = false;
         proc.once('exit', () => { exited = true; });
-        (process as unknown as { kill: unknown }).kill = ((pid: number, sig?: unknown) => {
-          if (pid === -12345 && sig === 'SIGTERM') {
-            process.nextTick(() => proc.emit('exit', null, 'SIGTERM'));
-            return true;
-          }
-          throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
-        }) as never;
+        isolation.signal.mockImplementation(async (_job, sig) => {
+          if (sig === 'SIGTERM') process.nextTick(() => proc.emit('exit', null, 'SIGTERM'));
+        });
 
         await expectStopToWaitFor(socket, finishRemoval);
         expect(exited).toBe(true);
@@ -3482,7 +2316,20 @@ describe('RunnerManager', () => {
 
       it("when the worker's exit never reached the manager", async () => {
         const { socket, finishRemoval } = await workerWithSlowRemoval();
-        await expectStopToWaitFor(socket, finishRemoval);
+        // The runner ignores the SIGTERM: its VM is stopped under it after
+        // the grace, and the socket's removal is still waited for.
+        jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] });
+        let stopped = false;
+        const stopping = runnerManager.stop().then(() => { stopped = true; });
+        await jest.advanceTimersByTimeAsync(5000);
+        for (let i = 0; i < 5; i++) await settle();
+        expect(isolation.release).toHaveBeenCalled();
+        expect(socket.stop).toHaveBeenCalled();
+        expect(stopped).toBe(false);
+
+        finishRemoval();
+        await stopping;
+        expect(stopped).toBe(true);
       });
 
       it('when the worker could not be spawned', async () => {
@@ -3490,10 +2337,10 @@ describe('RunnerManager', () => {
         const helper = new RunnerManagerTestHelper(runnerManager);
         let socket: DockerSocketStub | undefined;
         let finishRemoval: () => void = () => {};
-        mockSpawnSandboxed.mockImplementationOnce(() => {
+        isolation.spawnWorker.mockImplementationOnce(async () => {
           socket = dockerSocketOf(helper, 1);
           socket.stop.mockReturnValue(new Promise<void>((resolve) => { finishRemoval = resolve; }));
-          throw new Error('spawn EAGAIN');
+          throw new Error('the guest agent refused the job');
         });
         await runnerManager.initialize();
 
@@ -3513,8 +2360,8 @@ describe('RunnerManager', () => {
       // The finished stop forgets only its own socket, never whichever one
       // holds the slot by the time it is done.
       (fs.existsSync as jest.Mock).mockReturnValue(true);
-      const proc = createMockProcess(12345);
-      mockSpawnSandboxed.mockReturnValue(proc);
+      const proc = createMockWorker(12345);
+      isolation.spawnWorker.mockResolvedValue(proc);
       const helper = new RunnerManagerTestHelper(runnerManager);
       await helper.startWorkerWithoutJob(1);
       const first = dockerSocketOf(helper, 1);
@@ -3560,38 +2407,13 @@ describe('RunnerManager', () => {
   });
 });
 
-describe('docker access', () => {
-  const makeManager = () =>
-    new RunnerManager({
-      onLog: jest.fn(),
-      onStatusChange: jest.fn(),
-      onJobHistoryUpdate: jest.fn(),
-    });
-
-  it('leaves docker out of the policy stamp, since the socket is bound per claim', () => {
-    const manager = makeManager();
-    const stamp = (docker: DockerPolicy) =>
-      (manager as any).stampFor({
-        level: 'strict',
-        readPaths: [],
-        writePaths: [],
-        docker,
-      });
-
-    // Docker merges shared with the claimed workflow's section and the socket
-    // is bound to that at every claim; nothing of it is in the profile. The
-    // spawn stamp is taken before the workflow is known, so stamping docker
-    // made every claim of a workflow with its own docker section drift.
-    expect(stamp({})).toEqual(stamp({ run: { images: ['postgres:16'] } }));
-  });
-});
-
 describe('job-start detection against injected output', () => {
   const startedNames = (events: JobEvent[]) => events.filter((e) => e.type === 'started').map((e) => e.jobName);
 
   const setup = () => {
     const events: JobEvent[] = [];
     const manager = new RunnerManager({
+      isolation,
       onLog: jest.fn(),
       onStatusChange: jest.fn(),
       onJobHistoryUpdate: jest.fn(),
@@ -3634,6 +2456,7 @@ describe('a worker constrained by policy drift stays constrained', () => {
   it('does not reopen the docker socket or restore hosts when the job starts', async () => {
     const docker = { pull: { registries: ['docker.io'] }, run: { images: ['alpine:3'] } };
     const manager = new RunnerManager({
+      isolation,
       onLog: jest.fn(),
       onStatusChange: jest.fn(),
       onJobHistoryUpdate: jest.fn(),
@@ -3650,7 +2473,7 @@ describe('a worker constrained by policy drift stays constrained', () => {
     helper.setProxy(1, proxy);
     helper.setDockerProxy(1, dockerSocket);
     // A stamp that cannot match the policy above: the approved policy moved
-    // after this worker was built, so its profile is out of date.
+    // after this worker started, so what it was started with is out of date.
     helper.setInstance(1, {
       name: 'runner-1', status: 'busy', policyStamp: 'stale-stamp',
       currentJob: { name: 'build', repository: 'owner/repo', startedAt: 'now', id: 'job-1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' },
@@ -3675,6 +2498,7 @@ describe('a worker constrained by policy drift stays constrained', () => {
 describe('a released slot does not carry the finished job\'s context', () => {
   it('does not judge the next worker in that slot against the previous repository', () => {
     const manager = new RunnerManager({
+      isolation,
       onLog: jest.fn(), onStatusChange: jest.fn(), onJobHistoryUpdate: jest.fn(),
     });
     const helper = new RunnerManagerTestHelper(manager);
@@ -3699,6 +2523,7 @@ describe('a worker nobody spawned for a job', () => {
     // socket with that repository's container grants.
     const docker = { run: { images: ['alpine:3'] } };
     const manager = new RunnerManager({
+      isolation,
       onLog: jest.fn(), onStatusChange: jest.fn(), onJobHistoryUpdate: jest.fn(),
       getRepoPolicy: async () => ({ hosts: ['example.com'], level: 'strict' as const, readPaths: [], writePaths: [], docker }),
     });
@@ -3716,6 +2541,7 @@ describe('a worker nobody spawned for a job', () => {
   it('opens it for the repository it was spawned for', async () => {
     const docker = { run: { images: ['alpine:3'] } };
     const manager = new RunnerManager({
+      isolation,
       onLog: jest.fn(), onStatusChange: jest.fn(), onJobHistoryUpdate: jest.fn(),
       getRepoPolicy: async () => ({ hosts: [], level: 'strict' as const, readPaths: [], writePaths: [], docker }),
     });
@@ -3739,6 +2565,7 @@ describe('the job a worker claims through its proxy', () => {
     // hosts on this worker's proxy.
     const getJobTarget = jest.fn((..._args: unknown[]) => undefined);
     const manager = new RunnerManager({
+      isolation,
       onLog: jest.fn(), onStatusChange: jest.fn(), onJobHistoryUpdate: jest.fn(),
       getJobTarget: getJobTarget as never,
     });
@@ -3758,6 +2585,7 @@ describe('spawning the worker for an admitted job', () => {
   function manager() {
     const onLog = jest.fn();
     const m = new RunnerManager({
+      isolation,
       onLog, onStatusChange: jest.fn(), onJobHistoryUpdate: jest.fn(),
     });
     const helper = new RunnerManagerTestHelper(m);
@@ -3776,7 +2604,7 @@ describe('spawning the worker for an admitted job', () => {
       helper.setInstance(1, { name: 'runner-1', status: 'busy' });
       helper.setPendingTargetContext('next', { targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'req-1' });
 
-      const spawned = m.spawnWorkerForJob('seatbelt');
+      const spawned = m.spawnWorkerForJob();
       await jest.advanceTimersByTimeAsync(61_000);
 
       await expect(spawned).resolves.toBe(false);
@@ -3791,11 +2619,11 @@ describe('spawning the worker for an admitted job', () => {
     helper.setPendingTargetContext('next', { targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'req-1' });
     helper.stubCopyProxyCredentials(async () => undefined);
     helper.stubStartInstance(async (n) => {
-      helper.setInstance(n, { name: `runner-${n}`, status: 'starting', process: createMockProcess(4242) });
+      helper.setInstance(n, { name: `runner-${n}`, status: 'starting', worker: createMockWorker(4242) });
     });
     (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
 
-    await expect(m.spawnWorkerForJob('seatbelt')).resolves.toBe(true);
+    await expect(m.spawnWorkerForJob()).resolves.toBe(true);
   });
 
   it('says when the worker could not be started', async () => {
@@ -3805,53 +2633,36 @@ describe('spawning the worker for an admitted job', () => {
     helper.stubStartInstance(async () => undefined);
     (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
 
-    await expect(m.spawnWorkerForJob('seatbelt')).resolves.toBe(false);
+    await expect(m.spawnWorkerForJob()).resolves.toBe(false);
   });
 
-  it('starts a seatbelt worker with the isolation it was chosen under in its context', async () => {
+  it("starts the worker with the job's context in its slot", async () => {
     const { m, helper } = manager();
     helper.setPendingTargetContext('next', { targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'req-1' });
     helper.stubCopyProxyCredentials(async () => undefined);
     let contextAtStart: unknown;
     helper.stubStartInstance(async (n) => {
       contextAtStart = helper.pendingTargetContext(String(n));
-      helper.setInstance(n, { name: `runner-${n}`, status: 'starting', process: createMockProcess(4243) });
+      helper.setInstance(n, { name: `runner-${n}`, status: 'starting', worker: createMockWorker(4243) });
     });
     (jest.mocked(fs.existsSync) as unknown as jest.Mock).mockReturnValue(true);
 
-    await expect(m.spawnWorkerForJob('seatbelt')).resolves.toBe(true);
-    expect(contextAtStart).toEqual(expect.objectContaining({ jobId: 'req-1', isolation: 'seatbelt' }));
+    await expect(m.spawnWorkerForJob()).resolves.toBe(true);
+    expect(contextAtStart).toEqual(expect.objectContaining({ jobId: 'req-1', targetDisplayName: 'owner/repo' }));
   });
 
-  it.each(['service-account', 'macos-vm'] as const)(
-    'starts no worker for %s, which has no implementation in this build, and leaves nothing on offer',
-    async (isolation) => {
-      const { m, helper, onLog } = manager();
-      helper.setPendingTargetContext('next', { targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'req-1' });
-      const started = jest.fn(async () => undefined);
-      helper.stubStartInstance(started);
-
-      await expect(m.spawnWorkerForJob(isolation)).resolves.toBe(false);
-      expect(started).not.toHaveBeenCalled();
-      expect(helper.pendingTargetContext('next')).toBeUndefined();
-      expect(onLog).toHaveBeenCalledWith(
-        expect.objectContaining({ level: 'error', message: expect.stringContaining(`${isolation} isolation has no implementation in this build`) })
-      );
-    }
-  );
-
-  it('starts no worker for a type it does not know, rather than running it under seatbelt', async () => {
-    // A type added to ISOLATION_TYPES without a case here fails to compile;
-    // this is what it does at runtime if one ever arrives anyway.
+  it('starts no worker while no macOS VM can be started, and leaves nothing on offer', async () => {
     const { m, helper, onLog } = manager();
+    isolation.available.mockReturnValue({ ok: false, reason: 'the golden macOS image is still being built' });
     helper.setPendingTargetContext('next', { targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'req-1' });
     const started = jest.fn(async () => undefined);
     helper.stubStartInstance(started);
 
-    await expect(m.spawnWorkerForJob('linux-vm' as unknown as IsolationType)).resolves.toBe(false);
+    await expect(m.spawnWorkerForJob()).resolves.toBe(false);
     expect(started).not.toHaveBeenCalled();
+    expect(helper.pendingTargetContext('next')).toBeUndefined();
     expect(onLog).toHaveBeenCalledWith(
-      expect.objectContaining({ level: 'error', message: expect.stringContaining('unknown isolation type "linux-vm"') })
+      expect.objectContaining({ level: 'error', message: 'This job will not run: Taking no jobs: the golden macOS image is still being built' })
     );
   });
 
@@ -3865,6 +2676,7 @@ describe('spawning the worker for an admitted job', () => {
 describe('a job start on a worker', () => {
   function manager() {
     const m = new RunnerManager({
+      isolation,
       onLog: jest.fn(), onStatusChange: jest.fn(), onJobHistoryUpdate: jest.fn(),
     });
     const helper = new RunnerManagerTestHelper(m);
@@ -3907,6 +2719,7 @@ describe('a job start on a worker', () => {
 describe('a job that names no actor', () => {
   function manager(scope: 'everyone' | 'trigger' | 'contributors', cancelWorkflowRun = jest.fn(async () => undefined)) {
     return new RunnerManager({
+      isolation,
       onLog: jest.fn(), onStatusChange: jest.fn(), onJobHistoryUpdate: jest.fn(),
       getUserFilter: () => ({ scope, allowedUsers: 'just-me', allowlist: [] }),
       getCurrentUserLogin: () => 'me',
