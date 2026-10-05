@@ -43,6 +43,15 @@ const scratchInUse = new Set<string>();
 const execFileAsync = promisify(execFile);
 
 /**
+ * /bin/cp's arguments for copying what is in src into dest: on macOS `-c`
+ * clones, which only BSD cp has; GNU cp copies plainly. -R copies links as
+ * links in both, and "src/." copies what is in src, not src itself.
+ */
+export function treeCopyArgs(platform: NodeJS.Platform, src: string, dest: string): string[] {
+  return [platform === 'darwin' ? '-cR' : '-R', `${src}/.`, dest];
+}
+
+/**
  * What a runner template held when it came from its release: each file's
  * sha256 and each symlink's target, by path relative to the template.
  */
@@ -229,19 +238,19 @@ export class RunnerDownloader {
   /**
    * Clone a directory's contents into dest, which may already exist.
    *
-   * `cp -c` clones each file with clonefile(2): the copy shares the
-   * template's blocks on the volume until either side writes, so a sandbox
-   * costs next to no disk and a fraction of the time a byte copy of the
-   * runner took - nearly 500 MiB for every spawn. Where the volume cannot
-   * clone, cp falls back to a plain copy by itself. Node's own copyFile
-   * cannot clone here: on macOS its clone flag copies, and the forcing one
-   * fails with ENOSYS. Links are copied as links, never followed.
+   * On macOS, `cp -c` clones each file with clonefile(2): the copy shares
+   * the template's blocks on the volume until either side writes, so a
+   * sandbox costs next to no disk and a fraction of the time a byte copy of
+   * the runner took - nearly 500 MiB for every spawn. Where the volume
+   * cannot clone, cp falls back to a plain copy by itself. Node's own
+   * copyFile cannot clone here: on macOS its clone flag copies, and the
+   * forcing one fails with ENOSYS. Elsewhere - the tests' Linux leg - it is
+   * a plain copy (treeCopyArgs). Links are copied as links, never followed.
    */
   private async cloneTree(src: string, dest: string): Promise<void> {
     await fs.promises.mkdir(dest, { recursive: true });
     try {
-      // "src/." copies what is in src, not src itself.
-      await execFileAsync('/bin/cp', ['-cR', `${src}/.`, dest], { timeout: 120_000 });
+      await execFileAsync('/bin/cp', treeCopyArgs(process.platform, src, dest), { timeout: 120_000 });
     } catch (err) {
       const e = err as Error & { stderr?: string };
       throw new Error(`Could not copy ${src} to ${dest}: ${(e.stderr || e.message).trim()}`);

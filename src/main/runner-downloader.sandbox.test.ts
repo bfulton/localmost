@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as tar from 'tar';
-import { RunnerDownloader } from './runner-downloader';
+import { RunnerDownloader, treeCopyArgs } from './runner-downloader';
 
 /**
  * The developer tools' python3, by its own path: not /usr/bin/python3, which
@@ -165,8 +165,14 @@ describe('the sandbox a worker is built from', () => {
     const sandbox = await downloader.buildSandbox(1, version);
 
     const sandboxFile = path.join(sandbox, 'bin', 'libcoreclr.dylib');
-    const [template, copy] = deviceOffsets(arcFile, sandboxFile);
-    expect(copy).toBe(template);
+    if (process.platform === 'darwin') {
+      const [template, copy] = deviceOffsets(arcFile, sandboxFile);
+      expect(copy).toBe(template);
+    } else {
+      // No clonefile off macOS: a plain copy, a file of its own.
+      expect(process.platform).not.toBe('darwin');
+      expect(fs.statSync(sandboxFile).ino).not.toBe(fs.statSync(arcFile).ino);
+    }
     // Byte for byte the same, executable, and checked against the record.
     expect(fs.readFileSync(sandboxFile).equals(fs.readFileSync(arcFile))).toBe(true);
     expect(fs.statSync(sandboxFile).mode & 0o111).not.toBe(0);
@@ -795,5 +801,40 @@ describe('the runner template a sandbox is copied from', () => {
 
     await expect(build()).resolves.toBeDefined();
     expect(fs.readdirSync(path.join(root, 'runner', 'arc'))).toEqual([`v${version}`]);
+  });
+});
+
+describe("the copy a sandbox's runner is made with", () => {
+  it('clones with cp -c on darwin, and copies plainly elsewhere, where cp has no -c', () => {
+    expect(treeCopyArgs('darwin', '/t', '/s')).toEqual(['-cR', '/t/.', '/s']);
+    expect(treeCopyArgs('linux', '/t', '/s')).toEqual(['-R', '/t/.', '/s']);
+  });
+
+  it.each(['darwin', 'linux'] as const)("copies what is in the template, links as links, with %s's arguments", (platform) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lm-treecopy-'));
+    try {
+      const src = path.join(root, 'template');
+      const dest = path.join(root, 'sandbox');
+      fs.mkdirSync(path.join(src, 'bin'), { recursive: true });
+      fs.writeFileSync(path.join(src, 'bin', 'Runner.Listener'), 'listener', { mode: 0o755 });
+      fs.symlinkSync('bin/Runner.Listener', path.join(src, 'listener'));
+      fs.mkdirSync(dest);
+      const copy = () => execFileSync('/bin/cp', treeCopyArgs(platform, src, dest), { stdio: 'pipe' });
+
+      if (platform === 'darwin' && process.platform !== 'darwin') {
+        // GNU cp has no -c: why the arguments depend on the platform.
+        expect(copy).toThrow();
+        return;
+      }
+      // -R alone is common to BSD and GNU cp, so this host's cp runs either.
+      copy();
+
+      expect(fs.readdirSync(dest).sort()).toEqual(['bin', 'listener']);
+      expect(fs.readFileSync(path.join(dest, 'bin', 'Runner.Listener'), 'utf-8')).toBe('listener');
+      expect(fs.statSync(path.join(dest, 'bin', 'Runner.Listener')).mode & 0o111).not.toBe(0);
+      expect(fs.readlinkSync(path.join(dest, 'listener'))).toBe('bin/Runner.Listener');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

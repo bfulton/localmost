@@ -9,6 +9,7 @@ import * as fs from 'fs';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
+import * as tar from 'tar';
 import { closedPort, dryRunRunner, leaseTestVm, tarDirectory, VmStepRunner } from './test-vm';
 import { FakeGuest } from './test-utils/fake-guest';
 import { GUEST_TEST_ROOT, GUEST_WORKSPACE } from '../main/isolation/macos-vm/agent-client';
@@ -120,6 +121,29 @@ describe('VmStepRunner', () => {
 });
 
 describe('tarDirectory', () => {
+  it('writes entries relative to the directory, links as links, and nothing of the host but the files', async () => {
+    const dir = path.join(scratch, 'tree');
+    fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'src', 'main.txt'), 'x');
+    fs.chmodSync(path.join(dir, 'src', 'main.txt'), 0o755);
+    fs.symlinkSync('/etc/hosts', path.join(dir, 'hosts-link'));
+
+    const entries: Array<{ path: string; type: string; mode: number; uname: string; linkpath: string }> = [];
+    const parser = new tar.Parser({
+      onReadEntry: (entry) => {
+        entries.push({ path: entry.path, type: entry.type, mode: entry.mode ?? 0, uname: entry.uname ?? '', linkpath: entry.linkpath ?? '' });
+        entry.resume();
+      },
+    });
+    parser.end(await tarDirectory(dir));
+
+    expect(entries.map((e) => e.path).sort()).toEqual(['./', './hosts-link', './src/', './src/main.txt']);
+    expect(entries.find((e) => e.path === './hosts-link')).toMatchObject({ type: 'SymbolicLink', linkpath: '/etc/hosts' });
+    expect(entries.find((e) => e.path === './src/main.txt')!.mode & 0o111).not.toBe(0);
+    // No AppleDouble file, as macOS's tar would add, and no owner of the host's.
+    expect(entries.every((e) => e.uname === '')).toBe(true);
+  });
+
   it('refuses a directory over the most a run sends in', async () => {
     const dir = path.join(scratch, 'big');
     fs.mkdirSync(dir);

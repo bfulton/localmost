@@ -15,6 +15,39 @@ import * as path from 'path';
 
 const REPO = path.resolve(__dirname, '..', '..');
 
+const PLUTIL = '/usr/bin/plutil';
+
+/**
+ * On a Mac, plists here are read and written by plutil, the system's own
+ * parser. Off macOS - the Linux CI leg - there is no plutil, so the calls
+ * these tests and remove-usage-descriptions.js make of it are answered from
+ * the files by the plist package @electron/packager writes Info.plist with.
+ * Restored by the describes' jest.restoreAllMocks().
+ */
+const answerForPlutilOffMacOS = (): void => {
+  if (process.platform === 'darwin') return;
+  const plist = require(path.join(REPO, 'node_modules', 'plist'));
+  const childProcess = require('child_process');
+  const real = childProcess.execFileSync;
+  jest.spyOn(childProcess, 'execFileSync').mockImplementation(((file: string, args: string[], options?: object) => {
+    if (file !== PLUTIL) return real(file, args, options);
+    const target = args[args.length - 1];
+    const read = () => plist.parse(fs.readFileSync(target, 'utf-8'));
+    if (args.join(' ') === `-convert json -o - ${target}`) return JSON.stringify(read());
+    if (args.join(' ') === `-convert xml1 ${target}`) {
+      fs.writeFileSync(target, plist.build(JSON.parse(fs.readFileSync(target, 'utf-8'))));
+      return '';
+    }
+    if (args.length === 3 && args[0] === '-remove') {
+      const keys = read();
+      delete keys[args[1]];
+      fs.writeFileSync(target, plist.build(keys));
+      return '';
+    }
+    throw new Error(`no stand-in for plutil ${args.join(' ')}`);
+  }) as never);
+};
+
 describe('the installed localmost command', () => {
   // The bundle holds the wrapper and cli.js side by side in Resources; the
   // app installs /usr/local/bin/localmost as a link to the wrapper.
@@ -688,9 +721,10 @@ describe('the Darwin version of a macOS release', () => {
 });
 
 describe('the entitlements the app is signed with', () => {
-  // Read a plist as codesign does, with the system's own parser.
+  // Read a plist as codesign does, with the system's own parser (on a Mac;
+  // see answerForPlutilOffMacOS).
   const readPlist = (file: string) =>
-    JSON.parse(execFileSync('/usr/bin/plutil', ['-convert', 'json', '-o', '-', file], { encoding: 'utf-8' }));
+    JSON.parse(execFileSync(PLUTIL, ['-convert', 'json', '-o', '-', file], { encoding: 'utf-8' }));
 
   const APP = path.join(REPO, 'build', 'out', 'localmost-darwin-arm64', 'localmost.app');
   const FRAMEWORKS = path.join(APP, 'Contents', 'Frameworks');
@@ -738,6 +772,7 @@ describe('the entitlements the app is signed with', () => {
   const savedEnv = { ...process.env };
 
   beforeEach(() => {
+    answerForPlutilOffMacOS();
     // Sign with a named identity, without asking the keychain or git.
     process.env.APPLE_IDENTITY = 'Apple Development: Test (TEAMID1234)';
     process.env.RELEASE_BUILD = 'false';
@@ -864,7 +899,7 @@ describe('the usage descriptions the app declares', () => {
   // audio capture and Bluetooth. The app is signed without the entitlements
   // for any of them, so its Info.plist must not claim them either.
   const readPlist = (file: string) =>
-    JSON.parse(execFileSync('/usr/bin/plutil', ['-convert', 'json', '-o', '-', file], { encoding: 'utf-8' }));
+    JSON.parse(execFileSync(PLUTIL, ['-convert', 'json', '-o', '-', file], { encoding: 'utf-8' }));
   const { removeUsageDescriptions, USAGE_DESCRIPTION } = require(path.join(REPO, 'scripts', 'remove-usage-descriptions.js'));
 
   // The usage descriptions Electron's template app carries, and so what the
@@ -889,7 +924,7 @@ describe('the usage descriptions the app declares', () => {
   // does not always download Electron's app.
   const writePlist = (file: string, keys: Record<string, unknown>) => {
     fs.writeFileSync(file, JSON.stringify(keys));
-    execFileSync('/usr/bin/plutil', ['-convert', 'xml1', file]);
+    execFileSync(PLUTIL, ['-convert', 'xml1', file]);
   };
 
   // A packaged app's layout under root: the app's plist with the template's
@@ -918,6 +953,7 @@ describe('the usage descriptions the app declares', () => {
 
   beforeEach(() => {
     scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'usage-descriptions-')));
+    answerForPlutilOffMacOS();
     staging = path.join(scratch, 'localmost-darwin-arm64');
   });
 

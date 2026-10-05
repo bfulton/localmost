@@ -588,13 +588,27 @@ describe('workspace cleanup', () => {
 describe('a workspace cleanup cannot remove', () => {
   // A file flagged immutable can be neither unlinked nor moved, by the app
   // or by anyone - a removal that never clears, like the ones that would
-  // otherwise leave a copy of the checkout in app data run after run.
+  // otherwise leave a copy of the checkout in app data run after run. Off
+  // macOS - the Linux CI leg - only root can set an immutable flag, so
+  // there unlinking or moving a file named stuck is refused with EPERM, as
+  // the kernel refuses one flagged on a Mac.
   const stuck = (dir: string): void => {
     fs.writeFileSync(path.join(dir, 'stuck'), 'x');
-    execFileSync('chflags', ['uchg', path.join(dir, 'stuck')]);
+    if (process.platform === 'darwin') execFileSync('chflags', ['uchg', path.join(dir, 'stuck')]);
   };
+  beforeEach(() => {
+    if (process.platform === 'darwin') return;
+    const refused = (op: string, p: fs.PathLike) =>
+      Promise.reject(Object.assign(new Error(`EPERM: operation not permitted, ${op} '${p}'`), { code: 'EPERM' }));
+    const realUnlink = fs.promises.unlink.bind(fs.promises);
+    const realRename = fs.promises.rename.bind(fs.promises);
+    jest.spyOn(fs.promises, 'unlink').mockImplementation((p) => (path.basename(String(p)) === 'stuck' ? refused('unlink', p) : realUnlink(p)));
+    jest.spyOn(fs.promises, 'rename').mockImplementation((from, to) =>
+      path.basename(String(from)) === 'stuck' ? refused('rename', from) : realRename(from, to)
+    );
+  });
   afterEach(() => {
-    execFileSync('chflags', ['-R', 'nouchg', getWorkspacesDir()]);
+    if (process.platform === 'darwin') execFileSync('chflags', ['-R', 'nouchg', getWorkspacesDir()]);
   });
 
   it('is named in a warning, and not counted as removed', async () => {

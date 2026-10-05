@@ -16,7 +16,9 @@
  * Packager runs that hook only when the config sets extraResource.
  */
 
-const { execFileSync } = require('child_process');
+// Looked up at each call, so the tests' Linux leg, which has no plutil, can
+// answer for it.
+const childProcess = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
@@ -44,7 +46,7 @@ function bundlePlists(dir) {
 
 /** The top-level keys of a plist, read with the system's own parser. */
 function plistKeys(file) {
-  return Object.keys(JSON.parse(execFileSync(PLUTIL, ['-convert', 'json', '-o', '-', file], { encoding: 'utf-8' })));
+  return Object.keys(JSON.parse(childProcess.execFileSync(PLUTIL, ['-convert', 'json', '-o', '-', file], { encoding: 'utf-8' })));
 }
 
 /**
@@ -59,7 +61,7 @@ function removeUsageDescriptions(dir) {
   const removed = [];
   for (const plist of plists) {
     for (const key of plistKeys(plist).filter((k) => USAGE_DESCRIPTION.test(k))) {
-      execFileSync(PLUTIL, ['-remove', key, plist]);
+      childProcess.execFileSync(PLUTIL, ['-remove', key, plist]);
       removed.push(`${path.relative(dir, plist)}: ${key}`);
     }
   }

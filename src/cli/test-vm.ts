@@ -20,8 +20,8 @@
 
 import * as crypto from 'crypto';
 import * as net from 'net';
-import { spawn } from 'child_process';
 import * as path from 'path';
+import * as tar from 'tar';
 import {
   GUEST_TEST_ROOT,
   GUEST_WORKSPACE,
@@ -62,31 +62,36 @@ function guestRelative(guestPath: string, what: string): string {
   return normal.slice(GUEST_TEST_ROOT.length + 1);
 }
 
-/** A directory as a tar, as /usr/bin/tar writes one: links kept as links, no macOS metadata, at most MAX_PUT_BYTES. */
+/**
+ * A directory as a tar, at most MAX_PUT_BYTES: entries relative to it, links
+ * kept as links. node-tar writes the same archive on any host and, unlike
+ * macOS's own tar, never adds AppleDouble files or extended attributes;
+ * portable leaves out the host's owners, which mean nothing in the guest.
+ */
 export function tarDirectory(dir: string, maxBytes = MAX_PUT_BYTES): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const tar = spawn('/usr/bin/tar', ['-c', '-f', '-', '--no-mac-metadata', '-C', dir, '.'], {
-      env: { PATH: '/usr/bin:/bin', LANG: 'C', COPYFILE_DISABLE: '1' },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    const pack = tar.c({ cwd: dir, portable: true, strict: true }, ['.']);
     const chunks: Buffer[] = [];
     let total = 0;
-    let stderr = '';
-    let tooBig = false;
-    tar.stdout.on('data', (chunk: Buffer) => {
+    let done = false;
+    const fail = (err: Error) => {
+      if (done) return;
+      done = true;
+      pack.destroy();
+      reject(err);
+    };
+    pack.on('data', (chunk: Buffer) => {
+      if (done) return;
       total += chunk.length;
       if (total > maxBytes) {
-        tooBig = true;
-        tar.kill('SIGKILL');
-        return;
+        return fail(new Error(`${dir} is over ${maxBytes / 2 ** 20} MiB, the most localmost test sends into the macOS VM`));
       }
       chunks.push(chunk);
     });
-    tar.stderr.on('data', (d: Buffer) => (stderr += d.toString()));
-    tar.on('error', reject);
-    tar.on('close', (code) => {
-      if (tooBig) return reject(new Error(`${dir} is over ${maxBytes / 2 ** 20} MiB, the most localmost test sends into the macOS VM`));
-      if (code !== 0) return reject(new Error(`tar of ${dir} failed: ${stderr.trim() || `exit ${code}`}`));
+    pack.on('error', (err: unknown) => fail(new Error(`tar of ${dir} failed: ${(err as Error).message}`)));
+    pack.on('end', () => {
+      if (done) return;
+      done = true;
       resolve(Buffer.concat(chunks));
     });
   });
