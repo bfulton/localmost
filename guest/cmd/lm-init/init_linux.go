@@ -144,21 +144,11 @@ func boot() error {
 // startAgent starts lm-agent with the console as its output. lm-init waits
 // for it itself (with wait4), so that no reaping races an exec.Cmd.
 func startAgent() (int, error) {
-	pid, err := syscall.ForkExec(agentPath, []string{"lm-agent"}, &syscall.ProcAttr{
-		Dir:   "/",
-		Env:   []string{guestPATH, "HOME=/root"},
-		Files: []uintptr{devNull(), os.Stderr.Fd(), os.Stderr.Fd()},
-		Sys:   &syscall.SysProcAttr{Setsid: true},
-	})
-	return pid, err
-}
-
-func devNull() uintptr {
-	f, err := os.Open("/dev/null")
-	if err != nil {
-		return os.Stdin.Fd()
-	}
-	return f.Fd()
+	return forkExecNullStdin(syscall.ForkExec, agentPath, []string{"lm-agent"}, syscall.ProcAttr{
+		Dir: "/",
+		Env: []string{guestPATH, "HOME=/root"},
+		Sys: &syscall.SysProcAttr{Setsid: true},
+	}, os.Stderr.Fd())
 }
 
 // powerOff stops every process (TERM, then KILL after 5 s), syncs,
