@@ -33,9 +33,11 @@ function matchesEnvPattern(name: string, pattern: string): boolean {
  * wins over both - and then the runner's own settings and the job's proxy,
  * which no policy can replace. The guest reaches the proxy through its relay
  * at the same loopback address, so the URL is passed as the Mac's proxy has
- * it. The guest agent takes only the names a job may set (jobEnvNameAllowed
- * in the macOS VM's agent client), so a policy cannot reach the loader, the
- * shell or the runner's own configuration through this.
+ * it. Git is told to send the proxy's credentials up front: otherwise it
+ * waits for a 407 challenge the proxy answers by closing the connection, and
+ * every fetch aborts. The guest agent takes only the names a job may set
+ * (jobEnvNameAllowed in the macOS VM's agent client), so a policy cannot
+ * reach the loader, the shell or the runner's own configuration through this.
  */
 export function vmWorkerEnv(hostEnv: NodeJS.ProcessEnv, policy: EnvPolicy | undefined, proxyUrl: string): Record<string, string> {
   const allow = [...BASELINE_ENV, ...(policy?.allow ?? [])];
@@ -54,6 +56,7 @@ export function vmWorkerEnv(hostEnv: NodeJS.ProcessEnv, policy: EnvPolicy | unde
     https_proxy: proxyUrl,
     HTTP_PROXY: proxyUrl,
     HTTPS_PROXY: proxyUrl,
+    GIT_HTTP_PROXY_AUTHMETHOD: 'basic',
   };
 }
 

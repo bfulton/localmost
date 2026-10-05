@@ -29,6 +29,7 @@ describe('vmWorkerEnv', () => {
     https_proxy: PROXY,
     HTTP_PROXY: PROXY,
     HTTPS_PROXY: PROXY,
+    GIT_HTTP_PROXY_AUTHMETHOD: 'basic',
   };
 
   it("passes the locale and time zone of the app's own environment, and nothing else of it", () => {
@@ -69,6 +70,14 @@ describe('vmWorkerEnv', () => {
     const env = vmWorkerEnv({ ...host, HTTPS_PROXY: 'http://elsewhere:8080' }, { allow: ['HTTPS_PROXY', 'ACTIONS_*'] }, PROXY);
     expect(env.HTTPS_PROXY).toBe(PROXY);
     expect(env.ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT).toBe('true');
+  });
+
+  it("tells git to send the proxy's credentials up front, whatever the app's environment says", () => {
+    // The per-job .gitconfig used to set http.proxyAuthMethod=basic. Without
+    // it git waits for a 407 challenge the proxy answers by closing the
+    // connection, and every fetch through the job's proxy aborts.
+    const env = vmWorkerEnv({ ...host, GIT_HTTP_PROXY_AUTHMETHOD: 'negotiate' }, { allow: ['GIT_*'] }, PROXY);
+    expect(env.GIT_HTTP_PROXY_AUTHMETHOD).toBe('basic');
   });
 
   it('skips unset variables rather than passing them as empty', () => {
