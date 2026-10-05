@@ -11,7 +11,7 @@ import * as fs from 'fs';
 import { MacVmBackend } from './backend';
 import { MacVmImageManager } from './golden-image';
 import { concurrentVmLimit, currentHost } from './host';
-import { helperHasProvisioning, launcher, packRunner, runnerArchive, type RunnerPacking } from './launch';
+import { helperHasProvisioning, launcher, packVerifiedRunner, runnerArchive, type RunnerPacking } from './launch';
 import { macVmAgentPath, macVmHelperPath } from './paths';
 import { MacVmSlots } from './slots';
 import { processExecutableOf } from '../../vm/vm-manager';
@@ -75,7 +75,7 @@ export function createMacVmMode(opts: MacVmModeOptions): MacVmMode {
     launch,
     slots,
     runnerArc: opts.runnerArc,
-    packRunner,
+    packRunner: (version, dest) => packVerifiedRunner(opts.runnerPacking, version, dest),
     freeBytes,
     imageInUse: (id) => backend.imageInUse(id),
     jobsRunning: () => backend.jobsRunning(),

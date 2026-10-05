@@ -80,8 +80,8 @@ export interface ImageManagerDeps {
   slots: MacVmSlots;
   /** The host's runner: its version and its arc directory. */
   runnerArc: () => { version: string; dir: string } | null;
-  /** Packs a runner directory as a tar.gz at `dest`. */
-  packRunner: (dir: string, dest: string) => Promise<void>;
+  /** Packs the runner of `version` as a tar.gz at `dest`, from a copy checked against its integrity record. */
+  packRunner: (version: string, dest: string) => Promise<void>;
   freeBytes: (dir: string) => Promise<number>;
   /** Whether a job VM runs on `imageId` now. */
   imageInUse: (imageId: string) => boolean;
@@ -441,7 +441,7 @@ export class MacVmImageManager extends EventEmitter {
       this.set({ phase: 'setup', step: 'Waiting for the VM to get an address' });
       const ip = await this.waitForLease(started.mac, signal, exited);
       const tarball = path.join(boot, 'runner.tar.gz');
-      await d.packRunner(arc.dir, tarball);
+      await d.packRunner(arc.version, tarball);
       this.set({ phase: 'setup', step: headless ? 'Setting up the VM over Remote Login' : 'Waiting for Remote Login to be turned on in the VM' });
       // The setup runs while the VM is up. A VM that stops first - its
       // window closed, say - ends the setup too, once the guest's own

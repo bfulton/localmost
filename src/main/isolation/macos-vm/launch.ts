@@ -109,6 +109,21 @@ export interface RunnerPacking {
 }
 
 /**
+ * Packs the runner of `version` at `dest` as `packing` does, and keeps it
+ * only if its bytes check against the integrity record: the golden image's
+ * build puts the runner into the image this way, as a job's send does.
+ */
+export async function packVerifiedRunner(packing: RunnerPacking, version: string, dest: string): Promise<void> {
+  await packing.pack(version, dest);
+  try {
+    await packing.verify(version, fs.readFileSync(dest));
+  } catch (err) {
+    fs.rmSync(dest, { force: true });
+    throw err;
+  }
+}
+
+/**
  * The runner archive the guest is sent when it lacks the host's version:
  * packed once into `<data>/macos-vm/runner/<version>.tar.gz` and read back,
  * and checked against the runner's integrity record each time, from the

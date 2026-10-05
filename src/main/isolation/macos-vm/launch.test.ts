@@ -8,7 +8,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as tar from 'tar';
-import { packRunner, profileOptions, runnerArchive, type RunnerPacking } from './launch';
+import { packRunner, packVerifiedRunner, profileOptions, runnerArchive, type RunnerPacking } from './launch';
 import { buildMacVmProfile } from './helper-profile';
 import { shortTempDir } from '../../test-utils/vm-fixtures';
 
@@ -93,5 +93,38 @@ describe('runnerArchive', () => {
 
     // One that does not check even freshly packed is not sent at all.
     await expect(runnerArchive(data, '2.330.0', packing(() => true).p)).rejects.toThrow(/integrity record/);
+  });
+});
+
+describe('packVerifiedRunner', () => {
+  let data: string;
+  let arc: string;
+
+  beforeEach(() => {
+    data = shortTempDir();
+    arc = path.join(data, 'arc');
+    fs.mkdirSync(arc, { recursive: true });
+    fs.writeFileSync(path.join(arc, 'run.sh'), '#!/bin/sh\n', { mode: 0o755 });
+  });
+
+  afterEach(() => fs.rmSync(data, { recursive: true, force: true }));
+
+  const packing = (bad: boolean): RunnerPacking => ({
+    pack: async (_version, dest) => packRunner(arc, dest),
+    verify: async () => {
+      if (bad) throw new Error('does not match its integrity record');
+    },
+  });
+
+  it('keeps a packed runner that checks against its integrity record', async () => {
+    const dest = path.join(data, 'runner.tar.gz');
+    await packVerifiedRunner(packing(false), '2.330.0', dest);
+    expect(fs.existsSync(dest)).toBe(true);
+  });
+
+  it('removes, and refuses, one that does not, so the image build never uses it', async () => {
+    const dest = path.join(data, 'runner.tar.gz');
+    await expect(packVerifiedRunner(packing(true), '2.330.0', dest)).rejects.toThrow(/integrity record/);
+    expect(fs.existsSync(dest)).toBe(false);
   });
 });

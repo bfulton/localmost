@@ -66,7 +66,7 @@ describe('MacVmImageManager', () => {
         }),
       slots: new MacVmSlots(() => 2),
       runnerArc: () => ({ version: '2.330.0', dir: arc }),
-      packRunner: async (_dir, dest) => fs.writeFileSync(dest, 'runner tarball'),
+      packRunner: async (_version, dest) => fs.writeFileSync(dest, 'runner tarball'),
       freeBytes: async () => 100 * 2 ** 30,
       imageInUse: (id) => inUse.has(id),
       jobsRunning: () => inUse.size > 0,
