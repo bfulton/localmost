@@ -28,7 +28,7 @@ jest.mock('./proxy-server', () => ({
     getPort: jest.fn().mockReturnValue(12345),
     setPolicyAllowedHosts: jest.fn(),
     setPolicyDeniedHosts: jest.fn(),
-    setLoopbackPolicy: jest.fn(),
+    setBrokerPort: jest.fn(),
     setPolicyLevel: jest.fn(),
     rotateAuthToken: jest.fn(),
   })),
@@ -83,7 +83,7 @@ const policy = (overrides: Partial<RepoPolicyRuntime> = {}): RepoPolicyRuntime =
 const fakeProxy = () => ({
   setPolicyAllowedHosts: jest.fn(),
   setPolicyDeniedHosts: jest.fn(),
-  setLoopbackPolicy: jest.fn(),
+  setBrokerPort: jest.fn(),
   setPolicyLevel: jest.fn(),
   rotateAuthToken: jest.fn(),
   getPort: jest.fn(() => 12345),
@@ -91,12 +91,12 @@ const fakeProxy = () => ({
 type FakeProxy = ReturnType<typeof fakeProxy>;
 
 /** A reused proxy that holds whatever policy and token it was last given. */
-const holdingProxy = (held: { hosts: string[]; denied: string[]; loopback: unknown; level: string; token: string }) => ({
+const holdingProxy = (held: { hosts: string[]; denied: string[]; brokerPort: number; level: string; token: string }) => ({
   held,
   proxy: {
     setPolicyAllowedHosts: jest.fn((hosts: string[]) => { held.hosts = hosts; }),
     setPolicyDeniedHosts: jest.fn((hosts: string[]) => { held.denied = hosts; }),
-    setLoopbackPolicy: jest.fn((_brokerPort: number, grant: unknown) => { held.loopback = grant; }),
+    setBrokerPort: jest.fn((port: number) => { held.brokerPort = port; }),
     setPolicyLevel: jest.fn((level: string) => { held.level = level; }),
     rotateAuthToken: jest.fn((token: string) => { held.token = token; }),
     getPort: jest.fn(() => 12345),
@@ -153,7 +153,7 @@ describe("a claimed job's denied hosts on its proxy", () => {
 
     expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith(['ok.example']);
     expect(proxy.setPolicyDeniedHosts).toHaveBeenLastCalledWith(['bad.example']);
-    for (const [port, grant] of (proxy.setLoopbackPolicy as jest.Mock).mock.calls) expect([port, grant]).toEqual([BROKER_PORT, undefined]);
+    for (const [port] of (proxy.setBrokerPort as jest.Mock).mock.calls) expect(port).toBe(BROKER_PORT);
   });
 
   it('closes them when the worker is finished, so the next job on the slot starts without them', async () => {
@@ -169,7 +169,7 @@ describe("a claimed job's denied hosts on its proxy", () => {
     helper.releaseInstanceSlot(1);
 
     expect(proxy.setPolicyDeniedHosts).toHaveBeenLastCalledWith([]);
-    expect(proxy.setLoopbackPolicy).toHaveBeenLastCalledWith(BROKER_PORT, undefined);
+    expect(proxy.setBrokerPort).toHaveBeenLastCalledWith(BROKER_PORT);
   });
 
   it("does not leave one job's deny list on the next job's claim", async () => {
@@ -195,7 +195,7 @@ describe("a claimed job's denied hosts on its proxy", () => {
     await onJobAcquired('req-other');
 
     expect(proxy.setPolicyDeniedHosts).toHaveBeenLastCalledWith([]);
-    expect(proxy.setLoopbackPolicy).toHaveBeenLastCalledWith(BROKER_PORT, undefined);
+    expect(proxy.setBrokerPort).toHaveBeenLastCalledWith(BROKER_PORT);
   });
 
   it('closes them for a claim whose repository it cannot read', async () => {
@@ -212,11 +212,11 @@ describe("a claimed job's denied hosts on its proxy", () => {
     expect(getRepoPolicy).not.toHaveBeenCalled();
     expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith([]);
     expect(proxy.setPolicyDeniedHosts).toHaveBeenLastCalledWith([]);
-    expect(proxy.setLoopbackPolicy).toHaveBeenLastCalledWith(BROKER_PORT, undefined);
+    expect(proxy.setBrokerPort).toHaveBeenLastCalledWith(BROKER_PORT);
     expect(proxy.setPolicyLevel).toHaveBeenLastCalledWith('strict');
   });
 
-  it('logs traffic to a declared loopback port, and not the broker polling', async () => {
+  it('logs loopback traffic it refused, and not the broker polling', async () => {
     const onLog = jest.fn();
     const { helper } = managerWith({ onLog });
     await helper.startInstanceProxy(1);
@@ -225,12 +225,12 @@ describe("a claimed job's denied hosts on its proxy", () => {
     const entry = { timestamp: 'now', method: 'CONNECT', host: '127.0.0.1', blocked: false };
 
     proxyLog({ ...entry, port: BROKER_PORT, reason: 'infrastructure' });
-    proxyLog({ ...entry, port: 5432, reason: 'policy' });
-    proxyLog({ ...entry, host: 'localhost', port: 5433, reason: 'policy' });
+    proxyLog({ ...entry, port: 5432, blocked: true, reason: 'loopback' });
+    proxyLog({ ...entry, host: 'localhost', port: 5433, blocked: true, reason: 'loopback' });
 
     expect(logged()).toEqual([
-      '[proxy 1] ALLOWED CONNECT 127.0.0.1:5432 (policy)',
-      '[proxy 1] ALLOWED CONNECT localhost:5433 (policy)',
+      '[proxy 1] BLOCKED CONNECT 127.0.0.1:5432 (loopback)',
+      '[proxy 1] BLOCKED CONNECT localhost:5433 (loopback)',
     ]);
   });
 
@@ -246,7 +246,7 @@ describe("a claimed job's denied hosts on its proxy", () => {
 
     expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith([]);
     expect(proxy.setPolicyDeniedHosts).toHaveBeenLastCalledWith(['bad.example']);
-    expect(proxy.setLoopbackPolicy).toHaveBeenLastCalledWith(BROKER_PORT, undefined);
+    expect(proxy.setBrokerPort).toHaveBeenLastCalledWith(BROKER_PORT);
   });
 });
 
@@ -285,20 +285,20 @@ describe("a spawned worker", () => {
     expect(helper.instances.get(1)!.policyStamp).toBe('spawn-stamp');
   });
 
-  it('closes the proxy it is reusing, loopback and denies included, before the runner exists', async () => {
+  it('closes the proxy it is reusing, the broker port and denies included, before the runner exists', async () => {
     await spawn(policy());
     const proxy = jest.mocked(ProxyServer).mock.results.at(-1)!.value as FakeProxy;
     expect(proxy.setPolicyDeniedHosts).toHaveBeenCalledWith([]);
-    expect(proxy.setLoopbackPolicy).toHaveBeenCalledWith(BROKER_PORT, undefined);
-    expect(proxy.setLoopbackPolicy.mock.invocationCallOrder[0]).toBeLessThan(isolation.spawnWorker.mock.invocationCallOrder[0]);
+    expect(proxy.setBrokerPort).toHaveBeenCalledWith(BROKER_PORT);
+    expect(proxy.setBrokerPort.mock.invocationCallOrder[0]).toBeLessThan(isolation.spawnWorker.mock.invocationCallOrder[0]);
   });
 
-  it("clears the last job's hosts, denies and loopback from a reused proxy before the runner exists", async () => {
+  it("clears the last job's hosts and denies from a reused proxy, and sets its broker port, before the runner exists", async () => {
     // A slot's proxy is reused from job to job. A start with no job context
     // installs no policy of its own, so the close at the start of the spawn
     // is all that stands between the new runner and the last job's grants.
     const { manager } = managerWith({ getRepoPolicy: async () => policy() });
-    const { proxy, held } = holdingProxy({ hosts: ['stale.example'], denied: ['bad.example'], loopback: [5432], level: 'permissive', token: 'last-job' });
+    const { proxy, held } = holdingProxy({ hosts: ['stale.example'], denied: ['bad.example'], brokerPort: 1, level: 'permissive', token: 'last-job' });
     let atSpawn: typeof held | undefined;
     (fs.existsSync as jest.Mock).mockReturnValue(true);
     isolation.spawnWorker.mockImplementation(async () => { atSpawn = { ...held }; return createMockWorker(4242); });
@@ -308,7 +308,7 @@ describe("a spawned worker", () => {
 
     await manager.startInstance(1);
 
-    expect(atSpawn).toMatchObject({ hosts: [], denied: [], loopback: undefined, level: 'strict' });
+    expect(atSpawn).toMatchObject({ hosts: [], denied: [], brokerPort: BROKER_PORT, level: 'strict' });
     expect(atSpawn!.token).not.toBe('last-job');
   });
 
@@ -319,7 +319,7 @@ describe("a spawned worker", () => {
     const { manager } = managerWith({
       getRepoPolicy: async () => policy({ hosts: ['ok.example'], deniedHosts: ['bad.example'], level: 'permissive' }),
     });
-    const { proxy, held } = holdingProxy({ hosts: [], denied: [], loopback: undefined, level: 'strict', token: 'last-job' });
+    const { proxy, held } = holdingProxy({ hosts: [], denied: [], brokerPort: BROKER_PORT, level: 'strict', token: 'last-job' });
     let atSpawn: typeof held | undefined;
     (fs.existsSync as jest.Mock).mockReturnValue(true);
     isolation.spawnWorker.mockImplementation(async () => { atSpawn = { ...held }; throw new Error('the guest agent refused the job'); });
@@ -331,7 +331,7 @@ describe("a spawned worker", () => {
     await manager.startInstance(1);
 
     expect(atSpawn).toMatchObject({ hosts: ['ok.example'], denied: ['bad.example'], level: 'permissive' });
-    expect(held).toMatchObject({ hosts: [], denied: [], loopback: undefined, level: 'strict' });
+    expect(held).toMatchObject({ hosts: [], denied: [], brokerPort: BROKER_PORT, level: 'strict' });
     expect(held.token).not.toBe(atSpawn!.token);
   });
 
@@ -512,7 +512,7 @@ describe('a policy lookup that outlives its worker', () => {
     helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
     const late = policy({ hosts: ['old-job.example'], deniedHosts: [], level: 'permissive', docker: { run: { images: ['alpine:3'] } } });
     const untouched = () => {
-      for (const fn of [proxy.setPolicyAllowedHosts, proxy.setPolicyDeniedHosts, proxy.setLoopbackPolicy, proxy.setPolicyLevel, socket.bind]) {
+      for (const fn of [proxy.setPolicyAllowedHosts, proxy.setPolicyDeniedHosts, proxy.setBrokerPort, proxy.setPolicyLevel, socket.bind]) {
         expect(fn).not.toHaveBeenCalled();
       }
     };

@@ -6,7 +6,7 @@
  * infrastructure on any port, so a job reached every local service - a
  * debugger on 9229, a dev database, another app's local API - by asking its
  * proxy. A literal loopback target is now refused unless it is the broker's
- * port or one opened with setLoopbackPolicy, which the runner opens none of.
+ * port.
  */
 
 import * as http from 'http';
@@ -48,48 +48,17 @@ describe('literal loopback through the proxy', () => {
 
     it('opens the broker port it is told, and closes the default one', () => {
       const proxy = new ProxyServer({ policyLevel: level });
-      proxy.setLoopbackPolicy(4100, undefined);
+      proxy.setBrokerPort(4100);
       expect(checkHost(proxy, '127.0.0.1', 4100).allowed).toBe(true);
+      expect(checkHost(proxy, '::1', 4100, 'connect').allowed).toBe(true);
       expect(checkHost(proxy, '127.0.0.1', DEFAULT_BROKER_PORT).allowed).toBe(false);
-    });
-
-    it('opens exactly the ports it is given', () => {
-      const proxy = new ProxyServer({ policyLevel: level });
-      proxy.setLoopbackPolicy(DEFAULT_BROKER_PORT, [5432, 6379]);
-      expect(checkHost(proxy, '127.0.0.1', 5432)).toEqual({ allowed: true, reason: 'policy' });
-      expect(checkHost(proxy, '::1', 6379, 'connect').allowed).toBe(true);
-      expect(checkHost(proxy, '127.0.0.1', 5433).allowed).toBe(false);
-      expect(checkHost(proxy, '127.0.0.1', DEFAULT_BROKER_PORT).allowed).toBe(true);
-    });
-
-    it('opens every port when it is given all of loopback', () => {
-      const proxy = new ProxyServer({ policyLevel: level });
-      proxy.setLoopbackPolicy(DEFAULT_BROKER_PORT, true);
-      expect(checkHost(proxy, '127.0.0.1', 9229).allowed).toBe(true);
-      expect(checkHost(proxy, '::1', 1, 'connect').allowed).toBe(true);
+      expect(checkHost(proxy, '127.0.0.1', 5432)).toEqual({ allowed: false, reason: 'loopback' });
     });
   });
 
-  it("replaces the previous job's grant rather than keeping it", () => {
-    const proxy = new ProxyServer({ policyLevel: 'strict' });
-    proxy.setLoopbackPolicy(DEFAULT_BROKER_PORT, true);
-    proxy.setLoopbackPolicy(DEFAULT_BROKER_PORT, undefined);
-    expect(checkHost(proxy, '127.0.0.1', 9229).allowed).toBe(false);
-  });
-
-  it('keeps its own copy of the ports it was given', () => {
-    const ports = [5432];
-    const proxy = new ProxyServer({ policyLevel: 'strict' });
-    proxy.setLoopbackPolicy(DEFAULT_BROKER_PORT, ports);
-    ports.push(9229);
-    expect(checkHost(proxy, '127.0.0.1', 9229).allowed).toBe(false);
-  });
-
-  it('lets a deny entry close a declared loopback port, but never the broker', () => {
+  it('keeps the broker open against a deny entry that names this machine', () => {
     const proxy = new ProxyServer({ policyLevel: 'permissive' });
-    proxy.setLoopbackPolicy(DEFAULT_BROKER_PORT, true);
-    proxy.setPolicyDeniedHosts(['127.0.0.1:5432', '127.0.0.1']);
-    expect(checkHost(proxy, '127.0.0.1', 5432)).toEqual({ allowed: false, reason: 'denied' });
+    proxy.setPolicyDeniedHosts(['127.0.0.1']);
     expect(checkHost(proxy, '127.0.0.1', DEFAULT_BROKER_PORT)).toEqual({ allowed: true, reason: 'infrastructure' });
   });
 
@@ -156,7 +125,7 @@ describe('loopback refusals on the wire', () => {
     const other = await localService();
     const acquired: string[] = [];
     const p = new ProxyServer({ policyLevel: 'strict', authToken: 't', onJobAcquired: async (id) => { acquired.push(id); } });
-    p.setLoopbackPolicy(broker.port, undefined);
+    p.setBrokerPort(broker.port);
     await p.start();
     try {
       expect(await request(p.getPort(), 'GET', `http://127.0.0.1:${broker.port}/w/key/_apis/x`)).toBe(200);
@@ -169,33 +138,21 @@ describe('loopback refusals on the wire', () => {
     }
   });
 
-  it('rechecks acquirejob against the policy the claim installed, not the one it was buffered under', async () => {
-    // The worker was spawned under a policy that declared this port; the job
-    // it claimed does not. The claim runs while the body is buffered, and the
-    // forward must be judged by what the claim left.
+  it('rechecks acquirejob against what the claim left, not what it was buffered under', async () => {
+    // The port was open when the body began to buffer and is not once the
+    // claim has run, which it does while the body is buffered: the forward
+    // must be judged by what the claim left.
     const svc = await localService();
     const p = new ProxyServer({
       policyLevel: 'strict',
       authToken: 't',
-      onJobAcquired: async () => { p.setLoopbackPolicy(DEFAULT_BROKER_PORT, undefined); },
+      onJobAcquired: async () => { p.setBrokerPort(DEFAULT_BROKER_PORT); },
     });
-    p.setLoopbackPolicy(DEFAULT_BROKER_PORT, [svc.port]);
+    p.setBrokerPort(svc.port);
     await p.start();
     try {
       expect(await request(p.getPort(), 'POST', `http://127.0.0.1:${svc.port}/x/acquirejob`, '{"jobMessageId":"m"}')).toBe(403);
       expect(svc.connections()).toBe(0);
     } finally { svc.server.close(); await p.stop(); }
-  });
-
-  it('reaches a port the policy declares, and not the one beside it', async () => {
-    const svc = await localService();
-    const other = await localService();
-    const p = new ProxyServer({ policyLevel: 'strict', authToken: 't' });
-    p.setLoopbackPolicy(DEFAULT_BROKER_PORT, [svc.port]);
-    await p.start();
-    try {
-      expect(await request(p.getPort(), 'GET', `http://127.0.0.1:${svc.port}/`)).toBe(200);
-      expect(await connectStatus(p.getPort(), `127.0.0.1:${other.port}`)).toBe('HTTP/1.1 403 Forbidden');
-    } finally { svc.server.closeAllConnections(); svc.server.close(); other.server.close(); await p.stop(); }
   });
 });

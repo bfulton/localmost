@@ -12,7 +12,6 @@ import { REMOVAL_PREFIX, moveAsideForRemoval, removeMovedAside } from '../shared
 export { REMOVAL_PREFIX, moveAsideForRemoval, removeMovedAside };
 
 export type CleanupLogger = (message: string) => void;
-export type LeveledLogger = (level: 'info' | 'error', message: string) => void;
 
 /**
  * Validate that a child path stays within the expected base directory.
@@ -185,24 +184,5 @@ export async function cleanupWorkDirectories(
     }
   } catch {
     // Failed to scan work directories - non-fatal
-  }
-}
-
-/**
- * Move a directory to trash for background cleanup.
- * Returns true if successful, false if rename failed.
- */
-export function moveToTrash(dirPath: string, log: CleanupLogger): boolean {
-  const trashDir = `${dirPath}.trash.${Date.now()}`;
-  try {
-    fs.renameSync(dirPath, trashDir);
-    log(`Moved to trash for background cleanup`);
-    // Delete in background (fire and forget)
-    fs.promises.rm(trashDir, { recursive: true, force: true }).catch(() => {
-      // Background cleanup - failures are non-fatal, will retry on next startup
-    });
-    return true;
-  } catch {
-    return false;
   }
 }

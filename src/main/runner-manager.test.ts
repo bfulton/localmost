@@ -27,7 +27,7 @@ jest.mock('./proxy-server', () => ({
     getPort: jest.fn().mockReturnValue(12345),
     setPolicyAllowedHosts: jest.fn(),
     setPolicyDeniedHosts: jest.fn(),
-    setLoopbackPolicy: jest.fn(),
+    setBrokerPort: jest.fn(),
     setPolicyLevel: jest.fn(),
     rotateAuthToken: jest.fn(),
   })),
@@ -783,7 +783,7 @@ describe('RunnerManager', () => {
           githubSha: 'abc1234',
         },
       });
-      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel: jest.fn() });
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyDeniedHosts: jest.fn(), setBrokerPort: jest.fn(), setPolicyLevel: jest.fn() });
 
       await helper.applyRepoPolicy(1);
 
@@ -808,7 +808,7 @@ describe('RunnerManager', () => {
       const helper = new RunnerManagerTestHelper(manager);
       // The claim recorded the workflow the broker read from github.workflow.
       helper.setInstance(1, { name: 'runner-1', status: 'listening', claimedJob: { repository: 'owner/repo', sha: 'abc1234', workflow: 'integration' }, });
-      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel: jest.fn() });
+      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setBrokerPort: jest.fn(), setPolicyLevel: jest.fn() });
       helper.setPendingTargetContext('1', {
         targetId: 't1',
         targetDisplayName: 'owner/repo',
@@ -847,7 +847,7 @@ describe('RunnerManager', () => {
           targetDisplayName: 'owner/repo',
         },
       });
-      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel: jest.fn() });
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyDeniedHosts: jest.fn(), setBrokerPort: jest.fn(), setPolicyLevel: jest.fn() });
 
       await helper.applyRepoPolicy(1);
 
@@ -871,7 +871,7 @@ describe('RunnerManager', () => {
             : { hosts: ['second.example'], level: 'strict' as const, readPaths: [], writePaths: [], docker: {} },
       });
       const helper = new RunnerManagerTestHelper(manager);
-      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel: jest.fn() });
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyDeniedHosts: jest.fn(), setBrokerPort: jest.fn(), setPolicyLevel: jest.fn() });
 
       const runJob = async (repo: string) => {
         helper.setInstance(1, {
@@ -924,7 +924,7 @@ describe('RunnerManager', () => {
           id: 'job-3',
         },
       });
-      helper.setProxy(3, { setPolicyAllowedHosts, setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel: jest.fn() });
+      helper.setProxy(3, { setPolicyAllowedHosts, setPolicyDeniedHosts: jest.fn(), setBrokerPort: jest.fn(), setPolicyLevel: jest.fn() });
 
       await helper.applyRepoPolicy(3);
 
@@ -962,7 +962,7 @@ describe('RunnerManager', () => {
           githubSha: 'abc1234',
         },
       });
-      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel: jest.fn() });
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyDeniedHosts: jest.fn(), setBrokerPort: jest.fn(), setPolicyLevel: jest.fn() });
 
       await helper.applyRepoPolicy(1);
 
@@ -1000,7 +1000,7 @@ describe('RunnerManager', () => {
         policyStamp: 'a-stamp-from-an-older-policy',
         // No currentJob: the runner has not logged "Running job" yet.
       });
-      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel: jest.fn() });
+      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setBrokerPort: jest.fn(), setPolicyLevel: jest.fn() });
       const stopInstance = jest
         .spyOn(manager, 'stopInstance')
         .mockResolvedValue(undefined as never);
@@ -1042,7 +1042,7 @@ describe('RunnerManager', () => {
           githubSha: 'abc1234',
         },
       });
-      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel: jest.fn() });
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyDeniedHosts: jest.fn(), setBrokerPort: jest.fn(), setPolicyLevel: jest.fn() });
 
       await helper.applyRepoPolicy(1);
 
@@ -1081,7 +1081,7 @@ describe('RunnerManager', () => {
           githubSha: 'abc1234',
         },
       });
-      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel: jest.fn() });
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyDeniedHosts: jest.fn(), setBrokerPort: jest.fn(), setPolicyLevel: jest.fn() });
 
       await helper.applyRepoPolicy(1);
 
@@ -1116,7 +1116,7 @@ describe('RunnerManager', () => {
           githubSha: 'abc1234',
         },
       });
-      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel: jest.fn() });
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyDeniedHosts: jest.fn(), setBrokerPort: jest.fn(), setPolicyLevel: jest.fn() });
 
       await helper.applyPolicyOnClaim(1, 'owner/repo', 'abc1234');
 
@@ -1149,7 +1149,7 @@ describe('RunnerManager', () => {
           githubSha: 'abc1234',
         },
       });
-      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel });
+      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setBrokerPort: jest.fn(), setPolicyLevel });
 
       await helper.applyRepoPolicy(1);
 
@@ -1179,7 +1179,7 @@ describe('RunnerManager', () => {
           githubSha: 'abc1234',
         },
       });
-      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel });
+      helper.setProxy(1, { setPolicyAllowedHosts, setPolicyDeniedHosts: jest.fn(), setBrokerPort: jest.fn(), setPolicyLevel });
 
       await helper.applyRepoPolicy(1);
 
@@ -2147,7 +2147,7 @@ describe('RunnerManager', () => {
       });
       const helper = new RunnerManagerTestHelper(manager);
       helper.setInstance(1, { name: 'runner-1', status: 'listening', claimedJob: { repository: 'owner/repo', sha: 'abc1234', workflow: 'integration' }, });
-      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel: jest.fn() });
+      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setBrokerPort: jest.fn(), setPolicyLevel: jest.fn() });
       const socket = dockerSocketStub();
       helper.setDockerProxy(1, socket);
       helper.setPendingTargetContext('1', {
@@ -2181,7 +2181,7 @@ describe('RunnerManager', () => {
           githubSha: 'abc1234',
         });
         helper.setInstance(instanceNum, { name: `runner-${instanceNum}`, status: 'listening' });
-        helper.setProxy(instanceNum, { setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel: jest.fn() });
+        helper.setProxy(instanceNum, { setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setBrokerPort: jest.fn(), setPolicyLevel: jest.fn() });
         const socket = dockerSocketStub();
         helper.setDockerProxy(instanceNum, socket);
         sockets.push(socket);
@@ -2214,7 +2214,7 @@ describe('RunnerManager', () => {
       const helper = new RunnerManagerTestHelper(manager);
       helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
       helper.setInstance(1, { name: 'runner-1', status: 'listening' });
-      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel: jest.fn() });
+      helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setBrokerPort: jest.fn(), setPolicyLevel: jest.fn() });
       const socket = dockerSocketStub();
       helper.setDockerProxy(1, socket);
 
@@ -2466,7 +2466,7 @@ describe('a worker constrained by policy drift stays constrained', () => {
     });
     const helper = new RunnerManagerTestHelper(manager);
     const proxy = {
-      setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(),
+      setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setBrokerPort: jest.fn(),
       setPolicyLevel: jest.fn(), getStats: jest.fn(), getPolicyLevel: jest.fn(),
     };
     const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn(), staysClosed: jest.fn() };
@@ -2529,7 +2529,7 @@ describe('a worker nobody spawned for a job', () => {
     });
     const helper = new RunnerManagerTestHelper(manager);
     const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn(), staysClosed: jest.fn() };
-    helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel: jest.fn() });
+    helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setBrokerPort: jest.fn(), setPolicyLevel: jest.fn() });
     helper.setDockerProxy(1, dockerSocket);
     helper.setInstance(1, { name: 'runner-1', status: 'listening' });
 
@@ -2547,7 +2547,7 @@ describe('a worker nobody spawned for a job', () => {
     });
     const helper = new RunnerManagerTestHelper(manager);
     const dockerSocket = { bind: jest.fn(), boundRepository: jest.fn(), staysClosed: jest.fn() };
-    helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setLoopbackPolicy: jest.fn(), setPolicyLevel: jest.fn() });
+    helper.setProxy(1, { setPolicyAllowedHosts: jest.fn(), setPolicyDeniedHosts: jest.fn(), setBrokerPort: jest.fn(), setPolicyLevel: jest.fn() });
     helper.setDockerProxy(1, dockerSocket);
     helper.setInstance(1, { name: 'runner-1', status: 'listening' });
     helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });

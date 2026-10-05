@@ -116,10 +116,8 @@ export class ProxyServer {
   private onLog: ProxyLogCallback;
   private policyAllowedHosts: string[];
   private policyDeniedHosts: string[] = [];
-  /** The broker's port, the one loopback port open whatever the policy. */
+  /** The broker's port: the one loopback port open, whatever the policy. */
   private brokerPort = DEFAULT_BROKER_PORT;
-  /** Loopback opened beyond the broker: every port, these ones, or none - which is what a job gets. */
-  private loopback: true | number[] | undefined;
   private static readonly MAX_ACQUIRE_BODY_BYTES = 64 * 1024;
 
   private policyLevel: SandboxPolicyLevel;
@@ -184,7 +182,7 @@ export class ProxyServer {
    * spells host:port. Allowing a name used to allow every port on it, so
    * github.com on the infrastructure list opened github.com:22 to every job.
    * A target on this machine is decided by port alone, at every level: see
-   * setLoopbackPolicy.
+   * setBrokerPort.
    */
   private checkHostAccess(
     host: string,
@@ -207,20 +205,15 @@ export class ProxyServer {
     // level says (see hostPatternDenies).
     const denies = (entry: string): boolean => hostPatternDenies(entry, normalizedHost, port);
 
-    // This machine, on the ports the job may reach and no others, whatever
-    // the level: the broker's, which the runner reaches through this proxy
-    // and which its per-worker key rather than the port guards, and any
-    // opened with setLoopbackPolicy - none, for a job. A job's macOS VM has
-    // a loopback of its own; asked of this proxy, a literal loopback target
-    // is this Mac's, and without this the job had only to ask - localhost
-    // and 127.0.0.1 are on the infrastructure list, and permissive allows
-    // anything.
+    // This machine, on the broker's port and no other, whatever the level:
+    // the runner reaches the broker through this proxy, and its per-worker
+    // key rather than the port guards it. A job's macOS VM has a loopback of
+    // its own; asked of this proxy, a literal loopback target is this Mac's,
+    // and without this the job had only to ask - localhost and 127.0.0.1 are
+    // on the infrastructure list, and permissive allows anything.
     if (isLoopbackTarget(normalizedHost)) {
       if (port === this.brokerPort) return { allowed: true, reason: 'infrastructure' };
-      const declared = this.loopback === true || (this.loopback?.includes(port) ?? false);
-      if (!declared) return { allowed: false, reason: 'loopback' };
-      if (this.policyDeniedHosts.some(denies)) return { allowed: false, reason: 'denied' };
-      return { allowed: true, reason: 'policy' };
+      return { allowed: false, reason: 'loopback' };
     }
 
     // Runner infrastructure is allowed at every level - without it the runner
@@ -349,17 +342,13 @@ export class ProxyServer {
   }
 
   /**
-   * Set which loopback ports of this Mac the job about to run may reach
-   * through this proxy: the broker's, which the runner cannot work without,
-   * and `loopback` beyond it - every port for `true`, the listed ones for a
-   * list, none for undefined. The runner opens none: no policy can declare
-   * any, since a job's macOS VM has a loopback of its own. Until this is
-   * called only the default broker port is open. Replaces the previous
-   * job's, as setPolicyAllowedHosts does.
+   * Set the broker's port: the one loopback port of this Mac a job may reach
+   * through this proxy, which the runner cannot work without. No policy
+   * opens another, since a job's macOS VM has a loopback of its own. Until
+   * this is called the default broker port is the one open.
    */
-  setLoopbackPolicy(brokerPort: number, loopback: true | number[] | undefined): void {
+  setBrokerPort(brokerPort: number): void {
     this.brokerPort = brokerPort;
-    this.loopback = loopback === true ? true : Array.isArray(loopback) ? [...loopback] : undefined;
   }
 
   /**

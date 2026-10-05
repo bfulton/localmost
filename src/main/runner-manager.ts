@@ -1045,8 +1045,9 @@ export class RunnerManager {
         );
       },
       onLog: (entry: ProxyLogEntry) => {
-        // Skip logging routine localhost message polling (very noisy). Only
-        // the broker's: a declared loopback port is a grant worth auditing.
+        // Skip logging routine localhost message polling (very noisy): the
+        // broker's, the one loopback port a proxy allows. Any other is
+        // refused, and logged as such.
         if (
           !entry.blocked &&
           entry.reason === 'infrastructure' &&
@@ -1079,7 +1080,7 @@ export class RunnerManager {
   private closeProxyPolicy(proxy: ProxyServer): void {
     proxy.setPolicyAllowedHosts([]);
     proxy.setPolicyDeniedHosts([]);
-    proxy.setLoopbackPolicy(this.brokerPort(), undefined);
+    proxy.setBrokerPort(this.brokerPort());
     proxy.setPolicyLevel('strict');
   }
 
