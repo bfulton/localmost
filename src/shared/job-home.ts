@@ -13,8 +13,8 @@
  * the job's home at the same relative path, so a tool that looks for it
  * through HOME finds it. The link only names the real path: the sandbox
  * judges the path a link resolves to, so a link reaches exactly what the
- * grant already reached, and the floor's denies still hold. See
- * docs/roadmap/job-environment.md.
+ * grant already reached, and the floor's denies still hold. Used by
+ * `localmost test`'s steps; a runner job's home is its macOS VM's.
  */
 
 import * as fs from 'fs';

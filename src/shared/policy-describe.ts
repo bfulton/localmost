@@ -99,17 +99,13 @@ const MODERATE_WILDCARDS = MODERATE_NETWORK_ALLOWLIST.filter(
   (host) => host.startsWith('*.') && !RUNNER_INFRASTRUCTURE_ALLOWLIST.includes(host)
 );
 
-// Mirrors the home-directory toolchain paths process-sandbox makes writable
-// at moderate and permissive. Some hold binaries on the user's PATH, which is
-// why a write there outlives the job. Change both together.
-// Both loosened levels read the toolchains installed in the home directory,
-// and point package managers at a cache of the target's own that stays
-// writable across jobs - so what one job leaves there, the next one runs.
-// The home trees themselves are never writable: some are on the user's PATH.
+// Under localmost test only, both loosened levels also read the toolchains
+// installed in the home directory (levelToolchainPaths in sandbox-profile).
+// A runner job runs in a macOS VM with a home of its own, so the level is
+// only its proxy's for it.
 const HOME_TOOLCHAIN_ACCESS =
-  'read access to toolchains in your home (~/.cargo, ~/.rustup, ~/.local/bin, ~/.local/lib, ~/go, ~/.dotnet, ~/.gradle, ~/.m2, ' +
-  "~/Library/Caches), and a package-manager cache shared by this target's jobs, pull requests included, " +
-  'when the tool cache is persistent';
+  'under localmost test, also read access to toolchains in your home (~/.cargo, ~/.rustup, ~/.local/bin, ' +
+  '~/.local/lib, ~/go, ~/.dotnet, ~/.gradle, ~/.m2, ~/Library/Caches)';
 
 /**
  * What a level grants beyond strict. Strict is the baseline and has no entry:
@@ -119,16 +115,16 @@ const LEVEL_GRANTS: Record<Exclude<SandboxPolicyLevel, 'strict'>, string> = {
   moderate:
     `adds package registries, every host under ${MODERATE_WILDCARDS.join(', ')}, and GitHub content hosts ` +
     `(${CONTENT_HOSTS.filter((host) => MODERATE_NETWORK_ALLOWLIST.includes(host)).join(', ')}) - ` +
-    `CDNs and content hosts anyone can publish to - plus ${HOME_TOOLCHAIN_ACCESS}`,
-  permissive: `allows every network host, plus ${HOME_TOOLCHAIN_ACCESS}`,
+    `CDNs and content hosts anyone can publish to; ${HOME_TOOLCHAIN_ACCESS}`,
+  permissive: `allows every network host; ${HOME_TOOLCHAIN_ACCESS}`,
 };
 
 /**
- * Where a section sits. A worker's sandbox profile and environment are fixed
- * when it starts, before the runner knows which workflow it will run, so a
- * workflow section's filesystem grants and env allow are never applied to a
- * runner job - and a workflow's env deny is applied to every job, to be safe.
- * Listing them as plain grants told the reviewer something untrue.
+ * Where a section sits. A worker's environment is fixed when it starts,
+ * before the runner knows which workflow it will run, so a workflow
+ * section's env allow is never applied to a runner job - and a workflow's
+ * env deny is applied to every job, to be safe. Listing them as plain grants
+ * told the reviewer something untrue.
  */
 export type PolicyScope = 'shared' | 'workflow';
 
@@ -147,10 +143,14 @@ const LOOPBACK_ALL =
   "debuggers, dev servers, other jobs' test servers - without going through its proxy";
 const LOOPBACK_PORTS =
   'the job can connect to local services listening on these ports on this Mac, without going through its proxy';
+const LOOPBACK_NOT_APPLIED = "only localmost test applies it: a runner job's macOS VM reaches only its proxy and the broker";
 
-const FILESYSTEM_NOT_APPLIED =
-  'not applied to runner jobs: their filesystem is fixed when the worker starts, before the workflow is known; ' +
-  'only localmost test applies it';
+// A runner job runs in a macOS VM, which is given none of this Mac's
+// filesystem yet (VM shares are to come); localmost test still applies it.
+const FILESYSTEM_NOT_APPLIED = 'not applied to runner jobs: their macOS VM is given no filesystem grants yet; only localmost test applies it';
+const FILESYSTEM_DENY =
+  "under localmost test, no read or write even inside a granted path, the job's own sandbox excepted; " +
+  "a runner job's macOS VM reaches nothing of this Mac's filesystem";
 const ENV_ALLOW_NOT_APPLIED =
   'not applied: the environment is fixed when the worker starts, before the workflow is known; declare it under shared:';
 const ENV_DENY_EVERYWHERE =
@@ -190,22 +190,19 @@ export function describePolicy(policy: DescribablePolicy, prefix = '', scope: Po
   add('Network deny', '-', 'network denied', policy.network?.deny, {
     note: 'refused even where an allow or the level would let it through; runner infrastructure excepted',
   });
-  const filesystemNote = perWorkflow ? FILESYSTEM_NOT_APPLIED : undefined;
   const loopback = policy.network?.loopback;
   if (loopback === true) {
-    add('Network loopback', '+', 'loopback', ['every port'], { warn: () => LOOPBACK_ALL });
+    add('Network loopback', '+', 'loopback', ['every port'], { note: LOOPBACK_NOT_APPLIED, warn: () => LOOPBACK_ALL });
   } else if (loopback?.length) {
     const ports = `${loopback.length === 1 ? 'port' : 'ports'} ${loopback.join(', ')}`;
-    add('Network loopback', '+', 'loopback', [ports], { warn: () => LOOPBACK_PORTS });
+    add('Network loopback', '+', 'loopback', [ports], { note: LOOPBACK_NOT_APPLIED, warn: () => LOOPBACK_PORTS });
   }
-  add('Filesystem read', 'r', 'read', policy.filesystem?.read, { note: filesystemNote });
+  add('Filesystem read', 'r', 'read', policy.filesystem?.read, { note: FILESYSTEM_NOT_APPLIED });
   add('Filesystem write', 'w', 'write', policy.filesystem?.write, {
-    note: filesystemNote,
+    note: FILESYSTEM_NOT_APPLIED,
     warn: (value) => sensitiveWriteReason(value),
   });
-  add('Filesystem deny', '-', 'denied', policy.filesystem?.deny, {
-    note: filesystemNote ?? "no read or write, even inside a granted path; the job's own sandbox and caches excepted",
-  });
+  add('Filesystem deny', '-', 'denied', policy.filesystem?.deny, { note: FILESYSTEM_DENY });
   add('Environment allow', '+', 'env', policy.env?.allow, { note: perWorkflow ? ENV_ALLOW_NOT_APPLIED : undefined });
   add('Environment deny', '-', 'env denied', policy.env?.deny, { note: perWorkflow ? ENV_DENY_EVERYWHERE : undefined });
 

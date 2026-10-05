@@ -41,27 +41,25 @@ Features:
 - **Automatic fallback** — workflows detect when your Mac is available; fall back to hosted runners when it's not
 - **One-click setup** — no terminal commands, no manually generating registration tokens
 - **Lid-close protection** — close your laptop without killing in-progress jobs
-- **Multi-runner parallelism** — run 1-8 concurrent jobs
-- **Network isolation** — runner traffic is proxied through an allowlist (GitHub, npm, PyPI, etc.)
-- **Filesystem sandboxing** — runner processes can only write to their working directory
+- **A fresh macOS VM per job** — every job runs in a VM cloned from a golden image and thrown away afterwards, as a non-admin user with nothing of your Mac shared; two run at once
+- **Network isolation** — the VM has no network card: its only way out is a proxy that enforces the repository's allowlist (GitHub, npm, PyPI, etc.)
 - **Resource-aware scheduling** — automatically pause runners when on battery or during video calls; jobs already running finish (choose "Stop them" in the Power section of Settings to stop them instead), and resuming by hand overrides the pause until its condition clears
 
 ## What It Is
 
 localmost is a macOS app that manages GitHub's official [actions-runner](https://github.com/actions/runner) binary. It handles authentication, registration, runner process lifecycle, and automatic fallback — the tedious parts of self-hosted runners.
 
-**Requirements:** a Mac with Apple silicon, running macOS 14 or later. Intel Macs are not supported.
+**Requirements:** a Mac with Apple silicon, running macOS 14 or later, with 6 GiB of memory to spare for each job VM. Intel Macs are not supported. The runner takes no jobs until its golden macOS image is built, from the macOS VM section of Settings.
 
-**Security note:** Running CI jobs on your local machine has inherent risks—especially for public repos that accept external contributions. localmost sandboxes runner processes and restricts network access, but these are not VM-level isolation. See [SECURITY.md](SECURITY.md) for details on the threat model and recommendations.
+**Security note:** Running CI jobs on your local machine has inherent risks—especially for public repos that accept external contributions. Each job runs in a macOS VM of its own whose only way out is its proxy, so what remains is what the proxy allows and what the VM boundary itself holds. See [SECURITY.md](SECURITY.md) for details on the threat model and recommendations.
 
 ## Architecture
 
 <img src="docs/localmost-arch.png" alt="localmost architecture diagram" width="600" style="background-color: white; padding: 10px; border-radius: 8px;">
 
 - **Runner proxy** — maintains long-poll sessions with GitHub's broker to receive job assignments
-- **Runner pool** — 1-8 worker instances that execute jobs in sandboxed environments
-- **HTTP proxy** — allowlist-based network isolation for runner traffic (GitHub, npm, PyPI, etc.)
-- **Build cache** — persistent tool cache shared across job runs (Node.js, Python, etc.), one per repository or organization
+- **Runner pool** — up to two workers, each running its job in a fresh macOS VM cloned from a golden image
+- **HTTP proxy** — allowlist-based network isolation for runner traffic (GitHub, npm, PyPI, etc.), the VM's only way out
 
 ## Workflow Integration
 
@@ -121,6 +119,8 @@ The check workflow uses a simple heartbeat mechanism:
 This fallback-to-cloud design is intentional: if your Mac is asleep, offline, or the heartbeat is stale for any reason, workflows continue running on GitHub-hosted runners rather than waiting or failing.
 
 ## Docker in Jobs
+
+**Not available in this build.** Jobs run in a macOS VM, and the relay that carries the filtering Docker socket into it is the next piece of work: until it exists, a job whose approved policy grants Docker is refused, with a reason naming the missing relay. What follows is how container work behaves once it is back.
 
 A repository opts in to container work by declaring `pull`, `run` and `build` actions under `docker:` in its approved `.localmostrc`; anything unlisted is denied. Each job that does gets its own Linux VM, booted by localmost and discarded after the job, which sees none of your files but the job's work folder. Docker Desktop is not used. What that means for a policy:
 
@@ -258,12 +258,14 @@ npm run make
 ```
 
 Packaging the app (`npm run make`, and `npm run test:e2e`, which packages it
-first) runs `npm run build:native` to build the Docker VM's helper and guest
-and fetch the docker CLI. That needs Xcode's Swift and Go, and the guest build
-boots a VM, so run it on the Mac itself, not inside a localmost job. `npm test`
-needs none of this, but outside a localmost job its sandbox tests run this
-Mac's own tools under a constructed profile: Xcode's Swift, and a JDK, which
-`/usr/libexec/java_home` must find.
+first) runs `npm run build:native` to build the macOS VM's helper and guest
+agent and the Docker VM's helper and guest, and fetch the docker CLI. That
+needs Xcode's Swift and Go, and the guest build boots a VM, so run it on the
+Mac itself, not inside a localmost job. `npm test` needs none of this. Its
+sandbox tests - of the profiles localmost's own helpers and `localmost test`'s
+steps run under - construct seatbelt profiles, which works on the Mac and in
+a macOS VM job alike, and run this Mac's own tools under them: Xcode's Swift,
+and a JDK, which `/usr/libexec/java_home` must find.
 
 ## Roadmap
 
@@ -274,7 +276,7 @@ Current release: **0.3.0 — Test Locally, Secure by Default**
 - Contributor-based job filtering for public repos
 - Repository policies require approval before the runner applies them, in the app or the CLI, bound to the exact policy shown and recorded in an audit log
 - Opt-in [container work through a filtering Docker socket](docs/superpowers/specs/2026-09-05-docker-isolation-design.md) declared per repo as `pull`, `run` and `build` actions; anything unlisted is denied, and registry credentials never enter the sandbox
-- [Isolation selection](docs/roadmap/localmostrc.md#isolation): a repository lists the isolation types it accepts in order, and each job gets the first one this Mac allows and can run, or is refused (seatbelt is the only type built)
+- [macOS VM jobs](docs/roadmap/macos-vm-jobs.md): every job runs in a fresh macOS VM cloned from a golden image, as a non-admin guest user with no network card and nothing of the host shared
 - Environment comparison with GitHub runners
 
 Future feature ideas:
@@ -288,10 +290,10 @@ Future feature ideas:
 - **Artifact inspector** - Browse uploaded artifacts without leaving the app.
 - **Disk space monitoring** - Warn or pause when disk is low, auto-clean trash directories and caches.
 - **Linux and Windows host support** - Run self-hosted runners on non-Mac machines for projects that need them.
-- **Higher parallelism cap** - Parallelize proxy registration to support 16+ concurrent runners (currently capped at 8 due to serial registration time).
-- **macOS VM jobs** - An opt-in per-repository isolation level that runs each job in a fresh macOS VM cloned from a golden image, as a non-admin guest user with no network card and nothing of the host shared ([design](docs/roadmap/macos-vm-jobs.md)).
+- **Docker in macOS VM jobs** - A vsock relay from the guest to the worker's filtering Docker socket, and a workspace shared with the job's Docker VM, so a policy's `docker:` works again.
+- **Filesystem grants as VM shares** - Give a macOS VM job the paths its policy grants, as read-only shares or per-job clones ([design](docs/roadmap/macos-vm-jobs.md#not-built-yet)).
+- **`localmost test` in a VM** - Run local test mode's workflow in a macOS VM too, with filesystem discovery as guest-side tracing.
 - **Filtering VM network stack** - A userspace network stack for the Docker VM that enforces the job's hostname policy on traffic that ignores proxy settings ([design](docs/roadmap/vm-network-stack.md)).
-- **Service-account jobs** - The `service-account` isolation type: headless jobs run as a hidden `_localmost` user with its own temp directory, preferences and no access to your keychain ([design](docs/roadmap/service-account-jobs.md)).
 
 Bugs and quick improvements:
 

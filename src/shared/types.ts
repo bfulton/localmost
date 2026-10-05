@@ -378,19 +378,23 @@ export interface PolicySummary {
  */
 export type SandboxPolicyLevel = 'strict' | 'moderate' | 'permissive';
 
-/** Human-readable descriptions for sandbox policy level options */
+/**
+ * Human-readable descriptions of the policy levels: how much a job's proxy
+ * lets through before its .localmostrc adds hosts. A job runs in a macOS VM
+ * whose only way out is that proxy.
+ */
 export const SANDBOX_POLICY_LEVEL_DESCRIPTIONS: Record<SandboxPolicyLevel, { label: string; description: string }> = {
   strict: {
     label: 'Strict',
-    description: 'Only access explicitly listed in .localmostrc is allowed. Network connections, filesystem writes, and other operations must be pre-approved.',
+    description: 'Only GitHub Actions infrastructure and the hosts listed in .localmostrc are reachable.',
   },
   moderate: {
     label: 'Moderate',
-    description: 'GitHub Actions infrastructure, common package registries, and standard tool caches are allowed. This is the previous default behavior.',
+    description: 'Also common package registries, and CDNs and GitHub content hosts anyone can publish to.',
   },
   permissive: {
     label: 'Permissive',
-    description: 'All access is allowed with no restrictions. Use only for trusted repositories or when debugging policy issues.',
+    description: 'Every network host is reachable. Use only for trusted repositories or when debugging a policy.',
   },
 };
 

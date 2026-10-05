@@ -3,9 +3,17 @@
 A checked-in file that explicitly declares what network, filesystem and container access a workflow needs.
 
 > **Status:** implemented in 0.3.0. This document describes the design; where the
-> shipped behaviour differs it is noted inline. `isolation:` (see
-> [Isolation](#isolation)) is from the owner's decisions of 2026-10-03: the
-> grammar, approval and selection are built, and of the types only `seatbelt`.
+> shipped behaviour differs it is noted inline.
+>
+> **Runner jobs run in a macOS VM.** Every job the runner takes runs in a
+> fresh macOS VM ([macos-vm-jobs.md](macos-vm-jobs.md)) whose only way out is
+> its proxy. For a runner job the policy is its network (`network.allow`,
+> `network.deny` and `level`, enforced by the proxy), its `env:`, and its
+> `docker:` - a job whose policy grants Docker is refused until the Docker
+> relay into the VM exists. `filesystem:` grants and `network.loopback` are
+> not given to a runner job yet; the runner names them in its log when the
+> job starts. `localmost test` still runs each step under a seatbelt profile,
+> and applies all of it as described below.
 
 ## Problem
 
@@ -122,13 +130,14 @@ shared:
     allow:
       - "*.github.com"           # Wildcard subdomain
       - "registry.npmjs.org"     # Exact match
-    deny:                        # For runner jobs, wins over allow and the
-      - "*.analytics.com"        # level; the runner's own hosts excepted. See
-                                 # "Relationship to the policy level" below.
-    loopback: [5432]             # Loopback ports the job may connect to; true
-                                 # for all. shared: only. See "Loopback" below.
+    deny:                        # Wins over allow and the level; the runner's
+      - "*.analytics.com"        # own hosts excepted. See "Relationship to
+                                 # the policy level" below.
+    loopback: [5432]             # localmost test only: loopback ports a step may
+                                 # connect to; true for all. shared: only.
 
-  filesystem:
+  filesystem:                    # localmost test only, for now: a runner job's
+                                 # macOS VM is given no filesystem grants yet
     read:                        # Never a credential: ~/.ssh (known_hosts
                                  # included), ~/.aws and the rest stay denied
                                  # whatever is declared - see SECURITY.md
@@ -143,8 +152,9 @@ shared:
 
   # Container work. The job talks to a filtering socket localmost owns, not
   # the daemon; only the actions declared here are forwarded, and anything
-  # unlisted is denied. Allowed in shared and per workflow. See "Docker
-  # access" below.
+  # unlisted is denied. Allowed in shared and per workflow. A runner job whose
+  # policy grants any of it is refused until the Docker relay into its macOS
+  # VM exists. See "Docker access" below.
   docker:
     pull:
       registries:
@@ -164,15 +174,10 @@ shared:
   env:
     allow:
       - DEVELOPER_DIR
-      - PATH
+      - FASTLANE_*
     deny:
       - AWS_*
       - GITHUB_TOKEN             # Not inherited from localmost's own environment
-
-  # The isolation types the jobs accept, in the order to try; absent means
-  # any. A job gets the first this Mac allows and can run, or is refused. See
-  # "Isolation" below.
-  isolation: [macos-vm, service-account, seatbelt]
 
 # Per-workflow policies — merged with shared
 workflows:
@@ -180,9 +185,6 @@ workflows:
     filesystem:
       write:
         - "./DerivedData/**"
-
-  ui-tests:
-    isolation: [macos-vm, seatbelt]  # Replaces shared's: needs a window server
 
   deploy:
     network:
@@ -240,8 +242,11 @@ is a validation error, since the sandbox never matches it.
 
 ### Paths in your home, and the job's own
 
-A runner job's `HOME` is a home of its own, `<sandbox>/home`, empty and gone
-with the job (`localmost test` uses the workspace's `.home` the same way). Each
+This is `localmost test`'s: a runner job runs in a macOS VM with a home of its
+own in the guest, and is given none of these paths yet.
+
+A step's `HOME` is a home of its own, the workspace's `.home`, empty and gone
+with the run. Each
 path a policy grants under your home, `read` or `write`, is linked into it at
 the same path - `~/.npm` as `<home>/.npm`, pointing at your `~/.npm` - so a
 tool that looks for it through `HOME` finds it, and the sandbox, which judges
@@ -256,22 +261,14 @@ Nothing else of your home is in the job's: its `.gitconfig` is the per-job git
 config, whatever the policy grants, so declaring `~/.gitconfig` no longer gives
 git your configuration.
 
-A `write` grant under your home whose directories do not exist yet has them
-created before the job, empty, since the job is not granted their parents. The
-path the grant names is created too only when it says it is a directory, with
-a trailing `/` or `/**` - `~/.cache/my-tool/` - or when it is a directory
-above a credential location, which the job cannot create either (`~/.gradle`,
-on a Mac where Gradle never ran). Otherwise it is left to the job, since a
-grant can name a file (`~/.python_history`). This is the
-`jobEnvironment.createMissingGrantedDirs` preference, on by default; with it
-off, a missing directory stays missing, and you create it before the job or
-the job fails with "Operation not permitted" at its first write there. See
-[job-environment.md](job-environment.md) for this and what else a job's
-environment carries.
 
 ### Loopback
 
-A job's sandbox connects directly to two loopback ports by default: its own
+This is `localmost test`'s too: a runner job's macOS VM has no network card,
+and its only ways out are relays to its own proxy and the broker, so the
+runner ignores `network.loopback` and says so in its log when the job starts.
+
+A step's sandbox connects directly to two loopback ports by default: its own
 egress proxy, and the broker's, which the runner dials directly. Anything else
 listening on the Mac's loopback - a debugger on 9229, a browser's
 remote-debugging port, a development database, another job's server - is
@@ -304,105 +301,11 @@ SECURITY.md, Network Policy.
 
 ### Isolation
 
-How a job is kept from the rest of the Mac. There are three isolation types:
-
-| Type | What a job gets |
-|---|---|
-| `seatbelt` | Runs as the user, under a seatbelt profile built from the approved policy, with a home and temp directory of its own ([job-environment.md](job-environment.md)). Needs no setup. Shares the per-user temp directory and the window server with the user. |
-| `service-account` | Runs as a hidden `_localmost` user started by a privileged helper: its own `/var/folders` temp, its own preferences, none of the user's keychain, and TCC prompts fail closed. Headless only. See [service-account-jobs.md](service-account-jobs.md). |
-| `macos-vm` | Runs in a fresh macOS VM cloned from a golden image: full separation, its own window server included. At most two at once, and each waits for its VM to boot. See [macos-vm-jobs.md](macos-vm-jobs.md). |
-
-This build can run `seatbelt` only; the other two are designed, not built.
-
-A repository says which types its jobs accept, in the order to try:
-
-```yaml
-shared:
-  isolation: [macos-vm, seatbelt]  # the VM when this Mac can, seatbelt otherwise
-  # isolation: seatbelt            # one type: shorthand for [seatbelt]
-  # isolation: any                 # the default: [macos-vm, service-account, seatbelt]
-
-workflows:
-  ui-tests:
-    isolation: [macos-vm, seatbelt]  # replaces shared's for this workflow
-```
-
-**Grammar.** `isolation:` is `any`, one type, or a list of types. Each entry
-is one of `seatbelt`, `service-account` and `macos-vm`; an unknown one, one
-listed twice, `any` inside a list and an empty list are validation errors,
-each with a message that names what is accepted. A type this build cannot run
-is accepted: the list says what the repository accepts, and what this Mac
-cannot run is filtered out when a job is admitted. Under `shared:` it is every
-workflow's; under `workflows:` it replaces the shared list whole for that
-workflow (an order is not merged). Unlike the filesystem it is applied per
-workflow, because it is chosen at admission, when the job's workflow is known.
-A workflow's list is found by its workflow file name, as every `workflows:`
-key is; when GitHub does not send the workflow's path, the job's workflow
-`name:` is matched instead, and a job that matches no key gets the shared
-list - which can accept more than the workflow's own list, within the host's
-allowed set.
-
-**Absent means any.** A repository with no `isolation:`, or no
-`.localmostrc` at all, accepts `any`, which is `[macos-vm, service-account,
-seatbelt]`: the strongest separation this Mac allows and can run. So does a
-commit with no `.localmostrc` in a repository that has an approved policy:
-such a commit is admitted on the baseline, and for isolation the baseline is
-`any`. A pull request that deletes the file therefore drops the approved
-list - a repository that accepts only `macos-vm` has that pull request run
-under whatever this Mac allows - and only the host's allowed set bounds it
-(SECURITY.md, Isolation types). A commit whose file differs from the approved
-one is held for approval, not admitted.
-
-**Order and filtering.** This Mac allows a set of types (Settings > Isolation,
-the `isolation.allowed` section of `config.yaml`): `[seatbelt]` by default in
-this build, and `[macos-vm]` from the build that ships the VM type. This build
-can run, and has set up, a set of its own (`[seatbelt]` today). When the job
-is admitted - after its policy is approved and before any worker exists -
-localmost walks the repository's list in its order and takes the first type
-that is both allowed here and available. The repository's order decides
-among the types that pass; the host's allowed set decides which pass at all.
-So a repository's order cannot reach a type the owner has not allowed, and
-the owner's set cannot push a job onto a type its repository did not list.
-
-**Refusal.** When no type in the list passes, the job is refused, through the
-same path as a job the user filter or an unapproved policy refuses: dropped at
-the broker, recorded as refused in the job history with the reason, its run
-cancelled on GitHub, and a notification when job notifications are on. It is
-never run under a weaker type
-instead. The reason names all three sides, for example:
-
-```
-no isolation type this job accepts can run on this Mac: this repository
-accepts macos-vm; this Mac allows seatbelt; macos-vm is not available in
-this build
-```
-
-or, for `isolation: seatbelt` on a Mac that allows nothing: `... this
-repository accepts seatbelt; this Mac allows none; seatbelt is not allowed in
-Settings > Isolation`.
-
-**Approval.** `isolation:` is part of the approved policy like every other
-key: it is in the approval stamp, it appears in the approval card and
-`localmost policy show` with the order it means - a policy that declares none
-is shown with `any`, marked as the default, since its jobs still get a type -
-and a change to it - order
-included, since `[macos-vm, seatbelt]` and `[seatbelt, macos-vm]` are
-different lists - is in the approval diff (`~ shared.isolation: macos-vm,
-seatbelt -> seatbelt`). Writing out `any` where nothing was declared changes
-nothing a job can get, and is not a change to approve. A workflow's list is
-shown added, removed or changed on its own line. As with every `workflows:`
-key, any pull request can claim a workflow's list by naming a workflow file
-after it; the host's allowed set is what bounds that.
-
-**GUI.** The service account has no Aqua session, so it cannot reach the
-window server: Electron, the Simulator, UI tests and Safari fail in it. A
-repository whose jobs need a GUI lists `seatbelt` or `macos-vm`, never
-`service-account` alone.
-
-**`localmost test`** runs every step under its own seatbelt test profile,
-whatever `isolation:` says: it is a preview the user starts on their own
-checkout, not a job a repository is given, and the CLI does not read the
-host's allowed set.
+`isolation:` once listed, in order, the isolation types a repository's jobs
+accepted. Every runner job now runs in a macOS VM, so there is nothing to
+choose: a `.localmostrc` that still has the key, under `shared:` or a
+workflow, parses with a warning, and the key is dropped - it is neither
+approved nor shown, and a cached approval that has it reads back without it.
 
 ### Per-workflow policies
 
@@ -507,6 +410,13 @@ Add to .localmostrc under workflows.build? [y/n]
 ```
 
 ### Docker access
+
+**Not available to runner jobs yet.** A runner job runs in a macOS VM, and
+nothing carries the filtering socket into it until the Docker relay is built:
+a job whose approved policy grants its workflow any Docker action is refused
+at admission, with a reason naming the missing relay, rather than started in a
+VM where its first `docker` command would fail. What follows is the design the
+relay will connect to.
 
 `docker:` does not open the daemon socket. Each worker gets a unix socket of its
 own, served by localmost outside the sandbox, and `DOCKER_HOST` points the job at
@@ -646,7 +556,9 @@ and the Docker VM behind it in [vm-docker-backend.md](vm-docker-backend.md).
 
 ## When a denial does not look like one
 
-The sandbox returns the kernel's own error for a refused operation, and a tool
+These are `localmost test`'s, whose steps run under seatbelt; a runner job's
+macOS VM refuses nothing on its own filesystem. The sandbox returns the
+kernel's own error for a refused operation, and a tool
 that was reaching for something indirectly reports the symptom rather than the
 cause. Two that have cost real time:
 
@@ -662,9 +574,9 @@ choice, not the runner's, and a job that really does need Xcode should declare
 `/Applications/Xcode.app` and keep it.
 
 git also treats an unreadable `~/.gitconfig` as fatal rather than as "no
-configuration". A runner job never meets yours: its `HOME` is its own, and
-git's global config there is the per-job one, with the system config skipped
-- which also makes a run independent of whose machine it happened on.
+configuration". A step never meets yours: its `HOME` is its own, and git's
+global config there is the per-run one, with the system config skipped -
+which also makes a run independent of whose machine it happened on.
 
 **A bind is refused before the address is checked.** The seatbelt profile
 permits binding localhost, and a denied bind returns `EPERM` (errno 1) whatever
@@ -676,15 +588,15 @@ host fails with `EADDRNOTAVAIL` (errno 49) with no sandbox involved at all. A
 host process cannot join a container network there. The portable arrangement
 is a container with a foot in both networks - see `run.networks` above.
 
-**Connecting to loopback is refused unless declared.** A job may bind
-localhost, but it connects directly only to its worker's own proxy there, the
-broker's port, and the loopback ports `shared.network.loopback` declares: a
+**Connecting to loopback is refused unless declared.** A step may bind
+localhost, but it connects directly only to its run's own proxy there and the
+loopback ports `shared.network.loopback` declares: a
 list of fixed ports, or `true` for all of them (a test suite that binds an
 ephemeral port and talks to it needs `true`, since seatbelt matches single
 ports, never ranges). A direct connect to anything else on loopback - a
 database, a debugger on 9229 - fails with `EPERM` on the connect, not on the
-bind; a `localmost test` step's connect to the broker's port fails whatever is
-declared. The proxy applies the same rule to a request for a loopback address,
+bind, and so does a connect to the broker's port, whatever is declared. A
+runner job's proxy applies the same rule to a request for a loopback address,
 sent through `HTTP_PROXY` or tunnelled with `CONNECT`: it answers 403 unless
 the port is declared, or is the broker's - the runner reaches the broker at
 that port, and each worker's key to it, not the port, is what guards it. Only a
@@ -737,10 +649,15 @@ Running in permissive mode (not recommended for untrusted code).
 **Shipped behaviour differs from this design.** A `.localmostrc` does not replace
 anything; it adds to whatever the configured policy level already allows:
 
+For a runner job the level is its proxy's alone: its macOS VM has a system
+and a home of its own, and none of the Mac's filesystem. Under `localmost
+test` it also sets what a step reads:
+
 - `strict` (the default): runner infrastructure, a read-only OS baseline, and
   whatever the repo declares. This is closest to the original intent.
-- `moderate`: additionally GitHub Actions infrastructure, common registries and
-  tool caches, read-only. Of `~/.local` that is `~/.local/bin` and
+- `moderate`: additionally common registries, CDNs and GitHub content hosts,
+  and under `localmost test` the toolchains and tool caches in your home,
+  read-only. Of `~/.local` that is `~/.local/bin` and
   `~/.local/lib` only: `~/.local/share` and `~/.local/state` are where tools
   keep their state, tokens included. A job that runs a command linked from
   `~/.local/bin` into the rest of `~/.local` declares the directory the link
@@ -770,11 +687,9 @@ One thing is granted regardless of the repo's policy: the hosts the Actions
 runner itself needs to register and poll for jobs. That is the runner's own
 connection to GitHub rather than anything the job asked for, and the runner
 cannot function without it. Because a single proxy serves both, jobs reach those
-hosts too. A runner job's filesystem likewise starts from a fixed floor the
-policy does not list - the operating system, `/Library/Developer` (the Command
-Line Tools, not Xcode) and its own caches - see SECURITY.md.
+hosts too.
 
-Preferences are outside what a policy can grant. A job reads only the
+Preferences are outside what a policy can grant under `localmost test`. A step reads only the
 domains a build reads - the global domain and those of Xcode, `xcodebuild`,
 Swift Build, the simulator and codesign - and writes none, Xcode's
 included, and `~/Library/Preferences` stays closed to reads
@@ -784,22 +699,24 @@ domain through a grant of its plist. A workflow that ran
 `xcodebuild` instead, as a flag (`-skipMacroValidation`,
 `-skipPackagePluginValidation`) or as `-<key>=<value>` for that run.
 
-`env:` governs what a job inherits from the environment localmost itself was
+`env:` governs what a job is given of the environment localmost itself was
 launched with, and nothing else. It never affects the variables the runner or
 the workflow sets: `GITHUB_TOKEN`, secrets and a step's `env:` reach the job as
 usual whatever it says, and neither does it touch what localmost sets for the
-runner (the proxy, the job's own `HOME`, `TMPDIR`, `DIRHELPER_USER_DIR_SUFFIX`,
-`JAVA_TOOL_OPTIONS`, `GIT_SSH_COMMAND`, `DOCKER_HOST`, the job's bin directory
-at the front of `PATH`, the caches - see [job-environment.md](job-environment.md)).
-The environment, like the filesystem, is fixed when a worker starts, before the
-workflow is known. `env: allow` therefore applies from `shared:` only, and every
-`env: deny`, shared or per workflow, applies to every job. Without an allow, a
-job inherits nothing from the app's environment beyond `PATH`, `USER`,
-`LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TERM`, `TZ` and `__CF_USER_TEXT_ENCODING`
-(and `HOME`, which localmost then replaces with the job's own).
+runner (the proxy and the runner's own settings). The environment is fixed
+when a worker starts, before the workflow is known. `env: allow` therefore
+applies from `shared:` only, and every `env: deny`, shared or per workflow,
+applies to every job. Without an allow, a runner job is given nothing of the
+app's environment beyond `LANG`, `LC_ALL` and `TZ`; the guest sets its own
+`HOME`, `PATH`, user and shell. The guest agent takes a name only if a job may
+set it: none the agent sets itself, none that changes how the shell starts
+(`BASH_ENV`, `ENV`, `ZDOTDIR` and the like), `NODE_OPTIONS` and `NODE_PATH`,
+and none beginning `DYLD_`, `LD_`, `DOTNET_`, `COREHOST_`, `COMPlus_`,
+`CORECLR_`, `RUNNER_`, `ACTIONS_`, `GITHUB_` or `BASH_FUNC_`; an allow that
+names one gives the job nothing.
 
-**Loopback.** Without `network: loopback` a job reaches nothing on this Mac's
-loopback interface but its own proxy and the broker, directly and through the
+**Loopback** (`localmost test` only). Without `network: loopback` a step reaches nothing on this Mac's
+loopback interface but its own proxy, directly and through the
 proxy.
 `loopback: true` grants every port -
 what a test suite that starts servers on ephemeral ports needs - and a list

@@ -82,8 +82,8 @@ describe('describePolicy', () => {
   it('names what a loosened level opens, not just that it is common', () => {
     // "Common package registries" read as a narrow grant. Moderate also opens
     // whole CDN domains and GitHub content hosts anyone can publish to, and
-    // both levels read the toolchains installed in the home directory and keep
-    // a package-manager cache that later jobs of the same target execute from.
+    // under localmost test both levels read the toolchains installed in the
+    // home directory. A runner job's VM has a home of its own.
     const [moderate] = describePolicy({ level: 'moderate' });
     const wildcards = MODERATE_NETWORK_ALLOWLIST.filter(
       (host) => host.startsWith('*.') && !RUNNER_INFRASTRUCTURE_ALLOWLIST.includes(host)
@@ -102,9 +102,9 @@ describe('describePolicy', () => {
       expect(grant.summary).not.toMatch(/~\/\.local[,)]/);
       // Read, not write: the home trees hold directories on the user's PATH,
       // and a job's package managers are pointed at a cache of its own.
-      expect(grant.summary).toMatch(/read access to toolchains/);
+      expect(grant.summary).toMatch(/under localmost test, also read access to toolchains/);
       expect(grant.summary).not.toMatch(/write access to toolchain/);
-      expect(grant.summary).toMatch(/package-manager cache shared by this target's jobs/);
+      expect(grant.summary).not.toMatch(/package-manager cache/);
     }
   });
 
@@ -124,7 +124,7 @@ describe('describePolicy', () => {
   it('warns on a write to a place something outside the sandbox acts on', () => {
     const [grant] = describePolicy({ filesystem: { write: ['~/Library/LaunchAgents'] } });
     expect(grant.warning).toMatch(/launchd/);
-    expect(grant.summary).toMatch(/^write: ~\/Library\/LaunchAgents \(warning: launchd runs/);
+    expect(grant.summary).toMatch(/^write: ~\/Library\/LaunchAgents \(not applied to runner jobs.*\) \(warning: launchd runs/);
   });
 
   it('warns on a write to the home directory itself', () => {
@@ -142,15 +142,15 @@ describe('describePolicy', () => {
     // reviewer read a denial that did not exist. Both are enforced now.
     const grants = describePolicy({ network: { deny: ['bad.example'] }, filesystem: { deny: ['~/.aws'] } });
     expect(grants[0].summary).toMatch(/^network denied: bad\.example \(refused even where an allow or the level/);
-    expect(grants[1].summary).toMatch(/^denied: ~\/\.aws \(no read or write, even inside a granted path/);
-    // The job's own caches are re-allowed after the deny, as its sandbox is.
-    expect(grants[1].summary).toMatch(/the job's own sandbox and caches excepted\)$/);
+    expect(grants[1].summary).toMatch(/^denied: ~\/\.aws \(under localmost test, no read or write even inside a granted path/);
+    // A runner job's VM sees none of this Mac's filesystem, the denied path included.
+    expect(grants[1].summary).toMatch(/a runner job's macOS VM reaches nothing of this Mac's filesystem\)$/);
   });
 
   it('says which workflow-scoped grants the runner cannot apply', () => {
-    // The sandbox profile and the environment are fixed when a worker starts,
-    // before the workflow is known, so a per-workflow filesystem section and
-    // env allow were listed as grants the runner never made.
+    // The environment is fixed when a worker starts, before the workflow is
+    // known, so a per-workflow env allow was listed as a grant the runner
+    // never made; and a runner job's VM is given no filesystem grants.
     const grants = describePolicy(
       {
         network: { allow: ['api.example.com'] },
@@ -162,23 +162,24 @@ describe('describePolicy', () => {
     );
     const line = (value: string) => grants.find((g) => g.value === value)!.summary;
     expect(line('api.example.com')).toBe('deploy: network: api.example.com');
-    for (const value of ['/opt/x', './out', '~/.aws']) {
-      expect(line(value)).toMatch(/\(not applied to runner jobs: their filesystem is fixed when the worker starts.*only localmost test applies it\)$/);
+    for (const value of ['/opt/x', './out']) {
+      expect(line(value)).toMatch(/\(not applied to runner jobs: their macOS VM is given no filesystem grants yet; only localmost test applies it\)$/);
     }
+    expect(line('~/.aws')).toMatch(/\(under localmost test, no read or write/);
     expect(line('FASTLANE_*')).toMatch(/\(not applied: the environment is fixed when the worker starts.*declare it under shared:\)$/);
     expect(line('AWS_*')).toMatch(/\(applied to every job, not only this workflow's/);
   });
 
-  it('says nothing of scope for the same grants under shared:', () => {
+  it('says nothing of scope for the same grants under shared:, but that a runner job is not given the filesystem', () => {
     const grants = describePolicy({ filesystem: { write: ['./out'] }, env: { allow: ['CI'], deny: ['AWS_*'] } });
-    expect(grants.map((g) => g.summary)).toEqual(['write: ./out', 'env: CI', 'env denied: AWS_*']);
+    expect(grants.map((g) => g.summary)).toEqual([`write: ./out (not applied to runner jobs: their macOS VM is given no filesystem grants yet; only localmost test applies it)`, 'env: CI', 'env denied: AWS_*']);
   });
 
   it('shows a loopback grant with what it lets the job reach', () => {
     const [all] = describePolicy({ network: { loopback: true } });
-    expect(all.summary).toMatch(/^loopback: every port \(warning: the job can connect to any service listening on this Mac's loopback/);
+    expect(all.summary).toMatch(/^loopback: every port \(only localmost test applies it: a runner job's macOS VM reaches only its proxy and the broker\) \(warning: the job can connect to any service listening on this Mac's loopback/);
     const [some] = describePolicy({ network: { loopback: [5432, 6379] } });
-    expect(some.summary).toMatch(/^loopback: ports 5432, 6379 \(warning: the job can connect to local services listening on these ports/);
+    expect(some.summary).toMatch(/^loopback: ports 5432, 6379 \(only localmost test.*\) \(warning: the job can connect to local services listening on these ports/);
     expect(describePolicy({ network: { loopback: [5432] } })[0].value).toBe('port 5432');
   });
 

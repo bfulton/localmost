@@ -55,7 +55,7 @@ describe('summarizeGrants', () => {
 
   it('still shows the non-docker grants', () => {
     const grants = summarizeGrants({ shared: { network: { allow: ['example.com'] }, filesystem: { write: ['~/.npm'] } } });
-    expect(grants).toEqual(['network: example.com', 'write: ~/.npm']);
+    expect(grants).toEqual(['network: example.com', 'write: ~/.npm (not applied to runner jobs: their macOS VM is given no filesystem grants yet; only localmost test applies it)']);
   });
 });
 
@@ -77,15 +77,15 @@ describe('per-workflow grants on the approval screen', () => {
 describe('loopback on the approval screen', () => {
   it('shows a loopback grant, and that local services are reachable', () => {
     const [grant] = summarizeGrants({ shared: { network: { loopback: [5432] } } });
-    expect(grant).toMatch(/^loopback: port 5432 \(warning: the job can connect to local services/);
+    expect(grant).toMatch(/^loopback: port 5432 \(only localmost test applies it.*\) \(warning: the job can connect to local services/);
   });
 });
 
 describe('sensitive write paths on the approval screen', () => {
   it('marks a write the job could use to run code outside the sandbox', () => {
     const grants = summarizeGrants({ shared: { filesystem: { write: ['~/.zshrc', '~/.npm'] } } });
-    expect(grants[0]).toMatch(/^write: ~\/\.zshrc \(warning: your shell runs this file/);
-    expect(grants[1]).toBe('write: ~/.npm');
+    expect(grants[0]).toMatch(/^write: ~\/\.zshrc \(not applied to runner jobs.*\) \(warning: your shell runs this file/);
+    expect(grants[1]).toBe('write: ~/.npm (not applied to runner jobs: their macOS VM is given no filesystem grants yet; only localmost test applies it)');
   });
 });
 

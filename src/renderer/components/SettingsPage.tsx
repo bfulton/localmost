@@ -463,15 +463,14 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
               <PolicyApprovals />
             </div>
 
-            {/* Sandbox Policy Subsection */}
+            {/* Network Policy Subsection */}
             <div className={styles.subsection}>
-              <h4>Sandbox Policy</h4>
+              <h4>Network Policy</h4>
               <p className={shared.formHint}>
-                Each repository declares its own policy level in its{' '}
-                <code>.localmostrc</code>, alongside the hosts and paths it
-                needs. A repository that declares none runs strict. Changing the
-                level is a policy change like any other, so it appears in the
-                approval above before it takes effect.
+                Each job runs in a macOS VM whose only way out is its own proxy. Each repository declares in its{' '}
+                <code>.localmostrc</code> the hosts its jobs need and a policy level, which sets what the proxy lets
+                through besides; a repository that declares none runs strict. Changing either is a policy change like
+                any other, so it appears in the approval above before it takes effect.
               </p>
               <ul className={shared.formHint}>
                 {(['strict', 'moderate', 'permissive'] as const).map((level) => (

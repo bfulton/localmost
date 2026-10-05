@@ -1,27 +1,24 @@
-# macOS VM Jobs - An Opt-In Isolation Level
+# macOS VM Jobs
 
-A repository can choose to run each of its jobs inside a fresh macOS virtual
-machine instead of under seatbelt on the host:
+Every job the runner takes runs inside a fresh macOS virtual machine, and the
+VM is thrown away when the job ends.
 
-```yaml
-isolation: [macos-vm]        # an ordered list; the default is seatbelt
-```
-
-> **Status:** built as a self-contained mode behind the isolation backend
-> interface, with unit tests throughout; not yet wired into job selection
-> (the `isolation:` key, the host's `isolation.allowed` setting and the
-> refusal when nothing matches live on their own branch), and not yet run end
-> to end on a Mac. What was run live, and what the owner runs to finish it,
-> is under [Live validation](#live-validation).
+> **Status:** wired: the runner pool hands every job to this backend, and
+> takes no job until a golden image is ready. Unit tested throughout; not yet
+> run end to end on a Mac. `localmost test` still runs its steps under seatbelt
+> on the host until it is ported to the VM. What was run live, and what the
+> owner runs to finish it, is under [Live validation](#live-validation).
 
 ## Problem
 
-Today a job runs as the operator's user under a seatbelt profile. That
-profile is an allowlist and has been hardened, but it is the same kernel, the
-same user and the same filesystem as everything else the operator does. Some
-repositories deserve more: an untrusted contributor's workflow, a build that
-runs arbitrary third-party code, a job that needs admin rights in its own
-machine. For these the only boundary strong enough is a separate machine.
+A job used to run as the operator's user under a seatbelt profile. That
+profile was an allowlist and had been hardened, but it was the same kernel,
+the same user and the same filesystem as everything else the operator does,
+and every grant a build needed - toolchains in the home directory, the
+per-user temp directory, Xcode's preferences - was a hole in it. The only
+boundary strong enough for an untrusted contributor's workflow, or a build
+that runs arbitrary third-party code, is a separate machine; and once jobs
+have one, there is no reason to keep the other.
 
 ## What a job gets
 
@@ -31,10 +28,9 @@ job ends. Inside it the job is the guest's ordinary, non-admin `runner` user.
 The VM has no network card and no share of any host directory. Its only ways
 out are two vsock relays: one to the job's own `ProxyServer`, one to the local
 broker. The runner inside reaches the broker with the per-worker key the host
-issued, exactly as a sandboxed worker does, and never holds the registration's
-key.
+issued, and never holds the registration's key.
 
-So, against a job in this mode:
+So, against a job:
 
 - **The operator's data** is not in the guest. Nothing of the host is shared
   into it, and the guest cannot reach the host's filesystem, its loopback
@@ -48,7 +44,7 @@ So, against a job in this mode:
   `HTTPS_PROXY` has no route; it fails rather than going around the filter.
 - **A desktop and a temp of its own.** The guest has its own window server,
   so jobs that need a GUI - Electron, the Simulator, UI tests, Safari - run,
-  and the shared-temp exceptions a seatbelt job needs (bare `mktemp`'s names,
+  and the shared-temp exceptions a seatbelt job needed (bare `mktemp`'s names,
   Swift Build's link temp in the user's per-user temp directory) do not
   exist: the guest's temp is its own.
 
@@ -70,19 +66,18 @@ src/renderer/components/MacVmSetup.tsx the setup page component
 src/main/ipc-handlers/macos-vm.ts      its IPC, trusted-ipc guarded
 ```
 
-The wiring step creates the mode with `createMacVmMode()` at app start, calls
-`start()` (the sweep and the image check) before the pool takes jobs,
-registers the IPC with the mode's image manager, mounts `MacVmSetup` in
-Settings, and hands the backend the jobs whose isolation is `macos-vm`.
+`index.ts` creates the mode with `createMacVmMode()` at app start, gives the
+runner manager its backend, registers the IPC with the mode's image manager,
+and calls `start()` (the sweep, then the image check). `MacVmSetup` is the
+macOS VM section of Settings.
 
 ### The backend interface
 
-`types.ts` declares what every isolation mode is meant to share, for the
-wiring step to hoist:
+`types.ts` declares what the runner manager calls:
 
 ```ts
 interface IsolationBackend {
-  readonly type: 'seatbelt' | 'service-account' | 'macos-vm';
+  readonly type: 'macos-vm';
   available(): { ok: true } | { ok: false; reason: string };
   prepare(job, signal?): Promise<void>;      // the VM up, the agent prepared
   spawnWorker(job, argv, env): Promise<WorkerHandle>;   // argv is ['--once']
@@ -91,10 +86,40 @@ interface IsolationBackend {
 }
 ```
 
-A `WorkerHandle` emits `stdout`/`stderr` lines and one `exit`, like the child
-process the seatbelt path has, and holds its events until the turn after it
-is made, so a caller that attaches listeners once `spawnWorker` resolves sees
-the first line too.
+A `WorkerHandle` emits `stdout`/`stderr` lines and one `exit`, and holds its
+events until the turn after it is made, so a caller that attaches listeners
+once `spawnWorker` resolves sees the first line too.
+
+### The runner manager
+
+`runner-manager.ts` runs every worker this way. For a job admission let
+through, it builds the worker's sandbox directory, writes its `.runner`
+(pointed at the broker with the worker's key) and its per-start
+`.credentials`, starts its proxy with the job's policy, and then calls
+`prepare` and `spawnWorker(job, ['--once'], env)`. The runner's output lines
+and its exit drive the slot as they always did. Stopping a worker sends
+SIGTERM through the agent and, five seconds later, releases the VM under it;
+a worker's exit, a reap of one that never took its job, and `stop()` all
+release its VM and then remove its sandbox. A stop while `prepare` still
+waits for a slot or a boot aborts it.
+
+- **Two at most.** The pool runs `min(runner count, MAX_MAC_VMS)` workers,
+  two, so the broker never acquires a job that would only wait for a VM.
+- **No image, no jobs.** While `available()` says no, the pool's capacity
+  check refuses, so the broker leaves jobs with GitHub; the runner's status is
+  offline with the reason, logged once. A change of the image's status
+  refreshes it.
+- **The policy.** The level and hosts go to the job's proxy, as before. The
+  environment is the locale, the time zone and what the approved `env:`
+  allows of the app's, then the runner's settings and the proxy. Filesystem
+  grants and `network.loopback` are not provided: the runner names them in
+  the log when the job starts. A policy that grants Docker is refused at
+  admission until the Docker relay exists. The drift stamp is taken over the
+  whole approved policy - network, Docker, filesystem grants and env - so a
+  worker started before its workflow was known matches its claim unless the
+  approved policy changed in between.
+- **Registration** (`config.sh`) runs on the host, unsandboxed: it runs no
+  workflow code, from a copy checked against the release.
 
 ## The helper
 
@@ -152,11 +177,11 @@ on stdin as the parent gone; either stops the VM with no grace. VZ runs the
 VM in its own XPC process, which does not die with Electron, so nothing else
 would stop it. It refuses to start as an orphan.
 
-**Jobs cannot run it.** A seatbelt job that could exec the helper could
-install a macOS VM of its own, and the provisioning boot has a NAT network
-card - a way out past the job's proxy. The job profile denies its exec by
-path, beside the Docker VM helper's deny; the seatbelt test shows it refused
-by path, a case variant, a link and a copy.
+**Jobs cannot run it.** A job runs in a guest, which has neither the helper
+nor any way to the host's processes. (A process that could exec the helper on
+the host could install a macOS VM of its own, and the provisioning boot has a
+NAT network card - a way out past any proxy; `localmost test`'s step profile
+still denies its exec by path, beside the Docker VM helper's.)
 
 ## Restore image
 
@@ -367,8 +392,12 @@ has proved.
   at most 512 MiB) so the guest always runs the same version as the host's
   arc. Then the job: the worker's three runner files (`.runner`,
   `.credentials`, `.credentials_rsaparams`, each a regular file read without
-  following a link, at most 16 KiB) and an allowlisted environment (proxy
-  variables, locale, time zone, runner debug flags). The agent starts the
+  following a link, at most 16 KiB) and its environment, each name held to
+  `jobEnvNameAllowed`: the runner's own settings (proxy variables, locale,
+  time zone, runner debug flags), and any other plain name the approved env
+  policy passed, but none the agent sets, none that changes how the shell
+  starts, and none with the loader's, .NET's, the runner's, Actions' or
+  GitHub's prefixes. The agent holds the job to the same rule. It starts the
   runner as `runner` in that user's login session, through `launchctl
   asuser` and its own `exec-as`, which drops root and checks it cannot get
   it back.
@@ -426,8 +455,7 @@ a pf rule wrong for one macOS release would put the job on the operator's
 LAN. With no card there is nothing to configure, nothing a guest root could
 re-enable, and nothing to keep in step with macOS. System proxy settings are
 not set: with no network service there is nothing to attach them to, and a
-tool that ignores the environment's proxy gets no route - it fails closed,
-as it does under seatbelt.
+tool that ignores the environment's proxy gets no route - it fails closed.
 
 vsock in macOS guests: `VZVirtioSocketDevice` is supported for macOS guests
 (Tart's guest agent uses it), and the agent's listener accepts only
@@ -450,8 +478,8 @@ third job waits for a slot.
 
 ## Setup UI and IPC
 
-`MacVmSetup.tsx` is a self-contained component the wiring step mounts in
-Settings. It shows, by state: why this Mac cannot run macOS VMs; before an
+`MacVmSetup.tsx` is the macOS VM section of Settings, where the Isolation
+section was. It shows, by state: why this Mac cannot run macOS VMs; before an
 image exists, what the build does, whether it needs the operator (the guided
 setup before macOS 27) and the disk it needs against what is free, refusing
 a build the disk cannot hold; during a build, its phase, progress and Cancel;
@@ -483,7 +511,7 @@ hosted Apple silicon runner; nothing there boots macOS.
 
 - **Use its egress.** Anything the job's proxy allows, it can reach, and
   through it exfiltrate what the job holds - its checkout and its secrets.
-  That is the policy's to bound, as for a sandboxed job.
+  That is the policy's to bound.
 - **Talk to the broker as its worker.** It holds its worker's key, which
   works only at its own worker's broker endpoint, as on the host.
 - **Become root in its guest** through a macOS flaw. Root in the guest can
@@ -521,15 +549,21 @@ hosted Apple silicon runner; nothing there boots macOS.
 ## Not built yet
 
 - **Policy filesystem grants.** A macOS VM job sees nothing of the host, so
-  `filesystem.read`/`write` grants give it nothing. Read-only virtiofs shares
+  `filesystem.read`/`write` grants give it nothing; the runner names them in
+  the log when the job starts. Read-only virtiofs shares
   of granted paths, and writable grants as per-job APFS clones, are the next
   step if repositories need them; every share would follow the Docker
   backend's unswappable-share rules (resolved at `Start()`, created by
   localmost, denied as a node to the job, checked by the helper).
 - **Docker.** M2 has no nested virtualization, and Apple's (macOS 15, M3 or
   later) is for Linux guests only, so a macOS guest cannot run Docker. The
-  route would be the filtering socket over vsock to a sibling Linux VM, with
-  the open question of how that VM sees the macOS guest's workspace.
+  route is a third vsock relay from a socket in the guest to the worker's
+  filtering socket, which already exists in its sandbox, and a workspace the
+  host shares with both VMs. Until then a job whose policy grants Docker is
+  refused at admission, with a reason naming the missing relay.
+- **`localmost test`** still runs each step under seatbelt on the host; it is
+  to run the workflow in a VM from this backend, with filesystem discovery
+  ported as guest-side tracing.
 - **Full Xcode**, above, and several images keyed by macOS and Xcode version
   as GitHub's `runs-on: macos-15` is.
 - **Signing identities** in the guest; **Rosetta** in a macOS guest; caches
@@ -563,8 +597,8 @@ Headless only, within a 25 GB free-disk floor:
 
 ### For the owner
 
-On macOS 27 (headless) or macOS 26 (guided), after the wiring step mounts
-the setup component, with 45 GB free:
+On macOS 27 (headless) or macOS 26 (guided), with about 58 GB free (the
+build's own check: the restore image, an image estimate and a reserve):
 
 1. `npm run build:macvm`, then run the dev app.
 2. Settings, macOS VM: **Build the golden image**. Expect catalog, download (18-20 GB), verify,
@@ -573,13 +607,13 @@ the setup component, with 45 GB free:
    **Open the setup window**, follow the six steps with the values shown, and
    leave the window. Expect it to close on its own after the Command Line
    Tools install, and the page to show the image ready with two slots.
-3. In the data directory the wiring step gives the mode (`<data>` below),
+3. In the app's data directory (`<data>` below),
    `ls -l <data>/macos-vm/images/<id>/ <data>/macos-vm/images/<id>/slot1`
    shows `disk.img`, `aux.img`, `config.json` and per slot `state.vzvmsave`;
    `du -sh` that directory to record the image's real size, and note the
    install's time from the app's log.
-4. A repository with `isolation: [macos-vm]` in an approved `.localmostrc`
-   and a workflow that runs `id; sw_vers; xcode-select -p; curl -sI
+4. A repository with no `.localmostrc`, or an approved one without
+   `docker:`, and a workflow that runs `id; sw_vers; xcode-select -p; curl -sI
    https://github.com; curl -s --noproxy '*' https://github.com || echo
    no-route; ls /Volumes`. Expect: uid of `runner` and not in `admin`, the
    guest's macOS, `/Library/Developer/CommandLineTools`, a 200 through the

@@ -60,17 +60,13 @@ localmost is an Electron desktop application that manages GitHub Actions self-ho
 
 ### What localmost protects against
 
-- **Filesystem writes**: Under `strict`, workflows write only to the workspace, their own temp directory and home directory inside the job's sandbox, their target's own tool cache when the persistent tool cache is selected, the entries a bare `mktemp` creates in the per-user temp directory (and Swift Build's link step, with the `jobEnvironment.swiftBuildLinkTemp` preference on) and a directory of their own there (see Shared temp directories below), and whatever their `.localmostrc` declares. `moderate` and `permissive` additionally write a package cache the job's package managers are pointed at: their target's own (`~/.localmost/runner/caches/<target>/packages`) with the persistent cache selected, or one inside the job's sandbox with per-sandbox - never the tool caches in your home directory (`~/.npm`, `~/.cargo`, `~/.gradle`, `~/Library/Caches` and similar), which they can read but not write
-- **Home directory access**: Workflows cannot read or write `~/.ssh`, `~/.aws`, `~/.config` or the other credential locations listed below, at any level, whatever write paths their policy declares - by the path as written and, where one is a link (a `~/.aws` kept in a dotfiles repository and linked into place, say), by the path it resolves to when the job starts. Nor can they rename one, or any directory above one (`~/.m2`, `~/.gradle`, `~/.cargo`, `~/.nuget/NuGet`, `~/.gem`, `~/.terraform.d`, `~/.local/share/gem`, `~/.local/share/uv`, `~/.local/share/containers/podman`, `~/.local/share`, `~/.local`, `~/.cache/huggingface`, `~/.cache`, `~/Library`, `~` and so on), which would move it out from under that deny to be read under the new name: a write grant on a package cache or on `~` still writes what else it covers - a job granted `~/.gradle` writes its `caches` and `wrapper`, one granted `~/.terraform.d` its `plugins`, one granted `~/.cache` its `huggingface/hub` - but cannot move the credential files inside, nor create one of those directories where it is missing: granted `~`, a job cannot create a missing `~/.gradle`, `~/.m2`, `~/.cargo`, `~/.nuget`, `~/.gem`, `~/.terraform.d`, `~/.local` or `~/.cache`, nor granted `~/.local` a missing `~/.local/share` or `~/.local/share/gem`, nor granted `~/.cache` a missing `~/.cache/huggingface`, and you create the directory instead (`gem install --user-install`, which looks through `HOME`, installs into the job's own home where your home has no `~/.gem` or `~/.local/share/gem`, and the gem goes with the job; under `moderate` and `permissive` RubyGems 3.4 and later install into the package cache, where `XDG_DATA_HOME` points). Nor can a job granted `~` write a credential file in place: a step that logs in by writing one - `hashicorp/setup-terraform` with `cli_config_credentials_token` writes `~/.terraformrc`, `az login` and `azure/login` write `~/.azure` - fails with "Operation not permitted" rather than overwrite your own login, and the workflow points the tool at a file in its workspace instead (`TF_CLI_CONFIG_FILE`, `AZURE_CONFIG_DIR`). `HOME` is a home of the job's own, `<sandbox>/home`: empty but for the per-job git config as `.gitconfig`, an empty ssh config (`GIT_SSH_COMMAND` points ssh at it), and a link at the same path for each path its level and approved policy grant under your home, so a tool looking through `HOME` finds what was granted and nothing of yours else - not a regular `~/.gitconfig`, which `actions/checkout` copies from `$HOME` and failed on, nor a `~/.yarnrc.yml`. The sandbox judges the path a link resolves to, so a link reaches only what the grant does. Only what is there when the job starts is linked, and never a credential location above or anything in one, granted or not: a granted directory that holds one - `~/.cache` with Hugging Face's token, `~/.gradle` with `gradle.properties` - is a directory of the job's own holding a link to each of its other entries, so tools that found the denied file through `HOME` and failed on it no longer find it. A grant of `~` itself links each entry of your home that way, but `~/.localmost`. The JVM, which takes its home from the user database, is given the job's as `user.home` in `JAVA_TOOL_OPTIONS`. Tools that look your home up in the user database rather than through `HOME` - ssh, cfprefsd, Foundation's `NSHomeDirectory()` - still see your real home, so the sandbox, not `HOME`, is what keeps a job out: within your home a job reads only what its level and policy grant, and writes only its own sandbox and caches under `~/.localmost` and whatever write paths its approved policy declares. The directories above a path a write grant names that do not exist yet, which the job cannot create, are created by localmost before the job, one level at a time, empty, never through a link and never in a credential location above or the app's own directories, in any capitalization; the path itself is created too when the grant ends in `/` or `/**`, or when it is one of the directories above a credential, which the job cannot create either - `~/.gradle` for a job granted it, on a Mac where Gradle never ran (the `jobEnvironment.createMissingGrantedDirs` preference, set in the Job Environment section of Settings and on by default). A grant without the trailing `/` may name a file, like `~/.python_history`, which the job creates itself; a directory a grant does not name, like those above, still is not. See [docs/roadmap/job-environment.md](docs/roadmap/job-environment.md). `~/.localmost` and the app's Electron data directory (`~/Library/Application Support/localmost`) are closed to reads and writes whatever the policy declares, by their real paths and in any capitalization: a grant of `~`, `/Users`, `~/Library` or `~/Library/Application Support` grants everything else it covers, and the job still reaches nothing in either directory but its own sandbox and its target's caches, beyond listing the directories on the way down to them - not the logs, the job history, another worker's sandbox or another target's caches. Nor can it rename or replace any directory above them (`~`, `~/Library`, `~/Library/Application Support` and so on), which would move them out from under that deny
-- **Environment**: A job does not inherit the app's environment. Launched from a shell, the app carries every token and agent socket that shell had; a worker gets only `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TERM`, `TZ` and `__CF_USER_TEXT_ENCODING` from it, plus whatever the repository's approved `env: allow` names (`*` matches any run of characters), less whatever `env: deny` names. The variables localmost sets for the runner - the proxy, `HOME` (the job's own, in place of the app's), `TMPDIR`, `DIRHELPER_USER_DIR_SUFFIX`, `JAVA_TOOL_OPTIONS`, `GIT_SSH_COMMAND`, `DOCKER_HOST`, the job's bin directory at the front of `PATH`, the per-job configuration and the caches - are set after the policy is applied, so no policy can replace them; a workflow's own `env:` still can, for its steps. git gives `GIT_SSH_COMMAND` precedence over `core.sshCommand`, so a deploy key a step configures there - `actions/checkout` with `ssh-key` stores one for later steps' `git push` - is not used by a later step's git unless that step runs `unset GIT_SSH_COMMAND` or sets `GIT_SSH_COMMAND` itself. `JAVA_TOOL_OPTIONS` carries the job's proxy token, and every JVM prints it to stderr as it starts, so it appears in the job's log - which anyone can read on a public repository; the token works only on this Mac's loopback, for this job's proxy, and is replaced when the job ends. Secrets from GitHub reach steps through the job payload as usual; this is about what the host contributes
-- **Filesystem reads**: Under `strict` a job reads the OS, the runner's own directories, its workspace, and whatever its `.localmostrc` declares - nothing else. `moderate` and `permissive` additionally grant the standard toolchain locations (`/opt/homebrew`, `/usr/local`, Xcode) and the package-manager caches. Of `~/.local` they read only `~/.local/bin` and `~/.local/lib`: the rest of it is where tools keep their state, secrets and shell history included, so `~/.local/share`, `~/.local/state` and the rest are read only where a policy declares them. A command in `~/.local/bin` that is a link to somewhere else in `~/.local` fails in a job with "Operation not permitted" until the repository declares, under `filesystem.read`, the directory the link resolves into (`readlink ~/.local/bin/<command>` shows it): `~/.local/share/uv/tools` for a command from `uv tool install`, `~/.local/share/uv/python` for a uv-managed `python3.x`, `~/.local/share/claude` for Claude's native installer, `~/.local/share/mise` for mise's shims and installs on an inherited `PATH`, and for pipx `~/.local/pipx` or `~/Library/Application Support/pipx`, depending on its version (`pipx environment` says which). The secrets tools keep inside those directories stay on the floor below whatever is declared: uv's index credentials (`~/.local/share/uv/credentials`), the SSH keys into Podman's machines (`~/.local/share/containers/podman/machine`) and atuin's sync key (`~/.local/share/atuin/key`), so declaring `~/.local/share/uv` or `~/.local/share` whole does not reach them. At every level a job is denied `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.config`, `~/.azure`, `~/Library/Keychains`, `~/Library/Preferences` (see Preferences below), `~/.netrc`, `~/.npmrc`, the files other tools keep tokens and passwords in as plain text (`~/.git-credentials`, `~/.pypirc`, `~/.gem/credentials` and `~/.local/share/gem/credentials`, `~/.local/share/uv/credentials`, `~/.local/share/containers/podman/machine`, `~/.local/share/atuin/key`, `~/.terraform.d/credentials.tfrc.json`, `~/.terraformrc`, `~/.pgpass`, `~/.vault-token`, `~/.boto`, `~/.s3cfg`, `~/.my.cnf`, `~/.mylogin.cnf`, `~/.yarnrc.yml`, `~/.cache/huggingface/token` and `stored_tokens`), this app's credential store and approval cache, and the credential files kept inside the package-manager caches (`~/.m2/settings.xml`, `~/.gradle/gradle.properties`, cargo credentials, `NuGet.Config`), read and write, whatever write paths its policy declares, and none can be renamed into view (see Home directory access above). Granting write on `~/.gradle`, `~/.m2`, `~/.cargo` or `~/.nuget` is warned about on approval, since your own builds load and run what is kept there
-- **Preferences**: A job writes no preference domain, at any level - not even Xcode's `com.apple.dt.Xcode`, which jobs could write before and which your own Xcode loads outside any sandbox. `xcodebuild` (build and test) and `swift build` write none, so a build is unaffected; a workflow step that runs `defaults write com.apple.dt.Xcode ...` itself - the common `IDESkipMacroFingerprintValidation` recipe, say - now fails with "Could not write domain", and passes the setting to `xcodebuild` instead: a flag such as `-skipMacroValidation`, `-skipPackagePluginValidation` or `-skipPackageSignatureValidation`, or `-Key=Value` for any other key, which `xcodebuild` reads for that run only. A job reads only the domains a build reads: the global domain (`defaults read -g`), `com.apple.dt.Xcode`, `com.apple.dt.xcodebuild`, `xcodebuild`, `com.apple.dt.XCBuild`, `com.apple.dt.SWBBuildService`, `org.swift.swift-build`, `swift-build`, `com.apple.CoreSimulator`, `com.apple.security` and `com.apple.security.codesign` - so `defaults read com.apple.finder`, or of any other app's domain, says the domain does not exist. Every domain was readable before, at every level, past the file floor. `com.apple.dt.Xcode` stays readable because signing needs it, and it holds the Apple ID account names and provisioning teams Xcode knows. `~/Library/Preferences` is closed to reads and writes whatever the policy grants, as the credentials are: cfprefsd serves a domain to a process that may read or write its plist, whatever the sandbox's preference rules say, so a grant of `~` or `~/Library` would otherwise reach every app's settings through it. The same holds for a `localmost test` step and under `--updaterc`
-- **Policy denies**: A `filesystem.deny` entry refuses reads and writes of what it names, and everything beneath, over every grant, as written and by its real path. In a deny `*` matches within one name and never a `/`, and it may stand in any component: `~/out/*.pem` covers the `.pem` names directly in `~/out`, not `~/out/a/b.pem`. A job cannot rename, create or remove any directory above a denied path, which would carry the path out from under the deny - and for a `*` entry that includes every directory a wildcard stands for: under a deny of `~/out/sec*/key` a job cannot rename `~/out/secA`, nor create or rename a file or directory in `~/out` whose name matches `sec*`, though it still writes inside `~/out/secA`. A wildcard high in a path closes that many names (`~/*/key` closes every name directly in your home). Nor can a job clone a directory, whatever it reads: clonefile(2) copies the whole tree beneath a directory in one call without checking each file, so a clone of a readable directory holding a denied file - a policy deny, a credential the floor closes inside a package cache, the Docker VM share's nonce - would carry it into the job's sandbox under a name no deny covers. A file still clones, which asks for read on the file itself, and `cp -c -R` and Foundation's `copyItem` copy a tree file by file, less what is denied
-- **Network exfiltration**: A job's sandbox permits no outbound connection except to its own filtering proxy and the local broker's port, so the host policy holds even for code that ignores `HTTP_PROXY` and opens a raw socket. A direct connection to any other loopback port is refused too, unless its approved policy declares that port with `network.loopback`, and the proxy holds a request for a loopback address to the same ports, so going through `HTTP_PROXY` does not reach a service bound only to loopback either. The proxy judges the Mac's own routable addresses - a global IPv6 address, or a public IPv4 one, on one of its interfaces - like any remote host, so under `permissive`, or with such an address in an allow entry, a job reaches a service listening on all interfaces there (Docker Desktop publishes ports that way by default). Under `strict` the reachable set is runner infrastructure plus what the repository declares — not npm, PyPI or other registries
-- **Other processes**: A job can signal only processes in its own sandbox - its children and the members of its process group that share its sandbox - not the app, another worker's job or anything else you run. It cannot look up the app's own Chromium port rendezvous service either
-- **What a job leaves running**: Nothing of a job is meant to outlive it. Every job's sandbox is a new directory (`~/.localmost/runner/sandbox/<n>-<id>`), with its docker socket inside, so the next job's runner, checkout and socket are at paths no earlier job's profile grants. When a worker exits, its process group is sent SIGTERM and, ten seconds later, SIGKILL, and its slot takes no other job until the group is empty or has been sent SIGKILL. Two seconds after that, anything still running under that job's sandbox profile is killed - found by asking the kernel which processes run under the profile carrying the job's mark, which a process cannot leave the way it can leave its process group with `setsid()` - and then, once nothing is left in its process group, the job's sandbox directory is removed. It is first moved aside, to a name in `~/.localmost/runner/sandbox` that no job's profile grants, so that a process still running under the job's profile can no longer change the tree, and it is removed from there without following a link planted anywhere in it - even one swapped in for a directory while the removal runs, by a container of the job's writing its bind-mounted workspace through the Docker VM's share, say, which the job's profile does not confine - so the removal deletes nothing outside the tree. If the app quits first, the next startup does the same for every job it had not swept. That sweep runs a short script with the developer tools' `python3`, found through `xcode-select`; without the developer tools only the process group, and the processes holding the marker file descriptor the runner's shells pass down, are swept. So a process that left the group with `setsid()` and closed its inherited descriptors keeps its finished job's profile for about twelve seconds after the job ends, and without the developer tools until it exits. Until then it can write its own old sandbox directory while that is still in place (and after that a new directory at the same path, which the next startup removes), the paths its policy declares, and its target's caches, which the target's next job uses; connect to the loopback ports its policy declares; and listen on any free loopback port, where a later job, or one running in another slot, whose policy declares that port reaches it instead of the service it expects. It cannot reach the next job's sandbox or docker socket, nor use its proxy, which stops serving it when the job ends
-- **Container work**: A job is never handed a Docker daemon socket. It talks to a filtering socket localmost owns, which forwards only the `pull`, `run` and `build` requests the repository's approved `.localmostrc` declares, to a Linux VM of the job's own that is given none of your files but the job's work folder and whose only way out is the job's proxy - see Docker Access below
-- **Credential exposure**: OAuth tokens are encrypted at rest using macOS Keychain
+- **Everything of your Mac**: Every job the runner takes runs in a macOS VM of its own, booted from an APFS clone of a golden image no job has touched and thrown away with its clone when the job ends ([macos-vm-jobs.md](docs/roadmap/macos-vm-jobs.md)). Inside it the job is the guest's ordinary, non-admin `runner` user. Nothing of the Mac is shared into the VM: not your home, credentials, keychain, preferences, temp directories, loopback services or other processes. What a job writes, caches or leaves running goes with its VM
+- **Network exfiltration**: The VM has no network card. Its only ways out are two vsock relays, to the job's own filtering proxy and to the local broker, so the host policy holds even for code that ignores `HTTP_PROXY` and opens a raw socket: it has no route. Under `strict` the reachable set is runner infrastructure plus what the repository declares — not npm, PyPI or other registries
+- **Other jobs**: Each job has its own VM, disk clone, machine identity and saved state, and at most two run at once. No disk, share or socket is common to two jobs
+- **Environment**: A job is given nothing of the app's environment but `LANG`, `LC_ALL`, `TZ` and what its repository's approved `env: allow` names (`*` matches any run of characters), less what `env: deny` names. The variables localmost sets for the runner - the proxy and the runner's own settings - come after the policy, so no policy can replace them, and the guest agent refuses any name that would change how the loader, the shell or the runner's own code is found (see [localmostrc.md](docs/roadmap/localmostrc.md)). Secrets from GitHub reach steps through the job payload as usual; this is about what the host contributes
+- **Container work**: Not available yet. A job whose approved policy grants Docker is refused at admission, with a reason naming the missing relay, until the relay that carries the filtering Docker socket into the VM exists. The design it will connect to is under Docker Access below
+- **The app's own control plane**: A job cannot reach the approval cache, the settings file or the CLI control socket: nothing of the Mac's filesystem reaches its VM. Without this, a workflow could approve its own policy and the approval gate would mean nothing
+- **Credential exposure**: OAuth tokens are encrypted at rest using macOS Keychain, and the runner registration's key never enters a VM (see Runner registrations)
 
 ### Policy levels
 
@@ -84,57 +80,30 @@ level: strict    # strict (default) | moderate | permissive
 A repository that declares no level runs `strict`. Silence means the tightest
 setting, so a policy that says nothing cannot inherit something looser.
 
-The level governs both halves of the policy. On the network side, `strict`
-grants runner infrastructure plus declared hosts, while `moderate` adds the
-common package registries. On the filesystem side, `strict` grants the runner's
-floor plus declared paths, while `moderate` adds read access to the toolchain
-locations and package-manager caches, and a package cache of the repository's
-own to write.
+The level is the job's proxy's: `strict` grants runner infrastructure plus
+declared hosts, `moderate` adds the common package registries, CDNs and GitHub
+content hosts, and `permissive` allows every host (see Network Policy below).
+Under `localmost test`, which still runs each step under a seatbelt profile on
+the Mac, the level also sets what a step reads (see Local Test Mode).
 
-Because a sandbox profile is fixed when a worker starts, approving a policy
-retires that repository's idle workers. If a worker still claims a job after
-its policy changed, the job runs under the boundary approved when that worker
-started - which the machine owner approved, just not most recently - with its
-network cut back to runner infrastructure, and the worker is retired
-afterwards. A job already running is left alone.
+A worker's environment is fixed when it starts, so approving a policy retires
+that repository's idle workers. If a worker still claims a job after its
+approved policy changed - its network, Docker, filesystem grants or env - the
+job runs with its network cut back to runner infrastructure, and the worker
+is retired afterwards. A job already running is left alone.
 
 The level is part of the policy, so changing it is a policy change: it appears
 in the approval diff and takes effect only once approved. A repository cannot
-loosen its own sandbox without the machine owner agreeing to it.
+loosen its own policy without the machine owner agreeing to it.
 
-- **The app's own control plane**: A job cannot write the approval cache, the settings file, or reach the CLI control socket. Without this, a workflow could approve its own policy and the approval gate would mean nothing
+### Filesystem grants, loopback and isolation
 
-### Isolation types
-
-How a job is kept from the rest of the Mac is its isolation type: `seatbelt`
-(the job runs as you under the seatbelt profile this document describes),
-`service-account` (a hidden `_localmost` user of its own) or `macos-vm` (a
-fresh macOS VM). This build can run `seatbelt` only; the other two are
-designed ([service-account-jobs.md](docs/roadmap/service-account-jobs.md),
-[macos-vm-jobs.md](docs/roadmap/macos-vm-jobs.md)) and, once built, remove
-the shared-temp exceptions below entirely, since neither shares your
-per-user temp directory.
-
-The set of types this Mac allows - Settings > Isolation, `isolation.allowed`
-in `config.yaml`, `[seatbelt]` by default in this build - is what controls
-which isolation a job can get. A repository's `.localmostrc` lists, in order,
-the types it accepts (`isolation:`, `any` when absent); a job gets the first
-type in that list that is allowed here and available in this build, and is
-refused when there is none, never run under a type its repository did not
-list. A repository's order cannot override the allowed set: listing
-`seatbelt` first reaches seatbelt only on a Mac that allows it, and a
-repository that lists only `macos-vm` is refused on one that does not. The
-list is part of the approved policy, its order included, so a change to it is
-a policy change to approve; and like every `workflows:` key, a workflow's
-list can be claimed by any pull request that names a workflow file after it -
-the allowed set is what bounds that too. It also bounds a commit with no
-`.localmostrc`: such a commit runs on the baseline, and for isolation the
-baseline is `any`, so a pull request that deletes the file drops the
-repository's approved list. Removing the file narrows every grant, but widens
-which isolation types the job accepts: a repository whose approved policy
-accepts only `macos-vm` has that pull request run under whatever this Mac
-allows. A type must be out of the allowed set to be kept from every job. See
-[localmostrc.md](docs/roadmap/localmostrc.md), Isolation.
+A runner job's VM is given no filesystem grants and no loopback yet: a
+policy's `filesystem:` and `network.loopback` apply only under `localmost
+test`, and the runner names them in its log when a job starts. VM shares of
+granted paths are planned ([macos-vm-jobs.md](docs/roadmap/macos-vm-jobs.md),
+Not built yet). `isolation:`, which once chose among isolation types, is
+ignored with a warning: every job runs in a macOS VM.
 
 ### What localmost trusts (does NOT protect against)
 
@@ -142,58 +111,35 @@ allows. A type must be out of the allowed set to be kept from every job. See
 - **Malware on your machine**: If your system is already compromised, localmost cannot protect you.
 - **A compromised GitHub account**: If an attacker has access to your GitHub account, they can modify workflows that run on your runner.
 - **Allowlisted hosts**: Data can be exfiltrated to any host the active policy allows. Under `strict` that is runner infrastructure plus whatever the repository declares; looser levels allow more. Among the infrastructure hosts allowed at every level, `github.com`, `api.github.com` and `*.blob.core.windows.net` accept writes from any account, so `strict` limits reach, not exfiltration - see Network Policy below.
-- **Approved policies**: Once you approve a repository's `.localmostrc`, everything it declares is granted until you approve another. Approval is a judgement about that content, and is bound to it: what you approve is the policy you were shown, level included. A write grant on a place something outside the sandbox later acts on - `~/Library/LaunchAgents` and the other launchd directories, shell rc files, `~/.gitconfig`, `~/Library/Application Support`, the package caches `~/.gradle`, `~/.m2`, `~/.cargo` and `~/.nuget`, `/usr/local/bin`, `/opt/homebrew/bin`, or a parent of any of them, `~` and `/` included - is marked with a warning in the approval screen and `localmost policy show`. It is not refused: a job granted one can leave code that runs as you, unsandboxed, after it ends, and approving it means accepting that. A write grant on `~/.ssh`, `~/.config` or `~/Library/Preferences` is marked too, but does nothing: the sandbox refuses a job every write there whatever is granted (see Home directory access and Preferences above).
-- **Per-workflow filesystem sections**: A `workflows:` section can narrow or widen *network* access per workflow, because hosts are applied to the proxy when a job is claimed. Filesystem paths are taken from `shared:` only — the sandbox profile is built before the runner knows which workflow it will run, and cannot change afterwards.
+- **Approved policies**: Once you approve a repository's `.localmostrc`, everything it declares is granted until you approve another. Approval is a judgement about that content, and is bound to it: what you approve is the policy you were shown, level included. Under `localmost test`, a write grant on a place something outside the sandbox later acts on - `~/Library/LaunchAgents` and the other launchd directories, shell rc files, `~/.gitconfig`, `~/Library/Application Support`, the package caches `~/.gradle`, `~/.m2`, `~/.cargo` and `~/.nuget`, `/usr/local/bin`, `/opt/homebrew/bin`, or a parent of any of them, `~` and `/` included - is marked with a warning in the approval screen and `localmost policy show`. It is not refused: a job granted one can leave code that runs as you, unsandboxed, after it ends, and approving it means accepting that. A write grant on `~/.ssh`, `~/.config` or `~/Library/Preferences` is marked too, but does nothing: the step sandbox refuses every write there whatever is granted (see Local Test Mode). A runner job's VM is given no filesystem grant at all yet.
+- **Per-workflow network sections**: A `workflows:` section can narrow or widen *network* access per workflow, because hosts are applied to the proxy when a job is claimed.
 - **Per-workflow env sections**: The environment is fixed when the worker starts, for the same reason. `env: allow` is taken from `shared:` only; a per-workflow allow is not applied. `env: deny` is taken from `shared:` and from every workflow, and applied to every job - a per-workflow deny is honoured more widely than written rather than not at all.
 - **Per-workflow sections are not a boundary between contributors**: A `workflows.<name>` section is available to any commit that can run a workflow file with that name, including pull requests; approving a per-workflow grant approves it for anyone who can open a PR. The key matches a file name, and a pull request can add or change a workflow file like any other. Per-workflow sections keep a compromised dependency of one workflow from using another's grants, not a commit author.
-- **Loopback services on declared ports, and the broker**: A job reaches loopback ports other than its own proxy's only when the repository declares them with `network.loopback`, directly or through its proxy, and it always reaches the broker's port, directly and through its proxy - see Network Policy below. A service on a declared port is protected from jobs only by its own authentication, as the broker is by its per-worker key. A job's containers reach loopback only through the job's proxy, so under the same rule: the ports its policy declares, and the broker's - see Docker Access below.
-- **Processes running as you**: The CLI control socket is guarded only by file permissions (`0600` in a `0700` directory) and the job sandbox's deny of it. Any process running as your user can control the app through it - pause, resume, add or remove targets - as it could by editing `~/.localmost` directly.
-- **Apple's Virtualization.framework, and the Docker VM's kernel**: A job's containers run in a Linux VM of its own. A bug in Apple's virtiofs server or device emulation, which is closed source and has not been fuzzed here, is not contained by anything localmost adds. A kernel exploit from a container gives root in that VM, which holds only what the job can already reach and its repository's cache of public images - see Docker Access below.
-
-- **The runner's own floor**: A job's sandbox also contains the runner process, so the profile must grant what the runner needs to function - the OS, its own installation, the tool cache, the workspace and temp. A repository cannot narrow below that floor, only add to it.
-- **Package caches under `moderate` and `permissive`**: These levels used to grant write on `~/.npm`, `~/.cargo`, `~/.rustup`, `~/.gradle`, `~/.m2`, `~/.nuget`, `~/.dotnet`, `~/.local`, `~/go`, `~/Library/Caches` and similar. Those trees are not only caches: they hold directories on your `PATH` and configuration your own tools load, so a job could plant code you would later run outside any sandbox. They are now read-only to jobs (of `~/.local`, only `bin` and `lib` are readable at all; see Filesystem reads). Instead the job's environment points its package managers at a package cache of its own - its target's, or with per-sandbox selected one inside the job's sandbox - by these variables: `npm_config_cache`, `YARN_CACHE_FOLDER`, `YARN_GLOBAL_FOLDER`, `npm_config_store_dir` (pnpm), `XDG_CACHE_HOME`, `XDG_DATA_HOME`, `CARGO_HOME`, `GRADLE_USER_HOME`, `MAVEN_OPTS` and `MAVEN_ARGS` (`maven.repo.local`), `GOPATH`, `GOCACHE`, `NUGET_PACKAGES`, `NUGET_HTTP_CACHE_PATH`, `DOTNET_CLI_HOME`, `PIP_CACHE_DIR`, `electron_config_cache` and `npm_config_devdir` (node-gyp). The trade-offs: a job starts from an empty cache rather than yours; your own configuration in those trees (`~/.cargo/config.toml`, `~/.gradle/init.d` and the like) no longer applies to jobs; rustup cannot install a toolchain that `rust-toolchain.toml` asks for, since `~/.rustup` is read-only; because `XDG_DATA_HOME` moves too, what you installed under `~/.local/share` - mise's tools, uv's Pythons, pipx's packages - is not found by a job, which installs its own copy into the package cache instead; a workflow that sets one of these variables itself back to your home directory is refused on write - which includes a workflow that sets `MAVEN_OPTS` for its JVM flags on a Maven older than 3.9, which reads only `MAVEN_OPTS`; and a tool that writes somewhere else in your home through `HOME` - `~/Library/Caches` for Playwright browsers, CocoaPods or Homebrew - finds the read-only link to your `~/Library/Caches` in the job's home and fails with "Operation not permitted" unless the repository declares that path writable (under `strict`, where nothing is linked there, it writes the job's own home instead, and its download goes with the job). With the persistent cache selected, the package cache is kept across a target's jobs and shared by all of them, like the tool cache - and it holds what those jobs execute, not only downloaded packages: Gradle's `init.d` scripts and `gradle.properties`, Cargo's `config.toml` (a `rustc-wrapper`, say) and `bin`, `GOPATH/bin`. Within a target, a pull request's job can leave configuration or binaries there that a later default-branch job loads with that branch's secrets. With per-sandbox selected, the package cache is inside the job's own sandbox and goes with it.
-- **Tool cache**: With the persistent tool cache selected, each repository or organization target has its own (`~/.localmost/runner/caches/<target>/tool-cache`), readable and writable by that target's jobs and no other target's. `setup-node` and the other setup actions execute the highest matching version they find there, so a cache shared across targets would let one repository's job plant a toolchain another repository's job runs with its own secrets. Within one target the cache is still shared between jobs, including a pull request's and the default branch's. An organization target is one target: its cache is shared by every repository of the organization, so one repository's job can plant a toolchain another repository's job in the same organization runs with that repository's secrets. Choose per-sandbox to keep every job's tools to itself - and do, for an organization whose repositories do not trust each other. A worker with no target, or per-sandbox, gets no tool or package cache outside its sandbox at all. The single shared `tool-cache` directory earlier versions used is left on disk untouched and is no longer granted to any job; delete it when convenient.
-- **Shared temp directories**: A job gets no access to `/tmp` or to the per-user `/var/folders` directories, at any level, beyond the exceptions below. Those are shared with every process you run, and some of what lives there is trusted by your own tools - the xcrun lookup cache and the clang module cache among them. `TMPDIR`, `TMP` and `TEMP` point at the job's own temp directory, and xcrun's cache, the clang and Swift module cache and zsh's here-documents are pointed there too (`xcrun_db`, `CLANG_MODULE_CACHE_PATH`, `TMPPREFIX`). macOS `mktemp` ignores `TMPDIR`, so a bare `mktemp` or `mktemp -d` is allowed to create its entry in the per-user temp directory - by the `tmp.XXXXXXXXXX` name it generates only, without the right to list or read anything else there. Swift 6.4's default build system, Swift Build, does the same at its link step: the swift-driver it runs makes `TemporaryDirectory.XXXXXX` there with `mkdtemp`, whatever `TMPDIR` says. With the `jobEnvironment.swiftBuildLinkTemp` preference on - it is off by default, and set in the Job Environment section of Settings - a job may create that too, by the name it generates only, so a plain `swift build` links; off, the profile has no such rule, and a plain `swift build` fails at its link step unless the workflow passes `--build-system native`. A `localmost test` step never gets the rule, since the CLI reads no app preferences. What this rule shares with the `mktemp` exception is what it grants: names the tool itself makes up at random (six characters of `[A-Za-z0-9]` here, ten for `mktemp`), in a directory a job cannot list, with nothing else in the per-user temp reachable. What it exposes is wider. Your own SwiftPM, run outside any job with `TMPDIR` at the per-user temp as macOS sets it - and Xcode, resolving packages with it - makes directories of exactly this name and keeps in them what it is about to use: it compiles a package manifest to `TemporaryDirectory.XXXXXX/Package-1.o`, writes the `-vfsoverlay` file for that compile as `vfs.yaml` in another, links the manifest executable, `<package>-manifest`, in a third and runs it; swift-driver keeps its response files and temporary outputs in one too. Each of those paths is on a command line any job can read in `ps`, and a job may write anything at a path of that shape, so a job that watches for them can race to replace the manifest executable, its object file or the overlay before SwiftPM uses it - on every `swift build`, `swift package resolve` or package resolution in Xcode you run while the job is running, retrying each time. If it wins, its code runs as you, outside any job's sandbox, under at most SwiftPM's own manifest sandbox, which lets it read your files. A bare `mktemp` exposes only a script of yours that puts a `tmp.*` path on a command line; this exposes every Swift package build and resolution on the Mac, and seatbelt cannot tell which process made a directory, so the grant cannot be kept to a job's own - which is why it is off unless you turn it on. Your own `TMPDIR`, pointed at a directory of yours in the shell you build in, moves SwiftPM's manifest directories out of the per-user temp; Swift Build's link step makes its own there still. Foundation ignores `TMPDIR` too: `NSTemporaryDirectory()`, `java.io.tmpdir` and the staging directory of a sandboxed process's atomic writes (SwiftPM's and xcodebuild's among them) are in the per-user temp directory. So each job also gets a directory of its own there, `T/localmost-<data>-<sandbox id>`, which localmost makes before the job (0700) and names in `DIRHELPER_USER_DIR_SUFFIX` - which moves those into it - and which its profile grants, but not the directory's own node; localmost removes it after the job, moving it out of the per-user temp first, since macOS lets nothing but the system remove a `TemporaryItems` directory there (the `jobEnvironment.perJobTempDir` preference, set in the Job Environment section of Settings and on by default). The JVM's temp is set to the job's `TMPDIR` by `JAVA_TOOL_OPTIONS`. The trade-offs: `mktemp -t prefix` and a hard-coded `/tmp` path fail with "Operation not permitted" inside a job; use `$RUNNER_TEMP` or a template under it (`mktemp -d "$RUNNER_TEMP/x.XXXXXX"`). And any entry named like `tmp.XXXXXXXXXX` (or, with the preference on, `TemporaryDirectory.XXXXXX`) in the per-user temp directory is reachable by a job that learns its exact name - not only your own, but those of every other job running at the same time, other repositories' included. Names are not hard to learn: a job can list every process you run with its full command line (`ps`, `pgrep -lf`), so a concurrent job's `tar -C "$d"` or `bash "$f"` on a bare-`mktemp` path hands that path to any job that looks, which can then read what is in it or replace a script before it runs. A workflow that keeps anything sensitive in a temp file, or runs a script from one, should create it under `$RUNNER_TEMP`, which is its own.
-- **Declared system paths**: A policy that declares OS read paths grants them for the whole job. `localmost policy init` seeds that list with OS subpaths (`/usr/bin`, `/usr/lib`, `/System`, `/Library/Developer` and similar) because nothing runs without them. It deliberately excludes `/usr/local`, `/Library/Application Support` and `/Applications`, which hold third-party software and application data - but a policy is free to add them back, and approving one means accepting that.
+- **The broker**: A job always reaches the broker's port, through its relay and through its proxy - see Network Policy below. The broker is protected from jobs only by its per-worker key.
+- **Processes running as you**: The CLI control socket is guarded only by file permissions (`0600` in a `0700` directory), and from `localmost test`'s steps by their sandbox's deny of it. Any process running as your user can control the app through it - pause, resume, add or remove targets - as it could by editing `~/.localmost` directly.
+- **Apple's Virtualization.framework**: A job runs in a macOS VM, and a Docker job's containers would run in a Linux VM. A bug in Apple's device emulation (virtio disk, graphics, input, entropy, vsock) or virtiofs server, which is closed source and has not been fuzzed here, is not contained by anything localmost adds. That boundary is what a job's isolation rests on.
+- **Root in the guest**: A job can become root in its own guest through a macOS flaw. Root there can rewrite the guest agent's answers, which the app treats as untrusted and bounded; it has no network card to bring up, reaches the Mac only through the same two relays, and its VM is discarded at the end of the job.
+- **The Mac's resources**: A job VM has 4 CPUs and 6 GiB of memory for its life, and disk until the data volume's free space falls below 10 GiB, when its VM is stopped. Both job VMs share that reserve, so one job's writes can end the other's.
+- **Declared system paths**: Under `localmost test`, a policy that declares OS read paths grants them for the whole run. `localmost policy init` seeds that list with OS subpaths (`/usr/bin`, `/usr/lib`, `/System`, `/Library/Developer` and similar) because nothing runs without them. It deliberately excludes `/usr/local`, `/Library/Application Support` and `/Applications`, which hold third-party software and application data - but a policy is free to add them back, and approving one means accepting that.
 
 ## Network Policy
 
 Job traffic is routed through a local proxy, which decides each connection by
-hostname. macOS `sandbox-exec` cannot filter by hostname - its `(remote ...)`
-filter matches only addresses and ports - so the sandbox permits the job's own
-proxy on loopback, and the proxy makes the decision. It also permits the local
-broker's port: the runner dials the broker directly at `127.0.0.1`, because its
-HTTP client sends a loopback destination around the proxy. What guards the
-broker is each worker's key (below), not a closed port.
+hostname. A runner job's VM has no network card: in the guest the agent
+listens on `127.0.0.1:<proxy port>` and `127.0.0.1:<broker port>` and relays
+each connection over vsock to the job's proxy and the broker on the Mac's
+loopback, and nothing else, so the proxy is the job's only way out. The runner
+dials the broker directly at `127.0.0.1`, because its HTTP client sends a
+loopback destination around the proxy; what guards the broker is each
+worker's key (below), not a closed port. No other loopback port of the Mac is
+reachable from a VM: `network.loopback`, which opens ports to a `localmost
+test` step (see Local Test Mode), is ignored for runner jobs, and the runner
+says so in its log.
 
-Other loopback ports are closed to a job's direct connections by default: a
-debugger listening on 9229, a browser's remote-debugging port, a local database
-or another tool's proxy is not the job's to open a socket to, and neither is a
-port a concurrent job opened, and its proxy will not forward to one for it
-either (see below).
-A repository whose jobs need loopback - a test suite that starts a server on an
-ephemeral `127.0.0.1` port and connects to it, or a local database the job
-starts itself on a fixed port - declares it in `.localmostrc`, under `shared:`
-only, since the profile is fixed when the worker starts:
-
-```yaml
-shared:
-  network:
-    loopback: true          # every loopback port
-    # loopback: [5432, 6379]  # or only these; seatbelt has no port ranges
-```
-
-The grant is shown in the approval card and `localmost policy show` with a note
-that the job can reach local services on those ports, and like every other key
-it is part of the approval diff and stamp. Loopback is shared by everything on the Mac: a job
-granted a port reaches whatever listens there, a concurrent job's server
-included, whichever repository it belongs to, and two jobs that bind the same
-fixed port collide.
-
-The proxy holds a request for a loopback address to the same ports, at every
+The proxy holds a request for a loopback address to the same rule, at every
 level, `permissive` included: a plain request or a `CONNECT` tunnel to
 `127.0.0.1`, `::1` or any other `127/8` address is refused with 403 unless its
-port is declared or is the broker's. `localhost`, and any other name for this
+port is the broker's (or, for a `localmost test` step, declared). `localhost`, and any other name for this
 machine, is refused on every port, declared and broker's included: only a
 literal address is forwarded to loopback. The broker's port stays
 open, through the proxy and directly, because the runner reaches the local
@@ -244,8 +190,8 @@ policy change, approved like any other:
 
 - **strict** (default): runner infrastructure, plus whatever the repository's
   `.localmostrc` declares
-- **moderate**: also GitHub Actions infrastructure, common package registries
-  and tool caches
+- **moderate**: also common package registries, and CDNs and GitHub content
+  hosts anyone can publish to
 - **permissive**: unrestricted
 
 A small set of hosts is allowed at every level, because the Actions runner is
@@ -265,8 +211,8 @@ port 80 as a plain proxied request; a client that tunnels it through `CONNECT`
 instead needs a `host:80` entry. `permissive` stays unrestricted, ports
 included, except on this machine: a literal loopback address (`127.0.0.1`,
 `::1`) is reachable through the proxy at every level on the broker's port,
-because the runner reaches the broker at `127.0.0.1`, and on the
-ports `shared.network.loopback` declares - no others. The broker is guarded by
+because the runner reaches the broker at `127.0.0.1` (and, for a `localmost
+test` step, on the ports `shared.network.loopback` declares) - no others. The broker is guarded by
 each worker's key, not by its port. A name that resolves to loopback,
 `localhost` included, is refused.
 
@@ -278,47 +224,16 @@ port can. Like the allow list, it matches names, not addresses:
 at `permissive` a job can still reach the same server by its address or another
 name.
 
-A runner job's filesystem starts from a fixed floor that its policy does not
-list. Besides its own sandbox directory (workspace and temp), it can read the
-operating system - `/System`, `/bin`, `/sbin`, `/usr/bin`, `/usr/lib`,
-`/usr/libexec`, `/usr/sbin`, `/usr/share`, `/etc`, `/private/etc`,
-`/private/var/db`, `/private/var/select`, `/Library/Apple`,
-`/Library/Preferences`, `/Library/Frameworks` - and `/Library/Developer`
-(the Command Line Tools and simulator support), and a few device files
-(`/dev/null`, `/dev/random` and the like); it can read and write its target's
-own tool cache when one is kept, and create files under the names `mktemp`
-generates in the per-user temp directory (and Swift Build's link step, with
-the `swiftBuildLinkTemp` preference on), and read and write the directory of
-its own there (see Shared temp directories above, for what the link step's
-names expose). Xcode itself
-(`/Applications/Xcode.app`, usually the active developer directory) is not on
-the floor: under `strict` a job that runs `xcodebuild` from it declares it.
-SwiftPM and Xcode run each package manifest under a sandbox of their own,
-which macOS refuses to start inside the job's; the `swift` and `xcodebuild`
-shims first on the job's `PATH` add the argument that turns it off
-(`--disable-sandbox`, `-IDEPackageSupportDisableManifestSandbox=YES`), so the
-manifest runs under the job's sandbox alone (the `jobEnvironment.toolShims`
-preference, set in the Job Environment section of Settings and on by
-default). A tool called by its absolute path or through `xcrun` bypasses the
-shims, and a manifest it has not compiled before fails as it did.
-Under `moderate` and `permissive` it can also read Homebrew, `/usr/local`,
-Xcode, the package-manager caches in your home and `~/.local/bin` and
-`~/.local/lib` (not the rest of `~/.local`), and write a package cache of its
-own. Everything else must be declared in
-`.localmostrc`, and the credential files and app directories listed under What
-localmost protects against stay closed whatever it declares. A repository's
-policy therefore tells you what a job may touch beyond that floor, not
-everything it may touch. A `localmost test` step has no such floor: beyond its
-workspace, the same few device files, the names `mktemp` generates in the
-per-user temp directory and, read-only, the code of
-the actions it runs, its policy lists everything it reads, system paths
-included. `localmost policy init` starts from a policy that runs, and
+A runner job's filesystem is its VM's: the guest's own macOS, the Command
+Line Tools and the runner baked into the golden image, and the job's
+workspace and temp, all on its disk clone and gone with it. Nothing of the
+Mac's filesystem is shared into it, so a policy's `filesystem:` grants give a
+runner job nothing yet, and its denies have nothing to deny. A `localmost
+test` step has a profile instead: beyond its workspace, a few device files,
+the names `mktemp` generates in the per-user temp directory and, read-only,
+the code of the actions it runs, its policy lists everything it reads, system
+paths included. `localmost policy init` starts from a policy that runs, and
 `localmost test --updaterc` records what a workflow actually needs.
-
-Directory nodes on the way down - `/`, and for a runner job `/Users`, your home
-directory and the app directories above its own sandbox and caches - are
-readable so that an absolute path resolves at all. They grant no access to
-anything inside.
 
 A repository's `.localmostrc` only takes effect once approved. When the runner
 sees a new or changed policy it refuses the job, cancels the run, and records
@@ -460,6 +375,20 @@ sandbox profile. The checkout is treated as untrusted, and so is its
   own sandbox, not your other processes. Each step has a sandbox of its own, so
   a later step cannot signal a server an earlier one left running; the end of
   the job reaps it.
+- **The rest of the profile is the one runner jobs had** before every job
+  moved into a macOS VM. A step writes no preference domain - not even
+  Xcode's, which your own Xcode loads - and reads only the domains a build
+  reads (the global domain, Xcode's, `xcodebuild`'s, Swift Build's, the
+  simulator's and codesign's); `~/Library/Preferences` is closed whatever the
+  policy grants, since cfprefsd would serve any domain through it. A
+  `filesystem.deny` entry refuses reads and writes of what it names and
+  everything beneath, over every grant, as written and by its real path, and
+  no directory above a denied or credential path can be renamed, created or
+  removed to carry it out from under the deny; a step cannot clone a
+  directory, which would copy a denied file inside it in one call. Under
+  `moderate` and `permissive` a step also reads the toolchains in your home
+  (`~/.cargo`, `~/.rustup`, `~/.local/bin` and `~/.local/lib`, `~/go`,
+  `~/.dotnet`, `~/.gradle`, `~/.m2`, `~/Library/Caches`), read-only.
 
 What test mode still trusts: a loopback grant is shared, so a step granted a
 port reaches whatever listens on it, not only what the step started.
@@ -480,6 +409,14 @@ port reaches whatever listens on it, not only what the step started.
   - `Variables: Read & Write` (org-level) - Write the `LOCALMOST_HEARTBEAT` variable at the organization level
 
 ### Docker Access
+
+**Not available to runner jobs yet.** A runner job runs in a macOS VM, and
+nothing carries the filtering socket below into it until the Docker relay is
+built. Until then a job whose approved policy grants its workflow any Docker
+action is refused at admission, with a reason naming the missing relay; it is
+never started without what its policy says it needs. What follows describes
+the filtering socket and the Docker VM behind it, which the relay will
+connect to, written as they served jobs that ran on the Mac.
 
 A repository may declare `docker:` in its approved `.localmostrc`. The job is
 never handed a daemon socket. localmost serves a unix socket of its own inside
@@ -816,7 +753,7 @@ with the evidence for each claim above, in
 
 ### Runner registrations
 
-Each target's runner registrations live in `~/.localmost/runner/proxies/<target>/<n>/`: the runner's settings and the registration's RSA key. GitHub trusts that key to act as the runner: whoever holds it can open a session under the runner's name and receive the jobs routed to it, with their secrets. It therefore never enters a job's sandbox.
+Each target's runner registrations live in `~/.localmost/runner/proxies/<target>/<n>/`: the runner's settings and the registration's RSA key. GitHub trusts that key to act as the runner: whoever holds it can open a session under the runner's name and receive the jobs routed to it, with their secrets. It therefore never enters a job's VM: the guest is given only the worker's own per-start key and the runner's settings.
 
 - **The broker signs, not the worker.** The local broker makes every call to GitHub as the runner itself, with the registration's key, app-side. The runner's listener only ever talks to the broker, and the broker ignores the token a worker presents. The job's own operations (fetching actions, caches, artifacts, logs) go to GitHub with the token GitHub issues for that one job, not with anything of the runner's.
 - **The runner's token goes only to GitHub.** The broker acquires a job, on the runner's token, only from a run service at an https host under `actions.githubusercontent.com`. The two job operations the broker forwards for a worker (`completejob` and `renewjob`) go there or to GitHub's broker, and nowhere else; it forwards no other request. A job offered with any other run service is left unacquired.
@@ -894,48 +831,33 @@ Key security features:
   - A file added, missing or changed stops the start, with a log line naming each difference; nothing runs from that copy. Any difference counts, a `.DS_Store` left by browsing the directory in Finder included. To reinstall, quit localmost, delete `~/.localmost/runner/arc` (all of it: with one version gone, the newest one left would be used) and download the runner again
   - An install from before records were kept gets its record from a fresh download of the same release, checked against the published checksum - never from what is on disk, which may already have been changed
   - A download is extracted aside and swapped in whole, replacing any installed copy of that version, so nothing left in the old directory survives into the new one or its record
-  - The record is only as trustworthy as the protection on where it is kept. Jobs cannot write any of `~/.localmost` or the app's Electron data directory except their own sandbox and their target's caches, nor rename either directory or any directory above it, whatever path a repository's policy declares writable: both directories are denied, read and write, after every grant in the job's sandbox profile, the directories above them are denied writes as nodes, and only the job's own sandbox and caches are given back after that, so a policy granting `~` or `~/.localmost` does not reach the runner, its record, or the staging directories downloads use
-- **Execution**: Runner binary is spawned as a child process with controlled environment
-- **Process Management**: Child processes are managed via Node.js ChildProcess handles
-  - Workers are spawned with `detached: true`, so each leads a process group of its own and a stop signals the whole group. They do not end with the app on their own: quitting localmost stops them first, and the next startup sweeps what an app that crashed or was killed left running
-  - Stop/cleanup uses direct process handles stored in the instances Map
-  - Stale process cleanup on startup never matches processes by name or path. It signals only what it can tie to a spawn of its own, from the records in `~/.localmost/runner/pids`, which no job can write: the processes still holding a spawn's marker file descriptor, found with `lsof`; a worker's process group from its pid file, only while the process at that pid has the start time recorded when it was spawned, so a reused pid is left alone; and, with the developer tools' `python3`, whatever still runs under a sandbox profile carrying the mark of a job that was never swept (see What a job leaves running above)
-- **Directory Isolation**: Each runner instance has its own working directory
+  - The record is only as trustworthy as the protection on where it is kept. A runner job reaches nothing of `~/.localmost`: no path of the Mac is shared into its VM. A `localmost test` step's profile denies `~/.localmost` and the app's Electron data directory, read and write, whatever its policy declares
+- **Execution**: A job's runner runs in its macOS VM, started by the guest agent as the guest's non-admin `runner` user with `--once` and nothing else; the host never executes the runner for a job. If the guest lacks the host's runner version, the host's checked copy is packed and uploaded, its SHA-256 verified by the agent. Registration runs `config.sh` on the Mac, unsandboxed - it contacts GitHub with your token and runs no workflow code - from a copy checked against the record
+- **Process Management**: A worker is the runner in its VM, seen through the guest agent: its output lines and exit come back over vsock, and stopping it sends SIGTERM through the agent and, five seconds later, stops the VM under it. A worker's exit, a reap of one that never took its job, and quitting all stop its VM and delete its disk clone
+  - At startup, before any job, every VM directory an earlier run left is removed, and the helper it recorded is killed only if that pid is alive and its executable is this app's macOS VM helper, since a pid may have been reused. Nothing is matched by name. The helper also stops its VM when it sees the app gone
+- **Directory Isolation**: Each worker start has a sandbox directory of its own on the Mac, holding the runner files its VM is given, and a disk clone of its own in its VM
 
 ## Runner Security Model
 
 localmost adds isolation layers that the stock GitHub Actions Runner lacks:
 
-### Sandbox Restrictions
+### Job Isolation
 
-| Resource | Access Level |
-|----------|--------------|
-| File system (write) | The job's own sandbox directory (workspace, temp and home), its target's own tool cache, under `moderate`/`permissive` its target's package cache, bare `mktemp` entries (and Swift Build link-step ones with `swiftBuildLinkTemp` on) and a directory of its own in the per-user temp, and what its approved policy declares |
-| File system (read) | Essential system paths (`/usr/bin`, `/System/Library`, `/Library/Developer`); under `moderate`/`permissive` also Homebrew, `/usr/local`, Xcode and the package-manager caches; and what its approved policy declares |
-| Network | Allowlisted hosts only (GitHub, npm, PyPI, etc.) via HTTP proxy |
-| Docker daemon | Through a filtering socket to a Linux VM of the job's own; only declared `pull`/`run`/`build` requests are forwarded |
-| Home directory | **Denied** — no access to `~/.ssh`, `~/.aws`, etc. |
-| Preferences | Reads only the domains a build reads (the global domain, Xcode's, `xcodebuild`'s, Swift Build's, the simulator's and codesign's); writes none, Xcode's included; `~/Library/Preferences` closed whatever the policy grants |
-| Other applications | **Denied** — no access to `/Applications`, except Xcode (`/Applications/Xcode.app`) under `moderate`/`permissive`, and what its approved policy declares |
+| Resource | Access |
+|----------|--------|
+| File system | The guest's own, on a disk clone of the golden image made for the job and deleted after it; nothing of the Mac is shared |
+| Network | No network card: only the job's proxy (an allowlist) and the broker, over two vsock relays |
+| Docker daemon | None yet: a job whose policy grants Docker is refused |
+| Home, keychain, preferences | The guest user's own; none of yours |
+| Other processes | The guest's own; none of the Mac's, and no other job's |
+| Environment variables | The runner's own, the locale and time zone, and what the repository's `env:` policy allows of the app's |
+| Privileges | The guest's non-admin `runner` user |
 
-### What Remains Accessible
+### Isolation Limits
 
-| Resource | Access Level |
-|----------|--------------|
-| Environment variables | The runner's own, a baseline of the app's (`PATH`, `USER`, locale; `HOME` is the job's own), and what the repository's `env:` policy allows |
-| Process spawning | Can spawn any executable in allowed paths |
-| Mach/IPC | System frameworks require this |
-
-### Sandbox Limitations
-
-The sandbox is **not** VM-level isolation. It primarily restricts filesystem writes:
-
-- **Network**: Proxied through an allowlist, but the allowlist is broad (GitHub, npm, PyPI, Docker Hub, etc.). A malicious workflow could exfiltrate data to any allowlisted host.
-- **Process spawning**: Allowed for any executable in permitted paths. CI runners genuinely require this capability.
-- **Mach/IPC**: Allowed because system frameworks require it. This is a fundamental macOS constraint.
-- **Read access**: Broader than write access—runners can read from `/usr/bin`, `/System/Library` and the Command Line Tools, and under `moderate`/`permissive` Xcode, Homebrew and the package-manager caches.
-
-The sandbox reduces attack surface but does not provide full containment. For untrusted code, don't use a self-hosted runner.
+- **Network**: Proxied through an allowlist, but the allowlist is broad under `moderate` (package registries, CDNs) and the runner's own hosts accept writes from any account. A malicious workflow could exfiltrate what it holds - its checkout and its secrets - to any allowed host.
+- **The VM boundary**: A job that becomes root in its guest, through a macOS flaw, can still reach the Mac only through Virtualization.framework's devices and the two relays. A flaw in those is not contained by anything localmost adds.
+- **Resources**: A job VM takes 4 CPUs and 6 GiB of memory, two at most at a time, and disk until the data volume's free space falls below 10 GiB.
 
 ### Risk Levels by Repository Type
 
@@ -950,12 +872,12 @@ The sandbox reduces attack surface but does not provide full containment. For un
 
 | Feature | GitHub-Hosted | localmost |
 |---------|---------------|-----------|
-| Fresh environment | New VM each job | New sandbox directory each job |
-| Filesystem isolation | VM boundary | sandbox-exec restricts writes |
-| Network isolation | VM boundary | Proxy allowlist |
-| Credential isolation | No access to host | Home directory denied |
+| Fresh environment | New VM each job | New macOS VM each job, cloned from a golden image |
+| Filesystem isolation | VM boundary | VM boundary; nothing of the Mac shared |
+| Network isolation | VM boundary | No network card; proxy allowlist |
+| Credential isolation | No access to host | No access to host |
 
-Every job gets a sandbox directory of its own, built fresh at a path no earlier job used, and its writes are confined to that directory and its target's own caches. Workflows cannot modify files elsewhere on your system or exfiltrate data to non-allowlisted hosts.
+Every job gets a VM of its own, restored from a state no job has touched, and the VM and its disk go when the job ends. Workflows cannot reach files on your Mac or send data to hosts their proxy does not allow.
 
 ### User Filter
 
@@ -1019,7 +941,7 @@ This approach simplifies workflows by:
 
 ### CLI Socket
 
-The `localmost` CLI talks to the app over a unix socket, mode `0600` inside a `0700` directory. There is no application token on top of that: any process running as the same user can connect and pause, resume, or add and remove targets. A job cannot reach the socket, because the sandbox denies it. Requests are capped in size and answered one at a time per connection, and the CLI writes its own files with umask `077`.
+The `localmost` CLI talks to the app over a unix socket, mode `0600` inside a `0700` directory. There is no application token on top of that: any process running as the same user can connect and pause, resume, or add and remove targets. A job cannot reach the socket: nothing of the Mac's filesystem reaches its VM, and a `localmost test` step's sandbox denies it. Requests are capped in size and answered one at a time per connection, and the CLI writes its own files with umask `077`.
 
 ## Log Sanitization
 
@@ -1051,7 +973,7 @@ Code signing is required for distribution to prevent tampering warnings and esta
 - "Developer ID Application" certificate for distribution outside App Store
 - "Developer ID Installer" certificate if distributing PKG installers
 
-**Entitlements**: The app and every helper are signed with the hardened runtime and only the exceptions each needs. The app, its main, GPU and renderer helpers and Squirrel's ShipIt carry `com.apple.security.cs.allow-jit` (`packaging/entitlements.plist`); the plugin helper carries `cs.allow-unsigned-executable-memory` and `cs.disable-library-validation`, as Chromium's does (`packaging/entitlements.plugin.plist`); the camera helper in Resources (`is-camera-on`, which only reads CoreMediaIO's is-running-somewhere property of each camera to pause during video calls) carries none (`packaging/entitlements.none.plist`), and so does the `docker` CLI bundled for jobs (`Resources/docker-cli/docker`); the Docker VM helper in Resources (`localmost-vm`) and the macOS VM helper beside it (`localmost-macvm`) carry only `com.apple.security.virtualization`, with no JIT or library-validation exception (`packaging/entitlements.virtualization.plist`), and the macOS VM's guest agent (`localmost-macvm-agent`), which runs only inside the guest, carries none. A job's seatbelt profile denies the exec of both VM helpers, so a job cannot start a VM of its own. The Docker VM's guest files (`Resources/guest`) are data the helper hands the VM, not macOS code, and are not signed themselves; they are covered by the app bundle's seal like any other resource, so `codesign --verify` fails if one is changed, and the app also checks their hashes against the guest manifest once per launch. No device or personal information entitlement - camera, microphone, USB, Bluetooth, printing, location - and not the App Sandbox, under which the app could not run jobs under `sandbox-exec`. @electron/osx-sign reads entitlements only from `optionsForFile`; given none, it signs with its own defaults, which grant the device and location entitlements, and releases through 0.2.0 carried them. The app's Info.plist declares no usage either: Electron's template says why it would use the camera, microphone, audio capture and Bluetooth, and a packager hook (`scripts/remove-usage-descriptions.js`, run just before signing) removes every `NS...UsageDescription` key from the app's and its helpers' Info.plist.
+**Entitlements**: The app and every helper are signed with the hardened runtime and only the exceptions each needs. The app, its main, GPU and renderer helpers and Squirrel's ShipIt carry `com.apple.security.cs.allow-jit` (`packaging/entitlements.plist`); the plugin helper carries `cs.allow-unsigned-executable-memory` and `cs.disable-library-validation`, as Chromium's does (`packaging/entitlements.plugin.plist`); the camera helper in Resources (`is-camera-on`, which only reads CoreMediaIO's is-running-somewhere property of each camera to pause during video calls) carries none (`packaging/entitlements.none.plist`), and so does the `docker` CLI bundled for jobs (`Resources/docker-cli/docker`); the Docker VM helper in Resources (`localmost-vm`) and the macOS VM helper beside it (`localmost-macvm`) carry only `com.apple.security.virtualization`, with no JIT or library-validation exception (`packaging/entitlements.virtualization.plist`), and the macOS VM's guest agent (`localmost-macvm-agent`), which runs only inside the guest, carries none. A job runs in a guest, which has neither helper; a `localmost test` step's seatbelt profile denies the exec of both, so neither can start a VM of its own. The Docker VM's guest files (`Resources/guest`) are data the helper hands the VM, not macOS code, and are not signed themselves; they are covered by the app bundle's seal like any other resource, so `codesign --verify` fails if one is changed, and the app also checks their hashes against the guest manifest once per launch. No device or personal information entitlement - camera, microphone, USB, Bluetooth, printing, location - and not the App Sandbox, under which the app could not run its helpers and `localmost test`'s steps under `sandbox-exec`. @electron/osx-sign reads entitlements only from `optionsForFile`; given none, it signs with its own defaults, which grant the device and location entitlements, and releases through 0.2.0 carried them. The app's Info.plist declares no usage either: Electron's template says why it would use the camera, microphone, audio capture and Bluetooth, and a packager hook (`scripts/remove-usage-descriptions.js`, run just before signing) removes every `NS...UsageDescription` key from the app's and its helpers' Info.plist.
 
 **Forge config for signing and notarization:**
 ```js

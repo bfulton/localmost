@@ -2276,7 +2276,7 @@ export class RunnerManager {
       this.log('warn', `[instance ${instanceNum}]   Blocked hosts: ${blockedList}${moreCount}`);
 
       if (policyLevel === 'strict') {
-        this.log('info', `[instance ${instanceNum}]   To allow these hosts, add them to your .localmostrc file, or change sandbox policy level in Settings > Job Security.`);
+        this.log('info', `[instance ${instanceNum}]   To allow these hosts, add them to network.allow in the repository's .localmostrc, or raise its level.`);
       }
     }
 
