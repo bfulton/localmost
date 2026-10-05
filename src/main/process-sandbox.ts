@@ -170,6 +170,12 @@ export interface RunnerProfileOptions {
    * the virtualization entitlement, and would boot a VM of the job's choosing.
    */
   vmHelper?: string;
+  /**
+   * The macOS VM helper, which the job may not run by any path either: it
+   * carries the same entitlement, and its provisioning boot has a NAT
+   * network device, which would give the job a way out past its proxy.
+   */
+  macVmHelper?: string;
   /** This worker's target's tool cache, if it keeps one across jobs. */
   toolCacheDir?: string;
   /** This worker's target's package-manager cache; ignored under strict. */
@@ -241,6 +247,7 @@ export function generateSandboxProfile({
   shareDir,
   dockerCli,
   vmHelper,
+  macVmHelper,
   toolCacheDir: toolCache,
   packageCacheDir: packageCache,
   tempSuffixDir,
@@ -271,17 +278,20 @@ export function generateSandboxProfile({
     ].join('\n');
   })(dockerSocket);
   const dockerShareRules = shareRules(instanceDir, shareDir, dockerCli);
+  const execDeny = (helper: string) => `(deny process-exec* (literal "${helper.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"))`;
   const vmHelperRule =
-    vmHelper === undefined
+    vmHelper === undefined && macVmHelper === undefined
       ? ''
       : [
           '',
-          ';; The Docker VM helper carries the virtualization entitlement: run by the',
-          ";; job, it would boot a VM of the job's choosing, outside the admission gate.",
-          ';; Seatbelt needs no read of a Mach-O to exec it, so the deny is on the exec,',
-          ';; and a literal is enough: the job can neither read nor link the helper,',
-          ';; and exec is matched on the path it resolves to.',
-          `(deny process-exec* (literal "${vmHelper.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"))`,
+          ';; The Docker VM helper and the macOS VM helper carry the virtualization',
+          ";; entitlement: run by the job, either would boot a VM of the job's choosing,",
+          ';; outside the admission gate (the macOS one with a NAT network device of',
+          ';; its own). Seatbelt needs no read of a Mach-O to exec it, so the deny is on',
+          ';; the exec, and a literal is enough: the job can neither read nor link a',
+          ';; helper, and exec is matched on the path it resolves to.',
+          ...(vmHelper !== undefined ? [execDeny(vmHelper)] : []),
+          ...(macVmHelper !== undefined ? [execDeny(macVmHelper)] : []),
         ].join('\n');
 
   const escapedDir = instanceDir.replace(/"/g, '\\"');
@@ -846,6 +856,8 @@ export interface SandboxOptions extends SpawnOptions {
   dockerCli?: string;
   /** The Docker VM helper the job may not run; see RunnerProfileOptions.vmHelper. */
   vmHelper?: string;
+  /** The macOS VM helper the job may not run; see RunnerProfileOptions.macVmHelper. */
+  macVmHelper?: string;
   /**
    * The worker's target's own tool cache, kept across that target's jobs.
    * Absent means none: the runner keeps its tools in the job's work directory.
@@ -914,6 +926,7 @@ export function spawnSandboxed(
     shareDir,
     dockerCli,
     vmHelper,
+    macVmHelper,
     toolCacheDir,
     packageCacheDir,
     tempSuffixDir,
@@ -943,6 +956,7 @@ export function spawnSandboxed(
       shareDir,
       dockerCli,
       vmHelper,
+      macVmHelper,
       toolCacheDir,
       packageCacheDir,
       tempSuffixDir,

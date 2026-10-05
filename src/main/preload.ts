@@ -22,6 +22,7 @@ import {
   ResourcePauseState,
   PolicySummary,
 } from '../shared/types';
+import { MACOS_VM_CHANNELS, type MacVmSetupApi, type MacVmSetupStatus } from '../shared/macos-vm-setup';
 
 // Initialize zubridge preload handlers
 const { handlers: zubridgeHandlers } = preloadBridge();
@@ -179,6 +180,20 @@ contextBridge.exposeInMainWorld('localmost', {
       return () => ipcRenderer.removeListener(IPC_CHANNELS.RESOURCE_STATE_CHANGED, handler);
     },
   },
+
+  // The macOS VM mode's golden image (src/renderer/components/MacVmSetup.tsx)
+  macosVm: {
+    getStatus: () => ipcRenderer.invoke(MACOS_VM_CHANNELS.GET_STATUS),
+    build: () => ipcRenderer.invoke(MACOS_VM_CHANNELS.BUILD),
+    cancel: () => ipcRenderer.invoke(MACOS_VM_CHANNELS.CANCEL),
+    openGuidedSetup: () => ipcRenderer.invoke(MACOS_VM_CHANNELS.OPEN_GUIDED_SETUP),
+    remove: () => ipcRenderer.invoke(MACOS_VM_CHANNELS.REMOVE),
+    onStatusChange: (callback: (status: MacVmSetupStatus) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, status: MacVmSetupStatus) => callback(status);
+      ipcRenderer.on(MACOS_VM_CHANNELS.STATUS_CHANGED, handler);
+      return () => ipcRenderer.removeListener(MACOS_VM_CHANNELS.STATUS_CHANGED, handler);
+    },
+  },
 });
 
 // Type declarations for the exposed API
@@ -266,6 +281,7 @@ export interface LocalmostAPI {
     getState: () => Promise<ResourcePauseState>;
     onStateChange: (callback: (state: ResourcePauseState) => void) => () => void;
   };
+  macosVm: MacVmSetupApi;
 }
 
 declare global {

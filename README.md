@@ -289,7 +289,7 @@ Future feature ideas:
 - **Disk space monitoring** - Warn or pause when disk is low, auto-clean trash directories and caches.
 - **Linux and Windows host support** - Run self-hosted runners on non-Mac machines for projects that need them.
 - **Higher parallelism cap** - Parallelize proxy registration to support 16+ concurrent runners (currently capped at 8 due to serial registration time).
-- **macOS VM jobs** - The `macos-vm` isolation type: each job runs in a fresh macOS VM cloned from a golden image, with policy grants mapped to shares and a window server of its own ([design](docs/roadmap/macos-vm-jobs.md)).
+- **macOS VM jobs** - An opt-in per-repository isolation level that runs each job in a fresh macOS VM cloned from a golden image, as a non-admin guest user with no network card and nothing of the host shared ([design](docs/roadmap/macos-vm-jobs.md)).
 - **Filtering VM network stack** - A userspace network stack for the Docker VM that enforces the job's hostname policy on traffic that ignores proxy settings ([design](docs/roadmap/vm-network-stack.md)).
 - **Service-account jobs** - The `service-account` isolation type: headless jobs run as a hidden `_localmost` user with its own temp directory, preferences and no access to your keychain ([design](docs/roadmap/service-account-jobs.md)).
 

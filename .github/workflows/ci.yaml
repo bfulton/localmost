@@ -103,8 +103,9 @@ jobs:
             echo "- **Type**: GitHub-hosted runner (fallback)" >> $GITHUB_STEP_SUMMARY
           fi
 
-  # The Docker VM's native code: the Swift helper (native/localmost-vm) and
-  # the Go guest programs (guest/). It runs on a GitHub-hosted Apple silicon
+  # The VMs' native code: the Swift helpers (native/localmost-vm, and
+  # native/localmost-macvm with its guest agent) and the Go guest programs
+  # (guest/). It runs on a GitHub-hosted Apple silicon
   # runner, whatever the check above selects, because the self-hosted leg
   # runs inside a localmost job and the fallback leg has no Swift with
   # Virtualization. Nothing here boots a VM: hosted runners have no nested
@@ -122,6 +123,16 @@ jobs:
 
       - name: Test the VM helper
         run: swift test --package-path native/localmost-vm
+
+      # The macOS VM helper and its guest agent: their arguments, the golden
+      # image's files, clones and slots, the install and VM state machines
+      # against fake VZ layers, and the agent's protocol and setup plan.
+      # Nothing here installs or boots macOS.
+      - name: Build the macOS VM helper
+        run: swift build --package-path native/localmost-macvm
+
+      - name: Test the macOS VM helper
+        run: swift test --package-path native/localmost-macvm
 
       - name: Setup Go
         uses: actions/setup-go@v5
