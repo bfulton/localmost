@@ -694,7 +694,7 @@ build's own check: the restore image, an image estimate and a reserve):
    guest's macOS, `/Library/Developer/CommandLineTools`, a 200 through the
    proxy, `no-route` without it, and no host volume.
 5. Two such jobs at once both run, each in its own slot (the app's log names
-   slots 1 and 2); a third waits until one ends.
+   slots 1 and 2); a third stays queued on GitHub until one ends.
 6. After the jobs, `<data>/macos-vm/vms/` is empty and `pgrep -fl
    localmost-macvm` finds nothing.
 7. `localmost test -v` in a checkout whose workflow runs `id; pwd; git
@@ -705,3 +705,47 @@ build's own check: the restore image, an image estimate and a reserve):
    running on the runner's node, and the VM gone after the run. Ctrl-C during
    a long step ends it and the VM; with the image removed, the run names the
    setup step.
+
+What the reviews could not check without a guest, each with what to run in
+it (a workflow step, or `localmost test -v`):
+
+8. **The exec chain.** Whether `launchctl asuser` forks or execs `exec-as`,
+   and so what a step's session and process group are: `ps -o
+   pid,ppid,pgid,sess,uid,command -p $$ $PPID` and `ps -axo
+   pid,ppid,pgid,uid,command | grep -e launchctl -e exec-as` from a step.
+   Expect the step under `runner`'s uid, in a process group of its own that
+   the agent's KILL reaches, no `launchctl` or `exec-as` left running as
+   root, and `env` in the step holding the job's names and the agent's own,
+   nothing else (no `XPC_*` or `LAUNCHD_*` beyond what launchd itself adds).
+9. **Entropy after a restore.** Two jobs at once (both slots), each running
+   `head -c 32 /dev/urandom | xxd -p` and `openssl rand -hex 32` as its first
+   step, and a TLS handshake (`curl -sv https://github.com 2>&1 | grep -i
+   'SSL connection'`): the two VMs' values differ, and differ again in a
+   second pair of jobs from the same saved states.
+10. **Escape attempts.** From a step: `ifconfig -l` lists only `lo0`;
+    `nc -z -G 3 192.168.64.1 22` and `curl -s --noproxy '*'
+    http://192.168.64.1/` fail; through the proxy, `curl -sI
+    http://127.0.0.1:<a port the host listens on, not the broker's>/` and
+    `curl -sI http://localtest.me:<same port>/` get 403; a vsock connect
+    from the guest to any host port but the proxy's and the broker's relay
+    ports is refused (a small `socket(AF_VSOCK)` program, host CID 2); and a
+    connection from inside the guest to the agent's vsock port 1025 (guest
+    CID, from the guest itself) is rejected - the agent takes the host only.
+11. **A malicious upload.** `put` a tar holding `../escape`, an absolute
+    `/tmp/abs`, and a symlink `link -> /Users/runner` followed by a file
+    `link/planted` (the agent's own test harness, or a crafted
+    `localmost test` checkout): nothing lands outside
+    `/Users/runner/work/<dest>`, and nothing is written as root.
+12. **The golden image after a restore.** In a job: `sudo -n true` fails;
+    `launchctl print system/com.openssh.sshd` shows it disabled and `nc -z
+    127.0.0.1 22` fails; `ls -l /etc/kcpassword` is `root` and `-rw-------`;
+    `dscl . -read /Groups/admin GroupMembership` does not name `runner`. On
+    the host, nothing under `<data>/macos-vm/` keeps the administrator's
+    password (`grep -r` for it in the build log and the image's files finds
+    nothing).
+13. **Provisioning's SSH.** During a build's setup, `ps -axo command | grep
+    '[s]sh '` shows the setup's `ssh` with `StrictHostKeyChecking=accept-new`
+    and a known-hosts file of the build's own (not `~/.ssh/known_hosts`,
+    bootstrap.ts), connecting only to the
+    provisioning VM's NAT address (192.168.64.x) from the DHCP lease, and
+    the known-hosts file gone with the build directory afterwards.
