@@ -181,6 +181,13 @@ describe('runTest', () => {
     expect(logs.join('\n')).toMatch(/Filesystem grants are not provided in the macOS VM yet; this run goes without: write ~\/Library\/LaunchAgents/);
   }, RUN_TIMEOUT_MS);
 
+  it('says network.loopback is ignored, and runs anyway', async () => {
+    fs.writeFileSync(path.join(checkout, '.localmostrc'), 'version: 1\nshared:\n  network:\n    loopback: true\n');
+    const result = await runTest({}, fakeVm().deps);
+    expect(result.success).toBe(true);
+    expect(logs.join('\n')).toMatch(/network\.loopback is ignored/);
+  }, RUN_TIMEOUT_MS);
+
   it('fails clearly, and leaves nothing listening, when the app is not running to lend a VM', async () => {
     const stop = jest.spyOn((await import('../shared/discovery-proxy')).DiscoveryProxy.prototype, 'stop');
     try {

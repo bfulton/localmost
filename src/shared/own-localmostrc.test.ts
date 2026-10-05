@@ -14,8 +14,9 @@ describe("this repository's .localmostrc", () => {
     expect(result.success).toBe(true);
   });
 
-  it('grants loopback, which its test suites need to reach the servers they start', () => {
-    // The suites bind ephemeral 127.0.0.1 ports, so no fixed list would do.
-    expect(result.config?.shared?.network?.loopback).toBe(true);
+  it('parses without a warning: nothing in it is ignored', () => {
+    // Its suites bind ephemeral 127.0.0.1 ports, which the job's macOS VM
+    // has of its own: the network.loopback it once declared is ignored now.
+    expect(result.warnings).toEqual([]);
   });
 });

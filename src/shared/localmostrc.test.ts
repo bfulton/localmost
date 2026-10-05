@@ -791,15 +791,12 @@ describe('writing a policy back', () => {
     return reparsed.config;
   };
 
-  it.each([
-    ['every port', true],
-    ['a port list', [5432, 6379]],
-  ] as const)('keeps every key the grammar accepts, with loopback as %s', (_label, loopback) => {
+  it('keeps every key the grammar accepts', () => {
     const config: LocalmostrcConfig = {
       version: 1,
       level: 'moderate',
       shared: {
-        network: { allow: ['github.com'], deny: ['tracker.example'], loopback: loopback as true | number[] },
+        network: { allow: ['github.com'], deny: ['tracker.example'] },
         filesystem: { read: ['/usr/local'], write: ['./build'], deny: ['~/.ssh'] },
         env: { allow: ['NODE_OPTIONS'], deny: ['AWS_SECRET_ACCESS_KEY'] },
         docker: { pull: { registries: ['docker.io'] } },
@@ -1083,10 +1080,10 @@ describe('a policy key the grammar does not know', () => {
   });
 
   it('is refused inside a section too, and the message names the keys that section accepts', () => {
-    // `lookback: true` read as a loopback grant and did nothing; `denny:`
-    // read as a protection that did not exist. Both validated clean.
+    // `alow:` read as a grant and did nothing; `denny:` read as a
+    // protection that did not exist. Both validated clean.
     const cases: Array<[string, string, string[]]> = [
-      ['  network:\n    lookback: true\n', 'shared.network.lookback', ['allow', 'deny', 'loopback']],
+      ['  network:\n    alow: ["github.com"]\n', 'shared.network.alow', ['allow', 'deny']],
       ['  filesystem:\n    denny: ["~/.ssh"]\n', 'shared.filesystem.denny', ['read', 'write', 'deny']],
       ['  env:\n    alow: ["CI"]\n', 'shared.env.alow', ['allow', 'deny']],
     ];
@@ -1107,7 +1104,7 @@ describe('a policy key the grammar does not know', () => {
 
   it('still accepts every key a section knows', () => {
     const ok = parse(
-      '  network:\n    allow: ["github.com"]\n    deny: ["evil.example"]\n    loopback: [5432]\n' +
+      '  network:\n    allow: ["github.com"]\n    deny: ["evil.example"]\n' +
       '  filesystem:\n    read: ["/etc"]\n    write: ["~/.npm"]\n    deny: ["~/.ssh"]\n' +
       '  env:\n    allow: ["CI"]\n    deny: ["AWS_*"]\n'
     );
@@ -1209,66 +1206,30 @@ describe('a network entry', () => {
 });
 
 describe('network.loopback', () => {
-  const shared =(value: string) => parseLocalmostrcContent(`version: 1\nshared:\n  network:\n    loopback: ${value}\n`);
-  const messages = (value: string) => shared(value).errors.map((e) => e.message).join('\n');
-
-  it('accepts every port, or a list of ports, under shared:', () => {
-    expect(shared('true').config?.shared?.network?.loopback).toBe(true);
-    expect(shared('[5432, 6379]').config?.shared?.network?.loopback).toEqual([5432, 6379]);
-    expect(shared('[1, 65535]').success).toBe(true);
-  });
-
-  it('refuses anything but true or a list of distinct ports', () => {
-    for (const value of ['false', '"all"', '5432', '{}', '', '[0]', '[65536]', '[-1]', '[1.5]', '["5432"]', '[true]']) {
-      expect([value, shared(value).success]).toEqual([value, false]);
-      expect(messages(value)).toMatch(/shared\.network\.loopback/);
-    }
-    expect(messages('[5432, 5432]')).toMatch(/shared\.network\.loopback lists port 5432 twice/);
-  });
-
-  it('is refused per workflow, since the sandbox profile is fixed when the worker starts', () => {
-    const r = parseLocalmostrcContent('version: 1\nworkflows:\n  ci:\n    network:\n      loopback: true\n');
-    expect(r.success).toBe(false);
-    expect(r.errors.map((e) => e.message).join('\n')).toMatch(
-      /workflows\.ci\.network\.loopback is only accepted under shared\.network: the sandbox profile is fixed when the worker starts/
+  // It opened ports on this Mac's loopback to a job's sandbox. A job's macOS
+  // VM has a loopback of its own and reaches this Mac only through its
+  // proxy, so a file that still declares it parses, with one warning, and
+  // the key is neither approved nor shown.
+  it('is ignored with a warning, under shared and per workflow, whatever it says', () => {
+    const r = parseLocalmostrcContent(
+      'version: 1\nshared:\n  network:\n    allow: ["github.com"]\n    loopback: true\n' +
+      'workflows:\n  ci:\n    network:\n      loopback: [5432, 5432, "x"]\n'
     );
+    expect(r.errors).toEqual([]);
+    expect(r.success).toBe(true);
+    expect(r.warnings).toEqual([
+      "shared.network.loopback is ignored: a job's macOS VM has its own loopback, and reaches this Mac only through its proxy.",
+      "workflows.ci.network.loopback is ignored: a job's macOS VM has its own loopback, and reaches this Mac only through its proxy.",
+    ]);
+    expect(r.config?.shared?.network).toEqual({ allow: ['github.com'] });
+    expect(r.config?.workflows?.ci?.network).toEqual({});
   });
 
-  it('is a policy change, so a new grant is approved before it applies', () => {
-    const base: LocalmostrcConfig = { version: 1, shared: { network: { allow: ['github.com'] } } };
-    const withLoopback = (loopback: true | number[]): LocalmostrcConfig => ({
-      version: 1,
-      shared: { network: { allow: ['github.com'], loopback } },
-    });
-    expect(diffConfigs(base, withLoopback(true))).toEqual([
-      { path: 'shared.network.loopback', type: 'added', newValue: 'every port' },
-    ]);
-    expect(diffConfigs(withLoopback([5432]), withLoopback([5432, 6379]))).toEqual([
-      { path: 'shared.network.loopback', type: 'added', newValue: '6379' },
-    ]);
-    expect(diffConfigs(withLoopback([5432]), withLoopback(true))).toEqual([
-      { path: 'shared.network.loopback', type: 'added', newValue: 'every port' },
-      { path: 'shared.network.loopback', type: 'removed', oldValue: '5432' },
-    ]);
-    expect(diffConfigs(withLoopback([5432]), withLoopback([5432]))).toEqual([]);
-  });
-
-  it('survives serialization', () => {
-    for (const loopback of [true, [5432, 6379]] as const) {
-      const config: LocalmostrcConfig = { version: 1, shared: { network: { loopback: loopback as true | number[] } } };
-      const reparsed = parseLocalmostrcContent(serializeLocalmostrc(config));
-      expect(reparsed.config?.shared?.network?.loopback).toEqual(loopback);
-    }
-  });
-
-  it('carries into the effective policy of every workflow', () => {
-    const config: LocalmostrcConfig = {
-      version: 1,
-      shared: { network: { loopback: [5432] } },
-      workflows: { ci: { network: { allow: ['x.example'] } } },
-    };
-    expect(getEffectivePolicy(config, 'ci').network).toEqual(
-      expect.objectContaining({ allow: ['x.example'], loopback: [5432] })
-    );
+  it('changes nothing approved: a file with it reads as the same policy without it', () => {
+    const without = parseLocalmostrcContent('version: 1\nshared:\n  network:\n    allow: ["github.com"]\n').config!;
+    const withIt = parseLocalmostrcContent('version: 1\nshared:\n  network:\n    allow: ["github.com"]\n    loopback: [5432]\n').config!;
+    expect(withIt).toEqual(without);
+    expect(diffConfigs(without, withIt)).toEqual([]);
+    expect(serializeLocalmostrc(withIt)).not.toMatch(/loopback/);
   });
 });

@@ -44,8 +44,8 @@ export interface ProxyLogEntry {
   /**
    * Why the request was allowed/blocked. 'port' is a refusal of a host that
    * is allowed, but not on the port asked for; 'denied' of a host the
-   * repository's policy denies; 'loopback' of a port on this machine the
-   * policy does not open.
+   * repository's policy denies; 'loopback' of a port on this machine that
+   * is not open to the job.
    */
   reason?: 'infrastructure' | 'policy' | 'allowlist' | 'moderate-default' | 'permissive' | 'port' | 'denied' | 'loopback';
 }
@@ -117,7 +117,7 @@ export class ProxyServer {
   private policyDeniedHosts: string[] = [];
   /** The broker's port, the one loopback port open whatever the policy. */
   private brokerPort = DEFAULT_BROKER_PORT;
-  /** Loopback the policy declares beyond the broker: every port, these ones, or none. */
+  /** Loopback opened beyond the broker: every port, these ones, or none - which is what a job gets. */
   private loopback: true | number[] | undefined;
   private static readonly MAX_ACQUIRE_BODY_BYTES = 64 * 1024;
 
@@ -208,11 +208,12 @@ export class ProxyServer {
 
     // This machine, on the ports the job may reach and no others, whatever
     // the level: the broker's, which the runner reaches through this proxy
-    // and which its per-worker key rather than the port guards, and the ones
-    // the repository's policy declares. The sandbox closes every other
-    // loopback port to the job's own sockets, and without this the job had
-    // only to ask its proxy instead - localhost and 127.0.0.1 are on the
-    // infrastructure list, and permissive allows anything.
+    // and which its per-worker key rather than the port guards, and any
+    // opened with setLoopbackPolicy - none, for a job. A job's macOS VM has
+    // a loopback of its own; asked of this proxy, a literal loopback target
+    // is this Mac's, and without this the job had only to ask - localhost
+    // and 127.0.0.1 are on the infrastructure list, and permissive allows
+    // anything.
     if (isLoopbackTarget(normalizedHost)) {
       if (port === this.brokerPort) return { allowed: true, reason: 'infrastructure' };
       const declared = this.loopback === true || (this.loopback?.includes(port) ?? false);
@@ -261,8 +262,7 @@ export class ProxyServer {
   /** The body of a 403 for a host checkHostAccess refused. */
   private refusal(host: string, port: number, reason: ProxyLogEntry['reason']): string {
     if (reason === 'loopback') {
-      return `Blocked by sandbox policy (${this.policyLevel}): port ${port} on this machine is not open to this job; ` +
-        `a .localmostrc shared.network.loopback entry opens it`;
+      return `Blocked by sandbox policy (${this.policyLevel}): port ${port} on this machine is not open to this job`;
     }
     if (reason === 'denied') {
       return `Blocked by sandbox policy (${this.policyLevel}): host '${host}' is denied by the repository's .localmostrc`;
@@ -348,16 +348,13 @@ export class ProxyServer {
   }
 
   /**
-   * Set which loopback ports the job about to run may reach through this
-   * proxy: the broker's, which the runner cannot work without, and those
-   * its repository's approved policy declares - every port for `true`, the
-   * listed ones for a list, none for undefined.
-   *
-   * The sandbox closes a job's direct connections to loopback except to this
-   * proxy and the declared ports; a literal loopback target asked of the
-   * proxy is held to the same ports, or the proxy would be the way round
-   * it. Until this is called only the default broker port is open. Replaces
-   * the previous job's grant, as setPolicyAllowedHosts does.
+   * Set which loopback ports of this Mac the job about to run may reach
+   * through this proxy: the broker's, which the runner cannot work without,
+   * and `loopback` beyond it - every port for `true`, the listed ones for a
+   * list, none for undefined. The runner opens none: no policy can declare
+   * any, since a job's macOS VM has a loopback of its own. Until this is
+   * called only the default broker port is open. Replaces the previous
+   * job's, as setPolicyAllowedHosts does.
    */
   setLoopbackPolicy(brokerPort: number, loopback: true | number[] | undefined): void {
     this.brokerPort = brokerPort;

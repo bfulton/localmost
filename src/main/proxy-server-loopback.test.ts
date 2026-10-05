@@ -1,13 +1,12 @@
 /**
  * Loopback through a worker's own proxy.
  *
- * The sandbox closes a job's direct connections to loopback except to its
- * proxy and the ports its repository declares. The proxy treated a literal
- * loopback target as runner infrastructure on any port, so the same job
- * reached every local service - a debugger on 9229, a dev database, another
- * app's local API - by asking its proxy instead. A literal loopback target
- * is now refused unless it is the broker's port or one the repository's
- * approved policy declares.
+ * A job's macOS VM has a loopback of its own; asked of its proxy, a literal
+ * loopback target is this Mac's. The proxy treated one as runner
+ * infrastructure on any port, so a job reached every local service - a
+ * debugger on 9229, a dev database, another app's local API - by asking its
+ * proxy. A literal loopback target is now refused unless it is the broker's
+ * port or one opened with setLoopbackPolicy, which the runner opens none of.
  */
 
 import * as http from 'http';
@@ -54,7 +53,7 @@ describe('literal loopback through the proxy', () => {
       expect(checkHost(proxy, '127.0.0.1', DEFAULT_BROKER_PORT).allowed).toBe(false);
     });
 
-    it('opens exactly the ports the policy lists', () => {
+    it('opens exactly the ports it is given', () => {
       const proxy = new ProxyServer({ policyLevel: level });
       proxy.setLoopbackPolicy(DEFAULT_BROKER_PORT, [5432, 6379]);
       expect(checkHost(proxy, '127.0.0.1', 5432)).toEqual({ allowed: true, reason: 'policy' });
@@ -63,7 +62,7 @@ describe('literal loopback through the proxy', () => {
       expect(checkHost(proxy, '127.0.0.1', DEFAULT_BROKER_PORT).allowed).toBe(true);
     });
 
-    it('opens every port when the policy declares all of loopback', () => {
+    it('opens every port when it is given all of loopback', () => {
       const proxy = new ProxyServer({ policyLevel: level });
       proxy.setLoopbackPolicy(DEFAULT_BROKER_PORT, true);
       expect(checkHost(proxy, '127.0.0.1', 9229).allowed).toBe(true);
@@ -94,11 +93,11 @@ describe('literal loopback through the proxy', () => {
     expect(checkHost(proxy, '127.0.0.1', DEFAULT_BROKER_PORT)).toEqual({ allowed: true, reason: 'infrastructure' });
   });
 
-  it('says which loopback port was refused and where to declare it', () => {
+  it('says which loopback port was refused, and points at no key that could open it', () => {
     const proxy = new ProxyServer({ policyLevel: 'strict' });
     const body = (proxy as unknown as { refusal(h: string, p: number, r: string): string }).refusal('127.0.0.1', 9229, 'loopback');
-    expect(body).toContain('9229');
-    expect(body).toContain('network.loopback');
+    expect(body).toContain('port 9229 on this machine is not open to this job');
+    expect(body).not.toContain('network.loopback');
   });
 });
 

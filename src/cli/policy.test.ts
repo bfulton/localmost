@@ -192,7 +192,7 @@ describe('policy show --workflow', () => {
     // as plain effective grants, which the runner never makes.
     const out = show('--workflow', 'deploy');
     expect(out).toMatch(/FASTLANE_\*.*not applied/);
-    expect(out).toMatch(/\.\/out.*not applied to runner jobs/);
+    expect(out).toMatch(/\.\/out.*not applied yet/);
     expect(out).toMatch(/deploy \(any pull request can claim this\)/);
     // The shared section and the level still apply to it, and are shown.
     expect(out).toMatch(/moderate/);

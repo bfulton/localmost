@@ -16,7 +16,7 @@ import { MODERATE_NETWORK_ALLOWLIST, RUNNER_INFRASTRUCTURE_ALLOWLIST } from './n
  */
 const everything = {
   level: 'permissive' as const,
-  network: { allow: ['github.com'], deny: ['evil.example'], loopback: [5432] },
+  network: { allow: ['github.com'], deny: ['evil.example'] },
   filesystem: { read: ['/etc'], write: ['~/.npm'], deny: ['~/.ssh'] },
   env: { allow: ['CI'], deny: ['AWS_SECRET_ACCESS_KEY'] },
   docker: {
@@ -32,7 +32,7 @@ describe('describePolicy', () => {
     const text = describePolicy(everything).map((g) => `${g.group} ${g.marker} ${g.value} ${g.summary}`).join('\n');
     for (const value of [
       'github.com', 'evil.example', '/etc', '~/.npm', '~/.ssh',
-      'CI', 'AWS_SECRET_ACCESS_KEY', 'docker.io', 'alpine:3', 'vk-*', './docker', 'myapp:*', 'DEPLOY_KEY', 'permissive', '5432',
+      'CI', 'AWS_SECRET_ACCESS_KEY', 'docker.io', 'alpine:3', 'vk-*', './docker', 'myapp:*', 'DEPLOY_KEY', 'permissive',
     ]) {
       expect(text).toContain(value);
     }
@@ -81,9 +81,9 @@ describe('describePolicy', () => {
 
   it('names what a loosened level opens, not just that it is common', () => {
     // "Common package registries" read as a narrow grant. Moderate also opens
-    // whole CDN domains and GitHub content hosts anyone can publish to, and
-    // under localmost test both levels read the toolchains installed in the
-    // home directory. A runner job's VM has a home of its own.
+    // whole CDN domains and GitHub content hosts anyone can publish to. A
+    // job's VM has a home and toolchains of its own, so a level is only its
+    // proxy's.
     const [moderate] = describePolicy({ level: 'moderate' });
     const wildcards = MODERATE_NETWORK_ALLOWLIST.filter(
       (host) => host.startsWith('*.') && !RUNNER_INFRASTRUCTURE_ALLOWLIST.includes(host)
@@ -95,17 +95,9 @@ describe('describePolicy', () => {
 
     for (const level of ['moderate', 'permissive'] as const) {
       const [grant] = describePolicy({ level });
-      for (const dir of ['~/.cargo', '~/.local/bin', '~/.local/lib', '~/go', '~/Library/Caches']) {
-        expect(grant.summary).toContain(dir);
-      }
-      // Not ~/.local as a whole: tools keep their tokens in ~/.local/share.
-      expect(grant.summary).not.toMatch(/~\/\.local[,)]/);
-      // Read, not write: the home trees hold directories on the user's PATH,
-      // and a job's package managers are pointed at a cache of its own.
-      expect(grant.summary).toMatch(/under localmost test, also read access to toolchains/);
-      expect(grant.summary).not.toMatch(/write access to toolchain/);
-      expect(grant.summary).not.toMatch(/package-manager cache/);
+      expect(grant.summary).not.toMatch(/~\/|toolchain|localmost test/);
     }
+    expect(describePolicy({ level: 'permissive' })[0].summary).toMatch(/allows every network host/);
   });
 
   it('says nothing for strict, which is the baseline and grants nothing extra', () => {
@@ -124,7 +116,7 @@ describe('describePolicy', () => {
   it('warns on a write to a place something outside the sandbox acts on', () => {
     const [grant] = describePolicy({ filesystem: { write: ['~/Library/LaunchAgents'] } });
     expect(grant.warning).toMatch(/launchd/);
-    expect(grant.summary).toMatch(/^write: ~\/Library\/LaunchAgents \(not applied to runner jobs.*\) \(warning: launchd runs/);
+    expect(grant.summary).toMatch(/^write: ~\/Library\/LaunchAgents \(not applied yet.*\) \(warning: launchd runs/);
   });
 
   it('warns on a write to the home directory itself', () => {
@@ -142,15 +134,14 @@ describe('describePolicy', () => {
     // reviewer read a denial that did not exist. Both are enforced now.
     const grants = describePolicy({ network: { deny: ['bad.example'] }, filesystem: { deny: ['~/.aws'] } });
     expect(grants[0].summary).toMatch(/^network denied: bad\.example \(refused even where an allow or the level/);
-    expect(grants[1].summary).toMatch(/^denied: ~\/\.aws \(under localmost test, no read or write even inside a granted path/);
-    // A runner job's VM sees none of this Mac's filesystem, the denied path included.
-    expect(grants[1].summary).toMatch(/a runner job's macOS VM reaches nothing of this Mac's filesystem\)$/);
+    // A job's VM sees none of this Mac's filesystem yet, the denied path included.
+    expect(grants[1].summary).toMatch(/^denied: ~\/\.aws \(nothing of this Mac's filesystem reaches a job's macOS VM yet; once VM shares exist, no read or write inside a granted path\)$/);
   });
 
   it('says which workflow-scoped grants the runner cannot apply', () => {
     // The environment is fixed when a worker starts, before the workflow is
     // known, so a per-workflow env allow was listed as a grant the runner
-    // never made; and a runner job's VM is given no filesystem grants.
+    // never made; and a job's VM is given no filesystem grants yet.
     const grants = describePolicy(
       {
         network: { allow: ['api.example.com'] },
@@ -163,28 +154,16 @@ describe('describePolicy', () => {
     const line = (value: string) => grants.find((g) => g.value === value)!.summary;
     expect(line('api.example.com')).toBe('deploy: network: api.example.com');
     for (const value of ['/opt/x', './out']) {
-      expect(line(value)).toMatch(/\(not applied to runner jobs: their macOS VM is given no filesystem grants yet; only localmost test applies it\)$/);
+      expect(line(value)).toMatch(/\(not applied yet: a job's macOS VM is given no filesystem grants until VM shares exist\)$/);
     }
-    expect(line('~/.aws')).toMatch(/\(under localmost test, no read or write/);
+    expect(line('~/.aws')).toMatch(/\(nothing of this Mac's filesystem reaches a job's macOS VM yet/);
     expect(line('FASTLANE_*')).toMatch(/\(not applied: the environment is fixed when the worker starts.*declare it under shared:\)$/);
     expect(line('AWS_*')).toMatch(/\(applied to every job, not only this workflow's/);
   });
 
-  it('says nothing of scope for the same grants under shared:, but that a runner job is not given the filesystem', () => {
+  it('says nothing of scope for the same grants under shared:, but that a job is not given the filesystem yet', () => {
     const grants = describePolicy({ filesystem: { write: ['./out'] }, env: { allow: ['CI'], deny: ['AWS_*'] } });
-    expect(grants.map((g) => g.summary)).toEqual([`write: ./out (not applied to runner jobs: their macOS VM is given no filesystem grants yet; only localmost test applies it)`, 'env: CI', 'env denied: AWS_*']);
-  });
-
-  it('shows a loopback grant with what it lets the job reach', () => {
-    const [all] = describePolicy({ network: { loopback: true } });
-    expect(all.summary).toMatch(/^loopback: every port \(only localmost test applies it: a runner job's macOS VM reaches only its proxy and the broker\) \(warning: the job can connect to any service listening on this Mac's loopback/);
-    const [some] = describePolicy({ network: { loopback: [5432, 6379] } });
-    expect(some.summary).toMatch(/^loopback: ports 5432, 6379 \(only localmost test.*\) \(warning: the job can connect to local services listening on these ports/);
-    expect(describePolicy({ network: { loopback: [5432] } })[0].value).toBe('port 5432');
-  });
-
-  it('says nothing about loopback when none is granted', () => {
-    expect(describePolicy({ network: { loopback: [] } })).toEqual([]);
+    expect(grants.map((g) => g.summary)).toEqual([`write: ./out (not applied yet: a job's macOS VM is given no filesystem grants until VM shares exist)`, 'env: CI', 'env denied: AWS_*']);
   });
 
   it('prefixes the flat summary, which is how a workflow scope is shown', () => {

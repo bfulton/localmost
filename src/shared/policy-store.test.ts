@@ -231,16 +231,6 @@ describe('the stamp', () => {
     expect(approvalStamp(REPO, NARROW)).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it('changes with the loopback grant', () => {
-    const withLoopback = (loopback: true | number[]): LocalmostrcConfig => ({
-      version: 1,
-      shared: { network: { allow: ['index.crates.io'], loopback } },
-    });
-    expect(approvalStamp(REPO, withLoopback(true))).not.toBe(approvalStamp(REPO, NARROW));
-    expect(approvalStamp(REPO, withLoopback([5432]))).not.toBe(approvalStamp(REPO, withLoopback(true)));
-    expect(approvalStamp(REPO, withLoopback([5432]))).not.toBe(approvalStamp(REPO, withLoopback([5433])));
-  });
-
   it('covers the repository id when there is one, and is unchanged when there is none', () => {
     expect(approvalStamp(REPO, NARROW, 1)).not.toBe(approvalStamp(REPO, NARROW, 2));
     expect(approvalStamp(REPO, NARROW, 1)).not.toBe(approvalStamp(REPO, NARROW));

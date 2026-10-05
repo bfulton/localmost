@@ -2,8 +2,8 @@
  * How a repository's approved policy reaches a worker: its proxy (hosts,
  * denied hosts, level), its environment and its docker socket - for the job
  * the worker actually claimed, under the name GitHub gives the repository,
- * and never for a worker that has since finished. Loopback a policy declares
- * is not given: a macOS VM job reaches only its proxy and the broker.
+ * and never for a worker that has since finished. On loopback the proxy
+ * opens the broker's port and no other.
  */
 
 
@@ -140,9 +140,9 @@ beforeEach(() => {
 });
 
 describe("a claimed job's denied hosts on its proxy", () => {
-  it('installs them with the hosts, and keeps loopback to the broker whatever the policy declares', async () => {
+  it('installs them with the hosts, and keeps loopback to the broker', async () => {
     const { helper } = managerWith({
-      getRepoPolicy: async () => policy({ hosts: ['ok.example'], deniedHosts: ['bad.example'], loopback: [5432] }),
+      getRepoPolicy: async () => policy({ hosts: ['ok.example'], deniedHosts: ['bad.example'] }),
     });
     const proxy = fakeProxy();
     helper.setProxy(1, proxy);
@@ -153,12 +153,12 @@ describe("a claimed job's denied hosts on its proxy", () => {
 
     expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith(['ok.example']);
     expect(proxy.setPolicyDeniedHosts).toHaveBeenLastCalledWith(['bad.example']);
-    expect(proxy.setLoopbackPolicy).not.toHaveBeenCalledWith(BROKER_PORT, [5432]);
+    expect(proxy.setLoopbackPolicy).toHaveBeenLastCalledWith(BROKER_PORT, undefined);
   });
 
   it('closes them when the worker is finished, so the next job on the slot starts without them', async () => {
     const { helper } = managerWith({
-      getRepoPolicy: async () => policy({ deniedHosts: ['bad.example'], loopback: true }),
+      getRepoPolicy: async () => policy({ deniedHosts: ['bad.example'] }),
     });
     const proxy = fakeProxy();
     helper.setProxy(1, proxy);

@@ -194,10 +194,10 @@ describe('a worker started for a job', () => {
     expect(served).toEqual([path.join(first.job.sandboxDir, 'docker.sock'), path.join(second.job.sandboxDir, 'docker.sock')]);
   });
 
-  it("names the policy's filesystem grants and loopback, which a VM job is not given, when it starts", async () => {
+  it("names the policy's filesystem grants, which a VM job is not given, when it starts", async () => {
     const { manager, helper, logs } = newManager({
       getRepoPolicy: async () => ({
-        hosts: [], level: 'strict', docker: {}, readPaths: ['~/data'], writePaths: ['./out'], denyPaths: ['~/.ssh'], loopback: [5432],
+        hosts: [], level: 'strict', docker: {}, readPaths: ['~/data'], writePaths: ['./out'], denyPaths: ['~/.ssh'],
       }),
     });
     await manager.initialize();
@@ -207,7 +207,6 @@ describe('a worker started for a job', () => {
 
     const warnings = logs.filter((l) => l.level === 'warn').map((l) => l.message);
     expect(warnings).toContain('[instance 1] Filesystem grants are not provided in the macOS VM yet; this job runs without: read ~/data, write ./out');
-    expect(warnings).toContain('[instance 1] network.loopback is ignored: a macOS VM job reaches only its proxy and the broker');
   });
 });
 

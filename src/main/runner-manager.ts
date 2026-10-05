@@ -178,12 +178,6 @@ export interface RepoPolicyRuntime {
   /** Paths the policy denies. Nothing of the Mac's filesystem reaches a VM job, so nothing to apply. */
   denyPaths?: string[];
   /**
-   * Loopback the policy declares. A macOS VM job reaches only its own proxy
-   * and the broker, so this is never applied; it is named in the log when
-   * its worker starts.
-   */
-  loopback?: true | number[];
-  /**
    * The identity of the approved policy a worker is started under, the same
    * whichever workflow it is asked for (see policyStamp in repo-policy).
    * Absent, nothing is compared.
@@ -2088,17 +2082,13 @@ export class RunnerManager {
 
   /**
    * Say, as a worker starts, what of its approved policy a macOS VM job is
-   * not given: filesystem grants, which wait for VM shares, and loopback,
-   * since the guest reaches only its proxy and the broker. A deny needs
+   * not given: filesystem grants, which wait for VM shares. A deny needs
    * nothing: no path of the Mac reaches the guest.
    */
   private logUnprovided(instanceNum: number, policy: RepoPolicyRuntime): void {
     const grants = [...policy.readPaths.map((p) => `read ${p}`), ...policy.writePaths.map((p) => `write ${p}`)];
     if (grants.length > 0) {
       this.log('warn', `[instance ${instanceNum}] Filesystem grants are not provided in the macOS VM yet; this job runs without: ${grants.join(', ')}`);
-    }
-    if (policy.loopback !== undefined) {
-      this.log('warn', `[instance ${instanceNum}] network.loopback is ignored: a macOS VM job reaches only its proxy and the broker`);
     }
   }
 

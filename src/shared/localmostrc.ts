@@ -10,7 +10,6 @@ import {
   POLICY_SECTION_SUBKEYS,
   PolicyScope,
   WORKFLOW_POLICY_KEYS,
-  loopbackValues,
 } from './policy-describe';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
@@ -41,22 +40,8 @@ export interface WorkflowPolicy extends PolicyRules {
   secrets?: SecretsPolicy;
 }
 
-/** The network section as `shared:` may declare it. */
-export interface SharedNetworkPolicy extends NetworkPolicy {
-  /**
-   * Loopback ports a job may connect to directly, not through its proxy:
-   * `true` for every port, or a list (seatbelt has no port ranges). Without
-   * it a job reaches only its own proxy on loopback. Shared only: it is part
-   * of the sandbox profile, fixed when the worker starts, before the
-   * workflow is known.
-   */
-  loopback?: true | number[];
-}
-
-/** What `shared:` may declare: a section, plus what only a whole worker can be given. */
-export interface SharedPolicy extends PolicyRules {
-  network?: SharedNetworkPolicy;
-}
+/** What `shared:` may declare. */
+export type SharedPolicy = PolicyRules;
 
 /**
  * Keys a policy section once accepted that no longer decide anything. A
@@ -66,6 +51,15 @@ export interface SharedPolicy extends PolicyRules {
  */
 const IGNORED_POLICY_KEYS: Readonly<Record<string, string>> = Object.freeze({
   isolation: 'every job runs in a macOS VM, so there is no isolation type to choose',
+});
+
+/**
+ * The same, inside the network section. `network.loopback` opened ports on
+ * this Mac's loopback to a job's sandbox; a job's macOS VM has a loopback of
+ * its own, and reaches this Mac only through its proxy.
+ */
+const IGNORED_NETWORK_KEYS: Readonly<Record<string, string>> = Object.freeze({
+  loopback: "a job's macOS VM has its own loopback, and reaches this Mac only through its proxy",
 });
 
 export interface LocalmostrcConfig {
@@ -394,6 +388,11 @@ function withoutIgnoredKeys(policy: unknown): unknown {
   if (typeof policy !== 'object' || policy === null) return policy;
   const kept = { ...(policy as Record<string, unknown>) };
   for (const key of Object.keys(IGNORED_POLICY_KEYS)) delete kept[key];
+  if (typeof kept.network === 'object' && kept.network !== null) {
+    const network = { ...(kept.network as Record<string, unknown>) };
+    for (const key of Object.keys(IGNORED_NETWORK_KEYS)) delete network[key];
+    kept.network = network;
+  }
   return kept;
 }
 
@@ -431,7 +430,7 @@ function validatePolicy(policy: unknown, path: string, errors: ParseError[], sco
 
   // Validate network policy
   if (p.network !== undefined) {
-    validateNetworkPolicy(p.network, `${path}.network`, errors, scope);
+    validateNetworkPolicy(p.network, `${path}.network`, errors, warnings);
   }
 
   // Validate filesystem policy
@@ -462,13 +461,18 @@ function validatePolicy(policy: unknown, path: string, errors: ParseError[], sco
   }
 }
 
-function validateNetworkPolicy(policy: unknown, path: string, errors: ParseError[], scope: PolicyScope): void {
+function validateNetworkPolicy(policy: unknown, path: string, errors: ParseError[], warnings: string[]): void {
   if (typeof policy !== 'object' || policy === null) {
     errors.push({ message: `${path} must be an object` });
     return;
   }
 
-  const p = policy as Record<string, unknown>;
+  const p = { ...(policy as Record<string, unknown>) };
+  for (const key of Object.keys(IGNORED_NETWORK_KEYS)) {
+    if (!Object.hasOwn(p, key)) continue;
+    warnings.push(`${path}.${key} is ignored: ${IGNORED_NETWORK_KEYS[key]}.`);
+    delete p[key];
+  }
   refuseUnknownKeys(p, path, POLICY_SECTION_SUBKEYS.network, errors);
 
   if (p.allow !== undefined) {
@@ -476,9 +480,6 @@ function validateNetworkPolicy(policy: unknown, path: string, errors: ParseError
   }
   if (p.deny !== undefined) {
     validateHostPatternArray(p.deny, `${path}.deny`, errors);
-  }
-  if (p.loopback !== undefined) {
-    validateLoopback(p.loopback, `${path}.loopback`, errors, scope);
   }
 }
 
@@ -525,39 +526,6 @@ function validateHostPatternArray(value: unknown, path: string, errors: ParseErr
     if (typeof entry !== 'string') return;
     const problem = hostPatternProblem(entry);
     if (problem) errors.push({ message: `${path}[${i}] ${problem}` });
-  });
-}
-
-/**
- * Loopback is written into the sandbox profile, which a worker is spawned
- * with before anyone knows which workflow it will run - so, like the
- * filesystem, it can only come from `shared:`. A per-workflow one is refused
- * rather than shown and not applied. Ports are listed one by one because
- * seatbelt matches a single port or all of them, never a range.
- */
-function validateLoopback(value: unknown, path: string, errors: ParseError[], scope: PolicyScope): void {
-  if (scope === 'workflow') {
-    errors.push({
-      message:
-        `${path} is only accepted under shared.network: the sandbox profile is fixed when the worker starts, ` +
-        'before the workflow is known.',
-    });
-    return;
-  }
-  if (value === true) return;
-  if (!Array.isArray(value)) {
-    errors.push({ message: `${path} must be true (every port) or a list of port numbers` });
-    return;
-  }
-  const seen = new Set<number>();
-  value.forEach((port, i) => {
-    if (typeof port !== 'number' || !Number.isInteger(port) || port < 1 || port > 65535) {
-      errors.push({ message: `${path}[${i}] must be a port number from 1 to 65535` });
-    } else if (seen.has(port)) {
-      errors.push({ message: `${path} lists port ${port} twice` });
-    } else {
-      seen.add(port);
-    }
   });
 }
 
@@ -709,9 +677,9 @@ function mergeArrays(base?: string[], override?: string[]): string[] | undefined
  * Merge network policies.
  */
 function mergeNetworkPolicy(
-  base?: SharedNetworkPolicy,
+  base?: NetworkPolicy,
   override?: NetworkPolicy
-): SharedNetworkPolicy | undefined {
+): NetworkPolicy | undefined {
   if (!base && !override) {
     return undefined;
   }
@@ -719,8 +687,6 @@ function mergeNetworkPolicy(
   return {
     allow: mergeArrays(base?.allow, override?.allow),
     deny: mergeArrays(base?.deny, override?.deny),
-    // Only the shared section can declare it, and it holds for every workflow.
-    ...(base?.loopback !== undefined ? { loopback: base.loopback } : {}),
   };
 }
 
@@ -870,11 +836,8 @@ function serializePolicy(policy: SharedPolicy, indent: string): string[] {
   }
 
   if (policy.network) {
-    const { allow, deny, loopback } = policy.network;
+    const { allow, deny } = policy.network;
     const body = [...serializeList('allow', allow, inner), ...serializeList('deny', deny, inner)];
-    if (loopback !== undefined) {
-      body.push(`${inner}loopback: ${loopback === true ? 'true' : `[${loopback.join(', ')}]`}`);
-    }
     lines.push(...serializeSection('network', body, indent));
   }
 
@@ -950,14 +913,6 @@ function diffPolicies(
   // Network
   diffArrays(oldPolicy.network?.allow, newPolicy.network?.allow, `${prefix}.network.allow`, diffs);
   diffArrays(oldPolicy.network?.deny, newPolicy.network?.deny, `${prefix}.network.deny`, diffs);
-  // Each port its own entry, and "every port" one of its own, so widening a
-  // list to all of them reads as exactly that.
-  diffArrays(
-    loopbackValues(oldPolicy.network?.loopback),
-    loopbackValues(newPolicy.network?.loopback),
-    `${prefix}.network.loopback`,
-    diffs
-  );
 
   // Filesystem
   diffArrays(oldPolicy.filesystem?.read, newPolicy.filesystem?.read, `${prefix}.filesystem.read`, diffs);

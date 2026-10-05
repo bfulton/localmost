@@ -42,7 +42,7 @@ export const WORKFLOW_POLICY_KEYS = [...POLICY_SECTION_KEYS, 'secrets'] as const
  * grammar of its own, closed in docker-policy.
  */
 export const POLICY_SECTION_SUBKEYS = {
-  network: ['allow', 'deny', 'loopback'],
+  network: ['allow', 'deny'],
   filesystem: ['read', 'write', 'deny'],
   env: ['allow', 'deny'],
   secrets: ['require'],
@@ -60,8 +60,7 @@ export const DESCRIBED_POLICY_KEYS = [...WORKFLOW_POLICY_KEYS, 'level'] as const
 export interface DescribablePolicy {
   /** Top of the file only; a caller describing the whole policy passes it in. */
   level?: SandboxPolicyLevel;
-  /** `loopback` is shared-scope only; validation refuses it in a workflow. */
-  network?: { allow?: string[]; deny?: string[]; loopback?: true | number[] };
+  network?: { allow?: string[]; deny?: string[] };
   filesystem?: { read?: string[]; write?: string[]; deny?: string[] };
   env?: { allow?: string[]; deny?: string[] };
   docker?: DockerPolicy;
@@ -99,24 +98,17 @@ const MODERATE_WILDCARDS = MODERATE_NETWORK_ALLOWLIST.filter(
   (host) => host.startsWith('*.') && !RUNNER_INFRASTRUCTURE_ALLOWLIST.includes(host)
 );
 
-// Under localmost test only, both loosened levels also read the toolchains
-// installed in the home directory (levelToolchainPaths in sandbox-profile).
-// A runner job runs in a macOS VM with a home of its own, so the level is
-// only its proxy's for it.
-const HOME_TOOLCHAIN_ACCESS =
-  'under localmost test, also read access to toolchains in your home (~/.cargo, ~/.rustup, ~/.local/bin, ' +
-  '~/.local/lib, ~/go, ~/.dotnet, ~/.gradle, ~/.m2, ~/Library/Caches)';
-
 /**
- * What a level grants beyond strict. Strict is the baseline and has no entry:
- * it grants nothing a policy has to be approved for.
+ * What a level grants beyond strict, all of it the proxy's: a job runs in a
+ * macOS VM with a home and toolchains of its own. Strict is the baseline and
+ * has no entry: it grants nothing a policy has to be approved for.
  */
 const LEVEL_GRANTS: Record<Exclude<SandboxPolicyLevel, 'strict'>, string> = {
   moderate:
     `adds package registries, every host under ${MODERATE_WILDCARDS.join(', ')}, and GitHub content hosts ` +
     `(${CONTENT_HOSTS.filter((host) => MODERATE_NETWORK_ALLOWLIST.includes(host)).join(', ')}) - ` +
-    `CDNs and content hosts anyone can publish to; ${HOME_TOOLCHAIN_ACCESS}`,
-  permissive: `allows every network host; ${HOME_TOOLCHAIN_ACCESS}`,
+    'CDNs and content hosts anyone can publish to',
+  permissive: 'allows every network host',
 };
 
 /**
@@ -128,29 +120,12 @@ const LEVEL_GRANTS: Record<Exclude<SandboxPolicyLevel, 'strict'>, string> = {
  */
 export type PolicyScope = 'shared' | 'workflow';
 
-/** A loopback grant as the entries a diff compares: each port, or every one. */
-export function loopbackValues(loopback: true | number[] | undefined): string[] | undefined {
-  if (loopback === undefined) return undefined;
-  return loopback === true ? ['every port'] : loopback.map(String);
-}
-
-// A job otherwise reaches nothing on loopback but its own proxy. Services
-// that listen there - a dev database, a debugger on 9229, a browser's remote
-// debugging on 9222, another job's test server - mostly trust whoever can
-// connect, so this is shown as a warning, not a plain grant.
-const LOOPBACK_ALL =
-  "the job can connect to any service listening on this Mac's loopback interface - local databases, " +
-  "debuggers, dev servers, other jobs' test servers - without going through its proxy";
-const LOOPBACK_PORTS =
-  'the job can connect to local services listening on these ports on this Mac, without going through its proxy';
-const LOOPBACK_NOT_APPLIED = "only localmost test applies it: a runner job's macOS VM reaches only its proxy and the broker";
-
-// A runner job runs in a macOS VM, which is given none of this Mac's
-// filesystem yet (VM shares are to come); localmost test still applies it.
-const FILESYSTEM_NOT_APPLIED = 'not applied to runner jobs: their macOS VM is given no filesystem grants yet; only localmost test applies it';
+// A job runs in a macOS VM, which is given none of this Mac's filesystem
+// yet (VM shares are to come), and is told at its start which grants it
+// goes without; localmost test says the same before it runs.
+const FILESYSTEM_NOT_APPLIED = "not applied yet: a job's macOS VM is given no filesystem grants until VM shares exist";
 const FILESYSTEM_DENY =
-  "under localmost test, no read or write even inside a granted path, the job's own sandbox excepted; " +
-  "a runner job's macOS VM reaches nothing of this Mac's filesystem";
+  "nothing of this Mac's filesystem reaches a job's macOS VM yet; once VM shares exist, no read or write inside a granted path";
 const ENV_ALLOW_NOT_APPLIED =
   'not applied: the environment is fixed when the worker starts, before the workflow is known; declare it under shared:';
 const ENV_DENY_EVERYWHERE =
@@ -184,19 +159,10 @@ export function describePolicy(policy: DescribablePolicy, prefix = '', scope: Po
   add('Network allow', '+', 'network', policy.network?.allow);
   // A deny is checked ahead of every grant, so it holds against an allow
   // that would cover it, and against the level. Runner infrastructure is
-  // the one exception on the network side: the runner cannot work without it.
-  // On the filesystem side the profile re-allows the job's own sandbox and
-  // its target's caches after the policy's deny, so neither can be denied.
+  // the one exception: the runner cannot work without it.
   add('Network deny', '-', 'network denied', policy.network?.deny, {
     note: 'refused even where an allow or the level would let it through; runner infrastructure excepted',
   });
-  const loopback = policy.network?.loopback;
-  if (loopback === true) {
-    add('Network loopback', '+', 'loopback', ['every port'], { note: LOOPBACK_NOT_APPLIED, warn: () => LOOPBACK_ALL });
-  } else if (loopback?.length) {
-    const ports = `${loopback.length === 1 ? 'port' : 'ports'} ${loopback.join(', ')}`;
-    add('Network loopback', '+', 'loopback', [ports], { note: LOOPBACK_NOT_APPLIED, warn: () => LOOPBACK_PORTS });
-  }
   add('Filesystem read', 'r', 'read', policy.filesystem?.read, { note: FILESYSTEM_NOT_APPLIED });
   add('Filesystem write', 'w', 'write', policy.filesystem?.write, {
     note: FILESYSTEM_NOT_APPLIED,

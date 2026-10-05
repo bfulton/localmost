@@ -326,7 +326,7 @@ describe('mergeDiscoveredAccess', () => {
     expect(additions).toEqual([]);
   });
 
-  it('writes back what the file already declared, loopback and deny lists included', () => {
+  it('writes back what the file already declared, deny lists included, and drops what it ignores', () => {
     // --updaterc rewrites the whole file, not just what it adds: a
     // hand-written grant or protection it drops or garbles is lost.
     const existing = parseLocalmostrcContent([
@@ -354,7 +354,7 @@ describe('mergeDiscoveredAccess', () => {
     expect(reparsed.config).toEqual({
       version: 1,
       shared: {
-        network: { allow: ['github.com', 'registry.npmjs.org'], deny: ['tracker.example'], loopback: [5432, 6379] },
+        network: { allow: ['github.com', 'registry.npmjs.org'], deny: ['tracker.example'] },
         filesystem: { deny: ['~/.ssh'] },
         env: { deny: ['*_TOKEN'] },
       },

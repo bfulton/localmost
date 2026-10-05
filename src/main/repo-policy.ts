@@ -63,7 +63,6 @@ export function repoPolicyRuntime(approved: LocalmostrcConfig | null, workflowNa
     };
   }
   const policy = getEffectivePolicy(approved, workflowName);
-  const loopback = approved.shared?.network?.loopback;
   return {
     // Network is resolved per workflow and applied to the proxy per job.
     hosts: policy.network?.allow || [],
@@ -76,9 +75,6 @@ export function repoPolicyRuntime(approved: LocalmostrcConfig | null, workflowNa
     readPaths: approved.shared?.filesystem?.read || [],
     writePaths: approved.shared?.filesystem?.write || [],
     denyPaths: approved.shared?.filesystem?.deny || [],
-    // Declared, and named in the log as not given: a VM job reaches only its
-    // proxy and the broker. An empty list declares nothing.
-    ...(loopback === true || (Array.isArray(loopback) && loopback.length > 0) ? { loopback } : {}),
     // Docker composes across shared and workflow: the socket is bound to
     // the merged policy when the job is claimed, after the workflow is known.
     docker: policy.docker ?? {},
