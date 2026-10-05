@@ -73,10 +73,9 @@ describe('policyStamp', () => {
     }
   });
 
-  it('does not change with what no worker holds: required secrets, loopback, the order of workflows', () => {
+  it('does not change with what no worker holds: required secrets, the order of workflows', () => {
     const before = policyStamp(base);
     expect(stamp((c) => { c.workflows!.deploy.secrets = { require: ['KEY'] }; })).toBe(before);
-    expect(stamp((c) => { c.shared!.network!.loopback = [5432]; })).toBe(before);
     expect(stamp((c) => { c.workflows = { build: {}, ...c.workflows }; })).toBe(
       stamp((c) => { c.workflows = { ...c.workflows, build: {} }; })
     );

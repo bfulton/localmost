@@ -153,7 +153,7 @@ describe("a claimed job's denied hosts on its proxy", () => {
 
     expect(proxy.setPolicyAllowedHosts).toHaveBeenLastCalledWith(['ok.example']);
     expect(proxy.setPolicyDeniedHosts).toHaveBeenLastCalledWith(['bad.example']);
-    expect(proxy.setLoopbackPolicy).toHaveBeenLastCalledWith(BROKER_PORT, undefined);
+    for (const [port, grant] of (proxy.setLoopbackPolicy as jest.Mock).mock.calls) expect([port, grant]).toEqual([BROKER_PORT, undefined]);
   });
 
   it('closes them when the worker is finished, so the next job on the slot starts without them', async () => {
@@ -236,7 +236,7 @@ describe("a claimed job's denied hosts on its proxy", () => {
 
   it('keeps denied hosts when drift cuts a claim back to infrastructure', async () => {
     const { helper } = managerWith({
-      getRepoPolicy: async () => policy({ hosts: ['ok.example'], deniedHosts: ['bad.example'], loopback: true }),
+      getRepoPolicy: async () => policy({ hosts: ['ok.example'], deniedHosts: ['bad.example'] }),
     });
     const proxy = fakeProxy();
     helper.setProxy(1, proxy);
@@ -317,7 +317,7 @@ describe("a spawned worker", () => {
     // runner that never came up. Left as they are, both stay live until the
     // slot is next started, which may be never.
     const { manager } = managerWith({
-      getRepoPolicy: async () => policy({ hosts: ['ok.example'], deniedHosts: ['bad.example'], loopback: [5432], level: 'permissive' }),
+      getRepoPolicy: async () => policy({ hosts: ['ok.example'], deniedHosts: ['bad.example'], level: 'permissive' }),
     });
     const { proxy, held } = holdingProxy({ hosts: [], denied: [], loopback: undefined, level: 'strict', token: 'last-job' });
     let atSpawn: typeof held | undefined;
@@ -510,7 +510,7 @@ describe('a policy lookup that outlives its worker', () => {
     helper.setDockerProxy(1, socket);
     helper.setInstance(1, { name: 'runner-1', status: 'listening' });
     helper.setPendingTargetContext('1', { targetId: 't1', targetDisplayName: 'owner/repo', githubSha: 'abc1234' });
-    const late = policy({ hosts: ['old-job.example'], deniedHosts: [], loopback: true, level: 'permissive', docker: { run: { images: ['alpine:3'] } } });
+    const late = policy({ hosts: ['old-job.example'], deniedHosts: [], level: 'permissive', docker: { run: { images: ['alpine:3'] } } });
     const untouched = () => {
       for (const fn of [proxy.setPolicyAllowedHosts, proxy.setPolicyDeniedHosts, proxy.setLoopbackPolicy, proxy.setPolicyLevel, socket.bind]) {
         expect(fn).not.toHaveBeenCalled();

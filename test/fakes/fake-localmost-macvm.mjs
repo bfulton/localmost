@@ -131,6 +131,7 @@ async function play() {
   if (own.fail) return fail(own.fail, `${command} failed as scripted`);
   switch (command) {
     case 'catalog':
+      if (own.hang) return;
       return end({
         ok: true, reason: 'done', build: '25G83', os: '26.6.2', supported: true, minCpus: 2, minMemoryBytes: 4294967296,
         url: 'https://updates.cdn-apple.com/2026SummerFCS/fullrestores/140-75212/A2A24B94/UniversalMac_26.6.2_25G83_Restore.ipsw',
