@@ -44,6 +44,12 @@ describe('newc', () => {
     expect(() => newc([{ name: '/abs', mode: 0o100644, data: Buffer.alloc(0) }])).toThrow(/name/);
     expect(() => newc([{ name: 'a', mode: 0o040755 }, { name: 'a', mode: 0o040755 }])).toThrow(/twice/);
   });
+
+  it('refuses an entry named after the trailer, which would end the archive early', () => {
+    expect(() => newc([{ name: 'TRAILER!!!', mode: 0o100644, data: Buffer.alloc(0) }, ...entries])).toThrow(
+      /end-of-archive/,
+    );
+  });
 });
 
 describe('gzipFixed', () => {

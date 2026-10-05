@@ -10,6 +10,9 @@ const { checkName } = require('./tar');
 const S_IFMT = 0o170000;
 const S_IFDIR = 0o040000;
 const TYPES = new Set([0o100000, S_IFDIR, 0o120000]); // regular file, directory, symlink
+// newc's end-of-archive marker. An entry by this name would end the archive
+// for every reader, which would then drop each entry sorted after it.
+const TRAILER = 'TRAILER!!!';
 
 function hex8(v) {
   return v.toString(16).toUpperCase().padStart(8, '0');
@@ -29,6 +32,7 @@ function newc(entries) {
   const seen = new Set();
   for (const e of entries) {
     checkName(e.name);
+    if (e.name === TRAILER) throw new Error(`cpio: ${TRAILER} is the end-of-archive marker, not an entry name`);
     if (seen.has(e.name)) throw new Error(`cpio: ${e.name} is listed twice`);
     seen.add(e.name);
     if (!TYPES.has(e.mode & S_IFMT)) throw new Error(`cpio: ${e.name} has an unsupported type`);
@@ -54,7 +58,7 @@ function newc(entries) {
     const isDir = (e.mode & S_IFMT) === S_IFDIR;
     put(i + 1, e.mode, isDir ? 2 : 1, e.name, isDir ? Buffer.alloc(0) : Buffer.from(e.data ?? Buffer.alloc(0)));
   });
-  put(0, 0, 1, 'TRAILER!!!', Buffer.alloc(0));
+  put(0, 0, 1, TRAILER, Buffer.alloc(0));
   return Buffer.concat(chunks);
 }
 
