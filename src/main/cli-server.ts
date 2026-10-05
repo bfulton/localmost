@@ -96,6 +96,10 @@ export class CliServer {
   private socketPath: string;
   private onLog: (level: 'info' | 'warn' | 'error', message: string) => void;
   private testVms: TestVmProvider | undefined;
+  /** Open connections, so stop() can end them rather than wait on them. */
+  private sockets = new Set<net.Socket>();
+  /** Connections holding (or booting) a test VM: one lease each. */
+  private leasing = new Set<net.Socket>();
 
   constructor(options: {
     onLog: (level: 'info' | 'warn' | 'error', message: string) => void;
@@ -149,7 +153,10 @@ export class CliServer {
   }
 
   /**
-   * Stop the CLI server.
+   * Stop the CLI server. Open connections are destroyed rather than waited
+   * for: a `localmost test` run holds its connection for the whole run, and
+   * close() alone would hold up the app's quit until it finished. Destroying
+   * a connection releases the VM it borrowed.
    */
   async stop(): Promise<void> {
     return new Promise((resolve) => {
@@ -166,6 +173,7 @@ export class CliServer {
           this.server = null;
           resolve();
         });
+        for (const socket of this.sockets) socket.destroy();
       } else {
         resolve();
       }
@@ -176,6 +184,11 @@ export class CliServer {
    * Handle an incoming connection.
    */
   private handleConnection(socket: net.Socket): void {
+    this.sockets.add(socket);
+    socket.once('close', () => {
+      this.sockets.delete(socket);
+      this.leasing.delete(socket);
+    });
     let buffer = '';
     // Requests on one connection run one at a time, in the order sent. Each
     // data event used to start its own, so a pause still stopping the runner
@@ -271,10 +284,16 @@ export class CliServer {
     if (!isPort(proxyPort) || !isPort(brokerPort) || proxyPort === brokerPort) {
       return { success: false, error: 'Missing or invalid ports for the test run' };
     }
+    // A run needs one VM. Leasing more on the same connection would let one
+    // client hold every slot the runner has.
+    if (this.leasing.has(socket)) {
+      return { success: false, error: 'This connection already has a macOS VM' };
+    }
     const availability = vms.available();
     if (!availability.ok) {
       return { success: false, error: `No macOS VM can run the workflow: ${availability.reason}` };
     }
+    this.leasing.add(socket);
     const lease: VmLease = { key: `test-${crypto.randomBytes(6).toString('hex')}`, proxyPort, brokerPort };
     const abort = new AbortController();
     let released = false;
@@ -289,12 +308,14 @@ export class CliServer {
       const agentSocket = await vms.prepareTestRun(lease, abort.signal);
       if (socket.destroyed) {
         release();
+        this.leasing.delete(socket);
         return { success: false, error: 'The test run went away while its macOS VM started' };
       }
       this.onLog('info', `Lent a macOS VM to localmost test (${lease.key})`);
       return { success: true, command: 'test-vm', data: { agentSocket } };
     } catch (err) {
       release();
+      this.leasing.delete(socket);
       return { success: false, error: `Could not lend the test run a macOS VM: ${(err as Error).message}` };
     }
   }

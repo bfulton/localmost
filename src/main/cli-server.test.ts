@@ -928,6 +928,36 @@ describe('CliServer', () => {
       expect(leases).toEqual([]);
     });
 
+    it('lends one connection one VM: a second test-vm on it is refused', async () => {
+      const { response, socket } = await lend({ proxyPort: 41000, brokerPort: 41001 });
+      expect(response.success).toBe(true);
+      const second = new Promise<Record<string, unknown>>((resolve) => {
+        let buffer = '';
+        socket.removeAllListeners('data');
+        socket.on('data', (d) => {
+          buffer += d.toString();
+          const nl = buffer.indexOf('\n');
+          if (nl !== -1) resolve(JSON.parse(buffer.slice(0, nl)));
+        });
+      });
+      socket.write(`${JSON.stringify({ command: 'test-vm', args: { proxyPort: 42000, brokerPort: 42001 } })}\n`);
+      expect(await second).toEqual({ success: false, error: 'This connection already has a macOS VM' });
+      expect(leases).toHaveLength(1);
+      socket.destroy();
+      await until(() => released.length > 0);
+      expect(released).toEqual(leases);
+    });
+
+    it('stops without waiting for a test run\'s connection, and releases its VM', async () => {
+      const { socket } = await lend({ proxyPort: 41000, brokerPort: 41001 });
+      socket.on('error', () => undefined);
+      const stopped = server.stop().then(() => 'stopped');
+      const timeout = new Promise((r) => setTimeout(() => r('timed out'), 2000));
+      expect(await Promise.race([stopped, timeout])).toBe('stopped');
+      await until(() => released.length > 0);
+      expect(released).toEqual(leases);
+    });
+
     it('answers a boot that failed with its reason, and releases what it took', async () => {
       prepare = async () => {
         throw new Error('the macOS VM did not start: helper exited');
