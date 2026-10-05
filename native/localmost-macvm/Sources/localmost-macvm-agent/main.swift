@@ -3,7 +3,7 @@
 //   localmost-macvm-agent serve      the LaunchDaemon: vsock port 1025, from the host only
 //   localmost-macvm-agent setup      the golden image's one-time setup, as root over SSH;
 //                                    its inputs as one JSON object on stdin
-//   localmost-macvm-agent exec-as --user runner --dir <dir> -- <program> [args...]
+//   localmost-macvm-agent exec-as --user runner --dir <dir> [--env-file <file>] -- <program> [args...]
 //                                    root to the job user, then exec (see ExecAs.swift)
 //   localmost-macvm-agent kill-all --user runner
 //                                    root to the job user, then SIGKILL to all its processes
@@ -65,14 +65,27 @@ case "serve":
     }
 
 case "exec-as":
-    // Root, in the job user's login session: become the job user for good,
-    // check that root cannot be had back, then exec the runner.
+    // Root, in the job user's login session, started with rootSideEnvironment
+    // alone: read the program's environment from the agent's env file and
+    // remove it, become the job user for good, check that root cannot be had
+    // back, then exec the program with that environment and nothing else.
     let spec: ExecAs
     do {
         spec = try parseExecAs(Array(argv.dropFirst()))
     } catch let e as ProtocolError {
         log(e.message)
         exit(64)
+    }
+    var programEnv = execAsEnvironment([:], home: jobUserHome)
+    if let file = spec.envFile {
+        do {
+            let data = try readEnvFile(file, owner: 0)
+            unlink(file)
+            programEnv = execAsEnvironment(try parseEnvFile(data), home: jobUserHome)
+        } catch let e as ProtocolError {
+            log("exec-as cannot use its env file: \(e.message)")
+            exit(65)
+        }
     }
     guard let pw = getpwnam(spec.user) else {
         log("no user \(spec.user)")
@@ -93,7 +106,8 @@ case "exec-as":
         exit(66)
     }
     let cArgs = spec.argv.map { strdup($0) } + [nil]
-    execv(spec.argv[0], cArgs)
+    let cEnv = programEnv.map { strdup("\($0.key)=\($0.value)") } + [nil]
+    execve(spec.argv[0], cArgs, cEnv)
     log("exec-as cannot run \(spec.argv[0]): \(posixMessage())")
     exit(126)
 

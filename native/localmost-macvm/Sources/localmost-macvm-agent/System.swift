@@ -127,9 +127,23 @@ final class GuestSystem: AgentSystem {
         try? FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try runChecked(["/usr/sbin/chown", "-R", "\(uid):\(gid)", jobRunnerDir, tmp])
 
-        let env = runnerEnvironment(spec, home: jobUserHome)
-        let argv = execAsArgv(uid: uid, agent: agentInstallPath, dir: jobRunnerDir, program: jobRunnerDir + "/run.sh", args: spec.args)
-        let job = try Job.spawn(argv: argv, env: env, uid: uid, output: output, exit: exit)
+        // The runner's environment goes to exec-as in a file of root's, and
+        // reaches the runner only once exec-as is the job user: launchctl and
+        // exec-as, root both, are started with rootSideEnvironment alone.
+        let envFile = try scratchFile(in: stepScratchDir, owner: 0, "env", contents: encodeEnvFile(runnerEnvironment(spec, home: jobUserHome)),
+                                      uid: 0, gid: 0, mode: 0o600)
+        let launch = execAsLaunch(uid: uid, agent: agentInstallPath, dir: jobRunnerDir, envFile: envFile,
+                                  program: jobRunnerDir + "/run.sh", args: spec.args)
+        let job: Job
+        do {
+            job = try Job.spawn(argv: launch.argv, env: launch.env, uid: uid, output: output, exit: { code, signal in
+                unlink(envFile)
+                exit(code, signal)
+            })
+        } catch {
+            unlink(envFile)
+            throw error
+        }
         lock.lock()
         self.job = job
         lock.unlock()
@@ -177,18 +191,25 @@ final class GuestSystem: AgentSystem {
         }
         let outputs = try scratchFile(in: stepScratchDir, owner: 0, "output", contents: Data(), uid: uid, gid: gid, mode: 0o600)
         var script: String?
+        var envFile: String?
         do {
             if let text = spec.script {
                 script = try scratchFile(in: stepScratchDir, owner: 0, "step", contents: Data(text.utf8), uid: uid, gid: gid, mode: 0o400)
             }
             let args = [script ?? testRoot + "/" + spec.entry!]
-            let env = stepEnvironment(spec, home: jobUserHome, outputs: outputs)
-            let argv = execAsArgv(uid: uid, agent: agentInstallPath, dir: testRoot + "/" + spec.cwd, program: program, args: args)
+            // As for a job's runner: the step's environment reaches only the
+            // step, through exec-as once it is the job user.
+            let file = try scratchFile(in: stepScratchDir, owner: 0, "env",
+                                       contents: encodeEnvFile(stepEnvironment(spec, home: jobUserHome, outputs: outputs)),
+                                       uid: 0, gid: 0, mode: 0o600)
+            envFile = file
+            let launch = execAsLaunch(uid: uid, agent: agentInstallPath, dir: testRoot + "/" + spec.cwd, envFile: file,
+                                      program: program, args: args)
             // The leader can exit before spawn returns its pid: both sides
             // meet under the lock, whichever comes first.
             var leader: Int32?
             var exitedEarly = false
-            let job = try Job.spawn(argv: argv, env: env, uid: uid, output: output, exit: { [weak self] code, signal in
+            let job = try Job.spawn(argv: launch.argv, env: launch.env, uid: uid, output: output, exit: { [weak self] code, signal in
                 if let self = self {
                     self.lock.lock()
                     if let pid = leader {
@@ -200,6 +221,7 @@ final class GuestSystem: AgentSystem {
                 }
                 let text = readStepOutputs(outputs, onDropped: { output("stderr", $0) })
                 unlink(outputs)
+                unlink(file)
                 if let script = script { unlink(script) }
                 exit(code, signal, text)
             })
@@ -210,6 +232,7 @@ final class GuestSystem: AgentSystem {
             return job.pid
         } catch {
             unlink(outputs)
+            if let envFile = envFile { unlink(envFile) }
             if let script = script { unlink(script) }
             throw error
         }
@@ -217,16 +240,20 @@ final class GuestSystem: AgentSystem {
 
     /// Signals every step's process group. A group whose leader has exited
     /// and whose pid names a live process again is left alone: the group
-    /// emptied, and the pid is someone else's now. After a KILL the run's
-    /// groups are forgotten.
+    /// emptied, and the pid is someone else's now. A KILL also reaches every
+    /// process of the job user, as a job's does: a step's strays that left
+    /// its process group. After a KILL the run's groups are forgotten.
     func signalSteps(_ signal: JobSignal) {
         lock.lock()
         let groups = stepGroups
         if signal == .KILL { stepGroups = [:] }
         lock.unlock()
-        for (pid, leaderExited) in groups {
-            if leaderExited, kill(pid, 0) == 0 { continue }
-            kill(-pid, signal.number)
+        let targets = stepSignalTargets(groups, signal: signal, alive: { kill($0, 0) == 0 })
+        for pgid in targets.groups {
+            kill(-pgid, signal.number)
+        }
+        if targets.allOfJobUser {
+            killAllJobUserProcesses()
         }
     }
 
@@ -353,12 +380,14 @@ func signalName(_ sig: Int32) -> String {
     }
 }
 
-/// Runs a program to completion; a non-zero exit is an error naming it.
+/// Runs a program to completion, with rootSideEnvironment for its
+/// environment; a non-zero exit is an error naming it.
 @discardableResult
 func runChecked(_ argv: [String], stdin: Data? = nil) throws -> String {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: argv[0])
     p.arguments = Array(argv.dropFirst())
+    p.environment = rootSideEnvironment
     let out = Pipe()
     p.standardOutput = out
     p.standardError = out

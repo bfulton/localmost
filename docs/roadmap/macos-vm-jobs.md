@@ -410,7 +410,14 @@ has proved.
   GitHub's prefixes. The agent holds the job to the same rule. It starts the
   runner as `runner` in that user's login session, through `launchctl
   asuser` and its own `exec-as`, which drops root and checks it cannot get
-  it back.
+  it back. Both are root, and both are started with a fixed `PATH` and
+  nothing else: the job's environment is a blocklist, and a name it does not
+  foresee (`TZ`, `Malloc*`, `OBJC_*`) must not change how root's code runs.
+  The agent writes the runner's environment to a file of root's in
+  `/var/db/localmost/run` (created exclusively, never through a link);
+  `exec-as` reads it while still root, removes it, checks each name again,
+  and applies it with `execve` only once it is `runner`. A test run's steps
+  are started the same way.
 - **signal**: TERM, INT or KILL to that runner, through the agent.
 - **release**: the helper stopped with no grace (VZ pulls the plug: the guest
   is the job's), the VM directory and its clones removed, the slot freed.
@@ -470,7 +477,9 @@ the CLI parses the workflow and drives each step itself.
   through `exec-as`), runs each step as `runner` in its login session, streams
   its output, and ends it with an `exit` that carries what it wrote to
   `GITHUB_OUTPUT` (at most 16 KiB). After each job the CLI sends `KILL`, which
-  reaches every process group the job's steps started.
+  reaches every process group the job's steps started and, as for a runner
+  job, every process of `runner`'s, so a step's strays that left their group
+  go too.
 - **The broker relay leads nowhere.** The helper's `run` takes two ports; a
   test run needs only its proxy, so the CLI passes a port it holds that
   closes every connection, rather than a free one some other process could

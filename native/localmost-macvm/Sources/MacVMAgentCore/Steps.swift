@@ -178,6 +178,17 @@ public func stepProgramPath(_ program: StepProgram, runners: [String], nodes: (S
     }
 }
 
+/// What a signal to a test run's steps reaches: each step's process group
+/// (`groups` maps its leader's pid to whether that leader has exited), less
+/// one whose leader exited and whose pid names a live process again - the
+/// group emptied, and the pid is someone else's now - and, for a KILL, every
+/// process of the job user too, as for a job: a step's strays that left its
+/// process group.
+public func stepSignalTargets(_ groups: [Int32: Bool], signal: JobSignal, alive: (Int32) -> Bool) -> (groups: [Int32], allOfJobUser: Bool) {
+    let pgids = groups.keys.sorted().filter { pid in !(groups[pid]! && alive(pid)) }
+    return (pgids, signal == .KILL)
+}
+
 /// Whether `path` is a node stepProgramPath could have chosen.
 public func isRunnerNode(_ path: String) -> Bool {
     let parts = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
