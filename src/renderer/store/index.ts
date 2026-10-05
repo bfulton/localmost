@@ -26,13 +26,10 @@ export const useMaxLogScrollback = () => useStore((state) => state.config.maxLog
 export const useMaxJobHistory = () => useStore((state) => state.config.maxJobHistory);
 export const useSleepProtection = () => useStore((state) => state.config.sleepProtection);
 export const useSleepProtectionConsented = () => useStore((state) => state.config.sleepProtectionConsented);
-export const useToolCacheLocation = () => useStore((state) => state.config.toolCacheLocation);
 export const useUserFilter = () => useStore((state) => state.config.userFilter);
 export const usePower = () => useStore((state) => state.config.power);
 export const useNotifications = () => useStore((state) => state.config.notifications);
 export const useResourcePause = () => useStore((state) => state.config.resourcePause);
-export const useJobEnvironment = () => useStore((state) => state.config.jobEnvironment);
-export const useIsolation = () => useStore((state) => state.config.isolation);
 export const useLaunchAtLogin = () => useStore((state) => state.config.launchAtLogin);
 export const useHideOnStart = () => useStore((state) => state.config.hideOnStart);
 export const useRunnerConfig = () => useStore((state) => state.config.runnerConfig);
@@ -93,12 +90,10 @@ export type StoreAction =
   | { type: 'setMaxJobHistory'; payload: number }
   | { type: 'setSleepProtection'; payload: AppState['config']['sleepProtection'] }
   | { type: 'consentToSleepProtection' }
-  | { type: 'setToolCacheLocation'; payload: AppState['config']['toolCacheLocation'] }
   | { type: 'setUserFilter'; payload: AppState['config']['userFilter'] }
   | { type: 'setPower'; payload: AppState['config']['power'] }
   | { type: 'setNotifications'; payload: AppState['config']['notifications'] }
   | { type: 'setResourcePause'; payload: AppState['config']['resourcePause'] }
-  | { type: 'setJobEnvironment'; payload: AppState['config']['jobEnvironment'] }
   | { type: 'setLaunchAtLogin'; payload: boolean }
   | { type: 'setHideOnStart'; payload: boolean }
   | { type: 'updateRunnerConfig'; payload: Partial<AppState['config']['runnerConfig']> }

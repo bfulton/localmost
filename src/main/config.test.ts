@@ -24,7 +24,6 @@ import {
   loadConfig,
   resolveDockerVmConfig,
   resolveResourcePauseConfig,
-  resolveJobEnvironmentConfig,
   DockerVmConfigSource,
   SETTABLE_CONFIG_KEYS,
 } from './config';
@@ -104,13 +103,14 @@ describe('SETTABLE_CONFIG_KEYS', () => {
     expect(SETTABLE_CONFIG_KEYS).not.toContain('dockerVm');
   });
 
-  it('lets the Settings page set what a resource pause does and the job-environment conveniences', () => {
+  it('lets the Settings page set what a resource pause does', () => {
     expect(SETTABLE_CONFIG_KEYS).toContain('resourcePause');
-    expect(SETTABLE_CONFIG_KEYS).toContain('jobEnvironment');
   });
 
-  it('lets the Settings page set which isolation types this Mac allows', () => {
-    expect(SETTABLE_CONFIG_KEYS).toContain('isolation');
+  it('has no setting an earlier build had for seatbelt jobs: the job environment, isolation, the tool cache', () => {
+    for (const key of ['jobEnvironment', 'isolation', 'toolCacheLocation']) {
+      expect(SETTABLE_CONFIG_KEYS).not.toContain(key);
+    }
   });
 });
 
@@ -258,46 +258,26 @@ describe('resolveResourcePauseConfig', () => {
   });
 });
 
-describe('resolveJobEnvironmentConfig', () => {
-  it('turns every job-environment convenience on by default, and the Swift Build link-temp grant off', () => {
-    expect(resolveJobEnvironmentConfig(undefined)).toEqual({
-      toolShims: true,
-      javaToolOptions: true,
-      perJobTempDir: true,
-      createMissingGrantedDirs: true,
-      swiftBuildLinkTemp: false,
-    });
-    expect(resolveJobEnvironmentConfig({})).toEqual(resolveJobEnvironmentConfig(undefined));
-  });
+describe('a config.yaml an earlier build wrote', () => {
+  it('loads with the seatbelt sections it still has, which nothing reads', () => {
+    // jobEnvironment, isolation and toolCacheLocation: the store warns about
+    // each and drops it at its next save (persist.ts, RETIRED_CONFIG_KEYS).
+    fs.writeFileSync(
+      configPath,
+      [
+        'configVersion: 1',
+        'theme: dark',
+        'jobEnvironment:',
+        '  toolShims: false',
+        'isolation:',
+        '  allowed: [seatbelt, macos-vm]',
+        'toolCacheLocation: per-sandbox',
+        '',
+      ].join('\n')
+    );
 
-  it('turns each off on its own, and the link-temp grant on on its own', () => {
-    const defaults = resolveJobEnvironmentConfig(undefined);
-    for (const key of ['toolShims', 'javaToolOptions', 'perJobTempDir', 'createMissingGrantedDirs'] as const) {
-      expect(resolveJobEnvironmentConfig({ [key]: false })).toEqual({ ...defaults, [key]: false });
-    }
-    expect(resolveJobEnvironmentConfig({ swiftBuildLinkTemp: true })).toEqual({ ...defaults, swiftBuildLinkTemp: true });
-  });
+    const config = loadConfig();
 
-  it('takes a value that is not true or false as absent, and says so', () => {
-    const logged: string[] = [];
-    const resolved = resolveJobEnvironmentConfig({ toolShims: 'no', perJobTempDir: 0 }, (m) => logged.push(m));
-    expect(resolved.toolShims).toBe(true);
-    expect(resolved.perJobTempDir).toBe(true);
-    expect(logged).toEqual([
-      'jobEnvironment.toolShims must be true or false; using true',
-      'jobEnvironment.perJobTempDir must be true or false; using true',
-    ]);
-  });
-
-  it('ignores keys it does not know, and a section that is not a mapping', () => {
-    expect(Object.keys(resolveJobEnvironmentConfig({ realHome: true } as never)).sort()).toEqual([
-      'createMissingGrantedDirs', 'javaToolOptions', 'perJobTempDir', 'swiftBuildLinkTemp', 'toolShims',
-    ]);
-    expect(resolveJobEnvironmentConfig('off' as never)).toEqual(resolveJobEnvironmentConfig(undefined));
-  });
-
-  it('is read from config.yaml', () => {
-    saveConfig({ jobEnvironment: { javaToolOptions: false } });
-    expect(resolveJobEnvironmentConfig(loadConfig().jobEnvironment).javaToolOptions).toBe(false);
+    expect(config.theme).toBe('dark');
   });
 });

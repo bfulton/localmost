@@ -14,9 +14,9 @@ import {
   diffConfigs,
   PolicyDiff,
   formatPolicyDiff,
-  effectiveIsolation,
+  getEffectivePolicy,
 } from '../shared/localmostrc';
-import type { IsolationType } from '../shared/isolation';
+import { hasDockerGrants } from '../shared/docker-policy';
 import {
   PolicyEntry,
   approvalStamp,
@@ -194,19 +194,18 @@ export function getApprovedPolicyForCommit(repository: string, sha: string): Loc
 }
 
 /**
- * The isolation types a job accepts, in the order to try, as admission
- * walks them: the approved policy's list for the job's commit - its
- * workflow's list, else the shared one - never the repository's current
- * file. A job with no commit, or at a commit the check did not find carrying
- * the approved policy (one with no .localmostrc among them), accepts any:
- * there the host's allowed set alone bounds it (SECURITY.md, Isolation types).
+ * Whether the approved policy for a job's commit grants Docker to the job's
+ * workflow - shared and its own section merged, as the claim binds it - as
+ * admission asks before spawning. A job with no commit, or at one the check
+ * did not find carrying the approved policy, gets the baseline: no Docker.
  */
-export function approvedIsolationForCommit(
+export function approvedDockerForCommit(
   repository: string,
   sha: string | undefined,
   workflow: string | undefined
-): IsolationType[] {
-  return effectiveIsolation(sha ? getApprovedPolicyForCommit(repository, sha) : null, workflow);
+): boolean {
+  const approved = sha ? getApprovedPolicyForCommit(repository, sha) : null;
+  return approved !== null && hasDockerGrants(getEffectivePolicy(approved, workflow ?? '').docker);
 }
 
 /**

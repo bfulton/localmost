@@ -285,7 +285,7 @@ describe('SettingsPage', () => {
     });
   });
 
-  it('offers no setting to keep a job\'s _work directory for later jobs', async () => {
+  it('offers no setting to keep a job\'s _work directory or tools for later jobs', async () => {
     mockLocalmost.github.getAuthStatus.mockResolvedValue({
       isAuthenticated: true,
       user: { login: 'testuser', name: 'Test User', avatar_url: '' },
@@ -295,8 +295,10 @@ describe('SettingsPage', () => {
     renderWithProviders(<SettingsPage {...defaultProps} />);
 
     await waitFor(() => {
-      expect(screen.getByText('Tool cache')).toBeInTheDocument();
+      expect(screen.getByText('Parallelism')).toBeInTheDocument();
     });
+    // A macOS VM job's tools and work directory go with its VM.
+    expect(screen.queryByText('Tool cache')).not.toBeInTheDocument();
     expect(screen.queryByText('Cache work directory')).not.toBeInTheDocument();
     expect(screen.queryByText(/_work directory/)).not.toBeInTheDocument();
   });
@@ -311,16 +313,7 @@ describe('SettingsPage', () => {
   });
 });
 
-describe('the resource-pause and job-environment preferences', () => {
-  const DEFAULTS = { toolShims: true, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true, swiftBuildLinkTemp: false };
-  // Each convenience's control, by the label the page gives it.
-  const CONVENIENCES = [
-    ['toolShims', "Turn off SwiftPM's and Xcode's own sandbox"],
-    ['javaToolOptions', 'Set JAVA_TOOL_OPTIONS for JVMs'],
-    ['perJobTempDir', 'Give each job its own temp directory for Foundation'],
-    ['createMissingGrantedDirs', 'Create missing directories a policy grants'],
-  ] as const;
-
+describe('the resource-pause preference', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockLocalmost.github.getAuthStatus.mockResolvedValue({ isAuthenticated: false });
@@ -338,7 +331,6 @@ describe('the resource-pause and job-environment preferences', () => {
   afterEach(() => resetZubridge());
 
   const runningJobsSelect = () => screen.getByLabelText('Running jobs when a pause begins') as HTMLSelectElement;
-  const checkbox = (label: string) => screen.getByLabelText(label) as HTMLInputElement;
 
   it('lets running jobs finish by default, and offers to stop them', async () => {
     renderWithProviders(<SettingsPage onBack={jest.fn()} />);
@@ -364,186 +356,25 @@ describe('the resource-pause and job-environment preferences', () => {
     await waitFor(() => expect(runningJobsSelect().value).toBe('stop'));
   });
 
-  it('shows a saved value the runner would not use as the default it uses instead, and sends that', async () => {
-    // The runner takes a value that is not true or false as absent, so the
-    // shims are on; showing 0 as off would show the wrong thing, and sending
-    // it back with the next change would have the whole section refused.
-    mockLocalmost.settings.get.mockResolvedValue({
-      resourcePause: { runningJobs: 'kill' },
-      jobEnvironment: { toolShims: 0, javaToolOptions: false },
-    });
+  it('shows a saved value the runner would not use as the default it uses instead', async () => {
+    mockLocalmost.settings.get.mockResolvedValue({ resourcePause: { runningJobs: 'kill' } });
     renderWithProviders(<SettingsPage onBack={jest.fn()} />);
 
-    await waitFor(() => expect(checkbox('Set JAVA_TOOL_OPTIONS for JVMs').checked).toBe(false));
+    await waitFor(() => expect(mockLocalmost.settings.get).toHaveBeenCalled());
     expect(runningJobsSelect().value).toBe('finish');
-    expect(checkbox("Turn off SwiftPM's and Xcode's own sandbox").checked).toBe(true);
-
-    fireEvent.click(checkbox('Create missing directories a policy grants'));
-    await waitFor(() => {
-      expect(mockLocalmost.settings.set).toHaveBeenCalledWith({
-        jobEnvironment: { ...DEFAULTS, javaToolOptions: false, createMissingGrantedDirs: false },
-      });
-    });
   });
 
-  it('has every job-environment convenience on by default', async () => {
+  it('reads it from the store, not the settings file, once the store is populated', async () => {
+    // The store branch is the one the app runs; settings:get is only the
+    // fallback until zubridge syncs.
+    seedZubridge({ config: { resourcePause: { runningJobs: 'stop' } } });
     renderWithProviders(<SettingsPage onBack={jest.fn()} />);
 
-    await waitFor(() => expect(screen.getByText('Job Environment')).toBeInTheDocument());
-    for (const [, label] of CONVENIENCES) {
-      expect({ label, checked: checkbox(label).checked }).toEqual({ label, checked: true });
-    }
-  });
-
-  it.each(CONVENIENCES)('turns %s off on its own, and back on', async (key, label) => {
-    renderWithProviders(<SettingsPage onBack={jest.fn()} />);
-    await waitFor(() => expect(checkbox(label).checked).toBe(true));
-
-    fireEvent.click(checkbox(label));
-    await waitFor(() => {
-      expect(mockLocalmost.settings.set).toHaveBeenLastCalledWith({ jobEnvironment: { ...DEFAULTS, [key]: false } });
-    });
-    await waitFor(() => expect(checkbox(label).checked).toBe(false));
-
-    fireEvent.click(checkbox(label));
-    await waitFor(() => {
-      expect(mockLocalmost.settings.set).toHaveBeenLastCalledWith({ jobEnvironment: DEFAULTS });
-    });
-  });
-
-  it('says, beside the toggle, what a missing granted directory needs while creating them is off', async () => {
-    // Off, nothing creates a granted directory under the home that is not
-    // there, and the job finds out only at its first write: say so where the
-    // choice is made, and that the user must create it first.
-    const offHint = /under your home, or one above it, .*must create it yourself before the job runs.*"Operation not permitted" at its first write there/;
-    const onHint = /nothing to create yourself before a job/;
-    renderWithProviders(<SettingsPage onBack={jest.fn()} />);
-    const label = 'Create missing directories a policy grants';
-    await waitFor(() => expect(checkbox(label).checked).toBe(true));
-    const group = checkbox(label).closest('div') as HTMLElement;
-    expect(group).toHaveTextContent(onHint);
-    expect(group).not.toHaveTextContent(offHint);
-    expect(screen.queryByText(offHint)).not.toBeInTheDocument();
-
-    fireEvent.click(checkbox(label));
-    await waitFor(() => expect(checkbox(label).checked).toBe(false));
-    expect(group).toHaveTextContent(offHint);
-    expect(group).not.toHaveTextContent(onHint);
-
-    // Only beside its own toggle: turning another off says nothing of it.
-    fireEvent.click(checkbox(label));
-    await waitFor(() => expect(checkbox(label).checked).toBe(true));
-    fireEvent.click(checkbox('Set JAVA_TOOL_OPTIONS for JVMs'));
-    await waitFor(() => expect(checkbox('Set JAVA_TOOL_OPTIONS for JVMs').checked).toBe(false));
-    expect(screen.queryByText(offHint)).not.toBeInTheDocument();
-    expect(group).toHaveTextContent(onHint);
-  });
-
-  describe("the Swift Build link-temp grant", () => {
-    const label = 'Let Swift Build link in the shared temp directory';
-    // Both cases, beside the toggle whatever its state: the risk is read
-    // before it is taken, not only once the grant is on.
-    const onHint =
-      /On, a job may create <T>\/TemporaryDirectory\.XXXXXX names in that shared directory, which your own SwiftPM and Xcode also use for manifest executables, so a job could race to replace one before it runs\./;
-    const offHint =
-      /Off \(the default\), Swift 6\.4's default build system fails to link inside a job; a workflow can pass swift build --build-system native, or the repository can use the macOS VM isolation type once it is available\./;
-
-    it('is off by default, and says beside it what turning it on would expose, and what off costs', async () => {
-      renderWithProviders(<SettingsPage onBack={jest.fn()} />);
-      await waitFor(() => expect(checkbox(label).checked).toBe(false));
-      const group = checkbox(label).closest('div') as HTMLElement;
-      expect(group).toHaveTextContent(onHint);
-      expect(group).toHaveTextContent(offHint);
-    });
-
-    it('turns on, sending every key, and still says both cases', async () => {
-      renderWithProviders(<SettingsPage onBack={jest.fn()} />);
-      await waitFor(() => expect(checkbox(label).checked).toBe(false));
-      const group = checkbox(label).closest('div') as HTMLElement;
-
-      fireEvent.click(checkbox(label));
-      await waitFor(() => {
-        expect(mockLocalmost.settings.set).toHaveBeenLastCalledWith({ jobEnvironment: { ...DEFAULTS, swiftBuildLinkTemp: true } });
-      });
-      await waitFor(() => expect(checkbox(label).checked).toBe(true));
-      expect(group).toHaveTextContent(onHint);
-      expect(group).toHaveTextContent(offHint);
-
-      fireEvent.click(checkbox(label));
-      await waitFor(() => {
-        expect(mockLocalmost.settings.set).toHaveBeenLastCalledWith({ jobEnvironment: DEFAULTS });
-      });
-    });
-
-    it('shows a saved choice to turn it on', async () => {
-      mockLocalmost.settings.get.mockResolvedValue({ jobEnvironment: { swiftBuildLinkTemp: true } });
-      renderWithProviders(<SettingsPage onBack={jest.fn()} />);
-
-      await waitFor(() => expect(checkbox(label).checked).toBe(true));
-      expect(checkbox(label).closest('div') as HTMLElement).toHaveTextContent(onHint);
-      for (const [, other] of CONVENIENCES) expect(checkbox(other).checked).toBe(true);
-    });
-  });
-
-  it('shows the off hint for a saved choice to leave missing granted directories alone', async () => {
-    mockLocalmost.settings.get.mockResolvedValue({ jobEnvironment: { createMissingGrantedDirs: false } });
-    renderWithProviders(<SettingsPage onBack={jest.fn()} />);
-
-    await waitFor(() => expect(checkbox('Create missing directories a policy grants').checked).toBe(false));
-    expect(screen.getByText(/must create it yourself before the job runs/)).toBeInTheDocument();
-  });
-
-  it.each(CONVENIENCES)('shows %s as saved', async (key, label) => {
-    mockLocalmost.settings.get.mockResolvedValue({ jobEnvironment: { [key]: false } });
-    renderWithProviders(<SettingsPage onBack={jest.fn()} />);
-
-    await waitFor(() => expect(checkbox(label).checked).toBe(false));
-    for (const [otherKey, otherLabel] of CONVENIENCES) {
-      if (otherKey !== key) expect({ otherLabel, checked: checkbox(otherLabel).checked }).toEqual({ otherLabel, checked: true });
-    }
-  });
-
-  describe('with the store populated, as in the app', () => {
-    it('reads both from the store, not the settings file', async () => {
-      // The store branch is the one the app runs; settings:get is only the
-      // fallback until zubridge syncs.
-      seedZubridge({
-        config: {
-          resourcePause: { runningJobs: 'stop' },
-          jobEnvironment: { ...DEFAULTS, perJobTempDir: false },
-        },
-      });
-      renderWithProviders(<SettingsPage onBack={jest.fn()} />);
-
-      await waitFor(() => expect(runningJobsSelect().value).toBe('stop'));
-      expect(checkbox('Give each job its own temp directory for Foundation').checked).toBe(false);
-      expect(checkbox('Set JAVA_TOOL_OPTIONS for JVMs').checked).toBe(true);
-    });
-
-    it('sends the change from the store value, keeping the others', async () => {
-      seedZubridge({ config: { jobEnvironment: { ...DEFAULTS, toolShims: false } } });
-      renderWithProviders(<SettingsPage onBack={jest.fn()} />);
-      await waitFor(() => expect(checkbox('Create missing directories a policy grants').checked).toBe(true));
-
-      fireEvent.click(checkbox('Create missing directories a policy grants'));
-      await waitFor(() => {
-        expect(mockLocalmost.settings.set).toHaveBeenCalledWith({
-          jobEnvironment: { ...DEFAULTS, toolShims: false, createMissingGrantedDirs: false },
-        });
-      });
-    });
-
-    it('shows the defaults while the store holds neither yet', async () => {
-      seedZubridge({ config: {} });
-      renderWithProviders(<SettingsPage onBack={jest.fn()} />);
-
-      await waitFor(() => expect(runningJobsSelect().value).toBe('finish'));
-      for (const [, label] of CONVENIENCES) expect(checkbox(label).checked).toBe(true);
-    });
+    await waitFor(() => expect(runningJobsSelect().value).toBe('stop'));
   });
 });
 
-describe('the Isolation section', () => {
+describe('the macOS VM section', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockLocalmost.github.getAuthStatus.mockResolvedValue({ isAuthenticated: false });
@@ -552,71 +383,22 @@ describe('the Isolation section', () => {
     mockLocalmost.runner.getVersion.mockResolvedValue({ version: null, url: null });
     mockLocalmost.runner.getAvailableVersions.mockResolvedValue({ success: true, versions: [] });
     mockLocalmost.settings.get.mockResolvedValue({});
-    mockLocalmost.settings.set.mockResolvedValue({ success: true });
     mockLocalmost.runner.getStatus.mockResolvedValue({ status: 'offline' });
     mockLocalmost.jobs.getHistory.mockResolvedValue([]);
     mockLocalmost.network.isOnline.mockResolvedValue(true);
+    mockLocalmost.macosVm.getStatus.mockResolvedValue({
+      state: 'not-built', disk: { freeBytes: 80 * 2 ** 30, neededBytes: 60 * 2 ** 30 }, provisioning: 'guided', busy: false,
+    });
   });
 
-  afterEach(() => resetZubridge());
-
-  const checkbox = (label: string) => screen.getByLabelText(label) as HTMLInputElement;
-  const group = (label: string) => checkbox(label).closest('div') as HTMLElement;
-
-  it('has a checkbox per type, seatbelt allowed by default and the others not available in this build', async () => {
+  it("says every job runs in one, and shows the golden image's setup in place of the isolation choice", async () => {
     renderWithProviders(<SettingsPage onBack={jest.fn()} />);
-    await waitFor(() => expect(screen.getByText('Isolation')).toBeInTheDocument());
 
-    expect(checkbox('Seatbelt sandbox').checked).toBe(true);
-    expect(checkbox('Seatbelt sandbox').disabled).toBe(false);
-    for (const label of ['Service account', 'macOS VM']) {
-      expect({ label, checked: checkbox(label).checked, disabled: checkbox(label).disabled }).toEqual({
-        label,
-        checked: false,
-        disabled: true,
-      });
-      expect(group(label)).toHaveTextContent('Not available in this build');
-    }
-    expect(group('Seatbelt sandbox')).not.toHaveTextContent('Not available in this build');
-    // The service account is headless: say so where it would be chosen.
-    expect(group('Service account')).toHaveTextContent(/Headless only/);
-  });
-
-  it("says this Mac's set is the guard, and the repository's list only orders it", async () => {
-    renderWithProviders(<SettingsPage onBack={jest.fn()} />);
-    await waitFor(() => expect(screen.getByText('Isolation')).toBeInTheDocument());
-
-    const section = screen.getByText('Isolation').closest('section') as HTMLElement;
-    expect(section).toHaveTextContent(
-      "Each job runs under the first type in its repository's isolation: list that is checked here and available in " +
-        'this build (a repository that declares none accepts any, strongest first). If none qualifies, the job is ' +
-        'refused, never run under a type its repository did not list.'
-    );
-  });
-
-  it('turns seatbelt off and on, sending the allowed list', async () => {
-    renderWithProviders(<SettingsPage onBack={jest.fn()} />);
-    await waitFor(() => expect(checkbox('Seatbelt sandbox').checked).toBe(true));
-
-    fireEvent.click(checkbox('Seatbelt sandbox'));
-    await waitFor(() => expect(mockLocalmost.settings.set).toHaveBeenLastCalledWith({ isolation: { allowed: [] } }));
-    await waitFor(() => expect(checkbox('Seatbelt sandbox').checked).toBe(false));
-    // Nothing allowed: every job is refused, and the page says so.
-    expect(screen.getByText(/No type is allowed: every job is refused/)).toBeInTheDocument();
-
-    fireEvent.click(checkbox('Seatbelt sandbox'));
-    await waitFor(() => expect(mockLocalmost.settings.set).toHaveBeenLastCalledWith({ isolation: { allowed: ['seatbelt'] } }));
-  });
-
-  it('shows the saved set from the store, and sends only types this build can run', async () => {
-    // A config a later build wrote may allow the VM; it allows nothing here,
-    // and turning seatbelt on or off does not send it back.
-    seedZubridge({ config: { isolation: { allowed: ['macos-vm'] } } });
-    renderWithProviders(<SettingsPage onBack={jest.fn()} />);
-    await waitFor(() => expect(checkbox('Seatbelt sandbox').checked).toBe(false));
-    expect(checkbox('macOS VM').checked).toBe(false);
-
-    fireEvent.click(checkbox('Seatbelt sandbox'));
-    await waitFor(() => expect(mockLocalmost.settings.set).toHaveBeenLastCalledWith({ isolation: { allowed: ['seatbelt'] } }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Build the golden image' })).toBeInTheDocument());
+    const section = screen.getByText('macOS VM').closest('section') as HTMLElement;
+    expect(section).toHaveTextContent(/Every job runs in a fresh macOS VM/);
+    expect(section).toHaveTextContent(/takes no jobs until the image is ready/);
+    expect(screen.queryByText('Isolation')).not.toBeInTheDocument();
+    expect(screen.queryByText('Job Environment')).not.toBeInTheDocument();
   });
 });

@@ -11,7 +11,6 @@ import {
   LogEntry,
   SleepProtection,
   LogLevel,
-  ToolCacheLocation,
   UserFilterConfig,
   PowerConfig,
   BatteryPauseThreshold,
@@ -21,20 +20,10 @@ import {
 } from '../../shared/types';
 import {
   ResourcePauseConfig,
-  JobEnvironmentConfig,
   PreferenceSection,
   DEFAULT_RESOURCE_PAUSE_CONFIG,
-  DEFAULT_JOB_ENVIRONMENT_CONFIG,
   resolveResourcePauseConfig,
-  resolveJobEnvironmentConfig,
 } from '../../shared/job-preferences';
-import {
-  IsolationConfig,
-  IsolationType,
-  DEFAULT_ISOLATION_CONFIG,
-  availableIsolationTypes,
-  resolveIsolationConfig,
-} from '../../shared/isolation';
 import {
   useStore,
 } from '../store';
@@ -45,8 +34,6 @@ import {
 // exceeded". The store is `{}` until main's first state arrives. (The old
 // inline literal was also the pre-normalization shape.)
 const NO_USER_FILTER: UserFilterConfig = { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] };
-// The same, for a store with no isolation section yet.
-const DEFAULT_ISOLATION: IsolationConfig = { allowed: [...DEFAULT_ISOLATION_CONFIG.allowed] };
 
 export type ThemeSetting = 'light' | 'dark' | 'auto';
 
@@ -75,10 +62,6 @@ interface AppConfigContextValue {
   sleepProtectionConsented: boolean;
   consentToSleepProtection: () => Promise<void>;
 
-  // Runner settings
-  toolCacheLocation: ToolCacheLocation;
-  setToolCacheLocation: (setting: ToolCacheLocation) => Promise<void>;
-
   // User filter
   userFilter: UserFilterConfig;
   setUserFilter: (filter: UserFilterConfig) => Promise<void>;
@@ -100,14 +83,6 @@ interface AppConfigContextValue {
   // What a resource pause does to running jobs
   resourcePause: ResourcePauseConfig;
   setResourcePauseRunningJobs: (runningJobs: ResourcePauseConfig['runningJobs']) => Promise<void>;
-
-  // What localmost adds to each job's environment, each on or off
-  jobEnvironment: JobEnvironmentConfig;
-  setJobEnvironmentOption: (key: keyof JobEnvironmentConfig, enabled: boolean) => Promise<void>;
-
-  // Which isolation types this Mac allows a job to get
-  isolation: IsolationConfig;
-  setIsolationAllowed: (type: IsolationType, allowed: boolean) => Promise<void>;
 
   // App state
   isOnline: boolean;
@@ -140,13 +115,10 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
   const storeMaxJobHistory = useStore((state) => state?.config?.maxJobHistory ?? 10);
   const storeSleepProtection = useStore((state) => state?.config?.sleepProtection ?? 'never');
   const storeSleepProtectionConsented = useStore((state) => state?.config?.sleepProtectionConsented ?? false);
-  const storeToolCacheLocation = useStore((state) => state?.config?.toolCacheLocation ?? 'persistent');
   const storeUserFilter = useStore((state) => state?.config?.userFilter ?? NO_USER_FILTER);
   const storePower = useStore((state) => state?.config?.power ?? DEFAULT_POWER_CONFIG);
   const storeNotifications = useStore((state) => state?.config?.notifications ?? DEFAULT_NOTIFICATIONS_CONFIG);
   const storeResourcePause = useStore((state) => state?.config?.resourcePause ?? DEFAULT_RESOURCE_PAUSE_CONFIG);
-  const storeJobEnvironment = useStore((state) => state?.config?.jobEnvironment ?? DEFAULT_JOB_ENVIRONMENT_CONFIG);
-  const storeIsolation = useStore((state) => state?.config?.isolation ?? DEFAULT_ISOLATION);
   const storeIsOnline = useStore((state) => state?.ui?.isOnline ?? true);
   const storeIsLoading = useStore((state) => state?.ui?.isInitialLoading ?? true);
   const storeError = useStore((state) => state?.ui?.error ?? null);
@@ -170,13 +142,10 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     maxJobHistory: number;
     sleepProtection: SleepProtection;
     sleepProtectionConsented: boolean;
-    toolCacheLocation: ToolCacheLocation;
     userFilter: UserFilterConfig;
     power: PowerConfig;
     notifications: NotificationsConfig;
     resourcePause: ResourcePauseConfig;
-    jobEnvironment: JobEnvironmentConfig;
-    isolation: IsolationConfig;
     isOnline: boolean;
     isLoading: boolean;
     error: string | null;
@@ -188,13 +157,10 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     maxJobHistory: 10,
     sleepProtection: 'never',
     sleepProtectionConsented: false,
-    toolCacheLocation: 'persistent',
     userFilter: { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] },
     power: DEFAULT_POWER_CONFIG,
     notifications: DEFAULT_NOTIFICATIONS_CONFIG,
     resourcePause: DEFAULT_RESOURCE_PAUSE_CONFIG,
-    jobEnvironment: DEFAULT_JOB_ENVIRONMENT_CONFIG,
-    isolation: DEFAULT_ISOLATION,
     isOnline: true,
     isLoading: true,
     error: null,
@@ -208,13 +174,10 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
   const maxJobHistory = isZubridgeReady ? storeMaxJobHistory : fallbackState.maxJobHistory;
   const sleepProtection = isZubridgeReady ? storeSleepProtection : fallbackState.sleepProtection;
   const sleepProtectionConsented = isZubridgeReady ? storeSleepProtectionConsented : fallbackState.sleepProtectionConsented;
-  const toolCacheLocation = isZubridgeReady ? storeToolCacheLocation : fallbackState.toolCacheLocation;
   const userFilter = isZubridgeReady ? storeUserFilter : fallbackState.userFilter;
   const power = isZubridgeReady ? storePower : fallbackState.power;
   const notifications = isZubridgeReady ? storeNotifications : fallbackState.notifications;
   const resourcePause = isZubridgeReady ? storeResourcePause : fallbackState.resourcePause;
-  const jobEnvironment = isZubridgeReady ? storeJobEnvironment : fallbackState.jobEnvironment;
-  const isolation = isZubridgeReady ? storeIsolation : fallbackState.isolation;
   const isOnline = isZubridgeReady ? storeIsOnline : fallbackState.isOnline;
   const isLoading = isZubridgeReady ? storeIsLoading : fallbackState.isLoading;
   const error = isZubridgeReady ? storeError : fallbackState.error;
@@ -264,7 +227,6 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
             typeof settings.sleepProtectionConsented === 'boolean'
               ? settings.sleepProtectionConsented
               : prev.sleepProtectionConsented,
-          toolCacheLocation: (settings.toolCacheLocation as ToolCacheLocation) || prev.toolCacheLocation,
           // Normalize rather than accepting only the new shape: a config still
           // using the legacy `mode` field would otherwise be discarded here and
           // silently replaced by the default, so the UI would show a policy
@@ -277,8 +239,6 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
           // Read as the runner reads config.yaml, so a value it would take as
           // absent shows as the default it uses instead.
           resourcePause: resolveResourcePauseConfig(settings.resourcePause as PreferenceSection<ResourcePauseConfig> | undefined),
-          jobEnvironment: resolveJobEnvironmentConfig(settings.jobEnvironment as PreferenceSection<JobEnvironmentConfig> | undefined),
-          isolation: resolveIsolationConfig(settings.isolation as Partial<Record<keyof IsolationConfig, unknown>> | undefined),
           isLoading: false,
         }));
 
@@ -391,15 +351,6 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     }
   }, []);
 
-  const setToolCacheLocation = useCallback(async (setting: ToolCacheLocation) => {
-    setFallbackState(prev => ({ ...prev, toolCacheLocation: setting }));
-    try {
-      await window.localmost.settings.set({ toolCacheLocation: setting });
-    } catch {
-      // Optimistic update handled by zubridge sync
-    }
-  }, []);
-
   const setUserFilter = useCallback(async (filter: UserFilterConfig) => {
     setFallbackState(prev => ({ ...prev, userFilter: filter }));
     try {
@@ -478,33 +429,6 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     }
   }, [resourcePause]);
 
-  const setJobEnvironmentOption = useCallback(async (key: keyof JobEnvironmentConfig, enabled: boolean) => {
-    // Every key, each true or false: settings:set takes this section whole.
-    const newConfig = { ...jobEnvironment, [key]: enabled };
-    setFallbackState(prev => ({ ...prev, jobEnvironment: newConfig }));
-    try {
-      await window.localmost.settings.set({ jobEnvironment: newConfig });
-    } catch {
-      // Optimistic update handled by zubridge sync
-    }
-  }, [jobEnvironment]);
-
-  const setIsolationAllowed = useCallback(async (type: IsolationType, allowed: boolean) => {
-    // Only types this build can run: settings:set refuses any other, and a
-    // type a later build allowed in config.yaml allows nothing here anyway.
-    // So a change here drops such a type from config.yaml: a later build
-    // shows it off until it is turned on again (see resolveIsolationConfig).
-    const available = availableIsolationTypes();
-    const kept = isolation.allowed.filter((t: IsolationType) => t !== type && available.includes(t));
-    const newConfig: IsolationConfig = { allowed: allowed ? [...kept, type] : kept };
-    setFallbackState(prev => ({ ...prev, isolation: newConfig }));
-    try {
-      await window.localmost.settings.set({ isolation: newConfig });
-    } catch {
-      // Optimistic update handled by zubridge sync
-    }
-  }, [isolation]);
-
   const clearLogs = useCallback(() => {
     logsRef.current = [];
     setLogs([]);
@@ -528,8 +452,6 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     setSleepProtection,
     sleepProtectionConsented,
     consentToSleepProtection,
-    toolCacheLocation,
-    setToolCacheLocation,
     userFilter,
     setUserFilter,
     power,
@@ -542,10 +464,6 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     setNotifyOnJobEvents,
     resourcePause,
     setResourcePauseRunningJobs,
-    jobEnvironment,
-    setJobEnvironmentOption,
-    isolation,
-    setIsolationAllowed,
     isOnline,
     isLoading,
     error,

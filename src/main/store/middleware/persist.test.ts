@@ -15,8 +15,9 @@ jest.mock('../../log-file', () => ({
 }));
 
 import * as yaml from 'js-yaml';
+import { bootLog } from '../../log-file';
 import { loadPersistedConfig, savePersistedConfig } from './persist';
-import { store, runnerIsolation, runnerJobEnvironment, runnerResourcePause } from '../index';
+import { store, runnerResourcePause } from '../index';
 import { defaultConfigState } from '../types';
 import { CONFIG_VERSION, type AppConfig } from '../../config';
 import type { GitHubUser } from '../../../shared/types';
@@ -82,162 +83,88 @@ describe('savePersistedConfig auth preservation', () => {
   });
 });
 
-describe('the resource-pause and job-environment preferences', () => {
-  it('start at their defaults: running jobs finish, every convenience on, the Swift Build link-temp grant off', () => {
+describe('the resource-pause preference', () => {
+  it('starts at its default: running jobs finish', () => {
     loadPersistedConfig();
     expect(store.getState().config.resourcePause).toEqual({ runningJobs: 'finish' });
-    expect(store.getState().config.jobEnvironment).toEqual({
-      toolShims: true,
-      javaToolOptions: true,
-      perJobTempDir: true,
-      createMissingGrantedDirs: true,
-      swiftBuildLinkTemp: false,
-    });
   });
 
-  it('load from config.yaml and persist back, so a save at quit keeps them', () => {
-    // The store loads both sections from the file at launch, so a save that
-    // dropped them would quietly undo the setting at the next one.
-    fs.writeFileSync(
-      configPath,
-      [
-        'configVersion: 1',
-        'theme: auto',
-        'resourcePause:',
-        '  runningJobs: stop',
-        'jobEnvironment:',
-        '  toolShims: false',
-        '  perJobTempDir: false',
-        '',
-      ].join('\n')
-    );
+  it('loads from config.yaml and persists back, so a save at quit keeps it', () => {
+    fs.writeFileSync(configPath, 'configVersion: 1\ntheme: auto\nresourcePause:\n  runningJobs: stop\n');
     loadPersistedConfig();
-
     expect(store.getState().config.resourcePause).toEqual({ runningJobs: 'stop' });
-    expect(store.getState().config.jobEnvironment).toEqual({
-      toolShims: false,
-      javaToolOptions: true,
-      perJobTempDir: false,
-      createMissingGrantedDirs: true,
-      swiftBuildLinkTemp: false,
-    });
 
-    store.getState().setJobEnvironment({ ...store.getState().config.jobEnvironment, javaToolOptions: false });
     savePersistedConfig();
-
     const saved = yaml.load(fs.readFileSync(configPath, 'utf-8')) as AppConfig;
     expect(saved.resourcePause).toEqual({ runningJobs: 'stop' });
-    expect(saved.jobEnvironment).toEqual({
-      toolShims: false,
-      javaToolOptions: false,
-      perJobTempDir: false,
-      createMissingGrantedDirs: true,
-      swiftBuildLinkTemp: false,
-    });
-
-    // And back again, as the next launch reads it.
-    store.setState({ config: { ...defaultConfigState } });
-    loadPersistedConfig();
-    expect(store.getState().config.resourcePause).toEqual({ runningJobs: 'stop' });
-    expect(store.getState().config.jobEnvironment.javaToolOptions).toBe(false);
   });
 
-  it("keep the Swift Build link-temp grant off unless the file turns it on, and persist it turned on", () => {
-    fs.writeFileSync(configPath, 'configVersion: 1\ntheme: auto\njobEnvironment:\n  swiftBuildLinkTemp: true\n');
+  it('takes a value the runner would not as its default, as the runner does', () => {
+    fs.writeFileSync(configPath, 'configVersion: 1\ntheme: auto\nresourcePause:\n  runningJobs: kill\n');
     loadPersistedConfig();
-    expect(store.getState().config.jobEnvironment.swiftBuildLinkTemp).toBe(true);
-    expect(runnerJobEnvironment().swiftBuildLinkTemp).toBe(true);
-
-    savePersistedConfig();
-    const saved = yaml.load(fs.readFileSync(configPath, 'utf-8')) as AppConfig;
-    expect(saved.jobEnvironment).toEqual(expect.objectContaining({ swiftBuildLinkTemp: true, toolShims: true }));
-
-    store.getState().setJobEnvironment({ ...store.getState().config.jobEnvironment, swiftBuildLinkTemp: false });
-    savePersistedConfig();
-    store.setState({ config: { ...defaultConfigState } });
-    loadPersistedConfig();
-    expect(store.getState().config.jobEnvironment.swiftBuildLinkTemp).toBe(false);
-  });
-
-  it('take a value the runner would not as its default, as the runner does', () => {
-    fs.writeFileSync(
-      configPath,
-      'configVersion: 1\ntheme: auto\nresourcePause:\n  runningJobs: kill\njobEnvironment:\n  toolShims: "no"\n  javaToolOptions: false\n'
-    );
-    loadPersistedConfig();
-
     expect(store.getState().config.resourcePause).toEqual({ runningJobs: 'finish' });
-    expect(store.getState().config.jobEnvironment).toEqual({
-      toolShims: true,
-      javaToolOptions: false,
-      perJobTempDir: true,
-      createMissingGrantedDirs: true,
-      swiftBuildLinkTemp: false,
-    });
-  });
-});
-
-describe('the isolation types this Mac allows', () => {
-  it('start at seatbelt alone, load from config.yaml, and persist back', () => {
-    loadPersistedConfig();
-    expect(store.getState().config.isolation).toEqual({ allowed: ['seatbelt'] });
-
-    fs.writeFileSync(configPath, 'configVersion: 1\ntheme: auto\nisolation:\n  allowed: []\n');
-    loadPersistedConfig();
-    expect(store.getState().config.isolation).toEqual({ allowed: [] });
-    expect(runnerIsolation()).toEqual({ allowed: [] });
-
-    store.getState().setIsolation({ allowed: ['seatbelt'] });
-    savePersistedConfig();
-    const saved = yaml.load(fs.readFileSync(configPath, 'utf-8')) as AppConfig;
-    expect(saved.isolation).toEqual({ allowed: ['seatbelt'] });
   });
 
-  it('keep a type a later build can run, and drop one no build knows', () => {
-    // A config written by the build that ships the VM type survives a launch
-    // of this one; it allows nothing here, where the VM is not available.
-    fs.writeFileSync(configPath, 'configVersion: 1\ntheme: auto\nisolation:\n  allowed: [macos-vm, docker]\n');
+  it('is the one Settings shows, whatever is written to config.yaml while the app runs', () => {
+    // The store owns the section: the page shows the store's value, and
+    // every save writes it back over the file. A runner that read the file at
+    // each pause would act on a hand edit the page never showed.
+    fs.writeFileSync(configPath, 'configVersion: 1\ntheme: auto\nresourcePause:\n  runningJobs: stop\n');
     loadPersistedConfig();
-    expect(store.getState().config.isolation).toEqual({ allowed: ['macos-vm'] });
-  });
-});
-
-describe("the runner's resource-pause and job-environment preferences", () => {
-  it('are the ones Settings shows, whatever is written to config.yaml while the app runs', () => {
-    // The store owns both sections: the page shows the store's value, and
-    // every save writes it back over the file. The runner read the file at
-    // each pause and spawn instead, so a hand edit made while the app ran
-    // took effect for the next job, the page went on showing the old value,
-    // and the next save put the old value back.
-    fs.writeFileSync(
-      configPath,
-      'configVersion: 1\ntheme: auto\nresourcePause:\n  runningJobs: stop\njobEnvironment:\n  toolShims: false\n'
-    );
-    loadPersistedConfig();
+    fs.writeFileSync(configPath, 'configVersion: 1\ntheme: auto\nresourcePause:\n  runningJobs: finish\n');
     expect(runnerResourcePause()).toEqual({ runningJobs: 'stop' });
-    expect(runnerJobEnvironment()).toEqual({
-      toolShims: false,
-      javaToolOptions: true,
-      perJobTempDir: true,
-      createMissingGrantedDirs: true,
-      swiftBuildLinkTemp: false,
-    });
-
-    fs.writeFileSync(
-      configPath,
-      'configVersion: 1\ntheme: auto\nresourcePause:\n  runningJobs: finish\njobEnvironment:\n  toolShims: true\n  javaToolOptions: false\n'
-    );
-    expect(runnerResourcePause()).toEqual(store.getState().config.resourcePause);
-    expect(runnerResourcePause()).toEqual({ runningJobs: 'stop' });
-    expect(runnerJobEnvironment()).toEqual(store.getState().config.jobEnvironment);
-    expect(runnerJobEnvironment().toolShims).toBe(false);
-    expect(runnerJobEnvironment().javaToolOptions).toBe(true);
 
     // A change made in Settings reaches the runner at once.
     store.getState().setResourcePause({ runningJobs: 'finish' });
-    store.getState().setJobEnvironment({ ...store.getState().config.jobEnvironment, perJobTempDir: false });
     expect(runnerResourcePause()).toEqual({ runningJobs: 'finish' });
-    expect(runnerJobEnvironment().perJobTempDir).toBe(false);
+  });
+});
+
+describe('sections an earlier build wrote that nothing reads now', () => {
+  // The seatbelt job environment, the isolation types a Mac allowed, and the
+  // tool cache's location. A config.yaml that still has them loads, says
+  // once for each that it is ignored, and drops it at the next save.
+  const LEGACY = [
+    'configVersion: 1',
+    'theme: dark',
+    'jobEnvironment:',
+    '  toolShims: false',
+    '  swiftBuildLinkTemp: true',
+    'isolation:',
+    '  allowed: [seatbelt]',
+    'toolCacheLocation: per-sandbox',
+    'resourcePause:',
+    '  runningJobs: stop',
+    '',
+  ].join('\n');
+
+  it('load without error, the rest of the file applied, with one warning for each', () => {
+    fs.writeFileSync(configPath, LEGACY);
+    jest.mocked(bootLog).mockClear();
+    loadPersistedConfig();
+
+    expect(store.getState().config.theme).toBe('dark');
+    expect(store.getState().config.resourcePause).toEqual({ runningJobs: 'stop' });
+    const warnings = jest.mocked(bootLog).mock.calls.filter(([level]) => level === 'warn').map(([, message]) => message);
+    expect(warnings).toEqual([
+      expect.stringMatching(/^Ignoring jobEnvironment in config\.yaml: .*macOS VM/),
+      expect.stringMatching(/^Ignoring isolation in config\.yaml: .*macOS VM/),
+      expect.stringMatching(/^Ignoring toolCacheLocation in config\.yaml: /),
+    ]);
+    expect(jest.mocked(bootLog).mock.calls.some(([level]) => level === 'error')).toBe(false);
+  });
+
+  it('are left out at the next save, and nothing else is', () => {
+    fs.writeFileSync(configPath, LEGACY);
+    loadPersistedConfig();
+    savePersistedConfig();
+
+    const saved = yaml.load(fs.readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
+    expect(saved).not.toHaveProperty('jobEnvironment');
+    expect(saved).not.toHaveProperty('isolation');
+    expect(saved).not.toHaveProperty('toolCacheLocation');
+    expect(saved.theme).toBe('dark');
+    expect(saved.resourcePause).toEqual({ runningJobs: 'stop' });
   });
 });
 

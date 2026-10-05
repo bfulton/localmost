@@ -18,8 +18,7 @@ import {
   NotificationsConfig,
   UpdateSettings,
 } from '../shared/types';
-import type { ResourcePauseConfig, JobEnvironmentConfig } from '../shared/job-preferences';
-import type { IsolationConfig } from '../shared/isolation';
+import type { ResourcePauseConfig } from '../shared/job-preferences';
 
 // Config paths - uses centralized path management
 const configDir = getAppDataDir();
@@ -60,8 +59,6 @@ export const SETTABLE_CONFIG_KEYS = [
   'power',  // Power settings (battery/video call pausing)
   'notifications',
   'resourcePause',  // What a resource pause does to running jobs
-  'jobEnvironment',  // What localmost adds to each job's environment
-  'isolation',  // Which isolation types this Mac allows a job to get
 ] as const;
 
 export type SettableConfigKey = typeof SETTABLE_CONFIG_KEYS[number];
@@ -108,30 +105,12 @@ export interface AppConfig {
   dockerVm?: Partial<Record<keyof DockerVmConfig, unknown>>;
   /** What a resource pause does; see ResourcePauseConfig and resolveResourcePauseConfig. */
   resourcePause?: Partial<Record<keyof ResourcePauseConfig, unknown>>;
-  /** What localmost adds to each job's environment; see resolveJobEnvironmentConfig. */
-  jobEnvironment?: Partial<Record<keyof JobEnvironmentConfig, unknown>>;
-  /**
-   * Which isolation types this Mac allows a job to get: `allowed`, a list of
-   * `seatbelt`, `service-account`, `macos-vm`. Seatbelt alone by default in
-   * this build, the only type it can run; the VM alone from the build that
-   * ships the macOS VM type. A repository's .localmostrc orders the types it
-   * accepts, and a job gets the first that is both allowed here and
-   * available in this build, or is refused. See resolveIsolationConfig and
-   * docs/roadmap/localmostrc.md (Isolation).
-   */
-  isolation?: Partial<Record<keyof IsolationConfig, unknown>>;
 }
 
-// The resource-pause and job-environment preferences, with their defaults
-// and resolvers, live in shared/job-preferences, where the Settings page
-// reads them too.
-export {
-  DEFAULT_RESOURCE_PAUSE_CONFIG,
-  DEFAULT_JOB_ENVIRONMENT_CONFIG,
-  resolveResourcePauseConfig,
-  resolveJobEnvironmentConfig,
-} from '../shared/job-preferences';
-export type { ResourcePauseConfig, JobEnvironmentConfig } from '../shared/job-preferences';
+// The resource-pause preferences, with their defaults and resolver, live in
+// shared/job-preferences, where the Settings page reads them too.
+export { DEFAULT_RESOURCE_PAUSE_CONFIG, resolveResourcePauseConfig } from '../shared/job-preferences';
+export type { ResourcePauseConfig } from '../shared/job-preferences';
 
 /**
  * The per-job Docker VMs, as used: every key present, in range. See

@@ -1,11 +1,10 @@
-import { admitJob, buildAdmissionDeps, checkRepoPolicyApproval, JobAdmissionDeps, PolicyApprovalDeps } from './job-admission';
+import { admitJob, buildAdmissionDeps, checkRepoPolicyApproval, JobAdmissionDeps, NO_DOCKER_RELAY_REASON, PolicyApprovalDeps } from './job-admission';
 import type { GitHubJobInfo } from './broker-proxy-service';
 import type { PolicyDecision } from './policy-cache';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { findLocalmostrc, LOCALMOSTRC_FILENAME } from '../shared/localmostrc';
-import { availableIsolationTypes, DEFAULT_ISOLATION_CONFIG, isolationList, type IsolationType } from '../shared/isolation';
 
 describe('admitJob', () => {
   const target = { id: 't1', displayName: 'owner/repo' };
@@ -25,10 +24,8 @@ describe('admitJob', () => {
     policyReason?: string | null;
     spawn?: () => Promise<boolean>;
     findTarget?: JobAdmissionDeps['findTarget'];
-    /** The policy's isolation list for the job; any by default, as with no policy. */
-    accepted?: IsolationType[];
-    /** What this Mac allows; seatbelt alone by default, as in Settings. */
-    allowed?: IsolationType[];
+    /** Whether the approved policy grants the job Docker; not by default, as with no policy. */
+    docker?: boolean;
   } = {}) {
     const calls: string[] = [];
     const deps = {
@@ -54,14 +51,10 @@ describe('admitJob', () => {
         calls.push('policy');
         return overrides.policyReason ?? null;
       }),
-      isolation: {
-        accepted: jest.fn((_repository: string, _sha?: string, _workflow?: string) => {
-          calls.push('isolation');
-          return overrides.accepted ?? isolationList(undefined);
-        }),
-        allowed: jest.fn(() => overrides.allowed ?? [...DEFAULT_ISOLATION_CONFIG.allowed]),
-        available: jest.fn(() => availableIsolationTypes()),
-      },
+      dockerGranted: jest.fn((_repository: string, _sha?: string, _workflow?: string) => {
+        calls.push('docker');
+        return overrides.docker ?? false;
+      }),
       log: jest.fn(),
     };
     return { deps: deps as unknown as JobAdmissionDeps & typeof deps, calls };
@@ -72,8 +65,8 @@ describe('admitJob', () => {
 
     await admitJob(deps, 't1', 'req-1', info);
 
-    expect(calls).toEqual(['filter', 'policy', 'isolation', 'context', 'spawn']);
-    expect(deps.runnerManager.spawnWorkerForJob).toHaveBeenCalledWith('seatbelt');
+    expect(calls).toEqual(['filter', 'policy', 'docker', 'context', 'spawn']);
+    expect(deps.runnerManager.spawnWorkerForJob).toHaveBeenCalledWith();
     expect(deps.runnerManager.setPendingTargetContext).toHaveBeenCalledWith(
       'next', 't1', 'owner/repo', expect.any(String), 42, 7, 'me', 'abc1234def', 'refs/heads/main', 'ci', 'req-1', 'owner/repo'
     );
@@ -163,7 +156,7 @@ describe('admitJob', () => {
       announce: jest.fn(),
     } satisfies PolicyApprovalDeps;
     const admission = buildAdmissionDeps(policy, {
-      findTarget: deps.findTarget, runnerManager: deps.runnerManager, broker: deps.broker, isolation: deps.isolation, log: deps.log,
+      findTarget: deps.findTarget, runnerManager: deps.runnerManager, broker: deps.broker, dockerGranted: deps.dockerGranted, log: deps.log,
     });
 
     await admitJob(admission, 't1', 'req-1', { ...info, repositoryId: 4242 });
@@ -172,74 +165,44 @@ describe('admitJob', () => {
     expect(deps.runnerManager.spawnWorkerForJob).toHaveBeenCalled();
   });
 
-  describe('choosing the isolation', () => {
-    it("asks for the approved policy's list for the job's repository, commit and workflow", async () => {
+  describe('a policy that grants Docker', () => {
+    it("asks of the approved policy for the job's repository, commit and workflow", async () => {
       const { deps } = setup();
 
       await admitJob(deps, 't1', 'req-1', { ...info, githubRepo: 'MyOrg/App' });
 
-      expect(deps.isolation.accepted).toHaveBeenCalledWith('MyOrg/App', 'abc1234def', 'ci');
+      expect(deps.dockerGranted).toHaveBeenCalledWith('MyOrg/App', 'abc1234def', 'ci');
     });
 
-    it('runs the default policy (any) under seatbelt on a Mac at its defaults', async () => {
-      const { deps } = setup();
+    it('is refused through the refused-job path, naming the missing Docker relay', async () => {
+      // A macOS VM job has no way to the worker's Docker socket yet. Run, it
+      // would fail at its first docker command, after a VM booted for it.
+      const { deps, calls } = setup({ docker: true });
 
       await admitJob(deps, 't1', 'req-1', info);
 
-      expect(deps.runnerManager.spawnWorkerForJob).toHaveBeenCalledWith('seatbelt');
-    });
-
-    it('takes seatbelt for a policy that accepts macos-vm first and seatbelt after, as this build cannot run the VM', async () => {
-      const { deps } = setup({ accepted: ['macos-vm', 'seatbelt'] });
-
-      await admitJob(deps, 't1', 'req-1', info);
-
-      expect(deps.runnerManager.spawnWorkerForJob).toHaveBeenCalledWith('seatbelt');
-      expect(deps.broker.refuseJob).not.toHaveBeenCalled();
-    });
-
-    it('refuses a policy that accepts only macos-vm, through the refused-job path, saying why', async () => {
-      const { deps, calls } = setup({ accepted: ['macos-vm'] });
-
-      await admitJob(deps, 't1', 'req-1', info);
-
-      const reason =
-        'no isolation type this job accepts can run on this Mac: this repository accepts macos-vm; ' +
-        'this Mac allows seatbelt; macos-vm is not available in this build';
+      expect(NO_DOCKER_RELAY_REASON).toMatch(/Docker relay/);
       expect(deps.broker.refuseJob).toHaveBeenCalledWith('t1', 'req-1');
-      expect(deps.runnerManager.recordRefusedJob).toHaveBeenCalledWith(expect.objectContaining({ repository: 'owner/repo', reason }));
-      expect(deps.runnerManager.cancelRun).toHaveBeenCalledWith('owner', 'repo', 42, reason, 'refused-42-1');
+      expect(deps.runnerManager.recordRefusedJob).toHaveBeenCalledWith(
+        expect.objectContaining({ repository: 'owner/repo', reason: NO_DOCKER_RELAY_REASON })
+      );
+      expect(deps.runnerManager.cancelRun).toHaveBeenCalledWith('owner', 'repo', 42, NO_DOCKER_RELAY_REASON, 'refused-42-1');
       expect(calls.indexOf('refuse')).toBeLessThan(calls.indexOf('cancel'));
       expect(deps.runnerManager.setPendingTargetContext).not.toHaveBeenCalled();
       expect(deps.runnerManager.spawnWorkerForJob).not.toHaveBeenCalled();
     });
 
-    it('refuses a policy that accepts seatbelt on a Mac that allows nothing, rather than downgrade', async () => {
-      const { deps } = setup({ accepted: ['seatbelt'], allowed: [] });
-
-      await admitJob(deps, 't1', 'req-1', info);
-
-      expect(deps.runnerManager.recordRefusedJob).toHaveBeenCalledWith(
-        expect.objectContaining({
-          reason:
-            'no isolation type this job accepts can run on this Mac: this repository accepts seatbelt; ' +
-            'this Mac allows none; seatbelt is not allowed in Settings > Isolation',
-        })
-      );
-      expect(deps.runnerManager.spawnWorkerForJob).not.toHaveBeenCalled();
-    });
-
-    it('is not asked for a job refused before it', async () => {
+    it('is not asked about for a job refused before it', async () => {
       const { deps } = setup({ policyReason: 'not approved' });
 
       await admitJob(deps, 't1', 'req-1', info);
 
-      expect(deps.isolation.accepted).not.toHaveBeenCalled();
+      expect(deps.dockerGranted).not.toHaveBeenCalled();
     });
 
-    it('refuses the job when the choice itself throws', async () => {
+    it('refuses the job when the question itself throws', async () => {
       const { deps } = setup();
-      deps.isolation.accepted.mockImplementationOnce(() => {
+      deps.dockerGranted.mockImplementationOnce(() => {
         throw new Error('approval cache unreadable');
       });
 

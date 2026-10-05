@@ -6,7 +6,6 @@ import {
   LogEntry,
   LogLevel,
   SleepProtection,
-  ToolCacheLocation,
   UserFilterConfig,
   PowerConfig,
   NotificationsConfig,
@@ -26,13 +25,7 @@ import {
   DEFAULT_POWER_CONFIG,
   DEFAULT_NOTIFICATIONS_CONFIG,
 } from '../../shared/types';
-import {
-  ResourcePauseConfig,
-  JobEnvironmentConfig,
-  DEFAULT_RESOURCE_PAUSE_CONFIG,
-  DEFAULT_JOB_ENVIRONMENT_CONFIG,
-} from '../../shared/job-preferences';
-import { IsolationConfig, DEFAULT_ISOLATION_CONFIG } from '../../shared/isolation';
+import { ResourcePauseConfig, DEFAULT_RESOURCE_PAUSE_CONFIG } from '../../shared/job-preferences';
 
 // =============================================================================
 // Theme Types
@@ -60,9 +53,6 @@ export interface ConfigSlice {
   sleepProtection: SleepProtection;
   sleepProtectionConsented: boolean;
 
-  // Runner settings
-  toolCacheLocation: ToolCacheLocation;
-
   // User filter
   userFilter: UserFilterConfig;
 
@@ -77,12 +67,6 @@ export interface ConfigSlice {
 
   // What a resource pause does to running jobs (resourcePause in config.yaml)
   resourcePause: ResourcePauseConfig;
-
-  // What localmost adds to each job's environment (jobEnvironment in config.yaml)
-  jobEnvironment: JobEnvironmentConfig;
-
-  // Which isolation types this Mac allows a job to get (isolation in config.yaml)
-  isolation: IsolationConfig;
 
   // App launch settings
   launchAtLogin: boolean;
@@ -203,14 +187,11 @@ export interface ConfigActions {
   setMaxJobHistory: (max: number) => void;
   setSleepProtection: (setting: SleepProtection) => void;
   consentToSleepProtection: () => void;
-  setToolCacheLocation: (setting: ToolCacheLocation) => void;
   setUserFilter: (filter: UserFilterConfig) => void;
   setSandboxPolicyLevel: (level: SandboxPolicyLevel) => void;
   setPower: (config: PowerConfig) => void;
   setNotifications: (config: NotificationsConfig) => void;
   setResourcePause: (config: ResourcePauseConfig) => void;
-  setJobEnvironment: (config: JobEnvironmentConfig) => void;
-  setIsolation: (config: IsolationConfig) => void;
   setLaunchAtLogin: (enabled: boolean) => void;
   setHideOnStart: (enabled: boolean) => void;
   updateRunnerConfig: (updates: Partial<ConfigSlice['runnerConfig']>) => void;
@@ -293,15 +274,11 @@ export const defaultConfigState: ConfigSlice = {
   maxJobHistory: 10,
   sleepProtection: 'never',
   sleepProtectionConsented: false,
-  toolCacheLocation: 'persistent',
   userFilter: { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] },
   sandboxPolicyLevel: 'strict',
   power: DEFAULT_POWER_CONFIG,
   notifications: DEFAULT_NOTIFICATIONS_CONFIG,
   resourcePause: DEFAULT_RESOURCE_PAUSE_CONFIG,
-  jobEnvironment: DEFAULT_JOB_ENVIRONMENT_CONFIG,
-  // A copy: the store holds a mutable list, the default stays frozen.
-  isolation: { allowed: [...DEFAULT_ISOLATION_CONFIG.allowed] },
   launchAtLogin: false,
   hideOnStart: false,
   runnerConfig: {

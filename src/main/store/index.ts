@@ -16,7 +16,6 @@ import {
 import {
   LogLevel,
   SleepProtection,
-  ToolCacheLocation,
   UserFilterConfig,
   SandboxPolicyLevel,
   PowerConfig,
@@ -35,8 +34,7 @@ import {
   GitHubRepo,
   GitHubOrg,
 } from '../../shared/types';
-import { ResourcePauseConfig, JobEnvironmentConfig } from '../../shared/job-preferences';
-import { IsolationConfig } from '../../shared/isolation';
+import { ResourcePauseConfig } from '../../shared/job-preferences';
 
 // Create the store
 export const store = createStore<AppStore>()(
@@ -85,10 +83,6 @@ export const store = createStore<AppStore>()(
       set((state) => ({ config: { ...state.config, sleepProtectionConsented: true } }));
     },
 
-    setToolCacheLocation: (toolCacheLocation: ToolCacheLocation) => {
-      set((state) => ({ config: { ...state.config, toolCacheLocation } }));
-    },
-
     setUserFilter: (userFilter: UserFilterConfig) => {
       set((state) => ({ config: { ...state.config, userFilter } }));
     },
@@ -107,14 +101,6 @@ export const store = createStore<AppStore>()(
 
     setResourcePause: (resourcePause: ResourcePauseConfig) => {
       set((state) => ({ config: { ...state.config, resourcePause } }));
-    },
-
-    setJobEnvironment: (jobEnvironment: JobEnvironmentConfig) => {
-      set((state) => ({ config: { ...state.config, jobEnvironment } }));
-    },
-
-    setIsolation: (isolation: IsolationConfig) => {
-      set((state) => ({ config: { ...state.config, isolation } }));
     },
 
     setLaunchAtLogin: (launchAtLogin: boolean) => {
@@ -421,15 +407,3 @@ export const selectError = (state: AppState) => state.ui.error;
  * be put back by the next save.
  */
 export const runnerResourcePause = (): ResourcePauseConfig => store.getState().config.resourcePause;
-
-/**
- * What localmost adds to each job's environment, as Settings shows and sets
- * it: read at each worker spawn. From the store, as runnerResourcePause.
- */
-export const runnerJobEnvironment = (): JobEnvironmentConfig => store.getState().config.jobEnvironment;
-
-/**
- * Which isolation types this Mac allows, as Settings shows and sets them:
- * read at each job's admission. From the store, as runnerResourcePause.
- */
-export const runnerIsolation = (): IsolationConfig => store.getState().config.isolation;

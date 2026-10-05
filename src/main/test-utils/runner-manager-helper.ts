@@ -215,7 +215,7 @@ export class RunnerManagerTestHelper {
   ): Promise<boolean> {
     await this.manager.initialize();
     this.setPendingTargetContext('next', context);
-    return this.manager.spawnWorkerForJob('seatbelt');
+    return this.manager.spawnWorkerForJob();
   }
 
   /**

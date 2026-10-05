@@ -25,7 +25,6 @@ import { TargetManager } from './target-manager';
 import { ContributorCache } from './contributor-cache';
 import { admitJob, buildAdmissionDeps, PolicyApprovalDeps } from './job-admission';
 import { repoPolicyRuntime } from './repo-policy';
-import { availableIsolationTypes } from '../shared/isolation';
 
 // State management
 import {
@@ -115,12 +114,12 @@ import {
 
 // Zustand store
 import { initStore, connectWindow, cleanupStore, store } from './store/init';
-import { runnerIsolation, runnerJobEnvironment, runnerResourcePause } from './store';
+import { runnerResourcePause } from './store';
 import {
   decidePolicyForJob,
   recordPendingPolicy,
   getApprovedPolicyForCommit,
-  approvedIsolationForCommit,
+  approvedDockerForCommit,
   formatApprovalRequest,
 } from './policy-cache';
 
@@ -398,9 +397,6 @@ app.whenReady().then(async () => {
     // the job sees is localmost's; the VM's is never handed over.
     dockerBackend,
     getDockerVmConfig: () => dockerVmConfigSource.refresh(),
-    // What each job's environment gets (docs/roadmap/job-environment.md), as
-    // Settings shows it, at each worker spawn.
-    getJobEnvironmentConfig: runnerJobEnvironment,
     // Apply the policy that was approved, not whatever is in the repository
     // right now. A job only reaches this point once its policy has been
     // approved, and applying the approved copy means an unreviewed change
@@ -506,14 +502,9 @@ app.whenReady().then(async () => {
     findTarget: (targetId: string) => targetManager.getTargets().find(t => t.id === targetId),
     runnerManager,
     broker: brokerProxyService,
-    // The job's isolation: the first type in its approved policy's list -
-    // the commit's, as getRepoPolicy applies it - that Settings allows and
-    // this build can run (docs/roadmap/localmostrc.md, Isolation).
-    isolation: {
-      accepted: approvedIsolationForCommit,
-      allowed: () => runnerIsolation().allowed,
-      available: availableIsolationTypes,
-    },
+    // Docker in the approved policy - the commit's, as getRepoPolicy applies
+    // it - refuses the job: a macOS VM job cannot reach Docker yet.
+    dockerGranted: approvedDockerForCommit,
     log: (level, message) => getLogger()?.[level](message),
   });
   brokerProxyService.on('job-received', (targetId: string, jobId: string, _registeredRunnerName: string, githubInfo) => {

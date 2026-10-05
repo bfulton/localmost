@@ -13,8 +13,7 @@ import { bootLog } from '../../log-file';
 import { store, getState } from '../index';
 import { ConfigSlice, defaultConfigState } from '../types';
 import { AppConfig, CONFIG_VERSION, isConfigFromNewerBuild } from '../../config';
-import { resolveJobEnvironmentConfig, resolveResourcePauseConfig } from '../../../shared/job-preferences';
-import { resolveIsolationConfig } from '../../../shared/isolation';
+import { resolveResourcePauseConfig } from '../../../shared/job-preferences';
 
 // Debounce timer for persistence
 let persistTimer: NodeJS.Timeout | null = null;
@@ -41,14 +40,11 @@ const PERSISTED_CONFIG_KEYS: (keyof ConfigSlice)[] = [
   'maxJobHistory',
   'sleepProtection',
   'sleepProtectionConsented',
-  'toolCacheLocation',
   'userFilter',
   'sandboxPolicyLevel',
   'power',
   'notifications',
   'resourcePause',
-  'jobEnvironment',
-  'isolation',
   'launchAtLogin',
   'hideOnStart',
   'runnerConfig',
@@ -71,7 +67,8 @@ const PERSISTED_CONFIG_KEYS: (keyof ConfigSlice)[] = [
  * compile. dockerVm was added without telling this writer, and every save -
  * on each config change, and at quit - rebuilt the file without it, dropping
  * what was written there by hand. A key an earlier build wrote and AppConfig
- * no longer has (preserveWorkDir) still goes at the next save.
+ * no longer has (preserveWorkDir, RETIRED_CONFIG_KEYS) still goes at the next
+ * save.
  */
 const CONFIG_KEY_OWNER: {
   readonly [K in keyof AppConfig]-?: K extends keyof ConfigSlice ? 'store' : 'file' | 'auth' | 'version';
@@ -94,9 +91,18 @@ const CONFIG_KEY_OWNER: {
   notifications: 'store',
   dockerVm: 'file',
   resourcePause: 'store',
-  jobEnvironment: 'store',
-  isolation: 'store',
 };
+
+/**
+ * Sections of config.yaml an earlier build wrote that nothing reads now,
+ * each with why. A file that has one loads as usual, with one warning for
+ * it, and the next save leaves it out.
+ */
+export const RETIRED_CONFIG_KEYS: Readonly<Record<string, string>> = Object.freeze({
+  jobEnvironment: "the seatbelt job environment's conveniences are gone: every job runs in a macOS VM",
+  isolation: 'every job runs in a macOS VM, so there is no isolation type to allow',
+  toolCacheLocation: 'a macOS VM job keeps its tools in its own VM, which goes with the job',
+});
 
 /** The sections of config.yaml only the file holds, carried forward at each save (see CONFIG_KEY_OWNER). */
 const FILE_ONLY_CONFIG_KEYS = (Object.keys(CONFIG_KEY_OWNER) as Array<keyof AppConfig>).filter(
@@ -228,18 +234,13 @@ export function loadPersistedConfig(): void {
       };
     }
 
-    // What a resource pause does, and the job-environment conveniences: as
-    // the runner reads them at each pause and spawn, so a value it would
-    // take as absent loads as the default it uses instead.
+    // What a resource pause does: as the runner reads it at each pause, so
+    // a value it would take as absent loads as the default it uses instead.
     if (diskConfig.resourcePause !== undefined) {
       configUpdates.resourcePause = resolveResourcePauseConfig(diskConfig.resourcePause, (message) => bootLog('warn', message));
     }
-    if (diskConfig.jobEnvironment !== undefined) {
-      configUpdates.jobEnvironment = resolveJobEnvironmentConfig(diskConfig.jobEnvironment, (message) => bootLog('warn', message));
-    }
-    // Which isolation types this Mac allows, as admission reads them.
-    if (diskConfig.isolation !== undefined) {
-      configUpdates.isolation = resolveIsolationConfig(diskConfig.isolation, (message) => bootLog('warn', message));
+    for (const [key, why] of Object.entries(RETIRED_CONFIG_KEYS)) {
+      if ((diskConfig as Record<string, unknown>)[key] !== undefined) bootLog('warn', `Ignoring ${key} in config.yaml: ${why}`);
     }
 
     // Runner config

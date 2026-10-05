@@ -265,17 +265,6 @@ describe('policy approve', () => {
     expect(out).toMatch(/FASTLANE_TOKEN.*not applied/);
   });
 
-  it('shows the isolation a policy with no shared section gets, which is any', () => {
-    // Shown only when declared, a policy with no isolation: said nothing of
-    // it, though its jobs get the strongest type this Mac allows.
-    writeRc('version: 1\nworkflows:\n  deploy:\n    network:\n      allow: [x.com]\n');
-
-    expect(() => run()).toThrow('exit 1');
-    const ansi = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g');
-    const out = output.join('\n').replace(ansi, '');
-    expect(out).toMatch(/Shared policy:\n {2}Isolation:\n {4}~ any \(macos-vm, service-account, seatbelt\) \(not declared, so the default;/);
-  });
-
   it('approves exactly the policy whose stamp it was given, and records it', () => {
     writeRc(PERMISSIVE);
     run('--stamp', stampOf(PERMISSIVE));

@@ -803,7 +803,6 @@ describe('writing a policy back', () => {
         filesystem: { read: ['/usr/local'], write: ['./build'], deny: ['~/.ssh'] },
         env: { allow: ['NODE_OPTIONS'], deny: ['AWS_SECRET_ACCESS_KEY'] },
         docker: { pull: { registries: ['docker.io'] } },
-        isolation: ['macos-vm', 'seatbelt'],
       },
       workflows: {
         ci: {
@@ -812,7 +811,6 @@ describe('writing a policy back', () => {
           env: { allow: ['CI_FLAG'], deny: ['NPM_TOKEN'] },
           docker: { build: { context: './' } },
           secrets: { require: ['DEPLOY_KEY'] },
-          isolation: 'seatbelt',
         },
       },
     };
@@ -1070,7 +1068,7 @@ describe('a policy key the grammar does not know', () => {
 
   it('names the keys that are accepted, so the fix is in the message', () => {
     const errors = parse('  filesystm:\n    read: ["/etc"]\n').errors.map((e) => e.message).join('\n');
-    for (const key of ['network', 'filesystem', 'env', 'docker', 'isolation']) expect(errors).toContain(key);
+    for (const key of ['network', 'filesystem', 'env', 'docker']) expect(errors).toContain(key);
   });
 
   it('still accepts every key the grammar does know', () => {
@@ -1078,8 +1076,7 @@ describe('a policy key the grammar does not know', () => {
       '  network:\n    allow: ["github.com"]\n' +
       '  filesystem:\n    read: ["/etc"]\n' +
       '  env:\n    allow: ["CI"]\n' +
-      '  docker:\n    run:\n      images: ["alpine:3"]\n' +
-      '  isolation: [macos-vm, seatbelt]\n'
+      '  docker:\n    run:\n      images: ["alpine:3"]\n'
     );
     expect(ok.errors).toEqual([]);
     expect(ok.success).toBe(true);

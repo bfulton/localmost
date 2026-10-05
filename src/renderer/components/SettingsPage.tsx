@@ -2,79 +2,14 @@ import React, { useState, useEffect } from 'react';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faXmark, faLightbulb, faMoon, faDesktop } from '@fortawesome/free-solid-svg-icons';
 import { SleepProtection, BatteryPauseThreshold, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../../shared/types';
-import { ResourcePauseConfig, JobEnvironmentConfig } from '../../shared/job-preferences';
-import { ISOLATION_DESCRIPTIONS, ISOLATION_TYPES, availableIsolationTypes } from '../../shared/isolation';
+import { ResourcePauseConfig } from '../../shared/job-preferences';
 import { GITHUB_APP_SETTINGS_URL, PRIVACY_POLICY_URL, REPOSITORY_URL } from '../../shared/constants';
 import { useAppConfig, useRunner, useUpdate } from '../contexts';
 import UserFilterSettings from './UserFilterSettings';
 import PolicyApprovals from './PolicyApprovals';
+import MacVmSetup from './MacVmSetup';
 import styles from './SettingsPage.module.css';
 import shared from '../styles/shared.module.css';
-
-/**
- * The job-environment conveniences, in the order the page shows them: each
- * a checkbox, on by default but the Swift Build link-temp grant. See
- * docs/roadmap/job-environment.md.
- */
-const JOB_ENVIRONMENT_OPTIONS: ReadonlyArray<{
-  key: keyof JobEnvironmentConfig;
-  label: string;
-  hint: string;
-  /** What the current setting means for a job, where that is not said in the hint. */
-  stateHints?: { on: string; off: string };
-}> = [
-  {
-    key: 'toolShims',
-    label: "Turn off SwiftPM's and Xcode's own sandbox",
-    hint:
-      'Puts swift and xcodebuild shims first on the job\'s PATH, adding --disable-sandbox and ' +
-      '-IDEPackageSupportDisableManifestSandbox=YES: macOS will not start their sandbox inside the job\'s. ' +
-      'Off, a package manifest not compiled before fails to build. The docker CLI stays on PATH either way.',
-  },
-  {
-    key: 'javaToolOptions',
-    label: 'Set JAVA_TOOL_OPTIONS for JVMs',
-    hint:
-      'Gives JVMs a temp directory in the job\'s, IPv4 only, and the job\'s proxy with its credentials, ' +
-      'which every JVM prints to the job\'s log. A workflow that sets JAVA_TOOL_OPTIONS itself replaces it.',
-  },
-  {
-    key: 'perJobTempDir',
-    label: 'Give each job its own temp directory for Foundation',
-    hint:
-      'A directory of the job\'s own in the per-user temp directory, named by DIRHELPER_USER_DIR_SUFFIX and ' +
-      'removed after the job, for NSTemporaryDirectory() and atomic writes such as SwiftPM\'s and ' +
-      'xcodebuild\'s. Off, those writes fail.',
-  },
-  {
-    key: 'createMissingGrantedDirs',
-    label: 'Create missing directories a policy grants',
-    hint:
-      'Before a job, creates a missing directory a write grant names under your home, which the job ' +
-      'cannot create itself: empty, one level at a time, never through a link, never in a credential ' +
-      'location.',
-    stateHints: {
-      on: 'On: there is nothing to create yourself before a job.',
-      off:
-        'Off: a directory a policy grants under your home, or one above it, that does not exist stays ' +
-        'missing, and you must create it yourself before the job runs, or the job fails with "Operation not ' +
-        'permitted" at its first write there.',
-    },
-  },
-  {
-    key: 'swiftBuildLinkTemp',
-    label: 'Let Swift Build link in the shared temp directory',
-    // Both cases, whatever the toggle's state: the risk of turning it on is
-    // read before it is taken.
-    hint:
-      'Swift 6.4\'s default build system links in a TemporaryDirectory.XXXXXX directory it makes in the ' +
-      'per-user temp directory, whatever the job\'s TMPDIR says. On, a job may create ' +
-      '<T>/TemporaryDirectory.XXXXXX names in that shared directory, which your own SwiftPM and Xcode also use ' +
-      'for manifest executables, so a job could race to replace one before it runs. Off (the default), Swift ' +
-      '6.4\'s default build system fails to link inside a job; a workflow can pass swift build --build-system ' +
-      'native, or the repository can use the macOS VM isolation type once it is available.',
-  },
-];
 
 interface SettingsPageProps {
   onBack: () => void;
@@ -99,8 +34,6 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     setLogLevel,
     runnerLogLevel,
     setRunnerLogLevel,
-    toolCacheLocation,
-    setToolCacheLocation,
     userFilter,
     setUserFilter,
     power,
@@ -111,10 +44,6 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     setNotifyOnJobEvents,
     resourcePause,
     setResourcePauseRunningJobs,
-    jobEnvironment,
-    setJobEnvironmentOption,
-    isolation,
-    setIsolationAllowed,
   } = useAppConfig();
 
   // Runner state from context
@@ -516,21 +445,8 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
                 <span className={styles.parallelismValue}>{runnerConfig.runnerCount} runner{runnerConfig.runnerCount > 1 ? 's' : ''}</span>
               </div>
               <p className={shared.formHint}>
-                Maximum concurrent jobs across all targets.
-              </p>
-            </div>
-
-            <div className={shared.formGroup}>
-              <label>Tool cache</label>
-              <select
-                value={toolCacheLocation}
-                onChange={(e) => setToolCacheLocation(e.target.value as 'persistent' | 'per-sandbox')}
-              >
-                <option value="persistent">Persistent (recommended)</option>
-                <option value="per-sandbox">Per-sandbox</option>
-              </select>
-              <p className={shared.formHint}>
-                Persistent caches tools like Node.js across restarts, separately for each repository or organization, shared by all of its jobs (pull requests and, for an organization, all of its repositories). Per-sandbox rebuilds each time (slower, but no job can leave anything for the next).
+                Maximum concurrent jobs across all targets. Each job runs in a macOS VM, and a Mac runs at most two
+                at once, so more than two wait for a VM.
               </p>
             </div>
           </section>
@@ -580,62 +496,14 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
           </section>
         )}
 
-        {/* Job Environment Section */}
-        <section id="job-environment-section" className={styles.settingsSection} data-testid="settings-section">
-          <h3>Job Environment</h3>
+        {/* macOS VM Section */}
+        <section id="macos-vm-section" className={styles.settingsSection} data-testid="settings-section">
+          <h3>macOS VM</h3>
           <p className={shared.formHint}>
-            What localmost adds to each job&apos;s environment so common tools work in its sandbox. A change
-            applies to jobs that start after it.
+            Every job runs in a fresh macOS VM cloned from a golden image, and the VM is thrown away when the job
+            ends. The runner takes no jobs until the image is ready.
           </p>
-          {JOB_ENVIRONMENT_OPTIONS.map(({ key, label, hint, stateHints }) => (
-            <div key={key} className={shared.formGroup}>
-              <label className={shared.toggleRow}>
-                <input
-                  type="checkbox"
-                  checked={jobEnvironment[key]}
-                  onChange={(e) => setJobEnvironmentOption(key, e.target.checked)}
-                />
-                <span>{label}</span>
-              </label>
-              <p className={shared.formHint}>{hint}</p>
-              {stateHints && (
-                <p className={shared.formHint}>{jobEnvironment[key] ? stateHints.on : stateHints.off}</p>
-              )}
-            </div>
-          ))}
-        </section>
-
-        {/* Isolation Section */}
-        <section id="isolation-section" className={styles.settingsSection} data-testid="settings-section">
-          <h3>Isolation</h3>
-          <p className={shared.formHint}>
-            How a job is kept from the rest of your Mac. Each job runs under the first type in its
-            repository&apos;s isolation: list that is checked here and available in this build (a repository that
-            declares none accepts any, strongest first). If none qualifies, the job is refused, never run under a
-            type its repository did not list.
-          </p>
-          {ISOLATION_TYPES.map((type) => {
-            const available = availableIsolationTypes().includes(type);
-            const { label, description } = ISOLATION_DESCRIPTIONS[type];
-            return (
-              <div key={type} className={shared.formGroup}>
-                <label className={shared.toggleRow}>
-                  <input
-                    type="checkbox"
-                    checked={available && isolation.allowed.includes(type)}
-                    disabled={!available}
-                    onChange={(e) => setIsolationAllowed(type, e.target.checked)}
-                  />
-                  <span>{label}</span>
-                </label>
-                <p className={shared.formHint}>{description}</p>
-                {!available && <p className={shared.formHint}>Not available in this build.</p>}
-              </div>
-            );
-          })}
-          {!isolation.allowed.some((type) => availableIsolationTypes().includes(type)) && (
-            <p className={shared.formHint}>No type is allowed: every job is refused.</p>
-          )}
+          <MacVmSetup />
         </section>
 
         {/* Power Section */}

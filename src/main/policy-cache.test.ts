@@ -20,10 +20,9 @@ import {
   getPolicyEntry,
   getApprovedPolicyForCommit,
   rejectPolicy,
-  approvedIsolationForCommit,
+  approvedDockerForCommit,
 } from './policy-cache';
 import { LocalmostrcConfig } from '../shared/localmostrc';
-import { DEFAULT_ISOLATION_CONFIG, availableIsolationTypes, selectIsolation } from '../shared/isolation';
 
 afterAll(() => {
   fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -295,58 +294,42 @@ describe('a commit without a .localmostrc runs on the baseline', () => {
   });
 });
 
-describe('the isolation a job accepts', () => {
-  // What admission walks: the approved policy's list for the job's commit -
-  // never the repository's current file - with a workflow's list replacing
-  // the shared one, and any when the commit carries no approved policy.
-  const ISOLATED = [
+describe('whether the approved policy grants a job Docker', () => {
+  // What admission asks, to refuse a job a macOS VM cannot give Docker yet:
+  // the approved policy for the job's commit - never the repository's current
+  // file - with the shared section and the job's workflow's merged.
+  const DOCKER = [
     'version: 1',
     'shared:',
-    '  isolation: [macos-vm]',
+    '  network:',
+    '    allow: ["github.com"]',
     'workflows:',
-    '  ui-tests:',
-    '    isolation: [seatbelt, macos-vm]',
+    '  images:',
+    '    docker:',
+    '      pull:',
+    '        registries: ["docker.io"]',
     '',
   ].join('\n');
-  const approveIsolated = () => {
-    const first = decidePolicyForJob(REPO, ISOLATED, 'first-sha');
+  const approveDocker = () => {
+    const first = decidePolicyForJob(REPO, DOCKER, 'first-sha');
     if (first.action !== 'needs-approval') throw new Error('expected approval request');
     approve(first.request.newConfig);
+    expect(decidePolicyForJob(REPO, DOCKER, SHA)).toEqual({ action: 'allow', reason: 'unchanged' });
   };
-  const ANY = ['macos-vm', 'service-account', 'seatbelt'];
 
-  it("is the approved shared list for a commit the check found carrying it, and refused on this build's defaults", () => {
-    approveIsolated();
-    expect(decidePolicyForJob(REPO, ISOLATED, SHA)).toEqual({ action: 'allow', reason: 'unchanged' });
+  it("is true for the workflow whose section grants it, and false for the others", () => {
+    approveDocker();
 
-    const accepted = approvedIsolationForCommit(REPO, SHA, 'build');
-    expect(accepted).toEqual(['macos-vm']);
-    expect(selectIsolation(accepted, DEFAULT_ISOLATION_CONFIG.allowed, availableIsolationTypes())).toEqual({
-      refusal: 'this repository accepts macos-vm; this Mac allows seatbelt; macos-vm is not available in this build',
-    });
+    expect(approvedDockerForCommit(REPO, SHA, 'images')).toBe(true);
+    expect(approvedDockerForCommit(REPO, SHA, 'build')).toBe(false);
+    expect(approvedDockerForCommit(REPO, SHA, undefined)).toBe(false);
   });
 
-  it("is the workflow's list in place of the shared one", () => {
-    approveIsolated();
-    decidePolicyForJob(REPO, ISOLATED, SHA);
+  it('is false for a commit the check never covered, or a job with no commit', () => {
+    approveDocker();
 
-    expect(approvedIsolationForCommit(REPO, SHA, 'ui-tests')).toEqual(['seatbelt', 'macos-vm']);
-  });
-
-  it('is any for a commit the check never covered, or a job with no commit', () => {
-    approveIsolated();
-
-    expect(approvedIsolationForCommit(REPO, 'unchecked-sha', 'build')).toEqual(ANY);
-    expect(approvedIsolationForCommit(REPO, undefined, 'build')).toEqual(ANY);
-  });
-
-  it('is any for a commit with no .localmostrc, even where an approved policy lists less', () => {
-    // Documented in SECURITY.md (Isolation types): the host's allowed set is
-    // what bounds such a commit.
-    approveIsolated();
-    expect(decidePolicyForJob(REPO, null, SHA)).toEqual({ action: 'allow', reason: 'narrowed' });
-
-    expect(approvedIsolationForCommit(REPO, SHA, 'build')).toEqual(ANY);
+    expect(approvedDockerForCommit(REPO, 'unchecked-sha', 'images')).toBe(false);
+    expect(approvedDockerForCommit(REPO, undefined, 'images')).toBe(false);
   });
 });
 

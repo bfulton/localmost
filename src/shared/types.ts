@@ -262,9 +262,6 @@ export type SleepProtection = 'never' | 'when-busy' | 'always';
 /** Log level - controls what gets displayed/saved. Lower = more verbose */
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
-/** Tool cache location - controls where actions like setup-node cache downloaded tools */
-export type ToolCacheLocation = 'persistent' | 'per-sandbox';
-
 /** Log level priority for filtering (lower number = more verbose) */
 export const LOG_LEVEL_PRIORITY: Record<LogLevel, number> = {
   debug: 0,
@@ -283,8 +280,6 @@ export interface AppSettings {
   logLevel?: LogLevel;
   /** Minimum log level for runner output logs. Defaults to 'warn' */
   runnerLogLevel?: LogLevel;
-  /** Tool cache location. Defaults to 'persistent' (shared across restarts) */
-  toolCacheLocation?: ToolCacheLocation;
   /** Sandbox policy level for all sandbox restrictions. Defaults to 'strict' */
 }
 

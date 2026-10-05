@@ -67,8 +67,8 @@ const MacVmSetup: React.FC<MacVmSetupProps> = ({ api: given }) => {
         <>
           {status.state === 'failed' && <p className={shared.errorMessage}>The golden image is not usable: {status.reason}</p>}
           <p className={shared.formHint}>
-            Jobs that ask for macOS VM isolation run in a fresh macOS VM cloned from a golden image that localmost builds once:
-            macOS from Apple, the Xcode Command Line Tools and the runner.{' '}
+            Every job runs in a fresh macOS VM cloned from a golden image that localmost builds once: macOS from Apple, the
+            Xcode Command Line Tools and the runner. No job runs until it is built.{' '}
             {status.provisioning === 'guided'
               ? 'On this macOS, its first boot needs you for a few minutes in a setup window.'
               : 'It builds without your help.'}

@@ -19,7 +19,6 @@ import { DockerPolicy, describeDockerGrants } from './docker-policy';
 import { SandboxPolicyLevel } from './types';
 import { MODERATE_NETWORK_ALLOWLIST, RUNNER_INFRASTRUCTURE_ALLOWLIST } from './network-allowlist';
 import { sensitiveWriteReason } from './sensitive-paths';
-import { IsolationDeclaration, isolationList } from './isolation';
 
 /**
  * Every key a .localmostrc may declare at the top of the file. The parser
@@ -27,12 +26,8 @@ import { IsolationDeclaration, isolationList } from './isolation';
  */
 export const LOCALMOSTRC_KEYS = ['version', 'level', 'shared', 'workflows'] as const;
 
-/**
- * Every key a policy section may declare at any scope. `isolation` is the
- * ordered list of isolation types the repository accepts (see isolation.ts);
- * a workflow's replaces the shared one.
- */
-export const POLICY_SECTION_KEYS = ['network', 'filesystem', 'env', 'docker', 'isolation'] as const;
+/** Every key a policy section may declare at any scope. */
+export const POLICY_SECTION_KEYS = ['network', 'filesystem', 'env', 'docker'] as const;
 
 /**
  * What a workflow-scoped policy may declare on top of those: which secrets the
@@ -72,8 +67,6 @@ export interface DescribablePolicy {
   docker?: DockerPolicy;
   /** Workflow scope only. */
   secrets?: { require?: string[] };
-  /** The isolation types accepted, in order; a workflow's replaces the shared one. */
-  isolation?: IsolationDeclaration;
 }
 
 export interface PolicyGrant {
@@ -138,18 +131,6 @@ const LEVEL_GRANTS: Record<Exclude<SandboxPolicyLevel, 'strict'>, string> = {
  * Listing them as plain grants told the reviewer something untrue.
  */
 export type PolicyScope = 'shared' | 'workflow';
-
-/**
- * An `isolation:` declaration as a person reads it: the list in its order,
- * and `any` with what it stands for. Absent in shared, it is any.
- */
-export function describeIsolation(declaration: IsolationDeclaration | undefined): string {
-  const list = isolationList(declaration).join(', ');
-  return declaration === undefined || declaration === 'any' ? `any (${list})` : list;
-}
-
-const ISOLATION_ORDER =
-  'in this order, the first this Mac allows and can run; the job is refused if none is';
 
 /** A loopback grant as the entries a diff compares: each port, or every one. */
 export function loopbackValues(loopback: true | number[] | undefined): string[] | undefined {
@@ -229,20 +210,6 @@ export function describePolicy(policy: DescribablePolicy, prefix = '', scope: Po
   add('Environment deny', '-', 'env denied', policy.env?.deny, { note: perWorkflow ? ENV_DENY_EVERYWHERE : undefined });
 
   add('Secrets required', '+', 'secret', policy.secrets?.require);
-
-  // Which isolation the job gets: the first of these this Mac allows and
-  // this build can run. Absent in shared, it is any, and shown as such: the
-  // job still gets a type, and the reviewer is shown which. Absent in a
-  // workflow, the shared list applies, so there is nothing of its own to show.
-  if (policy.isolation !== undefined) {
-    add('Isolation', '~', 'isolation', [describeIsolation(policy.isolation)], {
-      note: perWorkflow ? `replaces the shared list for this workflow; ${ISOLATION_ORDER}` : ISOLATION_ORDER,
-    });
-  } else if (!perWorkflow) {
-    add('Isolation', '~', 'isolation', [describeIsolation(undefined)], {
-      note: `not declared, so the default; ${ISOLATION_ORDER}`,
-    });
-  }
 
   // Docker describes itself: what a container grant means is the docker
   // grammar's business, and the line it produces is already the flat form.

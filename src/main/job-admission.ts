@@ -3,9 +3,9 @@
  *
  * The broker has acquired a job from GitHub and queued it before anything
  * here decides whether it may run. This is that decision: the user filter,
- * the repository's policy approval and the job's isolation type, made before
- * any worker exists, followed by the spawn of the one worker that job is
- * for, under that type.
+ * the repository's policy approval and what the macOS VM can give the job,
+ * made before any worker exists, followed by the spawn of the one worker
+ * that job is for.
  *
  * Every job ends one of two ways. Admitted, it gets a worker announced to
  * the broker for it, and that worker is the only session that can take it.
@@ -21,7 +21,15 @@ import type { GitHubJobInfo } from './broker-proxy-service';
 import type { RunnerManager } from './runner-manager';
 import type { PolicyApprovalRequest, PolicyDecision } from './policy-cache';
 import { LOCALMOSTRC_FILENAME, type LocalmostrcConfig } from '../shared/localmostrc';
-import { selectIsolation, type IsolationType } from '../shared/isolation';
+
+/**
+ * Why a job whose approved policy grants Docker is refused: a macOS VM job
+ * has no way to the worker's Docker socket until the relay that carries it
+ * into the guest exists.
+ */
+export const NO_DOCKER_RELAY_REASON =
+  "its policy grants Docker, and a macOS VM job cannot reach Docker yet: localmost has no Docker relay into the VM. " +
+  'Remove docker: from the policy to run it without Docker';
 
 export interface JobAdmissionDeps {
   findTarget: (targetId: string) => { id: string; displayName: string } | undefined;
@@ -40,22 +48,11 @@ export interface JobAdmissionDeps {
    */
   checkPolicyApproval: (owner: string, repo: string, sha?: string, repositoryId?: number) => Promise<string | null>;
   /**
-   * What the job's isolation is chosen from, once its policy is approved:
-   * the repository's ordered list, what this Mac allows, and what this build
-   * can run (see selectIsolation).
+   * Whether the approved policy for the job's commit grants its workflow
+   * Docker (approvedDockerForCommit). Such a job is refused: see
+   * NO_DOCKER_RELAY_REASON.
    */
-  isolation: {
-    /**
-     * The isolation types the job accepts, in order: from the approved policy
-     * for its commit - its workflow's list, else the shared one - or any when
-     * there is none.
-     */
-    accepted: (repository: string, sha: string | undefined, workflow: string | undefined) => IsolationType[];
-    /** What this Mac allows (Settings > Isolation). */
-    allowed: () => readonly IsolationType[];
-    /** What this build can run and is set up for. */
-    available: () => readonly IsolationType[];
-  };
+  dockerGranted: (repository: string, sha: string | undefined, workflow: string | undefined) => boolean;
   log: (level: 'info' | 'warn' | 'error', message: string) => void;
 }
 
@@ -115,7 +112,6 @@ export async function admitJob(
     // repository and no actor) is one these checks cannot clear, so it is
     // refused - it could not have run anyway, having no stored payload.
     let refusal: string | null;
-    let isolation: IsolationType | undefined;
     try {
       if (!owner || !repo) {
         refusal = `cannot identify the repository of job ${jobId}`;
@@ -126,29 +122,22 @@ export async function admitJob(
         refusal = verdict.allowed
           ? await deps.checkPolicyApproval(owner, repo, githubInfo.githubSha, githubInfo.repositoryId)
           : verdict.reason;
-        if (!refusal) {
-          // The isolation, from the approved policy just checked: the first
-          // type in the repository's list, in its order, that this Mac allows
-          // and this build can run. None, and the job is refused - never run
-          // under a type the repository did not list.
-          const selection = selectIsolation(
-            deps.isolation.accepted(`${owner}/${repo}`, githubInfo.githubSha, githubInfo.githubWorkflow),
-            deps.isolation.allowed(),
-            deps.isolation.available()
-          );
-          if ('type' in selection) isolation = selection.type;
-          else refusal = `no isolation type this job accepts can run on this Mac: ${selection.refusal}`;
+        // What the approved policy just checked asks for that a macOS VM
+        // job cannot have yet. Refused here, before a VM boots for it,
+        // rather than run without what its policy says it needs.
+        if (!refusal && deps.dockerGranted(`${owner}/${repo}`, githubInfo.githubSha, githubInfo.githubWorkflow)) {
+          refusal = NO_DOCKER_RELAY_REASON;
         }
       }
     } catch (err) {
       refusal = `could not decide whether job ${jobId} may run: ${(err as Error).message}`;
     }
-    if (refusal || !isolation) {
-      await refuse(refusal ?? `no isolation chosen for job ${jobId}`);
+    if (refusal) {
+      await refuse(refusal);
       return;
     }
 
-    log('info', `Spawning worker for job ${jobId} from ${target.displayName} under ${isolation} isolation...`);
+    log('info', `Spawning worker for job ${jobId} from ${target.displayName}...`);
     // The repository as GitHub named it goes with the job: it is the name the
     // policy was just checked, and approved, under - which for an
     // organization target the display name is not.
@@ -156,7 +145,7 @@ export async function admitJob(
 
     let spawned = false;
     try {
-      spawned = await runnerManager.spawnWorkerForJob(isolation);
+      spawned = await runnerManager.spawnWorkerForJob();
     } catch (err) {
       log('error', `Failed to spawn worker for job ${jobId}: ${(err as Error).message}`);
     }

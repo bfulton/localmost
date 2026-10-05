@@ -23,7 +23,7 @@ jest.mock('../config', () => ({
   SETTABLE_CONFIG_KEYS: [
     'runnerConfig', 'theme', 'launchAtLogin', 'hideOnStart', 'sleepProtection', 'logLevel',
     'runnerLogLevel', 'userFilter', 'maxConcurrentJobs', 'power', 'notifications',
-    'resourcePause', 'jobEnvironment', 'isolation',
+    'resourcePause',
   ],
 }));
 
@@ -314,85 +314,19 @@ describe('settings IPC handlers', () => {
       expect(store.getState().config.resourcePause).toEqual({ runningJobs: 'finish' });
     });
 
-    it('saves the job-environment conveniences, each on or off, and hands them to the store', () => {
+    it('never saves a setting an earlier build had, the job environment, isolation or tool cache', () => {
+      // Nothing reads them now: every job runs in a macOS VM. A page from an
+      // earlier build that sends one has it left out.
       (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({} as any);
-      const jobEnvironment = { toolShims: false, javaToolOptions: true, perJobTempDir: false, createMissingGrantedDirs: true, swiftBuildLinkTemp: false };
 
-      expect(handlers['settings:set']({}, { jobEnvironment })).toEqual({ success: true });
-      expect(saveConfig).toHaveBeenLastCalledWith({ jobEnvironment });
-      expect(store.getState().config.jobEnvironment).toEqual(jobEnvironment);
-    });
+      handlers['settings:set']({}, {
+        theme: 'dark',
+        jobEnvironment: { toolShims: false },
+        isolation: { allowed: ['seatbelt'] },
+        toolCacheLocation: 'per-sandbox',
+      });
 
-    it("saves the Swift Build link-temp grant turned on, and hands it to the store", () => {
-      (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({} as any);
-      const jobEnvironment = { toolShims: true, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true, swiftBuildLinkTemp: true };
-
-      expect(handlers['settings:set']({}, { jobEnvironment })).toEqual({ success: true });
-      expect(saveConfig).toHaveBeenLastCalledWith({ jobEnvironment });
-      expect(store.getState().config.jobEnvironment.swiftBuildLinkTemp).toBe(true);
-    });
-
-    it('saves which isolation types this Mac allows, none included, and hands them to the store', () => {
-      (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({} as any);
-      for (const isolation of [{ allowed: [] }, { allowed: ['seatbelt'] }]) {
-        expect(handlers['settings:set']({}, { isolation })).toEqual({ success: true });
-        expect(saveConfig).toHaveBeenLastCalledWith({ isolation });
-        expect(store.getState().config.isolation).toEqual(isolation);
-      }
-    });
-
-    it('refuses an isolation type this build cannot run, an unknown or repeated one, and any other shape', () => {
-      (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({} as any);
-      store.getState().setIsolation({ allowed: ['seatbelt'] });
-
-      for (const isolation of [
-        // Known, but not available in this build: it cannot be enabled yet.
-        { allowed: ['macos-vm'] },
-        { allowed: ['seatbelt', 'service-account'] },
-        { allowed: ['docker'] },
-        { allowed: ['seatbelt', 'seatbelt'] },
-        { allowed: 'seatbelt' },
-        { allowed: [1] },
-        {},
-        { allowed: ['seatbelt'], order: ['seatbelt'] },
-        ['seatbelt'],
-        null,
-      ]) {
-        const result = handlers['settings:set']({}, { isolation });
-        expect({ isolation, result }).toEqual({
-          isolation,
-          result: { success: false, error: 'Refused settings of the wrong shape: isolation' },
-        });
-      }
-      expect(saveConfig).not.toHaveBeenCalledWith(expect.objectContaining({ isolation: expect.anything() }));
-      expect(store.getState().config.isolation).toEqual({ allowed: ['seatbelt'] });
-    });
-
-    it('refuses job-environment settings that miss one, add one, or are not true or false', () => {
-      (loadConfig as jest.MockedFunction<typeof loadConfig>).mockReturnValue({} as any);
-      const all = { toolShims: true, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true, swiftBuildLinkTemp: false };
-      store.getState().setJobEnvironment(all);
-
-      for (const jobEnvironment of [
-        { toolShims: 'no', javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true, swiftBuildLinkTemp: false },
-        { ...all, perJobTempDir: 0 },
-        { toolShims: true, javaToolOptions: true, perJobTempDir: true },
-        // Every key, the link-temp grant too: a page that left it out is not this one.
-        { toolShims: true, javaToolOptions: true, perJobTempDir: true, createMissingGrantedDirs: true },
-        { ...all, swiftBuildLinkTemp: 'on' },
-        // Not a preference: the per-job home is not one to turn off.
-        { ...all, jobHome: false },
-        [true, true, true, true],
-        false,
-      ]) {
-        const result = handlers['settings:set']({}, { jobEnvironment });
-        expect({ jobEnvironment, result }).toEqual({
-          jobEnvironment,
-          result: { success: false, error: 'Refused settings of the wrong shape: jobEnvironment' },
-        });
-      }
-      expect(saveConfig).not.toHaveBeenCalledWith(expect.objectContaining({ jobEnvironment: expect.anything() }));
-      expect(store.getState().config.jobEnvironment).toEqual(all);
+      expect(saveConfig).toHaveBeenLastCalledWith({ theme: 'dark' });
     });
 
     it('should merge with existing config', () => {
