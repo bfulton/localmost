@@ -98,8 +98,11 @@ export class CliServer {
   private testVms: TestVmProvider | undefined;
   /** Open connections, so stop() can end them rather than wait on them. */
   private sockets = new Set<net.Socket>();
-  /** Connections holding (or booting) a test VM: one lease each. */
-  private leasing = new Set<net.Socket>();
+  /**
+   * Connections holding (or booting) a test VM, one lease each, and how to
+   * release it: once, resolving when the VM is gone.
+   */
+  private leasing = new Map<net.Socket, () => Promise<void>>();
 
   constructor(options: {
     onLog: (level: 'info' | 'warn' | 'error', message: string) => void;
@@ -207,7 +210,9 @@ export class CliServer {
         const request = JSON.parse(line) as CliRequest;
         const response = request?.command === 'test-vm'
           ? await this.lendTestVm(socket, request.args)
-          : await this.handleCommand(request);
+          : request?.command === 'test-vm-release'
+            ? await this.releaseTestVm(socket)
+            : await this.handleCommand(request);
         socket.write(JSON.stringify(response) + '\n');
       } catch (parseError) {
         const errorResponse: ErrorResponse = {
@@ -293,31 +298,44 @@ export class CliServer {
     if (!availability.ok) {
       return { success: false, error: `No macOS VM can run the workflow: ${availability.reason}` };
     }
-    this.leasing.add(socket);
     const lease: VmLease = { key: `test-${crypto.randomBytes(6).toString('hex')}`, proxyPort, brokerPort };
     const abort = new AbortController();
-    let released = false;
-    const release = () => {
-      if (released) return;
-      released = true;
-      abort.abort();
-      vms.release(lease).catch((err: Error) => this.onLog('warn', `Releasing the macOS VM of ${lease.key} failed: ${err.message}`));
+    let released: Promise<void> | null = null;
+    const release = (): Promise<void> => {
+      released ??= (() => {
+        abort.abort();
+        return vms.release(lease).catch((err: Error) => this.onLog('warn', `Releasing the macOS VM of ${lease.key} failed: ${err.message}`));
+      })();
+      return released;
     };
-    socket.once('close', release);
+    this.leasing.set(socket, release);
+    socket.once('close', () => void release());
     try {
       const agentSocket = await vms.prepareTestRun(lease, abort.signal);
       if (socket.destroyed) {
-        release();
+        void release();
         this.leasing.delete(socket);
         return { success: false, error: 'The test run went away while its macOS VM started' };
       }
       this.onLog('info', `Lent a macOS VM to localmost test (${lease.key})`);
       return { success: true, command: 'test-vm', data: { agentSocket } };
     } catch (err) {
-      release();
+      void release();
       this.leasing.delete(socket);
       return { success: false, error: `Could not lend the test run a macOS VM: ${(err as Error).message}` };
     }
+  }
+
+  /**
+   * Release the test VM this connection holds, and answer once it is gone:
+   * the run keeps its proxy and broker ports until then, so no other
+   * process can take a port the VM's relays still lead to.
+   */
+  private async releaseTestVm(socket: net.Socket): Promise<CliResponse> {
+    const release = this.leasing.get(socket);
+    if (!release) return { success: false, error: 'This connection has no macOS VM' };
+    await release();
+    return { success: true, command: 'test-vm-release' };
   }
 
   /**

@@ -102,7 +102,7 @@ export class VmStepRunner implements StepRunner {
 
   constructor(
     private readonly agent: GuestAgent,
-    private readonly opts: { onNote?: (message: string) => void; onClose?: () => void } = {}
+    private readonly opts: { onNote?: (message: string) => void; onClose?: () => void | Promise<void> } = {}
   ) {
     agent.on('output', (stream, line) => this.current?.step.onLine(line, stream));
     agent.on('stepExit', (code, signal, outputs) => {
@@ -171,10 +171,21 @@ export class VmStepRunner implements StepRunner {
     await this.agent.signal('KILL');
   }
 
-  /** Ends the run: the agent connection, which kills the steps, then the VM. */
+  private closing: Promise<void> | null = null;
+
+  /**
+   * Ends the run: the agent connection, which kills the steps, then the VM.
+   * released() says when the VM is gone.
+   */
   close(): void {
+    if (this.closing) return;
     this.agent.close();
-    this.opts.onClose?.();
+    this.closing = Promise.resolve(this.opts.onClose?.()).catch(() => undefined);
+  }
+
+  /** Resolves once close() has let the VM go, and with it the run's ports. */
+  released(): Promise<void> {
+    return this.closing ?? Promise.resolve();
   }
 }
 
@@ -194,6 +205,22 @@ export async function closedPort(): Promise<{ port: number; close: () => void }>
   return { port: (server.address() as net.AddressInfo).port, close: () => server.close() };
 }
 
+/** How long the run waits for the app to say its VM is gone before it lets its ports go anyway. */
+const RELEASE_TIMEOUT_MS = 30_000;
+
+/** A macOS VM the app lent this run. */
+export interface TestVmLease {
+  agentSocket: string;
+  /** Lets the VM go at once, without waiting: for an interrupt, which exits next. */
+  release: () => void;
+  /**
+   * Asks the app to release the VM and resolves once it says the VM is gone,
+   * or the connection closes, or `timeoutMs` passes; the connection is
+   * closed either way.
+   */
+  end: (timeoutMs?: number) => Promise<void>;
+}
+
 /**
  * Asks the running app for a macOS VM for this run. Resolves with the VM's
  * agent socket and the connection that holds the VM; closing it releases
@@ -203,7 +230,7 @@ export function leaseTestVm(
   ports: { proxyPort: number; brokerPort: number },
   socketPath = getCliSocketPath(),
   timeoutMs = LEASE_TIMEOUT_MS
-): Promise<{ agentSocket: string; release: () => void }> {
+): Promise<TestVmLease> {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(socketPath);
     let answer = '';
@@ -259,8 +286,34 @@ export function leaseTestVm(
       }
       settled = true;
       socket.removeAllListeners('close');
-      socket.on('close', () => {});
-      resolve({ agentSocket, release: () => socket.destroy() });
+      socket.removeAllListeners('data');
+      let closed = false;
+      const closedListeners: Array<() => void> = [];
+      socket.on('close', () => {
+        closed = true;
+        for (const done of closedListeners.splice(0)) done();
+      });
+      let ending: Promise<void> | null = null;
+      const end = (waitMs = RELEASE_TIMEOUT_MS): Promise<void> => {
+        ending ??= new Promise<void>((done) => {
+          const finish = () => {
+            clearTimeout(timeout);
+            socket.destroy();
+            done();
+          };
+          const timeout = setTimeout(finish, waitMs);
+          if (closed) return finish();
+          closedListeners.push(finish);
+          let reply = '';
+          socket.on('data', (more: string) => {
+            reply += more;
+            if (reply.includes('\n') || reply.length > MAX_ANSWER_CHARS) finish();
+          });
+          socket.write(`${JSON.stringify({ command: 'test-vm-release' })}\n`);
+        });
+        return ending;
+      };
+      resolve({ agentSocket, release: () => socket.destroy(), end });
     });
   });
 }
@@ -277,7 +330,7 @@ export async function openVmStepRunner(opts: {
   log?: (level: 'debug' | 'info' | 'warn', message: string) => void;
 }): Promise<VmStepRunner> {
   const broker = await closedPort();
-  let lease: { agentSocket: string; release: () => void } | null = null;
+  let lease: TestVmLease | null = null;
   let agent: MacAgentClient | null = null;
   try {
     lease = await leaseTestVm({ proxyPort: opts.proxyPort, brokerPort: broker.port });
@@ -286,8 +339,11 @@ export async function openVmStepRunner(opts: {
     const held = lease;
     const runner = new VmStepRunner(agent, {
       onNote: opts.onNote,
-      onClose: () => {
-        held.release();
+      // The broker port stays this run's until the app says the VM is gone:
+      // let go sooner, another process could take the port the VM's broker
+      // relay still leads to.
+      onClose: async () => {
+        await held.end();
         broker.close();
       },
     });

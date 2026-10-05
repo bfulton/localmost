@@ -129,6 +129,26 @@ describe('tarDirectory', () => {
   });
 });
 
+describe('closing a VmStepRunner', () => {
+  it('closes the agent at once, and says it is released only once its VM is let go', async () => {
+    fs.mkdirSync(path.join(scratch, 'guest'));
+    const guest = new FakeGuest(path.join(scratch, 'guest'));
+    let letGo!: () => void;
+    const runner = new VmStepRunner(guest, { onClose: () => new Promise<void>((resolve) => { letGo = resolve; }) });
+    let released = false;
+    runner.close();
+    const waiting = runner.released().then(() => { released = true; });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(released).toBe(false);
+    letGo();
+    await waiting;
+    expect(released).toBe(true);
+    // A second close does not let it go twice.
+    runner.close();
+    await runner.released();
+  });
+});
+
 describe('dryRunRunner', () => {
   it('names the workspace and runs nothing', async () => {
     const r = dryRunRunner();
@@ -197,6 +217,58 @@ describe('leaseTestVm', () => {
     expect(lease.agentSocket).toBe('/data/macos-vm/vms/1-abc/agent.sock');
     expect(requests).toEqual([{ command: 'test-vm', args: { proxyPort: 41000, brokerPort: 41001 } }]);
     lease.release();
+    await closedByClient;
+  });
+
+  it('ends the lease by asking the app to release the VM, and waits for its answer', async () => {
+    let answerRelease!: () => void;
+    let conn!: net.Socket;
+    server = net.createServer((c) => {
+      conn = c;
+      let buf = '';
+      c.setEncoding('utf8');
+      c.on('data', (chunk: string) => {
+        buf += chunk;
+        let nl: number;
+        while ((nl = buf.indexOf('\n')) !== -1) {
+          const request = JSON.parse(buf.slice(0, nl));
+          buf = buf.slice(nl + 1);
+          requests.push(request);
+          if (request.command === 'test-vm') {
+            c.write(`${JSON.stringify({ success: true, command: 'test-vm', data: { agentSocket: '/a/agent.sock' } })}\n`);
+          } else {
+            answerRelease = () => c.write(`${JSON.stringify({ success: true, command: 'test-vm-release' })}\n`);
+          }
+        }
+      });
+    });
+    await new Promise<void>((resolve) => server!.listen(socketPath, resolve));
+    const lease = await leaseTestVm({ proxyPort: 1, brokerPort: 2 }, socketPath);
+    let ended = false;
+    const ending = lease.end().then(() => { ended = true; });
+    for (let i = 0; i < 100 && !answerRelease; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(requests).toEqual([{ command: 'test-vm', args: { proxyPort: 1, brokerPort: 2 } }, { command: 'test-vm-release' }]);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(ended).toBe(false);
+    const closed = new Promise<void>((r) => conn.once('close', () => r()));
+    answerRelease();
+    await ending;
+    await closed;
+  });
+
+  it('lets the lease go after a bound when the app never says the VM is gone', async () => {
+    // Answers test-vm, and never the release.
+    let markClosed!: () => void;
+    closedByClient = new Promise((r) => (markClosed = r));
+    server = net.createServer((c) => {
+      c.once('data', () => c.write(`${JSON.stringify({ success: true, command: 'test-vm', data: { agentSocket: '/a/agent.sock' } })}\n`));
+      c.on('close', () => markClosed());
+    });
+    await new Promise<void>((resolve) => server!.listen(socketPath, resolve));
+    const lease = await leaseTestVm({ proxyPort: 1, brokerPort: 2 }, socketPath);
+    const started = Date.now();
+    await lease.end(200);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(150);
     await closedByClient;
   });
 

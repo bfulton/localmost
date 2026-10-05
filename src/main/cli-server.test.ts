@@ -845,6 +845,7 @@ describe('CliServer', () => {
     let released: Lease[];
     let available: { ok: boolean; reason?: string };
     let prepare: (lease: Lease, signal?: AbortSignal) => Promise<string>;
+    let releaseVm: () => Promise<void>;
 
     beforeEach(async () => {
       await server.stop();
@@ -852,6 +853,7 @@ describe('CliServer', () => {
       released = [];
       available = { ok: true };
       prepare = async () => '/data/macos-vm/vms/1-abc/agent.sock';
+      releaseVm = async () => undefined;
       server = new CliServer({
         onLog: (level, message) => logMessages.push(`${level}: ${message}`),
         testVms: {
@@ -862,6 +864,7 @@ describe('CliServer', () => {
           },
           release: async (lease) => {
             released.push(lease);
+            await releaseVm();
           },
         },
       });
@@ -956,6 +959,43 @@ describe('CliServer', () => {
       expect(await Promise.race([stopped, timeout])).toBe('stopped');
       await until(() => released.length > 0);
       expect(released).toEqual(leases);
+    });
+
+    /** The next answer on a connection that already had one. */
+    const nextAnswer = (socket: net.Socket) =>
+      new Promise<Record<string, unknown>>((resolve) => {
+        let buffer = '';
+        socket.removeAllListeners('data');
+        socket.on('data', (d) => {
+          buffer += d.toString();
+          const nl = buffer.indexOf('\n');
+          if (nl !== -1) resolve(JSON.parse(buffer.slice(0, nl)));
+        });
+      });
+
+    it('answers test-vm-release only once the VM is gone, and releases it once', async () => {
+      const { socket } = await lend({ proxyPort: 41000, brokerPort: 41001 });
+      let gone!: () => void;
+      releaseVm = () => new Promise<void>((resolve) => { gone = resolve; });
+      let answered = false;
+      const answer = nextAnswer(socket).then((a) => { answered = true; return a; });
+      socket.write(`${JSON.stringify({ command: 'test-vm-release' })}\n`);
+      await until(() => released.length > 0);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(answered).toBe(false);
+      gone();
+      expect(await answer).toEqual({ success: true, command: 'test-vm-release' });
+      socket.destroy();
+      await new Promise((r) => setTimeout(r, 50));
+      expect(released).toEqual(leases);
+    });
+
+    it('refuses test-vm-release on a connection that holds no VM', async () => {
+      const socket = net.createConnection(testSocketPath, () => socket.write(`${JSON.stringify({ command: 'test-vm-release' })}\n`));
+      const answer = await nextAnswer(socket);
+      socket.destroy();
+      expect(answer).toEqual({ success: false, error: 'This connection has no macOS VM' });
+      expect(released).toEqual([]);
     });
 
     it('answers a boot that failed with its reason, and releases what it took', async () => {

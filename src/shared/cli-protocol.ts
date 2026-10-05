@@ -18,7 +18,8 @@ export type CliCommand =
   | 'targets-add'
   | 'targets-remove'
   | 'targets-update'
-  | 'test-vm';
+  | 'test-vm'
+  | 'test-vm-release';
 
 /** Arguments carried by target commands. */
 export interface CliRequestArgs {
@@ -128,6 +129,16 @@ export interface TestVmResponse {
   };
 }
 
+/**
+ * CLI response for test-vm-release, sent on the connection that holds the
+ * VM: the VM is stopped and its clone gone. Until then the run keeps its
+ * ports, so that nothing else can take one the VM's relays still lead to.
+ */
+export interface TestVmReleaseResponse {
+  success: true;
+  command: 'test-vm-release';
+}
+
 /** CLI error response */
 export interface ErrorResponse {
   success: false;
@@ -141,4 +152,5 @@ export type CliResponse =
   | TargetsListResponse
   | TargetMutationResponse
   | TestVmResponse
+  | TestVmReleaseResponse
   | ErrorResponse;

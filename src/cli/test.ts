@@ -300,7 +300,7 @@ export async function runTest(options: TestOptions = {}, deps: TestDeps = {}): P
   });
   const proxyPort = await discoveryProxy.start();
 
-  let runner: (StepRunner & { close(): void }) | undefined;
+  let runner: (StepRunner & { close(): void; released?(): Promise<void> }) | undefined;
   const removeInterruptHandlers = installInterruptHandlers(() => runner?.close());
 
   // Everything after the proxy starts runs inside try/finally: a throw in
@@ -335,7 +335,7 @@ export async function runTest(options: TestOptions = {}, deps: TestDeps = {}): P
 
   // A fresh macOS VM for the run, with the workspace sent into it. None for
   // a dry run, which runs nothing.
-  let active: StepRunner & { close(): void };
+  let active: StepRunner & { close(): void; released?(): Promise<void> };
   if (options.dryRun) {
     active = dryRunRunner();
   } else {
@@ -560,6 +560,9 @@ export async function runTest(options: TestOptions = {}, deps: TestDeps = {}): P
   } finally {
     removeInterruptHandlers();
     runner?.close();
+    // The proxy's port stays the run's until the VM is gone, as the broker's
+    // does: its relay leads there until then.
+    await runner?.released?.();
     await discoveryProxy.stop();
   }
 }

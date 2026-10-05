@@ -483,7 +483,10 @@ the CLI parses the workflow and drives each step itself.
 - **The broker relay leads nowhere.** The helper's `run` takes two ports; a
   test run needs only its proxy, so the CLI passes a port it holds that
   closes every connection, rather than a free one some other process could
-  take, or the app's broker.
+  take, or the app's broker. The run keeps that port, and its proxy's, until
+  the app says the VM is gone (`test-vm-release` on the lease's connection,
+  for at most 30 seconds), so no other process can take a port the VM's
+  relays still lead to.
 
 **Decision: the CLI, not the app, runs the steps.** The workflow parser,
 expressions, secrets and masking already live in the CLI, and the agent's
