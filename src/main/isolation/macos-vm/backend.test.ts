@@ -272,6 +272,46 @@ describe('MacVmBackend', () => {
     }
   });
 
+  it("counts as job capacity only the VMs this Mac's memory and the image's saved slots allow, less those the image or a test run holds", async () => {
+    const { b, slots } = backend();
+    expect(b.vmLimit()).toBe(2);
+    expect(b.jobCapacity()).toBe(2);
+    // A runner job's own VM is not taken off: the runner counts its workers.
+    const j = job('a');
+    await b.prepare(j);
+    expect(b.jobCapacity()).toBe(2);
+    await b.release(j);
+    // The golden image re-saving a slot's state holds a VM no job can use.
+    const held = await slots.acquire('save-state 2', [2]);
+    expect(b.jobCapacity()).toBe(1);
+    slots.release(held);
+    // So does a localmost test run.
+    const lease = { key: 'test-0a1b2c3d4e5f', proxyPort: 52000, brokerPort: 52001 };
+    await b.prepareTestRun(lease);
+    expect(b.jobCapacity()).toBe(1);
+    await b.release(lease);
+    // An image with one saved state runs one job at once.
+    ready = { imageId: IMAGE, slots: [1] };
+    expect(b.jobCapacity()).toBe(1);
+    // A Mac whose memory fits one VM runs one.
+    const small = backend({}, { host: () => ({ ...host, totalMemoryBytes: 12 * 2 ** 30 }) });
+    ready = { imageId: IMAGE, slots: [1, 2] };
+    expect(small.b.vmLimit()).toBe(1);
+    expect(small.b.jobCapacity()).toBe(1);
+    ready = null;
+    expect(b.jobCapacity()).toBe(0);
+  });
+
+  it('fails a job that waits longer than its bound for a slot, and leaves nothing behind', async () => {
+    const { b, slots } = backend();
+    await slots.acquire('save-state 1', [1]);
+    await slots.acquire('save-state 2', [2]);
+    await expect(b.prepare(job('a'), undefined, 50)).rejects.toThrow('no macOS VM became free within 0.05s');
+    expect(vms()).toEqual([]);
+    expect(b.jobsRunning()).toBe(false);
+    expect(slots.queued()).toBe(0);
+  });
+
   it('gives up a job cancelled while it waits for a slot', async () => {
     const { b, slots } = backend();
     await slots.acquire('x');

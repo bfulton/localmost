@@ -33,7 +33,7 @@ import * as path from 'path';
 import { MacAgentClient, MacAgentError, JOB_FILE_NAMES, jobEnvNameAllowed, type JobFiles, type MacAgentHello } from './agent-client';
 import type { LaunchHelper, ReadyImage } from './golden-image';
 import type { MacVmHelper } from './helper-client';
-import { JOB_VM_CPUS, JOB_VM_MEMORY_MIB, hostRefusal, type HostInfo } from './host';
+import { JOB_VM_CPUS, JOB_VM_MEMORY_MIB, concurrentVmLimit, hostRefusal, type HostInfo } from './host';
 import { assertRemovable, macVmLayout, newMacVmId, vmDir, MAC_VM_ID_RE } from './paths';
 import type { MacVmSlots, SlotNumber } from './slots';
 import type { IsolationAvailability, IsolationBackend, IsolationJob, JobSignal, VmLease, WorkerHandle } from './types';
@@ -88,6 +88,8 @@ interface Job {
   released: Promise<void> | null;
   abort: AbortController;
   diskTimer: NodeJS.Timeout | null;
+  /** A `localmost test` run's VM, not a runner job's. */
+  testRun: boolean;
 }
 
 /**
@@ -146,6 +148,18 @@ export class MacVmBackend implements IsolationBackend {
     return { ok: true };
   }
 
+  vmLimit(): number {
+    return concurrentVmLimit(this.deps.host().totalMemoryBytes);
+  }
+
+  jobCapacity(): number {
+    const image = this.deps.images.ready();
+    if (!image) return 0;
+    const runnerJobsHolding = [...this.jobs.values()].filter((j) => !j.testRun && j.slot !== null).length;
+    const heldElsewhere = this.deps.slots.holders().length - runnerJobsHolding;
+    return Math.max(0, Math.min(this.vmLimit(), image.slots.length) - heldElsewhere);
+  }
+
   /** Whether a job VM runs on `imageId`: the image is not removed under it. */
   imageInUse(imageId: string): boolean {
     return [...this.jobs.values()].some((j) => j.imageId === imageId);
@@ -155,20 +169,42 @@ export class MacVmBackend implements IsolationBackend {
     return this.jobs.size > 0;
   }
 
-  async prepare(job: VmLease, signal?: AbortSignal): Promise<void> {
+  prepare(job: VmLease, signal?: AbortSignal, slotWaitMs?: number): Promise<void> {
+    return this.prepareVm(job, false, signal, slotWaitMs);
+  }
+
+  private async prepareVm(job: VmLease, testRun: boolean, signal?: AbortSignal, slotWaitMs?: number): Promise<void> {
     if (this.jobs.has(job.key)) throw new Error(`job ${job.key} already has a macOS VM`);
     const availability = this.available();
     if (!availability.ok) throw new Error(availability.reason);
     const image = this.deps.images.ready()!;
     const rec: Job = {
       key: job.key, job, imageId: image.imageId, slot: null, vmId: null, helper: null, agent: null, hello: null, worker: null,
-      released: null, abort: new AbortController(), diskTimer: null,
+      released: null, abort: new AbortController(), diskTimer: null, testRun,
     };
     this.jobs.set(job.key, rec);
     const onAbort = () => rec.abort.abort();
     signal?.addEventListener('abort', onAbort, { once: true });
+    // A job GitHub has handed over cannot wait for a VM without end: past
+    // the bound it fails, and the caller gives the job up promptly.
+    const slotWait = new AbortController();
+    const onJobAbort = () => slotWait.abort();
+    rec.abort.signal.addEventListener('abort', onJobAbort, { once: true });
+    let slotWaitExpired = false;
+    const slotTimer = slotWaitMs === undefined ? null : setTimeout(() => {
+      slotWaitExpired = true;
+      slotWait.abort();
+    }, slotWaitMs);
     try {
-      rec.slot = await this.deps.slots.acquire(`job ${job.key}`, image.slots, rec.abort.signal);
+      try {
+        rec.slot = await this.deps.slots.acquire(`job ${job.key}`, image.slots, slotWait.signal);
+      } catch (err) {
+        if (slotWaitExpired) throw new Error(`no macOS VM became free within ${(slotWaitMs ?? 0) / 1000}s`);
+        throw err;
+      } finally {
+        if (slotTimer) clearTimeout(slotTimer);
+        rec.abort.signal.removeEventListener('abort', onJobAbort);
+      }
       const free = await this.freeBytes();
       if (free < JOB_DISK_RESERVE_BYTES) {
         throw new Error(`the Mac has ${gib(free)} free, and a macOS VM job needs at least ${gib(JOB_DISK_RESERVE_BYTES)} to start`);
@@ -214,7 +250,7 @@ export class MacVmBackend implements IsolationBackend {
    * is the run's until release.
    */
   async prepareTestRun(lease: VmLease, signal?: AbortSignal): Promise<string> {
-    await this.prepare(lease, signal);
+    await this.prepareVm(lease, true, signal);
     const rec = this.jobs.get(lease.key);
     if (!rec?.vmId) throw new Error(`test run ${lease.key} has no macOS VM`);
     return path.join(vmDir(this.deps.dataDir, rec.vmId), 'agent.sock');

@@ -135,7 +135,9 @@ describe('a worker started for a job', () => {
       sandboxDir: expect.stringMatching(/\/runner\/sandbox\/1-[0-9a-f]{12}$/),
       runnerVersion: '2.330.0',
     });
-    expect(isolation.prepare).toHaveBeenCalledWith(job, expect.any(AbortSignal));
+    // The wait for a VM slot is bounded: GitHub has handed the job over, and
+    // one that cannot get a VM fails promptly rather than hang.
+    expect(isolation.prepare).toHaveBeenCalledWith(job, expect.any(AbortSignal), 60_000);
     expect(isolation.prepare.mock.invocationCallOrder[0]).toBeLessThan(isolation.spawnWorker.mock.invocationCallOrder[0]);
     expect(argv).toEqual(['--once']);
     // The runner's settings and the proxy, which the guest reaches through
@@ -316,6 +318,25 @@ describe("a finished worker's VM and sandbox", () => {
     expect(isolation.prepare).not.toHaveBeenCalled();
     expect(isolation.spawnWorker).not.toHaveBeenCalled();
   });
+
+  it('are never used by a start whose slot was let go while its runner started', async () => {
+    // A stop while the guest agent starts the runner released the VM; the
+    // worker it hands back is not armed with an acquire deadline for a slot
+    // that is no longer its.
+    const { manager, helper } = newManager();
+    let spawned!: (worker: ReturnType<typeof createMockWorker>) => void;
+    isolation.spawnWorker.mockImplementationOnce(() => new Promise((resolve) => { spawned = resolve; }));
+
+    const started = helper.spawnForJob({ targetId: 't1', targetDisplayName: 'owner/repo', jobId: 'A' });
+    await settle();
+    expect(spawned).toBeDefined();
+    await manager.stop();
+    spawned(createMockWorker(501));
+
+    expect(await started).toBe(false);
+    expect(helper.instances.size).toBe(0);
+    expect((manager as unknown as { acquireDeadlines: Map<number, unknown> }).acquireDeadlines.size).toBe(0);
+  });
 });
 
 describe('stopping a worker', () => {
@@ -363,6 +384,34 @@ describe('how many workers run at once', () => {
     await settle();
     expect(manager.hasAvailableSlot()).toBe(true);
     expect(helper.reserveSlot()).toBe(1);
+  });
+
+  it('is one on a Mac whose memory fits only one macOS VM', async () => {
+    const { manager, helper } = newManager({}, 4);
+    isolation.vmLimit.mockReturnValue(1);
+    const a = await spawnWorker(helper, 501, 'A');
+    a.worker.emit('stdout', 'Running job: one');
+
+    expect(manager.hasAvailableSlot()).toBe(false);
+    expect(helper.reserveSlot()).toBeNull();
+  });
+
+  it('leaves out a VM the golden image or a localmost test run holds', async () => {
+    // Offered anyway, the job would be taken from GitHub only to wait for a
+    // VM that the save-state or the test run holds.
+    const { manager, helper } = newManager({}, 2);
+    isolation.jobCapacity.mockReturnValue(1);
+    const a = await spawnWorker(helper, 501, 'A');
+    a.worker.emit('stdout', 'Running job: one');
+    expect(manager.hasAvailableSlot()).toBe(false);
+    expect(helper.reserveSlot()).toBeNull();
+
+    a.worker.emit('exit', 0, null);
+    await settle();
+    isolation.jobCapacity.mockReturnValue(0);
+    expect(manager.hasAvailableSlot()).toBe(false);
+    isolation.jobCapacity.mockReturnValue(2);
+    expect(manager.hasAvailableSlot()).toBe(true);
   });
 
   it('is the runner count when that is fewer', async () => {

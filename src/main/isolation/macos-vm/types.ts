@@ -62,12 +62,21 @@ export interface IsolationBackend {
   readonly type: 'macos-vm';
   /** Cheap and synchronous: from what the backend last learned. */
   available(): IsolationAvailability;
+  /** How many macOS VMs this Mac runs at once: two, or one when its memory fits only one. */
+  vmLimit(): number;
+  /**
+   * How many runner jobs may hold a VM now: the limit, and the slots the
+   * golden image has saved states for, less the VMs a `localmost test` run
+   * or the golden image itself holds.
+   */
+  jobCapacity(): number;
   /**
    * Everything before the runner: a VM slot (waiting for one if both are
-   * taken), the VM booted or restored, and the guest prepared. Rejects with
-   * a reason; an abort while waiting or booting releases what was taken.
+   * taken, for at most `slotWaitMs` when given), the VM booted or restored,
+   * and the guest prepared. Rejects with a reason; an abort while waiting or
+   * booting releases what was taken.
    */
-  prepare(job: VmLease, signal?: AbortSignal): Promise<void>;
+  prepare(job: VmLease, signal?: AbortSignal, slotWaitMs?: number): Promise<void>;
   /** Starts the runner in the prepared VM: `argv` is its arguments, `env` the worker's environment. */
   spawnWorker(job: IsolationJob, argv: string[], env: Record<string, string>): Promise<WorkerHandle>;
   signal(job: IsolationJob, signal: JobSignal): Promise<void>;

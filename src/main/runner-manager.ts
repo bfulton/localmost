@@ -15,7 +15,6 @@ import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { GitHubClientError } from './github-client';
 import { RunnerDownloader } from './runner-downloader';
 import type { IsolationAvailability, IsolationBackend, IsolationJob, WorkerHandle } from './isolation/macos-vm/types';
-import { MAX_MAC_VMS } from './isolation/macos-vm/host';
 import type { WorkerCredentialFiles } from './worker-credentials';
 import type { BrokerJobTarget } from './broker-proxy-service';
 import { getConfigPath, getJobHistoryPath, getRunnerDir } from './paths';
@@ -36,6 +35,8 @@ const STOP_GRACE_MS = 5000;
 const NO_ISOLATION: IsolationBackend = {
   type: 'macos-vm',
   available: () => ({ ok: false, reason: 'this runner was started without a macOS VM backend' }),
+  vmLimit: () => 0,
+  jobCapacity: () => 0,
   prepare: async () => {
     throw new Error('this runner was started without a macOS VM backend');
   },
@@ -789,11 +790,31 @@ export class RunnerManager {
 
   /**
    * How many workers may run at once: the runner count, and never more than
-   * the two macOS VMs a Mac may run. A third job would only wait for a VM
-   * after GitHub had handed it over.
+   * the macOS VMs this Mac runs at once (two, or one when its memory fits
+   * only one). A job beyond that would only wait for a VM after GitHub had
+   * handed it over.
    */
   private maxSlots(): number {
-    return Math.min(this.runnerCount, MAX_MAC_VMS);
+    return Math.min(this.runnerCount, this.isolation.vmLimit());
+  }
+
+  /** Worker slots taken: a worker in them, starting, or reserved for a job on its way. */
+  private slotsInUse(): number {
+    let used = 0;
+    for (let i = 1; i <= this.maxSlots(); i++) {
+      if (this.reservedSlots.has(i) || this.startingInstances.has(i) || !this.slotIsFree(i)) used++;
+    }
+    return used;
+  }
+
+  /**
+   * Whether another job could get a VM now. A slot the golden image's build
+   * or save-state holds, or a `localmost test` run's, is one no job can use
+   * meanwhile: offered anyway, the job would wait for it after GitHub had
+   * handed it over.
+   */
+  private vmFreeForJob(): boolean {
+    return this.slotsInUse() < this.isolation.jobCapacity();
   }
 
   /**
@@ -804,6 +825,7 @@ export class RunnerManager {
     // No golden image, no job: the broker leaves it with GitHub rather than
     // acquire one nothing can run.
     if (!this.vmReady()) return false;
+    if (!this.vmFreeForJob()) return false;
     for (let i = 1; i <= this.maxSlots(); i++) {
       if (this.slotIsFree(i)) {
         return true;
@@ -840,6 +862,7 @@ export class RunnerManager {
    * and one of them would be acquired upstream and never run.
    */
   private reserveSlot(): number | null {
+    if (!this.vmFreeForJob()) return null;
     for (let i = 1; i <= this.maxSlots(); i++) {
       if (this.reservedSlots.has(i) || this.startingInstances.has(i)) continue;
       if (this.slotIsFree(i)) {
@@ -1327,9 +1350,11 @@ export class RunnerManager {
         throw new Error('its slot was let go while it started');
       }
 
-      // The job's VM: a slot (waiting behind the two a Mac may run), a clone
-      // of the golden image restored or booted, its guest prepared. A stop
-      // while this waits aborts it (releaseSpawn).
+      // The job's VM: a slot (waiting behind the two a Mac may run, but not
+      // for long: GitHub has handed the job over, and one that cannot get a
+      // VM fails promptly rather than hang), a clone of the golden image
+      // restored or booted, its guest prepared. A stop while this waits
+      // aborts it (releaseSpawn).
       const job: IsolationJob = {
         key: `${instanceNum}-${path.basename(sandboxDir)}`,
         proxyPort: proxy.getPort(),
@@ -1340,13 +1365,19 @@ export class RunnerManager {
       instance.job = job;
       instance.preparing = new AbortController();
       this.log('info', `Starting a macOS VM for instance ${instanceNum}...`);
-      await this.isolation.prepare(job, instance.preparing.signal);
+      await this.isolation.prepare(job, instance.preparing.signal, RunnerManager.SLOT_WAIT_MS);
       instance.preparing = undefined;
       if (instance.policySealed) {
         throw new Error('its slot was let go while its VM started');
       }
 
       const worker = await this.isolation.spawnWorker(job, ['--once'], env);
+      // Let go while the runner started: its VM was released with the slot,
+      // and an acquire deadline armed now would be for a slot that is no
+      // longer this worker's.
+      if (this.instances.get(instanceNum) !== instance || instance.policySealed) {
+        throw new Error('its slot was let go while its runner started');
+      }
       instance.worker = worker;
       instance.policyStamp = spawnPolicy?.stamp;
       this.log('info', `Runner instance ${instanceNum} started in its macOS VM (guest pid ${worker.pid})`);

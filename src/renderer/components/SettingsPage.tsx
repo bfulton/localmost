@@ -446,7 +446,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
               </div>
               <p className={shared.formHint}>
                 Maximum concurrent jobs across all targets. Each job runs in a macOS VM, and a Mac runs at most two
-                at once, so more than two wait for a VM.
+                at once (one with less than 16 GB of memory); jobs beyond that stay queued on GitHub until a VM is free.
               </p>
             </div>
           </section>

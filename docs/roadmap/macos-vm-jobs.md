@@ -103,8 +103,13 @@ a worker's exit, a reap of one that never took its job, and `stop()` all
 release its VM and then remove its sandbox. A stop while `prepare` still
 waits for a slot or a boot aborts it.
 
-- **Two at most.** The pool runs `min(runner count, MAX_MAC_VMS)` workers,
-  two, so the broker never acquires a job that would only wait for a VM.
+- **Two at most.** The pool runs `min(runner count, concurrentVmLimit)`
+  workers: two, or one on a Mac whose memory fits only one VM. Its capacity
+  check also leaves out a VM the golden image's build or save-state, or a
+  `localmost test` run, holds, and a slot the image has no saved state for,
+  so the broker does not acquire a job that would only wait for a VM. A job
+  that still finds none free (a race with a save-state) waits at most
+  `SLOT_WAIT_MS`, a minute, for one and then fails rather than hang.
 - **No image, no jobs.** While `available()` says no, the pool's capacity
   check refuses, so the broker leaves jobs with GitHub; the runner's status is
   offline with the reason, logged once. The heartbeat is stopped and cleared
