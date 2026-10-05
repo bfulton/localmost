@@ -766,6 +766,11 @@ export class RunnerManager {
     if (this.startedAt && !this.stopping) this.updateAggregateStatus();
   }
 
+  /** Whether a job could get a macOS VM now: the heartbeat is published only while one can. */
+  vmAvailable(): boolean {
+    return this.vmReady();
+  }
+
   /**
    * Whether a job can get a macOS VM now. Each change is logged once: a
    * pool with no golden image refuses every capacity check, and saying so at

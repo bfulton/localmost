@@ -43,6 +43,7 @@ import {
   resumeForResource,
   resumeRunner,
   startHeartbeatUnlessPaused,
+  syncHeartbeatWithVm,
   wireResourceMonitor,
 } from './runner-pause';
 import type { AppConfig } from './config';
@@ -53,6 +54,7 @@ const heartbeat = {
   stop: jest.fn(),
   clear: jest.fn(async () => {}),
   start: jest.fn(async () => true),
+  isRunning: jest.fn(() => false),
 };
 const runner = {
   isInitialized: jest.fn(() => true),
@@ -60,6 +62,7 @@ const runner = {
   stop: jest.fn(async () => {}),
   hasAvailableSlot: jest.fn(() => true),
   isRunning: jest.fn(() => false),
+  vmAvailable: jest.fn(() => true),
 };
 // Overriding stops it recommending the pause, as the real monitor does
 // until the condition clears.
@@ -93,6 +96,8 @@ beforeEach(() => {
   runner.isInitialized.mockReturnValue(true);
   runner.hasAvailableSlot.mockReturnValue(true);
   runner.isRunning.mockReturnValue(false);
+  runner.vmAvailable.mockReturnValue(true);
+  heartbeat.isRunning.mockReturnValue(false);
   resourceMonitor.shouldPause.mockReturnValue(false);
   setHeartbeatManager(heartbeat as unknown as HeartbeatManager);
   setRunnerManager(runner as unknown as RunnerManager);
@@ -750,6 +755,63 @@ describe('startHeartbeatUnlessPaused', () => {
 
     await startHeartbeatUnlessPaused(heartbeat as unknown as HeartbeatManager);
     expect(heartbeat.start).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves it stopped while no macOS VM can take a job', async () => {
+    // Every job is refused without a golden image; a heartbeat would route
+    // workflows here to queue for good.
+    startRunner();
+    runner.vmAvailable.mockReturnValue(false);
+
+    await startHeartbeatUnlessPaused(heartbeat as unknown as HeartbeatManager);
+    expect(heartbeat.start).not.toHaveBeenCalled();
+  });
+});
+
+describe('syncHeartbeatWithVm', () => {
+  it('stops and clears the heartbeat when the VM becomes unavailable, and starts it again when one is ready', async () => {
+    startRunner();
+    heartbeat.isRunning.mockReturnValue(true);
+    runner.vmAvailable.mockReturnValue(false);
+
+    await syncHeartbeatWithVm();
+    expect(heartbeat.stop).toHaveBeenCalledTimes(1);
+    expect(heartbeat.clear).toHaveBeenCalledTimes(1);
+    expect(heartbeat.start).not.toHaveBeenCalled();
+
+    heartbeat.isRunning.mockReturnValue(false);
+    runner.vmAvailable.mockReturnValue(true);
+    await syncHeartbeatWithVm();
+    expect(heartbeat.start).toHaveBeenCalledTimes(1);
+
+    // Nothing changed: nothing is sent.
+    heartbeat.isRunning.mockReturnValue(true);
+    await syncHeartbeatWithVm();
+    expect(heartbeat.start).toHaveBeenCalledTimes(1);
+    expect(heartbeat.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves a paused runner, or one not started, to its resume or start', async () => {
+    initRunnerStateMachine();
+    await syncHeartbeatWithVm();
+    expect(heartbeat.start).not.toHaveBeenCalled();
+
+    sendRunnerEvent({ type: 'START' });
+    sendRunnerEvent({ type: 'INITIALIZED' });
+    await pauseRunner();
+    jest.clearAllMocks();
+    await syncHeartbeatWithVm();
+    expect(heartbeat.start).not.toHaveBeenCalled();
+  });
+
+  it('keeps a resume from starting the heartbeat while no VM can take a job', async () => {
+    startRunner();
+    await pauseRunner();
+    runner.vmAvailable.mockReturnValue(false);
+    jest.clearAllMocks();
+
+    expect(await resumeRunner()).toBe('resumed');
+    expect(heartbeat.start).not.toHaveBeenCalled();
   });
 });
 

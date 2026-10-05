@@ -107,8 +107,12 @@ waits for a slot or a boot aborts it.
   two, so the broker never acquires a job that would only wait for a VM.
 - **No image, no jobs.** While `available()` says no, the pool's capacity
   check refuses, so the broker leaves jobs with GitHub; the runner's status is
-  offline with the reason, logged once. A change of the image's status
-  refreshes it.
+  offline with the reason, logged once. The heartbeat is stopped and cleared
+  meanwhile, so a workflow that picks self-hosted by `LOCALMOST_HEARTBEAT`
+  sends its job elsewhere rather than queueing it here; a runner that starts
+  without an image starts no heartbeat. A change of the image's status
+  refreshes both: the heartbeat starts again once a job can get a VM, unless
+  the runner is paused.
 - **The policy.** The level and hosts go to the job's proxy, as before. The
   environment is the locale, the time zone and what the approved `env:`
   allows of the app's, then the runner's settings and the proxy. Filesystem

@@ -16,6 +16,11 @@
  * here too. It stops the same two things, and by default also leaves running
  * jobs to finish; resourcePause.runningJobs set to 'stop' stops them. A
  * resume lifts it and overrides the condition behind it until that clears.
+ *
+ * A runner with no macOS VM to give a job (no golden image yet, or one that
+ * cannot be used) refuses every job too, and publishes no heartbeat while it
+ * does: a workflow that picks self-hosted by the heartbeat would otherwise
+ * queue its job here for good. syncHeartbeatWithVm follows the image.
  */
 
 import { IPC_CHANNELS } from '../shared/types';
@@ -121,10 +126,27 @@ export const ensureRunnerInitialized = async (): Promise<void> => {
   await initializing;
 };
 
+/** Whether a job could get a macOS VM now. */
+const vmCanTakeJobs = (): boolean => getRunnerManager()?.vmAvailable() ?? true;
+
+/**
+ * Start the heartbeat, if a job could get a VM; otherwise leave it stopped
+ * and say so, and syncHeartbeatWithVm starts it once one can.
+ */
+const startHeartbeatIfVmReady = async (
+  heartbeatManager: Pick<HeartbeatManager, 'start'>
+): Promise<void> => {
+  if (!vmCanTakeJobs()) {
+    getLogger()?.info('No macOS VM can take a job yet, so the heartbeat waits for one');
+    return;
+  }
+  await heartbeatManager.start();
+};
+
 /**
  * Start the heartbeat that routes workflows here, unless the runner is
- * paused. For starting the runner: one paused while it started comes up
- * paused, and its resume starts the heartbeat.
+ * paused or has no VM to give a job. For starting the runner: one paused
+ * while it started comes up paused, and its resume starts the heartbeat.
  */
 export const startHeartbeatUnlessPaused = async (
   heartbeatManager: Pick<HeartbeatManager, 'start'>
@@ -133,8 +155,26 @@ export const startHeartbeatUnlessPaused = async (
     getLogger()?.info('Runner is paused, so the heartbeat waits for resume');
     return;
   }
-  await heartbeatManager.start();
+  await startHeartbeatIfVmReady(heartbeatManager);
 };
+
+/**
+ * The golden image's status changed: publish the heartbeat while a job can
+ * get a VM, and stop and clear it while none can. A paused runner, or one
+ * not started, is left as it is: its resume or start decides.
+ */
+export const syncHeartbeatWithVm = (): Promise<void> => oneAtATime(async () => {
+  if (!isRunnerStarted() || getEffectivePauseState().isPaused) return;
+  const heartbeatManager = getHeartbeatManager();
+  if (!heartbeatManager || !getAuthState()?.accessToken) return;
+  if (vmCanTakeJobs()) {
+    if (!heartbeatManager.isRunning()) await heartbeatManager.start();
+  } else if (heartbeatManager.isRunning()) {
+    getLogger()?.info('No macOS VM can take a job; stopping the heartbeat until one can');
+    heartbeatManager.stop();
+    await heartbeatManager.clear();
+  }
+});
 
 /**
  * Stop taking jobs until the user resumes. Running jobs finish.
@@ -229,7 +269,7 @@ export const resumeForResource = (): Promise<void> => oneAtATime(async () => {
   const heartbeatManager = getHeartbeatManager();
   if (heartbeatManager && getAuthState()?.accessToken) {
     try {
-      await heartbeatManager.start();
+      await startHeartbeatIfVmReady(heartbeatManager);
     } catch (err) {
       getLogger()?.error(`Failed to restart heartbeat: ${(err as Error).message}`);
     }
@@ -314,7 +354,7 @@ export const resumeRunner = (): Promise<ResumeOutcome> => oneAtATime(async () =>
     const heartbeatManager = getHeartbeatManager();
     if (heartbeatManager && getAuthState()?.accessToken) {
       try {
-        await heartbeatManager.start();
+        await startHeartbeatIfVmReady(heartbeatManager);
       } catch (err) {
         getLogger()?.error(`Failed to restart heartbeat: ${(err as Error).message}`);
       }

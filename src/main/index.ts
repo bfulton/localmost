@@ -101,7 +101,7 @@ import { IPC_CHANNELS, SleepProtection, LogLevel, DEFAULT_POWER_CONFIG, DEFAULT_
 
 // Resource monitoring
 import { ResourceMonitor } from './resource-monitor';
-import { canAcceptJob, startHeartbeatUnlessPaused, wireResourceMonitor } from './runner-pause';
+import { canAcceptJob, startHeartbeatUnlessPaused, syncHeartbeatWithVm, wireResourceMonitor } from './runner-pause';
 
 // State machine
 import {
@@ -468,8 +468,12 @@ app.whenReady().then(async () => {
   });
   setRunnerManager(runnerManager);
   // A golden image built, removed or failed changes whether the pool can
-  // take a job; its status says so at once.
-  macVm.images.on('status', () => runnerManager.refreshAvailability());
+  // take a job; its status says so at once, and the heartbeat that routes
+  // workflows here is published only while it can.
+  macVm.images.on('status', () => {
+    runnerManager.refreshAvailability();
+    syncHeartbeatWithVm().catch((err: Error) => logger?.error(`Heartbeat update failed: ${err.message}`));
+  });
   // The VMs and helpers an earlier run left go first, then the image is
   // checked. Not awaited: until the check finds an image ready the backend
   // is unavailable, so the pool takes no job before the sweep is done.
