@@ -111,28 +111,6 @@ export class RunnerDownloader {
   }
 
   /**
-   * A target's own cache directory, kept across that target's jobs and never
-   * shared with another target's. A job can write its caches, and what it
-   * leaves there - a toolchain in the tool cache - the next job to find it
-   * executes. Target IDs are app-generated; checked anyway, since this
-   * becomes a path the sandbox grants write to.
-   */
-  getTargetCacheDir(targetId: string): string {
-    if (!/^[A-Za-z0-9-]+$/.test(targetId)) {
-      throw new Error(`Not a target id for a cache directory: ${JSON.stringify(targetId)}`);
-    }
-    return path.join(this.baseDir, 'caches', targetId);
-  }
-
-  /**
-   * The persistent tool cache for one target's jobs. The shared tool-cache
-   * directory earlier versions used is left in place and no longer granted.
-   */
-  getToolCacheDir(targetId: string): string {
-    return path.join(this.getTargetCacheDir(targetId), 'tool-cache');
-  }
-
-  /**
    * Where a version's integrity record lives: beside arc/, not in it, so a
    * version directory holds exactly what its release did.
    */
@@ -418,12 +396,9 @@ export class RunnerDownloader {
    * Build a sandbox for one start of an instance, by copying arc + config
    * into a directory made for it, and return that directory.
    *
-   * Never a directory an earlier start used. The profile a worker runs under
-   * grants its sandbox by path, and a process its job started can outlive it -
-   * one that traps SIGTERM, or leaves its process group - keeping that
-   * profile. Built again at the same path, the next job's runner (after its
-   * copy was checked), its checkout and its docker socket would all be within
-   * that process's reach, whatever repository the next job came from.
+   * Never a directory an earlier start used: each start's runner files and
+   * docker socket are at a path no earlier start's could be, and the
+   * directory goes once that start's VM is released.
    */
   async buildSandbox(
     instance: number,
@@ -497,8 +472,8 @@ export class RunnerDownloader {
 
   /**
    * Write the share's tripwire: a fresh random nonce in
-   * `<sandbox>/_work/.localmost-share`, before the worker starts. The job's
-   * profile lets it neither read nor replace the file, so when the guest
+   * `<sandbox>/_work/.localmost-share`, before the worker starts. No job
+   * process runs on the Mac to read or replace the file, so when the guest
    * reads the same nonce back through its share, the share is the directory
    * this app made (the design's share rule, clause 8).
    *
