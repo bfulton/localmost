@@ -15,6 +15,7 @@ export * from './step-executor';
 
 // Sandbox and policy
 export * from './sandbox-profile';
+export * from './policy-types';
 export * from './localmostrc';
 
 // Actions

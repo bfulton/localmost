@@ -17,7 +17,7 @@ import * as fs from 'fs';
 import * as net from 'net';
 import * as path from 'path';
 import { canonicalHost, parseHostPattern } from './egress-screen';
-import { SandboxPolicy, NetworkPolicy, FilesystemPolicy, EnvPolicy } from './sandbox-profile';
+import { PolicyRules, NetworkPolicy, FilesystemPolicy, EnvPolicy } from './policy-types';
 import { SandboxPolicyLevel } from './types';
 import {
   validateDockerPolicy,
@@ -37,7 +37,7 @@ export interface SecretsPolicy {
   require?: string[];
 }
 
-export interface WorkflowPolicy extends SandboxPolicy {
+export interface WorkflowPolicy extends PolicyRules {
   secrets?: SecretsPolicy;
 }
 
@@ -54,7 +54,7 @@ export interface SharedNetworkPolicy extends NetworkPolicy {
 }
 
 /** What `shared:` may declare: a section, plus what only a whole worker can be given. */
-export interface SharedPolicy extends SandboxPolicy {
+export interface SharedPolicy extends PolicyRules {
   network?: SharedNetworkPolicy;
 }
 
@@ -763,7 +763,7 @@ function mergeEnvPolicy(base?: EnvPolicy, override?: EnvPolicy): EnvPolicy | und
  * Merge two sandbox policies.
  * Override takes precedence, arrays are merged.
  */
-export function mergePolicies(base: SharedPolicy, override: SandboxPolicy): SharedPolicy {
+export function mergePolicies(base: SharedPolicy, override: PolicyRules): SharedPolicy {
   return {
     network: mergeNetworkPolicy(base.network, override.network),
     filesystem: mergeFilesystemPolicy(base.filesystem, override.filesystem),

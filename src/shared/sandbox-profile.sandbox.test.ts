@@ -38,8 +38,8 @@ import {
   generateDiscoveryProfile,
   MACOS_BASELINE_READ_PATHS,
   SandboxProfileOptions,
-  DEFAULT_BROKER_PORT,
 } from './sandbox-profile';
+import { DEFAULT_BROKER_PORT } from './constants';
 import { getWorkspacesDir, removeWorkspace } from './workspace';
 import { defaults, preferenceAllowed, removeThrowawayDomain, sweepStaleThrowawayDomains, throwawayDomain } from './test-utils/preference-probe';
 import { mkdtempChars, probeTempDirName } from './test-utils/temp-name-probe';

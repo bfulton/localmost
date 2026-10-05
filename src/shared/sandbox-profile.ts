@@ -10,36 +10,16 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
-import type { DockerPolicy } from './docker-policy';
 import { getAppDataDirWithoutElectron, getCliSocketPath } from './paths';
+import { DEFAULT_BROKER_PORT } from './constants';
 
 // =============================================================================
 // Types
 // =============================================================================
 
-export interface NetworkPolicy {
-  allow?: string[];
-  deny?: string[];
-}
+import type { PolicyRules } from './policy-types';
 
-export interface FilesystemPolicy {
-  read?: string[];
-  write?: string[];
-  deny?: string[];
-}
-
-export interface EnvPolicy {
-  allow?: string[];
-  deny?: string[];
-}
-
-export interface SandboxPolicy {
-  network?: NetworkPolicy;
-  filesystem?: FilesystemPolicy;
-  env?: EnvPolicy;
-  /** Container work, checked per request by the filtering socket - see docker-policy.ts. */
-  docker?: DockerPolicy;
-}
+export type SandboxPolicy = PolicyRules;
 
 /**
  * A `network.loopback` grant: every loopback port, or a list of them.
@@ -416,11 +396,6 @@ export const MACOS_BASELINE_READ_PATHS = [
   '/Applications/Xcode.app',
 ];
 
-/**
- * The broker's port, BrokerProxyService's default. Defined here, where the CLI
- * can reach it, so the runner's profile and the test profiles deny the same one.
- */
-export const DEFAULT_BROKER_PORT = 8787;
 
 /**
  * The network rules both test-mode profiles share, mirroring the runner's.

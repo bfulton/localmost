@@ -5,7 +5,7 @@
  * job user's HOME, PATH, shell and temp itself.
  */
 
-import type { EnvPolicy } from '../shared/sandbox-profile';
+import type { EnvPolicy } from '../shared/policy-types';
 import type { LocalmostrcConfig } from '../shared/localmostrc';
 
 /**

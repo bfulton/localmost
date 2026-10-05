@@ -10,7 +10,7 @@ import * as net from 'net';
 import { ProxyLogEntry, ProxyServer, parseConnectTarget } from './proxy-server';
 import { SandboxPolicyLevel } from '../shared/types';
 import { pinnedLookup } from '../shared/egress-screen';
-import { DEFAULT_BROKER_PORT } from '../shared/sandbox-profile';
+import { DEFAULT_BROKER_PORT } from '../shared/constants';
 
 type AccessDecision = { allowed: boolean; reason?: string };
 

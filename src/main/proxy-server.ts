@@ -32,7 +32,7 @@ import {
   STRICT_NETWORK_ALLOWLIST,
   RUNNER_INFRASTRUCTURE_ALLOWLIST,
 } from '../shared/network-allowlist';
-import { DEFAULT_BROKER_PORT } from '../shared/sandbox-profile';
+import { DEFAULT_BROKER_PORT } from '../shared/constants';
 
 export interface ProxyLogEntry {
   timestamp: string;

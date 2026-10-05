@@ -13,7 +13,7 @@ import {
   formatPolicyDiff,
   LocalmostrcConfig,
 } from './localmostrc';
-import { SandboxPolicy } from './sandbox-profile';
+import { PolicyRules } from './policy-types';
 
 // Finding and reading the file on disk: localmostrc.file.test.ts.
 
@@ -273,10 +273,10 @@ workflows: just-a-string
 
   describe('mergePolicies', () => {
     it('should merge network allow lists', () => {
-      const base: SandboxPolicy = {
+      const base: PolicyRules = {
         network: { allow: ['github.com'] },
       };
-      const override: SandboxPolicy = {
+      const override: PolicyRules = {
         network: { allow: ['npmjs.org'] },
       };
 
@@ -287,10 +287,10 @@ workflows: just-a-string
     });
 
     it('should deduplicate merged arrays', () => {
-      const base: SandboxPolicy = {
+      const base: PolicyRules = {
         network: { allow: ['github.com', 'npmjs.org'] },
       };
-      const override: SandboxPolicy = {
+      const override: PolicyRules = {
         network: { allow: ['npmjs.org', 'registry.com'] },
       };
 
@@ -300,10 +300,10 @@ workflows: just-a-string
     });
 
     it('should merge filesystem policies', () => {
-      const base: SandboxPolicy = {
+      const base: PolicyRules = {
         filesystem: { read: ['/usr'], write: ['./build'] },
       };
-      const override: SandboxPolicy = {
+      const override: PolicyRules = {
         filesystem: { read: ['/opt'], deny: ['~/.ssh'] },
       };
 
@@ -316,10 +316,10 @@ workflows: just-a-string
     });
 
     it('should merge env policies', () => {
-      const base: SandboxPolicy = {
+      const base: PolicyRules = {
         env: { allow: ['PATH'] },
       };
-      const override: SandboxPolicy = {
+      const override: PolicyRules = {
         env: { deny: ['AWS_SECRET'] },
       };
 
@@ -330,8 +330,8 @@ workflows: just-a-string
     });
 
     it('should handle empty base policy', () => {
-      const base: SandboxPolicy = {};
-      const override: SandboxPolicy = {
+      const base: PolicyRules = {};
+      const override: PolicyRules = {
         network: { allow: ['github.com'] },
       };
 
@@ -341,10 +341,10 @@ workflows: just-a-string
     });
 
     it('should handle empty override policy', () => {
-      const base: SandboxPolicy = {
+      const base: PolicyRules = {
         network: { allow: ['github.com'] },
       };
-      const override: SandboxPolicy = {};
+      const override: PolicyRules = {};
 
       const result = mergePolicies(base, override);
 

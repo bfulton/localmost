@@ -8,9 +8,9 @@ import { DockerBackend, noDockerBackend } from './docker/docker-backend';
 import { DockerFilterProxy } from './docker/docker-filter-proxy';
 import {
   SandboxPolicyLevel, RunnerState, RunnerStatus, LogEntry, RunnerConfig, JobHistoryEntry, JobStatus, LOG_LEVEL_PRIORITY, LogLevel, UserFilterConfig, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../shared/types';
-import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT } from '../shared/constants';
+import { DEFAULT_RUNNER_COUNT, DEFAULT_MAX_JOB_HISTORY, MIN_RUNNER_COUNT, MAX_RUNNER_COUNT, DEFAULT_BROKER_PORT } from '../shared/constants';
 import { vmWorkerEnv } from './worker-env';
-import { DEFAULT_BROKER_PORT, type EnvPolicy } from '../shared/sandbox-profile';
+import type { EnvPolicy } from '../shared/policy-types';
 import { ProxyServer, ProxyLogEntry } from './proxy-server';
 import { GitHubClientError } from './github-client';
 import { RunnerDownloader } from './runner-downloader';

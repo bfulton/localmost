@@ -13,7 +13,7 @@
 import * as http from 'http';
 import * as net from 'net';
 import { ProxyServer } from './proxy-server';
-import { DEFAULT_BROKER_PORT } from '../shared/sandbox-profile';
+import { DEFAULT_BROKER_PORT } from '../shared/constants';
 import { SandboxPolicyLevel } from '../shared/types';
 
 type AccessDecision = { allowed: boolean; reason?: string };
