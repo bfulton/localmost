@@ -128,6 +128,10 @@ const FILESYSTEM_DENY =
   "nothing of this Mac's filesystem reaches a job's macOS VM yet; once VM shares exist, no read or write inside a granted path";
 const ENV_ALLOW_NOT_APPLIED =
   'not applied: the environment is fixed when the worker starts, before the workflow is known; declare it under shared:';
+// Admission refuses such a job (NO_DOCKER_RELAY_REASON in job-admission):
+// approving the grant does not make it run.
+const DOCKER_REFUSED =
+  "a job with a Docker grant is refused until localmost has a Docker relay into the job's macOS VM";
 const ENV_DENY_EVERYWHERE =
   "applied to every job, not only this workflow's: the environment is fixed when the worker starts";
 
@@ -177,7 +181,7 @@ export function describePolicy(policy: DescribablePolicy, prefix = '', scope: Po
   // Docker describes itself: what a container grant means is the docker
   // grammar's business, and the line it produces is already the flat form.
   for (const grant of describeDockerGrants(policy.docker, '')) {
-    grants.push({ group: 'Docker', marker: '+', value: grant, summary: `${prefix}${grant}` });
+    grants.push({ group: 'Docker', marker: '+', value: grant, note: DOCKER_REFUSED, summary: `${prefix}${grant} (${DOCKER_REFUSED})` });
   }
 
   return grants;

@@ -100,6 +100,15 @@ describe('describePolicy', () => {
     expect(describePolicy({ level: 'permissive' })[0].summary).toMatch(/allows every network host/);
   });
 
+  it('says that a job with a Docker grant is refused until the Docker relay exists, on every Docker line', () => {
+    const grants = describePolicy({ docker: everything.docker });
+    expect(grants.length).toBeGreaterThan(0);
+    for (const grant of grants) {
+      expect(grant.note).toMatch(/refused until localmost has a Docker relay/);
+      expect(grant.summary).toMatch(/\(a job with a Docker grant is refused until localmost has a Docker relay into the job's macOS VM\)$/);
+    }
+  });
+
   it('says nothing for strict, which is the baseline and grants nothing extra', () => {
     expect(describePolicy({ level: 'strict' })).toEqual([]);
   });
