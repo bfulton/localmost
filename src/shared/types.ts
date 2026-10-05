@@ -373,7 +373,7 @@ export interface PolicySummary {
  * policy lists.
  *
  * - strict: Only access explicitly listed in .localmostrc is allowed. Most secure option.
- * - moderate: GitHub Actions infrastructure, common registries, and standard tool caches are allowed by default.
+ * - moderate: Also common package registries, and CDNs and GitHub content hosts anyone can publish to.
  * - permissive: All access is allowed. Use only for trusted repositories or debugging.
  */
 export type SandboxPolicyLevel = 'strict' | 'moderate' | 'permissive';

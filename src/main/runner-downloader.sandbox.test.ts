@@ -292,6 +292,32 @@ describe('the sandbox a worker is built from', () => {
     expect(fs.existsSync(path.join(lookalike, 'keep'))).toBe(true);
   });
 
+  it('removes the tool caches an earlier version kept at startup, and leaves a link there alone', async () => {
+    const caches = path.join(runnerDir, 'caches');
+    write(path.join(caches, 'target-a', 'go', 'pkg', 'mod', 'x@v1', 'x.go'), 'package x');
+    // Go leaves its module cache unwritable to its owner.
+    fs.chmodSync(path.join(caches, 'target-a', 'go', 'pkg', 'mod', 'x@v1'), 0o555);
+    // A removal an earlier start could not finish.
+    write(path.join(runnerDir, '.removing-caches.0a1b2c3d', 'left', 'file'), 'left');
+    const outside = path.join(root, 'outside');
+    write(path.join(outside, 'keep'), 'kept');
+
+    await downloader.cleanupStaleConfiguration();
+
+    expect(fs.existsSync(caches)).toBe(false);
+    expect(fs.readdirSync(runnerDir).filter((name) => name.startsWith('.removing-'))).toEqual([]);
+    expect(fs.existsSync(path.join(runnerDir, 'arc', `v${version}`, 'run.sh'))).toBe(true);
+    expect(fs.existsSync(path.join(runnerDir, 'proxies', 'target-a', '1', '.runner'))).toBe(true);
+
+    // A link at <runner>/caches is not followed, and not removed.
+    fs.symlinkSync(outside, caches);
+    const logs: string[] = [];
+    await downloader.cleanupStaleConfiguration((message) => logs.push(message));
+    expect(fs.lstatSync(caches).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(path.join(outside, 'keep'), 'utf8')).toBe('kept');
+    expect(logs).toContain(`Leaving ${caches}: it is not a directory`);
+  });
+
   it('moves a sandbox out of its path before removing it', async () => {
     // A process its job left running can still write the sandbox's path, so
     // it could swap a directory in the tree for a link while a removal walks

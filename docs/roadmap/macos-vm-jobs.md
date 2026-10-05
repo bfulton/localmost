@@ -121,8 +121,10 @@ waits for a slot or a boot aborts it.
 - **The policy.** The level and hosts go to the job's proxy, as before. The
   environment is the locale, the time zone and what the approved `env:`
   allows of the app's, then the runner's settings and the proxy. Filesystem
-  grants and `network.loopback` are not provided: the runner names them in
-  the log when the job starts. A policy that grants Docker is refused at
+  grants are not provided: the runner names them in the log when the job
+  starts. `network.loopback` is no longer part of the grammar: the parser
+  drops it with a warning, which the app logs once per repository and
+  policy content. A policy that grants Docker is refused at
   admission until the Docker relay exists. The drift stamp is taken over the
   whole approved policy - network, Docker, filesystem grants and env - so a
   worker started before its workflow was known matches its claim unless the

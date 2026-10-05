@@ -621,7 +621,7 @@ network:
 
 ## Integration with Workflow Test Mode
 
-See [workflow-test-mode.md](./workflow-test-mode.md) for the local testing CLI design.
+See [workflow-test-mode.md](./workflow-test-mode.md) for the local testing CLI's original design, superseded in part: `localmost test` now runs its steps in the macOS VM ([macos-vm-jobs.md](./macos-vm-jobs.md)).
 
 The test CLI becomes the policy authoring tool:
 - Run your workflow locally

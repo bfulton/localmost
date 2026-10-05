@@ -546,9 +546,9 @@ function validateFilesystemPolicy(policy: unknown, path: string, errors: ParseEr
   }
   if (p.deny !== undefined) {
     validatePathArray(p.deny, `${path}.deny`, errors);
-    // seatbelt never matches a relative path against a real one, so a
-    // relative deny would be shown as denying something and deny nothing.
-    // Unlike a grant, which is no worse for granting nothing.
+    // A deny is matched against absolute paths only, so a relative one
+    // would be shown as denying something and deny nothing. Unlike a grant,
+    // which is no worse for granting nothing.
     if (Array.isArray(p.deny)) {
       p.deny.forEach((entry, i) => {
         if (typeof entry !== 'string' || entry === '~' || entry.startsWith('~/') || entry.startsWith('/')) return;

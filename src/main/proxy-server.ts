@@ -68,8 +68,9 @@ export interface ProxyServerOptions {
   /**
    * A shared secret this proxy requires in Proxy-Authorization. Set per worker
    * so a job cannot route its traffic through another worker's proxy - every
-   * proxy is on loopback, which the sandbox lets any job reach. Unset means no
-   * auth (test-only).
+   * proxy is on loopback, where anything on this Mac can reach it. A job's VM
+   * is relayed only to its own proxy's port; the token holds should that
+   * change. Unset means no auth (test-only).
    */
   authToken?: string;
   /**

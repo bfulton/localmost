@@ -2,6 +2,15 @@
 
 Run and validate GitHub Actions workflows locally before pushing.
 
+> **Superseded in part.** This is the original design. `localmost test` now
+> runs each step in a fresh macOS VM from localmost's golden image, through
+> the running app, as runner jobs run (see
+> [macos-vm-jobs.md](./macos-vm-jobs.md)). What follows about `sandbox-exec`,
+> a filesystem box, running without the app, and filesystem discovery
+> describes that earlier design and no longer applies; the workflow parsing,
+> matrix and secrets handling, and network discovery through the run's proxy
+> still do.
+
 ## Problem
 
 The CI feedback loop is painfully slow:

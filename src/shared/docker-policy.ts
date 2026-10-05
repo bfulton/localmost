@@ -601,8 +601,7 @@ export function parseDockerPolicyHint(hint: string): DockerPolicy | undefined {
  * What a container on a routable network can reach, said wherever one is
  * granted. The job's Docker VM has no network card: a routable container is
  * given the job's own proxy (HTTP_PROXY and the rest), relayed out of the VM,
- * so it reaches exactly what the job's network allowlist and loopback policy
- * permit. Traffic that ignores the proxy settings has no route at all.
+ * so it reaches exactly what the job's network allowlist permits. Traffic that ignores the proxy settings has no route at all.
  */
 const PROXIED_EGRESS = "egress through this job's proxy, subject to its network allowlist";
 

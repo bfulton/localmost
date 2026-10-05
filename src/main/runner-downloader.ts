@@ -14,6 +14,7 @@ import {
   cleanupWorkDirectories as cleanupWorkDirs,
   moveAsideForRemoval,
   removeMovedAside,
+  REMOVAL_PREFIX,
 } from './runner-cleanup';
 
 export interface DownloadProgress {
@@ -77,7 +78,6 @@ export interface RunnerRelease {
  *   config/1/         - config files for instance 1 (persistent)
  *   sandbox/1-<id>/   - one start of instance 1: a directory of its own for
  *                       every start, removed once that worker is done
- *   caches/<target>/  - one target's caches, kept across its jobs (persistent)
  */
 export class RunnerDownloader {
   private readonly baseDir: string;
@@ -494,9 +494,10 @@ export class RunnerDownloader {
    * next startup.
    *
    * Moved out of its path first, and never removed in it, then removed
-   * without following a link: something of its job still running there
-   * could otherwise steer the removal outside the tree (see
-   * moveAsideForRemoval and removeMovedAside).
+   * without following a link (see moveAsideForRemoval and removeMovedAside).
+   * No job runs on this Mac - each runs in its macOS VM, which gets only the
+   * runner's three files from here - so nothing should be left to steer the
+   * removal; the care is kept in case something is.
    */
   async removeSandbox(sandboxDir: string): Promise<void> {
     const base = this.getSandboxBase();
@@ -962,6 +963,50 @@ export class RunnerDownloader {
     await this.cleanupStagingDirectories(log);
 
     await this.cleanupWorkDirectories(log);
+
+    await this.removeOrphanedCaches(log);
+  }
+
+  /**
+   * Remove the per-target tool caches an earlier version kept at
+   * <runner>/caches, which nothing uses now that every job runs in a macOS
+   * VM. Only that one directory, named here rather than computed from
+   * anything else, and only when it is a directory and not a link: a link
+   * there is left, never followed. Moved aside and removed as a sandbox is;
+   * a removal an earlier start could not finish is picked up from its
+   * moved-aside name. A failure is logged, and the next start tries again.
+   */
+  private async removeOrphanedCaches(log: (message: string) => void): Promise<void> {
+    const caches = path.join(this.baseDir, 'caches');
+    if (path.dirname(caches) !== this.baseDir || path.basename(caches) !== 'caches') {
+      throw new Error(`Refusing to remove ${caches}: not <runner>/caches`);
+    }
+    const leftovers = (await fs.promises.readdir(this.baseDir).catch(() => [] as string[]))
+      .filter((name) => name.startsWith(REMOVAL_PREFIX))
+      .map((name) => path.join(this.baseDir, name));
+    let target: string | null = null;
+    try {
+      const st = await fs.promises.lstat(caches);
+      if (st.isSymbolicLink() || !st.isDirectory()) {
+        log(`Leaving ${caches}: it is not a directory`);
+      } else {
+        log('Removing the tool caches an earlier version kept, which nothing uses now');
+        target = await moveAsideForRemoval(caches);
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        log(`Could not remove ${caches} yet: ${(err as Error).message}`);
+      }
+    }
+    for (const dir of [...leftovers, ...(target ? [target] : [])]) {
+      try {
+        const st = await fs.promises.lstat(dir);
+        if (st.isSymbolicLink() || !st.isDirectory()) continue;
+        await removeMovedAside(dir);
+      } catch (err) {
+        log(`Could not finish removing ${path.basename(dir)}; the next start tries again: ${(err as Error).message}`);
+      }
+    }
   }
 
   private async cleanupStagingDirectories(log: (message: string) => void): Promise<void> {
