@@ -2,23 +2,54 @@ import { describe, it, expect, jest } from '@jest/globals';
 import { buildWorkflowEnv, buildProxyEnv, installInterruptHandlers } from './test';
 
 describe('installInterruptHandlers', () => {
-  it('ends the run before exiting on Ctrl-C, a kill, or the terminal closing', () => {
+  it('ends the run, and waits for the VM to go, before exiting on Ctrl-C, a kill, or the terminal closing', async () => {
     // Steps run in the macOS VM, which the terminal's signals never reach; a
     // closed terminal or dropped SSH session sends this process SIGHUP, whose
-    // default is to die without running any cleanup.
+    // default is to die without running any cleanup. Exiting before the VM is
+    // gone would let the run's ports go while its relays still lead there.
     const exit = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
     try {
       for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]] as const) {
-        const reap = jest.fn();
+        let release!: () => void;
+        const reap = jest.fn(() => new Promise<void>((resolve) => { release = resolve; }));
         const before = process.listenerCount(signal);
+        exit.mockClear();
         const remove = installInterruptHandlers(reap);
         expect({ signal, added: process.listenerCount(signal) - before }).toEqual({ signal, added: 1 });
         process.emit(signal, signal);
         expect(reap).toHaveBeenCalledTimes(1);
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(exit).not.toHaveBeenCalled();
+        release();
+        await new Promise((resolve) => setImmediate(resolve));
         expect(exit).toHaveBeenLastCalledWith(code);
         remove();
         expect(process.listenerCount(signal)).toBe(before);
       }
+    } finally {
+      exit.mockRestore();
+    }
+  });
+
+  it('exits anyway once the wait for the VM runs out, or when ending the run throws', async () => {
+    const exit = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    try {
+      const remove = installInterruptHandlers(() => new Promise<void>(() => {}), 20);
+      process.emit('SIGTERM', 'SIGTERM');
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(exit).not.toHaveBeenCalled();
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(exit).toHaveBeenLastCalledWith(143);
+      remove();
+
+      exit.mockClear();
+      const removeThrowing = installInterruptHandlers(() => {
+        throw new Error('no agent');
+      });
+      process.emit('SIGINT', 'SIGINT');
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(exit).toHaveBeenLastCalledWith(130);
+      removeThrowing();
     } finally {
       exit.mockRestore();
     }

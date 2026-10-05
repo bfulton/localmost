@@ -199,7 +199,7 @@ export interface TestDeps {
     proxyPort: number;
     hostWorkDir: string;
     onNote: (message: string) => void;
-  }) => Promise<StepRunner & { close(): void }>;
+  }) => Promise<StepRunner & { close(): void; released?(): Promise<void> }>;
 }
 
 /**
@@ -302,7 +302,10 @@ export async function runTest(options: TestOptions = {}, deps: TestDeps = {}): P
   const proxyPort = await discoveryProxy.start();
 
   let runner: (StepRunner & { close(): void; released?(): Promise<void> }) | undefined;
-  const removeInterruptHandlers = installInterruptHandlers(() => runner?.close());
+  const removeInterruptHandlers = installInterruptHandlers(() => {
+    runner?.close();
+    return runner?.released?.();
+  });
 
   // Everything after the proxy starts runs inside try/finally: a throw in
   // workspace setup, the VM's start, parsing or job execution would
@@ -597,18 +600,43 @@ const INTERRUPT_EXIT_CODES: Partial<Record<NodeJS.Signals, number>> = {
 };
 
 /**
+ * How long an interrupted run waits for the app to say its VM is gone
+ * before it exits anyway. A second Ctrl-C exits at once: the handlers are
+ * gone after the first signal.
+ */
+export const INTERRUPT_RELEASE_TIMEOUT_MS = 10_000;
+
+/**
  * End the run - the agent connection, which kills the steps, and the VM -
  * then exit, when the run is interrupted. Returns a function that removes
  * the handlers.
  *
  * The steps run in the macOS VM, which the terminal's signals never reach;
  * without these, dying of one would leave the VM running its steps until
- * the app noticed the connection gone.
+ * the app noticed the connection gone. `reap` resolves once the VM is gone,
+ * and the exit waits for it, up to `timeoutMs`: exiting first would let the
+ * run's proxy and broker ports go while the VM's relays still lead to them,
+ * for another process to take.
  */
-export function installInterruptHandlers(reap: () => void): () => void {
+export function installInterruptHandlers(
+  reap: () => void | Promise<void>,
+  timeoutMs = INTERRUPT_RELEASE_TIMEOUT_MS
+): () => void {
   const onInterrupt = (signal: NodeJS.Signals) => {
-    reap();
-    process.exit(INTERRUPT_EXIT_CODES[signal] ?? 1);
+    let reaped: Promise<void>;
+    try {
+      reaped = Promise.resolve(reap()).catch(() => undefined);
+    } catch {
+      reaped = Promise.resolve();
+    }
+    let timer: NodeJS.Timeout | undefined;
+    const waited = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, timeoutMs);
+    });
+    void Promise.race([reaped, waited]).then(() => {
+      clearTimeout(timer);
+      process.exit(INTERRUPT_EXIT_CODES[signal] ?? 1);
+    });
   };
   const signals = Object.keys(INTERRUPT_EXIT_CODES) as NodeJS.Signals[];
   for (const signal of signals) process.once(signal, onInterrupt);

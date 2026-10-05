@@ -191,6 +191,39 @@ describe('runTest', () => {
     expect(env).toMatchObject({ GITHUB_JOB: 'build', RUNNER_NAME: 'localmost', GITHUB_TOKEN: 'from-the-step', WORKFLOW_ONLY: 'w', JOB_ONLY: 'j' });
   }, RUN_TIMEOUT_MS);
 
+  it('on Ctrl-C, ends the run and exits only once the VM is gone', async () => {
+    // The run's proxy and broker ports are where the VM's relays lead until
+    // the app says the VM is gone: exiting at once would let them go first.
+    const exit = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    let closed = false;
+    let letGo!: () => void;
+    const gone = new Promise<void>((resolve) => { letGo = resolve; });
+    const runner: StepRunner & { close(): void; released(): Promise<void> } = {
+      workDir: GUEST_WORKSPACE,
+      provide: () => Promise.reject(new Error('no actions here')),
+      endJob: () => Promise.resolve(),
+      close: () => { closed = true; },
+      released: () => gone,
+      run: async () => {
+        process.emit('SIGINT', 'SIGINT');
+        return { exitCode: 130, outputs: '' };
+      },
+    };
+    try {
+      const run = runTest({}, { openRunner: async () => runner });
+      for (let i = 0; i < 100 && !closed; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(closed).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(exit).not.toHaveBeenCalled();
+      letGo();
+      await run;
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(exit).toHaveBeenLastCalledWith(130);
+    } finally {
+      exit.mockRestore();
+    }
+  }, RUN_TIMEOUT_MS);
+
   it('does not run a checkout whose policy reaches the network without confirmation', async () => {
     fs.writeFileSync(path.join(checkout, '.localmostrc'), 'version: 1\nshared:\n  network:\n    allow:\n      - evil.example.com\n');
     const vm = fakeVm();
