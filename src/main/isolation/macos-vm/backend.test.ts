@@ -239,6 +239,39 @@ describe('MacVmBackend', () => {
     await expect(b.prepare(j)).rejects.toThrow(/already has/);
   });
 
+  it('frees the slot and forgets the job even when stopping its VM fails, and still reports the failure', async () => {
+    const helpers: MacVmHelper[] = [];
+    const { b, slots } = backend({}, {
+      launch: (invocation: HelperInvocation, opts) => {
+        const h = new MacVmHelper({
+          helper: '/unused/localmost-macvm',
+          invocation,
+          spawn: fakeMacVmSpawn({}, record),
+          env: { PATH: '/usr/bin:/bin', TMPDIR: data },
+          log: () => {},
+          ...(opts?.expectAgentSocket ? { expectAgentSocket: opts.expectAgentSocket } : {}),
+        });
+        helpers.push(h);
+        return h;
+      },
+    });
+    const j = job('a');
+    await b.prepare(j);
+    const stop = helpers[0].stop.bind(helpers[0]);
+    helpers[0].stop = async () => {
+      throw new Error('the helper would not stop');
+    };
+    try {
+      await expect(b.release(j)).rejects.toThrow(/would not stop/);
+      expect(slots.holders()).toEqual([]);
+      expect(b.jobsRunning()).toBe(false);
+      // The next job gets a VM rather than waiting on the leaked slot.
+      await b.prepare(job('b'));
+    } finally {
+      await stop(0);
+    }
+  });
+
   it('gives up a job cancelled while it waits for a slot', async () => {
     const { b, slots } = backend();
     await slots.acquire('x');

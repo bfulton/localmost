@@ -333,18 +333,28 @@ export class MacVmBackend implements IsolationBackend {
       rec.diskTimer = null;
       rec.abort.abort();
       rec.agent?.close();
-      if (rec.helper && !rec.helper.hasExited()) {
-        // The guest is the job's and is thrown away: no grace.
-        await rec.helper.stop(0);
+      // The slot is freed and the record dropped however the teardown goes:
+      // a helper that would not stop or a directory that would not go must
+      // not hold one of the Mac's two VMs until the app restarts. The error
+      // still reaches the caller.
+      try {
+        if (rec.helper && !rec.helper.hasExited()) {
+          // The guest is the job's and is thrown away: no grace.
+          await rec.helper.stop(0);
+        }
+      } finally {
+        rec.worker?.end(null, 'SIGKILL');
+        try {
+          if (rec.vmId) {
+            const dir = vmDir(this.deps.dataDir, rec.vmId);
+            assertRemovable(this.deps.dataDir, dir, 'vms', MAC_VM_ID_RE);
+            await fs.promises.rm(dir, { recursive: true, force: true });
+          }
+        } finally {
+          if (rec.slot) this.deps.slots.release(rec.slot);
+          this.jobs.delete(job.key);
+        }
       }
-      rec.worker?.end(null, 'SIGKILL');
-      if (rec.vmId) {
-        const dir = vmDir(this.deps.dataDir, rec.vmId);
-        assertRemovable(this.deps.dataDir, dir, 'vms', MAC_VM_ID_RE);
-        await fs.promises.rm(dir, { recursive: true, force: true });
-      }
-      if (rec.slot) this.deps.slots.release(rec.slot);
-      this.jobs.delete(job.key);
     })();
     return rec.released;
   }
