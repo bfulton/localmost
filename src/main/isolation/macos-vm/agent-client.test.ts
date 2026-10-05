@@ -8,7 +8,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as net from 'net';
 import * as path from 'path';
-import { MacAgentClient, jobEnvNameAllowed } from './agent-client';
+import { MacAgentClient, jobEnvNameAllowed, stepEnvNameAllowed } from './agent-client';
 import { shortTempDir } from '../../test-utils/vm-fixtures';
 
 const HELLO = { v: 1, event: 'hello', agent: '1.0.0', ready: true, os: '26.6.2', runnerVersions: ['2.330.0'] };
@@ -175,6 +175,79 @@ describe('MacAgentClient', () => {
     expect(await closed).toMatchObject({ code: 'E_AGENT_PROTOCOL' });
   });
 
+  it("sends a test run's workspace once the agent says to, and waits for it to be unpacked", async () => {
+    const bytes = crypto.randomBytes(3000);
+    const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+    let got = Buffer.alloc(0);
+    onRequest = (msg, send, conn) => {
+      if (msg.op !== 'put') return;
+      send({ v: 1, id: msg.id, ok: true, send: true });
+      conn.removeAllListeners('data');
+      conn.on('data', (chunk: Buffer) => {
+        got = Buffer.concat([got, chunk]);
+        if (got.length >= (msg.bytes as number)) send({ v: 1, id: msg.id, ok: true, put: msg.dest });
+      });
+    };
+    const { c } = client();
+    await c.connect();
+    await c.put('workspace', bytes, sha256);
+    expect(received[0]).toEqual({ v: 1, id: 1, op: 'put', dest: 'workspace', bytes: 3000, sha256 });
+    expect(got.equals(bytes)).toBe(true);
+    await expect(c.put('../x' as never, bytes, sha256)).rejects.toThrow(/not an upload destination/);
+    await expect(c.put('actions/0123456789ABCDEF', bytes, sha256)).rejects.toThrow(/not an upload destination/);
+    await expect(c.put('workspace', Buffer.alloc(0), sha256)).rejects.toThrow(/1 to/);
+  });
+
+  it("runs a test run's steps one after another, each with its output, exit and outputs", async () => {
+    let pid = 5000;
+    onRequest = (msg, send) => {
+      if (msg.op !== 'step') return;
+      send({ v: 1, id: msg.id, ok: true, pid: ++pid });
+      // Output and exit can come in the same read as the answer.
+      send({ v: 1, event: 'output', stream: 'stdout', data: `step ${pid}` });
+      send({ v: 1, event: 'exit', code: pid === 5001 ? 0 : null, signal: pid === 5001 ? null : 'SIGKILL', outputs: `n=${pid}\n` });
+    };
+    const { c } = client();
+    await c.connect();
+    const events: unknown[] = [];
+    c.on('output', (stream, line) => events.push([stream, line]));
+    c.on('stepExit', (code, signal, outputs) => events.push([code, signal, outputs]));
+    expect(await c.step({ program: 'bash', script: 'echo hi', cwd: 'workspace', env: { LANG: 'C' } })).toBe(5001);
+    expect(await c.step({ program: 'node', entry: 'actions/0123456789abcdef/index.js', cwd: 'workspace', env: {} })).toBe(5002);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(events).toEqual([['stdout', 'step 5001'], [0, null, 'n=5001\n'], ['stdout', 'step 5002'], [null, 'SIGKILL', 'n=5002\n']]);
+    expect(received[0]).toEqual({ v: 1, id: 1, op: 'step', program: 'bash', script: 'echo hi', cwd: 'workspace', env: { LANG: 'C' } });
+    expect(received[1]).toEqual({ v: 1, id: 2, op: 'step', program: 'node', entry: 'actions/0123456789abcdef/index.js', cwd: 'workspace', env: {} });
+  });
+
+  it('closes on a step exit without its outputs, or with more than a step may write, and on output after it', async () => {
+    for (const bad of [
+      [{ v: 1, event: 'exit', code: 0, signal: null }],
+      [{ v: 1, event: 'exit', code: 0, signal: null, outputs: 5 }],
+      [{ v: 1, event: 'exit', code: 0, signal: null, outputs: 'x'.repeat(16 * 1024 + 1) }],
+      [{ v: 1, event: 'exit', code: 0, signal: null, outputs: '' }, { v: 1, event: 'output', stream: 'stdout', data: 'late' }],
+    ]) {
+      onRequest = (msg, send) => {
+        send({ v: 1, id: msg.id, ok: true, pid: 4242 });
+        for (const line of bad) send(line);
+      };
+      const { c } = client();
+      await c.connect();
+      const closed = new Promise((resolve) => c.once('closed', resolve));
+      await c.step({ program: 'sh', script: 'true', cwd: 'workspace', env: {} });
+      expect(await closed).toMatchObject({ code: 'E_AGENT_PROTOCOL' });
+    }
+  });
+
+  it('refuses here a step whose command would not fit one line', async () => {
+    const { c } = client();
+    await c.connect();
+    await expect(c.step({ program: 'bash', script: 'x'.repeat(70 * 1024), cwd: 'workspace', env: {} })).rejects.toMatchObject({
+      code: 'E_STEP_TOO_LARGE',
+    });
+    expect(received).toEqual([]);
+  });
+
   it('rejects a refused request with the guest\'s message, cleaned', async () => {
     onRequest = (msg, send) => send({ v: 1, id: msg.id, ok: false, code: 'E_PROTO', message: 'a job already\nran in this VM' });
     const { c } = client();
@@ -216,5 +289,20 @@ describe('jobEnvNameAllowed', () => {
       expect([name, jobEnvNameAllowed(name)]).toEqual([name, false]);
     }
     expect(jobEnvNameAllowed('A'.repeat(128))).toBe(true);
+  });
+});
+
+describe('stepEnvNameAllowed', () => {
+  // The rule the agent holds a test run's steps to (MacVMAgentCore.stepEnvNameAllowed).
+  it('allows what a job may be given, and the GITHUB_* and RUNNER_* variables a step reads', () => {
+    for (const name of ['LANG', 'HTTPS_PROXY', 'INPUT_WHO', 'GITHUB_WORKSPACE', 'GITHUB_SHA', 'RUNNER_TEMP', 'RUNNER_OS', 'GIT_HTTP_PROXY_AUTHMETHOD']) {
+      expect([name, stepEnvNameAllowed(name)]).toEqual([name, true]);
+    }
+  });
+
+  it('refuses what the agent sets, and what reaches the loader or how the shell starts', () => {
+    for (const name of ['PATH', 'HOME', 'TMPDIR', 'BASH_ENV', 'NODE_OPTIONS', 'DYLD_INSERT_LIBRARIES', 'LD_PRELOAD', 'GITHUB_A-B', 'RUNNER_É', `GITHUB_${'A'.repeat(130)}`]) {
+      expect([name, stepEnvNameAllowed(name)]).toEqual([name, false]);
+    }
   });
 });

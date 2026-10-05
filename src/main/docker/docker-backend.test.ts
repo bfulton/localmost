@@ -109,8 +109,6 @@ describe('the Docker Desktop backend stays removed', () => {
       'src/main/vm/paths.ts',
       // A comment in the helper's profile, on the sockets it binds there.
       'src/main/vm/helper-profile.ts',
-      // Discovery's hint when a job reached a socket of that name.
-      'src/cli/test.ts',
       // The longest VM socket path, for the tests that must fit it.
       'src/main/test-utils/vm-fixtures.ts',
     ].map((rel) => path.join(...rel.split('/')));

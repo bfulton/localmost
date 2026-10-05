@@ -1,67 +1,36 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { spawn } from 'child_process';
 import {
   maskSecrets,
   createSecretMasker,
   buildStepEnvironment,
-  trackStepProcessGroup,
-  reapStepProcesses,
+  executeStep,
+  type ExecutionContext,
+  type RunnerStep,
+  type RunnerStepResult,
+  type StepRunner,
 } from './step-executor';
 
-describe('reapStepProcesses', () => {
-  const alive = (pid: number): boolean => {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  };
+const GUEST = '/Users/runner/work/workspace';
+const job = { 'runs-on': 'self-hosted', steps: [] } as never;
 
-  it('kills what a step left running after the step itself exited', async () => {
-    // A step that backgrounds a process and exits: the survivor keeps running
-    // after the step, and after the job, unless something reaps its group.
-    const step = spawn('/bin/sh', ['-c', '/bin/sleep 60 >/dev/null 2>&1 & echo $!'], {
-      detached: true,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    trackStepProcessGroup(step);
-    let out = '';
-    step.stdout!.on('data', (d: Buffer) => (out += d.toString()));
-    // 'close', not 'exit': the pid it printed may not have been read yet at exit.
-    await new Promise((resolve) => step.on('close', resolve));
-    const survivor = parseInt(out.trim(), 10);
-    try {
-      expect(alive(survivor)).toBe(true);
-
-      reapStepProcesses();
-
-      for (let i = 0; i < 250 && alive(survivor); i++) {
-        await new Promise((resolve) => setTimeout(resolve, 20));
-      }
-      expect(alive(survivor)).toBe(false);
-    } finally {
-      if (alive(survivor)) process.kill(survivor, 'SIGKILL');
-    }
-  });
-
-  it('leaves alone a group whose leader pid now belongs to someone else', () => {
-    // Once the step and its survivors are gone the pid can be reused, and a
-    // process group led by the new owner is not ours to kill.
-    const kill = jest.spyOn(process, 'kill').mockImplementation(() => true);
-    try {
-      const fake = { pid: 424242, once: (_e: string, cb: () => void) => cb() };
-      trackStepProcessGroup(fake as never);
-      reapStepProcesses();
-      expect(kill).toHaveBeenCalledWith(424242, 0);
-      expect(kill).not.toHaveBeenCalledWith(-424242, 'SIGKILL');
-    } finally {
-      kill.mockRestore();
-    }
-  });
-});
+/** A runner that runs nothing: it records each step and answers as told. */
+class FakeRunner implements StepRunner {
+  readonly workDir = GUEST;
+  readonly steps: RunnerStep[] = [];
+  readonly provided: string[] = [];
+  answer: (step: RunnerStep) => RunnerStepResult = () => ({ exitCode: 0, outputs: '' });
+  async provide(hostDir: string): Promise<string> {
+    this.provided.push(hostDir);
+    return '/Users/runner/work/actions/0123456789abcdef';
+  }
+  async run(step: RunnerStep): Promise<RunnerStepResult> {
+    this.steps.push(step);
+    return this.answer(step);
+  }
+  async endJob(): Promise<void> {}
+}
 
 describe('maskSecrets', () => {
   const secrets = { TOKEN: 'ghp_supersecretvalue', SHORT: 'ab' };
@@ -89,15 +58,8 @@ describe('maskSecrets', () => {
 });
 
 describe('buildStepEnvironment', () => {
-  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'step-env-'));
-
-  afterAll(() => {
-    fs.rmSync(workDir, { recursive: true, force: true });
-  });
-
   const ctx = {
-    workDir,
-    proxyPort: 1234,
+    workDir: GUEST,
     workflowEnv: {},
     jobEnv: {},
     matrix: {},
@@ -107,62 +69,161 @@ describe('buildStepEnvironment', () => {
   it('does not put secrets in the step environment', () => {
     // GitHub exposes secrets through ${{ secrets.X }}, not the environment.
     // Exporting them would hand every secret to every child process.
-    const env = buildStepEnvironment(
-      { run: 'echo hi' } as never,
-      ctx as never,
-      { 'runs-on': 'self-hosted', steps: [] } as never
-    );
+    const env = buildStepEnvironment({ run: 'echo hi' } as never, ctx as never, job);
 
     expect(env.MY_TOKEN).toBeUndefined();
     expect(Object.values(env)).not.toContain('ghp_supersecretvalue');
   });
 
-  it('points HOME inside the workspace', () => {
-    const env = buildStepEnvironment(
-      { run: 'echo hi' } as never,
-      ctx as never,
-      { 'runs-on': 'self-hosted', steps: [] } as never
-    );
+  it("leaves HOME, PATH, the user and temp to the guest, and gives none of this machine's", () => {
+    const env = buildStepEnvironment({ run: 'echo hi' } as never, ctx as never, job);
 
-    expect(env.HOME).toBe(path.join(workDir, '.home'));
-    // Every step gets this HOME, so it has to exist by the time one runs.
-    expect(fs.existsSync(env.HOME)).toBe(true);
-    // ssh finds its directory through the user database, not HOME, so git's
-    // ssh is pointed into it.
-    expect(env.GIT_SSH_COMMAND).toBe(
-      `ssh -F '${env.HOME}/.ssh/config' -o UserKnownHostsFile='${env.HOME}/.ssh/known_hosts'`
-    );
+    for (const name of ['HOME', 'PATH', 'USER', 'SHELL', 'TMPDIR', 'GIT_SSH_COMMAND']) {
+      expect([name, env[name]]).toEqual([name, undefined]);
+    }
+    expect(Object.values(env)).not.toContain(os.homedir());
   });
 
-  it('keeps the tool cache inside the workspace', () => {
-    // A tool cache shared across runs is one a checkout can poison for the
-    // next, and the app's data directory is not writable from a step at all.
-    const env = buildStepEnvironment(
-      { run: 'echo hi' } as never,
-      ctx as never,
-      { 'runs-on': 'self-hosted', steps: [] } as never
-    );
+  it('points the workspace, the runner temp and the tool cache into the workspace as steps see it', () => {
+    const env = buildStepEnvironment({ run: 'echo hi' } as never, ctx as never, job);
 
-    expect(path.dirname(env.RUNNER_TOOL_CACHE)).toBe(workDir);
+    expect(env.GITHUB_WORKSPACE).toBe(GUEST);
+    expect(env.RUNNER_TEMP).toBe(`${GUEST}/.runner-temp`);
+    expect(env.RUNNER_TOOL_CACHE).toBe(`${GUEST}/.runner-tool-cache`);
+    expect(env.GITHUB_ENV).toBe(`${GUEST}/.github-env`);
+  });
+});
+
+describe('executeStep', () => {
+  let host: string;
+  let runner: FakeRunner;
+  let output: string[];
+
+  const context = (overrides: Partial<ExecutionContext> = {}): ExecutionContext => ({
+    workDir: GUEST,
+    hostWorkDir: host,
+    runner,
+    workflowEnv: {},
+    jobEnv: {},
+    matrix: {},
+    secrets: { TOKEN: 'ghp_supersecretvalue' },
+    stepOutputs: {},
+    onOutput: (line, stream) => output.push(`${stream}: ${line}`),
+    ...overrides,
   });
 
-  it('points temp, and the caches tools keep in the shared temp directories, into the workspace', () => {
-    // The sandbox grants no shared temp directory. Each of these moves a tool
-    // that would otherwise need one: xcrun cannot find a tool at all without a
-    // cache it can write, clang and swiftc keep their module cache in the
-    // per-user cache directory, and zsh puts here-documents under /tmp.
-    const env = buildStepEnvironment(
-      { run: 'echo hi' } as never,
-      ctx as never,
-      { 'runs-on': 'self-hosted', steps: [] } as never
+  beforeEach(() => {
+    host = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'step-exec-')));
+    runner = new FakeRunner();
+    output = [];
+  });
+
+  afterEach(() => {
+    fs.rmSync(host, { recursive: true, force: true });
+  });
+
+  it("runs a run: step's script in its shell, from the workspace, and reads its outputs", async () => {
+    runner.answer = () => ({ exitCode: 0, outputs: 'a=1\nnotes<<EOF\nline one\nline two\nEOF\n' });
+    const ctx = context();
+    const result = await executeStep(
+      { id: 'build', run: 'echo "${{ secrets.TOKEN }}" | ./deploy', shell: 'zsh' } as never,
+      ctx,
+      job
     );
 
-    const tmp = path.join(workDir, '.tmp');
-    expect(env).toMatchObject({ TMPDIR: tmp, TMP: tmp, TEMP: tmp });
-    expect(path.dirname(env.xcrun_db)).toBe(tmp);
-    expect(path.dirname(env.CLANG_MODULE_CACHE_PATH)).toBe(tmp);
-    expect(path.dirname(env.TMPPREFIX)).toBe(tmp);
-    expect(fs.statSync(tmp).isDirectory()).toBe(true);
+    expect(result).toMatchObject({ status: 'success', exitCode: 0, outputs: { a: '1', notes: 'line one\nline two' } });
+    expect(ctx.stepOutputs.build).toEqual({ a: '1', notes: 'line one\nline two' });
+    expect(runner.steps[0]).toMatchObject({ program: 'zsh', script: 'echo "ghp_supersecretvalue" | ./deploy', cwd: GUEST });
+    expect(runner.steps[0].env.TOKEN).toBeUndefined();
+  });
+
+  it("masks secrets in a step's output and in its error, even one split across lines", async () => {
+    runner.answer = (step) => {
+      step.onLine('token: ghp_supersecretvalue', 'stdout');
+      step.onLine('-----BEGIN', 'stderr');
+      step.onLine('KEY----- failed', 'stderr');
+      return { exitCode: 2, outputs: '' };
+    };
+    const result = await executeStep(
+      { run: 'x' } as never,
+      context({ secrets: { TOKEN: 'ghp_supersecretvalue', KEY: '-----BEGIN\nKEY-----' } }),
+      job
+    );
+
+    expect(result).toMatchObject({ status: 'failure', exitCode: 2 });
+    expect(output).toEqual(['stdout: token: ***', 'stderr: *** failed']);
+    expect(result.error).toBe('*** failed');
+  });
+
+  it('starts a step in its working-directory, never outside the workspace', async () => {
+    await executeStep({ run: 'x', 'working-directory': 'packages/app' } as never, context(), job);
+    expect(runner.steps[0].cwd).toBe(`${GUEST}/packages/app`);
+
+    for (const dir of ['../..', '/etc']) {
+      const result = await executeStep({ run: 'x', 'working-directory': dir } as never, context(), job);
+      expect(result).toMatchObject({ status: 'failure', error: expect.stringMatching(/outside the workspace/) });
+    }
+    expect(runner.steps).toHaveLength(1);
+  });
+
+  it('refuses a shell the macOS VM does not run', async () => {
+    const result = await executeStep({ run: 'print(1)', shell: 'python' } as never, context(), job);
+    expect(result).toMatchObject({ status: 'failure', error: expect.stringMatching(/shell: python is not available/) });
+    expect(runner.steps).toHaveLength(0);
+  });
+
+  it("runs a local node action from the workspace, its entry point where steps see the action", async () => {
+    const action = path.join(host, '.github', 'actions', 'greet');
+    fs.mkdirSync(path.join(action, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(action, 'dist', 'index.js'), '');
+    fs.writeFileSync(
+      path.join(action, 'action.yml'),
+      'name: greet\ninputs:\n  who:\n    default: world\n  loud:\n    default: "no"\nruns:\n  using: node20\n  main: dist/index.js\n'
+    );
+    await executeStep({ uses: './.github/actions/greet', with: { loud: 'yes' } } as never, context(), job);
+
+    expect(runner.steps[0]).toMatchObject({ program: 'node', entry: `${GUEST}/.github/actions/greet/dist/index.js`, cwd: GUEST });
+    expect(runner.steps[0].env).toMatchObject({ INPUT_WHO: 'world', INPUT_LOUD: 'yes' });
+    expect(runner.provided).toEqual([]);
+  });
+
+  it("refuses a local action, or an entry point, outside where it belongs", async () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'step-exec-outside-'));
+    try {
+      fs.writeFileSync(path.join(outside, 'action.yml'), 'name: x\nruns:\n  using: node20\n  main: index.js\n');
+      const away = await executeStep({ uses: `./${path.relative(host, outside)}` } as never, context(), job);
+      expect(away).toMatchObject({ status: 'failure', error: expect.stringMatching(/outside the workspace/) });
+
+      const action = path.join(host, 'act');
+      fs.mkdirSync(action);
+      fs.writeFileSync(path.join(action, 'action.yml'), 'name: x\nruns:\n  using: node20\n  main: ../../etc/passwd\n');
+      const escape = await executeStep({ uses: './act' } as never, context(), job);
+      expect(escape).toMatchObject({ status: 'failure', error: expect.stringMatching(/outside the action|does not exist/) });
+      expect(runner.steps).toHaveLength(0);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("runs a composite action's steps one by one", async () => {
+    const action = path.join(host, 'comp');
+    fs.mkdirSync(action);
+    fs.writeFileSync(
+      path.join(action, 'action.yml'),
+      'name: comp\nruns:\n  using: composite\n  steps:\n    - run: echo one\n      shell: bash\n    - run: echo two\n      shell: sh\n'
+    );
+    const result = await executeStep({ uses: './comp' } as never, context(), job);
+    expect(result.status).toBe('success');
+    expect(runner.steps.map((s) => [s.program, s.script])).toEqual([['bash', 'echo one'], ['sh', 'echo two']]);
+  });
+
+  it('treats a cache as a miss, and saves nothing, until the macOS VM keeps caches', async () => {
+    const restore = await executeStep({ uses: 'actions/cache@v4', with: { key: 'k', path: 'node_modules' } } as never, context(), job);
+    expect(restore).toMatchObject({ status: 'success', outputs: { 'cache-hit': 'false' } });
+    const save = await executeStep({ uses: 'actions/cache/save@v4', with: { key: 'k', path: 'node_modules' } } as never, context(), job);
+    expect(save.status).toBe('success');
+    expect(output.join('\n')).toMatch(/keeps no caches in the macOS VM yet/);
+    expect(runner.steps).toHaveLength(0);
   });
 });
 

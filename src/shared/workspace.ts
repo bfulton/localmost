@@ -60,11 +60,11 @@ const DEFAULT_MAX_AGE_HOURS = 24;
 const METADATA_FILE = '.localmost-workspace.json';
 
 /**
- * The directories the app hands every step, in the workspace's top
- * directory and never copied from the checkout: its HOME and its TMPDIR
- * (see createStepHome in step-executor).
+ * The directories `localmost test` makes in the workspace's top directory
+ * before the first step, and never copies from the checkout: RUNNER_TEMP
+ * and RUNNER_TOOL_CACHE (see step-executor).
  */
-const STEP_DIRS = ['.home', '.tmp'];
+const STEP_DIRS = ['.runner-temp', '.runner-tool-cache'];
 
 /** A name as the default APFS volume compares it: in any case, and any Unicode form. */
 const folded = (name: string): string => name.normalize('NFD').toUpperCase().toLowerCase();
@@ -160,12 +160,11 @@ export async function createWorkspace(options: WorkspaceOptions): Promise<Worksp
   // wherever it pointed.
   fs.writeFileSync(path.join(workspacePath, METADATA_FILE), JSON.stringify(workspace, null, 2), { flag: 'wx' });
 
-  // The steps' home and temp are the app's to make, so the checkout's
+  // The runner temp and tool cache are the run's to make, so the checkout's
   // entries at their names - in any case the volume takes for them - are
-  // left out: `localmost test` fills the home unsandboxed before the first
-  // step, and a committed `.home` link had it write the git and ssh config
-  // wherever the link led. Only at the top: a `.home` deeper in is the
-  // checkout's own.
+  // left out: a committed one failed the run's mkdir, and one that was a
+  // link went into the guest as the steps' temp. Only at the top: one
+  // deeper in is the checkout's own.
   const isStepDir = (rel: string): boolean => STEP_DIRS.some((name) => folded(rel) === folded(name));
 
   const isMetadata = (rel: string): boolean => rel === METADATA_FILE || isStepDir(rel);

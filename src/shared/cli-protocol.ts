@@ -17,7 +17,8 @@ export type CliCommand =
   | 'targets-list'
   | 'targets-add'
   | 'targets-remove'
-  | 'targets-update';
+  | 'targets-update'
+  | 'test-vm';
 
 /** Arguments carried by target commands. */
 export interface CliRequestArgs {
@@ -31,6 +32,9 @@ export interface CliRequestArgs {
   ref?: string;
   /** targets-update: desired enabled state. */
   enabled?: boolean;
+  /** test-vm: the run's proxy and its closed broker port, both on 127.0.0.1 and both the CLI's. */
+  proxyPort?: number;
+  brokerPort?: number;
 }
 
 /** CLI command request. */
@@ -111,6 +115,19 @@ export interface TargetMutationResponse {
   };
 }
 
+/**
+ * CLI response for test-vm: a macOS VM booted for a `localmost test` run,
+ * and the agent socket the CLI drives it through. The VM is the run's for
+ * as long as this connection stays open, and released when it closes.
+ */
+export interface TestVmResponse {
+  success: true;
+  command: 'test-vm';
+  data: {
+    agentSocket: string;
+  };
+}
+
 /** CLI error response */
 export interface ErrorResponse {
   success: false;
@@ -123,4 +140,5 @@ export type CliResponse =
   | ActionResponse
   | TargetsListResponse
   | TargetMutationResponse
+  | TestVmResponse
   | ErrorResponse;

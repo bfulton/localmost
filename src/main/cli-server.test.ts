@@ -839,4 +839,103 @@ describe('CliServer', () => {
     });
   });
 
+  describe('test-vm lends localmost test a macOS VM for as long as its connection stays open', () => {
+    type Lease = { key: string; proxyPort: number; brokerPort: number };
+    let leases: Lease[];
+    let released: Lease[];
+    let available: { ok: boolean; reason?: string };
+    let prepare: (lease: Lease, signal?: AbortSignal) => Promise<string>;
+
+    beforeEach(async () => {
+      await server.stop();
+      leases = [];
+      released = [];
+      available = { ok: true };
+      prepare = async () => '/data/macos-vm/vms/1-abc/agent.sock';
+      server = new CliServer({
+        onLog: (level, message) => logMessages.push(`${level}: ${message}`),
+        testVms: {
+          available: () => available,
+          prepareTestRun: (lease, signal) => {
+            leases.push(lease);
+            return prepare(lease, signal);
+          },
+          release: async (lease) => {
+            released.push(lease);
+          },
+        },
+      });
+      await server.start();
+    });
+
+    /** Asks for a VM and keeps the connection, as the CLI does for the run. */
+    const lend = (args: Record<string, unknown>) =>
+      new Promise<{ response: Record<string, unknown>; socket: net.Socket }>((resolve, reject) => {
+        const socket = net.createConnection(testSocketPath, () => socket.write(`${JSON.stringify({ command: 'test-vm', args })}\n`));
+        let buffer = '';
+        socket.on('data', (d) => {
+          buffer += d.toString();
+          const nl = buffer.indexOf('\n');
+          if (nl !== -1) resolve({ response: JSON.parse(buffer.slice(0, nl)), socket });
+        });
+        socket.on('error', reject);
+      });
+
+    const until = async (check: () => boolean) => {
+      for (let i = 0; i < 100 && !check(); i++) await new Promise((r) => setTimeout(r, 10));
+    };
+
+    it('boots a VM with the run\'s ports, answers its agent socket, and releases it when the connection closes', async () => {
+      const { response, socket } = await lend({ proxyPort: 41000, brokerPort: 41001 });
+      expect(response).toEqual({ success: true, command: 'test-vm', data: { agentSocket: '/data/macos-vm/vms/1-abc/agent.sock' } });
+      expect(leases).toEqual([{ key: expect.stringMatching(/^test-[0-9a-f]{12}$/), proxyPort: 41000, brokerPort: 41001 }]);
+      expect(released).toEqual([]);
+      socket.destroy();
+      await until(() => released.length > 0);
+      expect(released).toEqual(leases);
+    });
+
+    it('cancels the boot when the connection closes before the VM is up', async () => {
+      let aborted = false;
+      prepare = (_lease, signal) => new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => {
+          aborted = true;
+          reject(new Error('cancelled'));
+        });
+      });
+      const socket = net.createConnection(testSocketPath, () => socket.write(`${JSON.stringify({ command: 'test-vm', args: { proxyPort: 1, brokerPort: 2 } })}\n`));
+      await until(() => leases.length > 0);
+      socket.destroy();
+      await until(() => aborted && released.length > 0);
+      expect(aborted).toBe(true);
+      expect(released).toEqual(leases);
+    });
+
+    it('says why no VM can run the workflow, and boots none', async () => {
+      available = { ok: false, reason: 'no golden macOS image has been built: build one in Settings' };
+      const { response, socket } = await lend({ proxyPort: 1, brokerPort: 2 });
+      socket.destroy();
+      expect(response).toEqual({ success: false, error: 'No macOS VM can run the workflow: no golden macOS image has been built: build one in Settings' });
+      expect(leases).toEqual([]);
+    });
+
+    it('refuses ports that are not two distinct port numbers', async () => {
+      for (const args of [{}, { proxyPort: 1, brokerPort: 1 }, { proxyPort: 0, brokerPort: 2 }, { proxyPort: '41000', brokerPort: 2 }, { proxyPort: 1.5, brokerPort: 2 }, { proxyPort: 1, brokerPort: 70000 }]) {
+        const { response, socket } = await lend(args);
+        socket.destroy();
+        expect(response).toEqual({ success: false, error: 'Missing or invalid ports for the test run' });
+      }
+      expect(leases).toEqual([]);
+    });
+
+    it('answers a boot that failed with its reason, and releases what it took', async () => {
+      prepare = async () => {
+        throw new Error('the macOS VM did not start: helper exited');
+      };
+      const { response, socket } = await lend({ proxyPort: 1, brokerPort: 2 });
+      socket.destroy();
+      expect(response).toEqual({ success: false, error: 'Could not lend the test run a macOS VM: the macOS VM did not start: helper exited' });
+      expect(released).toEqual(leases);
+    });
+  });
 });

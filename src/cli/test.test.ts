@@ -208,10 +208,10 @@ describe('output expression resolution', () => {
 
 describe('mergeDiscoveredAccess', () => {
   const discovered = (partial: Partial<DiscoveredAccess>): DiscoveredAccess => ({
-    hosts: [], readPaths: [], writePaths: [], ...partial,
+    hosts: [], ...partial,
   });
 
-  it('adds the hosts and paths an existing policy lacks, and lists only those', () => {
+  it('adds the hosts an existing policy lacks, lists only those, and keeps the rest of it', () => {
     const existing: LocalmostrcConfig = {
       version: 1,
       shared: { network: { allow: ['github.com'] }, filesystem: { read: ['/usr'] } },
@@ -220,19 +220,12 @@ describe('mergeDiscoveredAccess', () => {
 
     const { config, additions } = mergeDiscoveredAccess(existing, discovered({
       hosts: ['github.com', 'registry.npmjs.org'],
-      readPaths: ['/usr', '/opt/homebrew'],
-      writePaths: ['~/Library/Caches/pip'],
     }), 'ci');
 
     expect(config.shared?.network?.allow).toEqual(['github.com', 'registry.npmjs.org']);
-    expect(config.shared?.filesystem?.read).toEqual(['/usr', '/opt/homebrew']);
-    expect(config.shared?.filesystem?.write).toEqual(['~/Library/Caches/pip']);
+    expect(config.shared?.filesystem).toEqual({ read: ['/usr'] });
     expect(config.workflows).toEqual(existing.workflows);
-    expect(additions).toEqual([
-      { label: 'network.allow', items: ['registry.npmjs.org'] },
-      { label: 'filesystem.read', items: ['/opt/homebrew'] },
-      { label: 'filesystem.write', items: ['~/Library/Caches/pip'] },
-    ]);
+    expect(additions).toEqual([{ label: 'network.allow', items: ['registry.npmjs.org'] }]);
   });
 
   it('has nothing to add when the existing policy already covers what was discovered', () => {
@@ -244,19 +237,15 @@ describe('mergeDiscoveredAccess', () => {
   });
 
   it('starts a new policy from the discovered access, with an empty entry for the workflow', () => {
-    const { config, additions } = mergeDiscoveredAccess(undefined, discovered({
-      hosts: ['github.com'],
-      writePaths: ['~/.npm'],
-    }), 'ci');
+    const { config, additions } = mergeDiscoveredAccess(undefined, discovered({ hosts: ['github.com'] }), 'ci');
 
     expect(config).toEqual({
       version: LOCALMOSTRC_VERSION,
-      shared: { network: { allow: ['github.com'] }, filesystem: { write: ['~/.npm'] } },
+      shared: { network: { allow: ['github.com'] } },
       workflows: { ci: {} },
     });
     expect(additions).toEqual([
       { label: 'network.allow', items: ['github.com'] },
-      { label: 'filesystem.write', items: ['~/.npm'] },
       { label: 'workflows', items: ['"ci"'] },
     ]);
   });
@@ -358,15 +347,15 @@ describe('mergeDiscoveredAccess', () => {
       '',
     ].join('\n')).config!;
 
-    const { config } = mergeDiscoveredAccess(existing, discovered({ readPaths: ['/opt/homebrew'] }), 'ci');
+    const { config } = mergeDiscoveredAccess(existing, discovered({ hosts: ['registry.npmjs.org'] }), 'ci');
     const reparsed = parseLocalmostrcContent(serializeLocalmostrc(config));
 
     expect(reparsed.errors).toEqual([]);
     expect(reparsed.config).toEqual({
       version: 1,
       shared: {
-        network: { allow: ['github.com'], deny: ['tracker.example'], loopback: [5432, 6379] },
-        filesystem: { read: ['/opt/homebrew'], deny: ['~/.ssh'] },
+        network: { allow: ['github.com', 'registry.npmjs.org'], deny: ['tracker.example'], loopback: [5432, 6379] },
+        filesystem: { deny: ['~/.ssh'] },
         env: { deny: ['*_TOKEN'] },
       },
       workflows: { 'Release: tag': { secrets: { require: ['NPM_TOKEN'] } } },
@@ -375,24 +364,23 @@ describe('mergeDiscoveredAccess', () => {
 });
 
 describe('handleUpdateRc', () => {
-  it('says loopback is not recorded, and where a checkout that needs it declares it', async () => {
-    // Discovery leaves every local port open, so a suite that talks to a
-    // local server passes there and is refused the connection on its next,
-    // enforcing run - with nothing in what discovery wrote to say why.
+  it('says filesystem access is not recorded in the macOS VM yet', async () => {
+    // The sandbox trace that recorded paths went with the sandbox; a run
+    // that needs a path learns it from the failing step, not from silence.
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'updaterc-'));
     const lines: string[] = [];
     const log = jest.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
       lines.push(args.join(' '));
     });
     try {
-      await handleUpdateRc(cwd, { name: 'CI' } as never, { hosts: [], readPaths: [], writePaths: [] }, [], true);
+      await handleUpdateRc(cwd, { name: 'CI' } as never, { hosts: [] }, true);
     } finally {
       log.mockRestore();
       fs.rmSync(cwd, { recursive: true, force: true });
     }
     const output = lines.join('\n');
-    expect(output).toMatch(/Loopback:.*not recorded/);
-    expect(output).toMatch(/shared\.network\.loopback/);
+    expect(output).toMatch(/Filesystem:.*not recorded.*macOS VM/);
+    expect(output).toMatch(/No access to configure/);
   });
 
   it('writes a discovered host with the port it was reached on, and no host a policy cannot hold', async () => {
@@ -410,8 +398,7 @@ describe('handleUpdateRc', () => {
       await handleUpdateRc(
         cwd,
         { name: 'CI' } as never,
-        { hosts: ['a..b', 'api.example.com:8443', long, 'github.com'], readPaths: [], writePaths: [] },
-        [],
+        { hosts: ['a..b', 'api.example.com:8443', long, 'github.com'] },
         true
       );
       written = fs.readFileSync(path.join(cwd, '.localmostrc'), 'utf-8');
@@ -437,8 +424,8 @@ describe('handleUpdateRc and what is at .localmostrc', () => {
   let cwd: string;
   let outside: string;
   let lines: string[];
-  const found = { hosts: ['github.com'], readPaths: [], writePaths: [] };
-  const update = () => handleUpdateRc(cwd, { name: '$(touch pwned)' } as never, found, [], true);
+  const found = { hosts: ['github.com'] };
+  const update = () => handleUpdateRc(cwd, { name: '$(touch pwned)' } as never, found, true);
 
   beforeEach(() => {
     root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'updaterc-link-')));
@@ -485,7 +472,7 @@ describe('handleUpdateRc and what is at .localmostrc', () => {
     const result = callInChild(
       path.join(__dirname, 'test.ts'),
       'handleUpdateRc',
-      [cwd, { name: 'CI' }, found, [], true],
+      [cwd, { name: 'CI' }, found, true],
       { cwd, env: { ...process.env, HOME: root }, timeoutMs: 20_000 }
     );
     expect(result.timedOut).toBe(false);
@@ -511,7 +498,7 @@ describe('handleUpdateRc and what is at .localmostrc', () => {
     fs.symlinkSync(cwd, via);
     fs.writeFileSync(path.join(cwd, '.localmostrc'), 'version: 1\n');
 
-    await handleUpdateRc(via, { name: 'CI' } as never, found, [], true);
+    await handleUpdateRc(via, { name: 'CI' } as never, found, true);
 
     expect(lines.join('\n')).toContain(`These will be added to ${path.join(cwd, '.localmostrc')}:`);
     expect(fs.readFileSync(path.join(cwd, '.localmostrc'), 'utf-8')).toMatch(/github\.com/);
@@ -520,7 +507,7 @@ describe('handleUpdateRc and what is at .localmostrc', () => {
   it('writes .localmostrc, not a .localmostrc.yml the runner would never read', async () => {
     fs.writeFileSync(path.join(cwd, '.localmostrc.yml'), 'version: 1\n');
 
-    await handleUpdateRc(cwd, { name: 'CI' } as never, found, [], true);
+    await handleUpdateRc(cwd, { name: 'CI' } as never, found, true);
 
     expect(fs.readFileSync(path.join(cwd, '.localmostrc'), 'utf-8')).toMatch(/github\.com/);
     expect(fs.readFileSync(path.join(cwd, '.localmostrc.yml'), 'utf-8')).toBe('version: 1\n');

@@ -143,6 +143,23 @@ describe('MacVmBackend', () => {
     expect(b.jobsRunning()).toBe(false);
   });
 
+  it('lends a localmost test run a prepared VM: its agent socket, from the same slots, gone at release', async () => {
+    const { b, slots } = backend();
+    const lease = { key: 'test-0a1b2c3d4e5f', proxyPort: 52000, brokerPort: 52001 };
+    try {
+      const socket = await b.prepareTestRun(lease);
+      expect(vms()).toHaveLength(1);
+      expect(socket).toBe(path.join(data, 'macos-vm', 'vms', vms()[0], 'agent.sock'));
+      expect(agentLines().find((a) => a.op === 'prepare')).toMatchObject({ proxyPort: 52000, brokerPort: 52001 });
+      expect(agentLines().some((a) => a.op === 'job')).toBe(false);
+      expect(slots.holders()).toEqual([{ slot: expect.any(Number), owner: 'job test-0a1b2c3d4e5f' }]);
+    } finally {
+      await b.release(lease);
+    }
+    expect(vms()).toEqual([]);
+    expect(slots.holders()).toEqual([]);
+  });
+
   it('sends the guest the host runner when the golden image has another version', async () => {
     const { b } = backend({ agent: { runnerVersions: ['2.329.0'] } });
     const j = job('a');

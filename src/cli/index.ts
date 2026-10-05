@@ -3,8 +3,8 @@
  * localmost CLI
  *
  * Commands:
- *   localmost test    - Run workflows locally (standalone, no app required)
- *   localmost policy  - Manage sandbox policies
+ *   localmost test    - Run workflows locally, in a macOS VM the app starts
+ *   localmost policy  - Manage .localmostrc policies
  *   localmost env     - Show environment information
  *   localmost start   - Start the localmost app
  *   localmost stop    - Stop the localmost app
@@ -37,8 +37,8 @@ import type {
 // Everything the CLI writes - approved policies, workspace copies, the
 // action cache - is the user's alone, as it is for the app, which sets the
 // same mask. A shell's usual 022 would leave it readable by every account on
-// the machine. Workflow steps run by `localmost test` inherit this, as a real
-// job does from the app.
+// the machine. The workspace copy `localmost test` sends into its macOS VM is
+// made under it too.
 process.umask(0o077);
 
 const HELP_TEXT = `
@@ -48,11 +48,11 @@ USAGE:
   localmost <command> [options]
 
 STANDALONE COMMANDS (no app required):
-  test      Run workflows locally before pushing
-  policy    Manage .localmostrc sandbox policies
+  policy    Manage .localmostrc policies
   env       Show environment information
 
 APP COMMANDS (requires running app):
+  test      Run workflows locally before pushing, in a macOS VM
   start     Start the localmost app
   stop      Stop the localmost app
   status    Show current runner status
@@ -368,7 +368,8 @@ async function main(): Promise<void> {
   const subArgs = args.slice(1);
 
   // =========================================================================
-  // STANDALONE COMMANDS (no app required)
+  // STANDALONE COMMANDS (no app required), and test, which asks the app for
+  // its macOS VM itself
   // =========================================================================
 
   // Test command - run workflows locally

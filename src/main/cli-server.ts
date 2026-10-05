@@ -2,9 +2,12 @@
  * CLI Server - Unix domain socket server for CLI communication.
  *
  * Enables the CLI to communicate with the running Electron app.
- * Supports commands: status, pause, resume, jobs, quit
+ * Supports commands: status, pause, resume, jobs, quit, the targets
+ * commands, and test-vm, which lends `localmost test` a macOS VM for as long
+ * as its connection stays open.
  */
 
+import * as crypto from 'crypto';
 import * as net from 'net';
 import * as fs from 'fs';
 import { app } from 'electron';
@@ -28,6 +31,7 @@ import type {
   ErrorResponse,
   TargetSummary,
 } from '../shared/cli-protocol';
+import type { IsolationAvailability, VmLease } from './isolation/macos-vm';
 
 // Re-exported so importers of ./cli-server keep working.
 export type {
@@ -59,6 +63,16 @@ const MAX_REQUEST_LINE_CHARS = 64 * 1024;
  */
 const MAX_QUEUED_REQUESTS = 32;
 
+/** The macOS VMs a `localmost test` run can borrow: the job backend's. */
+export interface TestVmProvider {
+  available(): IsolationAvailability;
+  /** Boots a VM for the lease and resolves with its agent socket. */
+  prepareTestRun(lease: VmLease, signal?: AbortSignal): Promise<string>;
+  release(lease: VmLease): Promise<void>;
+}
+
+const isPort = (value: unknown): value is number => Number.isInteger(value) && (value as number) >= 1 && (value as number) <= 65535;
+
 /**
  * Describe a target for the CLI, including how many runner proxies are
  * registered for it.
@@ -81,12 +95,15 @@ export class CliServer {
   private server: net.Server | null = null;
   private socketPath: string;
   private onLog: (level: 'info' | 'warn' | 'error', message: string) => void;
+  private testVms: TestVmProvider | undefined;
 
   constructor(options: {
     onLog: (level: 'info' | 'warn' | 'error', message: string) => void;
+    testVms?: TestVmProvider;
   }) {
     this.socketPath = getCliSocketPath();
     this.onLog = options.onLog;
+    this.testVms = options.testVms;
   }
 
   /**
@@ -175,7 +192,9 @@ export class CliServer {
     const answer = async (line: string): Promise<void> => {
       try {
         const request = JSON.parse(line) as CliRequest;
-        const response = await this.handleCommand(request);
+        const response = request?.command === 'test-vm'
+          ? await this.lendTestVm(socket, request.args)
+          : await this.handleCommand(request);
         socket.write(JSON.stringify(response) + '\n');
       } catch (parseError) {
         const errorResponse: ErrorResponse = {
@@ -236,6 +255,48 @@ export class CliServer {
     socket.on('error', (err) => {
       this.onLog('warn', `CLI client error: ${err.message}`);
     });
+  }
+
+  /**
+   * Boot a macOS VM for a `localmost test` run and answer with its agent
+   * socket. The VM is the connection's: it is released when the connection
+   * closes, and a connection that closes while the VM boots cancels it.
+   */
+  private async lendTestVm(socket: net.Socket, args: CliRequest['args']): Promise<CliResponse> {
+    this.onLog('info', 'CLI request: test-vm');
+    const vms = this.testVms;
+    if (!vms) return { success: false, error: 'This app has no macOS VMs to run a workflow in' };
+    const proxyPort = args?.proxyPort;
+    const brokerPort = args?.brokerPort;
+    if (!isPort(proxyPort) || !isPort(brokerPort) || proxyPort === brokerPort) {
+      return { success: false, error: 'Missing or invalid ports for the test run' };
+    }
+    const availability = vms.available();
+    if (!availability.ok) {
+      return { success: false, error: `No macOS VM can run the workflow: ${availability.reason}` };
+    }
+    const lease: VmLease = { key: `test-${crypto.randomBytes(6).toString('hex')}`, proxyPort, brokerPort };
+    const abort = new AbortController();
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      abort.abort();
+      vms.release(lease).catch((err: Error) => this.onLog('warn', `Releasing the macOS VM of ${lease.key} failed: ${err.message}`));
+    };
+    socket.once('close', release);
+    try {
+      const agentSocket = await vms.prepareTestRun(lease, abort.signal);
+      if (socket.destroyed) {
+        release();
+        return { success: false, error: 'The test run went away while its macOS VM started' };
+      }
+      this.onLog('info', `Lent a macOS VM to localmost test (${lease.key})`);
+      return { success: true, command: 'test-vm', data: { agentSocket } };
+    } catch (err) {
+      release();
+      return { success: false, error: `Could not lend the test run a macOS VM: ${(err as Error).message}` };
+    }
   }
 
   /**

@@ -16,7 +16,7 @@ import { macVmAgentPath, macVmHelperPath } from './paths';
 import { MacVmSlots } from './slots';
 import { processExecutableOf } from '../../vm/vm-manager';
 
-export type { IsolationBackend, IsolationAvailability, IsolationJob, JobSignal, WorkerHandle } from './types';
+export type { IsolationBackend, IsolationAvailability, IsolationJob, JobSignal, VmLease, WorkerHandle } from './types';
 
 export interface MacVmModeOptions {
   /** `<data>`, realpathed. */

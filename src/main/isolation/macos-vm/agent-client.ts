@@ -10,6 +10,12 @@
  *   agent:    {"event":"output","stream":"stdout","data":"..."} ... {"event":"exit","code":0,"signal":null}
  *   Electron: {"id":4,"op":"signal","signal":"TERM"}
  *
+ * Instead of a job, a `localmost test` run (MacVMAgentCore/Steps.swift):
+ *
+ *   Electron: {"id":5,"op":"put","dest":"workspace","bytes":n,"sha256":"<hex>"}  then n raw bytes of a tar
+ *   Electron: {"id":6,"op":"step","program":"bash","script":"...","cwd":"workspace","env":{...}}
+ *   agent:    {"event":"output",...} ... {"event":"exit","code":0,"signal":null,"outputs":"name=value\n"}
+ *
  * The agent runs as root in a guest that is the job's, so everything it says
  * is hostile input: each line is matched to a request by id or to an event
  * this client expects, checked field by field and bounded, and anything else
@@ -19,7 +25,7 @@
 
 import { EventEmitter } from 'events';
 import * as net from 'net';
-import { frame, lineSplitter, parseFrame, sanitizeGuestText } from '../../vm/ndjson';
+import { frame, lineSplitter, MAX_LINE_BYTES, parseFrame, sanitizeGuestText } from '../../vm/ndjson';
 
 export const AGENT_TIMEOUTS_MS = {
   hello: 10_000,
@@ -28,6 +34,8 @@ export const AGENT_TIMEOUTS_MS = {
   runner: 300_000,
   job: 60_000,
   signal: 10_000,
+  put: 300_000,
+  step: 60_000,
 } as const;
 type Op = Exclude<keyof typeof AGENT_TIMEOUTS_MS, 'hello'>;
 
@@ -88,6 +96,40 @@ export function jobEnvNameAllowed(name: string): boolean {
   return !RESERVED_JOB_ENV_NAMES.has(name) && !RESERVED_JOB_ENV_PREFIXES.some((prefix) => name.startsWith(prefix));
 }
 
+/**
+ * Whether a test run's step may be given `name` (MacVMAgentCore.stepEnvNameAllowed):
+ * what a job may be given, and the GITHUB_* and RUNNER_* variables a step
+ * reads, which no runner sets in a test run.
+ */
+export function stepEnvNameAllowed(name: string): boolean {
+  if (jobEnvNameAllowed(name)) return true;
+  return /^(GITHUB|RUNNER)_[A-Za-z0-9_]*$/.test(name) && name.length <= 128;
+}
+
+/** Where a test run's uploads land in the guest (MacVMAgentCore.testRoot), and its workspace. */
+export const GUEST_TEST_ROOT = '/Users/runner/work';
+export const GUEST_WORKSPACE = `${GUEST_TEST_ROOT}/workspace`;
+/** The most one upload may be (MacVMAgentCore.maxPutBytes). */
+export const MAX_PUT_BYTES = 512 * 2 ** 20;
+/** The most a step's GITHUB_OUTPUT may be (MacVMAgentCore.maxStepOutputsBytes). */
+export const MAX_STEP_OUTPUTS_BYTES = 16 * 1024;
+
+/** A test run's upload: the workspace, or an action's directory under actions/<16 hex>. */
+export type PutDest = 'workspace' | `actions/${string}`;
+const PUT_DEST_RE = /^(workspace|actions\/[0-9a-f]{16})$/;
+
+/**
+ * One step of a test run: a guest shell with its script, or the runner's
+ * node with an entry point. `entry` and `cwd` are relative to GUEST_TEST_ROOT.
+ */
+export interface StepRequest {
+  program: 'bash' | 'sh' | 'zsh' | 'node';
+  script?: string;
+  entry?: string;
+  cwd: string;
+  env: Record<string, string>;
+}
+
 export interface JobRequest {
   runnerVersion: string;
   files: JobFiles;
@@ -116,7 +158,8 @@ export interface MacAgentClientOptions {
 
 /**
  * One control connection. Emits `output` (stream, line) and `exit` (code,
- * signal) for the job it started, and `closed` (MacAgentError) once.
+ * signal) for the job it started, or `output` and `stepExit` (code, signal,
+ * outputs) for each step of a test run, and `closed` (MacAgentError) once.
  */
 export class MacAgentClient extends EventEmitter {
   private socket: net.Socket | null = null;
@@ -129,6 +172,8 @@ export class MacAgentClient extends EventEmitter {
   private uploading: { id: number; bytes: Buffer; sent: boolean } | null = null;
   private jobStarted = false;
   private exited = false;
+  /** A test run's step runs: from its answer to its exit. */
+  private stepRunning = false;
 
   constructor(private readonly opts: MacAgentClientOptions) {
     super();
@@ -184,11 +229,39 @@ export class MacAgentClient extends EventEmitter {
   /** Uploads a runner tar.gz; resolves once the agent installed it. */
   async uploadRunner(version: string, bytes: Buffer, sha256: string): Promise<void> {
     if (!VERSION_RE.test(version)) throw new Error(`not a runner version: ${JSON.stringify(version)}`);
-    if (this.uploading) throw new Error('an upload is already in flight');
-    const a = await this.request('runner', { version, bytes: bytes.length, sha256 }, (id) => {
+    const a = await this.upload('runner', { version, bytes: bytes.length, sha256 }, bytes);
+    if (a.installed !== version) throw this.malformed('runner');
+  }
+
+  /** Sends a test run's tar to `dest` in the guest; resolves once the agent unpacked it. */
+  async put(dest: PutDest, bytes: Buffer, sha256: string): Promise<void> {
+    if (!PUT_DEST_RE.test(dest)) throw new Error(`not an upload destination: ${JSON.stringify(dest)}`);
+    if (bytes.length < 1 || bytes.length > MAX_PUT_BYTES) throw new Error(`an upload must be 1 to ${MAX_PUT_BYTES} bytes`);
+    const a = await this.upload('put', { dest, bytes: bytes.length, sha256 }, bytes);
+    if (a.put !== dest) throw this.malformed('put');
+  }
+
+  private upload(op: 'runner' | 'put', fields: Record<string, unknown>, bytes: Buffer): Promise<Record<string, unknown>> {
+    if (this.uploading) return Promise.reject(new Error('an upload is already in flight'));
+    return this.request(op, fields, (id) => {
       this.uploading = { id, bytes, sent: false };
     });
-    if (a.installed !== version) throw this.malformed('runner');
+  }
+
+  /**
+   * Starts one step of a test run; resolves with its pid in the guest. Its
+   * output comes as `output`, its end as `stepExit` (code, signal, outputs).
+   * A step whose command would not fit one line is refused here.
+   */
+  async step(req: StepRequest): Promise<number> {
+    const fields = { program: req.program, cwd: req.cwd, env: req.env, ...(req.script !== undefined ? { script: req.script } : {}),
+      ...(req.entry !== undefined ? { entry: req.entry } : {}) };
+    if (Buffer.byteLength(frame({ id: Number.MAX_SAFE_INTEGER, op: 'step', ...fields })) > MAX_LINE_BYTES + 1) {
+      throw new MacAgentError('E_STEP_TOO_LARGE', "the step's script and environment are over 64 KiB, the most a step in the macOS VM can carry");
+    }
+    const a = await this.request('step', fields);
+    if (!Number.isInteger(a.pid) || (a.pid as number) <= 1) throw this.malformed('step');
+    return a.pid as number;
   }
 
   /** Starts the job's runner; resolves with its pid in the guest. */
@@ -261,6 +334,7 @@ export class MacAgentClient extends EventEmitter {
     // The job's output can follow its answer in the same read, before the
     // caller's await resumes: it counts as started from its answer.
     if (waiting.op === 'job') this.jobStarted = true;
+    if (waiting.op === 'step') this.stepRunning = true;
     waiting.resolve(msg);
   }
 
@@ -281,7 +355,7 @@ export class MacAgentClient extends EventEmitter {
         return;
       }
       case 'output': {
-        if (!this.jobStarted || this.exited) return this.violate('output from no job');
+        if (!this.stepRunning && (!this.jobStarted || this.exited)) return this.violate('output from no job');
         if ((msg.stream !== 'stdout' && msg.stream !== 'stderr') || typeof msg.data !== 'string' || msg.data.length > MAX_OUTPUT_CHARS) {
           return this.violate('malformed output');
         }
@@ -289,12 +363,21 @@ export class MacAgentClient extends EventEmitter {
         return;
       }
       case 'exit': {
-        if (!this.jobStarted || this.exited) return this.violate('an exit of no job');
+        if (!this.stepRunning && (!this.jobStarted || this.exited)) return this.violate('an exit of no job');
         const code = msg.code;
         const signal = msg.signal;
         const codeOk = code === null || (Number.isInteger(code) && (code as number) >= 0 && (code as number) <= 255);
         const signalOk = signal === null || (typeof signal === 'string' && SIGNAL_RE.test(signal));
         if (!codeOk || !signalOk || (code === null) === (signal === null)) return this.violate('a malformed exit');
+        if (this.stepRunning) {
+          // A step's outputs are the step's to write: text, bounded, and
+          // never shown anywhere without being parsed as name=value first.
+          const outputs = msg.outputs;
+          if (typeof outputs !== 'string' || Buffer.byteLength(outputs) > MAX_STEP_OUTPUTS_BYTES) return this.violate('a malformed step exit');
+          this.stepRunning = false;
+          this.emit('stepExit', code as number | null, signal as string | null, outputs);
+          return;
+        }
         this.exited = true;
         this.emit('exit', code as number | null, signal as string | null);
         return;

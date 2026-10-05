@@ -492,6 +492,8 @@ app.whenReady().then(async () => {
       else if (level === 'warn') logger?.warn(message);
       else logger?.error(message);
     },
+    // localmost test runs its jobs in the same VMs, from the same slots.
+    testVms: macVmBackend,
   });
   setCliServer(cliServer);
   try {

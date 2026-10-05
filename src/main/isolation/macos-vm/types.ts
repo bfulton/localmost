@@ -14,17 +14,24 @@ export interface IsolationAvailability {
   reason?: string;
 }
 
-/** One job, as the runner manager hands it to the backend. */
-export interface IsolationJob {
+/**
+ * What a VM is booted for: a key, and the two host ports on 127.0.0.1 its
+ * relays lead to. A runner job's, or a `localmost test` run's.
+ */
+export interface VmLease {
   /**
-   * Unique for the job's life: the runner slot and job id, say. A second
+   * Unique for the VM's life: the runner slot and job id, say. A second
    * prepare under a key that is still held is refused.
    */
   key: string;
-  /** The worker's ProxyServer, on 127.0.0.1: the job's only way out. */
+  /** The worker's ProxyServer, or the test run's proxy: the guest's only way out. */
   proxyPort: number;
-  /** The broker, on 127.0.0.1, which the worker's runner dials with its per-worker key. */
+  /** The broker, which the worker's runner dials with its per-worker key; a test run's refuses every connection. */
   brokerPort: number;
+}
+
+/** One job, as the runner manager hands it to the backend. */
+export interface IsolationJob extends VmLease {
   /**
    * The worker's sandbox, as buildSandbox made it and the runner manager
    * filled it: its .runner (pointed at the broker), .credentials and
@@ -60,10 +67,10 @@ export interface IsolationBackend {
    * taken), the VM booted or restored, and the guest prepared. Rejects with
    * a reason; an abort while waiting or booting releases what was taken.
    */
-  prepare(job: IsolationJob, signal?: AbortSignal): Promise<void>;
+  prepare(job: VmLease, signal?: AbortSignal): Promise<void>;
   /** Starts the runner in the prepared VM: `argv` is its arguments, `env` the worker's environment. */
   spawnWorker(job: IsolationJob, argv: string[], env: Record<string, string>): Promise<WorkerHandle>;
   signal(job: IsolationJob, signal: JobSignal): Promise<void>;
   /** Stops the VM and deletes its clone. Safe to call at any point, and twice. */
-  release(job: IsolationJob): Promise<void>;
+  release(job: VmLease): Promise<void>;
 }

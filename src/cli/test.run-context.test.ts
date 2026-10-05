@@ -2,8 +2,8 @@ import { describe, it, expect, jest } from '@jest/globals';
 import { buildWorkflowEnv, buildProxyEnv, installInterruptHandlers } from './test';
 
 describe('installInterruptHandlers', () => {
-  it('reaps the steps before exiting on Ctrl-C, a kill, or the terminal closing', () => {
-    // Steps run detached, so the terminal's signals no longer reach them; a
+  it('ends the run before exiting on Ctrl-C, a kill, or the terminal closing', () => {
+    // Steps run in the macOS VM, which the terminal's signals never reach; a
     // closed terminal or dropped SSH session sends this process SIGHUP, whose
     // default is to die without running any cleanup.
     const exit = jest.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
@@ -27,14 +27,20 @@ describe('installInterruptHandlers', () => {
 
 describe('buildProxyEnv', () => {
   it('sends traffic through the proxy but leaves loopback direct', () => {
-    // The proxy refuses loopback, so a test that talks to a server it started
-    // on localhost has to reach it directly, where its policy grants that.
+    // The proxy refuses loopback, so a test that talks to a server another
+    // step started on the guest's localhost has to reach it directly.
     const env = buildProxyEnv('http://localmost:t@127.0.0.1:1234');
     expect(env.HTTPS_PROXY).toBe('http://localmost:t@127.0.0.1:1234');
     expect(env.http_proxy).toBe('http://localmost:t@127.0.0.1:1234');
     for (const name of ['NO_PROXY', 'no_proxy']) {
       expect(env[name]?.split(',')).toEqual(expect.arrayContaining(['localhost', '127.0.0.1', '::1']));
     }
+  });
+
+  it("tells git to send the proxy's credentials up front", () => {
+    // Without it git waits for a 407 challenge the proxy answers by closing
+    // the connection, and every fetch through the proxy aborts.
+    expect(buildProxyEnv('http://localmost:t@127.0.0.1:1234').GIT_HTTP_PROXY_AUTHMETHOD).toBe('basic');
   });
 });
 

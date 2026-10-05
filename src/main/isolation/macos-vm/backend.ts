@@ -16,6 +16,10 @@
  *   release      the helper stopped (VZ pulls the VM's plug), the VM
  *                directory removed, the slot freed
  *
+ * A `localmost test` run takes a VM the same way (prepareTestRun), but has
+ * no runner: the CLI connects to the VM's agent.sock itself and sends the
+ * workspace and each step (src/cli/test-vm.ts).
+ *
  * The guest has no network device. Its only ways out are the helper's two
  * vsock relays, to the job's proxy and to the broker on 127.0.0.1, so the
  * worker's HTTP_PROXY and broker URL work unchanged inside it, and anything
@@ -32,7 +36,7 @@ import type { MacVmHelper } from './helper-client';
 import { JOB_VM_CPUS, JOB_VM_MEMORY_MIB, hostRefusal, type HostInfo } from './host';
 import { assertRemovable, macVmLayout, newMacVmId, vmDir, MAC_VM_ID_RE } from './paths';
 import type { MacVmSlots, SlotNumber } from './slots';
-import type { IsolationAvailability, IsolationBackend, IsolationJob, JobSignal, WorkerHandle } from './types';
+import type { IsolationAvailability, IsolationBackend, IsolationJob, JobSignal, VmLease, WorkerHandle } from './types';
 import { sanitizeGuestText } from '../../vm/ndjson';
 
 /** The most one runner file may be (MacVMAgentCore.maxJobFileBytes). */
@@ -73,7 +77,7 @@ export interface MacVmBackendDeps {
 
 interface Job {
   key: string;
-  job: IsolationJob;
+  job: VmLease;
   imageId: string;
   slot: SlotNumber | null;
   vmId: string | null;
@@ -151,7 +155,7 @@ export class MacVmBackend implements IsolationBackend {
     return this.jobs.size > 0;
   }
 
-  async prepare(job: IsolationJob, signal?: AbortSignal): Promise<void> {
+  async prepare(job: VmLease, signal?: AbortSignal): Promise<void> {
     if (this.jobs.has(job.key)) throw new Error(`job ${job.key} already has a macOS VM`);
     const availability = this.available();
     if (!availability.ok) throw new Error(availability.reason);
@@ -202,6 +206,18 @@ export class MacVmBackend implements IsolationBackend {
     } finally {
       signal?.removeEventListener('abort', onAbort);
     }
+  }
+
+  /**
+   * A VM for a `localmost test` run: everything prepare does, and then the
+   * path of its agent.sock, which the CLI dials for the run itself. The VM
+   * is the run's until release.
+   */
+  async prepareTestRun(lease: VmLease, signal?: AbortSignal): Promise<string> {
+    await this.prepare(lease, signal);
+    const rec = this.jobs.get(lease.key);
+    if (!rec?.vmId) throw new Error(`test run ${lease.key} has no macOS VM`);
+    return path.join(vmDir(this.deps.dataDir, rec.vmId), 'agent.sock');
   }
 
   /** The data volume's free bytes; 0, so nothing starts, when they cannot be read. */
@@ -309,7 +325,7 @@ export class MacVmBackend implements IsolationBackend {
     });
   }
 
-  release(job: IsolationJob): Promise<void> {
+  release(job: VmLease): Promise<void> {
     const rec = this.jobs.get(job.key);
     if (!rec) return Promise.resolve();
     rec.released ??= (async () => {
