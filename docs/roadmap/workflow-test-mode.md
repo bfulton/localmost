@@ -232,9 +232,9 @@ See [localmostrc.md](./localmostrc.md) for the sandbox policy file design.
 
 | Command | Behavior |
 |---------|----------|
-| `localmost test` | Enforce `.localmostrc`, fail on violations |
-| `localmost test --updaterc` | Permissive, record access, prompt to update file |
-| `localmost test --dry-run` | Show what *would* be accessed without running |
+| `localmost test` | Run the workflow in a macOS VM, its proxy enforcing `.localmostrc` |
+| `localmost test --updaterc` | Let every host through, record the hosts reached, prompt to update file |
+| `localmost test --dry-run` | Show the steps that would run, without a VM |
 
 ## Why This Wins
 

@@ -227,6 +227,24 @@ running app picks up the new target without a restart. Removing one unregisters
 those runners; `remove` asks for confirmation unless you pass `--yes`, and refuses
 to run unconfirmed outside a terminal. Every subcommand accepts `--json`.
 
+### Testing workflows locally
+
+```bash
+localmost test                    # Run the default workflow
+localmost test ci.yml --job build # One job of one workflow
+localmost test --updaterc         # Record the hosts it reaches into .localmostrc
+```
+
+`localmost test` runs a workflow's steps in a fresh macOS VM from the same golden
+image, slots and helper as runner jobs, so the app must be running with the image
+built (Settings > macOS VM). It copies the checkout (or `--staged` changes) in as
+the workspace, runs each step there as the guest's non-admin user, and streams the
+output back with secrets masked. The VM's only way out is the run's proxy, which
+holds steps to the checkout's `.localmostrc` network policy - after you confirm any
+host it allows - or, under `--updaterc`, lets every host through and records it.
+Filesystem access is not recorded yet, and filesystem grants and `docker:` are not
+given in the VM yet; the run says which it goes without.
+
 ### Installing the CLI
 
 From the app menu: **localmost → Install Command Line Tool...**
@@ -262,15 +280,14 @@ first) runs `npm run build:native` to build the macOS VM's helper and guest
 agent and the Docker VM's helper and guest, and fetch the docker CLI. That
 needs Xcode's Swift and Go, and the guest build boots a VM, so run it on the
 Mac itself, not inside a localmost job. `npm test` needs none of this. Its
-sandbox tests - of the profiles localmost's own helpers and `localmost test`'s
-steps run under - construct seatbelt profiles, which works on the Mac and in
-a macOS VM job alike, and run this Mac's own tools under them: Xcode's Swift,
-and a JDK, which `/usr/libexec/java_home` must find.
+sandbox tests - of the profiles localmost's own VM helpers run under - construct
+seatbelt profiles, which works on the Mac and in a macOS VM job alike. The
+guest agent's unit tests run with `swift test` in `native/localmost-macvm`.
 
 ## Roadmap
 
 Current release: **0.3.0 — Test Locally, Secure by Default**
-- Run workflows locally before pushing with `localmost test`
+- Run workflows locally before pushing with `localmost test`, in the same macOS VM as runner jobs
 - Declarative sandbox policies with `.localmostrc`
 - Sandbox policy levels (strict / moderate / permissive) declared per repository and enforced by the local proxy
 - Contributor-based job filtering for public repos
@@ -282,7 +299,6 @@ Current release: **0.3.0 — Test Locally, Secure by Default**
 Future feature ideas:
 
 - **Fail a blocked job visibly** - a job refused by the filter is cancelled through the GitHub API before any worker starts, so it appears as cancelled rather than failing with a message explaining why.
-- **Roll discovery output up further** - `--updaterc` now drops paths already covered by a listed ancestor, which removes the bulk of the redundancy. It still records content-addressed cache paths (npm's `_cacache/content-v2/sha512/...`) verbatim, which differ per machine and per dependency change; those want rolling up to their cache directory.
 - **Show a full diff when `--updaterc` rewrites a policy** - it names the file and lists every grant it adds before asking, but it rewrites the whole file from the parsed policy, so the comments and formatting it drops are not shown.
 - **Homebrew formula** - `npx localmost` works; `brew install localmost` does not exist.
 - **Quick actions** - Re-run failed job, cancel all jobs.
@@ -292,7 +308,7 @@ Future feature ideas:
 - **Linux and Windows host support** - Run self-hosted runners on non-Mac machines for projects that need them.
 - **Docker in macOS VM jobs** - A vsock relay from the guest to the worker's filtering Docker socket, and a workspace shared with the job's Docker VM, so a policy's `docker:` works again.
 - **Filesystem grants as VM shares** - Give a macOS VM job the paths its policy grants, as read-only shares or per-job clones ([design](docs/roadmap/macos-vm-jobs.md#not-built-yet)).
-- **`localmost test` in a VM** - Run local test mode's workflow in a macOS VM too, with filesystem discovery as guest-side tracing.
+- **Filesystem discovery in the VM** - Record the paths a `localmost test --updaterc` run's steps miss in the guest, so discovery suggests filesystem grants again.
 - **Filtering VM network stack** - A userspace network stack for the Docker VM that enforces the job's hostname policy on traffic that ignores proxy settings ([design](docs/roadmap/vm-network-stack.md)).
 
 Bugs and quick improvements:

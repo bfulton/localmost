@@ -83,8 +83,6 @@ setting, so a policy that says nothing cannot inherit something looser.
 The level is the job's proxy's: `strict` grants runner infrastructure plus
 declared hosts, `moderate` adds the common package registries, CDNs and GitHub
 content hosts, and `permissive` allows every host (see Network Policy below).
-Under `localmost test`, which still runs each step under a seatbelt profile on
-the Mac, the level also sets what a step reads (see Local Test Mode).
 
 A worker's environment is fixed when it starts, so approving a policy retires
 that repository's idle workers. If a worker still claims a job after its
@@ -96,14 +94,15 @@ The level is part of the policy, so changing it is a policy change: it appears
 in the approval diff and takes effect only once approved. A repository cannot
 loosen its own policy without the machine owner agreeing to it.
 
-### Filesystem grants, loopback and isolation
+### Filesystem grants, and keys that are ignored
 
-A runner job's VM is given no filesystem grants and no loopback yet: a
-policy's `filesystem:` and `network.loopback` apply only under `localmost
-test`, and the runner names them in its log when a job starts. VM shares of
-granted paths are planned ([macos-vm-jobs.md](docs/roadmap/macos-vm-jobs.md),
-Not built yet). `isolation:`, which once chose among isolation types, is
-ignored with a warning: every job runs in a macOS VM.
+A job's VM - a runner job's or a `localmost test` run's - is given no
+filesystem grants yet: the runner names them in its log when a job starts,
+and `localmost test` says so before it runs. VM shares of granted paths are
+planned ([macos-vm-jobs.md](docs/roadmap/macos-vm-jobs.md), Not built yet).
+`isolation:`, which once chose among isolation types, and `network.loopback`,
+which once opened ports on the Mac's loopback, are ignored with a warning:
+every job runs in a macOS VM, which has a loopback of its own.
 
 ### What localmost trusts (does NOT protect against)
 
@@ -111,16 +110,15 @@ ignored with a warning: every job runs in a macOS VM.
 - **Malware on your machine**: If your system is already compromised, localmost cannot protect you.
 - **A compromised GitHub account**: If an attacker has access to your GitHub account, they can modify workflows that run on your runner.
 - **Allowlisted hosts**: Data can be exfiltrated to any host the active policy allows. Under `strict` that is runner infrastructure plus whatever the repository declares; looser levels allow more. Among the infrastructure hosts allowed at every level, `github.com`, `api.github.com` and `*.blob.core.windows.net` accept writes from any account, so `strict` limits reach, not exfiltration - see Network Policy below.
-- **Approved policies**: Once you approve a repository's `.localmostrc`, everything it declares is granted until you approve another. Approval is a judgement about that content, and is bound to it: what you approve is the policy you were shown, level included. Under `localmost test`, a write grant on a place something outside the sandbox later acts on - `~/Library/LaunchAgents` and the other launchd directories, shell rc files, `~/.gitconfig`, `~/Library/Application Support`, the package caches `~/.gradle`, `~/.m2`, `~/.cargo` and `~/.nuget`, `/usr/local/bin`, `/opt/homebrew/bin`, or a parent of any of them, `~` and `/` included - is marked with a warning in the approval screen and `localmost policy show`. It is not refused: a job granted one can leave code that runs as you, unsandboxed, after it ends, and approving it means accepting that. A write grant on `~/.ssh`, `~/.config` or `~/Library/Preferences` is marked too, but does nothing: the step sandbox refuses every write there whatever is granted (see Local Test Mode). A runner job's VM is given no filesystem grant at all yet.
+- **Approved policies**: Once you approve a repository's `.localmostrc`, everything it declares is granted until you approve another. Approval is a judgement about that content, and is bound to it: what you approve is the policy you were shown, level included. A write grant on a place something outside a job later acts on - `~/Library/LaunchAgents` and the other launchd directories, shell rc files, `~/.gitconfig`, `~/Library/Application Support`, the package caches `~/.gradle`, `~/.m2`, `~/.cargo` and `~/.nuget`, `/usr/local/bin`, `/opt/homebrew/bin`, or a parent of any of them, `~` and `/` included - is marked with a warning in the approval screen and `localmost policy show`, for what it would mean once VM shares exist. No job's VM is given a filesystem grant yet.
 - **Per-workflow network sections**: A `workflows:` section can narrow or widen *network* access per workflow, because hosts are applied to the proxy when a job is claimed.
 - **Per-workflow env sections**: The environment is fixed when the worker starts, for the same reason. `env: allow` is taken from `shared:` only; a per-workflow allow is not applied. `env: deny` is taken from `shared:` and from every workflow, and applied to every job - a per-workflow deny is honoured more widely than written rather than not at all.
 - **Per-workflow sections are not a boundary between contributors**: A `workflows.<name>` section is available to any commit that can run a workflow file with that name, including pull requests; approving a per-workflow grant approves it for anyone who can open a PR. The key matches a file name, and a pull request can add or change a workflow file like any other. Per-workflow sections keep a compromised dependency of one workflow from using another's grants, not a commit author.
 - **The broker**: A job always reaches the broker's port, through its relay and through its proxy - see Network Policy below. The broker is protected from jobs only by its per-worker key.
-- **Processes running as you**: The CLI control socket is guarded only by file permissions (`0600` in a `0700` directory), and from `localmost test`'s steps by their sandbox's deny of it. Any process running as your user can control the app through it - pause, resume, add or remove targets - as it could by editing `~/.localmost` directly.
+- **Processes running as you**: The CLI control socket is guarded only by file permissions (`0600` in a `0700` directory). Any process running as your user can control the app through it - pause, resume, add or remove targets, or borrow a macOS VM as `localmost test` does - as it could by editing `~/.localmost` directly.
 - **Apple's Virtualization.framework**: A job runs in a macOS VM, and a Docker job's containers would run in a Linux VM. A bug in Apple's device emulation (virtio disk, graphics, input, entropy, vsock) or virtiofs server, which is closed source and has not been fuzzed here, is not contained by anything localmost adds. That boundary is what a job's isolation rests on.
 - **Root in the guest**: A job can become root in its own guest through a macOS flaw. Root there can rewrite the guest agent's answers, which the app treats as untrusted and bounded; it has no network card to bring up, reaches the Mac only through the same two relays, and its VM is discarded at the end of the job.
 - **The Mac's resources**: A job VM has 4 CPUs and 6 GiB of memory for its life, and disk until the data volume's free space falls below 10 GiB, when its VM is stopped. Both job VMs share that reserve, so one job's writes can end the other's.
-- **Declared system paths**: Under `localmost test`, a policy that declares OS read paths grants them for the whole run. `localmost policy init` seeds that list with OS subpaths (`/usr/bin`, `/usr/lib`, `/System`, `/Library/Developer` and similar) because nothing runs without them. It deliberately excludes `/usr/local`, `/Library/Application Support` and `/Applications`, which hold third-party software and application data - but a policy is free to add them back, and approving one means accepting that.
 
 ## Network Policy
 
@@ -132,16 +130,14 @@ loopback, and nothing else, so the proxy is the job's only way out. The runner
 dials the broker directly at `127.0.0.1`, because its HTTP client sends a
 loopback destination around the proxy; what guards the broker is each
 worker's key (below), not a closed port. No other loopback port of the Mac is
-reachable from a VM: `network.loopback`, which opens ports to a `localmost
-test` step (see Local Test Mode), is ignored for runner jobs, and the runner
-says so in its log.
+reachable from a VM.
 
 The proxy holds a request for a loopback address to the same rule, at every
 level, `permissive` included: a plain request or a `CONNECT` tunnel to
 `127.0.0.1`, `::1` or any other `127/8` address is refused with 403 unless its
-port is the broker's (or, for a `localmost test` step, declared). `localhost`, and any other name for this
-machine, is refused on every port, declared and broker's included: only a
-literal address is forwarded to loopback. The broker's port stays
+port is the broker's. `localhost`, and any other name for this machine, is
+refused on every port, the broker's included: only a literal address is
+forwarded to loopback. The broker's port stays
 open, through the proxy and directly, because the runner reaches the local
 broker. What keeps a job from using that port is the broker's own
 authentication: each worker talks to it at an address carrying a key of its own
@@ -211,16 +207,14 @@ port 80 as a plain proxied request; a client that tunnels it through `CONNECT`
 instead needs a `host:80` entry. `permissive` stays unrestricted, ports
 included, except on this machine: a literal loopback address (`127.0.0.1`,
 `::1`) is reachable through the proxy at every level on the broker's port,
-because the runner reaches the broker at `127.0.0.1` (and, for a `localmost
-test` step, on the ports `shared.network.loopback` declares) - no others. The broker is guarded by
+because the runner reaches the broker at `127.0.0.1` - no others. The broker is guarded by
 each worker's key, not by its port. A name that resolves to loopback,
 `localhost` included, is refused.
 
 A `network.deny` entry is read the same way and refuses its host at every
 level, `permissive` included, whatever the allow list says; an entry with a
 port denies that port only. The runner infrastructure hosts on their scheme's
-port, and the broker's port on loopback, cannot be denied; a declared loopback
-port can. Like the allow list, it matches names, not addresses:
+port, and the broker's port on loopback, cannot be denied. Like the allow list, it matches names, not addresses:
 at `permissive` a job can still reach the same server by its address or another
 name.
 
@@ -229,11 +223,8 @@ Line Tools and the runner baked into the golden image, and the job's
 workspace and temp, all on its disk clone and gone with it. Nothing of the
 Mac's filesystem is shared into it, so a policy's `filesystem:` grants give a
 runner job nothing yet, and its denies have nothing to deny. A `localmost
-test` step has a profile instead: beyond its workspace, a few device files,
-the names `mktemp` generates in the per-user temp directory and, read-only,
-the code of the actions it runs, its policy lists everything it reads, system
-paths included. `localmost policy init` starts from a policy that runs, and
-`localmost test --updaterc` records what a workflow actually needs.
+test` run's VM is the same. `localmost policy init` starts from a policy that
+runs, and `localmost test --updaterc` records the hosts a workflow reaches.
 
 A repository's `.localmostrc` only takes effect once approved. When the runner
 sees a new or changed policy it refuses the job, cancels the run, and records
@@ -292,106 +283,67 @@ or stored by localmost.
 
 ## Local Test Mode
 
-`localmost test` runs a checkout's workflow on the Mac, each step under its own
-sandbox profile. The checkout is treated as untrusted, and so is its
-`.localmostrc`, which is as much the checkout's to write as its code:
+`localmost test` runs a checkout's workflow in a fresh macOS VM, cloned from
+the same golden image and taken from the same two slots as runner jobs. The
+running app boots it when the CLI asks over the control socket, and stops it
+and deletes its clone when that connection closes. Without the app, or with
+no golden image built, the run stops before any step and names the step to
+take. The checkout is treated as untrusted, and so is its `.localmostrc`,
+which is as much the checkout's to write as its code:
 
 - **Its policy is asked about, not applied.** Before running, the CLI lists
-  everything the checkout's `.localmostrc` grants beyond the workspace - every
-  write, every read past the OS baseline, every allowed host - and asks. A yes
-  is remembered for that checkout's location on disk and exactly those grants;
-  any change is asked again. Without a terminal, only `--yes` runs it. A policy
-  that stays within the workspace and the OS baseline runs without a prompt.
-- **Rooted at the workspace.** Every step's profile is rooted at the run's
-  workspace, a private (`0700`) copy of the checkout. Each file is its own
-  copy - an APFS clone where the volume can make one, never a hard link - so
-  a write to a workspace file never reaches the checkout. `.git`,
-  `node_modules` and whatever git ignores are left out, the ignore rules read
-  by git itself; in a submodule or a repository nested in the checkout, what
-  either its own rules or the checkout's ignore. With `--staged` only tracked
-  files are copied, and a submodule's directory is left empty. A
-  `working-directory`, a local action's path or an action's entry point that
-  resolves outside it is refused, and fetched action code is readable but not
-  writable. A step can change anything inside the workspace but not remove or
-  replace the workspace directory itself.
-- **Never reachable.** Whatever the policy declares, a step cannot read or
-  write the app's data directory (the runner template every worker is copied
-  from, approvals, settings, other runs; `~/.localmost` is closed even when the
-  CLI runs with another data directory) or the credentials the runner denies a
-  job at every level (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config`, the
-  keychains, `.netrc`, `.npmrc`, `.git-credentials`, `.pypirc` and the other
-  plaintext token files, and the package-manager credential files), nor
-  rename any directory above them - `~/Library/Application Support`,
-  `~/Library`, `~/.m2` - to reach them under another name. The CLI socket is
-  closed too.
-- **Nothing in home or shared temp granted implicitly.** Steps run with `HOME`,
-  `TMPDIR` and the tool cache inside the workspace; a home cache is writable
-  only if the policy declares it. As a runner job's, the steps' `HOME` holds
-  the per-job git config as `.gitconfig`, an empty ssh config, and a link for
-  each path the confirmed policy grants under your home. It is made new for
-  the run: the workspace copy leaves out a `.home` or `.tmp` the checkout
-  commits at its top, in any case, since the app fills the home outside the
-  sandbox and a committed link there had it write wherever the link led. As
-  in a runner job, `/tmp` and the per-user `/var/folders` directories are not
-  granted - only the entries a bare `mktemp` creates, never Swift Build's
-  link step's - and xcrun's cache, the clang and Swift module cache and zsh's
-  here-documents are pointed into the workspace. A hard-coded `/tmp` path
-  fails here as it does in a job.
-- **Proxy-only network.** A step can reach the run's proxy on loopback and
-  nothing else directly. Other loopback ports - a local database, a debugger,
-  another app's control port - are reached only when the checkout's
-  `shared.network.loopback` grants them (`true` for every port, or a list), and
-  that grant is listed and asked about with the rest of the policy. The
-  broker's port stays closed either way; `NO_PROXY` keeps loopback off the
-  proxy. The way out is the run's proxy, which needs a per-run token, refuses
-  names that resolve to internal or loopback addresses, and connects only to
-  the addresses it screened. It reads the checkout's network policy as a
-  runner job's proxy does: a `network.deny` host is refused whatever the allow
-  list covers, and an allowed host is reached on 443 through `CONNECT` and 80
-  for plain HTTP, on another port only when an entry spells `host:port`.
-  Discovery applies neither, since it observes every host, and records a host
-  reached on another port as `host:port`, the entry that allows it; it leaves
-  loopback open, says so, and records none of it: a checkout declares its
-  loopback grant itself.
-- **Discovery is asked about every time.** Under `--updaterc` reads are allowed
-  and recorded, and writes outside the workspace are refused and reported.
-  Discovery still lets a workflow read everything but the paths above and reach
-  any host, since that is what it exists to observe, so the CLI says so and
-  asks before each run (or takes `--yes`). Use it on checkouts whose code you
-  trust with that much.
-- **No unsandboxed code in the workspace.** The app's own work in the
-  workspace - step scripts, output files, action metadata, the cache intercept
-  (which copies with tar under the step's profile, scoped to the checkout's
-  location on disk and the repository and ref read from it) and the checkout
-  intercept (which runs no git) - never follows what a step left there.
-- **Nothing outlives the job.** When a job ends, its steps' process groups are
-  killed, and then every process still running under one of the job's
-  profiles - found by asking the kernel about each process's sandbox, which a
-  process cannot leave the way it can leave its process group. That sweep runs
-  a short `python3` script; if python3 cannot run, only the process groups are
-  killed and the CLI says so. Interrupting the CLI (Ctrl-C, a kill, or the
-  terminal closing) runs the same cleanup.
-- **Signals stay inside the step.** A step can signal only processes under its
-  own sandbox, not your other processes. Each step has a sandbox of its own, so
-  a later step cannot signal a server an earlier one left running; the end of
-  the job reaps it.
-- **The rest of the profile is the one runner jobs had** before every job
-  moved into a macOS VM. A step writes no preference domain - not even
-  Xcode's, which your own Xcode loads - and reads only the domains a build
-  reads (the global domain, Xcode's, `xcodebuild`'s, Swift Build's, the
-  simulator's and codesign's); `~/Library/Preferences` is closed whatever the
-  policy grants, since cfprefsd would serve any domain through it. A
-  `filesystem.deny` entry refuses reads and writes of what it names and
-  everything beneath, over every grant, as written and by its real path, and
-  no directory above a denied or credential path can be renamed, created or
-  removed to carry it out from under the deny; a step cannot clone a
-  directory, which would copy a denied file inside it in one call. Under
-  `moderate` and `permissive` a step also reads the toolchains in your home
-  (`~/.cargo`, `~/.rustup`, `~/.local/bin` and `~/.local/lib`, `~/go`,
-  `~/.dotnet`, `~/.gradle`, `~/.m2`, `~/Library/Caches`), read-only.
-
-What test mode still trusts: a loopback grant is shared, so a step granted a
-port reaches whatever listens on it, not only what the step started.
+  every host the checkout's `.localmostrc` allows, and asks. A yes is
+  remembered for that checkout's location on disk and exactly those hosts;
+  any change is asked again. Without a terminal, only `--yes` runs it.
+  Filesystem grants and `docker:` are not given in the VM yet, so they are
+  not asked about; the CLI names what the run goes without.
+- **The VM is the steps' whole world.** The workspace is a private (`0700`)
+  copy of the checkout - an APFS clone of each file where the volume can make
+  one, never a hard link - without `.git`, `node_modules` and whatever git
+  ignores, the ignore rules read by git itself; with `--staged`, tracked files
+  only. It is sent into the guest as a tar and unpacked by the guest's
+  non-admin `runner` user, so nothing in it - a link, an owner, a mode - can
+  do what that user cannot. Each step runs as that user, in the workspace or
+  a `working-directory` under it, with the guest's own home, temp and
+  toolchains. A remote action's code is fetched on the Mac and sent in the
+  same way, under a directory of its own. Nothing of the Mac is shared in:
+  not your home, credentials, keychain, preferences, the app's data or its
+  control socket, loopback services or processes.
+- **A narrow agent.** The guest agent takes a test run's commands only from
+  the host, and only in a fixed shape: two upload destinations (the workspace
+  and `actions/<id>`), four programs (bash, sh, zsh and the runner's own
+  node), paths only under the workspace or an action's upload, an environment
+  of the names a runner job may be given plus `GITHUB_*` and `RUNNER_*`, and
+  bounded sizes (512 MiB an upload, 32 KiB a script, 16 KiB of a step's
+  outputs). A step's script and `GITHUB_OUTPUT` file sit in a directory of
+  root's, so the step can use them but never put a link where the agent
+  writes or reads. A VM runs a runner job or a test run, never both, and
+  only the connection that sent the workspace can run or signal its steps.
+- **Proxy-only network.** The guest has no network card. Its only ways out
+  are the helper's two vsock relays: to the run's proxy on the Mac, at the
+  same `127.0.0.1` port in the guest, and to a port the CLI holds that closes
+  every connection, standing in for the broker a test run has no use for.
+  The proxy needs a per-run token, refuses every literal loopback target and
+  every name that resolves to an internal or loopback address, and connects
+  only to the addresses it screened. It reads the checkout's network policy
+  as a runner job's proxy does: a `network.deny` host is refused whatever the
+  allow list covers, and an allowed host is reached on 443 through `CONNECT`
+  and 80 for plain HTTP, on another port only when an entry spells
+  `host:port`. The guest's loopback is its own, so a step reaches a server
+  another step started directly.
+- **Discovery is asked about every time.** Under `--updaterc` the proxy
+  applies no policy and records every host, as `host:port` when reached on
+  another port. That lets the checkout's code reach any host with whatever
+  the run hands it, so the CLI says so and asks before each run (or takes
+  `--yes`). Filesystem access is not recorded in the VM yet.
+- **Nothing outlives the run.** At the end of each job the agent kills every
+  process group the job's steps started. Ending the run - at its end, on an
+  error, or on Ctrl-C, a kill or the terminal closing - closes the agent
+  connection, which kills the steps, and releases the VM.
+- **Nothing of the steps' runs on the Mac.** The CLI reads only its own copy
+  of the checkout, before any step: a local action's metadata, and what it
+  sends in. The checkout intercept runs no git, and `actions/cache` restores
+  nothing and saves nothing: caches are not kept between runs in the VM yet.
 
 ## Authentication
 
@@ -588,8 +540,8 @@ connections on a guest-only address, `198.18.0.1:3128`, and carries them over
 vsock to the helper, which connects them only to that worker's own filtering
 proxy on the Mac's loopback. The proxy requires the worker's token, which is
 rotated at every worker start and again when the job ends, and applies the
-job's own policy: the hosts its `network.allow` grants, loopback only as its
-`network.loopback` declares, and the local broker's port, which the proxy
+job's own policy: the hosts its `network.allow` grants, and the local
+broker's port, which the proxy
 always opens and which the per-worker broker key guards; that key never
 enters the VM. On a create whose network is routable (the default bridge, or
 a network the job created with `internal: false`), and on every build,
@@ -831,7 +783,7 @@ Key security features:
   - A file added, missing or changed stops the start, with a log line naming each difference; nothing runs from that copy. Any difference counts, a `.DS_Store` left by browsing the directory in Finder included. To reinstall, quit localmost, delete `~/.localmost/runner/arc` (all of it: with one version gone, the newest one left would be used) and download the runner again
   - An install from before records were kept gets its record from a fresh download of the same release, checked against the published checksum - never from what is on disk, which may already have been changed
   - A download is extracted aside and swapped in whole, replacing any installed copy of that version, so nothing left in the old directory survives into the new one or its record
-  - The record is only as trustworthy as the protection on where it is kept. A runner job reaches nothing of `~/.localmost`: no path of the Mac is shared into its VM. A `localmost test` step's profile denies `~/.localmost` and the app's Electron data directory, read and write, whatever its policy declares
+  - The record is only as trustworthy as the protection on where it is kept. A runner job reaches nothing of `~/.localmost`: no path of the Mac is shared into its VM, nor into a `localmost test` run's
 - **Execution**: A job's runner runs in its macOS VM, started by the guest agent as the guest's non-admin `runner` user with `--once` and nothing else; the host never executes the runner for a job. If the guest lacks the host's runner version, the host's checked copy is packed and uploaded, its SHA-256 verified by the agent. Registration runs `config.sh` on the Mac, unsandboxed - it contacts GitHub with your token and runs no workflow code - from a copy checked against the record
 - **Process Management**: A worker is the runner in its VM, seen through the guest agent: its output lines and exit come back over vsock, and stopping it sends SIGTERM through the agent and, five seconds later, stops the VM under it. A worker's exit, a reap of one that never took its job, and quitting all stop its VM and delete its disk clone
   - At startup, before any job, every VM directory an earlier run left is removed, and the helper it recorded is killed only if that pid is alive and its executable is this app's macOS VM helper, since a pid may have been reused. Nothing is matched by name. The helper also stops its VM when it sees the app gone

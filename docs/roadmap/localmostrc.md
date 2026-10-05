@@ -5,15 +5,16 @@ A checked-in file that explicitly declares what network, filesystem and containe
 > **Status:** implemented in 0.3.0. This document describes the design; where the
 > shipped behaviour differs it is noted inline.
 >
-> **Runner jobs run in a macOS VM.** Every job the runner takes runs in a
-> fresh macOS VM ([macos-vm-jobs.md](macos-vm-jobs.md)) whose only way out is
-> its proxy. For a runner job the policy is its network (`network.allow`,
-> `network.deny` and `level`, enforced by the proxy), its `env:`, and its
-> `docker:` - a job whose policy grants Docker is refused until the Docker
-> relay into the VM exists. `filesystem:` grants and `network.loopback` are
-> not given to a runner job yet; the runner names them in its log when the
-> job starts. `localmost test` still runs each step under a seatbelt profile,
-> and applies all of it as described below.
+> **Every job runs in a macOS VM.** Every job the runner takes, and every
+> `localmost test` run, runs in a fresh macOS VM
+> ([macos-vm-jobs.md](macos-vm-jobs.md)) whose only way out is its proxy. The
+> policy that applies is its network (`network.allow`, `network.deny` and
+> `level`, enforced by the proxy), its `env:`, and its `docker:` - a runner
+> job whose policy grants Docker is refused until the Docker relay into the
+> VM exists. `filesystem:` grants are not given to any job yet: the runner
+> names them in its log when a job starts, and `localmost test` before it
+> runs; the grammar stays for VM shares. `network.loopback` and `isolation:`
+> are ignored with a warning.
 
 ## Problem
 
@@ -63,23 +64,22 @@ workflows:                       # Per-workflow additions
 localmost test --updaterc
 ```
 
-Runs the workflow with reads allowed and every access logged. Writes outside
-the workspace and temp are refused rather than made - a denial is logged too,
-so the path is still offered - and the app's own data and the developer's
-credentials stay closed, since no policy can grant them:
+Runs the workflow in a fresh macOS VM with its proxy letting every host
+through and recording each, then offers what it recorded. Filesystem access is
+not recorded: nothing traces it in the VM yet (guest-side tracing of the paths
+a step misses is planned).
 
 ```
-Discovered access:
-  network:
-    + registry.npmjs.org (npm install)
-    + github.com (actions/checkout)
-    + api.cocoapods.org (pod install)    ← new
+Discovery Results:
+  Network: 3 host(s) discovered
+    - registry.npmjs.org
+    - github.com
+    - api.cocoapods.org
+  Filesystem: not recorded - discovery in the macOS VM does not trace filesystem access yet
 
-  filesystem:
-    + read: /opt/homebrew/bin
-    + write: ./Pods/                      ← new
-
-Write to .localmostrc? [y/n]
+These will be added to .localmostrc:
+  network.allow
+    + api.cocoapods.org
 ```
 
 ### 2. Subsequent runs: Enforced mode
@@ -133,17 +133,11 @@ shared:
     deny:                        # Wins over allow and the level; the runner's
       - "*.analytics.com"        # own hosts excepted. See "Relationship to
                                  # the policy level" below.
-    loopback: [5432]             # localmost test only: loopback ports a step may
-                                 # connect to; true for all. shared: only.
 
-  filesystem:                    # localmost test only, for now: a runner job's
-                                 # macOS VM is given no filesystem grants yet
-    read:                        # Never a credential: ~/.ssh (known_hosts
-                                 # included), ~/.aws and the rest stay denied
-                                 # whatever is declared - see SECURITY.md
+  filesystem:                    # Not given to any job yet: a job's macOS VM
+                                 # waits for VM shares, and says it runs without
+    read:
       - "~/.cache/pre-commit"
-                                 # Xcode is not on the strict floor
-      - "/Applications/Xcode.app"
     write:
       - "./build/**"
     deny:
@@ -211,93 +205,26 @@ workflows:
 | `./build/**` | All files under `build/` recursively |
 | `~/.ssh/id_*` | `~/.ssh/id_rsa`, `~/.ssh/id_ed25519`, etc. |
 
-A `filesystem.deny` entry refuses reads and writes of that path and everything
-beneath it, even inside a granted path. In a deny `*` matches any run of
-characters within one name, never a `/`, and may appear in any component:
-`~/out/sec*/key` covers `~/out/secA/key` but not `~/out/sec/A/key`, and `**` is
-no different from `*` (to deny everything beneath a directory, deny the
-directory). That is a deny's `*`; what `*` and `**` mean in `filesystem.read`
-and `filesystem.write` is unchanged. Each entry is denied as written and by its real path,
-so a deny of `/tmp/x`, `/etc/...` or a path through a symlink of your own covers
-where it leads. For a `*` entry the real path is taken up to the directory
-before the first `*`; a symlink past it, or a matched file that is itself a
-symlink, is not followed. The directories above a deny cannot be created,
-renamed or removed by the job, since renaming one would carry the denied path
-out from under it. For a `*` entry that includes every directory a wildcard
-stands for: under a deny of `~/out/sec*/key` the job cannot rename `~/out/secA`,
-nor create, rename or move in anything directly in `~/out` whose name matches
-`sec*`, while it still writes inside `~/out/secA` and creates other names in
-`~/out`. A wildcard high in a path closes that many more names: under
-`~/*/key`, nothing can be created, renamed or removed directly in your home.
-Nor can a job clone a directory: clonefile(2) copies the whole tree beneath a
-directory in one call without checking each file, so a clone of `~/out` would
-carry `~/out/secA/key` into the job's sandbox under a name no deny covers. A
-file still clones, and `cp -c -R` copies a tree file by file, less what is
-denied.
-The real path is looked up as far as it can be: a directory the app cannot look
-into, a symlink loop, or a folder macOS asks permission for (Desktop, Documents,
-Downloads, `~/Library`, `/Volumes`) ends the lookup there, and the rest is
-denied as written. A deny is absolute, `~`, or starts with `~/`; a relative one
-is a validation error, since the sandbox never matches it.
+A `filesystem.deny` entry names a path no grant may reach, even inside a
+granted path. In a deny `*` matches any run of characters within one name,
+never a `/`, and may appear in any component: `~/out/sec*/key` covers
+`~/out/secA/key` but not `~/out/sec/A/key`, and `**` is no different from `*`.
+A deny is absolute, `~`, or starts with `~/`; a relative one is a validation
+error. With nothing of the Mac's filesystem in a job's VM yet, a deny has
+nothing to refuse; it is approved and shown like the rest, for VM shares.
 
-### Paths in your home, and the job's own
-
-This is `localmost test`'s: a runner job runs in a macOS VM with a home of its
-own in the guest, and is given none of these paths yet.
-
-A step's `HOME` is a home of its own, the workspace's `.home`, empty and gone
-with the run. Each
-path a policy grants under your home, `read` or `write`, is linked into it at
-the same path - `~/.npm` as `<home>/.npm`, pointing at your `~/.npm` - so a
-tool that looks for it through `HOME` finds it, and the sandbox, which judges
-the path a link resolves to, lets it reach exactly what the grant does. A `*`
-in a granted path is matched against what is in your home when the job starts,
-and so is the rest: a path that is not there then is not linked, and its name
-is free for a tool to create in the job's home. A credential location is never
-linked, granted or not, and a granted directory that holds one - `~/.cache`
-with Hugging Face's token - is a directory of the job's own with a link to each
-of its other entries. Granting `~` itself links each entry of your home.
-Nothing else of your home is in the job's: its `.gitconfig` is the per-job git
-config, whatever the policy grants, so declaring `~/.gitconfig` no longer gives
-git your configuration.
-
+A job's home is the guest's own, made fresh with its VM; how a grant under
+your home reaches it is part of the VM shares design
+([macos-vm-jobs.md](macos-vm-jobs.md)).
 
 ### Loopback
 
-This is `localmost test`'s too: a runner job's macOS VM has no network card,
-and its only ways out are relays to its own proxy and the broker, so the
-runner ignores `network.loopback` and says so in its log when the job starts.
-
-A step's sandbox connects directly to two loopback ports by default: its own
-egress proxy, and the broker's, which the runner dials directly. Anything else
-listening on the Mac's loopback - a debugger on 9229, a browser's
-remote-debugging port, a development database, another job's server - is
-closed to the job's own sockets, and its proxy will not forward to it either
-(below). A repository whose jobs need loopback opts in under
-`shared.network`:
-
-```yaml
-shared:
-  network:
-    loopback: true               # every loopback port
-    # loopback: [5432, 6379]     # or only these
-```
-
-`true` is what a test suite that binds an ephemeral `127.0.0.1` port and
-connects to it needs, since its port is not known in advance. A list names fixed
-ports only: the sandbox profile language has no port ranges. Each entry is an
-integer from 1 to 65535, with no repeats. The sandbox profile is fixed when the
-worker starts, before the workflow is known, so `loopback` is valid in `shared:`
-only; under `workflows:` it is a validation error. The broker's port is open
-whatever the policy says: the runner dials the broker directly, and each
-worker's key, not the port, is what guards it.
-
-The grant appears in the approval card and `localmost policy show` with a note
-that the job can reach local services on those ports, and it is part of the
-approval diff and stamp like every other key. It governs the job's direct
-connections and its proxy alike: through the proxy a literal loopback address
-reaches the declared ports and the broker's, and nothing else - see
-SECURITY.md, Network Policy.
+`network.loopback` once opened ports on the Mac's loopback to a job's
+sandbox. A job's macOS VM has a loopback of its own, where a step reaches a
+server another step started, and reaches the Mac only through its proxy,
+which refuses every loopback port but the broker's. A `.localmostrc` that
+still has the key parses with a warning, and the key is dropped: it is
+neither approved, shown nor written back.
 
 ### Isolation
 
@@ -366,10 +293,9 @@ workflows:
 1. Start with `shared` policy
 2. Merge workflow-specific policy (additive)
 3. Explicit `deny` in workflow policy can revoke shared access. A per-workflow
-   `network.deny` applies to runner jobs; a per-workflow `filesystem` section,
-   `deny` included, applies only in `localmost test`, because a runner job's
-   filesystem is fixed when its worker starts, before the workflow is known.
-   Deny a path for runner jobs under `shared:`
+   `network.deny` applies to the job's proxy when the job is claimed. A
+   per-workflow `filesystem` section is fixed too late for a worker, which
+   starts before the workflow is known: declare paths under `shared:`
 
 **Why this matters:**
 - A compromised dependency of the test workflow can't use the deploy
@@ -404,7 +330,6 @@ Discovered access for build.yml:
 
   workflow-specific (new):
     + network: cdn.cocoapods.org
-    + filesystem write: ./Pods/**
 
 Add to .localmostrc under workflows.build? [y/n]
 ```
@@ -500,7 +425,7 @@ the VM holds, so running the daemon in a VM does not make it safe to grant.
 job's own proxy, so `routable` - the default bridge, `network: bridge`, or a
 network declared with `internal: false` - means *through the job's proxy,
 subject to its network allowlist*: a routable container reaches the hosts the
-job's `network.allow` grants, loopback as its `network.loopback` declares, and
+job's `network.allow` grants and
 the local broker's port, which the proxy always opens and the broker's
 per-worker key guards. localmost injects `HTTP_PROXY`, `HTTPS_PROXY`,
 `http_proxy`, `https_proxy` and `NO_PROXY` into every routable container and,
@@ -538,17 +463,16 @@ image already in the VM, whatever `run.images` says.
 additively like the rest of the policy. The socket is bound to the merged policy
 when the job is claimed, so a workflow can add an `rw` mount that the shared
 policy does not grant. Each denial logs the policy line that would have permitted
-the request, and `localmost test --updaterc` writes docker policy from those the
-same way it writes network and filesystem policy.
+the request, and `localmost test --updaterc` turns those into docker policy, once
+Docker reaches the VM.
 
 The old levels — `docker: socket | contexts | credentials` — are rejected with an
 error naming the actions that replace them, on the same reasoning `docker: true`
 was rejected: guessing which grant a coarse level meant is worse than failing in
 a key that governs what a container may reach.
 
-There is still no key for arbitrary unix sockets. `localmost test --updaterc`
-reports sockets a run reached, but writes no socket declaration; the only socket
-a job is handed is the one localmost serves.
+There is still no key for arbitrary unix sockets: the only socket a job is
+handed is the one localmost serves.
 
 The design, including what the filter does and does not contain, is in
 [docs/superpowers/specs/2026-09-05-docker-isolation-design.md](../superpowers/specs/2026-09-05-docker-isolation-design.md),
@@ -556,52 +480,20 @@ and the Docker VM behind it in [vm-docker-backend.md](vm-docker-backend.md).
 
 ## When a denial does not look like one
 
-These are `localmost test`'s, whose steps run under seatbelt; a runner job's
-macOS VM refuses nothing on its own filesystem. The sandbox returns the
-kernel's own error for a refused operation, and a tool
-that was reaching for something indirectly reports the symptom rather than the
-cause. Two that have cost real time:
+**A bind is refused before the address is checked.** A bridge network's
+gateway is an interface inside the Linux VM that runs a job's Docker daemon,
+so binding it from outside fails with `EADDRNOTAVAIL` (errno 49): a topology
+problem, not a policy one. A process outside cannot join a container network
+there. The portable arrangement is a container with a foot in both networks -
+see `run.networks` above.
 
-**git dies naming a dylib, not a permission.** `/usr/bin/git` shims through
-`xcrun`, which loads `libxcrun` from the *active* developer directory. Where
-that is Xcode (`xcode-select -p` says `/Applications/Xcode.app/...`) and the
-policy does not grant it, git fails on a missing library. A repository that
-does not otherwise need Xcode can point at the Command Line Tools instead -
-`DEVELOPER_DIR=/Library/Developer/CommandLineTools`, which needs no policy
-change since `/Library/Developer` is already on the read floor. That belongs in
-the repository's workflow: which toolchain a job wants is the repository's
-choice, not the runner's, and a job that really does need Xcode should declare
-`/Applications/Xcode.app` and keep it.
-
-git also treats an unreadable `~/.gitconfig` as fatal rather than as "no
-configuration". A step never meets yours: its `HOME` is its own, and git's
-global config there is the per-run one, with the system config skipped -
-which also makes a run independent of whose machine it happened on.
-
-**A bind is refused before the address is checked.** The seatbelt profile
-permits binding localhost, and a denied bind returns `EPERM` (errno 1) whatever
-else was wrong with it. So `Operation not permitted` on an address that does
-not exist on this host looks like a policy problem when it is a topology one.
-localmost runs each job's Docker daemon in a Linux VM of its own: a bridge
-network's gateway is an interface *inside* that VM, and binding it from the
-host fails with `EADDRNOTAVAIL` (errno 49) with no sandbox involved at all. A
-host process cannot join a container network there. The portable arrangement
-is a container with a foot in both networks - see `run.networks` above.
-
-**Connecting to loopback is refused unless declared.** A step may bind
-localhost, but it connects directly only to its run's own proxy there and the
-loopback ports `shared.network.loopback` declares: a
-list of fixed ports, or `true` for all of them (a test suite that binds an
-ephemeral port and talks to it needs `true`, since seatbelt matches single
-ports, never ranges). A direct connect to anything else on loopback - a
-database, a debugger on 9229 - fails with `EPERM` on the connect, not on the
-bind, and so does a connect to the broker's port, whatever is declared. A
-runner job's proxy applies the same rule to a request for a loopback address,
-sent through `HTTP_PROXY` or tunnelled with `CONNECT`: it answers 403 unless
-the port is declared, or is the broker's - the runner reaches the broker at
-that port, and each worker's key to it, not the port, is what guards it. Only a
-literal address gets that far: `localhost`, as a name, is refused through the
-proxy on every port.
+**Loopback through the proxy is refused.** A request for a loopback address
+sent to a job's proxy, through `HTTP_PROXY` or tunnelled with `CONNECT`, is
+answered 403 unless its port is the broker's (the runner reaches the broker
+there, and each worker's key to it, not the port, is what guards it).
+`localhost`, as a name, is refused on every port. A step reaches its own VM's
+loopback directly: `NO_PROXY` keeps `localhost`, `127.0.0.1` and `::1` off
+the proxy.
 
 ## Why Checked Into Git
 
@@ -629,9 +521,9 @@ network:
 
 | Command | Behavior |
 |---------|----------|
-| `localmost test` | Enforce `.localmostrc`, fail on violations; ask first if it grants more than the workspace |
-| `localmost test --updaterc` | Ask first (it reads widely and reaches any host), record reads and writes (writes outside the workspace refused), prompt to update |
-| `localmost test --dry-run` | Show what *would* be accessed without running |
+| `localmost test` | Run the workflow in a macOS VM, its proxy enforcing `.localmostrc`; ask first if it allows any host |
+| `localmost test --updaterc` | Ask first (it reaches any host), record the hosts reached, prompt to update |
+| `localmost test --dry-run` | Show the steps that would run, without a VM |
 | `localmost policy show` | Display current policy for this repo |
 | `localmost policy diff` | Compare local vs cached policy |
 
@@ -649,22 +541,12 @@ Running in permissive mode (not recommended for untrusted code).
 **Shipped behaviour differs from this design.** A `.localmostrc` does not replace
 anything; it adds to whatever the configured policy level already allows:
 
-For a runner job the level is its proxy's alone: its macOS VM has a system
-and a home of its own, and none of the Mac's filesystem. Under `localmost
-test` it also sets what a step reads:
+The level is the job's proxy's alone: its macOS VM has a system and a home of
+its own, and none of the Mac's filesystem.
 
-- `strict` (the default): runner infrastructure, a read-only OS baseline, and
-  whatever the repo declares. This is closest to the original intent.
-- `moderate`: additionally common registries, CDNs and GitHub content hosts,
-  and under `localmost test` the toolchains and tool caches in your home,
-  read-only. Of `~/.local` that is `~/.local/bin` and
-  `~/.local/lib` only: `~/.local/share` and `~/.local/state` are where tools
-  keep their state, tokens included. A job that runs a command linked from
-  `~/.local/bin` into the rest of `~/.local` declares the directory the link
-  resolves into, such as `~/.local/share/uv/tools` for `uv tool install`,
-  `~/.local/share/uv/python` for a uv-managed Python or `~/.local/share/mise`
-  for mise. uv's index credentials, the SSH keys into Podman's machines and
-  atuin's sync key stay closed whatever is declared.
+- `strict` (the default): runner infrastructure and whatever the repo
+  declares. This is closest to the original intent.
+- `moderate`: additionally common registries, CDNs and GitHub content hosts.
 - `permissive`: no network restrictions.
 
 Under `strict` and `moderate` a host is reached on 443 through `CONNECT` and on
@@ -678,8 +560,7 @@ that matches nothing. `localmost test --updaterc` writes a host it saw reached
 on another port as `host:port`. An `http://` URL tunnelled through `CONNECT`,
 rather than sent as a plain proxied request, needs a `host:80` entry. A literal
 loopback address (`127.0.0.1`, `::1`) is reachable at every level only on the
-broker's port, since the runner reaches the broker there,
-and on the ports `network.loopback` declares. `network.deny` entries read the
+broker's port, since the runner reaches the broker there. `network.deny` entries read the
 same way and win over any allow, at every level; only the runner's own hosts on
 their scheme's port and the broker's port stay reachable.
 
@@ -688,16 +569,6 @@ runner itself needs to register and poll for jobs. That is the runner's own
 connection to GitHub rather than anything the job asked for, and the runner
 cannot function without it. Because a single proxy serves both, jobs reach those
 hosts too.
-
-Preferences are outside what a policy can grant under `localmost test`. A step reads only the
-domains a build reads - the global domain and those of Xcode, `xcodebuild`,
-Swift Build, the simulator and codesign - and writes none, Xcode's
-included, and `~/Library/Preferences` stays closed to reads
-and writes whatever `filesystem` declares, since cfprefsd would serve any
-domain through a grant of its plist. A workflow that ran
-`defaults write com.apple.dt.Xcode <key> ...` passes the setting to
-`xcodebuild` instead, as a flag (`-skipMacroValidation`,
-`-skipPackagePluginValidation`) or as `-<key>=<value>` for that run.
 
 `env:` governs what a job is given of the environment localmost itself was
 launched with, and nothing else. It never affects the variables the runner or
@@ -713,19 +584,9 @@ set it: none the agent sets itself, none that changes how the shell starts
 (`BASH_ENV`, `ENV`, `ZDOTDIR` and the like), `NODE_OPTIONS` and `NODE_PATH`,
 and none beginning `DYLD_`, `LD_`, `DOTNET_`, `COREHOST_`, `COMPlus_`,
 `CORECLR_`, `RUNNER_`, `ACTIONS_`, `GITHUB_` or `BASH_FUNC_`; an allow that
-names one gives the job nothing.
-
-**Loopback** (`localmost test` only). Without `network: loopback` a step reaches nothing on this Mac's
-loopback interface but its own proxy, directly and through the
-proxy.
-`loopback: true` grants every port -
-what a test suite that starts servers on ephemeral ports needs - and a list
-grants those ports alone; the sandbox matches single ports, not ranges.
-Loopback is written into the sandbox profile, so like the filesystem it is
-accepted under `shared:` only, and a per-workflow one is a validation error.
-Local databases, debuggers and dev servers mostly trust whoever connects, so
-the approval screen and `localmost policy show` mark the grant with a warning,
-and a change to it is a policy change like any other.
+names one gives the job nothing. A `localmost test` step is held to the same
+rule, except that it is given the `GITHUB_*` and `RUNNER_*` variables a step
+reads, which no runner sets there.
 
 A repo's policy only takes effect once approved, in Settings > Job Security or
 with `localmost policy approve`, which shows the policy and a stamp, then
@@ -756,7 +617,7 @@ network:
 
 4. **Supply chain defense** — A malicious package update that phones home gets blocked unless someone explicitly approves the new domain in a PR.
 
-5. **Defense in depth** — Even if code escapes the sandbox, it can only access declared resources.
+5. **Defense in depth** — Even code that takes root in its VM reaches the network only through the proxy, and only the hosts declared.
 
 ## Integration with Workflow Test Mode
 

@@ -4,9 +4,9 @@ Every job the runner takes runs inside a fresh macOS virtual machine, and the
 VM is thrown away when the job ends.
 
 > **Status:** wired: the runner pool hands every job to this backend, and
-> takes no job until a golden image is ready. Unit tested throughout; not yet
-> run end to end on a Mac. `localmost test` still runs its steps under seatbelt
-> on the host until it is ported to the VM. What was run live, and what the
+> takes no job until a golden image is ready, and `localmost test` borrows a
+> VM from it for each run ([A test run](#a-test-run)). Unit tested
+> throughout; not yet run end to end on a Mac. What was run live, and what the
 > owner runs to finish it, is under [Live validation](#live-validation).
 
 ## Problem
@@ -180,8 +180,7 @@ would stop it. It refuses to start as an orphan.
 **Jobs cannot run it.** A job runs in a guest, which has neither the helper
 nor any way to the host's processes. (A process that could exec the helper on
 the host could install a macOS VM of its own, and the provisioning boot has a
-NAT network card - a way out past any proxy; `localmost test`'s step profile
-still denies its exec by path, beside the Docker VM helper's.)
+NAT network card - a way out past any proxy.)
 
 ## Restore image
 
@@ -438,6 +437,57 @@ removed, and its recorded helper killed only if that pid is alive and its
 executable is this app's helper (a pid may have been reused). Leftover
 profiles go too.
 
+## A test run
+
+`localmost test` runs a workflow's steps in a VM from the same backend, so a
+local run meets the guest a job meets and nothing of the Mac. It has no runner:
+the CLI parses the workflow and drives each step itself.
+
+- **The VM is the app's.** The CLI asks the running app over its control
+  socket (`test-vm`, with the run's proxy port and a closed port standing in
+  for the broker). The app takes a slot and prepares a VM as for a job
+  (`prepareTestRun`), answers with the VM's `agent.sock`, and releases the VM
+  when that connection closes - at the run's end, on an error, or when the
+  CLI dies. The two-VM limit, the disk reserve and the sweep hold as for jobs.
+- **The CLI drives the agent.** It dials `agent.sock` itself, on a second
+  connection, and sends `put` with the host's copy of the checkout as a tar
+  (at most 512 MiB) into `/Users/runner/work/workspace`, a remote action's code
+  the same way into `actions/<16 hex>` when a step first uses it, and `step`
+  for each step: `bash`, `sh` or `zsh` with its script, or the runner's own
+  node with an entry point, a `cwd` in the workspace and the step's
+  environment. The agent unpacks each upload as `runner` (`mkdir` and `tar`
+  through `exec-as`), runs each step as `runner` in its login session, streams
+  its output, and ends it with an `exit` that carries what it wrote to
+  `GITHUB_OUTPUT` (at most 16 KiB). After each job the CLI sends `KILL`, which
+  reaches every process group the job's steps started.
+- **The broker relay leads nowhere.** The helper's `run` takes two ports; a
+  test run needs only its proxy, so the CLI passes a port it holds that
+  closes every connection, rather than a free one some other process could
+  take, or the app's broker.
+
+**Decision: the CLI, not the app, runs the steps.** The workflow parser,
+expressions, secrets and masking already live in the CLI, and the agent's
+`step` is generic enough to serve them. The app lends the VM and nothing
+more, so a test run cannot change what the app does for jobs.
+
+**Decision: a narrow `step`, not a shell.** The agent takes four programs and
+paths under the test root only, an environment of the names a job may be
+given plus `GITHUB_*` and `RUNNER_*`, and bounded sizes. A step's script and
+output file sit in a directory of root's (`/var/db/localmost/run`), created
+without following anything at the name, so the step can use them but never
+put a link where the agent writes or reads. A boot runs a job or a test run,
+never both, and only the connection that sent the workspace can run or signal
+steps; closing it kills them.
+
+**Edge cases.** No app running, or no image ready: the run stops before any
+step with a message naming the setup step. A step whose script and
+environment would not fit one 64 KiB command is refused by the CLI. A step's
+`GITHUB_OUTPUT` over 16 KiB is dropped with a line saying so. Workflow env the
+guest sets itself or that could change how a step starts (`PATH`, `HOME`,
+`NODE_OPTIONS`, `DYLD_*`) is not passed, and the run says which once. Caches
+are a miss and save nothing, and `--updaterc` records hosts only: filesystem
+discovery is to come as guest-side tracing.
+
 ## Network
 
 **Decision: no network card at all, and vsock relays.** The save-state and
@@ -561,9 +611,8 @@ hosted Apple silicon runner; nothing there boots macOS.
   filtering socket, which already exists in its sandbox, and a workspace the
   host shares with both VMs. Until then a job whose policy grants Docker is
   refused at admission, with a reason naming the missing relay.
-- **`localmost test`** still runs each step under seatbelt on the host; it is
-  to run the workflow in a VM from this backend, with filesystem discovery
-  ported as guest-side tracing.
+- **Filesystem discovery for `localmost test`**, as guest-side tracing of
+  the paths a step misses; `--updaterc` records hosts only until then.
 - **Full Xcode**, above, and several images keyed by macOS and Xcode version
   as GitHub's `runs-on: macos-15` is.
 - **Signing identities** in the guest; **Rosetta** in a macOS guest; caches
@@ -622,3 +671,11 @@ build's own check: the restore image, an image estimate and a reserve):
    slots 1 and 2); a third waits until one ends.
 6. After the jobs, `<data>/macos-vm/vms/` is empty and `pgrep -fl
    localmost-macvm` finds nothing.
+7. `localmost test -v` in a checkout whose workflow runs `id; pwd; git
+   ls-remote https://github.com/bfulton/localmost HEAD; echo n=1 >>
+   "$GITHUB_OUTPUT"` and a node action (`actions/github-script`, say).
+   Expect `runner`, `/Users/runner/work/workspace`, the ref through the
+   proxy (git sending the proxy's credentials up front), the node action
+   running on the runner's node, and the VM gone after the run. Ctrl-C during
+   a long step ends it and the VM; with the image removed, the run names the
+   setup step.
