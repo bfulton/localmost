@@ -3,12 +3,14 @@
  *
  * Caches repository contributors to efficiently check if all code authors
  * are trusted. Uses SHA-based cache invalidation instead of TTL:
- * - Store contributors with the default branch SHA when fetched
+ * - Store, with the default branch SHA when fetched, the contributor list and
+ *   the authors of every default-branch update GitHub recorded in the last
+ *   day, which covers the list's lag
  * - On subsequent checks, fetch commits since that SHA and add their authors
  * - This is deterministic and never stale
  */
 
-import { GitHubAuth } from './github-auth';
+import { GitHubAuth, isNullSha } from './github-auth';
 
 /** Cache entry for a repository */
 interface RepoCacheEntry {
@@ -21,11 +23,11 @@ interface RepoCacheEntry {
 }
 
 /**
- * How far back from the default branch head the baseline also walks commits.
- * GitHub documents its contributor data as possibly "a few hours old"; a day
- * is comfortably past that.
+ * How far back, on GitHub's clock, the baseline also reads the default
+ * branch's updates. GitHub documents its contributor data as possibly "a few
+ * hours old"; a day is comfortably past that.
  */
-const RECENT_COMMIT_MARGIN_MS = 24 * 60 * 60 * 1000;
+const RECENT_UPDATE_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /** Logger function type */
 type LogFn = (message: string) => void;
@@ -55,7 +57,8 @@ export class ContributorCache {
    * Get all authors for a repository at a given commit SHA.
    *
    * This combines:
-   * 1. Cached contributors (from API at time of cache)
+   * 1. The cached baseline: contributors, and the authors of the default
+   *    branch's updates in the day before it was read
    * 2. Commit authors since the cached SHA
    *
    * @param accessToken GitHub access token
@@ -129,20 +132,39 @@ export class ContributorCache {
     // it, so everything up to it must be covered here. The contributor list
     // alone does not: GitHub serves it from a cache that can be a few hours
     // old, so a commit merged shortly before this read may be missing from
-    // it. The authors of the head's commits from the last day close that gap;
-    // a commit landing after the head is read may also show up, which only
-    // adds authors. The walk selects by commit date, which the committer
-    // sets, so a commit dated back past the margin and merged within the
-    // cache's lag can still be missed.
+    // it. Every update of the default branch GitHub recorded in the last day
+    // closes that gap, with each one's commits taken by ancestry (compare
+    // before...after, which also covers a force push). So commits are chosen
+    // by when GitHub saw them land, never by the dates a committer wrote into
+    // them. An update read after the head only adds authors. Any part that
+    // cannot be read in full throws, and then nothing is cached.
     const branchInfo = await this.githubAuth.getDefaultBranch(accessToken, owner, repo);
     const contributors = await this.githubAuth.getContributors(accessToken, owner, repo);
-    const recentAuthors = await this.githubAuth.getRecentCommitAuthors(
+    const updates = await this.githubAuth.getRecentBranchUpdates(
       accessToken,
       owner,
       repo,
-      branchInfo.sha,
-      new Date(Date.now() - RECENT_COMMIT_MARGIN_MS)
+      branchInfo.name,
+      RECENT_UPDATE_WINDOW_MS
     );
+
+    const recentAuthors: string[] = [];
+    const read = new Set<string>();
+    for (const update of updates) {
+      const range = `${update.before}...${update.after}`;
+      if (isNullSha(update.after) || read.has(range)) {
+        // A deletion adds no commits; a range already read adds no authors.
+        continue;
+      }
+      read.add(range);
+      // A branch created within the window has no earlier commit to compare
+      // from, so its whole history is read - for a new repository, the first
+      // push - and one longer than the read limit refuses the job.
+      const authors = isNullSha(update.before)
+        ? await this.githubAuth.getHistoryAuthors(accessToken, owner, repo, update.after)
+        : await this.githubAuth.getCommitAuthors(accessToken, owner, repo, update.before, update.after);
+      recentAuthors.push(...authors);
+    }
 
     const entry: RepoCacheEntry = {
       contributors: new Set([...contributors, ...recentAuthors]),
@@ -151,7 +173,7 @@ export class ContributorCache {
     };
 
     this.cache.set(cacheKey, entry);
-    this.log(`[ContributorCache] Cached ${contributors.length} contributors for ${owner}/${repo} at ${branchInfo.sha.slice(0, 7)}`);
+    this.log(`[ContributorCache] Cached ${contributors.length} contributors and ${updates.length} recent update(s) for ${owner}/${repo} at ${branchInfo.sha.slice(0, 7)}`);
 
     return entry;
   }

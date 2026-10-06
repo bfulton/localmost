@@ -66,6 +66,31 @@ export class GitHubClient {
   }
 
   /**
+   * GET one page of a list that GitHub paginates with a cursor in the Link
+   * header, as the repository activity endpoint does.
+   *
+   * Returns the page, the query parameters of the `rel="next"` link (to be
+   * sent to the same endpoint for the next page; null on the last page), and
+   * the response's Date header, GitHub's clock at the time of the read.
+   * Only the next link's parameters are used, never its URL, so the token is
+   * only ever sent to this client's API host.
+   */
+  async getPage<T>(
+    endpoint: string,
+    params: Record<string, string>
+  ): Promise<{ data: T; next: Record<string, string> | null; date: Date | null }> {
+    const url = `${GitHubClient.BASE_URL}${endpoint}?${new URLSearchParams(params).toString()}`;
+    const { data, headers } = await this.send<T>('GET', url);
+    const dateHeader = headers.get('date');
+    const date = dateHeader ? new Date(dateHeader) : null;
+    return {
+      data,
+      next: nextLinkParams(headers.get('link')),
+      date: date && !Number.isNaN(date.getTime()) ? date : null,
+    };
+  }
+
+  /**
    * Make a POST request to the GitHub API.
    */
   async post<T>(endpoint: string, body?: unknown): Promise<T> {
@@ -101,6 +126,13 @@ export class GitHubClient {
    * Internal request method with authentication and error handling.
    */
   private async request<T>(method: string, url: string, body?: unknown): Promise<T> {
+    return (await this.send<T>(method, url, body)).data;
+  }
+
+  /**
+   * Send a request and return the parsed body with the response headers.
+   */
+  private async send<T>(method: string, url: string, body?: unknown): Promise<{ data: T; headers: Headers }> {
     const headers: Record<string, string> = {
       Accept: GitHubClient.ACCEPT_HEADER,
       Authorization: `Bearer ${this.accessToken}`,
@@ -121,9 +153,9 @@ export class GitHubClient {
       // For 204 No Content or 201 Created without body
       const text = await response.text();
       if (!text) {
-        return undefined as T;
+        return { data: undefined as T, headers: response.headers };
       }
-      return JSON.parse(text) as T;
+      return { data: JSON.parse(text) as T, headers: response.headers };
     }
 
     if (!response.ok) {
@@ -135,8 +167,30 @@ export class GitHubClient {
       );
     }
 
-    return response.json() as Promise<T>;
+    return { data: (await response.json()) as T, headers: response.headers };
   }
+}
+
+/**
+ * The query parameters of the `rel="next"` link in a Link header, or null
+ * when there is none.
+ */
+export function nextLinkParams(link: string | null): Record<string, string> | null {
+  if (!link) {
+    return null;
+  }
+  for (const part of link.split(',')) {
+    const match = /^\s*<([^>]*)>\s*;(.*)$/.exec(part);
+    if (!match || !/(^|;)\s*rel="?next"?\s*(;|$)/.test(match[2])) {
+      continue;
+    }
+    const params: Record<string, string> = {};
+    for (const [key, value] of new URL(match[1]).searchParams) {
+      params[key] = value;
+    }
+    return params;
+  }
+  return null;
 }
 
 /**

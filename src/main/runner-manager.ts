@@ -2328,8 +2328,9 @@ export class RunnerManager {
    * Supports three scopes:
    * - 'everyone': No filtering, all jobs allowed
    * - 'trigger': Check the workflow trigger author only
-   * - 'contributors': Check the trigger author, the repository's contributors,
-   *   and the author of every commit since those were fetched - one with no
+   * - 'contributors': Check the trigger author, the repository's contributors
+   *   with the authors of the default branch's updates in the day before
+   *   they were fetched, and the author of every commit since - one with no
    *   linked account is allowed by no filter
    */
   async evaluateJobFilter(

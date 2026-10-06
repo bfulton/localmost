@@ -56,6 +56,59 @@ export function unattributedAuthor(detail: string): string {
   return `(unattributed ${shown}: no linked GitHub account, so no allowlist can admit it)`;
 }
 
+/** Commits per page when listing or comparing commits (GitHub's maximum). */
+const COMMIT_PAGE_SIZE = 100;
+
+/**
+ * The most commits an author check reads from one range or history. A longer
+ * one is refused rather than read in part.
+ */
+const COMMIT_READ_LIMIT = 1000;
+
+/** Entries per page of the repository activity API (GitHub's maximum). */
+const ACTIVITY_PAGE_SIZE = 100;
+
+/**
+ * The most pages of branch activity read for one window. A branch updated
+ * more often than that is refused rather than read in part.
+ */
+const ACTIVITY_PAGE_LIMIT = 10;
+
+/** One update of a branch, from the repository activity API. */
+export interface BranchUpdate {
+  /** The branch's commit before the update; all zeros when it was created. */
+  before: string;
+  /** The branch's commit after the update; all zeros when it was deleted. */
+  after: string;
+  /** GitHub's activity_type: push, force_push, pr_merge, branch_creation, ... */
+  type: string;
+}
+
+/** Whether `sha` is a full commit hash (SHA-1, or SHA-256 for such repositories), including all zeros. */
+function isCommitSha(sha: unknown): sha is string {
+  return typeof sha === 'string' && /^([0-9a-f]{40}|[0-9a-f]{64})$/.test(sha);
+}
+
+/** Whether `sha` is the all-zeros hash GitHub reports for a side of an update that has no commit. */
+export function isNullSha(sha: string): boolean {
+  return /^0+$/.test(sha);
+}
+
+/**
+ * The author a commit counts as: its linked account's login, lowercase.
+ *
+ * A commit with no linked account has an email that belongs to nobody GitHub
+ * knows, which is anyone who can get a commit merged or pushed. Skipping it
+ * read as "no new authors"; it stands in the set as unattributed, so no
+ * allowlist admits it and the refusal says which commit.
+ */
+function commitAuthor(commit: { sha?: string; author: { login?: string } | null }): string {
+  if (commit.author?.login) {
+    return commit.author.login.toLowerCase();
+  }
+  return unattributedAuthor(commit.sha ? `commit ${commit.sha.slice(0, 7)}` : 'commit');
+}
+
 /**
  * Rate limiting configuration for OAuth device flow polling.
  * These limits prevent abuse and ensure compliance with GitHub's API guidelines.
@@ -683,7 +736,9 @@ export class GitHubAuth {
 
   /**
    * Get commit authors between two SHAs.
-   * Returns array of author logins for commits from baseSha to headSha.
+   * Returns array of author logins for the commits in headSha that are not in
+   * baseSha - with three dots, those after their merge base, so it also holds
+   * when baseSha is not an ancestor of headSha, as after a force push.
    */
   async getCommitAuthors(
     accessToken: string,
@@ -693,40 +748,53 @@ export class GitHubAuth {
     headSha: string
   ): Promise<string[]> {
     const client = new GitHubClient(accessToken);
-    const authors = new Set<string>();
+    const authors = new Map<string, string>();
 
     try {
-      // Use compare API to get commits between two refs
-      const data = await client.get<{
-        total_commits: number;
-        commits: Array<{
-          sha: string;
-          author: { login: string } | null;
-          commit: { author: { name: string } | null };
-        }>;
-      }>(`/repos/${segment(owner)}/${segment(repo)}/compare/${segment(baseSha)}...${segment(headSha)}`);
+      // Called without paging parameters, compare returns at most 250
+      // commits while still reporting the true total; with them, it pages
+      // through all of them. The result gates job execution, so a range is
+      // read in full or not at all: past COMMIT_READ_LIMIT, or if the pages
+      // add up to less than the total, this throws.
+      let total = 0;
+      for (let page = 1; ; page++) {
+        const data = await client.get<{
+          total_commits: number;
+          commits: Array<{
+            sha: string;
+            author: { login: string } | null;
+          }>;
+        }>(`/repos/${segment(owner)}/${segment(repo)}/compare/${segment(baseSha)}...${segment(headSha)}`, {
+          params: { per_page: String(COMMIT_PAGE_SIZE), page: String(page) },
+        });
 
-      // The compare API caps the commits it returns (250) while still
-      // reporting the true total. A truncated response would silently omit
-      // authors, and callers gate job execution on this set.
-      const returned = data.commits?.length ?? 0;
-      if (typeof data.total_commits === 'number' && data.total_commits > returned) {
-        throw new Error(
-          `compare returned ${returned} of ${data.total_commits} commits; author list would be incomplete`
-        );
+        if (typeof data.total_commits !== 'number') {
+          throw new Error('compare response has no commit count');
+        }
+        total = data.total_commits;
+        if (total > COMMIT_READ_LIMIT) {
+          throw new Error(
+            `compare has ${total} commits, more than the ${COMMIT_READ_LIMIT} this check reads; author list would be incomplete`
+          );
+        }
+
+        const commits = data.commits || [];
+        for (const commit of commits) {
+          authors.set(commit.sha, commitAuthor(commit));
+        }
+        if (
+          authors.size >= total ||
+          commits.length < COMMIT_PAGE_SIZE ||
+          page * COMMIT_PAGE_SIZE >= COMMIT_READ_LIMIT
+        ) {
+          break;
+        }
       }
 
-      for (const commit of data.commits || []) {
-        if (commit.author?.login) {
-          authors.add(commit.author.login.toLowerCase());
-        } else {
-          // No linked account: the commit's email belongs to nobody GitHub
-          // knows, which is anyone who can get a commit merged or pushed.
-          // Skipping it read as "no new authors". It stands in the set as
-          // unattributed, so no allowlist admits it and the refusal says
-          // which commit.
-          authors.add(unattributedAuthor(commit.sha ? `commit ${commit.sha.slice(0, 7)}` : 'commit'));
-        }
+      if (authors.size < total) {
+        throw new Error(
+          `compare returned ${authors.size} of ${total} commits; author list would be incomplete`
+        );
       }
     } catch (error) {
       // Do not swallow this. An empty result is indistinguishable from "no new
@@ -737,56 +805,138 @@ export class GitHubAuth {
       );
     }
 
-    return Array.from(authors);
+    return Array.from(new Set(authors.values()));
   }
 
   /**
-   * Authors of the commits reachable from `headSha` dated after `since`.
+   * Authors of every commit reachable from `headSha`.
    *
-   * The contributor list is served from a cache GitHub says can be a few
-   * hours old, so it can predate commits already on the branch; this names
-   * their authors. Like getCommitAuthors, a commit with no linked account is
-   * unattributed and any failure throws, since the result gates admission.
+   * For a branch created within the activity window, which has no earlier
+   * commit to compare from: in practice a new repository's first push. Like
+   * getCommitAuthors, a history longer than COMMIT_READ_LIMIT throws rather
+   * than being read in part, and so does any failure.
    */
-  async getRecentCommitAuthors(
+  async getHistoryAuthors(
     accessToken: string,
     owner: string,
     repo: string,
-    headSha: string,
-    since: Date
+    headSha: string
   ): Promise<string[]> {
     const client = new GitHubClient(accessToken);
     const authors = new Set<string>();
-    let page = 1;
-    const perPage = 100;
 
     try {
-      while (true) {
+      for (let page = 1; ; page++) {
+        if ((page - 1) * COMMIT_PAGE_SIZE >= COMMIT_READ_LIMIT) {
+          throw new Error(`history is longer than the ${COMMIT_READ_LIMIT} commits this check reads`);
+        }
         const data = await client.get<Array<{ sha: string; author: { login?: string } | null }>>(
           `/repos/${segment(owner)}/${segment(repo)}/commits`,
-          { params: { sha: headSha, since: since.toISOString(), per_page: String(perPage), page: String(page) } }
+          { params: { sha: headSha, per_page: String(COMMIT_PAGE_SIZE), page: String(page) } }
         );
 
         for (const commit of data || []) {
-          if (commit.author?.login) {
-            authors.add(commit.author.login.toLowerCase());
-          } else {
-            authors.add(unattributedAuthor(commit.sha ? `commit ${commit.sha.slice(0, 7)}` : 'commit'));
-          }
+          authors.add(commitAuthor(commit));
         }
-
-        if (!data || data.length < perPage) {
+        if (!data || data.length < COMMIT_PAGE_SIZE) {
           break;
         }
-        page++;
       }
     } catch (error) {
       throw new Error(
-        `Failed to list commits since ${since.toISOString()} on ${headSha} for ${owner}/${repo}: ${(error as Error).message}`
+        `Failed to list the commits of ${headSha} for ${owner}/${repo}: ${(error as Error).message}`
       );
     }
 
     return Array.from(authors);
+  }
+
+  /**
+   * Every update of `branch` GitHub recorded within `windowMs` before now -
+   * pushes, force pushes, pull request and merge queue merges, creation and
+   * deletion - from the repository activity API, newest first.
+   *
+   * The window is measured on GitHub's clocks: each entry's timestamp is when
+   * GitHub recorded the update, and "now" is the Date header of the first
+   * page, so neither a committer's dates nor this machine's clock moves it.
+   * The result gates job execution, so anything that would leave the window
+   * read in part throws: an API error, an entry for another ref, entries out
+   * of order, a missing Date header, or more than ACTIVITY_PAGE_LIMIT pages.
+   */
+  async getRecentBranchUpdates(
+    accessToken: string,
+    owner: string,
+    repo: string,
+    branch: string,
+    windowMs: number
+  ): Promise<BranchUpdate[]> {
+    const client = new GitHubClient(accessToken);
+    const endpoint = `/repos/${segment(owner)}/${segment(repo)}/activity`;
+    const ref = `refs/heads/${branch}`;
+    const updates: BranchUpdate[] = [];
+
+    try {
+      let params: Record<string, string> = {
+        ref,
+        direction: 'desc',
+        per_page: String(ACTIVITY_PAGE_SIZE),
+      };
+      let cutoff: number | undefined;
+      let previous = Infinity;
+
+      for (let page = 1; ; page++) {
+        if (page > ACTIVITY_PAGE_LIMIT) {
+          throw new Error(
+            `more than ${ACTIVITY_PAGE_LIMIT * ACTIVITY_PAGE_SIZE} updates of ${branch} within the window`
+          );
+        }
+        const { data, next, date } = await client.getPage<Array<{
+          before: string;
+          after: string;
+          ref: string;
+          timestamp: string;
+          activity_type: string;
+        }>>(endpoint, params);
+
+        if (cutoff === undefined) {
+          if (!date) {
+            throw new Error('activity response has no Date header');
+          }
+          cutoff = date.getTime() - windowMs;
+        }
+
+        let reachedCutoff = false;
+        for (const entry of data || []) {
+          if (entry.ref !== ref && entry.ref !== branch) {
+            throw new Error(`activity entry for ${entry.ref}, not ${ref}`);
+          }
+          const at = Date.parse(entry.timestamp);
+          if (Number.isNaN(at) || at > previous) {
+            throw new Error(`activity entry timestamp '${entry.timestamp}' is out of order`);
+          }
+          previous = at;
+          if (at < cutoff) {
+            reachedCutoff = true;
+            break;
+          }
+          if (!isCommitSha(entry.before) || !isCommitSha(entry.after)) {
+            throw new Error(`activity entry has no commit range: ${entry.before}...${entry.after}`);
+          }
+          updates.push({ before: entry.before, after: entry.after, type: entry.activity_type });
+        }
+
+        if (reachedCutoff || !next) {
+          break;
+        }
+        params = next;
+      }
+    } catch (error) {
+      throw new Error(
+        `Failed to list recent updates of ${branch} for ${owner}/${repo}: ${(error as Error).message}`
+      );
+    }
+
+    return updates;
   }
 
   /**
