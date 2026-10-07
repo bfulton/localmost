@@ -132,19 +132,26 @@ export function buildMacVmProfile(opts: MacVmProfileOptions): string {
   const readWriteExtension = (filter: string) =>
     `(allow file-issue-extension (require-all (extension-class "com.apple.app-sandbox.read-write" "com.apple.app-sandbox.read") ${filter}))`;
   // Every command that boots a VM: the devices of a Mac VM, which VZ's
-  // service reaches through extensions of VZ's own classes, and the
-  // display's Metal shader cache, com.apple.metal-<hash> in the per-user
-  // cache directory, which it is handed the same way.
+  // service reaches through extensions of VZ's own classes, and two per-user
+  // caches it is handed the same way: the display's Metal shader cache,
+  // com.apple.metal-<hash>, and (macOS 27) ParavirtualizedGraphics' own
+  // cache, com.apple.paravirtualizedgraphics-<n> - without the latter VZ
+  // fails to start the VM ("Failed to issue sandbox extension for
+  // ParavirtualizedGraphics cache directory"). Each name was found by
+  // widening the file-issue-extension rule to the whole cache directory and
+  // reading back the exact path VZ asked for (a decimal suffix, unlike
+  // Metal's hex).
   const vmRules = (): string[] => {
     const cache = need(opts.userCacheDir, 'the per-user cache directory', c);
     if (!path.isAbsolute(cache) || path.normalize(cache) !== cache || cache.endsWith('/')) {
       throw new Error(`the per-user cache directory must be a plain absolute path: ${JSON.stringify(cache)}`);
     }
     return [
-      ";; A Mac VM's devices, and its display's Metal shader cache.",
+      ";; A Mac VM's devices, and its display's Metal and ParavirtualizedGraphics caches.",
       `(allow generic-issue-extension (extension-class ${MAC_VM_DEVICE_EXTENSIONS.map((e) => `"${e}"`).join(' ')}))`,
       '(allow file-issue-extension (require-all (extension-class "com.apple.app-sandbox.read-write")',
-      `  (regex #"^${regexLiteral(cache)}/com[.]apple[.]metal-[0-9a-f]+(/|$)")))`,
+      `  (regex #"^${regexLiteral(cache)}/com[.]apple[.]metal-[0-9a-f]+(/|$)"`,
+      `         #"^${regexLiteral(cache)}/com[.]apple[.]paravirtualizedgraphics-[0-9]+(/|$)")))`,
       ";; The display's frames, which VZ hands the helper as IOSurfaces once the",
       ";; guest's display comes up, headless or not. Mapping one opens IOSurface's",
       ";; user client, and IOSurface's first connect reads the main bundle - the",

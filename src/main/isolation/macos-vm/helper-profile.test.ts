@@ -88,10 +88,19 @@ describe('buildMacVmProfile', () => {
       expect(rs).toContain('(allow iokit-open (iokit-user-client-class "IOSurfaceRootUserClient"))');
       expect(rs).toContain('(allow file-read* (literal "/Applications/localmost.app/Contents/Resources"))');
       expect(rs.some((r) => r.includes('(subpath "/Applications/localmost.app/Contents/Resources")'))).toBe(false);
-      expect(rs).toContain(`(allow file-issue-extension (require-all (extension-class "com.apple.app-sandbox.read-write") (regex #"^/private/var/folders/45/abc_def/C/com[.]apple[.]metal-[0-9a-f]+(/|$)")))`);
+      // The display's two per-user caches, Metal's (hex suffix) and macOS 27's
+      // ParavirtualizedGraphics (decimal suffix), each read-write and anchored
+      // under the user cache dir, in one file-issue-extension rule.
+      expect(rs).toContain(
+        `(allow file-issue-extension (require-all (extension-class "com.apple.app-sandbox.read-write") ` +
+          `(regex #"^/private/var/folders/45/abc_def/C/com[.]apple[.]metal-[0-9a-f]+(/|$)" ` +
+          `#"^/private/var/folders/45/abc_def/C/com[.]apple[.]paravirtualizedgraphics-[0-9]+(/|$)")))`
+      );
     }
     for (const rs of [profile({ command: 'check', imageId: 'a1b2c3d4e5f6' }), profile({ command: 'inspect', ipswName: '25G83.ipsw' })]) {
       expect(rs.some((r) => r.includes('IOSurface') || r.includes('generic-issue-extension'))).toBe(false);
+      // No command that does not boot a VM issues the graphics cache extensions.
+      expect(rs.some((r) => r.includes('paravirtualizedgraphics') || r.includes('com[.]apple[.]metal-'))).toBe(false);
     }
   });
 
