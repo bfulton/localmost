@@ -502,6 +502,9 @@ app.whenReady().then(async () => {
     },
     // localmost test runs its jobs in the same VMs, from the same slots.
     testVms: macVmBackend,
+    // `localmost image` builds and watches the golden image headlessly, the
+    // same manager the Settings GUI drives.
+    images: macVm.images,
   });
   setCliServer(cliServer);
   try {

@@ -3,6 +3,8 @@ import * as net from 'net';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { EventEmitter } from 'events';
+import type { MacVmSetupStatus } from '../shared/macos-vm-setup';
 
 // Mock electron
 const mockQuit = jest.fn();
@@ -1006,6 +1008,225 @@ describe('CliServer', () => {
       socket.destroy();
       expect(response).toEqual({ success: false, error: 'Could not lend the test run a macOS VM: the macOS VM did not start: helper exited' });
       expect(released).toEqual(leases);
+    });
+  });
+
+  describe('image builds and watches the golden macOS VM image headlessly', () => {
+    /** A stand-in for MacVmImageManager: the status it reports, and whether build/cancel were called. */
+    class FakeImages extends EventEmitter {
+      built = 0;
+      cancelled = 0;
+      buildThrows: string | null = null;
+      private status_: MacVmSetupStatus;
+      private ready_: unknown | null;
+
+      constructor(initial: MacVmSetupStatus, ready: unknown | null = null) {
+        super();
+        this.status_ = initial;
+        this.ready_ = ready;
+      }
+
+      status(): MacVmSetupStatus {
+        return this.status_;
+      }
+      ready(): unknown | null {
+        return this.ready_;
+      }
+      build(): void {
+        if (this.buildThrows) throw new Error(this.buildThrows);
+        this.built++;
+        // Like the real manager, build() moves the status to building at once.
+        this.emitStatus({ ...this.status_, state: 'building', phase: 'catalog', step: 'Asking which macOS this Mac can run in a VM', percent: undefined, reason: undefined });
+      }
+      cancel(): void {
+        this.cancelled++;
+      }
+      /** Drive a status change, as the manager does as a build proceeds. */
+      emitStatus(status: MacVmSetupStatus): void {
+        this.status_ = status;
+        this.emit('status', status);
+      }
+    }
+
+    const disk = { freeBytes: 200 * 2 ** 30, neededBytes: 60 * 2 ** 30 };
+    const makeStatus = (over: Partial<MacVmSetupStatus> = {}): MacVmSetupStatus => ({
+      state: 'not-built',
+      disk,
+      provisioning: 'headless',
+      busy: false,
+      ...over,
+    });
+
+    let images: FakeImages;
+
+    const withImages = async (fake: FakeImages): Promise<void> => {
+      await server.stop();
+      images = fake;
+      server = new CliServer({
+        onLog: (level, message) => logMessages.push(`${level}: ${message}`),
+        images: fake,
+      });
+      await server.start();
+    };
+
+    const until = async (check: () => boolean): Promise<void> => {
+      for (let i = 0; i < 200 && !check(); i++) await new Promise((r) => setTimeout(r, 10));
+    };
+
+    type Line = { success: boolean; command?: string; error?: string; data?: { status?: MacVmSetupStatus; done?: boolean; note?: string } };
+
+    /** Open a streaming image-build connection, collecting each JSON line. */
+    const buildStream = (args: Record<string, unknown> = {}): { socket: net.Socket; lines: Line[] } => {
+      const lines: Line[] = [];
+      const socket = net.createConnection(testSocketPath, () => socket.write(`${JSON.stringify({ command: 'image-build', args })}\n`));
+      socket.setEncoding('utf8');
+      let buffer = '';
+      socket.on('data', (d: string) => {
+        buffer += d;
+        let nl: number;
+        while ((nl = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, nl);
+          buffer = buffer.slice(nl + 1);
+          if (line.trim()) lines.push(JSON.parse(line) as Line);
+        }
+      });
+      socket.on('error', () => undefined);
+      return { socket, lines };
+    };
+
+    it('image-status returns the manager\'s current status', async () => {
+      await withImages(new FakeImages(makeStatus({ state: 'building', phase: 'download', step: 'Downloading', percent: 42 })));
+      const response = (await sendRequest({ command: 'image-status' })) as Line;
+      expect(response.success).toBe(true);
+      expect(response.command).toBe('image-status');
+      expect(response.data?.status).toMatchObject({ state: 'building', phase: 'download', percent: 42 });
+    });
+
+    it('image-build starts a build and streams progress to a ready image (exit-worthy)', async () => {
+      await withImages(new FakeImages(makeStatus()));
+      const { socket, lines } = buildStream();
+      await until(() => lines.length >= 1);
+      expect(images.built).toBe(1);
+      expect(lines[0]).toMatchObject({ success: true, command: 'image-build', data: { done: false } });
+      expect(lines[0].data?.status?.state).toBe('building');
+
+      images.emitStatus(makeStatus({ state: 'building', phase: 'install', step: 'Installing', percent: 10 }));
+      images.emitStatus(makeStatus({ state: 'ready', disk: { freeBytes: 180 * 2 ** 30, neededBytes: 0 }, image: { os: '26', build: '23A1', diskAllocatedBytes: 20 * 2 ** 30, slots: [1, 2], stale: false } }));
+
+      await until(() => lines.some((l) => l.data?.done === true));
+      const last = lines[lines.length - 1];
+      expect(last).toMatchObject({ success: true, command: 'image-build', data: { done: true } });
+      expect(last.data?.status?.state).toBe('ready');
+      socket.destroy();
+    });
+
+    it('image-build streams a build that ends in failure', async () => {
+      await withImages(new FakeImages(makeStatus()));
+      const { socket, lines } = buildStream();
+      await until(() => lines.length >= 1);
+      images.emitStatus(makeStatus({ state: 'failed', reason: 'the first boot ended badly' }));
+      await until(() => lines.some((l) => l.data?.done === true));
+      const last = lines[lines.length - 1];
+      expect(last.data?.done).toBe(true);
+      expect(last.data?.status?.state).toBe('failed');
+      expect(last.data?.status?.reason).toBe('the first boot ended badly');
+      socket.destroy();
+    });
+
+    it('an image already ready finishes at once without rebuilding, unless --rebuild is passed', async () => {
+      await withImages(new FakeImages(makeStatus({ state: 'ready', disk: { freeBytes: 180 * 2 ** 30, neededBytes: 0 } }), { imageId: 'img-1', slots: [1, 2] }));
+      const { socket, lines } = buildStream();
+      await until(() => lines.length >= 1);
+      expect(images.built).toBe(0);
+      expect(lines[0]).toMatchObject({ success: true, command: 'image-build', data: { done: true, note: 'already-ready' } });
+      socket.destroy();
+
+      // --rebuild builds a new one anyway.
+      const { socket: s2, lines: l2 } = buildStream({ rebuild: true });
+      await until(() => l2.length >= 1 && images.built > 0);
+      expect(images.built).toBe(1);
+      expect(l2[0].data?.done).toBe(false);
+      s2.destroy();
+    });
+
+    it('a build already running is followed, not started again', async () => {
+      await withImages(new FakeImages(makeStatus({ state: 'building', phase: 'download', step: 'Downloading', percent: 5 })));
+      const { socket, lines } = buildStream();
+      await until(() => lines.length >= 1);
+      expect(images.built).toBe(0);
+      expect(lines[0]).toMatchObject({ success: true, command: 'image-build', data: { done: false, note: 'already-running' } });
+      socket.destroy();
+    });
+
+    it('fails fast with the specific reason when this Mac cannot build (unsupported host)', async () => {
+      await withImages(new FakeImages(makeStatus({ state: 'unsupported', reason: 'this build of localmost has no macOS VM helper' })));
+      const { socket, lines } = buildStream();
+      await until(() => lines.length >= 1);
+      expect(lines[0]).toEqual({ success: false, error: 'this build of localmost has no macOS VM helper' });
+      expect(images.built).toBe(0);
+      socket.destroy();
+    });
+
+    it('fails fast when there is not enough free disk', async () => {
+      await withImages(new FakeImages(makeStatus({ disk: { freeBytes: 10 * 2 ** 30, neededBytes: 60 * 2 ** 30 } })));
+      const { socket, lines } = buildStream();
+      await until(() => lines.length >= 1);
+      expect(lines[0].success).toBe(false);
+      expect(lines[0].error).toMatch(/not enough free disk/);
+      expect(images.built).toBe(0);
+      socket.destroy();
+    });
+
+    it('surfaces build()\'s own refusal (e.g. the runner is not downloaded)', async () => {
+      const fake = new FakeImages(makeStatus());
+      fake.buildThrows = 'download the runner first: the golden image gets the same runner as this Mac';
+      await withImages(fake);
+      const { socket, lines } = buildStream();
+      await until(() => lines.length >= 1);
+      expect(lines[0]).toEqual({ success: false, error: 'download the runner first: the golden image gets the same runner as this Mac' });
+      socket.destroy();
+    });
+
+    it('closing the connection detaches WITHOUT cancelling the build (it survives disconnect)', async () => {
+      await withImages(new FakeImages(makeStatus()));
+      const { socket, lines } = buildStream();
+      await until(() => lines.length >= 1 && images.built > 0);
+      expect(images.listenerCount('status')).toBe(1);
+
+      socket.destroy();
+      await until(() => images.listenerCount('status') === 0);
+      // Unlike test-vm's lease, which releases on disconnect, the build is not cancelled.
+      expect(images.cancelled).toBe(0);
+      expect(images.listenerCount('status')).toBe(0);
+
+      // The build goes on: a later status change has no stream to write to, and does not throw.
+      expect(() => images.emitStatus(makeStatus({ state: 'ready', disk: { freeBytes: 180 * 2 ** 30, neededBytes: 0 } }))).not.toThrow();
+      expect(images.cancelled).toBe(0);
+    });
+
+    it('image-cancel cancels a running build, and says so', async () => {
+      await withImages(new FakeImages(makeStatus({ state: 'building', phase: 'download', step: 'Downloading', percent: 5 })));
+      const response = (await sendRequest({ command: 'image-cancel' })) as Line;
+      expect(response).toEqual({ success: true, command: 'image-cancel', message: 'Cancelling the golden image build.' });
+      expect(images.cancelled).toBe(1);
+    });
+
+    it('image-cancel with no build running says nothing is running, and cancels nothing', async () => {
+      await withImages(new FakeImages(makeStatus({ state: 'not-built' })));
+      const response = (await sendRequest({ command: 'image-cancel' })) as Line;
+      expect(response).toEqual({ success: true, command: 'image-cancel', message: 'No golden image build is running.' });
+      expect(images.cancelled).toBe(0);
+    });
+
+    it('answers the image commands with an error when the app has no image manager', async () => {
+      // The default server from the outer beforeEach has no image manager.
+      await server.start();
+      expect(await sendRequest({ command: 'image-status' })).toEqual({ success: false, error: 'This app has no macOS VM image' });
+      expect(await sendRequest({ command: 'image-cancel' })).toEqual({ success: false, error: 'This app has no macOS VM image' });
+      const { socket, lines } = buildStream();
+      await until(() => lines.length >= 1);
+      expect(lines[0]).toEqual({ success: false, error: 'This app has no macOS VM image to build' });
+      socket.destroy();
     });
   });
 });

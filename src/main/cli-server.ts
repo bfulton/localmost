@@ -28,9 +28,12 @@ import type {
   ActionResponse,
   TargetsListResponse,
   TargetMutationResponse,
+  ImageStatusResponse,
+  ImageBuildResponse,
   ErrorResponse,
   TargetSummary,
 } from '../shared/cli-protocol';
+import type { MacVmSetupStatus } from '../shared/macos-vm-setup';
 import type { IsolationAvailability, VmLease } from './isolation/macos-vm';
 
 // Re-exported so importers of ./cli-server keep working.
@@ -42,6 +45,8 @@ export type {
   ActionResponse,
   TargetsListResponse,
   TargetMutationResponse,
+  ImageStatusResponse,
+  ImageBuildResponse,
   ErrorResponse,
   TargetSummary,
 };
@@ -71,6 +76,32 @@ export interface TestVmProvider {
   release(lease: VmLease): Promise<void>;
 }
 
+/**
+ * The golden-image manager the CLI's `image` commands reach: the same
+ * MacVmImageManager the Settings GUI drives, so a headless CI Mac can build
+ * and watch the image without the window. Unlike a test VM's lease, nothing
+ * here is tied to the connection: build() runs on, and the image stays, when
+ * the CLI disconnects.
+ */
+export interface ImageControl {
+  status(): MacVmSetupStatus;
+  ready(): unknown | null;
+  build(): void;
+  cancel(): void;
+  on(event: 'status', listener: (status: MacVmSetupStatus) => void): unknown;
+  off(event: 'status', listener: (status: MacVmSetupStatus) => void): unknown;
+}
+
+/** A build is settled once its status reaches one of these: nothing more streams. */
+const isSettledImageState = (status: MacVmSetupStatus): boolean =>
+  status.state === 'ready' || status.state === 'failed' || status.state === 'unsupported' || status.state === 'not-built';
+
+/** A build (or a wait for the guided setup) is in flight. */
+const isBuildingImageState = (status: MacVmSetupStatus): boolean =>
+  status.state === 'building' || status.state === 'needs-guided-setup';
+
+const formatGiB = (bytes: number): string => `${(bytes / 2 ** 30).toFixed(bytes < 10 * 2 ** 30 ? 1 : 0)} GB`;
+
 const isPort = (value: unknown): value is number => Number.isInteger(value) && (value as number) >= 1 && (value as number) <= 65535;
 
 /**
@@ -96,6 +127,7 @@ export class CliServer {
   private socketPath: string;
   private onLog: (level: 'info' | 'warn' | 'error', message: string) => void;
   private testVms: TestVmProvider | undefined;
+  private images: ImageControl | undefined;
   /** Open connections, so stop() can end them rather than wait on them. */
   private sockets = new Set<net.Socket>();
   /**
@@ -107,10 +139,12 @@ export class CliServer {
   constructor(options: {
     onLog: (level: 'info' | 'warn' | 'error', message: string) => void;
     testVms?: TestVmProvider;
+    images?: ImageControl;
   }) {
     this.socketPath = getCliSocketPath();
     this.onLog = options.onLog;
     this.testVms = options.testVms;
+    this.images = options.images;
   }
 
   /**
@@ -208,6 +242,12 @@ export class CliServer {
     const answer = async (line: string): Promise<void> => {
       try {
         const request = JSON.parse(line) as CliRequest;
+        // image-build streams many lines on this connection and writes them
+        // itself, so it is not one response for answer() to write.
+        if (request?.command === 'image-build') {
+          this.streamImageBuild(socket, request.args);
+          return;
+        }
         const response = request?.command === 'test-vm'
           ? await this.lendTestVm(socket, request.args)
           : request?.command === 'test-vm-release'
@@ -336,6 +376,106 @@ export class CliServer {
     if (!release) return { success: false, error: 'This connection has no macOS VM' };
     await release();
     return { success: true, command: 'test-vm-release' };
+  }
+
+  /**
+   * Build the golden image (or follow a build already running) and stream its
+   * progress on this connection: a line each time the status changes, then a
+   * last line with `done: true` once it settles.
+   *
+   * The build belongs to the app, not this connection. Closing the connection
+   * only detaches from the stream - the status listener is removed and nothing
+   * is cancelled - so a build survives the CLI disconnecting, which is the
+   * whole point on a headless CI Mac. Cancelling is its own command.
+   */
+  private streamImageBuild(socket: net.Socket, args: CliRequest['args']): void {
+    const images = this.images;
+    if (!images) {
+      socket.write(JSON.stringify({ success: false, error: 'This app has no macOS VM image to build' } as ErrorResponse) + '\n');
+      return;
+    }
+    const status = images.status();
+
+    // A build is already running: do not start a second one; follow this one.
+    if (isBuildingImageState(status)) {
+      this.onLog('info', 'CLI request: image-build (a build is already running; streaming it)');
+      this.streamStatusUntilSettled(socket, images, 'already-running');
+      return;
+    }
+
+    // An image is already ready: say so and finish, unless a rebuild is asked.
+    if (images.ready() && args?.rebuild !== true) {
+      this.onLog('info', 'CLI request: image-build (an image is already ready)');
+      socket.write(JSON.stringify({ success: true, command: 'image-build', data: { status, done: true, note: 'already-ready' } } as ImageBuildResponse) + '\n');
+      return;
+    }
+
+    // Fail fast with the specific reason the status gives when this Mac cannot
+    // build, rather than letting build() throw a bare message or stall.
+    const refusal = this.buildRefusal(status);
+    if (refusal) {
+      this.onLog('info', `CLI request: image-build refused: ${refusal}`);
+      socket.write(JSON.stringify({ success: false, error: refusal } as ErrorResponse) + '\n');
+      return;
+    }
+
+    try {
+      images.build();
+    } catch (err) {
+      // build()'s own guards (e.g. the runner is not downloaded) surface here.
+      socket.write(JSON.stringify({ success: false, error: (err as Error).message } as ErrorResponse) + '\n');
+      return;
+    }
+    this.onLog('info', 'CLI request: image-build (started)');
+    this.streamStatusUntilSettled(socket, images);
+  }
+
+  /** The reason this Mac cannot build the image now, or null when it can. */
+  private buildRefusal(status: MacVmSetupStatus): string | null {
+    if (status.state === 'unsupported') {
+      return status.reason ?? 'this Mac cannot build a macOS VM image';
+    }
+    const { freeBytes, neededBytes } = status.disk;
+    if (neededBytes > 0 && freeBytes < neededBytes) {
+      return `not enough free disk to build the golden image: ${formatGiB(freeBytes)} free, about ${formatGiB(neededBytes)} needed`;
+    }
+    return null;
+  }
+
+  /**
+   * Write the current status at once, then one line per status change, until
+   * the build settles; `note` rides the first line. Removes its listener when
+   * the build ends or the connection closes - and closing, nothing else.
+   */
+  private streamStatusUntilSettled(socket: net.Socket, images: ImageControl, note?: 'already-running'): void {
+    let finished = false;
+    const write = (status: MacVmSetupStatus, done: boolean, withNote?: ImageBuildResponse['data']['note']): void => {
+      const data: ImageBuildResponse['data'] = { status, done, ...(withNote ? { note: withNote } : {}) };
+      socket.write(JSON.stringify({ success: true, command: 'image-build', data } as ImageBuildResponse) + '\n');
+    };
+    const finish = (status: MacVmSetupStatus): void => {
+      if (finished) return;
+      finished = true;
+      images.off('status', listener);
+      write(status, true);
+    };
+    const listener = (status: MacVmSetupStatus): void => {
+      if (finished || socket.destroyed) return;
+      if (isSettledImageState(status)) finish(status);
+      else write(status, false);
+    };
+    images.on('status', listener);
+    socket.once('close', () => {
+      // Detaching from the stream must not cancel the build.
+      if (!finished) {
+        finished = true;
+        images.off('status', listener);
+      }
+    });
+    // The status right now: either already settled, or the first progress line.
+    const now = images.status();
+    if (isSettledImageState(now)) finish(now);
+    else write(now, false, note);
   }
 
   /**
@@ -557,6 +697,24 @@ export class CliServer {
           command: 'targets-update',
           data: { target: toTargetSummary(result.data) },
         };
+      }
+
+      case 'image-status': {
+        if (!this.images) {
+          return { success: false, error: 'This app has no macOS VM image' };
+        }
+        return { success: true, command: 'image-status', data: { status: this.images.status() } };
+      }
+
+      case 'image-cancel': {
+        if (!this.images) {
+          return { success: false, error: 'This app has no macOS VM image' };
+        }
+        if (!isBuildingImageState(this.images.status())) {
+          return { success: true, command: 'image-cancel', message: 'No golden image build is running.' };
+        }
+        this.images.cancel();
+        return { success: true, command: 'image-cancel', message: 'Cancelling the golden image build.' };
       }
 
       case 'quit': {

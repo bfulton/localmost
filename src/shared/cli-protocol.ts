@@ -6,6 +6,7 @@
  */
 
 import type { RunnerState, JobHistoryEntry, ResourcePauseState } from './types';
+import type { MacVmSetupStatus } from './macos-vm-setup';
 
 /** Commands the CLI can send to the app. */
 export type CliCommand =
@@ -19,7 +20,10 @@ export type CliCommand =
   | 'targets-remove'
   | 'targets-update'
   | 'test-vm'
-  | 'test-vm-release';
+  | 'test-vm-release'
+  | 'image-status'
+  | 'image-build'
+  | 'image-cancel';
 
 /** Arguments carried by target commands. */
 export interface CliRequestArgs {
@@ -36,6 +40,8 @@ export interface CliRequestArgs {
   /** test-vm: the run's proxy and its closed broker port, both on 127.0.0.1 and both the CLI's. */
   proxyPort?: number;
   brokerPort?: number;
+  /** image-build: rebuild even when an image is already ready. */
+  rebuild?: boolean;
 }
 
 /** CLI command request. */
@@ -91,11 +97,39 @@ export interface JobsResponse {
   };
 }
 
-/** CLI response for pause/resume/quit commands */
+/** CLI response for pause/resume/quit/image-cancel commands */
 export interface ActionResponse {
   success: true;
-  command: 'pause' | 'resume' | 'quit';
+  command: 'pause' | 'resume' | 'quit' | 'image-cancel';
   message: string;
+}
+
+/** CLI response for image-status: the golden image manager's current status. */
+export interface ImageStatusResponse {
+  success: true;
+  command: 'image-status';
+  data: {
+    status: MacVmSetupStatus;
+  };
+}
+
+/**
+ * CLI response for image-build. The app answers on one connection that stays
+ * open for the build: a line each time the status changes, then a last line
+ * with `done: true` once the build is ready, failed or otherwise settled.
+ * Closing the connection detaches from the stream; it does NOT cancel the
+ * build, which survives the CLI going away.
+ */
+export interface ImageBuildResponse {
+  success: true;
+  command: 'image-build';
+  data: {
+    status: MacVmSetupStatus;
+    /** False for a progress update; true once the build has settled or there was nothing to build. */
+    done: boolean;
+    /** On the first line only: a build was already running, or an image was already ready. */
+    note?: 'already-running' | 'already-ready';
+  };
 }
 
 /** CLI response for targets-list */
@@ -153,4 +187,6 @@ export type CliResponse =
   | TargetMutationResponse
   | TestVmResponse
   | TestVmReleaseResponse
+  | ImageStatusResponse
+  | ImageBuildResponse
   | ErrorResponse;
