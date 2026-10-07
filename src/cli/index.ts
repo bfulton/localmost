@@ -25,6 +25,7 @@ import { runTest, parseTestArgs, printTestHelp } from './test';
 import { runPolicy, parsePolicyArgs, printPolicyHelp } from './policy';
 import { runEnv, parseEnvArgs, printEnvHelp } from './env';
 import { runTargets, parseTargetsArgs, printTargetsHelp, createPrompt } from './targets';
+import { runImage, parseImageArgs, printImageHelp } from './image';
 
 import type {
   CliRequest,
@@ -60,6 +61,7 @@ APP COMMANDS (requires running app):
   resume    Resume the runner (start accepting jobs)
   jobs      Show recent job history
   targets   Manage the repos/orgs this machine runs jobs for
+  image     Build and watch the golden macOS VM image (status/build/cancel)
 
 EXAMPLES:
   localmost test                  Run default workflow locally
@@ -70,12 +72,14 @@ EXAMPLES:
   localmost status                Check runner status
   localmost targets               List configured targets
   localmost targets add o/r       Register runners for a repo
+  localmost image build           Build the golden macOS VM image
 
 For command-specific help:
   localmost test --help
   localmost policy --help
   localmost env --help
   localmost targets --help
+  localmost image --help
 
 DOCUMENTATION:
   https://github.com/bfulton/localmost
@@ -471,6 +475,37 @@ async function main(): Promise<void> {
     const exitCode = await runTargets(parsed.subcommand, parsed.ref, parsed.options, {
       send: request => sendCommand(request, TARGETS_TIMEOUT_MS),
       io: { isTTY: Boolean(process.stdin.isTTY), prompt: createPrompt() },
+      out: line => console.log(line),
+      err: line => console.error(line),
+    });
+    process.exit(exitCode);
+  }
+
+  // Image command - build and watch the golden macOS VM image
+  if (command === 'image') {
+    if (subArgs.includes('--help') || subArgs.includes('-h')) {
+      printImageHelp();
+      process.exit(0);
+    }
+
+    let parsed;
+    try {
+      parsed = parseImageArgs(subArgs);
+    } catch (err) {
+      console.error(`Error: ${(err as Error).message}`);
+      console.error('Run "localmost image --help" for usage information.');
+      process.exit(1);
+    }
+
+    if (!await isAppRunning()) {
+      console.error('Error: localmost app is not running (start it with "localmost start")');
+      process.exit(1);
+    }
+
+    // A build streams for as long as it runs, so it manages its own
+    // connection and timeout; status and cancel answer at once.
+    const exitCode = await runImage(parsed.subcommand, parsed.options, {
+      send: request => sendCommand(request),
       out: line => console.log(line),
       err: line => console.error(line),
     });
