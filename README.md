@@ -220,12 +220,28 @@ localmost targets add my-org --org           # Register runners for an org
 localmost targets disable bfulton/supdb      # Stop accepting its jobs
 localmost targets remove bfulton/supdb       # Unregister its runners
 localmost targets list --json                # Machine-readable output
+
+# Build and watch the golden macOS VM image (headless, no Settings GUI needed)
+localmost image status                       # State, progress and disk
+localmost image build                        # Build it (or follow a running build)
+localmost image build --rebuild              # Build a new one even if one is ready
+localmost image cancel                       # Cancel a running build
 ```
 
 Adding a target registers one runner per concurrent job slot with GitHub, and the
 running app picks up the new target without a restart. Removing one unregisters
 those runners; `remove` asks for confirmation unless you pass `--yes`, and refuses
 to run unconfirmed outside a terminal. Every subcommand accepts `--json`.
+
+`localmost image` builds the golden macOS VM image the runner needs, for a headless
+CI Mac with no Settings GUI. `image build` starts the build (or follows one already
+running) and streams its progress until the image is ready, exiting 0 on success and
+non-zero on error; it fails fast with the reason when this Mac cannot build (an
+unsupported host, a missing helper, or too little free disk). The build runs in the
+app, not the command: pressing Ctrl-C detaches and leaves the build running, so it
+survives the terminal closing - check it again with `image status`, stop it with
+`image cancel`. If an image is already ready, `image build` says so and does nothing
+unless you pass `--rebuild`.
 
 ### Testing workflows locally
 
