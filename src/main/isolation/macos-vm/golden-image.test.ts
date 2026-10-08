@@ -30,6 +30,7 @@ describe('MacVmImageManager', () => {
   let statuses: MacVmSetupStatus[];
   let bootstraps: BootstrapOptions[];
   let inUse: Set<string>;
+  let launched: MacVmHelper[];
   const managers: MacVmImageManager[] = [];
 
   beforeEach(() => {
@@ -41,6 +42,7 @@ describe('MacVmImageManager', () => {
     statuses = [];
     bootstraps = [];
     inUse = new Set();
+    launched = [];
   });
 
   afterEach(() => {
@@ -48,22 +50,35 @@ describe('MacVmImageManager', () => {
     fs.rmSync(data, { recursive: true, force: true });
   });
 
-  const manager = (opts: { host?: HostInfo; provisioning?: boolean; script?: Record<string, unknown>; helperExists?: boolean; bootstrap?: (o: BootstrapOptions) => Promise<void> } = {}) => {
+  const manager = (
+    opts: {
+      host?: HostInfo;
+      provisioning?: boolean;
+      script?: Record<string, unknown>;
+      helperExists?: boolean;
+      bootstrap?: (o: BootstrapOptions) => Promise<void>;
+      readLeases?: () => string;
+      leaseTimeoutMs?: number;
+    } = {}
+  ) => {
     const deps: ImageManagerDeps = {
       dataDir: data,
       host: () => opts.host ?? sonoma26,
       helperExists: () => opts.helperExists ?? true,
       helperHasProvisioning: async () => opts.provisioning ?? false,
       agentBinary: () => path.join(data, 'agent'),
-      launch: (invocation: HelperInvocation, launchOpts) =>
-        new MacVmHelper({
+      launch: (invocation: HelperInvocation, launchOpts) => {
+        const helper = new MacVmHelper({
           helper: '/unused/localmost-macvm',
           invocation,
           spawn: fakeMacVmSpawn(opts.script ?? {}, record),
           env: { PATH: '/usr/bin:/bin', TMPDIR: data },
           log: () => {},
           ...(launchOpts?.expectAgentSocket ? { expectAgentSocket: launchOpts.expectAgentSocket } : {}),
-        }),
+        });
+        launched.push(helper);
+        return helper;
+      },
       slots: new MacVmSlots(() => 2),
       runnerArc: () => ({ version: '2.330.0', dir: arc }),
       packRunner: async (_version, dest) => fs.writeFileSync(dest, 'runner tarball'),
@@ -73,9 +88,10 @@ describe('MacVmImageManager', () => {
       log: () => {},
       download: async (o) => fs.writeFileSync(o.dest, 'ipsw'),
       sha1For: async () => null,
-      readLeases: () => LEASES,
+      readLeases: opts.readLeases ?? (() => LEASES),
       bootstrap: opts.bootstrap ?? (async (o) => void bootstraps.push(o)),
       leasePollMs: 5,
+      ...(opts.leaseTimeoutMs !== undefined ? { leaseTimeoutMs: opts.leaseTimeoutMs } : {}),
       setupGraceMs: 2000,
     };
     const m = new MacVmImageManager(deps);
@@ -176,6 +192,52 @@ describe('MacVmImageManager', () => {
     await m.start();
     m.build();
     expect(await settled(m, ['failed', 'ready'])).toMatchObject({ state: 'failed', reason: 'the VM stopped before its setup finished' });
+    expect(images()).toEqual([]);
+  });
+
+  // The provisioning VM stays up (no guestStopsAfterMs) so that only the
+  // build's own teardown can stop it: a leak leaves this helper running.
+  const provisionHelper = () => launched.find((h) => h.command === 'provision');
+  const untilSetupWaiting = () =>
+    new Promise<void>((resolve) => {
+      const check = () => (statuses.some((s) => /Remote Login/.test(s.step ?? '')) ? resolve() : setTimeout(check, 10));
+      check();
+    });
+
+  it('stops the provisioning VM when the setup over Remote Login fails', async () => {
+    const m = manager({ host: tahoe27, provisioning: true, script: { provision: {} }, bootstrap: () => Promise.reject(new Error('setup boom')) });
+    await m.start();
+    m.build();
+    expect(await settled(m, ['failed', 'ready'])).toMatchObject({ state: 'failed', reason: expect.stringMatching(/setup boom/) });
+    const provision = provisionHelper();
+    expect(provision).toBeDefined();
+    await provision!.exited();
+    expect(provision!.hasExited()).toBe(true);
+    expect(images()).toEqual([]);
+  });
+
+  it('stops the provisioning VM when it never gets an address', async () => {
+    const m = manager({ host: tahoe27, provisioning: true, script: { provision: {} }, readLeases: () => '', leaseTimeoutMs: 20 });
+    await m.start();
+    m.build();
+    expect(await settled(m, ['failed', 'ready'])).toMatchObject({ state: 'failed', reason: expect.stringMatching(/no address/) });
+    const provision = provisionHelper();
+    expect(provision).toBeDefined();
+    await provision!.exited();
+    expect(provision!.hasExited()).toBe(true);
+  });
+
+  it('stops the provisioning VM when the build is cancelled during setup', async () => {
+    const m = manager({ host: tahoe27, provisioning: true, script: { provision: {} }, bootstrap: () => new Promise(() => {}) });
+    await m.start();
+    m.build();
+    await untilSetupWaiting();
+    m.cancel();
+    expect(await settled(m, ['not-built', 'failed'])).toMatchObject({ state: 'not-built' });
+    const provision = provisionHelper();
+    expect(provision).toBeDefined();
+    await provision!.exited();
+    expect(provision!.hasExited()).toBe(true);
     expect(images()).toEqual([]);
   });
 

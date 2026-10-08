@@ -428,63 +428,70 @@ export class MacVmImageManager extends EventEmitter {
       this.building!.helper = provision;
       provision.start();
       const exited = provision.exited();
-      if (headless) {
-        await Promise.race([new Promise((resolve) => provision.once('ready', resolve)), exited]);
-        if (!provision.hasExited()) provision.send({ op: 'provision', ...account });
-      } else {
-        provision.send({ op: 'guide', ...account });
-      }
-      const started = await Promise.race([new Promise<{ mac?: string }>((resolve) => provision.once('started', resolve)), exited.then(() => null)]);
-      if (!started?.mac) throw new Error(`the first boot did not start: ${(await exited).end?.message ?? (await exited).errorCode}`);
-      check();
-
-      this.set({ phase: 'setup', step: 'Waiting for the VM to get an address' });
-      const ip = await this.waitForLease(started.mac, signal, exited);
-      const tarball = path.join(boot, 'runner.tar.gz');
-      await d.packRunner(arc.version, tarball);
-      this.set({ phase: 'setup', step: headless ? 'Setting up the VM over Remote Login' : 'Waiting for Remote Login to be turned on in the VM' });
-      // The setup runs while the VM is up. A VM that stops first - its
-      // window closed, say - ends the setup too, once the guest's own
-      // shutdown at the end of a finished setup has had time to be reported.
-      const setupAbort = new AbortController();
-      signal.addEventListener('abort', () => setupAbort.abort(), { once: true });
-      let setUp = false;
-      const setup = (d.bootstrap ?? runBootstrap)({
-        ip, account, dir: boot, agentBinary: d.agentBinary(), runnerTarball: tarball, signal: setupAbort.signal,
-        inputs: {
-          jobPassword: crypto.randomBytes(24).toString('base64url'),
-          discardedAdminPassword: crypto.randomBytes(24).toString('base64url'),
-          runnerVersion: arc.version, osVersion: os, osBuild: build,
-        },
-        onStep: (index, of, what) => this.set({ phase: 'setup', step: `Setting up the VM: ${what}`, percent: Math.floor(((index - 1) / of) * 100), guided: undefined }),
-        log: (level, message) => d.log(level, `macOS VM setup: ${message}`),
-      }).then(() => {
-        setUp = true;
-      });
-      const grace = new AbortController();
-      const stoppedFirst = exited.then(async () => {
-        await delay(d.setupGraceMs ?? 15_000, grace.signal).catch(() => {});
-        if (!setUp && !grace.signal.aborted) {
-          setupAbort.abort();
-          throw new Error('the VM stopped before its setup finished');
-        }
-      });
-      stoppedFirst.catch(() => {});
+      // However this boot ends - the setup fails, the reachable-wait times
+      // out, the build is cancelled, or the guest shuts itself down - the
+      // provisioning helper and its VM must be stopped before we return, or
+      // one of the Mac's two VMs stays up until the app restarts (the same
+      // leak release() guards against for job VMs). stop(0) is a no-op once
+      // the helper has exited, so the clean path pays nothing.
       try {
-        await Promise.race([setup, stoppedFirst.then(() => setup)]);
+        if (headless) {
+          await Promise.race([new Promise((resolve) => provision.once('ready', resolve)), exited]);
+          if (!provision.hasExited()) provision.send({ op: 'provision', ...account });
+        } else {
+          provision.send({ op: 'guide', ...account });
+        }
+        const started = await Promise.race([new Promise<{ mac?: string }>((resolve) => provision.once('started', resolve)), exited.then(() => null)]);
+        if (!started?.mac) throw new Error(`the first boot did not start: ${(await exited).end?.message ?? (await exited).errorCode}`);
+        check();
+
+        this.set({ phase: 'setup', step: 'Waiting for the VM to get an address' });
+        const ip = await this.waitForLease(started.mac, signal, exited);
+        const tarball = path.join(boot, 'runner.tar.gz');
+        await d.packRunner(arc.version, tarball);
+        this.set({ phase: 'setup', step: headless ? 'Setting up the VM over Remote Login' : 'Waiting for Remote Login to be turned on in the VM' });
+        // The setup runs while the VM is up. A VM that stops first - its
+        // window closed, say - ends the setup too, once the guest's own
+        // shutdown at the end of a finished setup has had time to be reported.
+        const setupAbort = new AbortController();
+        signal.addEventListener('abort', () => setupAbort.abort(), { once: true });
+        let setUp = false;
+        const setup = (d.bootstrap ?? runBootstrap)({
+          ip, account, dir: boot, agentBinary: d.agentBinary(), runnerTarball: tarball, signal: setupAbort.signal,
+          inputs: {
+            jobPassword: crypto.randomBytes(24).toString('base64url'),
+            discardedAdminPassword: crypto.randomBytes(24).toString('base64url'),
+            runnerVersion: arc.version, osVersion: os, osBuild: build,
+          },
+          onStep: (index, of, what) => this.set({ phase: 'setup', step: `Setting up the VM: ${what}`, percent: Math.floor(((index - 1) / of) * 100), guided: undefined }),
+          log: (level, message) => d.log(level, `macOS VM setup: ${message}`),
+        }).then(() => {
+          setUp = true;
+        });
+        const grace = new AbortController();
+        const stoppedFirst = exited.then(async () => {
+          await delay(d.setupGraceMs ?? 15_000, grace.signal).catch(() => {});
+          if (!setUp && !grace.signal.aborted) {
+            setupAbort.abort();
+            throw new Error('the VM stopped before its setup finished');
+          }
+        });
+        stoppedFirst.catch(() => {});
+        try {
+          await Promise.race([setup, stoppedFirst.then(() => setup)]);
+        } finally {
+          grace.abort();
+        }
+        check();
+        // The setup shuts the guest down, which ends the provisioning helper.
+        const shutdown = new AbortController();
+        const end = await Promise.race([exited, delay(10 * 60_000, shutdown.signal).then(() => null, () => null)]);
+        shutdown.abort();
+        if (!end) throw new Error('the VM did not shut down after its setup');
+        if (end.errorCode) throw new Error(`the first boot ended badly: ${end.end?.message ?? end.errorCode}`);
       } finally {
-        grace.abort();
+        if (!provision.hasExited()) await provision.stop(0);
       }
-      check();
-      // The setup shuts the guest down, which ends the provisioning helper.
-      const shutdown = new AbortController();
-      const end = await Promise.race([exited, delay(10 * 60_000, shutdown.signal).then(() => null, () => null)]);
-      shutdown.abort();
-      if (!end) {
-        await provision.stop(0);
-        throw new Error('the VM did not shut down after its setup');
-      }
-      if (end.errorCode) throw new Error(`the first boot ended badly: ${end.end?.message ?? end.errorCode}`);
     } finally {
       d.slots.release(slot);
     }
